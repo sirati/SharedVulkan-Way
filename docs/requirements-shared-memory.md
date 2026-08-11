@@ -69,20 +69,48 @@ These are the questions the design must answer with evidence, not hope:
    Linux? If not, what is the fallback — dma-buf import, virtio-gpu blob
    resources, or something else?
 
-2. **Where does the arena physically live?** Two candidates, with very
-   different consequences:
-   - An **ivshmem BAR**. Simple and symmetric, but it is MMIO rather than
-     ordinary RAM, which affects whether a GPU driver will accept it as
-     importable memory, and it needs a driver on Windows — with the signing
-     problem that entails on a production machine.
-   - **The VM's own RAM**, which on this machine is already a
-     `memory-backend-memfd` with `share=on` (virtio-fs forced that), so the
-     Linux side can already mmap guest RAM. If the arena is ordinary guest RAM,
-     the GPU-side driver treats it as ordinary host-visible memory. The
-     difficulty moves to pinning and to translating guest-virtual to an offset
-     in the memfd, which in Windows is a kernel-mode job — reintroducing the
-     driver problem from a different direction.
-   Decide with evidence which is achievable without unsigned drivers.
+2. **Where does the arena physically live?**
+
+   **The user's stated preference: if direct VM↔host memory mapping already
+   works, use it and drop the dedicated shared-memory device entirely.** That
+   is the direction to pursue first, and it is the better answer if it holds —
+   no ivshmem, no extra PCI device, and, decisively, no unsigned Windows
+   driver.
+
+   The half that is already true: the VM's RAM on this machine is a
+   `memory-backend-memfd` with `share=on` (virtio-fs forced that), so the Linux
+   side can mmap guest RAM today, with nothing added. If the arena is ordinary
+   guest RAM then the GPU-side driver sees ordinary host-visible memory, which
+   is exactly what we want it to see.
+
+   The half that is not yet established, and must not be assumed: **how the two
+   sides agree on which pages.** Mapping the memfd gives Linux the whole of
+   guest RAM, but the arena has to be a specific region that the Windows
+   process has allocated and that Windows will not move, page out, or reuse.
+   Going from a Windows user-mode allocation to a stable offset in the memfd
+   means guest-virtual → guest-physical translation plus pinning, and on
+   Windows that is ordinarily kernel-mode work — which would reintroduce the
+   driver problem from the other direction.
+
+   So the open question is narrow and concrete: **is there a way to establish
+   and pin that correspondence without an unsigned driver?** Candidates worth
+   checking before concluding it cannot be done:
+   - A virtio device that exposes a **shared memory region**
+     (`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`) — the mechanism virtio-fs uses for
+     its DAX window and virtio-gpu uses for blob resources. This maps host
+     memory into the guest through a BAR, and the **virtio-win drivers are
+     WHQL-signed**, which would satisfy the constraint that a dedicated
+     ivshmem driver does not. Note this is still "a device", but a signed one
+     we already have drivers for.
+   - Large-page or non-paged allocations with a documented user-mode route to
+     physical addresses (`AWE`/`AllocateUserPhysicalPages`), and whether the
+     hypervisor's view of those is stable.
+   - Whether QEMU/KVM can be asked to expose the mapping the other way, so the
+     guest-physical range is chosen by the host and simply handed to the guest.
+
+   If none of these works, the honest conclusion is that *some* device is
+   required, and we choose the one with a signed driver rather than the most
+   elegant one. Establish this with evidence — it decides the architecture.
 
 3. **Coherency.** Who flushes what, and when. `vkFlushMappedMemoryRanges` and
    `vkInvalidateMappedMemoryRanges` become real operations that must be honoured
