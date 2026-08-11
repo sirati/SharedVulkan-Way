@@ -1,0 +1,11 @@
+[package]
+name = "awe-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Guest half of step 0: AWE window, shared with the host, imported into Vulkan"
+
+[dependencies]
+arena-record = { path = "../arena-record" }
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }

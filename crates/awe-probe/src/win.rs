@@ -1,0 +1,172 @@
+//! The Win32 surface this probe needs, declared by hand.
+//!
+//! Hand-written rather than pulled from `windows-sys` on purpose: the whole
+//! probe is about a dozen calls, the dev shell builds offline, and a reader
+//! checking whether we called `AllocateUserPhysicalPages` correctly should be
+//! able to see the exact signature we used without chasing a crate version.
+
+#![allow(non_camel_case_types, non_snake_case)]
+// The type names are the SDK's, deliberately: a reader checking a signature
+// against MSDN should see the same spelling.
+#![allow(clippy::upper_case_acronyms)]
+
+use std::ffi::c_void;
+
+pub type BOOL = i32;
+pub type HANDLE = *mut c_void;
+pub type ULONG_PTR = usize;
+
+pub const MEM_COMMIT: u32 = 0x0000_1000;
+pub const MEM_RESERVE: u32 = 0x0000_2000;
+pub const MEM_RELEASE: u32 = 0x0000_8000;
+pub const MEM_PHYSICAL: u32 = 0x0040_0000;
+pub const PAGE_READWRITE: u32 = 0x04;
+
+pub const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+pub const TOKEN_QUERY: u32 = 0x0008;
+pub const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+
+pub const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+pub const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LUID {
+    pub LowPart: u32,
+    pub HighPart: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LUID_AND_ATTRIBUTES {
+    pub Luid: LUID,
+    pub Attributes: u32,
+}
+
+#[repr(C)]
+pub struct TOKEN_PRIVILEGES {
+    pub PrivilegeCount: u32,
+    pub Privileges: [LUID_AND_ATTRIBUTES; 1],
+}
+
+unsafe extern "system" {
+    pub fn GetLastError() -> u32;
+    pub fn GetCurrentProcess() -> HANDLE;
+
+    pub fn VirtualAlloc(
+        lpAddress: *mut c_void,
+        dwSize: usize,
+        flAllocationType: u32,
+        flProtect: u32,
+    ) -> *mut c_void;
+    pub fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> BOOL;
+    pub fn VirtualLock(lpAddress: *mut c_void, dwSize: usize) -> BOOL;
+    pub fn VirtualUnlock(lpAddress: *mut c_void, dwSize: usize) -> BOOL;
+    pub fn GetProcessWorkingSetSize(
+        hProcess: HANDLE,
+        lpMinimumWorkingSetSize: *mut usize,
+        lpMaximumWorkingSetSize: *mut usize,
+    ) -> BOOL;
+    pub fn SetProcessWorkingSetSize(
+        hProcess: HANDLE,
+        dwMinimumWorkingSetSize: usize,
+        dwMaximumWorkingSetSize: usize,
+    ) -> BOOL;
+
+    // Address Windowing Extensions. `PageArray` is filled with physical frame
+    // numbers — inside a VM, guest-physical ones, which is the entire point.
+    pub fn AllocateUserPhysicalPages(
+        hProcess: HANDLE,
+        NumberOfPages: *mut ULONG_PTR,
+        PageArray: *mut ULONG_PTR,
+    ) -> BOOL;
+    pub fn FreeUserPhysicalPages(
+        hProcess: HANDLE,
+        NumberOfPages: *mut ULONG_PTR,
+        PageArray: *const ULONG_PTR,
+    ) -> BOOL;
+    pub fn MapUserPhysicalPages(
+        VirtualAddress: *mut c_void,
+        NumberOfPages: ULONG_PTR,
+        PageArray: *const ULONG_PTR,
+    ) -> BOOL;
+
+    pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+}
+
+// The token calls live in advapi32, which mingw does not link by default.
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    pub fn OpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: u32,
+        TokenHandle: *mut HANDLE,
+    ) -> BOOL;
+    pub fn LookupPrivilegeValueW(
+        lpSystemName: *const u16,
+        lpName: *const u16,
+        lpLuid: *mut LUID,
+    ) -> BOOL;
+    pub fn AdjustTokenPrivileges(
+        TokenHandle: HANDLE,
+        DisableAllPrivileges: BOOL,
+        NewState: *const TOKEN_PRIVILEGES,
+        BufferLength: u32,
+        PreviousState: *mut TOKEN_PRIVILEGES,
+        ReturnLength: *mut u32,
+    ) -> BOOL;
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Try to enable a privilege in this process's token.
+///
+/// Returns `Ok(true)` if the privilege was enabled, `Ok(false)` if the token
+/// does not hold it at all (`ERROR_NOT_ALL_ASSIGNED` — the answer when the
+/// account has no "Lock pages in memory" user-right assignment), and `Err` if
+/// the call machinery itself failed.
+pub fn enable_privilege(name: &str) -> Result<bool, String> {
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return Err(format!("OpenProcessToken failed: {}", GetLastError()));
+        }
+        let mut luid = LUID::default();
+        let n = wide(name);
+        if LookupPrivilegeValueW(std::ptr::null(), n.as_ptr(), &mut luid) == 0 {
+            let e = GetLastError();
+            CloseHandle(token);
+            return Err(format!("LookupPrivilegeValue({name}) failed: {e}"));
+        }
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let ok = AdjustTokenPrivileges(
+            token,
+            0,
+            &tp,
+            std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        // AdjustTokenPrivileges succeeds even when it changed nothing; the
+        // only honest test is GetLastError.
+        let err = GetLastError();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(format!("AdjustTokenPrivileges failed: {err}"));
+        }
+        Ok(err != ERROR_NOT_ALL_ASSIGNED)
+    }
+}

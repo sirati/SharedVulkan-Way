@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/vk-registry", "crates/vk-probe"]
+members = [
+  "crates/vk-registry",
+  "crates/vk-probe",
+  "crates/arena-record",
+  "crates/awe-probe",
+  "crates/arena-host",
+]
 
 [workspace.package]
 edition = "2024"

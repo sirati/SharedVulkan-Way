@@ -225,15 +225,47 @@ attestation-signed ~200-line pinning driver over ordinary `VirtualAlloc` memory,
 which dodges every AWE restriction — attestation signing is a genuine Microsoft
 signature, not test-signing, so R6 is not violated.
 
-### R20 — Importing guest RAM shared with the host is unmeasured
-The single largest gap in the whole design. What is measured is that the
-mechanism exists and is page-granular. What is *not* measured is whether a
-driver that pins pages will accept memory that is simultaneously guest RAM, an
-AWE allocation, and mapped by a process on the other side of the hypervisor.
-There is no prior art for this exact combination — gfxstream's equivalent path
-runs in the conventional direction.
-*Mitigation:* none. It is a gate, not a risk to manage: `design.md` §13 step 0
-answers it in an afternoon and nothing else is worth building first.
+### R20 — Importing guest RAM shared with the host — **measured, mostly retired**
+The single largest gap in the whole design was whether a driver that pins pages
+would accept memory that is simultaneously guest RAM, an AWE allocation, and
+mapped by a process on the other side of the hypervisor. There was no prior art
+for the combination — gfxstream's equivalent path runs in the conventional
+direction.
+
+**Measured 2026-08-11 on the real target** (`measured-gpu-side.md`, "Step 0").
+A 64 MiB window of guest RAM was allocated in the Windows guest, located in
+QEMU's `memory-backend-memfd` by a Linux process, written into from the host,
+and then imported by the Intel driver:
+
+- `vkGetMemoryHostPointerPropertiesEXT` → `SUCCESS`, `memoryTypeBits = 0x6` —
+  the same answer ordinary process memory gets. The driver does not distinguish
+  these pages.
+- `vkAllocateMemory` with `VkImportMemoryHostPointerInfoEXT` → **OK**, at
+  1 MiB and at 64 MiB.
+- All 16384 pages of the driver's mapping carried the bytes the *host* had
+  written across the hypervisor; bytes written back through the
+  `VkDeviceMemory` mapping appeared in the memfd at the predicted offsets and
+  were read out of guest-physical memory by QEMU's own `xp`; a second host
+  write, made after the import, was seen by the guest.
+
+So (a) guest RAM and (c) host-mapped across the hypervisor are settled: they
+import, and the memory is genuinely shared in both directions.
+
+**What remains open is (b), AWE specifically.** `SeLockMemoryPrivilege` is
+unassigned in the guest's local security policy — `AllocateUserPhysicalPages`
+returns `ERROR_PRIVILEGE_NOT_HELD` — and granting it is a security-policy
+change that was deliberately not made. The window was therefore obtained with
+`VirtualAlloc` + `VirtualLock`, and the host found its pages by scanning the
+memfd for their contents rather than by translating frame numbers. Two
+consequences: R19 is untouched, and the design's "the GPU side hands us frame
+numbers" step (§5.1) is still unexercised.
+*Residual mitigation:* grant the privilege (one `[Privilege Rights]` line plus a
+new logon — no reboot, no interactive logoff, no code-integrity setting
+touched) and re-run `awe-probe`, which takes the AWE path automatically when the
+privilege is present. The alternative remains the attestation-signed pinning
+driver of R19. Note also that nothing here proves the *GPU* can DMA from these
+pages, only that the driver accepts and maps them — that is R15's trivial
+compute workload, still unrun.
 
 ### R21 — GPA → memfd offset translation is configuration-dependent
 The arena's location in the memfd is derived from guest physical frame numbers
@@ -246,6 +278,15 @@ what the arena contains.
 cross-checked against the closed form, and is validated at handshake by writing
 a known pattern at known offsets from the GPU side and reading it back on the
 app side before any Vulkan call is made.
+*Measured 2026-08-11.* On this machine (`-machine pc`, 13312 MiB) the split is
+**3 GiB**, not the 3.5 GiB an i440fx uses at smaller RAM sizes: below 4 GiB
+`offset = gpa`, above it `offset = gpa - 0x4000_0000`. The failure mode was
+confirmed as predicted rather than assumed — reading the memfd offset as if it
+were the GPA lands on unrelated, zeroed memory and reports no error at all
+(`measured-gpu-side.md`). Two carve-outs below 4 GiB are also not RAM at their
+identity offsets: the `0xc0000-0xfffff` ROM window, and `0x103000-0x10efff`,
+which twelve Hyper-V SynIC message pages overlay — so the translation must walk
+the flat view, not compute a formula.
 
 ### R22 — Cross-ring ordering depends on a barrier we must emit correctly
 Per-queue rings mean the application's own happens-before does not survive the
