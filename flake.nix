@@ -90,6 +90,14 @@
           # at the mingw one from the store rather than whatever is on PATH.
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.buildPackages.gcc}/bin/x86_64-w64-mingw32-gcc"
 
+          # rustc's windows-gnu target links `-l:libpthread.a`, which the gcc
+          # wrapper does not bring along. The library lives in the mingw
+          # *target* package — which cannot go in `packages` above, since nix
+          # rejects Windows-built libraries in a Linux shell as an unsupported
+          # system. Referring to its store path is fine, though: we only need a
+          # search path, not to install it.
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib"
+
           echo "shared_vulkan dev shell"
           echo "  rustc    $(rustc --version 2>/dev/null | cut -d' ' -f2)"
           echo "  vk.xml   $VK_XML"

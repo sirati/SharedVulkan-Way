@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/vk-registry", "crates/vk-probe"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+
+[workspace.dependencies]
+anyhow = "1"
+vk-parse = "0.19"

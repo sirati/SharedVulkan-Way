@@ -3,14 +3,26 @@
 Counted from the pinned registry, `vulkan-headers 1.4.350.0`, the same
 `vk.xml` the dev shell exports as `$VK_XML`:
 
-| entity     | count |
-|------------|-------|
-| commands   | 1885  |
-| structs    | 1701  |
-| unions     | 16    |
-| enums      | 346   |
-| handles    | 62    |
-| extensions | 689   |
+| entity           | count |
+|------------------|-------|
+| commands         | 747   |
+| command aliases  | 105   |
+| structs          | 1701  |
+| unions           | 16    |
+| handles          | 62    |
+| enum types       | 404   |
+| extensions       | 689   |
+
+Counted by parsing the registry (`crates/vk-registry`), not by grepping it.
+The first version of this table said 1885 commands, which was wrong: `grep -c
+"<command"` also counts every `<command name="..."/>` *reference* inside the
+`<require>` blocks of features and extensions, and there are far more
+references than definitions. 747 definitions plus 105 aliases is the real
+figure.
+
+That the corrected number is smaller does not weaken the argument below — 747
+commands and 1701 structs is still several times what sharedgl hand-wrote for
+OpenGL — but a design should not rest on a number nobody checked.
 
 ## What follows from this
 
