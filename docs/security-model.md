@@ -93,6 +93,21 @@ just this project. On testhost the guest is a family laptop in production
 use.
 *Mitigation:* hard constraint — no permanent test-signing. This may eliminate a
 transport option entirely, which is a design input rather than a risk to accept.
+*Settled 2026-08-11 — the constraint cost nothing, because no path in the plan
+needs a driver at all.* Two candidates were live when this was written. The
+**attestation-signed pinning driver** (R19's fallback) is **dropped**, not merely
+unused: everything it was held in reserve for has been measured away — an
+ordinary pointer imports, AWE imports and still returns real guest-physical
+frames, and the content scan locates pages in ~2 s, so an EV certificate would
+have bought a one-off locate step 2 s faster on a path we have decided not to
+take (`design.md` §5.1, D2). **ivshmem** is out for a mechanism reason rather
+than a signing one — host-pointer import is kernel userptr, userptr pins pages,
+and a BAR is `VM_IO|VM_PFNMAP`, which the pinning path rejects by construction
+(`design.md` §5.1). The arena is ordinary guest RAM through the memfd the guest
+already runs on. The constraint itself is not retired — it is a property of the
+machine, not of the design — but nothing in the plan is now testing it. If a
+driver is ever proposed again, this entry is why it has to be argued from a
+stated new reason rather than revived from the old one.
 
 ### R7 — `unsafe` in our own code
 Mapping shared memory, casting generated structures, and pointer arithmetic in
@@ -103,25 +118,129 @@ number of reviewed modules with stated invariants, keep the generated code
 safe-by-construction where possible, and test the allocator and the ring under
 Miri. This is what "use Rust to make it as safe as possible" actually means in
 practice.
+*As built, 2026-08-11 (`design.md` §0.2, §7.3).* The generated protocol crate is
+`#![forbid(unsafe_code)]` in its entirety — 126,205 generated lines, 657 tests,
+Miri clean — so the largest body of code in the project contributes no `unsafe`
+at all. Nothing is transmuted out of shared memory; every field is read through a
+bounds-checked cursor. Hand-written `unsafe` remains confined to the three stated
+modules (mapping, ring, allocator), and the ICD entry stubs, which are unavoidably
+`extern "system"` over raw application pointers, are generated into a separate
+crate with one mechanical shape so they are reviewable by pattern rather than
+individually. What Miri cannot model is the cross-process race, which is outside
+the language by construction — see the stance at the top of this file.
 
-### R8 — Generated code trusting the registry
+### R8 — Generated code trusting the registry — **realised, twice**
 The wire format is generated from `vk.xml`. Wrong `len=`/`optional=` metadata,
 or a generator bug reading it, produces marshalling that is wrong in the same
 way on both sides and therefore *looks* consistent while corrupting memory.
+
+**This is the entry that fired.** Twice, during the codegen stage, in precisely
+the shape written above: a wrong answer that every symmetric test agreed with.
+Both instances are recorded below, because a risk that has actually happened is
+worth more than a risk that has only been imagined, and because the two of them
+produce a rule.
+
 *Mitigation:* pin `vk.xml` through nix so it changes only deliberately;
-differential-test generated marshalling round-trips rather than trusting
-symmetry. Stronger: compare byte-for-byte against Venus's MIT-licensed generated
-C on the shared subset, which is independent evidence rather than self-agreement
-(design.md §6.2, §7.3).
+differential-test generated marshalling against an independent implementation
+rather than trusting symmetry; and — the load-bearing one, learned rather than
+planned — assert every derived numeric value against an independently published
+number.
+
+> **[SUPERSEDED — 2026-08-11, `design.md` §0.2 and §6.2; `crates/sv-testkit`]**
+>
+> *Stronger: compare byte-for-byte against Venus's MIT-licensed generated C on
+> the shared subset, which is independent evidence rather than self-agreement
+> (design.md §6.2, §7.3).*
+>
+> **The byte-for-byte comparison was never available, and by our own hand.** D6
+> replaces Venus's per-parent `pNext` switch with length-prefixed links, and R13's
+> mitigation adds a `u32` length to every command header. Nearly every Vulkan
+> struct carries a `pNext`, so between them those two decisions change the bytes
+> of almost every struct and every command. This promise was retracted, not kept.
+
+**What was built instead, and why it is the stronger check.** The differential
+parses Venus's generated C and compares, for each struct body, the **ordered
+sequence of members and each member's kind and width** — scalar of a given width,
+array, pointer-to-one, blob, string. That is exactly the information the
+generator derives from `len=`, `optional=` and the C declarator, which are the
+three things this risk is about, and it catches the whole class: a member one
+generator emits and the other does not, a difference in member order, an array
+read as a single value or the reverse, a scalar at the wrong width. **208 structs
+are shared with the Zink profile and all 208 agree.**
+
+It is stronger than a byte comparison in the respect that matters here: a byte
+comparison passes or fails on one sample value, and can pass while `len=`
+handling is wrong for every *other* value, whereas the structural comparison
+holds for all values. It is weaker in one respect that does not: it does not
+check the primitive encodings themselves, which are pinned separately by
+`sv-wire` unit tests against the quoted C in `reference/venus/NOTES.md`.
+
+The differential carries a **negative control**, which is what makes a green run
+evidence rather than a formality: a test deliberately corrupts one shared struct
+by reading an array member as a single value — the exact mistake a wrong `len=`
+causes — and *requires* the comparison to fail. A differential can be green
+because the two implementations agree or because the comparison would accept
+anything, and without the control there is no way to tell which.
+
+**Realised instance 1 — a sign inversion that every symmetric test agreed with.**
+`vk-parse` exposes an extension enum's sign as `EnumSpec::Offset { dir, .. }`.
+`dir` is named after the registry attribute `dir="-"` but holds the *opposite*
+sense: it is `false` when the XML says `dir="-"` and `true` otherwise. Read as
+"is negative" — the obvious reading, and the one written first — it **inverts the
+sign of every extension-introduced enum value in the registry**, which for us
+means the wrong `sType` on every extension struct.
+
+Note carefully what did *not* catch it. The round-trip tests passed, because both
+sides computed the same wrong number — symmetric self-consistency proving
+nothing, which is this entry's central claim, now demonstrated rather than
+asserted. The structural differential did not catch it either: it compares member
+sequence, kind and width, and constants are none of those. What caught it was a
+test asserting generated constants against published `vulkan_core.h` values
+(`design.md` §7.3).
+
+*The rule it produces:* **every derived numeric value gets at least one assertion
+against an independently published number.** Round-trip tests establish that we
+are self-consistent; only an external fixture establishes that we are right. That
+is the same argument for keeping `vulkan_object.py`'s output as a fixture, and it
+is why that fixture is not optional — it is **still outstanding** (`design.md`
+§13 step 3), which this instance is the argument for doing rather than against.
+
+**Realised instance 2 — the registry moved shape underneath the generator.**
+`vulkan-headers 1.4.350` splits each core version into `apitype="internal"`
+sub-features chained by `depends=`, so `<feature name="VK_VERSION_1_0">` contains
+**no commands of its own**. A resolver that reads that feature and stops gets
+nothing at all from Vulkan 1.0 and reports no error: the Zink profile silently
+resolved to **55 commands instead of 239** — a small protocol, not a failure.
+Only a lower-bound assertion on the command count noticed. The model now resolves
+the `depends=` expression language rather than reading feature names, and **every
+profile carries an asserted command count** (`design.md` §7.1, §11).
+
+Same failure class, and worth stating because it widens the entry: pinning
+`vk.xml` does not help here. The pinned file is the one with the new shape, and
+the trust being violated is in the registry's *structure*, not its metadata. "The
+generator quietly emitted a smaller protocol" has no other check that would have
+caught it.
+
+**An unplanned mitigation, and a real strengthening.** Every variable-length
+thing on our wire carries its own explicit `u64` count — a decision taken for the
+decoder's benefit, not this risk's. The consequence is that **a wrong `len=`
+cannot desynchronise the stream**: the count on the wire governs, and a
+disagreeing `len=` can only trip the generated cross-check. The registry metadata
+this project most feared being wrong about was demoted from a load-bearing input
+to a verifier (`design.md` §7.4). It does not cover `optional=`, the declarator,
+or derived constants, which is why the structural differential and the
+published-value assertions remain the primary defences — instance 1 was in
+exactly the part this does not reach.
 
 ---
 
 R9–R18 arose from `research-vulkan-forwarding.md` §8. R19–R24 arise from the
 decisions taken in `design.md`. R25 arises from a change actually made to the
-guest while measuring step 0. All are recorded here because this file, not the
-design, is the maintained list.
+guest while measuring step 0, and R26 from something that measurement could not
+settle. All are recorded here because this file, not the design, is the
+maintained list.
 
-### R9 — `VK_EXT_external_memory_host` may not accept our arena
+### R9 — `VK_EXT_external_memory_host` may not accept our arena — **retired, measured**
 The zero-copy design rests on the GPU-side driver importing arena pages as
 `VkDeviceMemory`. `vkGetMemoryHostPointerPropertiesEXT` returning
 `memoryTypeBits == 0` is a *legal* driver response, and there are field reports
@@ -131,6 +250,19 @@ claim as our particular pages being importable.
 *Mitigation:* `design.md` §13 step 0 tests it before anything else is built. If
 it fails, every fallback is worse and the copying mode of
 `research-vulkan-forwarding.md` §2.6 does not meet the requirement at all.
+*Measured 2026-08-11 (`measured-gpu-side.md`).* The Intel driver advertises
+`VK_EXT_external_memory_host` with `minImportedHostPointerAlignment = 4096` — a
+page, so nothing has to be over-allocated to satisfy it — and the import was
+then performed rather than inferred. `vkGetMemoryHostPointerPropertiesEXT`
+returned `SUCCESS` with `memoryTypeBits = 0x6`, which is types 1 and 2, the two
+host-visible ones, so an arena allocation has somewhere legal to go;
+`vkAllocateMemory` accepted the import and `vkMapMemory` returned **the same
+virtual address**, with a byte written through the Vulkan mapping immediately
+visible through the original pointer. The feared answers — `memoryTypeBits == 0`
+or `VK_ERROR_OUT_OF_DEVICE_MEMORY` — did not occur on this driver. Retired **for
+this GPU side**; it says nothing about RADV, which refuses shared host mappings
+altogether, which is why the import stays behind a trait (`design.md` §5.4).
+Retiring R9 was never the same claim as R20, and R20 was measured separately.
 
 ### R10 — Cache attribute mismatch corrupts silently
 Mapping the same physical pages with different cache attributes from two page
@@ -141,6 +273,13 @@ fixes one cache class, write-back, identical on both sides, because neither the
 AWE window nor a memfd mapping can be made write-combining without adding a
 driver. The `cache_class` field exists with one legal value. Any future need for
 `honor-guest-pat=on` is treated as evidence we got this wrong.
+*Note on the evidence, so this is not over-read.* Step 0 carried bytes through
+the shared pages in both directions across the hypervisor without any explicit
+flush, on every allocator tried, which is supporting evidence — but it was
+measured **at rest**, one writer at a time, with a file-based rendezvous between
+phases. Nothing has been measured about concurrent access or about cache
+behaviour under load. §5.6 remains an argument with evidence behind it, not a
+measurement (`design.md` §0).
 
 ### R11 — The arena is a fixed-size, pre-negotiated window
 Host-visible memory cannot be grown on demand. An application allocating more
@@ -196,6 +335,13 @@ background process, imported-memory-only, with no swapchain. Intel does not test
 its driver this way.
 *Mitigation:* none available in advance. Run a trivial compute workload through
 the GPU-side server before building on it (design.md §13 step 7).
+*Sharpened 2026-08-11, and now the largest unmeasured thing in the project.*
+Step 0 retired R9, R19 and R20, so what it proved is that the driver **accepts
+and maps** our pages and that its mapping is demonstrably the same physical
+memory. **No GPU has touched an arena page.** GPU-side address translation is
+entirely downstream of the import succeeding, and none of it has been exercised.
+`design.md` §13 makes the compute workload the first thing in step 7 rather than
+a late check, for this reason.
 
 ### R16 — Loader unknown-extension trampoline ceiling
 `MAX_NUM_UNKNOWN_EXTS` is 250 in the loader, and its known-extension list
@@ -239,7 +385,13 @@ AWE window — `AllocateUserPhysicalPages` + `MapUserPhysicalPages` — was impo
 by the Intel driver with `memoryTypeBits = 0x6`, mapped at the same address, and
 carried the host's bytes through the `VkDeviceMemory` mapping in all 16384
 pages. The documented restriction does not bind WDDM's user-pointer import path
-on this driver. **The pinning driver is not needed.** Separately settled in the
+on this driver. **The pinning driver is therefore not needed, and has been
+dropped rather than held in reserve** (R6, `design.md` §5.1, D2). Note what
+retired this risk and what did not: AWE is *admissible* — it imports, and its
+frame numbers are real — and it still lost the arena to large pages on
+contiguity (5863–16339 runs per 64 MiB against 22). Retirement here means the
+documented prohibition is not real, not that AWE is the path we take.
+Separately settled in the
 same run: `AllocateUserPhysicalPages` still returns raw guest-physical frame
 numbers on Windows 11 build 26200 — all 16384 were verified against the memfd
 through the R21 translation (`design.md` §14 item 2, measured).
@@ -309,6 +461,18 @@ identity offsets: the `0xc0000-0xfffff` ROM window, and `0x103000-0x10efff`,
 which twelve Hyper-V SynIC message pages overlay — so the translation must walk
 the flat view, not compute a formula.
 
+*Two consequences for the mitigation above.* "Cross-checked against the closed
+form" is demoted: the closed form is a sanity check on the bulk of the range, not
+a source of truth, because the carve-outs are exactly where it is wrong and
+exactly where it would be wrong silently. And on the path actually chosen the
+risk is much reduced, because the arena is **located by content** rather than
+translated at all — `arena-host scan` sweeps the memfd for the run's stamp, so a
+page it reports is a page it found, and a wrong answer is not available in the
+way a wrong formula's is. Translation survives as the AWE alternative and as the
+verifier for it (16384/16384 frames checked that way), not as the primary
+mechanism. The handshake pattern check stays regardless — it is what catches R26
+as well.
+
 ### R22 — Cross-ring ordering depends on a barrier we must emit correctly
 Per-queue rings mean the application's own happens-before does not survive the
 split: an object created on the device ring may not yet exist on the GPU side
@@ -330,6 +494,16 @@ allocation failure at an arbitrary moment.
 *Mitigation:* report the *real* arena size in heap 1 and the real remaining heap
 in heap 0; drop the `DEVICE_LOCAL | HOST_VISIBLE` type entirely when the GPU
 side is not UMA, rather than advertising it optimistically (design.md §9.1).
+*Measured 2026-08-11 — the awkward case does not arise on this hardware, which
+is luck and should be treated as such.* The GPU side reports **one** heap,
+6624 MiB `DEVICE_LOCAL`, and of its three memory types every one except [0] is
+simultaneously `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`. There is no
+discrete VRAM an application can allocate but never map, so there is no class of
+allocation structurally unable to live in the arena, and the coherent types mean
+the first implementation can be correct without managing flushes. None of that
+is a property of the design; it is a property of this iGPU. The conditional in
+the mitigation stays, because the moment the GPU side is not UMA the table
+becomes the lie this entry describes.
 
 ### R24 — The arena takes guest RAM away from a production Windows session
 The arena is locked, non-pageable guest RAM, carved out of the 13 GiB a family
@@ -379,11 +553,30 @@ powerful; this adds nothing that account could not already reach by other means.
 `secedit` template so nothing else in the policy could move. The account held no
 explicitly assigned rights before, so its explicit set is now exactly this one.
 *Mitigation:* it is reversible in one command with no reboot and no interactive
-logoff (`scripts/win-account-right.ps1 -Revoke`), a pre-change policy export is
-kept on the guest, and if the arena ends up not needing it — which is possible,
-since the large-page route may be replaced — it should be revoked rather than
-left behind. Treat "the privilege is still granted" as something to re-justify
-whenever the memory plan changes.
+logoff (`scripts/win-account-right.ps1 -Revoke`), and a pre-change policy export
+is kept on the guest (`C:\Windows\Temp\user-rights-BEFORE-svprobe.inf`).
+
+*Status after the measurements — this is no longer provisional.* When it was
+granted it was an experiment's cost, to be revoked if the large-page route was
+replaced. The route was not replaced; it was chosen. `VirtualAlloc(MEM_LARGE_PAGES)`
+is the arena's primary allocator (22 runs per 64 MiB against 1471, and 1 run for
+a whole gigabyte), and it is also R26's mitigation-by-construction, so the
+privilege is now load-bearing on the main path and stays granted for as long as
+that design stands. Two facts keep the exposure honest rather than open-ended:
+
+- **The 4 KiB fallback needs no privilege at all** — `VirtualAlloc(MEM_COMMIT)`
+  + `VirtualLock` carried the whole of step 0 before the grant existed. So a
+  revocation degrades the arena to the fallback path; it does not stop the
+  project. That is the escape hatch, and it is measured rather than assumed.
+- **AWE no longer motivates it.** AWE was the first thing this privilege was
+  wanted for — step 0 was blocked on it (`ERROR_PRIVILEGE_NOT_HELD`) — and once
+  granted, AWE lost the arena on contiguity anyway (5863–16339 runs per 64 MiB).
+  It survives as an alternative, not a plan, so if large pages were ever
+  abandoned the privilege would have to be re-justified from AWE's own merits
+  rather than inherited.
+
+Treat "the privilege is still granted" as something to re-justify whenever the
+memory plan changes, and revoke it if the plan ever stops needing large pages.
 
 ### R26 — `VirtualLock` promises residency, not frame stability
 The 4 KiB path pins arena pages with `VirtualLock`, and the app side then holds
@@ -404,16 +597,18 @@ against. Re-scanning guest RAM costs a full sweep of the memfd (~2 s, measured)
 and only tells you where the pages are *now*.
 
 *Measured, weakly:* a 64 MiB `VirtualLock`ed window was located in the memfd,
-held while the guest went about ordinary business, and re-located minutes later;
-every page was at the same offset. That is evidence against casual movement and
-is **not** evidence against movement under memory pressure, which was not
-provoked — deliberately, since the guest is somebody's daily machine.
+held while the guest went about ordinary business, and re-located **3m14s**
+later; the offset table was byte-identical, all 16384 pages, 931 runs both
+times. That is evidence against casual movement and is **not** evidence against
+movement under memory pressure, which was not provoked — deliberately, since the
+guest is somebody's daily machine.
 
 *Mitigation, in order of preference:*
-1. **Use large pages** (`measured-gpu-side.md`). A large page is not a
-   candidate for relocation by the ordinary paging machinery, and the whole
-   problem is removed by construction rather than managed. This is now a second
-   independent argument for the large-page path.
+1. **Use large pages** (`measured-gpu-side.md`) — **and this is the path that
+   was chosen**, so the risk is removed by construction on the main path rather
+   than managed. A large page is not a candidate for relocation by the ordinary
+   paging machinery. This was a second independent argument for large pages; the
+   first was fragmentation, and they agree.
 2. If the 4 KiB fallback is used, **reserve a canary** — the arena allocator
    never hands out the first 64 bytes of each slab-sized block, and the host
    re-checks those canaries periodically and at every handshake. That restores a
