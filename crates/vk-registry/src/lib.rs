@@ -13,6 +13,18 @@
 //! different protocols and the mismatch shows up as a corrupted command stream
 //! rather than a build error.
 
+pub mod ctype;
+pub mod depends;
+pub mod model;
+pub mod profile;
+
+pub use ctype::{ArrayExtent, CType, CTypeKind, Declarator};
+pub use model::{
+    Bitmask, Command, Constant, EnumType, EnumValue, FeatureSet, FuncPointer, Handle, InterfaceRef,
+    LenSpec, LenTerm, Member, Model, Primitive, StructType, TypeDef,
+};
+pub use profile::{Profile, ResolvedProfile, profiles};
+
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +88,11 @@ impl Registry {
         }
 
         Ok(Self { raw, path })
+    }
+
+    /// Build the typed model the generator consumes.
+    pub fn model(&self) -> Result<Model> {
+        Model::build(&self.raw)
     }
 
     /// Counts of the things the generator will have to emit code for.
