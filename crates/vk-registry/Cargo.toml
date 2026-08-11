@@ -9,3 +9,4 @@ description = "Parse vk.xml into the shape the protocol generator needs"
 [dependencies]
 anyhow.workspace = true
 vk-parse.workspace = true
+indexmap.workspace = true

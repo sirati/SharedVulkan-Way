@@ -1,0 +1,20 @@
+[package]
+name = "sv-codegen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Generate the shared_vulkan protocol from the pinned Vulkan registry"
+
+[dependencies]
+anyhow.workspace = true
+indexmap.workspace = true
+vk-registry.workspace = true
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+prettyplease.workspace = true
+
+[[bin]]
+name = "sv-codegen"
+path = "src/main.rs"

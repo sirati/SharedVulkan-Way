@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/vk-registry", "crates/vk-probe"]
+members = [
+    "crates/vk-registry",
+    "crates/vk-probe",
+    "crates/sv-wire",
+    "crates/sv-codegen",
+    "crates/sv-proto",
+    "crates/sv-testkit",
+]
 
 [workspace.package]
 edition = "2024"
@@ -10,3 +17,20 @@ rust-version = "1.90"
 [workspace.dependencies]
 anyhow = "1"
 vk-parse = "0.19"
+# Insertion-ordered maps, so that every table the generator walks is walked in
+# a deterministic order without having to sort at each use. The generator's
+# output has to be byte-identical for the same registry, and a HashMap
+# iteration is the classic way to lose that.
+indexmap = "2"
+# Emission. `quote` builds the token stream and `prettyplease` formats it; both
+# are deterministic, and going through `syn` means a generated file that does
+# not parse fails the generator rather than the build of a 100,000-line crate.
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+prettyplease = "0.2"
+
+sv-wire = { path = "crates/sv-wire" }
+vk-registry = { path = "crates/vk-registry" }
+sv-codegen = { path = "crates/sv-codegen" }
+sv-proto = { path = "crates/sv-proto" }

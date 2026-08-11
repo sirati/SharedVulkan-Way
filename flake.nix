@@ -40,7 +40,28 @@
         # Windows. Cross-compiling both from Linux keeps one build machine.
         targets = ["x86_64-pc-windows-gnu"];
       };
+      # Miri needs nightly, and nothing else here does. Keeping it in a separate
+      # shell means the default shell stays on the pinned stable toolchain —
+      # which is the whole point of the comment above — while
+      # `design.md` §7.3's "every generated round-trip under Miri" is still
+      # something a person can run rather than something a document claims.
+      miriToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain:
+        toolchain.default.override {
+          extensions = ["miri" "rust-src"];
+        });
     in {
+      devShells.miri = pkgs.mkShell {
+        packages = [miriToolchain pkgs.vulkan-headers];
+        shellHook = ''
+          export VK_XML="${pkgs.vulkan-headers}/share/vulkan/registry/vk.xml"
+          # Miri interprets; the generated protocol is large and its round-trip
+          # tests are many, so give it a target directory of its own rather than
+          # invalidating the ordinary one on every switch.
+          export CARGO_TARGET_DIR="$PWD/target/miri"
+          echo "shared_vulkan miri shell — cargo miri test -p sv-wire -p sv-proto"
+        '';
+      };
+
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           rustToolchain

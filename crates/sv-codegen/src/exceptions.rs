@@ -1,0 +1,276 @@
+//! The exception table: everything `vk.xml` cannot express, budgeted rather
+//! than discovered.
+//!
+//! design.md §7.4 is the specification for this file, and its closing sentence
+//! is the rule it enforces: "Every exception is a data entry in one file, and an
+//! unlisted case is a build failure. That is the difference between a generator
+//! that is honest about its limits and one that emits plausible-looking wrong
+//! code."
+//!
+//! # What §7.4 budgeted for, and what actually turned out to be needed
+//!
+//! Three of the six budgeted exceptions dissolved, because they are artefacts of
+//! generating C rather than Rust. They are recorded here anyway — as notes, not
+//! as tables — because "we did not need this" is a finding, and a future
+//! reviewer comparing against the design deserves to know why the table is
+//! shorter than the design expected.
+//!
+//! - **Unions.** §7.4 expected to hardcode discriminators and error on the rest,
+//!   because C has no tag. Venus's generator carries a `UNION_DEFAULT_TAGS`
+//!   table for exactly this. A Rust `enum` *is* the tag, so an encoded union
+//!   always knows which member it holds and no default is ever guessed. The
+//!   `selector=` attribute is still recorded in the model for validity checks,
+//!   and a union member the generator cannot type is still a build failure — but
+//!   there is nothing to hardcode.
+//! - **Conditional presence** (`pTessellationState` depending on
+//!   `rasterizerDiscardEnable` in a sibling struct). §7.4 proposed a table of
+//!   Rust closures keyed by `(struct, field)`. Not needed for marshalling: the
+//!   field is `Option<Box<…>>` and its presence is a fact of the value, not
+//!   something to be recomputed. The condition matters when *lowering from the
+//!   application's C structs*, which is `sv-icd-entry`'s problem, and the table
+//!   belongs there when that crate is written.
+//! - **`len=` vs `altlen=`.** Handled in `vk-registry` where it belongs, and
+//!   cheaper than expected: every variable-length thing on our wire carries its
+//!   own explicit `u64` count, so `len=` is a *cross-check* rather than a
+//!   load-bearing input. A wrong `len=` in the registry therefore cannot
+//!   desynchronise the stream — it can only make the generated consistency
+//!   check fire. That is a direct and unplanned mitigation of R8.
+//!
+//! The three that survive are below.
+
+use std::collections::BTreeMap;
+
+/// What to do with a `void*` that is not `pNext` and has no `len=`.
+///
+/// design.md §7.4 counts 103 of these registry-wide. Those with a `len` are
+/// blobs and need no entry. The rest are listed here by `(owner, field)`, and an
+/// unlisted one is a generator error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoidPolicy {
+    /// An offset into the passthrough arena.
+    ///
+    /// `pHostPointer` is the interesting one, exactly as §7.4 says: it is
+    /// `VK_EXT_external_memory_host`, and in our design a host pointer *is* an
+    /// arena offset (design.md §5.3). It crosses as a `u64` offset, and the GPU
+    /// side resolves it against its own mapping of the same pages.
+    ArenaOffset,
+    /// An opaque token the app side owns and the GPU side never dereferences.
+    ///
+    /// `pUserData` is the canonical case: it is passed back to an app-side
+    /// callback and has no meaning on the other machine. It crosses as an
+    /// opaque `u64` so the app side can round-trip it, and the GPU side treats
+    /// it as a number.
+    OpaqueToken,
+    /// Not serialisable at all; a command or struct reaching one is a build
+    /// failure.
+    ///
+    /// Venus's exclusion list, taken verbatim in spirit (design.md §6.1):
+    /// function pointers, pointers to mapped memory, WSI handles and external
+    /// handles are not serialisable.
+    NotSerialisable,
+}
+
+/// `(type or command name, member or parameter name)` → policy.
+pub fn void_policy(owner: &str, field: &str) -> Option<VoidPolicy> {
+    VOID_POLICIES
+        .iter()
+        .find(|(o, f, _)| *o == owner && *f == field)
+        .map(|(_, _, p)| *p)
+        // A `pUserData` is a `pUserData` wherever it occurs, and listing all
+        // nineteen of them by owner would be noise that hides the two entries
+        // that actually carry a decision.
+        .or_else(|| BY_FIELD_NAME.iter().find(|(f, _)| *f == field).map(|(_, p)| *p))
+}
+
+const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
+    // design.md §5.3: an app-side `vkMapMemory` pointer is arena_base + offset,
+    // and the GPU side never maps arena memory through the driver at all. The
+    // import path therefore carries an offset.
+    ("VkImportMemoryHostPointerInfoEXT", "pHostPointer", VoidPolicy::ArenaOffset),
+    ("vkGetMemoryHostPointerPropertiesEXT", "pHostPointer", VoidPolicy::ArenaOffset),
+    // `vkMapMemory`'s out-parameter is a pointer into our own mapping. It is
+    // computed app-side and never crosses (design.md §5.3: "no round trip and
+    // no copy"), so the command is forwarded without it.
+    ("vkMapMemory", "ppData", VoidPolicy::NotSerialisable),
+    // Explicitly out of scope: a window handle is a WSI handle.
+    ("VkAndroidSurfaceCreateInfoKHR", "window", VoidPolicy::NotSerialisable),
+    // The descriptor-update-template family, which is the hardest `void*` in
+    // the registry and the one the generator found first.
+    //
+    // `pData` points at application memory laid out according to the
+    // `VkDescriptorUpdateTemplate` the call also names: the template's entries
+    // give the offset and stride of every descriptor within it. The registry
+    // cannot express that — there is no `len=` and there could not be one — so
+    // Venus and gfxstream both compute the extent in hand-written code from the
+    // template object.
+    //
+    // Our answer falls straight out of the arena. `requirements-shared-memory.md`
+    // says the command stream carries offsets and never payloads, so the ICD
+    // writes the descriptor data into an arena block and the command carries the
+    // offset. The GPU side already holds the template — it created it — so it
+    // can compute the extent itself and read the bytes through its own mapping
+    // of the same pages. No length needs to cross, and no copy happens.
+    //
+    // `VK_KHR_descriptor_update_template` is one of zink's five hard
+    // requirements (design.md §11), so this is not a case that can be excluded.
+    ("vkUpdateDescriptorSetWithTemplate", "pData", VoidPolicy::ArenaOffset),
+    ("vkUpdateDescriptorSetWithTemplateKHR", "pData", VoidPolicy::ArenaOffset),
+    ("vkCmdPushDescriptorSetWithTemplate", "pData", VoidPolicy::ArenaOffset),
+    ("vkCmdPushDescriptorSetWithTemplateKHR", "pData", VoidPolicy::ArenaOffset),
+    ("vkCmdPushDescriptorSetWithTemplate2", "pData", VoidPolicy::ArenaOffset),
+    ("VkPushDescriptorSetWithTemplateInfo", "pData", VoidPolicy::ArenaOffset),
+    ("VkPushDescriptorSetWithTemplateInfoKHR", "pData", VoidPolicy::ArenaOffset),
+];
+
+const BY_FIELD_NAME: &[(&str, VoidPolicy)] = &[
+    ("pUserData", VoidPolicy::OpaqueToken),
+    ("pCheckpointMarker", VoidPolicy::OpaqueToken),
+    ("pTag", VoidPolicy::OpaqueToken),
+    // An external handle by any name. Venus excludes these and so do we
+    // (design.md §9.2: we do not advertise handle types we cannot honour).
+    ("handle", VoidPolicy::NotSerialisable),
+    ("hostAddress", VoidPolicy::ArenaOffset),
+    ("address", VoidPolicy::NotSerialisable),
+    ("pPlacedAddress", VoidPolicy::NotSerialisable),
+];
+
+/// Types the generator refuses to emit marshalling for, with the reason.
+///
+/// Distinct from a profile's `excluded_types`: a profile excludes something
+/// because *this build* does not want it, whereas this list is about things no
+/// build can have. Reaching one is a build failure with the reason attached,
+/// which is the difference between "we decided not to" and "we cannot".
+pub fn unserialisable_reason(type_name: &str) -> Option<&'static str> {
+    UNSERIALISABLE.iter().find(|(n, _)| *n == type_name).map(|(_, r)| *r)
+}
+
+const UNSERIALISABLE: &[(&str, &str)] = &[
+    (
+        "VkAllocationCallbacks",
+        "host allocators are not supported: the callbacks are function pointers, \
+         which do not cross an address-space boundary. Stripped above the \
+         protocol, as Mesa's Venus driver does (design.md §7.4)",
+    ),
+    (
+        "VkAccelerationStructureInstanceKHR",
+        "bitfields the registry cannot describe, and out of scope with ray \
+         tracing (design.md §7.4)",
+    ),
+    (
+        "VkAccelerationStructureMatrixMotionInstanceNV",
+        "bitfields the registry cannot describe (design.md §7.4)",
+    ),
+    (
+        "VkAccelerationStructureSRTMotionInstanceNV",
+        "bitfields the registry cannot describe (design.md §7.4)",
+    ),
+    (
+        "VkDebugUtilsMessengerCreateInfoEXT",
+        "carries a function pointer; the reverse ring forwards messages instead \
+         (design.md §4.6)",
+    ),
+];
+
+/// Members whose value is a `(memory, offset)` pair the `transform` pass must
+/// rewrite (design.md §5.3).
+///
+/// Derived, not listed: any `VkDeviceMemory`-typed member, paired with the
+/// sibling that holds its offset. The pairing rule is here rather than in the
+/// walker so that the one place it could be wrong is visible.
+///
+/// > "A generated pass that walks whole struct graphs is the only tractable way
+/// > to catch all of them; hand-listing the sites is how this goes wrong."
+/// > — design.md §5.3
+pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<String> {
+    // `memory` → `memoryOffset`; `memory` → `offset`; `pMemory` → `pOffset`.
+    let base = memory_member.trim_start_matches('p');
+    let candidates = [
+        format!("{memory_member}Offset"),
+        format!("{}Offset", lower_first(base)),
+        "offset".to_string(),
+        "memoryOffset".to_string(),
+    ];
+    for c in candidates {
+        if let Some(found) = members.iter().find(|m| **m == c) {
+            return Some(found.clone());
+        }
+    }
+    None
+}
+
+fn lower_first(s: &str) -> String {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) => c.to_lowercase().collect::<String>() + cs.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Every exception the generator actually consulted, for the build log and for
+/// the manifest that the protocol hash is computed over.
+///
+/// design.md §4.3: the hash is "computed by the generator over the full command
+/// and struct table it emitted — not over `vk.xml`, because … the generator
+/// version matters too". An exception table that changed without the registry
+/// changing is exactly the kind of generator-version change that must move the
+/// hash, so consulted exceptions are recorded and hashed.
+#[derive(Debug, Default, Clone)]
+pub struct ConsultedExceptions {
+    pub void_policies: BTreeMap<(String, String), VoidPolicy>,
+    pub unserialisable: BTreeMap<String, &'static str>,
+}
+
+impl ConsultedExceptions {
+    pub fn note_void(&mut self, owner: &str, field: &str, policy: VoidPolicy) {
+        self.void_policies.insert((owner.to_string(), field.to_string()), policy);
+    }
+    pub fn note_unserialisable(&mut self, name: &str, reason: &'static str) {
+        self.unserialisable.insert(name.to_string(), reason);
+    }
+    pub fn len(&self) -> usize {
+        self.void_policies.len() + self.unserialisable.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_two_interesting_void_pointers_have_the_policies_the_design_names() {
+        assert_eq!(
+            void_policy("VkImportMemoryHostPointerInfoEXT", "pHostPointer"),
+            Some(VoidPolicy::ArenaOffset)
+        );
+        assert_eq!(
+            void_policy("VkDebugUtilsMessengerCreateInfoEXT", "pUserData"),
+            Some(VoidPolicy::OpaqueToken)
+        );
+    }
+
+    #[test]
+    fn an_unlisted_void_pointer_has_no_policy_and_will_fail_the_build() {
+        assert_eq!(void_policy("VkSomethingNew", "pMystery"), None);
+    }
+
+    #[test]
+    fn memory_offset_pairing_covers_the_registry_spellings() {
+        let members: Vec<String> =
+            ["memory", "memoryOffset"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(memory_offset_sibling(&members, "memory"), Some("memoryOffset".into()));
+
+        let members: Vec<String> = ["memory", "offset", "size"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(memory_offset_sibling(&members, "memory"), Some("offset".into()));
+
+        let members: Vec<String> = ["memory"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(memory_offset_sibling(&members, "memory"), None);
+    }
+
+    #[test]
+    fn the_allocation_callbacks_exclusion_states_its_reason() {
+        assert!(unserialisable_reason("VkAllocationCallbacks").unwrap().contains("function pointers"));
+    }
+}

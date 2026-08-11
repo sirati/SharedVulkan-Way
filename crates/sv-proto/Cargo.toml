@@ -1,0 +1,15 @@
+[package]
+name = "sv-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The generated shared_vulkan protocol: types, encode, decode, pnext, handle_map, transform, dispatch"
+
+[dependencies]
+sv-wire.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+sv-codegen.workspace = true
+vk-registry.workspace = true
