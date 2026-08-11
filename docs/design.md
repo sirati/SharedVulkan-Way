@@ -3,6 +3,7 @@
 Written 2026-08-11, against `requirements-shared-memory.md`, `security-model.md`,
 `hardware-constraints.md`, `measured-gpu-side.md`, `api-scale.md`,
 `research-sharedgl.md` and `research-vulkan-forwarding.md`.
+Revised 2026-08-11 against `measured-gpu-side.md` "Step 0" — see §0.
 
 This document **decides**. Where the research surveyed options, this picks one
 and says why. Where a decision is genuinely close, it says what would change it.
@@ -11,6 +12,75 @@ Citations are to the research documents by section, e.g. (fwd §2.1) for
 §7.2.
 
 Nothing here is implementation code. The layout tables are specifications.
+
+**Superseded passages are kept, not deleted.** Where measurement has overtaken a
+decision, the original text stays in a blockquote marked
+**[SUPERSEDED — <date>, see …]** and the replacement follows immediately. Half
+the value of this document is the record of what was believed and why; a design
+that quietly rewrites its own history cannot be audited by the person who has to
+trust it later.
+
+---
+
+## 0. Status: what step 0 settled, and what it did not
+
+This document was written before its own gating experiment had been run. That
+experiment has now been run, on the real machine, and the results are in
+`measured-gpu-side.md` ("Step 0", 2026-08-11). This section is the summary; §5
+and §14 carry the consequences.
+
+**The gate passed.** A 64 MiB window of guest RAM was allocated and pinned
+inside the Windows guest, located in QEMU's `memory-backend-memfd` by a Linux
+process on the other side of the hypervisor, written into from that process, and
+then imported by the Intel driver as `VkDeviceMemory`. All 16384 pages of the
+driver's own mapping carried the host's bytes; bytes written back through the
+`VkDeviceMemory` mapping appeared in the memfd at the offsets the translation
+predicts and were read out of guest-physical memory a third way, by QEMU's `xp`.
+`memoryTypeBits` was `0x6` and the chosen type index was 1 — the identical
+answer ordinary process memory gets. **The driver does not distinguish shared
+guest RAM from any other host pointer.** That is the friendliest available
+result and it is the one thing the entire design was hanging on
+(`measured-gpu-side.md`).
+
+Three things it also settled, each of which changes text below:
+
+- **The pages of a pinned 4 KiB Windows allocation are scattered.** A 64 MiB
+  window was **1471** discontiguous runs in guest-physical space, mean ~44 KiB,
+  so attaching one slab is roughly 1500 `mmap(MAP_FIXED)` calls rather than one.
+  §5's slab attach was not written against that; §5.1, §5.2 and §5.7 are. The
+  answer is large pages (§5.1) with the 4 KiB path retained as a fallback,
+  because the fallback is affordable — `vm.max_map_count` is 1048576 on this
+  host — and because large-page allocation can legitimately fail.
+- **GPA → memfd offset is not a formula.** On this machine the below-4 GiB split
+  is 3 GiB, not the 3.5 GiB an i440fx uses at smaller RAM sizes, and two ranges
+  below 4 GiB are not RAM at their identity offsets. §5.1 and R21.
+- **AWE was not tested**, because `SeLockMemoryPrivilege` is unassigned to any
+  account. The fallback (`VirtualAlloc` + `VirtualLock`) carried the whole
+  experiment instead, which is why the result above is stronger than planned:
+  the host had to *find* the pages by content rather than being told where they
+  were.
+
+**What is still not proven**, and is not to be quietly assumed anywhere below:
+
+1. **No GPU has touched these pages.** What passed is an *import*: the driver
+   accepted the pointer, mapped it, and its mapping is demonstrably the same
+   physical memory. Whether the GPU can DMA from a host-shared page — its own
+   translation is entirely downstream of the import succeeding — is a trivial
+   compute workload and it has not been run. That is R15 and §13 step 7, and it
+   is now the largest unmeasured thing in the project.
+2. **Coherency was measured at rest.** One writer at a time, with a file-based
+   rendezvous between phases. Nothing was measured about concurrent access, and
+   nothing about cache behaviour under load. §5.6's decision is still an
+   argument — now with supporting evidence — and not a measurement (R10).
+3. **Large pages are being measured now, and the design assumes them** (§5.1).
+   Whether the Intel driver accepts an import of large-page-backed memory is
+   *not* to be assumed from the 4 KiB result: an import path that pins pages may
+   well care about the PTE granularity underneath. Every number attached to the
+   large-page path in this document is marked **pending** until
+   `measured-gpu-side.md` carries it.
+4. **AWE remains untested end to end**, and so does R19. The privilege is being
+   granted for the large-page work, which makes AWE measurable again rather than
+   blocked; §5.1 says which way the decision goes on today's evidence.
 
 ---
 
@@ -41,8 +111,9 @@ the ring is rejected regardless of how fast the copy is.
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | Where does the arena live? | Ordinary **guest RAM**, allocated by whichever side is in the VM. On `testhost`: allocated by the GPU side via Windows **AWE**, mapped by the app side through QEMU's existing `memory-backend-memfd`. No ivshmem, no new device, no unsigned driver. (fwd §2.2) |
-| D2 | Fallback if AWE's PFNs are not usable | An **attestation-signed ~200-line pinning driver**. ivshmem is not a fallback we plan for; it is a last resort we expect never to reach. (fwd §2.2 verdict table) |
+| D1 | Where does the arena live? | Ordinary **guest RAM**, allocated by whichever side is in the VM, mapped by the other through QEMU's existing `memory-backend-memfd`. **Measured working end to end** (`measured-gpu-side.md`). No ivshmem, no new device, no unsigned driver. (fwd §2.2) |
+| D1a | How is it obtained inside the guest? | `VirtualAlloc(MEM_RESERVE\|MEM_COMMIT\|MEM_LARGE_PAGES)` — 2 MiB granularity, each large page physically contiguous and non-pageable. Needs `SeLockMemoryPrivilege`. **Fallback, measured:** 4 KiB `VirtualAlloc` + `VirtualLock`, no privilege, ~1471 runs per 64 MiB. **AWE is a live option, not the plan** — the choice is settled by measurement, §5.1. |
+| D2 | Fallback if neither path yields usable pages | An **attestation-signed ~200-line pinning driver**. Its role has narrowed: the ordinary-pointer import is measured working, so this now only buys frame numbers and contiguity, not viability. ivshmem is not a fallback we plan for; it is a last resort we expect never to reach. (fwd §2.2 verdict table) |
 | D3 | How does the GPU side get `VkDeviceMemory`? | `VK_EXT_external_memory_host`, `HOST_ALLOCATION_BIT_EXT`, **measured present, alignment 4096** (`measured-gpu-side.md`). Behind a pluggable `SlabImport` trait so dma-buf can be substituted on a Linux/AMD GPU side. |
 | D4 | Import granularity | Per **slab** (default 64 MiB), not per `VkDeviceMemory`. One driver import per slab; app-side allocations are sub-ranges. Requires the `(memory, offset)` rewrite pass. (fwd §2.1) |
 | D5 | Wire format | **Venus `VK_EXT_command_serialization`** encoding rules, reimplemented in Rust, with three deliberate deviations (§6.2). |
@@ -61,6 +132,8 @@ the ring is rejected regardless of how fast the copy is.
 | D18 | Scope | **Zink.** DXVK ≤ 2.6 as a stretch. DXVK ≥ 2.7 and vkd3d-proton are out of scope, and we will not advertise `bufferDeviceAddress` in v1 — a clean device-creation failure beats silent corruption. (fwd §5) |
 | D19 | Reverse channel | Built from day one, not retrofitted. Validation-layer output on the app side is the primary debugging tool. (fwd R14) |
 | D20 | Region ownership | The side **inside the VM** creates and publishes both regions; the other side attaches. sharedgl's "server initialises" rule inverted correctly, with the readiness flag sharedgl aliased away. (sgl §7.2b) |
+| D21 | How does the attaching side find the pages? | By **locating**, not by being told. Three locators behind one trait: strided probe (large pages, 2 MiB-aligned in GPA), full content sweep (4 KiB, 1.8 s per 13 GiB measured), PFN translation (AWE only). The **run list never crosses the wire** — it is derived on the attaching side. §5.1, §5.7. |
+| D22 | Attach granularity | Per **extent**, not per slab. One `VirtualAlloc` covering control region and arena, one locate, two views. A slab is an import unit and a cache-uniformity unit, never an attach unit. §5.7. |
 
 ---
 
@@ -70,7 +143,8 @@ the ring is rejected regardless of how fast the copy is.
   APP SIDE (Linux host, no GPU)                    GPU SIDE (Windows VM, iGPU)
   ┌────────────────────────────────┐               ┌────────────────────────────────┐
   │ application                    │               │ sv-gpu-server                  │
-  │   ↕ Vulkan loader              │               │  • AWE allocator (owns regions)│
+  │   ↕ Vulkan loader              │               │  • arena provider: large pages,│
+  │                                │               │    stamps, owns both regions   │
   │ sv-icd (cdylib)                │               │  • cold-path socket server     │
   │  • generated encoder           │               │  • ring consumers (1 thread/   │
   │  • handle ids, arena allocator │               │    ring, spin-then-park)       │
@@ -81,9 +155,10 @@ the ring is rejected regardless of how fast the copy is.
   │ sv-hostd (app side, one per    │               └────────┬───────────────────────┘
   │ machine)                       │                        │
   │  • opens QEMU's memfd          │  ── cold path ─────────┤ virtio-serial → vsock
-  │  • GPA → memfd offset          │                        │
-  │  • builds the contiguous view  │                        │
-  │  • hands fds to ICD processes  │                        │
+  │  • locates the extent's pages  │                        │
+  │  • GPA → offset via mtree      │                        │
+  │  • coalesces runs, stitches    │                        │
+  │  • hands fd + runs to the ICDs │                        │
   └──────┬─────────────────────────┘                        │
          │                                                  │
   ┌──────▼──────────────────────────────────────────────────▼───────────────────┐
@@ -103,6 +178,17 @@ centralises the GPA→offset translation, which is the fragile part (R21), and
 lets several application processes share one attachment. In the same-machine
 development loop it degenerates to "create a memfd, `ftruncate`, hand it out",
 which is why steps 1–6 of §13 need no VM at all.
+
+Step 0 made it a larger component than the box suggests. `sv-hostd` does not
+merely translate an address it was handed: on the paths that do not involve AWE
+the guest **cannot enumerate its own frames at all**, so `sv-hostd` has to
+*locate* the pages by content, coalesce what it finds into runs, and stitch the
+view out of one `mmap(MAP_FIXED)` per run (§5.1, §5.7). The working prototype of
+exactly this is `crates/arena-host`, written for step 0; its `scan`, `translate`
+and region-table logic is the seed of `sv-hostd` rather than throwaway probe
+code. Note that it had to run as root, because QEMU's memfd is only reachable
+through `/proc/<qemu-pid>/fd/<n>` — which is the argument for a daemon, made
+concrete.
 
 ---
 
@@ -201,12 +287,33 @@ sequence:
    increments `generation`, and only then rewrites the rest.
 2. The owner offers the regions over the cold-path socket:
    `Hello { layout_version, wire_version, protocol_hash, generation,
-   control_pfns[], arena_pfns[], slab_size, sizes, endianness, pointer_width }`.
-   The PFN arrays are run-length encoded, which is cheap because AWE frames sort
-   into long runs in practice (fwd §2.2, "Contiguity is a non-problem").
-3. `sv-hostd` translates GPA → memfd offset, reserves one `PROT_NONE` range per
-   region and `mmap(MAP_FIXED)`s each coalesced run into it. The result is
-   virtually contiguous with identical internal offsets — the §1 invariant.
+   extent: ExtentDesc, slab_size, sizes, endianness, pointer_width }`.
+
+   > **[SUPERSEDED — 2026-08-11, `measured-gpu-side.md` "Fragmentation"]**
+   > *`Hello { …, control_pfns[], arena_pfns[], … }`. The PFN arrays are
+   > run-length encoded, which is cheap because AWE frames sort into long runs
+   > in practice (fwd §2.2, "Contiguity is a non-problem").*
+   >
+   > Two things were wrong. Frame numbers are only available on the AWE path,
+   > which is no longer the primary one; and contiguity is emphatically a
+   > problem — a pinned 4 KiB 64 MiB window measured **1471** runs. What crosses
+   > now is an `ExtentDesc` describing *how to find* the pages, not a list of
+   > where they are. See §5.1.
+
+   `ExtentDesc { run_id: u64, granularity: Small | Large2M, control_pages: u64,
+   arena_pages: u64, locator: Scan | Probe | Pfns(runs[]) }`. It is small in
+   every case: on the two locating paths it carries no addresses at all, and on
+   the AWE path the frame list is run-length encoded because AWE frames really
+   do sort into runs — a claim that now applies only where it was actually
+   demonstrated.
+3. `sv-hostd` locates the extent's pages (§5.1), translates GPA → memfd offset by
+   walking QEMU's flat view, coalesces into runs, reserves one `PROT_NONE` range
+   per region and `mmap(MAP_FIXED)`s each run into it. The result is virtually
+   contiguous with identical internal offsets — the §1 invariant — and nothing
+   above the attacher ever learns that it was stitched. **The locator descriptor
+   must ride the cold path and cannot live in the control region**, for the
+   obvious reason that the control region is one of the two things being
+   located.
 4. The peer acquire-loads `magic`, then checks in this order and refuses with a
    named error on any mismatch: magic, `layout_version`, `wire_version`,
    `protocol_hash`, endianness, `control_size` against the mapping length.
@@ -333,38 +440,164 @@ error. Both are useful and they are not the same check.
 
 ### 5.1 Where it lives, and how the two sides agree on which pages
 
-**Decision: ordinary guest RAM, allocated by the side inside the VM.**
+**Decision: ordinary guest RAM, allocated by the side inside the VM.** This half
+is no longer a bet. It was measured end to end on 2026-08-11: guest RAM written
+by a Linux process through QEMU's memfd, imported by the Intel driver as
+`VkDeviceMemory`, and read back through the driver's own mapping, with
+`memoryTypeBits = 0x6` — the same answer ordinary process memory gets
+(`measured-gpu-side.md`, "Step 0"). What changed is *how the pages are obtained
+inside the guest*, and that is the rest of this section.
 
-On `testhost` that means the GPU-side process allocates it with Windows AWE:
-acquire `SeLockMemoryPrivilege`, `AllocateUserPhysicalPages`, then
-`MapUserPhysicalPages` into one reserved contiguous VA range. The returned
-`PageArray` holds real physical frame numbers — Microsoft's own released kernel
-source shows `NtAllocateUserPhysicalPages` doing a verbatim `RtlCopyMemory` of
-the MDL's PFN array into the user buffer, with three independent corroborations
-in the same file (fwd §2.2, "Windows AWE returns real guest-physical frame
-numbers"). Inside a VM, "physical" is guest-physical, so `PageArray[i] << 12` is
-a QEMU GPA, and the whole of guest RAM is already one
-`memory-backend-memfd,share=on` that the Linux side can map today (fwd §10a).
-The pages are locked for the lifetime of the allocation; the privilege is a
-local security-policy grant that does not touch code integrity, Secure Boot or
-test-signing, so the hard constraint in `hardware-constraints.md` is untouched.
+> **[SUPERSEDED — 2026-08-11, `measured-gpu-side.md` "AWE: refused, and not
+> worked around" and "Fragmentation"]**
+>
+> *On `testhost` that means the GPU-side process allocates it with Windows
+> AWE: acquire `SeLockMemoryPrivilege`, `AllocateUserPhysicalPages`, then
+> `MapUserPhysicalPages` into one reserved contiguous VA range. The returned
+> `PageArray` holds real physical frame numbers — Microsoft's own released
+> kernel source shows `NtAllocateUserPhysicalPages` doing a verbatim
+> `RtlCopyMemory` of the MDL's PFN array into the user buffer, with three
+> independent corroborations in the same file (fwd §2.2, "Windows AWE returns
+> real guest-physical frame numbers"). Inside a VM, "physical" is
+> guest-physical, so `PageArray[i] << 12` is a QEMU GPA …*
+>
+> *The user's stated preference and the research's ranking agree, and so do the
+> two independent lines of reasoning: the pages the two sides can most easily
+> agree on are also the only kind of pages the import mechanism actually likes
+> (fwd §2.2 verdict). That convergence is the reason to be confident in a
+> decision that still has an unrun experiment behind it (§14).*
+>
+> The reasoning about what AWE *returns* still stands and has not been
+> contradicted. What made it the wrong primary is that it was chosen for a
+> problem it does not solve. AWE gives frame numbers; it promises **nothing**
+> about contiguity, and contiguity turned out to be the expensive thing. It also
+> could not be run at all: `SeLockMemoryPrivilege` is unassigned to any account
+> in the guest's local security policy, which is the Windows default, so
+> `AllocateUserPhysicalPages` fails with `ERROR_PRIVILEGE_NOT_HELD`. The whole
+> of step 0 was carried by what this document had filed as a fallback.
 
-The user's stated preference and the research's ranking agree, and so do the two
-independent lines of reasoning: the pages the two sides can most easily agree on
-are also the only kind of pages the import mechanism actually likes (fwd §2.2
-verdict). That convergence is the reason to be confident in a decision that
-still has an unrun experiment behind it (§14).
+**Decision, revised: large pages are the intended path.** The GPU-side process
+allocates each extent with
 
-**Fallback, if AWE's frame numbers turn out not to be usable** — either because
-a modern Windows build transforms them, or because R19's "AWE address ranges
-cannot be used to buffer data for graphics or video calls" turns out to be
-enforced rather than vestigial — is an **attestation-signed pinning driver**:
-`MmProbeAndLockPages` on an ordinary `VirtualAlloc` region, walk
-`MmGetMdlPfnArray`, copy the frames out. Roughly 200 lines, and attestation
-signing is a genuine Microsoft signature that loads on retail Windows 11 with
-Secure Boot and HVCI on — it is not test-signing (fwd §2.2). The cost is an EV
-certificate and paperwork, not a technical obstacle, and it dodges every AWE
-restriction at once.
+    VirtualAlloc(NULL, len, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                 PAGE_READWRITE)
+
+in multiples of `GetLargePageMinimum()`, which is 2 MiB on x64. Each large page
+is a single physically contiguous, 2 MiB-aligned, non-pageable frame, so a
+64 MiB slab is on the order of **32** runs instead of 1471 — fewer if the guest
+allocator happens to hand out adjacent frames. That is the whole reason to
+prefer it: it does not make the memory better, it makes it *findable and
+attachable* cheaply (§5.7).
+
+Three consequences that are not just "fewer mmaps":
+
+- **A large page is 2 MiB-aligned in guest-physical space**, and every RAM alias
+  in QEMU's flat view on this machine is offset by 0 or `0x4000_0000` — both
+  multiples of 2 MiB. So every large page begins at a 2 MiB-aligned *memfd
+  offset*. The app side can therefore find the extent by probing one cache line
+  every 2 MiB rather than sweeping 13 GiB (§5.7). This is arithmetic, not a
+  measurement, and it is the single biggest reason large pages are worth a
+  security-policy change.
+- **Non-pageable by construction**, so the frame a page sits on cannot be
+  reclaimed and re-faulted somewhere else. On the 4 KiB path this rests on
+  `VirtualLock`, which promises *residency* and does not, in its documented
+  contract, promise frame stability — see §14.
+- **It is the same ordinary user pointer** the driver already accepted. Nothing
+  about the import call changes; `minImportedHostPointerAlignment` is 4096 and a
+  2 MiB-aligned pointer satisfies it trivially.
+
+**This is not yet measured and must not be treated as though it were.** Whether
+the Intel driver accepts an import backed by large pages is being measured now.
+A pinning import path can legitimately care about PTE granularity, and a refusal
+there would be a real finding rather than a nuisance. Every figure above marked
+"on the order of" stays pending until `measured-gpu-side.md` carries a number.
+**The project is not gated on it**: if large pages are refused, we fall back to
+the 4 KiB path, which is measured working, and we pay §5.7's attach cost.
+
+**When large-page allocation fails, degrade — once, per extent, loudly.**
+`VirtualAlloc(MEM_LARGE_PAGES)` needs physically contiguous free memory and
+fails with `ERROR_NO_SYSTEM_RESOURCES` on a guest whose physical memory has
+fragmented, which on a machine that has been up for weeks is a normal Tuesday
+rather than an exceptional condition. The policy:
+
+1. Try large pages for the whole extent.
+2. On failure, fall back to 4 KiB `VirtualAlloc(MEM_COMMIT)` + `VirtualLock` for
+   the whole extent, and record the granularity in the `ExtentDesc` so the
+   attaching side picks the right locator. Report it in the GPU side's own log
+   and not on the reverse ring: the first extent contains the control region,
+   so at the moment this decision is taken there is no ring to report it on.
+   Attach becomes slower and nothing else changes.
+3. Do **not** retry, do **not** loop, and do **not** mix granularities within one
+   extent. Windows offers no way to defragment on request, so a retry is a
+   spin; and mixing breaks the locator, whose probe stride is a property of the
+   extent. Different extents may legitimately differ, which is why granularity
+   is per-extent and not global.
+
+Allocating early helps and is free: the arena is committed when `sv-gpu-server`
+starts, which is the point at which the guest's memory is least fragmented.
+That, and not fear of the allocator, is the argument for eager commit (§5.7).
+
+**The privilege, stated as the cost it is.** `SeLockMemoryPrivilege` is required
+for `MEM_LARGE_PAGES` exactly as it was for AWE. It is unassigned by default;
+granting it means adding an account or group to `[Privilege Rights]` in the
+local security policy and obtaining a new token, which for an ssh session means
+reconnecting — no reboot, no interactive logoff, and no code-integrity setting
+touched: not Secure Boot, not HVCI, not test-signing, so the hard constraint in
+`hardware-constraints.md` is untouched (`measured-gpu-side.md`, "What AWE would
+take"). It is nonetheless a real change to the security policy of somebody's
+daily laptop, and it is worth being precise about what it buys and what it
+costs:
+
+- **It buys** a ~46× reduction in mappings per slab, a locate step that is a
+  strided probe instead of a 13 GiB sweep, frame stability by construction, and
+  AWE becoming measurable rather than blocked.
+- **It costs** the ability, for the account holding it, to lock arbitrary
+  amounts of memory non-pageably — a local denial-of-service surface on a
+  machine a family member uses. Grant it to the account that runs
+  `sv-gpu-server`, not to the interactive user, wherever the deployment permits
+  the two to differ.
+- **It is reversible**, and the 4 KiB fallback is what makes that true rather
+  than nominal: remove the right, obtain a new token, and the arena still works,
+  more slowly. A design that stops functioning when the privilege is withdrawn
+  would have made the grant permanent in practice. This one does not.
+
+**AWE is a live option again, and it is not the plan.** With the privilege
+granted, `AllocateUserPhysicalPages` and `AllocateUserPhysicalPages2` with
+`MEM_EXTENDED_PARAMETER_NONPAGED_LARGE` are both measurable, and both are being
+measured. **On current evidence the decision goes to large pages via
+`VirtualAlloc`**, for three reasons: the pointer it produces is the exact shape
+the driver has already been measured to accept; it needs no window remapping and
+no `MapUserPhysicalPages` bookkeeping in the hot path; and plain AWE solves the
+problem we do not have (frame numbers) while leaving the one we do
+(contiguity) untouched. *What would change my mind*, in order of likelihood:
+
+1. **The driver refuses a large-page-backed import but accepts an AWE range.**
+   Then AWE is primary and we live with 4 KiB fragmentation, since plain AWE
+   gives no contiguity either. Unlikely, and cheap to find out.
+2. **`AllocateUserPhysicalPages2` with `NONPAGED_LARGE` works.** Then it is
+   strictly better than both: 2 MiB contiguity *and* frame numbers, which
+   together eliminate the locate step entirely — the app side is simply told
+   where the pages are and does ~32 `mmap`s per slab. That makes AWE2 the
+   primary path and demotes plain `VirtualAlloc` to the no-privilege fallback.
+   This is the outcome to hope for and it is one call away from being known.
+3. **The locate step proves too slow at arena scale** even with the probe
+   stride. Same conclusion as (2), reached from the other end.
+
+Whichever wins, the shape of the code does not change: an `ArenaProvider` that
+allocates and describes, an `ArenaLocator` that produces a page map, and an
+`ArenaAttacher` that stitches runs. The measurements pick implementations, not
+architecture.
+
+**The pinning driver stays as the last fallback, with a narrowed role.** If
+neither AWE nor large pages yields what we need, an **attestation-signed ~200
+line driver** — `MmProbeAndLockPages` on an ordinary `VirtualAlloc` region, walk
+`MmGetMdlPfnArray`, copy the frames out — dodges every AWE restriction at once,
+and attestation signing is a genuine Microsoft signature that loads on retail
+Windows 11 with Secure Boot and HVCI on, not test-signing (fwd §2.2). Its role
+has narrowed sharply since this was written: the import itself is measured
+working from an ordinary pointer, so the driver would now buy only frame numbers
+and an escape from R19 — not viability. The cost is an EV certificate and
+paperwork. We are further from needing it than the original text assumed.
 
 **ivshmem is not in the plan.** It has the best driver story and the worst
 mechanism story: host-pointer import is implemented as kernel userptr, userptr
@@ -376,12 +609,103 @@ precisely because this does not work, and Looking Glass never asks a GPU to DMA
 §2.2). A BAR would need `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT`, which essentially
 nobody implements. We keep it in the risk table and not in the design.
 
+**How the two sides agree on which pages: locate, do not compute.**
+
+The original design had one answer — the guest reports frame numbers, the host
+translates them — and that answer is only available on the AWE path. Without
+`SeLockMemoryPrivilege` a Windows process cannot see its own physical frames at
+all: `QueryWorkingSetEx` does not report them, `\Device\PhysicalMemory` needs a
+privilege of its own, and there is no supported alternative. Step 0 therefore
+had to solve the problem the other way round, and did: **the app side finds the
+pages by content.** The guest stamps every page of the extent with
+`{magic, run_id, region_tag, page_index}` before publishing it; `sv-hostd`
+sweeps the memfd for the magic and builds a page map from what it finds. All
+16384 pages of the 64 MiB window were located this way, with zero wrong indices
+(`measured-gpu-side.md`).
+
+Three locators, one trait, chosen by the `ExtentDesc` granularity:
+
+| Locator | Mechanism | Cost |
+|---|---|---|
+| `PfnLocator` | Translate the reported frame list. AWE only | O(pages) arithmetic, no I/O |
+| `ProbeLocator` | Read one record every 2 MiB. Large pages only, because only they are guaranteed 2 MiB-aligned in GPA | ~6656 probes for 13 GiB of guest RAM; **pending measurement** |
+| `ScanLocator` | Sweep the whole memfd for the magic. Works for any granularity | **1.8 s per 13312 MiB, measured** |
+
+`ProbeLocator` is `ScanLocator` with the search space divided by 512, and it is
+sound for exactly one reason: on the large-page path the *only* place a stamped
+page can be is a 2 MiB-aligned offset, so every offset that is not 2 MiB-aligned
+can be skipped without being read. The guest therefore stamps only the first
+4 KiB page of each large page, and the record carries a large-page index rather
+than a page index. Get that pairing wrong in either direction — stamp every
+page but probe with a stride, or stamp with a stride but fall back to 4 KiB
+allocation — and the locator finds nothing, which is at least a loud failure
+rather than a quiet one.
+
+The stamp is overwritten by arena data the moment the extent is used, and that
+is deliberate: it is a locating device, not a header. Two consequences worth
+stating because both are easy to trip over later.
+
+- **An extent must be located before it is used, and cannot be re-located
+  afterwards.** If `sv-hostd` restarts, it does not re-scan and re-attach — it
+  cannot, the stamps are gone. It bumps the generation, which every ring
+  operation already carries, and every app-side client takes
+  `VK_ERROR_DEVICE_LOST` (§4.3). That is the same path a guest reboot takes and
+  it needs no new machinery.
+- **A permanent per-page stamp is rejected.** Reserving sixteen bytes at the
+  head of every arena page would make the map re-derivable at any time, and it
+  would put a hole in every page and destroy the flat offset invariant of §1 —
+  which is the property the entire design is built on. Not worth it at any
+  price.
+
+**GPA → memfd offset is read, never computed.** On this machine the mapping is
+
+    gpa <  0xc000_0000        ->  offset = gpa
+    gpa >= 0x1_0000_0000      ->  offset = gpa - 0x4000_0000
+    0xc000_0000..0xffff_ffff  ->  PCI hole, no RAM
+
+but the constants are properties of *this* guest at *this* RAM size, not of
+i440fx. The below-4 GiB split is **3 GiB, not the 3.5 GiB an i440fx uses at
+smaller RAM sizes**, because QEMU drops the split once `ram_size` crosses
+3.5 GiB on gigabyte-aligned machine types — anyone who hardcodes either constant
+has a 512 MiB error waiting. Two ranges below 4 GiB are also not RAM at their
+identity offsets: the `0xc0000-0xfffff` ROM window, and `0x103000-0x10efff`,
+which twelve Hyper-V SynIC message pages overlay (`measured-gpu-side.md`, R21).
+
+So: **`sv-hostd` parses QEMU's flat view (`info mtree -f`) into a region table
+and looks addresses up in it. It does not evaluate a formula, and there is no
+compiled-in default that is trusted without being re-read.** The reason to be
+this firm is the measured failure mode: reading the memfd offset as if it were
+the GPA lands on valid, zeroed, unrelated memory and reports no error whatsoever
+— a silent wrong answer, which is the worst thing this codebase can produce. The
+region table is re-read whenever the guest's RAM size, machine type or QEMU
+version changes, and the handshake validates it before any Vulkan call by
+checking a known pattern at known offsets — which on the locating paths is
+exactly the stamp check, already performed.
+
 **Direction-agnosticism.** The rule is "the side inside the VM allocates,
-because only it can produce pages the hypervisor can locate". Two traits:
-`ArenaProvider` (allocate, pin, enumerate frames) and `ArenaAttacher` (translate
-frames to a file offset, build the contiguous view). Today the GPU side provides
-and the app side attaches; if the app side were the VM, they swap, and nothing
-above §5 changes.
+because only it can produce pages the hypervisor can locate". Three traits now,
+because step 0 split the second one in half:
+
+```
+trait ArenaProvider {          // the side inside the VM
+    fn commit(&self, len, granularity) -> Result<Extent>;   // large pages, then 4 KiB
+    fn stamp(&self, extent: &Extent, run_id: u64);          // one record per page, or per
+                                                            // large page; skip if frames known
+    fn frames(&self, extent: &Extent) -> Option<RunList>;   // Some only on the AWE path
+}
+trait ArenaLocator {           // the attaching side
+    fn locate(&self, fd: BorrowedFd, desc: &ExtentDesc) -> Result<PageMap>;
+}
+trait ArenaAttacher {          // the attaching side
+    fn attach(&self, fd: BorrowedFd, map: &PageMap) -> Result<View>;  // reserve + MAP_FIXED per run
+    fn detach(&self, view: View);                                     // one munmap
+}
+```
+
+`frames()` returning `Option` is the honest encoding of what step 0 found: page
+enumeration is a *capability of one allocation path*, not a property of the
+guest. Today the GPU side provides and the app side locates and attaches; if the
+app side were the VM they swap, and nothing above §5 changes.
 
 ### 5.2 Slabs, cache class, and the allocator
 
@@ -391,6 +715,25 @@ gfxstream uses 16 MiB with 1 MiB rounding for small allocations
 (`kDefaultHostMemBlockSize`, fwd §2.1); 64 MiB is the same idea with fewer
 driver imports, chosen because `maxMemoryAllocationCount` is a real limit and
 each import is a pinning operation.
+
+**A slab is not the attach unit.** That is the one structural change
+fragmentation forces, and it is a clarification rather than a redesign: pages
+are committed, located and stitched per *extent* (§5.7), and a slab is a
+sub-range of an extent that the GPU side imports. The distinction did not matter
+when a slab was expected to be one contiguous run; it matters a great deal when
+attaching costs ~32 mappings on the intended path and ~1471 on the fallback.
+
+**64 MiB stays, and the 2 MiB granularity is why it is now comfortable rather
+than arbitrary.** A slab is exactly 32 large pages, so `GetLargePageMinimum()`
+rounding wastes nothing and every slab boundary is 2 MiB-aligned for free.
+Shrinking the slab towards 2 MiB would multiply driver imports by up to 32
+against `maxMemoryAllocationCount` and buy nothing, because the attach cost it
+would be trying to reduce is not paid per slab. Growing it buys nothing either,
+for the same reason. The one scenario that would force a much larger slab —
+locating each slab independently, at 1.8 s a sweep — is precisely the design
+§5.7 rejects. Sub-allocation granularity inside a slab is unaffected and stays
+at 4096 bytes: it is an offset into an already-imported `VkDeviceMemory`, and
+the large page underneath imposes nothing on it.
 
 **Allocator: a segregated free-list over 4096-byte pages, per slab.**
 
@@ -412,11 +755,18 @@ each import is a pinning operation.
   than in the shared region means the GPU side cannot be corrupted by an
   allocator bug and the allocator can be Miri-tested against a plain `Vec<u8>`
   (fwd §9).
-- Slabs are created lazily. When the app side needs a slab it picks a free
+- Slabs are **imported** lazily. When the app side needs a slab it picks a free
   region of the arena, writes a slab-directory entry, and sends
   `svImportArenaSlab`. The GPU side imports it and replies. A failed import is a
   hard error surfaced as `VK_ERROR_OUT_OF_DEVICE_MEMORY` from the triggering
-  `vkAllocateMemory`, plus a reverse-ring diagnostic.
+  `vkAllocateMemory`, plus a reverse-ring diagnostic. *Note the narrowing:* the
+  original wording was "created lazily", which implied the pages themselves
+  arrived on demand. They do not — the extent is committed, locked and attached
+  up front (§5.7), so lazy import bounds the number of driver imports and the
+  driver's own pinning, and does nothing for the guest's resident set. R24's
+  mitigation "allocate slabs lazily so the resident set tracks actual use" is
+  superseded for that reason; what actually limits guest cost is the configured
+  arena size and releasing the extent on last disconnect.
 - Slabs are **never unimported while the process lives.** Unmapping a slab the
   GPU might still be reading is the one lifetime race with no cheap answer, and
   slab churn buys nothing: the arena is a fixed window anyway.
@@ -445,6 +795,15 @@ offset`.** A real pointer into real shared pages. It involves **no round trip
 and no copy**: the arena is mapped for the process's whole lifetime, so
 `vkMapMemory` and `vkUnmapMemory` are pure app-side bookkeeping. That is the
 requirement, stated as an implementation consequence.
+
+That the app-side view is stitched from tens or thousands of separate mappings
+(§5.7) is invisible here and must stay invisible. The reserved range is
+virtually contiguous, every internal offset matches the GPU side's, and no
+structure above `ArenaAttacher` — not the allocator, not the encoder, not the
+`transform` pass — is permitted to know how many `mmap` calls produced it. The
+run boundaries are not aligned to anything meaningful and an allocation
+straddles them freely; that is fine, because they are boundaries in the *file*,
+not in the address space.
 
 **On the GPU side nothing calls `vkMapMemory` on arena-backed memory at all.**
 The specification does not require the driver to return the pointer we imported
@@ -484,11 +843,25 @@ construction, surfacing as `VK_ERROR_INVALID_EXTERNAL_HANDLE` (fwd §2.1). The
 brief requires either side to be either OS, so the trait exists from the first
 commit even though `testhost` only ever exercises the first row.
 
+**`SlabImport` is unchanged by the fragmentation finding, and that is worth
+saying rather than leaving implicit.** The GPU side imports a pointer into its
+own *virtual* address space, which `VirtualAlloc` made contiguous regardless of
+how the frames underneath are laid out. Scattering is entirely an attaching-side
+problem; the importing side never learns of it, the trait needs no run list, and
+`import(device, arena_offset, size, cache_class)` keeps its signature. The only
+thing the large-page decision adds is a question for the implementation to
+answer empirically — whether this call still succeeds when the pages behind the
+pointer are 2 MiB PTEs (§0, §14).
+
 **Copy gfxstream's defensive memory-type rewrite.** Call
 `vkGetMemoryHostPointerPropertiesEXT` first; if the preferred type index is not
 in the returned `memoryTypeBits`, pick the lowest set bit instead. A
 `memoryTypeBits` mask that excludes your choice is a normal condition to handle,
-not a failure (fwd §2.1).
+not a failure (fwd §2.1). Measured on the real target, for both ordinary process
+memory and host-shared guest RAM, the mask is `0x6` and the choice is index 1 —
+so on this hardware the rewrite never fires. Keep it anyway: it costs one branch
+and the whole point is that the mask is the driver's business, not ours
+(`measured-gpu-side.md`).
 
 **`NoopImport` is a great harness and a dangerous oracle.** lavapipe's
 properties query returns `memoryTypeBits = 1` unconditionally and the allocation
@@ -542,11 +915,24 @@ ordinary acquire/release ordering suffices. This is why Venus's vtest
 `bo_flush`/`bo_invalidate` are literal no-ops and why gfxstream has no
 app-side `on_vkFlushMappedMemoryRanges` at all (fwd §2.3).
 
+**Step 0 supports this and does not settle it.** Bytes written by the host
+appeared through the guest's plain mapping *and* through the driver's
+`VkDeviceMemory` mapping; bytes written through the `VkDeviceMemory` mapping
+appeared in the memfd and in QEMU's guest-physical reader — 16384 pages, in both
+directions, with no flush of any kind performed on either side
+(`measured-gpu-side.md`). But it was measured **at rest**: one writer at a time,
+with a file rendezvous between phases. It says nothing about concurrent access
+and nothing about cache behaviour under load. Treat §5.6 as an argument with
+corroboration, not as a measurement, and treat R10 as retired *by construction*
+— which is what the text below actually claims — rather than retired by
+experiment.
+
 The interesting question was whether to follow gfxstream in deriving a
 per-allocation cache attribute from the memory type — WC for upload, WB for
-readback. **We do not, in v1, for a concrete reason:** on the AWE path the
-GPU-side window is write-back and `MapUserPhysicalPages` takes no cache
-attribute, while the app side's view is an ordinary `mmap` of a memfd, also
+readback. **We do not, in v1, for a concrete reason:** the GPU-side window is
+write-back on every path §5.1 contemplates — `VirtualAlloc` with or without
+`MEM_LARGE_PAGES`, and `MapUserPhysicalPages`, which takes no cache attribute at
+all — while the app side's view is an ordinary `mmap` of a memfd, also
 write-back. There is no supported way to make either side write-combining
 without adding a driver, and mapping the same physical page with two different
 attributes from two page tables is architecturally undefined on x86 (R10). So
@@ -570,6 +956,110 @@ advertising a non-coherent-only table — and could not be, since the
 specification requires at least one `HOST_VISIBLE | HOST_COHERENT` type to
 exist, so the tempting "force the app to call flush so we can intercept" design
 is not legal in the first place (fwd §2.0).
+
+### 5.7 Fragmentation, and what attaching actually costs
+
+Step 0 measured the thing this section did not previously contemplate: **the
+pages of a pinned Windows allocation are scattered in guest-physical space.**
+
+| Window | Allocation units | Runs in the memfd | Mean run |
+|---|---:|---:|---|
+| 1 MiB, 4 KiB pages | 256 pages | 29 | ~35 KiB |
+| 64 MiB, 4 KiB pages | 16384 pages | **1471** | ~44 KiB |
+| 64 MiB, 2 MiB pages | 32 large pages | ≤ 32 by construction | ≥ 2 MiB |
+
+The first two rows are measured (`measured-gpu-side.md`). The third is
+arithmetic — a large page is one physically contiguous frame — and the count is
+an upper bound because adjacent large pages coalesce into one run when the guest
+allocator happens to hand them out that way. **The actual figure is pending
+measurement.**
+
+Roughly 23 runs per MiB on the 4 KiB path is not a rounding error, it is a
+factor of 1471, and it lands entirely on the attaching side. Working through it
+honestly:
+
+**Attach is one `mmap(MAP_FIXED)` per run, into a reserved `PROT_NONE` range.**
+That mechanism was already in §4.3 and it is still correct; only the count was
+wrong. The kernel cannot merge the resulting VMAs — adjacent runs are by
+definition non-adjacent in the file — so **VMA count equals run count exactly**.
+A 2 GiB arena is ~47,000 VMAs on the 4 KiB path and ~1,024 on the large-page
+path.
+
+**It is affordable, and it is now a documented host dependency.**
+`vm.max_map_count` is **1048576** on this host, so even the 4 KiB path at 2 GiB
+sits at 4.5% of the per-process limit. But the limit is per process and every
+ICD client builds its own view from the fd and run list that `sv-hostd` hands
+it, so this is a cost each application pays, not a system total. `sv-hostd`
+reads `vm.max_map_count` at startup, compares it against the run count it just
+built, and **refuses loudly with the actual numbers** rather than letting a
+client discover it at the 1048577th mapping. The alternative failure is an
+`mmap` returning `ENOMEM` halfway through building an arena, which is
+recoverable in principle and horrible in practice.
+
+**Latency: bounded by measurement, not yet measured directly.** The step-0 host
+wrote all 16384 pages of a 64 MiB window through per-page `mmap(MAP_SHARED)`
+plus `msync` in **60 ms**. Run-granular attach does 11× fewer calls and no
+writes and no `msync`, so 60 ms is a generous upper bound for a 64 MiB attach on
+the 4 KiB path, and a 2 GiB arena is 32 slabs' worth of the same work. Call the
+budget **under two seconds, once, at startup**, and measure it before believing
+it. On the large-page path it is ~1,024 calls for the whole arena and
+disappears. Detach is not a problem in either case: a single `munmap` over the
+whole reservation frees every VMA inside it regardless of how many there are.
+
+**Locating dominates, which is why the extent is the attach unit.** The 4 KiB
+path locates by sweeping the entire memfd — 1.8 s for 13312 MiB, about
+7.2 GiB/s, and that cost is a function of *guest RAM*, not of arena size. Paying
+it per slab would put 1.8 seconds inside a `vkAllocateMemory` that happened to
+need a new slab, which is not a latency, it is a fault. Hence D22:
+
+- **One extent covers both regions.** A single `VirtualAlloc` holding the 16 MiB
+  control region and the whole arena, stamped with one `run_id` and a per-page
+  `region_tag`, located by one sweep, then stitched into **two** reserved ranges
+  with independent bases. §4.1's "two independent mappings" is a statement about
+  the protocol and survives intact; there is simply no reason to sweep 13 GiB
+  twice.
+- **The arena is committed at `sv-gpu-server` startup and does not grow on the
+  4 KiB path.** R11 already says the arena is a fixed pre-negotiated window;
+  this makes it true for a second, independent reason. Size it from
+  configuration, default modestly on a machine whose RAM belongs to somebody
+  else (R24), and release the extent when the last client disconnects.
+- **On the large-page path growth becomes cheap and is allowed.** `ProbeLocator`
+  reads one record every 2 MiB — 6656 probes for 13 GiB — so a second extent
+  costs milliseconds rather than seconds, and lazy growth is back on the table
+  as an option we do not have to take in v1.
+
+**Bookkeeping per slab: none.** That is the point of moving attach to the
+extent. The run list is per-extent state held by `sv-hostd` and by each client's
+attacher: ~24 bytes per run, so ~1.1 MiB for a 2 GiB arena on the 4 KiB path and
+~24 KiB on the large-page path. The transient page map during locate is 8 bytes
+per page and is dropped once coalesced. A slab-directory entry gains nothing and
+carries no runs.
+
+**The run list does not cross the wire, and it never did have to.** On the
+locating paths the guest does not know it — that is the entire reason
+`ScanLocator` exists — and on the AWE path what crosses is the frame list, from
+which the runs are derived on the far side. So in no configuration is the run
+list itself protocol; it is a derived, side-local artefact, rebuilt per
+attachment rather than carried. `sv-hostd` computes it once per generation and
+hands it to each client with the fd, which is a local optimisation and not a
+protocol feature.
+
+**`SlabImport` is untouched; `ArenaAttacher` changed shape.** §5.4 explains the
+first. The second is the trait split in §5.1: locating was folded into
+"translate frames to a file offset" when frames were assumed available, and it
+is now a separate stage with three implementations, because on the path we
+actually measured there are no frames to translate.
+
+**AWE would not have fixed this**, and it is worth recording so the option is
+not misremembered later. `AllocateUserPhysicalPages` chooses frames and promises
+nothing whatsoever about their contiguity — an AWE-backed 64 MiB window would
+have been just as scattered as the `VirtualLock`ed one, with the single
+improvement that the host would have been told the offsets instead of scanning
+for them. The mechanisms that actually fix fragmentation are large pages
+(`MEM_LARGE_PAGES`, §5.1) and `AllocateUserPhysicalPages2` with
+`MEM_EXTENDED_PARAMETER_NONPAGED_LARGE`, and both need the same privilege AWE
+needed. Fragmentation and page enumeration are orthogonal problems that happened
+to share a prerequisite.
 
 ---
 
@@ -896,14 +1386,18 @@ there; §11 explains why the subset is not a compromise but the scope.
 | `vk-registry` typed model + C declarator parser | 1,600 |
 | `sv-wire` (cursor, headers, primitives) | 600 |
 | `sv-transport` (regions, rings, handshake, parkers, backends) | 1,800 |
-| `sv-arena` (allocator, slabs, deferred free) | 1,000 |
+| `sv-arena` (allocator, slabs, deferred free, provider/locator/attacher traits) | 1,200 |
 | `sv-handles` (id allocation, object table) | 600 |
 | `sv-icd` hand-written half (instance/device/queue objects, WSI, memory) | 1,800 |
 | `sv-gpu-server` (ring consumers, semantic glue, import, submit path) | 4,500 |
 | `sv-present` | 1,000 |
-| `sv-hostd` (GPA translation, view construction, fd handoff) | 800 |
+| `sv-hostd` (mtree region table, three locators, coalescing, stitching, fd handoff) | 1,200 |
 | Tools, probes, integration tests | 2,000 |
 | **Total hand-written** | **~20,000** |
+
+The two revised lines are step 0's doing: `sv-hostd` inherited a region table, a
+coalescer and three locators it was not budgeted for, and `sv-arena` inherited
+the provider/locator/attacher split (§5.1). Neither moves the total materially.
 
 Call it **15–22k hand-written**. That is below gfxstream's ~30k of hand-written
 semantic glue (fwd §1.3) because we skip snapshots, Android, GLES, the composer,
@@ -1176,7 +1670,10 @@ framing holds for GL and for older D3D, and does not hold for D3D12.
 | `sv-gpu-server` | bin | The GPU side: ring consumers, `SlabImport`, semantic glue, submit path, validation forwarding |
 | `sv-present` | lib | Swapchain plumbing shared by both sides; `wl_shm`/`XShm` blit on the app side |
 | `sv-hostd` | bin | App-side daemon: opens QEMU's memfd, GPA→offset, builds the contiguous view, hands fds to ICD processes |
-| `vk-probe` | bin | **Exists.** Grows the arena-import probe of §13 step 0 |
+| `vk-probe` | bin | **Exists.** The GPU-side capability probe of `measured-gpu-side.md` |
+| `awe-probe` | bin, Windows | **Exists.** The guest half of step 0: commit, lock, stamp, import, verify. Cross-compiled to `x86_64-pc-windows-gnu` |
+| `arena-host` | bin | **Exists.** The host half of step 0: mtree region table, scan/translate, run coalescing, mmap stitching. **This is the seed of `sv-hostd`**, not a throwaway probe |
+| `arena-record` | lib | **Exists.** The stamped page record, defined **once** so a match cannot be an artefact of the two sides disagreeing about a field offset. Shared by the guest and host halves |
 | `sv-testkit` | lib, test-only | Round-trip harness, the Venus differential comparison, fake transports, fixtures |
 
 `sv-proto` is the enormous one and it is generated, which is why the worktree
@@ -1195,13 +1692,42 @@ transport's shared-memory backend is a plain memfd. That is also the mitigation
 for R18: the iGPU that would hang drives a family member's laptop panel, and we
 should not be pointing malformed command streams at it while learning.
 
-**0. Retire the gating risk.** Extend `vk-probe` to allocate an AWE region in
-the guest, call `vkGetMemoryHostPointerPropertiesEXT` on it and on an ordinary
-`VirtualAlloc` pointer, and attempt `vkAllocateMemory` with
-`VkImportMemoryHostPointerInfoEXT` on both. Separately, dump the PFN array and
-check it against `info mtree -f` from the host. *Test: the import succeeds and
-the frames resolve to plausible memfd offsets.* Nothing below is worth building
-until this passes. It is an afternoon.
+**0. Retire the gating risk. — DONE, 2026-08-11. It passed.**
+
+> **[SUPERSEDED — the step as planned]**
+> *Extend `vk-probe` to allocate an AWE region in the guest, call
+> `vkGetMemoryHostPointerPropertiesEXT` on it and on an ordinary `VirtualAlloc`
+> pointer, and attempt `vkAllocateMemory` with `VkImportMemoryHostPointerInfoEXT`
+> on both. Separately, dump the PFN array and check it against `info mtree -f`
+> from the host. Test: the import succeeds and the frames resolve to plausible
+> memfd offsets. Nothing below is worth building until this passes. It is an
+> afternoon.*
+
+What was actually run is in `measured-gpu-side.md`, "Step 0", and it was a
+better experiment than the one planned, for an unwelcome reason: AWE was
+unavailable, so the host had to **find** the pages by content instead of being
+told where they were, which tests the translation far harder than trusting a PFN
+array would have. Three tools — `awe-probe` (guest), `arena-host` (host, as
+root) and `arena-record` (the shared page layout) — rendezvous over the existing
+virtio-fs share. The result: 64 MiB located, written from the host, imported by
+the Intel driver, all 16384 pages carrying the host's bytes through the driver's
+own mapping, and the reverse direction confirmed in QEMU's guest-physical
+memory. `memoryTypeBits = 0x6`, the same as ordinary memory.
+
+Three things it did **not** do, each of which moved elsewhere in this plan: AWE
+was never exercised (privilege), no GPU touched the pages (step 7), and large
+pages had not been thought of yet (§5.1, being measured now). The harness is
+kept runnable, because step 7 crosses this same boundary for real.
+
+**0a. The privilege, and the granularity measurements.** Grant
+`SeLockMemoryPrivilege` to the account running the probes, obtain a new token,
+and measure three things: `VirtualAlloc(MEM_LARGE_PAGES)` and its run count;
+whether the driver still accepts an import backed by large pages; and
+`AllocateUserPhysicalPages` / `AllocateUserPhysicalPages2` with
+`MEM_EXTENDED_PARAMETER_NONPAGED_LARGE`. *Test: the run count per 64 MiB, and an
+import that succeeds.* These settle §5.1's open decision and the pending numbers
+in §5.7. The privilege grant is reversible and the 4 KiB path keeps working
+without it, which is what makes it a decision and not a commitment.
 
 **1. `sv-wire` + `sv-transport` over a memfd, two Linux processes, no Vulkan.**
 Handshake, magic-written-last, generation counter, ring ping-pong, reply ring,
@@ -1237,12 +1763,20 @@ through our ICD. *Test: deqp pass rate, compared against `zink-venus-lavapipe`
 as the reference configuration.* This is the largest single step and it is
 mostly generator coverage plus GPU-side semantic glue.
 
-**7. Cross the boundary.** Windows build of `sv-gpu-server`, AWE arena,
-`sv-hostd`, cold path over virtio-serial. *Test: step 4's byte-pattern test,
-across the VM boundary, then step 6's deqp suite across it.* Note R15: nobody
-has validated Intel's Windows driver running headless in a background process
-with imported memory only, so run a trivial compute workload through it before
-building on it.
+**7. Cross the boundary.** Windows build of `sv-gpu-server`, the large-page
+arena with its 4 KiB fallback, `sv-hostd` (locate, coalesce, stitch), cold path
+over virtio-serial. *Test: step 4's byte-pattern test, across the VM boundary,
+then step 6's deqp suite across it.* Step 0 has already demonstrated the memory
+half of this in isolation, so what step 7 adds is the protocol on top of it.
+
+**Run the compute workload first, before anything else in this step.** R15 is
+now the largest unmeasured thing in the project (§0): nobody has validated
+Intel's Windows driver running headless in a background process with imported
+memory only, and — more sharply — **no GPU has yet touched an arena page at
+all**. Step 0 proved the driver accepts and maps our memory; it proved nothing
+about the GPU reading it. A trivial compute shader over an arena buffer,
+producing a result the host can check in the memfd, is an hour and it gates the
+rest of the step.
 
 **8. Presentation**, after the §10 measurement decides whether it is needed.
 
@@ -1255,39 +1789,93 @@ separate worktrees; 4 needs all three.
 
 ## 14. What remains unmeasured
 
-Listed plainly, largest first.
+Listed plainly, largest first. Rewritten 2026-08-11 after step 0; the two items
+it settled are kept, marked, and moved to the bottom, because what a list like
+this stops saying is as informative as what it says.
 
-1. **Whether importing *guest RAM shared with the host* works.** This is the
-   big one and it is the whole design. `measured-gpu-side.md` establishes that
-   `VK_EXT_external_memory_host` is present and page-granular on the real GPU
-   side — that the *mechanism* exists. It does not establish that an import of
-   *our particular pages* will succeed. Ordinary process memory and AWE-backed
-   guest RAM that a host process also has mapped are not obviously the same
-   thing to a driver that pins pages. Step 0 exists for this and nothing should
-   be built on top of it first.
-2. **Whether `AllocateUserPhysicalPages` still returns raw guest PFNs** on
-   Windows 11 24H2. The Windows Research Kernel source settles it for the NT 5.2
-   era and there is no reason to think it changed, but "no reason to think"
-   is not a measurement.
-3. **Whether AWE's "cannot be used to buffer data for graphics or video calls"
-   is enforced or vestigial.** The phrasing smells of GDI/DirectDraw and
-   `MmProbeAndLockPages` has a dedicated AWE path with `MDL_DESCRIBES_AWE`, so
-   kernel-level DMA from AWE is supported — but whether WDDM's user-pointer
-   import path accepts it is empirical. This is R19 and the reason D2 exists.
-4. **The GPA→memfd offset formula on this machine.** i440fx computes the
-   below-4G split with a machine-version compat knob; it is not a constant to
-   hardcode, and `info mtree -f` must be parsed. R21.
-5. **Whether the Intel Windows driver tolerates headless service operation**
+1. **Whether a GPU can DMA from these pages.** This is now the big one, and it
+   is the whole design in the same way item 1 used to be. Step 0 proved the
+   driver *accepts* an import of host-shared guest RAM and that its mapping is
+   the same physical memory — an entirely CPU-side result. The iGPU's own
+   translation, its TLB and the WDDM residency path are all downstream of the
+   import succeeding and none of them was exercised. A trivial compute workload
+   settles it (§13 step 7, R15). Until it runs, everything below the arena is
+   built on a mechanism proven only as far as the driver's front door.
+2. **Whether the Intel Windows driver accepts a large-page-backed import.**
+   §5.1 makes `MEM_LARGE_PAGES` the intended path on the strength of arithmetic
+   and a privilege grant, not a measurement. A pinning import path may care
+   about the PTE granularity underneath the pointer. Being measured now; a
+   refusal costs us §5.7's attach cost and nothing else, because the 4 KiB path
+   is measured working.
+3. **Whether the Intel Windows driver tolerates headless service operation**
    with imported memory only and no swapchain. Not a configuration its vendor
-   tests. R15.
-6. **Ring throughput and latency in this topology.** Every number in the
-   research is either arithmetic or from another machine.
-7. **Whether the app side should present at all**, or whether the physical panel
-   should stay on the passed-through iGPU (§10, fwd §6.6).
-8. **Whether `AllocateUserPhysicalPages2` accepts
-   `MEM_EXTENDED_PARAMETER_NONPAGED_LARGE`**, which would give both PFNs and
-   2 MiB contiguity and cut the app-side VMA count 512×. Ten minutes, worth
-   spending during step 0.
+   tests. R15, and it travels with item 1.
+4. **Every number attached to the large-page path.** Runs per 64 MiB, probe-locate
+   time, attach time at full arena size. §5.7 states the arithmetic and marks
+   each figure pending; none of them has been taken. The only measured attach
+   figures are the 4 KiB ones, and even those are extrapolated from 64 MiB to
+   2 GiB by multiplication, which is a hypothesis about linearity.
+5. **Whether `AllocateUserPhysicalPages2` accepts
+   `MEM_EXTENDED_PARAMETER_NONPAGED_LARGE`.** Promoted from "ten minutes, worth
+   spending" to a decision point: it would give **both** frame numbers and 2 MiB
+   contiguity, which together delete the locate step entirely and make AWE the
+   primary path (§5.1). Needs the same privilege as large pages, so it is
+   measurable the moment that is granted.
+6. **Whether `AllocateUserPhysicalPages` still returns raw guest PFNs** on
+   Windows 11 24H2. The Windows Research Kernel source settles it for the NT 5.2
+   era and there is no reason to think it changed, but "no reason to think" is
+   not a measurement. Lower stakes than it was: it matters only on the AWE path,
+   which is no longer the primary one.
+7. **Whether AWE's "cannot be used to buffer data for graphics or video calls"
+   is enforced or vestigial.** R19, untouched by step 0 because AWE was never
+   reached. Same demotion as item 6: it now decides between two available paths
+   rather than gating the project.
+8. **Whether `VirtualLock` keeps a page on the same physical frame.** Its
+   documented contract promises *residency*, not frame stability, and the whole
+   attaching side is a table of file offsets that silently becomes wrong if a
+   frame moves — the same class of silent wrong answer as R21, with no cheap
+   detector, because the stamps that would reveal it are overwritten by arena
+   data (§5.1). Nothing observed suggests Windows migrates locked user pages,
+   and step 0 held for the duration of a run. Large pages remove the question by
+   construction, which is a further argument for them. Not currently mitigated;
+   record it, and revisit if a corruption is ever seen that fits this shape.
+9. **Whether balloon inflation can take arena pages.** `info balloon` reports
+   `actual=13312`, so nothing is inflated today, and a locked user allocation
+   should not be reachable by the balloon driver's non-paged pool — but that is
+   reasoning, not a test, and R24 already says the arena's RAM belongs to
+   somebody else (`measured-gpu-side.md`).
+10. **Coherency under concurrent access.** Step 0 measured one writer at a time,
+    at rest, with a file rendezvous between phases (§5.6). R10 is retired by
+    construction, not by experiment.
+11. **Ring throughput and latency in this topology.** Every number in the
+    research is either arithmetic or from another machine.
+12. **Whether the app side should present at all**, or whether the physical panel
+    should stay on the passed-through iGPU (§10, fwd §6.6).
+
+**Settled by step 0**, kept for the record:
+
+> **[MEASURED — `measured-gpu-side.md` "Step 0"]**
+> *1. Whether importing guest RAM shared with the host works. This is the big one
+> and it is the whole design. … It does not establish that an import of our
+> particular pages will succeed. Ordinary process memory and AWE-backed guest RAM
+> that a host process also has mapped are not obviously the same thing to a
+> driver that pins pages.*
+>
+> They are the same thing to this driver: `memoryTypeBits = 0x6` for both,
+> `vkAllocateMemory` succeeds at 1 MiB and 64 MiB, and the bytes are shared in
+> both directions. R20 is retired for everything except AWE specifically.
+
+> **[MEASURED — `measured-gpu-side.md` "R21"]**
+> *4. The GPA→memfd offset formula on this machine. i440fx computes the below-4G
+> split with a machine-version compat knob; it is not a constant to hardcode, and
+> `info mtree -f` must be parsed. R21.*
+>
+> Read off the running machine: the split is 3 GiB, not 3.5 GiB, and two ranges
+> below 4 GiB are not RAM at their identity offsets. The instruction stands and
+> is now stronger — §5.1 requires the translation to *walk* the flat view rather
+> than evaluate anything, because the wrong answer is silent. What remains
+> unmeasured is only whether we re-read it when the machine changes, which is a
+> discipline question, not an experiment.
 
 ---
 
@@ -1303,3 +1891,20 @@ cross-ring ordering, memory-table honesty, and the guest RAM the arena takes awa
 from a production Windows session.
 
 That file is the maintained list. This one is the design.
+
+**Three entries there now need amending, and this document is not the place to
+do it.** Recorded here so the discrepancy is deliberate rather than rot:
+
+- **R11 and R24** — "grow by adding slabs" and "allocate slabs lazily so the
+  resident set tracks actual use" are superseded on the 4 KiB path, where the
+  extent is committed and located up front and lazy import bounds driver
+  imports rather than guest RAM (§5.2, §5.7). On the large-page path lazy growth
+  is viable again. What limits the guest's cost either way is the configured
+  arena size and releasing the extent on last disconnect.
+- **R19/R20** — both are now decisions between available paths rather than gates
+  on the project, and the reason `SeLockMemoryPrivilege` is being granted has
+  changed from "to test AWE" to "to get large pages", which is a different
+  justification for the same policy change and should be recorded as such.
+- **A new risk is missing:** `VirtualLock` promises residency, not frame
+  stability (§14 item 8). It is the same silent-wrong-answer shape as R21 and it
+  has no cheap detector.
