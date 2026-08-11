@@ -323,7 +323,9 @@ cargo build -p arena-host --release
 install -m0755 target/x86_64-pc-windows-gnu/release/awe-probe.exe /srv/winshare/probe/
 
 # guest (ssh, console only, no window)
-awe-probe.exe --workdir "Z:\probe" --pages 16384
+awe-probe.exe --workdir "Z:\probe" --pages 16384 --mode large
+#   --mode large|awe|awe2|locked  which allocator (default: awe, then locked)
+#   --stress N [--stress-only]    repeat the allocation N times and report
 
 # host, as root; QEMU's memfd is the fd whose /proc link is /memfd:memory-backend-memfd
 arena-host scan   --fd /proc/<qemu>/fd/<n> --run <run_id> --out map.txt
@@ -342,3 +344,182 @@ The unit tests are where the translation arithmetic is pinned down:
 `cargo test -p arena-host` covers the measured mapping, the PCI hole, and the
 identity-mapping mistake; `cargo test -p arena-record` covers the record layout
 the two sides share.
+
+---
+
+# Large pages, AWE, and the privilege that unlocks both
+
+Measured 2026-08-11, immediately after the section above. Step 0's fragmentation
+result — 1471 discontiguous runs for a 64 MiB window — prompted the obvious
+question: if we know we need a large contiguous chunk, ask for one. Windows does
+support that, and the mechanism is **large pages**: `VirtualAlloc` with
+`MEM_LARGE_PAGES`, in multiples of `GetLargePageMinimum()` (2 MiB here). Each
+large page is one physically contiguous 2 MiB block and is never paged.
+
+Large pages and AWE need the same thing: `SeLockMemoryPrivilege`. So the
+privilege question that step 0 stopped at had to be answered first.
+
+## The privilege grant, and how to undo it
+
+**What was changed.** One LSA account right was added, to one account:
+
+    account : TESTGUEST\<guest-user>  (S-1-5-21-2794265523-3702185664-1359551570-1001)
+    right   : SeLockMemoryPrivilege  ("Lock pages in memory")
+    method  : LsaAddAccountRights, via scripts/win-account-right.ps1
+    date    : 2026-08-11
+
+`LsaAddAccountRights` was chosen over `secedit /configure` deliberately: it adds
+one right to one SID and touches nothing else, whereas `secedit` applies a whole
+template. Before the change the account held **no** explicitly assigned rights
+at all (`LsaEnumerateAccountRights` → status 2, everything it had came from
+group membership), so the account's entire explicit-rights set is now exactly
+this one entry.
+
+**To revert**, from the guest:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\win-account-right.ps1 `
+  -Sid S-1-5-21-2794265523-3702185664-1359551570-1001 `
+  -Right SeLockMemoryPrivilege -Revoke
+```
+
+and reconnect (or log off) so the next token is issued without it. `-List` shows
+the current state without changing anything. A full pre-change snapshot of the
+machine's user-rights policy is also saved at
+`C:\Windows\Temp\user-rights-BEFORE-svprobe.inf` (`secedit /export`), which can
+be diffed or re-applied if anything else is ever suspected.
+
+**What it cost, verified rather than assumed.** Each of these was checked before
+and after:
+
+| claim | before | after |
+|-------|--------|-------|
+| a reboot is needed | — | no; a fresh ssh connection issues a token that has it |
+| the interactive user must log off | — | no; that session was never touched |
+| `testsigning` | not set | not set |
+| `nointegritychecks` | not set | not set |
+| `hypervisorlaunchtype` | `Off` | `Off` |
+| DeviceGuard `SecurityServicesRunning` | `0` | `0` |
+
+So the grant is a local security-policy change and nothing more: no code
+integrity setting moved, and the constraint that ruled out test-signing is
+untouched. What it *widens* is recorded as R25 in `security-model.md`.
+
+## Fragmentation, which was the point
+
+Same 64 MiB window, same host-side run count, four allocators:
+
+| allocator | runs in guest-physical space | mean run | frames known? |
+|-----------|------------------------------|----------|---------------|
+| `VirtualAlloc` + `VirtualLock` (4 KiB) | 1471 | ~44 KiB | no |
+| `AllocateUserPhysicalPages` (AWE, 4 KiB) | 5863 – 16339 | ~11–44 KiB | **yes** |
+| `AllocateUserPhysicalPages2`, `NONPAGED_LARGE` | 3992 of 3992 | **4 KiB** | yes |
+| **`VirtualAlloc(MEM_LARGE_PAGES)`** | **22** | **~2.9 MiB** | no |
+
+**Large pages are a 67× improvement** over the step-0 baseline and better than
+the 32-run floor a naive reading predicts, because adjacent 2 MiB blocks merge:
+22 runs for 32 large pages means ten pairs happened to be neighbours.
+
+Two of those rows are worth reading carefully.
+
+**AWE is the *worst* case for contiguity, not the best.** `AllocateUserPhysical`
+`Pages` hands out whatever frames are free, one at a time; measured in-process
+over the returned frame array it was 5863 runs (2.8 pages per run) on one
+attempt and 16339 on another — essentially scattered, and variable with the
+guest's memory state. Getting frame numbers and getting contiguity are separate
+problems, and AWE only solves the first.
+
+**`MEM_EXTENDED_PARAMETER_NONPAGED_LARGE` did not deliver large pages here.**
+`AllocateUserPhysicalPages2` resolves from `kernelbase.dll` (not `kernel32.dll`
+— asking only kernel32 produces a wrong negative) and the call *succeeds*, but:
+it satisfied only 3992 of 16384 requested frames, took ~200 ms, and the frames
+it returned were **1.0 pages per run** — completely scattered 4 KiB frames. On
+Windows 11 build 26200 this parameter bought nothing. `design.md` §14 item 8
+proposed it as the fix for fragmentation; measured, it is not.
+
+## Does the driver still import them?
+
+The import path pins pages, so a 2 MiB page is not obviously the same thing to
+it as a 4 KiB one. It is:
+
+```
+large-pages window, 64 MiB:  getMemoryHostPointerProperties = SUCCESS
+                             memoryTypeBits = 0x6, type 1, import = ok
+                             mapped_same_address = true
+                             host records via the Vulkan mapping: 16384/16384
+awe window, 64 MiB:          identical, and 16384/16384
+awe2 window, 16 MiB:         identical, and 3992/3992
+```
+
+Every allocator produced memory the driver accepted, with the same
+`memoryTypeBits` as ordinary process memory, and in every case the full
+host↔guest↔Vulkan loop of step 0 passed unchanged: the host wrote through the
+memfd, the guest saw it through the `VkDeviceMemory` mapping, the guest wrote
+back through that mapping, the host read it, and a second host write made after
+the import was seen by the guest.
+
+## R19 is retired, and so is the last of R20
+
+With the privilege present, the AWE path ran for real:
+
+- `AllocateUserPhysicalPages` returned 16384 frames, and **`arena-host translate`
+  verified all 16384 against the memfd**: every frame number, put through the
+  GPA→offset mapping, landed on exactly the page the guest said it was. That is
+  `design.md` §5.1's mechanism working end to end, and it settles §14 item 2 —
+  **`AllocateUserPhysicalPages` still returns raw guest-physical frame numbers**
+  on Windows 11 build 26200. Not "no reason to think it changed": measured.
+- The driver imported that AWE window without complaint, which retires **R19**.
+  Microsoft's "AWE address ranges cannot be used to buffer data for graphics or
+  video calls" does not bind WDDM's user-pointer import path on this driver.
+
+## Is large-page allocation reliable?
+
+A slab allocator that intermittently cannot get its memory is worse than one
+that is merely slow, so this was measured rather than assumed:
+
+```
+64 MiB   x5 : 5/5 succeeded, slowest 26 ms
+256 MiB  x5 : 5/5 succeeded, slowest 28 ms
+1024 MiB x3 : 3/3 succeeded, slowest 90 ms
+```
+
+Context, because this is the favourable case and should not be read as a
+guarantee: Windows 11 build 26200, 13248 MiB total with 8973 MiB free, 1.3 hours
+of uptime. Large-page allocation needs *contiguous* physical memory, and its
+failure mode (`ERROR_NO_SYSTEM_RESOURCES`, 1450) becomes more likely the longer
+the guest has been running and the more fragmented its physical memory is. None
+of that was exercised here, and deliberately so — the guest is somebody's daily
+machine and manufacturing memory pressure on it is not acceptable.
+
+**What the fallback should be.** Three things, in order:
+
+1. **Allocate the whole arena once, at GPU-side start-up**, not per-slab on
+   demand. Fragmentation grows with uptime, so the cheapest mitigation is to ask
+   early and hold. This also matches R11: the arena is a fixed pre-negotiated
+   window anyway.
+2. **Fall back to 4 KiB locked pages per slab** if `MEM_LARGE_PAGES` fails. It
+   is the step-0 configuration, it needs no contiguity, it never failed, and the
+   only cost is the VMA count on the host side — which `vm.max_map_count` of
+   1048576 makes affordable. A slab should record which kind it is.
+3. **Degrade per slab, not per arena.** A 64 MiB slab that cannot get large
+   pages should become a 4 KiB slab; the arena should not fail because one slab
+   was unlucky.
+
+The `ArenaProvider` trait in `design.md` §5.1 is the right place for this: it
+already abstracts "allocate, pin, enumerate frames", and large-versus-small is
+one more thing it decides rather than something its callers see.
+
+## The recommendation
+
+Use **`VirtualAlloc(MEM_LARGE_PAGES)`** for the arena, with 4 KiB locked pages
+as the per-slab fallback. It gives 22 runs instead of 1471, needs no PFN
+enumeration at all, and the driver imports it exactly like anything else.
+
+Note what that costs: large pages give contiguity but **not** frame numbers, so
+the host has to locate the pages some other way. Today that is the content scan
+`arena-host` does, which is fine for an experiment and not fine for a product.
+The clean combination is to allocate with `MEM_LARGE_PAGES` and obtain the
+frames separately — `QueryWorkingSetEx` reports each page's physical address to
+a caller holding `SeLockMemoryPrivilege`, which is now available and is worth
+measuring before the arena is written. The AWE route remains the alternative
+that reports frames directly, at the cost of the fragmentation measured above.

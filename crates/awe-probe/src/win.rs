@@ -20,7 +20,33 @@ pub const MEM_COMMIT: u32 = 0x0000_1000;
 pub const MEM_RESERVE: u32 = 0x0000_2000;
 pub const MEM_RELEASE: u32 = 0x0000_8000;
 pub const MEM_PHYSICAL: u32 = 0x0040_0000;
+pub const MEM_LARGE_PAGES: u32 = 0x2000_0000;
 pub const PAGE_READWRITE: u32 = 0x04;
+
+/// `MEM_EXTENDED_PARAMETER_TYPE::MemExtendedParameterAttributeFlags`.
+pub const MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: u64 = 5;
+/// Allocate the physical pages as large pages — the one flag that would give
+/// AWE both frame numbers *and* 2 MiB contiguity.
+pub const MEM_EXTENDED_PARAMETER_NONPAGED_LARGE: u64 = 0x0000_0008;
+
+/// `MEM_EXTENDED_PARAMETER`: an 8-bit type in the low bits of the first word,
+/// 56 reserved bits above it, then a union of pointer-sized values. Declared as
+/// two `u64`s because Rust has no bitfields and the layout is what matters.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MEM_EXTENDED_PARAMETER {
+    pub type_and_reserved: u64,
+    pub value: u64,
+}
+
+impl MEM_EXTENDED_PARAMETER {
+    pub fn attribute_flags(flags: u64) -> Self {
+        MEM_EXTENDED_PARAMETER {
+            type_and_reserved: MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS & 0xff,
+            value: flags,
+        }
+    }
+}
 
 pub const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
 pub const TOKEN_QUERY: u32 = 0x0008;
@@ -90,6 +116,12 @@ unsafe extern "system" {
         NumberOfPages: ULONG_PTR,
         PageArray: *const ULONG_PTR,
     ) -> BOOL;
+    /// 2 MiB on x64, and the granularity every large-page allocation must be a
+    /// multiple of.
+    pub fn GetLargePageMinimum() -> usize;
+
+    pub fn LoadLibraryA(lpLibFileName: *const u8) -> HANDLE;
+    pub fn GetProcAddress(hModule: HANDLE, lpProcName: *const u8) -> *const c_void;
 
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
 }
@@ -169,4 +201,52 @@ pub fn enable_privilege(name: &str) -> Result<bool, String> {
         }
         Ok(err != ERROR_NOT_ALL_ASSIGNED)
     }
+}
+
+/// `AllocateUserPhysicalPages2`, resolved at run time.
+///
+/// It arrived in Windows 10 1803 and mingw's import library does not carry it,
+/// so linking against it directly would fail to build rather than fail to run —
+/// and "this Windows is too old" is an answer the probe should be able to
+/// report rather than a link error. Signature:
+///
+/// ```c
+/// BOOL AllocateUserPhysicalPages2(HANDLE, PULONG_PTR NumberOfPages,
+///     PULONG_PTR PageArray, PMEM_EXTENDED_PARAMETER, ULONG ParameterCount);
+/// ```
+pub type PfnAllocateUserPhysicalPages2 = unsafe extern "system" fn(
+    HANDLE,
+    *mut ULONG_PTR,
+    *mut ULONG_PTR,
+    *mut MEM_EXTENDED_PARAMETER,
+    u32,
+) -> BOOL;
+
+/// Where to look. Newer memory APIs are often exported by `kernelbase.dll` (or
+/// only by the API set) and merely *forwarded* from `kernel32.dll` — so asking
+/// kernel32 alone and concluding "not available" would be a wrong negative.
+pub const ALLOC2_DLLS: [&std::ffi::CStr; 3] = [
+    c"kernel32.dll",
+    c"kernelbase.dll",
+    c"api-ms-win-core-memory-l1-1-8.dll",
+];
+
+pub fn allocate_user_physical_pages2() -> Option<(PfnAllocateUserPhysicalPages2, &'static str)> {
+    for (i, dll) in ALLOC2_DLLS.iter().enumerate() {
+        unsafe {
+            let lib = LoadLibraryA(dll.as_ptr() as *const u8);
+            if lib.is_null() {
+                continue;
+            }
+            let p = GetProcAddress(lib, c"AllocateUserPhysicalPages2".as_ptr() as *const u8);
+            if !p.is_null() {
+                let name = ["kernel32", "kernelbase", "api-ms-win-core-memory-l1-1-8"][i];
+                return Some((
+                    std::mem::transmute::<*const c_void, PfnAllocateUserPhysicalPages2>(p),
+                    name,
+                ));
+            }
+        }
+    }
+    None
 }

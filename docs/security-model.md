@@ -117,7 +117,8 @@ C on the shared subset, which is independent evidence rather than self-agreement
 ---
 
 R9–R18 arose from `research-vulkan-forwarding.md` §8. R19–R24 arise from the
-decisions taken in `design.md`. All are recorded here because this file, not the
+decisions taken in `design.md`. R25 arises from a change actually made to the
+guest while measuring step 0. All are recorded here because this file, not the
 design, is the maintained list.
 
 ### R9 — `VK_EXT_external_memory_host` may not accept our arena
@@ -213,7 +214,7 @@ adding to it.
 ordered so that steps 1–6 need no VM, no Windows and no GPU at all, which is the
 main reason for that ordering.
 
-### R19 — AWE's "not for graphics or video calls"
+### R19 — AWE's "not for graphics or video calls" — **retired, measured**
 Microsoft's Address Windowing Extensions documentation states that "AWE address
 ranges cannot be used to buffer data for graphics or video calls". The text is
 old and the phrasing suggests GDI/DirectDraw, and `MmProbeAndLockPages` has a
@@ -224,8 +225,17 @@ empirical, and the whole primary memory plan depends on it.
 attestation-signed ~200-line pinning driver over ordinary `VirtualAlloc` memory,
 which dodges every AWE restriction — attestation signing is a genuine Microsoft
 signature, not test-signing, so R6 is not violated.
+*Measured 2026-08-11, once `SeLockMemoryPrivilege` was granted (R25).* A 64 MiB
+AWE window — `AllocateUserPhysicalPages` + `MapUserPhysicalPages` — was imported
+by the Intel driver with `memoryTypeBits = 0x6`, mapped at the same address, and
+carried the host's bytes through the `VkDeviceMemory` mapping in all 16384
+pages. The documented restriction does not bind WDDM's user-pointer import path
+on this driver. **The pinning driver is not needed.** Separately settled in the
+same run: `AllocateUserPhysicalPages` still returns raw guest-physical frame
+numbers on Windows 11 build 26200 — all 16384 were verified against the memfd
+through the R21 translation (`design.md` §14 item 2, measured).
 
-### R20 — Importing guest RAM shared with the host — **measured, mostly retired**
+### R20 — Importing guest RAM shared with the host — **retired, measured**
 The single largest gap in the whole design was whether a driver that pins pages
 would accept memory that is simultaneously guest RAM, an AWE allocation, and
 mapped by a process on the other side of the hypervisor. There was no prior art
@@ -251,21 +261,23 @@ and then imported by the Intel driver:
 So (a) guest RAM and (c) host-mapped across the hypervisor are settled: they
 import, and the memory is genuinely shared in both directions.
 
-**What remains open is (b), AWE specifically.** `SeLockMemoryPrivilege` is
-unassigned in the guest's local security policy — `AllocateUserPhysicalPages`
-returns `ERROR_PRIVILEGE_NOT_HELD` — and granting it is a security-policy
-change that was deliberately not made. The window was therefore obtained with
-`VirtualAlloc` + `VirtualLock`, and the host found its pages by scanning the
-memfd for their contents rather than by translating frame numbers. Two
-consequences: R19 is untouched, and the design's "the GPU side hands us frame
-numbers" step (§5.1) is still unexercised.
-*Residual mitigation:* grant the privilege (one `[Privilege Rights]` line plus a
-new logon — no reboot, no interactive logoff, no code-integrity setting
-touched) and re-run `awe-probe`, which takes the AWE path automatically when the
-privilege is present. The alternative remains the attestation-signed pinning
-driver of R19. Note also that nothing here proves the *GPU* can DMA from these
-pages, only that the driver accepts and maps them — that is R15's trivial
-compute workload, still unrun.
+**Leg (b), AWE, was measured later the same day**, once `SeLockMemoryPrivilege`
+was granted (R25). The AWE window imported exactly like the others, and its
+frame numbers resolved to the right memfd offsets for all 16384 pages — so the
+design's §5.1 mechanism, "the side inside the VM allocates and reports frames,
+the other side translates them", is measured end to end rather than assumed. All
+three legs of R20 now hold.
+
+Four allocators were run through the identical loop — `VirtualLock`ed 4 KiB
+pages, AWE, `AllocateUserPhysicalPages2` with `NONPAGED_LARGE`, and
+`VirtualAlloc(MEM_LARGE_PAGES)` — and the driver accepted every one of them with
+the same `memoryTypeBits`. The import path does not care how the pages were
+obtained. What differs between them is fragmentation, not admissibility
+(`measured-gpu-side.md`, "Large pages, AWE, and the privilege that unlocks
+both").
+*Residual:* nothing here proves the *GPU* can DMA from these pages, only that
+the driver accepts and maps them — that is R15's trivial compute workload, still
+unrun. Coherency was also measured at rest, one writer at a time (R10).
 
 ### R21 — GPA → memfd offset translation is configuration-dependent
 The arena's location in the memfd is derived from guest physical frame numbers
@@ -320,3 +332,36 @@ paid whether or not anyone is rendering.
 default; allocate slabs lazily so the resident set tracks actual use; release
 the whole arena when the last app-side client disconnects. Do not run the
 GPU-side server at boot until this has been exercised.
+
+### R25 — The guest account now holds `SeLockMemoryPrivilege`
+Granted 2026-08-11 to `TESTGUEST\<guest-user>` so the arena can use large pages and
+AWE, both of which require it (`measured-gpu-side.md` records the exact change
+and its revert). This is a real widening and belongs in this list rather than in
+a paragraph of a measurement note.
+
+**What it permits.** A process running as that account can lock pages into
+physical memory that the kernel may not page out or trim: `VirtualLock` beyond
+the working-set quota, `VirtualAlloc(MEM_LARGE_PAGES)`, and AWE. The concrete
+abuse is a denial of service — a buggy or hostile process can pin memory the
+system cannot reclaim, and unlike ordinary allocation the kernel has no recourse
+but to fail other allocations. It also makes memory contents durably resident,
+which slightly weakens the assumption that secrets eventually leave RAM.
+
+**What it does not permit.** It is not a code-integrity setting. Secure Boot,
+HVCI/VBS and driver signing are untouched — verified before and after: no
+`testsigning`, no `nointegritychecks`, `hypervisorlaunchtype` still `Off`,
+DeviceGuard `SecurityServicesRunning` still `0`. It grants no kernel-mode
+execution, which is precisely why it is acceptable where R6's test-signing ban
+is not. The account in question is already a local administrator and already
+holds `SeDebugPrivilege` and `SeLoadDriverPrivilege`, both strictly more
+powerful; this adds nothing that account could not already reach by other means.
+
+**Scope.** One right, one SID, added with `LsaAddAccountRights` rather than a
+`secedit` template so nothing else in the policy could move. The account held no
+explicitly assigned rights before, so its explicit set is now exactly this one.
+*Mitigation:* it is reversible in one command with no reboot and no interactive
+logoff (`scripts/win-account-right.ps1 -Revoke`), a pre-change policy export is
+kept on the guest, and if the arena ends up not needing it — which is possible,
+since the large-page route may be replaced — it should be revoked rather than
+left behind. Treat "the privilege is still granted" as something to re-justify
+whenever the memory plan changes.

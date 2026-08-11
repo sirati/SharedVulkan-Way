@@ -43,6 +43,12 @@ const PAGE: usize = rec::PAGE;
 enum Mode {
     /// `AllocateUserPhysicalPages` — we know the guest-physical frames.
     Awe,
+    /// `AllocateUserPhysicalPages2` with `MEM_EXTENDED_PARAMETER_NONPAGED_LARGE`
+    /// — frames *and* 2 MiB contiguity, if the kernel will do it.
+    Awe2Large,
+    /// `VirtualAlloc(MEM_LARGE_PAGES)` — no frame numbers, but every 2 MiB is
+    /// physically contiguous and non-pageable by construction.
+    LargePages,
     /// `VirtualAlloc` + `VirtualLock` — ordinary committed memory, pinned into
     /// the working set. The frames are unknown to us, so the host has to find
     /// the pages by searching for their contents.
@@ -53,14 +59,27 @@ impl Mode {
     fn as_str(self) -> &'static str {
         match self {
             Mode::Awe => "awe",
+            Mode::Awe2Large => "awe2-large",
+            Mode::LargePages => "large-pages",
             Mode::LockedVa => "locked-va",
         }
     }
     fn code(self) -> u32 {
         match self {
             Mode::Awe => rec::MODE_AWE,
+            Mode::Awe2Large => rec::MODE_AWE2_LARGE,
+            Mode::LargePages => rec::MODE_LARGE_PAGES,
             Mode::LockedVa => rec::MODE_LOCKED_VA,
         }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "awe" => Mode::Awe,
+            "awe2" | "awe2-large" => Mode::Awe2Large,
+            "large" | "large-pages" => Mode::LargePages,
+            "locked" | "locked-va" => Mode::LockedVa,
+            _ => return None,
+        })
     }
 }
 
@@ -81,6 +100,11 @@ macro_rules! log {
 pub fn run() {
     let mut workdir = PathBuf::from("Z:\\probe");
     let mut pages: usize = 256;
+    // Which allocators to try, in order. The default reproduces the original
+    // step-0 run; `--mode` pins one so a measurement can name its mechanism.
+    let mut order: Vec<Mode> = vec![Mode::Awe, Mode::LockedVa];
+    let mut stress = 0usize;
+    let mut stress_only = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -93,10 +117,29 @@ pub fn run() {
                 pages = args[i + 1].parse().expect("--pages takes a number");
                 i += 2;
             }
+            "--mode" => {
+                order = args[i + 1]
+                    .split(',')
+                    .map(|m| Mode::parse(m).unwrap_or_else(|| panic!("unknown mode {m}")))
+                    .collect();
+                i += 2;
+            }
+            // Repeat the large-page allocation N times to see whether it is
+            // reliable or merely lucky. Nothing is held between attempts.
+            "--stress" => {
+                stress = args[i + 1].parse().expect("--stress takes a number");
+                i += 2;
+            }
+            // Answer only the reliability question and exit, without holding
+            // anything or involving the host.
+            "--stress-only" => {
+                stress_only = true;
+                i += 1;
+            }
             other => panic!("unknown argument {other}"),
         }
     }
-    let size = pages * PAGE;
+    let mut size = pages * PAGE;
 
     // A run id makes every claim falsifiable: a page that matches was written
     // by *this* run, not left over from a previous one.
@@ -116,30 +159,84 @@ pub fn run() {
     log!("SeLockMemoryPrivilege: {priv_state}");
 
     // ---- 2. the window -----------------------------------------------------
+    let large_min = unsafe { win::GetLargePageMinimum() };
+    log!("GetLargePageMinimum: {large_min} bytes");
+
+    // A large-page allocation is a multiple of the large page or it is nothing,
+    // so round the window up rather than quietly measuring a different size.
+    let wants_large = order
+        .iter()
+        .any(|m| matches!(m, Mode::LargePages | Mode::Awe2Large));
+    if wants_large && large_min > PAGE {
+        let per = large_min / PAGE;
+        if !pages.is_multiple_of(per) {
+            let rounded = pages.div_ceil(per) * per;
+            log!("rounding {pages} pages up to {rounded} ({large_min}-byte granularity)");
+            pages = rounded;
+            size = pages * PAGE;
+        }
+    }
+
+    if stress > 0 {
+        stress_large(size, stress);
+    }
+    if stress_only {
+        return;
+    }
+
     let mut awe_state: Option<AweWindow> = None;
     let mut lock_state: Option<LockedWindow> = None;
+    let mut chosen: Option<(Mode, *mut c_void)> = None;
 
-    let (mode, base): (Mode, *mut c_void) = match try_awe(pages) {
-        Ok(w) => {
-            let b = w.base;
-            log!(
-                "AWE window: base=0x{:x} pages={} — frames known",
-                b as usize,
-                w.pfns.len()
-            );
-            awe_state = Some(w);
-            (Mode::Awe, b)
+    for m in &order {
+        let attempt = match m {
+            Mode::Awe => try_awe(pages, false).map(Acquired::Awe),
+            Mode::Awe2Large => try_awe(pages, true).map(Acquired::Awe),
+            Mode::LargePages => try_large(size).map(Acquired::Va),
+            Mode::LockedVa => try_locked(size).map(Acquired::Va),
+        };
+        match attempt {
+            Ok(Acquired::Awe(w)) => {
+                log!(
+                    "{} window: base=0x{:x} pages={} — frames known, first pfn 0x{:x}",
+                    m.as_str(),
+                    w.base as usize,
+                    w.pfns.len(),
+                    w.pfns[0]
+                );
+                chosen = Some((*m, w.base));
+                awe_state = Some(w);
+                break;
+            }
+            Ok(Acquired::Va(w)) => {
+                log!(
+                    "{} window: base=0x{:x} size={}",
+                    m.as_str(),
+                    w.base as usize,
+                    size
+                );
+                chosen = Some((*m, w.base));
+                lock_state = Some(w);
+                break;
+            }
+            Err(e) => log!("{} unavailable: {e}", m.as_str()),
         }
-        Err(e) => {
-            log!("AWE unavailable: {e}");
-            log!("falling back to VirtualAlloc + VirtualLock (frames unknown to us)");
-            let w = try_locked(size).expect("even the fallback allocation failed");
-            let b = w.base;
-            log!("locked window: base=0x{:x} size={}", b as usize, size);
-            lock_state = Some(w);
-            (Mode::LockedVa, b)
-        }
+    }
+
+    let Some((mode, base)) = chosen else {
+        log!("NO ALLOCATOR WORKED — nothing to measure");
+        return;
     };
+
+    // An AWE allocator may hand back fewer frames than asked for; the window is
+    // then whatever we actually own, and every count below has to follow it.
+    if let Some(w) = &awe_state
+        && w.pfns.len() != pages
+    {
+        pages = w.pfns.len();
+        size = pages * PAGE;
+        log!("window is {pages} pages ({size} bytes) after the short allocation");
+    }
 
     let window: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, size) };
 
@@ -259,6 +356,16 @@ struct AweWindow {
 
 struct LockedWindow {
     base: *mut c_void,
+    /// Large-page allocations are non-pageable by construction and were never
+    /// `VirtualLock`ed, so unlocking them on the way out would just fail.
+    locked: bool,
+}
+
+/// What an allocator handed back, so the caller can keep it alive without
+/// caring which one succeeded.
+enum Acquired {
+    Awe(AweWindow),
+    Va(LockedWindow),
 }
 
 /// `AllocateUserPhysicalPages` + `MapUserPhysicalPages`.
@@ -266,12 +373,62 @@ struct LockedWindow {
 /// This is the arrangement `design.md` §5.1 wants: the frame numbers come back
 /// to user mode, and inside a VM they are guest-physical, which is what makes
 /// the host able to find the pages at all.
-fn try_awe(pages: usize) -> Result<AweWindow, String> {
+///
+/// With `large = true` it goes through `AllocateUserPhysicalPages2` and asks for
+/// `MEM_EXTENDED_PARAMETER_NONPAGED_LARGE`, which is the only documented way to
+/// get frame numbers *and* 2 MiB physical contiguity at once. The count
+/// semantics of that flag are not spelled out anywhere legible, so both
+/// readings are tried and whichever the kernel accepts is reported.
+fn try_awe(pages: usize, large: bool) -> Result<AweWindow, String> {
     unsafe {
         let proc = GetCurrentProcess();
         let mut want: ULONG_PTR = pages;
         let mut pfns: Vec<ULONG_PTR> = vec![0; pages];
-        if AllocateUserPhysicalPages(proc, &mut want, pfns.as_mut_ptr()) == 0 {
+
+        let ok = if large {
+            let Some((alloc2, from)) = win::allocate_user_physical_pages2() else {
+                return Err(format!(
+                    "AllocateUserPhysicalPages2 is exported by none of {:?}",
+                    win::ALLOC2_DLLS
+                ));
+            };
+            log!("AllocateUserPhysicalPages2 resolved from {from}");
+            let mut ep =
+                MEM_EXTENDED_PARAMETER::attribute_flags(MEM_EXTENDED_PARAMETER_NONPAGED_LARGE);
+            let r = alloc2(proc, &mut want, pfns.as_mut_ptr(), &mut ep, 1);
+            if r == 0 {
+                // Reading two: the count is in large pages, not small ones.
+                let e1 = GetLastError();
+                let large_min = GetLargePageMinimum();
+                let per = if large_min > PAGE {
+                    large_min / PAGE
+                } else {
+                    512
+                };
+                let mut want2: ULONG_PTR = pages / per;
+                if want2 > 0 {
+                    let r2 = alloc2(proc, &mut want2, pfns.as_mut_ptr(), &mut ep, 1);
+                    if r2 != 0 {
+                        return Err(format!(
+                            "AllocateUserPhysicalPages2(NONPAGED_LARGE) took a large-page \
+                             count ({want2} of {}) but not a small-page one (error {e1}) — \
+                             the frame array then needs interpreting before use",
+                            pages / per
+                        ));
+                    }
+                }
+                return Err(format!(
+                    "AllocateUserPhysicalPages2(NONPAGED_LARGE) failed: {e1} \
+                     (small-page count), {} (large-page count)",
+                    GetLastError()
+                ));
+            }
+            r
+        } else {
+            AllocateUserPhysicalPages(proc, &mut want, pfns.as_mut_ptr())
+        };
+
+        if ok == 0 {
             let e = GetLastError();
             let why = if e == ERROR_PRIVILEGE_NOT_HELD {
                 " (ERROR_PRIVILEGE_NOT_HELD — SeLockMemoryPrivilege is not in this token)"
@@ -280,12 +437,28 @@ fn try_awe(pages: usize) -> Result<AweWindow, String> {
             };
             return Err(format!("AllocateUserPhysicalPages failed: {e}{why}"));
         }
+        // A short allocation is a documented outcome, not an error: the call
+        // succeeds and reports how many frames it actually found. Take what we
+        // were given and say so — the interesting question is what those frames
+        // look like, and refusing them would throw that away.
         if want != pages {
-            return Err(format!(
-                "AllocateUserPhysicalPages gave {want} of {pages} pages"
-            ));
+            log!("asked for {pages} frames, got {want}");
         }
+        if want == 0 {
+            return Err("AllocateUserPhysicalPages returned zero frames".into());
+        }
+        let pages = want;
         pfns.truncate(want);
+
+        // How contiguous are the frames we were given? This is the number the
+        // host-side run count reflects, measured here without needing the host,
+        // and the whole reason large pages are interesting.
+        let runs = 1 + pfns.windows(2).filter(|w| w[1] != w[0] + 1).count();
+        log!(
+            "{} frames, {runs} contiguous runs ({:.1} pages per run)",
+            pfns.len(),
+            pfns.len() as f64 / runs as f64
+        );
 
         let base = VirtualAlloc(
             std::ptr::null_mut(),
@@ -342,8 +515,73 @@ fn try_locked(size: usize) -> Result<LockedWindow, String> {
             let e = GetLastError();
             log!("VirtualLock failed: {e} — continuing with unlocked memory");
         }
-        Ok(LockedWindow { base })
+        Ok(LockedWindow { base, locked: true })
     }
+}
+
+/// `VirtualAlloc(MEM_LARGE_PAGES)`.
+///
+/// Each large page is one physically contiguous 2 MiB block and is never paged,
+/// so a 64 MiB window is at most 32 runs in guest-physical space instead of the
+/// ~1471 that 4 KiB pages measured. The costs are that the size must be a
+/// multiple of `GetLargePageMinimum()`, that it needs the same
+/// `SeLockMemoryPrivilege` AWE does, and that it can simply fail when the
+/// guest's physical memory is too fragmented to find contiguous blocks —
+/// which is a property worth measuring rather than hoping about.
+fn try_large(size: usize) -> Result<LockedWindow, String> {
+    unsafe {
+        let base = VirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+            PAGE_READWRITE,
+        );
+        if base.is_null() {
+            let e = GetLastError();
+            let why = match e {
+                ERROR_PRIVILEGE_NOT_HELD => {
+                    " (ERROR_PRIVILEGE_NOT_HELD — large pages need SeLockMemoryPrivilege too)"
+                }
+                1450 => " (ERROR_NO_SYTEM_RESOURCES — no contiguous physical blocks left)",
+                _ => "",
+            };
+            return Err(format!("VirtualAlloc(MEM_LARGE_PAGES) failed: {e}{why}"));
+        }
+        std::ptr::write_bytes(base as *mut u8, rec::FILL, size);
+        Ok(LockedWindow {
+            base,
+            locked: false,
+        })
+    }
+}
+
+/// Does the large-page allocation work every time, or was it luck?
+///
+/// A slab allocator that intermittently cannot get its memory is worse than one
+/// that is merely slow, so this repeats the same allocation and reports how
+/// often it succeeded and what it failed with. Each attempt is released
+/// immediately: nothing is held, and the guest is a production machine.
+fn stress_large(size: usize, tries: usize) {
+    let mut ok = 0usize;
+    let mut worst = 0u32;
+    let mut slowest = Duration::ZERO;
+    for _ in 0..tries {
+        let t = Instant::now();
+        match try_large(size) {
+            Ok(w) => {
+                ok += 1;
+                slowest = slowest.max(t.elapsed());
+                unsafe { VirtualFree(w.base, 0, MEM_RELEASE) };
+            }
+            Err(_) => worst = unsafe { GetLastError() },
+        }
+    }
+    log!(
+        "large-page stress: {ok}/{tries} allocations of {} MiB succeeded, \
+         slowest {:?}, last failure error {worst}",
+        size / (1024 * 1024),
+        slowest
+    );
 }
 
 fn cleanup(awe: Option<AweWindow>, locked: Option<LockedWindow>, size: usize) {
@@ -355,7 +593,9 @@ fn cleanup(awe: Option<AweWindow>, locked: Option<LockedWindow>, size: usize) {
             FreeUserPhysicalPages(GetCurrentProcess(), &mut n, w.pfns.as_ptr());
         }
         if let Some(w) = locked {
-            VirtualUnlock(w.base, size);
+            if w.locked {
+                VirtualUnlock(w.base, size);
+            }
             VirtualFree(w.base, 0, MEM_RELEASE);
         }
     }
