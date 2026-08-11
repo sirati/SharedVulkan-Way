@@ -72,6 +72,37 @@ VK_KHR_timeline_semaphore              yes
   measurement confirms the driver would not be the limiting factor if that were
   ever solved.
 
+## The import, actually performed
+
+Advertising an extension is not the same as accepting an import, so the probe
+was extended to try it. Same machine, same run:
+
+```
+=== host-pointer import test
+    getMemoryHostPointerProperties: SUCCESS
+    memoryTypeBits: 0x6
+    importing into memory type 1
+    vkAllocateMemory(import): OK
+    mapped ok: first byte = 0xab (wrote 0xAB), same address = true
+    wrote 0x5C via Vulkan mapping, read 0x5c via the original pointer
+      -> SHARED, zero-copy confirmed
+```
+
+Read that last pair of lines carefully, because it is the whole design in four
+values. A megabyte of ordinary page-aligned memory was allocated and filled
+with `0xAB`. The driver imported that pointer as `VkDeviceMemory` and
+`vkMapMemory` returned **the same virtual address** — not a copy, the same
+pages. Writing `0x5C` through the Vulkan mapping was immediately visible
+through the original pointer.
+
+So on this hardware the GPU can be pointed at memory the application allocated,
+with no marshalling and no copy. `memoryTypeBits == 0x6` says the driver
+permits types 1 and 2, which are precisely the two host-visible types, so an
+arena allocation has somewhere legal to go.
+
+This retires R9 (the driver refusing host pointers) for this GPU side. It does
+not retire R20.
+
 ## What this does not tell us
 
 That the extension is advertised is not that an import of *our particular

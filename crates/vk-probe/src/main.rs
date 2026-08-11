@@ -117,6 +117,132 @@ fn main() -> Result<()> {
         println!("    ({} device extensions total)", exts.len());
     }
 
+    // The extension being advertised is not the same claim as an import
+    // succeeding: vkGetMemoryHostPointerPropertiesEXT returning
+    // memoryTypeBits == 0 is a legal answer, and some drivers fail the
+    // allocation outright (security-model.md R9). So try it for real.
+    if let Err(e) = try_import(&instance, devices[0]) {
+        println!("\nIMPORT TEST FAILED: {e:#}");
+    }
+
     unsafe { instance.destroy_instance(None) };
+    Ok(())
+}
+
+/// Allocate ordinary page-aligned memory and ask the driver to import it as
+/// `VkDeviceMemory`.
+///
+/// This is step 0 of the arena, reduced to its smallest honest form. It does
+/// NOT test the case the design actually needs — memory that is simultaneously
+/// guest RAM and mapped by the host across the hypervisor — because that needs
+/// the host side in the loop. It tests the half that can fail on its own: does
+/// this driver accept a host pointer at all?
+fn try_import(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Result<()> {
+    use std::alloc::{Layout, alloc, dealloc};
+
+    println!("\n=== host-pointer import test");
+
+    // Page-aligned and page-sized, because minImportedHostPointerAlignment is
+    // 4096 and the import is rejected outright if either is wrong.
+    const SIZE: usize = 1024 * 1024;
+    let layout = Layout::from_size_align(SIZE, 4096)?;
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        bail!("allocation failed");
+    }
+    // Touch every page: the driver has to pin these, and untouched pages of a
+    // fresh allocation may not be committed yet.
+    unsafe { std::ptr::write_bytes(ptr, 0xAB, SIZE) };
+
+    let queue_prio = [1.0f32];
+    let queue_info = [vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(0)
+        .queue_priorities(&queue_prio)];
+    let ext_names = [c"VK_EXT_external_memory_host".as_ptr()];
+    let dev_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_info)
+        .enabled_extension_names(&ext_names);
+    let device = unsafe { instance.create_device(pd, &dev_info, None) }?;
+
+    let host_mem = ash::ext::external_memory_host::Device::new(instance, &device);
+
+    // ash 0.38 ships no safe wrapper for this entry point, only the loaded
+    // function pointer, so call it directly.
+    let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+    let res = unsafe {
+        (host_mem.fp().get_memory_host_pointer_properties_ext)(
+            device.handle(),
+            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+            ptr as *const std::ffi::c_void,
+            &mut host_props,
+        )
+    };
+    println!("    getMemoryHostPointerProperties: {res:?}");
+    println!("    memoryTypeBits: 0x{:x}", host_props.memory_type_bits);
+
+    if host_props.memory_type_bits == 0 {
+        println!("    -> driver accepts no memory type for this pointer (R9 realised)");
+        unsafe { device.destroy_device(None); dealloc(ptr, layout) };
+        return Ok(());
+    }
+
+    // Any type the driver named will do; prefer a host-visible one, since that
+    // is what an arena allocation has to be.
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let chosen = (0..mem_props.memory_type_count).find(|i| {
+        let bit = 1u32 << i;
+        host_props.memory_type_bits & bit != 0
+            && mem_props.memory_types[*i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+    });
+    let Some(type_index) = chosen else {
+        println!("    -> no host-visible type among the permitted ones");
+        unsafe { device.destroy_device(None); dealloc(ptr, layout) };
+        return Ok(());
+    };
+    println!("    importing into memory type {type_index}");
+
+    let mut import =
+        vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+            .host_pointer(ptr as *mut std::ffi::c_void);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(SIZE as u64)
+        .memory_type_index(type_index)
+        .push_next(&mut import);
+
+    match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(mem) => {
+            println!("    vkAllocateMemory(import): OK — THE ARENA MECHANISM WORKS");
+
+            // If the import is real, mapping it must show the bytes we wrote
+            // through the original pointer: same memory, two names for it.
+            match unsafe { device.map_memory(mem, 0, SIZE as u64, vk::MemoryMapFlags::empty()) } {
+                Ok(mapped) => {
+                    let first = unsafe { *(mapped as *const u8) };
+                    let same_address = mapped as usize == ptr as usize;
+                    println!(
+                        "    mapped ok: first byte = 0x{first:02x} (wrote 0xAB), \
+                         same address = {same_address}"
+                    );
+                    // Write through the Vulkan mapping, read through ours.
+                    unsafe { *(mapped as *mut u8) = 0x5C };
+                    let via_original = unsafe { *ptr };
+                    println!(
+                        "    wrote 0x5C via Vulkan mapping, read 0x{via_original:02x} via \
+                         the original pointer -> {}",
+                        if via_original == 0x5C { "SHARED, zero-copy confirmed" } else { "NOT shared" }
+                    );
+                    unsafe { device.unmap_memory(mem) };
+                }
+                Err(e) => println!("    map failed: {e:?}"),
+            }
+            unsafe { device.free_memory(mem, None) };
+        }
+        Err(e) => println!("    vkAllocateMemory(import) FAILED: {e:?}"),
+    }
+
+    unsafe { device.destroy_device(None); dealloc(ptr, layout) };
     Ok(())
 }
