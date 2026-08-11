@@ -250,3 +250,64 @@ pub fn allocate_user_physical_pages2() -> Option<(PfnAllocateUserPhysicalPages2,
     }
     None
 }
+
+// ---------------------------------------------------------------------------
+// QueryWorkingSetEx
+// ---------------------------------------------------------------------------
+
+/// `PSAPI_WORKING_SET_EX_INFORMATION`: a virtual address in, a bitfield out.
+///
+/// The bitfield is a union of two layouts selected by `Valid`; we keep it as a
+/// raw word and decode it ourselves, because the interesting question is
+/// exactly what is and is not in those 64 bits.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PSAPI_WORKING_SET_EX_INFORMATION {
+    pub VirtualAddress: *mut c_void,
+    pub VirtualAttributes: usize,
+}
+
+#[link(name = "psapi")]
+unsafe extern "system" {
+    pub fn QueryWorkingSetEx(hProcess: HANDLE, pv: *mut c_void, cb: u32) -> BOOL;
+}
+
+/// The `Valid == 1` layout of `PSAPI_WORKING_SET_EX_BLOCK`, decoded.
+#[derive(Clone, Copy)]
+pub struct WsBits(pub usize);
+
+impl WsBits {
+    pub fn valid(self) -> bool {
+        self.0 & 1 != 0
+    }
+    pub fn share_count(self) -> usize {
+        (self.0 >> 1) & 0x7
+    }
+    pub fn win32_protection(self) -> usize {
+        (self.0 >> 4) & 0x7ff
+    }
+    pub fn shared(self) -> bool {
+        (self.0 >> 15) & 1 != 0
+    }
+    pub fn node(self) -> usize {
+        (self.0 >> 16) & 0x3f
+    }
+    pub fn locked(self) -> bool {
+        (self.0 >> 22) & 1 != 0
+    }
+    pub fn large_page(self) -> bool {
+        (self.0 >> 23) & 1 != 0
+    }
+    pub fn bad(self) -> bool {
+        (self.0 >> 31) & 1 != 0
+    }
+    /// Bits 24..30 — documented as `Reserved`.
+    pub fn reserved_mid(self) -> usize {
+        (self.0 >> 24) & 0x7f
+    }
+    /// Bits 32..63 — documented as `ReservedUlong`, and the only place in this
+    /// structure a page frame number could possibly hide.
+    pub fn reserved_high(self) -> u64 {
+        (self.0 as u64) >> 32
+    }
+}

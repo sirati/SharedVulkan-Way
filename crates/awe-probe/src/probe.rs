@@ -105,6 +105,7 @@ pub fn run() {
     let mut order: Vec<Mode> = vec![Mode::Awe, Mode::LockedVa];
     let mut stress = 0usize;
     let mut stress_only = false;
+    let mut wsex_only = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -134,6 +135,12 @@ pub fn run() {
             // anything or involving the host.
             "--stress-only" => {
                 stress_only = true;
+                i += 1;
+            }
+            // Allocate, ask Windows what it will say about the pages, and stop.
+            // No host, no Vulkan, nothing held.
+            "--wsex-only" => {
+                wsex_only = true;
                 i += 1;
             }
             other => panic!("unknown argument {other}"),
@@ -251,6 +258,14 @@ pub fn run() {
     }
     log!("stamped {pages} pages with SVARENA1/{run_id:016x}");
 
+    // What will Windows tell user mode about these pages?
+    let wsex = wsex_report(base, size, large_min);
+
+    if wsex_only {
+        cleanup(awe_state, lock_state, size);
+        return;
+    }
+
     // ---- 4. tell the host ---------------------------------------------------
     let mut status = String::new();
     status.push_str(&format!("run_id={run_id:016x}\n"));
@@ -259,6 +274,7 @@ pub fn run() {
     status.push_str(&format!("page_size={PAGE}\n"));
     status.push_str(&format!("base_va={:016x}\n", base as usize));
     status.push_str(&format!("privilege={priv_state}\n"));
+    status.push_str(&wsex);
     if let Some(w) = &awe_state {
         for (i, pfn) in w.pfns.iter().enumerate() {
             status.push_str(&format!(
@@ -835,4 +851,98 @@ fn parse_hex_field(text: &str, key: &str) -> Option<u64> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// QueryWorkingSetEx
+// ---------------------------------------------------------------------------
+
+/// Ask Windows what it will tell user mode about the pages of the window.
+///
+/// This exists to settle a specific question: large pages give physical
+/// contiguity but no frame numbers, AWE gives frame numbers but the worst
+/// contiguity measured, and if some documented call reported frames for
+/// large-page memory we could have both. `QueryWorkingSetEx` is the candidate,
+/// because it is the one user-mode call that reports per-page physical
+/// *attributes* to a caller holding `SeLockMemoryPrivilege`.
+///
+/// So: dump every bit it returns, including the ones documented as reserved,
+/// because a frame number would have to be hiding in those or nowhere.
+fn wsex_report(base: *mut c_void, size: usize, large_min: usize) -> String {
+    let mut out = String::new();
+    let pages = size / PAGE;
+
+    for (label, stride) in [
+        ("4KiB-stride", PAGE),
+        (
+            "large-page-stride",
+            if large_min > PAGE { large_min } else { PAGE },
+        ),
+    ] {
+        if stride > size {
+            continue;
+        }
+        let n = size / stride;
+        let mut info: Vec<win::PSAPI_WORKING_SET_EX_INFORMATION> = (0..n)
+            .map(|i| win::PSAPI_WORKING_SET_EX_INFORMATION {
+                VirtualAddress: (base as usize + i * stride) as *mut c_void,
+                VirtualAttributes: 0,
+            })
+            .collect();
+
+        let bytes = std::mem::size_of::<win::PSAPI_WORKING_SET_EX_INFORMATION>() * n;
+        let t = Instant::now();
+        let ok = unsafe {
+            QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr() as *mut c_void,
+                bytes as u32,
+            )
+        };
+        let elapsed = t.elapsed();
+        if ok == 0 {
+            log!("QueryWorkingSetEx({label}) FAILED: {}", unsafe {
+                GetLastError()
+            });
+            continue;
+        }
+
+        let bits: Vec<win::WsBits> = info
+            .iter()
+            .map(|i| win::WsBits(i.VirtualAttributes))
+            .collect();
+        let valid = bits.iter().filter(|b| b.valid()).count();
+        let large = bits.iter().filter(|b| b.large_page()).count();
+        let locked = bits.iter().filter(|b| b.locked()).count();
+        let shared = bits.iter().filter(|b| b.shared()).count();
+        let bad = bits.iter().filter(|b| b.bad()).count();
+        // The whole point: is there anything in the reserved bits?
+        let hi = bits.iter().map(|b| b.reserved_high()).max().unwrap_or(0);
+        let mid = bits.iter().map(|b| b.reserved_mid()).max().unwrap_or(0);
+        let distinct_hi = {
+            let mut v: Vec<u64> = bits.iter().map(|b| b.reserved_high()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+
+        let line = format!(
+            "wsex[{label}]: n={n} in {elapsed:?} ({:.1} ns/entry)\n  \
+             valid={valid} largePage={large} locked={locked} shared={shared} bad={bad} \
+             shareCount={} node={} prot=0x{:x}\n  \
+             raw[0]=0x{:016x} raw[1]=0x{:016x}\n  \
+             reserved bits 24..30 max={mid}, bits 32..63 max=0x{hi:x} over {distinct_hi} distinct value(s)",
+            elapsed.as_nanos() as f64 / n as f64,
+            bits[0].share_count(),
+            bits[0].node(),
+            bits[0].win32_protection(),
+            bits[0].0,
+            if bits.len() > 1 { bits[1].0 } else { 0 },
+        );
+        log!("{line}");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let _ = pages;
+    out
 }

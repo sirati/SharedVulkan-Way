@@ -523,3 +523,148 @@ frames separately — `QueryWorkingSetEx` reports each page's physical address t
 a caller holding `SeLockMemoryPrivilege`, which is now available and is worth
 measuring before the arena is written. The AWE route remains the alternative
 that reports frames directly, at the cost of the fragmentation measured above.
+
+---
+
+# Can we have both? `QueryWorkingSetEx`, measured
+
+The previous section left the arena with a real tension. Large pages give
+physical contiguity — 22 runs for 64 MiB — but no frame numbers. AWE gives frame
+numbers but the worst contiguity measured. If some user-mode call reported
+physical addresses for large-page memory, we would have both and the arena's
+shape would be settled. I named `QueryWorkingSetEx` as the candidate. It is not.
+
+## It reports no physical address at all
+
+The structure it fills, `PSAPI_WORKING_SET_EX_BLOCK`, is one word per page, and
+`SeLockMemoryPrivilege` does not add a field to it. Measured over a 1 GiB
+large-page window, all 262144 entries:
+
+```
+wsex[4KiB-stride]: n=262144 in 48.8 ms (186 ns/entry)
+  valid=262144 largePage=262144 locked=262144 shared=0 bad=0
+  shareCount=0 node=0 prot=0x4
+  raw[0]=0x0000000000c00041  raw[1]=0x0000000000c00041
+  reserved bits 24..30 max=0, bits 32..63 max=0x0 over 1 distinct value(s)
+```
+
+Read the last line: across a quarter of a million pages the whole 64-bit word
+took **exactly one distinct value**. A frame number would have to differ per
+page; nothing here does. The documented `ReservedUlong` (bits 32..63) — the only
+place a physical address could hide — is zero for every page of every allocator
+tried. This is not "the field is zeroed on this build"; there is no field, and
+the measurement confirms the structure carries nothing page-specific beyond the
+virtual address you passed in.
+
+So **`QueryWorkingSetEx` does not serve.** Windows does not report frame numbers
+to user mode outside AWE, which is exactly why AWE exists.
+
+## What it *is* good for: telling the allocations apart
+
+The `LargePage` bit works, and the three allocators are distinguishable
+programmatically. Same call, same fields, three windows:
+
+| window | raw word | `Locked` | `LargePage` | reserved 24..30 |
+|--------|----------|----------|-------------|-----------------|
+| `VirtualLock`ed 4 KiB | `0x0000000005400041` | 1 | 0 | 5 |
+| AWE | `0x0000000000400041` | 1 | 0 | 0 |
+| `MEM_LARGE_PAGES` | `0x0000000000c00041` | 1 | **1** | 0 |
+
+So the GPU side can assert what it actually got rather than what it asked for —
+worth doing, since a slab that silently fell back to 4 KiB pages has different
+properties (R26) and the host side should be told which kind it is attaching.
+`Locked` is set on all three, so it confirms pinning but does not discriminate.
+
+**Cost.** ~180 ns per entry at 4 KiB stride — 48.8 ms for 1 GiB, 93.9 ms for
+2 GiB, so linear and fine at attach time, once. But the call answers per
+*address*, not per page-table entry, so on large pages you can stride by the
+large page: 512 entries instead of 262144, **156 µs instead of 48.8 ms, a 312×
+saving** for the same coverage (345 µs for 2 GiB). Enumerating a large-page
+arena is free; enumerating a 4 KiB one is a one-off ~50 ms per gigabyte.
+
+## So how does the host find large-page memory? Ranked
+
+Since no API hands over the frames, the options are:
+
+1. **The content scan (`arena-host scan`) — recommended.** The guest stamps the
+   window, the host sweeps QEMU's memfd for the stamp. Measured cost:
+
+   | window | scan wall time | pages located |
+   |--------|----------------|---------------|
+   | 64 MiB | 1.8 s | 16384 |
+   | 1 GiB | 2.02 s | 262144 |
+   | 2 GiB | 2.32 s | 524288 |
+
+   **The cost is flat in window size, because it is linear in *guest RAM* size,
+   not arena size** — the sweep reads 13312 MiB whatever the window is, and only
+   the match handling grows: 32× the arena cost 0.5 s more. `design.md` flagged
+   the extrapolation from 64 MiB as unproven; measured at 1 GiB and 2 GiB, it
+   does not extrapolate the way a reader would fear. It is ~2 s of one-off
+   attach cost for any arena this machine can hold, and it would be ~2 s on a
+   4 KiB arena too.
+
+   It is also the only method that *verifies* rather than trusts: it finds pages
+   by their contents, so a wrong answer is not possible in the way a wrong
+   translation formula is (R21).
+
+2. **AWE's frame list**, if the frames matter more than contiguity. It reports
+   frames directly and `arena-host translate` verified 16384/16384 of them — but
+   at 267× the run count of large pages, which is the trade the previous section
+   measured. Reasonable only if a future GPU side turns out to need frame
+   numbers for something other than locating the pages.
+
+3. **A pinning driver**, which could report anything it likes. Now clearly not
+   worth an EV certificate: R19 is retired and the scan is 2 s.
+
+The scan's one weakness is that it locates pages *once*. If a frame could later
+move, the table would go stale silently — that is R26, and it is another reason
+the large-page path is preferable, since large pages are not candidates for
+relocation by the ordinary paging machinery.
+
+## Two things the 1 GiB run settled on the way
+
+**Large-page contiguity gets better with size, not worse.**
+
+| window | contiguous runs in guest-physical space |
+|--------|------------------------------------------|
+| 64 MiB | 22 |
+| 1 GiB | **1** |
+| 2 GiB | 2 |
+
+The 1 GiB window came back as one single extent — 512 adjacent 2 MiB blocks, the
+whole gigabyte — and 2 GiB as two. A host-side attacher maps those with one or
+two `mmap` calls rather than the ~1471-per-64-MiB the 4 KiB path needs. (The
+1 GiB window's base landed at memfd offset `0x200000000`, GPA `0x240000000`:
+gigabyte-aligned.) Windows is evidently satisfying these from a contiguous pool,
+so asking for the whole arena in one call is better than asking slab by slab.
+
+**Imports of 1 GiB and 2 GiB work.** `vkAllocateMemory` with
+`VkImportMemoryHostPointerInfoEXT` accepted each in a single `VkDeviceMemory` —
+`memoryTypeBits = 0x6`, mapped at the same address, and for the 1 GiB case all
+262144 pages verified against the host afterwards. Slab size is therefore a
+choice about allocator behaviour and import count, not a limit the driver
+imposes at these sizes.
+
+**Frames did not move under `VirtualLock`, over the interval tested.** A 64 MiB
+locked window was located in the memfd, held while the guest went about ordinary
+business, and re-located 3m14s later: byte-identical offset table, all 16384
+pages, 931 runs both times. That is evidence against casual relocation and *not*
+evidence against relocation under memory pressure, which was not provoked. It is
+recorded as R26 rather than treated as settled — and it is another reason to
+prefer large pages, which are not candidates for the ordinary paging machinery
+at all.
+
+## A false negative worth recording
+
+One run first reported `host_records_via_vk = 0/262144`, which looked like a
+1 GiB import silently failing to share. It was not: the rendezvous flag file had
+been written with a literal `n` instead of a newline (`stamp=abcd...2222n`), so
+the guest's hex parse failed, fell back to zero, and dutifully searched for a
+stamp of zero. Host-side verification of the same pages found all 262144 host
+records and all 262144 Vulkan-written records present.
+
+Recording it because the experiment is only worth what its failure modes are
+worth: the run id and per-page index checks did their job — the "failure" was
+localised to a parse in the harness in a couple of minutes — but a reader
+skimming logs would have seen a zero and believed it. Counts that come out at
+exactly zero deserve the same suspicion as counts that come out perfect.

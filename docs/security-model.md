@@ -151,6 +151,15 @@ inherit the constraint.
 applications budget against it, and grow by adding slabs rather than resizing.
 A segregated free list rather than a buddy allocator, because buddy waste
 converts directly into this error (design.md §5.2).
+*Amended 2026-08-11.* "Grow by adding slabs" survives, but **growing late is
+worse than it looks and lazy slabs are not the hedge they appear to be.** Both
+paths commit their memory up front: the 4 KiB path must be committed and
+located before the app side can map it at all, and the large-page path needs
+contiguous physical memory, which is most available early and decays with guest
+uptime (`measured-gpu-side.md`). A slab added an hour into a session is the
+slab most likely to fail or to be badly fragmented. Prefer allocating the whole
+arena at GPU-side start-up and treating late growth as a fallback that may fail,
+not as the normal path.
 
 ### R12 — `bufferDeviceAddress` puts DXVK ≥ 2.7 and vkd3d-proton out of reach
 A property of those projects and of the D3D12 contract, not a bug to fix.
@@ -332,6 +341,16 @@ paid whether or not anyone is rendering.
 default; allocate slabs lazily so the resident set tracks actual use; release
 the whole arena when the last app-side client disconnects. Do not run the
 GPU-side server at boot until this has been exercised.
+*Amended 2026-08-11 — "allocate slabs lazily" is superseded.* It does not do
+what it promises on either measured path. The 4 KiB path commits and locks the
+extent up front, because the app side cannot map pages that do not yet exist and
+the offset table is built at attach time; the large-page path wants to allocate
+early while contiguous physical memory is still available. Laziness therefore
+buys no guest RAM back and costs reliability. The honest levers on guest cost
+are the two that remain: **size the arena from configuration**, and **release it
+promptly when the last client disconnects** — which is now the load-bearing one,
+since the memory is held in full for as long as the GPU-side server runs. That
+strengthens the closing advice: do not run the server at boot.
 
 ### R25 — The guest account now holds `SeLockMemoryPrivilege`
 Granted 2026-08-11 to `TESTGUEST\<guest-user>` so the arena can use large pages and
@@ -365,3 +384,40 @@ kept on the guest, and if the arena ends up not needing it — which is possible
 since the large-page route may be replaced — it should be revoked rather than
 left behind. Treat "the privilege is still granted" as something to re-justify
 whenever the memory plan changes.
+
+### R26 — `VirtualLock` promises residency, not frame stability
+The 4 KiB path pins arena pages with `VirtualLock`, and the app side then holds
+a table of memfd offsets derived from where those pages were when it attached.
+`VirtualLock`'s contract is that the pages stay *resident* — it says nothing
+about the physical frame behind a page staying the same one. Nothing in the
+documented behaviour forbids the memory manager from relocating a locked page,
+and a hypervisor-side actor could in principle move guest-physical pages too.
+If a frame moved, the app side would keep reading the old offset: no fault, no
+error, just an arena where one side's writes stop reaching the other. The two
+sides would disagree about memory contents, which is R21's failure mode arriving
+by a different route.
+
+**There is no cheap detector on the 4 KiB path as designed.** The per-page
+stamps that make step 0's verification work are overwritten the moment arena
+data lands in those pages, so "is this still my page?" has nothing to compare
+against. Re-scanning guest RAM costs a full sweep of the memfd (~2 s, measured)
+and only tells you where the pages are *now*.
+
+*Measured, weakly:* a 64 MiB `VirtualLock`ed window was located in the memfd,
+held while the guest went about ordinary business, and re-located minutes later;
+every page was at the same offset. That is evidence against casual movement and
+is **not** evidence against movement under memory pressure, which was not
+provoked — deliberately, since the guest is somebody's daily machine.
+
+*Mitigation, in order of preference:*
+1. **Use large pages** (`measured-gpu-side.md`). A large page is not a
+   candidate for relocation by the ordinary paging machinery, and the whole
+   problem is removed by construction rather than managed. This is now a second
+   independent argument for the large-page path.
+2. If the 4 KiB fallback is used, **reserve a canary** — the arena allocator
+   never hands out the first 64 bytes of each slab-sized block, and the host
+   re-checks those canaries periodically and at every handshake. That restores a
+   cheap detector at a cost of 64 bytes per block, and turns a silent
+   divergence into a loud one.
+3. Treat a canary mismatch as fatal to the session, not as something to repair:
+   by the time it is noticed the two sides have already disagreed.

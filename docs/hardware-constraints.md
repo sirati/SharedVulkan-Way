@@ -93,3 +93,28 @@ signed, before committing to that transport.
 - The host is reachable only over the network. Anything that risks the host's
   networking or its ability to run the guest is unacceptable.
 - No permanent Windows test-signing mode.
+
+## Host limits the design depends on
+
+    vm.max_map_count = 1048576
+
+Measured 2026-08-11. This is not trivia: the app side builds its view of the
+arena by mapping the guest's pages out of QEMU's memfd, and those pages are not
+contiguous in guest-physical space, so a contiguous host-side view costs one VMA
+per discontiguous run. A 64 MiB slab of ordinary 4 KiB guest pages measured
+~1471 runs (`measured-gpu-side.md`), so the 4 KiB path costs roughly 23 VMAs per
+MiB of arena — about 24k for a 1 GiB arena.
+
+At the kernel's older default of 65530 that would have capped the arena at
+around 2.8 GiB, and at a size that varies with the *guest's* memory
+fragmentation rather than with anything we control, which is the worst kind of
+limit. At 1048576 it is a non-issue: a 1 GiB arena uses ~2% of the budget.
+
+Two consequences worth stating rather than assuming:
+
+- The design should **check this at start-up and refuse to run if it is too
+  low**, rather than failing at an arbitrary `mmap` half way through attaching a
+  slab. It is a one-line read of `/proc/sys/vm/max_map_count`.
+- Large pages make it nearly free — the same 64 MiB measured 22 runs, and a
+  1 GiB large-page window measured **1**. The VMA budget only binds the 4 KiB
+  fallback path.
