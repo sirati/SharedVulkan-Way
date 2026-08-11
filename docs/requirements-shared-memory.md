@@ -98,11 +98,17 @@ These are the questions the design must answer with evidence, not hope:
    transfer commands. Getting this table right is what makes applications
    naturally use the fast path instead of the slow one.
 
-5. **Lifetime and safety.** The arena is memory one side can write while the
-   other reads. A misbehaving or crashed app side must not be able to corrupt
-   the GPU side, and `vkFreeMemory` has to be safe while the GPU may still be
-   reading. Note sharedgl's `VP_DOWNLOAD` has an unbounded guest-controlled
-   `memcpy` into its server; we are not repeating that.
+5. **Lifetime.** The arena is memory one side can write while the other reads,
+   and `vkFreeMemory` has to behave sanely while the GPU may still be reading.
+
+   Note this is a *correctness* question, not a security one. **This is not a
+   security boundary** — see security-model.md. Do not propose copying,
+   revalidation or shadow buffers whose purpose is to protect one side from the
+   other; that would defeat the arena, and it could not be enforced anyway,
+   since anything validated can be rewritten before it is read. Cheap measures
+   that mostly catch our own bugs (bounds-checking an offset against the region
+   length, handle tables) are worth taking. Everything else gets documented as
+   a risk rather than defended against.
 
 ## Consequence for the protocol
 
