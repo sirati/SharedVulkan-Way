@@ -1,0 +1,62 @@
+#version 450
+//
+// The workload the GPU runs against imported arena memory.
+//
+// Two storage buffers, both bound to the *same* imported VkDeviceMemory — the
+// input at offset 0 and the output at offset `input_bytes`. So a run exercises
+// binding a VkBuffer to imported host memory, at zero and at a non-zero offset,
+// and then actually dispatching against it.
+//
+// `transform` MUST agree bit for bit with `arena_record::gpu::transform`, and
+// the header skip MUST agree with `arena_record::gpu::is_payload`. Three
+// parties check the result — this shader, the Windows guest and the Linux host
+// — and a disagreement between any two of them would look exactly like the
+// failure the experiment exists to detect. `gpu-probe`'s build.rs re-derives
+// the constants below from the Rust source and fails the build if they drift.
+//
+// Nothing here loops unboundedly, reads outside its buffers, or writes to the
+// input. That is not tidiness: this GPU drives the physical laptop panel and
+// somebody is using the machine (security-model.md R1, R18). A shader that can
+// hang is a shader that blanks their screen.
+
+layout(local_size_x = 256) in;
+
+// `std430` so the array is a plain uint array with no padding, which is what
+// the two CPU sides read it as.
+layout(set = 0, binding = 0, std430) readonly  buffer InBuf  { uint d[]; } inb;
+layout(set = 0, binding = 1, std430) writeonly buffer OutBuf { uint d[]; } outb;
+
+layout(push_constant) uniform Push {
+    uint words;   // words in the region, headers included
+    uint kernel;  // 0 = transform, 1 = copy
+} pc;
+
+// arena_record::gpu::transform
+uint transform(uint v, uint i) {
+    uint h = v ^ (v >> 15);
+    h = h * 0x2545F491u;
+    // arena_record::gpu::SEED — without it zero is a fixed point and an
+    // untouched page would pass the check.
+    h = h + i * 0x9E3779B1u + 0x27D4EB2Fu;
+    h = h ^ (h >> 13);
+    h = h * 0x85EBCA6Bu;
+    h = h ^ (h >> 16);
+    return h;
+}
+
+void main() {
+    // A grid-stride loop rather than one invocation per word. The dispatch is
+    // then clamped to a workgroup count the driver certainly accepts whatever
+    // the window size is, instead of the caller having to know
+    // maxComputeWorkGroupCount and get it right at 1 GiB.
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.words; i += stride) {
+        // arena_record::gpu::is_payload — the first 64 words of every 1024-word
+        // page belong to the SVARENA1 record. Leaving them alone is what lets
+        // the host still identify the page after the GPU has written it, which
+        // is R26's canary made cheap.
+        if ((i & 1023u) < 64u) { continue; }
+        uint v = inb.d[i];
+        outb.d[i] = (pc.kernel == 0u) ? transform(v, i) : v;
+    }
+}

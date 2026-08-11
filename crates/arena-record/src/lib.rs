@@ -96,6 +96,8 @@ pub fn is_ours(page: &[u8], run_id: u64) -> bool {
     page.len() >= PAGE && &tag_at(page, OFF_MAGIC) == MAGIC && get_u64(page, OFF_RUN_ID) == run_id
 }
 
+pub mod gpu;
+
 #[cfg(test)]
 mod tests {
     use super::*;

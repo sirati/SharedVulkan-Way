@@ -264,6 +264,18 @@ this GPU side**; it says nothing about RADV, which refuses shared host mappings
 altogether, which is why the import stays behind a trait (`design.md` §5.4).
 Retiring R9 was never the same claim as R20, and R20 was measured separately.
 
+*Widened 2026-08-11, on other hardware* (`measured-gpu-side.md`, "two drivers
+refuse a shared mapping"). The same probe was run against three Linux
+implementations with a `MAP_SHARED` window rather than an anonymous one, and
+**two of the three refused it**: RADV with `VK_ERROR_INVALID_EXTERNAL_HANDLE`,
+as predicted, and **NVIDIA's proprietary driver with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`** — the exact field report quoted above,
+reproduced. Both imported an ordinary anonymous mapping without complaint, so
+the distinguishing property is that the memory is *shared*, which is not
+optional for an arena. R9 is retired for the Intel/Windows GPU side and is
+**live for every Linux GPU side except lavapipe**, whose acceptance
+`design.md` §5.4 already warns is not evidence of anything.
+
 ### R10 — Cache attribute mismatch corrupts silently
 Mapping the same physical pages with different cache attributes from two page
 tables is architecturally undefined on x86, and the failure mode is corrupted
@@ -280,6 +292,23 @@ measured **at rest**, one writer at a time, with a file-based rendezvous between
 phases. Nothing has been measured about concurrent access or about cache
 behaviour under load. §5.6 remains an argument with evidence behind it, not a
 measurement (`design.md` §0).
+
+*An instrument now exists, 2026-08-11* (`measured-gpu-side.md`, "A GPU running
+work against arena memory"). `gpu-probe --concurrent` and `arena-host gpuchurn`
+put a writer and the GPU on the same pages at the same time: the host alternates
+the input region between two stamps while the GPU repeatedly copies it, and
+every output word must then be one of the two values the writer ever wrote. A
+word that is **neither** is the only thing an incoherent or torn read could
+produce, so this can return positive evidence rather than only an absence.
+Two things bound what a clean result would mean, and they are built into the
+report rather than left to the reader: the check is at **4-byte granularity**,
+so it says nothing about the atomicity of anything wider, and it observes
+**whatever interleaving actually happened** — which is why the probe also counts
+how many words held the old value and how many the new, and says outright that
+the run measures nothing if the GPU only ever saw one of them.
+**R10 is not retired by this.** An instrument that has not yet been pointed at
+the target hardware changes nothing about the risk; what it changes is that the
+gap is now closable by an experiment rather than only by an argument.
 
 ### R11 — The arena is a fixed-size, pre-negotiated window
 Host-visible memory cannot be grown on demand. An application allocating more
@@ -342,6 +371,40 @@ memory. **No GPU has touched an arena page.** GPU-side address translation is
 entirely downstream of the import succeeding, and none of it has been exercised.
 `design.md` §13 makes the compute workload the first thing in step 7 rather than
 a late check, for this reason.
+
+*The workload exists, 2026-08-11* (`measured-gpu-side.md`, "A GPU running work
+against arena memory"). `crates/gpu-probe` binds the imported allocation to two
+`VkBuffer`s — at offset 0 and half-way in, so a suballocating arena's real
+question is asked too — dispatches a compute shader that transforms every word
+by a hash of its value *and* its index, waits on a fence, and has the result
+judged independently by the guest and by a Linux process reading QEMU's memfd.
+It reuses `awe_probe::alloc`, so it runs against the same memory the earlier
+measurements did rather than an approximation of it. The whole path was
+validated end to end on other hardware first, including the three-party
+protocol; a first submission that hangs the target GPU would be visible to
+whoever is at the laptop (R1, R18), so the fence has a 2 s timeout, a device
+loss exits instead of retrying, and the window is released on every path.
+It has run on **two real GPUs, and both passed** — NVIDIA's proprietary driver
+and RADV, over a 128 MiB window of ordinary anonymous memory, 15728640 payload
+words each, zero wrong and zero untouched, with buffers bound at offset 0 *and*
+at 64 MiB. So a compute shader executing correctly against host-imported memory
+is no longer hypothetical, and one specific way this could have failed early did
+not: on both drivers the buffer's `memoryTypeBits` intersected the mask the
+pointer import permitted, so imported memory was bindable and not merely
+mappable. A mask that excluded it would have meant imported memory is usable for
+CPU sharing and useless for GPU work, which would change the arena's premise.
+
+**R15 is not retired, and the two passes are encouragement rather than
+evidence.** They were the wrong driver, the wrong OS, and — the part that
+matters most — the wrong *memory*: ordinary process memory, not guest RAM mapped
+by a process across the hypervisor. R9's new result is the reason to keep those
+apart rather than treat one as standing in for the other: two of three Linux
+drivers accept an anonymous mapping and refuse a merely shared one, so "imports
+anonymous memory" and "imports arena memory" are demonstrably different claims,
+and "dispatches against anonymous memory" is a third. What remains unmeasured is
+the whole of it on the target: an Intel Windows driver, headless,
+imported-memory-only, no swapchain, over pages that are simultaneously guest RAM
+and host-mapped. Building an instrument is not taking a reading.
 
 ### R16 — Loader unknown-extension trampoline ceiling
 `MAX_NUM_UNKNOWN_EXTS` is 250 in the loader, and its known-extension list
@@ -437,8 +500,15 @@ obtained. What differs between them is fragmentation, not admissibility
 (`measured-gpu-side.md`, "Large pages, AWE, and the privilege that unlocks
 both").
 *Residual:* nothing here proves the *GPU* can DMA from these pages, only that
-the driver accepts and maps them — that is R15's trivial compute workload, still
-unrun. Coherency was also measured at rest, one writer at a time (R10).
+the driver accepts and maps them — that is R15's compute workload, for which an
+instrument now exists (`crates/gpu-probe`) but which has not been run on the
+target. Coherency was also measured at rest, one writer at a time (R10).
+
+*Scope narrowed 2026-08-11.* R20 is retired **for the Intel/Windows GPU side**
+and that boundary is now measured rather than assumed: on Linux, RADV and
+NVIDIA's proprietary driver both refuse to import a shared mapping while
+accepting an anonymous one (R9). "Guest RAM shared with the host is importable"
+is a property of this driver, not of `VK_EXT_external_memory_host`.
 
 ### R21 — GPA → memfd offset translation is configuration-dependent
 The arena's location in the memfd is derived from guest physical frame numbers
@@ -614,5 +684,17 @@ guest is somebody's daily machine.
    re-checks those canaries periodically and at every handshake. That restores a
    cheap detector at a cost of 64 bytes per block, and turns a silent
    divergence into a loud one.
+   *Built and exercised 2026-08-11* (`measured-gpu-side.md`, "A GPU running work
+   against arena memory"). `gpu-probe` reserves the first 256 bytes of every
+   page: neither the host's fill nor the compute shader writes them, so the
+   `SVARENA1` record survives the workload and both sides re-check page identity
+   *after* the GPU has written the whole window rather than only before. On the
+   harness run all 2048 page headers were intact on the guest side and all 1024
+   output-page headers on the host side. The cost was measured rather than
+   estimated — at page granularity it is 6.25% of the window, which is
+   substantially more than the 64-bytes-per-slab this entry proposed, and the
+   difference is the point: per-page canaries are what make a *wrong page*
+   detectable, per-slab canaries only detect a wrong slab. Which granularity the
+   arena wants is a design decision this measurement can now inform.
 3. Treat a canary mismatch as fatal to the session, not as something to repair:
    by the time it is noticed the two sides have already disagreed.

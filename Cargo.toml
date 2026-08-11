@@ -5,6 +5,7 @@ members = [
   "crates/vk-probe",
   "crates/arena-record",
   "crates/awe-probe",
+  "crates/gpu-probe",
   "crates/arena-host",
   "crates/sv-wire",
   "crates/sv-codegen",

@@ -4,18 +4,14 @@
 //!
 //! It stays a member of the workspace anyway — a crate that is only ever built
 //! by hand is a crate that quietly stops compiling — so the real body is behind
-//! `cfg(windows)` and the Linux build produces a binary that explains itself.
+//! `cfg(windows)` in the library and the Linux build produces a binary that
+//! explains itself.
 //!
 //!   cargo build -p awe-probe --release --target x86_64-pc-windows-gnu
 
 #[cfg(windows)]
-mod probe;
-#[cfg(windows)]
-mod win;
-
-#[cfg(windows)]
 fn main() {
-    probe::run();
+    awe_probe::probe::run();
 }
 
 #[cfg(not(windows))]

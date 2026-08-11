@@ -668,3 +668,288 @@ worth: the run id and per-page index checks did their job — the "failure" was
 localised to a parse in the harness in a couple of minutes — but a reader
 skimming logs would have seen a zero and believed it. Counts that come out at
 exactly zero deserve the same suspicion as counts that come out perfect.
+
+---
+
+# A GPU running work against arena memory — the instrument, not yet the reading
+
+Built and validated 2026-08-11; **not yet run on the target hardware**, for the
+reason given at the end. Read the title as written: everything below is a
+working experiment and a set of results from *other* machines. No number here
+comes from the Intel iGPU.
+
+This is `design.md` §14 item 1 and `security-model.md` R15 — **has a GPU ever
+executed a workload against arena memory?** Everything above measures that the
+driver *accepts* our pages: the import succeeds, `vkMapMemory` returns the same
+virtual address, and CPUs on both sides of the hypervisor see the same bytes.
+An import is not a submission.
+GPU-side address translation is entirely downstream of the import succeeding and
+none of it had been exercised.
+
+## What the experiment is
+
+`crates/gpu-probe`, a sibling of `awe-probe` rather than a rewrite of it: the
+window comes from `awe_probe::alloc`, the same four allocators the sections
+above measured, so this is the same memory and not an approximation of it.
+`crates/arena-host` gains three commands for the Linux side, and
+`crates/arena-record` gains the definition of the arithmetic — *once*, because
+three parties now have to agree about it rather than two.
+
+The window is split in half. The first half is a `VkBuffer` bound to the
+imported `VkDeviceMemory` at offset 0; the second is a second `VkBuffer` bound
+to the same allocation at offset `half`, which also answers "can a buffer live
+part-way into imported memory?", the question a suballocating arena actually
+asks. A compute shader reads every input word and writes
+
+    out[i] = transform(in[i], i)
+
+where `transform` is a finalising hash of the value *and* the index. That choice
+is the whole point. A GPU that wrote a constant, read the wrong page, read a
+stale page, or got the index off by one produces a value that is unrelated to
+the right one rather than nearly right, so the check cannot be passed by
+accident. `arena_record::gpu::transform` and
+`crates/gpu-probe/shaders/arena.comp` state the same function in Rust and GLSL,
+and `build.rs` fails the build if the constants in the two ever drift.
+
+Three parties then judge the same bytes: the shader produces them, the Windows
+guest checks them through its mapping, and a Linux process checks them again by
+reading QEMU's memfd. The guest's check is the weak one — its mapping and the
+Vulkan mapping are the same virtual address, measured — so the host's
+independent read through different page tables in a different process is what
+the claim rests on.
+
+### Two design details that are load-bearing
+
+**The host predicts, it does not compare.** The guest and the host both check
+the output against `transform(host_fill(stamp, i), i)`, derived from the stamp
+the writer announced — not against a transform of whatever the input currently
+holds. Comparing against the current input would let a GPU reading a stale copy
+of a page and a CPU reading the same stale copy agree with each other, and the
+check would pass on memory that is not shared at all.
+
+**The first 256 bytes of every page are reserved and nothing writes them.** The
+`SVARENA1` record therefore survives the workload, so after the GPU has written
+the whole window the host can still ask "is this the page I mapped?" and get an
+answer. R26 says the 4 KiB path has no cheap detector because step 0's stamps
+are destroyed the moment real data lands in the pages; this is R26's proposed
+canary, built and exercised, at a cost of 6.25% of the window.
+
+## Two bugs the tests caught before any GPU ran
+
+Recorded because a measurement is worth what its failure modes are worth, and
+both of these would have produced a *false pass* rather than a visible error.
+
+1. **`transform(0, 0) == 0`.** The original hash had zero as a fixed point, so
+   word 0 of a page the GPU never touched would have been accepted as correct. A
+   non-zero seed constant fixes it, and the test now asserts no fixed point over
+   4096 indices.
+2. **The stamp fold collapsed.** `host_fill` folded the two halves of the 64-bit
+   stamp with a plain XOR, so every stamp of the form `0xAAAAAAAA_AAAAAAAA`
+   became zero and two different stamps could produce byte-identical fills —
+   which would have silently disarmed the concurrency check, whose entire
+   content is telling two stamps apart. Each half is now multiplied by a
+   different odd constant first.
+
+Neither was found by inspection. Both were found by a unit test asking whether
+an untouched page passes, which is the test worth writing.
+
+## The harness, validated end to end before touching the laptop
+
+`gpu-probe` is OS-agnostic in its Vulkan half and takes a pointer, so the whole
+path — shader, binding, submission, fences, and the three-party protocol —
+was run on the build machine first. That is not squeamishness: the target GPU
+drives a physical laptop panel and somebody is using the machine (R1, R18), and
+a first submission that hangs it would be visible to them.
+
+With `--file`, the Linux build backs its window with a `MAP_SHARED` file that
+`arena-host` plays the host half against. One machine, no hypervisor, so it
+proves nothing about the arena — but it proves the harness, which is the part
+that could otherwise produce "every word wrong" on the laptop for a reason that
+has nothing to do with the GPU:
+
+```
+located 2048 pages, 1 contiguous run
+gpufill: 983040 payload words across 1024 input pages in 2.65 ms
+guest : checked 983040, correct 983040, wrong 0, untouched 0, headers 2048/2048
+host  : gpuverify -> 983040/983040 as the shader required, headers 1024/1024
+```
+
+The concurrency phase was exercised the same way: 4004 dispatch-and-check passes
+against 1229 host churn passes, and the guest saw **both** stamps (2.12 G words
+of the old value, 1.82 G of the new), which is the check that the two sides
+actually overlapped. A concurrency result where the GPU only ever saw one value
+would mean nothing, and the probe says so rather than reporting a clean zero.
+
+## A finding on the way: two drivers refuse a shared mapping
+
+The same binary, the same 4 MiB window, on the build machine's three
+implementations. The only variable is whether the pages are an anonymous private
+mapping or a `MAP_SHARED` mapping of a file:
+
+| driver | anonymous private | `MAP_SHARED` of a file |
+|---|---|---|
+| NVIDIA RTX 5090 (proprietary, Linux) | imported, `memoryTypeBits=0xc` | **`VK_ERROR_OUT_OF_DEVICE_MEMORY`** |
+| RADV (AMD iGPU, Mesa) | imported, `memoryTypeBits=0x20` | **`VK_ERROR_INVALID_EXTERNAL_HANDLE`** |
+| lavapipe | imported, `memoryTypeBits=0x1` | imported |
+
+RADV's refusal is `design.md` §5.4's prediction measured rather than cited —
+libdrm passes `AMDGPU_GEM_USERPTR_ANONONLY` unconditionally and Linux gives
+`MAP_SHARED|MAP_ANONYMOUS` a backing file, so a shared arena is unimportable on
+AMD/Linux by construction, and the error code is exactly the one the forwarding
+research names.
+
+**The NVIDIA result is new and corrects the design.** §5.4's table lists
+"Intel/NVIDIA Linux" as a `HostPointerImport` row. That row is right for
+ordinary process memory and wrong for the memory this design actually shares: an
+arena mapping is necessarily shared, and the proprietary driver rejects it — with
+`OUT_OF_DEVICE_MEMORY`, which reads like a resource problem and is not one. So a
+Linux GPU side needs `DmaBufImport` on **both** AMD and NVIDIA, not only AMD, and
+`HostPointerImport` on Linux is currently evidenced only by lavapipe, which
+§5.4 already calls a dangerous oracle.
+
+None of this touches the target hardware, whose GPU side is Windows and whose
+answer is above: the Intel driver imports host-shared guest RAM with
+`memoryTypeBits = 0x6`. It does say the pluggable `SlabImport` trait is carrying
+more weight than the table suggests.
+
+## Re-running it
+
+The two sides rendezvous through the same virtio-fs share as step 0
+(`/srv/winshare/probe` on the host, `Z:\probe` in the guest).
+
+```
+# build (from the dev shell — glslangValidator is now in it, for the shader)
+cargo build -p gpu-probe --release --target x86_64-pc-windows-gnu
+cargo build -p arena-host --release
+install -m0755 target/x86_64-pc-windows-gnu/release/gpu-probe.exe /srv/winshare/probe/
+
+# the whole run, both sides, one command
+scripts/gpu-workload-run.sh --agent <ssh-agent-socket> --pages 16384 --mode large
+scripts/gpu-workload-run.sh --agent ... --concurrent    # adds the churn phase
+
+# or by hand — guest first, it waits for the host between phases
+gpu-probe.exe --workdir "Z:\probe" --pages 16384 --mode large
+#   --no-host      fill the input locally; no memfd, no host half
+#   --no-perf      correctness only, disturb the machine as little as possible
+#   --concurrent   the host-writes-while-the-GPU-reads phase
+# host, as root, against QEMU's memfd
+arena-host scan     --fd /proc/<qemu>/fd/<n> --run <run_id> --out map.txt
+arena-host gpufill  --fd ... --map map.txt --stamp <hex>
+echo stamp=<hex> > /srv/winshare/probe/host-gpu-fill.txt
+arena-host gpuverify --fd ... --map map.txt --stamp <hex> --run <run_id>
+
+# the harness, on any Linux machine with a GPU, sharing nothing
+gpu-probe --file /tmp/window --pages 4096 --workdir /tmp/probe
+```
+
+Safety properties worth not removing: the fence has a 2 s timeout rather than an
+unbounded wait, `VK_ERROR_DEVICE_LOST` exits rather than retries, the window is
+released on every exit path including panics, and the shader has no unbounded
+loop and writes nothing outside its own buffer.
+
+The unit tests are where this is pinned down without a GPU: `cargo test -p
+arena-record` covers the shared arithmetic and the fixed-point bug, `cargo test
+-p gpu-probe` covers the verifier — including that a zeroed output does *not*
+pass and that a right-value-wrong-index answer does not either — and `cargo test
+-p arena-host` covers the host's page-index arithmetic and its behaviour when
+the scan misses a page.
+
+## What did run: two real GPUs, imported host memory, correct results
+
+Not the target, and not the arena — ordinary anonymous process memory on the
+build machine, with no hypervisor anywhere near it. But two real drivers from
+two vendors, and this is the first time in the project that a GPU has executed a
+workload against memory imported through `VK_EXT_external_memory_host` at all.
+Identical 128 MiB window, 64 MiB per buffer, 15728640 payload words:
+
+| | NVIDIA RTX 5090 (discrete) | RADV, Ryzen 9950X3D iGPU (unified) |
+|---|---|---|
+| import `memoryTypeBits` | `0xc`, used type 2 | `0x20`, used type 5 |
+| buffer `memoryTypeBits` | `0x1f` — intersects | intersects |
+| bind at 0 and at 64 MiB | OK | OK |
+| correct / checked | **15728640 / 15728640** | **15728640 / 15728640** |
+| untouched, wrong | 0, 0 | 0, 0 |
+| page headers intact | 32768 / 32768 | 32768 / 32768 |
+| submit+fence, empty dispatch | 0.051 ms | 0.651 ms |
+
+Three things follow that do transfer to the design, even though the memory does
+not.
+
+**The bind gate is not obviously a problem.** On both drivers the buffer's
+`memoryTypeBits` intersected the mask the pointer import permitted, and
+`vkBindBufferMemory` accepted the allocation at offset 0 *and* at a 64 MiB
+offset. The failure mode where imported memory is mappable but not bindable did
+not occur on either. It remains unmeasured on the target.
+
+**Submission overhead is real and differs by an order of magnitude between
+implementations** — 0.051 ms against 0.651 ms for the same empty dispatch. That
+is worth knowing before the forwarding design starts counting round trips: the
+floor is a property of the implementation, not of the work.
+
+**The performance question has a proxy answer, and it is the encouraging one.**
+Bandwidth over the payload, read plus write, with the empty-submit floor
+removed:
+
+| | imported host pointer | driver alloc, same memory type | driver alloc, device-local |
+|---|---|---|---|
+| RTX 5090 (discrete) | 55.9 GB/s | 58.7 GB/s | 3213 GB/s |
+| RADV iGPU (unified) | **33.6 GB/s** | 31.0 GB/s | **62.5 GB/s** |
+
+Read the two rows against each other, because the contrast is the result. On the
+discrete card imported host memory is crippled — it is across PCIe, and the
+gap is the bus. **On the unified-memory iGPU the gap is 1.9×, not two orders of
+magnitude**, which is the shape the arena needs: host memory is a fraction
+slower than the GPU's preferred pool rather than a different class of thing.
+
+Two cautions on that table, because it would be easy to over-read. The RTX
+5090's device-local figure is **cache-resident** — the card has 128 MB of L2 and
+the working set is 128 MiB — so it is "much faster", not a DRAM bandwidth
+measurement; the honest discrete-card claim is only that imported host memory is
+bus-limited. And on both machines **the import itself costs nothing**: imported
+memory ran within a few percent of a driver allocation of the *same memory type*
+(1.047× on NVIDIA, 0.935× on RADV — imported was marginally the faster of the
+two there). What costs is which memory type the pages are, not whether the
+driver got them from us.
+
+None of this is the Intel iGPU, and an AMD APU is not an Intel one. It does
+mean the design's viability question now has a measured analogue instead of an
+assumption, and that the analogue says the arena is plausible for real work
+rather than only for staging.
+
+## What this does not establish — the target reading has not been taken
+
+Stated plainly, because the section above is a set of results from the wrong
+machines and would otherwise be easy to skim as though the question had been
+answered.
+
+**No GPU has yet executed this workload against arena memory.** The run needs
+the Windows guest and the Linux host on `testhost` at the same time, and the
+ssh agent that authenticates to both stopped signing part-way through this work
+— `agent refused operation`, the 1Password agent having locked — so the live
+half never happened. Nothing was worked around: no number attributed to the
+Intel iGPU appears anywhere above.
+
+So these remain open:
+
+1. **R15 proper.** Whether an Intel Windows driver, headless,
+   imported-memory-only and with no swapchain, will execute a submission at all.
+   Two other drivers doing so on Linux is encouragement, not evidence about this
+   one.
+2. **Whether the iGPU's translation reaches host-shared guest RAM.** The AMD and
+   NVIDIA runs imported *ordinary process memory*. The arena's memory is
+   simultaneously guest RAM and mapped by a process across the hypervisor, and
+   the whole content of §14 item 1 is that GPU-side translation is downstream of
+   the import and has never been exercised on those pages. R9's new result
+   sharpens this rather than softening it: two of three Linux drivers refuse a
+   merely *shared* mapping outright, so "imports anonymous memory" and "imports
+   arena memory" are demonstrably different claims.
+3. **Large pages against 4 KiB.** The chosen path and the fallback have never
+   been compared under GPU load. A difference would matter more than almost
+   anything else here, and `--mode large` versus `--mode locked` is the whole
+   experiment.
+4. **R10 under concurrency.** The churn phase has run only against lavapipe,
+   which is a CPU.
+
+To take the reading, publish the binaries and run
+`scripts/gpu-workload-run.sh --agent <socket> --pages 16384 --mode large`, then
+the same with `--concurrent`, then with `--mode locked`.

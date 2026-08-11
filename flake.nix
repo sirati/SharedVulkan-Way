@@ -82,6 +82,10 @@
           # behaviour that a sloppy forwarder gets away with until it does
           # not.
           vulkan-validation-layers
+          # glslangValidator, so a compute shader can be written as GLSL and
+          # compiled to SPIR-V by the build rather than checked in as an opaque
+          # blob nobody can read or re-derive. `gpu-probe`'s build.rs needs it.
+          glslang
 
           # --- Windows cross ---------------------------------------------
           # Only the cross *compiler* belongs in a Linux dev shell — it is the

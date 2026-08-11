@@ -35,11 +35,13 @@
 //! and adding one to the flake for a probe is not worth the closure.
 
 use arena_record as rec;
+use arena_record::gpu;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, Instant};
 
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -165,7 +167,13 @@ pub fn run() {
              --regions <gpa:size:off,...> [--out <file>]\n  \
              arena-host write1 --fd <path> --map <file> --stamp <hex>\n  \
              arena-host verify --fd <path> --map <file> [--stamp <hex>] [--vkstamp <hex>]\n  \
-             arena-host write2 --fd <path> --map <file> --stamp <hex>"
+             arena-host write2 --fd <path> --map <file> --stamp <hex>\n\
+             \n\
+             the GPU-workload phase (docs/measured-gpu-side.md, \"a GPU has now run\"):\n  \
+             arena-host gpufill   --fd <path> --map <file> --stamp <hex>\n  \
+             arena-host gpuverify --fd <path> --map <file> --stamp <hex>\n  \
+             arena-host gpuchurn  --fd <path> --map <file> --stampa <hex> --stampb <hex> \
+             [--seconds <n>]"
         );
         std::process::exit(2);
     }
@@ -334,7 +342,240 @@ pub fn run() {
                 }
             }
         }
+        "gpufill" => {
+            let stamp = hexarg(&args, "--stamp").expect("--stamp");
+            let map = read_map(&arg(&args, "--map").expect("--map"));
+            let half = halves(&map);
+            let t = Instant::now();
+            let n = gpu_fill(&file, &map, half, stamp);
+            println!(
+                "gpufill: wrote host_fill(0x{stamp:016x}, i) into {n} payload words across \
+                 {half} input pages in {:?}",
+                t.elapsed()
+            );
+            println!("  the output pages ({half}..{}) were left alone", map.len());
+        }
+        "gpuverify" => {
+            let stamp = hexarg(&args, "--stamp").expect("--stamp");
+            let map = read_map(&arg(&args, "--map").expect("--map"));
+            let run = hexarg(&args, "--run");
+            gpu_verify(&file, &map, halves(&map), stamp, run);
+        }
+        "gpuchurn" => {
+            let a = hexarg(&args, "--stampa").expect("--stampa");
+            let b = hexarg(&args, "--stampb").expect("--stampb");
+            let secs: u64 = arg(&args, "--seconds")
+                .map(|s| s.parse().expect("--seconds wants a number"))
+                .unwrap_or(10);
+            let map = read_map(&arg(&args, "--map").expect("--map"));
+            gpu_churn(&file, &map, halves(&map), a, b, secs);
+        }
         other => panic!("unknown command {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the GPU-workload phase
+// ---------------------------------------------------------------------------
+
+/// Pages in the input half.
+///
+/// The guest splits its window down the middle: the first half is the shader's
+/// input buffer, the second its output. Derived from the *page indices* rather
+/// than from the map's length, because a scan that missed a page would
+/// otherwise shift the split by half a page and quietly make every subsequent
+/// index wrong — R21's failure mode arriving through the harness instead of
+/// through the translation.
+fn halves(map: &[(u32, u64)]) -> usize {
+    let max = map.iter().map(|(i, _)| *i).max().unwrap_or(0) as usize;
+    let window = max + 1;
+    if map.len() != window {
+        println!(
+            "WARNING: the map has {} entries but page indices run to {max}. \
+             {} pages are missing, and the split is derived from the indices.",
+            map.len(),
+            window - map.len()
+        );
+    }
+    window / 2
+}
+
+/// The entries of `map` whose page index falls in `[lo, hi)`, in index order.
+///
+/// Selecting by index rather than by position in the map is the same
+/// robustness point as `halves`: the page the guest calls 5 is the page the
+/// host must write as 5, whatever order the scan found things in and whatever
+/// it missed.
+fn pages_in(map: &[(u32, u64)], lo: usize, hi: usize) -> Vec<(u32, u64)> {
+    let mut v: Vec<(u32, u64)> = map
+        .iter()
+        .filter(|(i, _)| (*i as usize) >= lo && (*i as usize) < hi)
+        .cloned()
+        .collect();
+    v.sort();
+    v
+}
+
+/// Map the pages of `map[range]` as few times as possible.
+///
+/// The step-0 writers `mmap` one page at a time, which is fine for a one-shot
+/// 60 ms write and useless for the churn phase, where the host has to keep a
+/// 32 MiB region moving fast enough to overlap with GPU dispatches. Coalescing
+/// contiguous memfd offsets into single mappings turns ~8192 syscalls into ~11
+/// on the large-page path — which is the same fragmentation result from the
+/// other side, now costing something concrete.
+fn coalesce(map: &[(u32, u64)]) -> Vec<(usize, usize, u64, usize)> {
+    // (first index in map, count, memfd offset, byte length)
+    let mut runs: Vec<(usize, usize, u64, usize)> = Vec::new();
+    for (i, (_, off)) in map.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if r.2 + r.3 as u64 == *off => {
+                r.1 += 1;
+                r.3 += rec::PAGE;
+            }
+            _ => runs.push((i, 1, *off, rec::PAGE)),
+        }
+    }
+    runs
+}
+
+/// Write `host_fill(stamp, i)` into every payload word of the input half.
+///
+/// The page headers are left untouched, so the `SVARENA1` record still
+/// identifies each page after the workload has run. That is R26's canary at the
+/// price of 6.25% of the window, and it is what makes `gpuverify` able to say
+/// "this is still the page I mapped" rather than only "these bytes are wrong".
+fn gpu_fill(file: &File, map: &[(u32, u64)], half: usize, stamp: u64) -> u64 {
+    let input = pages_in(map, 0, half);
+    let mut written = 0u64;
+    for (first, count, off, len) in coalesce(&input) {
+        let mut pm = PageMap::new(file, off, len).expect("mmap run");
+        let s = pm.as_mut_slice();
+        for p in 0..count {
+            let page_index = input[first + p].0;
+            let page = &mut s[p * rec::PAGE..(p + 1) * rec::PAGE];
+            for w in gpu::HEADER_WORDS..gpu::WORDS_PER_PAGE {
+                // The word index the *shader* sees is the index within the
+                // whole input region, so it has to be derived from the page's
+                // logical index and not from where the page happens to sit in
+                // the memfd.
+                let i = page_index * gpu::WORDS_PER_PAGE + w;
+                let o = w as usize * 4;
+                page[o..o + 4].copy_from_slice(&gpu::host_fill(stamp, i).to_le_bytes());
+                written += 1;
+            }
+        }
+        pm.flush();
+    }
+    written
+}
+
+/// Read the output half through the memfd and check it against what the shader
+/// was required to compute.
+///
+/// This is the independent check. The guest already verified the same words
+/// through its own mapping, but the guest's mapping and the Vulkan mapping are
+/// the same virtual address (measured), so a guest-side pass proves less than
+/// it looks like it does. Reading the bytes out of QEMU's memfd is a different
+/// path through different page tables in a different process on the other side
+/// of the hypervisor.
+fn gpu_verify(file: &File, map: &[(u32, u64)], half: usize, stamp: u64, run: Option<u64>) {
+    let output = pages_in(map, half, half * 2);
+    let (mut checked, mut correct, mut wrong, mut zero) = (0u64, 0u64, 0u64, 0u64);
+    let mut header_ok = 0usize;
+    let mut examples: Vec<String> = Vec::new();
+    for (first, count, off, len) in coalesce(&output) {
+        let pm = PageMap::new(file, off, len).expect("mmap run");
+        let s = pm.as_slice();
+        for p in 0..count {
+            let page_index = output[first + p].0;
+            let page = &s[p * rec::PAGE..(p + 1) * rec::PAGE];
+            // Is this still the page we mapped? The shader never writes the
+            // header, so the answer is available even after the workload.
+            if &rec::tag_at(page, rec::OFF_MAGIC) == rec::MAGIC
+                && run.map(|r| rec::get_u64(page, rec::OFF_RUN_ID) == r).unwrap_or(true)
+                && rec::get_u32(page, rec::OFF_PAGE_INDEX) == page_index
+            {
+                header_ok += 1;
+            }
+            // The output word at region index `i` was produced from the input
+            // word at the same index — the input region's page `page_index -
+            // half`, which is why the shader's index is region-relative.
+            let region_index = page_index - half as u32;
+            for w in gpu::HEADER_WORDS..gpu::WORDS_PER_PAGE {
+                let i = region_index * gpu::WORDS_PER_PAGE + w;
+                let o = w as usize * 4;
+                let got = u32::from_le_bytes(page[o..o + 4].try_into().unwrap());
+                let expect = gpu::transform(gpu::host_fill(stamp, i), i);
+                checked += 1;
+                if got == expect {
+                    correct += 1;
+                } else {
+                    if got == 0 {
+                        zero += 1;
+                    }
+                    wrong += 1;
+                    if examples.len() < 4 {
+                        examples.push(format!(
+                            "page {page_index} word {w} (region index {i}): expected \
+                             0x{expect:08x}, found 0x{got:08x}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    println!("gpuverify over {} output pages:", output.len());
+    println!("  payload words checked : {checked}");
+    println!("  as the shader required: {correct}");
+    println!("  wrong                 : {wrong} (of which {zero} are zero)");
+    println!("  page headers intact   : {header_ok}/{}", output.len());
+    for e in &examples {
+        println!("  ! {e}");
+    }
+    println!(
+        "  VERDICT: {}",
+        if checked > 0 && wrong == 0 {
+            "the Linux host can read what the GPU computed"
+        } else {
+            "FAILED — see above"
+        }
+    );
+}
+
+/// Alternate the input half between two stamps for `secs`, as fast as the host
+/// can, while the guest dispatches against it.
+///
+/// The point is overlap, so it reports how many full passes it managed: if the
+/// guest only ever saw one of the two values, the two sides did not actually
+/// overlap and the concurrency result means nothing. Saying that out loud is
+/// the difference between a measurement and a claim.
+fn gpu_churn(file: &File, map: &[(u32, u64)], half: usize, a: u64, b: u64, secs: u64) {
+    let start = std::time::Instant::now();
+    let mut passes = 0u64;
+    let mut which = 0;
+    println!(
+        "gpuchurn: alternating stamps 0x{a:016x} / 0x{b:016x} over {half} input pages for {secs}s"
+    );
+    while start.elapsed() < Duration::from_secs(secs) {
+        let stamp = if which % 2 == 0 { a } else { b };
+        gpu_fill(file, map, half, stamp);
+        which += 1;
+        passes += 1;
+    }
+    let el = start.elapsed();
+    println!(
+        "gpuchurn: {passes} full passes over {} MiB in {el:?} ({:.1} passes/s, {:.2} GB/s of \
+         host writes)",
+        half * rec::PAGE / (1 << 20),
+        passes as f64 / el.as_secs_f64(),
+        passes as f64 * (half * rec::PAGE) as f64 / el.as_secs_f64() / 1e9
+    );
+    if passes < 2 {
+        println!(
+            "  WARNING: fewer than two passes, so the guest cannot have seen both values. \
+             The concurrency result from this run means nothing."
+        );
     }
 }
 
@@ -478,6 +719,102 @@ mod tests {
         // And the naive reading lands on a page that exists, which is why it
         // fails quietly rather than out of bounds.
         assert!(off_to_gpa(&r, off).is_some());
+    }
+
+    // ---- the GPU-workload phase --------------------------------------------
+
+    /// The whole point of coalescing: scattered pages cost one mapping each,
+    /// contiguous ones cost one mapping between them. This is the fragmentation
+    /// result seen from the writing side.
+    #[test]
+    fn contiguous_pages_become_one_mapping_and_scattered_ones_do_not() {
+        // Four pages, laid out contiguously in the memfd.
+        let contiguous: Vec<(u32, u64)> = (0..4).map(|i| (i, 0x1000 * i as u64)).collect();
+        let runs = coalesce(&contiguous);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0], (0, 4, 0, 4 * rec::PAGE));
+
+        // The same four pages scattered, as a VirtualLock'ed window is.
+        let scattered = vec![(0u32, 0x1000u64), (1, 0x9000), (2, 0xa000), (3, 0x40000)];
+        let runs = coalesce(&scattered);
+        assert_eq!(runs.len(), 3, "0x1000 | 0x9000+0xa000 | 0x40000");
+        assert_eq!(runs[1], (1, 2, 0x9000, 2 * rec::PAGE));
+    }
+
+    /// The split is derived from page indices, so a scan that missed a page
+    /// must not shift it. This is the harness's own version of R21.
+    #[test]
+    fn the_split_survives_a_missing_page() {
+        let full: Vec<(u32, u64)> = (0..16).map(|i| (i, 0x1000 * i as u64)).collect();
+        assert_eq!(halves(&full), 8);
+        // Drop one page from the middle. A length-based split would say 7.
+        let mut gappy = full.clone();
+        gappy.retain(|(i, _)| *i != 3);
+        assert_eq!(halves(&gappy), 8, "the split must follow the indices");
+        // And selection still picks the right pages by index, not by position.
+        let input = pages_in(&gappy, 0, 8);
+        assert_eq!(input.len(), 7);
+        assert!(input.iter().all(|(i, _)| *i < 8));
+        let output = pages_in(&gappy, 8, 16);
+        assert_eq!(output.len(), 8);
+        assert!(output.iter().all(|(i, _)| *i >= 8));
+    }
+
+    /// Output page `half + k` holds the transform of input page `k`. If the
+    /// host and the shader disagreed about that, every word would be wrong and
+    /// it would read as a GPU failure rather than as arithmetic.
+    #[test]
+    fn the_output_page_indexes_back_to_its_input_page() {
+        let half = 8usize;
+        for page_index in half as u32..(half as u32 * 2) {
+            let region_index = page_index - half as u32;
+            // The word the host verifies at the first payload slot...
+            let verify_i = region_index * gpu::WORDS_PER_PAGE + gpu::HEADER_WORDS;
+            // ...must be the word the host filled on the matching input page.
+            let input_page = region_index;
+            let fill_i = input_page * gpu::WORDS_PER_PAGE + gpu::HEADER_WORDS;
+            assert_eq!(verify_i, fill_i);
+        }
+    }
+
+    /// End to end over a fake window in memory: fill, apply the shader's
+    /// function, verify. It pins the index arithmetic on both sides at once,
+    /// which is the only part of this the unit tests can reach without a GPU.
+    #[test]
+    fn fill_then_transform_then_verify_agrees_with_itself() {
+        let half = 2usize;
+        let stamp = 0xFEED_FACE_1234_5678u64;
+        let mut input = vec![0u8; half * rec::PAGE];
+        let mut output = vec![0u8; half * rec::PAGE];
+        for page in 0..half as u32 {
+            for w in gpu::HEADER_WORDS..gpu::WORDS_PER_PAGE {
+                let i = page * gpu::WORDS_PER_PAGE + w;
+                let o = page as usize * rec::PAGE + w as usize * 4;
+                input[o..o + 4].copy_from_slice(&gpu::host_fill(stamp, i).to_le_bytes());
+            }
+        }
+        // What the shader does.
+        for page in 0..half as u32 {
+            for w in gpu::HEADER_WORDS..gpu::WORDS_PER_PAGE {
+                let i = page * gpu::WORDS_PER_PAGE + w;
+                let o = page as usize * rec::PAGE + w as usize * 4;
+                let v = u32::from_le_bytes(input[o..o + 4].try_into().unwrap());
+                output[o..o + 4].copy_from_slice(&gpu::transform(v, i).to_le_bytes());
+            }
+        }
+        // What gpuverify checks, with the output page indices it would see.
+        let mut checked = 0;
+        for page_index in half as u32..(half as u32 * 2) {
+            let region_index = page_index - half as u32;
+            for w in gpu::HEADER_WORDS..gpu::WORDS_PER_PAGE {
+                let i = region_index * gpu::WORDS_PER_PAGE + w;
+                let o = region_index as usize * rec::PAGE + w as usize * 4;
+                let got = u32::from_le_bytes(output[o..o + 4].try_into().unwrap());
+                assert_eq!(got, gpu::transform(gpu::host_fill(stamp, i), i));
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, half * (1024 - 64));
     }
 
     /// A 3.5 GiB split is what an i440fx uses at smaller RAM sizes. If someone

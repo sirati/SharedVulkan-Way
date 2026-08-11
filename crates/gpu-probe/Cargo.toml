@@ -1,0 +1,15 @@
+[package]
+name = "gpu-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Give the GPU real work against imported arena memory — R15, design.md §14 item 1"
+
+[dependencies]
+arena-record = { path = "../arena-record" }
+# The allocators, the rendezvous and the run id come from step 0's probe rather
+# than being re-typed here. Measuring "the arena" with a second implementation
+# of the same four Win32 calls would be measuring something else.
+awe-probe = { path = "../awe-probe" }
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
