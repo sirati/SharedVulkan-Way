@@ -112,6 +112,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-arena"
+version = "0.1.0"
+dependencies = [
+ "sv-transport",
+]
+
+[[package]]
 name = "sv-codegen"
 version = "0.1.0"
 dependencies = [
@@ -122,6 +129,15 @@ dependencies = [
  "quote",
  "syn",
  "vk-registry",
+]
+
+[[package]]
+name = "sv-hostd"
+version = "0.1.0"
+dependencies = [
+ "sv-arena",
+ "sv-transport",
+ "sv-wire",
 ]
 
 [[package]]
@@ -143,6 +159,13 @@ dependencies = [
  "sv-proto",
  "sv-wire",
  "vk-registry",
+]
+
+[[package]]
+name = "sv-transport"
+version = "0.1.0"
+dependencies = [
+ "sv-wire",
 ]
 
 [[package]]

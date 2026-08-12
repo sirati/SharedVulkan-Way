@@ -1,0 +1,14 @@
+[package]
+name = "sv-transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Control region, rings, handshake, parkers and the cold path (design.md §4)"
+
+[dependencies]
+# The ring's packets are sv-wire streams, and the cold path's messages are
+# encoded with the same primitives rather than with a second serialiser. There
+# is deliberately nothing else: this crate is one of the three that is allowed
+# `unsafe`, and a dependency here is a dependency inside that boundary.
+sv-wire = { workspace = true }

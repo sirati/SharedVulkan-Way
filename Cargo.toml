@@ -11,6 +11,9 @@ members = [
   "crates/sv-codegen",
   "crates/sv-proto",
   "crates/sv-testkit",
+  "crates/sv-transport",
+  "crates/sv-arena",
+  "crates/sv-hostd",
 ]
 
 [workspace.package]
@@ -38,3 +41,5 @@ sv-wire = { path = "crates/sv-wire" }
 vk-registry = { path = "crates/vk-registry" }
 sv-codegen = { path = "crates/sv-codegen" }
 sv-proto = { path = "crates/sv-proto" }
+sv-transport = { path = "crates/sv-transport" }
+sv-arena = { path = "crates/sv-arena" }

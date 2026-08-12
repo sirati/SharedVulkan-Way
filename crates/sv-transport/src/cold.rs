@@ -1,0 +1,774 @@
+//! The cold path: the handshake messages, and the fd handoff.
+//!
+//! design.md D10: "A socket: **virtio-serial** at first because it is already
+//! attached, **vsock** once `viosock` is installed. Handshake, capability
+//! negotiation, wakeups, teardown. **Never data.**" On the same machine it is a
+//! Unix socket, which is what §13 steps 1–6 run over.
+//!
+//! # Why the locator descriptor rides here and not in the control region
+//!
+//! > **The locator descriptor must ride the cold path and cannot live in the
+//! > control region**, for the obvious reason that the control region is one of
+//! > the two things being located. — design.md §4.3
+//!
+//! Hence [`ExtentDesc`] is a cold-path message type and lives in this crate
+//! rather than in `sv-arena`. The split is worth stating once: `ExtentDesc`
+//! describes *how to find* an extent and crosses the wire; `sv_arena::Extent`
+//! and the run list describe *where it is* on one side and never do (§5.7,
+//! "The run list does not cross the wire, and it never did have to").
+//!
+//! # `unsafe`
+//!
+//! One function pair, [`send_with_fd`] and [`recv_with_fd`], for `SCM_RIGHTS`.
+//! Everything else in this module is safe code over `sv-wire`.
+
+use crate::control::{Geometry, ProtocolIds, ENDIAN_MARKER};
+use crate::{Error, Result};
+use sv_wire::{Decoder, Encoder, pad4};
+
+/// How the guest obtained the extent's pages. design.md §4.3:
+///
+/// > **`granularity` is asserted, never assumed.** The GPU side calls
+/// > `QueryWorkingSetEx` on the extent and publishes the `LargePage` bit it
+/// > actually observed, not the flag it passed to `VirtualAlloc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Granularity {
+    /// 4 KiB pages, `VirtualAlloc` + `VirtualLock`. Measured at 1471 runs per
+    /// 64 MiB, and the path on which the R26 canary is required.
+    Small4K = 0,
+    /// 2 MiB large pages. Measured at 22 runs per 64 MiB and **1 per GiB**, and
+    /// the path on which R26 is removed by construction.
+    Large2M = 1,
+}
+
+impl Granularity {
+    pub fn from_u32(v: u32) -> Option<Granularity> {
+        match v {
+            0 => Some(Granularity::Small4K),
+            1 => Some(Granularity::Large2M),
+            _ => None,
+        }
+    }
+
+    /// Bytes in one allocation unit of this granularity.
+    pub fn unit(self) -> u64 {
+        match self {
+            Granularity::Small4K => 4096,
+            Granularity::Large2M => 2 << 20,
+        }
+    }
+}
+
+/// One run of physically contiguous frames, as the AWE path would report them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PfnRun {
+    pub first_frame: u64,
+    pub frames: u64,
+}
+
+/// How the attaching side is to find the extent. design.md §5.1's table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Locator {
+    /// Sweep the memfd for the stamp. **v1 on every path**: 1.8 s at 64 MiB,
+    /// 2.02 s at 1 GiB, 2.32 s at 2 GiB, because the cost is linear in guest RAM
+    /// and not in arena size — and it is the only locator that *verifies* rather
+    /// than trusts.
+    Scan,
+    /// One record every 2 MiB. Sound only on the large-page path. Recorded in
+    /// the design, not implemented in v1.
+    Probe,
+    /// A reported frame list, run-length encoded. AWE only, and AWE is not the
+    /// path: 5863–16339 runs per 64 MiB against large pages' 22.
+    Pfns(Vec<PfnRun>),
+}
+
+/// What crosses about an extent. design.md §4.3:
+///
+/// > `ExtentDesc { run_id, granularity, control_pages, arena_pages, locator }`.
+/// > It is small in every case: on the two locating paths it carries no
+/// > addresses at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtentDesc {
+    pub run_id: u64,
+    pub granularity: Granularity,
+    pub control_pages: u64,
+    pub arena_pages: u64,
+    pub locator: Locator,
+}
+
+impl ExtentDesc {
+    fn size(&self) -> usize {
+        8 + 4 + 8 + 8
+            + 4
+            + match &self.locator {
+                Locator::Scan | Locator::Probe => 8,
+                Locator::Pfns(runs) => 8 + runs.len() * 16,
+            }
+    }
+
+    fn encode(&self, e: &mut Encoder<'_>) -> Result<()> {
+        e.u64(self.run_id)?;
+        e.u32(self.granularity as u32)?;
+        e.u64(self.control_pages)?;
+        e.u64(self.arena_pages)?;
+        match &self.locator {
+            Locator::Scan => {
+                e.u32(0)?;
+                e.array_size(0)?;
+            }
+            Locator::Probe => {
+                e.u32(1)?;
+                e.array_size(0)?;
+            }
+            Locator::Pfns(runs) => {
+                e.u32(2)?;
+                e.array_size(runs.len() as u64)?;
+                for r in runs {
+                    e.u64(r.first_frame)?;
+                    e.u64(r.frames)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(d: &mut Decoder<'_>) -> Result<ExtentDesc> {
+        let run_id = d.u64()?;
+        let g = d.u32()?;
+        let granularity =
+            Granularity::from_u32(g).ok_or(Error::BadColdMessage("unknown granularity"))?;
+        let control_pages = d.u64()?;
+        let arena_pages = d.u64()?;
+        let tag = d.u32()?;
+        // Branch on the tag *before* reading the count. Reading it with
+        // `array_size` first would bounds-check it against the bytes remaining
+        // and fail with `ImplausibleCount`, which is true but useless: the thing
+        // actually wrong is that a locating path carried a frame list, and that
+        // is what the person reading the log needs to be told.
+        let locator = match tag {
+            0 | 1 => {
+                if d.u64()? != 0 {
+                    return Err(Error::BadColdMessage("a locating path carried a frame list"));
+                }
+                if tag == 0 { Locator::Scan } else { Locator::Probe }
+            }
+            2 => {
+                let n = d.array_size(16)?;
+                let mut runs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    runs.push(PfnRun { first_frame: d.u64()?, frames: d.u64()? });
+                }
+                Locator::Pfns(runs)
+            }
+            _ => return Err(Error::BadColdMessage("unknown locator")),
+        };
+        Ok(ExtentDesc { run_id, granularity, control_pages, arena_pages, locator })
+    }
+}
+
+/// design.md §4.3 step 2, in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    pub ids: ProtocolIds,
+    pub generation: u32,
+    pub extent: ExtentDesc,
+    pub geometry: Geometry,
+    /// [`crate::control::ENDIAN_MARKER`] as the sender wrote it.
+    pub endianness: u32,
+    pub pointer_width: u32,
+}
+
+impl Hello {
+    /// The check design.md §4.3 step 4 makes explicit, made here because a
+    /// diagnostic that says "big-endian peer" is worth more than one that says
+    /// "bad magic".
+    pub fn check_against(&self, ours: ProtocolIds) -> Result<()> {
+        if self.endianness != ENDIAN_MARKER || self.pointer_width != 64 {
+            return Err(Error::IncompatiblePeer {
+                endianness: self.endianness,
+                pointer_width: self.pointer_width,
+            });
+        }
+        if self.ids.layout_version != ours.layout_version {
+            return Err(Error::LayoutVersionMismatch {
+                ours: ours.layout_version,
+                theirs: self.ids.layout_version,
+            });
+        }
+        if self.ids.wire_version != ours.wire_version {
+            return Err(Error::WireVersionMismatch {
+                ours: ours.wire_version,
+                theirs: self.ids.wire_version,
+            });
+        }
+        if self.ids.protocol_hash != ours.protocol_hash {
+            return Err(Error::ProtocolHashMismatch {
+                ours: ours.protocol_hash,
+                theirs: self.ids.protocol_hash,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// What `sv-hostd` hands a client along with the memfd.
+///
+/// The run list is *not* in here: §5.7 says it is a side-local derived artefact,
+/// and in the development loop it is the identity run anyway. What is in here is
+/// the geometry of the two views the client is to build from the fd, which is
+/// the only thing the client cannot work out for itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub control_offset: u64,
+    pub control_len: u64,
+    pub arena_offset: u64,
+    pub arena_len: u64,
+    pub generation: u32,
+    /// Runs the daemon stitched the view from. Zero means "the extent is one
+    /// contiguous range of the fd", which is the development loop and is also
+    /// what a 1 GiB large-page extent measured as (§5.7).
+    pub run_count: u64,
+}
+
+/// Every message on the cold path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColdMessage {
+    Hello(Box<Hello>),
+    Accept { generation: u32 },
+    Refuse { code: u32, reason: String },
+    /// `sv-hostd` → client, carrying the memfd out of band.
+    Attach(Attachment),
+    /// The client asks for one.
+    AttachRequest,
+    /// `svPing` / `svShutdown` of design.md §6.3, on the cold path where they
+    /// belong: a ring cannot carry liveness for a peer whose rings are the thing
+    /// in doubt.
+    Ping,
+    Shutdown,
+}
+
+const TAG_HELLO: u32 = 1;
+const TAG_ACCEPT: u32 = 2;
+const TAG_REFUSE: u32 = 3;
+const TAG_ATTACH: u32 = 4;
+const TAG_ATTACH_REQUEST: u32 = 5;
+const TAG_PING: u32 = 6;
+const TAG_SHUTDOWN: u32 = 7;
+
+impl ColdMessage {
+    fn size(&self) -> usize {
+        4 + match self {
+            ColdMessage::Hello(h) => 4 + 4 + 8 + 4 + h.extent.size() + 8 * 3 + 4 * 3 + 4 + 4,
+            ColdMessage::Accept { .. } => 4,
+            ColdMessage::Refuse { reason, .. } => 4 + 8 + pad4(reason.len() + 1),
+            ColdMessage::Attach(_) => 8 * 4 + 4 + 8,
+            ColdMessage::AttachRequest | ColdMessage::Ping | ColdMessage::Shutdown => 0,
+        }
+    }
+
+    /// Encode into `out`, replacing its contents. Uses `sv-wire`'s exact-fill
+    /// encoder, so a `size`/`encode` disagreement is caught here rather than
+    /// producing a message the far side silently mis-parses — the same
+    /// discipline the generated protocol is held to (design.md §7.2).
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        out.resize(self.size(), 0);
+        let mut e = Encoder::new(out);
+        match self {
+            ColdMessage::Hello(h) => {
+                e.u32(TAG_HELLO)?;
+                e.u32(h.ids.layout_version)?;
+                e.u32(h.ids.wire_version)?;
+                e.u64(h.ids.protocol_hash)?;
+                e.u32(h.generation)?;
+                h.extent.encode(&mut e)?;
+                e.u64(h.geometry.control_size)?;
+                e.u64(h.geometry.arena_size)?;
+                e.u64(h.geometry.arena_slab_size)?;
+                e.u32(h.geometry.ring_slot_count)?;
+                e.u32(h.geometry.ring_data_bytes)?;
+                e.u32(h.geometry.timeline_count)?;
+                e.u32(h.endianness)?;
+                e.u32(h.pointer_width)?;
+            }
+            ColdMessage::Accept { generation } => {
+                e.u32(TAG_ACCEPT)?;
+                e.u32(*generation)?;
+            }
+            ColdMessage::Refuse { code, reason } => {
+                e.u32(TAG_REFUSE)?;
+                e.u32(*code)?;
+                e.c_string(reason.as_bytes())?;
+            }
+            ColdMessage::Attach(a) => {
+                e.u32(TAG_ATTACH)?;
+                e.u64(a.control_offset)?;
+                e.u64(a.control_len)?;
+                e.u64(a.arena_offset)?;
+                e.u64(a.arena_len)?;
+                e.u32(a.generation)?;
+                e.u64(a.run_count)?;
+            }
+            ColdMessage::AttachRequest => e.u32(TAG_ATTACH_REQUEST)?,
+            ColdMessage::Ping => e.u32(TAG_PING)?,
+            ColdMessage::Shutdown => e.u32(TAG_SHUTDOWN)?,
+        }
+        e.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<ColdMessage> {
+        let mut d = Decoder::new(bytes);
+        let msg = match d.u32()? {
+            TAG_HELLO => {
+                let ids = ProtocolIds {
+                    layout_version: d.u32()?,
+                    wire_version: d.u32()?,
+                    protocol_hash: d.u64()?,
+                };
+                let generation = d.u32()?;
+                let extent = ExtentDesc::decode(&mut d)?;
+                let geometry = Geometry {
+                    control_size: d.u64()?,
+                    arena_size: d.u64()?,
+                    arena_slab_size: d.u64()?,
+                    ring_slot_count: d.u32()?,
+                    ring_data_bytes: d.u32()?,
+                    timeline_count: d.u32()?,
+                };
+                ColdMessage::Hello(Box::new(Hello {
+                    ids,
+                    generation,
+                    extent,
+                    geometry,
+                    endianness: d.u32()?,
+                    pointer_width: d.u32()?,
+                }))
+            }
+            TAG_ACCEPT => ColdMessage::Accept { generation: d.u32()? },
+            TAG_REFUSE => {
+                let code = d.u32()?;
+                let reason = String::from_utf8_lossy(d.c_string()?).into_owned();
+                ColdMessage::Refuse { code, reason }
+            }
+            TAG_ATTACH => ColdMessage::Attach(Attachment {
+                control_offset: d.u64()?,
+                control_len: d.u64()?,
+                arena_offset: d.u64()?,
+                arena_len: d.u64()?,
+                generation: d.u32()?,
+                run_count: d.u64()?,
+            }),
+            TAG_ATTACH_REQUEST => ColdMessage::AttachRequest,
+            TAG_PING => ColdMessage::Ping,
+            TAG_SHUTDOWN => ColdMessage::Shutdown,
+            _ => return Err(Error::BadColdMessage("unknown message tag")),
+        };
+        if d.remaining() != 0 {
+            return Err(Error::BadColdMessage("trailing bytes"));
+        }
+        Ok(msg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The socket
+// ---------------------------------------------------------------------------
+
+/// The largest cold-path message we will read. The cold path carries a
+/// handshake, never data (D10), so this is generous by two orders of magnitude
+/// and exists so that a corrupt length is an error rather than an allocation.
+pub const MAX_COLD_MESSAGE: usize = 1 << 20;
+
+#[cfg(unix)]
+mod unix_socket {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    /// Send a message, optionally passing a file descriptor with it.
+    ///
+    /// # Safety
+    ///
+    /// The `unsafe` here is one `sendmsg` with a hand-built `msghdr` and one
+    /// `SCM_RIGHTS` control message. The invariants:
+    ///
+    /// - The `iovec` points at `framed`, which outlives the call.
+    /// - The control buffer is `CMSG_SPACE(4)` bytes — 24 on a 64-bit Linux —
+    ///   and `cmsg_len` is set to `CMSG_LEN(4)`, so the kernel reads exactly one
+    ///   `int` from it.
+    /// - The descriptor is *borrowed*: the kernel duplicates it into the
+    ///   receiver, and this side's ownership is unaffected.
+    ///
+    /// The layout of `msghdr`, `iovec` and `cmsghdr` is transcribed for 64-bit
+    /// Linux, which is asserted at compile time below rather than assumed.
+    pub fn send_with_fd(
+        sock: &UnixStream,
+        payload: &[u8],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<()> {
+        let mut framed = Vec::with_capacity(payload.len() + 4);
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(payload);
+
+        let Some(fd) = fd else {
+            sock.try_clone()
+                .and_then(|mut s| s.write_all(&framed))
+                .map_err(|e| Error::Os { call: "write", errno: e.raw_os_error().unwrap_or(0) })?;
+            return Ok(());
+        };
+
+        let mut iov = sys::Iovec { base: framed.as_ptr() as *mut u8, len: framed.len() };
+        let mut cbuf = [0u8; sys::CMSG_SPACE_ONE_FD];
+        // cmsg_len, cmsg_level, cmsg_type, then the fd.
+        cbuf[0..8].copy_from_slice(&(sys::CMSG_LEN_ONE_FD as u64).to_le_bytes());
+        cbuf[8..12].copy_from_slice(&sys::SOL_SOCKET.to_le_bytes());
+        cbuf[12..16].copy_from_slice(&sys::SCM_RIGHTS.to_le_bytes());
+        cbuf[16..20].copy_from_slice(&fd.as_raw_fd().to_le_bytes());
+
+        let mut msg = sys::MsgHdr {
+            name: core::ptr::null_mut(),
+            namelen: 0,
+            _pad0: 0,
+            iov: &mut iov,
+            iovlen: 1,
+            control: cbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            controllen: sys::CMSG_SPACE_ONE_FD,
+            flags: 0,
+            _pad1: 0,
+        };
+        // SAFETY: as documented above. `sendmsg` reads through the pointers for
+        // the duration of the call only, and all three buffers are live locals.
+        let n = unsafe { sys::sendmsg(sock.as_raw_fd(), &mut msg, 0) };
+        if n < 0 {
+            return Err(Error::Os { call: "sendmsg", errno: crate::region::sys::errno() });
+        }
+        // A short send of the header would desynchronise the stream, so it is an
+        // error rather than something to loop over: on a Unix socket with a
+        // message this small it cannot happen, and if it does the assumption is
+        // wrong and we want to know.
+        if (n as usize) != framed.len() {
+            return Err(Error::BadColdMessage("short sendmsg"));
+        }
+        Ok(())
+    }
+
+    /// Receive one message, and the descriptor that came with it if any.
+    ///
+    /// # Safety
+    ///
+    /// One `recvmsg`, with `MSG_CMSG_CLOEXEC` so a descriptor cannot leak
+    /// through an `exec` between arriving and being wrapped. The returned fd is
+    /// wrapped in an [`OwnedFd`] immediately, so it is closed exactly once.
+    ///
+    /// The first `recvmsg` asks for the four-byte length prefix only. On a
+    /// `SOCK_STREAM` Unix socket the ancillary data is delivered with the read
+    /// that consumes the first byte it was attached to, and the sender attaches
+    /// it to the same `sendmsg` as the prefix — so the fd arrives here or not at
+    /// all.
+    pub fn recv_with_fd(sock: &UnixStream, out: &mut Vec<u8>) -> Result<Option<OwnedFd>> {
+        let mut lenbuf = [0u8; 4];
+        let mut iov = sys::Iovec { base: lenbuf.as_mut_ptr(), len: 4 };
+        let mut cbuf = [0u8; sys::CMSG_SPACE_ONE_FD];
+        let mut msg = sys::MsgHdr {
+            name: core::ptr::null_mut(),
+            namelen: 0,
+            _pad0: 0,
+            iov: &mut iov,
+            iovlen: 1,
+            control: cbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            controllen: sys::CMSG_SPACE_ONE_FD,
+            flags: 0,
+            _pad1: 0,
+        };
+        // SAFETY: as documented. All buffers are live locals; the kernel writes
+        // at most `iov.len` payload bytes and at most `controllen` control bytes.
+        let n = unsafe { sys::recvmsg(sock.as_raw_fd(), &mut msg, sys::MSG_CMSG_CLOEXEC) };
+        if n < 0 {
+            return Err(Error::Os { call: "recvmsg", errno: crate::region::sys::errno() });
+        }
+        if n == 0 {
+            return Err(Error::BadColdMessage("peer closed the cold path"));
+        }
+
+        let mut fd = None;
+        if msg.controllen >= sys::CMSG_LEN_ONE_FD {
+            let level = i32::from_le_bytes(cbuf[8..12].try_into().unwrap());
+            let ty = i32::from_le_bytes(cbuf[12..16].try_into().unwrap());
+            if level == sys::SOL_SOCKET && ty == sys::SCM_RIGHTS {
+                let raw = i32::from_le_bytes(cbuf[16..20].try_into().unwrap());
+                // SAFETY: the kernel installed `raw` in this process's table and
+                // nobody else has it; wrapping it here is the unique owner.
+                fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+            }
+        }
+
+        let mut have = n as usize;
+        let mut s = sock;
+        while have < 4 {
+            let got = s
+                .read(&mut lenbuf[have..])
+                .map_err(|e| Error::Os { call: "read", errno: e.raw_os_error().unwrap_or(0) })?;
+            if got == 0 {
+                return Err(Error::BadColdMessage("truncated cold-path length"));
+            }
+            have += got;
+        }
+        let len = u32::from_le_bytes(lenbuf) as usize;
+        if len > MAX_COLD_MESSAGE {
+            return Err(Error::BadColdMessage("cold-path message is implausibly long"));
+        }
+        out.clear();
+        out.resize(len, 0);
+        s.read_exact(out)
+            .map_err(|e| Error::Os { call: "read_exact", errno: e.raw_os_error().unwrap_or(0) })?;
+        Ok(fd)
+    }
+
+    /// Send a [`ColdMessage`], with no descriptor.
+    pub fn send(sock: &UnixStream, msg: &ColdMessage) -> Result<()> {
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)?;
+        send_with_fd(sock, &buf, None)
+    }
+
+    /// Receive a [`ColdMessage`], and the descriptor that came with it if any.
+    pub fn recv(sock: &UnixStream) -> Result<(ColdMessage, Option<OwnedFd>)> {
+        let mut buf = Vec::new();
+        let fd = recv_with_fd(sock, &mut buf)?;
+        Ok((ColdMessage::decode(&buf)?, fd))
+    }
+
+    /// The three structures `sendmsg` needs, transcribed for 64-bit Linux.
+    pub(super) mod sys {
+        use core::ffi::c_void;
+
+        pub const SOL_SOCKET: i32 = 1;
+        pub const SCM_RIGHTS: i32 = 1;
+        pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
+
+        /// `CMSG_LEN(sizeof(int))` — a 16-byte `cmsghdr` plus four bytes.
+        pub const CMSG_LEN_ONE_FD: usize = 16 + 4;
+        /// `CMSG_SPACE(sizeof(int))` — the same, aligned up to 8.
+        pub const CMSG_SPACE_ONE_FD: usize = 16 + 8;
+
+        #[repr(C)]
+        pub struct Iovec {
+            pub base: *mut u8,
+            pub len: usize,
+        }
+
+        #[repr(C)]
+        pub struct MsgHdr {
+            pub name: *mut c_void,
+            pub namelen: u32,
+            pub _pad0: u32,
+            pub iov: *mut Iovec,
+            pub iovlen: usize,
+            pub control: *mut c_void,
+            pub controllen: usize,
+            pub flags: i32,
+            pub _pad1: i32,
+        }
+
+        // The layout is the ABI's, not ours. If either of these ever fails, the
+        // transcription above is wrong for the target and the fd handoff would
+        // corrupt memory rather than fail — so it is a compile error.
+        const _: () = assert!(core::mem::size_of::<MsgHdr>() == 56);
+        const _: () = assert!(core::mem::size_of::<Iovec>() == 16);
+        const _: () = assert!(core::mem::size_of::<usize>() == 8);
+
+        unsafe extern "C" {
+            pub fn sendmsg(fd: i32, msg: *mut MsgHdr, flags: i32) -> isize;
+            pub fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: i32) -> isize;
+        }
+    }
+}
+
+#[cfg(unix)]
+pub use unix_socket::{recv, recv_with_fd, send, send_with_fd};
+
+/// On Windows the cold path is a named pipe, and it is not written.
+///
+/// Stated rather than stubbed: design.md requires either side to be either OS,
+/// and `testhost` exercises Linux-app-side only. A named-pipe implementation
+/// of exactly these four functions is what a Windows app side needs, and
+/// nothing above this module would change.
+#[cfg(not(unix))]
+pub fn send(_sock: &(), _msg: &ColdMessage) -> Result<()> {
+    Err(Error::Unsupported("the cold-path socket is Unix-only in this build"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello() -> ColdMessage {
+        ColdMessage::Hello(Box::new(Hello {
+            ids: ProtocolIds::new(3, 0x0123_4567_89ab_cdef),
+            generation: 7,
+            extent: ExtentDesc {
+                run_id: 0xdead_beef_cafe_f00d,
+                granularity: Granularity::Large2M,
+                control_pages: 4096,
+                arena_pages: 524288,
+                locator: Locator::Scan,
+            },
+            geometry: Geometry::default(),
+            endianness: ENDIAN_MARKER,
+            pointer_width: 64,
+        }))
+    }
+
+    #[test]
+    fn every_message_round_trips() {
+        let msgs = [
+            hello(),
+            ColdMessage::Accept { generation: 7 },
+            ColdMessage::Refuse { code: 2, reason: "protocol hash mismatch".into() },
+            ColdMessage::Attach(Attachment {
+                control_offset: 0,
+                control_len: 16 << 20,
+                arena_offset: 16 << 20,
+                arena_len: 2 << 30,
+                generation: 7,
+                run_count: 1,
+            }),
+            ColdMessage::AttachRequest,
+            ColdMessage::Ping,
+            ColdMessage::Shutdown,
+        ];
+        let mut buf = Vec::new();
+        for m in &msgs {
+            m.encode(&mut buf).unwrap();
+            assert_eq!(&ColdMessage::decode(&buf).unwrap(), m, "{m:?}");
+        }
+        assert_eq!(msgs.len(), 7, "every variant must appear above");
+    }
+
+    /// design.md §4.3: the descriptor "is small in every case: on the two
+    /// locating paths it carries no addresses at all". Worth an assertion,
+    /// because the superseded design *did* put a page list on the wire and the
+    /// reason it no longer does is a measurement, not a preference.
+    #[test]
+    fn a_scan_locator_carries_no_addresses_whatever_the_extent_size() {
+        let small = ExtentDesc {
+            run_id: 1,
+            granularity: Granularity::Large2M,
+            control_pages: 1,
+            arena_pages: 1,
+            locator: Locator::Scan,
+        };
+        let huge = ExtentDesc { arena_pages: 524_288, ..small.clone() };
+        assert_eq!(small.size(), huge.size());
+        assert!(small.size() < 64, "an ExtentDesc is a handful of words");
+
+        // …and the AWE path is the counter-example that shows the saving is
+        // real: 5863 runs per 64 MiB, measured, at 16 bytes each.
+        let awe = ExtentDesc {
+            locator: Locator::Pfns(vec![PfnRun { first_frame: 1, frames: 1 }; 5863]),
+            ..small.clone()
+        };
+        assert!(awe.size() > 90_000);
+    }
+
+    #[test]
+    fn a_locating_path_that_carries_a_frame_list_is_refused() {
+        // Hand-built, because `encode` will not produce one.
+        let mut buf = vec![0u8; 40];
+        let mut e = Encoder::new(&mut buf);
+        e.u64(1).unwrap(); // run_id
+        e.u32(0).unwrap(); // Small4K
+        e.u64(1).unwrap();
+        e.u64(1).unwrap();
+        e.u32(0).unwrap(); // Locator::Scan
+        e.array_size(1).unwrap(); // …with a run list
+        e.finish().unwrap();
+        let mut d = Decoder::new(&buf);
+        assert!(matches!(ExtentDesc::decode(&mut d), Err(Error::BadColdMessage(_))));
+    }
+
+    #[test]
+    fn a_hello_from_a_big_endian_or_32_bit_peer_is_refused_by_name() {
+        let ours = ProtocolIds::new(3, 0x0123_4567_89ab_cdef);
+        let ColdMessage::Hello(h) = hello() else { unreachable!() };
+        h.check_against(ours).unwrap();
+
+        let mut be = h.clone();
+        be.endianness = ENDIAN_MARKER.swap_bytes();
+        assert!(matches!(be.check_against(ours), Err(Error::IncompatiblePeer { .. })));
+
+        let mut narrow = h.clone();
+        narrow.pointer_width = 32;
+        assert!(matches!(narrow.check_against(ours), Err(Error::IncompatiblePeer { .. })));
+
+        let mut skew = h.clone();
+        skew.ids.protocol_hash = 1;
+        assert!(matches!(skew.check_against(ours), Err(Error::ProtocolHashMismatch { .. })));
+    }
+
+    #[test]
+    fn a_message_with_trailing_bytes_is_refused() {
+        let mut buf = Vec::new();
+        ColdMessage::Ping.encode(&mut buf).unwrap();
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(matches!(ColdMessage::decode(&buf), Err(Error::BadColdMessage(_))));
+    }
+
+    #[test]
+    fn an_unknown_tag_is_refused_rather_than_ignored() {
+        let mut buf = vec![0u8; 4];
+        Encoder::new(&mut buf).u32(999).unwrap();
+        assert!(matches!(ColdMessage::decode(&buf), Err(Error::BadColdMessage(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "socketpair and sendmsg are syscalls Miri does not implement")]
+    fn a_descriptor_crosses_the_socket_and_names_the_same_memory() {
+        use crate::region::{SharedRegion, memfd};
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let fd = memfd("sv-cold-test", 8192).unwrap();
+        let msg = ColdMessage::Attach(Attachment {
+            control_offset: 0,
+            control_len: 4096,
+            arena_offset: 4096,
+            arena_len: 4096,
+            generation: 1,
+            run_count: 0,
+        });
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        send_with_fd(&a, &buf, Some(fd.as_fd())).unwrap();
+
+        let (got, got_fd) = recv(&b).unwrap();
+        assert_eq!(got, msg);
+        let got_fd = got_fd.expect("the descriptor did not cross");
+
+        // The proof that it is the *same* memfd and not merely a descriptor: a
+        // write through the sender's mapping is visible through the receiver's.
+        let here = SharedRegion::map_fd(fd.as_fd(), 0, 4096).unwrap();
+        let there = SharedRegion::map_fd(got_fd.as_fd(), 0, 4096).unwrap();
+        here.write_bytes(128, b"crossed").unwrap();
+        let mut out = [0u8; 7];
+        there.read_bytes(128, &mut out).unwrap();
+        assert_eq!(&out, b"crossed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "socketpair is a syscall Miri does not implement")]
+    fn a_message_without_a_descriptor_carries_none() {
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        send(&a, &ColdMessage::Ping).unwrap();
+        let (msg, fd) = recv(&b).unwrap();
+        assert_eq!(msg, ColdMessage::Ping);
+        assert!(fd.is_none(), "a descriptor arrived that nobody sent");
+    }
+}
