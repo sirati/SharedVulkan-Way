@@ -1,0 +1,20 @@
+[package]
+name = "sv-icd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The shared_vulkan app side: a Vulkan ICD the real loader can enumerate"
+
+[lib]
+# `cdylib` for the loader to `dlopen`, `rlib` so the tests can drive the same
+# code in-process without going through the loader at all.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sv-icd-entry.workspace = true
+sv-proto.workspace = true
+sv-wire.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

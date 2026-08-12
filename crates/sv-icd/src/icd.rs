@@ -1,0 +1,683 @@
+//! The safe half: `IcdLocal` and `Icd` for [`SharedVulkan`].
+//!
+//! Every method here takes owned wire values and returns owned wire values.
+//! There is no `unsafe` in this file and there are no raw pointers in any
+//! signature — that is what `sv-icd-entry`'s generated lowering bought, and it
+//! is what design.md §7.3 means by "the unsafe block is one line and reviewable
+//! by pattern".
+//!
+//! # Reading this file
+//!
+//! A method falls into one of three groups and each says which:
+//!
+//! - **Answered from what we advertise** (`crate::advertise`). These are correct
+//!   as far as this stage goes and stay correct once a GPU side exists, because
+//!   design.md §9 says we advertise a curated table rather than the peer's.
+//! - **Answered from app-side state.** Object ids, arena allocations, mapping.
+//!   These are the real implementation, not a placeholder: design.md §6.4 and
+//!   §5.3 put exactly this work on the app side.
+//! - **Accepted and dropped.** Anything that would need a GPU. Every one of them
+//!   is marked `// NO GPU:` and returns a success the application can proceed
+//!   through, because the alternative — failing — makes it impossible to see how
+//!   far an application gets.
+//!
+//! The third group is the honest gap in this stage and it is deliberately easy
+//! to grep for.
+
+use crate::advertise;
+use crate::arena::Backing;
+use crate::state::{Memory, SharedVulkan, API_VERSION};
+use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError};
+use sv_proto as p;
+
+impl IcdLocal for SharedVulkan {
+    fn api_version(&self) -> u32 {
+        API_VERSION
+    }
+
+    fn instance_extensions(&self) -> &[(&'static str, u32)] {
+        advertise::INSTANCE_EXTENSIONS
+    }
+
+    fn device_extensions(&self) -> &[(&'static str, u32)] {
+        advertise::DEVICE_EXTENSIONS
+    }
+
+    fn instance_proc_addr(
+        &self,
+        instance: Option<u64>,
+        name: &str,
+    ) -> Option<*const core::ffi::c_void> {
+        // The rule that produces the classic silent failure: with a NULL
+        // instance the loader is doing its global lookup and **only** the global
+        // commands may be answered. Answering a device command here hands the
+        // loader a pointer it will call with no dispatch table behind it.
+        if instance.is_none() {
+            return sv_icd_entry::lookup(sv_icd_entry::GLOBAL_COMMANDS, name);
+        }
+        // `vkGetInstanceProcAddr` must be able to return itself, and it is not
+        // in any generated table because the profile excludes it from the wire.
+        if name == "vkGetInstanceProcAddr" {
+            return Some(
+                sv_icd_entry::local::sv_vk_get_instance_proc_addr as *const core::ffi::c_void,
+            );
+        }
+        sv_icd_entry::lookup(sv_icd_entry::GLOBAL_COMMANDS, name)
+            .or_else(|| sv_icd_entry::lookup(sv_icd_entry::INSTANCE_COMMANDS, name))
+            // A non-NULL instance may also be asked for device-level commands;
+            // the loader turns them into trampolines.
+            .or_else(|| sv_icd_entry::lookup(sv_icd_entry::DEVICE_COMMANDS, name))
+    }
+
+    fn device_proc_addr(&self, _device: u64, name: &str) -> Option<*const core::ffi::c_void> {
+        if name == "vkGetDeviceProcAddr" {
+            return Some(
+                sv_icd_entry::local::sv_vk_get_device_proc_addr as *const core::ffi::c_void,
+            );
+        }
+        sv_icd_entry::lookup(sv_icd_entry::DEVICE_COMMANDS, name)
+    }
+
+    fn create_instance(&self, _info: &p::VkInstanceCreateInfo) -> IcdResult<u64> {
+        let mut s = self.state();
+        let id = s.mint();
+        // One physical device, minted with the instance. design.md §8: we do not
+        // export `vk_icdEnumerateAdapterPhysicalDevices`, because we have no PnP
+        // adapter LUID and its only benefit — the loader sorting physical
+        // devices for drivers at interface ≥ 6 — is meaningless with one device.
+        let phys = s.mint();
+        s.physical_devices.insert(phys, id);
+        s.instances.insert(
+            id,
+            crate::state::Instance { api_version: API_VERSION, physical_devices: vec![phys] },
+        );
+        Ok(id)
+    }
+
+    fn destroy_instance(&self, instance: u64) {
+        let mut s = self.state();
+        if let Some(i) = s.instances.remove(&instance) {
+            for p in i.physical_devices {
+                s.physical_devices.remove(&p);
+            }
+        }
+    }
+
+    fn enumerate_physical_devices(&self, instance: u64) -> IcdResult<Vec<u64>> {
+        let s = self.state();
+        s.instances
+            .get(&instance)
+            .map(|i| i.physical_devices.clone())
+            .ok_or(LowerError::Shape("vkEnumeratePhysicalDevices: unknown instance"))
+    }
+
+    fn create_device(&self, physical_device: u64, info: &p::VkDeviceCreateInfo) -> IcdResult<u64> {
+        let mut s = self.state();
+        if !s.physical_devices.contains_key(&physical_device) {
+            return Err(LowerError::Shape("vkCreateDevice: unknown physical device"));
+        }
+        // An extension the application asks for that we do not advertise is
+        // `VK_ERROR_EXTENSION_NOT_PRESENT`, which is the spec's answer and is
+        // what makes a curated extension list honest rather than a filter that
+        // silently drops things (design.md §9.2, R16).
+        for want in &info.pp_enabled_extension_names {
+            let want = String::from_utf8_lossy(want).to_string();
+            if !advertise::DEVICE_EXTENSIONS.iter().any(|(n, _)| *n == want) {
+                return Err(LowerError::Result(
+                    sv_icd_entry::VkResult::VK_ERROR_EXTENSION_NOT_PRESENT.0,
+                ));
+            }
+        }
+        let id = s.mint();
+        // One queue object per requested queue, across all requested families.
+        // We advertise one family with one queue, so an application that asks
+        // for more than that has been told it cannot have them.
+        let wanted: usize = info
+            .p_queue_create_infos
+            .iter()
+            .map(|q| q.queue_count.max(1) as usize)
+            .sum::<usize>()
+            .max(1);
+        let mut queue_ids = Vec::with_capacity(wanted);
+        for _ in 0..wanted {
+            let q = s.mint();
+            s.queues.insert(q, id);
+            queue_ids.push(q);
+        }
+        s.devices.insert(id, crate::state::Device { physical_device, queues: queue_ids });
+        Ok(id)
+    }
+
+    fn destroy_device(&self, device: u64) {
+        let mut s = self.state();
+        if let Some(d) = s.devices.remove(&device) {
+            for q in d.queues {
+                s.queues.remove(&q);
+            }
+        }
+    }
+
+    fn get_device_queue(&self, device: u64, family: u32, index: u32) -> IcdResult<u64> {
+        if family != 0 {
+            return Err(LowerError::Shape("vkGetDeviceQueue: we advertise one queue family"));
+        }
+        let s = self.state();
+        s.devices
+            .get(&device)
+            .and_then(|d| d.queues.get(index as usize).copied())
+            .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))
+    }
+
+    fn allocate_command_buffers(
+        &self,
+        device: u64,
+        info: &p::VkCommandBufferAllocateInfo,
+    ) -> IcdResult<Vec<u64>> {
+        let mut s = self.state();
+        if !s.devices.contains_key(&device) {
+            return Err(LowerError::Shape("vkAllocateCommandBuffers: unknown device"));
+        }
+        // design.md §6.5: each `VkCommandBuffer` owns an arena block that
+        // recording encodes straight into. That block is allocated when there is
+        // a GPU side to hand `(offset, len)` to; for now the id is real and the
+        // block is not.
+        // NO GPU: no arena block is reserved.
+        Ok((0..info.command_buffer_count).map(|_| s.mint()).collect())
+    }
+
+    fn free_command_buffers(&self, _device: u64, _pool: u64, _buffers: &[u64]) {}
+
+    /// design.md §5.3, and the whole point of the project.
+    fn map_memory(
+        &self,
+        _device: u64,
+        memory: u64,
+        offset: u64,
+        size: u64,
+    ) -> IcdResult<*mut core::ffi::c_void> {
+        let mut s = self.state();
+        let Some(alloc) = s.memories.get(&memory).map(|m| m.allocation) else {
+            return Err(LowerError::Shape("vkMapMemory: unknown memory"));
+        };
+        let Some(alloc) = alloc else {
+            // Heap 0 is never host-visible, so this cannot be reached through a
+            // legal call — the application would have had to allocate from a
+            // type whose flags say it cannot be mapped.
+            return Err(LowerError::Shape("vkMapMemory: memory is not host-visible"));
+        };
+        let whole = size == u64::MAX; // VK_WHOLE_SIZE
+        let len = if whole { alloc.size.saturating_sub(offset) } else { size };
+        if offset.saturating_add(len) > alloc.size {
+            return Err(LowerError::Shape("vkMapMemory: range is outside the allocation"));
+        }
+        let base = s
+            .allocator
+            .arena_offset(alloc)
+            .map_err(|_| LowerError::Shape("vkMapMemory: allocation is outside the arena"))?;
+        // R2: bounds-checked against the region length, not merely against the
+        // allocation, because the two checks catch different bugs — this one
+        // catches ours.
+        let p = self
+            .arena
+            .pointer_at(base + offset, len.max(1))
+            .ok_or(LowerError::Shape("vkMapMemory: outside the arena mapping"))?;
+        if let Some(m) = s.memories.get_mut(&memory) {
+            m.mapped = true;
+        }
+        Ok(p as *mut core::ffi::c_void)
+    }
+
+    fn unmap_memory(&self, _device: u64, memory: u64) {
+        // Pure bookkeeping: the arena is mapped for the process's lifetime, so
+        // there is nothing to unmap (design.md §5.3).
+        let mut s = self.state();
+        if let Some(m) = s.memories.get_mut(&memory) {
+            m.mapped = false;
+        }
+    }
+}
+
+impl Icd for SharedVulkan {
+    // -- what we advertise --------------------------------------------------
+
+    fn get_physical_device_properties(
+        &self,
+        _args: p::VkGetPhysicalDevicePropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDevicePropertiesReply> {
+        Ok(p::VkGetPhysicalDevicePropertiesReply {
+            p_properties: Some(Box::new(device_properties())),
+        })
+    }
+
+    fn get_physical_device_properties2(
+        &self,
+        _args: p::VkGetPhysicalDeviceProperties2Args,
+    ) -> IcdResult<p::VkGetPhysicalDeviceProperties2Reply> {
+        let mut out = p::VkPhysicalDeviceProperties2::default();
+        out.properties = device_properties();
+        // The application's own chain links are left exactly as it left them:
+        // answering a link we have no answer for would be inventing data. See
+        // `store_pnext` in `sv-icd-entry` for the direction that fills them in
+        // once there is something to fill them with.
+        Ok(p::VkGetPhysicalDeviceProperties2Reply { p_properties: Some(Box::new(out)) })
+    }
+
+    fn get_physical_device_memory_properties(
+        &self,
+        _args: p::VkGetPhysicalDeviceMemoryPropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceMemoryPropertiesReply> {
+        Ok(p::VkGetPhysicalDeviceMemoryPropertiesReply {
+            p_memory_properties: Some(Box::new(memory_properties(self))),
+        })
+    }
+
+    fn get_physical_device_memory_properties2(
+        &self,
+        _args: p::VkGetPhysicalDeviceMemoryProperties2Args,
+    ) -> IcdResult<p::VkGetPhysicalDeviceMemoryProperties2Reply> {
+        let mut out = p::VkPhysicalDeviceMemoryProperties2::default();
+        out.memory_properties = memory_properties(self);
+        Ok(p::VkGetPhysicalDeviceMemoryProperties2Reply {
+            p_memory_properties: Some(Box::new(out)),
+        })
+    }
+
+    fn get_physical_device_features(
+        &self,
+        _args: p::VkGetPhysicalDeviceFeaturesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceFeaturesReply> {
+        Ok(p::VkGetPhysicalDeviceFeaturesReply {
+            p_features: Some(Box::new(p::VkPhysicalDeviceFeatures::default())),
+        })
+    }
+
+    fn get_physical_device_features2(
+        &self,
+        _args: p::VkGetPhysicalDeviceFeatures2Args,
+    ) -> IcdResult<p::VkGetPhysicalDeviceFeatures2Reply> {
+        Ok(p::VkGetPhysicalDeviceFeatures2Reply {
+            p_features: Some(Box::new(p::VkPhysicalDeviceFeatures2::default())),
+        })
+    }
+
+    fn get_physical_device_queue_family_properties(
+        &self,
+        _args: p::VkGetPhysicalDeviceQueueFamilyPropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceQueueFamilyPropertiesReply> {
+        let families = queue_families();
+        Ok(p::VkGetPhysicalDeviceQueueFamilyPropertiesReply {
+            p_queue_family_property_count: Some(families.len() as u32),
+            p_queue_family_properties: families,
+        })
+    }
+
+    fn get_physical_device_queue_family_properties2(
+        &self,
+        _args: p::VkGetPhysicalDeviceQueueFamilyProperties2Args,
+    ) -> IcdResult<p::VkGetPhysicalDeviceQueueFamilyProperties2Reply> {
+        let families: Vec<p::VkQueueFamilyProperties2> = queue_families()
+            .into_iter()
+            .map(|q| {
+                let mut w = p::VkQueueFamilyProperties2::default();
+                w.queue_family_properties = q;
+                w
+            })
+            .collect();
+        Ok(p::VkGetPhysicalDeviceQueueFamilyProperties2Reply {
+            p_queue_family_property_count: Some(families.len() as u32),
+            p_queue_family_properties: families,
+        })
+    }
+
+    fn get_physical_device_format_properties(
+        &self,
+        _args: p::VkGetPhysicalDeviceFormatPropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceFormatPropertiesReply> {
+        // NO GPU: an empty feature set for every format. It is the conservative
+        // answer — an application that respects it will not try anything — and
+        // it is the one place a *forwarded* answer is strictly required before
+        // Zink can run, because Zink chooses formats from exactly this table.
+        Ok(p::VkGetPhysicalDeviceFormatPropertiesReply {
+            p_format_properties: Some(Box::new(p::VkFormatProperties::default())),
+        })
+    }
+
+    // -- app-side state -----------------------------------------------------
+
+    fn allocate_memory(
+        &self,
+        args: p::VkAllocateMemoryArgs,
+    ) -> IcdResult<p::VkAllocateMemoryReply> {
+        let Some(info) = args.p_allocate_info.as_ref() else {
+            return Err(LowerError::Shape("vkAllocateMemory: no VkMemoryAllocateInfo"));
+        };
+        let mut s = self.state();
+        let id = s.mint();
+        let type_index = info.memory_type_index;
+        if type_index >= 4 {
+            return Err(LowerError::Shape("vkAllocateMemory: no such memory type"));
+        }
+
+        let allocation = if advertise::is_arena_backed(type_index) {
+            match s.allocator.alloc(info.allocation_size) {
+                Ok(a) => Some(a),
+                Err(_) => {
+                    // R11: the arena is a fixed pre-negotiated window, and
+                    // exhaustion is a normal condition an application handles.
+                    return Ok(p::VkAllocateMemoryReply {
+                        result: p::VkResult(
+                            sv_icd_entry::VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY.0,
+                        ),
+                        p_memory: None,
+                    });
+                }
+            }
+        } else {
+            // NO GPU: a heap-0 allocation would be a GPU-side `vkAllocateMemory`
+            // and is only recorded here.
+            None
+        };
+        let size = allocation.map(|a| a.size).unwrap_or(info.allocation_size);
+        s.memories.insert(
+            id,
+            Memory { memory_type_index: type_index, allocation, size, mapped: false },
+        );
+        Ok(p::VkAllocateMemoryReply {
+            result: p::VkResult(0),
+            p_memory: Some(p::VkDeviceMemory(id)),
+        })
+    }
+
+    fn free_memory(&self, args: p::VkFreeMemoryArgs) -> IcdResult<()> {
+        let mut s = self.state();
+        if let Some(m) = s.memories.remove(&args.memory.0)
+            && let Some(a) = m.allocation
+        {
+            // design.md §5.5 defers this until the timelines an allocation could
+            // be referenced by have passed. With nothing executing there is
+            // nothing to wait for, and `sv_arena::free_deferred` replaces this
+            // line when there is.
+            let _ = s.allocator.free_now(a);
+        }
+        Ok(())
+    }
+
+    fn get_buffer_memory_requirements(
+        &self,
+        args: p::VkGetBufferMemoryRequirementsArgs,
+    ) -> IcdResult<p::VkGetBufferMemoryRequirementsReply> {
+        let s = self.state();
+        let size = s.buffers.get(&args.buffer.0).copied().unwrap_or(0);
+        let mut r = p::VkMemoryRequirements::default();
+        // Rounded to the allocator's granularity and reported honestly, because
+        // `VUID-VkMemoryAllocateInfo-allocationSize-01745` requires the size to
+        // be a multiple of the alignment too (design.md §5.2).
+        r.size = crate::arena::round_up(size.max(1));
+        r.alignment = crate::arena::GRANULARITY;
+        // Every arena-backed type, which is every type but 0.
+        r.memory_type_bits = 0b1110;
+        Ok(p::VkGetBufferMemoryRequirementsReply { p_memory_requirements: Some(Box::new(r)) })
+    }
+
+    fn create_buffer(&self, args: p::VkCreateBufferArgs) -> IcdResult<p::VkCreateBufferReply> {
+        let Some(info) = args.p_create_info.as_ref() else {
+            return Err(LowerError::Shape("vkCreateBuffer: no VkBufferCreateInfo"));
+        };
+        let mut s = self.state();
+        let id = s.mint();
+        s.buffers.insert(id, info.size);
+        // NO GPU: the id is real and is what would go on the wire (design.md
+        // §6.4 — object creation costs no round trip), but no `VkBuffer` exists
+        // on any driver.
+        Ok(p::VkCreateBufferReply { result: p::VkResult(0), p_buffer: Some(p::VkBuffer(id)) })
+    }
+
+    fn destroy_buffer(&self, args: p::VkDestroyBufferArgs) -> IcdResult<()> {
+        self.state().buffers.remove(&args.buffer.0);
+        Ok(())
+    }
+
+    fn bind_buffer_memory(
+        &self,
+        _args: p::VkBindBufferMemoryArgs,
+    ) -> IcdResult<p::VkBindBufferMemoryReply> {
+        // NO GPU: the `(memory, offset)` rewrite of design.md §5.3 happens in
+        // the generated `transform` pass on the way to the peer, and there is no
+        // peer.
+        Ok(p::VkBindBufferMemoryReply { result: p::VkResult(0) })
+    }
+
+    // -- accepted and dropped ------------------------------------------------
+
+    fn create_command_pool(
+        &self,
+        _args: p::VkCreateCommandPoolArgs,
+    ) -> IcdResult<p::VkCreateCommandPoolReply> {
+        let id = self.state().mint();
+        Ok(p::VkCreateCommandPoolReply {
+            result: p::VkResult(0),
+            p_command_pool: Some(p::VkCommandPool(id)),
+        })
+    }
+
+    fn destroy_command_pool(&self, _args: p::VkDestroyCommandPoolArgs) -> IcdResult<()> {
+        Ok(())
+    }
+
+    fn begin_command_buffer(
+        &self,
+        _args: p::VkBeginCommandBufferArgs,
+    ) -> IcdResult<p::VkBeginCommandBufferReply> {
+        // NO GPU: recording would encode straight into the command buffer's
+        // arena block (design.md §6.5).
+        Ok(p::VkBeginCommandBufferReply { result: p::VkResult(0) })
+    }
+
+    fn end_command_buffer(
+        &self,
+        _args: p::VkEndCommandBufferArgs,
+    ) -> IcdResult<p::VkEndCommandBufferReply> {
+        Ok(p::VkEndCommandBufferReply { result: p::VkResult(0) })
+    }
+
+    fn queue_submit(&self, _args: p::VkQueueSubmitArgs) -> IcdResult<p::VkQueueSubmitReply> {
+        // NO GPU: design.md D15 makes submit asynchronous and non-negotiable, so
+        // returning success without having executed anything is the *shape* the
+        // real implementation has. What is missing is the `svQueueSubmitAsync`
+        // that would carry it and the timeline value that would retire it.
+        Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
+    }
+
+    fn device_wait_idle(
+        &self,
+        _args: p::VkDeviceWaitIdleArgs,
+    ) -> IcdResult<p::VkDeviceWaitIdleReply> {
+        // NO GPU: design.md §9.3 makes this a timeline wait against the mirrored
+        // counters in the control region. With nothing submitted, idle is
+        // immediate and the answer happens to be right.
+        Ok(p::VkDeviceWaitIdleReply { result: p::VkResult(0) })
+    }
+
+    fn queue_wait_idle(&self, _args: p::VkQueueWaitIdleArgs) -> IcdResult<p::VkQueueWaitIdleReply> {
+        Ok(p::VkQueueWaitIdleReply { result: p::VkResult(0) })
+    }
+
+    fn create_fence(&self, args: p::VkCreateFenceArgs) -> IcdResult<p::VkCreateFenceReply> {
+        let _ = args;
+        let id = self.state().mint();
+        Ok(p::VkCreateFenceReply { result: p::VkResult(0), p_fence: Some(p::VkFence(id)) })
+    }
+
+    fn destroy_fence(&self, _args: p::VkDestroyFenceArgs) -> IcdResult<()> {
+        Ok(())
+    }
+
+    fn get_fence_status(
+        &self,
+        _args: p::VkGetFenceStatusArgs,
+    ) -> IcdResult<p::VkGetFenceStatusReply> {
+        // NO GPU: a local acquire load of the timeline mirror table once one
+        // exists (design.md §9.3). Signalled, because nothing is outstanding.
+        Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) })
+    }
+
+    fn reset_fences(&self, _args: p::VkResetFencesArgs) -> IcdResult<p::VkResetFencesReply> {
+        Ok(p::VkResetFencesReply { result: p::VkResult(0) })
+    }
+
+    fn wait_for_fences(
+        &self,
+        _args: p::VkWaitForFencesArgs,
+    ) -> IcdResult<p::VkWaitForFencesReply> {
+        Ok(p::VkWaitForFencesReply { result: p::VkResult(0) })
+    }
+
+    fn create_semaphore(
+        &self,
+        _args: p::VkCreateSemaphoreArgs,
+    ) -> IcdResult<p::VkCreateSemaphoreReply> {
+        let id = self.state().mint();
+        Ok(p::VkCreateSemaphoreReply {
+            result: p::VkResult(0),
+            p_semaphore: Some(p::VkSemaphore(id)),
+        })
+    }
+
+    fn destroy_semaphore(&self, _args: p::VkDestroySemaphoreArgs) -> IcdResult<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the advertised values, converted from the C ABI types to the wire types
+// ---------------------------------------------------------------------------
+//
+// `crate::advertise` builds the C ABI structs because that is what its numbers
+// describe and what a test can compare against `vulkan_core.h`. The wire types
+// are a different set with the same field names, so the conversion is
+// field-by-field and mechanical. It is written by hand here rather than
+// generated because it is four structs, and a generated "C to wire for a value
+// we made up ourselves" pass would be a pass with no other user.
+
+fn device_properties() -> p::VkPhysicalDeviceProperties {
+    let c = advertise::device_properties(API_VERSION);
+    let mut w = p::VkPhysicalDeviceProperties::default();
+    w.api_version = c.api_version;
+    w.driver_version = c.driver_version;
+    w.vendor_id = c.vendor_id;
+    w.device_id = c.device_id;
+    w.device_type = p::VkPhysicalDeviceType(c.device_type.0);
+    for (i, b) in c.device_name.iter().enumerate() {
+        w.device_name[i] = *b as u8;
+    }
+    w.pipeline_cache_uuid = c.pipeline_cache_uuid;
+    w.limits = limits(&c.limits);
+    w
+}
+
+fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits {
+    // The struct has 110 members and every one is a scalar or a small array, so
+    // a byte-for-byte reinterpretation would work and is exactly what this
+    // project does not do (design.md §7.3: "never transmute"). The fields that
+    // matter to an application checking whether it can run are set; the rest
+    // keep the zero the wire type's `Default` gives them.
+    let mut w = p::VkPhysicalDeviceLimits::default();
+    w.max_image_dimension1_d = c.max_image_dimension1_d;
+    w.max_image_dimension2_d = c.max_image_dimension2_d;
+    w.max_image_dimension3_d = c.max_image_dimension3_d;
+    w.max_image_dimension_cube = c.max_image_dimension_cube;
+    w.max_image_array_layers = c.max_image_array_layers;
+    w.max_texel_buffer_elements = c.max_texel_buffer_elements;
+    w.max_uniform_buffer_range = c.max_uniform_buffer_range;
+    w.max_storage_buffer_range = c.max_storage_buffer_range;
+    w.max_push_constants_size = c.max_push_constants_size;
+    w.max_memory_allocation_count = c.max_memory_allocation_count;
+    w.max_sampler_allocation_count = c.max_sampler_allocation_count;
+    w.buffer_image_granularity = c.buffer_image_granularity;
+    w.max_bound_descriptor_sets = c.max_bound_descriptor_sets;
+    w.max_per_stage_resources = c.max_per_stage_resources;
+    w.max_vertex_input_attributes = c.max_vertex_input_attributes;
+    w.max_vertex_input_bindings = c.max_vertex_input_bindings;
+    w.max_compute_work_group_count = c.max_compute_work_group_count;
+    w.max_compute_work_group_invocations = c.max_compute_work_group_invocations;
+    w.max_compute_work_group_size = c.max_compute_work_group_size;
+    w.max_compute_shared_memory_size = c.max_compute_shared_memory_size;
+    w.max_draw_indexed_index_value = c.max_draw_indexed_index_value;
+    w.max_draw_indirect_count = c.max_draw_indirect_count;
+    w.max_viewports = c.max_viewports;
+    w.max_viewport_dimensions = c.max_viewport_dimensions;
+    w.viewport_bounds_range = c.viewport_bounds_range;
+    w.min_memory_map_alignment = c.min_memory_map_alignment as u64;
+    w.min_texel_buffer_offset_alignment = c.min_texel_buffer_offset_alignment;
+    w.min_uniform_buffer_offset_alignment = c.min_uniform_buffer_offset_alignment;
+    w.min_storage_buffer_offset_alignment = c.min_storage_buffer_offset_alignment;
+    w.max_framebuffer_width = c.max_framebuffer_width;
+    w.max_framebuffer_height = c.max_framebuffer_height;
+    w.max_framebuffer_layers = c.max_framebuffer_layers;
+    w.max_color_attachments = c.max_color_attachments;
+    w.max_sample_mask_words = c.max_sample_mask_words;
+    w.discrete_queue_priorities = c.discrete_queue_priorities;
+    w.point_size_range = c.point_size_range;
+    w.line_width_range = c.line_width_range;
+    w.non_coherent_atom_size = c.non_coherent_atom_size;
+    w.timestamp_period = c.timestamp_period;
+    w.framebuffer_color_sample_counts =
+        p::VkSampleCountFlags(c.framebuffer_color_sample_counts.0);
+    w.framebuffer_depth_sample_counts =
+        p::VkSampleCountFlags(c.framebuffer_depth_sample_counts.0);
+    w.framebuffer_stencil_sample_counts =
+        p::VkSampleCountFlags(c.framebuffer_stencil_sample_counts.0);
+    w.framebuffer_no_attachments_sample_counts =
+        p::VkSampleCountFlags(c.framebuffer_no_attachments_sample_counts.0);
+    w.sampled_image_color_sample_counts =
+        p::VkSampleCountFlags(c.sampled_image_color_sample_counts.0);
+    w.sampled_image_integer_sample_counts =
+        p::VkSampleCountFlags(c.sampled_image_integer_sample_counts.0);
+    w.sampled_image_depth_sample_counts =
+        p::VkSampleCountFlags(c.sampled_image_depth_sample_counts.0);
+    w.sampled_image_stencil_sample_counts =
+        p::VkSampleCountFlags(c.sampled_image_stencil_sample_counts.0);
+    w.storage_image_sample_counts = p::VkSampleCountFlags(c.storage_image_sample_counts.0);
+    w.standard_sample_locations = c.standard_sample_locations != 0;
+    w.optimal_buffer_copy_offset_alignment = c.optimal_buffer_copy_offset_alignment;
+    w.optimal_buffer_copy_row_pitch_alignment = c.optimal_buffer_copy_row_pitch_alignment;
+    w
+}
+
+fn memory_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceMemoryProperties {
+    let c = advertise::memory_properties(icd.arena_len);
+    let mut w = p::VkPhysicalDeviceMemoryProperties::default();
+    w.memory_type_count = c.memory_type_count;
+    for i in 0..c.memory_type_count as usize {
+        w.memory_types[i] = p::VkMemoryType {
+            property_flags: p::VkMemoryPropertyFlags(c.memory_types[i].property_flags.0),
+            heap_index: c.memory_types[i].heap_index,
+        };
+    }
+    w.memory_heap_count = c.memory_heap_count;
+    for i in 0..c.memory_heap_count as usize {
+        w.memory_heaps[i] = p::VkMemoryHeap {
+            size: c.memory_heaps[i].size,
+            flags: p::VkMemoryHeapFlags(c.memory_heaps[i].flags.0),
+        };
+    }
+    w
+}
+
+fn queue_families() -> Vec<p::VkQueueFamilyProperties> {
+    advertise::queue_families()
+        .into_iter()
+        .map(|q| {
+            let mut w = p::VkQueueFamilyProperties::default();
+            w.queue_flags = p::VkQueueFlags(q.queue_flags.0);
+            w.queue_count = q.queue_count;
+            w.timestamp_valid_bits = q.timestamp_valid_bits;
+            w.min_image_transfer_granularity = p::VkExtent3D {
+                width: q.min_image_transfer_granularity.width,
+                height: q.min_image_transfer_granularity.height,
+                depth: q.min_image_transfer_granularity.depth,
+            };
+            w
+        })
+        .collect()
+}

@@ -74,6 +74,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.2.189"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
 name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -112,13 +118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sv-arena"
-version = "0.1.0"
-dependencies = [
- "sv-transport",
-]
-
-[[package]]
 name = "sv-codegen"
 version = "0.1.0"
 dependencies = [
@@ -132,12 +131,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "sv-hostd"
+name = "sv-icd"
 version = "0.1.0"
 dependencies = [
- "sv-arena",
- "sv-transport",
+ "libc",
+ "sv-icd-entry",
+ "sv-proto",
  "sv-wire",
+]
+
+[[package]]
+name = "sv-icd-entry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sv-codegen",
+ "sv-proto",
+ "sv-wire",
+ "vk-registry",
 ]
 
 [[package]]
@@ -159,13 +170,6 @@ dependencies = [
  "sv-proto",
  "sv-wire",
  "vk-registry",
-]
-
-[[package]]
-name = "sv-transport"
-version = "0.1.0"
-dependencies = [
- "sv-wire",
 ]
 
 [[package]]

@@ -187,6 +187,92 @@ Two further findings are about the registry and about R8, and are recorded in
   number, exactly as R8 says they would; only checking generated constants
   against `vulkan_core.h` caught it.
 
+### 0.3 What the ICD stage settled
+
+Built 2026-08-12: pass 10 (`sv-icd-entry`, generated) and the hand-written app
+side (`sv-icd`). **The real Vulkan loader enumerates us**: `vulkaninfo` with
+`VK_DRIVER_FILES` pointing at the generated manifest reports
+`shared_vulkan forwarded device`, the §9.1 memory table, and no loader
+complaint at `VK_LOADER_DEBUG=all`; it does the same under
+`VK_LAYER_KHRONOS_validation`, which is what exercises the dispatchable-handle
+contract of §6.4. §13 step 5 is met except for the triangle, which needs a GPU
+side. Six of the findings are corrections to this document.
+
+1. **The ICD's C surface is not the wire profile, and §12 implies it is.** The
+   Zink profile resolves to 239 forwarded commands; the surface the ICD must
+   *export* is **250**, and the difference is precisely the commands §8 and §10
+   say are answered app-side — proc-address lookup, the swapchain family, the
+   surface queries, the debug-utils messenger — plus `VkAllocationCallbacks`,
+   which §7.4 strips *from the wire* and which is still in every C signature.
+   The generator therefore resolves a second, wider profile for the ABI. A
+   generator driven by one profile silently omits eleven entry points, and the
+   loader's symptom is a null function pointer with no diagnostic.
+2. **`len=` is load-bearing again at this boundary, and §7.4 says the
+   opposite.** That section's finding — every variable-length thing carries its
+   own `u64` count, so `len=` is "a verifier rather than an input" — is true of
+   the wire and **stops at the C ABI**. Here `len=` is the only thing that
+   bounds a read of the *application's* memory, and a wrong one is an
+   out-of-bounds read of somebody else's process rather than a failed check. The
+   consequence is concrete: `(rasterizationSamples + 31) / 32` on
+   `VkPipelineMultisampleStateCreateInfo::pSampleMask`, which §7.4 is content to
+   record unparsed, has to be parsed here. It is the only such expression on the
+   surface and the generator now refuses anything it cannot resolve.
+3. **A count sibling is frequently a *pointer*, and the registry does not say
+   so.** `vkGetPhysicalDeviceQueueFamilyProperties` has
+   `len="pQueueFamilyPropertyCount"` and `uint32_t* pQueueFamilyPropertyCount`;
+   C dereferences it in the caller's head and `vk.xml` records only the name.
+   The first `vulkaninfo` run against this ICD died on exactly that — the
+   address, taken as a length, asked for a `Vec` of 3.4×10¹⁵ elements. Nothing
+   in the registry distinguishes the two cases; the generator has to look at the
+   sibling's own C type.
+4. **An array *parameter* is a pointer, not an array.**
+   `vkCmdSetBlendConstants(VkCommandBuffer, const float blendConstants[4])` takes
+   a `const float*`; C decays it and Rust does not. A `[f32; 4]` in an
+   `extern "system"` signature is a different calling convention, and the only
+   diagnostic is an FFI-safety warning. Array-to-pointer decay applies at the
+   outermost level of a parameter and nowhere else — `char deviceName[256]`
+   inside a struct is a genuine array.
+5. **A command that returns a value which is neither `void` nor `VkResult` has
+   no way to return it.** §7.2's reply rule, as implemented, is
+   `generates_reply = returns_result || !outputs.is_empty()`, and three commands
+   in the Zink profile satisfy neither: `vkGetBufferDeviceAddress`,
+   `vkGetBufferOpaqueCaptureAddress` and `vkGetDeviceMemoryOpaqueCaptureAddress`
+   all return a `VkDeviceAddress` with no output parameter, so the generated
+   reply has nowhere to put it. It is **latent rather than live** — §9.2 does not
+   advertise `bufferDeviceAddress`, so a conforming application never calls them
+   — but it is a hole in the protocol and not in the ICD, and the fix belongs in
+   `plan.rs`: a reply exists whenever the command returns anything at all.
+6. **A dispatchable handle cannot be generated, and that bounds the hand-written
+   half.** §7.3 says the ICD stubs are "one mechanical shape"; seventeen of the
+   250 are not, and sixteen of those for one structural reason. What
+   `vkCreateInstance` returns is a pointer to an allocation whose first word the
+   loader owns, and no fold over a wire reply produces one — the reply carries a
+   `u64` id. Every command that mints or destroys a dispatchable object is
+   therefore hand-written, and the list is short and closed because Vulkan has
+   five dispatchable types. Two further facts fell out: **a physical device and a
+   queue must return the same pointer every time** (an application may compare
+   them, and a fresh allocation per call also leaks), and §12's description of
+   `sv-icd-entry` as "lib, **generated**" needs the qualifier that it has a small
+   hand-written half.
+
+Two smaller corrections. **§8's "Exports: exactly `vk_icdGetInstanceProcAddr`,
+`vk_icdNegotiateLoaderICDInterfaceVersion` and `vk_icdGetPhysicalDeviceProcAddr`"
+is right at loader interface 7 and wrong below it**, where the loader looks for
+`vkGetInstanceProcAddr` by name; we export it as well, which costs one
+forwarding function. And **§7.5's estimate for this pass was low by the same
+factor as the rest**: 10,000 lines budgeted for "ICD entry stubs + proc tables",
+**47,120** emitted — because the estimate did not include a `#[repr(C)]` type
+layer (596 types) or the C-to-wire lowering, both of which turn out to be where
+the work is.
+
+What is **not** settled, and is the honest state of this stage: nothing reaches a
+GPU. `sv-transport` and `sv-gpu-server` are not on master, so every forwarded
+command is answered app-side, `vkQueueSubmit` accepts and drops, and the arena is
+a `memfd` this process created rather than guest RAM `sv-hostd` located. The
+arena mapping and `vkMapMemory` are real — the pointer is a real pointer into
+real shared pages — and the half that has not happened is the GPU side importing
+them.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
