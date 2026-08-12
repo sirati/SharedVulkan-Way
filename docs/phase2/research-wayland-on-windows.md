@@ -20,7 +20,7 @@ answer, so here they are separately:
 | "All extensions we can implement" | **~55 clean, ~60 with caveats, ~22 impossible or pointless** out of 137 enumerated. Full matrix in §5. |
 | Tray icon support | **Feasible, and the easiest major item.** Not a Wayland protocol at all — it is StatusNotifierItem over D-Bus, and D-Bus runs on Windows. The hard part is not D-Bus; it is that **Windows 11 hides new tray icons with no supported API to un-hide them**. See §6. |
 | Accelerated video decode over forwarded Vulkan | **Yes — and it is the single best-suited workload for phase 1**, because decoded pixels never need to cross the arena. But note §7.6a: **VA-API now runs natively on Windows on D3D12**, which may be the better path and needs no proxy work. |
-| Digital rights management | **Software DRM yes; hardware DRM through this compositor is logically contradictory, not merely hard.** Expect Netflix at 720p, never 4K. See §8 — this is the section to read if you read only one. |
+| Digital rights management | **Hardware DRM is implementable** — §8's "contradictory" verdict was wrong and is superseded by **§11**. The supported design passes a handle, never pixels; Microsoft's D3D12 spec names the compositor as the intended recipient and Chromium ships it from an unsigned, low-privilege sandboxed process. **The one real blocker is that a Linux client cannot hold an SL3000 licence** (§11.4), which makes this the strongest argument in the report for the mingw-native client architecture. |
 
 **The single most important correction to the plan:** the question you flagged as decisive — fd
 passing — is **not** the thing that kills this. It is real, it is confirmed, and it is a
@@ -1587,10 +1587,24 @@ with any protected-content future at all.
 
 ## 8. Digital rights management
 
-**Verdict up front: hardware DRM through this compositor is not hard, it is logically
-contradictory.** Software DRM works and always would have. There is a middle tier that works only
-by bypassing the compositor entirely. This section gives the reasons rather than a plan, because
-the plan does not exist.
+> ## ⚠ THE CONCLUSION OF THIS SECTION IS SUPERSEDED BY §11
+>
+> **The verdict below is wrong.** It rests on an unchecked premise: that protected pixels would have
+> to traverse the shared-memory arena. They do not, and need not — the supported design passes a
+> *handle and a geometry* while the pixels stay in memory we are never given an address for.
+> Microsoft's own D3D12 specification describes sharing a protected resource session "to other
+> processes, **such as the compositor**", and Chromium ships exactly this architecture from a
+> low-privilege LPAC sandboxed process holding no signing certificate.
+>
+> **The evidence gathered in this section is sound and still worth reading** — the hardware
+> guarantees, the tier definitions, the least-capable-monitor rule, the VM and blocklist findings
+> all stand. It is the conclusion drawn from them that was a scope error. **Read §11 for the
+> corrected analysis and an implementation path.**
+
+**Verdict up front (SUPERSEDED — see §11): hardware DRM through this compositor is not hard, it is
+logically contradictory.** Software DRM works and always would have. There is a middle tier that
+works only by bypassing the compositor entirely. This section gives the reasons rather than a plan,
+because the plan does not exist.
 
 ### 8.1 What the tiers actually require
 
@@ -1942,6 +1956,16 @@ They differ only in the transport module. B gets you a working, testable, useful
 stage 3 instead of stage 9, and it de-risks the one item most likely to sink the project. If the
 toolkit ports later succeed, the same compositor serves native clients with no rework.
 
+> **Caveat added by §11, and it is the one thing that could overturn this recommendation.**
+> Hardware DRM (PlayReady SL3000) requires the client to be a **Windows process able to call Media
+> Foundation**, because the licence is bound to local hardware attestation that cannot be forwarded
+> (§11.4). **Architecture B can therefore never play protected 4K content, no matter what the
+> compositor does.** If protected playback is a real requirement rather than a nice-to-have, that is
+> a decisive argument for Architecture A and this staging order should be revisited. Note the
+> tension: Architecture A is also the topology in which the Vulkan forwarder has the *least* value
+> (see the "logical tension" subsection below). These two goals genuinely pull apart, and the choice
+> should be made deliberately rather than discovered in month four.
+
 ### There is a logical tension in the stated goal that is worth surfacing now
 
 Phase 1 exists because the **NixOS host has no GPU** — the GPU was passed into the Windows guest.
@@ -2115,6 +2139,9 @@ Cheap to get right up front, expensive to retrofit.
 
 Collected here because you asked to be told plainly rather than have gaps papered over.
 
+*Items 1–10 predate §11 and are unchanged. Note that item 3 has been promoted: it is now the
+go/no-go experiment for a tier §11 concludes is implementable, not a footnote to an impossibility.*
+
 **Unverified, but cheap for you to settle on your own hardware:**
 1. **Which Vulkan Video extensions your actual passed-through GPU exposes.** Run `vulkaninfo` in the
    guest. One command, worth more than every aggregate in §7.2.
@@ -2149,7 +2176,676 @@ Collected here because you asked to be told plainly rather than have gaps papere
     in §6.4 are paraphrase rather than quotation. Read the `#transports-nonce-tcp-sockets` and
     `#meta-transports-autolaunch` anchors before implementing.
 
+
+**Added by §11 — open questions on the protected-content path:**
+11. **Whether MF's VM detection (`MF_MEDIA_ENGINE_OPM_FAILED_VM`) fires under full GPU passthrough.**
+    The single unknown that could invalidate the whole hardware-DRM tier, and step P1 of §11.8's
+    staging table for that reason.
+12. **Whether a DComp surface handle can be passed to a *lower*-integrity process than the producer.**
+    Chromium only ever goes LPAC → browser → GPU, i.e. upward in privilege. Our client→compositor
+    direction is probably peer-to-peer, but this is untested.
+13. **Whether DWM imposes extra restrictions on a non-DWM-known window hosting a protected visual.**
+    Chromium's case suggests none beyond OPM policy on the output, but no documentation states it.
+14. **Whether `IDCompositionEffect`/blur can be applied to a protected visual.** Undocumented in both
+    directions; mechanically it would require DWM to allocate a protected intermediate. Chromium
+    never attempts it. Assume no until measured.
+15. **Whether the `DISPLAY_ONLY` "another process created the HWND" clause applies to windowless
+    composition surfaces.** Written for windowed swapchains; our design has no HWND swapchain.
+    Setting `SetWindowDisplayAffinity` anyway is cheap insurance (§11.10.4).
+16. **Whether `VK_KHR_external_memory_win32` may import a `HW_PROTECTED` D3D11 resource.**
+    Unspecified rather than forbidden — no valid-usage statement authorises it and no structure
+    carries protection semantics. Treated as unusable (§11.9.1).
+17. **Whether the screen-space rect also drives multi-adapter GPU selection.** Recorded earlier from
+    a Chromium comment I could not re-confirm on re-verification (§11.10.3). Plausible, unverified.
+
 **One conflict between research passes, resolved:** whether a standard Windows-HKL → XKB-layout
 mapping table exists. One pass concluded no and that you would have to build one; the other found
 FreeRDP's `xkb_layout_ids.c`, surfaced in Weston's RDP backend as `rdp_keyboards[]`. **The second is
 correct** — the table exists and saves the work (§4.7).
+
+---
+
+## 11. DRM reconsidered — the earlier conclusion was wrong
+
+*This section supersedes the headline verdict of §8. The factual findings in §8 stand; the
+conclusion drawn from them did not. §11.1 explains what changed and why.*
+
+### 11.1 What I got wrong, and what I got right
+
+**Superseded:** §8's headline, "hardware DRM through this compositor is not hard, it is logically
+contradictory."
+
+**The error was a scope error**, and it is worth naming precisely so a reader can tell which parts
+of §8 still stand. My argument ran:
+
+> D3D guarantees protected allocations are never CPU-readable; Vulkan requires protected memory
+> never be host-visible; our central mechanism is a host-visible shared arena; therefore
+> contradiction.
+
+**The third premise does not hold.** Nothing requires protected pixels to use the arena. The arena
+is the transport for the *unprotected* data path. Under the model put to me — the GPU allocates the
+protected buffer, the CPU is never told where it is, and the CPU defines only the surface on which
+that content is presented — what crosses the boundary is a **handle and a geometry**. The pixels
+never move.
+
+I should have caught this, because **§8.7(b) of my own report already described the escape** — the
+`IMFMediaEngineEx::GetVideoSwapchainHandle()` DirectComposition hole-punch — and I nonetheless
+filed it under "achievable only by bypassing the compositor" rather than recognising it as *the*
+supported way a compositor handles protected content. That framing buried the answer underneath the
+impossibility claim.
+
+**What still stands from §8**, unchanged and re-verified:
+- Protected surfaces cannot be sampled, copied to unprotected resources, mapped or read back. The
+  three-layer guarantee (creation flags, capability contract, driver DDI `Lock` failure) is real.
+- Vulkan has no route to Windows DRM (§11.3, §11.9).
+- The least-capable-monitor rule and its consequences for virtual displays.
+- Widevine hardware DRM on Windows desktop is not a thing; Windows hardware DRM means PlayReady
+  SL3000.
+
+**What changes:** the conclusion, the recommended architecture, and which of the two client
+topologies from §9.1 you should choose if protected content matters.
+
+### 11.2 The model is correct, and it has a name
+
+The model — "the GPU allocates it, doesn't tell the CPU where it is, but lets the CPU define a
+surface on which the content is presented; the panel queries as black while the display shows the
+content" — is the standard **protected/secure video path**, and its compositor-facing expression is
+a **hole punch**:
+
+1. The **decoder** writes into protected memory the CPU cannot address.
+2. The **compositor** never receives pixels. It receives an opaque handle plus a rectangle, and
+   renders a *transparent hole* in its own content where the video belongs.
+3. A **trusted composer** (DWM; the display controller's overlay planes at the hardware level) puts
+   the protected surface behind that hole at scan-out.
+4. **Output protection** (HDCP via OPM) is established on the physical connector — see the
+   correction below, because this step does *not* work the way one would assume.
+5. **Capture** paths are blanked, because capture reads a separate composition, not the overlay
+   plane.
+
+#### One correction to the model, and it creates a real obligation
+
+The natural assumption — mine, in the first draft of this section — is that DWM negotiates HDCP/OPM
+on our behalf, below the compositor and invisibly. **That is wrong.**
+
+OPM is driven by the *application's* media pipeline and is **keyed to an HWND**. From
+[Output Protection Manager](https://learn.microsoft.com/en-us/windows/win32/medfound/output-protection-manager):
+"OPM enables **an application** to protect video content as it travels over a physical connector…
+**Before an application plays protected content, it must set the appropriate protection mechanisms
+on every video output** associated with the graphics card that will display the video." Where the
+protected media path is used, `mfpmp.exe` makes those calls — still on the application's behalf,
+not DWM's. The binding is explicit:
+[`IMFMediaEngineProtectedContent::SetOPMWindow`](https://learn.microsoft.com/en-us/windows/win32/api/mfmediaengine/nf-mfmediaengine-imfmediaengineprotectedcontent-setopmwindow)
+— "Specifies the window that should receive output link protections… The Media Engine uses this
+window to set link protections, using the Output Protection Manager (OPM)."
+
+**Design consequence:** a protected surface needs a real, stable HWND positioned at the right screen
+rectangle, so Media Foundation can resolve it to a monitor and drive HDCP on that connector. §11.10.4
+shows that the *client* can own this window rather than us — but somebody must, and it must be
+correctly positioned, which drives the protocol requirement in §11.10.3.
+
+#### Do not conflate the two "black" mechanisms
+
+The `SetWindowDisplayAffinity(WDA_MONITOR)` analogy is a good intuition pump for the *observable
+behaviour*, but Windows has **two independent mechanisms** that both produce "visible on the panel,
+black to capture", and they must not be confused:
+
+| | `DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED` | `DISPLAY_ONLY` / `SetWindowDisplayAffinity` |
+|---|---|---|
+| What it protects | **memory** — hardware-enforced | **capture** — DWM software policy |
+| Enforced by | GPU / driver | DWM's capture composition |
+| Is it DRM? | yes | **explicitly not** |
+
+Microsoft is blunt about the second: "**unlike a security feature or an implementation of Digital
+Rights Management (DRM), there is no guarantee**", and "**it works only when the Desktop Window
+Manager (DWM) is composing the desktop**"
+([SetWindowDisplayAffinity](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity)).
+Chromium sets both flags separately, precisely because neither implies the other.
+
+### 11.3 Reconsidering the 4.1 % figure — it measured the wrong API
+
+§8.4 measured Vulkan's `protectedMemory` on Windows: 4.1 %, every supporting device an Arm SoC.
+That number is **accurate and irrelevant to whether Windows supports hardware DRM.**
+
+Windows' protected media path is **D3D11/D3D12 + Media Foundation**. Vulkan is not a participant —
+there is no Vulkan↔PlayReady binding on Windows (§8.4(b) stands, and §11.9.1 re-confirms it from
+the registry). So the correct statement is not "Windows barely supports protected memory" but:
+
+> **Vulkan has no route to Windows hardware DRM at all — while the D3D+MF route is ubiquitous.**
+
+Ubiquity is established by a conformance requirement rather than a survey. From DirectX-Specs:
+
+> "**Starting with WDDM 2.4 a driver must report protected resource support in both D3D11 and D3D12
+> and support cross API sharing, or it must support protected resources in neither API.**"
+
+WDDM 2.4 is Windows 10 1803, so on any system in scope this is all-or-nothing at the driver level —
+and since PlayReady SL3000 / Netflix 4K demonstrably works on ordinary consumer NVIDIA, AMD and
+Intel hardware through Edge, the "all" branch is what ships. Android's `protectedMemory` at
+**64.11 %** versus Windows' 4.10 % (§11.9.2) confirms the underlying capability is mass-market; it
+is simply not plumbed through Vulkan on Windows desktop.
+
+**The consequence for phase 1 is the important part: protected content does not travel through the
+Vulkan forwarder at all.** It is a second, parallel path — MF/D3D produces a handle, DComp carries
+it, DWM composites it. Phase 1 is not involved, which is why the arena's host-visibility was never
+the obstacle.
+
+### 11.4 Where the CDM has to live — this *is* the real constraint
+
+The constraint is not signing. It is **which operating system the client process runs on.**
+
+The application does **not** need to be Microsoft-signed — §11.10.1 proves this conclusively from
+Chromium. The application is a *client* of the protected path, never a member of it. But it must be
+**a Windows process able to call Media Foundation.** Apply that to §9.1's two architectures and they
+diverge sharply:
+
+| | Architecture A — mingw-native Windows clients | Architecture B — Linux clients |
+|---|---|---|
+| Client can call MF / instantiate a PlayReady CDM | **Yes** — it is a Win32 process | **No** — Linux has no PMP, no MF |
+| Best achievable DRM | **PlayReady SL3000**, subject to §11.8's preconditions | **Widevine L3 / software only**, permanently |
+| Protected surface handoff | DComp surface handle over a Wayland buffer type | nothing to hand off |
+
+> **Hardware DRM is the one capability that requires the mingw-native client architecture.** It is
+> the single strongest argument in this report *for* Architecture A — and it cuts directly against
+> §9.1's recommendation to build Architecture B first.
+
+#### The precise reason a Linux client cannot be rescued — and it is not the memory
+
+It would be easy to assume the blocker is that a Linux process cannot allocate Windows protected
+memory. True, but incidental. **The blocker is key binding.**
+
+In hardware DRM the content key is delivered by the licence server *encrypted to the client's
+hardware certificate* and unwrapped **inside the TEE**. It never exists in addressable memory on
+either side. On Windows that TEE is reached only through Media Foundation and the PlayReady `PRITEE`
+path, which routes to the graphics driver (§8.1). There is no API surface, forwarded or otherwise,
+by which a Linux process participates in that exchange.
+
+The tempting bridge — "let the Linux app acquire the licence and hand the content key to the GPU
+side to load into a crypto session" — **defeats the entire mechanism**, because the key would be in
+the clear on the Linux side. That is precisely the attack SL3000 exists to prevent, and no licence
+server will issue an SL3000 licence to a client that cannot attest to a hardware certificate.
+
+**This is the API that cannot be bridged, named precisely:** the CDM's licence-acquisition and
+key-loading path (`IMFContentDecryptionModule` / PlayReady `PRITEE`). It cannot be forwarded because
+it requires *local hardware attestation* — the client must prove to a remote server that it runs on
+specific silicon with a provisioned certificate. **Forwarding is exactly what attestation exists to
+detect.** Everything else in the protected path — allocation, decode, composition, output protection
+— bridges or delegates cleanly. This one does not, and no engineering changes it.
+
+Note this is a *good* negative result: we are not being asked to be trusted and failing. We are being
+told the client itself must be on the trusted platform, and our forwarder is irrelevant to the
+question.
+
+### 11.5 The design principle: we are a bridge, never an enforcer
+
+> **We do not protect anything. We forward faithfully so the hardware's own enforcement stays intact
+> end to end. Our incapacity is the guarantee.**
+
+This removes the requirement that anyone trust us. We are not a trusted component, we implement no
+protection mechanism, and we need not be correct-for-security — only correct-for-function. Protected
+allocations are made by the GPU-side driver, live in memory we are never handed an address for, and
+cross our boundary only as opaque handles. There is no code path by which protected pixels reach a
+buffer we can read, so there is nothing for us to leak, by bug or by malice.
+
+#### 11.5.1 Microsoft's own spec names the compositor as the recipient
+
+This is the sentence that most directly refutes my earlier conclusion. From
+[DirectX-Specs, `ProtectedResources.md`](https://raw.githubusercontent.com/microsoft/DirectX-Specs/master/d3d/ProtectedResources.md),
+on `ID3D12ProtectedResourceSession`:
+
+> **"This session may be used with `ID3D12Device::CreateSharedHandle` when we need to flow
+> information to other processes, such as the compositor."**
+
+Microsoft's D3D12 specification anticipates exactly the architecture proposed here: a protected
+resource session shared, by handle, into a **separate compositor process**. Cross-process handoff of
+protected content to a compositor is not a loophole to be argued for — it is the documented,
+intended design, and the spec calls out the compositor by name as the motivating case.
+
+My §8 treated "a third-party compositor in the path" as a trust violation. It is not. The compositor
+receives a handle and a geometry, which is precisely what the spec describes. **The hardware's
+enforcement keeps the content safe regardless of who holds the handle.**
+
+#### 11.5.2 Fail-closed — verified at four layers, and Microsoft closed the one hole that existed
+
+The approach rests on one property: **a bridging error must cause playback to fail, never to
+silently produce unprotected output.** I checked this rather than assuming it.
+
+| Layer | Behaviour on error | Source |
+|---|---|---|
+| Protected resource creation | "Resource creation will fail if hardware content protection is not supported." | [`D3D11_RESOURCE_MISC_FLAG`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_resource_misc_flag) |
+| Protected → unprotected flow | **"An operation may read from a combination of protected and unprotected resources, but when it reads from any protected resource the output must be a protected resource."** | DirectX-Specs |
+| CPU access | driver "should explicitly **fail** the calls to its **Lock** function" while protection is enabled | [Content Protection DDI](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/content-protection-ddi) |
+| Output protection | licence policy refuses, or Media Engine reports `MF_MEDIA_ENGINE_OPM_FAILED_*` and playback stops | `MF_MEDIA_ENGINE_OPM_STATUS` |
+
+and underpinning all of it, from DirectX-Specs:
+
+> "Hardware must protect these resources from being read by cpu code either through protected memory
+> or encrypted memory."
+
+**The decisive detail: the fail-open path used to exist and was deliberately removed.** The spec
+records the old behaviour — "Creating a texture using this flag does not automatically guarantee that
+hardware protection will be enabled for the underlying allocation. Some implementations require that
+the DRM components are first initialized prior to any guarantees of protection." — and then closes
+it: **"This is no longer valid for D3D11 or D3D12 starting with WDDM 2.4."**
+
+That is exactly the failure mode this principle worries about — an API that silently degrades to
+unprotected output when the caller gets something wrong — and Microsoft eliminated it platform-wide.
+On any WDDM 2.4+ system the protected flag is honoured or creation fails.
+
+**Conclusion: fail-closed holds at four independent layers, by explicit design rather than by
+accident.** A mis-bridged call produces a black window or a playback error, not a leak.
+
+### 11.6 Which APIs must be bridged
+
+The honest summary is that **the path that works needs almost no bridging, while the path that would
+need bridging is blocked by something other than memory.**
+
+#### Path 1 — D3D + Media Foundation, Windows-native client (the one that works)
+
+**Nothing crosses the VM boundary.** The client is a Win32 process in the same guest as the GPU, the
+driver, the CDM and DWM. shared_vulkan is not in this path at all. The only bridging is the Wayland
+hop, and it carries a handle:
+
+| What crosses | Direction | Our obligation |
+|---|---|---|
+| DComp surface handle for the protected swapchain | client → compositor | bind verbatim into our visual tree; never `OpenSharedResource`, never sample |
+| Surface geometry, z-order, clip | client → compositor | ordinary compositor state |
+| **Screen-space rectangle** | **compositor → client** | **required — see §11.10.3** |
+| Output/protection status | compositor → client (optional) | report what Windows reports; never synthesise |
+
+#### Path 2 — Vulkan protected memory through the forwarder (well-formed, unavailable)
+
+Recorded because it is the design this project's architecture would naturally reach for, and the
+bridge would be clean:
+
+| Call | Bridging |
+|---|---|
+| `vkCreateDevice` with `VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT` | forward; GPU side creates a real protected queue |
+| `vkCreateImage`/`vkCreateBuffer` with `VK_IMAGE_CREATE_PROTECTED_BIT` | forward; allocation GPU-side, never arena-backed |
+| `vkAllocateMemory` from a protected type | forward; **never** host-import or arena-place |
+| `vkQueueSubmit2` with `VkProtectedSubmitInfo` | forward verbatim |
+| `vkMapMemory` on protected memory | **must fail** — protected types are never host-visible |
+| `vkCreateSwapchainKHR` with `VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR` | forward |
+
+Fail-closed by construction: protected memory types cannot carry `HOST_VISIBLE`, so there is no
+arena placement to get wrong, and the forwarder's zero-copy mechanism
+(`VK_EXT_external_memory_host`) simply cannot apply — the GPU side does a real `vkAllocateMemory`,
+exactly as §7.4 concluded for video DPB memory. **Unavailable on Windows for two independent
+reasons** (§11.9): desktop drivers do not expose `protectedMemory`, and Vulkan has no CDM binding.
+
+### 11.7 What the compositor must actually do
+
+#### 11.7.1 The representation
+
+A protected surface reaches us as a **DirectComposition surface handle**, not a buffer. The client
+drives Media Foundation and obtains an opaque handle; it is duplicated across the process boundary
+and we bind it with `IDCompositionDevice::CreateSurfaceFromHandle`, attaching it to a visual via
+`SetContent`.
+
+**This slots into the DirectComposition design already recommended in §9.2 with no new machinery.**
+We were going to build a DComp visual tree per toplevel anyway, with subsurfaces as child visuals. A
+protected video surface is simply a child visual we never sample — a pleasing outcome, since the
+architecture chosen for unrelated reasons (atomic commit semantics) is the one that makes protected
+content possible.
+
+#### 11.7.2 What we may and may not do
+
+| Operation | Allowed | Why |
+|---|---|---|
+| Position, z-order, clip the visual | **Yes** | DWM applies it, not us |
+| Scale / transform via `SetTransform` | **Yes** | DWM applies it — keeps the surface a real window, not a fixed rectangle |
+| Composite unprotected content above/below | **Yes** | ordinary visual-tree layering |
+| Sample it in a shader | **No** | hardware refuses; output would have to be protected |
+| Copy to a normal texture | **No** | protected → unprotected blocked in hardware |
+| Map / read back | **No** | driver fails `Lock` |
+| Include in screencopy, screenshot, thumbnail | **No** | must be excluded or blanked by us |
+| Our own blur / effects / rounded corners | **No** | requires sampling |
+
+The transform row matters: because *DWM* performs it, a protected surface is **not** limited to an
+unscaled axis-aligned rectangle. We can place, scale and clip it like any other window. We simply
+cannot *read* it.
+
+#### 11.7.3 Mixing protected and unprotected content in one frame
+
+1. Render our own content with a **fully transparent rectangle** where the protected video belongs.
+2. Place the protected visual **behind** that content in the visual tree.
+3. `Commit()` the tree atomically (§9.2). DWM composites both at scan-out.
+
+Consequences to design for, because they are user-visible:
+- The video is always **behind** our content in that region — no translucent overlay *blended* with
+  it (an opaque overlay is fine, it just occludes).
+- Live thumbnails, our screencopy path, `ext-image-copy-capture`, workspace previews **must skip or
+  blank protected surfaces.** Not us enforcing DRM — us not producing a broken black rectangle and
+  not asking for pixels the hardware will refuse.
+- `wp_viewporter` crop/scale must become DComp transforms rather than shader work, for protected
+  surfaces specifically.
+
+#### 11.7.4 Protocol implications
+
+A new Wayland buffer type is required. It cannot be `wl_shm`, and it cannot be the `wp_win32_buffer`
+of §2.4 (designed to be sampled). Protected content needs a distinct type whose contract is
+explicitly *"the compositor will never read this"*:
+
+- a `wp_win32_protected_surface` carrying a DComp surface handle;
+- a surface attribute marking it protected, so screencopy/thumbnail/effect paths exclude it **by
+  construction** rather than by remembering to check;
+- a compositor→client **screen-space rectangle** event (§11.10.3);
+- **no `wl_shm` fallback** — if the handle cannot be bound, the surface shows nothing. Fail-closed at
+  the protocol layer too.
+
+#### 11.7.5 Two constraints that will silently degrade quality
+
+**Overlay eligibility is geometry-dependent.** There is no API to request a hardware plane —
+`IDXGIOutput3::CheckOverlaySupport` is a *query*; promotion is driver and DWM policy. What an app
+controls is eligibility: transform should be a positive scale-or-translation, and **downscaling is
+poison**. Chromium's comment names our exact case: downscaling forces "DWM to perform an extra BLT
+to avoid HW downscaling", which "prevents the use of hardware overlays especially for protected
+video". Keep protected visuals axis-aligned, avoid downscaling, be sparing with opacity and rounded
+corners. What DWM does with hardware-protected content it *cannot* promote is undocumented; Chromium
+treats it as a failure state.
+
+**Protected sessions can be invalidated at runtime.** `ID3D12ProtectedResourceSession` carries a
+status fence incremented whenever protected content becomes invalid — typically across sleep/resume,
+or by driver/hardware tamper protection. Our compositor must survive a protected surface going
+invalid: drop the visual, have the client re-establish. In a VM, suspend/resume and GPU reset are
+more frequent than on bare metal, so this is not an edge case.
+
+#### 11.7.6 Capture paths
+
+Desktop Duplication documents it explicitly:
+[`DXGI_OUTDUPL_FRAME_INFO.ProtectedContentMaskedOut`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ns-dxgi1_2-dxgi_outdupl_frame_info)
+— "Specifies whether the desktop image might contain protected content that **was already blacked
+out in the desktop image**." Note *already*: blanking happens upstream in DWM's capture composition.
+Windows.Graphics.Capture honours `SetWindowDisplayAffinity` but has **no equivalent status flag**, so
+a WGC consumer cannot tell content was blanked. Our `ext-image-copy-capture` implementation should
+therefore mark frames containing protected surfaces itself — Windows will not tell our clients.
+
+### 11.8 Revised verdict
+
+**Superseding §8.7.** Tier (b) was mis-scoped: what I described as "bypassing the compositor" is in
+fact *the* supported way a compositor handles protected content.
+
+| Tier | Status | Notes |
+|---|---|---|
+| **Software DRM** — Widevine L3, PlayReady SL150/SL2000 | **Works, both architectures** | Unchanged from §8. Licence-capped at 720p/1080p. |
+| **Hardware DRM — PlayReady SL3000, Windows-native client** | **Architecturally supported. Implementable.** | Requires Architecture A, the DComp handle path, an HWND for OPM, and the preconditions below. Not "contradictory" — that was my error. |
+| **Hardware DRM — Linux client** | **Impossible, for a precise reason** | Not the memory model: licence acquisition requires local hardware attestation that cannot be forwarded (§11.4). |
+| **Compositor-applied effects on protected surfaces** | **Impossible** | Requires sampling. Transforms via DWM remain available. |
+
+#### Environment preconditions — none of it is our code
+
+1. **A physical HDCP 2.2+ monitor on the passed-through GPU.** Not Looking Glass, not a relayed
+   framebuffer — no HDCP sink.
+2. **No virtual/indirect display active anywhere**, because of the least-capable-monitor rule (§8.5):
+   one dummy plug or IddCx display kills hardware DRM on *all* outputs.
+3. **A real vendor WDDM driver in the guest**, which full passthrough provides.
+4. **The adapter must not look emulated.** Chromium blocklists `0x0000`, `0xffff`, `0x15ad` (VMware)
+   and WARP; a passed-through NVIDIA/AMD/Intel ID is not on that list.
+5. **DirectComposition and GPU compositing enabled**; **Windows 10 20H1+**; **x86_64, not emulated
+   ARM64** (§11.10.5).
+6. **Whether MF's VM detection fires.** `MF_MEDIA_ENGINE_OPM_FAILED_VM` exists (§8.2) and I could not
+   establish whether full GPU passthrough avoids it. **This is the one remaining unknown that could
+   invalidate the whole tier, and it is empirically testable in an afternoon.**
+
+#### The honest summary
+
+**The memory-model objection is withdrawn.** Protected pixels never needed to cross the arena; the
+architecture that avoids it is documented, shipping in Chromium, and named in Microsoft's D3D12
+spec. Our compositor is a bridge that forwards handles and geometry, safe not because we are careful
+but because **the hardware never gives us an address we could leak.**
+
+**What remains blocked is narrower and better-defined than "contradictory":** a Linux client cannot
+hold an SL3000 licence, and no compositor-side engineering changes that. Everything else is
+implementation work with known APIs plus environment preconditions that are properties of the
+machine.
+
+**The plan-level consequence:** if protected 4K playback matters, it is a vote for Architecture A
+(mingw-native clients) against §9.1's recommendation to build B first — and note the irony that
+Architecture A is also where phase 1's Vulkan forwarder has the *least* value (§9.1's "logical
+tension"). These two goals genuinely pull apart. Decide deliberately rather than discovering it in
+month four.
+
+#### Staging, if pursued
+
+Slot after §9.3's stage 6 (the Win32 buffer protocol), because it shares the DComp infrastructure:
+
+| Step | Deliverable | Test |
+|---|---|---|
+| **P1** | Environment probe | `chrome://media-internals/#cdms` in the guest after a `requestMediaKeySystemAccess('com.microsoft.playready.recommendation.3000', …)`. Its status enum names the exact gate that closes. **Do this before writing any code** — a one-afternoon go/no-go on the entire tier. |
+| **P2** | `wp_win32_protected_surface` + typed handle transport | Client sends a DComp surface handle; compositor binds it and shows an *unprotected* test swapchain through the same path. |
+| **P3** | Protected flags + HWND/OPM wiring | `HW_PROTECTED \| DISPLAY_ONLY`, `SetWindowDisplayAffinity`, OPM window positioned via the screen-rect event. Verify `Present` succeeds. |
+| **P4** | Exclusion plumbing | Protected surfaces skipped by screencopy, thumbnails, effects; capture yields black/omitted, not a crash. |
+| **P5** | Real content | Protected playback at 4K in a mingw client, with resume-from-sleep session invalidation handled. |
+
+**If P1 fails, stop.** Everything after it is unreachable on this machine, and the software-DRM tier
+is what you get.
+
+### 11.9 The Vulkan and Linux picture
+
+#### 11.9.1 The API is shaped correctly; the platform binding is missing
+
+Vulkan's protected memory is a strict two-world partition — exactly the shape the model describes.
+The spec's guarantees, verbatim
+([Protected Memory Access Rules](https://docs.vulkan.org/spec/latest/chapters/memory.html)):
+
+> - **Protected device memory must never be visible to the host.**
+> - **Values written to unprotected device memory must not be a function of values from protected
+>   memory.**
+
+A protected image can be created, bound, sampled and composited by a protected-capable queue into a
+protected swapchain (`VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR`), and nothing can legally get back out.
+**This is a handles-only compositor design expressed natively in Vulkan.**
+
+Two constraints for any future protected pass: protected submissions **forbid queries and indirect
+draws/dispatches**, and implementations may support **far fewer simultaneous protected allocations**
+than unprotected ones. A GPU-driven, indirect-command compositor would need a simpler dedicated path.
+
+**What does not exist outside Android is any binding to a DRM system.** The registry contains exactly
+two protection-related extensions — `VK_EXT_pipeline_protected_access` and
+`VK_KHR_surface_protected_capabilities`. There is no `VK_EXT_protected_content` and no Vulkan↔CDM
+interop on any desktop platform. Importing a `HW_PROTECTED` D3D11 texture through
+`VK_KHR_external_memory_win32` is **unspecified** — no valid-usage statement authorises it and no
+`VkExternalMemory*` structure carries protection semantics; since D3D12 makes protectedness a
+property of a *session* with no Vulkan analogue, the handle alone cannot convey it. Treat as
+unusable rather than forbidden.
+
+#### 11.9.2 Android proves the model
+
+| Platform | `protectedMemory` |
+|---|---|
+| **Android** | **64.11 %** |
+| Windows | 4.10 % |
+| Linux | 2.38 % |
+
+Android settles what the 4.1 % figure could not: **the feature is real, shipping and mass-market —
+it is simply not plumbed into Windows desktop.** Android also has the complete end-to-end binding
+§8 said did not exist anywhere: `AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT` maps to
+`VK_IMAGE_CREATE_PROTECTED_BIT`, so MediaDrm secure decode allocates from a secure heap and Vulkan
+imports it as a protected image. Exactly this model, in production, on a billion devices.
+
+One trap: `VK_KHR_surface_protected_capabilities` shows ~51 % on Windows, but it is an *instance*
+extension that merely lets you ask the question and receive "no". Neither it nor
+`VK_EXT_pipeline_protected_access` indicates protected-memory support.
+
+#### 11.9.3 The surprise: Linux desktop is overtaking Windows desktop here
+
+The 2.38 % Linux figure is a **lagging indicator**:
+
+- **RADV now exposes `protectedMemory` backed by AMD TMZ** (Trusted Memory Zone), landing for Mesa
+  26.2 on supported Vega and Navi parts.
+- **ANV exposes it via Intel PXP** (Protected Xe Path), with explicit uAPI in the Xe driver.
+- **NVIDIA: nothing anywhere** (NVK has zero occurrences; the proprietary driver could not be
+  established).
+
+> **Linux desktop is acquiring Vulkan protected memory while Windows desktop still has none.**
+
+It does not rescue the Linux-client case, for the same reason as §11.4: the secure heap now exists
+with **nothing authorised to fill it.** Widevine L1 on Linux desktop remains effectively
+nonexistent — a protected buffer with no CDM permitted to put licensed content in it. The mirror
+image of Windows, which has the CDM and no Vulkan path.
+
+#### 11.9.4 The existing Wayland protocol is not a model for this
+
+`weston-content-protection` is the only Wayland protected-content protocol, was never promoted to
+wayland-protocols, and **its own description disclaims our use case**:
+
+> "This protocol is not intended for implementing Digital Rights Management on general (e.g.
+> Desktop) systems, and would only be useful for closed systems. **As the server is the one
+> responsible for implementing the content-protection, the client can only trust the
+> content-protection as much they can trust the server.**"
+
+That sentence is the precise articulation of why it is the wrong model. It makes the **compositor
+the enforcer** — asking the server to censor surfaces and manage link protection on the client's
+behalf — which is the design that requires trusting us. Our protocol should be the opposite shape:
+the client obtains protection from the platform, and hands us a handle we could not misuse if we
+tried.
+
+For contrast, Linux's KMS makes the same division structurally: the `Content Protection` connector
+property has an `ENABLED` value **only the driver may set** — userspace writing it gets `-EINVAL`.
+Userspace may request, never assert. That is the correct division of labour, and the one to mirror.
+
+### 11.10 The Chromium reference implementation
+
+Chromium is the existence proof: its GPU process is not DWM, not Microsoft-signed, and not in the
+Protected Environment, yet it composites PlayReady SL3000 content. Tracing its code settled three
+things, one of which is a protocol requirement I had missed entirely.
+
+#### 11.10.1 Signing: definitively not required — the proof is stronger than expected
+
+Chrome's `MediaFoundationCdm` runs in a utility process sandboxed as an **LPAC AppContainer** —
+*less* privileged than an ordinary desktop application — and it plays hardware DRM. From
+[`sandbox/policy/mojom/sandbox.mojom`](https://raw.githubusercontent.com/chromium/chromium/main/sandbox/policy/mojom/sandbox.mojom):
+
+```
+// Allows LPAC capabilities for the Windws Media Foundation CDM, including
+// internet and private network access, COM, Identity & others.
+[EnableIf=is_win] kMediaFoundationCdm,
+```
+
+*(the `Windws` typo is upstream's, quoted as-is)*
+
+Protection is requested by a single attribute, with no signing ceremony anywhere
+([`media/renderers/win/media_foundation_renderer.cc`](https://raw.githubusercontent.com/chromium/chromium/main/media/renderers/win/media_foundation_renderer.cc)):
+
+```cpp
+RETURN_IF_FAILED(
+    creation_attributes->SetUINT32(MF_MEDIA_ENGINE_CONTENT_PROTECTION_FLAGS,
+                                   MF_MEDIA_ENGINE_ENABLE_PROTECTED_CONTENT));
+```
+
+**Nothing in Chromium requests, checks, or possesses a Protected Environment signing certificate.**
+A low-privilege sandboxed process obtains hardware DRM by asking Media Foundation politely. This is
+the strongest possible confirmation of §11.4: the application is a *client* of the protected path,
+never a member of it — and neither our clients nor our compositor need be trusted.
+
+#### 11.10.2 The protected surface need not live in the process owning the HWND
+
+This was my main open question. Chromium answers it with three processes, none of them DWM, none
+signed:
+
+- **MediaFoundationService (LPAC utility)** — hosts the CDM and `IMFMediaEngine`, *produces* the
+  surface.
+- **GPU process** — owns the `IDCompositionDevice`, the DComp target bound to the browser HWND, and
+  the visual tree. *Binds* the handle, never reads it.
+- **Renderer** — holds a placeholder video frame with no pixels at all.
+
+They are joined solely by a duplicated `HANDLE` carried over IPC and bound with
+`CreateSurfaceFromHandle`. The producer side is:
+
+```cpp
+RETURN_IF_FAILED(media_engine_ex->EnableWindowlessSwapchainMode(true));
+...
+RETURN_IF_FAILED(media_engine_ex->GetVideoSwapchainHandle(surface_handle));
+```
+
+**Our compositor takes the GPU-process role and the client takes the producer role, with the handle
+crossing over Wayland** via the §2 typed-handle transport, with a new `Protected` tag. The GPU-side
+backing is scanout-only and write-only by construction, and Chromium's own comment notes the texture
+"shouldn't be accessed via GL at all" — the only representation it produces is an overlay. **Our
+incapacity is enforced by the object model, not by our discipline.**
+
+#### 11.10.3 The requirement I missed: the compositor must feed screen-space geometry *back* to the client
+
+This inverts the usual Wayland direction and must be in the protocol from the start.
+
+Media Foundation renders into the windowless swapchain **at a size and position it is told**. It has
+no idea where the compositor placed the visual. Chromium therefore computes the screen-space rect
+and pushes it back to the producer
+([`gpu/ipc/service/dcomp_texture_win.cc`](https://raw.githubusercontent.com/chromium/chromium/main/gpu/ipc/service/dcomp_texture_win.cc)):
+
+```cpp
+output_rect = window_relative_rect_;
+output_rect.set_x(window_relative_rect_.x() + parent_window_rect_.x());
+output_rect.set_y(window_relative_rect_.y() + parent_window_rect_.y());
+...
+client_->OnOutputRectChange(output_rect);
+```
+
+which the media process applies via:
+
+```cpp
+RECT dest_rect = {0, 0, rect_size.width(), rect_size.height()};
+RETURN_IF_FAILED(mf_media_engine_ex->UpdateVideoStream(
+    /*pSrc=*/nullptr, &dest_rect, /*pBorderClr=*/nullptr));
+```
+
+The rect is not merely cosmetic. Chromium's comment records that it must be set with "an non-empty
+destination rectangle. Otherwise, the next `EnableWindowlessSwapchainMode()` call to MFMediaEngine
+will skip the creation of the DCOMP surface handle." **A zero or stale rect means no surface at
+all.**
+
+**Protocol consequence:** `wp_win32_protected_surface` needs a compositor→client event carrying the
+surface's **screen-space rectangle** — not surface-local coordinates, not a scale factor, but where
+it landed on the desktop. Wayland deliberately never tells clients their global position; this is a
+documented exception we must carve out, and it is required for correct resolution, for surface
+creation at all, and for positioning the OPM window (§11.10.4).
+
+Expect the resize to lag: the round trip is asynchronous and cross-process, so protected video will
+visibly trail the window during an interactive resize. Chromium accepts this; so must we.
+
+*One caveat on this subsection:* on re-verification I confirmed the rect computation, the client
+notification and the non-empty-destination-rectangle comment directly from source. A further
+rationale I had recorded earlier — that the rect also drives GPU adapter selection on multi-adapter
+systems — I could **not** re-confirm in the same file. It is plausible and consistent with the
+virtual-window mechanism below, but treat it as unverified.
+
+#### 11.10.4 The OPM window — the client can own it, which lightens our obligation
+
+§11.2 concluded a protected surface needs a real HWND for OPM. Chromium shows the lighter form: it
+creates a **virtual, never-visible window** purely for that purpose —
+
+```cpp
+// To enable OPM
+// (https://docs.microsoft.com/en-us/windows/win32/medfound/output-protection-manager)
+// protection for video playback, We call CreateWindowEx() to get a window
+// and pass it to MFMediaEngine as an attribute.
+
+if (virtual_video_window_) {
+    RETURN_IF_FAILED(creation_attributes->SetUINT64(
+        MF_MEDIA_ENGINE_OPM_HWND,
+        reinterpret_cast<uint64_t>(virtual_video_window_)));
+}
+```
+
+— and positions it at the target screen rect. So **the client can own its own hidden OPM window**,
+provided we tell it the screen rect (§11.10.3). We need not hand out our HWNDs.
+
+This also narrows an obligation I flagged earlier. The `DXGI_SWAP_CHAIN_FLAG` docs say that for
+`DISPLAY_ONLY` "windowed swap chains where another process created the HWND, the owner of the HWND
+must use the `SetWindowDisplayAffinity` function appropriately in order to allow calls to
+Present/Present1 to succeed." In the composition-surface (windowless) design there is no HWND
+swapchain, so that clause likely does not apply — but **I could not establish this definitively**,
+and calling `SetWindowDisplayAffinity` on our toplevel is harmless and cheap. Do it.
+
+#### 11.10.5 Additional preconditions, and a clean statement of fail-closed
+
+Chromium's Windows feature checks add constraints §8 did not list: **Windows 10 20H1 or later**,
+**x86_64 only**, and **not emulated on ARM64**. The full gate list is GPU compositing enabled,
+DirectComposition present, adapter not software-emulated, not driver-blocklisted, accelerated video
+decode enabled — each with its own named status enum, which is why the
+`chrome://media-internals/#cdms` probe in §11.8's P1 is so informative.
+
+And the fail-closed property, stated by the reference implementation's behaviour: **if Media
+Foundation decides the output is not protectable — HDCP down, capture detected, OPM refused — it
+blanks the surface and the compositor simply shows nothing.** We are not consulted, we cannot
+override it, and there is no path by which the content instead arrives in a buffer we can read. That
+is the property the whole approach rests on, and it is enforced by the producer and the platform,
+not by us.

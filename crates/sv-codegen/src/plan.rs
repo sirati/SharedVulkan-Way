@@ -700,11 +700,28 @@ fn enum_values(model: &Model, e: &vk_registry::EnumType) -> Vec<(String, i64)> {
         direct.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     // Aliases become ordinary constants with the target's value, so that a name
     // the application may legitimately use resolves without a second table.
+    //
+    // The chain is followed rather than stepped once, because the registry has
+    // aliases *of* aliases: `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTER_FEATURES_KHR`
+    // names `…_VARIABLE_POINTERS_FEATURES_KHR`, which in turn names the 1.1 core
+    // `…_VARIABLE_POINTERS_FEATURES`. Resolving one hop dropped that name from
+    // the generated table silently — a constant an application may legitimately
+    // pass, missing, with nothing to notice it. Found by the `vulkan_core.h`
+    // cross-check (2026-08-12), which is R8's rule doing its job: only an
+    // external source says what we *should* have emitted.
     for v in &e.values {
-        if let Some(target) = &v.alias_of
-            && let Some(value) = direct.get(target.as_str()) {
+        let Some(first) = &v.alias_of else { continue };
+        let mut target = first.as_str();
+        for _ in 0..8 {
+            if let Some(value) = direct.get(target) {
                 out.insert(v.name.clone(), *value);
+                break;
             }
+            match e.values.iter().find(|x| x.name == target).and_then(|x| x.alias_of.as_deref()) {
+                Some(next) => target = next,
+                None => break,
+            }
+        }
     }
     let _ = model;
     out.into_iter().collect()
@@ -940,6 +957,43 @@ mod tests {
         assert_eq!(Scalar::Enum("VkFormat".into()).wire_size(), Some(4));
         assert_eq!(Scalar::Bitmask64("VkPipelineStageFlags2".into()).wire_size(), Some(8));
         assert_eq!(Scalar::Struct("VkExtent2D".into()).wire_size(), None);
+    }
+
+    /// An alias of an alias still names a number.
+    ///
+    /// The registry has them: `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTER_FEATURES_KHR`
+    /// names `…_VARIABLE_POINTERS_FEATURES_KHR`, which names the 1.1 core
+    /// `…_VARIABLE_POINTERS_FEATURES`. Stepping the chain once dropped the name
+    /// from the generated table without a word — found by the `vulkan_core.h`
+    /// cross-check, which is the only thing that could have: nothing internal
+    /// knows what we *failed* to emit.
+    #[test]
+    fn an_alias_of_an_alias_resolves() {
+        use vk_registry::{EnumType, EnumValue};
+        let v = |name: &str, value: i64, alias: Option<&str>| EnumValue {
+            name: name.into(),
+            value,
+            provenance: None,
+            alias_of: alias.map(str::to_string),
+            deprecated: false,
+        };
+        let e = EnumType {
+            name: "VkStructureType".into(),
+            bit_width: 32,
+            values: vec![
+                v("VK_ONE", 1_000_120_000, None),
+                v("VK_ONE_KHR", 0, Some("VK_ONE")),
+                v("VK_LEGACY_KHR", 0, Some("VK_ONE_KHR")),
+            ],
+        };
+        let out: BTreeMap<String, i64> = enum_values(&Model::default(), &e).into_iter().collect();
+        assert_eq!(out.get("VK_ONE"), Some(&1_000_120_000));
+        assert_eq!(out.get("VK_ONE_KHR"), Some(&1_000_120_000));
+        assert_eq!(
+            out.get("VK_LEGACY_KHR"),
+            Some(&1_000_120_000),
+            "an alias whose target is itself an alias must still resolve"
+        );
     }
 
     #[test]
