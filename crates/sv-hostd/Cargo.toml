@@ -10,3 +10,15 @@ description = "App-side daemon: owns the extent's descriptor, hands the fd and t
 sv-transport = { workspace = true }
 sv-arena = { workspace = true }
 sv-wire = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The stamped page record, defined once and shared with the guest half. design.md
+# §12 calls `arena-record` "the stamped page record, defined **once** so a match
+# cannot be an artefact of the two sides disagreeing about a field offset" — and
+# `Mode::Qemu` is precisely the configuration where the two sides are different
+# programs on different operating systems, so a second copy of these offsets is
+# the one thing that must not exist.
+arena-record = { path = "../arena-record" }
+# Stitching a scattered extent into one contiguous view is `mmap(MAP_FIXED)` per
+# run, which has no safe spelling.
+libc = { workspace = true }

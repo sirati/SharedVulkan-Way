@@ -17,6 +17,7 @@ members = [
   "crates/sv-arena",
   "crates/sv-hostd",
   "crates/sv-gpu-server",
+  "crates/dmabuf-probe",
 ]
 
 [workspace.package]

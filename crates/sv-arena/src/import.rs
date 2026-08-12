@@ -84,8 +84,19 @@ pub enum BackingKind {
 /// to satisfy whatever this returns, and it has to know before it commits.
 pub fn path_for_driver(driver: &str) -> BackingKind {
     match driver {
-        // Measured on this machine: both refuse a shared host pointer.
-        "radv" | "amdgpu" | "nvidia" => BackingKind::DmaBuf,
+        // **RADV refuses every shared mapping, whatever backs it.** libdrm
+        // passes `AMDGPU_GEM_USERPTR_ANONONLY` unconditionally, so this is
+        // structural rather than incidental and no choice of backing helps.
+        // udmabuf is the only route (`measured-gpu-side.md`, "The reverse
+        // direction").
+        "radv" | "amdgpu" => BackingKind::DmaBuf,
+        // **NVIDIA takes a shared mapping of shmem** — measured 2026-08-12,
+        // `memoryTypeBits = 0xc`, coherent in both directions, at 4 MiB and
+        // 128 MiB. The earlier "NVIDIA refuses MAP_SHARED" result was measured
+        // against a file on ext4; the boundary is shmem versus page cache, and
+        // the arena is a memfd, which is shmem. So the discrete card can serve
+        // a guest with no udmabuf and no group change.
+        "nvidia" => BackingKind::HostPointer,
         "lavapipe" | "llvmpipe" | "swiftshader" => BackingKind::Noop,
         // The measured-working target, and the conservative default: a driver
         // we have not tried gets the path that is known to work somewhere real
@@ -184,7 +195,10 @@ mod tests {
     fn the_measured_drivers_get_the_path_that_works_for_them() {
         // The correction to design.md §5.4's table, measured on this machine.
         assert_eq!(path_for_driver("radv"), BackingKind::DmaBuf);
-        assert_eq!(path_for_driver("nvidia"), BackingKind::DmaBuf);
+        // Corrected 2026-08-12: NVIDIA imports a shared mapping of *shmem*, and
+        // the arena is a memfd. What it refuses is a file on a real filesystem,
+        // which is what the contradicted measurement used.
+        assert_eq!(path_for_driver("nvidia"), BackingKind::HostPointer);
         assert_eq!(path_for_driver("lavapipe"), BackingKind::Noop);
         // The Windows/Intel target, and the default for anything untried.
         assert_eq!(path_for_driver("intel"), BackingKind::HostPointer);

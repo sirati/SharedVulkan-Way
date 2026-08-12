@@ -953,3 +953,212 @@ So these remain open:
 To take the reading, publish the binaries and run
 `scripts/gpu-workload-run.sh --agent <socket> --pages 16384 --mode large`, then
 the same with `--concurrent`, then with `--mode locked`.
+
+---
+
+# The reading was taken: the Intel iGPU computed against arena memory
+
+Measured 2026-08-12 on `testhost`, 64 MiB large-page window, the run the
+section above says is needed. **R15 is retired and §14 item 1 is closed.**
+
+```
+guest : device: Intel(R) UHD Graphics — queue family 0, VK_EXT_external_memory_host: yes
+guest : imported 64 MiB as VkDeviceMemory: memoryTypeBits=0x6, using type 1
+guest : bind: buffer memoryTypeBits=0x7 (import permitted 0x6), alignment 64
+guest : bind: vkBindBufferMemory OK at offset 0 and at offset 33554432
+guest : submit -> fence signalled in 3.265 ms
+guest : payload words checked 7864320, correct 7864320, wrong 0, untouched 0
+guest : page headers intact 16384/16384
+host  : gpuverify -> 7864320/7864320 as the shader required, headers 8192/8192
+        VERDICT: the Linux host can read what the GPU computed
+```
+
+Read the last two lines together. The input half was filled **by a Linux process
+through QEMU's memfd**, the shader read it and wrote `transform(in[i], i)` into
+the output half, the guest checked it, and then a process on the other side of
+the hypervisor checked the same bytes through different page tables. The
+transform depends on the value *and* the index, so a GPU that read a stale page,
+the wrong page, or the right page at the wrong offset produces an unrelated
+number rather than a nearly-right one.
+
+**Nothing about the arena is unproven at the memory level any more.** Step 0
+proved the driver accepts our pages; this proves the GPU executes against them.
+
+## The performance answer, which is the encouraging one
+
+Same run, `--iters 10`, over 7864320 payload words read+write:
+
+| | median | with the 1.347 ms empty-submit floor removed |
+|---|---|---|
+| **imported host pointer (the arena)** | 3.262 ms | **34.08 GB/s** |
+| driver allocation, same memory type (1) | 3.732 ms | 33.56 GB/s |
+| driver allocation, device-local (type 0) | 3.646 ms | 29.02 GB/s |
+
+**The import costs nothing: 0.991× against a driver allocation of the same
+type.** That matches the AMD APU proxy (0.935×) and the NVIDIA one (1.047×)
+almost exactly, so the "imported memory is a fraction slower" shape holds on the
+target hardware and not only on the analogues.
+
+The third row is the surprise and it is worth not skipping: on this unified iGPU
+**device-local memory is *slower* than the arena**, 29.02 GB/s against 34.08.
+There is one heap and every type is `DEVICE_LOCAL`; type 0 differs from type 1
+only in not being host-visible, and being uncached for the CPU evidently costs
+the GPU nothing while costing this benchmark's access pattern something. The
+practical consequence is that on this machine there is no memory the arena is
+giving up performance to, which removes the last reason to want a staging path
+in v1.
+
+`submit+fence with an empty dispatch: min 1.347 ms, median 1.445 ms` — an order
+of magnitude worse than the RTX 5090's 0.051 ms and twice RADV's 0.651 ms. That
+is the floor a forwarding design has to amortise, and it is a property of this
+driver rather than of the forwarding.
+
+## Four harness faults found on the way, all of which fake a negative result
+
+Recorded because the section above was written against a harness that had never
+run end to end, and every one of these presents as the arena failing.
+
+1. **`gpu-workload-run.sh`'s root helper ran the command unprivileged.** It was
+   `{ $1; } | ~/rootc`, which executes `$1` as the user and feeds *its output*
+   to root. `/proc/<qemu>/fd/*` therefore came back empty and every redirect
+   into `/srv/winshare` failed with `EACCES`, both silently.
+2. **`rootc` truncates and kills anything slower than half a second.** It pipes
+   the script into `socat`, which sees EOF and closes the connection after its
+   default 0.5 s, SIGHUPping the root shell and its children. Measured:
+   `date; sleep 3; date; echo survived` prints the first date and nothing else.
+   **The ~2 s arena scan was killed part-way on every run**, leaving an empty
+   `map.txt`, a `gpufill` that wrote nothing, and a guest reporting "0 of
+   7864320 words". The working pattern is detach with `nohup setsid`, redirect
+   to a file, poll for a completion marker, fetch afterwards — `pl.sh rootlong`.
+3. **A glibc binary built on another NixOS machine does not run here.** Its
+   `INTERP` names a store path that does not exist on the target and the error
+   is `cannot execute: required file not found`, which reads like a missing
+   binary. The fix is a **static musl build**; `flake.nix` now carries
+   `x86_64-unknown-linux-musl` for exactly this, and it is what makes `sv-hostd`
+   deployable to the target without putting a toolchain on somebody's laptop.
+4. **Windows OpenSSH kills a `nohup`'d background process when the channel
+   closes.** The command runs under a job object and the job is torn down; msys
+   `nohup` sets a signal disposition, which a job-object kill does not respect.
+   The symptom is `guest.log` created by the redirect and left at zero bytes.
+   Hold the ssh channel open for the run instead.
+
+Two of these produced *exactly* the "0 of N words" shape that the false negative
+already recorded in this document produced, and for four different reasons. A
+count that comes out at zero really does deserve the same suspicion as one that
+comes out perfect.
+
+---
+
+# `sv-hostd`'s QEMU mode, measured against the live guest
+
+Built and run 2026-08-12. This is design.md §13 step 7's host half: discover
+QEMU, read `info mtree -f` over QMP into a region table, locate the guest's
+extent by content, coalesce, and stitch it into one virtually contiguous view.
+
+```
+guest RAM in the flat view: 13311 MiB in 4 alias(es)
+  gpa 0x000000000000..0x0000000bffff -> offset 0x000000000000
+  gpa 0x000000100000..0x000000102fff -> offset 0x000000100000
+  gpa 0x00000010f000..0x0000bfffffff -> offset 0x00000010f000
+  gpa 0x000100000000..0x00037fffffff -> offset 0x0000c0000000
+located 16384/16384 pages in 2.20s (swept 13312 MiB; 0 other-run, 0 outside RAM)
+coalesced into 29 run(s) covering 64 MiB — 565.0 pages per run
+  first run: offset 0x00013ca00000 (gpa 0x00017ca00000), 2048 KiB
+stitched 64 MiB into one view with 29 mmap(MAP_FIXED) call(s) in 95.74µs
+verify: 16384/16384 pages of the stitched view carry their own extent index
+```
+
+Four things this settles.
+
+**The region table is read, and it is the measured one.** Four RAM aliases,
+including the 3 GiB split and the 1 GiB offset above 4 GiB, discovered rather
+than compiled in — the backend's *id* comes from `query-memdev`, its descriptor
+from the `/proc/<pid>/fd` link, and QEMU's pid from a cmdline match that refuses
+rather than guesses if two match.
+
+**Guest RAM is 13311 MiB, not 13312, and the missing 311296 bytes are exactly
+the ROM window plus the twelve SynIC pages.** 76 pages of the backing object are
+not memory the guest can see. `arena-host`, which sweeps the whole file, would
+accept a stamp found in them; `sv-hostd` checks every hit against the region
+table and counts the rejects. On this run the count was 0, which is what it
+should be — but it is now a number rather than an assumption.
+
+**The scan cost is 2.20 s**, against the 1.8–2.32 s measured for `arena-host`.
+Same order, same shape, and still flat in arena size because it is linear in
+guest RAM.
+
+**Stitching 64 MiB of large-page memory took 29 `mmap` calls and 95.74 µs.** The
+run count is the fragmentation figure this document measured at **22** for the
+same window; 29 on this occasion. That is the same allocator on a guest with
+three more days of uptime, so treat 22 as one sample of a small number rather
+than a constant. Either way it is two orders of magnitude below the 1471 of the
+4 KiB path, and the attach is *microseconds* — the cost of the extent is
+entirely in the locate.
+
+**`verify` is the §1 invariant, asserted over real guest memory.** Every one of
+the 16384 pages of the stitched view carries the page index the guest stamped
+into it, so extent offset *n* holds the page the guest called *n* — which is the
+property everything above the attacher is built on, and which a stitcher that
+mapped the right pages in the wrong order would fail while still looking like a
+working arena to any test that does not read the index.
+
+---
+
+# The reverse direction: two Linux drivers, and only one needs a privilege
+
+Measured 2026-08-12 on the build machine with `crates/dmabuf-probe`. The question
+is the *conventional* topology — GPU side on the host, app side inside the VM, a
+guest borrowing the host's GPUs with no passthrough. The arena must still be
+guest RAM, because an fd cannot cross into the guest, so the importing driver is
+NVIDIA or RADV rather than Intel-on-Windows.
+
+The premise everybody was working from is in this document already: "two drivers
+refuse a shared mapping", RADV with `INVALID_EXTERNAL_HANDLE` and NVIDIA with
+`OUT_OF_DEVICE_MEMORY`. From that, `sv_arena::import` concluded that a Linux GPU
+side needs `/dev/udmabuf`, which is `root:kvm` 0660 and unreachable without a
+group change.
+
+**Half of that conclusion is wrong, and the variable is which kind of shared
+memory it is.** Four rows per device, 4 MiB and 128 MiB, identical results:
+
+| backing | NVIDIA RTX 5090 | RADV (9950X3D iGPU) | lavapipe |
+|---|---|---|---|
+| anonymous private | imported, `0xc` | imported, `0x20` | imported |
+| **`MAP_SHARED` of a memfd** | **imported, `0xc`, coherent both ways** | refused, `INVALID_EXTERNAL_HANDLE` | imported |
+| `MAP_SHARED` of a tmpfs file | **imported** | refused | imported |
+| `MAP_SHARED` of an ext4 file | refused, `OUT_OF_DEVICE_MEMORY` | refused | imported |
+| the memfd handed to `VkImportMemoryFdInfoKHR` | refused, no memory type | refused | imported |
+
+The earlier measurement used `gpu-probe --file /tmp/window`, and `/tmp` here is
+ext4. **The arena is a memfd**, which is shmem — so the recorded refusal was
+measured against a backing the arena does not use.
+
+Two consequences, and they differ per vendor:
+
+- **NVIDIA can serve a guest with no privilege change at all.** It imports a
+  shared mapping of shmem — memfd or tmpfs, which is exactly what QEMU's
+  `memory-backend-memfd` is — as `VK_EXT_external_memory_host`, with bytes
+  verified in both directions. No udmabuf, no `kvm` group, no dma-buf.
+  `sv_arena::import::path_for_driver` currently sends `"nvidia"` to
+  `BackingKind::DmaBuf` and that is now wrong.
+- **RADV still cannot**, and the reason is structural rather than incidental:
+  libdrm passes `AMDGPU_GEM_USERPTR_ANONONLY` unconditionally, so *any* shared
+  mapping is refused whatever it is backed by. udmabuf remains the only route,
+  and it remains blocked: `/dev/udmabuf` is `root:kvm` 0660 and this account is
+  not in `kvm`, so `open` gives `EACCES` (13).
+
+**What to run once `sirati` is in `kvm`**, unchanged, to close the RADV half:
+
+```
+cargo build -p dmabuf-probe --release
+./target/release/dmabuf-probe --size-mib 128
+```
+
+The probe already creates the memfd with `MFD_ALLOW_SEALING`, seals it with
+`F_SEAL_SHRINK`, and calls `UDMABUF_CREATE`; the only thing that fails today is
+the `open`. It prints the `fd(udmabuf)` row per device and says whether the
+question was answered or merely blocked, so a single run settles it.
+
+Worth stating either way: the group change buys **RADV and nothing else**. If
+the reverse direction only ever has to serve the discrete card, it is not
+needed.

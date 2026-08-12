@@ -49,6 +49,7 @@ pub mod control;
 pub mod park;
 pub mod region;
 pub mod ring;
+pub mod stream;
 
 use core::fmt;
 

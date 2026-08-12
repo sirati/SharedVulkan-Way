@@ -38,7 +38,17 @@
         # The client and the server each have to build for the opposite OS
         # from the one they run on, because either end may be Linux or
         # Windows. Cross-compiling both from Linux keeps one build machine.
-        targets = ["x86_64-pc-windows-gnu"];
+        # musl is here for one reason, and it is not portability in the abstract:
+        # `arena-host` and `sv-hostd` run on **testhost**, whose nix store is
+        # not this machine's. A glibc binary built here names an interpreter
+        # under a store path that does not exist there, and the only symptom is
+        # `cannot execute: required file not found` — which reads like a missing
+        # binary rather than a missing loader, and cost a run of the GPU
+        # experiment to diagnose. A statically linked musl build has no
+        # interpreter and no store path in it at all, so it runs wherever it is
+        # copied. It is also what makes the app side deployable to the target at
+        # all without putting a Rust toolchain on somebody's daily laptop.
+        targets = ["x86_64-pc-windows-gnu" "x86_64-unknown-linux-musl"];
       };
       # Miri needs nightly, and nothing else here does. Keeping it in a separate
       # shell means the default shell stays on the pinned stable toolchain —

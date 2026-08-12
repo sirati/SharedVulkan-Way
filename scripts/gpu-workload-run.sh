@@ -89,12 +89,68 @@ if [ -z "$KEY" ]; then
 fi
 SSH_GUEST=(ssh -o IdentityAgent="$AGENT" -o IdentitiesOnly=yes -i "$KEY" -o BatchMode=yes)
 
+# One run at a time, enforced rather than assumed.
+#
+# Two copies of this script racing is not a theoretical worry: the rendezvous is
+# a directory of files with fixed names, so the second copy overwrites
+# `host-gpu-fill.txt` with *its* stamp while the first is still waiting to
+# verify against its own. The guest then reports "0 of 7864320 words" and the
+# run looks like the arena failing, when what failed was the harness. That
+# happened on the first real run of this script and it is exactly the shape of
+# the false negative already recorded in measured-gpu-side.md — a number that
+# comes out at zero deserving the same suspicion as one that comes out perfect.
+exec 9>/tmp/.gpu-workload-run.lock
+flock -n 9 || { echo "another gpu-workload-run.sh is already running"; exit 1; }
+
 say() { echo "[$(date +%H:%M:%S)] $*"; }
+
+# The guest's stdout comes back over the held-open ssh channel, so it lands here
+# rather than in a file inside the guest.
+GUESTLOG=${GUESTLOG:-/tmp/gpu-workload-guest.log}
+: > "$GUESTLOG"
 
 # Root on the host is reached by piping into ~/rootc, and every such call has to
 # set PATH first because it starts from nothing.
-hroot() { "${SSH_HOST[@]}" "$HOST" "export PATH=/run/current-system/sw/bin:/run/wrappers/bin; { $1; } | ~/rootc"; }
+# The script goes to `rootc` on *stdin*, not the output of running it as the
+# user. Writing it the other way round — `{ $1; } | ~/rootc` — reads like the
+# same thing and is not: it runs the command unprivileged and feeds whatever it
+# printed to root, so `/proc/<qemu>/fd/*` comes back empty and a redirect into
+# /srv/winshare fails with EACCES, both silently. It was that way until the
+# first real run of this script, which found it immediately.
+hroot() {
+  # …and the script is piped in rather than heredoc'd inside the ssh argument,
+  # so that `$p` and `$(readlink …)` in the caller's script are evaluated by the
+  # root shell that will run them and not by this one.
+  { printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n'
+    printf '%s\n' "$1"
+  } | "${SSH_HOST[@]}" "$HOST" "export PATH=/run/current-system/sw/bin:/run/wrappers/bin; ~/rootc"
+}
 huser() { "${SSH_HOST[@]}" "$HOST" "export PATH=/run/current-system/sw/bin:/run/wrappers/bin; $1"; }
+
+# `hroot` is only good for commands that finish in under half a second, and the
+# way it fails is silent. `rootc` pipes the script into socat; once the script
+# has been sent socat sees EOF and closes the connection after its default 0.5 s,
+# which SIGHUPs the root shell and every child. Measured:
+#
+#     hroot 'date; sleep 3; date; echo survived'   -> prints the first date only
+#
+# The ~2 s arena scan is therefore killed part-way *every time*, leaving an empty
+# `map.txt`, a `gpufill` that writes nothing, and a guest that reports "0 of
+# 7864320 words" — which reads exactly like the arena not working. Every
+# arena-host step below goes through `hrootl` instead: detach with nohup,
+# redirect to a file, poll for a completion marker, fetch the output afterwards.
+hrootl() {
+  local tag=$1; shift
+  hroot "rm -f /tmp/sv-$tag.log /tmp/sv-$tag.rc; nohup setsid bash -c '{ $*; } > /tmp/sv-$tag.log 2>&1; echo \$? > /tmp/sv-$tag.rc' > /dev/null 2>&1 < /dev/null &" > /dev/null
+  local rc=""
+  for _ in $(seq 1 600); do
+    rc=$(hroot "cat /tmp/sv-$tag.rc 2>/dev/null" | tr -d '\r' | head -1)
+    [ -n "$rc" ] && break
+    sleep 1
+  done
+  hroot "cat /tmp/sv-$tag.log"
+  return "${rc:-1}"
+}
 
 # ---------------------------------------------------------------------------
 say "finding QEMU's memory-backend-memfd"
@@ -104,7 +160,11 @@ say "finding QEMU's memory-backend-memfd"
 FD=$(hroot 'p=$(pgrep -f "qemu-system-x86_64.*windows" | head -1); \
   for f in /proc/$p/fd/*; do \
     case "$(readlink $f)" in *memfd:memory-backend-memfd*) echo "$f"; break;; esac; \
-  done' | tr -d '\r' | tail -1)
+  done' | tr -d '\r' | grep -m1 '^/proc/')
+# `grep`, not `tail -1`: `rootc` prints the remote exit code on its own line and
+# strips it again, which leaves a trailing empty line, so the last line of any
+# `rootc` output is blank. `tail -1` therefore returned "" for a lookup that had
+# in fact succeeded.
 [ -n "$FD" ] || { echo "could not find the memfd — is the VM running?"; exit 1; }
 say "memfd is $FD"
 
@@ -117,14 +177,21 @@ hroot "rm -f $SHARE/guest-status.txt $SHARE/guest-gpu.txt $SHARE/host-gpu-fill.t
 say "starting gpu-probe in the guest ($PAGES pages, mode $MODE)"
 GARGS="--workdir $GUEST_WORKDIR --pages $PAGES --mode $MODE --iters $ITERS"
 [ "$CONCURRENT" = 1 ] && GARGS="$GARGS --concurrent"
-# Detached, because the guest half waits for us between phases and an ssh
-# session that dies would take it with it. `< /dev/null` matters as much as the
-# nohup: a child still holding the session's stdin keeps it open, and ssh then
-# refuses to return.
+# The ssh session is **held open for the whole run**, in the background of this
+# script, rather than detaching the probe with `nohup … &` and returning.
+#
+# Detaching was tried first and does not work here. Windows OpenSSH runs the
+# command under a job object and tears the job down when the channel closes;
+# msys `nohup` sets a signal disposition, which is not what a job-object kill
+# respects. The observable symptom is exactly what it looks like when the probe
+# crashes on startup: `guest.log` is created by the redirect and stays zero
+# bytes, and nothing is ever in `tasklist`. Holding the channel open costs one
+# idle ssh connection and removes the whole class of problem.
 "${SSH_GUEST[@]}" "$GUEST" \
   "export MSYS_NO_PATHCONV=1; cd /z/probe 2>/dev/null || cd '$GUEST_WORKDIR'; \
-   nohup ./gpu-probe.exe $GARGS > guest.log 2>&1 < /dev/null &" \
-  >/dev/null 2>&1 &
+   ./gpu-probe.exe $GARGS 2>&1" </dev/null > "$GUESTLOG" 2>&1 &
+GUEST_SSH_PID=$!
+trap 'kill $GUEST_SSH_PID 2>/dev/null' EXIT
 
 say "waiting for guest-status.txt"
 for _ in $(seq 1 120); do
@@ -138,12 +205,24 @@ huser "cat $SHARE/guest-status.txt | head -8"
 
 # ---------------------------------------------------------------------------
 say "locating the guest's pages in the memfd (this reads all of guest RAM, ~2 s)"
-hroot "/root/arena-host scan --fd $FD --run $RUN --out $SHARE/map.txt 2>&1 | \
-       grep -E 'located|contiguous|note:'"
+# Unfiltered. Filtering the scan's output through `grep -E 'located|…'` hides
+# the case that actually happened on the first real run: `arena-host` would not
+# execute at all — a glibc binary built on another NixOS machine names an
+# interpreter under a store path that does not exist here, and the error is
+# `cannot execute: required file not found`. The grep swallowed it, `map.txt`
+# was never written, `gpufill` wrote nothing, and the guest reported "0 of
+# 7864320 words", which reads like the arena failing. Print what the tool says.
+hrootl scan "/root/arena-host scan --fd $FD --run $RUN --out $SHARE/map.txt"
+# And check the artefact rather than the exit status, because every step after
+# this one silently does nothing without it.
+PAGES_MAPPED=$(huser "grep -c . $SHARE/map.txt 2>/dev/null" | tr -d '\r' | head -1)
+[ "${PAGES_MAPPED:-0}" -gt 0 ] 2>/dev/null || {
+  echo "the scan produced no page map — nothing below this point would measure anything"; exit 1; }
+say "map.txt has $PAGES_MAPPED lines"
 
 STAMP=$(printf '%016x' $(( (RANDOM<<48) ^ (RANDOM<<32) ^ (RANDOM<<16) ^ RANDOM )))
 say "host fills the input half, stamp=$STAMP"
-hroot "/root/arena-host gpufill --fd $FD --map $SHARE/map.txt --stamp $STAMP 2>&1 | grep gpufill"
+hrootl gpufill "/root/arena-host gpufill --fd $FD --map $SHARE/map.txt --stamp $STAMP"
 hroot "echo stamp=$STAMP > $SHARE/host-gpu-fill.txt"
 
 # ---------------------------------------------------------------------------
@@ -155,8 +234,7 @@ done
 huser "cat $SHARE/guest-gpu.txt" || { echo "no guest-gpu.txt — see the guest log"; }
 
 say "the Linux host now checks the same bytes through the memfd, independently"
-hroot "/root/arena-host gpuverify --fd $FD --map $SHARE/map.txt --stamp $STAMP --run $RUN 2>&1 | \
-       grep -v '^memfd'"
+hrootl gpuverify "/root/arena-host gpuverify --fd $FD --map $SHARE/map.txt --stamp $STAMP --run $RUN"
 
 # ---------------------------------------------------------------------------
 if [ "$CONCURRENT" = 1 ]; then
@@ -169,8 +247,8 @@ if [ "$CONCURRENT" = 1 ]; then
   B=$(printf '%016x' $(( (RANDOM<<32) ^ RANDOM ^ 0xB000000 )))
   say "host churns the input between $A and $B for 10 s while the GPU reads it"
   hroot "{ echo stampa=$A; echo stampb=$B; echo seconds=10; } > $SHARE/host-churn.txt"
-  hroot "/root/arena-host gpuchurn --fd $FD --map $SHARE/map.txt --stampa $A --stampb $B \
-         --seconds 10 2>&1 | grep -E 'gpuchurn|WARNING'"
+  hrootl gpuchurn "/root/arena-host gpuchurn --fd $FD --map $SHARE/map.txt --stampa $A --stampb $B \
+         --seconds 10"
   for _ in $(seq 1 60); do
     huser "test -s $SHARE/guest-churn-done.txt" && break
     sleep 1
@@ -180,8 +258,11 @@ fi
 
 hroot "echo done=1 > $SHARE/host-done.txt"
 say "waiting for the guest to exit and release the window"
-sleep 6
+# Wait on the process rather than on a fixed sleep: the window is 64 MiB of
+# somebody's locked RAM and the only thing that gives it back is the probe
+# exiting, so it is worth knowing that it did.
+wait $GUEST_SSH_PID
+trap - EXIT
 say "----- the guest's log -----"
-huser "cat $SHARE/guest.log 2>/dev/null" || \
-  "${SSH_GUEST[@]}" "$GUEST" "cat /z/probe/guest.log" 2>/dev/null
+cat "$GUESTLOG"
 say "done"

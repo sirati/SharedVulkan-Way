@@ -18,12 +18,16 @@
 //!   there is no hypervisor to hide the layout. The extent is contiguous in the
 //!   file because `sv-hostd` made it that way, so the locator is
 //!   [`sv_arena::extent::ContiguousLocator`] and the run list has one entry.
-//! - `Mode::Qemu` opens QEMU's memfd, parses `info mtree -f` into a region
+//! - [`Mode::Qemu`] opens QEMU's memfd, parses `info mtree -f` into a region
 //!   table, locates the guest's pages by content and coalesces them into runs.
-//!   **Not implemented in this stage**, and deliberately not stubbed: its seed
-//!   is `crates/arena-host`, which already does the scan, the translation and
-//!   the coalescing against a real guest, and folding that in belongs with §13
-//!   step 7 where a VM is available to test it against.
+//!   Built in §13 step 7, from `crates/arena-host`'s scan, translation and
+//!   coalescing. See [`qemu`] for the region table and [`locate`] for the scan
+//!   and the stitcher.
+//!
+//!   **It is not Windows-specific.** Everything in it is about QEMU's memory
+//!   backend and says nothing about what the guest runs, which is why it is
+//!   developed against a Linux guest where the VM can be restarted freely and
+//!   only then pointed at the production machine.
 //!
 //! The distinction the two modes share, and the reason they are one daemon:
 //! **everything above the run list is identical**. The client receives a
@@ -54,12 +58,20 @@ use sv_transport::control::{Control, Geometry, ProtocolIds};
 use sv_transport::region::{PAGE, SharedRegion};
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+pub mod locate;
+#[cfg(target_os = "linux")]
+pub mod qemu;
+
 /// How the daemon obtained the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// The daemon created the backing itself: development loop, and the
     /// Linux/Linux topology.
     Local,
+    /// The extent is guest RAM, reached through QEMU's memory backend and
+    /// located by content. The topology design.md was written for.
+    Qemu,
 }
 
 /// The daemon's view of the one extent it serves.
@@ -135,6 +147,58 @@ impl Hostd {
         runs.check_map_count(max_map_count())?;
 
         Ok(Hostd { mode: Mode::Local, geometry, extent, runs, fd, generation })
+    }
+
+    /// Attach to an extent the *guest* allocated, located by content.
+    ///
+    /// The whole of `Mode::Qemu`. Everything about it is discovered:
+    ///
+    /// 1. find QEMU, its memory backend and the backend's descriptor;
+    /// 2. read `info mtree -f` into a region table — never a formula (R21);
+    /// 3. sweep the backend for the run's stamps, in extent order;
+    /// 4. coalesce into runs and check them against `vm.max_map_count`.
+    ///
+    /// What is *not* done here is the stitching, because the run list is what a
+    /// client needs and each client stitches its own view — the mapping is
+    /// per-process, and a daemon that stitched once could not hand the result
+    /// to anyone. [`locate::attach`] is the function a client calls.
+    ///
+    /// The geometry comes from the descriptor rather than from the caller: in
+    /// this direction the guest owns the region (D20) and the app side is told
+    /// how big it is. Passing a geometry in would be the app side deciding
+    /// something it does not get to decide.
+    pub fn qemu(
+        qmp: &std::path::Path,
+        hint: &str,
+        desc: &sv_transport::cold::ExtentDesc,
+        generation: u32,
+    ) -> Result<(Hostd, qemu::RegionTable, locate::ScanReport)> {
+        let target = qemu::QemuTarget::discover(qmp, hint).map_err(HostdError::Io)?;
+        let (map, report) = locate::scan(&target.file, target.file_len, &target.regions, desc)
+            .map_err(|e| match e {
+                locate::LocateError::Io(e) => HostdError::Io(e),
+                other => HostdError::Io(std::io::Error::other(other.to_string())),
+            })?;
+        let runs = map.coalesce();
+        let total = (desc.control_pages + desc.arena_pages) * PAGE as u64;
+        runs.validate(total)?;
+        runs.check_map_count(max_map_count())?;
+
+        let extent = Extent { desc: desc.clone(), runs: runs.clone() };
+        // The descriptor is the daemon's own view of the backend; `Hostd` holds
+        // it as an `OwnedFd` so the mapping outlives the discovery.
+        use std::os::fd::{AsFd, OwnedFd};
+        let fd: OwnedFd = target.file.as_fd().try_clone_to_owned().map_err(HostdError::Io)?;
+        let geometry = Geometry {
+            control_size: desc.control_pages * PAGE as u64,
+            arena_size: desc.arena_pages * PAGE as u64,
+            ..Geometry::default()
+        };
+        Ok((
+            Hostd { mode: Mode::Qemu, geometry, extent, runs, fd, generation },
+            target.regions,
+            report,
+        ))
     }
 
     /// The message a client gets, alongside the descriptor.
