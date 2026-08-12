@@ -698,3 +698,36 @@ guest is somebody's daily machine.
    arena wants is a design decision this measurement can now inform.
 3. Treat a canary mismatch as fatal to the session, not as something to repair:
    by the time it is noticed the two sides have already disagreed.
+
+### R27 — The ICD talks to the window system from inside the application
+design.md §10 stage 2 makes the app side responsible for putting a finished
+frame in a window, which means an ICD `dlopen`ing `libX11.so.6` and issuing X
+requests from a process it does not own. Three distinct hazards, all realised
+at least once during the stage that introduced this entry (design.md §0.6):
+
+- **Xlib's default error handler calls `exit(1)`.** Every request names a window
+  the *application* owns and may already have destroyed, and that race is the
+  ordinary shape of a GL program rather than a corner: `glxinfo` creates and
+  destroys a window per config it probes, and the first version of this code
+  killed it with `BadDrawable` from `XCreateGC`. **A driver must never abort the
+  application because a frame could not be shown.**
+- **`XSetErrorHandler` is process-global, not per-`Display`.** Installing one
+  changes the application's error handling too, for as long as it is installed.
+- **Using the application's own `Display*`** — which the loader hands us in the
+  surface — would put the driver inside somebody else's locking discipline, and
+  Xlib is only thread-safe if the *application* called `XInitThreads`. glxgears
+  does not.
+
+*Mitigation, and all three are in `sv_icd::present`:* open a **separate**
+connection (X window ids are global to the display, so a second connection can
+draw into a window the first created, and `$DISPLAY` names the same server);
+install the swallowing error handler only around our own requests and end that
+window with an `XSync`, so every error we caused has been consumed before the
+application's handler goes back; and never dereference the `Display*` or
+`xcb_connection_t*` the surface carries — only the window id is read.
+
+*What this does not mitigate:* the extra connection is a second client the X
+server accounts to the same user, and a frame is `XPutImage`d unencrypted over
+whatever transport `$DISPLAY` names. Both are properties of X rather than of
+this design, and both are reasons the phase-2 answer is a compositor rather than
+more of this.

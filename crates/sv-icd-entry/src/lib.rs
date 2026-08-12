@@ -488,6 +488,163 @@ pub trait IcdLocal {
     fn unmap_memory(&self, device: u64, memory: u64) {
         let _ = (device, memory);
     }
+
+    // -- presentation (design.md §10) ---------------------------------------
+    //
+    // Eleven methods, none of which has a wire opcode. The whole of
+    // `VK_KHR_swapchain` is implemented on this side, out of ordinary forwarded
+    // commands: a swapchain image is a `vkCreateImage` the ICD made on the
+    // application's behalf, and `vkQueuePresentKHR` is a `vkQueueSubmit` of a
+    // command buffer the ICD recorded. The GPU side is not told that any of it
+    // is a swapchain and does not have to be.
+    //
+    // They speak in [`PresentTarget`], [`SurfaceCaps`] and [`SwapchainDesc`]
+    // rather than in `VkIcdSurface*` and `VkSwapchainCreateInfoKHR*`, which is
+    // the same division of labour as everything above: the pointer stops at
+    // `local.rs`.
+
+    /// `vkCreateXxxSurfaceKHR`, for every `Xxx` this ICD answers for.
+    ///
+    /// **The ICD owns its surfaces**, which design.md §8 says it does not. See
+    /// `sv_codegen::emit::icd_entry::EXTRA_LOCAL`: at loader interface ≥ 3 the
+    /// loader creates the driver's surface lazily by calling this, and a driver
+    /// that does not export it is silently told it cannot present.
+    fn create_surface(&self, target: PresentTarget) -> IcdResult<u64> {
+        let _ = target;
+        Err(LowerError::NotImplemented("vkCreateXxxSurfaceKHR"))
+    }
+
+    fn destroy_surface(&self, surface: u64) {
+        let _ = surface;
+    }
+
+    /// What a `VkSurfaceKHR` of ours names.
+    fn surface_target(&self, surface: u64) -> Option<PresentTarget> {
+        let _ = surface;
+        None
+    }
+
+    /// `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`.
+    fn surface_capabilities(&self, target: PresentTarget) -> IcdResult<SurfaceCaps> {
+        let _ = target;
+        Err(LowerError::NotImplemented("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"))
+    }
+
+    /// `vkGetPhysicalDeviceSurfaceFormatsKHR`, as `(VkFormat, VkColorSpaceKHR)`.
+    fn surface_formats(&self, target: PresentTarget) -> Vec<(i32, i32)> {
+        let _ = target;
+        Vec::new()
+    }
+
+    /// `vkGetPhysicalDeviceSurfacePresentModesKHR`, as `VkPresentModeKHR`.
+    fn surface_present_modes(&self, target: PresentTarget) -> Vec<i32> {
+        let _ = target;
+        Vec::new()
+    }
+
+    /// `vkCreateSwapchainKHR`. Returns the swapchain's app-side id.
+    fn create_swapchain(&self, device: u64, desc: &SwapchainDesc) -> IcdResult<u64> {
+        let _ = (device, desc);
+        Err(LowerError::NotImplemented("vkCreateSwapchainKHR"))
+    }
+
+    fn destroy_swapchain(&self, device: u64, swapchain: u64) {
+        let _ = (device, swapchain);
+    }
+
+    /// `vkGetSwapchainImagesKHR`: the `VkImage` ids, in acquire order.
+    fn swapchain_images(&self, swapchain: u64) -> IcdResult<Vec<u64>> {
+        let _ = swapchain;
+        Err(LowerError::NotImplemented("vkGetSwapchainImagesKHR"))
+    }
+
+    /// `vkAcquireNextImageKHR`. Returns the image index.
+    ///
+    /// `semaphore` and `fence` are zero for "not requested"; if either is given
+    /// it **must** be signalled before the application may use the image, and
+    /// the only way to signal an object that lives on the GPU side is to submit
+    /// something that signals it.
+    fn acquire_next_image(
+        &self,
+        device: u64,
+        swapchain: u64,
+        timeout: u64,
+        semaphore: u64,
+        fence: u64,
+    ) -> IcdResult<u32> {
+        let _ = (device, swapchain, timeout, semaphore, fence);
+        Err(LowerError::NotImplemented("vkAcquireNextImageKHR"))
+    }
+
+    /// `vkQueuePresentKHR`, for one `(swapchain, image index)` pair.
+    ///
+    /// `waits` are the application's wait semaphores and belong to the *first*
+    /// pair only, exactly as the specification's own "the presentation engine
+    /// waits once" wording implies.
+    fn queue_present(
+        &self,
+        queue: u64,
+        swapchain: u64,
+        image_index: u32,
+        waits: &[u64],
+    ) -> IcdResult<()> {
+        let _ = (queue, swapchain, image_index, waits);
+        Err(LowerError::NotImplemented("vkQueuePresentKHR"))
+    }
+}
+
+/// Where a presented frame goes, once the app side holds its pixels.
+///
+/// **Deliberately not a `Display*` or an `xcb_connection_t*`.** The ICD reads a
+/// window id out of the loader's `VkIcdSurface` and nothing else: it never calls
+/// into the application's X connection, because doing so would need this crate
+/// to link a window-system library and would put us inside somebody else's
+/// locking discipline. What the display target does with the id is its business
+/// (`sv_icd::present`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentTarget {
+    /// `VK_EXT_headless_surface`, which is what Wine maps `VK_KHR_win32_surface`
+    /// onto when there is no display (design.md §0.5). The frame stops in the
+    /// arena; `SV_PRESENT_DUMP` is how a harness reads it out.
+    Headless,
+    /// An X11 window, by XID.
+    X11 { window: u64 },
+}
+
+/// The parts of `VkSurfaceCapabilitiesKHR` that are not constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceCaps {
+    /// `currentExtent`. `0xFFFF_FFFF` in either field means "the surface has no
+    /// size of its own and the swapchain decides", which is the honest answer
+    /// for a headless surface.
+    pub current_width: u32,
+    pub current_height: u32,
+}
+
+/// `VkSurfaceCapabilitiesKHR::minImageCount`.
+///
+/// Two, because FIFO needs one image on screen and one to draw into, and
+/// because a swapchain image here costs a GPU-side allocation plus an arena
+/// buffer of the same size — so the floor should be the real floor.
+pub const MIN_SWAPCHAIN_IMAGES: u32 = 2;
+
+/// `VkSurfaceCapabilitiesKHR::maxImageCount`.
+pub const MAX_SWAPCHAIN_IMAGES: u32 = 8;
+
+/// `VkSwapchainCreateInfoKHR`, reduced to what the app side acts on.
+#[derive(Clone, Copy, Debug)]
+pub struct SwapchainDesc {
+    /// Resolved from `VkSwapchainCreateInfoKHR::surface` in `local.rs`, so that
+    /// the loader's `VkIcdSurface*` never reaches a safe method.
+    pub target: PresentTarget,
+    pub min_image_count: u32,
+    pub format: i32,
+    pub color_space: i32,
+    pub width: u32,
+    pub height: u32,
+    pub image_usage: u32,
+    pub present_mode: i32,
+    pub old_swapchain: u64,
 }
 
 /// The implementation of last resort: every method is the trait's default.
@@ -741,18 +898,19 @@ mod tests {
     #[test]
     fn the_stubbed_entry_points_are_exactly_these() {
         let expected: &[&str] = &[
-            // Answered app-side by design (design.md §8, §10) and not yet
-            // written: the surface queries, the swapchain's neighbours, and the
-            // debug-utils messenger whose GPU-side half is the reverse ring.
+            // The debug-utils messenger, whose GPU-side half is the reverse
+            // ring (design.md §4.6) rather than a forwarded command.
             "vkCreateDebugUtilsMessengerEXT",
-            "vkCreateHeadlessSurfaceEXT",
             "vkDestroyDebugUtilsMessengerEXT",
-            "vkDestroySurfaceKHR",
-            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
-            "vkGetPhysicalDeviceSurfaceFormatsKHR",
-            "vkGetPhysicalDeviceSurfacePresentModesKHR",
-            "vkGetPhysicalDeviceSurfaceSupportKHR",
             "vkSubmitDebugUtilsMessageEXT",
+            // The device-group half `VK_KHR_swapchain` absorbed when 1.1
+            // promoted `VK_KHR_device_group`. We advertise one physical device
+            // in one group, so there is nothing for these to say, and the GPU
+            // side has no surface to ask about even if there were (§10).
+            "vkAcquireNextImage2KHR",
+            "vkGetDeviceGroupPresentCapabilitiesKHR",
+            "vkGetDeviceGroupSurfacePresentModesKHR",
+            "vkGetPhysicalDevicePresentRectanglesKHR",
             // Returns dispatchable objects, so it belongs with the hand-written
             // set and has not been written.
             "vkEnumeratePhysicalDeviceGroups",
@@ -806,6 +964,54 @@ mod tests {
                 || lookup(INSTANCE_COMMANDS, name).is_some()
                 || lookup(DEVICE_COMMANDS, name).is_some();
             assert!(found, "{name} is hand-written but in no table");
+        }
+    }
+
+    /// The surface creators are reachable, and the loader will `abort()` if the
+    /// presentation-support queries are not.
+    ///
+    /// Both halves of this are things the loader punishes silently or fatally
+    /// rather than with a diagnostic, which is why they are asserted here rather
+    /// than left to a run:
+    ///
+    /// - a missing `vkCreateXxxSurfaceKHR` makes `wsi_unwrap_icd_surface` fail
+    ///   and every surface query answer "not supported" with no message
+    ///   (`sv_codegen::emit::icd_entry::EXTRA_LOCAL`);
+    /// - a missing `vkGetPhysicalDeviceXcbPresentationSupportKHR` makes the
+    ///   loader's terminator call `abort()`.
+    #[test]
+    fn the_whole_wsi_family_is_reachable() {
+        let must: &[&str] = &[
+            "vkCreateHeadlessSurfaceEXT",
+            "vkCreateXlibSurfaceKHR",
+            "vkCreateXcbSurfaceKHR",
+            "vkDestroySurfaceKHR",
+            "vkGetPhysicalDeviceSurfaceSupportKHR",
+            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+            "vkGetPhysicalDeviceSurfaceFormatsKHR",
+            "vkGetPhysicalDeviceSurfacePresentModesKHR",
+            "vkGetPhysicalDeviceXlibPresentationSupportKHR",
+            "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+            "vkCreateSwapchainKHR",
+            "vkDestroySwapchainKHR",
+            "vkGetSwapchainImagesKHR",
+            "vkAcquireNextImageKHR",
+            "vkQueuePresentKHR",
+        ];
+        for name in must {
+            let found = lookup(INSTANCE_COMMANDS, name).is_some()
+                || lookup(DEVICE_COMMANDS, name).is_some();
+            assert!(found, "{name} must be exported once the WSI is advertised");
+            assert!(
+                !NOT_IMPLEMENTED.contains(name),
+                "{name} is exported but refuses, which the loader cannot tell from working"
+            );
+        }
+        for name in EXTRA_LOCAL {
+            assert!(
+                lookup(INSTANCE_COMMANDS, name).is_some(),
+                "{name} is hand-written off the C surface and must still be in a table"
+            );
         }
     }
 }

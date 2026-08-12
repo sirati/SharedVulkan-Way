@@ -566,3 +566,419 @@ pub unsafe fn expand_descriptor_template(
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// presentation (design.md §10)
+// ---------------------------------------------------------------------------
+//
+// Thirteen entry points, all hand-written for the same two reasons: none of
+// them has a wire opcode, so there is no reply to fold; and the one parameter
+// that matters is a `VkSurfaceKHR`, which is not a handle at all but a pointer
+// into the *loader's* memory whose layout `vk_icd.h` fixes and `vk.xml` does
+// not mention.
+//
+// What each of them does is in `sv_icd::wsi`. What is here is the pointer work.
+
+/// The two surface create-info structs the registry will not give us.
+///
+/// `VkXcbSurfaceCreateInfoKHR::connection` is an `xcb_connection_t*` and
+/// `VkXlibSurfaceCreateInfoKHR::dpy` is a `Display*`, both from platform headers
+/// this project does not include, so `sv_codegen::abi::SURFACE_CREATORS` keeps
+/// the two commands and the two structs off the generated C surface and they are
+/// declared here instead — which costs nine lines and no build dependency.
+///
+/// **Neither pointer is ever dereferenced.** All this ICD takes from an X
+/// surface is the window id; see `sv_icd::present` for why it opens a connection
+/// of its own rather than using the application's.
+mod surface_ci {
+    /// `{ VkStructureType sType; const void* pNext; VkFlags flags;
+    /// xcb_connection_t* connection; xcb_window_t window; }`
+    #[repr(C)]
+    pub struct Xcb {
+        pub s_type: i32,
+        pub p_next: *const core::ffi::c_void,
+        pub flags: u32,
+        pub connection: *mut core::ffi::c_void,
+        pub window: u32,
+    }
+
+    /// `{ VkStructureType sType; const void* pNext; VkFlags flags;
+    /// Display* dpy; Window window; }`. `Window` is an X11 `XID`, an
+    /// `unsigned long`.
+    #[repr(C)]
+    pub struct Xlib {
+        pub s_type: i32,
+        pub p_next: *const core::ffi::c_void,
+        pub flags: u32,
+        pub dpy: *mut core::ffi::c_void,
+        pub window: core::ffi::c_ulong,
+    }
+}
+
+/// The `VkSurfaceKHR` a terminator handed us, resolved to what it points at.
+fn read_surface(surface: VkSurfaceKHR) -> Option<PresentTarget> {
+    if surface == 0 {
+        return None;
+    }
+    let t = icd().surface_target(surface);
+    if t.is_none() {
+        report_transport_failure(&format_args!(
+            "VkSurfaceKHR {surface:#x} is not one this ICD created"
+        ));
+    }
+    t
+}
+
+fn create_surface(target: PresentTarget, p_surface: *mut VkSurfaceKHR) -> VkResult {
+    if p_surface.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    match icd().create_surface(target) {
+        Ok(id) => {
+            // SAFETY: the loader passes writable storage for one
+            // non-dispatchable handle.
+            unsafe { *p_surface = id };
+            VkResult::VK_SUCCESS
+        }
+        Err(e) => lower_failed(e),
+    }
+}
+
+/// `vkCreateHeadlessSurfaceEXT`.
+///
+/// See `sv_codegen::emit::icd_entry::EXTRA_LOCAL` for why an ICD that would
+/// rather not implement surface creation has to implement it anyway.
+pub unsafe extern "system" fn sv_vk_create_headless_surface_ext(
+    _instance: VkInstance,
+    _p_create_info: *const VkHeadlessSurfaceCreateInfoEXT,
+    _p_allocator: *const VkAllocationCallbacks,
+    p_surface: *mut VkSurfaceKHR,
+) -> VkResult {
+    create_surface(PresentTarget::Headless, p_surface)
+}
+
+pub unsafe extern "system" fn sv_vk_create_xlib_surface_khr(
+    _instance: VkInstance,
+    p_create_info: *const c_void,
+    _p_allocator: *const VkAllocationCallbacks,
+    p_surface: *mut VkSurfaceKHR,
+) -> VkResult {
+    if p_create_info.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: the loader passes the application's `VkXlibSurfaceCreateInfoKHR`,
+    // valid for reads for the duration of the call.
+    let ci = unsafe { &*(p_create_info as *const surface_ci::Xlib) };
+    create_surface(PresentTarget::X11 { window: ci.window as u64 }, p_surface)
+}
+
+pub unsafe extern "system" fn sv_vk_create_xcb_surface_khr(
+    _instance: VkInstance,
+    p_create_info: *const c_void,
+    _p_allocator: *const VkAllocationCallbacks,
+    p_surface: *mut VkSurfaceKHR,
+) -> VkResult {
+    if p_create_info.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: as above, for `VkXcbSurfaceCreateInfoKHR`.
+    let ci = unsafe { &*(p_create_info as *const surface_ci::Xcb) };
+    create_surface(PresentTarget::X11 { window: ci.window as u64 }, p_surface)
+}
+
+/// `vkDestroySurfaceKHR`.
+pub unsafe extern "system" fn sv_vk_destroy_surface_khr(
+    _instance: VkInstance,
+    surface: VkSurfaceKHR,
+    _p_allocator: *const VkAllocationCallbacks,
+) {
+    if surface != 0 {
+        icd().destroy_surface(surface);
+    }
+}
+
+/// `vkGetPhysicalDeviceSurfaceSupportKHR`.
+///
+/// True for family 0 — the one family design.md §9 advertises — and for any
+/// surface whose platform we can read. Presentation needs nothing of the GPU
+/// side, so there is no family that could fail to support it.
+pub unsafe extern "system" fn sv_vk_get_physical_device_surface_support_khr(
+    _physical_device: VkPhysicalDevice,
+    queue_family_index: u32,
+    surface: VkSurfaceKHR,
+    p_supported: *mut VkBool32,
+) -> VkResult {
+    if p_supported.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: a surface from the loader.
+    let ok = read_surface(surface).is_some() && queue_family_index == 0;
+    report_transport_failure(&format_args!(
+        "vkGetPhysicalDeviceSurfaceSupportKHR: family {queue_family_index} -> {ok}"
+    ));
+    // SAFETY: writable storage for one `VkBool32`.
+    unsafe { *p_supported = u32::from(ok) };
+    VkResult::VK_SUCCESS
+}
+
+/// `vkGetPhysicalDeviceXlibPresentationSupportKHR`, and its XCB twin below.
+///
+/// **These exist because the loader `abort()`s without them.** Its terminator
+/// for the `…PresentationSupportKHR` family does not fall back to a default
+/// when the selected ICD does not export the entry point — it logs "ICD for
+/// selected physical device does not export …" and aborts the process. So
+/// advertising `VK_KHR_xcb_surface` at all obliges us to answer, and the answer
+/// is yes: presentation here is a memcpy from the arena into a window, and any
+/// X visual can receive one.
+pub unsafe extern "system" fn sv_vk_get_physical_device_xlib_presentation_support_khr(
+    _physical_device: VkPhysicalDevice,
+    queue_family_index: u32,
+    _dpy: *mut c_void,
+    _visual_id: core::ffi::c_ulong,
+) -> VkBool32 {
+    u32::from(queue_family_index == 0)
+}
+
+pub unsafe extern "system" fn sv_vk_get_physical_device_xcb_presentation_support_khr(
+    _physical_device: VkPhysicalDevice,
+    queue_family_index: u32,
+    _connection: *mut c_void,
+    _visual_id: u32,
+) -> VkBool32 {
+    u32::from(queue_family_index == 0)
+}
+
+/// `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`.
+///
+/// Everything but `currentExtent` is a constant of this implementation rather
+/// than a property of a window, because the presentation engine *is* this
+/// implementation: there is no compositor to impose a transform, no alpha
+/// blending we do not do ourselves, and no minimum image count beyond what FIFO
+/// needs.
+pub unsafe extern "system" fn sv_vk_get_physical_device_surface_capabilities_khr(
+    _physical_device: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    p_capabilities: *mut VkSurfaceCapabilitiesKHR,
+) -> VkResult {
+    if p_capabilities.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: a surface from the loader.
+    let Some(t) = read_surface(surface) else {
+        return VkResult::VK_ERROR_SURFACE_LOST_KHR;
+    };
+    let caps = match icd().surface_capabilities(t) {
+        Ok(c) => c,
+        Err(e) => return lower_failed(e),
+    };
+    let mut out = VkSurfaceCapabilitiesKHR::default();
+    out.min_image_count = MIN_SWAPCHAIN_IMAGES;
+    out.max_image_count = MAX_SWAPCHAIN_IMAGES;
+    out.current_extent = VkExtent2D { width: caps.current_width, height: caps.current_height };
+    out.min_image_extent = VkExtent2D { width: 1, height: 1 };
+    out.max_image_extent = VkExtent2D { width: 16384, height: 16384 };
+    out.max_image_array_layers = 1;
+    out.supported_transforms =
+        VkSurfaceTransformFlagsKHR::VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    out.current_transform =
+        VkSurfaceTransformFlagBitsKHR::VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    out.supported_composite_alpha =
+        VkCompositeAlphaFlagsKHR::VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // `TRANSFER_SRC` is not a courtesy to the application: it is what the ICD
+    // itself needs, because presenting is `vkCmdCopyImageToBuffer` out of the
+    // image the application rendered into.
+    out.supported_usage_flags = VkImageUsageFlags::VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+        | VkImageUsageFlags::VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+        | VkImageUsageFlags::VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | VkImageUsageFlags::VK_IMAGE_USAGE_SAMPLED_BIT
+        | VkImageUsageFlags::VK_IMAGE_USAGE_STORAGE_BIT;
+    // SAFETY: writable storage for one struct.
+    unsafe { *p_capabilities = out };
+    VkResult::VK_SUCCESS
+}
+
+pub unsafe extern "system" fn sv_vk_get_physical_device_surface_formats_khr(
+    _physical_device: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    p_surface_format_count: *mut u32,
+    p_surface_formats: *mut VkSurfaceFormatKHR,
+) -> VkResult {
+    // SAFETY: a surface from the loader.
+    let Some(t) = read_surface(surface) else {
+        return VkResult::VK_ERROR_SURFACE_LOST_KHR;
+    };
+    let formats: Vec<VkSurfaceFormatKHR> = icd()
+        .surface_formats(t)
+        .into_iter()
+        .map(|(f, c)| VkSurfaceFormatKHR { format: VkFormat(f), color_space: VkColorSpaceKHR(c) })
+        .collect();
+    // SAFETY: the count-then-fill contract, once, as everywhere else here.
+    unsafe { fill(&formats, p_surface_format_count, p_surface_formats) }
+}
+
+pub unsafe extern "system" fn sv_vk_get_physical_device_surface_present_modes_khr(
+    _physical_device: VkPhysicalDevice,
+    surface: VkSurfaceKHR,
+    p_present_mode_count: *mut u32,
+    p_present_modes: *mut VkPresentModeKHR,
+) -> VkResult {
+    // SAFETY: a surface from the loader.
+    let Some(t) = read_surface(surface) else {
+        return VkResult::VK_ERROR_SURFACE_LOST_KHR;
+    };
+    let modes: Vec<VkPresentModeKHR> =
+        icd().surface_present_modes(t).into_iter().map(VkPresentModeKHR).collect();
+    // SAFETY: as above.
+    unsafe { fill(&modes, p_present_mode_count, p_present_modes) }
+}
+
+/// `vkCreateSwapchainKHR`.
+///
+/// The `VkSurfaceKHR` is resolved here and the rest of the structure reduced to
+/// a [`SwapchainDesc`], so that `sv-icd` never sees the loader's pointer. The
+/// `pNext` chain is *dropped* rather than refused: every link that can legally
+/// appear on this structure comes from an extension we do not advertise, so an
+/// application cannot have written one that means anything.
+pub unsafe extern "system" fn sv_vk_create_swapchain_khr(
+    device: VkDevice,
+    p_create_info: *const VkSwapchainCreateInfoKHR,
+    _p_allocator: *const VkAllocationCallbacks,
+    p_swapchain: *mut VkSwapchainKHR,
+) -> VkResult {
+    if p_create_info.is_null() || p_swapchain.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: a handle this ICD returned, and a structure the specification
+    // says is valid for reads for the duration of the call.
+    let dev = unsafe { dispatchable_id(device as *const c_void) };
+    let ci = unsafe { &*p_create_info };
+    // SAFETY: a surface from the loader.
+    let Some(target) = read_surface(ci.surface) else {
+        return VkResult::VK_ERROR_SURFACE_LOST_KHR;
+    };
+    let desc = SwapchainDesc {
+        target,
+        min_image_count: ci.min_image_count,
+        format: ci.image_format.0,
+        color_space: ci.image_color_space.0,
+        width: ci.image_extent.width,
+        height: ci.image_extent.height,
+        image_usage: ci.image_usage.0,
+        present_mode: ci.present_mode.0,
+        old_swapchain: ci.old_swapchain,
+    };
+    match icd().create_swapchain(dev, &desc) {
+        Ok(id) => {
+            // SAFETY: writable storage for one non-dispatchable handle.
+            unsafe { *p_swapchain = id };
+            VkResult::VK_SUCCESS
+        }
+        Err(e) => lower_failed(e),
+    }
+}
+
+pub unsafe extern "system" fn sv_vk_destroy_swapchain_khr(
+    device: VkDevice,
+    swapchain: VkSwapchainKHR,
+    _p_allocator: *const VkAllocationCallbacks,
+) {
+    if device.is_null() || swapchain == 0 {
+        return;
+    }
+    // SAFETY: a handle this ICD returned.
+    let dev = unsafe { dispatchable_id(device as *const c_void) };
+    icd().destroy_swapchain(dev, swapchain);
+}
+
+pub unsafe extern "system" fn sv_vk_get_swapchain_images_khr(
+    _device: VkDevice,
+    swapchain: VkSwapchainKHR,
+    p_swapchain_image_count: *mut u32,
+    p_swapchain_images: *mut VkImage,
+) -> VkResult {
+    let images = match icd().swapchain_images(swapchain) {
+        Ok(v) => v,
+        Err(e) => return lower_failed(e),
+    };
+    // SAFETY: the count-then-fill contract.
+    unsafe { fill(&images, p_swapchain_image_count, p_swapchain_images) }
+}
+
+pub unsafe extern "system" fn sv_vk_acquire_next_image_khr(
+    device: VkDevice,
+    swapchain: VkSwapchainKHR,
+    timeout: u64,
+    semaphore: VkSemaphore,
+    fence: VkFence,
+    p_image_index: *mut u32,
+) -> VkResult {
+    if p_image_index.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: a handle this ICD returned.
+    let dev = unsafe { dispatchable_id(device as *const c_void) };
+    match icd().acquire_next_image(dev, swapchain, timeout, semaphore, fence) {
+        Ok(i) => {
+            // SAFETY: writable storage for one index.
+            unsafe { *p_image_index = i };
+            VkResult::VK_SUCCESS
+        }
+        Err(e) => lower_failed(e),
+    }
+}
+
+/// `vkQueuePresentKHR`.
+///
+/// The wait semaphores go to the **first** swapchain's copy submission and to
+/// no other. That is what "the presentation engine waits once" means for an
+/// implementation that presents by submitting: a binary semaphore's signal can
+/// only be waited on once, so handing the same list to a second submission
+/// would deadlock rather than double-wait.
+pub unsafe extern "system" fn sv_vk_queue_present_khr(
+    queue: VkQueue,
+    p_present_info: *const VkPresentInfoKHR,
+) -> VkResult {
+    if p_present_info.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: a handle this ICD returned, and the application's own structure.
+    let q = unsafe { dispatchable_id(queue as *const c_void) };
+    let info = unsafe { &*p_present_info };
+    if info.p_swapchains.is_null() || info.p_image_indices.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: `pWaitSemaphores` has `waitSemaphoreCount` elements — invariant 2
+    // of the generator's header, applied by hand because this stub is by hand.
+    let waits: Vec<u64> = if info.p_wait_semaphores.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            core::slice::from_raw_parts(info.p_wait_semaphores, info.wait_semaphore_count as usize)
+        }
+        .to_vec()
+    };
+    let n = info.swapchain_count as usize;
+    // SAFETY: both arrays have `swapchainCount` elements.
+    let (chains, indices) = unsafe {
+        (
+            core::slice::from_raw_parts(info.p_swapchains, n),
+            core::slice::from_raw_parts(info.p_image_indices, n),
+        )
+    };
+    let mut worst = VkResult::VK_SUCCESS;
+    for i in 0..n {
+        let r =
+            match icd().queue_present(q, chains[i], indices[i], if i == 0 { &waits } else { &[] }) {
+                Ok(()) => VkResult::VK_SUCCESS,
+                Err(e) => lower_failed(e),
+            };
+        if !info.p_results.is_null() {
+            // SAFETY: `pResults` is null or has `swapchainCount` elements.
+            unsafe { *info.p_results.add(i) = r };
+        }
+        if r.0 < worst.0 {
+            worst = r;
+        }
+    }
+    worst
+}

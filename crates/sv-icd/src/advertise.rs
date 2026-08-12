@@ -276,9 +276,22 @@ pub fn features() -> VkPhysicalDeviceFeatures {
 
 /// The instance extensions we advertise.
 pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
-    // design.md §10 stage 1: headless first, and no swapchain at all.
+    // design.md §10. Headless is stage 1 and is what Wine maps
+    // `VK_KHR_win32_surface` onto when there is no display (§0.5); the two X11
+    // extensions are stage 2, and are what Mesa's `zink_kopper` asks for by
+    // name when a GL application draws to a window.
+    //
+    // **Advertising an X surface extension obliges us to export its
+    // `vkGetPhysicalDevice…PresentationSupportKHR`**, because the loader's
+    // terminator for that family calls `abort()` rather than answering
+    // `VK_FALSE` when the selected ICD does not have it. It does *not* oblige us
+    // to export `vkCreateXcbSurfaceKHR`: not exporting that is how the loader
+    // knows to hand us its own `VkIcdSurfaceXcb` instead, which is design.md
+    // §8's decision and is what keeps `libxcb` out of this crate's link line.
     ("VK_KHR_surface", 25),
     ("VK_EXT_headless_surface", 1),
+    ("VK_KHR_xlib_surface", 6),
+    ("VK_KHR_xcb_surface", 6),
     // **Wine asks for these three on every instance it creates**, whatever the
     // application asked for, and `vkCreateInstance` fails with
     // `VK_ERROR_EXTENSION_NOT_PRESENT` if the host ICD does not have them. That

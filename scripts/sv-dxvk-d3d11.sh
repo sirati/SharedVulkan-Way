@@ -24,10 +24,18 @@
 #     `bufferDeviceAddress` is not among them. On 2.7 and later it refuses,
 #     because 2.7 rewrote the requirement list.
 #
-#  3. **What still blocks a frame**, which on 2.6.2 is exactly one thing:
-#     `VK_KHR_swapchain`, a *required* device extension in DXVK even for a device
-#     that will never present. design.md §10 stage 1 has no swapchain by
-#     decision, so this is §10 work and not a feature question.
+#  3. **A frame.** `VK_KHR_swapchain` used to be what stopped this — DXVK marks
+#     it *required* even for a device that will never present — and design.md
+#     §10 stage 2 now advertises and implements it, so 2.6.2 creates the device
+#     and the probe draws. The frame is judged on its pixels, like every other
+#     harness here.
+#
+# Two things this stage found and neither is about DXVK. The **triangle in
+# `d3d11-probe.c` was wound the wrong way** and was being back-face culled by
+# D3D11's default rasterizer state, on every implementation including RADV with
+# no forwarding at all; that was invisible while DXVK refused the device. And
+# `--clients` is still exact (below), which is a property of `sv-gpu-server`
+# rather than of this test.
 #
 # Wine, DXVK and the mingw cross-compiler are all in the dev shell or the store.
 # The .exe deliberately has no window: see `scripts/d3d11-probe.c`.
@@ -111,9 +119,13 @@ if grep -q "^PASS" "$RUNDIR/probe.log"; then
   exit 0
 fi
 if grep -q "Required Vulkan extension VK_KHR_swapchain not supported" "$RUNDIR/probe.log"; then
-  echo "Direct3D 11 over DXVK $VER: BLOCKED on VK_KHR_swapchain (design.md §10), and on"
-  echo "nothing else — DXVK computed a maximum feature level from this device first."
-  exit 0
+  echo "Direct3D 11 over DXVK $VER: BLOCKED on VK_KHR_swapchain — which design.md §10"
+  echo "stage 2 implements, so this is a regression in the WSI rather than a known gap."
+  exit 1
 fi
 echo "Direct3D 11 over DXVK $VER: refused, for the reason above."
-exit 0
+echo
+echo "A refusal is the **expected** answer for DXVK >= 2.7, which rewrote its"
+echo "requirement list and demands bufferDeviceAddress, descriptorIndexing and"
+echo "VK_KHR_pipeline_library (design.md §0.5, §9.2). For 2.6.x it is a failure."
+exit 1

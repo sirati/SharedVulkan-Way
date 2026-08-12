@@ -117,9 +117,21 @@ pub fn header_path() -> Result<PathBuf> {
 pub fn header_paths() -> Result<Vec<PathBuf>> {
     let core = header_path()?;
     let mut out = vec![core.clone()];
-    let beta = core.with_file_name("vulkan_beta.h");
-    if beta.is_file() {
-        out.push(beta);
+    // `vulkan_core.h` is not the whole of the published API. Anything behind a
+    // `VK_USE_PLATFORM_*` guard lives in its own header, and a profile that
+    // names such an extension would otherwise be reported as inventing it —
+    // which is what `VK_KHR_xcb_surface` did the first time design.md §10 stage
+    // 2 put it in the profile: "the profile lists it, but vulkan_core.h has no
+    // block for it". The published header exists; it is just a different file.
+    //
+    // Only the platform headers this project's profiles can reach are listed,
+    // and each is optional, because a header set for a different release may not
+    // carry all of them.
+    for sibling in ["vulkan_beta.h", "vulkan_xcb.h", "vulkan_xlib.h"] {
+        let p = core.with_file_name(sibling);
+        if p.is_file() {
+            out.push(p);
+        }
     }
     Ok(out)
 }

@@ -116,8 +116,29 @@ impl Driver {
                 })
             })
             .unwrap_or(false);
-        let inst_exts: Vec<*const std::ffi::c_char> =
-            if have_debug_utils { vec![c"VK_EXT_debug_utils".as_ptr()] } else { Vec::new() };
+        // `VK_KHR_surface`, if the loader has it, for one reason and not for
+        // presentation: `VK_KHR_swapchain` is in the profile (design.md §10) so
+        // that the device enables it and
+        // `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` exists, and a device extension may
+        // only be enabled when its instance-level dependency is. This side
+        // creates no surface and never will — the window is on the *other* side
+        // of the boundary — so the extension is enabled purely to make the
+        // layout legal.
+        let have_surface = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map(|v| {
+                v.iter().any(|e| {
+                    let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                    name == c"VK_KHR_surface"
+                })
+            })
+            .unwrap_or(false);
+        let mut inst_exts: Vec<*const std::ffi::c_char> = Vec::new();
+        if have_debug_utils {
+            inst_exts.push(c"VK_EXT_debug_utils".as_ptr());
+        }
+        if have_surface {
+            inst_exts.push(c"VK_KHR_surface".as_ptr());
+        }
         let ci = vk::InstanceCreateInfo::default()
             .application_info(&app)
             .enabled_extension_names(&inst_exts);

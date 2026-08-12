@@ -38,8 +38,10 @@
 pub mod advertise;
 pub mod arena;
 pub mod icd;
+pub mod present;
 pub mod state;
 pub mod transport;
+pub mod wsi;
 
 /// The identity this build puts in the handshake, and checks on attach.
 ///

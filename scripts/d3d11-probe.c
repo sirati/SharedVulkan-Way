@@ -2,11 +2,13 @@
  *
  * WHY IT HAS NO WINDOW
  *
- * design.md §10 puts presentation outside the protocol, so this ICD has no
- * `VK_KHR_swapchain` and no surface extension of any kind. A normal D3D11
- * program creates a swap chain, and one that did would be measuring exactly the
- * thing §10 says is not built yet — and it would fail inside `IDXGIFactory`
- * before a single Vulkan feature had been looked at, which tells us nothing.
+ * Not because presentation is missing — design.md §10 stage 2 is built and this
+ * ICD has a `VK_KHR_swapchain` — but because a `IDXGISwapChain` would put Wine's
+ * window management between the test and the thing being tested. What this
+ * program measures is the *forwarder*, and a window adds an `HWND`, a
+ * `VK_KHR_win32_surface` mapped onto a headless one, and a whole second
+ * subsystem's worth of ways to fail. `scripts/sv-present.sh` measures
+ * presentation directly and byte for byte, which is a better instrument for it.
  *
  * D3D11 does not need a window to render. `D3D11CreateDevice` with no swap
  * chain, a render-target texture, and a staging texture read back on the CPU is
@@ -19,8 +21,8 @@
  *
  * It proves that DXVK can create a `VkDevice` on our forwarded physical device
  * and drive a real frame through it. It does not prove that a *game* runs: a
- * game presents, and presenting needs §10 stage 2. Those are separate claims and
- * this program is careful to make only the first.
+ * game presents through DXGI, and this program never touches DXGI's swap chain.
+ * Those are separate claims and this program is careful to make only the first.
  *
  * The HLSL is compiled at run time through `D3DCompile`, resolved by name from
  * `d3dcompiler_47.dll` rather than linked, so that a Wine build without one
@@ -170,9 +172,23 @@ int main(void) {
         float x, y, z, w;
         float r, g, b, a;
     };
+    /* THE WINDING IS LOAD-BEARING, and it was wrong.
+     *
+     * D3D11's default rasterizer state is `CullMode = D3D11_CULL_BACK` with
+     * `FrontCounterClockwise = FALSE`, and D3D11's viewport transform puts y
+     * *down* in screen space. Listed bottom-left, bottom-right, top-centre the
+     * triangle is counter-clockwise on screen, so it is back-facing and every
+     * pixel of it is culled — on any implementation, including RADV with no
+     * forwarding at all, which is how this was finally established. The frame
+     * comes back as the clear colour and nothing reports an error.
+     *
+     * Swapping the first two vertices makes it clockwise and therefore front-
+     * facing. This is a bug in this program that the previous stage could not
+     * have found: DXVK never reached a draw, because it refused the device over
+     * `VK_KHR_swapchain` (design.md §0.5). */
     static const struct V verts[3] = {
-        {-0.8f, -0.7f, 0.f, 1.f, 1.f, 0.15f, 0.1f, 1.f},
         {0.8f, -0.7f, 0.f, 1.f, 0.1f, 1.f, 0.2f, 1.f},
+        {-0.8f, -0.7f, 0.f, 1.f, 1.f, 0.15f, 0.1f, 1.f},
         {0.0f, 0.85f, 0.f, 1.f, 0.15f, 0.2f, 1.f, 1.f},
     };
     D3D11_BUFFER_DESC bd = {0};

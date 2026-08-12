@@ -151,6 +151,22 @@ pub struct SharedVulkan {
     /// loader `dlopen`s it once — and the alternative is a lifetime on the
     /// generated `Icd` trait for a `Vec` that is never freed anyway.
     device_extensions: Vec<(&'static str, u32)>,
+    /// Live swapchains, by id (design.md §10, [`crate::wsi`]).
+    ///
+    /// **A second lock rather than a field of [`State`]**, and the lock order is
+    /// swapchain-then-state, never the reverse. Every step of
+    /// `vkQueuePresentKHR` is an ordinary forwarded Vulkan command, and every
+    /// one of those takes `State` — so holding `State` across a present would
+    /// deadlock on the first `vkQueueSubmit`. Keeping the two apart makes that
+    /// impossible rather than merely avoided.
+    swapchains: Mutex<HashMap<u64, crate::wsi::Swapchain>>,
+    /// Live surfaces, by id.
+    ///
+    /// **The ICD owns these**, which design.md §8 says it does not: see
+    /// `sv_codegen::emit::icd_entry::EXTRA_LOCAL`. A `VkSurfaceKHR` that reaches
+    /// any entry point of this driver is a key of this map, and one that is not
+    /// is a surface some other ICD created.
+    surfaces: Mutex<HashMap<u64, sv_icd_entry::PresentTarget>>,
 }
 
 impl SharedVulkan {
@@ -170,6 +186,8 @@ impl SharedVulkan {
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: None,
             device_extensions: Vec::new(),
+            swapchains: Mutex::new(HashMap::new()),
+            surfaces: Mutex::new(HashMap::new()),
         })
     }
 
@@ -208,6 +226,8 @@ impl SharedVulkan {
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: Some(attached.transport),
             device_extensions: Vec::new(),
+            swapchains: Mutex::new(HashMap::new()),
+            surfaces: Mutex::new(HashMap::new()),
         };
         icd.device_extensions = icd.ask_device_extensions();
         Ok(icd)
@@ -250,7 +270,8 @@ impl SharedVulkan {
             return Vec::new();
         }
         let Ok(full) = ask(n) else { return Vec::new() };
-        full.p_properties
+        let mut out: Vec<(&'static str, u32)> = full
+            .p_properties
             .iter()
             .filter_map(|e| {
                 let end = e.extension_name.iter().position(|b| *b == 0).unwrap_or(0);
@@ -260,12 +281,46 @@ impl SharedVulkan {
                 }
                 Some((&*Box::leak(name.to_string().into_boxed_str()), e.spec_version))
             })
-            .collect()
+            .collect();
+        // **`VK_KHR_swapchain` is added here rather than intersected**, and that
+        // is a correction to design.md §0.4 item 8 rather than an exception to
+        // it. §0.4's rule — the list is "the profile's extensions intersected
+        // with what the driver actually has, and only the side holding the
+        // driver knows the second half" — is right for every extension whose
+        // commands are *forwarded*. This one's commands are not: the whole of
+        // `VK_KHR_swapchain` is implemented in [`crate::wsi`], out of ordinary
+        // Vulkan the GPU side never learns is a swapchain. §9.2 says an
+        // extension in this list is a promise its entry points work, and the
+        // side that keeps that promise here is this one.
+        //
+        // The GPU-side driver still has to *enable* it — an application
+        // transitions a swapchain image to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`,
+        // and that layout does not exist on a device that did not — which is
+        // why it is in the profile the GPU side enables from
+        // (`vk_registry::profile::zink`). If the driver over there lacks it
+        // entirely, that is a driver we cannot present through, and it will say
+        // so at the first barrier rather than here.
+        if !out.iter().any(|(n, _)| *n == "VK_KHR_swapchain") {
+            out.push(("VK_KHR_swapchain", 70));
+        }
+        out
     }
 
     /// What this build advertises to an application.
     pub fn device_extensions(&self) -> &[(&'static str, u32)] {
         &self.device_extensions
+    }
+
+    /// The swapchain table (design.md §10).
+    pub fn swapchains(&self) -> std::sync::MutexGuard<'_, HashMap<u64, crate::wsi::Swapchain>> {
+        self.swapchains.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The surface table.
+    pub fn surfaces(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<u64, sv_icd_entry::PresentTarget>> {
+        self.surfaces.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The transport, if this process is connected to a GPU side.

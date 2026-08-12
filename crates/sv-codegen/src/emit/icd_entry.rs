@@ -1085,6 +1085,28 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkEnumerateDeviceLayerProperties",
     "vkMapMemory",
     "vkUnmapMemory",
+    // design.md §10. Presentation is the ICD's, entirely: a swapchain image is
+    // a GPU-side `VkImage` the app side created out of ordinary forwarded
+    // commands, and `vkQueuePresentKHR` is a copy into the arena followed by
+    // whatever the app side's display target does with the pixels. None of
+    // these commands has a wire opcode, so none of them can be a fold over a
+    // reply; and their C parameters are `VkIcdSurfaceXXX` pointers the registry
+    // does not describe at all.
+    "vkDestroySurfaceKHR",
+    "vkCreateHeadlessSurfaceEXT",
+    "vkCreateXlibSurfaceKHR",
+    "vkCreateXcbSurfaceKHR",
+    "vkGetPhysicalDeviceSurfaceSupportKHR",
+    "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+    "vkGetPhysicalDeviceSurfaceFormatsKHR",
+    "vkGetPhysicalDeviceSurfacePresentModesKHR",
+    "vkGetPhysicalDeviceXlibPresentationSupportKHR",
+    "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+    "vkCreateSwapchainKHR",
+    "vkDestroySwapchainKHR",
+    "vkGetSwapchainImagesKHR",
+    "vkAcquireNextImageKHR",
+    "vkQueuePresentKHR",
 ];
 
 fn emit_command(
@@ -1888,11 +1910,56 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
     }
 }
 
+/// Entry points that are hand-written **and not on the generated C surface**,
+/// which have to be put in the proc tables by name.
+///
+/// Three, all surface creators, and they are here for two facts that only make
+/// sense together.
+///
+/// **The registry cannot give them a signature.** `vkCreateXcbSurfaceKHR` takes
+/// a `VkXcbSurfaceCreateInfoKHR`, whose `connection` member is an
+/// `xcb_connection_t*` — a type that comes from a platform header this project
+/// does not include and would not link. `sv_codegen::abi::SURFACE_CREATORS`
+/// therefore keeps them, and the two structs, off the generated surface.
+///
+/// **The loader nonetheless requires them.** This is a correction to design.md
+/// §8, which says "We opt *out* of interface-3 surface creation by not exposing
+/// `vkCreateXXXSurfaceKHR`, so the loader hands us a `VkIcdSurfaceXXX` from
+/// `vk_icd.h` which we cast." **That opt-out no longer exists.** In
+/// Vulkan-Loader 1.4.350 `wsi_unwrap_icd_surface` allocates a per-ICD surface
+/// slot for every driver that enables `VK_KHR_surface` at interface ≥ 3, and
+/// creates the ICD's surface *lazily* on first use by calling the ICD's own
+/// `vkCreateXxxSurfaceKHR`. A driver that does not export one gets
+/// `VK_ERROR_EXTENSION_NOT_PRESENT` from that lazy creation, which the
+/// terminators turn into `*pSupported = false` and `VK_ERROR_SURFACE_LOST_KHR`
+/// **with no diagnostic of any kind**. The observed symptom was Mesa printing
+/// "zink: could not create swapchain" and this ICD's own trace showing that not
+/// one of its surface entry points had been called.
+///
+/// So they are written by hand, with the create-info structs declared by hand
+/// beside them, and the platform pointer is read as an opaque `usize`.
+const EXTRA_LOCAL: &[(&str, &str)] = &[
+    ("vkCreateHeadlessSurfaceEXT", "sv_vk_create_headless_surface_ext"),
+    ("vkCreateXlibSurfaceKHR", "sv_vk_create_xlib_surface_khr"),
+    ("vkCreateXcbSurfaceKHR", "sv_vk_create_xcb_surface_khr"),
+];
+
 fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     let mut global = Vec::new();
     let mut instance = Vec::new();
     let mut phys = Vec::new();
     let mut device = Vec::new();
+
+    // The hand-written instance-level entry points the C surface does not carry.
+    for (name, f) in EXTRA_LOCAL {
+        let f = format_ident!("{}", f);
+        instance.push(quote! {
+            crate::ProcEntry {
+                name: #name,
+                pfn: crate::local::#f as *const core::ffi::c_void,
+            },
+        });
+    }
 
     for c in &cx.abi.commands {
         let hand = HAND_WRITTEN.contains(&c.name.as_str());
@@ -1921,6 +1988,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     let n_impl = cx.abi.commands.len() - refused.len();
     let total = cx.abi.commands.len();
     let hand_written = HAND_WRITTEN;
+    let extra_local: Vec<&str> = EXTRA_LOCAL.iter().map(|(n, _)| *n).collect();
 
     quote! {
         /// Commands answerable by `vkGetInstanceProcAddr(NULL, …)`.
@@ -1945,6 +2013,11 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// Entry points `sv-icd-entry` writes by hand — see the generator's
         /// `HAND_WRITTEN` for why each one cannot be a fold over a wire reply.
         pub static HAND_WRITTEN: &[&str] = &[#(#hand_written,)*];
+
+        /// Entry points that exist only by hand: the registry cannot give them
+        /// a signature, and the loader requires them anyway. See the
+        /// generator's `EXTRA_LOCAL`.
+        pub static EXTRA_LOCAL: &[&str] = &[#(#extra_local,)*];
 
         /// How many of the C surface's entry points do something.
         pub const IMPLEMENTED_COUNT: usize = #n_impl;

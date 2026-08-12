@@ -288,11 +288,31 @@ impl Geometry {
     /// shader module, so the data buffer is 256 KiB and the slot count drops
     /// from 64 to 16 to pay for it. §4.2's own arithmetic then lands on the same
     /// 16 MiB control region it specifies.
+    ///
+    /// # The slab size is 64 MiB, and it was 4
+    ///
+    /// **A `VkDeviceMemory` is a sub-range of one slab (§5.3), so the slab size
+    /// is a hard ceiling on every host-visible allocation an application can
+    /// make**, and `ArenaAllocator::alloc` refuses a larger one with
+    /// `LargerThanSlab` — which the ICD reports as
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY`, a result an application is entitled to
+    /// see and has no way to interpret.
+    ///
+    /// At 4 MiB that ceiling is below one 1080p frame (8.29 MB), which is how it
+    /// was found: `vkCreateSwapchainKHR` at 1920×1080 failed while the identical
+    /// call at 256×256 succeeded. Nothing before this stage had asked for a
+    /// single allocation that big — Zink stages in pieces and DXVK's probe is
+    /// 256×256 — so a limit that would stop any real application went unnoticed.
+    ///
+    /// 64 MiB is design.md §5.2's own number and this was a silent deviation
+    /// from it. It costs nothing measurable: the slab directory shrinks by the
+    /// same factor it grows, and §0.1 measured that a *larger* window is more
+    /// contiguous rather than less.
     pub fn for_arena(arena_size: u64) -> Self {
         Geometry {
             control_size: 16 << 20,
             arena_size,
-            arena_slab_size: 4 << 20,
+            arena_slab_size: 64 << 20,
             ring_slot_count: 16,
             ring_data_bytes: 256 << 10,
             timeline_count: 64,

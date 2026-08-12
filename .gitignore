@@ -6,3 +6,7 @@ sv-icd-entry-unparsed.rs
 result
 result-*
 .direnv/
+# DXVK writes its pipeline state cache next to the *working directory* rather
+# than next to the .exe, so `scripts/sv-dxvk-d3d11.sh` run from the repo root
+# leaves one here.
+*.dxvk-cache

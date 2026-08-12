@@ -380,6 +380,78 @@ impl IcdLocal for SharedVulkan {
             m.mapped = false;
         }
     }
+
+    // -- presentation (design.md §10) ---------------------------------------
+    //
+    // Delegations only. The implementation is [`crate::wsi`], which is long
+    // enough to want its own file and is the one place in this crate that
+    // *issues* Vulkan commands rather than answering them.
+
+    fn create_surface(&self, target: sv_icd_entry::PresentTarget) -> IcdResult<u64> {
+        let id = self.state().mint();
+        self.surfaces().insert(id, target);
+        Ok(id)
+    }
+
+    fn destroy_surface(&self, surface: u64) {
+        self.surfaces().remove(&surface);
+    }
+
+    fn surface_target(&self, surface: u64) -> Option<sv_icd_entry::PresentTarget> {
+        self.surfaces().get(&surface).copied()
+    }
+
+    fn surface_capabilities(
+        &self,
+        target: sv_icd_entry::PresentTarget,
+    ) -> IcdResult<sv_icd_entry::SurfaceCaps> {
+        crate::wsi::surface_capabilities(target)
+    }
+
+    fn surface_formats(&self, target: sv_icd_entry::PresentTarget) -> Vec<(i32, i32)> {
+        crate::wsi::surface_formats(target)
+    }
+
+    fn surface_present_modes(&self, target: sv_icd_entry::PresentTarget) -> Vec<i32> {
+        crate::wsi::surface_present_modes(target)
+    }
+
+    fn create_swapchain(
+        &self,
+        device: u64,
+        desc: &sv_icd_entry::SwapchainDesc,
+    ) -> IcdResult<u64> {
+        crate::wsi::create_swapchain(self, device, desc)
+    }
+
+    fn destroy_swapchain(&self, device: u64, swapchain: u64) {
+        crate::wsi::destroy_swapchain(self, device, swapchain)
+    }
+
+    fn swapchain_images(&self, swapchain: u64) -> IcdResult<Vec<u64>> {
+        crate::wsi::swapchain_images(self, swapchain)
+    }
+
+    fn acquire_next_image(
+        &self,
+        device: u64,
+        swapchain: u64,
+        timeout: u64,
+        semaphore: u64,
+        fence: u64,
+    ) -> IcdResult<u32> {
+        crate::wsi::acquire_next_image(self, device, swapchain, timeout, semaphore, fence)
+    }
+
+    fn queue_present(
+        &self,
+        queue: u64,
+        swapchain: u64,
+        image_index: u32,
+        waits: &[u64],
+    ) -> IcdResult<()> {
+        crate::wsi::queue_present(self, queue, swapchain, image_index, waits)
+    }
 }
 
 impl Icd for SharedVulkan {

@@ -422,9 +422,17 @@ pub mod profiles {
     /// design.md §11: Zink's requirement set, which is the v1 scope.
     ///
     /// Core 1.0–1.3 plus the extensions zink's own `VP_ZINK_requirements.json`
-    /// profile names as required. `VK_KHR_swapchain` is deliberately absent:
-    /// design.md §10 puts presentation outside the protocol, and §13 step 5
-    /// targets `VK_EXT_headless_surface` first.
+    /// profile names as required, plus the WSI family of design.md §10 stage 2.
+    ///
+    /// **`VK_KHR_swapchain` is in this list and none of its commands are on the
+    /// wire.** That is not a contradiction: an extension appears here so that
+    /// its *types* exist on the C surface and so that its *name* reaches the GPU
+    /// side's `vkCreateDevice`, and `excluded_commands` decides separately which
+    /// of its commands cross. Presentation is implemented in the ICD (§10), so
+    /// none of them do — but the GPU-side driver still has to have the extension
+    /// enabled, because the application will transition a swapchain image to
+    /// `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` and that layout does not exist on a
+    /// device that never enabled it.
     pub fn zink() -> Profile {
         Profile {
             name: "zink".into(),
@@ -491,6 +499,21 @@ pub mod profiles {
                 // Headless first (design.md §10 stage 1).
                 "VK_EXT_headless_surface".into(),
                 "VK_KHR_surface".into(),
+                // §10 stage 2. The ICD implements every command of this
+                // extension; see the note above for why it is nonetheless in the
+                // profile. Advertising it is also what DXVK ≤ 2.6.2 was waiting
+                // for — it marks `VK_KHR_swapchain` *required* even for a device
+                // that will never present (§0.5).
+                "VK_KHR_swapchain".into(),
+                // The two X11 surface extensions Mesa's `zink_kopper` asks for
+                // by name. Neither carries a window-system dependency into this
+                // crate: the loader's `VkIcdSurfaceXlib`/`VkIcdSurfaceXcb` are
+                // what an ICD actually receives, and the ICD reads a window id
+                // out of one rather than linking Xlib. `VK_KHR_wayland_surface`
+                // is deliberately not here — it needs a `wl_display` this side
+                // would have to speak to, which is phase 2.
+                "VK_KHR_xlib_surface".into(),
+                "VK_KHR_xcb_surface".into(),
             ],
             extra_commands: vec![],
             excluded_commands: excluded_commands(),
@@ -509,14 +532,53 @@ pub mod profiles {
             "vkGetSwapchainImagesKHR",
             "vkAcquireNextImageKHR",
             "vkQueuePresentKHR",
+            // The rest of `VK_KHR_swapchain`, which is the device-group half it
+            // absorbed when 1.1 promoted `VK_KHR_device_group`. We advertise one
+            // physical device in one group, so there is nothing for these to
+            // say; they exist on the C surface and refuse, and nothing on the
+            // wire could answer them anyway because the GPU side has no surface.
+            "vkGetDeviceGroupPresentCapabilitiesKHR",
+            "vkGetDeviceGroupSurfacePresentModesKHR",
+            "vkGetPhysicalDevicePresentRectanglesKHR",
+            "vkAcquireNextImage2KHR",
             // Surface queries are answered app-side from what the ICD
             // advertises, not asked of a GPU side that has no window system.
             "vkDestroySurfaceKHR",
+            // Also off the C surface (`sv_codegen::abi::SURFACE_CREATORS`), and
+            // for a sharper reason than the X11 pair: an ICD that exports *any*
+            // surface creator is handed its own handle for those surfaces and
+            // the loader's `VkIcdSurface*` for the rest, and there is no way to
+            // tell one 64-bit value from the other. Exporting none makes every
+            // `VkSurfaceKHR` a `VkIcdSurfaceBase*` whose first field says which
+            // window system it is.
             "vkCreateHeadlessSurfaceEXT",
             "vkGetPhysicalDeviceSurfaceSupportKHR",
             "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
             "vkGetPhysicalDeviceSurfaceFormatsKHR",
             "vkGetPhysicalDeviceSurfacePresentModesKHR",
+            // Surface creation, likewise. **The ICD implements these rather
+            // than declining them**, which is a change from design.md §8's "we
+            // opt out of interface-3 surface creation by not exposing
+            // `vkCreateXXXSurfaceKHR`": an ICD that does not export
+            // `vkGetPhysicalDeviceXcbPresentationSupportKHR` makes the loader
+            // `abort()` rather than fall back, so once the extension is
+            // advertised at all the whole family has to be there.
+            // §8's opt-out, and the only two commands that stay off the *C*
+            // surface as well (`sv_codegen::abi::SURFACE_CREATORS`). Their one
+            // interesting parameter is an `xcb_connection_t*` or a `Display*`,
+            // which comes from a platform header, so neither the wire nor a
+            // generated C signature can name it — and neither has to: an ICD
+            // that does not export them is handed the loader's own
+            // `VkIcdSurfaceXcb`/`VkIcdSurfaceXlib` instead, which is the
+            // documented fallback and carries the same two fields.
+            "vkCreateXlibSurfaceKHR",
+            "vkCreateXcbSurfaceKHR",
+            // These two, by contrast, **must** be exported once the extension is
+            // advertised: the loader's terminator calls `abort()` when the
+            // selected ICD does not have them, rather than answering VK_FALSE.
+            // They are hand-written and ignore their connection argument.
+            "vkGetPhysicalDeviceXlibPresentationSupportKHR",
+            "vkGetPhysicalDeviceXcbPresentationSupportKHR",
             // The debug-utils messenger lives on the app side; its GPU-side
             // half is the reverse ring, which is hand-written (design.md §4.6,
             // §6.3), not a forwarded command.
@@ -550,6 +612,16 @@ pub mod profiles {
             // here rather than left to fail in the generator so that the reason
             // is next to the decision.
             "VkDebugUtilsMessengerCreateInfoEXT",
+            // The two X11 surface-creation structs. Each holds a pointer into a
+            // library this project does not link — `xcb_connection_t*`,
+            // `Display*` — so they are not serialisable in exactly the sense
+            // design.md §6.1 means, and they are not on the C surface either,
+            // because the two commands that take them are the ones §8 declines
+            // to export. What the ICD is handed instead is the loader's
+            // `VkIcdSurfaceXcb`/`VkIcdSurfaceXlib`, a `vk_icd.h` struct with the
+            // same two fields and no registry entry at all.
+            "VkXcbSurfaceCreateInfoKHR",
+            "VkXlibSurfaceCreateInfoKHR",
         ]
         .iter()
         .map(|s| s.to_string())

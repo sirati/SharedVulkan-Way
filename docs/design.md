@@ -402,6 +402,11 @@ nothing rejects it.
   outside the protocol, so glxgears cannot run: Xvfb's GLX has no DRI3 and there
   is no other display. What was tested instead is the same workload without the
   window.
+  **[RESOLVED — §0.6. `glxgears` runs, in an X window, and agrees with llvmpipe
+  on every histogram statistic. The DRI3 half of this sentence was right about
+  the fact and wrong about the layer: kopper needs no DRI3, but Mesa's *GLX*
+  refuses the visual for lack of it before zink is reached, which
+  `LIBGL_KOPPER_DRI2=1` skips.]**
 - **`vkQueueSubmit` is forwarded rather than blob-executed.** §6.5's
   `svExecuteCommandBlob` is still not built; every `vkCmd*` crosses as its own
   ring packet. The generic forwarding is strictly better than the hand-written
@@ -592,6 +597,177 @@ advertise external handle types we cannot honour, and before this it was true
 only because nothing could ask — the queries are core 1.1, an application can
 make them regardless, and RADV's honest answer is our dishonest one.
 
+### 0.6 What the presentation stage settled
+
+Built 2026-08-12. **Presentation works, and the two things §0.5 said it would
+unblock are unblocked.**
+
+```
+scripts/sv-present.sh    3 frames through a headless VK_KHR_swapchain, byte-identical, validation clean
+scripts/sv-zink-gl.sh    glxgears in an X window, agreeing with llvmpipe on every histogram statistic
+scripts/sv-dxvk-d3d11.sh Direct3D 11 on DXVK 2.6.2: 31.1% coverage, 1082 colours — the same frame RADV draws unforwarded
+```
+
+The measurement §10 asks for and never had: at **1920×1080, `vkQueuePresentKHR`
+costs 1.47 ms**, of which the whole is one `vkQueueSubmit` round trip carrying a
+pre-recorded `vkCmdCopyImageToBuffer`, a fence wait, and the app side reading
+arena memory it already has mapped — **5.4 GB/s of presented pixels**, against
+§10's estimate that 60 Hz at 1080p needs 500 MB/s. At 256×256 it is 0.18 ms.
+Presentation is not the bottleneck it was budgeted to be.
+
+Seven findings. The first is a correction to this section's own plan, the second
+and third are corrections to §8, and the fifth is a limit that would have stopped
+any real application and had nothing to do with presentation.
+
+**1. Presentation needs no protocol, and §10 stage 2's `svPresentBlit` should
+not be built.** §10 says "the app side sends `svPresentBlit`; the GPU side runs
+`vkCmdCopyImageToBuffer` … and signals a present timeline value" — a new
+non-Vulkan command (§6.3), a GPU-side handler, and a timeline. None of it is
+necessary. The app side can already issue every Vulkan command there is, because
+that is what an ICD *is*, so it creates the swapchain's images, creates the arena
+buffers, records the copy and submits it out of the existing wire.
+**`sv-gpu-server` is unchanged by this entire stage** and is never told that any
+of it is a swapchain. Because the copy command buffer is recorded once at
+swapchain creation, a frame costs *one* round trip rather than one per command.
+
+  The rule that falls out is the mirror of §0.5's "each side may rewrite exactly
+  what only it knows": **a capability that is expressible in the forwarded API
+  does not deserve a protocol extension.** The two places this project genuinely
+  needed one — `vkUpdateDescriptorSetWithTemplate`'s `pData` and
+  `vkCreateBuffer`'s external-memory chain — are both cases where one side held
+  information the API gives the other side no way to name. Presentation is not
+  one of those, and it is worth checking the next candidate against this test
+  before adding an opcode.
+
+**2. §8's "we opt *out* of interface-3 surface creation" no longer exists, and
+its failure mode is silence.** That sentence — "by not exposing
+`vkCreateXXXSurfaceKHR`, so the loader hands us a `VkIcdSurfaceXXX` from
+`vk_icd.h` which we cast" — described Vulkan-Loader behaviour that has since
+changed. In **1.4.350**, `allocate_icd_surface_struct` gives a per-ICD surface
+slot to *every* driver that enables `VK_KHR_surface` at interface ≥ 3, and
+`wsi_unwrap_icd_surface` then creates that driver's surface **lazily, by calling
+the driver's own `vkCreateXxxSurfaceKHR`**. A driver that does not export one
+gets `VK_ERROR_EXTENSION_NOT_PRESENT` from the lazy creation, which the
+terminators quietly turn into `*pSupported = false` and
+`VK_ERROR_SURFACE_LOST_KHR`. Nothing is logged, by the loader or by anyone.
+
+  The symptom was Mesa printing `zink: could not create swapchain` three times
+  while this ICD's own trace showed that **not one** of its surface entry points
+  had been called, and the same shape from the Vulkan side as
+  `surface support family 0: no`. Reading `loader/wsi.c` was the only way to find
+  it. So the ICD now creates and owns its surfaces, `VkSurfaceKHR` is one of its
+  own ids, and the `vk_icd.h` cast §8 describes is gone.
+
+  The cost is exactly what §8 was trying to avoid: `vkCreateXcbSurfaceKHR` takes
+  a `VkXcbSurfaceCreateInfoKHR` whose `connection` member is an
+  `xcb_connection_t*`, which comes from a platform header this project does not
+  include. Three commands are therefore hand-written *off* the generated C
+  surface and injected into the proc tables by name
+  (`sv_codegen::emit::icd_entry::EXTRA_LOCAL`), with the two create-info structs
+  declared by hand beside them — nine lines and no build dependency. **Exporting
+  none of the surface creators was not an option either**: exporting some makes
+  `VkSurfaceKHR` "either one of my ids or a loader pointer", which cannot be told
+  apart at run time. It is all of them or none, and none is no longer available.
+
+**3. The `…PresentationSupportKHR` family is not optional, and the loader
+`abort()`s without it.** `terminator_GetPhysicalDeviceXcbPresentationSupportKHR`
+does not fall back to `VK_FALSE` for a driver that lacks the entry point — it
+logs "ICD for selected physical device does not export …" and aborts the
+process. So advertising `VK_KHR_xcb_surface` at all obliges an ICD to answer,
+even though the answer here is a constant. That is a general property of the WSI
+terminators worth remembering: **the surface family is the one place where "the
+loader will handle it" is false in both directions.**
+
+**4. An extension implemented entirely app-side must not be intersected with
+what the GPU side has**, which is a qualification to §0.4 item 8. That item's
+rule — the device-extension list is "the profile's extensions intersected with
+what the driver actually has, and only the side holding the driver knows the
+second half" — is right for every extension whose commands are *forwarded*.
+`VK_KHR_swapchain`'s are not: the whole of it lives in `sv_icd::wsi`, and the
+side that keeps §9.2's promise is the app side. It is added unconditionally.
+
+  It is still in the *profile*, and for a reason that is not about the app side
+  at all: the application transitions a swapchain image to
+  `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`, and that layout does not exist on a
+  GPU-side device that never enabled the extension. So the profile carries the
+  name so the GPU side enables it, and `excluded_commands` keeps every one of its
+  commands off the wire. **A profile entry and a wire entry are different
+  things**, which §11 and §9.2 both read as if they were the same.
+
+**5. `Geometry::for_arena` set a 4 MiB slab, and a slab is the ceiling on every
+host-visible allocation an application can make.** §5.3 makes a `VkDeviceMemory`
+a sub-range of one slab, so `ArenaAllocator::alloc` refuses anything larger with
+`LargerThanSlab`, which the ICD reports as `VK_ERROR_OUT_OF_DEVICE_MEMORY`. One
+1080p BGRA frame is 8.29 MB, so `vkCreateSwapchainKHR` failed at 1920×1080 while
+the identical call at 256×256 succeeded. §5.2 says 64 MiB and the live geometry
+said 4; it is 64 now.
+
+  **This was never a presentation bug.** Any application wanting a single
+  host-visible allocation above 4 MiB — a staging buffer for one large texture, a
+  vertex buffer for a real mesh — would have been refused, with a result code
+  that says "out of device memory" for an arena that is 99% free. It went
+  unnoticed because Zink stages in pieces and every probe so far has been
+  256×256. **A limit expressed as a configuration constant, whose violation is
+  reported as a resource shortage, is close to undiagnosable**, and the general
+  lesson is that `max_allocation()` belongs in the numbers an application can
+  read — `maxMemoryAllocationCount` has a sibling this table does not report.
+
+**6. The arena-backed swapchain image is *admissible* and is still the wrong
+trade.** Measured rather than assumed: RADV reports
+`COLOR_ATTACHMENT | COLOR_ATTACHMENT_BLEND | BLIT_SRC | TRANSFER_SRC` in
+`linearTilingFeatures` for `VK_FORMAT_B8G8R8A8_UNORM`, so a linear, arena-backed
+colour attachment would work and presentation would need no copy at all. It is
+not what is built, for three reasons in increasing order of weight: it moves
+every frame's render target out of `DEVICE_LOCAL`, which is the one thing §9.1's
+ordering exists to prevent; it drags `VkExternalMemoryImageCreateInfo` onto
+*every* forwarded image, which §0.5 item 3 already identified as unconditional
+and therefore global; and the copy is 1.47 ms at 1080p, which is not where the
+time goes. The zero-copy variant is recorded as measured-possible rather than
+assumed-impossible, and it becomes attractive the moment the boundary is a real
+VM rather than a socket.
+
+**7. `d3d11-probe.c`'s triangle was wound the wrong way and was being back-face
+culled** — on every implementation, including RADV with no forwarding at all,
+which is how it was finally established. D3D11's default rasterizer state is
+`CULL_BACK` with `FrontCounterClockwise = FALSE` and its viewport transform puts
+y down, so the vertices as listed were back-facing and every pixel was culled.
+The frame came back as the clear colour and nothing anywhere reported an error.
+It was invisible until this stage because DXVK never reached a draw: it refused
+the device over `VK_KHR_swapchain` (§0.5). **A control run against the real
+driver is worth more than any amount of reading**, and it took two minutes.
+
+**What is not settled**, and is the honest state of this stage:
+
+- **`vkQueuePresentKHR` waits.** It submits the copy, waits on a fence, and only
+  then hands the pixels to the display target. §9.3 wants a timeline and §10
+  wants triple buffering; what is built is a queue of length zero, which is why
+  `IMMEDIATE`, `MAILBOX` and `FIFO` are all advertised and all mean the same
+  thing. It is correct, it never tears, and it costs 1.47 ms of the application's
+  frame at 1080p. The fix needs the timeline mirror wired to submissions, which
+  is the same thing `vkQueueSubmit` has been waiting for since §0.3.
+- **`vkGetImageMemoryRequirements` passes the driver's `memoryTypeBits`
+  through**, while `vkGetBufferMemoryRequirements` is patched to §9.1's numbering
+  (`icd::get_buffer_memory_requirements`). The two sides number memory types
+  differently, so an application indexing our four-entry table with RADV's mask
+  is reading somebody else's answer, and it works today only because RADV's type
+  0 and ours are both the device-local one. `wsi` sidesteps it by choosing type 0
+  outright rather than consulting the mask. **The image path should be patched
+  the same way as the buffer path**; it is a latent version of §0.4 item 3.
+- **Presentation to X costs an `XSync` per frame.** `XSetErrorHandler` is
+  process-global rather than per-`Display`, so the ICD installs its own handler,
+  syncs to be sure its own errors have been consumed, and restores the
+  application's. Without a handler Xlib's default calls `exit(1)` — which it did,
+  killing `glxinfo` with `BadDrawable` from `XCreateGC` on a window the
+  application had already destroyed. A driver that aborts the application because
+  a frame could not be shown is worse than one that drops the frame.
+- **No Wayland, and no compositor.** §10 stage 3's damage rectangles and video
+  encode are untouched, and the phase-2 compositor is untouched.
+- **`glxgears` needs `LIBGL_KOPPER_DRI2=1` on Xvfb.** Not because kopper needs
+  DRI3 — its whole point is that the swapchain is Vulkan's — but because Mesa's
+  *GLX* refuses the visual for lack of DRI3 before zink is reached at all. §0.4
+  read that wall from the other side and concluded glxgears could not run; the
+  wall is one layer higher than it looked.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
@@ -638,7 +814,7 @@ the ring is rejected regardless of how fast the copy is.
 | D14 | Command buffers | Recorded straight into an arena block; `vkQueueSubmit` ships an `(offset, len)`. Zero round trips and zero copies from record to execute. (fwd §1.3, §7.2) |
 | D15 | Submit | **Asynchronous**, non-negotiable. |
 | D16 | Sync | Everything is a 64-bit monotonic timeline; counters mirrored into the control region so an app-side wait is a local load. (fwd §2.9) |
-| D17 | Presentation | **Outside the protocol.** Headless first; a swapchain that blits GPU-side into a linear arena buffer second. (fwd §2.8) |
+| D17 | Presentation | **Outside the protocol**, and §0.6 makes that stronger than it was written: not merely unserialised but *needing no protocol at all*. The app side creates the swapchain's images and records the copy out of ordinary forwarded Vulkan, so `sv-gpu-server` has no presentation code. Headless first, then a real swapchain, then a window. (fwd §2.8, §10) |
 | D18 | Scope | **Zink.** DXVK ≤ 2.6 as a stretch. DXVK ≥ 2.7 and vkd3d-proton are out of scope, and we will not advertise `bufferDeviceAddress` in v1 — a clean device-creation failure beats silent corruption. (fwd §5) |
 | D19 | Reverse channel | Built from day one, not retrofitted. Validation-layer output on the app side is the primary debugging tool. (fwd R14) |
 | D20 | Region ownership | The side **inside the VM** creates and publishes both regions; the other side attaches. sharedgl's "server initialises" rule inverted correctly, with the readiness flag sharedgl aliased away. (sgl §7.2b) |
@@ -1420,6 +1596,15 @@ applies per slab either. What is left:
   header (§4.2) and both sides read it. *What would change it:* a measurement
   showing import time or `maxMemoryAllocationCount` binds — in which case raise
   it, because a single import of the entire arena is measured legal.
+- **It is also the largest allocation an application can make**, and that is the
+  reason it must never be quietly lowered. §5.3 makes a `VkDeviceMemory` a
+  sub-range of *one* slab, so `alloc` refuses anything bigger with
+  `LargerThanSlab`, and the ICD has no result code for that but
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` — which an application reads as "the arena is
+  full" for an arena that is 99% free. `Geometry::for_arena` shipped 4 MiB
+  against this section's 64, and the first thing to notice was a 1080p swapchain
+  (8.29 MB a frame) failing while a 256×256 one worked (§0.6 item 5). Any
+  application wanting one large staging buffer would have hit it first.
 
 Sub-allocation granularity inside a slab is unaffected and stays at 4096 bytes:
 it is an offset into an already-imported `VkDeviceMemory`, and the large page
@@ -2417,12 +2602,35 @@ Note this path only matters when the *app side* is Windows — not on
 **WSI.** `VK_KHR_surface` is loader-owned; `VK_KHR_swapchain` is always
 driver-owned and we must implement it, along with
 `vkGetPhysicalDeviceSurface{Support,Capabilities,Formats,PresentModes}KHR` and
-the `…PresentationSupportKHR` family. We opt *out* of interface-3 surface
-creation by not exposing `vkCreateXXXSurfaceKHR`, so the loader hands us a
-`VkIcdSurfaceXXX` from `vk_icd.h` which we cast. **`VK_EXT_headless_surface` is
+the `…PresentationSupportKHR` family. **`VK_EXT_headless_surface` is
 the first target** (fwd §3.4, §10). A silent-failure trap to remember:
 `terminator_CreateSwapchainKHR` with a NULL driver pointer returns `VK_SUCCESS`
 with an uninitialised swapchain.
+
+> **[CORRECTED — 2026-08-12, §0.6 items 2 and 3; read against
+> `Vulkan-Loader v1.4.350` `loader/wsi.c`]**
+>
+> *We opt out of interface-3 surface creation by not exposing
+> `vkCreateXXXSurfaceKHR`, so the loader hands us a `VkIcdSurfaceXXX` from
+> `vk_icd.h` which we cast.*
+>
+> **That opt-out no longer exists.** `wsi_unwrap_icd_surface` creates the
+> driver's own surface lazily by calling the driver's `vkCreateXxxSurfaceKHR`,
+> for every ICD that enables `VK_KHR_surface` at interface ≥ 3, and turns a
+> missing one into `*pSupported = false` and `VK_ERROR_SURFACE_LOST_KHR` with no
+> diagnostic anywhere. An ICD must export **all** of the surface creators for the
+> platforms it advertises, or none of them — and "none" is not available once it
+> advertises any surface extension. The ICD therefore owns its surfaces and a
+> `VkSurfaceKHR` is one of its own ids.
+>
+> Worse in the same family: `terminator_GetPhysicalDeviceXcbPresentationSupportKHR`
+> and its siblings call **`abort()`** rather than answering `VK_FALSE` when the
+> selected ICD does not export them.
+>
+> The three commands whose C signature names a platform type — the two X11
+> surface creators and `vkCreateHeadlessSurfaceEXT`, which is in the list only
+> so that all-or-none holds — are hand-written off the generated surface and
+> injected into the proc tables by name (`emit::icd_entry::EXTRA_LOCAL`).
 
 **Extension filtering, not mirroring.** The loader has
 `MAX_NUM_UNKNOWN_EXTS = 250` hand-generated trampolines, and its known-extension
@@ -2485,6 +2693,23 @@ then renders garbage. See §11 for the nuance.
 > for it only alongside `VK_NVX_binary_import` for CUDA interop — and reaches
 > `D3D_FEATURE_LEVEL_12_0` on this device. What stops D3D11 there is
 > `VK_KHR_swapchain` and therefore §10, not this decision.
+>
+> **[SUPERSEDED — 2026-08-12, §0.6]** Nothing stops it now: §10 stage 2 is built,
+> `VK_KHR_swapchain` is advertised, and `scripts/sv-dxvk-d3d11.sh` renders and
+> reads back a frame on DXVK 2.6.2. The cost of declining `bufferDeviceAddress`
+> is what the correction above says it is and no more: D3D12 through
+> vkd3d-proton, and DXVK ≥ 2.7.
+
+**An extension in the profile is not an extension on the wire.** §11 and the
+paragraph above both read as if advertising an extension meant forwarding its
+commands, and `VK_KHR_swapchain` is the counterexample: it is in the profile so
+that its *types* exist on the C surface and its *name* reaches the GPU side's
+`vkCreateDevice` — which is what makes `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` a legal
+layout over there — while every one of its commands is in `excluded_commands` and
+is answered by `sv_icd::wsi`. The device-extension list the app side reports is
+therefore *not* purely the intersection §0.4 item 8 describes: an extension
+implemented entirely app-side is added unconditionally, because the side keeping
+the promise is this one (§0.6 item 4).
 
 We also do not advertise external memory/semaphore/fence handle types we cannot
 honour, which is legal and avoids gfxstream's rather comical OPAQUE_FD cookie
@@ -2517,6 +2742,26 @@ expressible on top of timelines; the reverse is not (fwd §2.9).
 
 ## 10. Presentation
 
+> **[BUILT — 2026-08-12, §0.6. Stages 1 and 2 are done and stage 2 is not what
+> this section describes.]** Read this section for its decisions, which held, and
+> §0.6 for what the implementation corrected:
+>
+> - **there is no `svPresentBlit` and there should not be one.** Everything below
+>   the words "the app side sends" is done out of ordinary forwarded Vulkan, by
+>   the app side, with a command buffer recorded once at swapchain creation.
+>   `sv-gpu-server` has no presentation code at all.
+> - **`vkQueuePresentKHR` costs 1.47 ms at 1080p**, or 5.4 GB/s of presented
+>   pixels, against the 500 MB/s this section budgets for 60 Hz. The frame is
+>   *not* the expensive part.
+> - **triple buffering is not built.** Present waits on its own fence, so the
+>   queue is of length zero and `IMMEDIATE`/`MAILBOX`/`FIFO` are the same thing.
+>   The vertical flip is not needed — `vkCmdCopyImageToBuffer` has no flip — and
+>   the stride is the actual width, so two of the three improvements over sharedgl
+>   below are had for free and the third is outstanding.
+> - **an arena-backed swapchain image is admissible on RADV** (measured:
+>   `linearTilingFeatures` for `B8G8R8A8_UNORM` carries `COLOR_ATTACHMENT`) and is
+>   deliberately not used. §0.6 item 6 has the three reasons.
+
 **Outside the protocol**, as gfxstream does it — it never forwards
 `VK_KHR_swapchain` at all, and presentation is deliberately not serialised
 (fwd §2.8).
@@ -2531,7 +2776,7 @@ should not be solved at all:**
 
 1. **v1: `VK_EXT_headless_surface` and no swapchain.** Zink under EGL/surfaceless
    and the entire deqp suite need no presentation. This unblocks everything in
-   §13 steps 1–6 and costs nothing.
+   §13 steps 1–6 and costs nothing. **[DONE]**
 2. **v2: a real swapchain.** App-side `VK_KHR_swapchain` whose images are
    GPU-side `VkImage`s. On `vkQueuePresentKHR` the app side sends `svPresentBlit`;
    the GPU side runs `vkCmdCopyImageToBuffer` into a **triple-buffered linear
@@ -2540,7 +2785,9 @@ should not be solved at all:**
    memcpy from shared memory into a window buffer, with no GPU involvement and
    no second copy of our own. Format is negotiated at swapchain creation, not
    hardcoded to BGRA the way sharedgl hardcodes `GL_BGRA` in two places
-   (sgl §3.6).
+   (sgl §3.6). **[DONE, minus the triple buffering and without `svPresentBlit`:
+   the copy is a `vkQueueSubmit` of a command buffer the app side recorded, so
+   the GPU side needed no code. §0.6 item 1.]**
 3. **Only then, if measurement justifies it:** damage rectangles, and hardware
    video encode via QuickSync for a genuinely remote app side.
 
@@ -2595,6 +2842,12 @@ enabled `bufferDeviceAddress` opportunistically for NVX CUDA interop only.
 > back, and computed a maximum Direct3D feature level of **12_0** before
 > refusing for want of a swapchain. §9.2's looser "DXVK 3.x" was the sentence
 > that needed correcting, not this one.
+>
+> **[MET — 2026-08-12, §0.6]** `VK_KHR_swapchain` is advertised and implemented,
+> so both required extensions are present and DXVK 2.6.2 creates the device,
+> selects 11_1 and draws: 31.1% coverage and 1082 distinct colours, the same
+> frame the identical program gets from RADV with no forwarding at all. The
+> stretch goal is reached.
 
 **Out of scope: DXVK ≥ 2.7 / 3.x and vkd3d-proton.** DXVK 3.x's `dxbc-spirv`
 backend emits `CapabilityPhysicalStorageBufferAddresses` and
@@ -2645,7 +2898,7 @@ framing holds for GL and for older D3D, and does not hold for D3D12.
 | `sv-handles` | lib | App-side id allocation; GPU-side `SlotMap` object table with deferred destroy |
 | `sv-icd` | cdylib | The app side: instance/device/queue objects, memory, WSI, the hand-written half of the ICD |
 | `sv-gpu-server` | bin | The GPU side: ring consumers, `SlabImport`, semantic glue, submit path, validation forwarding |
-| `sv-present` | lib | Swapchain plumbing shared by both sides; `wl_shm`/`XShm` blit on the app side |
+| ~~`sv-present`~~ | — | **Not built, and should not be.** It was to be "swapchain plumbing shared by both sides", and there is nothing to share: §0.6 found that presentation is expressible entirely in the forwarded API, so the GPU side has no half. What exists is `sv_icd::wsi` (the swapchain, out of ordinary Vulkan) and `sv_icd::present` (the blit, and the only module that knows what a window is), both inside `sv-icd`. |
 | `sv-hostd` | bin | App-side daemon: opens QEMU's memfd, GPA→offset, builds the contiguous view, hands fds to ICD processes |
 | `vk-probe` | bin | **Exists.** The GPU-side capability probe of `measured-gpu-side.md` |
 | `awe-probe` | bin, Windows | **Exists.** The guest half of step 0: commit, lock, stamp, import, verify. Cross-compiled to `x86_64-pc-windows-gnu` |
@@ -2793,9 +3046,36 @@ about the GPU reading it. A trivial compute shader over an arena buffer,
 producing a result the host can check in the memfd, is an hour and it gates the
 rest of the step.
 
-**8. Presentation**, after the §10 measurement decides whether it is needed.
+**8. Presentation. — DONE, 2026-08-12**, and it did not wait for step 7.
 
-**9. DXVK ≤ 2.6**, as a stretch, only once 6 and 7 hold.
+> **[SUPERSEDED — the step as planned]**
+> ***8. Presentation**, after the §10 measurement decides whether it is needed.*
+
+The measurement this step was waiting on — "on this machine the physical panel
+is driven by the passed-through iGPU … it may well be that the right answer is
+to leave it there" (§10) — was overtaken. Presentation stopped being a question
+about the panel the moment §0.5 established that **DXVK requires
+`VK_KHR_swapchain` for a device that will never present**, and that
+`zink_kopper` needs one for any windowed GL at all. Two of the three things the
+project could not do were one piece of work, and it was this one.
+
+*Test, as run:* `scripts/sv-present.sh` — a headless `VK_KHR_swapchain`, three
+frames of a known pattern presented and compared **byte for byte**, clean under
+`VK_LAYER_KHRONOS_validation`; `scripts/sv-zink-gl.sh`'s fourth check —
+`glxgears` in an X window under Xvfb, agreeing with llvmpipe on every histogram
+statistic; and 1.47 ms per 1080p present, measured. §0.6 has the seven findings,
+of which the first is that this step needed no protocol work at all and the fifth
+is a 4 MiB ceiling on host-visible allocations that had nothing to do with
+presentation. **Outstanding:** the present is synchronous and there is no triple
+buffering (§9.3's timeline mirror is the blocker, as it is for `vkQueueSubmit`),
+and there is no Wayland.
+
+**9. DXVK ≤ 2.6, as a stretch. — DONE, 2026-08-12**, and it did not need step 7
+either: `scripts/sv-dxvk-d3d11.sh` runs a windowless Direct3D 11 program under
+Wine 11.0 on DXVK 2.6.2 against this ICD, and it renders and reads back a frame
+that matches what the same program gets from RADV unforwarded. The step said
+"only once 6 and 7 hold"; 6 holds and 7 does not, and the dependency on 7 turns
+out to have been about the *target machine* rather than about DXVK.
 
 Steps 1, 2 and 3 are independent of each other and can proceed in parallel in
 separate worktrees; 4 needs all three.

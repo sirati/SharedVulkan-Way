@@ -208,14 +208,49 @@ impl AbiPlan {
 pub fn surface_profile(wire: &Profile) -> Profile {
     let mut p = wire.clone();
     p.name = format!("{}-icd", wire.name);
-    p.excluded_commands = Vec::new();
+    p.excluded_commands = SURFACE_CREATORS.iter().map(|s| s.to_string()).collect();
     // The one type that stays excluded is the one the registry genuinely cannot
     // describe: `VkAccelerationStructureInstanceKHR` is bitfields (design.md
     // §7.4). It is unreachable from this surface; the exclusion is a tripwire
     // rather than a workaround, and reaching it is a generator error.
-    p.excluded_types = vec!["VkAccelerationStructureInstanceKHR".to_string()];
+    //
+    // The two X11 create-info structs are excluded for the opposite reason:
+    // they are perfectly describable and they hold a pointer into a library
+    // nobody here links. They are unreachable once [`SURFACE_CREATORS`] is out,
+    // and reaching one would mean a create-surface command had come back.
+    p.excluded_types = vec![
+        "VkAccelerationStructureInstanceKHR".to_string(),
+        "VkXcbSurfaceCreateInfoKHR".to_string(),
+        "VkXlibSurfaceCreateInfoKHR".to_string(),
+    ];
     p
 }
+
+/// The commands that are not on the C surface either, and the only ones.
+///
+/// design.md §8: "We opt *out* of interface-3 surface creation by not exposing
+/// `vkCreateXXXSurfaceKHR`, so the loader hands us a `VkIcdSurfaceXXX` from
+/// `vk_icd.h` which we cast." That decision is what makes advertising
+/// `VK_KHR_xcb_surface` cost nothing in platform headers, and it is enforced
+/// here rather than left to the emitter, so that a generated `extern "system"`
+/// signature naming `xcb_connection_t` cannot come back by accident.
+///
+/// Note what is **not** in this list: the two
+/// `vkGetPhysicalDevice…PresentationSupportKHR` queries take the same
+/// `xcb_connection_t*`/`Display*` and are on the surface anyway, because the
+/// loader's terminator calls `abort()` for an ICD that does not export them.
+/// They ignore the argument, so a `*mut c_void` in the signature is enough.
+/// `vkCreateHeadlessSurfaceEXT` is in the list for a second reason, and it is
+/// the one that decided the shape of the ICD's WSI: **if any one surface
+/// creator is exported, the ICD sees two kinds of `VkSurfaceKHR`.** The loader
+/// keeps its own `VkIcdSurface` either way, and passes the ICD's own handle to
+/// every terminator only for the surfaces the ICD created. Exporting exactly
+/// none of them makes `VkSurfaceKHR` uniformly "a pointer to a
+/// `VkIcdSurfaceBase`", which is a thing that can be read; exporting some makes
+/// it "either that or one of my ids", which is a thing that can only be
+/// guessed at.
+pub const SURFACE_CREATORS: &[&str] =
+    &["vkCreateXlibSurfaceKHR", "vkCreateXcbSurfaceKHR", "vkCreateHeadlessSurfaceEXT"];
 
 /// Build the ABI plan.
 ///

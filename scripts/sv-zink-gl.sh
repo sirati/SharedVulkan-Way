@@ -28,6 +28,14 @@
 #     against GLSL 1.50 on purpose and passes identically at 3.2 and 4.6, so it
 #     cannot tell them apart; this one can, and it judges each capability on the
 #     pixels it produces rather than on the version string.
+#
+#  5. **`glxgears`, in a real X window**, which is the program §13's acceptance
+#     criterion names and which the previous stage could not run at all: Zink's
+#     windowed path is `zink_kopper` and it wants a `VK_KHR_swapchain`, which
+#     design.md §10 stage 2 now provides. The frame is captured with `xwd` and
+#     compared against the same program on llvmpipe — not pixel for pixel, since
+#     glxgears animates from the wall clock, but on the histogram statistics
+#     that are invariant under the gears' rotation.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -102,13 +110,12 @@ fi
 
 # --- 2. a real GL program renders, and the pixels are checked -----------------
 #
-# WHY NOT glxgears. It is a GLX program and GLX needs an X server; this machine
-# is headless, and Xvfb's GLX has no DRI3, so Zink's window-system path
-# (`zink_kopper`) cannot create a screen on it — it wants a swapchain, which
-# design.md §10 deliberately keeps outside the protocol. A windowed test would
-# be measuring the one thing this stage does not implement. `gl-probe` is the
-# same workload without the window: an indexed, depth-tested, textured, lit mesh
-# through a real graphics pipeline, read back and judged.
+# WHY THIS AND NOT ONLY glxgears. `glxgears` now runs (check 5 below), but it
+# animates, so it can only be judged on statistics. `gl-probe` renders one
+# deterministic frame and can be compared against llvmpipe pixel for pixel,
+# which is a much sharper instrument for the *rendering* half. The two check
+# different things and both are worth keeping: an indexed, depth-tested,
+# textured, lit mesh through a real graphics pipeline, read back and judged.
 echo
 echo "--- gl-probe: a rendered frame, and its pixels ---"
 PROBE="$RUNDIR/gl-probe"
@@ -186,6 +193,109 @@ else
       fail=1
     fi
   fi
+fi
+
+# --- 4. a windowed GL program, in a real X window -----------------------------
+#
+# The check the previous stage could not make. design.md §10 stage 2 exists, so
+# `zink_kopper` has a swapchain to create and `glxgears` — which is the program
+# §13's acceptance criterion actually names — runs against a window rather than
+# refusing to start.
+#
+# WHY THE JUDGEMENT IS STRUCTURAL AND NOT A PSNR. `glxgears` animates from the
+# wall clock, so two runs never produce the same frame and there is nothing to
+# compare byte for byte. What *is* invariant under rotation is the shape of the
+# histogram: the three gears keep their areas and their colours whatever angle
+# they are at. So the same five numbers are taken from our capture and from
+# llvmpipe's, and they have to agree — which is the same argument §0.4 makes for
+# `gl-probe`, applied to a moving picture.
+#
+# `LIBGL_KOPPER_DRI2` is set because Xvfb's GLX has no DRI3 and Mesa's GLX
+# refuses the visual before zink is reached without it (§0.4 saw the same wall
+# from the other side). Kopper itself needs no DRI3: its whole point is that the
+# swapchain is Vulkan's rather than the X server's.
+echo
+echo "--- glxgears: a window, and what ends up in it ---"
+if ! command -v Xvfb >/dev/null || ! command -v xwd >/dev/null || ! command -v glxgears >/dev/null; then
+  echo "  SKIP — Xvfb, xwd or glxgears is missing; enter 'nix develop'"
+else
+  XDISPLAY=":$((90 + RANDOM % 8))"
+  GEARS=300
+  Xvfb "$XDISPLAY" -screen 0 ${GEARS}x${GEARS}x24 -nolisten tcp > "$RUNDIR/xvfb.log" 2>&1 &
+  XPID=$!
+  sleep 1
+
+  # The root window *is* the gears window, so a root capture needs no cropping
+  # and "coverage" means coverage of the frame the application drew.
+  gears_capture() {
+    local tag="$1"; shift
+    env DISPLAY="$XDISPLAY" "$@" glxgears -geometry ${GEARS}x${GEARS}+0+0 \
+      > "$RUNDIR/$tag.log" 2>&1 &
+    local pid=$!
+    sleep 5
+    DISPLAY="$XDISPLAY" xwd -root -silent -out "$RUNDIR/$tag.xwd" 2>/dev/null
+    kill $pid 2>/dev/null; sleep 0.3; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null
+    [ -s "$RUNDIR/$tag.xwd" ] && xwdtopnm < "$RUNDIR/$tag.xwd" > "$RUNDIR/$tag.ppm" 2>/dev/null
+  }
+
+  # colours, non-black coverage, and the share of each gear's hue. `ppmhist`
+  # gives (r g b lum count) rows; everything else is arithmetic.
+  gears_stats() {
+    ppmhist "$1" 2>/dev/null | awk '
+      /^[ \t]*[0-9]/ {
+        r=$1; g=$2; b=$3; n=$5; total+=n; colours++
+        if (r+g+b > 0) { lit+=n
+          if (r > g && r > b) red+=n
+          else if (g > r && g > b) green+=n
+          else if (b > r && b > g) blue+=n }
+      }
+      END { if (total==0) total=1
+            printf "%d %.3f %.3f %.3f %.3f\n", colours, lit/total, red/total, green/total, blue/total }'
+  }
+
+  start_gpu_side || { echo "  the GPU side never came up"; kill "$XPID" 2>/dev/null; exit 1; }
+  gears_capture zink env VK_DRIVER_FILES="$MANIFEST" SV_SOCKET="$SOCK" \
+    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=1
+  stop_gpu_side
+  gears_capture soft env LIBGL_ALWAYS_SOFTWARE=1
+
+  if [ ! -s "$RUNDIR/zink.ppm" ]; then
+    echo "  FAIL — nothing was captured. glxgears said:"
+    head -8 "$RUNDIR/zink.log" | sed 's/^/    /'
+    fail=1
+  else
+    read -r ZC ZLIT ZR ZG ZB <<< "$(gears_stats "$RUNDIR/zink.ppm")"
+    echo "  ours     : $ZC colours, $ZLIT lit, gears r/g/b $ZR / $ZG / $ZB"
+    if [ -s "$RUNDIR/soft.ppm" ]; then
+      read -r SC SLIT SR SG SB <<< "$(gears_stats "$RUNDIR/soft.ppm")"
+      echo "  llvmpipe : $SC colours, $SLIT lit, gears r/g/b $SR / $SG / $SB"
+    fi
+    # A dropped frame leaves the window at the X server's background, which is
+    # one colour and no coverage; a present that showed something but not the
+    # gears has no three-hue split. Both are what this catches.
+    ok=$(awk -v c="$ZC" -v lit="$ZLIT" -v r="$ZR" -v g="$ZG" -v b="$ZB" \
+      -v sr="${SR:-0}" -v sg="${SG:-0}" -v sb="${SB:-0}" -v slit="${SLIT:-0}" '
+      BEGIN {
+        if (c < 50)   { print "too few colours: " c; exit }
+        if (lit < 0.05) { print "almost nothing was drawn: " lit; exit }
+        if (r < 0.01 || g < 0.01 || b < 0.01) { print "a gear is missing: " r " " g " " b; exit }
+        if (slit > 0) {
+          if (lit < slit * 0.5 || lit > slit * 2.0) { print "coverage disagrees with llvmpipe"; exit }
+          if (r  < sr * 0.4 || r  > sr * 2.5)       { print "the red gear disagrees";  exit }
+          if (g  < sg * 0.4 || g  > sg * 2.5)       { print "the green gear disagrees"; exit }
+          if (b  < sb * 0.4 || b  > sb * 2.5)       { print "the blue gear disagrees";  exit }
+        }
+        print "ok"
+      }')
+    if [ "$ok" = "ok" ]; then
+      echo "  PASS — three gears, in a window, over a forwarded swapchain"
+    else
+      echo "  FAIL — $ok"
+      grep -E 'MESA|Error|error' "$RUNDIR/zink.log" | head -6 | sed 's/^/    /'
+      fail=1
+    fi
+  fi
+  kill "$XPID" 2>/dev/null; wait "$XPID" 2>/dev/null
 fi
 
 echo
