@@ -277,6 +277,44 @@ pub trait Transport: Send + Sync {
 
     /// Send a command that generates no reply (design.md §4.4, D15).
     fn send(&self, ring: RingClass, opcode: u32, command: &[u8]) -> IcdResult<()>;
+
+    /// Append a recorded `vkCmd*` to `command_buffer`'s blob (design.md §6.5).
+    ///
+    /// > Each `VkCommandBuffer` owns an arena block; recording encodes straight
+    /// > into it; `vkEndCommandBuffer` publishes `(offset, len)`.
+    ///
+    /// The default forwards to [`Transport::send`] on the device ring, which is
+    /// what every transport did before blobs existed and is exactly right for
+    /// one that has no arena — `sv-loopback` and the test doubles. A transport
+    /// that overrides this owes [`Transport::publish_blob`] as well: the two are
+    /// the two halves of one mechanism and overriding one without the other
+    /// records commands nobody ever executes.
+    ///
+    /// **`opcode` is passed unchanged and the ordering is the caller's.** A
+    /// blob is append-only and the sub-decoder replays it in order, which is
+    /// what makes this safe under §4.4's rule that nothing may reorder `vkCmd*`
+    /// within a command buffer.
+    fn record(&self, command_buffer: u64, opcode: u32, command: &[u8]) -> IcdResult<()> {
+        let _ = command_buffer;
+        self.send(RingClass::Device, opcode, command)
+    }
+
+    /// Hand `command_buffer`'s accumulated blob to the GPU side and reset it.
+    ///
+    /// Called from `vkEndCommandBuffer`. The default does nothing, which pairs
+    /// with the default [`Transport::record`] having already sent every command
+    /// individually.
+    fn publish_blob(&self, command_buffer: u64) -> IcdResult<()> {
+        let _ = command_buffer;
+        Ok(())
+    }
+
+    /// Forget `command_buffer`'s blob without executing it.
+    ///
+    /// `vkResetCommandBuffer`, `vkResetCommandPool` and `vkFreeCommandBuffers`.
+    fn discard_blob(&self, command_buffer: u64) {
+        let _ = command_buffer;
+    }
 }
 
 pub type LowerResult<T> = Result<T, LowerError>;

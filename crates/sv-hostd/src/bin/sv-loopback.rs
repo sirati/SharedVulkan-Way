@@ -316,6 +316,7 @@ fn gpu_side(
                 wait_until(
                     &control,
                     &ctrl,
+                    Some(Lane::Command),
                     &parker,
                     &|| !cons.is_empty().unwrap_or(false),
                     overall,
@@ -336,6 +337,7 @@ fn gpu_side(
                     wait_until(
                         &control,
                         &ctrl,
+                        None,
                         &parker,
                         &|| barrier_satisfied(&control, b).unwrap_or(false),
                         overall,
@@ -528,6 +530,7 @@ fn app_side(socket: &str, wait_for_replies: bool) -> Result<(), Box<dyn std::err
             match wait_until(
                 &control,
                 ctrl,
+                Some(Lane::Reply),
                 &parker,
                 &|| !cons.is_empty().unwrap_or(false),
                 slice,
@@ -563,6 +566,7 @@ fn app_side(socket: &str, wait_for_replies: bool) -> Result<(), Box<dyn std::err
     wait_until(
         &control,
         &RingCtrl::open(&control, REVERSE_RING_SLOT)?,
+        Some(Lane::Command),
         &parker,
         &|| !reverse.is_empty().unwrap_or(false),
         overall,

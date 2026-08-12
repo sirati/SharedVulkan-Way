@@ -267,6 +267,95 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
 /// would have been. What it costs is that the driver pins the configured arena
 /// up front instead of tracking demand. What it does not cost is any of §5.3:
 /// the `(memory, offset)` rewrite is unchanged, with one slab.
+/// Import one slab of an already-mapped arena (design.md §5.2, `svImportArenaSlab`).
+///
+/// The lazy half of [`import_whole`]: the same call over a sub-range of the same
+/// mapping. §5.4's claim that "`import` is granularity-blind, allocator-blind
+/// and — up to 2 GiB — size-blind" is what makes this a parameter change rather
+/// than a second implementation.
+///
+/// # What it is worth, measured
+///
+/// Importing the whole arena at startup costs about **70 ms per GiB** on this
+/// machine past the first quarter-gigabyte: 17 ms to have a 64 MiB or 256 MiB
+/// arena ready to serve, 72 ms at 1 GiB, 141 ms at 2 GiB. That is startup an
+/// application pays for memory it may never touch, and it is what §5.2 means by
+/// "lazy import bounds the number of driver imports and the driver's own
+/// pinning". A 64 MiB slab is about 4.4 ms, paid once, when something first
+/// allocates in it.
+pub fn import_slab(
+    driver: &Driver,
+    region: &SharedRegion,
+    arena_offset: u64,
+    len: u64,
+) -> Result<(vk::DeviceMemory, u32)> {
+    let ext = driver
+        .external_host
+        .as_ref()
+        .ok_or(DriverError::Missing("VK_EXT_external_memory_host"))?;
+    if arena_offset.checked_add(len).is_none_or(|e| e > region.len() as u64) {
+        return Err(DriverError::Other(format!(
+            "a slab at {arena_offset}+{len} is outside the {}-byte arena",
+            region.len()
+        )));
+    }
+    // SAFETY: as `import_whole` — the base of a live mapping this process owns,
+    // offset inside it by the check above, handed to the driver rather than
+    // dereferenced. The mapping outlives the import because `Arena` holds the
+    // `Arc` and slabs are never released while the process lives (§5.2).
+    let ptr = unsafe { region.base_ptr().add(arena_offset as usize) } as *mut std::ffi::c_void;
+
+    let mut hp = vk::MemoryHostPointerPropertiesEXT::default();
+    let r = unsafe {
+        (ext.fp().get_memory_host_pointer_properties_ext)(
+            driver.device.handle(),
+            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+            ptr,
+            &mut hp,
+        )
+    };
+    if r != vk::Result::SUCCESS {
+        return Err(DriverError::Vk("vkGetMemoryHostPointerPropertiesEXT", r));
+    }
+    let preferred = driver
+        .memory_type(hp.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE)
+        .unwrap_or(0);
+    let type_index = sv_arena::import::choose_memory_type(preferred, hp.memory_type_bits)
+        .map_err(|e| DriverError::Other(format!("{e}")))?;
+    let mut imp = vk::ImportMemoryHostPointerInfoEXT::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+        .host_pointer(ptr);
+    let ai = vk::MemoryAllocateInfo::default()
+        .allocation_size(len)
+        .memory_type_index(type_index)
+        .push_next(&mut imp);
+    let memory = unsafe { driver.device.allocate_memory(&ai, None) }
+        .map_err(|e| DriverError::Vk("vkAllocateMemory(import slab)", e))?;
+    Ok((memory, type_index))
+}
+
+/// An arena that is mapped but not yet imported: every slab arrives on demand.
+///
+/// Nothing is asked of the driver here, which is the point — this is the
+/// constructor whose whole content is the *absence* of the `vkAllocateMemory`
+/// that [`import_whole`] makes.
+pub fn map_lazy(region: Arc<SharedRegion>) -> Arena {
+    let len = region.len() as u64;
+    Arena {
+        provider: Provider::AppMemfd,
+        region,
+        memory: vk::DeviceMemory::null(),
+        len,
+        // Not known until the first slab is imported. It is only read for the
+        // startup report and by `check_external_buffers_keep_the_arena`, which
+        // runs after the first import on this path.
+        memory_type: u32::MAX,
+        external_handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+        #[cfg(target_os = "linux")]
+        exported_fd: None,
+    }
+}
+
 pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena> {
     let ext = driver
         .external_host
@@ -347,10 +436,32 @@ pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena>
 ///
 /// Measured on RADV (RAPHAEL_MENDOCINO, Mesa 26.1.1): the mask is unchanged.
 pub fn check_external_buffers_keep_the_arena(driver: &Driver, arena: &Arena) -> Result<()> {
-    let kind = arena.external_handle_type;
-    if kind.is_empty() {
+    check_external_buffers(driver, arena.external_handle_type, arena.memory_type)
+}
+
+/// The same check against a memory type that is known separately.
+///
+/// Lazy import (§5.2) means the arena's memory type does not exist until the
+/// first `svImportArenaSlab` succeeds, so on that path this runs *then* rather
+/// than at startup. Late is much better than not at all: the failure it catches
+/// — a driver that narrows `memoryTypeBits` for external-capable buffers past
+/// the arena's own type — makes every subsequent `vkBindBufferMemory` illegal,
+/// and diagnosing that from `VUID-vkBindBufferMemory-memory-01035` is an
+/// afternoon.
+pub fn check_external_buffers(
+    driver: &Driver,
+    kind: vk::ExternalMemoryHandleTypeFlags,
+    memory_type: u32,
+) -> Result<()> {
+    if kind.is_empty() || memory_type == u32::MAX {
         return Ok(());
     }
+    // Named `arena` so the body below reads unchanged; it is only the two fields
+    // the check actually consults.
+    struct ProbeArena {
+        memory_type: u32,
+    }
+    let arena = ProbeArena { memory_type };
     // Everything Zink binds into host-visible memory: vertex, index, uniform,
     // storage and staging.
     let usage = vk::BufferUsageFlags::TRANSFER_SRC

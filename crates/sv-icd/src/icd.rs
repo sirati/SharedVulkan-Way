@@ -46,6 +46,27 @@ macro_rules! forwarded {
     };
 }
 
+/// Encode one command straight into a command buffer's blob (design.md §6.5).
+///
+/// The generated forwarders do this for every `vkCmd*`; this is for the two
+/// framing commands, which the generator emits as replying calls because that is
+/// what their signatures say and which travel in the blob anyway.
+fn record_into_blob(
+    t: &dyn sv_icd_entry::Transport,
+    command_buffer: u64,
+    opcode: p::Opcode,
+    size: usize,
+    encode: impl FnOnce(&mut sv_wire::Encoder<'_>) -> sv_wire::Result<()>,
+) -> IcdResult<()> {
+    let mut buf = vec![0u8; size];
+    {
+        let mut enc = sv_wire::Encoder::new(&mut buf);
+        encode(&mut enc).map_err(LowerError::Wire)?;
+        enc.finish().map_err(LowerError::Wire)?;
+    }
+    t.record(command_buffer, opcode as u32, &buf)
+}
+
 impl IcdLocal for SharedVulkan {
     fn api_version(&self) -> u32 {
         API_VERSION
@@ -329,6 +350,14 @@ impl IcdLocal for SharedVulkan {
                     p_command_buffers: buffers.iter().map(|b| p::VkCommandBuffer(*b)).collect(),
                 },
             );
+        }
+        // After the free has been queued, not before: `free_blob` waits for the
+        // GPU side to finish with the block, and the packet it is waiting past
+        // has to be on the ring for that wait to end.
+        if let Some(t) = self.ring_transport() {
+            for b in buffers {
+                t.free_blob(*b);
+            }
         }
     }
 
@@ -688,11 +717,33 @@ impl Icd for SharedVulkan {
             None
         };
         let size = allocation.map(|a| a.size).unwrap_or(info.allocation_size);
+        let slab_geometry = allocation.map(|a| (a.slab, s.allocator.slab_size()));
         s.memories.insert(
             id,
             Memory { memory_type_index: type_index, allocation, size, mapped: false },
         );
         drop(s);
+
+        // design.md §5.2: "When the app side needs a slab it picks a free region
+        // of the arena, writes a slab-directory entry, and sends
+        // `svImportArenaSlab`. The GPU side imports it and replies. A failed
+        // import is a hard error surfaced as `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+        // from the triggering `vkAllocateMemory`."
+        //
+        // The allocator has just told us which slab this landed in, and the slab
+        // directory says whether that slab exists on the other side yet. On a
+        // provider that imported the whole arena up front — which is every
+        // GPU-allocated one — the directory says so at attach and this is one
+        // acquire load.
+        if let (Some((slab, slab_size)), Some(t)) = (slab_geometry, self.ring_transport())
+            && let Err(e) = t.ensure_slab(slab, u64::from(slab) * slab_size, slab_size)
+        {
+            sv_icd_entry::report_failure(e);
+            return Ok(p::VkAllocateMemoryReply {
+                result: p::VkResult(sv_icd_entry::VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY.0),
+                p_memory: None,
+            });
+        }
 
         if allocation.is_none()
             && let Some(t) = self.wire()
@@ -990,12 +1041,69 @@ impl Icd for SharedVulkan {
         forwarded!(self, destroy_command_pool, args, { Ok(()) })
     }
 
+    /// design.md §6.5, and the correction to it that the blob forced.
+    ///
+    /// §6.5 leaves `vkBeginCommandBuffer` as an ordinary forwarded command and
+    /// only `vkCmd*` in the blob. That cannot work: the GPU side replays a blob
+    /// when it *arrives*, which is at `vkEndCommandBuffer`, so a `Begin` that
+    /// crossed when the application called it would open the driver's command
+    /// buffer at an unrelated moment — and with two command buffers being
+    /// recorded concurrently, which Vulkan explicitly permits, the second
+    /// `Begin` would close the first's recording and every `vkCmd*` replayed
+    /// afterwards would land in the wrong one.
+    ///
+    /// So both framing commands go **inside** the blob
+    /// (`sv_codegen::exceptions::BLOB_FRAMING`), the blob is self-describing,
+    /// and a command buffer's whole recording is one packet instead of two round
+    /// trips and N sends.
+    ///
+    /// The result is answered locally, which is the same optimism
+    /// `vkQueueSubmit` now takes: a `Begin` that the driver refuses surfaces as
+    /// the ring going fatal with the opcode in `fatal_msg`, and the application
+    /// sees `VK_ERROR_DEVICE_LOST` on its next call. That is a worse diagnostic
+    /// than a returned `VkResult` and it is the only failure this trades away —
+    /// `vkBeginCommandBuffer` may return `VK_ERROR_OUT_OF_*_MEMORY` and nothing
+    /// else.
     fn begin_command_buffer(
         &self,
         args: p::VkBeginCommandBufferArgs,
     ) -> IcdResult<p::VkBeginCommandBufferReply> {
-        forwarded!(self, begin_command_buffer, args, {
-            Ok(p::VkBeginCommandBufferReply { result: p::VkResult(0) })
+        let Some(t) = self.wire() else {
+            return Ok(p::VkBeginCommandBufferReply { result: p::VkResult(0) });
+        };
+        let cb = args.command_buffer.0;
+        // Begin implicitly resets a command buffer that was already recorded
+        // (VUID-vkBeginCommandBuffer-commandBuffer-00049 permits it when the
+        // pool allows individual reset, and requires the application not to do
+        // it otherwise), so the blob starts empty here whatever was in it.
+        t.discard_blob(cb);
+        record_into_blob(
+            t,
+            cb,
+            p::Opcode::VkBeginCommandBuffer,
+            p::size_cmd_vk_begin_command_buffer(&args),
+            |enc| p::encode_cmd_vk_begin_command_buffer(enc, 0, &args),
+        )?;
+        Ok(p::VkBeginCommandBufferReply { result: p::VkResult(0) })
+    }
+
+    /// `vkResetCommandBuffer` throws away the recording on both sides.
+    ///
+    /// The forwarded command still crosses — the GPU side's driver command
+    /// buffer is a real object and resetting it is what the application asked
+    /// for — and the blob is emptied without giving its block back, because a
+    /// reset command buffer is almost always about to be recorded into again and
+    /// returning the block only to ask for the same size a moment later is how a
+    /// first-fit allocator fragments.
+    fn reset_command_buffer(
+        &self,
+        args: p::VkResetCommandBufferArgs,
+    ) -> IcdResult<p::VkResetCommandBufferReply> {
+        if let Some(t) = self.wire() {
+            t.discard_blob(args.command_buffer.0);
+        }
+        forwarded!(self, reset_command_buffer, args, {
+            Ok(p::VkResetCommandBufferReply { result: p::VkResult(0) })
         })
     }
 
@@ -1003,26 +1111,73 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkEndCommandBufferArgs,
     ) -> IcdResult<p::VkEndCommandBufferReply> {
-        forwarded!(self, end_command_buffer, args, {
-            Ok(p::VkEndCommandBufferReply { result: p::VkResult(0) })
-        })
+        let Some(t) = self.wire() else {
+            return Ok(p::VkEndCommandBufferReply { result: p::VkResult(0) });
+        };
+        let cb = args.command_buffer.0;
+        record_into_blob(
+            t,
+            cb,
+            p::Opcode::VkEndCommandBuffer,
+            p::size_cmd_vk_end_command_buffer(&args),
+            |enc| p::encode_cmd_vk_end_command_buffer(enc, 0, &args),
+        )?;
+        t.publish_blob(cb)?;
+        Ok(p::VkEndCommandBufferReply { result: p::VkResult(0) })
     }
 
-    /// design.md D15 makes submit asynchronous and non-negotiable — "if submit
-    /// is synchronous the design is dead on latency grounds regardless of
-    /// transport".
+    /// design.md D15: submit is asynchronous, and it is now.
     ///
-    /// **This one is synchronous, and it is the clearest debt in the app side.**
-    /// `vkQueueSubmit` generates a reply, so the generated forwarder waits for
-    /// it. Making it asynchronous needs `svQueueSubmitAsync` (§6.3) and the
-    /// timeline mirror wired to it (§9.3), neither of which exists; without them
-    /// there is nothing to tell the application the submission was accepted. It
-    /// is correct and it is slow, and the fix is a protocol command rather than
-    /// a change here.
+    /// > if submit is synchronous the design is dead on latency grounds
+    /// > regardless of transport
+    ///
+    /// # It needed no new opcode, and that is a correction to §6.3
+    ///
+    /// §6.3 budgets `svQueueSubmitAsync` — "submit with no reply; timeline
+    /// values are the completion signal" — as one of thirteen non-Vulkan
+    /// commands. It does not exist and does not need to: *asynchronous* is a
+    /// property of the **flag**, not of the command. `vkQueueSubmit` sent
+    /// without `CMD_FLAG_GENERATE_REPLY` is exactly `svQueueSubmitAsync`, the
+    /// GPU side's generated arm already respects `wants_reply()`, and the
+    /// timeline mirror §9.3 wanted turns out not to be needed either: what an
+    /// application uses to learn a submission has completed is a fence or a
+    /// semaphore, and both of those are objects the GPU side already owns.
+    ///
+    /// This is §0.6 item 1's rule — "a capability that is expressible in the
+    /// forwarded API does not deserve a protocol extension" — applied to the
+    /// second-largest opcode on that list.
+    ///
+    /// # What it costs, stated plainly
+    ///
+    /// The `VkResult` is not read. `VK_SUCCESS` is returned optimistically, and
+    /// a submission the driver refuses shows up as the ring going fatal with
+    /// `vkQueueSubmit` and the driver's own code in `fatal_msg`, which the
+    /// application sees as `VK_ERROR_DEVICE_LOST` on its next call
+    /// (`sv_gpu_server::session::drain` does that check, and it exists for this).
+    /// The results `vkQueueSubmit` may return are the two out-of-memory codes
+    /// and `VK_ERROR_DEVICE_LOST`; an application that would have handled the
+    /// first two now sees the third.
+    ///
+    /// # The ordering it breaks, and the barrier that puts it back
+    ///
+    /// A blocking submit is an accidental cross-ring barrier — nothing else is
+    /// issued until the GPU side has answered. Removing it exposes
+    /// `vkDeviceWaitIdle`, which the ring rule puts on the *device* ring and
+    /// which would otherwise be able to run before the submission it is supposed
+    /// to be waiting for. [`crate::transport::Barriers`] is the answer and
+    /// carries the argument.
     fn queue_submit(&self, args: p::VkQueueSubmitArgs) -> IcdResult<p::VkQueueSubmitReply> {
-        forwarded!(self, queue_submit, args, {
-            Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
-        })
+        let Some(t) = self.wire() else {
+            return Ok(p::VkQueueSubmitReply { result: p::VkResult(0) });
+        };
+        let mut buf = vec![0u8; p::size_cmd_vk_queue_submit(&args)];
+        {
+            let mut enc = sv_wire::Encoder::new(&mut buf);
+            p::encode_cmd_vk_queue_submit(&mut enc, 0, &args).map_err(LowerError::Wire)?;
+            enc.finish().map_err(LowerError::Wire)?;
+        }
+        t.send(sv_icd_entry::RingClass::Queue, p::Opcode::VkQueueSubmit as u32, &buf)?;
+        Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
     }
 
     fn device_wait_idle(

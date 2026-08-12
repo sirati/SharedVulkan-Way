@@ -328,6 +328,16 @@ impl SharedVulkan {
         self.transport.as_ref().map(|t| t as &dyn sv_icd_entry::Transport)
     }
 
+    /// The transport as itself rather than as the trait.
+    ///
+    /// One caller: `vkFreeCommandBuffers`, which returns a command blob's arena
+    /// block. That is not on [`sv_icd_entry::Transport`] because it is not
+    /// something a *generated* forwarder ever needs — only this crate knows the
+    /// difference between a command buffer being reset and one being freed.
+    pub fn ring_transport(&self) -> Option<&crate::transport::RingTransport> {
+        self.transport.as_ref()
+    }
+
     /// design.md §5.3's rewrite, app-side half: allocation coordinates become
     /// arena coordinates.
     ///

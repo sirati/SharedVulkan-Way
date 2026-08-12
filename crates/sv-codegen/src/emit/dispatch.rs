@@ -103,6 +103,20 @@ fn emit_opcodes(plan: &Plan) -> TokenStream {
     } else {
         quote!(matches!(self, #(#recorded)|*))
     };
+    let blob_extra: Vec<TokenStream> = plan
+        .commands
+        .iter()
+        .filter(|c| crate::exceptions::BLOB_FRAMING.contains(&c.name.as_str()))
+        .map(|c| {
+            let v = naming::opcode_variant(&c.name);
+            quote!(Opcode::#v)
+        })
+        .collect();
+    let blob_allowed_body = if blob_extra.is_empty() {
+        quote!(self.is_recorded())
+    } else {
+        quote!(self.is_recorded() || matches!(self, #(#blob_extra)|*))
+    };
     let count = plan.commands.len();
 
     quote! {
@@ -134,6 +148,24 @@ fn emit_opcodes(plan: &Plan) -> TokenStream {
             /// Whether this opcode belongs to the recorded `vkCmd*` subset the
             /// restricted sub-decoder accepts (design.md §6.5).
             pub fn is_recorded(self) -> bool { #recorded_body }
+
+            /// Whether this opcode may appear in a command blob at all.
+            ///
+            /// The recorded subset **plus the two commands that frame it**.
+            /// design.md §6.5 says "`vkEndCommandBuffer` publishes
+            /// `(offset, len)`" and stops there, leaving `vkBeginCommandBuffer`
+            /// as an ordinary round trip — which cannot work, because the GPU
+            /// side replays the blob when it arrives rather than when the
+            /// application recorded it, so a `Begin` that crossed at call time
+            /// would open the driver's command buffer and a `vkCmd*` replayed
+            /// afterwards would land in a *different* recording. Both framing
+            /// commands therefore travel inside the blob, which also makes it
+            /// self-describing: a blob names the buffer it opens and closes it.
+            ///
+            /// It is still a *restricted* decoder, and that is the property
+            /// §6.5 is about — this list is closed, generated, and two entries
+            /// longer than it was.
+            pub fn is_blob_allowed(self) -> bool { #blob_allowed_body }
 
             /// Whether this command's reply begins with a `VkResult`.
             ///
@@ -456,14 +488,20 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
                 Opcode::#v => {
                     let args = #decode_cmd(&mut body)?;
                     let r = srv.#m(args)?;
-                    if header.wants_reply() {
-                        let n = #size_reply(&r);
-                        let at = reply.len();
-                        reply.resize(at + n, 0);
-                        let mut enc = sv_wire::Encoder::new(&mut reply[at..]);
-                        #encode_reply(&mut enc, &r)?;
-                        enc.finish()?;
-                    }
+                    // Encoded whether or not anyone asked, so that a caller
+                    // which sent this command *without* `GENERATE_REPLY` can
+                    // still look at the `VkResult` before throwing the bytes
+                    // away. That is not hypothetical: `vkQueueSubmit` is sent
+                    // fire-and-forget (D15), and without this its result would
+                    // be discarded here — a driver refusing a submission would
+                    // be silence on both sides. The consumer decides what to do
+                    // with the reply; this pass only produces it.
+                    let n = #size_reply(&r);
+                    let at = reply.len();
+                    reply.resize(at + n, 0);
+                    let mut enc = sv_wire::Encoder::new(&mut reply[at..]);
+                    #encode_reply(&mut enc, &r)?;
+                    enc.finish()?;
                 }
             }
         } else {
@@ -476,17 +514,33 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
         }
     });
 
-    let sub_arms = plan.commands.iter().filter(|c| c.is_recorded).map(|c| {
-        let v = naming::opcode_variant(&c.name);
-        let m = naming::command_method(&c.name);
-        let decode_cmd = format_ident!("decode_cmd_{}", naming::snake_case(&c.name));
-        quote! {
-            Opcode::#v => {
-                let args = #decode_cmd(&mut body)?;
-                srv.#m(args)?;
+    let sub_arms = plan
+        .commands
+        .iter()
+        .filter(|c| c.is_recorded || crate::exceptions::BLOB_FRAMING.contains(&c.name.as_str()))
+        .map(|c| {
+            let v = naming::opcode_variant(&c.name);
+            let m = naming::command_method(&c.name);
+            let decode_cmd = format_ident!("decode_cmd_{}", naming::snake_case(&c.name));
+            // A framing command returns a `VkResult` and there is nobody to
+            // give it to: the app side answered `VK_SUCCESS` optimistically
+            // when it recorded the call. A failure here is not lost — it is
+            // reported through the ring's `fatal_msg`, which is what the whole
+            // blob shares, and which is the right granularity because a
+            // command buffer that failed to open has no meaningful partial
+            // outcome.
+            let call = if c.generates_reply {
+                quote!(let _ = srv.#m(args)?;)
+            } else {
+                quote!(srv.#m(args)?;)
+            };
+            quote! {
+                Opcode::#v => {
+                    let args = #decode_cmd(&mut body)?;
+                    #call
+                }
             }
-        }
-    });
+        });
 
     quote! {
         /// Decode one command and hand it to the server.
@@ -543,7 +597,7 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
                 let header = sv_wire::CommandHeader::decode(dec)?;
                 let opcode = Opcode::from_u32(header.cmd_type)
                     .ok_or(sv_wire::WireError::UnknownCommand { opcode: header.cmd_type })?;
-                if !opcode.is_recorded() {
+                if !opcode.is_blob_allowed() {
                     return Err(sv_wire::WireError::UnknownCommand { opcode: header.cmd_type });
                 }
                 let body_len = (header.cmd_size as usize)

@@ -1,7 +1,13 @@
 //! The generated shared_vulkan protocol.
 //!
 //! Everything in this crate is emitted by `sv-codegen` from the registry
-//! `$VK_XML` names. Nothing here is hand-written except this file.
+//! `$VK_XML` names. Nothing here is hand-written except this file and [`sv`],
+//! which carries design.md §6.3's non-Vulkan commands — "hand-written, not
+//! generated, and … the only place the protocol is ours rather than Vulkan's".
+//! They live here rather than in `sv-wire` because they are protocol and not
+//! primitives, and beside the generated protocol because both sides need them
+//! and the assertion that keeps their two opcode ranges apart has to be able to
+//! see `Opcode::COUNT`.
 //!
 //! # `#![forbid(unsafe_code)]`
 //!
@@ -67,6 +73,8 @@
 #![allow(clippy::unnecessary_cast)]
 
 include!(concat!(env!("OUT_DIR"), "/sv_proto.rs"));
+
+pub mod sv;
 
 /// The `protocol_hash` this build carries into the handshake (design.md §4.3).
 ///

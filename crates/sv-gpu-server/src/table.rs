@@ -103,6 +103,9 @@ pub struct Objects {
     memory: HashMap<u64, MemoryRange>,
     /// The whole-arena allocation, under [`crate::ARENA_MEMORY_ID`].
     arena: Option<MemoryRange>,
+    /// One entry per slab; `None` until `svImportArenaSlab` names it (§5.2).
+    slabs: Vec<Option<vk::DeviceMemory>>,
+    slab_size: u64,
 }
 
 impl Default for Objects {
@@ -113,18 +116,77 @@ impl Default for Objects {
 
 impl Objects {
     pub fn new() -> Objects {
-        Objects { map: HashMap::new(), memory: HashMap::new(), arena: None }
+        Objects {
+            map: HashMap::new(),
+            memory: HashMap::new(),
+            arena: None,
+            slabs: Vec::new(),
+            slab_size: 1,
+        }
     }
 
-    /// Publish the arena's `VkDeviceMemory` under the reserved id.
+    /// Publish the arena as **one** imported slab covering all of it.
+    ///
+    /// This is what the GPU-allocated provider does and always will: there the
+    /// arena *is* a `vkAllocateMemory` this process made and then exported, so
+    /// there is nothing to import lazily — the memory exists before the app side
+    /// has attached, let alone allocated. design.md §5.2's lazy import is a
+    /// property of the *import* providers, and [`Objects::set_lazy_arena`] is
+    /// the other half.
     pub fn set_arena(&mut self, memory: vk::DeviceMemory, len: u64) {
         let r = MemoryRange { memory, base: 0, len };
         self.arena = Some(r);
+        self.slab_size = len.max(1);
+        self.slabs = vec![Some(memory)];
         self.memory.insert(crate::ARENA_MEMORY_ID, r);
+    }
+
+    /// Publish an arena whose slabs will arrive one `svImportArenaSlab` at a
+    /// time (design.md §5.2).
+    ///
+    /// > Slabs are **imported** lazily. When the app side needs a slab it picks
+    /// > a free region of the arena, writes a slab-directory entry, and sends
+    /// > `svImportArenaSlab`. The GPU side imports it and replies.
+    pub fn set_lazy_arena(&mut self, len: u64, slab_size: u64) {
+        self.arena = Some(MemoryRange { memory: vk::DeviceMemory::null(), base: 0, len });
+        self.slab_size = slab_size.max(1);
+        self.slabs = vec![None; len.div_ceil(slab_size.max(1)) as usize];
+        self.memory.insert(
+            crate::ARENA_MEMORY_ID,
+            MemoryRange { memory: vk::DeviceMemory::null(), base: 0, len },
+        );
+    }
+
+    /// Has any slab been imported yet? The first one is where the arena's
+    /// memory type comes into existence on the lazy path.
+    pub fn any_slab_imported(&self) -> bool {
+        self.slabs.iter().any(|s| s.is_some())
+    }
+
+    /// Record a slab the GPU side has just imported.
+    pub fn set_slab(&mut self, slab: u32, memory: vk::DeviceMemory) {
+        if let Some(s) = self.slabs.get_mut(slab as usize) {
+            *s = Some(memory);
+        }
+    }
+
+    /// The `VkDeviceMemory` covering an arena offset, and the offset inside it.
+    ///
+    /// `None` means the slab has not been imported, which is a protocol error
+    /// rather than a resource shortage: the app side must not use a slab it has
+    /// not asked for.
+    pub fn arena_slab(&self, offset: u64) -> Option<(vk::DeviceMemory, u64)> {
+        let slab = (offset / self.slab_size) as usize;
+        let m = (*self.slabs.get(slab)?)?;
+        Some((m, offset % self.slab_size))
     }
 
     pub fn arena(&self) -> Option<MemoryRange> {
         self.arena
+    }
+
+    pub fn slab_size(&self) -> u64 {
+        self.slab_size
     }
 
     /// Record `id` as naming `handle`.
@@ -238,6 +300,13 @@ pub fn resolve_memory(
     // whose arena offset was computed against a different slab size.
     if at > r.base.saturating_add(r.len) {
         return Err(TableError::NotInArena { memory, offset });
+    }
+    if memory == crate::ARENA_MEMORY_ID {
+        // §5.3 makes an app-side allocation "a sub-range of *one* slab", so this
+        // never has to span two — and a lookup that lands in a slab nobody
+        // imported is a protocol error rather than a bounds error, because the
+        // app side is only supposed to allocate out of slabs it asked for.
+        return objects.arena_slab(at).ok_or(TableError::NotInArena { memory, offset });
     }
     Ok((r.memory, at))
 }

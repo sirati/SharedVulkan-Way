@@ -671,15 +671,44 @@ fn emit_test_server(plan: &Plan) -> TokenStream {
                     assert_eq!(subdecode(&mut dec, &mut srv).unwrap(), 3);
                     assert_eq!(srv.calls, 3);
 
-                    // A non-recorded opcode in the same blob is refused.
+                    // An opcode outside the blob subset is refused. The subset
+                    // is `is_blob_allowed`, which is the recorded commands plus
+                    // the two that frame them — so the sample has to be chosen
+                    // against *that*, not against `is_recorded`, or this test
+                    // passes while checking the wrong list.
                     let mut bad = blob.clone();
-                    let non_recorded = Opcode::from_u32(0).filter(|o| !o.is_recorded());
-                    if let Some(op) = non_recorded {
+                    let outside = (0..Opcode::COUNT as u32)
+                        .filter_map(Opcode::from_u32)
+                        .find(|o| !o.is_blob_allowed());
+                    if let Some(op) = outside {
                         bad[0..4].copy_from_slice(&(op as u32).to_le_bytes());
                         let mut srv = TestServer::default();
                         let mut dec = sv_wire::Decoder::new(&bad);
                         assert!(subdecode(&mut dec, &mut srv).is_err());
                     }
+                }
+
+                /// The blob subset is the `vkCmd*` opcodes **plus the two that
+                /// frame them**, and it is exactly those.
+                ///
+                /// design.md §6.5 says "only the `vkCmd*` opcode subset"; the
+                /// blob turned out to have to carry its own
+                /// `vkBeginCommandBuffer` and `vkEndCommandBuffer`, because the
+                /// GPU side replays a blob when it arrives rather than when the
+                /// application recorded it. That widening is a two-entry list
+                /// and this is what keeps it a two-entry list.
+                #[test]
+                fn the_blob_subset_is_the_recorded_commands_plus_exactly_two() {
+                    let extra: Vec<&'static str> = (0..Opcode::COUNT as u32)
+                        .filter_map(Opcode::from_u32)
+                        .filter(|o| o.is_blob_allowed() && !o.is_recorded())
+                        .map(|o| o.name())
+                        .collect();
+                    assert_eq!(
+                        extra,
+                        vec!["vkBeginCommandBuffer", "vkEndCommandBuffer"],
+                        "the restricted sub-decoder has grown a new opcode"
+                    );
                 }
             }
         }

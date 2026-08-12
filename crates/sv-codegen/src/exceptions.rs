@@ -198,6 +198,21 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
     None
 }
 
+/// The two commands that frame a blob and are therefore inside it.
+///
+/// design.md §6.5 gives the sub-decoder "only the `vkCmd*` opcode subset". That
+/// is one command short at each end. The GPU side replays a blob when it
+/// *arrives*, not when the application recorded it, so a `vkBeginCommandBuffer`
+/// that crossed as an ordinary round trip would open the driver's command buffer
+/// at a moment unrelated to the recording it belongs to — and with two command
+/// buffers being recorded at once, which Vulkan permits, the `vkCmd*` of one
+/// would land in the other. Putting both framing commands in the blob makes it
+/// self-describing and removes two round trips per command buffer.
+///
+/// It is a list of two and it is closed. Anything longer would be the
+/// restriction §6.5 asks for quietly dissolving.
+pub const BLOB_FRAMING: &[&str] = &["vkBeginCommandBuffer", "vkEndCommandBuffer"];
+
 /// The commands a GPU side must give meaning to rather than forward verbatim.
 ///
 /// This is the honest measure of how much of a GPU side is hand-written: pass 12

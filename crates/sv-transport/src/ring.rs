@@ -63,9 +63,10 @@
 //! the entire justification for that type's atomic-and-copy API (R7).
 
 use crate::control::{
-    Control, RC_CMD_HEAD, RC_CMD_TAIL, RC_COMPLETED_SEQNO, RC_FATAL_CODE, RC_FATAL_MSG,
-    RC_FATAL_MSG_LEN, RC_FATAL_SEQNO, RC_IDLE_TIMEOUT_US, RC_NEXT_SEQNO, RC_NOTIFY_COUNT,
-    RC_REPLY_HEAD, RC_REPLY_TAIL, RC_STATUS, RingStatus,
+    Control, RC_CMD_HEAD, RC_CMD_PARKED, RC_CMD_TAIL, RC_CMD_WAKE, RC_COMPLETED_SEQNO,
+    RC_FATAL_CODE, RC_FATAL_MSG, RC_FATAL_MSG_LEN, RC_FATAL_SEQNO, RC_IDLE_TIMEOUT_US,
+    RC_NEXT_SEQNO, RC_NOTIFY_COUNT, RC_REPLY_HEAD, RC_REPLY_PARKED, RC_REPLY_TAIL, RC_REPLY_WAKE,
+    RC_STATUS, RingStatus,
 };
 use crate::region::SharedRegion;
 use crate::{Error, Result};
@@ -251,6 +252,22 @@ impl RingCtrl {
 
     pub fn generation(&self) -> u32 {
         self.generation
+    }
+
+    /// The doorbell words for one lane: `(wake, parked)`.
+    ///
+    /// See [`crate::park::Bell`] for the handshake they implement and
+    /// `control.rs` for why there is a pair per lane rather than one `status`
+    /// word for the ring.
+    pub fn bell(&self, lane: Lane) -> Result<crate::park::Bell<'_>> {
+        let (wake_off, parked_off) = match lane {
+            Lane::Command => (RC_CMD_WAKE, RC_CMD_PARKED),
+            Lane::Reply => (RC_REPLY_WAKE, RC_REPLY_PARKED),
+        };
+        Ok(crate::park::Bell {
+            wake: self.region.atomic_u32(self.base + wake_off)?,
+            parked: self.region.atomic_u32(self.base + parked_off)?,
+        })
     }
 }
 
@@ -453,6 +470,11 @@ impl RingProducer {
         // consumer that acquire-loads the new tail sees a complete record — and
         // a producer that dies before reaching this line has published nothing.
         self.region.atomic_u64(self.lanes.tail_off)?.store(tail + total, Ordering::Release);
+        // design.md §4.4: "the producer checks `IDLE` before paying for a
+        // notification". `Bell::ring` is that check — an acquire load, and the
+        // syscall only when somebody is actually asleep. It has to be *after*
+        // the store above or a woken consumer could find nothing.
+        self.ctrl.bell(self.lanes.lane)?.ring();
         Ok(())
     }
 
@@ -798,6 +820,29 @@ impl BarrierTracker {
         self.last_emitted = Some(want);
         self.emitted += 1;
         Some(RingBarrier { ring: self.depends_ring, seqno: want })
+    }
+
+    /// Put back a barrier whose packet was not sent after all.
+    ///
+    /// [`BarrierTracker::take`] both clears `pending` and advances
+    /// `last_emitted`, so a caller that took a barrier and then failed to push
+    /// cannot simply call `note_produced` again — the next `take` would see
+    /// `last_emitted >= want` and *suppress* it. The barrier would be silently
+    /// lost, and a lost barrier is R22: an intermittent "unknown handle" under
+    /// load, which is the single worst class of bug to ship.
+    ///
+    /// One caller: the producer retrying after a full ring.
+    pub fn restore(&mut self, b: RingBarrier) {
+        debug_assert_eq!(b.ring, self.depends_ring);
+        self.pending = Some(match self.pending {
+            Some(p) => p.max(b.seqno),
+            None => b.seqno,
+        });
+        self.last_emitted = match self.last_emitted {
+            Some(l) if l >= b.seqno => b.seqno.checked_sub(1),
+            other => other,
+        };
+        self.emitted = self.emitted.saturating_sub(1);
     }
 
     /// `(emitted, suppressed)`. A conservative rule that never suppresses is a

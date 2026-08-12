@@ -25,8 +25,9 @@
 //! choosing between "slow" and "gone".
 
 use crate::control::{Control, Liveness, LivenessMonitor, RingStatus};
-use crate::ring::{RingCtrl, RingId};
+use crate::ring::{Lane, RingCtrl, RingId};
 use crate::{Error, Result};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// A point in time a wait must not pass. There is deliberately no `Deadline`
@@ -74,6 +75,13 @@ pub struct WaitSite<'a> {
     pub ready: &'a dyn Fn() -> bool,
     /// Has the ring gone fatal underneath us?
     pub status: &'a dyn Fn() -> RingStatus,
+    /// The doorbell for the lane being waited on, when the wait is for a lane.
+    ///
+    /// `None` for the waits that are not: a barrier waits on another ring's
+    /// `completed_seqno` and nobody rings a bell for it, so those fall back to
+    /// spinning — which is right, because a barrier is satisfied on the first
+    /// load in the common case (design.md §4.4).
+    pub bell: Option<Bell<'a>>,
 }
 
 impl<'a> WaitSite<'a> {
@@ -82,7 +90,49 @@ impl<'a> WaitSite<'a> {
         ready: &'a dyn Fn() -> bool,
         status: &'a dyn Fn() -> RingStatus,
     ) -> Self {
-        WaitSite { ring, ready, status }
+        WaitSite { ring, ready, status, bell: None }
+    }
+
+    pub fn with_bell(mut self, bell: Bell<'a>) -> Self {
+        self.bell = Some(bell);
+        self
+    }
+}
+
+/// The two shared words one lane's doorbell needs.
+///
+/// `wake` is what both sides name to the kernel; `parked` is the producer's
+/// permission to skip the syscall.
+///
+/// # The handshake, and why this order
+///
+/// Consumer: `parked = 1`; read `w = wake`; **then** check ready; then wait for
+/// `wake != w`. Producer: publish; `if parked != 0 { wake += 1; signal }`.
+///
+/// Every interleaving is covered by reading `wake` *before* the last readiness
+/// check. If the producer publishes before that check, the consumer sees the
+/// work and never waits. If it publishes between the check and the wait, it has
+/// already bumped `wake` past `w`, so the wait returns immediately rather than
+/// sleeping on a doorbell that has already been rung. If it publishes after, the
+/// wake is delivered. The one thing that must never happen — a consumer asleep
+/// with work queued — is exactly the case this ordering removes.
+#[derive(Debug, Clone, Copy)]
+pub struct Bell<'a> {
+    pub wake: &'a AtomicU32,
+    pub parked: &'a AtomicU32,
+}
+
+impl Bell<'_> {
+    /// Producer side: wake a parked consumer, and pay nothing if there is none.
+    ///
+    /// Must be called *after* the release store that publishes the work, so that
+    /// a consumer woken by it can see what it was woken for.
+    pub fn ring(&self) {
+        if self.parked.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.wake.fetch_add(1, Ordering::Release);
+        sys::wake(self.wake);
     }
 }
 
@@ -192,6 +242,234 @@ impl Parker for SpinYield {
     }
 }
 
+/// design.md §4.5 implementation 2: "`Futex` — Linux-only, works across
+/// processes on shared memory. Used by the same-machine development loop, where
+/// it is strictly better than spinning and costs nothing."
+///
+/// It is not Linux-only as built: Windows has had `WaitOnAddress` since 8, it
+/// takes the same shape, and the GPU side runs on Windows on the target machine.
+///
+/// # Why this exists, and what it is worth
+///
+/// §4.5 shipped implementation 1 and nothing else, and the measurement says the
+/// gap between them is the whole performance story of this stage. A ring whose
+/// consumer has reached [`SpinYield`]'s sleep does not answer in
+/// `initial_sleep`; it answers in **fifty microseconds**, because that is
+/// Linux's default timer slack and `nanosleep` rounds up into it. It is per
+/// *sleep*, not per *ceiling*, so §4.5's careful exponential backoff to 200 µs
+/// is not what costs — the very first 2 µs sleep costs the same 50 µs as the
+/// last one. Measured through the real loader, every forwarded command that
+/// arrived at a ring whose consumer had just gone quiet cost 59.6 µs, against
+/// 1.0 µs for the same command in a tight loop where the consumer never slept.
+/// Removing the sleep entirely took `glxgears` from 472 to 749 FPS against
+/// zink-on-RADV's 762 — and burned four cores doing it.
+///
+/// So this parker keeps §4.5's spin and yield, and replaces the sleep with a
+/// wait the producer can end in one syscall. A ring with nothing on it costs one
+/// blocked thread and no CPU at all, which is what the sleep was for; a ring
+/// that gets a packet answers in the time a futex wake takes.
+#[derive(Debug, Clone, Copy)]
+pub struct Futex {
+    pub spins: u32,
+    pub yields: u32,
+    /// How long one wait may block before the readiness predicate and the ring
+    /// status are re-examined. This is not the wake-up latency — a rung
+    /// doorbell returns immediately — it is the bound on how stale a *missed*
+    /// doorbell can make us, and R4's reason for there being no infinite wait.
+    pub slice: Duration,
+}
+
+impl Default for Futex {
+    fn default() -> Self {
+        // §4.5's own spin and yield budgets, unchanged. **Only the sleep is
+        // replaced**, and the first attempt at this changed the yields too —
+        // dropping them to four on the argument that a real doorbell makes them
+        // redundant. Measured, that cost `roundtrip` a factor of two, 0.60 µs to
+        // 1.2 µs: a reply that arrives in half a microsecond is caught by 32
+        // `sched_yield` calls and missed by four, and missing it means a pair of
+        // futex syscalls for a wait that was about to end anyway. The yields are
+        // what stands between "this round trip is fast" and "this round trip
+        // pays for a doorbell it did not need", and they were the one part of
+        // §4.5 that was not broken.
+        Futex { spins: 256, yields: 32, slice: Duration::from_millis(20) }
+    }
+}
+
+impl Parker for Futex {
+    fn park(&self, site: &WaitSite<'_>, deadline: Deadline) -> ParkOutcome {
+        if (site.ready)() {
+            return ParkOutcome::Woken;
+        }
+        for _ in 0..self.spins {
+            core::hint::spin_loop();
+            if (site.ready)() {
+                return ParkOutcome::Woken;
+            }
+        }
+        for _ in 0..self.yields {
+            std::thread::yield_now();
+            if (site.ready)() {
+                return ParkOutcome::Woken;
+            }
+            if (site.status)() == RingStatus::Fatal {
+                return ParkOutcome::Fatal;
+            }
+        }
+        let Some(bell) = site.bell else {
+            // No doorbell for this site: fall back to §4.5 implementation 1
+            // rather than busy-waiting to the deadline.
+            return SpinYield::default().park(site, deadline);
+        };
+
+        // `parked` is a count and not a flag, because two threads may wait on
+        // one lane in principle and a flag one of them cleared would silence the
+        // doorbell for the other.
+        bell.parked.fetch_add(1, Ordering::SeqCst);
+        let outcome = loop {
+            // Read the doorbell *before* the last readiness check. `Bell`'s
+            // documentation is where the argument for that order lives.
+            let seen = bell.wake.load(Ordering::Acquire);
+            if (site.ready)() {
+                break ParkOutcome::Woken;
+            }
+            if (site.status)() == RingStatus::Fatal {
+                break ParkOutcome::Fatal;
+            }
+            let now = Instant::now();
+            if deadline.expired(now) {
+                break ParkOutcome::TimedOut;
+            }
+            sys::wait(bell.wake, seen, self.slice.min(deadline.remaining(now)));
+        };
+        bell.parked.fetch_sub(1, Ordering::SeqCst);
+        // One last look: a doorbell rung between the loop's exit and the
+        // decrement above would otherwise be the one that is lost.
+        if outcome == ParkOutcome::TimedOut && (site.ready)() {
+            return ParkOutcome::Woken;
+        }
+        outcome
+    }
+}
+
+/// The one syscall each side of the doorbell needs.
+///
+/// Two implementations and a fallback, and the fallback is what makes the
+/// `Futex` parker safe to use unconditionally: on a platform with neither
+/// primitive `wait` sleeps for the slice and `wake` does nothing, which is
+/// exactly [`SpinYield`]'s behaviour and no worse than what was there before.
+mod sys {
+    use core::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    mod imp {
+        use core::sync::atomic::AtomicU32;
+        use std::time::Duration;
+
+        // The mapping is `MAP_SHARED` across two processes, so this is a
+        // **shared** futex: `FUTEX_PRIVATE_FLAG` must not be set. Setting it
+        // would make the two sides hash the word to different keys and the wake
+        // would reach nobody — a hang, not an error.
+        const FUTEX_WAIT: i32 = 0;
+        const FUTEX_WAKE: i32 = 1;
+        #[cfg(target_arch = "x86_64")]
+        const SYS_FUTEX: core::ffi::c_long = 202;
+        #[cfg(target_arch = "aarch64")]
+        const SYS_FUTEX: core::ffi::c_long = 98;
+
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: i64,
+            tv_nsec: i64,
+        }
+
+        unsafe extern "C" {
+            fn syscall(num: core::ffi::c_long, ...) -> core::ffi::c_long;
+        }
+
+        pub fn wait(word: &AtomicU32, expect: u32, timeout: Duration) {
+            let ts = Timespec {
+                tv_sec: timeout.as_secs() as i64,
+                tv_nsec: timeout.subsec_nanos() as i64,
+            };
+            unsafe {
+                syscall(
+                    SYS_FUTEX,
+                    word as *const AtomicU32,
+                    FUTEX_WAIT,
+                    expect,
+                    &ts as *const Timespec,
+                );
+            }
+        }
+
+        pub fn wake(word: &AtomicU32) {
+            unsafe {
+                syscall(SYS_FUTEX, word as *const AtomicU32, FUTEX_WAKE, i32::MAX);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        use core::ffi::c_void;
+        use core::sync::atomic::AtomicU32;
+        use std::time::Duration;
+
+        #[link(name = "synchronization")]
+        unsafe extern "system" {
+            fn WaitOnAddress(
+                address: *const c_void,
+                compare: *const c_void,
+                size: usize,
+                milliseconds: u32,
+            ) -> i32;
+            fn WakeByAddressAll(address: *const c_void);
+        }
+
+        pub fn wait(word: &AtomicU32, expect: u32, timeout: Duration) {
+            // `WaitOnAddress` takes whole milliseconds and would round a
+            // sub-millisecond slice to zero, which is a poll rather than a wait.
+            // One millisecond is the floor, and it is a *slice* rather than the
+            // wake-up latency — a rung doorbell returns at once.
+            let ms = timeout.as_millis().clamp(1, u128::from(u16::MAX)) as u32;
+            let expect = expect;
+            unsafe {
+                WaitOnAddress(
+                    word as *const AtomicU32 as *const c_void,
+                    &expect as *const u32 as *const c_void,
+                    4,
+                    ms,
+                );
+            }
+        }
+
+        pub fn wake(word: &AtomicU32) {
+            unsafe { WakeByAddressAll(word as *const AtomicU32 as *const c_void) }
+        }
+    }
+
+    #[cfg(not(any(
+        windows,
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    )))]
+    mod imp {
+        use core::sync::atomic::AtomicU32;
+        use std::time::Duration;
+        pub fn wait(_word: &AtomicU32, _expect: u32, timeout: Duration) {
+            std::thread::sleep(timeout.min(Duration::from_micros(200)));
+        }
+        pub fn wake(_word: &AtomicU32) {}
+    }
+
+    pub fn wait(word: &AtomicU32, expect: u32, timeout: Duration) {
+        imp::wait(word, expect, timeout)
+    }
+    pub fn wake(word: &AtomicU32) {
+        imp::wake(word)
+    }
+}
+
 /// Wait for `ready`, and turn a timeout into a diagnosis rather than into a
 /// retry loop.
 ///
@@ -205,16 +483,24 @@ impl Parker for SpinYield {
 /// deadline each round so that liveness is re-examined periodically rather than
 /// once at the very end — a peer that died in the first millisecond of a
 /// thirty-second wait should not cost thirty seconds to notice.
+/// `lane` names the doorbell to sleep on: `Some(Lane::Command)` for a consumer
+/// waiting for work, `Some(Lane::Reply)` for a caller waiting for its answer,
+/// and `None` for a wait that no producer rings a bell for — a barrier against
+/// another ring's `completed_seqno`, which is satisfied on the first load in the
+/// common case and spins in the rest.
 pub fn wait_until(
     control: &Control,
     ctrl: &RingCtrl,
+    lane: Option<Lane>,
     parker: &dyn Parker,
     ready: &dyn Fn() -> bool,
     overall: Deadline,
     liveness_interval: Duration,
 ) -> Result<()> {
     let status = || ctrl.status();
-    let site = WaitSite::new(ctrl.id(), ready, &status);
+    let bell = lane.and_then(|l| ctrl.bell(l).ok());
+    let mut site = WaitSite::new(ctrl.id(), ready, &status);
+    site.bell = bell;
     let mut monitor = LivenessMonitor::new(Instant::now(), liveness_interval * 3);
     loop {
         // Beat before parking. A side that is blocked here is *alive*, and if it
@@ -313,6 +599,7 @@ mod tests {
         let err = wait_until(
             &owner,
             &ctrl,
+            None,
             &SpinYield::eager(),
             &|| false,
             Deadline::after(Duration::from_millis(60)),
@@ -335,6 +622,7 @@ mod tests {
         let err = wait_until(
             &owner,
             &ctrl,
+            None,
             &SpinYield::eager(),
             &|| false,
             Deadline::after(Duration::from_millis(50)),
@@ -365,6 +653,7 @@ mod tests {
             wait_until(
                 &waiter,
                 &ctrl,
+                None,
                 &SpinYield::eager(),
                 &|| false,
                 Deadline::after(Duration::from_millis(300)),
@@ -395,6 +684,68 @@ mod tests {
 
         // And the wait itself still ends in a timeout rather than in PeerGone.
         assert_eq!(handle.join().unwrap().unwrap_err(), Error::TimedOut { ring: slot });
+    }
+
+    /// The doorbell answers in microseconds where the sleep answered in tens.
+    ///
+    /// This is the measurement of §4.5's two implementations, made small enough
+    /// to be a test: a consumer parks on an empty ring, a producer pushes one
+    /// packet after a delay long enough that the consumer is genuinely asleep,
+    /// and the consumer's wake-up latency is asserted. [`SpinYield`] fails this
+    /// at any reasonable threshold — its first `nanosleep` costs ~50 µs of
+    /// Linux timer slack whatever `initial_sleep` says — which is the whole
+    /// reason [`Futex`] exists.
+    ///
+    /// The threshold is 5 ms rather than 50 µs because this runs on a shared
+    /// machine and under Miri's siblings; what it is protecting against is the
+    /// doorbell not being rung *at all*, which is a wait to the 20 ms slice.
+    #[test]
+    #[cfg_attr(miri, ignore = "two threads and a real clock")]
+    fn a_rung_doorbell_wakes_the_consumer_rather_than_the_slice_expiring() {
+        let (owner, peer, slot) = setup();
+        let ctrl = std::sync::Arc::new(RingCtrl::open(&owner, slot).unwrap());
+        let owner = std::sync::Arc::new(owner);
+        let cons = RingConsumer::open(&owner, slot, Lane::Command).unwrap();
+
+        let waiter = {
+            let owner = std::sync::Arc::clone(&owner);
+            let ctrl = std::sync::Arc::clone(&ctrl);
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                wait_until(
+                    &owner,
+                    &ctrl,
+                    Some(Lane::Command),
+                    &Futex::default(),
+                    &|| !cons.is_empty().unwrap_or(false),
+                    Deadline::after(Duration::from_secs(5)),
+                    Duration::from_millis(200),
+                )
+                .unwrap();
+                t0.elapsed()
+            })
+        };
+
+        // Long enough that the consumer is past its spin budget and inside the
+        // wait, so what is timed below is the doorbell and not the spin.
+        std::thread::sleep(Duration::from_millis(50));
+        peer.beat_now().unwrap();
+        let mut prod = RingProducer::open(&peer, slot, Lane::Command).unwrap();
+        let mut cmd = vec![0u8; 16];
+        cmd[8..12].copy_from_slice(&16u32.to_le_bytes());
+        let sent = Instant::now();
+        prod.push(&cmd, None).unwrap();
+
+        let _ = waiter.join().unwrap();
+        // `join` returns once the waiter has, so this is the wake-up latency
+        // plus the cost of joining a thread — an upper bound, which is the
+        // direction an assertion wants to be wrong in.
+        let latency = sent.elapsed();
+        assert!(
+            latency < Duration::from_millis(5),
+            "the doorbell took {latency:?} to wake a parked consumer; \
+             the 20 ms slice expiring instead means it was never rung"
+        );
     }
 
     /// The trait's whole reason for existing: a second implementation, swapped
@@ -428,6 +779,7 @@ mod tests {
         wait_until(
             &owner,
             &ctrl,
+            None,
             &parker,
             &ready,
             Deadline::after(Duration::from_millis(50)),

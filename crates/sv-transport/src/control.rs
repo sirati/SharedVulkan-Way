@@ -173,6 +173,33 @@ pub const RC_FATAL_SEQNO: u64 = 0x148;
 pub const RC_FATAL_MSG: u64 = 0x150;
 pub const RC_FATAL_MSG_LEN: u64 = 160;
 
+// -- the doorbell, one pair of words per lane --------------------------------
+//
+// design.md §4.5 lists four parkers and says the second — "`Futex` — Linux-only,
+// works across processes on shared memory. Used by the same-machine development
+// loop, where it is strictly better than spinning and costs nothing" — is the
+// one the development loop should use. These are the words it needs.
+//
+// **Why a pair per lane rather than reusing `status` and `notify_count`.**
+// `RC_STATUS` is one word for the whole ring, and both lanes park: the app side
+// waits on the reply lane while the GPU side waits on the command lane, so one
+// `IDLE` flag cannot say which of the two is asleep. And `RC_NOTIFY_COUNT` is a
+// `u64` counter for diagnostics; a futex word must be a `u32` at a known address
+// because that is what the kernel compares against.
+//
+// `wake` is bumped by the producer and is the address both sides name; `parked`
+// is set by the consumer immediately before it waits, so the producer can skip
+// the syscall entirely in the common case — design.md §4.4's "the producer
+// checks `IDLE` before paying for a notification", made per-lane.
+//
+// They are at 0x200 and 0x240 rather than in the gap after `RC_NOTIFY_COUNT`
+// because `RC_FATAL_MSG` runs to 0x1F0, and because a doorbell word shared with
+// anything else is a cache line two threads fight over on every packet.
+pub const RC_CMD_WAKE: u64 = 0x200;
+pub const RC_CMD_PARKED: u64 = 0x204;
+pub const RC_REPLY_WAKE: u64 = 0x240;
+pub const RC_REPLY_PARKED: u64 = 0x244;
+
 /// `status`, design.md §4.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

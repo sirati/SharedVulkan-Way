@@ -1767,6 +1767,43 @@ fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
                     sv_proto::#decode_reply(&mut __dec).map_err(crate::wire_failed)
                 }
             }
+        } else if c.is_recorded {
+            // design.md §6.5: "`vkCmd*` calls are **not** sent individually.
+            // Each `VkCommandBuffer` owns an arena block; recording encodes
+            // straight into it."
+            //
+            // The command buffer is the first parameter of every `vkCmd*` in
+            // the registry — that is what makes one a `vkCmd*` — and it is the
+            // only thing the transport needs in order to know which blob these
+            // bytes belong to. Asserting it rather than assuming it, because a
+            // recorded command whose first parameter were something else would
+            // otherwise route its bytes into whichever blob that id happened to
+            // name.
+            let cb = c
+                .inputs
+                .first()
+                .filter(|f| matches!(&f.shape, Shape::Scalar(Scalar::Handle(h)) if h == "VkCommandBuffer"))
+                .map(|f| naming::ident(&f.rust_name));
+            let Some(cb) = cb else {
+                return quote! {
+                    compile_error!(concat!(
+                        "a recorded command whose first parameter is not a VkCommandBuffer: ",
+                        #doc
+                    ));
+                };
+            };
+            quote! {
+                #[doc = #doc]
+                pub fn #m(
+                    __t: &dyn crate::Transport,
+                    args: sv_proto::#args,
+                ) -> crate::IcdResult<()> {
+                    let __flags = 0u32;
+                    let __cb = args.#cb.0;
+                    #encode
+                    __t.record(__cb, #opcode, &__cmd)
+                }
+            }
         } else {
             quote! {
                 #[doc = #doc]

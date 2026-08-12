@@ -277,7 +277,7 @@ fn work(
         d.cmd_dispatch(cmd, 64, 1, 1);
         d.end_command_buffer(cmd).map_err(|e| format!("vkEndCommandBuffer: {e:?}"))?;
     }
-    println!("[app] recorded {} commands, all of them ring packets", 5);
+    println!("[app] recorded {} commands, all of them in one arena blob (design.md §6.5)", 5);
 
     let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }
         .map_err(|e| format!("vkCreateFence: {e:?}"))?;

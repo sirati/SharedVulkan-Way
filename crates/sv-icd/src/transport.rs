@@ -32,9 +32,10 @@
 use std::sync::{Arc, Mutex};
 use sv_icd_entry::{IcdResult, LowerError, RingClass, Transport};
 use sv_transport::control::{Control, Flags};
-use sv_transport::park::{Deadline, SpinYield, wait_until};
+use sv_transport::park::{Deadline, Futex, wait_until};
 use sv_transport::region::SharedRegion;
-use sv_transport::ring::{BarrierTracker, RingConsumer, RingCtrl, RingProducer};
+use crate::arena::Backing as _;
+use sv_transport::ring::{BarrierTracker, Lane, RingConsumer, RingCtrl, RingProducer};
 
 /// How long a single command may take before the GPU side is presumed gone.
 ///
@@ -43,13 +44,219 @@ use sv_transport::ring::{BarrierTracker, RingConsumer, RingCtrl, RingProducer};
 /// 'gone'." `wait_until` does that check; this is the budget it does it within.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How much of the arena is set aside for command blobs.
+///
+/// An eighth, between 4 MiB and 64 MiB. There is no measurement behind the
+/// fraction and it should not pretend otherwise; what is behind the *bounds* is
+/// that a blob has to hold one whole command buffer's recording, a real frame
+/// records a few hundred kilobytes of them, and several may be open at once.
+/// The failure when it is too small is clean and named — `BlobArenaFull` on the
+/// `vkCmd*` that did not fit — which is the property that matters, because the
+/// thing it replaces was not.
+fn blob_reserve(arena_len: u64) -> u64 {
+    let want = (arena_len / 8).clamp(4 << 20, 64 << 20);
+    // Never take more than half the arena, however small it is: a 4 MiB arena
+    // with a 4 MiB reserve is an arena an application cannot allocate from.
+    want.min(arena_len / 2) & !(crate::arena::GRANULARITY - 1)
+}
+
+/// One command buffer's recording, as design.md §6.5 describes it.
+///
+/// > Each `VkCommandBuffer` owns an arena block; recording encodes straight into
+/// > it; `vkEndCommandBuffer` publishes `(offset, len)`.
+#[derive(Debug, Clone, Copy)]
+struct Blob {
+    /// Arena offset of the block.
+    off: u64,
+    /// Bytes of it that hold recorded commands.
+    len: u64,
+    /// Bytes of it that have already been handed to the GPU side.
+    ///
+    /// # Why a recording is streamed rather than sent whole
+    ///
+    /// §6.5 sends one blob per command buffer, at submit. Measured, that is a
+    /// *loss* on a same-machine boundary and the reason is not obvious: with one
+    /// packet per `vkCmd*` the GPU side decodes command `i` while the
+    /// application encodes command `i + 1`, so half the work is free. A single
+    /// blob at the end throws that away — the app records all 200 commands
+    /// alone, then the GPU side decodes all 200 alone — and `frame-200` went
+    /// from 105 µs to 130 µs on exactly that.
+    ///
+    /// So the block is published in pieces as it fills, and the last piece goes
+    /// at `vkEndCommandBuffer`. The bytes never move and nothing is copied
+    /// twice: a piece is `(off + published, len - published)` of the same
+    /// append-only block, and `published` only ever advances. What §6.5 wanted —
+    /// a recording that costs one packet rather than N — is kept to within a
+    /// small constant, and the pipelining that N packets bought is kept too.
+    ///
+    /// It is safe against the driver because a `vkCmd*` names its command buffer
+    /// as a parameter: the GPU side may interleave pieces of two recordings and
+    /// the driver cannot tell, which is the same reason Vulkan lets an
+    /// application record two command buffers at once.
+    published: u64,
+    /// Bytes of it that exist.
+    cap: u64,
+    /// The seqno of the `svExecuteCommandBlob` that last named this block.
+    ///
+    /// **This is design.md §5.5's read-pending word, and it did not need to be a
+    /// word.** §5.5 asks for "an 8-byte handshake word the GPU side flips from
+    /// `READ_PENDING` to `READ_COMPLETE`, so the app side never recycles a blob
+    /// the decoder is still walking". The ring already publishes exactly that
+    /// fact: `completed_seqno` is stored by `RingConsumer::advance`, which runs
+    /// after the packet has been *processed*, so `completed >= this` is
+    /// precisely "the sub-decoder has finished with these bytes". A second
+    /// mechanism would be a second thing to get wrong, and it would need the
+    /// GPU side to write into a blob it otherwise only reads.
+    in_flight: u64,
+}
+
+/// A hasher for object ids, which are not adversarial and are not random.
+///
+/// The default `HashMap` hasher is SipHash-1-3, chosen to make hash-flooding
+/// impossible from untrusted keys. These keys are ours: `State::mint` hands them
+/// out from a counter starting at 1 (design.md §6.4), so they are dense small
+/// integers that this process chose. SipHash on the recording path measured at
+/// roughly a fifth of what a whole `vkCmd*` costs, for a property nothing here
+/// needs — the multiply-shift below spreads a dense counter perfectly and is one
+/// instruction.
+///
+/// This is confined to the blob table. It is deliberately *not* offered to
+/// `State`'s maps: they are not on a per-draw-call path, and a fast hasher
+/// spread across a crate is how one ends up hashing something that did come from
+/// outside.
+#[derive(Default, Clone, Copy)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Only ever called for `u64` keys; a byte fallback is here so the impl
+        // is total rather than panicking if the key type ever changes.
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        // Fibonacci hashing: multiply by 2^64/φ and let `HashMap` take the high
+        // bits it wants. Dense inputs come out well spread.
+        self.0 = v.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct IdHash;
+
+impl std::hash::BuildHasher for IdHash {
+    type Hasher = IdHasher;
+    fn build_hasher(&self) -> IdHasher {
+        IdHasher(0)
+    }
+}
+
+/// Every open recording, and the allocator the blocks come from.
+struct Blobs {
+    /// First-fit over the reserve; blocks are long-lived and few, so the
+    /// simplest allocator that coalesces is the right one.
+    alloc: crate::arena::Placeholder,
+    /// Where the reserve starts in the arena. `Placeholder` counts from zero.
+    base: u64,
+    open: std::collections::HashMap<u64, Blob, IdHash>,
+}
+
+/// The block a recording starts with. One 4 KiB page would be a growth on the
+/// second `vkCmd*` of every frame; 64 KiB holds a thousand of them and is
+/// reached in one allocation.
+const BLOB_INITIAL: u64 = 64 << 10;
+
+/// How many unsent bytes a recording accumulates before a piece is handed over.
+///
+/// The trade is one ring packet against how far ahead the GPU side can be. Too
+/// large and a recording is again one lump the GPU side only starts on when the
+/// application has finished — which is what §6.5 asks for and what measured
+/// worse than the per-command packets it replaces. Too small and the packet
+/// count creeps back towards one per `vkCmd*`.
+///
+/// 8 KiB is a hundred-odd commands: enough that the framing is negligible,
+/// small enough that the GPU side starts decoding while a real frame is still
+/// being recorded.
+const BLOB_FLUSH: u64 = 8 << 10;
+
+impl Blobs {
+    fn new(base: u64, reserve: u64) -> Blobs {
+        Blobs {
+            // One slab, because the reserve is not the application's arena and
+            // nothing imports it separately: it lives inside whatever slabs the
+            // GPU side has, and `Placeholder`'s slab rule would only fragment
+            // it.
+            alloc: crate::arena::Placeholder::new(reserve.max(crate::arena::GRANULARITY), reserve.max(crate::arena::GRANULARITY))
+                .expect("the blob reserve is a whole number of pages"),
+            base,
+            open: std::collections::HashMap::default(),
+        }
+    }
+}
+
 /// One ring, and everything needed to use it from several threads.
 struct Ring {
     producer: RingProducer,
     replies: RingConsumer,
     ctrl: RingCtrl,
-    /// `Some` on the queue ring: the device ring it orders against.
-    tracker: Option<BarrierTracker>,
+}
+
+/// Cross-ring ordering, in **both** directions.
+///
+/// # The correction to design.md §4.4
+///
+/// §4.4 describes one direction: "an object created on the device ring may not
+/// yet exist on the GPU side when a queue ring references it", and the app side
+/// "emits one whenever a packet references an id created on another ring". As
+/// built that was a single [`BarrierTracker`] on the queue ring, and it was
+/// sufficient for exactly as long as `vkQueueSubmit` was **synchronous**: a
+/// blocking submit is itself a barrier, because the app side does not issue
+/// anything else until the GPU side has answered.
+///
+/// Making submit asynchronous — which §4.4's own D15 calls non-negotiable —
+/// removes that accidental ordering and the hazard appears in the other
+/// direction. `vkDeviceWaitIdle` is a *device*-ring command by the rule that
+/// picks a ring from the first parameter, so
+///
+/// ```text
+///     vkQueueSubmit(queue, …)   → queue ring, no reply
+///     vkDeviceWaitIdle(device)  → device ring, round trip
+/// ```
+///
+/// lets the device thread call the driver's `vkDeviceWaitIdle` **before** the
+/// queue thread has submitted anything, and it returns at once having waited for
+/// nothing. The application is then told its work is complete when it has not
+/// started. The same shape reaches `vkWaitForFences` with a finite timeout.
+///
+/// So there are two trackers, and the rule is symmetric: *a packet on either
+/// ring carries a barrier past everything produced on the other since the last
+/// one.*
+///
+/// # Why they live in one mutex of their own
+///
+/// The old comment here read "lock order is device → queue and never the
+/// reverse", which held because only the queue ring consulted a tracker. A
+/// second tracker in the other direction makes that a cycle immediately. One
+/// mutex holding both, always taken *inside* a ring lock and never containing
+/// one, has no order to get wrong.
+///
+/// # No deadlock, and the argument is short
+///
+/// Suppose the GPU side's device thread is blocked before packet `D`, waiting
+/// for queue seqno `Q`. `D` names `Q`, so the app produced `Q` first; `Q`'s own
+/// barrier, if it has one, names some device seqno `D'` produced before `Q` and
+/// therefore before `D`. The device ring is FIFO, so `D'` was advanced before
+/// the thread reached `D`. `Q` is satisfiable, the queue thread runs it, and
+/// `D` proceeds.
+struct Barriers {
+    /// Attached to queue packets; names device seqnos.
+    to_queue: BarrierTracker,
+    /// Attached to device packets; names queue seqnos.
+    to_device: BarrierTracker,
 }
 
 /// A connected app side.
@@ -58,7 +265,14 @@ pub struct RingTransport {
     instance: Mutex<Ring>,
     device: Mutex<Ring>,
     queue: Mutex<Ring>,
-    parker: SpinYield,
+    /// Cross-ring ordering. Always taken *inside* a ring lock, never outside.
+    barriers: Mutex<Barriers>,
+    /// Serialises `svImportArenaSlab`, so two threads allocating in one slab
+    /// send one import rather than two.
+    importing: Mutex<()>,
+    parker: Futex,
+    /// design.md §6.5's per-command-buffer arena blocks.
+    blobs: Mutex<Blobs>,
     /// The arena, mapped. Held here because the mapping must outlive every
     /// pointer `vkMapMemory` handed out, and this is the only thing that lives
     /// as long as the process.
@@ -371,19 +585,22 @@ impl RingTransport {
             .claim_ring(RingKind::Queue, 3, Some(device_slot))
             .map_err(|e| e.to_string())?;
 
-        let open = |slot: u32, tracker: Option<BarrierTracker>| -> Result<Ring, String> {
+        let open = |slot: u32| -> Result<Ring, String> {
             Ok(Ring {
                 producer: RingProducer::open(&control, slot, Lane::Command)
                     .map_err(|e| e.to_string())?,
                 replies: RingConsumer::open(&control, slot, Lane::Reply)
                     .map_err(|e| e.to_string())?,
                 ctrl: RingCtrl::open(&control, slot).map_err(|e| e.to_string())?,
-                tracker,
             })
         };
-        let instance = open(instance_slot, None)?;
-        let device = open(device_slot, None)?;
-        let queue = open(queue_slot, Some(BarrierTracker::new(device_slot)))?;
+        let instance = open(instance_slot)?;
+        let device = open(device_slot)?;
+        let queue = open(queue_slot)?;
+        let barriers = Barriers {
+            to_queue: BarrierTracker::new(device_slot),
+            to_device: BarrierTracker::new(queue_slot),
+        };
 
         let control = Arc::new(control);
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -401,13 +618,24 @@ impl RingTransport {
                 .map_err(|e| format!("cannot start the heartbeat thread: {e}"))?;
         }
 
+        // The blob reserve is the *tail* of the arena, so what the application's
+        // allocator sees is a shorter arena starting at zero and nothing above
+        // it changes. Taking it from the tail rather than the head also leaves
+        // §5.2's rule about the largest possible allocation intact: the reserve
+        // removes whole slabs, not room inside one.
+        let reserve = blob_reserve(arena_len);
+        let arena_len = arena_len - reserve;
+
         Ok(Attached {
             transport: RingTransport {
                 control,
                 instance: Mutex::new(instance),
                 device: Mutex::new(device),
                 queue: Mutex::new(queue),
-                parker: SpinYield::default(),
+                barriers: Mutex::new(barriers),
+                importing: Mutex::new(()),
+                parker: Futex::default(),
+                blobs: Mutex::new(Blobs::new(arena_len, reserve)),
                 arena,
                 beating,
             },
@@ -437,17 +665,259 @@ impl RingTransport {
     /// Record a device-ring seqno so the next queue packet carries a barrier
     /// past it (R22).
     ///
-    /// **Lock order is device → queue and never the reverse.** A queue-ring
-    /// operation takes only the queue lock, so no cycle exists; stating it here
-    /// is cheaper than rediscovering it from a hang.
-    fn note_device_seqno(&self, class: RingClass, seqno: u64) {
-        if class != RingClass::Device {
-            return;
+    /// The barrier to attach to the next packet on `class`, if any.
+    fn take_barrier(&self, class: RingClass) -> Option<sv_transport::ring::RingBarrier> {
+        let mut b = self.barriers.lock().unwrap_or_else(|e| e.into_inner());
+        match class {
+            RingClass::Queue => b.to_queue.take(),
+            RingClass::Device => b.to_device.take(),
+            RingClass::Instance => None,
         }
-        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = q.tracker.as_mut() {
-            t.note_produced(seqno);
+    }
+
+    /// Record that `class` produced `seqno`, so the *other* ring orders past it.
+    fn note_seqno(&self, class: RingClass, seqno: u64) {
+        let mut b = self.barriers.lock().unwrap_or_else(|e| e.into_inner());
+        match class {
+            RingClass::Device => b.to_queue.note_produced(seqno),
+            RingClass::Queue => b.to_device.note_produced(seqno),
+            // Nothing orders against the instance ring: by the time a device
+            // exists every instance command has been answered, because they all
+            // generate replies.
+            RingClass::Instance => {}
         }
+    }
+
+    /// Push one packet, with whatever barrier the other ring has earned, waiting
+    /// for room rather than failing if the ring is full.
+    ///
+    /// The single place either tracker is consulted, so the two directions
+    /// cannot drift apart.
+    ///
+    /// # Why it waits
+    ///
+    /// `RingProducer::push` returns `RingFull` immediately, and every caller of
+    /// this used to turn that into a `LowerError` — which for a command that
+    /// returns `void` means `report_failure` and a return. **The command was
+    /// dropped and the application was told nothing.** Measured on master, a
+    /// burst of 500,000 `vkCmdSetViewport` lost 24,292 of them exactly that way,
+    /// visible only under `SV_DEBUG`. §6.5's blob takes `vkCmd*` off this path
+    /// entirely, but `vkDestroy*` and every other fire-and-forget command is
+    /// still here, and "the ring was momentarily full" must not be able to mean
+    /// "your command did not happen".
+    ///
+    /// So a full ring is back-pressure: wait for the consumer to make room, and
+    /// only give up on the R4 deadline — at which point the peer is gone and
+    /// `VK_ERROR_DEVICE_LOST` is the truth rather than a shrug.
+    fn push_on(&self, class: RingClass, command: &[u8]) -> IcdResult<u64> {
+        let mut ring = self.ring(class).lock().unwrap_or_else(|e| e.into_inner());
+        self.push_into(class, &mut ring, command, Deadline::after(CALL_TIMEOUT))
+    }
+
+    /// The body of [`RingTransport::push_on`], against a ring the caller has
+    /// already locked.
+    ///
+    /// `call` needs this shape: it holds the producer across the *reply* wait,
+    /// which is what makes "the packet that arrives is this call's" true, so it
+    /// cannot hand the lock to a helper and take it back.
+    fn push_into(
+        &self,
+        class: RingClass,
+        ring: &mut Ring,
+        command: &[u8],
+        deadline: Deadline,
+    ) -> IcdResult<u64> {
+        loop {
+            let barrier = self.take_barrier(class);
+            match ring.producer.push(command, barrier) {
+                Ok(seqno) => {
+                    self.note_seqno(class, seqno);
+                    return Ok(seqno);
+                }
+                Err(sv_transport::Error::RingFull { .. }) => {
+                    // The barrier goes back before anything else can take one,
+                    // or this packet's ordering guarantee is lost (R22).
+                    if let Some(b) = barrier {
+                        self.restore_barrier(class, b);
+                    }
+                    // Header, the widest barrier and the alignment, so this asks
+                    // for at least what `frame_len` will.
+                    let want = (command.len() as u64
+                        + sv_transport::ring::PACKET_HEADER_SIZE
+                        + sv_transport::ring::BARRIER_SIZE)
+                        .next_multiple_of(sv_transport::ring::PACKET_ALIGN);
+                    // There is no doorbell in this direction — space is freed by
+                    // the *consumer* advancing `head`, and nobody rings a bell
+                    // for that — so this spins and backs off. A ring that is
+                    // full is a ring whose consumer is actively working, so the
+                    // wait is short by construction; giving the producer a bell
+                    // of its own would be two more words per lane for a case
+                    // that only arises under a burst.
+                    let has_room =
+                        || ring.producer.free_bytes().map(|f| f >= want).unwrap_or(true);
+                    wait_until(
+                        &self.control,
+                        &ring.ctrl,
+                        None,
+                        &self.parker,
+                        &has_room,
+                        deadline,
+                        std::time::Duration::from_millis(50),
+                    )
+                    .map_err(lower)?;
+                }
+                Err(e) => {
+                    if let Some(b) = barrier {
+                        self.restore_barrier(class, b);
+                    }
+                    return Err(lower(e));
+                }
+            }
+        }
+    }
+
+    fn restore_barrier(&self, class: RingClass, b: sv_transport::ring::RingBarrier) {
+        let mut t = self.barriers.lock().unwrap_or_else(|e| e.into_inner());
+        match class {
+            RingClass::Queue => t.to_queue.restore(b),
+            RingClass::Device => t.to_device.restore(b),
+            RingClass::Instance => {}
+        }
+    }
+
+    /// Grow `cb`'s block to hold `need` more bytes, or make it one.
+    ///
+    /// Doubling with a copy, rather than a chain of chunks. The chunk list is
+    /// the tidier data structure and it buys nothing here: recording is
+    /// append-only and a doubling copy is amortised nothing, the *steady state*
+    /// after one frame is a block that never grows again, and one contiguous
+    /// range keeps `svExecuteCommandBlob` a fixed-size message and the GPU side
+    /// a single `subdecode`. The copy happens only while a workload is finding
+    /// its size.
+    fn grow(blobs: &mut Blobs, arena: &SharedRegion, cb: u64, need: u64) -> IcdResult<()> {
+        let old = blobs.open.get(&cb).copied();
+        let want = match old {
+            Some(b) => (b.cap * 2).max(b.len + need),
+            None => BLOB_INITIAL.max(need),
+        };
+        let a = blobs.alloc.alloc(want).map_err(|_| LowerError::OutOfDeviceMemory)?;
+        let off = blobs.base
+            + blobs.alloc.arena_offset(a).map_err(|_| LowerError::OutOfDeviceMemory)?;
+        if let Some(b) = old {
+            // Read out and write back rather than a mapped-memory move: the
+            // arena is peer-visible and `SharedRegion` deliberately offers no
+            // `&mut [u8]` over it (R7, `region`'s invariant I3).
+            let mut carry = vec![0u8; b.len as usize];
+            arena.read_bytes(b.off, &mut carry).map_err(lower)?;
+            arena.write_bytes(off, &carry).map_err(lower)?;
+            Self::release(blobs, b);
+        }
+        let (len, published, in_flight) =
+            old.map(|b| (b.len, b.published, b.in_flight)).unwrap_or((0, 0, 0));
+        blobs.open.insert(cb, Blob { off, len, published, cap: a.size, in_flight });
+        Ok(())
+    }
+
+    /// Hand the GPU side everything recorded since the last piece.
+    ///
+    /// Called when a block passes [`BLOB_FLUSH`] of unsent bytes and again at
+    /// `vkEndCommandBuffer`. Returns without a packet when there is nothing new,
+    /// which is what makes calling it from both places harmless.
+    fn flush_blob(&self, command_buffer: u64) -> IcdResult<()> {
+        let (off, len, upto) = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            match blobs.open.get(&command_buffer) {
+                Some(b) if b.len > b.published => {
+                    (b.off + b.published, b.len - b.published, b.len)
+                }
+                _ => return Ok(()),
+            }
+        };
+        let mut cmd = Vec::new();
+        sv_proto::sv::ExecuteCommandBlob { command_buffer, arena_offset: off, len }
+            .encode(&mut cmd)
+            .map_err(LowerError::Wire)?;
+        let seqno = self.push_on(RingClass::Device, &cmd)?;
+        let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = blobs.open.get_mut(&command_buffer) {
+            // `upto`, not `b.len`. Vulkan forbids two threads recording into one
+            // command buffer so they cannot differ today, but writing `b.len`
+            // here would mean that if they ever did, the bytes recorded between
+            // the read above and this line would be marked published without
+            // having been sent — commands that vanish, which is the exact
+            // failure the blob exists to remove.
+            b.published = upto;
+            b.in_flight = seqno;
+        }
+        Ok(())
+    }
+
+    /// The slow half of [`Transport::record`]: make room, then write.
+    ///
+    /// Growing has to wait for every piece already handed over, because it
+    /// copies the recorded bytes to a new block and the GPU side may still be
+    /// reading them out of the old one.
+    fn grow_and_write(&self, command_buffer: u64, command: &[u8]) -> IcdResult<()> {
+        let in_flight = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0)
+        };
+        // Without the blob lock held: this can block for as long as the GPU
+        // side takes, and a thread recording into a different command buffer
+        // has no reason to wait behind it.
+        self.await_blob_read(in_flight)?;
+        let at = {
+            let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            let blobs = &mut *blobs;
+            Self::grow(blobs, &self.arena, command_buffer, command.len() as u64)?;
+            let b = blobs
+                .open
+                .get_mut(&command_buffer)
+                .ok_or(LowerError::Shape("a blob that grow() did not create"))?;
+            let at = b.off + b.len;
+            b.len += command.len() as u64;
+            at
+        };
+        self.arena.write_bytes(at, command).map_err(lower)
+    }
+
+    /// Return a block to the reserve.
+    fn release(blobs: &mut Blobs, b: Blob) {
+        let slab_size = blobs.alloc.slab_size();
+        let off = b.off - blobs.base;
+        let a = crate::arena::Allocation {
+            slab: (off / slab_size) as u32,
+            offset_in_slab: off % slab_size,
+            size: b.cap,
+        };
+        let _ = blobs.alloc.free_now(a);
+    }
+
+    /// Wait until the GPU side has finished with a block before overwriting it.
+    ///
+    /// design.md §5.5 item 3, answered with the ring's own `completed_seqno`
+    /// rather than with a second handshake word — see [`Blob::in_flight`].
+    fn await_blob_read(&self, in_flight: u64) -> IcdResult<()> {
+        if in_flight == 0 {
+            return Ok(());
+        }
+        let ctrl = {
+            let d = self.device.lock().unwrap_or_else(|e| e.into_inner());
+            d.ctrl.clone()
+        };
+        if ctrl.completed_seqno().map_err(lower)? >= in_flight {
+            return Ok(());
+        }
+        wait_until(
+            &self.control,
+            &ctrl,
+            None,
+            &self.parker,
+            &|| ctrl.completed_seqno().map(|c| c >= in_flight).unwrap_or(false),
+            Deadline::after(CALL_TIMEOUT),
+            std::time::Duration::from_millis(50),
+        )
+        .map_err(lower)
     }
 }
 
@@ -459,17 +929,21 @@ impl Transport for RingTransport {
         command: &[u8],
         reply: &mut Vec<u8>,
     ) -> IcdResult<()> {
+        // The producer lock is held from here to the reply, which is what makes
+        // the packet that arrives *this* call's — a ring is SPSC and replies come
+        // back in the order the commands went out.
         let mut ring = self.ring(class).lock().unwrap_or_else(|e| e.into_inner());
         let ring = &mut *ring;
-        let barrier = ring.tracker.as_mut().and_then(|t| t.take());
-        let seqno = ring.producer.push(command, barrier).map_err(lower)?;
-        self.note_device_seqno(class, seqno);
-
         let deadline = Deadline::after(CALL_TIMEOUT);
+        // Through the same helper as everything else, so a full ring is
+        // back-pressure here too rather than a `NotConnected` on a command the
+        // application is waiting for an answer to.
+        let seqno = self.push_into(class, ring, command, deadline)?;
         loop {
             wait_until(
                 &self.control,
                 &ring.ctrl,
+                Some(Lane::Reply),
                 &self.parker,
                 &|| !ring.replies.is_empty().unwrap_or(false),
                 deadline,
@@ -493,12 +967,173 @@ impl Transport for RingTransport {
     }
 
     fn send(&self, class: RingClass, _opcode: u32, command: &[u8]) -> IcdResult<()> {
-        let seqno = {
-            let mut ring = self.ring(class).lock().unwrap_or_else(|e| e.into_inner());
-            let barrier = ring.tracker.as_mut().and_then(|t| t.take());
-            ring.producer.push(command, barrier).map_err(lower)?
+        self.push_on(class, command).map(|_| ())
+    }
+
+    /// design.md §6.5: append to the command buffer's arena block, and cross
+    /// nothing.
+    ///
+    /// This is the whole of the blob change on the recording side. What it
+    /// replaces is one ring packet per `vkCmd*` — a mutex, a sequence number,
+    /// a framing header, a doorbell check and a consumer wake-up, for a command
+    /// that has no reply and that the application will not look at again until
+    /// it submits.
+    ///
+    /// It also removes a failure this transport had no way to report. A
+    /// `vkCmd*` returns `void`, so a full ring produced `RingFull`, which the
+    /// generated stub turned into `report_failure` and a return: **the command
+    /// was dropped and the application was told nothing.** Measured on master,
+    /// a burst of 500,000 `vkCmdSetViewport` lost 24,292 of them that way. A
+    /// blob has no such window — it grows, and if the reserve is exhausted the
+    /// error is `VK_ERROR_OUT_OF_DEVICE_MEMORY` from a command that is allowed
+    /// to fail.
+    /// # The hot path is one lock, one map lookup and one `memcpy`
+    ///
+    /// It is written as an explicit fast path rather than left to fall out of
+    /// the general case, and that is not premature: recording is the *only*
+    /// operation in this transport that happens hundreds of times per frame, so
+    /// a second `HashMap` probe and a second uncontended mutex acquisition —
+    /// which is all the obvious version costs — measured at 0.056 µs a command,
+    /// against 0.075 µs for the entire ring push this is replacing. A blob that
+    /// is slower than the packet it removes is not an optimisation.
+    ///
+    /// The write happens after the lock is released. That is safe because
+    /// advancing `len` under the lock is what *reserves* the range: no other
+    /// thread can be given the same bytes, and the GPU side cannot see them
+    /// until `publish_blob` names them.
+    fn record(&self, command_buffer: u64, _opcode: u32, command: &[u8]) -> IcdResult<()> {
+        let need = command.len() as u64;
+        let flush = {
+            let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            match blobs.open.get_mut(&command_buffer) {
+                Some(b) if b.len + need <= b.cap => {
+                    let at = b.off + b.len;
+                    b.len += need;
+                    let flush = b.len - b.published >= BLOB_FLUSH;
+                    drop(blobs);
+                    self.arena.write_bytes(at, command).map_err(lower)?;
+                    flush
+                }
+                // No block yet, or a full one. Both are the slow path, and both
+                // are rare: a block that has found its size never grows again.
+                _ => {
+                    drop(blobs);
+                    self.grow_and_write(command_buffer, command)?;
+                    false
+                }
+            }
         };
-        self.note_device_seqno(class, seqno);
+        if flush {
+            self.flush_blob(command_buffer)?;
+        }
         Ok(())
+    }
+
+    /// `vkEndCommandBuffer`: send the last piece, and do not wait for an answer.
+    ///
+    /// It goes on the **device** ring, in program order with everything else the
+    /// application does to that command buffer, which is what keeps a
+    /// `vkCmdExecuteCommands` naming a secondary that was ended earlier working
+    /// without any extra ordering: the secondary's pieces are device-ring
+    /// packets with lower seqnos.
+    fn publish_blob(&self, command_buffer: u64) -> IcdResult<()> {
+        self.flush_blob(command_buffer)
+    }
+
+    /// `vkBeginCommandBuffer` and `vkResetCommandBuffer`: start again at zero.
+    ///
+    /// **This is where design.md §5.5 item 3's read-pending check lives**, and
+    /// it is the right place for it: rewinding is the only operation that
+    /// rewrites bytes the GPU side may still be walking, it happens once per
+    /// recording rather than once per command, and by the time an application
+    /// re-begins a command buffer the pieces of the previous recording have
+    /// almost always long since retired — so the wait is one acquire load.
+    ///
+    /// If the wait fails the block is **not** rewound. That leaves the next
+    /// `vkCmd*` to wait again and to report the failure through a call that can
+    /// return one, which is better than overwriting a blob the peer is reading
+    /// because the peer stopped answering.
+    fn discard_blob(&self, command_buffer: u64) {
+        let in_flight = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0)
+        };
+        if self.await_blob_read(in_flight).is_err() {
+            return;
+        }
+        let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = blobs.open.get_mut(&command_buffer) {
+            // The block itself is kept: a command buffer that is reset is about
+            // to be recorded into again, and giving the reserve back only to ask
+            // for the same size a moment later is how a first-fit allocator
+            // fragments. It is released for real by `free_blob`.
+            b.len = 0;
+            b.published = 0;
+            b.in_flight = 0;
+        }
+    }
+}
+
+impl RingTransport {
+    /// Make sure the GPU side has imported the slab an allocation landed in
+    /// (design.md §5.2, `svImportArenaSlab`).
+    ///
+    /// Idempotent and cheap: the slab directory in the control region is the
+    /// shared record of which slabs exist, so the common case — a slab already
+    /// imported, or a provider that imported the whole arena at startup — is one
+    /// acquire load and no packet.
+    ///
+    /// It is a **round trip**, and that is right rather than regrettable: the
+    /// memory type is the GPU side's answer, `vkAllocateMemory` cannot proceed
+    /// without knowing the import succeeded, and it happens once per 64 MiB of
+    /// arena an application actually touches.
+    pub fn ensure_slab(&self, slab: u32, arena_offset: u64, len: u64) -> IcdResult<()> {
+        // A second thread allocating in the same slab must not send a second
+        // import; the GPU side would allocate a second `VkDeviceMemory` over the
+        // same pages and leak one of them.
+        let _serialise = self.importing.lock().unwrap_or_else(|e| e.into_inner());
+        match self.control.slab_import_state(slab) {
+            Ok((1, _)) => return Ok(()),
+            Ok(_) => {}
+            // A slab index the directory cannot hold is a geometry disagreement
+            // and not something to paper over.
+            Err(e) => return Err(lower(e)),
+        }
+        self.control.write_slab(slab, arena_offset, len).map_err(lower)?;
+
+        let mut cmd = Vec::new();
+        sv_proto::sv::ImportArenaSlab { slab, arena_offset, len }
+            .encode(&mut cmd)
+            .map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        // On the device ring, because that is where everything about objects
+        // goes and because the barrier machinery already orders the queue ring
+        // against it.
+        self.call(RingClass::Device, sv_proto::sv::SV_IMPORT_ARENA_SLAB, &cmd, &mut reply)?;
+        let r = sv_proto::sv::ImportArenaSlabReply::decode(&reply).map_err(LowerError::Wire)?;
+        if r.result != 0 {
+            return Err(LowerError::Result(r.result));
+        }
+        self.control.complete_slab_import(slab, r.memory_type).map_err(lower)?;
+        Ok(())
+    }
+
+    /// `vkFreeCommandBuffers`: give the block back to the reserve.
+    ///
+    /// Separate from [`Transport::discard_blob`] because the two mean different
+    /// things — a reset command buffer keeps its block and a freed one does not
+    /// — and because only `sv-icd` knows which happened.
+    pub fn free_blob(&self, command_buffer: u64) {
+        let in_flight = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0)
+        };
+        // The GPU side may still be walking these bytes; handing them to the
+        // next `vkCmd*` before it has finished is §5.5 item 3's whole subject.
+        let _ = self.await_blob_read(in_flight);
+        let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = blobs.open.remove(&command_buffer) {
+            Self::release(&mut blobs, b);
+        }
     }
 }

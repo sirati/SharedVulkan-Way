@@ -394,17 +394,26 @@ fn attach(
     )?;
     control.stamp_epoch()?;
 
-    let arena = arena::import_whole(&driver, arena_region)?;
+    // design.md §5.2: "Slabs are **imported** lazily." Nothing is asked of the
+    // driver here; the app side sends `svImportArenaSlab` for each slab it
+    // allocates in, and each import costs about 4.4 ms of the ~70 ms per GiB
+    // this would otherwise all pay at startup (`arena::import_slab`).
+    //
+    // This is the *import* provider, and it is the only one where the question
+    // arises: on the GPU-allocated path the arena **is** a `vkAllocateMemory`
+    // this process made before the app side existed, so there is nothing to
+    // defer. §5.2 does not say that and reads as if lazy import were a property
+    // of the arena; it is a property of the provider.
+    let arena = arena::map_lazy(arena_region);
     eprintln!(
-        "[gpu] arena {} MiB imported as a host pointer, memory type {}",
+        "[gpu] arena {} MiB mapped, {} slabs of {} MiB to import on demand",
         arena.len >> 20,
-        arena.memory_type
+        arena.len.div_ceil(geometry.arena_slab_size),
+        geometry.arena_slab_size >> 20
     );
 
-    arena::check_external_buffers_keep_the_arena(&driver, &arena)?;
-
     let mut objects = Objects::new();
-    objects.set_arena(arena.memory, arena.len);
+    objects.set_lazy_arena(arena.len, geometry.arena_slab_size);
     let fns = driver.load_fns();
     report_missing(&fns);
     let shared = Arc::new(Shared {
