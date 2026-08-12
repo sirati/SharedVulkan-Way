@@ -1392,8 +1392,22 @@ pub fn emit_all(
     ];
     sections.extend(full_lowers);
     sections.extend(raises);
-    let forwardable_names: BTreeSet<String> = forwardable.keys().cloned().collect();
-    sections.push(("fns".to_string(), emit_driver_fns(cx, &forwardable_names)));
+    // The generated forwarders **and** the hand-written ones, because
+    // `DriverFns` is "every entry point the GPU side may need" and a command
+    // being hand-written says nothing about whether it ends up calling the
+    // driver. It said the wrong thing here for as long as every hand-written
+    // command either answered locally (the session, the memory table) or went
+    // through `ash` (`vkAllocateMemory`). `vkCreateBuffer` is the first that
+    // must call the driver with the *registry's* signature — it raises the
+    // registry's `VkBufferCreateInfo`, and reaching it through `ash` would mean
+    // handing one binding's struct to a function typed by another, which is the
+    // stack corruption this table exists to prevent.
+    let table: BTreeSet<String> = forwardable
+        .keys()
+        .cloned()
+        .chain(hand_cmds.iter().filter(|c| c.forwarded).map(|c| c.name.clone()))
+        .collect();
+    sections.push(("fns".to_string(), emit_driver_fns(cx, &table)));
     sections.push(("host".to_string(), emit_host_trait(cx, &hand_cmds)));
     sections.push((
         "server".to_string(),

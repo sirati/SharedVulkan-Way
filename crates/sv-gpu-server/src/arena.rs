@@ -151,6 +151,19 @@ pub struct Arena {
     pub len: u64,
     /// The memory type the driver ended up using, for the report.
     pub memory_type: u32,
+    /// The external handle type the arena's `VkDeviceMemory` was allocated
+    /// **with** — exported on one provider, imported on the other — or zero if
+    /// this arena is not external memory at all.
+    ///
+    /// This is not diagnostic information. Vulkan requires that a buffer bound
+    /// into memory that was exported or imported have been *created* naming at
+    /// least one of the same handle types
+    /// (`VUID-vkBindBufferMemory-memory-02726` for export, `-02727` for
+    /// import), and this field is the only place that value exists. It is a
+    /// property of the arena, decided by whichever of §5.4's providers built
+    /// it, and it is why `vkCreateBuffer` is hand-written on this side: see
+    /// `GpuServer::create_buffer`.
+    pub external_handle_type: vk::ExternalMemoryHandleTypeFlags,
     /// Held for as long as the arena lives on the export path: the app side has
     /// its own duplicate, but dropping ours would be a surprise waiting to
     /// happen if the app side ever reconnects.
@@ -234,6 +247,7 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
         memory,
         len,
         memory_type: type_index,
+        external_handle_type: kind,
         exported_fd: Some(fd),
     })
 }
@@ -300,11 +314,84 @@ pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena>
         memory,
         len,
         memory_type: type_index,
+        // The mirror of the export path, and the reason the field is named for
+        // "external" rather than for "export": an *imported* allocation carries
+        // the same obligation on every buffer bound into it
+        // (`VUID-vkBindBufferMemory-memory-02727`), naming the handle type it
+        // was imported with. design.md §0.4 recorded this as a consequence of
+        // the export provider; it is a consequence of the arena being external
+        // memory at all, which both providers make it.
+        external_handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
         // The import path never exports anything, on either OS; the field only
         // exists where a descriptor does.
         #[cfg(target_os = "linux")]
         exported_fd: None,
     })
+}
+
+/// Does naming the arena's handle type on a buffer cost us the arena?
+///
+/// `GpuServer::create_buffer` adds a `VkExternalMemoryBufferCreateInfo` to every
+/// forwarded buffer, because a buffer bound into the arena must carry one and
+/// nothing at create time knows which buffers those will be. The price of doing
+/// it unconditionally is that a driver is entitled to answer
+/// `vkGetBufferMemoryRequirements` with a *narrower* `memoryTypeBits` for an
+/// external-capable buffer — and if the narrowing excluded the arena's own
+/// memory type, every buffer we created would become unbindable to the arena.
+///
+/// That is not a thing to discover as a failed bind in the middle of a frame,
+/// and it is not a thing to assume either: it is one query, asked once, of the
+/// driver that is actually here. Two identical buffers, one with the link and
+/// one without, with the usage bits Zink asks for; the check is that the arena's
+/// memory type survives.
+///
+/// Measured on RADV (RAPHAEL_MENDOCINO, Mesa 26.1.1): the mask is unchanged.
+pub fn check_external_buffers_keep_the_arena(driver: &Driver, arena: &Arena) -> Result<()> {
+    let kind = arena.external_handle_type;
+    if kind.is_empty() {
+        return Ok(());
+    }
+    // Everything Zink binds into host-visible memory: vertex, index, uniform,
+    // storage and staging.
+    let usage = vk::BufferUsageFlags::TRANSFER_SRC
+        | vk::BufferUsageFlags::TRANSFER_DST
+        | vk::BufferUsageFlags::UNIFORM_BUFFER
+        | vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::INDEX_BUFFER
+        | vk::BufferUsageFlags::VERTEX_BUFFER;
+    let bits = |external: bool| -> Result<u32> {
+        let mut ext = vk::ExternalMemoryBufferCreateInfo::default().handle_types(kind);
+        let mut ci = vk::BufferCreateInfo::default()
+            .size(4096)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        if external {
+            ci = ci.push_next(&mut ext);
+        }
+        let b = unsafe { driver.device.create_buffer(&ci, None) }
+            .map_err(|e| DriverError::Vk("vkCreateBuffer(probe)", e))?;
+        let req = unsafe { driver.device.get_buffer_memory_requirements(b) };
+        unsafe { driver.device.destroy_buffer(b, None) };
+        Ok(req.memory_type_bits)
+    };
+    let plain = bits(false)?;
+    let external = bits(true)?;
+    if external & (1 << arena.memory_type) == 0 {
+        return Err(DriverError::Other(format!(
+            "naming {kind:?} on a buffer narrows memoryTypeBits from {plain:#x} to {external:#x}, \
+             which excludes the arena's memory type {}; buffers could be created or bound to the \
+             arena but not both",
+            arena.memory_type
+        )));
+    }
+    if plain != external {
+        eprintln!(
+            "[gpu] external-capable buffers have memoryTypeBits {external:#x} rather than \
+             {plain:#x}; the arena's type {} survives",
+            arena.memory_type
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

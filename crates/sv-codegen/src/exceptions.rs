@@ -236,6 +236,26 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     ("vkUnmapMemory", "as vkMapMemory"),
     ("vkFlushMappedMemoryRanges", "ranges are in arena coordinates"),
     ("vkInvalidateMappedMemoryRanges", "as vkFlushMappedMemoryRanges"),
+    // The first command on this surface the GPU side has to **alter** rather
+    // than reproduce, and the reason is the arena rather than the command.
+    //
+    // The arena's `VkDeviceMemory` is external memory on every provider of
+    // design.md §5.4 — exported as a dma-buf on the GPU-allocated path,
+    // imported as a host pointer on the app-allocated one — and Vulkan requires
+    // that every buffer bound into such memory was *created* naming at least
+    // one of the same handle types (`VUID-vkBindBufferMemory-memory-02726` and
+    // `-02727`). Neither side can supply that from where it stands: the
+    // application never knows its memory is external, and the app side never
+    // knows *which* handle type, because that is decided by whichever provider
+    // the GPU side chose at startup. Only this side holds the value, and
+    // `vkCreateBuffer` is where it has to be applied — before the buffer
+    // exists, and long before anyone knows which memory it will be bound to.
+    //
+    // A generated forwarder cannot do it. The generated path raises the wire
+    // struct into C and calls the driver; there is no seam at which a `pNext`
+    // link can be added, and adding one is not a shape any pass in §7.2 has —
+    // every pass converts what it was given, and none of them invents.
+    ("vkCreateBuffer", "the arena is external memory, so every buffer bound into it must say so"),
     // --- 3. answers that are ours -----------------------------------------
     //
     // `vkQueueSubmit` is deliberately **not** here, although design.md §6.5

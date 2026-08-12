@@ -381,6 +381,12 @@ nothing rejects it.
   first job of the next stage — Zink computes its GL version from Gallium caps
   that are themselves computed from device features, so the answer is a specific
   feature or format that is not crossing correctly.
+  **[RESOLVED — §0.5 items 1 and 2. It was 4.6 all along and three answers were
+  wrong: a forwarded `apiVersion` above what we implement, and two extension
+  names left out of the profile. The guess in the sentence above — "a specific
+  feature or format that is not crossing correctly" — was wrong in an
+  instructive way: every feature was crossing correctly and was never asked
+  for.]**
 - **`VUID-vkBindBufferMemory-memory-02726` fires twelve times per run.** The
   arena on the export path is allocated with `VkExportMemoryAllocateInfo`, so
   every buffer bound into it must be created with a matching
@@ -388,6 +394,10 @@ nothing rejects it.
   does not know the handle type — and the GPU side cannot add it in the generated
   path. RADV tolerates it; another driver need not. This is a consequence of the
   arena provider and belongs with §5.4.
+  **[RESOLVED — §0.5 item 3 and §5.4. Both halves of "neither side can" were
+  right; the answer was that the GPU side stops using the generated path for
+  `vkCreateBuffer`. It is also not export-specific: the import providers carry
+  the identical obligation under `-02727`. Validation is now clean.]**
 - **No windowed GL.** `zink_kopper` wants a swapchain and §10 keeps presentation
   outside the protocol, so glxgears cannot run: Xvfb's GLX has no DRI3 and there
   is no other display. What was tested instead is the same workload without the
@@ -396,6 +406,191 @@ nothing rejects it.
   `svExecuteCommandBlob` is still not built; every `vkCmd*` crosses as its own
   ring packet. The generic forwarding is strictly better than the hand-written
   version it replaced — it carries the `pNext` chain — but it is not §6.5.
+
+### 0.5 What the GL 4.6 and Direct3D stage settled
+
+Built 2026-08-12. **OpenGL 4.6.** `eglinfo` on the surfaceless platform now
+reports
+
+```
+OpenGL core profile renderer: zink Vulkan 1.3(AMD Ryzen 9 9950X3D … (RADV RAPHAEL_MENDOCINO) (MESA_RADV))
+OpenGL core profile version:  4.6 (Core Profile) Mesa 26.2.0
+```
+
+— the same 4.6 core, 4.6 compatibility and GLES 3.2 that Zink reports when it is
+run on that RADV *directly*, and with the GL extension string now differing from
+that reference only in extensions no GL version requires. `scripts/sv-zink-gl.sh`
+grew a third check, `gl4-probe`, which uses the three capabilities that were
+missing and judges each on its pixels: a patch tessellated to level 16 and mapped
+onto a disc (the disc fills 0.794 of its bounding box; four corners alone would
+fill 0.500), four instances placed by a vertex attribute with
+`glVertexAttribDivisor`, and `glMultiDrawArraysIndirectCount` given four commands
+and a parameter buffer saying two. All three agree with llvmpipe at **69.8 dB
+PSNR**, and `gl-probe`'s original frame is unchanged at 64.1 dB.
+
+Six findings, and the first is the one §0.4 asked the next stage to find.
+
+**1. The GL version was held at 3.2 by a *version number*, not by a feature.**
+`vkGetPhysicalDeviceProperties` was forwarded whole, so `apiVersion` was the
+driver's **1.4.348** while the wire profile is core 1.0–1.3, the manifest says
+1.3 and `vkEnumerateInstanceVersion` says 1.3. A physical device was claiming a
+version its own ICD does not implement. Zink takes `screen->vk_version` from
+exactly that field, and its device-info pass stops chaining an extension's
+feature struct into `vkGetPhysicalDeviceFeatures2` once the version says the
+extension is core, reading the feature out of the core aggregate instead
+(`zink_device_info.py`, `features_promoted`). At 1.4 it therefore read
+`vertexAttributeInstanceRateDivisor` from `VkPhysicalDeviceVulkan14Features`,
+which this profile has never heard of, got zero, and dropped
+`GL_ARB_instanced_arrays` — the GL 3.3 gate — while the
+`VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT` we *do* answer, and which
+says `true`, went unasked. **Claiming a version above what you implement does
+not merely overstate the answer; it makes the honest answer unreachable.**
+`apiVersion` is now clamped in `sv_icd::icd::clamp_api_version` and is the one
+field of that struct which is ours rather than the driver's.
+
+**2. The remaining two steps were extension *names*, both for capabilities we
+already had.** `VK_KHR_maintenance2` gates the whole tessellation stage in Zink
+(`zink_init_shader_caps` skips the tessellation-control and -evaluation stages
+unless `tessellationShader && have_KHR_maintenance2`), and it reads
+`have_KHR_maintenance2` from the extension list, promoted-to-core or not — so
+`tessellationShader = true`, which we had been reporting all along, bought
+nothing and GL stopped at 4.0. `VK_KHR_draw_indirect_count` likewise gates
+`GL_ARB_indirect_parameters`, the last extension before 4.6, although its two
+commands are core since 1.2 and were already forwarded. Both are in the profile
+now. **Neither added a capability. Both were §9.2's "curated, not mirrored"
+curating out something the curator had no reason to think mattered**, which is
+the standing hazard of a curated list and is worth a rule: *an extension whose
+every command and type is already in the profile costs nothing to advertise, and
+consumers use extension names as capability flags whether or not the
+specification promoted them.*
+
+**3. §0.4's `VUID-vkBindBufferMemory-memory-02726` is not export-specific, and
+neither side could fix it from where §0.4 left it.** The requirement is on
+external memory of *any* provenance — export is `-02726`, import is the
+identically-shaped `-02727` — so it applies to both of §5.4's providers and not
+just to the one `testhost` happens to use. It is fixed on the **GPU side**, in
+a now hand-written `vkCreateBuffer` that merges a
+`VkExternalMemoryBufferCreateInfo` naming the arena's handle type into every
+forwarded buffer. That side is the only one that holds the value: on the
+app-allocated path the `Attach` that carries the arena to the ICD is sent by
+`sv-hostd`, which does not know the handle type either, so an app-side fix would
+need a new protocol message carrying a value the app side would only send
+straight back. Three consequences worth stating:
+  - **The GPU side is not a faithful relay any more, and this is the first place
+    it is not.** §7.2's passes all *convert* what they were given; none of them
+    invents. Adding a `pNext` link the application did not write is a new
+    operation, and the mirror of §0.4 item 10 where the app side expands
+    `vkUpdateDescriptorSetWithTemplate` into what it means. The rule that falls
+    out: **each side may rewrite exactly what only it knows.**
+  - **It cannot be conditional**, because `vkCreateBuffer` happens before anyone
+    has asked for memory requirements, let alone chosen a type. Every forwarded
+    buffer is therefore created external-capable, and the price is that a driver
+    may narrow `memoryTypeBits` for such a buffer.
+    `arena::check_external_buffers_keep_the_arena` asks that question once at
+    startup and refuses to serve if the narrowing would exclude the arena's own
+    memory type. On RADV the mask does not move.
+  - **The same argument applies to images** (`VkExternalMemoryImageCreateInfo`,
+    `VUID-vkBindImageMemory-memory-02728`) and does not fire only because §9.1
+    puts optimal-tiling images in memory type 0, which is a GPU-side allocation.
+    That is a load-bearing consequence of §9.1's ordering which §9.1 does not
+    state, and it should be read as one: reorder that table and images land in
+    the arena and need the same treatment.
+
+  Validation is now **zero errors** over a full `gl4-probe` run, where it was
+  fourteen.
+
+**4. An output *blob* was crossing with its length thrown away.** The app side's
+lowering sends an output array's capacity — that is Venus's `_partial` array —
+but a sized `void*` fell through to "send nothing at all", so the GPU side, which
+sizes the buffer it hands the driver from the length of the array it received,
+passed a **null `pData` with a non-zero size**. `vkGetPipelineCacheData` returned
+`VK_INCOMPLETE` on every run, which is how it was noticed;
+`vkGetQueryPoolResults` on the same path returns `VK_SUCCESS` with the caller's
+buffer untouched, which nothing reports. Zink does not take that second path —
+it copies query results into a buffer with `vkCmdCopyQueryPoolResults` — so it
+had not fired. This is §0.4 item 5's mistake in the other direction: there the
+*count* was derived from the array's length on the way back, here the array's
+length was dropped on the way out. **The count-then-fill idiom has now been got
+wrong once in each direction, which suggests the shape rather than the code is
+what is hard**, and that a generator which treats "output" as "nothing to send"
+will keep finding new ways to say it.
+
+**5. `DriverFns` was derived from the set of *generated* forwarders**, so a
+hand-written command that still had to call the driver had nowhere to get its
+entry point. It said the wrong thing for as long as every hand-written command
+either answered locally or went through `ash`. `vkCreateBuffer` is the first that
+must call the driver with the *registry's* signature — it raises the registry's
+`VkBufferCreateInfo`, and reaching the driver through `ash` would hand one
+binding's struct to a function typed by another. The table now covers every
+forwarded command, hand-written or not.
+
+**6. Direct3D: the blocker is §10, and it is not `bufferDeviceAddress`.** See
+the section below; this is the correction to §9.2 and §11.
+
+#### Where Direct3D actually stands
+
+Measured, not reasoned: `scripts/sv-dxvk-d3d11.sh` runs `scripts/d3d11-probe.c`
+— a windowless D3D11 program that renders to a texture and reads it back —
+under Wine 11.0 with a real DXVK, against this ICD.
+
+**DXVK 2.6.2 reaches `D3D_FEATURE_LEVEL_12_0` on our forwarded device.** It
+enumerates the physical device, reads §9.1's memory table back verbatim, computes
+a maximum Direct3D feature level of 12_0 and selects 11_1 — and then fails on
+exactly one thing: **`VK_KHR_swapchain`, which DXVK marks `Required` even for a
+device that will never present.** Its only other required device extension is
+`VK_EXT_robustness2`, which we advertise. So:
+
+- **`bufferDeviceAddress` is not what stops D3D11.** DXVK ≤ 2.6.2 requires it
+  only when it can also see `VK_NVX_binary_import` and `VK_NVX_image_view_handle`
+  and is turning on CUDA interop; on this device it never asks. §9.2's sentence
+  "a device that does not advertise the feature causes DXVK 3.x and vkd3d-proton
+  to fail device creation cleanly" is right about the direction and wrong about
+  the version: **it is DXVK ≥ 2.7**, which rewrote its requirement list and now
+  demands `bufferDeviceAddress`, `descriptorIndexing`, `VK_KHR_pipeline_library`
+  and a good deal more (`dxvk_device_info.cpp`, `ENABLE_FEATURE(vk12,
+  bufferDeviceAddress, true)`). Measured: 2.7.1 refuses this device, naming
+  `VK_KHR_pipeline_library` first because that is where its list reaches first.
+- **The decision not to advertise `bufferDeviceAddress` therefore costs less than
+  §9.2 assumed.** It costs D3D12 through vkd3d-proton, which is structural —
+  `ID3D12Resource::GetGPUVirtualAddress` is in the D3D12 API itself, so a raw
+  device address is not an implementation choice vkd3d could make differently —
+  and it costs DXVK ≥ 2.7. It does **not** cost D3D9/10/11 through DXVK ≤ 2.6,
+  which is a supported, widely deployed configuration.
+- **What D3D9/10/11 costs instead is §10 stage 2**, or a smaller piece of it: a
+  `VK_KHR_swapchain` that exists. That is a real piece of work and it is the same
+  piece of work windowed GL needs (`zink_kopper`, §0.4). Two of the three things
+  this project cannot currently do turn out to be one thing.
+
+Two findings about the plumbing rather than about Direct3D.
+
+**`sv-gpu-server serve --clients N` accepts exactly `N` connections before it
+serves any of them, and that is the wrong shape for a real application.** Wine
+starts helper processes that each create a Vulkan instance, so the count is a
+property of the workload rather than of the configuration: one too few and a
+helper takes the application's slot — after which the ICD refuses to load and
+the loader reports only `VK_ERROR_INCOMPATIBLE_DRIVER` — and one too many and
+the server waits for a client that never arrives while the application's first
+command times out. Neither symptom names the cause. §3 does not say the GPU side
+must know its client count in advance and it should not: accepting on a thread
+while serving would remove the parameter entirely. Recorded rather than fixed;
+`scripts/sv-dxvk-d3d11.sh` works around it by warming the Wine prefix first so
+that "1" is a fact.
+
+And one about Wine, which cost most of an afternoon to see: **Wine puts instance
+extensions on the host instance that the application never asked for**, and `vkCreateInstance` fails with
+`VK_ERROR_EXTENSION_NOT_PRESENT` if the host ICD lacks them. It needs
+`VK_KHR_external_memory_capabilities`, `VK_KHR_external_semaphore_capabilities`
+and `VK_KHR_get_physical_device_properties2`, and it maps the Windows
+`VK_KHR_win32_surface` onto the host's **`VK_EXT_headless_surface`** when there
+is no display — which is precisely the surface extension §10 stage 1 already
+chose, so Wine's headless path and this design agree by accident. The three
+capability extensions are now advertised, and the three
+`vkGetPhysicalDeviceExternal*Properties` queries behind them are answered
+**app-side with "no handle type is supported"** rather than forwarded. That is a
+strengthening of §9.2 rather than a departure from it: §9.2 says we do not
+advertise external handle types we cannot honour, and before this it was true
+only because nothing could ask — the queries are core 1.1, an application can
+make them regardless, and RADV's honest answer is our dishonest one.
 
 ---
 
@@ -1347,6 +1542,20 @@ construction, surfacing as `VK_ERROR_INVALID_EXTERNAL_HANDLE` (fwd §2.1). The
 brief requires either side to be either OS, so the trait exists from the first
 commit even though `testhost` only ever exercises the first row.
 
+**Every provider makes the arena external memory, and that reaches every buffer
+bound into it.** A `VkDeviceMemory` that was exported or imported may only have
+buffers bound to it that were *created* naming at least one of the same external
+handle types (`VUID-vkBindBufferMemory-memory-02726` for the export row of the
+table above, `-02727` for the import rows). The obligation is on `vkCreateBuffer`
+— before the buffer exists, and long before anyone has chosen memory for it — so
+it cannot be applied selectively to the buffers that will land in the arena, and
+it cannot be applied by the app side, which does not know which row of this table
+is in force. It is therefore applied by the GPU side, to every forwarded buffer,
+from `Arena::external_handle_type`; §0.5 has the consequences and
+`GpuServer::create_buffer` has the code. The trait keeps its signature: the
+handle type is a property of the `Arena` the provider returned, not an argument
+to `import`.
+
 **`SlabImport` is unchanged by the fragmentation finding, and that is worth
 saying rather than leaving implicit.** The GPU side imports a pointer into its
 own *virtual* address space, which `VirtualAlloc` made contiguous regardless of
@@ -2266,13 +2475,24 @@ Curated, not mirrored. The v1 set is Zink's requirement set (§11), which is
 lacks it — the measurement confirms it is present — but because an application
 that writes a raw 64-bit address into arena memory for a shader to dereference
 has done something our transform pass cannot see. A device that does not
-advertise the feature causes DXVK 3.x and vkd3d-proton to fail device creation
-cleanly and loudly. That is a much better outcome than a device that advertises
-it and then renders garbage. See §11 for the nuance.
+advertise the feature fails device creation cleanly and loudly in the consumers
+that need it, which is a much better outcome than a device that advertises it and
+then renders garbage. See §11 for the nuance.
+
+> **[CORRECTED — 2026-08-12, §0.5 "Where Direct3D actually stands"; measured
+> with `scripts/sv-dxvk-d3d11.sh`]** The consumers are **vkd3d-proton and DXVK
+> ≥ 2.7**, not "DXVK 3.x". DXVK ≤ 2.6.2 does not require the feature — it asks
+> for it only alongside `VK_NVX_binary_import` for CUDA interop — and reaches
+> `D3D_FEATURE_LEVEL_12_0` on this device. What stops D3D11 there is
+> `VK_KHR_swapchain` and therefore §10, not this decision.
 
 We also do not advertise external memory/semaphore/fence handle types we cannot
 honour, which is legal and avoids gfxstream's rather comical OPAQUE_FD cookie
-workaround (fwd §2.9).
+workaround (fwd §2.9). **The three `vkGetPhysicalDeviceExternal*Properties`
+queries are answered app-side with an all-zero reply** rather than forwarded,
+because they are core 1.1 and an application can make them whether or not the
+extensions are advertised — and the GPU-side driver's honest answer about its own
+export capabilities is a false answer about ours (§0.5).
 
 ### 9.3 Synchronisation
 
@@ -2366,6 +2586,15 @@ GL 4.4 — the arena handles natively. That is the requirement justifying itself
 
 **Stretch: DXVK ≤ 2.6.x**, which needed only two required device extensions and
 enabled `bufferDeviceAddress` opportunistically for NVX CUDA interop only.
+
+> **[CONFIRMED — 2026-08-12, §0.5; `scripts/sv-dxvk-d3d11.sh` against DXVK
+> 2.6.2 under Wine 11.0]** Both halves of that sentence measured out exactly.
+> The two required device extensions are `VK_EXT_robustness2`, which we
+> advertise, and `VK_KHR_swapchain`, which we do not — and the second is the
+> whole of what remains. DXVK enumerated the device, read §9.1's memory table
+> back, and computed a maximum Direct3D feature level of **12_0** before
+> refusing for want of a swapchain. §9.2's looser "DXVK 3.x" was the sentence
+> that needed correcting, not this one.
 
 **Out of scope: DXVK ≥ 2.7 / 3.x and vkd3d-proton.** DXVK 3.x's `dxbc-spirv`
 backend emits `CapabilityPhysicalStorageBufferAddresses` and

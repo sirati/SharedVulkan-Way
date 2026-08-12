@@ -279,6 +279,27 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
     // design.md §10 stage 1: headless first, and no swapchain at all.
     ("VK_KHR_surface", 25),
     ("VK_EXT_headless_surface", 1),
+    // **Wine asks for these three on every instance it creates**, whatever the
+    // application asked for, and `vkCreateInstance` fails with
+    // `VK_ERROR_EXTENSION_NOT_PRESENT` if the host ICD does not have them. That
+    // is the entire reason DXVK could not start against this driver — not a
+    // feature, not `bufferDeviceAddress`, an instance extension list.
+    //
+    // They cost nothing to advertise and they do not weaken §9.2. All three are
+    // **query** extensions, promoted to core 1.1, whose commands this profile
+    // already forwards; what §9.2 declines to advertise is external *handle
+    // types*, and these extensions are the mechanism by which a device says
+    // which handle types it supports. Saying "none" through them is more honest
+    // than not being askable. See `external_semaphore_properties` and its two
+    // siblings in `icd.rs`, which answer exactly that rather than forwarding
+    // the GPU-side driver's much longer list.
+    ("VK_KHR_external_memory_capabilities", 1),
+    ("VK_KHR_external_semaphore_capabilities", 1),
+    ("VK_KHR_external_fence_capabilities", 1),
+    // Same story, and the same zero cost: core 1.1, every command already
+    // forwarded, and Wine puts it on the host instance whenever the client
+    // instance is 1.0 — which is what its own helper processes create.
+    ("VK_KHR_get_physical_device_properties2", 2),
 ];
 
 /// The device extensions we advertise **with no GPU side**.

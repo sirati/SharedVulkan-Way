@@ -21,6 +21,13 @@
 #  3. The frame is compared against the **same program on llvmpipe**. Two
 #     entirely different rasterisers agreeing to within a rounding error is much
 #     stronger evidence than either one looking plausible on its own.
+#
+#  4. `gl4-probe` uses the three capabilities that were absent while GL was
+#     3.2 — tessellation, an instance-rate vertex attribute, and an indirect
+#     draw whose count comes from a parameter buffer. `gl-probe` is written
+#     against GLSL 1.50 on purpose and passes identically at 3.2 and 4.6, so it
+#     cannot tell them apart; this one can, and it judges each capability on the
+#     pixels it produces rather than on the version string.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -137,6 +144,44 @@ else
     echo "  against llvmpipe : $PSNR dB (luma)"
     DB=$(echo "$PSNR" | grep -oE '[0-9]+' | head -1)
     if [ "${DB:-0}" -lt 30 ]; then
+      echo "  FAIL — the frame does not agree with the software reference"
+      fail=1
+    fi
+  fi
+fi
+
+# --- 3. the GL 4.x capabilities, each judged on its own pixels ----------------
+echo
+echo "--- gl4-probe: tessellation, instance divisor, indirect count ---"
+PROBE4="$RUNDIR/gl4-probe"
+if ! cc -O1 -o "$PROBE4" "$ROOT/scripts/gl4-probe.c" -lEGL -lGL -lm 2>"$RUNDIR/cc4.log"; then
+  echo "  SKIP — gl4-probe did not build:"
+  sed 's/^/    /' "$RUNDIR/cc4.log" | head -10
+else
+  LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless GL4_PROBE_PPM="$RUNDIR/ref4.ppm" \
+    "$PROBE4" > "$RUNDIR/ref4.log" 2>&1
+  REF4=$?
+
+  start_gpu_side || { echo "  the GPU side never came up"; exit 1; }
+  GL4_PROBE_PPM="$RUNDIR/zink4.ppm" gl_env "$PROBE4" > "$RUNDIR/probe4.log" 2>&1
+  RC4=$?
+  stop_gpu_side
+
+  sed -n 's/^/  /p' "$RUNDIR/probe4.log" | grep -E 'version|coverage|disc|instances|marks' || true
+  if [ $RC4 -ne 0 ]; then
+    echo "  FAIL — gl4-probe returned $RC4"
+    grep -E 'gl4-probe:' "$RUNDIR/probe4.log" | head -12 | sed 's/^/    /'
+    echo "  --- gpu ---"; tail -8 "$RUNDIR/gpu.log" | sed 's/^/    /'
+    fail=1
+  else
+    echo "  PASS — all three GL 4.x capabilities produced the geometry they should"
+  fi
+
+  if [ $REF4 -eq 0 ] && [ $RC4 -eq 0 ] && command -v pnmpsnr >/dev/null; then
+    PSNR4=$(pnmpsnr "$RUNDIR/ref4.ppm" "$RUNDIR/zink4.ppm" 2>&1 | grep -oE 'Y: *[0-9.]+' | head -1)
+    echo "  against llvmpipe : $PSNR4 dB (luma)"
+    DB4=$(echo "$PSNR4" | grep -oE '[0-9]+' | head -1)
+    if [ "${DB4:-0}" -lt 30 ]; then
       echo "  FAIL — the frame does not agree with the software reference"
       fail=1
     fi

@@ -437,6 +437,19 @@ pub mod profiles {
             extensions: vec![
                 // Zink's five hard requirements (design.md §11).
                 "VK_KHR_maintenance1".into(),
+                // Advertised for its *name*, not for anything it adds. Every
+                // type and command it defines is core since 1.1 and so already
+                // in this profile; what is not already here is the string in
+                // `VkPhysicalDeviceProperties`' extension list, and Zink gates
+                // the whole tessellation stage on finding it there —
+                // `zink_init_shader_caps` skips `MESA_SHADER_TESS_CTRL`/`_EVAL`
+                // unless `feats.features.tessellationShader &&
+                // have_KHR_maintenance2` (`zink_screen.c`), and it reads
+                // `have_KHR_maintenance2` from the extension list rather than
+                // from the version, promoted or not. Without it Mesa's state
+                // tracker sees zero tessellation-control instructions, drops
+                // `GL_ARB_tessellation_shader`, and GL stops at 3.3.
+                "VK_KHR_maintenance2".into(),
                 "VK_KHR_maintenance5".into(),
                 "VK_KHR_create_renderpass2".into(),
                 "VK_KHR_dynamic_rendering".into(),
@@ -461,6 +474,16 @@ pub mod profiles {
                 "VK_EXT_non_seamless_cube_map".into(),
                 "VK_EXT_primitives_generated_query".into(),
                 "VK_KHR_shader_draw_parameters".into(),
+                // Likewise name-only: `vkCmdDrawIndirectCount` and
+                // `vkCmdDrawIndexedIndirectCount` are core since 1.2 and were
+                // already forwarded, but Zink sets
+                // `PIPE_CAP_MULTI_DRAW_INDIRECT_PARAMS` from
+                // `have_KHR_draw_indirect_count` alone, and Mesa gates
+                // `GL_ARB_indirect_parameters` — the last extension on the way
+                // to GL 4.6 — on that cap. Adding the string also brings the
+                // two `…KHR` aliases onto the exported ABI, which is what Zink
+                // resolves once it believes the extension is present.
+                "VK_KHR_draw_indirect_count".into(),
                 "VK_EXT_robustness2".into(),
                 // The reverse ring forwards validation-layer output to the app
                 // side, which needs the messenger types (design.md §4.6).

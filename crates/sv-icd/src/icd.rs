@@ -389,14 +389,22 @@ impl Icd for SharedVulkan {
     /// the *driver's* properties — its `deviceName`, its limits — rather than
     /// design.md §9's synthesised table, which is how `vulkaninfo` tells the two
     /// configurations apart from the outside.
+    ///
+    /// Every field but one is the driver's answer. `apiVersion` is **ours**, for
+    /// the reason [`clamp_api_version`] gives.
     fn get_physical_device_properties(
         &self,
         args: p::VkGetPhysicalDevicePropertiesArgs,
     ) -> IcdResult<p::VkGetPhysicalDevicePropertiesReply> {
-        forwarded!(self, get_physical_device_properties, args, {
-            Ok(p::VkGetPhysicalDevicePropertiesReply {
-                p_properties: Some(Box::new(device_properties())),
-            })
+        if let Some(t) = self.wire() {
+            let mut reply = forward::get_physical_device_properties(t, args)?;
+            if let Some(p) = reply.p_properties.as_mut() {
+                clamp_api_version(&mut p.api_version);
+            }
+            return Ok(reply);
+        }
+        Ok(p::VkGetPhysicalDevicePropertiesReply {
+            p_properties: Some(Box::new(device_properties())),
         })
     }
 
@@ -404,15 +412,20 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkGetPhysicalDeviceProperties2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceProperties2Reply> {
-        forwarded!(self, get_physical_device_properties2, args, {
-            let mut out = p::VkPhysicalDeviceProperties2::default();
-            out.properties = device_properties();
-            // The application's own chain links are left exactly as it left
-            // them: answering a link we have no answer for would be inventing
-            // data. See `store_pnext` in `sv-icd-entry` for the direction that
-            // fills them in once there is something to fill them with.
-            Ok(p::VkGetPhysicalDeviceProperties2Reply { p_properties: Some(Box::new(out)) })
-        })
+        if let Some(t) = self.wire() {
+            let mut reply = forward::get_physical_device_properties2(t, args)?;
+            if let Some(p) = reply.p_properties.as_mut() {
+                clamp_api_version(&mut p.properties.api_version);
+            }
+            return Ok(reply);
+        }
+        let mut out = p::VkPhysicalDeviceProperties2::default();
+        out.properties = device_properties();
+        // The application's own chain links are left exactly as it left
+        // them: answering a link we have no answer for would be inventing
+        // data. See `store_pnext` in `sv-icd-entry` for the direction that
+        // fills them in once there is something to fill them with.
+        Ok(p::VkGetPhysicalDeviceProperties2Reply { p_properties: Some(Box::new(out)) })
     }
 
     fn get_physical_device_memory_properties(
@@ -495,6 +508,52 @@ impl Icd for SharedVulkan {
         Ok(p::VkGetPhysicalDeviceQueueFamilyProperties2Reply {
             p_queue_family_property_count: Some(families.len() as u32),
             p_queue_family_properties: families,
+        })
+    }
+
+    /// "No external handle type is supported", answered here rather than
+    /// forwarded.
+    ///
+    /// The three `vkGetPhysicalDeviceExternal*Properties` queries are the only
+    /// commands on this surface where the *driver's* honest answer is our
+    /// dishonest one. RADV can export a `VkBuffer` as a dma-buf; we cannot pass
+    /// a dma-buf to the application, because the application is on the other
+    /// side of a wire that design.md §6.1 puts external handles explicitly
+    /// outside of ("WSI handles and external handles are **not
+    /// serialisable**"). Forwarding the reply would advertise an export path
+    /// that fails at the first `vkGetMemoryFdKHR`.
+    ///
+    /// design.md §9.2 already says we "do not advertise external
+    /// memory/semaphore/fence handle types we cannot honour"; before these
+    /// overrides that sentence was true only because the *extensions* were not
+    /// advertised, which is not the same thing — the queries are core 1.1 and an
+    /// application can make them regardless. All-zero
+    /// `externalMemoryProperties`/`externalSemaphoreProperties` is the
+    /// specification's way of spelling "not supported for this handle type".
+    fn get_physical_device_external_buffer_properties(
+        &self,
+        _args: p::VkGetPhysicalDeviceExternalBufferPropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceExternalBufferPropertiesReply> {
+        Ok(p::VkGetPhysicalDeviceExternalBufferPropertiesReply {
+            p_external_buffer_properties: Some(Box::default()),
+        })
+    }
+
+    fn get_physical_device_external_semaphore_properties(
+        &self,
+        _args: p::VkGetPhysicalDeviceExternalSemaphorePropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceExternalSemaphorePropertiesReply> {
+        Ok(p::VkGetPhysicalDeviceExternalSemaphorePropertiesReply {
+            p_external_semaphore_properties: Some(Box::default()),
+        })
+    }
+
+    fn get_physical_device_external_fence_properties(
+        &self,
+        _args: p::VkGetPhysicalDeviceExternalFencePropertiesArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceExternalFencePropertiesReply> {
+        Ok(p::VkGetPhysicalDeviceExternalFencePropertiesReply {
+            p_external_fence_properties: Some(Box::default()),
         })
     }
 
@@ -978,6 +1037,35 @@ impl Icd for SharedVulkan {
 // field-by-field and mechanical. It is written by hand here rather than
 // generated because it is four structs, and a generated "C to wire for a value
 // we made up ourselves" pass would be a pass with no other user.
+
+/// Hold the forwarded `apiVersion` down to the version this ICD implements.
+///
+/// **The one field of `VkPhysicalDeviceProperties` that is not the driver's to
+/// answer.** Everything else in that struct describes the hardware, and the
+/// whole point of forwarding it is that the application learns about the real
+/// device. `apiVersion` does not describe hardware: it is a promise about which
+/// entry points and which structures exist, and the side that has to keep that
+/// promise is this one. The wire profile is core 1.0–1.3 (`vk_registry::
+/// profile::zink`), the manifest says 1.3 and `vkEnumerateInstanceVersion`
+/// says 1.3 — so a physical device reporting the driver's 1.4 was reporting a
+/// version its own ICD does not implement.
+///
+/// It is not a cosmetic inconsistency, and the cost was two GL versions. Mesa's
+/// Zink takes `screen->vk_version` from exactly this field, and its device-info
+/// pass stops chaining an extension's feature struct into
+/// `vkGetPhysicalDeviceFeatures2` once the version says that extension is core —
+/// it reads the feature out of the core aggregate instead
+/// (`zink_device_info.py`, `features_promoted`). At 1.4,
+/// `vertexAttributeInstanceRateDivisor` is read from
+/// `VkPhysicalDeviceVulkan14Features`, which is not a struct this profile knows,
+/// so it came back false, `PIPE_CAP_VERTEX_ELEMENT_INSTANCE_DIVISOR` was 0,
+/// `GL_ARB_instanced_arrays` was absent and GL stopped at 3.2 — while the
+/// `VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT` we *do* answer, and which
+/// says `true`, went unasked. Claiming a version above what you implement makes
+/// an honest answer unreachable rather than wrong.
+fn clamp_api_version(v: &mut u32) {
+    *v = (*v).min(API_VERSION);
+}
 
 fn device_properties() -> p::VkPhysicalDeviceProperties {
     let c = advertise::device_properties(API_VERSION);

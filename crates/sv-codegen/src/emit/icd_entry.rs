@@ -1242,6 +1242,56 @@ fn stub_body(
             if field.is_output { partial_validity(field) } else { PartialValidity::Full };
 
         let e = match (&field.shape, validity) {
+            // An output **blob** — a sized `void*` — carries the caller's
+            // capacity and no values, and it has to be matched here, *above*
+            // the `Skip` arm, because `partial_validity` calls a blob `Skip`
+            // and `Skip` means "send nothing at all".
+            //
+            // Sending nothing is right about the *contents* — the caller's
+            // buffer is uninitialised memory and reading it is undefined — and
+            // wrong about the length, which is the one thing an output
+            // parameter genuinely carries inwards. The GPU side sizes the
+            // buffer it hands the driver from the length of the array it
+            // received, so a zero-length blob became a **null `pData` with a
+            // non-zero size**, and the driver did what a driver does with a
+            // null output pointer: nothing.
+            //
+            // Two commands on this surface. `vkGetPipelineCacheData` is the one
+            // that was observed: it returned `VK_INCOMPLETE` on every run,
+            // which Zink prints and survives, and which is what led here. The
+            // other is `vkGetQueryPoolResults`, and it is the reason this is
+            // worth fixing rather than silencing — there the same path returns
+            // `VK_SUCCESS` with the caller's buffer *untouched*, so a query
+            // reads whatever was already in that memory and nothing anywhere
+            // reports a problem. Zink does not take that path for occlusion
+            // queries (it copies results into a buffer with
+            // `vkCmdCopyQueryPoolResults` and reads the buffer), so it had not
+            // fired; an application that calls `vkGetQueryPoolResults`
+            // directly, as the specification entirely permits, would have got
+            // silent nonsense.
+            //
+            // It is design.md §0.4 item 5's mistake in the other direction:
+            // there the *count* was derived from the array's length on the way
+            // back, here the array's length is dropped on the way out.
+            (Shape::Blob { .. }, _) if field.is_output => {
+                let len = abi.len.as_ref().ok_or_else(|| {
+                    format!("{}.{}: an output blob with no len=", c.name, field.name)
+                })?;
+                let n = match len {
+                    ArrayLen::Path { root, field } => {
+                        let a = path_access(root, field);
+                        let r = naming::ident(&naming::snake_case(root));
+                        quote!(if #r.is_null() { 0usize } else { (#a) as usize })
+                    }
+                    other => count_expr(other, &count_access).ok_or_else(|| {
+                        format!("{}.{}: len={other:?} is not readable", c.name, field.name)
+                    })?,
+                };
+                quote!({
+                    let __n = if #access.is_null() { 0usize } else { #n };
+                    vec![0u8; __n]
+                })
+            }
             (_, PartialValidity::Skip) => wire_default(&field.shape),
             // The decayed array of `c_param_type`: the wire shape is a fixed
             // array but what arrived is a pointer, so it is indexed as one.

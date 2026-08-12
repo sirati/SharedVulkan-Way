@@ -265,6 +265,7 @@ fn serve(
         arena.len >> 20,
         arena.memory_type
     );
+    arena::check_external_buffers_keep_the_arena(&driver, &arena)?;
     let arena_fd = arena
         .exported_fd
         .as_ref()
@@ -395,6 +396,8 @@ fn attach(
         arena.len >> 20,
         arena.memory_type
     );
+
+    arena::check_external_buffers_keep_the_arena(&driver, &arena)?;
 
     let mut objects = Objects::new();
     objects.set_arena(arena.memory, arena.len);

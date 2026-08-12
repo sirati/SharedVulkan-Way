@@ -141,10 +141,14 @@ static P_glBindAttribLocation p_glBindAttribLocation;
 #define W 256
 #define H 256
 
-/* GLSL 1.50, not 3.30: Zink over this forwarder advertises GL **3.2**, and a
- * `#version 330` shader is rejected outright. Attribute locations are bound with
- * `glBindAttribLocation` for the same reason — `layout(location=)` on an input
- * is a 3.3 feature. */
+/* GLSL 1.50, not 3.30, and it stays that way now that Zink over this forwarder
+ * reports GL **4.6**. Written against the lowest version that expresses the
+ * workload, this program measures the *pipeline* rather than the version, so it
+ * is the check that keeps working when the advertised level changes in either
+ * direction — and it passed identically at 3.2 and at 4.6, which is exactly why
+ * it cannot be the evidence for 4.6. `gl4-probe.c` is. Attribute locations are
+ * bound with `glBindAttribLocation` for the same reason — `layout(location=)` on
+ * an input is a 3.3 feature. */
 static const char *VS =
     "#version 150 core\n"
     "in vec3 aPos;\n"

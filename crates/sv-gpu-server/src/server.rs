@@ -282,6 +282,81 @@ impl GpuHost for GpuServer {
         }
     }
 
+    /// Forwarded, with one `pNext` link the application did not write.
+    ///
+    /// **The only command on this surface the GPU side alters rather than
+    /// reproduces**, and the alteration is about the arena rather than about
+    /// buffers. The arena's `VkDeviceMemory` is external memory on every
+    /// provider of design.md §5.4 — exported as a dma-buf here, imported as a
+    /// host pointer on the Windows path — and a buffer bound into external
+    /// memory must have been *created* naming at least one of the same handle
+    /// types. Without it RADV renders correctly and the validation layer says
+    /// `VUID-vkBindBufferMemory-memory-02726` twelve times a frame; a stricter
+    /// driver is entitled to fail the bind.
+    ///
+    /// Three things are worth saying about why it lands here and not elsewhere.
+    ///
+    /// **It cannot be conditional**, because at `vkCreateBuffer` nobody knows
+    /// which memory the buffer will be bound to: the application has not called
+    /// `vkGetBufferMemoryRequirements`, let alone chosen a type. So every
+    /// forwarded buffer is created external-capable, including the ones that
+    /// end up in §9.1's type 0, which is an ordinary driver allocation. That is
+    /// legal — naming a handle type permits an external binding, it does not
+    /// require one — and its real cost is that the driver may narrow
+    /// `memoryTypeBits`. `Driver::assert_arena_buffers_are_exportable` checks
+    /// at startup that it does not narrow it past the arena.
+    ///
+    /// **It cannot be done by the app side.** design.md §0.4 says "the app side
+    /// cannot add that chain — it does not know the handle type", which is true
+    /// and understates it: the handle type is chosen by whichever §5.4 provider
+    /// this side used, and on the app-allocated path the `Attach` that carries
+    /// the arena to the ICD comes from `sv-hostd`, which does not know it
+    /// either. Nothing outside this process holds the value.
+    ///
+    /// **It merges rather than appends.** Two `pNext` links of the same `sType`
+    /// is invalid usage and the second is ignored, so an application that
+    /// supplied its own `VkExternalMemoryBufferCreateInfo` — as one importing a
+    /// dma-buf legitimately would — has ours OR-ed into it instead.
+    fn create_buffer(&mut self, a: p::VkCreateBufferArgs) -> WireResult<p::VkCreateBufferReply> {
+        let mut a = a;
+        a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let kind = self.shared.arena.external_handle_type.as_raw();
+        let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
+        if kind != 0 {
+            let existing = info.p_next.iter_mut().find_map(|l| match l {
+                p::PNextLink::VkExternalMemoryBufferCreateInfo(x) => Some(x),
+                _ => None,
+            });
+            match existing {
+                Some(x) => x.handle_types.0 |= kind,
+                None => {
+                    let mut x = p::VkExternalMemoryBufferCreateInfo::default();
+                    x.handle_types = p::VkExternalMemoryHandleTypeFlags(kind);
+                    info.p_next.push(p::PNextLink::VkExternalMemoryBufferCreateInfo(Box::new(x)));
+                }
+            }
+        }
+
+        let Some(f) = self.fns().vk_create_buffer else {
+            self.note_missing("vkCreateBuffer");
+            let mut r = p::VkCreateBufferReply::default();
+            r.result = p::VkResult(-3);
+            return Ok(r);
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let ci = sv_gpu_entry::raise_vk_buffer_create_info(info, &mut pool)?;
+        let mut buffer = Default::default();
+        // SAFETY: `ci` and every pointer inside it are owned by `pool`, which
+        // outlives the call; `device` is the driver handle the map produced.
+        let r = unsafe {
+            f(a.device.0 as usize as _, &ci, core::ptr::null(), &mut buffer)
+        };
+        if let Some(id) = a.p_buffer {
+            self.bind(id.0, HandleType::VkBuffer, buffer as usize as u64);
+        }
+        Ok(p::VkCreateBufferReply { result: p::VkResult(r.0), p_buffer: a.p_buffer })
+    }
+
     fn free_memory(&mut self, a: p::VkFreeMemoryArgs) -> WireResult<()> {
         let id = a.memory.0;
         if id == crate::ARENA_MEMORY_ID {
