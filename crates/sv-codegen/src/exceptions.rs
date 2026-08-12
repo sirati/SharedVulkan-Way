@@ -198,6 +198,96 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
     None
 }
 
+/// The commands a GPU side must give meaning to rather than forward verbatim.
+///
+/// This is the honest measure of how much of a GPU side is hand-written: pass 12
+/// generates the other ~210, and every entry here is a place where "call the
+/// driver with the same arguments" is the *wrong* answer, with the reason
+/// alongside. An entry that is merely inconvenient does not belong.
+///
+/// Four groups, and no others:
+///
+/// 1. **The session.** The GPU side opens its driver before any application
+///    connects (`sv_gpu_server::driver`), because the arena has to be allocated
+///    and exported before the app side can attach at all. So `vkCreateInstance`
+///    and `vkCreateDevice` *bind an id* to objects that already exist rather
+///    than creating new ones, and `vkDestroyDevice` must not destroy the device
+///    the arena lives in.
+/// 2. **The arena.** `vkAllocateMemory` is a sub-range of a slab the GPU side
+///    already imported (design.md §5.2, §5.3); it never reaches a driver.
+/// 3. **Submission.** `vkQueueSubmit` carries `svExecuteCommandBlob`
+///    descriptors, not a driver call (design.md §6.5).
+/// 4. **Two queries whose answer is ours rather than the driver's**: the memory
+///    table of design.md §9.1, which is renumbered, and the extension list,
+///    which is a promise about what *we* forward.
+pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
+    // --- 1. the session ---------------------------------------------------
+    ("vkCreateInstance", "binds an id to the instance the GPU side already opened"),
+    ("vkDestroyInstance", "the GPU side's instance outlives any one client"),
+    ("vkEnumeratePhysicalDevices", "design.md §8 advertises exactly one device"),
+    ("vkCreateDevice", "binds an id to the device the arena was allocated from"),
+    ("vkDestroyDevice", "the arena lives in this device"),
+    ("vkGetDeviceQueue", "the queue was chosen at startup, with the arena"),
+    ("vkGetDeviceQueue2", "as vkGetDeviceQueue"),
+    // --- 2. the arena -----------------------------------------------------
+    ("vkAllocateMemory", "a sub-range of an imported slab (design.md §5.2)"),
+    ("vkFreeMemory", "returns a sub-range to the allocator, and must not free the slab"),
+    ("vkMapMemory", "the mapping is the app side's; nothing crosses"),
+    ("vkUnmapMemory", "as vkMapMemory"),
+    ("vkFlushMappedMemoryRanges", "ranges are in arena coordinates"),
+    ("vkInvalidateMappedMemoryRanges", "as vkFlushMappedMemoryRanges"),
+    // --- 3. answers that are ours -----------------------------------------
+    //
+    // `vkQueueSubmit` is deliberately **not** here, although design.md §6.5
+    // implies it must be. Its blob form (`svExecuteCommandBlob`) is a change to
+    // what the *app side* sends, not to what the GPU side does with a
+    // `VkSubmitInfo`, and until the app side records blobs the generic
+    // forwarding is strictly better than the hand-written version it replaced:
+    // it carries the `pNext` chain, so a timeline-semaphore submit works.
+    (
+        "vkGetPhysicalDeviceMemoryProperties",
+        "design.md §9.1's table is renumbered; the driver's would index ours wrongly",
+    ),
+    ("vkGetPhysicalDeviceMemoryProperties2", "as vkGetPhysicalDeviceMemoryProperties"),
+    (
+        "vkEnumerateDeviceExtensionProperties",
+        "an extension we advertise is a promise that we forward its entry points",
+    ),
+    // The same argument as the memory table, and it was not obvious until an
+    // application acted on the forwarded answer: a GPU side has **one** queue,
+    // on one family, chosen at startup. Passing the driver's whole family table
+    // through has the application select family 3 and `vkGetDeviceQueue` hand it
+    // the queue from family 0, silently. One synthesised family, describing the
+    // queue that actually exists, is the only answer that is true.
+    (
+        "vkGetPhysicalDeviceQueueFamilyProperties",
+        "a GPU side has one queue on one family; the driver's table is not ours to pass on",
+    ),
+    ("vkGetPhysicalDeviceQueueFamilyProperties2", "as vkGetPhysicalDeviceQueueFamilyProperties"),
+    // --- 5. a handle the registry does not type as one --------------------
+    //
+    // `VkDebugUtilsObjectNameInfoEXT::objectHandle` is a `uint64_t` carrying
+    // `objecttype="objectType"` — the registry says, in an attribute nothing in
+    // this generator reads, that its type is decided at run time by a *sibling
+    // member*. The generated `handle_map` pass walks types, so it cannot see it,
+    // and the app side's object id therefore reaches the driver unmapped. RADV
+    // dereferences it and segfaults, which is how this was found.
+    //
+    // Mapping it needs a `VkObjectType` → `HandleType` switch at run time, which
+    // is a different shape from every other handle site. Two commands, and they
+    // are the only ones on this surface.
+    (
+        "vkSetDebugUtilsObjectNameEXT",
+        "objectHandle is a handle only `objecttype=` identifies; no type-directed pass sees it",
+    ),
+    ("vkSetDebugUtilsObjectTagEXT", "as vkSetDebugUtilsObjectNameEXT"),
+];
+
+/// Just the names, for the generator's set membership.
+pub fn gpu_hand_written() -> Vec<&'static str> {
+    GPU_HAND_WRITTEN.iter().map(|(n, _)| *n).collect()
+}
+
 fn lower_first(s: &str) -> String {
     let mut cs = s.chars();
     match cs.next() {

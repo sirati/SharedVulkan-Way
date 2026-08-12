@@ -11,6 +11,7 @@ members = [
   "crates/sv-codegen",
   "crates/sv-proto",
   "crates/sv-icd-entry",
+  "crates/sv-gpu-entry",
   "crates/sv-icd",
   "crates/sv-testkit",
   "crates/sv-transport",
@@ -52,3 +53,4 @@ sv-proto = { path = "crates/sv-proto" }
 sv-transport = { path = "crates/sv-transport" }
 sv-arena = { path = "crates/sv-arena" }
 sv-icd-entry = { path = "crates/sv-icd-entry" }
+sv-gpu-entry = { path = "crates/sv-gpu-entry" }

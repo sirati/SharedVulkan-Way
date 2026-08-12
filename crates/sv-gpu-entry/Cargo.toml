@@ -1,0 +1,21 @@
+[package]
+name = "sv-gpu-entry"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The generated GPU-side C boundary: the wire-to-C raise pass, the driver's function table, and the forwarding Server impl"
+
+[dependencies]
+sv-proto.workspace = true
+sv-wire.workspace = true
+# For the `#[repr(C)]` type layer and the `lower_*` functions, which are the
+# same in both directions: a C struct a *driver* filled in lowers exactly as one
+# an *application* filled in does. Sharing them rather than generating a second
+# copy is what keeps the two sides' idea of a struct's layout provably identical.
+sv-icd-entry.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+sv-codegen.workspace = true
+vk-registry.workspace = true

@@ -75,6 +75,27 @@ pub struct Ctx<'a> {
     /// Structs present in both plans, which are the ones that can be lowered.
     shared: BTreeSet<String>,
     dispatchable: BTreeSet<String>,
+    /// Emit lowerings that read **every** member, under the name `lower_full_*`.
+    ///
+    /// # The correction this field is
+    ///
+    /// The app side's lowering of a `returnedonly` struct deliberately *skips*
+    /// its scalar members and writes zeros, because on the way **out** the
+    /// storage behind `pProperties` is the application's uninitialised memory
+    /// and reading it is undefined behaviour plus a small information leak
+    /// (design.md §6.1's three-state validity, applied at the C boundary).
+    ///
+    /// The GPU side lowers the identical struct in the identical direction —
+    /// C to wire — and for it those members are **the driver's answer**. Reusing
+    /// the app side's `lower_*` there produces a `VkPhysicalDeviceProperties`
+    /// whose `deviceName` is empty and whose `apiVersion` is zero, which is
+    /// exactly what the first run of the generated GPU side reported.
+    ///
+    /// So "which direction" does not determine the conversion: **the validity
+    /// state does**, and it differs between the two sides for the same struct in
+    /// the same direction. design.md §7.2's two-by-two is really a two-by-two-by
+    /// -two, and that third axis is what this flag selects.
+    lower_full: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -99,11 +120,81 @@ impl<'a> Ctx<'a> {
                 _ => None,
             })
             .collect();
-        Ctx { model, abi, wire, defined, shared, dispatchable }
+        Ctx { model, abi, wire, defined, shared, dispatchable, lower_full: false }
     }
 
-    fn is_dispatchable(&self, name: &str) -> bool {
+    /// The same context emitting `lower_full_*` instead of `lower_*`. See the
+    /// note on [`Ctx::lower_full`].
+    pub fn full_lowering(&self) -> Ctx<'a> {
+        Ctx { lower_full: true, ..self.clone_shallow() }
+    }
+
+    fn clone_shallow(&self) -> Ctx<'a> {
+        Ctx {
+            model: self.model,
+            abi: self.abi,
+            wire: self.wire,
+            defined: self.defined.clone(),
+            shared: self.shared.clone(),
+            dispatchable: self.dispatchable.clone(),
+            lower_full: self.lower_full,
+        }
+    }
+
+    pub fn is_dispatchable(&self, name: &str) -> bool {
         self.dispatchable.contains(&self.model.canonical_type(name))
+    }
+
+    /// Whether a wire struct also exists on the C surface, so a conversion
+    /// between the two can be emitted at all.
+    pub fn shared_struct(&self, name: &str) -> bool {
+        self.shared.contains(name)
+    }
+
+    /// Close the shared set under "this struct can be raised", for
+    /// [`super::gpu_entry`].
+    ///
+    /// The same fixpoint [`close`] runs for the app side's two directions, and
+    /// for the same reason: a struct whose conversion was refused makes every
+    /// struct containing it unconvertible, and emitting a call to a function
+    /// that was never emitted is a generated crate that does not compile.
+    pub fn close_raise<F>(&self, emit: F) -> (BTreeMap<String, String>, Ctx<'a>)
+    where
+        F: Fn(&Ctx<'_>, &StructPlan) -> Result<TokenStream, String>,
+    {
+        close(self, |_| true, emit)
+    }
+
+    /// Close the shared set under a caller-chosen "wanted" predicate.
+    pub fn close_with<F, W>(&self, wanted: W, emit: F) -> (BTreeMap<String, String>, Ctx<'a>)
+    where
+        F: Fn(&Ctx<'_>, &StructPlan) -> Result<TokenStream, String>,
+        W: Fn(&StructPlan) -> bool,
+    {
+        close(self, wanted, emit)
+    }
+
+    /// Whether this context emits the full lowering.
+    pub fn is_full_lowering(&self) -> bool {
+        self.lower_full
+    }
+
+    /// `lower_<Struct>`, or `lower_full_<Struct>` in a full-lowering context.
+    pub fn lower_fn(&self, name: &str) -> proc_macro2::Ident {
+        if self.lower_full {
+            format_ident!("lower_full_{}", naming::snake_case(name))
+        } else {
+            format_ident!("lower_{}", naming::snake_case(name))
+        }
+    }
+
+    /// `lower_pnext`, or `lower_full_pnext`.
+    pub fn lower_pnext_fn(&self) -> proc_macro2::Ident {
+        if self.lower_full {
+            format_ident!("lower_full_pnext")
+        } else {
+            format_ident!("lower_pnext")
+        }
     }
 
     /// The same context with a narrowed set of lowerable structs.
@@ -115,6 +206,7 @@ impl<'a> Ctx<'a> {
             defined: self.defined.clone(),
             shared: self.shared.iter().filter(|n| !refused.contains_key(*n)).cloned().collect(),
             dispatchable: self.dispatchable.clone(),
+            lower_full: self.lower_full,
         }
     }
 }
@@ -500,6 +592,7 @@ fn wire_default(shape: &Shape) -> TokenStream {
 }
 
 fn lower_struct_fn(name: &str) -> proc_macro2::Ident {
+    // Kept for the app side; a full-lowering context goes through `Ctx::lower_fn`.
     format_ident!("lower_{}", naming::snake_case(name))
 }
 fn store_struct_fn(name: &str) -> proc_macro2::Ident {
@@ -672,7 +765,8 @@ fn lower_expr(
         }
         Shape::PNext => {
             let allowed = crate::emit::pnext::allowed_fn_ident(owner);
-            quote!(lower_pnext(#access as *const core::ffi::c_void, sv_proto::#allowed)?)
+            let walker = cx.lower_pnext_fn();
+            quote!(#walker(#access as *const core::ffi::c_void, sv_proto::#allowed)?)
         }
     })
 }
@@ -692,6 +786,18 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
         Scalar::Handle(n) => {
             let t = naming::type_ident(n);
             if cx.is_dispatchable(n) {
+                if cx.lower_full {
+                    // A dispatchable handle the *driver* returned is the
+                    // driver's own pointer, and `dispatchable_id` reads a
+                    // `DispatchableHeader` only `sv-icd` ever writes. Reading one
+                    // out of a driver's object would be a wild dereference, so
+                    // this is refused rather than converted; the commands that
+                    // return such a handle are handled by name in pass 12, which
+                    // binds the app side's id to it instead.
+                    return Err(format!(
+                        "a dispatchable {n} inside a struct cannot be lowered on the GPU side"
+                    ));
+                }
                 quote!(sv_proto::#t(crate::dispatchable_id(#access as *const core::ffi::c_void)))
             } else {
                 quote!(sv_proto::#t(#access))
@@ -701,21 +807,21 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
             if !cx.shared.contains(n) {
                 return Err(format!("{n} has no wire counterpart"));
             }
-            let f = lower_struct_fn(n);
+            let f = cx.lower_fn(n);
             quote!(#f(&(#access))?)
         }
         Scalar::Union(n) => {
             if !cx.shared.contains(n) {
                 return Err(format!("{n} has no wire counterpart"));
             }
-            let f = lower_struct_fn(n);
+            let f = cx.lower_fn(n);
             quote!(#f(&(#access))?)
         }
     })
 }
 
 /// `lower_<Struct>(p: *const abi::Struct) -> Result<sv_proto::Struct>`.
-fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String> {
+pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String> {
     let name = &s.name;
     let abi_members: BTreeMap<&str, &AbiMember> = match cx.abi.type_named(name) {
         Some(AbiType::Struct { members, .. }) => {
@@ -723,7 +829,7 @@ fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
         }
         _ => return Err(format!("{name} is not a struct on the C surface")),
     };
-    let f = lower_struct_fn(name);
+    let f = cx.lower_fn(name);
     let ty = naming::type_ident(name);
     let member_access = |sibling: &str| {
         let id = naming::ident(&naming::snake_case(sibling));
@@ -788,7 +894,16 @@ fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
         // where it matters most: reading those bytes would be reading
         // uninitialised memory, which is undefined behaviour and a small
         // information leak besides (design.md §6.1).
-        let validity = if s.returned_only { partial_validity(field) } else { PartialValidity::Full };
+        // `returnedonly` means "the *implementation* fills this in". On the app
+        // side we are the caller, so those members are uninitialised on the way
+        // out and must not be read. On the GPU side we are the implementation's
+        // proxy and those same members are the driver's answer — the only part
+        // of the struct that carries information. See [`Ctx::lower_full`].
+        let validity = if s.returned_only && !cx.lower_full {
+            partial_validity(field)
+        } else {
+            PartialValidity::Full
+        };
         let access = member_access(&field.name);
         let e = match validity {
             PartialValidity::Skip => wire_default(&field.shape),
@@ -1399,8 +1514,40 @@ fn emit_writeback(
                     // buffer overflow in *our* code the moment either side has a
                     // bug, and the clamp is one comparison.
                     Capacity::OutPointer(count_ptr) => {
+                        // **The count comes from the reply's count field, not
+                        // from the length of the reply's array**, and the
+                        // difference is the whole count-then-fill idiom.
+                        //
+                        // On the first call an application passes `pProperties =
+                        // NULL` and asks only "how many?". A GPU side answering
+                        // that honestly sends back the number and *no array* —
+                        // there is nowhere to put one and nobody asked. Deriving
+                        // `*pCount` from the array's length then writes zero,
+                        // the application allocates nothing, and the query comes
+                        // back empty with no error anywhere.
+                        //
+                        // It looked right for as long as the GPU side happened
+                        // to return the full array on every call, which the
+                        // hand-written half did. The first generated forwarder
+                        // that did the sane thing turned every enumeration in
+                        // the API into "count = 0", and `vulkaninfo` printed an
+                        // empty queue-family list while the validation layer
+                        // indexed the empty vector and died.
+                        let want = count_ptr.to_string();
+                        let count_id = naming::ident(
+                            &wire
+                                .outputs
+                                .iter()
+                                .find(|f| f.name == want || naming::snake_case(&f.name) == want)
+                                .map(|f| f.rust_name.clone())
+                                .unwrap_or(want),
+                        );
                         stmts.push(quote! {
                             let __have = __reply.#id.len();
+                            // What the peer says the real count is. Falls back to
+                            // what it actually sent, so a reply with no count
+                            // field still behaves.
+                            let __said = __reply.#count_id.map(|v| v as usize).unwrap_or(__have);
                             let __cap = if (#count_ptr).is_null() {
                                 0usize
                             } else {
@@ -1408,7 +1555,7 @@ fn emit_writeback(
                             };
                             if (#ptr).is_null() {
                                 if !(#count_ptr).is_null() {
-                                    *(#count_ptr) = __have as _;
+                                    *(#count_ptr) = __said as _;
                                 }
                             } else {
                                 let __n = core::cmp::min(__cap, __have);
@@ -1416,7 +1563,7 @@ fn emit_writeback(
                                 if !(#count_ptr).is_null() {
                                     *(#count_ptr) = __n as _;
                                 }
-                                if __n < __have { __incomplete = true; }
+                                if __n < __said { __incomplete = true; }
                             }
                         });
                         incomplete.push(());

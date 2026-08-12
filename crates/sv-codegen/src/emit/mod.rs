@@ -10,6 +10,7 @@
 //! `cargo build` in a 100,000-line file with no line numbers worth having.
 
 pub mod dispatch;
+pub mod gpu_entry;
 pub mod icd_entry;
 pub mod passes;
 pub mod pnext;

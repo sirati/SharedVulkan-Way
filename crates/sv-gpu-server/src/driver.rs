@@ -77,6 +77,9 @@ pub struct Driver {
     pub has_dma_buf: bool,
     /// `VK_EXT_external_memory_host`, and its dispatch table.
     pub external_host: Option<ash::ext::external_memory_host::Device>,
+    /// `VK_EXT_debug_utils`, for the one command whose handle argument the
+    /// generated passes cannot see (`server::set_debug_utils_object_name_ext`).
+    pub debug_utils: Option<ash::ext::debug_utils::Device>,
 }
 
 impl Driver {
@@ -84,13 +87,40 @@ impl Driver {
     pub fn open(index: usize) -> Result<Driver> {
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| DriverError::NoLoader(e.to_string()))?;
+        // 1.1 was the floor the arena needed and it is **not** enough for Zink:
+        // `scalarBlockLayout` and `timelineSemaphore` live in
+        // `VkPhysicalDeviceVulkan12Features` and `dynamicRendering` in the 1.3
+        // block, and a 1.1 instance cannot even name those structures. Ask for
+        // what the loader says is available, capped at 1.3 — asking for more
+        // than the driver has makes `vkCreateInstance` fail outright, and asking
+        // for 1.4 buys nothing the profile uses.
+        let available = unsafe { entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten()
+            .unwrap_or(vk::API_VERSION_1_0);
+        let want = available.clamp(vk::API_VERSION_1_1, vk::API_VERSION_1_3);
         let app = vk::ApplicationInfo::default()
             .application_name(c"sv-gpu-server")
-            // 1.1 is the floor the design needs: timeline semaphores and the
-            // external-memory queries are 1.1-era, and asking for more than the
-            // driver has makes `vkCreateInstance` fail outright.
-            .api_version(vk::API_VERSION_1_1);
-        let ci = vk::InstanceCreateInfo::default().application_info(&app);
+            .api_version(want);
+        // `VK_EXT_debug_utils` if the loader has it. Zink names every object it
+        // creates, and without the extension enabled here
+        // `vkSetDebugUtilsObjectNameEXT` resolves to null on this side and every
+        // one of those calls is a forwarded command with nothing behind it.
+        // It is an *instance* extension whose device entry points the loader
+        // itself provides, so enabling it costs one string and nothing else.
+        let have_debug_utils = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map(|v| {
+                v.iter().any(|e| {
+                    let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                    name == c"VK_EXT_debug_utils"
+                })
+            })
+            .unwrap_or(false);
+        let inst_exts: Vec<*const std::ffi::c_char> =
+            if have_debug_utils { vec![c"VK_EXT_debug_utils".as_ptr()] } else { Vec::new() };
+        let ci = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_extension_names(&inst_exts);
         let instance =
             unsafe { entry.create_instance(&ci, None) }.map_err(vkerr("vkCreateInstance"))?;
 
@@ -115,6 +145,10 @@ impl Driver {
                     .to_string_lossy()
                     .into_owned();
                 let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
+                // Instance-level extension, device-level entry points, provided
+                // by the loader rather than by the driver — so it is available
+                // whenever the instance enabled it, which `open` does.
+                let debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
                 Ok(Driver {
                     entry,
                     instance,
@@ -128,6 +162,7 @@ impl Driver {
                     external_fd,
                     has_dma_buf,
                     external_host,
+                    debug_utils,
                 })
             }
             Err(e) => {
@@ -166,6 +201,7 @@ impl Driver {
         let has_fd = has(c"VK_KHR_external_memory_fd");
         let has_dma_buf = has_fd && has(c"VK_EXT_external_memory_dma_buf");
         let has_host = has(c"VK_EXT_external_memory_host");
+        let _ = &has;
 
         let qfams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
         // COMPUTE and TRANSFER, because the acceptance workload is a dispatch
@@ -180,19 +216,105 @@ impl Driver {
         let qi = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&prio)];
-        let mut names: Vec<*const std::ffi::c_char> = Vec::new();
-        if has_fd {
-            names.push(c"VK_KHR_external_memory_fd".as_ptr());
+
+        // Every extension the profile forwards that this driver actually has,
+        // plus the three the arena needs.
+        //
+        // # Why everything, rather than what the application asked for
+        //
+        // The GPU side opens its device at startup, before any application
+        // connects, because on the export arena path the arena *is* a driver
+        // allocation (see this module's header). So by the time
+        // `vkCreateDevice` arrives the device exists and its enabled set is
+        // fixed. The only way for the answer to "did I get what I asked for" to
+        // be yes is to have enabled everything the driver could have said yes
+        // to. This is a real limitation of opening early, and it is recorded in
+        // `server::create_device` from the other end.
+        let mut owned: Vec<std::ffi::CString> = Vec::new();
+        for want in sv_gpu_entry::PROFILE_DEVICE_EXTENSIONS {
+            let Ok(c) = std::ffi::CString::new(want) else { continue };
+            if has(c.as_c_str()) {
+                owned.push(c);
+            }
         }
-        if has_dma_buf {
-            names.push(c"VK_EXT_external_memory_dma_buf".as_ptr());
+        for want in [
+            c"VK_KHR_external_memory_fd",
+            c"VK_EXT_external_memory_dma_buf",
+            c"VK_EXT_external_memory_host",
+        ] {
+            if has(want) && !owned.iter().any(|o| o.as_c_str() == want) {
+                owned.push(want.to_owned());
+            }
         }
-        if has_host {
-            names.push(c"VK_EXT_external_memory_host".as_ptr());
+        let names: Vec<*const std::ffi::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+
+        // The features likewise: ask the driver what it supports and enable all
+        // of it. `VkPhysicalDeviceFeatures2` with the 1.1/1.2/1.3 blocks chained
+        // is the whole set that matters to Zink — `robustBufferAccess`,
+        // `logicOp`, `scalarBlockLayout`, `timelineSemaphore`,
+        // `dynamicRendering`, `nullDescriptor` and the rest all live in one of
+        // these four structures or in an extension one, and an extension feature
+        // struct is enabled by default when its extension is.
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut rb2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+        let mut xfb = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
+        let mut cond = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+        let mut prov = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
+        let mut line = vk::PhysicalDeviceLineRasterizationFeaturesEXT::default();
+        let mut vdiv = vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
+        let mut eds = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+        let mut eds2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
+        let mut dclip = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
+        let mut bcs = vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT::default();
+        let mut cbc = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
+        let mut v2d3 = vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT::default();
+        let mut md = vk::PhysicalDeviceMultiDrawFeaturesEXT::default();
+        let mut cwe = vk::PhysicalDeviceColorWriteEnableFeaturesEXT::default();
+        let mut nscm = vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT::default();
+        let mut pgq = vk::PhysicalDevicePrimitivesGeneratedQueryFeaturesEXT::default();
+        let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
+        let enabled = |name: &CStr| owned.iter().any(|o| o.as_c_str() == name);
+        let mut f2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f11)
+            .push_next(&mut f12)
+            .push_next(&mut f13);
+        // Only chain a feature struct whose extension was enabled: a driver is
+        // permitted to reject `vkGetPhysicalDeviceFeatures2` chains it does not
+        // recognise, and enabling a feature from an extension that is not in
+        // `ppEnabledExtensionNames` is invalid usage the validation layer will
+        // fail the call for.
+        macro_rules! chain_if {
+            ($name:expr, $s:expr) => {
+                if enabled($name) {
+                    f2 = f2.push_next(&mut $s);
+                }
+            };
         }
+        chain_if!(c"VK_EXT_robustness2", rb2);
+        chain_if!(c"VK_EXT_transform_feedback", xfb);
+        chain_if!(c"VK_EXT_conditional_rendering", cond);
+        chain_if!(c"VK_EXT_provoking_vertex", prov);
+        chain_if!(c"VK_EXT_line_rasterization", line);
+        chain_if!(c"VK_EXT_vertex_attribute_divisor", vdiv);
+        chain_if!(c"VK_EXT_extended_dynamic_state", eds);
+        chain_if!(c"VK_EXT_extended_dynamic_state2", eds2);
+        chain_if!(c"VK_EXT_depth_clip_enable", dclip);
+        chain_if!(c"VK_EXT_border_color_swizzle", bcs);
+        chain_if!(c"VK_EXT_custom_border_color", cbc);
+        chain_if!(c"VK_EXT_image_2d_view_of_3d", v2d3);
+        chain_if!(c"VK_EXT_multi_draw", md);
+        chain_if!(c"VK_EXT_color_write_enable", cwe);
+        chain_if!(c"VK_EXT_non_seamless_cube_map", nscm);
+        chain_if!(c"VK_EXT_primitives_generated_query", pgq);
+        chain_if!(c"VK_KHR_maintenance5", m5);
+        unsafe { instance.get_physical_device_features2(pd, &mut f2) };
+
         let dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qi)
-            .enabled_extension_names(&names);
+            .enabled_extension_names(&names)
+            .push_next(&mut f2);
         let device =
             unsafe { instance.create_device(pd, &dci, None) }.map_err(vkerr("vkCreateDevice"))?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -224,6 +346,36 @@ impl Driver {
         }
     }
 
+    /// Resolve every entry point of the profile from this driver.
+    ///
+    /// Instance-level names come from `vkGetInstanceProcAddr` and device-level
+    /// ones from `vkGetDeviceProcAddr`. The distinction is not cosmetic: the
+    /// loader's instance table answers device commands with a *trampoline* that
+    /// dispatches on the handle, and we are calling a driver directly with a
+    /// handle the loader has never seen.
+    pub fn load_fns(&self) -> sv_gpu_entry::DriverFns {
+        let inst_fp = self.entry.static_fn().get_instance_proc_addr;
+        let dev_fp = self.instance.fp_v1_0().get_device_proc_addr;
+        let inst_handle = self.instance.handle();
+        let dev_handle = self.device.handle();
+        let by_instance = |name: &str| -> Option<unsafe extern "system" fn()> {
+            let c = std::ffi::CString::new(name).ok()?;
+            unsafe { inst_fp(inst_handle, c.as_ptr()) }
+        };
+        let by_device = |name: &str| -> Option<unsafe extern "system" fn()> {
+            let c = std::ffi::CString::new(name).ok()?;
+            // A device-level name the driver does not have comes back null from
+            // `vkGetDeviceProcAddr`, and so does one whose extension was not
+            // enabled — which is the same thing from our point of view, since
+            // `open_inner` enables everything the driver offers.
+            match unsafe { dev_fp(dev_handle, c.as_ptr()) } {
+                Some(f) => Some(f),
+                None => by_instance(name),
+            }
+        };
+        sv_gpu_entry::DriverFns::load(&by_instance, &by_device)
+    }
+
     /// The first memory type satisfying `want`, or `None`.
     pub fn memory_type(&self, mask: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
         (0..self.mem_props.memory_type_count).find(|i| {
@@ -231,6 +383,32 @@ impl Driver {
                 && self.mem_props.memory_types[*i as usize].property_flags.contains(want)
         })
     }
+}
+
+/// The device extensions this GPU side may advertise: the profile's, restricted
+/// to what the driver actually has, with the driver's own `specVersion`.
+///
+/// Both halves of the intersection are load-bearing and for different reasons.
+/// The profile half is design.md §9.2's rule — "an extension in this list is a
+/// promise that its entry points work", and an entry point works only if pass 12
+/// emitted a forwarder. The driver half is obvious and is the one a hand-written
+/// list would have got right anyway.
+pub fn forwardable_device_extensions(d: &Driver) -> Vec<(String, u32)> {
+    let exts = match unsafe { d.instance.enumerate_device_extension_properties(d.pd) } {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for want in sv_gpu_entry::PROFILE_DEVICE_EXTENSIONS {
+        for e in &exts {
+            let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+            if name.to_bytes() == want.as_bytes() {
+                out.push(((*want).to_string(), e.spec_version));
+                break;
+            }
+        }
+    }
+    out
 }
 
 impl Drop for Driver {

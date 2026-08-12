@@ -13,6 +13,7 @@ fn main() -> Result<()> {
     let mut check_determinism = false;
     let mut stats_only = false;
     let mut icd_entry = false;
+    let mut gpu_entry = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -24,6 +25,7 @@ fn main() -> Result<()> {
                 out_dir = Some(PathBuf::from(args.next().context("--out needs a directory")?));
             }
             "--icd-entry" => icd_entry = true,
+            "--gpu-entry" => gpu_entry = true,
             "--check-determinism" => check_determinism = true,
             "--stats" => stats_only = true,
             "--list-profiles" => {
@@ -49,6 +51,33 @@ fn main() -> Result<()> {
     let profile = sv_codegen::profile_by_name(&profile_name).with_context(|| {
         format!("unknown profile {profile_name:?}; try one of {:?}", sv_codegen::PROFILE_NAMES)
     })?;
+
+    if gpu_entry {
+        let registry = vk_registry::Registry::load()?;
+        let model = registry.model()?;
+        let g = sv_codegen::generate_gpu_entry(&model, &profile)?;
+        eprintln!("forwarded generically {} commands", g.forwarded);
+        eprintln!("hand-written GPU side {} commands", g.hand_written);
+        eprintln!("generated lines       {}", g.generated_lines);
+        eprintln!("refused commands      {}", g.refusals.commands.len());
+        for r in &g.refusals.commands {
+            eprintln!("  {:<48} {}", r.command, r.reason);
+        }
+        eprintln!("refused raises        {}", g.refusals.raise.len());
+        for (n, why) in &g.refusals.raise {
+            eprintln!("  {n:<48} {why}");
+        }
+        match out_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)?;
+                let rs = dir.join("sv_gpu_entry.rs");
+                std::fs::write(&rs, &g.source)?;
+                eprintln!("wrote                 {}", rs.display());
+            }
+            None => print!("{}", g.source),
+        }
+        return Ok(());
+    }
 
     if icd_entry {
         let registry = vk_registry::Registry::load()?;

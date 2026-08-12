@@ -140,8 +140,55 @@ fn emit_handle_map_union(s: &StructPlan) -> TokenStream {
     }
 }
 
+/// [`handle_walk`], for a *command parameter* rather than a struct member.
+///
+/// A command's own handle parameters are not reachable from any struct walker —
+/// `vkCmdBindPipeline(commandBuffer, bindPoint, pipeline)` has two handles and
+/// no struct at all — so the GPU-side forwarding pass (pass 12) needs the same
+/// fold applied one level up. Exposed rather than duplicated so that the two
+/// passes cannot disagree about what counts as a handle.
+///
+/// The mapper is named `__m` in the emitted statements, which is the binding
+/// [`super::gpu_entry`] puts it in.
+pub fn handle_walk_pub(plan: &Plan, shape: &Shape, access: &TokenStream) -> Option<TokenStream> {
+    let inner = handle_walk(plan, shape, access)?;
+    // The walk names `HandleType` and `handle_map_*` unqualified, because it was
+    // written to be emitted *into* `sv-proto`. A block-scoped glob import is
+    // what lets the identical fold be emitted into another crate without the
+    // two versions being able to drift apart.
+    Some(quote!({
+        use sv_proto::*;
+        let m = &mut *__m;
+        #inner
+    }))
+}
+
+/// [`transform_walk`], for a command parameter. See [`handle_walk_pub`].
+pub fn transform_walk_pub(plan: &Plan, shape: &Shape, access: &TokenStream) -> Option<TokenStream> {
+    let inner = transform_walk(plan, shape, access)?;
+    Some(quote!({
+        use sv_proto::*;
+        let m = &mut *__t;
+        #inner
+    }))
+}
+
 fn handle_walk(plan: &Plan, shape: &Shape, access: &TokenStream) -> Option<TokenStream> {
     match shape {
+        // **`VkDeviceMemory` belongs to the transform pass, not to this one**,
+        // and the two must partition the handle space rather than both claiming
+        // it. design.md §7.2 lists passes 5 and 6 side by side without saying
+        // so, and the failure when both run is specific and confusing: an
+        // app-side memory id is not a table entry at all — it is either
+        // `ARENA_MEMORY_ID`, a sentinel with no driver handle behind it, or an
+        // offset into a slab — so the handle map fails to resolve it and the
+        // ring goes fatal with "no VkDeviceMemory with id 18446744073709551614"
+        // on the first `vkBindBufferMemory` an application makes.
+        //
+        // Pass 6 rewrites the *pair*, which is the only operation that makes
+        // sense on one: a memory id without its offset is not a thing the GPU
+        // side can resolve.
+        Shape::Scalar(Scalar::Handle(name)) if name == "VkDeviceMemory" => None,
         Shape::Scalar(Scalar::Handle(name)) => {
             let ht = naming::type_ident(name);
             Some(quote!(#access.0 = m.map(HandleType::#ht, #access.0)?;))

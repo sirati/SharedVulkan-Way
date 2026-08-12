@@ -96,6 +96,14 @@ pub struct State {
     /// Buffer id → its memory requirements, so `vkGetBufferMemoryRequirements`
     /// can answer without a GPU.
     pub buffers: HashMap<u64, u64>,
+    /// `VkDescriptorUpdateTemplate` id → the entries it was created with.
+    ///
+    /// Kept because `vkUpdateDescriptorSetWithTemplate`'s `pData` has no
+    /// describable shape without them — see
+    /// [`sv_icd_entry::local::expand_descriptor_template`]. This is the only object
+    /// whose *contents* the app side has to remember; everything else it only
+    /// has to name.
+    pub templates: HashMap<u64, Vec<sv_proto::VkDescriptorUpdateTemplateEntry>>,
     pub allocator: Box<dyn Backing>,
 }
 
@@ -109,6 +117,7 @@ impl State {
             queues: HashMap::new(),
             memories: HashMap::new(),
             buffers: HashMap::new(),
+            templates: HashMap::new(),
             allocator,
         }
     }
@@ -126,6 +135,22 @@ pub struct SharedVulkan {
     pub arena_len: u64,
     state: Mutex<State>,
     transport: Option<crate::transport::RingTransport>,
+    /// What we tell an application `vkEnumerateDeviceExtensionProperties`
+    /// returns, and what `vkCreateDevice` will accept.
+    ///
+    /// **Asked of the GPU side once, at connect**, rather than being the
+    /// constant `advertise::DEVICE_EXTENSIONS` used to be. design.md §9.2 says
+    /// an extension in this list is a promise its entry points work, and the
+    /// only side that can keep that promise is the one holding the driver: it
+    /// answers the intersection of the profile with what its driver has
+    /// (`sv_gpu_server::driver::forwardable_device_extensions`). With no GPU
+    /// side the list stays empty, which is the honest answer for a driver that
+    /// cannot forward anything.
+    ///
+    /// Leaked to `'static` because an ICD is a process-lifetime singleton — the
+    /// loader `dlopen`s it once — and the alternative is a lifetime on the
+    /// generated `Icd` trait for a `Vec` that is never freed anyway.
+    device_extensions: Vec<(&'static str, u32)>,
 }
 
 impl SharedVulkan {
@@ -144,6 +169,7 @@ impl SharedVulkan {
             arena_len,
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: None,
+            device_extensions: Vec::new(),
         })
     }
 
@@ -176,12 +202,66 @@ impl SharedVulkan {
             sv_arena::canary::CanaryPolicy::None,
         )
         .map_err(|e| format!("{e}"))?;
-        Ok(SharedVulkan {
+        let mut icd = SharedVulkan {
             arena,
             arena_len: attached.arena_len,
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: Some(attached.transport),
-        })
+            device_extensions: Vec::new(),
+        };
+        icd.device_extensions = icd.ask_device_extensions();
+        Ok(icd)
+    }
+
+    /// Ask the GPU side which device extensions it will forward.
+    ///
+    /// Two round trips at startup — count, then fill — and they are the
+    /// count-then-fill idiom the protocol was built for. Failure is not fatal:
+    /// an empty list means an application that asks for an extension is told
+    /// `VK_ERROR_EXTENSION_NOT_PRESENT`, which is a clean refusal rather than a
+    /// driver that loads and then misbehaves.
+    #[cfg(target_os = "linux")]
+    fn ask_device_extensions(&self) -> Vec<(&'static str, u32)> {
+        let Some(t) = self.wire() else { return Vec::new() };
+        let ask = |capacity: usize| {
+            sv_icd_entry::forward::enumerate_device_extension_properties(
+                t,
+                sv_proto::VkEnumerateDeviceExtensionPropertiesArgs {
+                    // The GPU side answers for the one physical device it has
+                    // and does not read this; zero is `VK_NULL_HANDLE` and is
+                    // the honest thing to send before anything is enumerated.
+                    physical_device: sv_proto::VkPhysicalDevice(0),
+                    p_layer_name: Vec::new(),
+                    p_property_count: Some(capacity as u32),
+                    p_properties: vec![
+                        sv_proto::VkExtensionProperties::default();
+                        capacity
+                    ],
+                },
+            )
+        };
+        let Ok(count) = ask(0) else { return Vec::new() };
+        let n = count.p_property_count.unwrap_or(0) as usize;
+        if n == 0 {
+            return Vec::new();
+        }
+        let Ok(full) = ask(n) else { return Vec::new() };
+        full.p_properties
+            .iter()
+            .filter_map(|e| {
+                let end = e.extension_name.iter().position(|b| *b == 0).unwrap_or(0);
+                let name = std::str::from_utf8(&e.extension_name[..end]).ok()?;
+                if name.is_empty() {
+                    return None;
+                }
+                Some((&*Box::leak(name.to_string().into_boxed_str()), e.spec_version))
+            })
+            .collect()
+    }
+
+    /// What this build advertises to an application.
+    pub fn device_extensions(&self) -> &[(&'static str, u32)] {
+        &self.device_extensions
     }
 
     /// The transport, if this process is connected to a GPU side.

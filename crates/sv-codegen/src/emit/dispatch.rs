@@ -79,6 +79,20 @@ fn emit_opcodes(plan: &Plan) -> TokenStream {
         let n = &c.name;
         quote!(Opcode::#v => #n,)
     });
+    let result_arms: Vec<TokenStream> = plan
+        .commands
+        .iter()
+        .filter(|c| c.returns_result)
+        .map(|c| {
+            let v = naming::opcode_variant(&c.name);
+            quote!(Opcode::#v)
+        })
+        .collect();
+    let returns_result_body = if result_arms.is_empty() {
+        quote!(false)
+    } else {
+        quote!(matches!(self, #(#result_arms)|*))
+    };
     let recorded_arms = plan.commands.iter().filter(|c| c.is_recorded).map(|c| {
         let v = naming::opcode_variant(&c.name);
         quote!(Opcode::#v)
@@ -120,6 +134,16 @@ fn emit_opcodes(plan: &Plan) -> TokenStream {
             /// Whether this opcode belongs to the recorded `vkCmd*` subset the
             /// restricted sub-decoder accepts (design.md §6.5).
             pub fn is_recorded(self) -> bool { #recorded_body }
+
+            /// Whether this command's reply begins with a `VkResult`.
+            ///
+            /// Emitted for the benefit of anything that wants to look at a reply
+            /// without knowing its type — the GPU side's `SV_TRACE`, which
+            /// prints the result of every forwarded command. Without it a
+            /// tracer reading the first word of a reply prints the first
+            /// *output* of a `void` command and calls it a failure, which is
+            /// worse than no tracing at all.
+            pub fn returns_result(self) -> bool { #returns_result_body }
         }
     }
 }

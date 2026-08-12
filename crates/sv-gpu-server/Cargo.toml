@@ -10,6 +10,9 @@ description = "The shared_vulkan GPU side: ring consumers, the object table, Sla
 sv-proto.workspace = true
 sv-wire.workspace = true
 sv-transport.workspace = true
+# Pass 12: the generated wire → C raise pass, the driver's function table, and
+# the forwarding `Server` impl that covers 221 of the 239 commands.
+sv-gpu-entry.workspace = true
 sv-arena.workspace = true
 # The reference implementation of the workload's transform, and the page-record
 # layout. Shared with `gpu-probe` rather than re-typed, so the shader, the GPU

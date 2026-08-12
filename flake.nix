@@ -109,6 +109,35 @@
           # which costs about an hour before anyone can type a command. Add it
           # in a separate optional shell if and when it is actually needed.
 
+          # --- OpenGL, through Zink ----------------------------------------
+          # The stated acceptance criterion of this stage is an OpenGL program
+          # running on Zink on top of our forwarded Vulkan. Three things are
+          # needed for that and none of them were in this shell:
+          #
+          #   mesa      — carries `zink_dri.so`, the Gallium driver that turns GL
+          #               into Vulkan, plus libgbm and libEGL. The system has a
+          #               mesa at /run/opengl-driver, but that is a NixOS
+          #               artefact of *this* machine and the shell should not
+          #               depend on the host's graphics stack being present.
+          #   libglvnd  — the GL/EGL/GLX dispatch libraries a GL program links
+          #               against; mesa is loaded *through* it.
+          #   mesa-demos— glxinfo, glxgears, eglinfo, es2gears. The smallest real
+          #               GL applications there are, and the ones §13's
+          #               acceptance criterion names.
+          #
+          # `xvfb` is here because glxinfo and glxgears are GLX programs and
+          # GLX needs an X server. This machine is headless (no DISPLAY), so the
+          # only way to run the two programs the brief actually names is a
+          # virtual framebuffer. `xwd` captures what was drawn, so
+          # "it rendered" can be a checked pixel rather than a claim.
+          mesa
+          libglvnd
+          mesa-demos
+          xvfb
+          xwd
+          xdpyinfo
+          netpbm # xwdtopnm, so a captured frame can be inspected without a GUI
+
           # --- Misc --------------------------------------------------------
           pkg-config
           # Reading the shared-memory region while debugging both ends.
@@ -140,6 +169,17 @@
           # system. Referring to its store path is fine, though: we only need a
           # search path, not to install it.
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib"
+
+          # Where Zink lives. mesa's Gallium drivers are `dlopen`ed from a
+          # directory the loader finds by convention, and on a non-NixOS-graphics
+          # path (or inside a bubblewrap container that has no
+          # /run/opengl-driver) it has to be named. Pointing at the *shell's*
+          # mesa rather than the system one is deliberate: it makes the GL half
+          # of this project reproducible from flake.lock rather than dependent on
+          # whatever the host happens to have configured.
+          export SV_MESA="${pkgs.mesa}"
+          export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
+          export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
 
           echo "shared_vulkan dev shell"
           echo "  rustc    $(rustc --version 2>/dev/null | cut -d' ' -f2)"
