@@ -153,12 +153,16 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let fns = driver.load_fns();
+    report_missing(&fns);
+
     let mut objects = Objects::new();
     objects.set_arena(arena.memory, arena.len);
     let shared = Arc::new(Shared {
         driver,
         arena,
         objects: std::sync::Mutex::new(objects),
+        fns,
     });
     let handled = session::serve(
         Arc::new(control),
@@ -589,7 +593,9 @@ fn guest(
 /// `vkCmdBeginRendering`" is a fact about the configuration, and an application
 /// should be told before it has drawn nothing for ten seconds. An empty list is
 /// the normal case on a modern driver and prints nothing.
-#[cfg(target_os = "linux")]
+// Both platforms: a driver missing part of the profile is worth saying out
+// loud wherever the GPU side runs.
+#[cfg(any(target_os = "linux", windows))]
 fn report_missing(fns: &sv_gpu_entry::DriverFns) {
     let missing = fns.missing();
     if missing.is_empty() {

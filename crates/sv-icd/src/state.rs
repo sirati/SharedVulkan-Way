@@ -220,7 +220,11 @@ impl SharedVulkan {
     /// an empty list means an application that asks for an extension is told
     /// `VK_ERROR_EXTENSION_NOT_PRESENT`, which is a clean refusal rather than a
     /// driver that loads and then misbehaves.
-    #[cfg(target_os = "linux")]
+    // Same cfg as its one caller, `connected`. It was linux-only while the
+    // Windows transport did not exist; now that it does, a windows-gnu build
+    // fails to compile without this — the caller is compiled and the callee
+    // is not.
+    #[cfg(any(target_os = "linux", windows))]
     fn ask_device_extensions(&self) -> Vec<(&'static str, u32)> {
         let Some(t) = self.wire() else { return Vec::new() };
         let ask = |capacity: usize| {
