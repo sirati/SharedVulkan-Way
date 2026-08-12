@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/wc-transport",
+  "crates/wc-handle",
+  "crates/wc-server",
+  "crates/wc-probe",
+  "vendor/wayland-backend",
+  "vendor/wayland-scanner",
+  "vendor/wayland-server",
+]
+
+# The forks are members of this workspace *and* the resolution target for
+# anything that asks crates.io for these names. Without the patch table a
+# transitive `wayland-server -> wayland-backend = "0.3"` would silently pull the
+# unpatched crates.io copy, which does not build for Windows, and the failure
+# would look like our fork being wrong rather than being bypassed.
+#
+# See vendor/PATCHES.md for what was changed and why. Nothing in `vendor/` is
+# upstream code any more; treat it as ours.
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }
+wayland-server = { path = "vendor/wayland-server" }
+wayland-scanner = { path = "vendor/wayland-scanner" }
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+
+[workspace.dependencies]
+wc-transport = { path = "crates/wc-transport" }
+wc-handle = { path = "crates/wc-handle" }
+
+wayland-backend = { path = "vendor/wayland-backend" }
+wayland-server = { path = "vendor/wayland-server" }
+wayland-scanner = { path = "vendor/wayland-scanner" }
+
+# The Windows half. `windows-sys` rather than `windows` because everything we
+# call is a plain C entry point — no COM, no WinRT — and the raw bindings cost
+# nothing to compile. Version 0.61 is what `uds_windows` 1.2.1 accepts, so
+# pinning the same one keeps a single copy in the tree.
+windows-sys = "0.61"
+# AF_UNIX on Windows. See docs/design.md §2.2 for why this rather than a named
+# pipe; the short version is that wepoll can poll a socket and cannot poll a
+# pipe, and calloop on Windows is wepoll.
+uds_windows = "1.2"

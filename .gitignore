@@ -1,0 +1,8 @@
+target/
+result
+result-*
+.direnv/
+# Wine prefixes are disposable and enormous; the shellHook puts them under /tmp
+# but a stray WINEPREFIX=. would otherwise drop one here.
+.wine/
+*.exe.so

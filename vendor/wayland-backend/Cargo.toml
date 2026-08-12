@@ -1,0 +1,88 @@
+# FORKED from wayland-backend 0.3.16. See ../PATCHES.md.
+#
+# The manifest changes are half of the port. Upstream declares `rustix` and
+# `wayland-sys` as unconditional dependencies; both fail to build for
+# `x86_64-pc-windows-gnu` — `wayland-sys` because its build script runs
+# `pkg-config` looking for `libwayland-*.so`, and `rustix` because the crate
+# requests feature sets (`fs`, `process`) that it does not provide on Windows.
+# Neither is *used* by the rust backend on the paths we need, so both move
+# behind `cfg(unix)` rather than being ported.
+
+[package]
+edition = "2021"
+rust-version = "1.71"
+name = "wayland-backend"
+version = "0.3.16"
+authors = ["Elinor Berger <elinor@safaradeg.net>"]
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Low-level bindings to the Wayland protocol (waycompose fork: builds for Windows)"
+license = "MIT"
+repository = "https://github.com/smithay/wayland-rs"
+
+[features]
+client_system = ["wayland-sys/client", "dep:scoped-tls"]
+dlopen = ["wayland-sys/dlopen"]
+server_system = ["wayland-sys/server", "dep:scoped-tls"]
+
+# WAYCOMPOSE FORK: these three gate rust-backend API that mirrors what newer
+# libwayland versions added, and upstream forwards them to `wayland-sys` so the
+# sys backend gets the corresponding symbols. Here they are inert: the rust
+# backend implements the API regardless of which libwayland is on the machine —
+# on Windows there is none — and the sys backend is not built. Kept rather than
+# deleted so that a dependent enabling them still resolves.
+libwayland_client_1_23 = []
+libwayland_server_1_22 = []
+libwayland_server_1_23 = ["libwayland_server_1_22"]
+
+[lib]
+name = "wayland_backend"
+path = "src/lib.rs"
+
+[[test]]
+name = "null_object"
+path = "tests/null_object.rs"
+
+# `rs_sys_impls` asserts that the rust and sys backends implement the same
+# traits. We have no sys backend on the target that matters and the rust one is
+# the only one that will ever run, so the test is dropped rather than ported.
+
+[dependencies]
+downcast-rs = "1.2"
+smallvec = { version = "1.9", features = ["union", "const_generics", "const_new"] }
+log = { version = "0.4", optional = true }
+scoped-tls = { version = "1.0", optional = true }
+# Not Windows-only: `crate::os::WlStream` is this crate's socket type on *both*
+# platforms, so that the port has one socket abstraction rather than a `cfg` at
+# every use site. On Unix it is a transparent re-export of
+# `std::os::unix::net::UnixStream`, so this costs nothing and changes no
+# behaviour there.
+wc-transport = { path = "../../crates/wc-transport" }
+
+[target.'cfg(unix)'.dependencies]
+# `event` for epoll/kqueue, `net` for sendmsg/recvmsg with SCM_RIGHTS, `fs` and
+# `process` for the peer-credentials and flock paths. On Windows rustix provides
+# none of what is used here, which is why the whole dependency is Unix-only.
+rustix = { version = "1.0.2", features = ["event", "fs", "net", "process"] }
+wayland-sys = { version = "0.31.11", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+# The `h`-argument shim: what an fd becomes when the OS has no SCM_RIGHTS.
+wc-handle = { path = "../../crates/wc-handle" }
+# The third path in `rs/server_impl/common_poll.rs`, where upstream has only
+# epoll and kqueue. `polling` is wepoll on Windows and is what `calloop` already
+# uses, so choosing it keeps the dispatch loop compatible with the event loop
+# the compositor will eventually be built on.
+polling = "3.7"
+
+[dev-dependencies]
+concat-idents = "1.1"
+env_logger = "0.11"
+scoped-tls = "1.0"
+
+[build-dependencies]
+cc = "1.0"
