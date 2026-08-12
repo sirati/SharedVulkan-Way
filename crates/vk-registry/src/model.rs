@@ -722,7 +722,8 @@ impl Model {
             depends: f.depends.clone(),
             ..Default::default()
         };
-        collect_children(&f.children, &f.name, None, &mut fs, extra);
+        let supported = fs.supported_for_vulkan;
+        collect_children(&f.children, &f.name, None, &mut fs, extra, supported);
         Ok(fs)
     }
 
@@ -747,7 +748,8 @@ impl Model {
                 .unwrap_or(false),
             ..Default::default()
         };
-        collect_children(&e.children, &e.name, e.number, &mut fs, extra);
+        let supported = fs.supported_for_vulkan;
+        collect_children(&e.children, &e.name, e.number, &mut fs, extra, supported);
         Ok(fs)
     }
 
@@ -996,12 +998,34 @@ fn parse_c_signed(text: &str) -> Option<i64> {
 
 /// Walk a `<feature>`/`<extension>`'s children, filling in the require blocks
 /// and computing every extension enum value it introduces.
+///
+/// `supported` is whether the registry supports this feature or extension for
+/// the `vulkan` API, and it gates the enum values — not the require blocks,
+/// which stay recorded so that [`crate::profile`] can still name and refuse an
+/// unsupported extension by name.
+///
+/// **Why that gate exists** (2026-08-12, found by the `vulkan_core.h`
+/// cross-check in `sv-testkit`): `api_matches` is applied to each `<enum>`'s own
+/// `api=` attribute, but a *whole extension* declared `supported="vulkansc"` or
+/// `supported="disabled"` carries no `api=` on its individual enums — the
+/// attribute lives on the extension. Without this gate the values of 225
+/// disabled extensions and every Vulkan SC extension were merged into our enum
+/// tables: `VK_STRUCTURE_TYPE_APPLICATION_PARAMETERS_EXT`,
+/// `VK_MEMORY_HEAP_SEU_SAFE_BIT`, `VK_PIPELINE_CACHE_CREATE_READ_ONLY_BIT` and
+/// 100-odd more, none of which are Vulkan.
+///
+/// This module's own header says mixing the two APIs "is a silent-corruption
+/// class of error, so the filter is applied once, here". It was applied on two
+/// of the three paths an enum value arrives by. This is the third — the same
+/// shape as `security-model.md` R8's two realised instances: a filter that looks
+/// applied, is not, and produces a plausible answer either way.
 fn collect_children(
     children: &[vk_parse::ExtensionChild],
     owner: &str,
     owner_number: Option<i64>,
     fs: &mut FeatureSet,
     extra: &mut BTreeMap<String, Vec<EnumValue>>,
+    supported: bool,
 ) {
     for child in children {
         match child {
@@ -1028,8 +1052,8 @@ fn collect_children(
                                 name: e.name.clone(),
                                 extends: extends.clone(),
                             });
-                            if let (Some(group), Some(v)) =
-                                (extends, extension_enum_value(e, owner_number))
+                            if let (true, Some(group), Some(v)) =
+                                (supported, extends, extension_enum_value(e, owner_number))
                             {
                                 extra.entry(group).or_default().push(EnumValue {
                                     name: e.name.clone(),
@@ -1242,6 +1266,55 @@ mod tests {
         let Some(TypeDef::Enum(results)) = m.type_def("VkResult") else { unreachable!() };
         assert!(results.values.iter().any(|v| v.value > 1_000_000_000));
         assert!(results.values.iter().any(|v| v.value < -1_000_000_000));
+    }
+
+    /// Vulkan SC is a different API and its values are not ours.
+    ///
+    /// Found by the `vulkan_core.h` cross-check in `sv-testkit` on 2026-08-12:
+    /// `api_matches` was applied to each `<enum>`'s own `api=` attribute, but an
+    /// extension declared `supported="vulkansc"` or `supported="disabled"`
+    /// carries that fact on the *extension*, and its individual enums have no
+    /// `api=` at all. Every one of their values was therefore merged into our
+    /// tables. This module's header says mixing the two APIs is a
+    /// silent-corruption error; this is the assertion that it is not happening.
+    #[test]
+    fn values_from_unsupported_extensions_do_not_leak() {
+        let Ok(path) = crate::registry_path() else {
+            eprintln!("VK_XML unset — skipping (run inside `nix develop`)");
+            return;
+        };
+        let reg = crate::Registry::load_from(path).unwrap();
+        let m = Model::build(&reg.raw).unwrap();
+
+        let has = |enum_name: &str, constant: &str| -> bool {
+            match m.type_def(enum_name) {
+                Some(TypeDef::Enum(e)) => e.values.iter().any(|v| v.name == constant),
+                _ => panic!("{enum_name} is not an enum in the model"),
+            }
+        };
+
+        // Vulkan SC, from extensions marked `supported="vulkansc"`.
+        for (group, name) in [
+            ("VkStructureType", "VK_STRUCTURE_TYPE_APPLICATION_PARAMETERS_EXT"),
+            ("VkStructureType", "VK_STRUCTURE_TYPE_EXPORT_MEMORY_SCI_BUF_INFO_NV"),
+            ("VkMemoryHeapFlagBits", "VK_MEMORY_HEAP_SEU_SAFE_BIT"),
+            ("VkPipelineCacheCreateFlagBits", "VK_PIPELINE_CACHE_CREATE_READ_ONLY_BIT"),
+            ("VkResult", "VK_ERROR_INVALID_PIPELINE_CACHE_DATA"),
+        ] {
+            assert!(!has(group, name), "{name} is Vulkan SC's and must not be in our {group}");
+        }
+
+        // Placeholder extensions marked `supported="disabled"`, which reserve a
+        // bit position under a name that will change when the extension ships.
+        assert!(
+            !has("VkAccessFlagBits2", "VK_ACCESS_2_RESERVED_28_BIT_AMD"),
+            "a reserved bit from a disabled extension must not reach our tables"
+        );
+
+        // …while the real values are all still there.
+        assert!(has("VkStructureType", "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO"));
+        assert!(has("VkStructureType", "VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR"));
+        assert!(has("VkMemoryHeapFlagBits", "VK_MEMORY_HEAP_DEVICE_LOCAL_BIT"));
     }
 
     #[test]
