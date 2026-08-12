@@ -198,6 +198,21 @@ pub struct FieldPlan {
     /// Whether the registry marks the outermost pointer optional. Only affects
     /// validity checks; the wire is the same either way.
     pub optional: bool,
+    /// `noautovalidity="true"`.
+    ///
+    /// The registry saying, in as many words, that its own automatic rules do
+    /// not describe this member — the valid-usage prose does. For a member with
+    /// a `len=` that means **the length rule does not hold unconditionally**,
+    /// and applying it anyway is the R8 class of bug this project exists to
+    /// avoid.
+    ///
+    /// The case that found it: `VkWriteDescriptorSet` gives `descriptorCount` as
+    /// the `len=` of `pImageInfo`, `pBufferInfo` *and* `pTexelBufferView`, and
+    /// `descriptorType` selects exactly one. All three are `noautovalidity` and
+    /// none is `optional`, so a check keyed only on `optional` rejected every
+    /// legal `vkUpdateDescriptorSets` — the two arrays the type did not select
+    /// are empty, and the count describes the one it did.
+    pub no_auto_validity: bool,
     /// True when some other field's `len=` names this one, which is what makes
     /// a member "the count of" another (design.md R13's implicit-length problem,
     /// made explicit).
@@ -507,6 +522,7 @@ fn field_plan(
         rust_name: crate::naming::snake_case(&m.name),
         shape,
         optional: m.is_optional(0),
+        no_auto_validity: m.no_auto_validity,
         is_a_length: lengths.contains(&m.name),
         is_output: m.is_output_pointer(),
     })

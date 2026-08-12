@@ -118,6 +118,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-arena"
+version = "0.1.0"
+dependencies = [
+ "sv-transport",
+]
+
+[[package]]
 name = "sv-codegen"
 version = "0.1.0"
 dependencies = [
@@ -131,12 +138,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-gpu-server"
+version = "0.1.0"
+dependencies = [
+ "arena-record",
+ "ash",
+ "libc",
+ "sv-arena",
+ "sv-hostd",
+ "sv-icd",
+ "sv-proto",
+ "sv-transport",
+ "sv-wire",
+]
+
+[[package]]
+name = "sv-hostd"
+version = "0.1.0"
+dependencies = [
+ "sv-arena",
+ "sv-transport",
+ "sv-wire",
+]
+
+[[package]]
 name = "sv-icd"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sv-arena",
  "sv-icd-entry",
  "sv-proto",
+ "sv-transport",
  "sv-wire",
 ]
 
@@ -170,6 +203,13 @@ dependencies = [
  "sv-proto",
  "sv-wire",
  "vk-registry",
+]
+
+[[package]]
+name = "sv-transport"
+version = "0.1.0"
+dependencies = [
+ "sv-wire",
 ]
 
 [[package]]

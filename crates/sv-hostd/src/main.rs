@@ -43,13 +43,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     if args.len() < 2 || args[1] != "serve" {
         eprintln!(
-            "usage: sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>]"
+            "usage: sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]"
         );
         return Err("no subcommand".into());
     }
     let path = arg("--socket").ok_or("--socket is required")?;
     let generation: u32 = arg("--generation").map_or(Ok(1), |s| s.parse())?;
-    let mut geometry = demo_geometry();
+    // `--live` serves the geometry a real session uses; the default stays the
+    // demo one, because `sv-loopback` and the container harness are sized for
+    // it and a 16 MiB control region would make them slower for no gain.
+    //
+    // The two must not be chosen independently. On the memfd path `sv-hostd`
+    // sizes the file and `sv-gpu-server` publishes the header, so a daemon
+    // serving 1 MiB to an owner that wants 16 MiB produces "the layout does not
+    // fit in control_size" from the *other* process — which is how this flag
+    // came to exist.
+    let mut geometry = if args.iter().any(|a| a == "--live") {
+        sv_transport::control::Geometry::for_arena(64 << 20)
+    } else {
+        demo_geometry()
+    };
     if let Some(n) = arg("--arena") {
         geometry.arena_size = n.parse()?;
     }

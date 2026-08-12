@@ -106,7 +106,8 @@ mod demo {
         }
     }
 
-    /// A reply, and a reverse-ring debug message, share a shape.
+    /// A reverse-ring debug message. The reverse ring is a **command** lane in
+    /// the GPU→app direction, so it carries a `CommandHeader`.
     pub fn encode_small(out: &mut Vec<u8>, op: u32, a: u64, b: u64) -> WireResult<()> {
         let size = sv_wire::COMMAND_HEADER_SIZE + 16;
         out.clear();
@@ -122,6 +123,35 @@ mod demo {
     pub fn decode_small(bytes: &[u8]) -> WireResult<(u32, u64, u64)> {
         let mut d = Decoder::new(bytes);
         let h = CommandHeader::decode(&mut d)?;
+        Ok((h.cmd_type, d.u64()?, d.u64()?))
+    }
+
+    /// A reply, which is **not** the same shape.
+    ///
+    /// This originally reused `encode_small` and put a `CommandHeader` on the
+    /// reply lane. It worked, because the only reader was this file — and it
+    /// hid a live bug in `RingConsumer`, which read every payload's declared
+    /// length from the command header's offset. A real `sv_wire::ReplyHeader` is
+    /// `{cmd_type, reply_size}` and puts its length four bytes earlier, so the
+    /// consumer read a reply's first payload field as a length; the first
+    /// forwarded `vkCreateInstance` came back declaring zero bytes. The
+    /// transport is fixed and so is this, and the two had to be fixed together
+    /// because each was covering for the other.
+    pub fn encode_reply_small(out: &mut Vec<u8>, op: u32, a: u64, b: u64) -> WireResult<()> {
+        let size = sv_wire::REPLY_HEADER_SIZE + 16;
+        out.clear();
+        out.resize(size, 0);
+        let mut e = Encoder::new(out);
+        sv_wire::ReplyHeader { cmd_type: op, reply_size: size as u32 }.encode(&mut e)?;
+        e.u64(a)?;
+        e.u64(b)?;
+        e.finish()?;
+        Ok(())
+    }
+
+    pub fn decode_reply_small(bytes: &[u8]) -> WireResult<(u32, u64, u64)> {
+        let mut d = Decoder::new(bytes);
+        let h = sv_wire::ReplyHeader::decode(&mut d)?;
         Ok((h.cmd_type, d.u64()?, d.u64()?))
     }
 
@@ -334,7 +364,8 @@ fn gpu_side(
                     "[gpu] {which} seqno {seqno}: {} bytes at arena+{}, checksum matches",
                     cmd.len, cmd.off
                 );
-                demo::encode_small(&mut out, demo::OP_VERIFY_BLOB, got, cmd.expect).map_err(err)?;
+                demo::encode_reply_small(&mut out, demo::OP_VERIFY_BLOB, got, cmd.expect)
+                    .map_err(err)?;
                 rep.push_seq(seqno, &out, None).map_err(err)?;
                 cons.advance().map_err(err)?;
                 handled += 1;
@@ -512,7 +543,7 @@ fn app_side(socket: &str, wait_for_replies: bool) -> Result<(), Box<dyn std::err
                 Some(p) => p.payload.to_vec(),
                 None => continue,
             };
-            let (op, computed, claimed) = demo::decode_small(&payload)?;
+            let (op, computed, claimed) = demo::decode_reply_small(&payload)?;
             cons.advance()?;
             if op != demo::OP_VERIFY_BLOB || computed != claimed {
                 return Err(format!(

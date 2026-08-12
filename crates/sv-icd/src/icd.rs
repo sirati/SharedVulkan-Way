@@ -25,14 +25,40 @@
 //! to grep for.
 
 use crate::advertise;
-use crate::arena::Backing;
 use crate::state::{Memory, SharedVulkan, API_VERSION};
-use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError};
+use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError, forward};
 use sv_proto as p;
+
+/// Forward if there is a GPU side, otherwise answer with `$local`.
+///
+/// Every physical-device query below has this shape, and writing it out
+/// thirteen times buried the one thing that differs. The two arms are both
+/// correct answers to different questions: with a GPU side the honest answer is
+/// the driver's, and without one it is the curated table of design.md §9 —
+/// which is what makes `vulkaninfo` against a standalone driver a meaningful
+/// test rather than a crash.
+macro_rules! forwarded {
+    ($self:ident, $fwd:ident, $args:ident, $local:block) => {
+        match $self.wire() {
+            Some(t) => forward::$fwd(t, $args),
+            None => $local,
+        }
+    };
+}
 
 impl IcdLocal for SharedVulkan {
     fn api_version(&self) -> u32 {
         API_VERSION
+    }
+
+    fn transport(&self) -> Option<&dyn sv_icd_entry::Transport> {
+        self.wire()
+    }
+
+    /// One id space for the process, so that `State`'s tables and the wire agree
+    /// about what an id means (design.md §6.4).
+    fn mint_id(&self) -> u64 {
+        self.state().mint()
     }
 
     fn instance_extensions(&self) -> &[(&'static str, u32)] {
@@ -78,23 +104,64 @@ impl IcdLocal for SharedVulkan {
         sv_icd_entry::lookup(sv_icd_entry::DEVICE_COMMANDS, name)
     }
 
-    fn create_instance(&self, _info: &p::VkInstanceCreateInfo) -> IcdResult<u64> {
-        let mut s = self.state();
-        let id = s.mint();
-        // One physical device, minted with the instance. design.md §8: we do not
-        // export `vk_icdEnumerateAdapterPhysicalDevices`, because we have no PnP
-        // adapter LUID and its only benefit — the loader sorting physical
-        // devices for drivers at interface ≥ 6 — is meaningless with one device.
-        let phys = s.mint();
-        s.physical_devices.insert(phys, id);
-        s.instances.insert(
-            id,
-            crate::state::Instance { api_version: API_VERSION, physical_devices: vec![phys] },
-        );
+    /// The ids are minted here whether or not there is a GPU side, which is
+    /// design.md §6.4 exactly: "the app side allocates ids from a counter, so
+    /// `vkCreateBuffer` encodes the id it chose and returns immediately". What
+    /// the round trip adds is not the id — it is the GPU side *learning* the id,
+    /// so that everything referencing this instance afterwards resolves.
+    fn create_instance(&self, info: &p::VkInstanceCreateInfo) -> IcdResult<u64> {
+        let (id, phys) = {
+            let mut s = self.state();
+            let id = s.mint();
+            // One physical device, minted with the instance. design.md §8: we do
+            // not export `vk_icdEnumerateAdapterPhysicalDevices`, because we
+            // have no PnP adapter LUID and its only benefit — the loader sorting
+            // physical devices for drivers at interface ≥ 6 — is meaningless
+            // with one device.
+            let phys = s.mint();
+            s.physical_devices.insert(phys, id);
+            s.instances.insert(
+                id,
+                crate::state::Instance { api_version: API_VERSION, physical_devices: vec![phys] },
+            );
+            (id, phys)
+        };
+        if let Some(t) = self.wire() {
+            let reply = forward::create_instance(
+                t,
+                p::VkCreateInstanceArgs {
+                    p_create_info: Some(Box::new(info.clone())),
+                    p_instance: Some(p::VkInstance(id)),
+                },
+            )?;
+            if reply.result.0 != 0 {
+                return Err(LowerError::Result(reply.result.0));
+            }
+            // The GPU side has an instance now; tell it about the physical
+            // device the loader is about to ask us for, so the id resolves
+            // before the first query arrives on the same ring.
+            let r = forward::enumerate_physical_devices(
+                t,
+                p::VkEnumeratePhysicalDevicesArgs {
+                    instance: p::VkInstance(id),
+                    p_physical_device_count: Some(1),
+                    p_physical_devices: vec![p::VkPhysicalDevice(phys)],
+                },
+            )?;
+            if r.result.0 != 0 {
+                return Err(LowerError::Result(r.result.0));
+            }
+        }
         Ok(id)
     }
 
     fn destroy_instance(&self, instance: u64) {
+        if let Some(t) = self.wire() {
+            let _ = forward::destroy_instance(
+                t,
+                p::VkDestroyInstanceArgs { instance: p::VkInstance(instance) },
+            );
+        }
         let mut s = self.state();
         if let Some(i) = s.instances.remove(&instance) {
             for p in i.physical_devices {
@@ -145,10 +212,29 @@ impl IcdLocal for SharedVulkan {
             queue_ids.push(q);
         }
         s.devices.insert(id, crate::state::Device { physical_device, queues: queue_ids });
+        drop(s);
+
+        if let Some(t) = self.wire() {
+            let reply = forward::create_device(
+                t,
+                p::VkCreateDeviceArgs {
+                    physical_device: p::VkPhysicalDevice(physical_device),
+                    p_create_info: Some(Box::new(info.clone())),
+                    p_device: Some(p::VkDevice(id)),
+                },
+            )?;
+            if reply.result.0 != 0 {
+                return Err(LowerError::Result(reply.result.0));
+            }
+        }
         Ok(id)
     }
 
     fn destroy_device(&self, device: u64) {
+        if let Some(t) = self.wire() {
+            let _ =
+                forward::destroy_device(t, p::VkDestroyDeviceArgs { device: p::VkDevice(device) });
+        }
         let mut s = self.state();
         if let Some(d) = s.devices.remove(&device) {
             for q in d.queues {
@@ -161,11 +247,25 @@ impl IcdLocal for SharedVulkan {
         if family != 0 {
             return Err(LowerError::Shape("vkGetDeviceQueue: we advertise one queue family"));
         }
-        let s = self.state();
-        s.devices
-            .get(&device)
-            .and_then(|d| d.queues.get(index as usize).copied())
-            .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))
+        let id = {
+            let s = self.state();
+            s.devices
+                .get(&device)
+                .and_then(|d| d.queues.get(index as usize).copied())
+                .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))?
+        };
+        if let Some(t) = self.wire() {
+            forward::get_device_queue(
+                t,
+                p::VkGetDeviceQueueArgs {
+                    device: p::VkDevice(device),
+                    queue_family_index: family,
+                    queue_index: index,
+                    p_queue: Some(p::VkQueue(id)),
+                },
+            )?;
+        }
+        Ok(id)
     }
 
     fn allocate_command_buffers(
@@ -173,19 +273,47 @@ impl IcdLocal for SharedVulkan {
         device: u64,
         info: &p::VkCommandBufferAllocateInfo,
     ) -> IcdResult<Vec<u64>> {
-        let mut s = self.state();
-        if !s.devices.contains_key(&device) {
-            return Err(LowerError::Shape("vkAllocateCommandBuffers: unknown device"));
+        let ids: Vec<u64> = {
+            let mut s = self.state();
+            if !s.devices.contains_key(&device) {
+                return Err(LowerError::Shape("vkAllocateCommandBuffers: unknown device"));
+            }
+            // design.md §6.5 gives each `VkCommandBuffer` an arena block that
+            // recording encodes straight into, and `vkQueueSubmit` then sends
+            // `svExecuteCommandBlob` descriptors. **That is not built** — see
+            // the note in `sv_gpu_server::server` — so no block is reserved and
+            // each `vkCmd*` crosses as its own device-ring packet instead.
+            (0..info.command_buffer_count.max(1)).map(|_| s.mint()).collect()
+        };
+        if let Some(t) = self.wire() {
+            let reply = forward::allocate_command_buffers(
+                t,
+                p::VkAllocateCommandBuffersArgs {
+                    device: p::VkDevice(device),
+                    p_allocate_info: Some(Box::new(info.clone())),
+                    p_command_buffers: ids.iter().map(|i| p::VkCommandBuffer(*i)).collect(),
+                },
+            )?;
+            if reply.result.0 != 0 {
+                return Err(LowerError::Result(reply.result.0));
+            }
         }
-        // design.md §6.5: each `VkCommandBuffer` owns an arena block that
-        // recording encodes straight into. That block is allocated when there is
-        // a GPU side to hand `(offset, len)` to; for now the id is real and the
-        // block is not.
-        // NO GPU: no arena block is reserved.
-        Ok((0..info.command_buffer_count).map(|_| s.mint()).collect())
+        Ok(ids)
     }
 
-    fn free_command_buffers(&self, _device: u64, _pool: u64, _buffers: &[u64]) {}
+    fn free_command_buffers(&self, device: u64, pool: u64, buffers: &[u64]) {
+        if let Some(t) = self.wire() {
+            let _ = forward::free_command_buffers(
+                t,
+                p::VkFreeCommandBuffersArgs {
+                    device: p::VkDevice(device),
+                    command_pool: p::VkCommandPool(pool),
+                    command_buffer_count: buffers.len() as u32,
+                    p_command_buffers: buffers.iter().map(|b| p::VkCommandBuffer(*b)).collect(),
+                },
+            );
+        }
+    }
 
     /// design.md §5.3, and the whole point of the project.
     fn map_memory(
@@ -240,26 +368,34 @@ impl IcdLocal for SharedVulkan {
 impl Icd for SharedVulkan {
     // -- what we advertise --------------------------------------------------
 
+    /// **The acceptance criterion of this stage.** With a GPU side this reports
+    /// the *driver's* properties — its `deviceName`, its limits — rather than
+    /// design.md §9's synthesised table, which is how `vulkaninfo` tells the two
+    /// configurations apart from the outside.
     fn get_physical_device_properties(
         &self,
-        _args: p::VkGetPhysicalDevicePropertiesArgs,
+        args: p::VkGetPhysicalDevicePropertiesArgs,
     ) -> IcdResult<p::VkGetPhysicalDevicePropertiesReply> {
-        Ok(p::VkGetPhysicalDevicePropertiesReply {
-            p_properties: Some(Box::new(device_properties())),
+        forwarded!(self, get_physical_device_properties, args, {
+            Ok(p::VkGetPhysicalDevicePropertiesReply {
+                p_properties: Some(Box::new(device_properties())),
+            })
         })
     }
 
     fn get_physical_device_properties2(
         &self,
-        _args: p::VkGetPhysicalDeviceProperties2Args,
+        args: p::VkGetPhysicalDeviceProperties2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceProperties2Reply> {
-        let mut out = p::VkPhysicalDeviceProperties2::default();
-        out.properties = device_properties();
-        // The application's own chain links are left exactly as it left them:
-        // answering a link we have no answer for would be inventing data. See
-        // `store_pnext` in `sv-icd-entry` for the direction that fills them in
-        // once there is something to fill them with.
-        Ok(p::VkGetPhysicalDeviceProperties2Reply { p_properties: Some(Box::new(out)) })
+        forwarded!(self, get_physical_device_properties2, args, {
+            let mut out = p::VkPhysicalDeviceProperties2::default();
+            out.properties = device_properties();
+            // The application's own chain links are left exactly as it left
+            // them: answering a link we have no answer for would be inventing
+            // data. See `store_pnext` in `sv-icd-entry` for the direction that
+            // fills them in once there is something to fill them with.
+            Ok(p::VkGetPhysicalDeviceProperties2Reply { p_properties: Some(Box::new(out)) })
+        })
     }
 
     fn get_physical_device_memory_properties(
@@ -284,30 +420,36 @@ impl Icd for SharedVulkan {
 
     fn get_physical_device_features(
         &self,
-        _args: p::VkGetPhysicalDeviceFeaturesArgs,
+        args: p::VkGetPhysicalDeviceFeaturesArgs,
     ) -> IcdResult<p::VkGetPhysicalDeviceFeaturesReply> {
-        Ok(p::VkGetPhysicalDeviceFeaturesReply {
-            p_features: Some(Box::new(p::VkPhysicalDeviceFeatures::default())),
+        forwarded!(self, get_physical_device_features, args, {
+            Ok(p::VkGetPhysicalDeviceFeaturesReply {
+                p_features: Some(Box::new(p::VkPhysicalDeviceFeatures::default())),
+            })
         })
     }
 
     fn get_physical_device_features2(
         &self,
-        _args: p::VkGetPhysicalDeviceFeatures2Args,
+        args: p::VkGetPhysicalDeviceFeatures2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceFeatures2Reply> {
-        Ok(p::VkGetPhysicalDeviceFeatures2Reply {
-            p_features: Some(Box::new(p::VkPhysicalDeviceFeatures2::default())),
+        forwarded!(self, get_physical_device_features2, args, {
+            Ok(p::VkGetPhysicalDeviceFeatures2Reply {
+                p_features: Some(Box::new(p::VkPhysicalDeviceFeatures2::default())),
+            })
         })
     }
 
     fn get_physical_device_queue_family_properties(
         &self,
-        _args: p::VkGetPhysicalDeviceQueueFamilyPropertiesArgs,
+        args: p::VkGetPhysicalDeviceQueueFamilyPropertiesArgs,
     ) -> IcdResult<p::VkGetPhysicalDeviceQueueFamilyPropertiesReply> {
-        let families = queue_families();
-        Ok(p::VkGetPhysicalDeviceQueueFamilyPropertiesReply {
-            p_queue_family_property_count: Some(families.len() as u32),
-            p_queue_family_properties: families,
+        forwarded!(self, get_physical_device_queue_family_properties, args, {
+            let families = queue_families();
+            Ok(p::VkGetPhysicalDeviceQueueFamilyPropertiesReply {
+                p_queue_family_property_count: Some(families.len() as u32),
+                p_queue_family_properties: families,
+            })
         })
     }
 
@@ -331,14 +473,18 @@ impl Icd for SharedVulkan {
 
     fn get_physical_device_format_properties(
         &self,
-        _args: p::VkGetPhysicalDeviceFormatPropertiesArgs,
+        args: p::VkGetPhysicalDeviceFormatPropertiesArgs,
     ) -> IcdResult<p::VkGetPhysicalDeviceFormatPropertiesReply> {
-        // NO GPU: an empty feature set for every format. It is the conservative
-        // answer — an application that respects it will not try anything — and
-        // it is the one place a *forwarded* answer is strictly required before
-        // Zink can run, because Zink chooses formats from exactly this table.
-        Ok(p::VkGetPhysicalDeviceFormatPropertiesReply {
-            p_format_properties: Some(Box::new(p::VkFormatProperties::default())),
+        // §9's "curated, not mirrored" does *not* extend to this table, and the
+        // previous stage said so: it is "the one place a forwarded answer is
+        // strictly required before Zink can run, because Zink chooses formats
+        // from exactly this table". With a GPU side it is now forwarded. Without
+        // one the conservative empty set stays, and an application that respects
+        // it will not try anything.
+        forwarded!(self, get_physical_device_format_properties, args, {
+            Ok(p::VkGetPhysicalDeviceFormatPropertiesReply {
+                p_format_properties: Some(Box::new(p::VkFormatProperties::default())),
+            })
         })
     }
 
@@ -358,6 +504,12 @@ impl Icd for SharedVulkan {
             return Err(LowerError::Shape("vkAllocateMemory: no such memory type"));
         }
 
+        // Arena-backed memory is allocated **entirely on the app side** and does
+        // not cross: design.md §5.2 puts the allocator here ("it is the side
+        // that receives the allocation requests, and keeping the free lists in
+        // private memory means the GPU side cannot be corrupted by an allocator
+        // bug"), and §5.3 makes the resulting `VkDeviceMemory` a sub-range of a
+        // slab the GPU side has already imported. There is nothing to ask for.
         let allocation = if advertise::is_arena_backed(type_index) {
             match s.allocator.alloc(info.allocation_size) {
                 Ok(a) => Some(a),
@@ -373,8 +525,8 @@ impl Icd for SharedVulkan {
                 }
             }
         } else {
-            // NO GPU: a heap-0 allocation would be a GPU-side `vkAllocateMemory`
-            // and is only recorded here.
+            // Heap 0 is `DEVICE_LOCAL` and never mapped, so it *is* a GPU-side
+            // allocation and it does cross.
             None
         };
         let size = allocation.map(|a| a.size).unwrap_or(info.allocation_size);
@@ -382,6 +534,24 @@ impl Icd for SharedVulkan {
             id,
             Memory { memory_type_index: type_index, allocation, size, mapped: false },
         );
+        drop(s);
+
+        if allocation.is_none()
+            && let Some(t) = self.wire()
+        {
+            let reply = forward::allocate_memory(
+                t,
+                p::VkAllocateMemoryArgs {
+                    device: args.device,
+                    p_allocate_info: args.p_allocate_info,
+                    p_memory: Some(p::VkDeviceMemory(id)),
+                },
+            )?;
+            if reply.result.0 != 0 {
+                self.state().memories.remove(&id);
+                return Ok(reply);
+            }
+        }
         Ok(p::VkAllocateMemoryReply {
             result: p::VkResult(0),
             p_memory: Some(p::VkDeviceMemory(id)),
@@ -389,15 +559,29 @@ impl Icd for SharedVulkan {
     }
 
     fn free_memory(&self, args: p::VkFreeMemoryArgs) -> IcdResult<()> {
-        let mut s = self.state();
-        if let Some(m) = s.memories.remove(&args.memory.0)
-            && let Some(a) = m.allocation
-        {
-            // design.md §5.5 defers this until the timelines an allocation could
-            // be referenced by have passed. With nothing executing there is
-            // nothing to wait for, and `sv_arena::free_deferred` replaces this
-            // line when there is.
-            let _ = s.allocator.free_now(a);
+        let arena_backed = {
+            let mut s = self.state();
+            match s.memories.remove(&args.memory.0) {
+                Some(m) => match m.allocation {
+                    Some(a) => {
+                        // design.md §5.5 defers this until the timelines an
+                        // allocation could be referenced by have passed. The
+                        // timeline mirror is not wired to submissions yet, so
+                        // this is still immediate — the honest gap, and the one
+                        // `ArenaAllocator::free_deferred` is waiting for.
+                        let _ = s.allocator.free_now(a);
+                        true
+                    }
+                    None => false,
+                },
+                None => return Ok(()),
+            }
+        };
+        // Arena memory has no GPU-side object to free: it is a sub-range of the
+        // one arena allocation, which outlives every application. Heap-0 memory
+        // does, and it is a real driver allocation there.
+        if !arena_backed && let Some(t) = self.wire() {
+            forward::free_memory(t, args)?;
         }
         Ok(())
     }
@@ -406,6 +590,21 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkGetBufferMemoryRequirementsArgs,
     ) -> IcdResult<p::VkGetBufferMemoryRequirementsReply> {
+        // Forwarded for the *numbers* and patched for the *mask*. The driver
+        // knows the real size and alignment for this buffer and we do not; it
+        // also numbers memory types its own way, and design.md §9.1 says we
+        // advertise ours. Passing its `memoryTypeBits` through would have an
+        // application select a type from our four-entry table by an index that
+        // means something else.
+        if let Some(t) = self.wire() {
+            let mut reply = forward::get_buffer_memory_requirements(t, args)?;
+            if let Some(r) = reply.p_memory_requirements.as_mut() {
+                r.alignment = r.alignment.max(crate::arena::GRANULARITY);
+                r.size = crate::arena::round_up(r.size.max(1));
+                r.memory_type_bits = advertise::ARENA_MEMORY_TYPE_BITS;
+            }
+            return Ok(reply);
+        }
         let s = self.state();
         let size = s.buffers.get(&args.buffer.0).copied().unwrap_or(0);
         let mut r = p::VkMemoryRequirements::default();
@@ -414,8 +613,7 @@ impl Icd for SharedVulkan {
         // be a multiple of the alignment too (design.md §5.2).
         r.size = crate::arena::round_up(size.max(1));
         r.alignment = crate::arena::GRANULARITY;
-        // Every arena-backed type, which is every type but 0.
-        r.memory_type_bits = 0b1110;
+        r.memory_type_bits = advertise::ARENA_MEMORY_TYPE_BITS;
         Ok(p::VkGetBufferMemoryRequirementsReply { p_memory_requirements: Some(Box::new(r)) })
     }
 
@@ -423,128 +621,215 @@ impl Icd for SharedVulkan {
         let Some(info) = args.p_create_info.as_ref() else {
             return Err(LowerError::Shape("vkCreateBuffer: no VkBufferCreateInfo"));
         };
-        let mut s = self.state();
-        let id = s.mint();
-        s.buffers.insert(id, info.size);
-        // NO GPU: the id is real and is what would go on the wire (design.md
-        // §6.4 — object creation costs no round trip), but no `VkBuffer` exists
-        // on any driver.
+        let size = info.size;
+        let id = {
+            let mut s = self.state();
+            let id = s.mint();
+            s.buffers.insert(id, size);
+            id
+        };
+        // §6.4: the id is chosen here and the command carries it, so creation
+        // costs no round trip in the sense that matters — the app side never
+        // waits to learn a handle. It still waits for the *result*, because
+        // `VK_ERROR_OUT_OF_DEVICE_MEMORY` from `vkCreateBuffer` is something an
+        // application is entitled to see.
+        if let Some(t) = self.wire() {
+            let reply = forward::create_buffer(
+                t,
+                p::VkCreateBufferArgs {
+                    device: args.device,
+                    p_create_info: args.p_create_info,
+                    p_buffer: Some(p::VkBuffer(id)),
+                },
+            )?;
+            if reply.result.0 != 0 {
+                self.state().buffers.remove(&id);
+                return Ok(reply);
+            }
+            return Ok(p::VkCreateBufferReply {
+                result: p::VkResult(0),
+                p_buffer: Some(p::VkBuffer(id)),
+            });
+        }
         Ok(p::VkCreateBufferReply { result: p::VkResult(0), p_buffer: Some(p::VkBuffer(id)) })
     }
 
     fn destroy_buffer(&self, args: p::VkDestroyBufferArgs) -> IcdResult<()> {
         self.state().buffers.remove(&args.buffer.0);
+        if let Some(t) = self.wire() {
+            forward::destroy_buffer(t, args)?;
+        }
         Ok(())
     }
 
+    /// design.md §5.3's rewrite, app-side half.
+    ///
+    /// The memory id becomes [`sv_gpu_server::ARENA_MEMORY_ID`]'s value and the
+    /// offset becomes the allocation's arena offset plus the application's. §5.3
+    /// says the id becomes "the slab's GPU-side handle"; it cannot — the app
+    /// side knows no driver handle and §6.4 depends on it not knowing one — so
+    /// what crosses is a well-known id and a number this side already owns, and
+    /// the GPU side finishes the translation. See `sv_gpu_server::table`.
     fn bind_buffer_memory(
         &self,
-        _args: p::VkBindBufferMemoryArgs,
+        args: p::VkBindBufferMemoryArgs,
     ) -> IcdResult<p::VkBindBufferMemoryReply> {
-        // NO GPU: the `(memory, offset)` rewrite of design.md §5.3 happens in
-        // the generated `transform` pass on the way to the peer, and there is no
-        // peer.
-        Ok(p::VkBindBufferMemoryReply { result: p::VkResult(0) })
+        let Some(t) = self.wire() else {
+            // NO GPU: nothing to bind to.
+            return Ok(p::VkBindBufferMemoryReply { result: p::VkResult(0) });
+        };
+        let (memory, offset) = self.rewrite_memory(args.memory.0, args.memory_offset)?;
+        forward::bind_buffer_memory(
+            t,
+            p::VkBindBufferMemoryArgs {
+                device: args.device,
+                buffer: args.buffer,
+                memory: p::VkDeviceMemory(memory),
+                memory_offset: offset,
+            },
+        )
     }
 
     // -- accepted and dropped ------------------------------------------------
 
+    // -- forwarded, with a standalone answer behind them ---------------------
+    //
+    // Each of these was "accepted and dropped" in the previous stage. They are
+    // now round trips whenever there is a GPU side; the local answer stays
+    // because a driver with no GPU side still has to let `vulkaninfo` and the
+    // loader test walk create-instance → create-device → submit → allocate →
+    // map without failing, which is design.md §13 step 5.
+    //
+    // The object id is minted here in every case (§6.4), so the *only*
+    // difference between the two arms is whether anything learns of it.
+
     fn create_command_pool(
         &self,
-        _args: p::VkCreateCommandPoolArgs,
+        args: p::VkCreateCommandPoolArgs,
     ) -> IcdResult<p::VkCreateCommandPoolReply> {
         let id = self.state().mint();
-        Ok(p::VkCreateCommandPoolReply {
-            result: p::VkResult(0),
+        let args = p::VkCreateCommandPoolArgs {
             p_command_pool: Some(p::VkCommandPool(id)),
+            ..args
+        };
+        forwarded!(self, create_command_pool, args, {
+            Ok(p::VkCreateCommandPoolReply {
+                result: p::VkResult(0),
+                p_command_pool: Some(p::VkCommandPool(id)),
+            })
         })
     }
 
-    fn destroy_command_pool(&self, _args: p::VkDestroyCommandPoolArgs) -> IcdResult<()> {
-        Ok(())
+    fn destroy_command_pool(&self, args: p::VkDestroyCommandPoolArgs) -> IcdResult<()> {
+        forwarded!(self, destroy_command_pool, args, { Ok(()) })
     }
 
     fn begin_command_buffer(
         &self,
-        _args: p::VkBeginCommandBufferArgs,
+        args: p::VkBeginCommandBufferArgs,
     ) -> IcdResult<p::VkBeginCommandBufferReply> {
-        // NO GPU: recording would encode straight into the command buffer's
-        // arena block (design.md §6.5).
-        Ok(p::VkBeginCommandBufferReply { result: p::VkResult(0) })
+        forwarded!(self, begin_command_buffer, args, {
+            Ok(p::VkBeginCommandBufferReply { result: p::VkResult(0) })
+        })
     }
 
     fn end_command_buffer(
         &self,
-        _args: p::VkEndCommandBufferArgs,
+        args: p::VkEndCommandBufferArgs,
     ) -> IcdResult<p::VkEndCommandBufferReply> {
-        Ok(p::VkEndCommandBufferReply { result: p::VkResult(0) })
+        forwarded!(self, end_command_buffer, args, {
+            Ok(p::VkEndCommandBufferReply { result: p::VkResult(0) })
+        })
     }
 
-    fn queue_submit(&self, _args: p::VkQueueSubmitArgs) -> IcdResult<p::VkQueueSubmitReply> {
-        // NO GPU: design.md D15 makes submit asynchronous and non-negotiable, so
-        // returning success without having executed anything is the *shape* the
-        // real implementation has. What is missing is the `svQueueSubmitAsync`
-        // that would carry it and the timeline value that would retire it.
-        Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
+    /// design.md D15 makes submit asynchronous and non-negotiable — "if submit
+    /// is synchronous the design is dead on latency grounds regardless of
+    /// transport".
+    ///
+    /// **This one is synchronous, and it is the clearest debt in the app side.**
+    /// `vkQueueSubmit` generates a reply, so the generated forwarder waits for
+    /// it. Making it asynchronous needs `svQueueSubmitAsync` (§6.3) and the
+    /// timeline mirror wired to it (§9.3), neither of which exists; without them
+    /// there is nothing to tell the application the submission was accepted. It
+    /// is correct and it is slow, and the fix is a protocol command rather than
+    /// a change here.
+    fn queue_submit(&self, args: p::VkQueueSubmitArgs) -> IcdResult<p::VkQueueSubmitReply> {
+        forwarded!(self, queue_submit, args, {
+            Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
+        })
     }
 
     fn device_wait_idle(
         &self,
-        _args: p::VkDeviceWaitIdleArgs,
+        args: p::VkDeviceWaitIdleArgs,
     ) -> IcdResult<p::VkDeviceWaitIdleReply> {
-        // NO GPU: design.md §9.3 makes this a timeline wait against the mirrored
-        // counters in the control region. With nothing submitted, idle is
-        // immediate and the answer happens to be right.
-        Ok(p::VkDeviceWaitIdleReply { result: p::VkResult(0) })
+        // §9.3 makes this a timeline wait against the mirrored counters. The
+        // mirror is not wired to submissions, so it is a round trip to a real
+        // `vkDeviceWaitIdle` instead — correct, and one round trip rather than
+        // an acquire load.
+        forwarded!(self, device_wait_idle, args, {
+            Ok(p::VkDeviceWaitIdleReply { result: p::VkResult(0) })
+        })
     }
 
-    fn queue_wait_idle(&self, _args: p::VkQueueWaitIdleArgs) -> IcdResult<p::VkQueueWaitIdleReply> {
-        Ok(p::VkQueueWaitIdleReply { result: p::VkResult(0) })
+    fn queue_wait_idle(&self, args: p::VkQueueWaitIdleArgs) -> IcdResult<p::VkQueueWaitIdleReply> {
+        forwarded!(self, queue_wait_idle, args, {
+            Ok(p::VkQueueWaitIdleReply { result: p::VkResult(0) })
+        })
     }
 
     fn create_fence(&self, args: p::VkCreateFenceArgs) -> IcdResult<p::VkCreateFenceReply> {
-        let _ = args;
         let id = self.state().mint();
-        Ok(p::VkCreateFenceReply { result: p::VkResult(0), p_fence: Some(p::VkFence(id)) })
+        let args = p::VkCreateFenceArgs { p_fence: Some(p::VkFence(id)), ..args };
+        forwarded!(self, create_fence, args, {
+            Ok(p::VkCreateFenceReply { result: p::VkResult(0), p_fence: Some(p::VkFence(id)) })
+        })
     }
 
-    fn destroy_fence(&self, _args: p::VkDestroyFenceArgs) -> IcdResult<()> {
-        Ok(())
+    fn destroy_fence(&self, args: p::VkDestroyFenceArgs) -> IcdResult<()> {
+        forwarded!(self, destroy_fence, args, { Ok(()) })
     }
 
     fn get_fence_status(
         &self,
-        _args: p::VkGetFenceStatusArgs,
+        args: p::VkGetFenceStatusArgs,
     ) -> IcdResult<p::VkGetFenceStatusReply> {
-        // NO GPU: a local acquire load of the timeline mirror table once one
-        // exists (design.md §9.3). Signalled, because nothing is outstanding.
-        Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) })
+        forwarded!(self, get_fence_status, args, {
+            Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) })
+        })
     }
 
-    fn reset_fences(&self, _args: p::VkResetFencesArgs) -> IcdResult<p::VkResetFencesReply> {
-        Ok(p::VkResetFencesReply { result: p::VkResult(0) })
+    fn reset_fences(&self, args: p::VkResetFencesArgs) -> IcdResult<p::VkResetFencesReply> {
+        forwarded!(self, reset_fences, args, {
+            Ok(p::VkResetFencesReply { result: p::VkResult(0) })
+        })
     }
 
     fn wait_for_fences(
         &self,
-        _args: p::VkWaitForFencesArgs,
+        args: p::VkWaitForFencesArgs,
     ) -> IcdResult<p::VkWaitForFencesReply> {
-        Ok(p::VkWaitForFencesReply { result: p::VkResult(0) })
+        forwarded!(self, wait_for_fences, args, {
+            Ok(p::VkWaitForFencesReply { result: p::VkResult(0) })
+        })
     }
 
     fn create_semaphore(
         &self,
-        _args: p::VkCreateSemaphoreArgs,
+        args: p::VkCreateSemaphoreArgs,
     ) -> IcdResult<p::VkCreateSemaphoreReply> {
         let id = self.state().mint();
-        Ok(p::VkCreateSemaphoreReply {
-            result: p::VkResult(0),
-            p_semaphore: Some(p::VkSemaphore(id)),
+        let args = p::VkCreateSemaphoreArgs { p_semaphore: Some(p::VkSemaphore(id)), ..args };
+        forwarded!(self, create_semaphore, args, {
+            Ok(p::VkCreateSemaphoreReply {
+                result: p::VkResult(0),
+                p_semaphore: Some(p::VkSemaphore(id)),
+            })
         })
     }
 
-    fn destroy_semaphore(&self, _args: p::VkDestroySemaphoreArgs) -> IcdResult<()> {
-        Ok(())
+    fn destroy_semaphore(&self, args: p::VkDestroySemaphoreArgs) -> IcdResult<()> {
+        forwarded!(self, destroy_semaphore, args, { Ok(()) })
     }
 }
 

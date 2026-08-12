@@ -222,6 +222,61 @@ pub enum LowerError {
     DeviceLost,
     /// A specific `VkResult` chosen by the implementation.
     Result(i32),
+    /// The wire itself failed: a truncated reply, a length disagreement, a
+    /// command the GPU side does not implement. Kept as a `WireError` rather
+    /// than flattened, because R13's whole point is that the *first* mismatch is
+    /// reportable with its own opcode.
+    Wire(sv_wire::WireError),
+}
+
+/// A wire failure, as a `LowerError`.
+///
+/// One function so that every one of the ~239 generated forwarders spells the
+/// conversion identically. A `From` impl would be tidier and is deliberately not
+/// used: `?` on a `WireError` inside a generated body would then convert
+/// silently, and this crate's rule is that a generated block does nothing the
+/// generator did not write out.
+pub fn wire_failed(e: sv_wire::WireError) -> LowerError {
+    LowerError::Wire(e)
+}
+
+/// Which ring a forwarded command belongs on (design.md §4.4).
+///
+/// The generated forwarders pass one of these with every packet; the transport
+/// decides what a ring is. Note that this is a *class*, not a ring id: the app
+/// side has one instance ring but a device ring per `VkDevice` and a queue ring
+/// per `VkQueue`, and the id inside the command's own arguments is what picks
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingClass {
+    /// Everything before a device exists.
+    Instance,
+    /// Object creation and destruction, descriptor updates, command recording.
+    Device,
+    /// `vkQueueSubmit`, `vkQueueWaitIdle`, present.
+    Queue,
+}
+
+/// Where a forwarded command goes.
+///
+/// design.md called this seam "`state::Transport`" and put it in `sv-icd`; it
+/// belongs here instead, because the *generated* forwarders have to name it and
+/// they cannot depend on the crate that depends on them. The signature is
+/// `(ring, opcode, bytes) -> bytes` and nothing more: the typing has already
+/// happened in `sv-proto`, and a transport that knew about Vulkan would be a
+/// transport with a reason to be regenerated.
+pub trait Transport: Send + Sync {
+    /// Send a command and wait for its reply.
+    fn call(
+        &self,
+        ring: RingClass,
+        opcode: u32,
+        command: &[u8],
+        reply: &mut Vec<u8>,
+    ) -> IcdResult<()>;
+
+    /// Send a command that generates no reply (design.md §4.4, D15).
+    fn send(&self, ring: RingClass, opcode: u32, command: &[u8]) -> IcdResult<()>;
 }
 
 pub type LowerResult<T> = Result<T, LowerError>;
@@ -257,6 +312,17 @@ pub fn lower_failed(e: LowerError) -> VkResult {
 pub fn report_failure(e: LowerError) {
     if debug_enabled() {
         eprintln!("sv-icd: {e:?}");
+    }
+}
+
+/// Say what the transport said, since [`LowerError`] cannot carry it.
+///
+/// `LowerError` is `Copy` and stringless by design — it is returned from every
+/// generated lowering, so it has to be free — which means a transport error's
+/// own message has nowhere to go. It goes here.
+pub fn report_transport_failure(e: &dyn core::fmt::Display) {
+    if debug_enabled() {
+        eprintln!("sv-icd: transport: {e}");
     }
 }
 
@@ -317,6 +383,37 @@ pub trait IcdLocal {
     /// The device extensions we advertise, for the same reason.
     fn device_extensions(&self) -> &[(&'static str, u32)] {
         &[]
+    }
+
+    /// A fresh wire object id.
+    ///
+    /// design.md §6.4's counter. Every generated [`Icd`] default that forwards a
+    /// command with an output handle calls this *before* encoding, because the
+    /// id is what the command carries — the application's `*pBuffer` holds
+    /// nothing until we have returned.
+    ///
+    /// The default is a process-wide counter so that even an implementation
+    /// which overrides nothing produces unique, non-zero ids. `sv-icd` overrides
+    /// it with its own `State::mint`, so that there is exactly one id space and
+    /// its tables can be keyed by it.
+    fn mint_id(&self) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The transport to the GPU side, if this build has one connected.
+    ///
+    /// This is the hinge of the whole app side. Every generated [`Icd`] method
+    /// consults it: with a transport the command is encoded and sent, without
+    /// one it refuses by name. An implementation therefore does not have to
+    /// write 239 forwarders — it writes the handful design.md §8 and §10 say are
+    /// answered app-side, and the rest cross by default.
+    ///
+    /// `None` is a legitimate steady state and not only a startup window: a
+    /// `vulkaninfo` run against a driver with no GPU side behind it still
+    /// enumerates, because the commands that answer it are the overridden ones.
+    fn transport(&self) -> Option<&dyn Transport> {
+        None
     }
 
     /// `vkGetInstanceProcAddr`, which cannot be forwarded because its answer is

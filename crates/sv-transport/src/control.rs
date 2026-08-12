@@ -269,6 +269,35 @@ impl Geometry {
             timeline_count: 16,
         }
     }
+
+    /// The geometry a live session uses, for an arena of `arena_size`.
+    ///
+    /// **Both sides must choose the same one**, and the reason this is a
+    /// function here rather than a constant in each binary is that they did not:
+    /// `sv-hostd` served `demo_geometry`'s 1 MiB control region while
+    /// `sv-gpu-server` wanted 16 MiB, and the session died at `Control::create`
+    /// with "the layout does not fit in control_size". The owner publishes the
+    /// geometry and the peer reads it (§4.3), so only the *owner* strictly needs
+    /// this — but on the memfd path the owner is not the side that sized the
+    /// file, so both do.
+    ///
+    /// It differs from [`Geometry::default`] in one respect, and the reason is a
+    /// consequence of what design.md §6.5 does not yet have: a
+    /// `vkCreateShaderModule` carries its SPIR-V **inline on the ring**, because
+    /// the arena-blob path is not built. §4.2's 64 KiB ring cannot hold a real
+    /// shader module, so the data buffer is 256 KiB and the slot count drops
+    /// from 64 to 16 to pay for it. §4.2's own arithmetic then lands on the same
+    /// 16 MiB control region it specifies.
+    pub fn for_arena(arena_size: u64) -> Self {
+        Geometry {
+            control_size: 16 << 20,
+            arena_size,
+            arena_slab_size: 4 << 20,
+            ring_slot_count: 16,
+            ring_data_bytes: 256 << 10,
+            timeline_count: 64,
+        }
+    }
 }
 
 /// Where everything is. Computed once, published, and read rather than

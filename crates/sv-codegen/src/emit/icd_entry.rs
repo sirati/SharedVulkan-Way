@@ -1478,15 +1478,172 @@ fn emit_writeback(
 // the trait, the tables and the whole crate
 // ---------------------------------------------------------------------------
 
+/// Which ring a command's packet belongs on (design.md §4.4).
+///
+/// Derived from the command's first parameter, which is the only thing that
+/// decides it: a `VkQueue` command is a queue-ring command, anything naming a
+/// `VkDevice` or an object owned by one is a device-ring command, and everything
+/// before a device exists goes on the instance ring.
+///
+/// This is generated rather than hand-listed for the reason §5.3 gives about the
+/// `transform` pass: hand-listing the sites is how it goes wrong, and the
+/// registry already knows the answer.
+fn ring_class(c: &crate::plan::CommandPlan) -> TokenStream {
+    let first = c.inputs.first().map(|f| &f.shape);
+    match first {
+        Some(Shape::Scalar(Scalar::Handle(h))) => match h.as_str() {
+            "VkQueue" => quote!(crate::RingClass::Queue),
+            "VkInstance" | "VkPhysicalDevice" => quote!(crate::RingClass::Instance),
+            _ => quote!(crate::RingClass::Device),
+        },
+        // No handle at all: `vkEnumerateInstanceVersion` and friends, which are
+        // answered before an instance exists.
+        _ => quote!(crate::RingClass::Instance),
+    }
+}
+
+/// The app side's forwarding functions: `Args` in, ring out, `Reply` back.
+///
+/// One free function per forwarded command, each the exact dual of the arm
+/// `sv_proto::dispatch` generates for the same opcode. They are free functions
+/// rather than methods on a trait so that nothing here has to be object-safe and
+/// so that `sv-icd` can call one directly when it wants to forward a command it
+/// otherwise answers locally.
+fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
+    let fns = cx.wire.commands.iter().map(|c| {
+        let m = naming::command_method(&c.name);
+        let snake = naming::snake_case(&c.name);
+        let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
+        let size_cmd = format_ident!("size_cmd_{}", snake);
+        let encode_cmd = format_ident!("encode_cmd_{}", snake);
+        let opcode = c.opcode;
+        let ring = ring_class(c);
+        let doc = format!("Forward `{}` to the GPU side.", c.name);
+
+        // The command bytes are identical in both directions; only the flag and
+        // what happens afterwards differ.
+        let encode = quote! {
+            let mut __cmd = vec![0u8; sv_proto::#size_cmd(&args)];
+            {
+                let mut __enc = sv_wire::Encoder::new(&mut __cmd);
+                sv_proto::#encode_cmd(&mut __enc, __flags, &args).map_err(crate::wire_failed)?;
+                __enc.finish().map_err(crate::wire_failed)?;
+            }
+        };
+
+        if c.generates_reply {
+            let reply = format_ident!("{}Reply", naming::opcode_variant(&c.name));
+            let decode_reply = format_ident!("decode_reply_{}", snake);
+            quote! {
+                #[doc = #doc]
+                pub fn #m(
+                    __t: &dyn crate::Transport,
+                    args: sv_proto::#args,
+                ) -> crate::IcdResult<sv_proto::#reply> {
+                    let __flags = sv_wire::CMD_FLAG_GENERATE_REPLY;
+                    #encode
+                    let mut __reply = Vec::new();
+                    __t.call(#ring, #opcode, &__cmd, &mut __reply)?;
+                    let mut __dec = sv_wire::Decoder::new(&__reply);
+                    sv_proto::#decode_reply(&mut __dec).map_err(crate::wire_failed)
+                }
+            }
+        } else {
+            quote! {
+                #[doc = #doc]
+                pub fn #m(
+                    __t: &dyn crate::Transport,
+                    args: sv_proto::#args,
+                ) -> crate::IcdResult<()> {
+                    let __flags = 0u32;
+                    #encode
+                    __t.send(#ring, #opcode, &__cmd)
+                }
+            }
+        }
+    });
+
+    quote! {
+        /// Encode a command, hand it to the transport, decode the reply.
+        ///
+        /// The dual of `sv_proto::dispatch`, and the thing that turns
+        /// [`crate::Icd`]'s default method from a refusal into a round trip.
+        pub mod forward {
+            #(#fns)*
+        }
+    }
+}
+
+/// Statements that fill every output handle of a command with a fresh id.
+///
+/// # Why this has to be generated, and cannot be a plain forward
+///
+/// design.md §6.4: "the app side allocates ids from a per-device 64-bit counter,
+/// so `vkCreateBuffer` encodes the id it chose and returns immediately". The id
+/// is therefore an **input** to the command even though C calls it an output
+/// parameter — and the lowering pass, faithfully, fills it from the
+/// application's `*pBuffer`, which before the call holds nothing.
+///
+/// A default that forwarded the lowered arguments unchanged therefore sent
+/// `pImage = 0` for every command `sv-icd` had not overridden, the GPU side
+/// dutifully recorded "object 0 is this image", and the *next* call arrived with
+/// a null handle. RADV segfaulted inside
+/// `vkGetImageMemoryRequirements2` — no error, no diagnostic, just a dead GPU
+/// side and `VK_ERROR_DEVICE_LOST` on the app side one call later.
+///
+/// So minting belongs in the default. It also means `sv-icd` does not have to
+/// override a command merely to give it an id, which was the shape of every
+/// create-command override this crate would otherwise need.
+fn emit_mint_outputs(c: &crate::plan::CommandPlan) -> Vec<TokenStream> {
+    let mut stmts = Vec::new();
+    for f in &c.outputs {
+        let name = format_ident!("{}", f.rust_name);
+        match &f.shape {
+            Shape::Optional(inner) => {
+                if let Shape::Scalar(Scalar::Handle(h)) = &**inner {
+                    let ty = format_ident!("{}", h);
+                    stmts.push(quote! {
+                        args.#name = Some(sv_proto::#ty(crate::IcdLocal::mint_id(self)));
+                    });
+                }
+            }
+            Shape::Array { elem, .. } => {
+                if let Shape::Scalar(Scalar::Handle(h)) = &**elem {
+                    let ty = format_ident!("{}", h);
+                    // The length comes from the lowering, which read the
+                    // application's own count. Each slot gets its own id.
+                    stmts.push(quote! {
+                        for __slot in args.#name.iter_mut() {
+                            *__slot = sv_proto::#ty(crate::IcdLocal::mint_id(self));
+                        }
+                    });
+                }
+            }
+            Shape::Scalar(Scalar::Handle(h)) => {
+                let ty = format_ident!("{}", h);
+                stmts.push(quote! {
+                    args.#name = sv_proto::#ty(crate::IcdLocal::mint_id(self));
+                });
+            }
+            _ => {}
+        }
+    }
+    stmts
+}
+
 fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
     let methods = cx.wire.commands.iter().map(|c| {
         let m = naming::command_method(&c.name);
         let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
         let cname = c.name.as_str();
+        let mint = emit_mint_outputs(c);
+        let mut_args = if mint.is_empty() { quote!() } else { quote!(mut) };
         let doc = format!(
-            "`{}`.\n\nThe default implementation refuses, so `sv-icd` implements \
-             the commands it has and every other entry point still fails cleanly \
-             rather than being a null function pointer.",
+            "`{}`.\n\n**The default forwards.** If [`crate::IcdLocal::transport`] \
+             returns a connected transport this encodes the command, sends it to \
+             the GPU side and decodes the reply; with no transport it refuses by \
+             name. An implementation overrides this method only for the commands \
+             design.md §8 and §10 say are answered app-side.",
             c.name
         );
         if HAND_WRITTEN.contains(&c.name.as_str()) {
@@ -1495,21 +1652,24 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
             // every call site ambiguous, since `Icd: IcdLocal`.
             return quote!();
         }
-        if c.generates_reply {
+        let ret = if c.generates_reply {
             let reply = format_ident!("{}Reply", naming::opcode_variant(&c.name));
-            quote! {
-                #[doc = #doc]
-                fn #m(&self, args: sv_proto::#args) -> crate::IcdResult<sv_proto::#reply> {
-                    let _ = args;
-                    Err(crate::LowerError::NotImplemented(#cname))
-                }
-            }
+            quote!(sv_proto::#reply)
         } else {
-            quote! {
-                #[doc = #doc]
-                fn #m(&self, args: sv_proto::#args) -> crate::IcdResult<()> {
-                    let _ = args;
-                    Err(crate::LowerError::NotImplemented(#cname))
+            quote!(())
+        };
+        quote! {
+            #[doc = #doc]
+            fn #m(&self, #mut_args args: sv_proto::#args) -> crate::IcdResult<#ret> {
+                match crate::IcdLocal::transport(self) {
+                    Some(__t) => {
+                        #(#mint)*
+                        crate::forward::#m(__t, args)
+                    }
+                    None => {
+                        let _ = args;
+                        Err(crate::LowerError::NotImplemented(#cname))
+                    }
                 }
             }
         }
@@ -1802,6 +1962,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     let refused_names: BTreeSet<String> = commands.iter().map(|r| r.command.clone()).collect();
 
     let pnext = emit_pnext_walkers(&lower_cx, &store_cx);
+    let forward = emit_forward_module(cx);
     let icd_trait = emit_icd_trait(cx);
     let tables = emit_tables(cx, &refused_names);
 
@@ -1826,6 +1987,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     {
         sections.push((format!("stub {}", c.name), t));
     }
+    sections.push(("forward".to_string(), forward));
     sections.push(("trait".to_string(), icd_trait));
     sections.push(("tables".to_string(), tables));
 

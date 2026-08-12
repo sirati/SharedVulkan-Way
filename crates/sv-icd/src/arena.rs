@@ -215,6 +215,52 @@ impl Backing for Placeholder {
 // the mapping
 // ---------------------------------------------------------------------------
 
+/// `sv_arena::ArenaAllocator` is what [`Backing`] was shaped after, so the
+/// adaptor is four forwarding methods and one field-for-field conversion.
+///
+/// The conversion is written out rather than `transmute`d even though the two
+/// `Allocation` types have identical fields, for the reason design.md §7.3 gives
+/// about the generated code: two independently declared views of one layout
+/// agreeing is a coincidence maintained by nobody.
+impl Backing for sv_arena::alloc::ArenaAllocator {
+    fn slab_size(&self) -> u64 {
+        sv_arena::alloc::ArenaAllocator::slab_size(self)
+    }
+    fn arena_len(&self) -> u64 {
+        sv_arena::alloc::ArenaAllocator::arena_len(self)
+    }
+    fn alloc(&mut self, size: u64) -> Result<Allocation> {
+        sv_arena::alloc::ArenaAllocator::alloc(self, size)
+            .map(|a| Allocation { slab: a.slab, offset_in_slab: a.offset_in_slab, size: a.size })
+            .map_err(|_| ArenaError::OutOfMemory)
+    }
+    fn arena_offset(&self, a: Allocation) -> Result<u64> {
+        sv_arena::alloc::ArenaAllocator::arena_offset(
+            self,
+            sv_arena::alloc::Allocation {
+                slab: a.slab,
+                offset_in_slab: a.offset_in_slab,
+                size: a.size,
+            },
+        )
+        .map_err(|_| ArenaError::BadGeometry("allocation is outside the arena"))
+    }
+    fn free_now(&mut self, a: Allocation) -> Result<()> {
+        sv_arena::alloc::ArenaAllocator::free_now(
+            self,
+            sv_arena::alloc::Allocation {
+                slab: a.slab,
+                offset_in_slab: a.offset_in_slab,
+                size: a.size,
+            },
+        )
+        .map_err(|_| ArenaError::BadGeometry("freeing a range that is not allocated"))
+    }
+    fn free_bytes(&self) -> u64 {
+        sv_arena::alloc::ArenaAllocator::free_bytes(self)
+    }
+}
+
 /// A shared mapping of the arena.
 ///
 /// One of the three modules design.md §7.3 permits hand-written `unsafe` in
@@ -231,8 +277,29 @@ impl Backing for Placeholder {
 pub struct Mapping {
     base: *mut u8,
     len: usize,
-    #[cfg(unix)]
-    fd: std::os::fd::OwnedFd,
+    /// Never read on a platform whose `create` cannot succeed — the field is
+    /// what decides whether `Drop` unmaps, and `Drop` only unmaps on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    backing: MappingBacking,
+}
+
+/// Who owns the pages under a [`Mapping`].
+///
+/// Two cases, and conflating them is a double `munmap`: a standalone driver made
+/// the mapping itself and must unmap it, while a connected one is looking at
+/// `sv-transport`'s mapping and must not. Holding the `Arc` in the second case
+/// is what makes the pointer `vkMapMemory` returns outlive every use of it.
+#[derive(Debug)]
+enum MappingBacking {
+    /// `memfd_create` + `mmap` here; unmapped in `Drop`.
+    #[cfg(target_os = "linux")]
+    Owned(std::os::fd::OwnedFd),
+    /// `sv_transport::region::SharedRegion` owns the mapping and unmaps it.
+    ///
+    /// The `Arc` is never read and is the entire point of the variant: it is
+    /// what keeps that mapping alive for as long as any pointer `vkMapMemory`
+    /// handed out. Dropping it would unmap the arena under the application.
+    Shared(#[allow(dead_code)] std::sync::Arc<sv_transport::region::SharedRegion>),
 }
 
 // SAFETY: a raw pointer to a shared mapping is as thread-safe as the mapping
@@ -278,7 +345,30 @@ impl Mapping {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Mapping { base: base as *mut u8, len, fd })
+        Ok(Mapping { base: base as *mut u8, len, backing: MappingBacking::Owned(fd) })
+    }
+
+    /// Adopt `sv-transport`'s mapping of the arena.
+    ///
+    /// The pointer is the region's own base, so `vkMapMemory` returns an address
+    /// inside the *same* mapping the transport reads and the GPU side's
+    /// `VkDeviceMemory` covers. That identity is design.md §1's invariant, and
+    /// making it a borrow rather than a second `mmap` is what guarantees it
+    /// rather than arranging it.
+    pub fn attach(
+        region: &std::sync::Arc<sv_transport::region::SharedRegion>,
+        len: u64,
+    ) -> Mapping {
+        // SAFETY: the pointer is the base of a live mapping, and the `Arc` kept
+        // in `backing` holds that mapping alive for as long as this `Mapping`
+        // exists. Nothing here forms a reference into it — see the type's own
+        // invariants above.
+        let base = unsafe { region.base_ptr() };
+        Mapping {
+            base,
+            len: (len as usize).min(region.len()),
+            backing: MappingBacking::Shared(std::sync::Arc::clone(region)),
+        }
     }
 
     /// No arena on a platform whose mapping has not been written.
@@ -306,9 +396,15 @@ impl Mapping {
     }
 
     /// The descriptor, for handing to the peer over the cold path.
-    #[cfg(unix)]
-    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(&self.fd)
+    ///
+    /// `None` on an attached mapping: the descriptor belongs to whichever side
+    /// provided the arena, and it is not ours to hand on.
+    #[cfg(target_os = "linux")]
+    pub fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        match &self.backing {
+            MappingBacking::Owned(fd) => Some(std::os::fd::AsFd::as_fd(fd)),
+            MappingBacking::Shared(_) => None,
+        }
     }
 
     /// A pointer to `offset` within the mapping, or `None` if the range does not
@@ -331,10 +427,15 @@ impl Mapping {
 impl Drop for Mapping {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        // SAFETY: `base`/`len` are exactly what `mmap` returned and this runs
-        // once.
-        unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.len);
+        if matches!(self.backing, MappingBacking::Owned(_)) {
+            // SAFETY: `base`/`len` are exactly what `mmap` returned and this
+            // runs once. The `Shared` case is deliberately excluded: that
+            // mapping belongs to `sv_transport::region::SharedRegion`, which
+            // unmaps it in its own `Drop`, and unmapping it here would be the
+            // second `munmap` of one range.
+            unsafe {
+                libc::munmap(self.base as *mut libc::c_void, self.len);
+            }
         }
     }
 }

@@ -65,6 +65,15 @@ pub fn is_arena_backed(memory_type_index: u32) -> bool {
     memory_type_index != memory_type::DEVICE_LOCAL
 }
 
+/// The `memoryTypeBits` a buffer gets: every arena-backed type, which is every
+/// type but 0.
+///
+/// This substitutes for whatever the real driver reports, and it has to: the two
+/// sides number memory types differently, and design.md §9.1 says we advertise
+/// our four rather than mirroring the driver's. An application handed the
+/// driver's mask would index our table with somebody else's numbering.
+pub const ARENA_MEMORY_TYPE_BITS: u32 = 0b1110;
+
 /// The memory table of design.md §9.1.
 ///
 /// `arena_len` is the real arena size and is reported honestly: "applications

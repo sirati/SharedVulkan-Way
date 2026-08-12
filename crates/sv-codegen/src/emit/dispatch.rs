@@ -336,17 +336,60 @@ fn emit_server_trait(plan: &Plan) -> TokenStream {
     let methods = plan.commands.iter().map(|c| {
         let m = naming::command_method(&c.name);
         let args = args_ty(c);
-        let doc = format!("Handle `{}`.", c.name);
-        if c.generates_reply {
+        let opcode = c.opcode;
+        let doc = format!(
+            "Handle `{}`.\n\nThe default refuses with \
+             [`sv_wire::WireError::UnknownCommand`] carrying this command's own \
+             opcode, so a GPU side implements the commands it has and every \
+             other one fails by name rather than failing to compile.",
+            c.name
+        );
+        if c.generates_reply && c.returns_result {
+            // A command that returns a `VkResult` has somewhere to put a
+            // refusal, so the default **fails the call and not the session**.
+            //
+            // That distinction is the difference between a GPU side that can be
+            // widened one command at a time and one that cannot. Returning `Err`
+            // here propagates out of `dispatch`, which produces no reply at all
+            // — so the ring goes fatal and the app side, still waiting, times
+            // out on a command it will never hear about. One unimplemented query
+            // would take the device with it, which is exactly what happened on
+            // the first end-to-end run: `vulkaninfo` reached
+            // `vkGetPhysicalDeviceImageFormatProperties` and lost the device.
             let reply = reply_ty(c);
             quote! {
                 #[doc = #doc]
-                fn #m(&mut self, args: #args) -> sv_wire::Result<#reply>;
+                fn #m(&mut self, args: #args) -> sv_wire::Result<#reply> {
+                    let _ = args;
+                    let mut r = <#reply as Default>::default();
+                    // `VK_ERROR_INITIALIZATION_FAILED`, for the reason
+                    // `sv_icd_entry::lower_failed` gives: it is a result almost
+                    // every command may return, so an application that handles
+                    // errors at all handles it.
+                    r.result = VkResult(-3);
+                    Ok(r)
+                }
+            }
+        } else if c.generates_reply {
+            // A reply with no `VkResult` — `vkGetBufferMemoryRequirements` and
+            // its kind. There is nowhere to put a refusal and inventing zeros
+            // would be worse than failing, because the caller cannot tell them
+            // apart from a real answer.
+            let reply = reply_ty(c);
+            quote! {
+                #[doc = #doc]
+                fn #m(&mut self, args: #args) -> sv_wire::Result<#reply> {
+                    let _ = args;
+                    Err(sv_wire::WireError::UnknownCommand { opcode: #opcode })
+                }
             }
         } else {
             quote! {
                 #[doc = #doc]
-                fn #m(&mut self, args: #args) -> sv_wire::Result<()>;
+                fn #m(&mut self, args: #args) -> sv_wire::Result<()> {
+                    let _ = args;
+                    Err(sv_wire::WireError::UnknownCommand { opcode: #opcode })
+                }
             }
         }
     });
@@ -359,6 +402,18 @@ fn emit_server_trait(plan: &Plan) -> TokenStream {
         /// trait; nothing about Vulkan is. That separation is what lets the
         /// whole protocol be tested against a fake server with no driver
         /// present, which is what design.md §13 steps 1–6 need.
+        ///
+        /// # Every method has a default, and that is a correction to design.md
+        ///
+        /// §13 sequences the GPU side as a widening series of steps — step 4 is
+        /// a byte-pattern round trip, step 6 is "widen to Zink's requirement
+        /// set" — and that sequence is only expressible if a `Server` may
+        /// implement a *subset*. As first generated this trait had 239 required
+        /// methods, so the smallest possible GPU side was 239 stubs before it
+        /// could answer one command, and each new step would have edited stubs
+        /// rather than added methods. The refusal is the dual of the `Icd`
+        /// trait's, which had defaults from the start; the asymmetry was an
+        /// oversight rather than a decision.
         pub trait Server {
             #(#methods)*
         }

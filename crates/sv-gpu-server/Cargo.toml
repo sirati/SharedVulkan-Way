@@ -1,0 +1,34 @@
+[package]
+name = "sv-gpu-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The shared_vulkan GPU side: ring consumers, the object table, SlabImport, and a real Vulkan driver behind them"
+
+[dependencies]
+sv-proto.workspace = true
+sv-wire.workspace = true
+sv-transport.workspace = true
+sv-arena.workspace = true
+# The reference implementation of the workload's transform, and the page-record
+# layout. Shared with `gpu-probe` rather than re-typed, so the shader, the GPU
+# side and the app side cannot drift — which is the whole reason the check is
+# informative.
+arena-record = { path = "../arena-record" }
+# `loaded` rather than `linked`: the GPU side dlopens the loader at run time,
+# which is what lets one binary run against lavapipe in a container and against
+# a real driver on the metal without a rebuild. `vk-probe` and `gpu-probe`
+# already make the same choice.
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+# Only so the two sides' shared constants can be *compared* rather than each
+# asserted against a literal. Neither side may depend on the other at run time —
+# they are separate processes and, on `testhost`, separate operating systems —
+# but a test binary can link both and check they agree.
+sv-icd = { path = "../sv-icd" }
+sv-hostd = { path = "../sv-hostd" }

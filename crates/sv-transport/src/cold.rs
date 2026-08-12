@@ -409,24 +409,69 @@ mod unix_socket {
         payload: &[u8],
         fd: Option<BorrowedFd<'_>>,
     ) -> Result<()> {
+        match fd {
+            Some(f) => send_with_fds(sock, payload, &[f]),
+            None => send_with_fds(sock, payload, &[]),
+        }
+    }
+
+    /// The most descriptors one cold-path message may carry.
+    ///
+    /// Two, and the reason is the GPU-side arena provider: when the driver
+    /// allocates the arena and exports it, the control region stays a memfd —
+    /// §4.1 splits the two regions *by purpose*, and the control region has no
+    /// reason to be GPU memory — so the client needs one descriptor for each.
+    /// The memfd provider still sends one, because there both regions are the
+    /// same file.
+    pub const MAX_FDS: usize = 2;
+
+    /// Send a message, passing up to [`MAX_FDS`] descriptors with it.
+    ///
+    /// # Safety
+    ///
+    /// One `sendmsg` with a hand-built `msghdr` and one `SCM_RIGHTS` control
+    /// message. The invariants:
+    ///
+    /// - The `iovec` points at `framed`, which outlives the call.
+    /// - The control buffer is `CMSG_SPACE(4 * MAX_FDS)` bytes — 24 on a 64-bit
+    ///   Linux, which is the same 24 that one descriptor already needed, because
+    ///   `CMSG_SPACE` rounds up to 8 — and `cmsg_len` is set to
+    ///   `CMSG_LEN(4 * n)`, so the kernel reads exactly `n` `int`s from it.
+    /// - The descriptors are *borrowed*: the kernel duplicates them into the
+    ///   receiver, and this side's ownership is unaffected.
+    ///
+    /// The layout of `msghdr`, `iovec` and `cmsghdr` is transcribed for 64-bit
+    /// Linux, which is asserted at compile time below rather than assumed.
+    pub fn send_with_fds(
+        sock: &UnixStream,
+        payload: &[u8],
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<()> {
+        if fds.len() > MAX_FDS {
+            return Err(Error::BadColdMessage("too many descriptors for one cold-path message"));
+        }
         let mut framed = Vec::with_capacity(payload.len() + 4);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         framed.extend_from_slice(payload);
 
-        let Some(fd) = fd else {
+        if fds.is_empty() {
             sock.try_clone()
                 .and_then(|mut s| s.write_all(&framed))
                 .map_err(|e| Error::Os { call: "write", errno: e.raw_os_error().unwrap_or(0) })?;
             return Ok(());
-        };
+        }
 
         let mut iov = sys::Iovec { base: framed.as_ptr() as *mut u8, len: framed.len() };
-        let mut cbuf = [0u8; sys::CMSG_SPACE_ONE_FD];
-        // cmsg_len, cmsg_level, cmsg_type, then the fd.
-        cbuf[0..8].copy_from_slice(&(sys::CMSG_LEN_ONE_FD as u64).to_le_bytes());
+        let mut cbuf = [0u8; sys::CMSG_SPACE_MAX_FDS];
+        // cmsg_len, cmsg_level, cmsg_type, then the descriptors.
+        let cmsg_len = sys::CMSG_LEN_HDR + 4 * fds.len();
+        cbuf[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
         cbuf[8..12].copy_from_slice(&sys::SOL_SOCKET.to_le_bytes());
         cbuf[12..16].copy_from_slice(&sys::SCM_RIGHTS.to_le_bytes());
-        cbuf[16..20].copy_from_slice(&fd.as_raw_fd().to_le_bytes());
+        for (i, f) in fds.iter().enumerate() {
+            let at = 16 + 4 * i;
+            cbuf[at..at + 4].copy_from_slice(&f.as_raw_fd().to_le_bytes());
+        }
 
         let mut msg = sys::MsgHdr {
             name: core::ptr::null_mut(),
@@ -435,7 +480,7 @@ mod unix_socket {
             iov: &mut iov,
             iovlen: 1,
             control: cbuf.as_mut_ptr() as *mut core::ffi::c_void,
-            controllen: sys::CMSG_SPACE_ONE_FD,
+            controllen: sys::cmsg_space(fds.len()),
             flags: 0,
             _pad1: 0,
         };
@@ -469,9 +514,26 @@ mod unix_socket {
     /// it to the same `sendmsg` as the prefix — so the fd arrives here or not at
     /// all.
     pub fn recv_with_fd(sock: &UnixStream, out: &mut Vec<u8>) -> Result<Option<OwnedFd>> {
+        Ok(recv_with_fds(sock, out)?.into_iter().next())
+    }
+
+    /// Receive one message, and every descriptor that came with it.
+    ///
+    /// # Safety
+    ///
+    /// One `recvmsg`, with `MSG_CMSG_CLOEXEC` so a descriptor cannot leak
+    /// through an `exec` between arriving and being wrapped. Each returned fd is
+    /// wrapped in an [`OwnedFd`] immediately, so it is closed exactly once.
+    ///
+    /// The first `recvmsg` asks for the four-byte length prefix only. On a
+    /// `SOCK_STREAM` Unix socket the ancillary data is delivered with the read
+    /// that consumes the first byte it was attached to, and the sender attaches
+    /// it to the same `sendmsg` as the prefix — so the descriptors arrive here or
+    /// not at all.
+    pub fn recv_with_fds(sock: &UnixStream, out: &mut Vec<u8>) -> Result<Vec<OwnedFd>> {
         let mut lenbuf = [0u8; 4];
         let mut iov = sys::Iovec { base: lenbuf.as_mut_ptr(), len: 4 };
-        let mut cbuf = [0u8; sys::CMSG_SPACE_ONE_FD];
+        let mut cbuf = [0u8; sys::CMSG_SPACE_MAX_FDS];
         let mut msg = sys::MsgHdr {
             name: core::ptr::null_mut(),
             namelen: 0,
@@ -479,7 +541,7 @@ mod unix_socket {
             iov: &mut iov,
             iovlen: 1,
             control: cbuf.as_mut_ptr() as *mut core::ffi::c_void,
-            controllen: sys::CMSG_SPACE_ONE_FD,
+            controllen: sys::CMSG_SPACE_MAX_FDS,
             flags: 0,
             _pad1: 0,
         };
@@ -493,15 +555,25 @@ mod unix_socket {
             return Err(Error::BadColdMessage("peer closed the cold path"));
         }
 
-        let mut fd = None;
-        if msg.controllen >= sys::CMSG_LEN_ONE_FD {
+        let mut fds = Vec::new();
+        if msg.controllen >= sys::CMSG_LEN_HDR + 4 {
+            let cmsg_len = u64::from_le_bytes(cbuf[0..8].try_into().unwrap()) as usize;
             let level = i32::from_le_bytes(cbuf[8..12].try_into().unwrap());
             let ty = i32::from_le_bytes(cbuf[12..16].try_into().unwrap());
             if level == sys::SOL_SOCKET && ty == sys::SCM_RIGHTS {
-                let raw = i32::from_le_bytes(cbuf[16..20].try_into().unwrap());
-                // SAFETY: the kernel installed `raw` in this process's table and
-                // nobody else has it; wrapping it here is the unique owner.
-                fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+                // How many descriptors the kernel actually delivered, from the
+                // header it wrote — not from how many we hoped for. A truncated
+                // `cmsg_len` would otherwise have us wrap uninitialised bytes as
+                // descriptor numbers.
+                let n = cmsg_len.saturating_sub(sys::CMSG_LEN_HDR) / 4;
+                for i in 0..n.min(MAX_FDS) {
+                    let at = 16 + 4 * i;
+                    let raw = i32::from_le_bytes(cbuf[at..at + 4].try_into().unwrap());
+                    // SAFETY: the kernel installed `raw` in this process's table
+                    // and nobody else has it; wrapping it here is the unique
+                    // owner.
+                    fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                }
             }
         }
 
@@ -524,7 +596,7 @@ mod unix_socket {
         out.resize(len, 0);
         s.read_exact(out)
             .map_err(|e| Error::Os { call: "read_exact", errno: e.raw_os_error().unwrap_or(0) })?;
-        Ok(fd)
+        Ok(fds)
     }
 
     /// Send a [`ColdMessage`], with no descriptor.
@@ -541,6 +613,13 @@ mod unix_socket {
         Ok((ColdMessage::decode(&buf)?, fd))
     }
 
+    /// Receive a [`ColdMessage`] and every descriptor it carried.
+    pub fn recv_all(sock: &UnixStream) -> Result<(ColdMessage, Vec<OwnedFd>)> {
+        let mut buf = Vec::new();
+        let fds = recv_with_fds(sock, &mut buf)?;
+        Ok((ColdMessage::decode(&buf)?, fds))
+    }
+
     /// The three structures `sendmsg` needs, transcribed for 64-bit Linux.
     pub(super) mod sys {
         use core::ffi::c_void;
@@ -549,10 +628,20 @@ mod unix_socket {
         pub const SCM_RIGHTS: i32 = 1;
         pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
-        /// `CMSG_LEN(sizeof(int))` — a 16-byte `cmsghdr` plus four bytes.
-        pub const CMSG_LEN_ONE_FD: usize = 16 + 4;
-        /// `CMSG_SPACE(sizeof(int))` — the same, aligned up to 8.
-        pub const CMSG_SPACE_ONE_FD: usize = 16 + 8;
+        /// The `cmsghdr` itself: `cmsg_len` (8), `cmsg_level` (4), `cmsg_type` (4).
+        pub const CMSG_LEN_HDR: usize = 16;
+        /// `CMSG_SPACE(sizeof(int) * MAX_FDS)`.
+        ///
+        /// Two descriptors need 16 + 8 = 24 bytes, which is the same 24 one
+        /// descriptor needed, because `CMSG_SPACE` rounds the data up to 8. That
+        /// coincidence is why widening the cold path to two costs no buffer
+        /// growth — it is checked by `two_fds_need_no_more_space_than_one`.
+        pub const CMSG_SPACE_MAX_FDS: usize = 16 + 8;
+
+        /// `CMSG_SPACE(sizeof(int) * n)`.
+        pub const fn cmsg_space(n: usize) -> usize {
+            CMSG_LEN_HDR + (4 * n).div_ceil(8) * 8
+        }
 
         #[repr(C)]
         pub struct Iovec {
@@ -588,7 +677,9 @@ mod unix_socket {
 }
 
 #[cfg(unix)]
-pub use unix_socket::{recv, recv_with_fd, send, send_with_fd};
+pub use unix_socket::{
+    MAX_FDS, recv, recv_all, recv_with_fd, recv_with_fds, send, send_with_fd, send_with_fds,
+};
 
 /// On Windows the cold path is a named pipe, and it is not written.
 ///
@@ -758,6 +849,87 @@ mod tests {
         let mut out = [0u8; 7];
         there.read_bytes(128, &mut out).unwrap();
         assert_eq!(&out, b"crossed");
+    }
+
+    /// The GPU-allocated arena needs two descriptors, not one.
+    ///
+    /// On that path the control region stays an ordinary memfd — §4.1 splits the
+    /// two regions by purpose and the control region has no reason to be GPU
+    /// memory — while the arena is the driver's own allocation, exported. They
+    /// are two kernel objects and both have to cross in one message, because the
+    /// client cannot attach to one without the other.
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "socketpair and sendmsg are syscalls Miri does not implement")]
+    fn two_descriptors_cross_together_and_stay_distinct() {
+        use crate::region::{SharedRegion, memfd};
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let control = memfd("sv-cold-control", 4096).unwrap();
+        let arena = memfd("sv-cold-arena", 4096).unwrap();
+        let msg = ColdMessage::Attach(Attachment {
+            control_offset: 0,
+            control_len: 4096,
+            // Zero, because on this path the arena is its own object and begins
+            // at *its* offset zero — which is how a client distinguishes the two
+            // providers without a flag.
+            arena_offset: 0,
+            arena_len: 4096,
+            generation: 7,
+            run_count: 0,
+        });
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        send_with_fds(&a, &buf, &[control.as_fd(), arena.as_fd()]).unwrap();
+
+        let (got, fds) = recv_all(&b).unwrap();
+        assert_eq!(got, msg);
+        assert_eq!(fds.len(), 2, "both descriptors must arrive, in order");
+
+        // They must be *different* objects: a receiver that got the same fd
+        // twice would map the control region as the arena and the ring
+        // directory would be the first thing an allocation overwrote.
+        let c_here = SharedRegion::map_fd(control.as_fd(), 0, 4096).unwrap();
+        let a_there = SharedRegion::map_fd(fds[1].as_fd(), 0, 4096).unwrap();
+        let c_there = SharedRegion::map_fd(fds[0].as_fd(), 0, 4096).unwrap();
+        c_here.write_bytes(0, b"CONTROL").unwrap();
+        let mut out = [0u8; 7];
+        c_there.read_bytes(0, &mut out).unwrap();
+        assert_eq!(&out, b"CONTROL", "the first descriptor is the control region");
+        a_there.read_bytes(0, &mut out).unwrap();
+        assert_eq!(&out, &[0u8; 7], "the arena must not be the control region");
+    }
+
+    /// One descriptor still works, because `sv-hostd` still sends one.
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "socketpair and sendmsg are syscalls Miri does not implement")]
+    fn one_descriptor_is_still_one_descriptor() {
+        use crate::region::memfd;
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let fd = memfd("sv-cold-single", 4096).unwrap();
+        let mut buf = Vec::new();
+        ColdMessage::Ping.encode(&mut buf).unwrap();
+        send_with_fds(&a, &buf, &[fd.as_fd()]).unwrap();
+        let (_, fds) = recv_all(&b).unwrap();
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn two_descriptors_need_no_more_control_space_than_one() {
+        // `CMSG_SPACE` rounds the data up to 8, so one `int` and two `int`s
+        // occupy the same 24 bytes. The buffer size is therefore unchanged by
+        // widening the cold path, which is worth pinning rather than
+        // rediscovering the next time it widens to three.
+        assert_eq!(unix_socket::sys::cmsg_space(1), unix_socket::sys::CMSG_SPACE_MAX_FDS);
+        assert_eq!(unix_socket::sys::cmsg_space(2), unix_socket::sys::CMSG_SPACE_MAX_FDS);
+        // Three would not fit, which is what `MAX_FDS` is for.
+        assert!(unix_socket::sys::cmsg_space(3) > unix_socket::sys::CMSG_SPACE_MAX_FDS);
     }
 
     #[cfg(unix)]

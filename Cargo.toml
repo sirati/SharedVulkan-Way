@@ -16,6 +16,7 @@ members = [
   "crates/sv-transport",
   "crates/sv-arena",
   "crates/sv-hostd",
+  "crates/sv-gpu-server",
 ]
 
 [workspace.package]

@@ -39,6 +39,26 @@ pub mod advertise;
 pub mod arena;
 pub mod icd;
 pub mod state;
+pub mod transport;
+
+/// The identity this build puts in the handshake, and checks on attach.
+///
+/// Must equal `sv_gpu_server::protocol_ids()`. Both are `sv_proto`'s hash over
+/// the generated command and struct table, which is what makes a version skew a
+/// refusal rather than a desynchronisation (design.md §4.3, R13).
+pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
+    sv_transport::control::ProtocolIds::new(WIRE_VERSION, sv_proto::PROTOCOL_HASH)
+}
+
+/// See `sv_gpu_server::WIRE_VERSION`.
+pub const WIRE_VERSION: u32 = 1;
+
+/// The environment variable that points at a GPU side.
+///
+/// An ICD cannot be given arguments — the loader `dlopen`s it — so the socket
+/// has to arrive as environment. Unset means "no GPU side", which is a supported
+/// configuration and not an error: the driver still loads and still enumerates.
+pub const SOCKET_ENV: &str = "SV_SOCKET";
 
 use core::ffi::{c_char, c_void};
 use std::sync::OnceLock;
@@ -74,6 +94,31 @@ static ICD: OnceLock<Option<&'static state::SharedVulkan>> = OnceLock::new();
 
 fn instance() -> Option<&'static state::SharedVulkan> {
     *ICD.get_or_init(|| {
+        // A GPU side, if one was named. Failing to reach it is fatal rather
+        // than a silent fallback to the standalone driver: an application told
+        // to use a GPU side and quietly given a driver that answers everything
+        // from a table would produce plausible nonsense, which is the one
+        // failure mode this project must not have.
+        #[cfg(target_os = "linux")]
+        if let Some(sock) = std::env::var_os(SOCKET_ENV) {
+            let sock = sock.to_string_lossy().into_owned();
+            return match state::SharedVulkan::connected(&sock) {
+                Ok(icd) => {
+                    let leaked: &'static state::SharedVulkan = Box::leak(Box::new(icd));
+                    sv_icd_entry::set_icd(leaked);
+                    eprintln!("sv-icd: connected to the GPU side at {sock}");
+                    Some(leaked)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "sv-icd: {SOCKET_ENV}={sock} but the GPU side is unreachable: {e}\n\
+                         sv-icd: refusing to load rather than answering locally"
+                    );
+                    None
+                }
+            };
+        }
+
         let arena_len = std::env::var("SV_ARENA_BYTES")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())

@@ -22,13 +22,21 @@
 //!   constant, and every such place says so. Nothing here pretends to have run
 //!   on a GPU.
 //!
-//! The seam where the transport goes is [`Transport`]: one trait, no
-//! implementations yet, and the reason it is a trait rather than a direct call
-//! to `sv_transport` is that the crate is being written in another worktree and
-//! this one must not guess at its API.
+//! **That is no longer the state of this crate.** `sv-transport` and
+//! `sv-gpu-server` exist, [`crate::transport::RingTransport`] implements the
+//! seam, and when `SV_SOCKET` names a live GPU side every one of the ~239
+//! forwarded commands crosses instead of being answered here. What is still
+//! answered locally is exactly the set design.md §8, §9 and §10 name — the
+//! memory table, the extension lists, the WSI family, and `vkMapMemory` — plus,
+//! when there is *no* GPU side, everything, so that `vulkaninfo` against a
+//! standalone driver still produces a report.
+//!
+//! The seam is [`sv_icd_entry::Transport`], and it lives there rather than here
+//! because the generated forwarders have to name it and they cannot depend on
+//! the crate that depends on them.
 
 use crate::advertise;
-use crate::arena::{Allocation, Mapping, Placeholder};
+use crate::arena::{Allocation, Backing, Mapping, Placeholder};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use sv_icd_entry::{IcdResult, LowerError};
@@ -36,28 +44,16 @@ use sv_icd_entry::{IcdResult, LowerError};
 /// `VK_MAKE_API_VERSION(0, 1, 3, 0)`, and it must agree with the manifest.
 pub const API_VERSION: u32 = (1 << 22) | (3 << 12);
 
+/// The reserved id the arena's `VkDeviceMemory` has on the GPU side.
+///
+/// Must equal `sv_gpu_server::ARENA_MEMORY_ID`. Declared here rather than taken
+/// as a dependency because the app side must not link the GPU side: the two are
+/// separate processes and, on `testhost`, separate operating systems. The
+/// agreement is checked by `the_two_sides_agree_about_the_arena_id`.
+pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
+
 /// The default arena size when nothing else says (design.md §4.2's table).
 pub const DEFAULT_ARENA_LEN: u64 = 256 << 20;
-
-/// Where the command stream would go.
-///
-/// Deliberately not implemented in this crate. `sv-transport` (rings, handshake,
-/// reply rings, `Parker`/`Doorbell`) is being written separately; when it lands,
-/// the implementation of this trait is the only thing that changes here, and
-/// every `Icd` method below that currently answers locally instead encodes and
-/// waits.
-///
-/// The signature is `(opcode, encoded bytes) -> reply bytes` rather than
-/// anything typed, because the typing has already happened: `sv-proto`'s
-/// generated `encode_cmd_*` produced the bytes and its `decode_reply_*` consumes
-/// them. A transport that knew about Vulkan would be a transport with a reason
-/// to be regenerated.
-pub trait Transport: Send + Sync {
-    /// Send a command and wait for its reply.
-    fn call(&self, opcode: u32, command: &[u8], reply: &mut Vec<u8>) -> Result<(), LowerError>;
-    /// Send a command that generates no reply (design.md §4.4, D15).
-    fn send(&self, opcode: u32, command: &[u8]) -> Result<(), LowerError>;
-}
 
 #[derive(Debug)]
 pub struct Instance {
@@ -100,10 +96,23 @@ pub struct State {
     /// Buffer id → its memory requirements, so `vkGetBufferMemoryRequirements`
     /// can answer without a GPU.
     pub buffers: HashMap<u64, u64>,
-    pub allocator: Placeholder,
+    pub allocator: Box<dyn Backing>,
 }
 
 impl State {
+    fn new(allocator: Box<dyn Backing>) -> State {
+        State {
+            next_id: 1,
+            instances: HashMap::new(),
+            physical_devices: HashMap::new(),
+            devices: HashMap::new(),
+            queues: HashMap::new(),
+            memories: HashMap::new(),
+            buffers: HashMap::new(),
+            allocator,
+        }
+    }
+
     pub fn mint(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -116,11 +125,16 @@ pub struct SharedVulkan {
     pub arena: Mapping,
     pub arena_len: u64,
     state: Mutex<State>,
-    #[allow(dead_code)]
-    transport: Option<Box<dyn Transport>>,
+    transport: Option<crate::transport::RingTransport>,
 }
 
 impl SharedVulkan {
+    /// A standalone driver: its own memfd, no GPU side.
+    ///
+    /// Not a fallback to be removed. `vulkaninfo` against this configuration is
+    /// what design.md §13 step 5 tests, the loader test in `tests/loader.rs`
+    /// drives it, and a machine with no GPU side running has to enumerate rather
+    /// than fail to load.
     pub fn new(arena_len: u64) -> Result<SharedVulkan, std::io::Error> {
         let arena = Mapping::create(arena_len)?;
         let allocator = Placeholder::new(arena_len, crate::arena::DEFAULT_SLAB_SIZE)
@@ -128,18 +142,70 @@ impl SharedVulkan {
         Ok(SharedVulkan {
             arena,
             arena_len,
-            state: Mutex::new(State {
-                next_id: 1,
-                instances: HashMap::new(),
-                physical_devices: HashMap::new(),
-                devices: HashMap::new(),
-                queues: HashMap::new(),
-                memories: HashMap::new(),
-                buffers: HashMap::new(),
-                allocator,
-            }),
+            state: Mutex::new(State::new(Box::new(allocator))),
             transport: None,
         })
+    }
+
+    /// A connected driver: the arena and the control region come from the peer.
+    ///
+    /// The allocator becomes the real `sv_arena::ArenaAllocator` rather than
+    /// `Placeholder`, because from here the offsets it produces are read by
+    /// *another process* — §5.2's segregated free lists and its slab-boundary
+    /// rule stop being an implementation detail and start being the contract.
+    #[cfg(target_os = "linux")]
+    pub fn connected(socket: &str) -> Result<SharedVulkan, String> {
+        let attached = crate::transport::RingTransport::connect(socket)?;
+        let arena = Mapping::attach(&attached.transport.arena, attached.arena_len);
+        // `CanaryPolicy::None`: R26's canary detects a *guest page* moving
+        // underneath a `VirtualLock`ed window, which is a Windows-in-a-VM
+        // failure. Neither Linux provider can exhibit it — a memfd's pages do
+        // not migrate under a `MAP_SHARED` mapping, and driver memory is the
+        // driver's — so the canary here would cost a page per slab to detect
+        // something that cannot happen.
+        let allocator = sv_arena::alloc::ArenaAllocator::new(
+            attached.arena_len,
+            attached.slab_size,
+            sv_arena::canary::CanaryPolicy::None,
+        )
+        .map_err(|e| format!("{e}"))?;
+        Ok(SharedVulkan {
+            arena,
+            arena_len: attached.arena_len,
+            state: Mutex::new(State::new(Box::new(allocator))),
+            transport: Some(attached.transport),
+        })
+    }
+
+    /// The transport, if this process is connected to a GPU side.
+    pub fn wire(&self) -> Option<&dyn sv_icd_entry::Transport> {
+        self.transport.as_ref().map(|t| t as &dyn sv_icd_entry::Transport)
+    }
+
+    /// design.md §5.3's rewrite, app-side half: allocation coordinates become
+    /// arena coordinates.
+    ///
+    /// Returns `(memory id, offset)` ready to cross. For an arena-backed
+    /// allocation that is `(ARENA_MEMORY_ID, arena_offset + offset)`; for
+    /// heap-0 memory it is the pair unchanged, because that memory is a real
+    /// GPU-side allocation under the app's own id.
+    pub fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
+        let s = self.state();
+        let m = s
+            .memories
+            .get(&memory)
+            .ok_or(LowerError::Shape("no such VkDeviceMemory"))?;
+        let Some(a) = m.allocation else {
+            return Ok((memory, offset));
+        };
+        if offset > a.size {
+            return Err(LowerError::Shape("offset is outside the allocation"));
+        }
+        let base = s
+            .allocator
+            .arena_offset(a)
+            .map_err(|_| LowerError::Shape("allocation is outside the arena"))?;
+        Ok((ARENA_MEMORY_ID, base + offset))
     }
 
     /// A poisoned lock is not a reason to abort an application's Vulkan call:

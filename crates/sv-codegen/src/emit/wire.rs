@@ -681,15 +681,31 @@ fn length_check(
         format!("{sibling} / {divisor} (the altlen= of {})", f.name)
     };
 
-    // An `optional="true"` array is allowed to be absent *while its count is
-    // non-zero*, and this is not a corner case: `VkSubpassDescription` has
-    // `colorAttachmentCount` governing `pColorAttachments`, `pResolveAttachments`
-    // and `pDepthStencilAttachment`, and a subpass with no resolve attachments
-    // passes NULL for the second while the count describes the first. Venus
-    // encodes a NULL array as a count of zero, so "empty" and "absent" are the
-    // same thing on the wire and an empty optional array must not trip the
-    // check.
-    let guard = if f.optional {
+    // An array that may be absent *while its count is non-zero* must not trip
+    // the check, and this is not a corner case. Two registry markers say it:
+    //
+    // - `optional="true"`. `VkSubpassDescription` has `colorAttachmentCount`
+    //   governing `pColorAttachments`, `pResolveAttachments` and
+    //   `pDepthStencilAttachment`, and a subpass with no resolve attachments
+    //   passes NULL for the second while the count describes the first.
+    //
+    // - `noautovalidity="true"`, which the registry uses for a member whose
+    //   validity is decided by *another member's value* rather than by its own
+    //   metadata. `VkWriteDescriptorSet` is the case that matters:
+    //   `descriptorCount` is the `len=` of `pImageInfo`, `pBufferInfo` and
+    //   `pTexelBufferView`, and `descriptorType` picks one. None of the three is
+    //   `optional`, so keying only on that rejected **every legal
+    //   `vkUpdateDescriptorSets`** — which is how this was found, by a compute
+    //   dispatch whose descriptors are buffers and whose `pImageInfo` is
+    //   therefore empty.
+    //
+    // Venus encodes a NULL array as a count of zero, so "empty" and "absent" are
+    // the same thing on the wire, and the relaxation costs nothing: the wire
+    // carries its own count for every array (§7.4), so this check is a verifier
+    // and never an input. What is given up is catching a *populated* array whose
+    // count disagrees — and that is still caught, because the guard only skips
+    // the empty case.
+    let guard = if f.optional || f.no_auto_validity {
         quote!(!#binding.#array.is_empty() &&)
     } else {
         quote!()

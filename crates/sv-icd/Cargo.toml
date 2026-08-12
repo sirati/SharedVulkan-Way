@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 sv-icd-entry.workspace = true
 sv-proto.workspace = true
 sv-wire.workspace = true
+sv-transport.workspace = true
+sv-arena.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

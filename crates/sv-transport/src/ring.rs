@@ -123,6 +123,10 @@ struct Lanes {
     capacity: u64,
     head_off: u64,
     tail_off: u64,
+    /// Which lane this is. Kept because the two carry *different headers* —
+    /// `CommandHeader` one way and `ReplyHeader` the other — and the framing
+    /// cross-check has to read the right one. See `RingConsumer::next`.
+    lane: Lane,
 }
 
 fn lanes(control: &Control, slot: u32, lane: Lane) -> Result<Lanes> {
@@ -134,12 +138,14 @@ fn lanes(control: &Control, slot: u32, lane: Lane) -> Result<Lanes> {
             capacity: u64::from(cmd_len),
             head_off: ctrl + RC_CMD_HEAD,
             tail_off: ctrl + RC_CMD_TAIL,
+            lane,
         },
         Lane::Reply => Lanes {
             data_off: reply_off,
             capacity: u64::from(reply_len),
             head_off: ctrl + RC_REPLY_HEAD,
             tail_off: ctrl + RC_REPLY_TAIL,
+            lane,
         },
     })
 }
@@ -635,9 +641,9 @@ impl RingConsumer {
             self.region.read_bytes(self.lanes.data_off + pos + at, &mut self.buf)?;
 
             // Deviation 1's second half: the framing length and the sv-wire
-            // command header's own `cmd_size` are two independent statements
-            // about the same bytes, and a desynchronised stream is caught here
-            // rather than three commands later.
+            // header's own declared size are two independent statements about
+            // the same bytes, and a desynchronised stream is caught here rather
+            // than three commands later.
             //
             // This is also where the ring's one-command-per-packet rule is
             // enforced. Batching several commands into one packet would save a
@@ -646,8 +652,31 @@ impl RingConsumer {
             // could be neither ordered against nor replied to individually.
             // Commands that genuinely want batching go into an arena blob and
             // travel as one `svExecuteCommandBlob` descriptor (design.md §6.5).
-            if self.buf.len() >= sv_wire::COMMAND_HEADER_SIZE {
-                let declared = u32::from_le_bytes(self.buf[8..12].try_into().unwrap());
+            //
+            // **THE SIZE IS AT A DIFFERENT OFFSET ON THE TWO LANES**, and
+            // reading it from the command position on a reply lane was a live
+            // bug. A `sv_wire::CommandHeader` is `{cmd_type, cmd_flags,
+            // cmd_size}` and puts its length at byte 8; a `ReplyHeader` is
+            // `{cmd_type, reply_size}` and puts its length at byte 4. Checking a
+            // reply at offset 8 reads the reply's *first payload field* as a
+            // length — for `vkCreateInstance` that is `VkResult`, so a
+            // successful reply declared a length of zero and every forwarded
+            // command failed at the first round trip.
+            //
+            // It was invisible until a real reply crossed: `sv-loopback` builds
+            // its replies with a `CommandHeader`, because it predates the
+            // generated protocol and had no `ReplyHeader` to use.
+            let size_at = match self.lanes.lane {
+                Lane::Command => 8,
+                Lane::Reply => 4,
+            };
+            let header_len = match self.lanes.lane {
+                Lane::Command => sv_wire::COMMAND_HEADER_SIZE,
+                Lane::Reply => sv_wire::REPLY_HEADER_SIZE,
+            };
+            if self.buf.len() >= header_len {
+                let declared =
+                    u32::from_le_bytes(self.buf[size_at..size_at + 4].try_into().unwrap());
                 // The payload is zero-padded up to the packet alignment, so the
                 // framed payload is `declared` rounded up to 16 — never less,
                 // and never a whole alignment unit more.
@@ -813,6 +842,21 @@ mod tests {
         v
     }
 
+    /// The reply lane's shape, which is **not** the command lane's.
+    ///
+    /// `sv_wire::ReplyHeader` is `{cmd_type, reply_size}` — eight bytes, with
+    /// the length at offset 4, where a `CommandHeader` has `cmd_flags`.
+    fn reply(opcode: u32, payload_len: usize) -> Vec<u8> {
+        let total = sv_wire::REPLY_HEADER_SIZE + payload_len;
+        let mut v = vec![0u8; total];
+        v[0..4].copy_from_slice(&opcode.to_le_bytes());
+        v[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+        for (i, b) in v[sv_wire::REPLY_HEADER_SIZE..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        v
+    }
+
     #[test]
     fn a_packet_makes_the_round_trip() {
         let f = fixture();
@@ -852,10 +896,44 @@ mod tests {
         // A reply carries the seqno of the command it answers, so it is matched
         // by number rather than by position — which is what makes replies a
         // stream and not sharedgl's single mailbox (§4.4).
-        rep_p.push_seq(seqno, &command(7, 4), None).unwrap();
+        rep_p.push_seq(seqno, &reply(7, 4), None).unwrap();
         let r = rep_c.next().unwrap().unwrap();
         assert_eq!(r.seqno, seqno);
         rep_c.advance().unwrap();
+    }
+
+    /// The two lanes carry different headers, and the framing check has to read
+    /// the right one.
+    ///
+    /// This is a regression test, and the regression it guards against was live:
+    /// the consumer read every payload's declared length from the *command*
+    /// header's offset 8, so on a reply lane it read the reply's first payload
+    /// field. A `vkCreateInstance` reply whose first field is `VK_SUCCESS`
+    /// declared a length of zero, and the very first forwarded command failed
+    /// with `FramingDisagreement { framed: 32, declared: 0 }`. It was invisible
+    /// because the only reply lane in the tree at the time — `sv-loopback`'s —
+    /// hand-encoded its replies with a `CommandHeader`.
+    #[test]
+    fn each_lane_checks_its_own_header() {
+        let f = fixture();
+        let slot = f.control_peer.claim_ring(RingKind::Device, 1, None).unwrap();
+
+        // A well-formed reply passes on the reply lane…
+        let mut rep_p = RingProducer::open(&f.control_owner, slot, Lane::Reply).unwrap();
+        let mut rep_c = RingConsumer::open(&f.control_peer, slot, Lane::Reply).unwrap();
+        rep_p.push_seq(1, &reply(7, 24), None).unwrap();
+        assert!(rep_c.next().unwrap().is_some());
+        rep_c.advance().unwrap();
+
+        // …and a *command*-shaped payload on the reply lane does not, because
+        // its offset-4 word is `cmd_flags`, not a length. This is the check
+        // doing its job rather than a limitation: the two headers are different
+        // and a stream carrying the wrong one is desynchronised (R13).
+        rep_p.push_seq(2, &command(7, 24), None).unwrap();
+        assert!(
+            matches!(rep_c.next(), Err(Error::FramingDisagreement { .. })),
+            "a command header on the reply lane must be caught, not decoded"
+        );
     }
 
     #[test]
