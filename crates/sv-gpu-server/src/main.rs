@@ -170,10 +170,13 @@ fn serve(
 
     let mut objects = Objects::new();
     objects.set_arena(arena.memory, arena.len);
+    let fns = driver.load_fns();
+    report_missing(&fns);
     let shared = Arc::new(Shared {
         driver,
         arena,
         objects: std::sync::Mutex::new(objects),
+        fns,
     });
     let handled = session::serve(
         Arc::new(control),
@@ -244,10 +247,13 @@ fn attach(
 
     let mut objects = Objects::new();
     objects.set_arena(arena.memory, arena.len);
+    let fns = driver.load_fns();
+    report_missing(&fns);
     let shared = Arc::new(Shared {
         driver,
         arena,
         objects: std::sync::Mutex::new(objects),
+        fns,
     });
     let handled = session::serve(
         Arc::new(control),
@@ -257,6 +263,25 @@ fn attach(
     )?;
     eprintln!("[gpu] {handled} commands dispatched");
     Ok(())
+}
+
+/// Say once, at startup, which of the profile's entry points this driver lacks.
+///
+/// Reported here rather than discovered per command: "this driver has no
+/// `vkCmdBeginRendering`" is a fact about the configuration, and an application
+/// should be told before it has drawn nothing for ten seconds. An empty list is
+/// the normal case on a modern driver and prints nothing.
+#[cfg(target_os = "linux")]
+fn report_missing(fns: &sv_gpu_entry::DriverFns) {
+    let missing = fns.missing();
+    if missing.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[gpu] the driver is missing {} of the profile's entry points, starting with {:?}",
+        missing.len(),
+        &missing[..missing.len().min(8)]
+    );
 }
 
 /// The geometry both sides use — [`sv_transport::control::Geometry::for_arena`],

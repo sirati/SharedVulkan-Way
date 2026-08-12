@@ -273,6 +273,130 @@ arena mapping and `vkMapMemory` are real — the pointer is a real pointer into
 real shared pages — and the half that has not happened is the GPU side importing
 them.
 
+### 0.4 What the Zink stage settled
+
+Built 2026-08-12. **OpenGL runs.** `eglinfo` on the surfaceless platform reports
+
+```
+OpenGL core profile renderer: zink Vulkan 1.4(AMD Ryzen 9 9950X3D … (RADV RAPHAEL_MENDOCINO) (MESA_RADV))
+OpenGL core profile version:  3.2 (Core Profile) Mesa 26.2.0
+```
+
+— GL 3.2 core, 3.2 compatibility and GLES 2.0, every context naming *the GPU
+side's* device — and `scripts/sv-zink-gl.sh` then renders a frame and checks its
+pixels: an indexed, depth-tested, textured, lit 4608-triangle mesh drawn into an
+FBO and read back, agreeing with the **same program on llvmpipe at 64.1 dB
+PSNR**. Two entirely different rasterisers producing the same image is the
+strongest available statement that what crossed the wire was right. §13 step 6 is
+met for GL 3.2; the deqp suite it also names has not been run.
+
+The stage is **223 of the 239 commands forwarded by a generated pass**, against
+about forty written by hand before it. Sixteen remain hand-written and each has a
+reason in `sv_codegen::exceptions::GPU_HAND_WRITTEN`. Eleven of its findings are
+corrections to this document.
+
+**1. §7.2's taxonomy is missing a pass, and it is not a two-by-two.** The
+previous stage recorded the gap — no wire→C "raise" for the GPU side — and it is
+now generated (`emit::gpu_entry`, pass 12). What it also found is that the table
+has a *third* axis. "C→wire, GPU side" looked reusable from the app side's
+`lower_*`, and is not: a `returnedonly` struct's members are the application's
+uninitialised memory on the app side and **the driver's answer** on the GPU side,
+so the app side's lowering deliberately zeroes exactly the members the GPU side
+exists to carry. The first generated run reported
+`VkPhysicalDeviceProperties` with an empty `deviceName` and `apiVersion = 0`.
+The direction does not determine the conversion; **the validity state does**, and
+`lower_full_*` is emitted alongside `lower_*` for that reason.
+
+**2. Pass 4 is not dead, it moved.** §7.2 strikes out `arena_bind` because owned
+Rust values make it a no-op. That is true of *decoding* and false of *raising*,
+which is the operation gfxstream's `deepcopy` actually serves: a C
+`VkGraphicsPipelineCreateInfo` holds eight pointers to sub-structures that must
+outlive the call. Pass 4 is `sv_gpu_entry::Raise`.
+
+**3. Passes 5 and 6 have to partition the handle space, and §7.2 does not say
+so.** Both claimed `VkDeviceMemory`. An app-side memory id is not a table entry
+at all — it is `ARENA_MEMORY_ID`, a sentinel, or an offset into a slab — so the
+handle map cannot resolve one and took the ring fatal on the first
+`vkBindBufferMemory` an application made. Only the *pair* means anything, so
+pass 6 owns it and pass 5 skips it.
+
+**4. `objecttype=` is a fifth kind of handle occurrence, and nothing reads it.**
+`VkDebugUtilsObjectNameInfoEXT::objectHandle` is a `uint64_t` whose type is
+decided at run time by a *sibling member*. No type-directed walk can see it, so
+the app side's id reached the driver unmapped and RADV dereferenced it. Two
+commands on this surface; both are hand-written.
+
+**5. The count-then-fill idiom was broken in the app side's writeback, silently,
+for every enumeration in the API.** It derived `*pCount` from *the length of the
+reply's array* rather than from the reply's count field. A GPU side answering the
+count query honestly — a number and no array, since `pProperties` was NULL —
+therefore wrote zero. It looked correct for exactly as long as the hand-written
+GPU side returned the full array on every call. The symptom was `vulkaninfo`
+printing an empty queue-family list and the validation layer indexing that empty
+vector and dying inside `ValidateDeviceQueueCreateInfos`.
+
+**6. `Vec<Box<T>>` as a pointer pool is unsound, and only Miri could say so.**
+Moving a `Box` retags its pointee, invalidating every pointer derived from it —
+and pushing it into a vector is a move, as is each reallocation afterwards. The
+code was entirely safe Rust and worked perfectly. `Box::into_raw` is the fix.
+This is R7's argument for Miri paying for itself in one afternoon.
+
+**7. The queue-family table is ours, not the driver's, for exactly §9.1's
+reason.** A GPU side has one queue on one family, chosen at startup. Passing
+RADV's five families through had an application select family 3 and
+`vkGetDeviceQueue` hand it family 0's queue in silence. One synthesised family,
+with the real flags of the one that exists.
+
+**8. §9.2 describes the device-extension list as something the app side
+curates. It cannot.** The list is the profile's extensions intersected with what
+the driver actually has, and only the side holding the driver knows the second
+half. It is asked of the GPU side once at connect.
+
+**9. Opening the driver before the application connects has a cost §3 does not
+mention.** `vkCreateDevice` binds an id to a device that already exists, so the
+application's requested feature set cannot be honoured. The mitigation is to
+enable everything the physical device reports — and to raise the instance to 1.3,
+because `scalarBlockLayout`, `timelineSemaphore` and `dynamicRendering` live in
+the 1.2 and 1.3 feature blocks and a 1.1 instance cannot name those structures.
+
+**10. `vkUpdateDescriptorSetWithTemplate`'s `pData` is the one parameter on this
+surface whose size is a property of another object's contents.** No fold over
+`vk.xml` can marshal it. It does not have to cross: the pointer is the
+*application's* and the ICD runs in the application's process, so the app side
+expands it into the `vkUpdateDescriptorSets` it means, using the entries it
+remembered at template creation. Zink's default descriptor path uses templates
+unconditionally, so this is on the critical path for OpenGL rather than a corner.
+
+**11. Overriding a generated `Icd` create-command silently opts out of id
+minting.** `emit_mint_outputs` lives in the trait *default*. Two descriptor
+update templates both numbered 0 aliased in the app side's table, the second
+overwrote the first, and a descriptor write went to a binding the other set's
+layout does not have. The failure is silent because 0 is `VK_NULL_HANDLE` and
+nothing rejects it.
+
+**What is not settled**, and is the honest state of this stage:
+
+- **GL 3.2, not 4.6.** llvmpipe gives 4.6 through the same program. Which
+  capability Zink is missing has not been established, and finding out is the
+  first job of the next stage — Zink computes its GL version from Gallium caps
+  that are themselves computed from device features, so the answer is a specific
+  feature or format that is not crossing correctly.
+- **`VUID-vkBindBufferMemory-memory-02726` fires twelve times per run.** The
+  arena on the export path is allocated with `VkExportMemoryAllocateInfo`, so
+  every buffer bound into it must be created with a matching
+  `VkExternalMemoryBufferCreateInfo`. The app side cannot add that chain — it
+  does not know the handle type — and the GPU side cannot add it in the generated
+  path. RADV tolerates it; another driver need not. This is a consequence of the
+  arena provider and belongs with §5.4.
+- **No windowed GL.** `zink_kopper` wants a swapchain and §10 keeps presentation
+  outside the protocol, so glxgears cannot run: Xvfb's GLX has no DRI3 and there
+  is no other display. What was tested instead is the same workload without the
+  window.
+- **`vkQueueSubmit` is forwarded rather than blob-executed.** §6.5's
+  `svExecuteCommandBlob` is still not built; every `vkCmd*` crosses as its own
+  ring packet. The generic forwarding is strictly better than the hand-written
+  version it replaced — it carries the `pNext` chain — but it is not §6.5.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
@@ -1793,6 +1917,36 @@ a reason we would otherwise discover painfully (fwd §1.3).
 | 9 | `subdecode` | GPU | The restricted `vkCmd*` decoder of §6.5 |
 | 10 | `icd_entry` | app | `extern "system"` stubs and the `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` tables |
 | 11 | `roundtrip_tests` | both | Generated property tests: encode → decode → compare, including pNext chains |
+| 12 | `gpu_entry` | GPU | **wire → C**, the driver's function table, and the forwarding `Server` impl (added 2026-08-12) |
+
+**This table is a two-by-two with a corner missing, and the corner is not
+optional** (2026-08-12, the Zink stage). "Which side" × "which direction" has
+four cells; passes 10 and 11 cover three of them and nothing covered *wire → C on
+the GPU side*, which is what every `vkCreate*` needs to call a driver at all. The
+previous stage wrote it by hand for about forty commands and recorded that it
+would not scale; pass 12 generates it for 223 and the hand-written GPU side is
+sixteen commands, each listed with its reason in
+`sv_codegen::exceptions::GPU_HAND_WRITTEN`.
+
+**And it is really a two-by-two-by-two.** The remaining cell — C → wire on the
+GPU side — looked like a free reuse of pass 10's `lower_*` and is not, because
+what differs between the two sides is not the direction but the **validity
+state**: a `returnedonly` struct's members are the *caller's uninitialised
+memory* on the app side (§6.1's three-state validity says do not read them) and
+*the driver's answer* on the GPU side. Reusing the app side's lowering produced a
+`VkPhysicalDeviceProperties` with an empty `deviceName`. Pass 12 emits
+`lower_full_*` from the same emitter with that one flag flipped.
+
+**Pass 4 is not dead; it moved into pass 12.** It is struck through below because
+*decoding* has nothing to bind — but *raising* does, and it is exactly
+gfxstream's `deepcopy`: a C `VkGraphicsPipelineCreateInfo` holds eight pointers
+to sub-structures that must outlive the call. Its pool is `sv_gpu_entry::Raise`.
+
+**Passes 5 and 6 partition the handle space.** `VkDeviceMemory` belongs to pass
+6 and pass 5 must skip it: an app-side memory id is not a table entry — it is a
+sentinel or a slab offset — so only the `(memory, offset)` *pair* can be
+resolved. Both passes claiming it took the ring fatal on the first
+`vkBindBufferMemory` an application made (§0.4).
 
 Not emitted, deliberately: gfxstream's `decodersnapshot` (7,063 lines of VM
 snapshot support we will never use) and `api_log_decoder`. `marshaling`,
@@ -1807,7 +1961,7 @@ with the packet's lifetime. Our decoder produces owned Rust values — `Vec<T>`,
 `Option<Box<T>>` — whose storage *is* their lifetime, so there is no binding step
 to generate. It is struck through above rather than deleted because a reader
 comparing the emitted crate against this table deserves to know why a file is
-missing; the pass numbering is otherwise unchanged. Ten passes are emitted.
+missing; the pass numbering is otherwise unchanged. Ten passes were emitted at that point; pass 12 is the eleventh (§0.4).
 
 The `(size, encode)` split is not collapsible. Both mature projects have a
 separate size pass and both need it for the same reason: you cannot reserve a
@@ -2348,7 +2502,7 @@ where it was aimed.
 The tiny command set was skipped: the profile machinery that selects commands is
 the same code whether it selects eight or 239, so the generator emits the whole
 **239-command Zink profile** — 126,205 lines from 10,145 hand-written, 657 tests,
-Miri clean. Ten passes are emitted (`arena_bind` has nothing to do, §7.2). Along
+Miri clean. Ten passes are emitted (`arena_bind` has nothing to do — until pass 12, where it does, §0.4). Along
 the way it corrected §6.1, §6.2, §7.2 and §7.4, found the `depends=` chain that
 had been silently cutting the profile to 55 commands (§7.1, §11), and caught a
 sign-inversion bug that every symmetric test agreed with (§7.3).
@@ -2372,10 +2526,28 @@ through `vkcube` on headless. *Test: `vulkaninfo` under the validation layers
 with no errors — the dispatch-magic contract is the classic silent-segfault
 trap and this is where it surfaces or does not.*
 
-**6. Widen to Zink's requirement set**, and run the `zink-lavapipe` deqp suite
-through our ICD. *Test: deqp pass rate, compared against `zink-venus-lavapipe`
-as the reference configuration.* This is the largest single step and it is
-mostly generator coverage plus GPU-side semantic glue.
+**6. Widen to Zink's requirement set. — DONE for GL 3.2, 2026-08-12.**
+
+> **[SUPERSEDED — the step as planned]**
+> ***6. Widen to Zink's requirement set**, and run the `zink-lavapipe` deqp suite
+> through our ICD. *Test: deqp pass rate, compared against `zink-venus-lavapipe`
+> as the reference configuration.* This is the largest single step and it is
+> mostly generator coverage plus GPU-side semantic glue.*
+
+It was mostly generator coverage, and the estimate of *which* generator work was
+wrong in an informative way: the widening was not "add commands", it was **add
+the pass §7.2 does not have**. 223 of 239 commands are forwarded by pass 12 and
+sixteen are hand-written, against about forty hand-written before it. §0.4 has
+the eleven corrections that came out of it.
+
+*Test, as run:* `scripts/sv-zink-gl.sh` — Zink starting on the surfaceless EGL
+platform and reporting a renderer string that names the GPU side's device, then
+`scripts/gl-probe.c` rendering a depth-tested, textured, lit mesh into an FBO and
+reading it back, compared against the identical program on llvmpipe at 64.1 dB
+PSNR. **Outstanding:** deqp has not been run, and the context is GL **3.2** where
+llvmpipe gives 4.6 — the missing capability is not yet identified and is the
+first thing to find. `scripts/sv-end-to-end.sh` and `scripts/sv-memfd-path.sh`
+still pass, the second on lavapipe with no GPU at all.
 
 **7. Cross the boundary.** Windows build of `sv-gpu-server`, the large-page
 arena with its 4 KiB fallback, `sv-hostd` (locate, coalesce, stitch), cold path

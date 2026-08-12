@@ -424,12 +424,23 @@ fn a_command_reaches_a_server_and_a_reply_comes_back() {
     assert_eq!(decode_reply_vk_create_buffer(&mut dec).unwrap(), reply);
 }
 
-/// The handle-map pass reaches into a `pNext` chain.
+/// The handle-map pass walks a struct's handles — and **leaves
+/// `VkDeviceMemory` alone**, because that one belongs to the transform pass.
 ///
-/// A `(memory, offset)` pair or an object id hidden in a chain link is exactly
-/// what a hand-written list of rewrite sites misses (design.md §5.3).
+/// # Why the two passes have to partition the handle space
+///
+/// design.md §7.2 lists `handle_map` (pass 5) and `transform` (pass 6) side by
+/// side and does not say which owns a `VkDeviceMemory`. Both did, and the result
+/// is specific: an app-side memory id is not a table entry at all — it is either
+/// `ARENA_MEMORY_ID`, a sentinel with no driver handle behind it, or an offset
+/// into a slab — so the handle map fails to resolve it and takes the ring fatal
+/// on the first `vkBindBufferMemory` an application makes. Zink's first buffer
+/// found it.
+///
+/// Pass 6 rewrites the *pair*, which is the only operation that means anything
+/// on a memory id: without its offset there is nothing to resolve.
 #[test]
-fn the_handle_map_pass_reaches_into_a_pnext_chain() {
+fn the_handle_map_pass_leaves_device_memory_to_the_transform_pass() {
     struct Plus(u64);
     impl HandleMapper for Plus {
         fn map(&mut self, _ty: HandleType, id: u64) -> sv_wire::Result<u64> {
@@ -444,8 +455,13 @@ fn the_handle_map_pass_reaches_into_a_pnext_chain() {
         memory_offset: 4096,
     };
     handle_map_vk_bind_buffer_memory_info(&mut v, &mut Plus(1000)).unwrap();
-    assert_eq!(v.buffer, VkBuffer(1010));
-    assert_eq!(v.memory, VkDeviceMemory(1020));
+    assert_eq!(v.buffer, VkBuffer(1010), "an ordinary handle is mapped");
+    assert_eq!(
+        v.memory,
+        VkDeviceMemory(20),
+        "a VkDeviceMemory is not, because only the transform pass can resolve one"
+    );
+    assert_eq!(v.memory_offset, 4096, "and its offset is untouched with it");
 }
 
 /// The transform pass rewrites `(memory, offset)` together.

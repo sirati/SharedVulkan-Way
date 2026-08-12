@@ -66,7 +66,7 @@ impl IcdLocal for SharedVulkan {
     }
 
     fn device_extensions(&self) -> &[(&'static str, u32)] {
-        advertise::DEVICE_EXTENSIONS
+        self.device_extensions()
     }
 
     fn instance_proc_addr(
@@ -189,7 +189,7 @@ impl IcdLocal for SharedVulkan {
         // silently drops things (design.md §9.2, R16).
         for want in &info.pp_enabled_extension_names {
             let want = String::from_utf8_lossy(want).to_string();
-            if !advertise::DEVICE_EXTENSIONS.iter().any(|(n, _)| *n == want) {
+            if !self.device_extensions().iter().any(|(n, _)| *n == want) {
                 return Err(LowerError::Result(
                     sv_icd_entry::VkResult::VK_ERROR_EXTENSION_NOT_PRESENT.0,
                 ));
@@ -243,10 +243,27 @@ impl IcdLocal for SharedVulkan {
         }
     }
 
+    /// `vkGetDeviceQueue` — one family, and a family index we do not have is
+    /// *reported* rather than refused.
+    ///
+    /// The command returns `void`. There is nowhere to put an error, so refusing
+    /// meant writing nothing through `pQueue` and leaving the application with
+    /// whatever its uninitialised memory held — which Zink then passes to
+    /// `vkQueueSubmit`. An application asking for a family we did not advertise
+    /// has made a mistake; handing it the one queue that exists makes that
+    /// mistake harmless instead of a wild pointer, and `SV_DEBUG` says so.
+    ///
+    /// (Zink asks for `sparse_queue`, which it leaves at `UINT32_MAX` when no
+    /// family advertises `VK_QUEUE_SPARSE_BINDING_BIT` — so this is not a
+    /// hypothetical application error, it is the one in front of us.)
     fn get_device_queue(&self, device: u64, family: u32, index: u32) -> IcdResult<u64> {
         if family != 0 {
-            return Err(LowerError::Shape("vkGetDeviceQueue: we advertise one queue family"));
+            sv_icd_entry::report_transport_failure(&format_args!(
+                "vkGetDeviceQueue: queue family {family} was never advertised; \
+                 giving the one queue this device has"
+            ));
         }
+        let index = if family == 0 { index } else { 0 };
         let id = {
             let s = self.state();
             s.devices
@@ -453,10 +470,20 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// The `2` form, forwarded like the plain one.
+    ///
+    /// It was answered locally, and that was a bug the moment the plain form
+    /// started forwarding: an application that asks both — Zink asks the plain
+    /// one, the validation layer asks both — was told two different things about
+    /// the same device. The local answer stays behind it for the standalone
+    /// configuration, exactly as everywhere else.
     fn get_physical_device_queue_family_properties2(
         &self,
-        _args: p::VkGetPhysicalDeviceQueueFamilyProperties2Args,
+        args: p::VkGetPhysicalDeviceQueueFamilyProperties2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceQueueFamilyProperties2Reply> {
+        if let Some(t) = self.wire() {
+            return forward::get_physical_device_queue_family_properties2(t, args);
+        }
         let families: Vec<p::VkQueueFamilyProperties2> = queue_families()
             .into_iter()
             .map(|q| {
@@ -686,6 +713,114 @@ impl Icd for SharedVulkan {
                 buffer: args.buffer,
                 memory: p::VkDeviceMemory(memory),
                 memory_offset: offset,
+            },
+        )
+    }
+
+    // -- descriptor update templates ----------------------------------------
+    //
+    // Zink's default descriptor path uses templates unconditionally, so these
+    // two are on the critical path for OpenGL and not a corner.
+
+    /// Remember the entries, then forward as usual.
+    ///
+    /// The template object itself crosses and is created on the far side like
+    /// any other; what stays here is a *copy of its entries*, because they are
+    /// the only description of `pData`'s layout that exists anywhere.
+    fn create_descriptor_update_template(
+        &self,
+        args: p::VkCreateDescriptorUpdateTemplateArgs,
+    ) -> IcdResult<p::VkCreateDescriptorUpdateTemplateReply> {
+        // **Mint the id.** `emit_mint_outputs` puts this in the *trait default*,
+        // so overriding a create-command silently opts out of it and every
+        // object of that type gets id 0 — which is `VK_NULL_HANDLE`, so nothing
+        // complains, they all alias, and the last one created wins every lookup.
+        // Two descriptor update templates both numbered 0 is how this was found:
+        // the second overwrote the first's entries and a descriptor write went
+        // to a binding the other set's layout does not have.
+        let mut args = args;
+        args.p_descriptor_update_template =
+            Some(p::VkDescriptorUpdateTemplate(sv_icd_entry::IcdLocal::mint_id(self)));
+        let entries = args
+            .p_create_info
+            .as_ref()
+            .map(|c| c.p_descriptor_update_entries.clone())
+            .unwrap_or_default();
+        let id = args.p_descriptor_update_template.map(|t| t.0);
+        let reply = match self.wire() {
+            Some(t) => forward::create_descriptor_update_template(t, args)?,
+            None => p::VkCreateDescriptorUpdateTemplateReply {
+                result: p::VkResult(0),
+                p_descriptor_update_template: args.p_descriptor_update_template,
+            },
+        };
+        if reply.result.0 == 0
+            && let Some(id) = id
+        {
+            self.state().templates.insert(id, entries);
+        }
+        Ok(reply)
+    }
+
+    fn destroy_descriptor_update_template(
+        &self,
+        args: p::VkDestroyDescriptorUpdateTemplateArgs,
+    ) -> IcdResult<()> {
+        self.state().templates.remove(&args.descriptor_update_template.0);
+        if let Some(t) = self.wire() {
+            forward::destroy_descriptor_update_template(t, args)?;
+        }
+        Ok(())
+    }
+
+    /// Rewritten into `vkUpdateDescriptorSets`, which is a shape the wire has.
+    ///
+    /// `pData` is a pointer whose *layout* lives in the template object and
+    /// whose *bytes* live in the application's memory. It cannot cross, and it
+    /// does not have to: expanding it here produces exactly the same descriptor
+    /// writes in a form the registry describes. See
+    /// [`sv_icd_entry::local::expand_descriptor_template`] for why this is the only
+    /// parameter on the surface that needs it.
+    fn update_descriptor_set_with_template(
+        &self,
+        args: p::VkUpdateDescriptorSetWithTemplateArgs,
+    ) -> IcdResult<()> {
+        let Some(t) = self.wire() else { return Ok(()) };
+        let entries = {
+            let s = self.state();
+            match s.templates.get(&args.descriptor_update_template.0) {
+                Some(e) => e.clone(),
+                // A template we never saw created. Refusing is right: silently
+                // doing nothing would leave the descriptor set holding whatever
+                // it held, which is a wrong picture rather than a failed call.
+                None => {
+                    return Err(LowerError::Shape(
+                        "vkUpdateDescriptorSetWithTemplate: unknown template",
+                    ));
+                }
+            }
+        };
+        // SAFETY: `p_data` is the application's own `pData` for this call, read
+        // in the application's process, with the entries it created the template
+        // with. The specification's contract; see the function's own note.
+        let writes = unsafe {
+            sv_icd_entry::local::expand_descriptor_template(
+                args.p_data,
+                args.descriptor_set.0,
+                &entries,
+            )
+        };
+        if writes.is_empty() {
+            return Ok(());
+        }
+        forward::update_descriptor_sets(
+            t,
+            p::VkUpdateDescriptorSetsArgs {
+                device: args.device,
+                descriptor_write_count: writes.len() as u32,
+                p_descriptor_writes: writes,
+                descriptor_copy_count: 0,
+                p_descriptor_copies: Vec::new(),
             },
         )
     }

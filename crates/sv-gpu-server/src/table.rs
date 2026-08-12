@@ -134,6 +134,34 @@ impl Objects {
         }
     }
 
+    /// Record `id` as naming the raw 64-bit handle `raw`.
+    ///
+    /// The generated forwarding pass has already turned the driver's answer into
+    /// a `u64` — a dispatchable handle is a pointer and a non-dispatchable one is
+    /// a number, and both fit — so it has nothing typed to hand over. The type
+    /// tag comes from the registry rather than from the value, which is the same
+    /// place [`insert`](Self::insert) gets it.
+    pub fn insert_raw(&mut self, id: u64, ty: HandleType, raw: u64) {
+        if id != 0 {
+            self.map.insert(id, Object { raw, ty });
+        }
+    }
+
+    /// The driver handle behind `id`, whatever type it is.
+    ///
+    /// For the one site where the *caller* states the type and the registry does
+    /// not: `VkDebugUtilsObjectNameInfoEXT::objectHandle`, whose type comes from
+    /// its `objectType` sibling. Checking the tag here would mean maintaining a
+    /// `VkObjectType` → [`HandleType`] table to check something the caller has
+    /// already told the driver, and getting *that* wrong would refuse valid
+    /// calls. The driver checks it for real.
+    pub fn raw(&self, id: u64) -> Option<u64> {
+        if id == 0 {
+            return Some(0);
+        }
+        self.map.get(&id).map(|o| o.raw)
+    }
+
     /// Look `id` up as a handle of type `H`.
     ///
     /// `VK_NULL_HANDLE` is 0 on the wire and 0 in the driver, and passing it

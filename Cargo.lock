@@ -138,6 +138,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-gpu-entry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sv-codegen",
+ "sv-icd-entry",
+ "sv-proto",
+ "sv-wire",
+ "vk-registry",
+]
+
+[[package]]
 name = "sv-gpu-server"
 version = "0.1.0"
 dependencies = [
@@ -145,6 +157,7 @@ dependencies = [
  "ash",
  "libc",
  "sv-arena",
+ "sv-gpu-entry",
  "sv-hostd",
  "sv-icd",
  "sv-proto",

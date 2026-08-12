@@ -452,3 +452,117 @@ pub unsafe extern "system" fn sv_vk_unmap_memory(device: VkDevice, memory: VkDev
     let dev = unsafe { dispatchable_id(device as *const c_void) };
     icd().unmap_memory(dev, memory);
 }
+
+// ---------------------------------------------------------------------------
+// descriptor update templates
+// ---------------------------------------------------------------------------
+
+/// Expand a `vkUpdateDescriptorSetWithTemplate` into the `VkWriteDescriptorSet`
+/// list it means.
+///
+/// # Why this is here and not in the generator
+///
+/// `pData` is a `const void*` with **no `len=`, no `altlen=` and no sibling that
+/// bounds it**. Its layout is described by the *template object* — a handle —
+/// and by nothing in the registry. It is the one parameter on this surface whose
+/// size is a property of another object's contents, so no fold over `vk.xml`
+/// can marshal it and design.md §7.4's `void*` policy table can only classify it
+/// as opaque. Venus and gfxstream both special-case it; so do we.
+///
+/// # Why translating is better than forwarding
+///
+/// The pointer is the *application's* and this code runs in the application's
+/// process, so the data is readable here and meaningless anywhere else. Reading
+/// it now turns a parameter that cannot cross into one that never has to:
+/// `vkUpdateDescriptorSets` carries the same information in a shape the registry
+/// does describe, and the GPU side needs no special case at all. The template
+/// object still crosses and is still created on the far side — it is only the
+/// *update* that is rewritten.
+///
+/// This is also what makes Zink work: Zink's descriptor path uses templates
+/// unconditionally in its default mode, so without this every descriptor update
+/// is a null pointer handed to a driver.
+///
+/// # Safety
+///
+/// `p_data` is the application's `pData` for a call made with `entries`, so for
+/// each entry `e` and each `j < e.descriptor_count` the bytes at
+/// `p_data + e.offset + j * e.stride` are a valid value of the type `e
+/// .descriptor_type` selects. That is the Vulkan specification's contract for
+/// this command and it is not checkable — the whole point of the parameter is
+/// that its shape lives in the template.
+pub unsafe fn expand_descriptor_template(
+    p_data: u64,
+    dst_set: u64,
+    entries: &[sv_proto::VkDescriptorUpdateTemplateEntry],
+) -> Vec<sv_proto::VkWriteDescriptorSet> {
+    let mut out = Vec::with_capacity(entries.len());
+    if p_data == 0 {
+        return out;
+    }
+    for e in entries {
+        let n = e.descriptor_count as usize;
+        let mut w = sv_proto::VkWriteDescriptorSet {
+            p_next: Vec::new(),
+            dst_set: sv_proto::VkDescriptorSet(dst_set),
+            dst_binding: e.dst_binding,
+            dst_array_element: e.dst_array_element,
+            descriptor_count: e.descriptor_count,
+            descriptor_type: e.descriptor_type,
+            p_image_info: Vec::new(),
+            p_buffer_info: Vec::new(),
+            p_texel_buffer_view: Vec::new(),
+        };
+        let at = |j: usize| -> *const u8 {
+            (p_data as *const u8).wrapping_add(e.offset as usize + j * e.stride as usize)
+        };
+        match e.descriptor_type.0 {
+            // SAMPLER, COMBINED_IMAGE_SAMPLER, SAMPLED_IMAGE, STORAGE_IMAGE,
+            // INPUT_ATTACHMENT
+            0 | 1 | 2 | 3 | 10 => {
+                for j in 0..n {
+                    let p = at(j) as *const VkDescriptorImageInfo;
+                    let c = unsafe { core::ptr::read_unaligned(p) };
+                    w.p_image_info.push(sv_proto::VkDescriptorImageInfo {
+                        sampler: sv_proto::VkSampler(c.sampler),
+                        image_view: sv_proto::VkImageView(c.image_view),
+                        image_layout: sv_proto::VkImageLayout(c.image_layout.0),
+                    });
+                }
+            }
+            // UNIFORM_TEXEL_BUFFER, STORAGE_TEXEL_BUFFER
+            4 | 5 => {
+                for j in 0..n {
+                    let p = at(j) as *const VkBufferView;
+                    let c = unsafe { core::ptr::read_unaligned(p) };
+                    w.p_texel_buffer_view.push(sv_proto::VkBufferView(c));
+                }
+            }
+            // UNIFORM_BUFFER, STORAGE_BUFFER, and the two dynamic forms
+            6..=9 => {
+                for j in 0..n {
+                    let p = at(j) as *const VkDescriptorBufferInfo;
+                    let c = unsafe { core::ptr::read_unaligned(p) };
+                    w.p_buffer_info.push(sv_proto::VkDescriptorBufferInfo {
+                        buffer: sv_proto::VkBuffer(c.buffer),
+                        offset: c.offset,
+                        range: c.range,
+                    });
+                }
+            }
+            // An inline uniform block's "count" is a byte length and its data is
+            // carried in a `VkWriteDescriptorSetInlineUniformBlock` chain link
+            // rather than in an array. Not in this profile's feature set;
+            // dropped rather than guessed at, and said so.
+            _ => {
+                report_transport_failure(&format_args!(
+                    "vkUpdateDescriptorSetWithTemplate: descriptor type {} is not expandable",
+                    e.descriptor_type.0
+                ));
+                continue;
+            }
+        }
+        out.push(w);
+    }
+    out
+}

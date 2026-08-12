@@ -1,0 +1,1413 @@
+//! Pass 12: `sv-gpu-entry` — **wire → C**, and the driver call on the far side.
+//!
+//! # The pass design.md §7.2 does not have, and why it is not optional
+//!
+//! §7.2's taxonomy has four corners of a two-by-two — *which side* by *which
+//! direction* — and names three of them:
+//!
+//! ```text
+//!                   C ──▶ wire                     wire ──▶ C
+//!   app side    pass 10 `lower_*`   (icd_entry)   pass 10 `store_*` (icd_entry)
+//!   GPU side    pass 10 `lower_*`   (reusable!)   ***missing***
+//! ```
+//!
+//! The bottom-left corner needs no new code: lowering a C struct the *driver*
+//! filled in is byte-for-byte the same problem as lowering one the
+//! *application* filled in, and [`crate::emit::icd_entry`]'s `lower_*` does it
+//! already. The bottom-right corner is genuinely new, and without it the GPU
+//! side cannot call a driver at all: every `vkCreate*` needs a `const
+//! VkFooCreateInfo*`, and what arrived is an owned Rust value.
+//!
+//! The previous stage wrote that corner by hand for about forty commands and
+//! recorded, correctly, that it would not scale to 239. This pass is that
+//! finding acted on.
+//!
+//! # Pass 4 is not dead, it moved
+//!
+//! design.md §7.2 strikes out pass 4 (`arena_bind`) with the note that owned
+//! Rust values make it a no-op — "our decoder produces owned Rust values whose
+//! storage *is* their lifetime, so there is no binding step to generate". That
+//! is true of *decoding* and false of *raising*, which is the operation
+//! gfxstream's `deepcopy` actually serves. A C `VkGraphicsPipelineCreateInfo`
+//! holds eight pointers to sub-structs that must outlive the call, and
+//! producing them is exactly gfxstream's pool-allocated deep copy.
+//!
+//! So pass 4 exists after all, it is generated here, and its pool is
+//! [`sv_gpu_entry::Raise`] — a `Vec<Box<dyn Any>>` rather than a C++ arena,
+//! because `Box` is what gives a stable address in safe Rust.
+//!
+//! # The raise pass contains no `unsafe`, which was not obvious
+//!
+//! Creating a raw pointer is safe; only dereferencing one is not. Every
+//! `raise_*` function here allocates owned storage and *takes its address* —
+//! it never reads through a pointer. So the whole of the largest half of this
+//! crate is safe Rust, and the `unsafe` is confined to the one line per command
+//! that calls the driver's function pointer. That is a better ratio than the app
+//! side manages, where lowering has to read the application's memory.
+//!
+//! # What is emitted
+//!
+//! ```text
+//!   raise_<Struct>    sv_proto::Struct  ──▶ C Struct           (safe)
+//!   raise_pnext       Vec<PNextLink>    ──▶ *const c_void      (safe)
+//!   DriverFns         every command's entry point, by name     (unsafe to load)
+//!   impl Server for Forward<H>          decode ▶ map ▶ raise ▶ call ▶ lower
+//! ```
+//!
+//! and, for the commands a GPU side must give meaning to rather than forward
+//! (the arena, the session, submission), a call out to [`GpuHost`], whose method
+//! list is [`crate::exceptions::GPU_HAND_WRITTEN`].
+
+use crate::abi::{AbiCommand, AbiMember, AbiPlan, AbiType, ArrayLen};
+use crate::naming;
+use crate::plan::{CommandPlan, FieldPlan, Plan, Scalar, Shape, StructPlan};
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+use std::collections::{BTreeMap, BTreeSet};
+use vk_registry::{CType, CTypeKind, Model};
+
+use super::icd_entry::{Ctx, c_param_type, c_type};
+
+/// `VkBufferCreateInfo` → `raise_vk_buffer_create_info`.
+fn raise_fn(name: &str) -> proc_macro2::Ident {
+    format_ident!("raise_{}", naming::snake_case(name))
+}
+
+/// `vkCreateBuffer` → the field of [`DriverFns`] holding its entry point.
+fn fn_field(name: &str) -> proc_macro2::Ident {
+    naming::ident(&naming::snake_case(name))
+}
+
+/// Handles a `vkDestroy*`/`vkFree*` call names but does **not** destroy.
+///
+/// `vkDestroyBuffer(device, buffer, …)` destroys the buffer and not the device;
+/// `vkFreeCommandBuffers(device, commandPool, count, pBuffers)` frees the
+/// buffers and not the pool. Without this list the generated unbind would drop
+/// the device out of the table on the first `vkDestroyBuffer`, and the next
+/// command would fail to resolve it — which is a failure mode worth naming
+/// because it is silent until the *second* call.
+const PARENT_HANDLES: &[&str] = &[
+    "VkInstance",
+    "VkPhysicalDevice",
+    "VkDevice",
+    "VkQueue",
+    "VkCommandPool",
+    "VkDescriptorPool",
+];
+
+/// Why a command could not be forwarded mechanically.
+#[derive(Debug, Clone)]
+pub struct Refusal {
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Refusals {
+    /// Structs with no `raise_*`, keyed by name.
+    pub raise: BTreeMap<String, String>,
+    pub commands: Vec<Refusal>,
+}
+
+// ---------------------------------------------------------------------------
+// raising a value
+// ---------------------------------------------------------------------------
+
+/// A C-valued expression producing `shape` from the wire lvalue `access`.
+///
+/// `access` is a *place* expression of the wire type (`v.p_bindings`,
+/// `(*inner)`), and the result is a value of the corresponding C type. `__a` is
+/// the [`Raise`] pool in scope.
+fn raise_expr(
+    cx: &Ctx<'_>,
+    shape: &Shape,
+    abi: &AbiMember,
+    access: &TokenStream,
+    owner: &str,
+) -> Result<TokenStream, String> {
+    Ok(match shape {
+        Shape::Scalar(s) => raise_scalar(cx, s, access, owner)?,
+        Shape::FixedArray { elem, count, .. } => {
+            let n = *count as usize;
+            // The element type is the C one, and it is not always the wire one:
+            // `char deviceName[256]` is `[i8; 256]` in C and `[u8; 256]` on the
+            // wire. Building through a `Vec` and converting keeps the `raise`
+            // of each element in one place, and `try_from` cannot fail because
+            // the loop runs exactly `n` times.
+            let inner = raise_expr(cx, elem, abi, &quote!((#access)[__i]), owner)?;
+            let cty = fixed_elem_c_type(cx, &abi.ty)?;
+            quote!({
+                let mut __t: Vec<#cty> = Vec::with_capacity(#n);
+                for __i in 0..#n { __t.push(#inner); }
+                match <[#cty; #n]>::try_from(__t) {
+                    Ok(__x) => __x,
+                    // Unreachable: the loop pushed exactly #n elements.
+                    Err(_) => return Err(sv_wire::WireError::Truncated { need: #n, have: 0 }),
+                }
+            })
+        }
+        // Everything below produces a pointer, and the C member it lands in may
+        // be `*const T` or `*mut T` depending on whether the struct is
+        // `returnedonly`. `as _` reconciles the two; it is a constness cast and
+        // nothing else, since the pointee type is derived from the same member.
+        Shape::Optional(inner) => {
+            let deref = quote!(*__x);
+            let e = raise_expr(cx, inner, abi, &deref, owner)?;
+            let cty = pointee_c_type(cx, &abi.ty)?;
+            // A pointer to one, allocated in the pool so it outlives the call.
+            quote!(match &(#access) {
+                Some(__x) => { let __v: #cty = #e; __a.one(__v) as _ }
+                None => core::ptr::null_mut::<#cty>() as _,
+            })
+        }
+        Shape::Array { elem, .. } => {
+            let inner = raise_expr(cx, elem, abi, &quote!(*__x), owner)?;
+            let cty = pointee_c_type(cx, &abi.ty)?;
+            // An empty array becomes a **null** pointer rather than a dangling
+            // one. Vulkan permits null whenever the count is zero, and a driver
+            // that null-checks before consulting the count — several do — reads
+            // the dangling address otherwise.
+            quote!({
+                let mut __t: Vec<#cty> = Vec::with_capacity((#access).len());
+                for __x in (#access).iter() { __t.push(#inner); }
+                if __t.is_empty() {
+                    core::ptr::null_mut::<#cty>() as _
+                } else {
+                    __a.slice(__t) as _
+                }
+            })
+        }
+        // A blob's C type is whatever the header says — `void*` for
+        // `pInitialData`, `const uint32_t*` for SPIR-V. The bytes are the same
+        // either way; the pool gives eight-byte alignment, which covers every
+        // element type the registry uses behind a sized `void*`.
+        Shape::Blob { .. } => quote!(__a.blob(&(#access)) as _),
+        Shape::CString => quote!(__a.cstring(&(#access)) as _),
+        Shape::CStringArray { .. } => quote!({
+            let mut __t: Vec<*const core::ffi::c_char> = Vec::with_capacity((#access).len());
+            for __x in (#access).iter() { __t.push(__a.cstring(__x)); }
+            if __t.is_empty() {
+                core::ptr::null_mut::<*const core::ffi::c_char>() as _
+            } else {
+                __a.slice(__t) as _
+            }
+        }),
+        Shape::PNext => quote!(raise_pnext(&(#access), &mut *__a)? as _),
+    })
+}
+
+fn raise_scalar(
+    cx: &Ctx<'_>,
+    s: &Scalar,
+    access: &TokenStream,
+    owner: &str,
+) -> Result<TokenStream, String> {
+    Ok(match s {
+        Scalar::U8
+        | Scalar::I8
+        | Scalar::U16
+        | Scalar::I16
+        | Scalar::U32
+        | Scalar::I32
+        | Scalar::U64
+        | Scalar::I64
+        | Scalar::Size => quote!((#access) as _),
+        Scalar::F32 | Scalar::F64 => quote!(#access),
+        Scalar::Bool32 => quote!(if #access { 1 } else { 0 }),
+        // A `void*` the policy table calls opaque: on the wire it is a `u64`,
+        // and the only meaning it can have on this side is "not a pointer we
+        // are permitted to reconstruct". Zero it rather than casting a number
+        // out of another address space into a pointer.
+        Scalar::OpaqueU64(_) => quote!({ let _ = #access; Default::default() }),
+        Scalar::Enum(n) | Scalar::Bitmask(n) | Scalar::Bitmask64(n) => {
+            let t = naming::type_ident(n);
+            quote!(#t((#access).0 as _))
+        }
+        Scalar::Handle(n) => {
+            // By this point the handle map has already replaced the app side's
+            // object id with the driver's own handle, so what `.0` holds is a
+            // driver handle — a `u64` for a non-dispatchable one and a pointer
+            // for a dispatchable one, both stored as `u64` in the table.
+            if cx.is_dispatchable(n) {
+                quote!((#access).0 as usize as _)
+            } else {
+                quote!((#access).0)
+            }
+        }
+        Scalar::Struct(n) | Scalar::Union(n) => {
+            if !raisable(cx, n) {
+                return Err(format!("{owner}: {n} has no C counterpart"));
+            }
+            let f = raise_fn(n);
+            quote!(#f(&(#access), &mut *__a)?)
+        }
+    })
+}
+
+/// Whether a wire struct has a C counterpart this pass may emit a `raise_*` for.
+fn raisable(cx: &Ctx<'_>, name: &str) -> bool {
+    cx.shared_struct(name)
+}
+
+/// The C element type behind a pointer member, for sizing pool storage.
+fn pointee_c_type(cx: &Ctx<'_>, ty: &CType) -> Result<TokenStream, String> {
+    match &ty.kind {
+        CTypeKind::Pointer(inner) => Ok(c_type(cx, inner)),
+        _ => Err(format!("expected a pointer, got {ty:?}")),
+    }
+}
+
+/// The C element type of a fixed array member.
+fn fixed_elem_c_type(cx: &Ctx<'_>, ty: &CType) -> Result<TokenStream, String> {
+    match &ty.kind {
+        CTypeKind::Array(inner, _) => Ok(c_type(cx, inner)),
+        // A decayed array *parameter*: `const float blendConstants[4]` arrives
+        // as `const float*`. Raising still produces four floats and takes their
+        // address, so the element type is the pointee.
+        CTypeKind::Pointer(inner) => Ok(c_type(cx, inner)),
+        _ => Err(format!("expected an array, got {ty:?}")),
+    }
+}
+
+/// `raise_<Struct>(v: &sv_proto::Struct, __a: &mut Raise) -> Result<CStruct>`.
+fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String> {
+    let name = &s.name;
+    let abi_members: BTreeMap<&str, &AbiMember> = match cx.abi.type_named(name) {
+        Some(AbiType::Struct { members, .. }) => {
+            members.iter().map(|m| (m.name.as_str(), m)).collect()
+        }
+        _ => return Err(format!("{name} is not a struct on the C surface")),
+    };
+    let f = raise_fn(name);
+    let cty = naming::type_ident(name);
+    let wty = naming::type_ident(name);
+
+    if s.is_union {
+        // A C union is written through whichever member the wire value names.
+        // The Rust enum carries the tag the C type does not, so unlike the
+        // lowering direction there is nothing to guess: the value says which
+        // member it is.
+        let mut arms = Vec::new();
+        for field in &s.fields {
+            let v = naming::union_variant(&field.name);
+            let abi = abi_members
+                .get(field.name.as_str())
+                .ok_or_else(|| format!("{name}.{}: no C member", field.name))?;
+            let id = naming::ident(&field.rust_name);
+            let e = raise_expr(cx, &field.shape, abi, &quote!(*__x), name)?;
+            arms.push(quote! {
+                sv_proto::#wty::#v(__x) => { __c.#id = #e; }
+            });
+        }
+        let doc = format!(
+            "Raise a wire `{name}` into its C form.\n\n\
+             Unlike lowering, which has to pick a member because a C union \
+             carries no tag, this direction is exact: the Rust enum *is* the \
+             tag (design.md §7.4)."
+        );
+        return Ok(quote! {
+            #[doc = #doc]
+            #[allow(unused_variables, clippy::needless_update)]
+            pub fn #f(v: &sv_proto::#wty, __a: &mut crate::Raise) -> sv_wire::Result<#cty> {
+                let mut __c = <#cty as Default>::default();
+                match v { #(#arms)* }
+                Ok(__c)
+            }
+        });
+    }
+
+    let wire_fields: BTreeMap<&str, &FieldPlan> =
+        s.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let mut stmts = Vec::new();
+    // The ABI's member order is the C header's, which is the order a reader
+    // checks against `vulkan_core.h`.
+    for (mname, abi) in &abi_members {
+        let cid = naming::ident(&abi.rust_name);
+        if *mname == "sType" {
+            // `sType` is not a wire field at all — dropping it from the Rust
+            // type is what makes "a value with the wrong sType" unrepresentable
+            // (design.md §7.2). It is reconstructed here from the registry.
+            let Some(v) = s.s_type_value else {
+                return Err(format!("{name} has an sType member but no value in the registry"));
+            };
+            let v = v as i32;
+            stmts.push(quote!(__c.#cid = VkStructureType(#v);));
+            continue;
+        }
+        let Some(field) = wire_fields.get(mname) else {
+            return Err(format!("{name}.{mname}: no wire field"));
+        };
+        let access = {
+            let id = naming::ident(&field.rust_name);
+            quote!(v.#id)
+        };
+        let e = raise_expr(cx, &field.shape, abi, &access, name)?;
+        stmts.push(quote!(__c.#cid = #e;));
+    }
+
+    let doc = format!(
+        "Raise a wire `{name}` into the C struct a driver can be handed.\n\n\
+         Pointer-valued members are allocated in `__a` and live as long as it \
+         does, which is design.md §7.2's pass 4 doing the job it was struck out \
+         for not having."
+    );
+    Ok(quote! {
+        #[doc = #doc]
+        #[allow(unused_variables, clippy::needless_update)]
+        pub fn #f(v: &sv_proto::#wty, __a: &mut crate::Raise) -> sv_wire::Result<#cty> {
+            let mut __c = <#cty as Default>::default();
+            #(#stmts)*
+            Ok(__c)
+        }
+    })
+}
+
+/// The `pNext` chain walker, wire → C.
+///
+/// Built back to front so each link's `pNext` is known when the link itself is
+/// allocated. A link this build does not know is dropped, which is the only
+/// thing it can be — an unknown link has no C type to allocate.
+fn emit_raise_pnext(cx: &Ctx<'_>) -> TokenStream {
+    let arms = cx.wire.pnext_links.iter().filter_map(|(name, _)| {
+        if !raisable(cx, name) {
+            return None;
+        }
+        let v = naming::pnext_variant(name);
+        let f = raise_fn(name);
+        let ty = naming::type_ident(name);
+        Some(quote! {
+            sv_proto::PNextLink::#v(__inner) => {
+                let mut __l: #ty = #f(__inner, &mut *__a)?;
+                // `pNext` is `const void*` in an input struct and `void*` in a
+                // `returnedonly` one, and both occur in the same chain.
+                __l.p_next = __next as _;
+                __a.one::<#ty>(__l) as *const core::ffi::c_void
+            }
+        })
+    });
+    quote! {
+        /// Rebuild a C `pNext` chain from the wire's flat, length-prefixed form.
+        ///
+        /// The chain is built **back to front**: a C link holds a pointer to the
+        /// next one, so the tail has to exist before the head can point at it.
+        ///
+        /// A link whose `sType` this build does not know is skipped rather than
+        /// forwarded. That is not the app side's leniency (design.md §6.1 —
+        /// "the app side silently drops unknown links") reappearing on the wrong
+        /// side: an unknown link is *already* fatal at the decoder here, so
+        /// anything reaching this function is known to the protocol and merely
+        /// has no `raise_*`, which the generator's own closure makes
+        /// unreachable.
+        pub fn raise_pnext(
+            links: &[sv_proto::PNextLink],
+            __a: &mut crate::Raise,
+        ) -> sv_wire::Result<*const core::ffi::c_void> {
+            let mut __next: *const core::ffi::c_void = core::ptr::null();
+            for __link in links.iter().rev() {
+                __next = match __link {
+                    #(#arms)*
+                    _ => __next,
+                };
+            }
+            Ok(__next)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the driver's function table
+// ---------------------------------------------------------------------------
+
+/// The type of one driver entry point, as an `extern "system"` fn pointer.
+fn fn_ptr_type(cx: &Ctx<'_>, c: &AbiCommand) -> TokenStream {
+    let params = c.params.iter().map(|p| c_param_type(cx, &p.ty));
+    if c.returns_void {
+        quote!(unsafe extern "system" fn(#(#params),*))
+    } else {
+        let r = c_type(cx, &c.return_type);
+        quote!(unsafe extern "system" fn(#(#params),*) -> #r)
+    }
+}
+
+fn emit_driver_fns(cx: &Ctx<'_>, forwardable: &BTreeSet<String>) -> TokenStream {
+    let cmds: Vec<&AbiCommand> =
+        cx.abi.commands.iter().filter(|c| forwardable.contains(&c.name)).collect();
+
+    let fields = cmds.iter().map(|c| {
+        let id = fn_field(&c.name);
+        let ty = fn_ptr_type(cx, c);
+        let doc = format!("`{}`", c.name);
+        quote! { #[doc = #doc] pub #id: Option<#ty>, }
+    });
+    let defaults = cmds.iter().map(|c| {
+        let id = fn_field(&c.name);
+        quote!(#id: None,)
+    });
+    let loads = cmds.iter().map(|c| {
+        let id = fn_field(&c.name);
+        let ty = fn_ptr_type(cx, c);
+        let name = c.name.as_str();
+        // A device-level command is looked up through `vkGetDeviceProcAddr`
+        // when there is a device: the loader's own documentation is emphatic
+        // that the device table is the one without a trampoline, and on a
+        // multi-device driver the instance answer is a dispatch stub.
+        let getter = if c.level.is_device() {
+            quote!(__dev)
+        } else {
+            quote!(__inst)
+        };
+        quote! {
+            #id: #getter(#name).map(|__p| unsafe {
+                core::mem::transmute::<
+                    unsafe extern "system" fn(),
+                    #ty,
+                >(__p)
+            }),
+        }
+    });
+    let names = cmds.iter().map(|c| {
+        let id = fn_field(&c.name);
+        let n = c.name.as_str();
+        quote!(if self.#id.is_none() { __missing.push(#n); })
+    });
+
+    quote! {
+        /// Every entry point the GPU side may need from the real driver.
+        ///
+        /// Loaded by name rather than through `ash`'s typed wrappers, and that
+        /// is deliberate: the whole point of this crate is that the C signature
+        /// comes from the same `vk.xml` the wire format does, so the argument
+        /// list a driver is called with is derived from the registry rather than
+        /// from a second hand-maintained binding. A disagreement between the two
+        /// would be a stack corruption with no diagnostic.
+        #[allow(non_snake_case)]
+        pub struct DriverFns {
+            #(#fields)*
+        }
+
+        impl Default for DriverFns {
+            fn default() -> Self {
+                Self { #(#defaults)* }
+            }
+        }
+
+        impl DriverFns {
+            /// Resolve every entry point.
+            ///
+            /// `__inst` answers instance- and physical-device-level names,
+            /// `__dev` device-level ones. Both return `None` for a name the
+            /// driver does not have, which is normal — the profile is a superset
+            /// of any one driver's extensions.
+            pub fn load(
+                __inst: &dyn Fn(&str) -> Option<unsafe extern "system" fn()>,
+                __dev: &dyn Fn(&str) -> Option<unsafe extern "system" fn()>,
+            ) -> DriverFns {
+                DriverFns { #(#loads)* }
+            }
+
+            /// Which entry points the driver did not supply.
+            ///
+            /// Reported once at startup rather than discovered as a refusal per
+            /// command, because "this driver has no `vkCmdBeginRendering`" is a
+            /// fact about the configuration and an application should be told
+            /// before it has drawn nothing for ten seconds.
+            pub fn missing(&self) -> Vec<&'static str> {
+                let mut __missing = Vec::new();
+                #(#names)*
+                __missing
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per-command forwarding
+// ---------------------------------------------------------------------------
+
+/// How an output parameter is served.
+enum Out {
+    /// `VkBuffer* pBuffer`: one value, and if it is a handle the app side's id
+    /// must be bound to it afterwards.
+    One { c_ty: TokenStream, handle: Option<String> },
+    /// `VkPhysicalDevice* pDevices` with `uint32_t* pCount`: an array whose
+    /// capacity the caller stated and whose real length comes back.
+    Array { c_ty: TokenStream, handle: Option<String>, count: Option<String> },
+    /// `uint64_t* pValue`: one number, not a struct. `vkGetSemaphoreCounterValue`
+    /// and four others.
+    Scalar { c_ty: TokenStream, back: Scalar },
+    /// A blob, held as bytes. `count` is the output sibling holding the driver's
+    /// answer in bytes (`vkGetPipelineCacheData`); `None` when the size is an
+    /// *input* the caller fixed (`vkGetQueryPoolResults`), in which case the
+    /// whole buffer comes back.
+    Blob { count: Option<String> },
+    /// `uint32_t* pCount` itself, when some other output names it.
+    Count { c_ty: TokenStream },
+}
+
+fn handle_name(shape: &Shape) -> Option<String> {
+    match shape {
+        Shape::Scalar(Scalar::Handle(n)) => Some(n.clone()),
+        Shape::Optional(inner) | Shape::Array { elem: inner, .. } => handle_name(inner),
+        _ => None,
+    }
+}
+
+fn classify_output(
+    cx: &Ctx<'_>,
+    c: &AbiCommand,
+    wire: &CommandPlan,
+    abi: &AbiMember,
+    field: &FieldPlan,
+) -> Result<Out, String> {
+    let counts: BTreeSet<&str> = wire
+        .outputs
+        .iter()
+        .chain(wire.inputs.iter())
+        .filter(|f| f.is_a_length)
+        .map(|f| f.name.as_str())
+        .collect();
+    if counts.contains(field.name.as_str()) {
+        // The C type is the authority on the width: `uint32_t*` for most
+        // enumerations, `size_t*` for `vkGetPipelineCacheData`, and guessing
+        // from the wire's `u64` would corrupt the caller's stack on one of them.
+        return Ok(Out::Count { c_ty: pointee_c_type(cx, &abi.ty)? });
+    }
+    let count_sibling = match &abi.len {
+        Some(ArrayLen::Sibling(s)) if wire.outputs.iter().any(|f| &f.name == s) => {
+            Some(s.clone())
+        }
+        _ => None,
+    };
+    Ok(match &field.shape {
+        // A scalar behind an out-pointer that is *not* somebody's length: one
+        // number, and the only thing to do with it is convert it back.
+        Shape::Optional(inner)
+            if matches!(&**inner, Shape::Scalar(s)
+                if !matches!(s, Scalar::Struct(_) | Scalar::Union(_) | Scalar::Handle(_))) =>
+        {
+            let Shape::Scalar(s) = &**inner else { unreachable!() };
+            Out::Scalar { c_ty: pointee_c_type(cx, &abi.ty)?, back: s.clone() }
+        }
+        Shape::Optional(inner) => Out::One {
+            c_ty: pointee_c_type(cx, &abi.ty)?,
+            handle: handle_name(inner),
+        },
+        Shape::Array { elem, .. } => Out::Array {
+            c_ty: pointee_c_type(cx, &abi.ty)?,
+            handle: handle_name(elem),
+            count: count_sibling,
+        },
+        // An output blob is `void* pData`, and `c_void` is neither `Default`
+        // nor sized in a way `resize_with` can use. Bytes are what a blob is.
+        Shape::Blob { .. } => Out::Blob { count: count_sibling },
+        other => {
+            return Err(format!("{}.{}: an output shaped {other:?}", c.name, field.name));
+        }
+    })
+}
+
+/// The whole body of one forwarded `Server` method.
+///
+/// `cx` is the *raise* context (wire → C) and `lower_cx` the *full lowering* one
+/// (C → wire, reading every member). They are different closures over the same
+/// plans and one command's body needs both — which is itself the finding: the
+/// two directions do not have the same set of convertible structs.
+fn emit_forward_command(
+    cx: &Ctx<'_>,
+    lower_cx: &Ctx<'_>,
+    c: &AbiCommand,
+    wire: &CommandPlan,
+) -> Result<TokenStream, String> {
+    let abi_by_name: BTreeMap<&str, &AbiMember> =
+        c.params.iter().map(|p| (p.name.as_str(), p)).collect();
+
+    // -- 0. remember what a destroy call is about to invalidate -------------
+    //
+    // Captured *before* the handle map, because the map overwrites the app
+    // side's id with the driver's handle and the table is keyed by the id.
+    let mut unbind = Vec::new();
+    if c.name.starts_with("vkDestroy") || c.name.starts_with("vkFree") {
+        for f in &wire.inputs {
+            let id = naming::ident(&f.rust_name);
+            match &f.shape {
+                Shape::Scalar(Scalar::Handle(h)) if !PARENT_HANDLES.contains(&h.as_str()) => {
+                    unbind.push(quote!(__gone.push(a.#id.0);));
+                }
+                Shape::Array { elem, .. } => {
+                    if let Shape::Scalar(Scalar::Handle(h)) = &**elem
+                        && !PARENT_HANDLES.contains(&h.as_str())
+                    {
+                        unbind.push(quote!(
+                            for __x in a.#id.iter() { __gone.push(__x.0); }
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let reply_ty = format_ident!("{}Reply", naming::opcode_variant(&c.name));
+    let unbind_block = if unbind.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            let mut __gone: Vec<u64> = Vec::new();
+            #(#unbind)*
+        }
+    };
+    let unbind_after = if unbind.is_empty() {
+        quote!()
+    } else {
+        quote!(for __x in __gone { __b.unbind(__x); })
+    };
+
+    // -- 1. handle map and memory transform, over the inputs ----------------
+    //
+    // Both run on the wire value in place, before anything is raised, because
+    // raising reads `.0` and expects it to already be a driver handle.
+    let mut handle_pre = Vec::new();
+    for f in &wire.inputs {
+        let id = naming::ident(&f.rust_name);
+        if let Some(stmt) = super::passes::handle_walk_pub(cx.wire, &f.shape, &quote!(a.#id)) {
+            handle_pre.push(stmt);
+        }
+    }
+    // A `(memory, offset)` pair at the top level of a parameter list, which the
+    // struct walkers cannot see: `vkBindBufferMemory(device, buffer, memory,
+    // memoryOffset)` is exactly this shape and it is not a struct.
+    let param_names: Vec<String> = wire.inputs.iter().map(|f| f.name.clone()).collect();
+    let mut mem_pre = Vec::new();
+    for f in &wire.inputs {
+        if !matches!(&f.shape, Shape::Scalar(Scalar::Handle(h)) if h == "VkDeviceMemory") {
+            continue;
+        }
+        let mem = naming::ident(&f.rust_name);
+        match crate::exceptions::memory_offset_sibling(&param_names, &f.name) {
+            Some(off) => {
+                let off_id = naming::ident(&naming::snake_case(&off));
+                mem_pre.push(quote! {
+                    let (__mm, __oo) = __h.rewrite_memory(a.#mem.0, a.#off_id)?;
+                    a.#mem.0 = __mm;
+                    a.#off_id = __oo;
+                });
+            }
+            None => mem_pre.push(quote! {
+                let (__mm, _) = __h.rewrite_memory(a.#mem.0, 0)?;
+                a.#mem.0 = __mm;
+            }),
+        }
+    }
+    let mut transform_pre = Vec::new();
+    for f in &wire.inputs {
+        let id = naming::ident(&f.rust_name);
+        if let Some(stmt) = super::passes::transform_walk_pub(cx.wire, &f.shape, &quote!(a.#id)) {
+            transform_pre.push(stmt);
+        }
+    }
+    let has_pre = !handle_pre.is_empty() || !mem_pre.is_empty() || !transform_pre.is_empty();
+    // The two generated walkers want a `&mut dyn HandleMapper` and a
+    // `&mut dyn MemoryTransform`, and one host cannot lend both at once. They
+    // are used in separate statements, so two short-lived adapters over the same
+    // host is the whole of the reconciliation.
+    let handle_pre = if handle_pre.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            {
+                let mut __ad = crate::Mapping(&mut *__h);
+                let __m: &mut dyn sv_proto::HandleMapper = &mut __ad;
+                #(#handle_pre)*
+            }
+        }
+    };
+    let transform_pre = if transform_pre.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            {
+                let mut __ad = crate::Mapping(&mut *__h);
+                let __t: &mut dyn sv_proto::MemoryTransform = &mut __ad;
+                #(#transform_pre)*
+            }
+        }
+    };
+    let pre = quote! {
+        #handle_pre
+        #(#mem_pre)*
+        #transform_pre
+    };
+
+    // -- 2. raise the inputs into C locals ----------------------------------
+    let mut locals = Vec::new();
+    for f in &wire.inputs {
+        let abi = abi_by_name
+            .get(f.name.as_str())
+            .ok_or_else(|| format!("{}.{}: no C parameter", c.name, f.name))?;
+        let id = naming::ident(&f.rust_name);
+        let ty = c_param_type(cx, &abi.ty);
+        let e = raise_expr(cx, &f.shape, abi, &quote!(a.#id), &c.name)?;
+        // An array *parameter* decays to a pointer and an array *member* does
+        // not — design.md §0.3's finding 4, met from the other side.
+        // `vkCmdSetBlendConstants(const float blendConstants[4])` takes four
+        // floats by address, so the raised `[f32; 4]` has to be given one.
+        let e = if matches!(abi.ty.kind, CTypeKind::Array(..)) {
+            quote!({ let __v = #e; __a.one(__v) as _ })
+        } else {
+            e
+        };
+        locals.push(quote!(let #id: #ty = #e;));
+    }
+
+    // -- 3. output storage ---------------------------------------------------
+    let mut outs: Vec<(&FieldPlan, Out)> = Vec::new();
+    for f in &wire.outputs {
+        let abi = abi_by_name
+            .get(f.name.as_str())
+            .ok_or_else(|| format!("{}.{}: no C parameter", c.name, f.name))?;
+        outs.push((f, classify_output(cx, c, wire, abi, f)?));
+    }
+
+    let mut out_decls = Vec::new();
+    for (f, kind) in &outs {
+        let id = naming::ident(&f.rust_name);
+        match kind {
+            Out::Count { c_ty } => {
+                // The caller's capacity on the way in, the answer on the way
+                // out — Venus's `_partial` count, and the reason an output
+                // parameter travels in *both* directions (design.md §7.2).
+                out_decls.push(quote!(let mut #id: #c_ty = a.#id.unwrap_or(0) as #c_ty;));
+            }
+            // # An output struct's `sType` and `pNext` are *inputs*
+            //
+            // This is Venus's three-state validity read the right way round, and
+            // getting it wrong is what the first run of this pass did.
+            // `vkGetPhysicalDeviceFeatures2(pFeatures)` fills in
+            // `pFeatures->features`, but `pFeatures->sType` and
+            // `pFeatures->pNext` are the *caller's*: the chain is how the caller
+            // says which extension features it wants, and a zeroed `sType` makes
+            // the call invalid usage. So an output struct is **raised from the
+            // wire value**, exactly like an input, and only its body is
+            // overwritten by the driver.
+            //
+            // That is also what makes `vkGetPhysicalDeviceFeatures2` work at
+            // all across the boundary, which is the single query Zink's startup
+            // turns on: the chain goes out, the driver fills every link, and
+            // `lower_full_pnext` brings all of them back.
+            Out::One { c_ty, handle } => {
+                let init = match (handle, output_struct(f)) {
+                    (None, Some(n)) if cx.shared_struct(n) => {
+                        let r = raise_fn(n);
+                        quote!(match &a.#id {
+                            Some(__v) => #r(__v, &mut *__a)?,
+                            None => <#c_ty as Default>::default(),
+                        })
+                    }
+                    _ => quote!(<#c_ty as Default>::default()),
+                };
+                out_decls.push(quote!(let mut #id: #c_ty = #init;));
+            }
+            Out::Scalar { c_ty, .. } => {
+                out_decls.push(quote!(let mut #id: #c_ty = <#c_ty as Default>::default();));
+            }
+            Out::Array { c_ty, handle, .. } => {
+                let init = match (handle, output_struct(f)) {
+                    (None, Some(n)) if cx.shared_struct(n) => {
+                        let r = raise_fn(n);
+                        quote! {
+                            for __e in a.#id.iter() {
+                                let __v = #r(__e, &mut *__a)?;
+                                #id.push(__v);
+                            }
+                        }
+                    }
+                    _ => quote!(#id.resize_with(a.#id.len(), <#c_ty as Default>::default);),
+                };
+                out_decls.push(quote! {
+                    let mut #id: Vec<#c_ty> = Vec::with_capacity(a.#id.len());
+                    #init
+                });
+            }
+            // Over-aligned deliberately: `vkGetQueryPoolResults` writes
+            // `uint64_t` when `VK_QUERY_RESULT_64_BIT` is set, and the caller's
+            // capacity in bytes says nothing about the alignment the driver
+            // wants. A `Vec<u64>` sized in words is the cheapest way to be
+            // right for both widths.
+            Out::Blob { .. } => out_decls.push(quote! {
+                let mut #id: Vec<u64> = vec![0u64; a.#id.len().div_ceil(8)];
+            }),
+        }
+    }
+
+    // -- 4. the call ---------------------------------------------------------
+    let mut args = Vec::new();
+    for p in &c.params {
+        let id = naming::ident(&p.rust_name);
+        if wire.inputs.iter().any(|f| f.name == p.name) {
+            args.push(quote!(#id));
+            continue;
+        }
+        if let Some((f, kind)) = outs.iter().find(|(f, _)| f.name == p.name) {
+            let id = naming::ident(&f.rust_name);
+            args.push(match kind {
+                Out::Count { .. } | Out::One { .. } | Out::Scalar { .. } => quote!(&mut #id),
+                Out::Array { .. } => quote!(
+                    if #id.is_empty() { core::ptr::null_mut() } else { #id.as_mut_ptr() }
+                ),
+                Out::Blob { .. } => quote!(
+                    if #id.is_empty() {
+                        core::ptr::null_mut()
+                    } else {
+                        #id.as_mut_ptr() as *mut _
+                    }
+                ),
+            });
+            continue;
+        }
+        // The only parameter in neither list is `pAllocator`, which design.md
+        // §7.4 strips above the protocol. Host allocators are not supported and
+        // that is legal; null is what "no callbacks" means.
+        if p.name == "pAllocator" {
+            args.push(quote!(core::ptr::null()));
+            continue;
+        }
+        return Err(format!("{}.{}: a parameter in neither direction", c.name, p.name));
+    }
+
+    let field = fn_field(&c.name);
+    let cname = c.name.as_str();
+    let call = if c.returns_void {
+        quote!(unsafe { __f(#(#args),*) };)
+    } else {
+        quote!(let __r = unsafe { __f(#(#args),*) };)
+    };
+
+    // -- 5. bind created objects, and lower the outputs back ----------------
+    let mut post = Vec::new();
+    let mut reply_fields = Vec::new();
+    if wire.returns_result {
+        reply_fields.push(quote!(result: sv_proto::VkResult(__r.0),));
+    }
+    for (f, kind) in &outs {
+        let id = naming::ident(&f.rust_name);
+        match kind {
+            Out::Count { .. } => {
+                reply_fields.push(quote!(#id: Some(#id as _),));
+            }
+            Out::Scalar { back, .. } => {
+                let e = lower_scalar_back(back, &quote!(#id));
+                reply_fields.push(quote!(#id: Some(#e),));
+            }
+            Out::One { handle: Some(h), .. } => {
+                let ht = naming::type_ident(h);
+                // The reply carries the id the *app side* chose, not the
+                // driver's handle: object creation costs no round trip
+                // precisely because the app already knows the id (design.md
+                // §6.4). What crosses back is only whether it worked.
+                post.push(quote! {
+                    if let Some(__id) = a.#id {
+                        __b.bind(__id.0, sv_proto::HandleType::#ht, #id as usize as u64);
+                    }
+                });
+                reply_fields.push(quote!(#id: a.#id,));
+            }
+            Out::One { handle: None, .. } => {
+                let n = output_struct(f)
+                    .ok_or_else(|| format!("{}: an output that is not a struct", f.name))?;
+                if !lower_cx.shared_struct(n) {
+                    return Err(format!("{}: {n} has no full lowering", f.name));
+                }
+                let lower = lower_cx.lower_fn(n);
+                post.push(quote! {
+                    let #id = unsafe { #lower(&raw const #id) }
+                        .map_err(|_| sv_wire::WireError::UnknownCommand { opcode: 0 })?;
+                });
+                reply_fields.push(quote!(#id: Some(Box::new(#id)),));
+            }
+            Out::Array { handle: Some(h), count, .. } => {
+                let ht = naming::type_ident(h);
+                let n = match count {
+                    Some(s) => {
+                        let cid = naming::ident(&naming::snake_case(s));
+                        quote!((#cid as usize).min(#id.len()))
+                    }
+                    None => quote!(#id.len()),
+                };
+                post.push(quote! {
+                    for __i in 0..#n {
+                        if let Some(__id) = a.#id.get(__i) {
+                            __b.bind(
+                                __id.0,
+                                sv_proto::HandleType::#ht,
+                                #id[__i] as usize as u64,
+                            );
+                        }
+                    }
+                });
+                reply_fields.push(quote!(#id: a.#id.clone(),));
+            }
+            Out::Array { handle: None, count, .. } => {
+                let sname = output_struct(f)
+                    .ok_or_else(|| format!("{}: an output that is not a struct", f.name))?;
+                if !lower_cx.shared_struct(sname) {
+                    return Err(format!("{}: {sname} has no full lowering", f.name));
+                }
+                let lower = lower_cx.lower_fn(sname);
+                let n = match count {
+                    Some(s) => {
+                        let cid = naming::ident(&naming::snake_case(s));
+                        quote!((#cid as usize).min(#id.len()))
+                    }
+                    None => quote!(#id.len()),
+                };
+                post.push(quote! {
+                    let mut __v = Vec::with_capacity(#n);
+                    for __i in 0..#n {
+                        __v.push(
+                            unsafe { #lower(&raw const #id[__i]) }
+                                .map_err(|_| sv_wire::WireError::UnknownCommand { opcode: 0 })?,
+                        );
+                    }
+                    let #id = __v;
+                });
+                reply_fields.push(quote!(#id: #id,));
+            }
+            Out::Blob { count, .. } => {
+                // The count is in **bytes**, whatever the element type of the
+                // storage is, and it is the driver's answer rather than the
+                // capacity. Clamping against our own buffer is Venus's rule
+                // (design.md §6.1) applied in the direction the reply travels.
+                let n = match count {
+                    Some(s) => {
+                        let cid = naming::ident(&naming::snake_case(s));
+                        quote!((#cid as usize).min(__bytes.len()))
+                    }
+                    // The size was an input the caller fixed, so the whole
+                    // buffer is the answer: `vkGetQueryPoolResults`.
+                    None => quote!(__bytes.len()),
+                };
+                post.push(quote! {
+                    let #id: Vec<u8> = {
+                        let __bytes: &[u8] = unsafe {
+                            core::slice::from_raw_parts(
+                                #id.as_ptr() as *const u8,
+                                core::mem::size_of_val(&#id[..]),
+                            )
+                        };
+                        __bytes[..#n].to_vec()
+                    };
+                });
+                reply_fields.push(quote!(#id: #id,));
+            }
+        }
+    }
+
+
+    let tail = if wire.generates_reply {
+        quote! {
+            #(#post)*
+            #unbind_after
+            Ok(sv_proto::#reply_ty { #(#reply_fields)* })
+        }
+    } else {
+        quote! {
+            #(#post)*
+            #unbind_after
+            Ok(())
+        }
+    };
+
+    // What a command answers when the driver does not have it. Deliberately the
+    // same three cases `emit_server_trait`'s default refusal uses.
+    let missing_answer = if wire.generates_reply && wire.returns_result {
+        quote!({
+            let mut __r = <sv_proto::#reply_ty as Default>::default();
+            __r.result = sv_proto::VkResult(-3);
+            Ok(__r)
+        })
+    } else if wire.generates_reply {
+        quote!(Err(sv_wire::WireError::UnknownCommand { opcode: 0 }))
+    } else {
+        quote!(Ok(()))
+    };
+
+    let mut_a = if has_pre { quote!(mut) } else { quote!() };
+    Ok(quote! {
+        let #mut_a a = a;
+        let __h = &mut self.0;
+        #unbind_block
+        #pre
+        let __maybe = __h.fns().#field;
+        let __f = match __maybe {
+            Some(__f) => __f,
+            None => {
+                __h.note_missing(#cname);
+                // **Fail the call, not the session.** The profile is a superset
+                // of any one driver's extensions, so a missing entry point is a
+                // normal configuration and not a protocol error — and returning
+                // `Err` here would propagate out of `dispatch`, produce no reply
+                // at all, and take the ring fatal. That is exactly what
+                // `sv_proto::Server`'s own default refusal was changed to avoid
+                // (design.md §7.2's note on the trait), and the same argument
+                // applies one layer down: `vkSetDebugUtilsObjectNameEXT` on a
+                // driver without the extension must not lose the device.
+                return #missing_answer;
+            }
+        };
+        let mut __pool = crate::Raise::default();
+        let __a = &mut __pool;
+        #(#locals)*
+        #(#out_decls)*
+        #call
+        let __b = __h;
+        #tail
+    })
+}
+
+/// C → wire for one scalar: the inverse of [`raise_scalar`], for the handful of
+/// commands whose output is a bare number rather than a struct.
+///
+/// It is a *different* function from the app side's `lower_scalar`, and only
+/// because that one is private; the conversions are the same three lines and a
+/// test asserts the round trip rather than the reader having to compare them.
+fn lower_scalar_back(s: &Scalar, access: &TokenStream) -> TokenStream {
+    match s {
+        Scalar::Bool32 => quote!((#access) != 0),
+        Scalar::F32 | Scalar::F64 => quote!(#access),
+        Scalar::Enum(n) | Scalar::Bitmask(n) | Scalar::Bitmask64(n) => {
+            let t = naming::type_ident(n);
+            quote!(sv_proto::#t((#access).0 as _))
+        }
+        Scalar::OpaqueU64(_) => quote!((#access) as usize as u64),
+        _ => quote!((#access) as _),
+    }
+}
+
+/// The struct a command output is made of.
+fn output_struct(f: &FieldPlan) -> Option<&str> {
+    fn base(shape: &Shape) -> Option<&str> {
+        match shape {
+            Shape::Scalar(Scalar::Struct(n)) | Shape::Scalar(Scalar::Union(n)) => Some(n),
+            Shape::Optional(i) | Shape::Array { elem: i, .. } => base(i),
+            _ => None,
+        }
+    }
+    base(&f.shape)
+}
+
+/// The full-lowering `pNext` walker: C chain → wire links, reading every member.
+///
+/// A copy of `sv-icd-entry`'s `lower_pnext` in shape and a different function in
+/// substance, because the links it calls are the `lower_full_*` ones. The two
+/// cannot be shared: which of them is correct depends on which side is asking,
+/// not on the direction (see [`Ctx::lower_full`]).
+fn emit_lower_full_pnext(cx: &Ctx<'_>) -> TokenStream {
+    let arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
+        if !cx.shared_struct(name) {
+            return None;
+        }
+        let v = naming::pnext_variant(name);
+        let f = cx.lower_fn(name);
+        let ty = naming::type_ident(name);
+        let val = *value as i32;
+        Some(quote!(#val => sv_proto::PNextLink::#v(Box::new(#f(__p as *const #ty)?)),))
+    });
+    quote! {
+        /// Walk a C `pNext` chain the **driver** filled in into wire links.
+        ///
+        /// # Safety
+        /// `head` is null or the chain this side raised and handed to the driver,
+        /// so every link is a struct of our own allocation whose `sType` we set.
+        pub unsafe fn lower_full_pnext(
+            head: *const core::ffi::c_void,
+            allowed: fn(i32) -> bool,
+        ) -> crate::LowerResult<Vec<sv_proto::PNextLink>> {
+            let mut out = Vec::new();
+            let mut __p = head;
+            let mut __guard = 0usize;
+            while !__p.is_null() {
+                __guard += 1;
+                if __guard > crate::MAX_PNEXT_LINKS {
+                    return Err(crate::LowerError::ChainTooLong);
+                }
+                let __base = __p as *const VkBaseInStructure;
+                let (__s_type, __next) = unsafe { ((*__base).s_type.0, (*__base).p_next) };
+                if allowed(__s_type) {
+                    let link = unsafe {
+                        match __s_type {
+                            #(#arms)*
+                            _ => {
+                                __p = __next as *const core::ffi::c_void;
+                                continue;
+                            }
+                        }
+                    };
+                    out.push(link);
+                }
+                __p = __next as *const core::ffi::c_void;
+            }
+            Ok(out)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the whole crate
+// ---------------------------------------------------------------------------
+
+fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
+    let methods = hand.iter().filter_map(|c| {
+        let wire = cx.wire.commands.iter().find(|w| w.name == c.name)?;
+        let m = naming::command_method(&c.name);
+        let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
+        let ret = if wire.generates_reply {
+            let r = format_ident!("{}Reply", naming::opcode_variant(&c.name));
+            quote!(sv_proto::#r)
+        } else {
+            quote!(())
+        };
+        let doc = format!(
+            "`{}` — hand-written, because forwarding it verbatim would be wrong.",
+            c.name
+        );
+        Some(quote! {
+            #[doc = #doc]
+            fn #m(&mut self, args: sv_proto::#args) -> sv_wire::Result<#ret>;
+        })
+    });
+
+    quote! {
+        /// What a GPU side supplies so that the generated forwarding can run.
+        ///
+        /// Everything here is either a table the generated code consults or a
+        /// command whose meaning is *ours* rather than the driver's — the arena,
+        /// the session, submission. The list is short and closed, and it is the
+        /// honest measure of how much of a GPU side is hand-written: everything
+        /// not named here is generated (design.md §7.2, pass 12).
+        pub trait GpuHost {
+            /// The driver's entry points.
+            fn fns(&self) -> &DriverFns;
+            /// App-assigned object id → the driver's own handle (design.md §6.4).
+            fn map_handle(
+                &mut self,
+                ty: sv_proto::HandleType,
+                id: u64,
+            ) -> sv_wire::Result<u64>;
+            /// Arena coordinates → a driver allocation and an offset into it
+            /// (design.md §5.3, GPU-side half).
+            fn rewrite_memory(&mut self, memory: u64, offset: u64)
+                -> sv_wire::Result<(u64, u64)>;
+            /// Record the app side's id for an object the driver just created.
+            fn bind(&mut self, id: u64, ty: sv_proto::HandleType, driver: u64);
+            /// Forget an object the driver just destroyed.
+            fn unbind(&mut self, id: u64);
+            /// Record that the driver has no such entry point, for one clear
+            /// diagnosis rather than a silent refusal.
+            fn note_missing(&mut self, command: &'static str);
+
+            #(#methods)*
+        }
+    }
+}
+
+fn emit_server_impl(
+    cx: &Ctx<'_>,
+    forwardable: &BTreeMap<String, TokenStream>,
+    hand: &BTreeSet<String>,
+    refused: &BTreeMap<String, String>,
+) -> TokenStream {
+    let methods = cx.wire.commands.iter().map(|w| {
+        let m = naming::command_method(&w.name);
+        let args = format_ident!("{}Args", naming::opcode_variant(&w.name));
+        let ret = if w.generates_reply {
+            let r = format_ident!("{}Reply", naming::opcode_variant(&w.name));
+            quote!(sv_proto::#r)
+        } else {
+            quote!(())
+        };
+        if hand.contains(&w.name) {
+            let doc = format!("`{}` — delegated to the hand-written half.", w.name);
+            return quote! {
+                #[doc = #doc]
+                fn #m(&mut self, args: sv_proto::#args) -> sv_wire::Result<#ret> {
+                    self.0.#m(args)
+                }
+            };
+        }
+        if let Some(body) = forwardable.get(&w.name) {
+            let doc = format!("`{}` — forwarded to the driver, generated.", w.name);
+            return quote! {
+                #[doc = #doc]
+                #[allow(unused_mut, unused_variables, clippy::let_and_return)]
+                fn #m(&mut self, a: sv_proto::#args) -> sv_wire::Result<#ret> {
+                    #body
+                }
+            };
+        }
+        let why = refused.get(&w.name).cloned().unwrap_or_else(|| "not forwardable".into());
+        let doc = format!(
+            "`{}` — **not forwarded**: {why}\n\nThe trait default answers, which \
+             fails the call rather than the session.",
+            w.name
+        );
+        quote! { #[doc = #doc] }
+    });
+
+    quote! {
+        /// A [`GpuHost`] wearing the protocol's [`sv_proto::Server`] trait.
+        ///
+        /// A newtype rather than a blanket `impl<H: GpuHost> Server for H`,
+        /// which the orphan rule forbids — `Server` is `sv-proto`'s and `H` is
+        /// nobody's.
+        pub struct Forward<H: GpuHost>(pub H);
+
+        impl<H: GpuHost> Forward<H> {
+            pub fn new(host: H) -> Forward<H> { Forward(host) }
+            pub fn host(&mut self) -> &mut H { &mut self.0 }
+        }
+
+        impl<H: GpuHost> sv_proto::Server for Forward<H> {
+            #(#methods)*
+        }
+    }
+}
+
+/// Emit the whole `sv-gpu-entry` crate body, as labelled sections.
+/// The profile's *device* extensions, as a constant the GPU side can filter the
+/// driver's list against.
+///
+/// design.md §9.2's rule, made checkable: "an extension in this list is a
+/// promise that its entry points work". An entry point works only if pass 12
+/// emitted a forwarder for it, so the set a GPU side may advertise is exactly
+/// the profile's device extensions intersected with the driver's — and the first
+/// half of that intersection has to come from the generator, because the
+/// alternative is a hand-kept list beside `vk_registry::profiles::zink()` that
+/// silently stops matching it.
+fn emit_profile_extensions(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
+    let names: Vec<&str> = wanted
+        .iter()
+        .filter(|n| {
+            cx.model
+                .extensions
+                .iter()
+                .find(|e| &e.name == *n)
+                .and_then(|e| e.ext_kind.as_deref())
+                == Some("device")
+        })
+        .map(|s| s.as_str())
+        .collect();
+    let n = names.len();
+    quote! {
+        /// The device extensions this build's profile forwards, sorted as the
+        /// profile lists them.
+        ///
+        /// A GPU side advertises the intersection of this with what its driver
+        /// actually has; an app side advertises what the GPU side answered.
+        /// Neither may advertise anything else, because an advertised extension
+        /// is a promise that its entry points cross (design.md §9.2).
+        pub const PROFILE_DEVICE_EXTENSIONS: [&str; #n] = [#(#names),*];
+    }
+}
+
+pub fn emit_all(
+    cx: &Ctx<'_>,
+    hand_written: &[&str],
+    profile_extensions: &[String],
+) -> (Vec<(String, TokenStream)>, Refusals) {
+    // Close the raisable set under containment, exactly as the app side closes
+    // its lowerable set: a struct whose raise was refused makes every struct
+    // containing it unraisable too, and emitting a call to a function that was
+    // never emitted is a generated crate that does not compile.
+    let (raise_refused, raise_cx) = cx.close_raise(emit_raise_struct);
+
+    // And the same for the *other* direction. Not `sv-icd-entry`'s `lower_*`,
+    // although it is the same direction and the same structs: a `returnedonly`
+    // struct's members are uninitialised application memory on the app side and
+    // the driver's answer here, so the app side's lowering zeroes exactly the
+    // members this side exists to carry. See `Ctx::lower_full`.
+    //
+    // Restricted to `needs_partial`, which design.md §6.1 defines as
+    // "`returnedonly` or reachable from a command output" — precisely the
+    // structs that can come back.
+    let full_cx = cx.full_lowering();
+    let (_, lower_cx) =
+        full_cx.close_with(|s| s.needs_partial, super::icd_entry::emit_lower_struct);
+
+    let full_lowers: Vec<(String, TokenStream)> = cx
+        .wire
+        .structs
+        .iter()
+        .filter(|s| lower_cx.shared_struct(&s.name))
+        .map(|s| {
+            (
+                format!("lower_full {}", s.name),
+                super::icd_entry::emit_lower_struct(&lower_cx, s).expect("closed above"),
+            )
+        })
+        .collect();
+
+    let raises: Vec<(String, TokenStream)> = cx
+        .wire
+        .structs
+        .iter()
+        .filter(|s| raise_cx.shared_struct(&s.name))
+        .map(|s| {
+            (
+                format!("raise {}", s.name),
+                emit_raise_struct(&raise_cx, s).expect("closed above"),
+            )
+        })
+        .collect();
+
+    let hand: BTreeSet<String> = hand_written.iter().map(|s| s.to_string()).collect();
+    let mut forwardable = BTreeMap::new();
+    let mut refused: BTreeMap<String, String> = BTreeMap::new();
+    let mut refusals = Vec::new();
+    for c in &cx.abi.commands {
+        if !c.forwarded || hand.contains(&c.name) {
+            continue;
+        }
+        let Some(wire) = cx.wire.commands.iter().find(|w| w.name == c.name) else {
+            continue;
+        };
+        match emit_forward_command(&raise_cx, &lower_cx, c, wire) {
+            Ok(body) => {
+                forwardable.insert(c.name.clone(), body);
+            }
+            Err(reason) => {
+                refused.insert(c.name.clone(), reason.clone());
+                refusals.push(Refusal { command: c.name.clone(), reason });
+            }
+        }
+    }
+
+    let hand_cmds: Vec<&AbiCommand> =
+        cx.abi.commands.iter().filter(|c| hand.contains(&c.name)).collect();
+
+    let mut sections = vec![
+        ("extensions".to_string(), emit_profile_extensions(cx, profile_extensions)),
+        ("raise pnext".to_string(), emit_raise_pnext(&raise_cx)),
+        ("lower_full pnext".to_string(), emit_lower_full_pnext(&lower_cx)),
+    ];
+    sections.extend(full_lowers);
+    sections.extend(raises);
+    let forwardable_names: BTreeSet<String> = forwardable.keys().cloned().collect();
+    sections.push(("fns".to_string(), emit_driver_fns(cx, &forwardable_names)));
+    sections.push(("host".to_string(), emit_host_trait(cx, &hand_cmds)));
+    sections.push((
+        "server".to_string(),
+        emit_server_impl(cx, &forwardable, &hand, &refused),
+    ));
+
+    (sections, Refusals { raise: raise_refused, commands: refusals })
+}
+
+/// Everything the GPU-side emitter needs from the model that is not in a plan.
+pub fn contexts<'a>(
+    model: &'a Model,
+    abi: &'a AbiPlan,
+    wire: &'a Plan,
+) -> Ctx<'a> {
+    Ctx::new(model, abi, wire)
+}

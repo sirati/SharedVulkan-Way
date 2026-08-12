@@ -150,10 +150,14 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     let mut replies = RingProducer::open(&control, slot, Lane::Reply).map_err(err)?;
     let ctrl = RingCtrl::open(&control, slot).map_err(err)?;
     let parker = SpinYield::default();
-    let mut srv = GpuServer::new(Arc::clone(&shared));
+    // `Forward` is the generated half: 221 of the 239 commands are answered
+    // inside it, and `GpuServer` supplies only the eighteen whose meaning is
+    // ours (design.md §7.2 pass 12).
+    let mut srv = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&shared)));
     let mut handled = 0u64;
     let mut reply = Vec::new();
     let mut idle_since = Instant::now();
+    let trace = std::env::var_os("SV_TRACE").is_some();
 
     loop {
         if control.flags().map_err(err)? & Flags::SHUTDOWN != 0 {
@@ -216,6 +220,28 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
         let mut dec = sv_wire::Decoder::new(&payload);
         match sv_proto::dispatch(&mut dec, &mut srv, &mut reply) {
             Ok(op) => {
+                // `SV_TRACE=1` prints every command and the `VkResult` its reply
+                // carries. It exists because the failure mode of a forwarder is
+                // "the application says something failed" with no way to tell
+                // *which* of two hundred commands, and reconstructing that from
+                // an application's own error message is guesswork. The result is
+                // read out of the encoded reply rather than threaded back
+                // through `dispatch`, which keeps the tracing entirely out of
+                // the generated code.
+                if trace {
+                    let code = op
+                        .returns_result()
+                        .then(|| {
+                            reply
+                                .get(sv_wire::REPLY_HEADER_SIZE..sv_wire::REPLY_HEADER_SIZE + 4)
+                                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        })
+                        .flatten();
+                    match code {
+                        Some(0) | None => eprintln!("[trace] {}", op.name()),
+                        Some(c) => eprintln!("[trace] {} -> VkResult({c})", op.name()),
+                    }
+                }
                 if !reply.is_empty() {
                     replies.push_seq(seqno, &reply, None).map_err(err)?;
                 }
@@ -226,11 +252,18 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
                 // R13's detector firing, or a handle that has not arrived. Both
                 // are fatal to the ring and both must say which command, because
                 // "the stream desynchronised" without an opcode is undebuggable.
-                let detail = match srv.last_error.take() {
+                let detail = match srv.host().last_error.take() {
                     Some(d) => format!("{e} ({d})"),
                     None => e.to_string(),
                 };
                 let _ = ctrl.set_fatal(1, seqno, &detail);
+                // Said here as well as returned, because the return value only
+                // reaches a person if the process exits normally — and a ring
+                // going fatal usually means the app side is about to be killed,
+                // taking this process's exit path with it. The app side sees
+                // "ring N is fatal, code 1" and nothing else; this is the line
+                // that says which command and why.
+                eprintln!("[gpu] ring {slot} seqno {seqno} FATAL: {detail}");
                 return Err(format!("ring {slot} seqno {seqno}: {detail}"));
             }
         }

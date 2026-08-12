@@ -281,14 +281,18 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
     ("VK_EXT_headless_surface", 1),
 ];
 
-/// The device extensions we advertise.
+/// The device extensions we advertise **with no GPU side**.
 ///
-/// Empty in this build, and that is the honest state rather than a placeholder:
-/// an extension in this list is a promise that its entry points work, and
-/// nothing forwards yet. Zink's five required extensions
-/// (`maintenance1`, `maintenance5`, `create_renderpass2`, `dynamic_rendering`,
-/// `descriptor_update_template`) plus `timeline_semaphore` go here when there is
-/// a GPU side to forward them to (design.md §11).
+/// Empty, and that is the honest state rather than a placeholder: an extension
+/// in this list is a promise that its entry points work, and a standalone driver
+/// forwards nothing.
+///
+/// With a GPU side the list is **not a constant** — it is asked of the peer at
+/// connect and cached in [`crate::state::SharedVulkan::device_extensions`],
+/// because the only side that can keep §9.2's promise is the one holding the
+/// driver. That is a correction to design.md §9.2, which describes the list as
+/// something the app side curates: it cannot, because the intersection with the
+/// driver's own extensions is not knowable here.
 pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
 
 #[cfg(test)]
