@@ -5,10 +5,41 @@ members = [
   "crates/wc-handle",
   "crates/wc-server",
   "crates/wc-probe",
+  "crates/wc-xkb-probe",
+  "crates/wc-compositor",
   "vendor/wayland-backend",
   "vendor/wayland-scanner",
   "vendor/wayland-server",
 ]
+
+# WHICH FORKS ARE MEMBERS, AND WHY THE OTHERS ARE NOT
+#
+# `wayland-backend`, `wayland-server` and `wayland-scanner` are members. They
+# are ours — stage 1 rewrote their transport, their fd type and their poll loop,
+# and `vendor/PATCHES.md` says outright to treat them as this project's code.
+# They are held to this project's gates: `cargo clippy --workspace
+# --all-targets` lints them and they are clean.
+#
+# `smithay` and `xkbcommon` are not members, for two different reasons that
+# happen to point the same way.
+#
+# smithay, the mechanical reason: a member is built by `cargo check --workspace`
+# with its *own* default features, and smithay's defaults are `backend_drm`,
+# `backend_gbm`, `backend_libinput`, `backend_udev`, `backend_session_libseat`,
+# `backend_x11`, `backend_winit`, `renderer_gl`, `renderer_multi`, `xwayland`
+# and `backend_vulkan` — the Linux graphics stack, top to bottom. Excluding it
+# means the only way smithay is ever built is through `wc-compositor`, which
+# names the feature set we actually ship, so the Windows gate tests the
+# configuration that exists rather than one nobody uses.
+#
+# Both, the real reason: these two are near-upstream forks that we intend to
+# send patches back to (docs/design.md §5.3 — smithay has merged this patch
+# class three times). Holding somebody else's crate to this project's lint
+# standard would mean carrying a dozen hunks that have nothing to do with the
+# port, which is exactly what makes a fork hard to rebase and a patch series
+# hard to review. Our changes to them are reviewed by diff, not by clippy;
+# `vendor/PATCHES.md` is the index.
+exclude = ["vendor/smithay", "vendor/xkbcommon"]
 
 # The forks are members of this workspace *and* the resolution target for
 # anything that asks crates.io for these names. Without the patch table a
@@ -22,6 +53,10 @@ members = [
 wayland-backend = { path = "vendor/wayland-backend" }
 wayland-server = { path = "vendor/wayland-server" }
 wayland-scanner = { path = "vendor/wayland-scanner" }
+# smithay depends on `xkbcommon` non-optionally, so without this entry a
+# smithay build resolves the crates.io copy, whose `use std::os::unix::io` fails
+# for Windows before the linker is ever reached.
+xkbcommon = { path = "vendor/xkbcommon" }
 
 [workspace.package]
 edition = "2024"
@@ -35,6 +70,11 @@ wc-handle = { path = "crates/wc-handle" }
 wayland-backend = { path = "vendor/wayland-backend" }
 wayland-server = { path = "vendor/wayland-server" }
 wayland-scanner = { path = "vendor/wayland-scanner" }
+xkbcommon = { path = "vendor/xkbcommon" }
+# smithay is deliberately absent from this table. It is declared inline by
+# `crates/wc-compositor`, because a `workspace.dependencies` entry cannot be
+# overridden with `default-features = false` by the crate that inherits it, and
+# `default-features = false` is the entire point. See the `exclude` note above.
 
 # The Windows half. `windows-sys` rather than `windows` because everything we
 # call is a plain C entry point — no COM, no WinRT — and the raw bindings cost

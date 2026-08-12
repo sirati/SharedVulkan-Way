@@ -94,6 +94,64 @@ impl FdRepr for BorrowedFd<'_> {
     }
 }
 
+/// "This thing can lend out a descriptor", the Windows counterpart of
+/// `std::os::fd::AsFd`.
+///
+/// ADDED FOR STAGE 2. Upstream `wayland-backend` never needed this because on
+/// Unix `AsFd` comes from `std`. It exists here because smithay's port needs
+/// one spelling that works on both platforms: `wayland/shm/pool.rs`,
+/// `utils/sealed_file.rs`, `input/keyboard/keymap_file.rs` and the clipboard
+/// code all take an `impl AsFd` for what is, on this platform, a named kernel
+/// object rather than a descriptor.
+///
+/// Note what is deliberately *not* here: no `AsRawFd`, and no blanket impl over
+/// `Deref`. On Unix `AsFd` and `AsRawFd` differ in whether the caller gets an
+/// ownership guarantee; on Windows the handle is refcounted, so the two would
+/// collapse into the same method and the distinction would silently stop
+/// meaning anything. A call site that genuinely wants the raw form should say
+/// so with a `cfg` and be visible in the diff.
+#[cfg(windows)]
+pub trait AsFd {
+    /// Borrow the descriptor.
+    fn as_fd(&self) -> BorrowedFd<'_>;
+}
+
+#[cfg(windows)]
+impl AsFd for wc_handle::Handle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        BorrowedFd::borrow(self)
+    }
+}
+
+#[cfg(windows)]
+impl AsFd for BorrowedFd<'_> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        BorrowedFd { handle: self.handle.clone(), _marker: std::marker::PhantomData }
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsFd + ?Sized> AsFd for &T {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        T::as_fd(self)
+    }
+}
+
+/// A live, read-only view of a descriptor's memory.
+///
+/// ADDED FOR STAGE 2. On Unix a compositor maps a `wl_shm_pool` with `mmap` and
+/// holds nothing but a pointer, because the fd it mapped is a separate object
+/// it already owns. On Windows the mapping *is* the object reference — the
+/// `MapViewOfFile` result has to stay alive for the pointer to stay valid — so
+/// the type has to be nameable by whoever holds the pointer. Re-exported here
+/// so that a consumer (smithay's `wayland/shm/pool.rs`) can name it without
+/// depending on `wc-handle` directly.
+///
+/// There is deliberately no writable counterpart; see `wc_handle::Handle::map`
+/// for why a compositor reading client buffers should not have one by default.
+#[cfg(windows)]
+pub use wc_handle::Mapping;
+
 /// The socket type the transport is built on.
 pub use wc_transport::Stream as WlStream;
 

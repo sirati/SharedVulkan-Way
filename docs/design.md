@@ -18,6 +18,11 @@ estimate, it says so in those words.
 
 ---
 
+> **Stage 2 is §7.** §0 through §6 are stage 1's document and are left as they
+> were written, except where a passage has been explicitly superseded. Read §7
+> for what has changed: `libxkbcommon` is measured, smithay compiles for Windows,
+> and a mingw-built compositor reaches `xdg_toplevel`.
+
 ## 0. Status: what stage 1 settled, and what it did not
 
 The research was explicit that one question dominated the schedule risk
@@ -92,6 +97,10 @@ Listed here rather than left implicit, because the temptation to read §0 as
 3. **No compositor exists.** There are no surfaces, no `xdg-shell`, no HWNDs and
    no pixels. `wl_shm.create_pool` maps the client's memory and prints what is in
    it; it does not implement `wl_shm`.
+   **[SUPERSEDED — 2026-08-13, see §7.5.** One exists. It has surfaces and
+   `xdg-shell`, through smithay's own implementations, and a real C client
+   reaches `xdg_toplevel` against the Windows binary. There are still no HWNDs
+   and no pixels. The updated list is §7.7.**]**
 4. **Level-triggered wepoll is asserted, not observed under load.** The
    registration asks for `PollMode::Level` and `polling`'s IOCP backend reports
    `supports_level() == true` unconditionally, but no test has yet produced a
@@ -650,6 +659,12 @@ lines rather than thousands.
 
 ### 5.4 The two things that could still go wrong
 
+> **[SUPERSEDED — 2026-08-13, see §7. Both were measured in stage 2 and neither
+> went wrong. The original text is kept because the *shape* of the estimates is
+> the interesting part: one was wrong by being too pessimistic in a way that was
+> flagged in the same paragraph, and the other was right about the mechanism and
+> silent about the one thing that actually bit.]**
+
 Stated separately because the estimate above does not cover them.
 
 1. **`wayland/shm/pool.rs` is the one architecturally hard file** (370 lines, 13
@@ -674,6 +689,11 @@ Stated separately because the estimate above does not cover them.
    1.0.0"), and it may well be right, but nothing in this measurement touched
    linking. **This is the next thing to measure**, and it is a prerequisite for
    the smithay decision actually being actionable.
+
+**Outcome.** (1) was the *easiest* file, exactly as the hedge in its own last
+three sentences suggested: the guard is omitted, not reimplemented, and the
+120–180 lines were not spent. (2) is answered yes, with one upstream bug found
+along the way that neither the research nor this section anticipated. §7.
 
 ### 5.5 Corrections to the research
 
@@ -704,8 +724,10 @@ table (res §9.3), which this project is following.
 |---|---|---|
 | `wayland-client` fork (Architecture A only) | 100–300 lines of diff | **high** — the backend's client half is already ported and compiles; only the `wayland-client` crate itself remains, and it is the same shape as `wayland-server`, which cost 142 lines |
 | `wayland-protocols`, `-wlr`, `-misc` | **0 lines — done** | **measured**: all three check clean for `x86_64-pc-windows-gnu` against these forks, as a side effect of the smithay probe in §5.1. The research's prediction that their gate is "entirely `wayland-backend`" is confirmed. |
-| smithay port (§5) | 300–400 changed lines, plus the two unknowns in §5.4 | **medium** — the 56 errors and 139 coupled lines are measured; the split into new-code and mechanical is an estimate |
-| `libxkbcommon` cross-built for mingw, and linking | unknown | **none — not measured at all.** §5.4. Next thing to establish. |
+| smithay port (§5) | ~~300–400 changed lines, plus the two unknowns in §5.4~~ **done: 240 changed lines across 27 files, plus 2 new modules** | **measured** — §7.3. The estimate was high because §5.4 item 1 turned out not to need writing at all. |
+| `libxkbcommon` cross-built for mingw, and linking | ~~unknown~~ **done: one upstream patch, one nix derivation, three crate sites** | **measured** — §7.2. Runs under Wine; the guest still has to confirm. |
+| `XkbConfig` variant taking a keymap string (so `KeyboardHandle::new` works on Windows) | 20–50 lines | **high** — `new_from_names` is one call site and `new_from_string` already works there (§7.2) |
+| A DACL on `wc_handle` sections, so `SealedFile` is actually sealed | 50–150 lines | **medium** — the mechanism (`SECURITY_ATTRIBUTES` on `CreateFileMappingW`) is standard; getting the SID right is the work. §7.7 item 6 |
 | `wl_shm` properly (pools, buffers, `SEC_RESERVE` growth) | 500–1,000 lines | **medium** — the `resize` problem is real (a Windows section's size is fixed at creation) and the two answers are both known |
 | Stage 4: `backend_win32`, one HWND per toplevel, shm blit, pointer + keyboard | 8,000–15,000 lines | **low** — this is the research's own estimate and nothing measured here bears on it |
 | Verification on the real guest | one afternoon | **high** |
@@ -722,3 +744,288 @@ The research called stages 1–4 "the real project risk"; stages 1 and 2 are don
 and they were three to four times smaller than estimated. What is left in that
 band is stage 3 (a headless compositor) and stage 4 (the first real window),
 neither of which contains an unknown of the kind that had to be settled here.
+
+---
+
+## 7. Stage 2: `libxkbcommon`, and smithay as a Windows binary
+
+Written 2026-08-13. Stage 1 ended with two open items (§5.4) and one decision
+that could not be acted on until the first of them was settled. Both are settled.
+
+### 7.1 Status in one paragraph
+
+**libxkbcommon cross-compiles for `x86_64-pc-windows-gnu`, the `xkbcommon` crate
+binds to it, and a Windows binary compiles a real 2,081-line keymap and
+translates keycodes with modifiers.** **smithay compiles for
+`x86_64-pc-windows-gnu`** — 56 errors to zero — with `wayland_frontend` and
+`desktop` enabled. **`wc-compositor.exe`, a mingw-built smithay compositor,
+stands up a `wl_display`, advertises `xdg_wm_base`, and lets
+`weston-multi-resource` — a C client from the Weston project — create a
+`wl_surface`, an `xdg_toplevel`, receive a `configure` and commit.** That is the
+stage-2 milestone, and it is observed under Wine against the `.exe`, not
+inferred from a unit test.
+
+### 7.2 `libxkbcommon`: the answer is yes, with one upstream bug
+
+The question §5.4 item 2 asked was three questions, and they have different
+answers.
+
+**Does libxkbcommon cross-compile for mingw? Yes, after a one-line patch, and
+the patch is a case-sensitivity bug that upstream's CI structurally cannot see.**
+
+`src/utils.h` includes `<BaseTsd.h>` unconditionally under `_WIN32`, but takes
+only `SSIZE_T` from it, two lines later, inside `#ifdef _MSC_VER`. mingw-w64
+ships that header as `basetsd.h`, lower case, and only that spelling. Windows
+filesystems are case-insensitive, so MSVC and clang-cl *on Windows* never notice.
+Cross-compiling with `x86_64-w64-mingw32-gcc` from a case-sensitive filesystem,
+every translation unit that reaches `utils.h` fails:
+
+```
+../src/utils.h:28:11: fatal error: BaseTsd.h: No such file or directory
+```
+
+**Measured: 250-odd of the 290 ninja targets.** libxkbcommon 1.13.2,
+`x86_64-w64-mingw32-gcc` 15.3.0.
+
+This is precisely the gap the research flagged and then discounted. res §5 says
+mingw is "**claimed-fixed but not CI-covered**"; res §3 says "libxkbcommon is the
+one bright spot — Windows-supported since 1.0.0, non-MSVC Windows compilers fixed
+in 1.12.3". Both sentences are true and the first one is the load-bearing one:
+the fix landed, the coverage did not, and it regressed. **Correction to the
+research: "the one bright spot" is right about the destination and wrong about
+the road being clear.**
+
+The fix is `nix/libxkbcommon-mingw-basetsd.patch`, written as a submittable
+commit with the measurement in the message.
+
+*Also blocking, and packaging rather than upstream:* nixpkgs' `libxkbcommon`
+hard-enables X11 — `libxcb` in `buildInputs`, `libx11.out` in `mesonFlags` — and
+`libx11` genuinely does not cross-compile to mingw here (`xorgproto` for mingw
+installs no `include/X11`). `nix/libxkbcommon-mingw.nix` switches off X11,
+Wayland, docs, the registry and the tools, which is everything smithay does not
+use.
+
+**Does the Rust crate bind to it? Yes, three sites, as predicted.** §5.4 item 2
+guessed "a three-site patch (it uses `std::os::unix` and `OsStr::as_bytes`)" and
+that is exactly what it was. `vendor/PATCHES.md` has them.
+
+**Can a Windows binary load a keymap and translate a keycode? Yes.**
+`scripts/wc-xkb.sh`, all five checks, under Wine:
+
+| | |
+|---|---|
+| `xkb_context_new` | ok |
+| `xkb_keymap_new_from_string`, 2,081-line `us` keymap, 71,249 bytes | ok, keycodes 9..709 |
+| keycode 38 → keysym `0x61` `a`, UTF-8 `"a"` | ok |
+| keycode 38 + Shift → keysym `0x41` `A`, UTF-8 `"A"` | ok |
+| `xkb_keymap_get_as_string` → 35,571 bytes, recompiles | ok |
+
+The Shift case is there because the first three would pass against a keymap that
+had compiled to nothing useful; a modifier requires the compiled tables to be
+real. Proven twice, in C (`scripts/probe-xkb.c`, linked by hand) and in Rust
+(`crates/wc-xkb-probe`, linked by cargo) — different questions, because the
+second also tests the fork's `cfg` gating and cargo's linker invocation.
+
+Static, not shared: `-Ddefault_library=static` gives `libxkbcommon.a`, so the
+`.exe` carries the keymap engine and nothing is resolved from a search path we
+arranged.
+
+**And the thing that does not work, deliberately.**
+`xkb_keymap_new_from_names` — the call smithay's `XkbConfig::compile_keymap`
+makes, and the call every Linux compositor makes — **fails on Windows and must**:
+
+```
+xkbcommon: ERROR: [XKB-632] Failed to add any default include path
+                  (system path: C:/ProgramData/waycompose/xkb)
+xkbcommon: ERROR: [XKB-595] Cannot load XKB rules "evdev"
+```
+
+It resolves RMLVO names against the xkeyboard-config data tree, ~2,000 files of
+X11 configuration that does not exist on Windows. The compiled-in config root
+deliberately names a path nobody creates, so that a `new_from_names` which
+silently started working off a Linux store path would be a visible bug rather
+than an accident, and both probes assert on the failure.
+
+> **The keymap design follows from this and is not optional.** RMLVO names are
+> resolved on Linux at build time (`scripts/gen-keymap.sh`); the Windows side
+> only ever compiles a *string*. This is what the research recommends (res §5)
+> and what Weston's RDP backend does. The cost is that the set of layouts is
+> fixed at build time, and a compositor answering `WM_INPUTLANGCHANGE` must map
+> the new HKL onto one it shipped — FreeRDP's `xkb_layout_ids.c` is that table,
+> and it is stage-4 work.
+
+**Consequence for smithay, not yet paid:** `XkbConfig::compile_keymap` is
+`new_from_names`, so `KeyboardHandle::new` cannot succeed on Windows as smithay
+is written. It is not on the path to `xdg_toplevel` and nothing in this stage
+calls it. Fixing it is an `XkbConfig` variant carrying a keymap string, which is
+small and probably upstreamable, and is the first thing stage 4 needs.
+
+### 7.3 smithay: 56 errors to zero
+
+Measured with `default-features = false, features = ["wayland_frontend",
+"desktop"]`, this project's three stage-1 forks patched in, plus the
+`vendor/xkbcommon` fork. The 56 errors in 22 files reproduce exactly.
+
+| Step | Errors removed | Running total |
+|---|---|---|
+| baseline | — | 56 |
+| the `backend_dmabuf` feature gate | **19** | 37 |
+| `utils/os.rs` + `utils/clock/timespec.rs` and their call sites | 21 | 16 |
+| `sealed_file`, `security_context`, `commit_timing`, `socket`, `virtual_keyboard` | 16 | **0** |
+
+The 19 is worth noting: §5.3 predicted "four one-line gates remove 2,537 lines
+and **19 of the 56 errors (34 %)**". Exact.
+
+**The diff, measured:** 529 lines added and 146 removed across 27 changed files
+and 2 new ones, of 246. Of the 529 added, 293 are code and 236 are comments; of
+the 293, 51 are the two new modules. So roughly **240 changed lines across 27
+existing files**, against §5.2's estimate of 300–400. The estimate was high, and
+§7.4 is why.
+
+One small correction to §5.2's own arithmetic: the per-file distribution is
+"one error each in **sixteen** further files", not fourteen. 15+13+5+3+2+2 = 40,
+plus 16 = 56.
+
+### 7.4 `shm/pool.rs` was the easiest file, not the hardest
+
+§5.4 item 1 called it "the one architecturally hard file", budgeted 120–180
+lines for a vectored exception handler, and said it was "the one estimate I would
+not trust without a spike" — while noting, in the same paragraph, that §2.6 might
+make the guard omittable entirely.
+
+**It is omittable, and the guard is omitted.** The `SIGBUS` handler exists
+because a Linux client can `ftruncate` its pool *smaller* and fault the
+compositor mid-read. A Windows section's size is fixed at `CreateFileMappingW`
+time and cannot be reduced. The event does not exist, so nothing catches it, and
+the 120–180 lines were not spent. This is the one place so far where the Windows
+model is *stronger* than the Unix one.
+
+What the file did need was smaller and different in kind: `MemMap` has to carry
+the `wc_handle::Mapping` and not only a pointer, because `MapViewOfFile` returns
+a view whose lifetime *is* the mapping's — dropping it dangles the pointer, which
+is a silent use-after-free rather than a compile error.
+
+`with_data_mut` returns `Err(())` on Windows rather than pretending: the mapping
+is `FILE_MAP_READ` and a `*mut u8` into it would fault on the first store.
+
+### 7.5 The evidence, and what it is worth
+
+`scripts/wc-xdg.sh all` — 10 passed, 0 failed.
+
+**On Linux**, `weston-multi-resource` and `weston-flower` both reach
+`xdg_toplevel`.
+
+**Under Wine, as a Windows binary**, `wc-compositor.exe`:
+
+1. binds an AF_UNIX socket — verified as a real host socket node with
+   `find -type s`, at
+   `drive_c/users/<user>/AppData/Local/waycompose/wayland-xdgwin`;
+2. accepts a **native Linux** `weston-multi-resource`, which creates a
+   `wl_surface`;
+3. creates an **`xdg_toplevel`** — the milestone;
+4. sends a `configure`, and the client commits.
+
+Steps 2–4 all run through smithay's own `compositor` and `xdg::shell` modules.
+The client is C, uses libwayland-client and the upstream `xdg-shell` XML, and has
+never heard of this project — the same standard `wayland-info` set in §4.2, one
+protocol layer deeper.
+
+**A limit found by running, not predicted: `weston-flower` does *not* work
+against the Windows build, and the reason is §2.4 arriving on schedule.**
+Toytoolkit allocates its `wl_shm` pool during `display_create()`, before any
+surface exists. `wl_shm.create_pool` carries an `h`; a stock libwayland client
+sends the fd out-of-band by `SCM_RIGHTS`; Wine's AF_UNIX carries no ancillary
+data; so the in-band descriptor our parser expects is simply absent and framing
+desynchronises at that request. Measured with `WAYLAND_DEBUG=1`: the client
+sends `create_surface`, `get_xdg_surface`, `get_toplevel` and `commit`, and the
+server sees none of them.
+
+`weston-multi-resource` is a simple-client rather than a toytoolkit one and
+creates the surface and toplevel *before* touching shm, so the whole xdg-shell
+exchange completes before the first `h`. Both are run on Linux, where
+`SCM_RIGHTS` works, and `weston-flower`'s Linux pass is what establishes that
+request order is the only difference.
+
+> **This makes §2.4 concrete in a way it was not before.** "The Windows byte
+> stream is not libwayland's byte stream" was written as a cost that nobody
+> currently pays, because there are no Windows libwayland clients. It is also a
+> cost paid by *our own testing*: any third-party client that sends an `h` can
+> only be used against the Windows build up to that point. Every stage from here
+> that involves buffers needs either a client speaking our dialect
+> (`wc-probe.exe --shm` is the existing one) or the Architecture B proxy.
+
+### 7.6 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo clippy --workspace --all-targets` (Linux) | clean, no warnings |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo test --workspace` | 30 tests, 0 failures |
+| `scripts/wc-xkb.sh` | 5 passed, 0 failed |
+| `scripts/wc-xdg.sh all` | 10 passed, 0 failed |
+
+The Windows clippy gate is stronger than stage 1's, which did not pass
+`--all-targets`; making it pass needed `#![cfg(unix)]` on
+`wayland-backend/tests/null_object.rs`, which uses `UnixStream::pair()`, and
+there is no `socketpair(2)` for Windows AF_UNIX.
+
+`vendor/smithay` and `vendor/xkbcommon` are **excluded from the workspace**, so
+clippy does not lint them. That is deliberate and the criterion is in
+`Cargo.toml`: the three stage-1 forks are ours and are linted; these two are
+near-upstream and are kept rebaseable, because most of these patches are meant to
+go back. Their changes are reviewed by diff, and `vendor/PATCHES.md` is the
+index. **Stated plainly because it is a real weakening of the gate**: nine clippy
+warnings in untouched upstream `xkbcommon` code are not being fixed, and our
+patches to those two crates are not clippy-checked.
+
+### 7.7 What is not proven, updated
+
+§0.2's list, with stage 2's changes:
+
+1. **Nothing has still run on Windows.** Everything executable was executed
+   under Wine 11.14 staging. §4.4 stands unchanged and is the most important
+   section in this document. One narrowing: libxkbcommon is pure userspace
+   computation over a string — no syscalls beyond `fopen`, no sockets, no timers
+   — so §7.2 is the result here where Wine is closest to conclusive. "Closest to"
+   is not "is".
+2. **`SIO_AF_UNIX_GETPEERPID` is still untested.** Unchanged.
+3. ~~No compositor exists.~~ **Superseded.** One exists, it reaches
+   `xdg_toplevel`, and it draws nothing.
+4. **Level-triggered wepoll is still asserted, not observed under load.**
+   Unchanged, and stage 2 did not exercise it any harder: the poll loop is still
+   the sleep-poll loop of stage 1.
+5. **New: the `Monotonic` clock's epoch is process start, not boot.** Correct
+   for every current caller (ordering, differences, input timestamps) and wrong
+   for a client comparing against its own clock, which is what `wp_presentation`
+   expects. Must become `QueryPerformanceCounter` before presentation feedback.
+6. **New: `SealedFile` is not sealed on Windows.** A client handed a section
+   *name* could `OpenFileMappingW(FILE_MAP_WRITE, …)` and modify the keymap other
+   clients read. A sealed `memfd` cannot be written by anyone. The fix is a DACL
+   on the section, which is a `wc_handle` change. **This is a genuine regression
+   against the Unix security model and the first one this project has taken.**
+7. **New: `with_data_mut` is unimplemented on Windows**, so
+   `wayland::shm::with_buffer_contents_mut` fails. No current caller.
+8. **New: `KeyboardHandle::new` cannot succeed on Windows**, because
+   `XkbConfig::compile_keymap` is `new_from_names`. §7.2.
+
+### 7.8 What to re-check on the guest, in priority order
+
+The list from §4.4 plus stage 2's additions. This is the afternoon's agenda when
+the machine is reachable.
+
+1. **`SIO_AF_UNIX_GETPEERPID`** returns a real pid. Wine implements no
+   `IOC_VENDOR` ioctl at all, so this has compiled and never run.
+2. **`afunix.sys` accept/peer-address semantics.** Stage 1 found Wine reports
+   `sun_family = 0` where Windows documents `AF_UNIX`; the fix works on both, but
+   the divergence class is proven to exist.
+3. **wepoll under load, level-triggered.** A partial read that exercises
+   re-readiness. Nothing has produced one yet.
+4. **Named section create/open across a process boundary**, with the real
+   `Local\` namespace and the real `BCryptGenRandom` — now on the critical path
+   for keymaps as well as `wl_shm`.
+5. **`libxkbcommon.a` linked into a real `.exe`.** Lowest risk of the list —
+   §7.2's caveat — but it is 590 KB of somebody else's C and it costs one command.
+6. **The 56 MB debug binary itself.** Nothing has checked that a binary this
+   size loads sensibly on real Windows; Wine's loader is not `ntdll`'s.
+7. **`std::time::Instant`'s resolution**, if §7.7 item 5 is fixed with QPC.

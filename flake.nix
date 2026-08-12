@@ -45,7 +45,26 @@
         extensions = ["clippy" "rust-analyzer" "rust-src" "rustfmt"];
         targets = ["x86_64-pc-windows-gnu"];
       };
+
+      # libxkbcommon for the Windows target. smithay depends on the `xkbcommon`
+      # crate non-optionally and that crate is `#[link(name = "xkbcommon")]`,
+      # so without this there is no Windows *binary* — only a `cargo check`
+      # that never reaches the linker. nix/libxkbcommon-mingw.nix carries the
+      # measurements and the one upstream bug that had to be patched.
+      #
+      # `allowUnsupportedSystem` is needed because nixpkgs marks libxkbcommon
+      # `meta.platforms = unix`. That marking is about the X11 and Wayland
+      # halves, both of which are switched off here; the keymap engine itself
+      # has upstream Windows support and builds clean.
+      pkgsUnsupported = import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+        config.allowUnsupportedSystem = true;
+      };
+      libxkbcommonMingw = pkgsUnsupported.callPackage ./nix/libxkbcommon-mingw.nix {};
     in {
+      packages.libxkbcommon-mingw = libxkbcommonMingw;
+
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           rustToolchain
@@ -89,6 +108,24 @@
           wayland-utils
           wayland
 
+          # Stage 2's independent client. `wayland-info` enumerates globals and
+          # stops there; reaching `xdg_toplevel` needs a client that actually
+          # makes a window. Weston's demo clients are C, use libwayland and the
+          # upstream `xdg-shell` protocol, and have never heard of this project
+          # — which is the whole point, exactly as it was for `wayland-info` in
+          # stage 1. `weston-flower` is the smallest of them that maps a
+          # toplevel.
+          weston
+
+          # `xkbcli compile-keymap` — the Linux-side half of the keymap story.
+          # There is no xkeyboard-config data tree on Windows and there is not
+          # going to be one, so keymap *strings* are generated here, on Linux,
+          # from real RMLVO names, and the Windows binary only ever compiles a
+          # string it was handed. scripts/gen-keymap.sh does the generating and
+          # docs/design.md §7.2 explains why this is the whole design and not a
+          # test convenience.
+          libxkbcommon
+
           pkg-config
           gdb
         ];
@@ -105,7 +142,17 @@
           # system. Referring to its store path is fine: we need a search path,
           # not an installation. Inherited verbatim from phase 1, where this
           # exact line was the difference between linking and not.
-          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib"
+          #
+          # The second `-L` is libxkbcommon, built by nix/libxkbcommon-mingw.nix
+          # and static, so `#[link(name = "xkbcommon")]` resolves to
+          # `libxkbcommon.a` and the produced .exe carries the keymap engine
+          # inside it rather than needing a DLL beside it.
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib -L ${libxkbcommonMingw}/lib"
+
+          # For the C probe (scripts/probe-xkb.c) and for anything that wants to
+          # find the headers without going through cargo.
+          export WC_XKB_MINGW="${libxkbcommonMingw}"
+          export WC_XKB_MINGW_DEV="${libxkbcommonMingw.dev}"
 
           # Keep every wine artefact out of the user's real ~/.wine. A prefix
           # under the build tree is disposable and cannot damage anything the

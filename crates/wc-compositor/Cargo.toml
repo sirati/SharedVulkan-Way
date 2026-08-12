@@ -1,0 +1,29 @@
+[package]
+name = "wc-compositor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A smithay compositor that stands up wl_display and xdg_shell as a Windows binary"
+
+[dependencies]
+# The feature set is the whole point of this crate existing separately from the
+# vendored fork. `vendor/smithay` is deliberately NOT a workspace member: as a
+# member, `cargo check --workspace` would build it with its own `default`
+# features, which are DRM, GBM, libinput, libseat, X11, winit, XWayland and
+# Vulkan — none of which exist on Windows and none of which we want on Linux
+# either. Declaring the features here, at the one place that consumes smithay,
+# keeps the fork's manifest identical to upstream's on that point and keeps the
+# gate honest.
+#
+# `wayland_frontend` is the protocol implementations. `desktop` is the space and
+# window management (4,768 lines, docs/design.md §5.2).
+smithay = { path = "../../vendor/smithay", default-features = false, features = [
+  "wayland_frontend",
+  "desktop",
+] }
+wayland-server = { workspace = true }
+wc-transport = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+wc-handle = { workspace = true }
