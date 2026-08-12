@@ -1,0 +1,12 @@
+[package]
+name = "sv-hostd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "App-side daemon: owns the extent's descriptor, hands the fd and the view geometry to ICD processes"
+
+[dependencies]
+sv-transport = { workspace = true }
+sv-arena = { workspace = true }
+sv-wire = { workspace = true }

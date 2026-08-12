@@ -1,0 +1,13 @@
+[package]
+name = "sv-arena"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The passthrough arena: extents, slabs, the 4096-granularity allocator, the R26 canary"
+
+[dependencies]
+# For the slab directory in the control region and the shared mapping the arena
+# is carved from. The allocator itself touches neither: design.md §5.2 keeps it
+# entirely in the app side's private memory.
+sv-transport = { workspace = true }
