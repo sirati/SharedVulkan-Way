@@ -146,5 +146,27 @@
           echo "  vk.xml   $VK_XML"
         '';
       };
+
+      # The development guest of §13 step 7.
+      #
+      # `nix build .#svGuest` produces a script that boots a NixOS VM whose RAM
+      # is a `memory-backend-memfd` the host can map, with a QMP socket and a
+      # virtio-serial cold path. That is the whole cross-VM topology on a
+      # machine that can be rebooted, as against `testhost`, which cannot.
+      #
+      # The store is shared over 9p rather than copied into an image, so the
+      # guest can run a binary that was `cargo build`ed a second ago.
+      packages.svGuest =
+        (nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            ./nix/guest.nix
+            "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+          ];
+        })
+        .config
+        .system
+        .build
+        .vm;
     });
 }

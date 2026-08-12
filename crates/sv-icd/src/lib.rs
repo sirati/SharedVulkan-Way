@@ -58,6 +58,14 @@ pub const WIRE_VERSION: u32 = 1;
 /// An ICD cannot be given arguments — the loader `dlopen`s it — so the socket
 /// has to arrive as environment. Unset means "no GPU side", which is a supported
 /// configuration and not an error: the driver still loads and still enumerates.
+///
+/// On Windows the value is a **session name** rather than a path: there is no
+/// Unix socket, and the pipe and the two section objects are all named from one
+/// string ([`sv_transport::winpipe::pipe_name`],
+/// [`sv_transport::winshm::section_name`]). One variable for both platforms is
+/// deliberate — a second variable for the same job is how somebody sets the one
+/// that is not read on the OS they are on and gets a driver that answers
+/// everything locally without saying so.
 pub const SOCKET_ENV: &str = "SV_SOCKET";
 
 use core::ffi::{c_char, c_void};
@@ -99,7 +107,7 @@ fn instance() -> Option<&'static state::SharedVulkan> {
         // to use a GPU side and quietly given a driver that answers everything
         // from a table would produce plausible nonsense, which is the one
         // failure mode this project must not have.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if let Some(sock) = std::env::var_os(SOCKET_ENV) {
             let sock = sock.to_string_lossy().into_owned();
             return match state::SharedVulkan::connected(&sock) {

@@ -28,20 +28,34 @@
 //!
 //! | driver | app-allocated memfd, imported as a host pointer | GPU-allocated, exported as a descriptor |
 //! |---|---|---|
-//! | NVIDIA RTX 5090 | refused (`OUT_OF_DEVICE_MEMORY`) | **dma-buf, `mmap` works, coherent both directions** |
-//! | RADV (Raphael iGPU) | refused (`INVALID_EXTERNAL_HANDLE`) | **dma-buf, `mmap` works, coherent both directions** |
+//! | NVIDIA RTX 5090 | **works** — corrected 2026-08-12, see below | **dma-buf, `mmap` works, coherent both directions** |
+//! | RADV (Raphael iGPU) | refused (`INVALID_EXTERNAL_HANDLE`), structurally | **dma-buf, `mmap` works, coherent both directions** |
 //! | lavapipe | works — it adopts the pointer | **no**: no dma-buf export, and its opaque-fd export is *not the same pages* |
 //! | Intel, Windows guest | works (step 0, up to 2 GiB) | n/a — a descriptor cannot cross the VM boundary |
+//!
+//! **The NVIDIA row is a correction, and it matters for the reverse direction.**
+//! The `OUT_OF_DEVICE_MEMORY` this table used to record was measured against
+//! `gpu-probe --file /tmp/window`, and `/tmp` is ext4. `dmabuf-probe` isolated
+//! the variable: NVIDIA imports a `MAP_SHARED` mapping of **shmem** — a memfd or
+//! a tmpfs file — at 4 MiB and 128 MiB, `memoryTypeBits = 0xc`, coherent in both
+//! directions, and refuses only a page-cache-backed regular file. The arena is a
+//! memfd. So the discrete card *can* serve an app side that cannot receive a
+//! descriptor, which is exactly the reverse-direction topology. RADV's refusal
+//! is structural by contrast — libdrm passes `AMDGPU_GEM_USERPTR_ANONONLY`
+//! unconditionally, so no choice of backing helps it.
 //!
 //! Two things in that table are worth stating out loud rather than leaving to be
 //! read off it.
 //!
-//! **The two paths are complements, not alternatives.** Every row has exactly
-//! one working column. There is no driver here for which both work and no driver
-//! for which neither does, so the provider is *chosen by capability* and neither
-//! implementation can be deleted. In particular the `testhost` topology has to
-//! keep the memfd path: the GPU side is inside a VM, a descriptor cannot cross
-//! that boundary, and the arena there has to be guest RAM the host locates.
+//! **Every driver has at least one working column, and the choice is by
+//! capability rather than policy.** Neither implementation can be deleted: the
+//! `testhost` topology has to keep the memfd path, because the GPU side is
+//! inside a VM, a descriptor cannot cross that boundary, and the arena there has
+//! to be guest RAM the host locates. What changed with the NVIDIA correction is
+//! that the columns are no longer *exclusive* — NVIDIA can do both — so
+//! [`Provider::for_driver`] is now "the better one where there is a choice" and
+//! [`Provider::for_driver_across_a_vm`] is "the one that is possible at all when
+//! no descriptor can cross".
 //!
 //! **lavapipe is a worse oracle than §5.4 said, and in a new direction.** §5.4
 //! warns that lavapipe "will cheerfully import a pointer every real driver
@@ -52,11 +66,10 @@
 //! `sv-export-probe` writes through both mappings and reads back through the
 //! other one, and why the check is in both directions.
 
-// Both providers are Linux-only: one needs `mmap` of a descriptor and the other
-// needs a descriptor to pass. A Windows GPU side keeps `Arena` and replaces the
-// two constructors with `CreateFileMapping` and the host-pointer import, which
-// is why the *type* is portable and the functions are not.
-#[cfg(target_os = "linux")]
+// `allocate_and_export` is Linux-only, because a dma-buf descriptor is. The
+// host-pointer *import* is not — it takes a pointer and nothing else — and a
+// Windows GPU side needs exactly it, over a section object rather than a memfd.
+// So `import_whole` is built on both and only the export half is gated.
 use crate::driver::{Driver, DriverError, Result};
 use ash::vk;
 use std::sync::Arc;
@@ -84,7 +97,10 @@ impl Provider {
     /// allocation rather than at startup.
     pub fn for_driver(key: &str) -> Provider {
         match key {
-            // Both refuse a shared host pointer and both export a dma-buf.
+            // RADV refuses a shared host pointer whatever backs it, and exports
+            // a dma-buf. NVIDIA can do either; the export is preferred on one
+            // machine because it needs no shmem-shaped arena and puts the pages
+            // in memory the driver chose.
             "radv" | "nvidia" => Provider::GpuExport,
             // Adopts a host pointer; its export is not the same pages.
             "lavapipe" => Provider::AppMemfd,
@@ -92,6 +108,31 @@ impl Provider {
             // an untried driver gets the path that is proven somewhere real and
             // has no extra prerequisite.
             _ => Provider::AppMemfd,
+        }
+    }
+
+    /// Which provider is *possible* when the two sides are on opposite sides of
+    /// a hypervisor.
+    ///
+    /// A descriptor cannot cross a VM boundary, so `GpuExport` is unavailable
+    /// however capable the driver is. The arena must be memory both sides can
+    /// map, which is guest RAM, which the GPU side imports as a host pointer.
+    ///
+    /// Returning `None` is the honest answer for RADV: it is not that the
+    /// project has not written the code, it is that libdrm's
+    /// `AMDGPU_GEM_USERPTR_ANONONLY` refuses every shared mapping, so the only
+    /// route is `/dev/udmabuf` and that is a privilege this account does not
+    /// hold. Saying so in the type stops a caller from discovering it as an
+    /// `INVALID_EXTERNAL_HANDLE` three layers down.
+    pub fn for_driver_across_a_vm(key: &str) -> Option<Provider> {
+        match key {
+            // Structural refusal. Needs a dma-buf made from the guest's RAM by
+            // `/dev/udmabuf`, which is `root:kvm` 0660.
+            "radv" | "amdgpu" => None,
+            // Corrected 2026-08-12: imports a shared mapping of shmem, which is
+            // what QEMU's `memory-backend-memfd` is.
+            "nvidia" => Some(Provider::AppMemfd),
+            _ => Some(Provider::AppMemfd),
         }
     }
 }
@@ -212,7 +253,6 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
 /// would have been. What it costs is that the driver pins the configured arena
 /// up front instead of tracking demand. What it does not cost is any of §5.3:
 /// the `(memory, offset)` rewrite is unchanged, with one slab.
-#[cfg(target_os = "linux")]
 pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena> {
     let ext = driver
         .external_host
@@ -260,6 +300,9 @@ pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena>
         memory,
         len,
         memory_type: type_index,
+        // The import path never exports anything, on either OS; the field only
+        // exists where a descriptor does.
+        #[cfg(target_os = "linux")]
         exported_fd: None,
     })
 }
@@ -279,24 +322,43 @@ mod tests {
         assert_eq!(Provider::for_driver("unknown"), Provider::AppMemfd);
     }
 
-    /// Every driver has exactly one working column, so the two providers are
-    /// complements. If this ever stops being true the choice becomes a policy
-    /// rather than a capability, and that is a different design.
+    /// The two tables have to agree about whether a host pointer is acceptable,
+    /// because one of them is what the arena commits to and the other is what
+    /// the import actually does. They are separate crates and drift silently.
     #[test]
-    fn the_two_providers_do_not_overlap_on_any_measured_driver() {
+    fn the_provider_and_the_import_path_agree_about_host_pointers() {
         for (key, import_path) in [
             ("radv", sv_arena::import::BackingKind::DmaBuf),
-            ("nvidia", sv_arena::import::BackingKind::DmaBuf),
+            ("nvidia", sv_arena::import::BackingKind::HostPointer),
             ("lavapipe", sv_arena::import::BackingKind::Noop),
             ("intel", sv_arena::import::BackingKind::HostPointer),
         ] {
+            assert_eq!(
+                sv_arena::import::path_for_driver(key),
+                import_path,
+                "{key}: sv-arena's import table moved"
+            );
             let host_pointer_works = import_path != sv_arena::import::BackingKind::DmaBuf;
             assert_eq!(
-                Provider::for_driver(key) == Provider::AppMemfd,
+                Provider::for_driver_across_a_vm(key).is_some(),
                 host_pointer_works,
-                "{key}: the provider and the import path must agree about whether \
-                 a host pointer is acceptable"
+                "{key}: across a VM only a host-pointer import is possible, so the two \
+                 tables must agree about whether one works"
             );
         }
+    }
+
+    /// The reverse direction, as a table. `None` for RADV is the finding, not an
+    /// omission: it is blocked on `/dev/udmabuf` being `root:kvm` 0660, and
+    /// nothing in this codebase can change that.
+    #[test]
+    fn across_a_vm_only_a_host_pointer_import_is_possible() {
+        assert_eq!(Provider::for_driver_across_a_vm("nvidia"), Some(Provider::AppMemfd));
+        assert_eq!(Provider::for_driver_across_a_vm("intel"), Some(Provider::AppMemfd));
+        assert_eq!(Provider::for_driver_across_a_vm("lavapipe"), Some(Provider::AppMemfd));
+        assert_eq!(Provider::for_driver_across_a_vm("radv"), None);
+        // …even though on one machine RADV is perfectly capable, which is the
+        // point: the topology removes an option the driver has.
+        assert_eq!(Provider::for_driver("radv"), Provider::GpuExport);
     }
 }

@@ -11,3 +11,11 @@ description = "The passthrough arena: extents, slabs, the 4096-granularity alloc
 # is carved from. The allocator itself touches neither: design.md §5.2 keeps it
 # entirely in the app side's private memory.
 sv-transport = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The stamped page record, for the Linux guest-side provider. Shared with
+# `sv-hostd`, `arena-host` and `awe-probe` rather than re-typed: the whole value
+# of the locator is that a match means the two sides really are looking at the
+# same page, and two layouts that agree on the magic and differ on a field
+# offset would turn a genuine result into a confusing one.
+arena-record = { path = "../arena-record" }

@@ -77,6 +77,20 @@ pub const fn page_up(n: u64) -> u64 {
     n.div_ceil(PAGE as u64) * PAGE as u64
 }
 
+/// One run, as [`SharedRegion::stitch`] needs it.
+///
+/// The same three numbers as `sv_arena::extent::Run` and
+/// `crate::cold::AttachRun`, and deliberately a third type: this one is the
+/// argument to a syscall loop, that one is the arena's side-local derivation,
+/// and the third is a wire form. Collapsing them would make the arena's internal
+/// representation into protocol by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StitchRun {
+    pub file_offset: u64,
+    pub extent_offset: u64,
+    pub len: u64,
+}
+
 enum Backing {
     /// An ordinary heap allocation. Portable, works under Miri, and is what the
     /// single-process tests and the `Vec<u8>`-backed arena of design.md §13
@@ -85,6 +99,18 @@ enum Backing {
     /// `mmap(MAP_SHARED)` of a file descriptor. The real one.
     #[cfg(target_os = "linux")]
     Mapped,
+    /// A slice of memory somebody else owns and will free — the guest-side
+    /// provider's one pinned window, sliced into the control region and the
+    /// arena. Dropping this must do nothing.
+    Borrowed,
+    /// `MapViewOfFile` of a named section object — the Windows counterpart, and
+    /// what a Windows-to-Windows pair shares. Owned, so that unmapping and
+    /// closing the handle happen together and in the right order.
+    ///
+    /// Held only for its `Drop`, which is why the compiler cannot see it being
+    /// read: releasing the view and the handle *is* what owning it does.
+    #[cfg(windows)]
+    Section(#[allow(dead_code)] crate::winshm::Section),
 }
 
 /// A region of shared memory, addressed only by offset.
@@ -149,6 +175,133 @@ impl SharedRegion {
         }
         // I1: the kernel established the mapping. I2: mmap is page-aligned.
         Ok(SharedRegion { base: addr as *mut u8, len, backing: Backing::Mapped })
+    }
+
+    /// Build one virtually contiguous region out of scattered runs of `fd`.
+    ///
+    /// > `sv-hostd` … reserves one `PROT_NONE` range per region and
+    /// > `mmap(MAP_FIXED)`s each run into it. The result is virtually contiguous
+    /// > with identical internal offsets — the §1 invariant — and nothing above
+    /// > the attacher ever learns that it was stitched. — design.md §4.3
+    ///
+    /// **Both the daemon and every ICD call this**, on the same descriptor with
+    /// the same run list, which is the point: two implementations of scatter
+    /// stitching would be two chances to get the offsets subtly different, and
+    /// the symptom of that is an arena where one side's writes land somewhere
+    /// the other is not reading. There is no error for that.
+    ///
+    /// The reservation is one `mmap` of the whole extent and each run then
+    /// replaces its slice of it. Reserving first is not an optimisation:
+    /// mapping the runs one at a time and hoping the kernel places them
+    /// adjacently does not work, and the failure would be a region whose offsets
+    /// are wrong rather than a call that fails.
+    #[cfg(target_os = "linux")]
+    pub fn stitch(fd: std::os::fd::BorrowedFd<'_>, runs: &[StitchRun]) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let total: u64 = runs.iter().map(|r| r.len).sum();
+        let len = usize::try_from(total)
+            .map_err(|_| Error::BadGeometry("the extent does not fit in a usize"))?;
+        if len == 0 {
+            return Err(Error::BadGeometry("a zero-length region is not a region"));
+        }
+        // Check the runs cover [0, total) exactly once, in order, before any
+        // mapping happens. A gap is a hole in the offset space, which is
+        // precisely what §1's invariant forbids, and finding out half way
+        // through leaves a partly-built arena.
+        let mut at = 0u64;
+        for r in runs {
+            if r.extent_offset != at || r.len == 0 {
+                return Err(Error::BadGeometry("the run list has a gap, an overlap or a hole"));
+            }
+            at = at
+                .checked_add(r.len)
+                .ok_or(Error::BadGeometry("the run list overflows"))?;
+        }
+
+        // SAFETY: a null hint lets the kernel choose; PROT_NONE so that a run
+        // we failed to map faults immediately rather than reading zeroes — the
+        // same reasoning as R21's, applied to our own mistakes.
+        let base = unsafe {
+            sys::mmap(
+                core::ptr::null_mut(),
+                len,
+                0, // PROT_NONE
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base as isize == -1 {
+            return Err(Error::Os { call: "mmap(reserve)", errno: sys::errno() });
+        }
+        // Owned from here, so an early return unmaps the whole reservation
+        // including whatever was already stitched into it.
+        let region = SharedRegion { base: base as *mut u8, len, backing: Backing::Mapped };
+
+        for r in runs {
+            // SAFETY: `extent_offset + len <= total` by the check above.
+            let at = unsafe { (base as *mut u8).add(r.extent_offset as usize) }
+                as *mut core::ffi::c_void;
+            let got = unsafe {
+                sys::mmap(
+                    at,
+                    r.len as usize,
+                    sys::PROT_READ | sys::PROT_WRITE,
+                    sys::MAP_SHARED | sys::MAP_FIXED,
+                    fd.as_raw_fd(),
+                    r.file_offset as i64,
+                )
+            };
+            if got as isize == -1 {
+                return Err(Error::Os { call: "mmap(MAP_FIXED run)", errno: sys::errno() });
+            }
+            if got != at {
+                return Err(Error::BadGeometry(
+                    "MAP_FIXED did not honour the address — the reservation was not respected",
+                ));
+            }
+        }
+        Ok(region)
+    }
+
+    /// A region over memory somebody else owns.
+    ///
+    /// The one caller is the guest-side arena provider, which commits **one**
+    /// pinned window covering both regions — because the host locates and
+    /// attaches per *extent* (D22), so the guest must lay the two regions out as
+    /// sub-ranges of one allocation rather than as two objects. Slicing that
+    /// window into a control region and an arena is what this constructor is
+    /// for.
+    ///
+    /// # Safety
+    /// `base` must be valid for `len` bytes for as long as the region lives, and
+    /// nothing else may free it. In practice that means the caller keeps the
+    /// window alive, and the region's `Drop` must not touch it — which is why
+    /// this is its own backing variant rather than a `Mapped` with a null owner.
+    pub unsafe fn from_raw(base: *mut u8, len: usize) -> Self {
+        assert!(len > 0, "a zero-length region is not a region");
+        SharedRegion { base, len, backing: Backing::Borrowed }
+    }
+
+    /// Take a mapped Windows section object as a region.
+    ///
+    /// The counterpart of [`SharedRegion::map_fd`], and deliberately the *whole*
+    /// section rather than a sub-range: Windows view offsets have to be
+    /// multiples of the allocation granularity, which is 64 KiB and not 4 KiB,
+    /// so a caller that wanted "the arena starts after the control region" would
+    /// be constrained by a number that has nothing to do with this design. Two
+    /// sections — one per region — is both simpler and closer to §4.1's "two
+    /// independent mappings with independent bases", and it is what the
+    /// GPU-allocated Linux path already does with two descriptors.
+    #[cfg(windows)]
+    pub fn map_section(section: crate::winshm::Section) -> Result<Self> {
+        let len = section.len();
+        assert!(len > 0);
+        // SAFETY: the region takes ownership of the section, so the pointer is
+        // valid for as long as the region is. I2: MapViewOfFile returns an
+        // allocation-granularity-aligned address, which is 64 KiB here.
+        let base = unsafe { section.base_ptr() };
+        Ok(SharedRegion { base, len, backing: Backing::Section(section) })
     }
 
     pub fn len(&self) -> usize {
@@ -290,6 +443,13 @@ impl Drop for SharedRegion {
             Backing::Mapped => unsafe {
                 sys::munmap(self.base as *mut core::ffi::c_void, self.len);
             },
+            // Somebody else's memory. Freeing it here would be a double free of
+            // the guest provider's window.
+            Backing::Borrowed => {}
+            // The section's own `Drop` unmaps the view and closes the handle,
+            // in that order. Nothing to do here but let it run.
+            #[cfg(windows)]
+            Backing::Section(_) => {}
         }
     }
 }
@@ -314,6 +474,12 @@ pub(crate) mod sys {
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_SHARED: i32 = 1;
+    pub const MAP_PRIVATE: i32 = 0x02;
+    pub const MAP_ANONYMOUS: i32 = 0x20;
+    pub const MAP_POPULATE: i32 = 0x8000;
+    pub const MAP_HUGETLB: i32 = 0x40000;
+    pub const MAP_FIXED: i32 = 0x10;
+    pub const MAP_NORESERVE: i32 = 0x4000;
     /// `MFD_CLOEXEC | MFD_ALLOW_SEALING`.
     pub const MFD_CLOEXEC_ALLOW_SEALING: u32 = 0x0001 | 0x0002;
 
@@ -327,6 +493,8 @@ pub(crate) mod sys {
             off: i64,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn mlock(addr: *const c_void, len: usize) -> i32;
+        pub fn munlock(addr: *const c_void, len: usize) -> i32;
         pub fn memfd_create(name: *const c_char, flags: u32) -> c_int;
         pub fn ftruncate(fd: c_int, len: i64) -> c_int;
         #[link_name = "__errno_location"]
@@ -337,6 +505,163 @@ pub(crate) mod sys {
         // SAFETY: `__errno_location` returns a pointer to this thread's errno,
         // valid for the life of the thread.
         unsafe { *errno_location() }
+    }
+}
+
+/// A pinned window of this process's own memory, for a **guest-side** arena
+/// provider.
+///
+/// This is the Linux counterpart of `awe-probe`'s `VirtualAlloc` + `VirtualLock`
+/// window, and it lives here rather than in `sv-arena` for one reason:
+/// `sv-arena` is `forbid(unsafe_code)`, deliberately, and its crate docs say
+/// "every touch of the shared mapping goes through `sv_transport::region`, which
+/// bounds-checks and owns the one `unsafe` block". Committing and pinning a
+/// mapping is exactly that kind of touch, so the syscalls are here and
+/// `sv_arena::guestram` is safe code over them.
+///
+/// # Why `mlock` and not merely `MAP_POPULATE`
+///
+/// `MAP_POPULATE` faults the pages in, which makes them exist and does not make
+/// them stay. The kernel may reclaim an anonymous page and refault it on a
+/// different frame, and the arena's model is that the host located a page once
+/// and keeps reading that offset — so a moved frame is a silent divergence, not
+/// an error. That is R26. On Windows it rests on `VirtualLock`, whose documented
+/// contract promises residency and not frame stability; on Linux anonymous pages
+/// are precisely what reclaim is for, so `mlock` is not optional here.
+#[cfg(target_os = "linux")]
+pub struct LockedWindow {
+    base: *mut u8,
+    len: usize,
+    locked: bool,
+}
+
+// The window is this process's own memory, handed to a driver as a pointer and
+// otherwise touched only through the slice accessors below.
+#[cfg(target_os = "linux")]
+unsafe impl Send for LockedWindow {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for LockedWindow {}
+
+#[cfg(target_os = "linux")]
+impl LockedWindow {
+    /// Commit `len` bytes and pin them.
+    ///
+    /// `huge` asks for `MAP_HUGETLB`, which needs a pre-reserved pool
+    /// (`vm.nr_hugepages`) and fails cleanly without one. It is offered rather
+    /// than assumed, and **transparent** huge pages are deliberately not relied
+    /// on: they are advisory and can be split under pressure, so a locator that
+    /// assumed 2 MiB alignment because THP was likely would find nothing when it
+    /// was not.
+    pub fn commit(len: u64, huge: bool) -> Result<LockedWindow> {
+        if len == 0 || !len.is_multiple_of(PAGE as u64) {
+            return Err(Error::BadGeometry("a window is a whole number of pages"));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Error::BadGeometry("the window does not fit in a usize"))?;
+        // MAP_POPULATE = 0x8000, MAP_HUGETLB = 0x40000 on Linux/x86-64.
+        let mut flags = sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_POPULATE;
+        if huge {
+            flags |= sys::MAP_HUGETLB;
+        }
+        // SAFETY: a null hint lets the kernel choose the address; `len` is
+        // checked above; the return is checked against MAP_FAILED before use.
+        let base = unsafe {
+            sys::mmap(core::ptr::null_mut(), len, sys::PROT_READ | sys::PROT_WRITE, flags, -1, 0)
+        };
+        if base as isize == -1 {
+            return Err(Error::Os { call: "mmap(anonymous window)", errno: sys::errno() });
+        }
+        // SAFETY: the mapping was just established and is `len` bytes.
+        let locked = unsafe { sys::mlock(base, len) } == 0;
+        if !locked {
+            let errno = sys::errno();
+            // SAFETY: releasing the mapping we just made, exactly once.
+            unsafe { sys::munmap(base, len) };
+            // ENOMEM here is almost always RLIMIT_MEMLOCK rather than memory,
+            // and the two need different fixes, so say which.
+            return Err(Error::Os { call: "mlock (RLIMIT_MEMLOCK?)", errno });
+        }
+        Ok(LockedWindow { base: base as *mut u8, len, locked })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The window's bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: I1 — the mapping is `len` bytes this type owns, and `&mut
+        // self` excludes any other reference to it.
+        unsafe { core::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: as above, shared.
+        unsafe { core::slice::from_raw_parts(self.base, self.len) }
+    }
+
+    /// The base address, for handing to a driver as a host pointer.
+    ///
+    /// # Safety
+    /// The caller must not outlive the window, and must treat the memory as
+    /// shared with whatever it hands the pointer to.
+    pub unsafe fn base_ptr(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// The page size the kernel actually used, read from `/proc/self/smaps`.
+    ///
+    /// The counterpart of §4.3's "**`granularity` is asserted, never
+    /// assumed**": the Windows side publishes the `LargePage` bit
+    /// `QueryWorkingSetEx` reports rather than the flag it passed to
+    /// `VirtualAlloc`, and this is the same discipline. `KernelPageSize` is used
+    /// rather than `AnonHugePages` because the latter is transparent huge pages,
+    /// which may be split later; `KernelPageSize` is 2048 kB only for a real
+    /// hugetlb mapping.
+    pub fn observed_page_size(&self) -> Option<u64> {
+        let base = self.base as usize as u64;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+        let mut in_ours = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ')
+                && let Some((start, _)) = range.split_once('-')
+                && let Ok(start) = u64::from_str_radix(start, 16)
+            {
+                in_ours = start == base;
+                continue;
+            }
+            if in_ours && let Some(rest) = line.strip_prefix("KernelPageSize:") {
+                return rest.trim().trim_end_matches(" kB").parse::<u64>().ok().map(|kb| kb * 1024);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LockedWindow {
+    fn drop(&mut self) {
+        // SAFETY: `base`/`len` are the mapping `commit` established, released
+        // exactly once. `munlock` first so the accounting is returned even if
+        // the unmap were to fail — the pages are locked, and leaking them takes
+        // them away from the guest until the process dies.
+        unsafe {
+            if self.locked {
+                sys::munlock(self.base as *const core::ffi::c_void, self.len);
+            }
+            sys::munmap(self.base as *mut core::ffi::c_void, self.len);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl core::fmt::Debug for LockedWindow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LockedWindow").field("len", &self.len).finish_non_exhaustive()
     }
 }
 

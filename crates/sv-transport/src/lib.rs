@@ -50,6 +50,8 @@ pub mod park;
 pub mod region;
 pub mod ring;
 pub mod stream;
+pub mod winpipe;
+pub mod winshm;
 
 use core::fmt;
 

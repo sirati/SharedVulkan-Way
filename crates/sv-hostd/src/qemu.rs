@@ -141,12 +141,54 @@ impl RegionTable {
 ///    different memory; taking them would make the table claim RAM that is not
 ///    the backing object.
 ///
-/// The address space is not filtered here. Aliases of one backend appear only
-/// in the system flat view in practice, and filtering by name is both simpler
-/// and stricter than tracking which `FlatView` block we are inside.
+/// **Only the system address space is parsed**, and that is a correction rather
+/// than a refinement.
+///
+/// This function used to take every matching line in the dump, with the comment
+/// "aliases of one backend appear only in the system flat view in practice, and
+/// filtering by name is both simpler and stricter than tracking which
+/// `FlatView` block we are inside". That is true of `testhost`, whose guest
+/// runs with `smm=off`. It is false of a guest with SMM: **every alias appeared
+/// exactly twice**, once in the `memory` flat view and once in the SMM one, and
+/// the symptom was a 2 GiB guest reporting 4095 MiB of RAM.
+///
+/// It was benign in that run only because the duplicates were identical, so
+/// `gpa_to_offset` took the first and got the right answer. It would not stay
+/// benign: SMRAM legitimately aliases the same backend at *different* guest
+/// addresses, and a table holding both would answer `offset_to_gpa` with
+/// whichever it happened to sort first. That is R21's silent-wrong-answer shape
+/// arriving through a different door.
+///
+/// So the parser tracks the `FlatView` blocks and takes the one whose address
+/// space list contains `"memory"` — the system view, which is the one an
+/// application's memory actually lives in.
 pub fn parse_flat_view(text: &str, backend_id: &str) -> RegionTable {
     let mut out = Vec::new();
+    // Which FlatView block we are inside, and whether it is the system one.
+    // `AS "memory"` marks it; a block may list many address spaces before its
+    // first region line, which is why this is a flag rather than a match on the
+    // immediately preceding line.
+    let mut in_system = false;
+    let mut seen_any_flatview = false;
     for line in text.lines() {
+        let t = line.trim_end_matches('\r').trim_start();
+        if t.starts_with("FlatView") {
+            seen_any_flatview = true;
+            in_system = false;
+            continue;
+        }
+        if t.starts_with("AS \"memory\"") {
+            in_system = true;
+            continue;
+        }
+        // A dump with no `FlatView` header at all is a fragment — the test
+        // fixtures are exactly that — and filtering it to nothing would make
+        // every one of them silently pass. Treat "no blocks seen" as "the whole
+        // text is the system view".
+        if seen_any_flatview && !in_system {
+            continue;
+        }
+        let line = t;
         let line = line.trim_end_matches('\r').trim();
         let Some((range, rest)) = line.split_once(' ') else { continue };
         let Some((start, end)) = range.split_once('-') else { continue };
@@ -176,7 +218,15 @@ pub fn parse_flat_view(text: &str, backend_id: &str) -> RegionTable {
         if end < start {
             continue;
         }
-        out.push(RamAlias { gpa: start, len: end - start + 1, file_offset });
+        let alias = RamAlias { gpa: start, len: end - start + 1, file_offset };
+        // Belt and braces: even inside one flat view an alias can be listed
+        // twice (the `cpu-memory-N` spaces share the system root). Identical
+        // triples are the same memory described twice and must not be counted
+        // twice — `total_ram()` is reported to a human and a doubled figure is
+        // the kind of number nobody questions.
+        if !out.contains(&alias) {
+            out.push(alias);
+        }
     }
     RegionTable::new(out)
 }
@@ -557,6 +607,47 @@ mod tests {
         assert_ne!(t.gpa_to_offset(0x2_76a6_d000), Some(0x2_76a6_d000));
     }
 
+    /// The flat view of a guest **with SMM**, where every alias of the backend
+    /// appears twice — once in the system view and once in the SMM one. Measured
+    /// on the local development guest 2026-08-12; `testhost` runs `smm=off`
+    /// and never showed it.
+    ///
+    /// The symptom without this filter was a 2 GiB guest reporting 4095 MiB.
+    const SMM_GUEST: &str = "\
+FlatView #0
+ AS \"memory\", root: system
+ AS \"cpu-memory-0\", root: system
+ Root memory region: system
+  0000000000000000-00000000000cafff (prio 0, ram): svmem KVM
+  00000000000cb000-00000000000e7fff (prio 0, ram): svmem @00000000000cb000 KVM
+  0000000000100000-000000007fffffff (prio 0, ram): svmem @0000000000100000 KVM
+
+FlatView #1
+ AS \"smm-memory\", root: smram-region
+ Root memory region: smram-region
+  0000000000000000-00000000000cafff (prio 0, ram): svmem KVM
+  00000000000cb000-00000000000e7fff (prio 0, ram): svmem @00000000000cb000 KVM
+  0000000000100000-000000007fffffff (prio 0, ram): svmem @0000000000100000 KVM
+";
+
+    #[test]
+    fn only_the_system_flat_view_is_parsed() {
+        let t = parse_flat_view(SMM_GUEST, "svmem");
+        assert_eq!(t.aliases().len(), 3, "the SMM view's copies must not be counted");
+        // 2 GiB less the two holes the fixture carries.
+        let holes = (0xcb000 - 0xcb000) + (0x100000 - 0xe8000);
+        assert_eq!(t.total_ram(), 0x8000_0000 - holes);
+        assert!(t.total_ram() < 0x8000_0000, "and it is under the guest's RAM, not double it");
+    }
+
+    /// The fixtures in this file are fragments with no `FlatView` header, and a
+    /// filter that required one would make every one of them pass by matching
+    /// nothing at all.
+    #[test]
+    fn a_headerless_fragment_is_still_parsed() {
+        assert_eq!(parse_flat_view(TESTHOST, "virtiofsmem").aliases().len(), 4);
+    }
+
     #[test]
     fn a_different_backend_id_selects_nothing() {
         // Naming the wrong backend must give an empty table rather than the
@@ -590,7 +681,11 @@ mod tests {
 
     #[test]
     fn json_string_unescaping_handles_the_flat_view_shape() {
-        let reply = r#"{"return": "FlatView #0\r\n  0000-0fff (prio 0, ram): mem KVM\r\n"}"#;
+        // The `AS "memory"` line is part of the fixture because it is part of
+        // every real dump, and because the parser now needs it to know which
+        // flat view it is in.
+        let reply =
+            r#"{"return": "FlatView #0\r\n AS \"memory\", root: system\r\n  0000-0fff (prio 0, ram): mem KVM\r\n"}"#;
         let s = unescape_json_string_after(reply, "\"return\":").unwrap();
         assert!(s.contains("FlatView #0"));
         assert!(s.contains("(prio 0, ram): mem KVM"));

@@ -1162,3 +1162,141 @@ question was answered or merely blocked, so a single run settles it.
 Worth stating either way: the group change buys **RADV and nothing else**. If
 the reverse direction only ever has to serve the discrete card, it is not
 needed.
+
+---
+
+# The cross-VM topology, running — and three things the design had wrong
+
+Built and run 2026-08-12 against a local NixOS guest (`nix/guest.nix`,
+`nix build .#svGuest`): 2 GiB of `memory-backend-memfd` RAM, a QMP socket, and a
+virtio-serial port, on a machine that can be rebooted — which `testhost`
+cannot.
+
+```
+guest : llvmpipe (lavapipe), provider AppMemfd
+guest : extent 48 MiB of guest RAM, run 0xfc8ccc910e1cbdf7, kernel page size 4 KiB,
+        stamped 12288 pages
+guest : arena imported as a host pointer, memory type 0
+guest : publishing the extent on /dev/virtio-ports/org.sirati.svcold.0
+host  : the guest offers run 0xfc8ccc910e1cbdf7, 4096 control + 8192 arena pages, locator Scan
+host  : located 12288/12288 pages in 128.58ms over 2047 MiB of guest RAM; 1 run, 0 outside RAM
+host  : stitched 48 MiB with 1 mmap call; all 12288 pages carry their own index
+guest : the host located the extent and accepted generation 1
+guest : control region published, generation 1
+host  : ICD client 0 attached (1 run)
+guest : serving rings [1, 2, 3] on llvmpipe (lavapipe)
+
+$ VK_DRIVER_FILES=…/sv_icd.json SV_SOCKET=/tmp/sv-guest/icd.sock vulkaninfo --summary
+        deviceName = llvmpipe (LLVM 21.1.8, 256 bits)
+```
+
+That last line is the whole topology in one string. `vulkaninfo` ran on the
+**host**, with no driver of its own available, through the real Vulkan loader
+and our ICD; the command crossed a ring in memory belonging to **another
+kernel**, located by sweeping QEMU's memory backend for a magic number; a driver
+inside the VM answered; the reply came back through the generated decoder. The
+app side and the GPU side did not share a descriptor, a filesystem, or an
+address space.
+
+Three corrections came out of it, and each of them was invisible until this
+configuration existed.
+
+## 1. §4.3's publish order destroys the stamps §5.1 depends on
+
+design.md §4.3 step 1 has the owner "allocate both regions, **zero them**, write
+every header field, then store `magic`", and step 2 offer the extent over the
+cold path. §5.1 has the guest stamp every page and the host find those pages by
+content. On one machine the two are compatible, because the host is handed a
+descriptor and never has to search.
+
+**Across a hypervisor they contradict each other.** `Control::create` zeroes the
+control region, which erases exactly the stamps the host is about to sweep for.
+Measured, first run of this path:
+
+```
+sv-hostd: located 8192 of 12288 pages
+```
+
+— the 8192 arena pages present and all 4096 control pages missing. Nothing said
+why; the count was simply short, and a short count reads like fragmentation or a
+slow guest rather than like a design error.
+
+**The fix is to publish before initialising, and it costs nothing**, because the
+design already requires the peer to tolerate an unpublished region: `magic` is
+written last precisely so an early attacher gets `NotReady` and retries (§4.3
+step 4 — and sharedgl's aliased-away readiness flag is why that rule exists). So
+the order is stamp → publish → *let the host locate* → then write the header over
+stamps that have done their job. §4.3's step order needs the qualifier that step
+1's zeroing must follow step 3's locate whenever the locator is `Scan`.
+
+## 2. `run_count == 0` conflates two different claims
+
+`Attachment::run_count` is documented as "zero means the extent is one
+contiguous range of the fd", and the client takes that as licence to
+`mmap(fd, control_offset)`. That is right for `Mode::Local`, where `sv-hostd`
+*made* the file and offset 0 of the memfd is offset 0 of the extent.
+
+It is wrong for `Mode::Qemu`, where the file is QEMU's memory backend and offset
+0 of it is **guest-physical zero**. A one-run extent at file offset
+`0x2a00_0000` would have been mapped at 0, and the client would have found
+valid, unrelated guest memory and reported no error — R21's failure mode
+arriving through the handoff rather than through the translation.
+
+"Contiguous" and "at the attachment's offsets in the file" are different claims
+and the protocol was using one number for both. `qemu-serve` now always sends
+the real run count; a one-run extent costs the client exactly one `mmap` either
+way, so the shortcut bought nothing.
+
+## 3. A backend's aliases appear in more than one flat view
+
+`parse_flat_view` originally took every matching line in `info mtree -f`, with
+the reasoning that "aliases of one backend appear only in the system flat view
+in practice". That is true of `testhost`, which runs `smm=off`. It is false of
+a guest with SMM: **every alias appeared exactly twice**, once under
+`AS "memory"` and once under the SMM view, and a 2 GiB guest reported
+**4095 MiB** of RAM.
+
+It was benign in that run only because the duplicates were identical, so the
+lookup took the first and got the right answer. It would not have stayed benign
+— SMRAM legitimately aliases the same backend at *different* guest addresses,
+and a table holding both would answer `offset_to_gpa` with whichever sorted
+first. The parser now tracks the `FlatView` blocks and takes the one whose
+address-space list contains `"memory"`.
+
+## What the daemon→ICD boundary needs that the guest→host one does not
+
+design.md §5.7 is firm that "**the run list does not cross the wire, and it never
+did have to**". That is about the **guest↔host** boundary, where the guest cannot
+know the runs — the entire reason `ScanLocator` exists.
+
+The **daemon↔ICD** boundary is the opposite, and §3's own topology box already
+says so: `sv-hostd` "hands **fd + runs** to the ICDs". It has to, for a
+structural reason rather than a convenience: **a scattered extent has no single
+descriptor whose `mmap` reproduces it.** The daemon's contiguous view is many
+`mmap(MAP_FIXED)` calls into one reservation, and a view is not a file. Either
+the runs reach the client and it stitches its own — one `mmap` per run, the cost
+§5.7 already budgets — or the daemon copies, which §1's second invariant
+forbids.
+
+`ColdMessage::Runs` is that message, and `SharedRegion::stitch` is the one
+implementation both sides call. Two implementations of scatter stitching would
+be two chances to get an offset subtly different, and the symptom of that is an
+arena where one side's writes land where the other is not reading — for which
+there is no error.
+
+## The numbers, against the Windows guest for comparison
+
+| | local Linux guest | `testhost`'s Windows guest |
+|---|---|---|
+| guest RAM swept | 2047 MiB | 13311 MiB |
+| locate | **128 ms** | 2.20 s |
+| runs per 48–64 MiB | **1** (4 KiB pages, freshly booted) | 29 (2 MiB large pages) |
+| stitch | 1 `mmap` | 29 `mmap`, 95.74 µs |
+
+The one-run result is not evidence that 4 KiB pages are fine — it is a guest that
+booted seconds earlier with 2 GiB free, which is the most favourable memory state
+that exists. The Windows figure of 1471 runs per 64 MiB on the same page size is
+the one to plan against. What the local rig is good for is that the *locate* is
+sixteen times faster, because the sweep is linear in guest RAM and this guest has
+a sixth as much — so an iteration is seconds rather than a round trip over
+somebody's WiFi.

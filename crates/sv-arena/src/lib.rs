@@ -37,6 +37,10 @@
 pub mod alloc;
 pub mod canary;
 pub mod extent;
+/// The Linux guest-side provider. Gated because it is `mlock` and `smaps`, and
+/// because the *other* guest-side provider is `awe-probe`'s Win32 one.
+#[cfg(target_os = "linux")]
+pub mod guestram;
 pub mod import;
 
 use core::fmt;

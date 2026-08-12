@@ -89,7 +89,7 @@ impl Drop for RingTransport {
 /// The heartbeat has to be independent of what the side is doing, because that
 /// is what it *means*. R4's distinction between "slow" and "gone" is not
 /// answerable by a signal only the not-busy send.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const BEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// What the app side learned when it attached.
@@ -135,8 +135,6 @@ impl RingTransport {
         use std::os::fd::AsFd;
         use std::os::unix::net::UnixStream;
         use sv_transport::cold::{ColdMessage, recv_with_fds, send};
-        use sv_transport::control::RingKind;
-        use sv_transport::ring::Lane;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let sock = loop {
@@ -161,14 +159,182 @@ impl RingTransport {
         let control_fd = fds.first().ok_or("no descriptor for the control region")?;
         let arena_fd = fds.get(1).unwrap_or(control_fd);
 
+        // A non-zero `run_count` means the extent is scattered through the
+        // descriptor and the daemon is sending the runs next. That is the
+        // `Mode::Qemu` path: the descriptor is QEMU's memory backend, the pages
+        // are guest RAM, and a plain `map_fd` would map the wrong 64 MiB of a
+        // thirteen-gigabyte file. §3: `sv-hostd` "hands **fd + runs** to the
+        // ICDs".
+        let (control_region, arena) = if at.run_count == 0 {
+            (
+                Arc::new(
+                    SharedRegion::map_fd(
+                        control_fd.as_fd(),
+                        at.control_offset,
+                        at.control_len as usize,
+                    )
+                    .map_err(|e| e.to_string())?,
+                ),
+                Arc::new(
+                    SharedRegion::map_fd(arena_fd.as_fd(), at.arena_offset, at.arena_len as usize)
+                        .map_err(|e| e.to_string())?,
+                ),
+            )
+        } else {
+            let mut buf = Vec::new();
+            let _ = recv_with_fds(&sock, &mut buf).map_err(|e| e.to_string())?;
+            let runs = match ColdMessage::decode(&buf).map_err(|e| e.to_string())? {
+                ColdMessage::Runs(r) => r,
+                other => return Err(format!("expected the run list, got {other:?}")),
+            };
+            if runs.len() as u64 != at.run_count {
+                return Err(format!(
+                    "the daemon said {} runs and sent {}",
+                    at.run_count,
+                    runs.len()
+                ));
+            }
+            RingTransport::stitch_two(control_fd.as_fd(), &at, &runs)?
+        };
+        RingTransport::finish_attach(control_region, arena, at.arena_len)
+    }
+
+    /// Connect to a Windows GPU side over a named pipe and two named sections.
+    ///
+    /// The counterpart of the Linux `connect`, and shorter, because **nothing is
+    /// handed over**. The section names are derived from the session string on
+    /// both sides ([`sv_transport::winshm::section_name`]), so the cold path
+    /// carries geometry and no handle — no `DuplicateHandle`, and therefore no
+    /// `PROCESS_DUP_HANDLE` right for the GPU side over this process.
+    ///
+    /// Everything after the two mappings is [`RingTransport::finish_attach`],
+    /// shared with the Linux path. That sharing is the claim this whole axis
+    /// exists to make: the platform layer differs and the transport does not.
+    #[cfg(windows)]
+    pub fn connect(session: &str) -> Result<Attached, String> {
+        use sv_transport::cold::ColdMessage;
+        use sv_transport::stream::{read_message, write_message};
+        use sv_transport::{winpipe, winshm};
+
+        let mut pipe = winpipe::Pipe::connect(&winpipe::pipe_name(session), 10_000)
+            .map_err(|e| format!("cannot reach the GPU side's pipe: {e}"))?;
+        write_message(&mut pipe, &ColdMessage::AttachRequest).map_err(|e| e.to_string())?;
+        let mut scratch = Vec::new();
+        let at = match read_message(&mut pipe, &mut scratch).map_err(|e| e.to_string())? {
+            ColdMessage::Attach(a) => a,
+            ColdMessage::Refuse { code, reason } => {
+                return Err(format!("refused {code}: {reason}"));
+            }
+            other => return Err(format!("unexpected cold-path message {other:?}")),
+        };
+
         let control_region = Arc::new(
-            SharedRegion::map_fd(control_fd.as_fd(), at.control_offset, at.control_len as usize)
+            SharedRegion::map_section(
+                winshm::Section::open(
+                    &winshm::section_name(&format!("{session}.ctl")),
+                    at.control_len,
+                )
                 .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?,
         );
         let arena = Arc::new(
-            SharedRegion::map_fd(arena_fd.as_fd(), at.arena_offset, at.arena_len as usize)
+            SharedRegion::map_section(
+                winshm::Section::open(
+                    &winshm::section_name(&format!("{session}.arena")),
+                    at.arena_len,
+                )
                 .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?,
         );
+        // The pipe is dropped here, and that is deliberate: D10 says the cold
+        // path is "handshake, capability negotiation, wakeups, teardown, never
+        // data", and this build has no `SocketDoorbell` yet, so holding it open
+        // would only be a handle nobody reads.
+        RingTransport::finish_attach(control_region, arena, at.arena_len)
+    }
+
+    /// Stitch the two regions out of one descriptor and one run list.
+    ///
+    /// The extent covers both regions and the runs describe the whole of it, so
+    /// the control region and the arena are two *slices* of one stitched view.
+    /// They are built as two independent stitches rather than one view sliced in
+    /// two, because §4.1 wants two independent mappings with independent bases —
+    /// and because slicing a mapping would mean one `munmap` releasing both,
+    /// which is not what `Arc<SharedRegion>` promises.
+    #[cfg(target_os = "linux")]
+    fn stitch_two(
+        fd: std::os::fd::BorrowedFd<'_>,
+        at: &sv_transport::cold::Attachment,
+        runs: &[sv_transport::cold::AttachRun],
+    ) -> Result<(Arc<SharedRegion>, Arc<SharedRegion>), String> {
+        use sv_transport::region::StitchRun;
+
+        // Cut the run list at `arena_offset`, splitting a run if the boundary
+        // falls inside one. The control region is a whole number of pages and
+        // the runs are page-granular, so the split is always legal — but it does
+        // happen, because nothing makes a guest's fragmentation line up with our
+        // geometry.
+        let split = at.arena_offset;
+        let mut control = Vec::new();
+        let mut arena = Vec::new();
+        for r in runs {
+            let end = r.extent_offset + r.len;
+            if end <= split {
+                control.push(StitchRun {
+                    file_offset: r.file_offset,
+                    extent_offset: r.extent_offset,
+                    len: r.len,
+                });
+            } else if r.extent_offset >= split {
+                arena.push(StitchRun {
+                    file_offset: r.file_offset,
+                    extent_offset: r.extent_offset - split,
+                    len: r.len,
+                });
+            } else {
+                let head = split - r.extent_offset;
+                control.push(StitchRun {
+                    file_offset: r.file_offset,
+                    extent_offset: r.extent_offset,
+                    len: head,
+                });
+                arena.push(StitchRun {
+                    file_offset: r.file_offset + head,
+                    extent_offset: 0,
+                    len: r.len - head,
+                });
+            }
+        }
+        let control = SharedRegion::stitch(fd, &control).map_err(|e| e.to_string())?;
+        let arena = SharedRegion::stitch(fd, &arena).map_err(|e| e.to_string())?;
+        if control.len() as u64 != at.control_len || arena.len() as u64 != at.arena_len {
+            return Err(format!(
+                "the runs cover {}+{} bytes and the attachment says {}+{}",
+                control.len(),
+                arena.len(),
+                at.control_len,
+                at.arena_len
+            ));
+        }
+        Ok((Arc::new(control), Arc::new(arena)))
+    }
+
+    /// The half of attaching that is the same on every platform: wait for the
+    /// owner to publish, claim the three rings, start the heartbeat.
+    ///
+    /// Extracted when the Windows path was written, because it is 60 lines and
+    /// duplicating it is how the two platforms come to claim rings in a
+    /// different order.
+    #[cfg(any(target_os = "linux", windows))]
+    fn finish_attach(
+        control_region: Arc<SharedRegion>,
+        arena: Arc<SharedRegion>,
+        attached_arena_len: u64,
+    ) -> Result<Attached, String> {
+        use sv_transport::control::RingKind;
+        use sv_transport::ring::Lane;
 
         // The owner may not have published yet. `NotReady` is the expected
         // answer and retrying it is the whole reason `magic` is written last.
@@ -195,7 +361,7 @@ impl RingTransport {
         };
         control.stamp_epoch().map_err(|e| e.to_string())?;
         let slab_size = control.layout().geometry.arena_slab_size;
-        let arena_len = control.layout().geometry.arena_size.min(at.arena_len);
+        let arena_len = control.layout().geometry.arena_size.min(attached_arena_len);
 
         let instance_slot =
             control.claim_ring(RingKind::Instance, 1, None).map_err(|e| e.to_string())?;
@@ -250,9 +416,9 @@ impl RingTransport {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     pub fn connect(_socket: &str) -> Result<Attached, String> {
-        Err("the cold-path descriptor handoff is Linux-only in this build".into())
+        Err("this build has a cold path for Linux and Windows only".into())
     }
 
     fn ring(&self, class: RingClass) -> &Mutex<Ring> {

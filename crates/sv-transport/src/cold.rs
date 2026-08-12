@@ -246,6 +246,48 @@ pub enum ColdMessage {
     /// in doubt.
     Ping,
     Shutdown,
+    /// `sv-hostd` → **ICD**, following an [`ColdMessage::Attach`] whose
+    /// `run_count` is non-zero: how to stitch the extent out of the descriptor
+    /// that came with it.
+    ///
+    /// # This is a different boundary from the one §5.7 is about
+    ///
+    /// design.md §5.7 says, firmly, "**the run list does not cross the wire, and
+    /// it never did have to**", and §4.3's `ExtentDesc` carries a *locator*
+    /// rather than addresses. Both are about the **guest↔host** boundary, where
+    /// the guest cannot know the runs — that is the entire reason `ScanLocator`
+    /// exists.
+    ///
+    /// This is the **daemon↔ICD** boundary, and there the picture is the
+    /// opposite: both processes are the app side, on one kernel, and design.md
+    /// §3's own topology box says `sv-hostd` "hands **fd + runs** to the ICDs".
+    /// It has to, and the reason is structural rather than a matter of taste:
+    /// **a scattered extent has no single descriptor whose `mmap` reproduces
+    /// it.** The daemon's contiguous view is many `mmap(MAP_FIXED)` calls into
+    /// one reservation, and a view is not a file. So either the runs reach the
+    /// client and it stitches its own — one `mmap` per run, the cost §5.7
+    /// already budgets — or the daemon copies, which §1's second invariant
+    /// forbids.
+    ///
+    /// `Attachment::run_count` was already in the protocol for this, with 0
+    /// meaning "one contiguous range". What was missing was the message that
+    /// carries the runs when it is not.
+    Runs(Vec<AttachRun>),
+}
+
+/// One run of the daemon's stitched view, as the ICD needs it.
+///
+/// Deliberately *not* `sv_arena::extent::Run`: this is the wire form of a
+/// same-machine handoff and that is the side-local derived type. They hold the
+/// same three numbers, and keeping them separate is what stops the arena's
+/// internal representation becoming protocol by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachRun {
+    /// Offset in the descriptor that came with the `Attach`.
+    pub file_offset: u64,
+    /// Offset within the extent — the number both sides agree on (§1).
+    pub extent_offset: u64,
+    pub len: u64,
 }
 
 const TAG_HELLO: u32 = 1;
@@ -255,6 +297,15 @@ const TAG_ATTACH: u32 = 4;
 const TAG_ATTACH_REQUEST: u32 = 5;
 const TAG_PING: u32 = 6;
 const TAG_SHUTDOWN: u32 = 7;
+const TAG_RUNS: u32 = 8;
+
+/// The most runs one `Runs` message may carry.
+///
+/// A 2 GiB arena of 4 KiB guest pages measured ~47,000 runs (§5.7), and each is
+/// 24 bytes, so the message is ~1.1 MiB — which is why [`MAX_COLD_MESSAGE`] is
+/// 1 MiB and this is checked rather than assumed. Beyond it the daemon refuses
+/// rather than truncating: half a run list is an arena with a hole in it.
+pub const MAX_ATTACH_RUNS: usize = (MAX_COLD_MESSAGE - 16) / 24;
 
 impl ColdMessage {
     fn size(&self) -> usize {
@@ -263,6 +314,7 @@ impl ColdMessage {
             ColdMessage::Accept { .. } => 4,
             ColdMessage::Refuse { reason, .. } => 4 + 8 + pad4(reason.len() + 1),
             ColdMessage::Attach(_) => 8 * 4 + 4 + 8,
+            ColdMessage::Runs(r) => 8 + r.len() * 24,
             ColdMessage::AttachRequest | ColdMessage::Ping | ColdMessage::Shutdown => 0,
         }
     }
@@ -309,6 +361,15 @@ impl ColdMessage {
                 e.u64(a.arena_len)?;
                 e.u32(a.generation)?;
                 e.u64(a.run_count)?;
+            }
+            ColdMessage::Runs(runs) => {
+                e.u32(TAG_RUNS)?;
+                e.u64(runs.len() as u64)?;
+                for r in runs {
+                    e.u64(r.file_offset)?;
+                    e.u64(r.extent_offset)?;
+                    e.u64(r.len)?;
+                }
             }
             ColdMessage::AttachRequest => e.u32(TAG_ATTACH_REQUEST)?,
             ColdMessage::Ping => e.u32(TAG_PING)?,
@@ -360,6 +421,25 @@ impl ColdMessage {
                 generation: d.u32()?,
                 run_count: d.u64()?,
             }),
+            TAG_RUNS => {
+                let n = d.u64()?;
+                // Bound before allocating. A corrupted or hostile length here is
+                // R2's shape — `n` comes off the wire and `Vec::with_capacity`
+                // would take it at its word.
+                let n = usize::try_from(n)
+                    .ok()
+                    .filter(|n| *n <= MAX_ATTACH_RUNS)
+                    .ok_or(Error::BadColdMessage("implausible run count"))?;
+                let mut runs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    runs.push(AttachRun {
+                        file_offset: d.u64()?,
+                        extent_offset: d.u64()?,
+                        len: d.u64()?,
+                    });
+                }
+                ColdMessage::Runs(runs)
+            }
             TAG_ATTACH_REQUEST => ColdMessage::AttachRequest,
             TAG_PING => ColdMessage::Ping,
             TAG_SHUTDOWN => ColdMessage::Shutdown,

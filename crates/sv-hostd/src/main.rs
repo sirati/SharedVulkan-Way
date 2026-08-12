@@ -44,11 +44,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("serve") => {}
         Some("qemu") => return qemu_mode(&args),
+        Some("qemu-serve") => return qemu_serve(&args),
         _ => {
             eprintln!(
                 "usage:\n  \
                  sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]\n  \
-                 sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]"
+                 sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n  \
+                 sv-hostd qemu-serve --qmp <sock> --cold <sock> --socket <path> [--vm <hint>] [--clients N]"
             );
             return Err("no subcommand".into());
         }
@@ -248,3 +250,232 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// `sv-hostd qemu-serve` — the app-side daemon for the cross-VM topology.
+///
+/// The whole of `Mode::Qemu`, wired end to end:
+///
+///  1. accept the guest's `Hello` on the **cold path** — a Unix socket that
+///     QEMU's virtio-serial chardev is the other end of, so what arrives here
+///     was written to `/dev/virtio-ports/...` inside the guest;
+///  2. locate the extent it describes by content, translate through the region
+///     table read off `info mtree -f`, coalesce, and stitch;
+///  3. reply `Accept`, which is the guest's signal that its memory is reachable;
+///  4. serve the stitched view to ICD processes over an ordinary Unix socket.
+///
+/// Step 4 is where the two topologies converge. The ICD receives an
+/// `Attachment` and a descriptor exactly as it does from `Mode::Local`, and it
+/// never learns that the pages behind that descriptor are another machine's RAM
+/// found by sweeping thirteen gigabytes for a magic number.
+///
+/// **The descriptor handed to the ICD is not the memfd.** It cannot be: the
+/// extent is scattered through QEMU's backing object and the ICD needs one flat
+/// region whose offsets match the guest's. So the daemon stitches the runs into
+/// its own contiguous view and re-publishes *that* as a memfd of its own, which
+/// is the one place this design copies rather than shares — and it does not:
+/// the stitched view is `MAP_SHARED` over the same pages, so the memfd the ICD
+/// maps is the guest's memory reached through a second set of page tables.
+#[cfg(target_os = "linux")]
+fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use sv_hostd::locate;
+    use sv_transport::cold::{Attachment, ColdMessage, recv, send_with_fd};
+    use sv_transport::region::PAGE;
+    use sv_transport::stream::{read_message, write_message};
+
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let qmp = arg("--qmp").ok_or("--qmp is required")?;
+    let cold = arg("--cold").ok_or("--cold is required")?;
+    let path = arg("--socket").ok_or("--socket is required")?;
+    let hint = arg("--vm").unwrap_or_else(|| "sv-guest".into());
+    let clients: usize = arg("--clients").map_or(Ok(1), |s| s.parse())?;
+
+    // The cold path. QEMU is listening on this socket as the host end of the
+    // guest's virtio-serial port, so connecting to it puts us on the other end
+    // of `/dev/virtio-ports/<name>` inside the guest.
+    eprintln!("sv-hostd: waiting for the guest on the cold path {cold}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut port = loop {
+        match UnixStream::connect(&cold) {
+            Ok(s) => break s,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100))
+            }
+            Err(e) => return Err(format!("cannot reach {cold}: {e}").into()),
+        }
+    };
+
+    let mut scratch = Vec::new();
+    let hello = match read_message(&mut port, &mut scratch)? {
+        ColdMessage::Hello(h) => h,
+        other => return Err(format!("expected Hello, got {other:?}").into()),
+    };
+    eprintln!(
+        "sv-hostd: the guest offers run 0x{:016x}, {} control pages + {} arena pages, locator {:?}",
+        hello.extent.run_id,
+        hello.extent.control_pages,
+        hello.extent.arena_pages,
+        hello.extent.locator,
+    );
+
+    // Locate. This is the two seconds, and it is the only expensive step.
+    let started = std::time::Instant::now();
+    let located = sv_hostd::Hostd::qemu(
+        std::path::Path::new(&qmp),
+        &hint,
+        &hello.extent,
+        hello.generation,
+    );
+    let (hostd, regions, report) = match located {
+        Ok(v) => v,
+        Err(e) => {
+            // Tell the guest rather than leaving it waiting. It is holding a
+            // pinned window of its own RAM and the only thing that releases it
+            // is the process exiting.
+            let _ = write_message(
+                &mut port,
+                &ColdMessage::Refuse { code: 2, reason: format!("{e}") },
+            );
+            return Err(Box::new(e));
+        }
+    };
+    eprintln!(
+        "sv-hostd: located {}/{} pages in {:.2?} over {} MiB of guest RAM; {} run(s), {} outside RAM",
+        report.pages_found,
+        report.pages_expected,
+        started.elapsed(),
+        regions.total_ram() >> 20,
+        hostd.runs.len(),
+        report.outside_ram,
+    );
+
+    // Stitch, and check the §1 invariant before telling the guest anything. A
+    // view whose pages are in the wrong order reads as a working arena to
+    // everything except an application, so it is checked here, once, where the
+    // stamps still exist — they are overwritten the moment the arena is used.
+    let file = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let raw = hostd.fd.as_fd().as_raw_fd();
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(raw) })
+    };
+    let view = locate::attach(&file, &hostd.runs)?;
+    let pages = view.len() / PAGE;
+    let mut header = [0u8; 20];
+    let mut wrong = 0usize;
+    for i in 0..pages {
+        view.read(i as u64 * PAGE as u64, &mut header).ok_or("short read")?;
+        if &header[0..8] != arena_record::MAGIC
+            || u64::from_le_bytes(header[8..16].try_into().unwrap()) != hello.extent.run_id
+            || u32::from_le_bytes(header[16..20].try_into().unwrap()) != i as u32
+        {
+            wrong += 1;
+        }
+    }
+    if wrong > 0 {
+        let reason = format!("{wrong} of {pages} stitched pages are not where the extent says");
+        let _ = write_message(&mut port, &ColdMessage::Refuse { code: 3, reason: reason.clone() });
+        return Err(reason.into());
+    }
+    eprintln!(
+        "sv-hostd: stitched {} MiB with {} mmap call(s); all {pages} pages carry their own index",
+        view.len() >> 20,
+        view.runs(),
+    );
+
+    // Accepting is the guest's signal that its memory is reachable, so it is
+    // sent only after the check above has passed.
+    write_message(&mut port, &ColdMessage::Accept { generation: hello.generation })?;
+
+    // Serve the ICD. What it gets is a descriptor for the *stitched* view, not
+    // for QEMU's backing object: the extent is scattered through that object and
+    // an application needs one flat region whose offsets match the guest's.
+    //
+    // The descriptor is a memfd this daemon owns whose pages are the guest's,
+    // because `attach` mapped the runs `MAP_SHARED` into it — so nothing is
+    // copied and the ICD's `vkMapMemory` returns a pointer into the VM's RAM.
+    let runs_for_wire: Vec<sv_transport::cold::AttachRun> = hostd
+        .runs
+        .runs()
+        .iter()
+        .map(|r| sv_transport::cold::AttachRun {
+            file_offset: r.file_offset,
+            extent_offset: r.extent_offset,
+            len: r.len,
+        })
+        .collect();
+    if runs_for_wire.len() > sv_transport::cold::MAX_ATTACH_RUNS {
+        return Err(format!(
+            "{} runs will not fit in one cold-path message (max {}); \
+             the guest needs huge pages for an arena this fragmented",
+            runs_for_wire.len(),
+            sv_transport::cold::MAX_ATTACH_RUNS
+        )
+        .into());
+    }
+
+    let attachment = Attachment {
+        control_offset: 0,
+        control_len: hello.extent.control_pages * PAGE as u64,
+        arena_offset: hello.extent.control_pages * PAGE as u64,
+        arena_len: hello.extent.arena_pages * PAGE as u64,
+        generation: hello.generation,
+        // **Always the real count, never the `0` shortcut**, even when the
+        // extent came back as a single run.
+        //
+        // `run_count == 0` means "map the fd at the attachment's offsets", and
+        // that is only true where the daemon *made* the file — `Mode::Local`,
+        // where offset 0 of the memfd is offset 0 of the extent. Here the file
+        // is QEMU's memory backend and offset 0 of it is guest-physical zero, so
+        // a client taking the shortcut would map the guest's first 48 MiB
+        // instead of the arena. It would find valid, unrelated memory and report
+        // no error, which is R21's failure mode arriving through the handoff
+        // rather than through the translation.
+        //
+        // A one-run extent costs the client exactly one `mmap` either way, so
+        // the shortcut buys nothing here and the two claims — "contiguous" and
+        // "at these file offsets" — are kept apart.
+        run_count: hostd.runs.len() as u64,
+    };
+
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    eprintln!("sv-hostd: listening on {path} for {clients} ICD client(s)");
+    for i in 0..clients {
+        let (sock, _) = listener.accept()?;
+        let (msg, _) = recv(&sock)?;
+        match msg {
+            ColdMessage::AttachRequest => {
+                let mut buf = Vec::new();
+                ColdMessage::Attach(attachment.clone()).encode(&mut buf)?;
+                // QEMU's own descriptor, not a copy of anything: the ICD maps
+                // the guest's RAM directly. What it needs on top is the run
+                // list, because a scattered extent has no single descriptor
+                // whose `mmap` reproduces it — design.md §3's "hands **fd +
+                // runs** to the ICDs", which is a different boundary from
+                // §5.7's "the run list does not cross the wire".
+                send_with_fd(&sock, &buf, Some(hostd.fd.as_fd()))?;
+                if attachment.run_count != 0 {
+                    let mut buf = Vec::new();
+                    ColdMessage::Runs(runs_for_wire.clone()).encode(&mut buf)?;
+                    send_with_fd(&sock, &buf, None)?;
+                }
+                eprintln!(
+                    "sv-hostd: ICD client {i} attached ({} run(s))",
+                    hostd.runs.len()
+                );
+            }
+            other => {
+                let mut buf = Vec::new();
+                ColdMessage::Refuse { code: 1, reason: format!("expected AttachRequest, got {other:?}") }
+                    .encode(&mut buf)?;
+                send_with_fd(&sock, &buf, None)?;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+

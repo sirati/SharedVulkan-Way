@@ -153,8 +153,15 @@ impl SharedVulkan {
     /// `Placeholder`, because from here the offsets it produces are read by
     /// *another process* — §5.2's segregated free lists and its slab-boundary
     /// rule stop being an implementation detail and start being the contract.
-    #[cfg(target_os = "linux")]
-    pub fn connected(socket: &str) -> Result<SharedVulkan, String> {
+    ///
+    /// `endpoint` is a Unix socket path on Linux and a **session name** on
+    /// Windows, from which the pipe and the two section names are derived. One
+    /// environment variable either way, because an ICD cannot be given
+    /// arguments and adding a second variable for the same job is how a user
+    /// ends up setting the wrong one.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn connected(endpoint: &str) -> Result<SharedVulkan, String> {
+        let socket = endpoint;
         let attached = crate::transport::RingTransport::connect(socket)?;
         let arena = Mapping::attach(&attached.transport.arena, attached.arena_len);
         // `CanaryPolicy::None`: R26's canary detects a *guest page* moving
