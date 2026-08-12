@@ -10,6 +10,8 @@ members = [
   "crates/sv-wire",
   "crates/sv-codegen",
   "crates/sv-proto",
+  "crates/sv-icd-entry",
+  "crates/sv-icd",
   "crates/sv-testkit",
 ]
 
@@ -21,6 +23,10 @@ rust-version = "1.90"
 [workspace.dependencies]
 anyhow = "1"
 vk-parse = "0.19"
+# The app side maps the arena itself, which is `memfd_create` + `mmap` and has
+# no portable standard-library spelling. Confined to `sv-icd`'s `arena` module,
+# which is one of the three places design.md §7.3 permits hand-written `unsafe`.
+libc = "0.2"
 # Insertion-ordered maps, so that every table the generator walks is walked in
 # a deterministic order without having to sort at each use. The generator's
 # output has to be byte-identical for the same registry, and a HashMap
@@ -38,3 +44,4 @@ sv-wire = { path = "crates/sv-wire" }
 vk-registry = { path = "crates/vk-registry" }
 sv-codegen = { path = "crates/sv-codegen" }
 sv-proto = { path = "crates/sv-proto" }
+sv-icd-entry = { path = "crates/sv-icd-entry" }

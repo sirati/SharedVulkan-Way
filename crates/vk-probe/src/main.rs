@@ -221,7 +221,7 @@ fn try_import(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Result<()> {
             match unsafe { device.map_memory(mem, 0, SIZE as u64, vk::MemoryMapFlags::empty()) } {
                 Ok(mapped) => {
                     let first = unsafe { *(mapped as *const u8) };
-                    let same_address = mapped as usize == ptr as usize;
+                    let same_address = std::ptr::eq(mapped as *const u8, ptr as *const u8);
                     println!(
                         "    mapped ok: first byte = 0x{first:02x} (wrote 0xAB), \
                          same address = {same_address}"

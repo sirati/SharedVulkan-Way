@@ -111,6 +111,14 @@
           export VK_XML="${pkgs.vulkan-headers}/share/vulkan/registry/vk.xml"
           export VULKAN_SDK="${pkgs.vulkan-headers}"
 
+          # The ICD's end-to-end test drives the *real* loader, which means
+          # `dlopen("libvulkan.so.1")` from a test binary. `vulkaninfo` finds it
+          # through its own rpath and a test binary has none, so without this the
+          # one test that exercises the loader contract skips silently — which is
+          # the worst possible outcome for a test whose whole point is that the
+          # loader accepts us.
+          export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
           # cargo defaults to the gnu linker for the windows target; point it
           # at the mingw one from the store rather than whatever is on PATH.
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.buildPackages.gcc}/bin/x86_64-w64-mingw32-gcc"

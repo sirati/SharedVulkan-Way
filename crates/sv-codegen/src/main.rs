@@ -12,6 +12,7 @@ fn main() -> Result<()> {
     let mut out_dir: Option<PathBuf> = None;
     let mut check_determinism = false;
     let mut stats_only = false;
+    let mut icd_entry = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -22,6 +23,7 @@ fn main() -> Result<()> {
             "--out" | "-o" => {
                 out_dir = Some(PathBuf::from(args.next().context("--out needs a directory")?));
             }
+            "--icd-entry" => icd_entry = true,
             "--check-determinism" => check_determinism = true,
             "--stats" => stats_only = true,
             "--list-profiles" => {
@@ -47,6 +49,36 @@ fn main() -> Result<()> {
     let profile = sv_codegen::profile_by_name(&profile_name).with_context(|| {
         format!("unknown profile {profile_name:?}; try one of {:?}", sv_codegen::PROFILE_NAMES)
     })?;
+
+    if icd_entry {
+        let registry = vk_registry::Registry::load()?;
+        let model = registry.model()?;
+        let g = sv_codegen::generate_icd_entry(&model, &profile)?;
+        eprintln!("icd surface           {} commands, {} types", g.commands, g.types);
+        eprintln!("generated lines       {}", g.generated_lines);
+        eprintln!("refused commands      {}", g.refusals.commands.len());
+        for r in &g.refusals.commands {
+            eprintln!("  {:<48} {}", r.command, r.reason);
+        }
+        eprintln!("refused lowerings     {}", g.refusals.lower.len());
+        for (n, why) in &g.refusals.lower {
+            eprintln!("  {n:<48} {why}");
+        }
+        eprintln!("refused writebacks    {}", g.refusals.store.len());
+        for (n, why) in &g.refusals.store {
+            eprintln!("  {n:<48} {why}");
+        }
+        match out_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)?;
+                let rs = dir.join("sv_icd_entry.rs");
+                std::fs::write(&rs, &g.source)?;
+                eprintln!("wrote                 {}", rs.display());
+            }
+            None => print!("{}", g.source),
+        }
+        return Ok(());
+    }
 
     let generated = sv_codegen::generate(&profile)?;
     let s = &generated.stats;

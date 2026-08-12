@@ -1,4 +1,8 @@
 target/
+# Written by `sv_codegen::generate_icd_entry` only when a generated section does
+# not parse, so that a person has the offending tokens to read. Never useful
+# checked in.
+sv-icd-entry-unparsed.rs
 result
 result-*
 .direnv/
