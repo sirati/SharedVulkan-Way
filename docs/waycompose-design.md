@@ -14433,6 +14433,7 @@ been wrong about on this project before. §37.8 item 1.
    a conflicted pop does not drop the stash, but the recovery was manual. Stash
    by explicit ref (`git stash pop stash@{N}`) after reading `git stash list`,
    or do not stash at all in a shared checkout.
+
 ## 36. The Wayland connection moves onto shared_vulkan's channel — and the doorbell that was costing 216.9 ms a frame
 
 This section records a correction, and then a much larger thing the correction
@@ -15434,3 +15435,255 @@ Three, and the test for each is the same: can a run reach it *silently*.
    runs two of our own clients on the guest itself with no proxy and no arena,
    so it has no substrate to declare. Worth stating because "every block of
    every harness" is the kind of claim that is easy to make and wrong.
+
+## 40. The scene had no lookup, and half the suite was one call site
+
+The standing requirement is that the Windows Wayland server passes the Wayland
+compliance suite. It did not, and the reason was concentrated rather than
+diffuse: of 236 failures at the last measurement, 136 came from one line, and
+that line had been correct exactly once — when every window was one surface.
+
+### 40.1 The re-baseline, before anything was changed
+
+A great deal had landed since the last recorded run — §37's pointer coordinate
+fix, popup destroy and grab, cursor shapes, touch, the clipboard, idle-inhibit,
+activation, taskbar identity, tabs-in-titlebar — and several of those should
+have moved verdicts. So the first thing done here was to re-measure, and to
+report the delta before touching anything:
+
+| | passed | failed | skipped |
+|---|---|---|---|
+| recorded baseline | 230 | 236 | 759 |
+| re-measured, unchanged tree | **232** | **234** | **759** |
+
+**Two tests.** §37 fixed the *coordinate* half of the pointer bug — the surface
+origin stopped being a hard-coded `(0, 0)` — and that moved two verdicts, both
+in `ToplevelInputRegions`. Everything else it was hoped to have moved, it had
+not, and the reason is worth stating plainly: §37 fixed *where* the pointer was
+on a surface, and the failures were about *which surface it was on*. Those are
+different halves of the same call, and fixing one of them changes almost nothing
+until the other is fixed too. A re-baseline that had been skipped would have
+attributed the later gains to §37 and left the actual defect unnamed.
+
+### 40.2 What the failures actually were
+
+They clustered, and the clusters had different causes that looked identical from
+the scoreboard:
+
+* **`State::pointer_motion` had no scene lookup at all.** It took the window id
+  the platform gave it and sent the event to that window's *root* surface. Not
+  the surface under the pointer — the root, always. So a `wl_subsurface` never
+  received a pointer event in the compositor's entire history, and
+  `wl_surface.set_input_region` was parsed by smithay and read by nobody.
+* **The touch device in the WLCS shim was a stub**, and its comment explained at
+  length that this was correct because "there is no touch anywhere in this
+  project".
+* **`xdg_surface.set_window_geometry`'s default was the root buffer**, not the
+  tree.
+* **A null buffer never dropped the surface's pixels**, so an unmapped surface
+  kept its size and went on swallowing input.
+* **Nothing re-ran the hit test when the scene moved** under a pointer that had
+  not.
+
+### 40.3 The scene lookup
+
+`State::surface_under` replaces `surface_and_origin`. It walks the surface tree
+in the reverse of paint order and returns the first surface that accepts the
+point, honouring input regions and subsurface placement.
+
+The walk itself is not new — `compose_tree` has had it since stage 9 — and the
+whole of the change is that it is now *one* walk with two callers. `placed_tree`
+is a free function whose single caller-visible promise is the order, because
+hit-testing is the exact inverse of painting and the only way to keep that true
+as the tree grows a case is to derive both from one list.
+
+Three rules decide whether a surface accepts a point, and the order is the
+protocol's: a surface with no buffer has no size and takes nothing; the point
+must be within the buffer, because `set_input_region` says the region "is
+clipped to the surface size", so a region *larger* than the buffer does not
+extend it; and an absent region means the whole surface rather than none of it,
+because `None` is the protocol's initial value and it means infinite.
+
+`accepts_input_at` takes the region as an argument rather than reading it off
+the `WlSurface`, and that is the whole reason it has unit tests. A `WlSurface`
+needs a live display and a connected client to exist, so a function that took
+one could only ever be exercised through the full suite — a hundred-second
+feedback loop, which is precisely the loop that let the placeholder survive
+twenty-six stages. Seven tests now cover the empty region, the absent region,
+the clipped-larger region, the subtracted hole, disjoint rectangles and the
+sizeless surface, and they run in microseconds.
+
+**The architecture note in `control.rs` was what hid this.** It said this
+compositor "does not place windows and does not hit-test a pointer — Windows
+does", and that is true *between* windows and false *within* one. A
+`wl_subsurface` has no `HWND`; the whole tree is composed into one window's
+pixels; `set_input_region` is a concept Win32 has never heard of. Windows can
+answer "which window" and nothing else can answer "which surface". The comment
+was accurate about the outer question and was read as covering the inner one,
+and that is how the largest cluster of failures in the suite came to be filed as
+somebody else's layer. It now says "between windows" in bold.
+
+### 40.4 The touch stub, and a comment that outlived its reason by sixteen stages
+
+The shim's touch device had empty methods and a comment explaining that this was
+the correct answer because `wl_seat` advertised no touch capability, `FromUi`
+had no touch event, and `win32.rs` handled no `WM_POINTER*` message.
+
+All three were true when written. None was true after §20 and §24: `has_touch`
+gates a real `add_touch`, `FromUi` carries four touch variants, `win32.rs` has a
+`WM_POINTER*` handler with a `pointerId`-to-slot map. The seat in every run of
+this suite had been printing `capabilities: pointer, keyboard, touch` while the
+harness reported that touch could not be tested.
+
+**A stub is only honest for as long as its reason is checked.** This one went on
+explaining, in confident and specific detail, why roughly a hundred failing
+tests were not the compositor's problem. It is worth recording as a failure mode
+rather than quietly deleting, because the comment was what stopped anyone
+looking — a bare `todo!()` would have been found years earlier.
+
+Wiring it up needed three verbs on the control socket (`touch-down`,
+`touch-move`, `touch-up`) and produced **no change whatsoever** on the first
+attempt. The reason is a genuine trap in WLCS's own ABI:
+
+```c
+/* wlcs/touch.h */
+void (*touch_down)(WlcsTouch* touch, wl_fixed_t x, wl_fixed_t y);
+```
+
+```c++
+/* in_process_server.cpp — what actually runs */
+void down_at(int x, int y) { touch->touch_down(touch.get(), x, y); }
+```
+
+The header says `wl_fixed_t`; the call passes whole pixels. `wlcs::Pointer`
+really does send fixed-point and really does convert, so dividing by 256 in both
+places is both the obvious thing and wrong in one of them.
+
+**How it was found is the point.** Every touch test failed with the contact
+landing on no surface at all — which looks exactly like "touch is not wired up",
+the conclusion the stub had already asserted. One `eprintln!` of the received
+coordinates printed `0.355, 0.059` where `91, 15` was expected, and 91/256 =
+0.355 named the bug in one line. A wrong unit is invisible in a pass/fail
+scoreboard and obvious in a single printed number.
+
+### 40.5 Three smaller defects the lookup exposed
+
+**An unset window geometry is the bounds of the tree, not of the root buffer.**
+`xdg_surface.set_window_geometry` says the default is "the full bounds of the
+surface, *including any subsurfaces*", and the last three words were missing. A
+subsurface hanging over its parent's edge was clipped out of the window — not
+drawn, and therefore not clickable either, since the window is the canvas the
+hit test searches. This changes nothing for a client without subsurfaces (the
+union of a one-surface tree is that surface) and nothing for a client that sets
+a geometry (Firefox, `weston-terminal`, everything GTK).
+
+**A null buffer has to drop the staging entry.** It unmaps the surface, which
+means no content and no input — but the pixels stayed, so the surface kept its
+size for anything that asked. `surface_under` takes its size from there, so an
+unmapped subsurface went on swallowing every click that landed where it used to
+be, invisibly and permanently. The same leak `cursor_surface` had already been
+guarding against by hand.
+
+**The scene can move under a stationary pointer.** Every hit test before this ran
+on a pointer *event*. The other half of the same question is a commit: a
+subsurface repositioned, raised with `place_above`, given a new input region or
+unmapped changes what is under a pointer that has not moved at all, and the
+client is owed a `leave` and an `enter` for it. The re-delivery uses the stored
+`pointer_at` rather than a synthesised move, so it cannot invent motion the user
+did not make, and it is gated on the committing tree being the one under the
+pointer.
+
+**A destroyed surface has to release its contacts.** `wl_touch` has no `leave`:
+`down` binds a contact to a surface and only `up` or `cancel` releases it. A
+client whose surface was destroyed mid-gesture was left holding a finger it
+could never put down. `up` rather than `cancel`, and the distinction is not
+pedantry — `cancel` means "the compositor took the gesture away, undo what it
+did" and ends every contact on the seat, which would be wrong for the contacts
+still live on other surfaces.
+
+### 40.6 The scoreboard
+
+| | passed | failed | skipped |
+|---|---|---|---|
+| recorded baseline | 230 | 236 | 759 |
+| re-measured, before changes | 232 | 234 | 759 |
+| **after §40** | **351** | **115** | **759** |
+
+**351 of the 466 applicable tests, 75.3%**, from 49.8%. Suites that went from
+failing to perfect: `ClippedLargerRegion`, `FullSurface`, `SmallerRegion` and
+`MultiRectCorners/RegionSurfaceInputCombinations`, `ToplevelInputRegions` and
+`AllSurfaceTypes/TouchTest`.
+
+**Measured again after merging master**, rather than carried across from the
+branch it was measured on — §36's ring, the Vulkan work and the rest landed in
+between, and a number quoted from a tree that no longer exists is not a
+measurement. Identical: 351/115/759, the same 677/79/3 split, and the fallback
+table still matches the registry. The workspace gate on the merged tree is 82
+binaries and 1,324 tests, none failing.
+
+**The skip count did not move, and that is the number to check first.** 759
+before and 759 after, splitting 677 justified / 79 gaps / 3 WLCS self-tests
+exactly as it did at the baseline. Not one failure was converted into an
+exclusion. A compliance claim that folds debts into exclusions is worse than no
+claim, and the cheapest way to detect it is that the total skips rose while the
+failures fell.
+
+The `wine` leg was re-run and `compare` with it: **35 tests ran on both legs**
+(the count the mode now reports, and the thing to check before trusting it),
+with one disagreement — `CopyCutPaste.given_source_has_offered_when_sink_gets_focus_it_sees_offer`,
+which fails under Wine and passes headless. That is a clipboard-focus difference
+and it predates this section; none of the tests §40 moved are on the wine leg at
+all, because `--control` is `#[cfg(unix)]` and every pointer and touch test is
+excluded there by filter.
+
+### 40.7 The 115 that remain, honestly
+
+Named rather than aggregated, because the split is the only part of a compliance
+number that carries information:
+
+* **44 — `xdg_positioner`.** Not touched here by agreement; §38 is fixing popup
+  constraint against the monitor work area in a parallel worktree. The count is
+  unchanged from the baseline, which is the expected result of leaving it alone.
+* **22 — input outside the window geometry rectangle.** WLCS's
+  `XdgStableSurfaceBuilder(12, 5, 20, 6)` sets a window geometry inset and then
+  probes the four buffer edges, all of which lie *outside* it. Wayland is clear
+  that window geometry does not clip input — only the input region does. **On
+  this platform it does, and that is a consequence of the design rather than an
+  oversight:** the `HWND` is the geometry rectangle, because that is what
+  `set_window_geometry` is for (the rest is the client's own shadow and resize
+  margin, and a window sized to include it would snap, maximise and tile
+  wrongly). Windows delivers no message outside the `HWND`, so those pixels
+  cannot reach the client. This is the first entry in this project's list that
+  is a *justified failure* rather than a justified skip — WLCS offers no
+  mechanism to declare it, since nothing is missing from the registry, so it
+  stays in the failed column with a written reason rather than being hidden.
+  Reversing it would mean extending the `HWND` past the geometry rectangle and
+  is a decision for whoever owns §37's model, not for this section.
+* **12 — surface unmap and remap.** `input_seen_by_subsurface_after_parent_unmapped_and_remapped`
+  (8) and `unmapping_parent_stops_subsurface_getting_input` (4). A genuine
+  lifecycle gap: `present` re-maps a window on any commit in its tree, including
+  a subsurface's, so an unmapped parent is resurrected by a child. A debt.
+* **10 — popup behaviour other than positioning** (`XdgPopupTest`), and
+  **16 — toplevel configuration** (`XdgToplevelStableTest`,
+  `XdgToplevelStableConfigurationTest`, `XdgSurfaceStableTest`). Uncharacterised
+  here; they are the tail this section did not reach, and they are debts.
+* **7 — subsurface commit synchronisation.** `sync`/`desync` position changes
+  applying on the wrong commit. A debt.
+* **4 — one each** in `BadBufferTest`, `ClientSurfaceEventsTest`, `CopyCutPaste`
+  and `XdgDecorationV1Test`.
+
+The 79 skipped gaps are unchanged and remain debts: `wp_viewporter` (23),
+`zwp_pointer_constraints_v1` (15), the two text-input protocols (23),
+`zwlr_virtual_pointer_manager_v1` (12), `zwp_relative_pointer_manager_v1` (3),
+`wp_fractional_scale_manager_v1` (2), `zxdg_output_manager_v1` (1). None of them
+moved, because none of them is an input-routing problem.
+
+### 40.8 One drift caught on the way
+
+`scripts/wc-wlcs.sh globals` failed at the start of this section: the registry
+advertises `wc_clipboard_manager_v1` and the shim's fallback table did not list
+it. Harmless for a harness run, which generates the extension list from
+`wayland-info` rather than from the table — and exactly the kind of divergence
+that makes a *hand*-run silently test a different claim, which is why the
+harness treats it as a failure rather than a note. The table was updated. The
+mechanism worked as designed: nobody had to notice.
