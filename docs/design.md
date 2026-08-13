@@ -2367,8 +2367,8 @@ naming as work:
   a trace. The answer is a fourth `sv_codegen::exceptions::VoidPolicy` — "we do
   not advertise the capture-replay feature, so this is null on the wire and a
   non-null one is a usage error we refuse by name" — and it is what stands
-  between this profile and `VK_KHR_ray_tracing_pipeline` (7 commands) plus
-  `VK_EXT_descriptor_buffer` (11).
+  between this profile and `VK_KHR_ray_tracing_pipeline` plus
+  `VK_EXT_descriptor_buffer` — **17 commands**, counted in item 7a.
 - **The union-of-handles class.** `VkAccelerationStructureGeometryDataKHR`,
   `VkIndirectExecutionSetInfoEXT`, `VkDescriptorMappingSourceDataEXT` and
   `VkResourceDescriptorDataEXT` are unions with a handle in an arm, and the
@@ -2376,7 +2376,9 @@ naming as work:
   It is the same `noautovalidity` gap `exceptions::SIBLING_SELECTED` already
   closes for `VkWriteDescriptorSet`, one level in. This is the expensive one:
   `VK_KHR_acceleration_structure` takes ray query, ray tracing maintenance and
-  position fetch, and `VK_EXT_opacity_micromap` with it — 16 + 14 + 13 commands.
+  position fetch, and `VK_EXT_opacity_micromap` with it — **53 commands** across
+  six extensions, again counted in item 7a. It is the largest single thing
+  standing between 509 and 740.
 
 **5. Advertisement is now the intersection of three things, and the third was
 missing.** §9.2 says an extension in the advertised list is a promise its entry
@@ -2417,8 +2419,16 @@ device does not have. The eighteen differences are exactly the two exclusion
 classes of §4 (11) and `INCOMPLETE_EXTENSIONS` (7: both buffer-device-address
 extensions, `VK_KHR_deferred_host_operations`, `VK_KHR_device_group`,
 `VK_KHR_pipeline_binary`, `VK_KHR_pipeline_executable_properties`,
-`VK_EXT_present_timing`). The device `apiVersion` still reads 1.3.0, which is
-`sv-worktrees/vers`'s §0.18 and deliberately untouched here.
+`VK_EXT_present_timing`).
+
+The device `apiVersion` read 1.3.0 when this was first measured and reads
+**1.4.0** now, which is §0.18's negotiation working on top of a profile that
+declares 1.4. Neither number was set here: §0.18 made the version
+`min(driver, wire)` over `svDriverVersions`, derived from
+`Profile::core_api_version`, and this section only moved what the profile
+declares. RADV's own is 1.4.348, so the driver is not the binding term — the
+wire is, and it is 1.4.0 because that is the highest core feature the profile
+lists.
 
 **The run caught one regression, and the ordering of two statements was the
 whole of it.** `VK_KHR_swapchain` is in `INCOMPLETE_EXTENSIONS` —
@@ -2430,16 +2440,101 @@ promise"; the `VK_KHR_swapchain` line answers "did `crate::wsi`", and those are
 different questions about different code. Nothing but the diff would have found
 it: the count moved by one.
 
-**7. What this cost the default build: nothing.** `zink` remains the default
-profile and its numbers are unchanged — `cargo test --workspace --no-fail-fast`
-is 82 binaries and 1314 tests, the same control as before. `full` is
-`SV_PROTO_PROFILE=full`, and `sv-icd` and `sv-gpu-server` both build and run
-against it. The one behaviour that changed under `zink` is the one that was
-wrong: three buffer-device-address extensions are no longer advertised, which is
-§9.2 being kept rather than a capability lost, and `sv-worktrees/cts2` owns
-making them real.
+**7. `full` is now the default, and that was a decision with a measurement
+behind it.** A capability behind an environment variable is a capability nobody
+gets, so leaving `SV_PROTO_PROFILE` unset had to mean the wide profile.
+`sv_codegen::DEFAULT_PROFILE` is the single place it is stated; the three build
+scripts read it instead of each repeating a literal. What made the switch safe:
 
-**8. One instrument was added and it was wrong the first time.**
+| | `zink` | `full` (default) |
+|---|---|---|
+| commands forwarded | 253 | **509** |
+| device extensions advertised, of RADV's 236 | 25 | **218** |
+| advertised but absent from the device | 0 | **0** |
+| `cargo test --workspace --no-fail-fast` | 1386, 0 failed | **2393, 0 failed** |
+| cold build, the two generated crates | 31 s | 50 s |
+
+`SV_PROTO_PROFILE=zink` gets the narrow protocol back with no code change. The
+two profiles now differ in extensions alone: **`zink` carries core 1.4 too**,
+because §0.18's blocker was one policy entry and §5.3 already contained its
+answer — see item 9.
+
+**7a. The remaining gap, as a list rather than a number.** 740 defined, 509
+carried, 231 not. Grouped by *why*, which is the form that says what work would
+close each:
+
+| commands | extensions | class |
+|---:|---:|---|
+| 67 | 32 | **platform-gated** — the registry's own `platform=`: Win32, Android, Fuchsia, Metal, GGP, QNX, VI, OHOS, screen, DirectFB, the X11/Wayland surface creators, and `provisional`. Out of scope for this build rather than missing from it. |
+| 53 | 6 | **union-of-handles** — a union with a handle in an arm whose live arm a sibling decides. `VK_KHR_acceleration_structure` (16) and `VK_EXT_opacity_micromap` (14) are the bulk. The same `noautovalidity` class `exceptions::SIBLING_SELECTED` closes one level in. |
+| 42 | 13 | **`void*` with no `len=` and no honest policy** — a vendor blob whose extent lives where the registry does not point. `VK_ARM_data_graph` (11) and `VK_ARM_shader_instrumentation` (7) lead. |
+| 23 | — | **unreachable by any profile** — Vulkan SC, or behind a `disabled` extension. |
+| 20 | 5 | **answered app-side by design** — `VK_KHR_swapchain` (9), `VK_KHR_surface` (5), `VK_EXT_debug_utils` (3), the two proc-address lookups. Implemented, never forwarded (§8, §10, §4.6). |
+| 17 | 2 | **capture-replay `void*`** — `VK_EXT_descriptor_buffer` (11) and `VK_KHR_ray_tracing_pipeline` (6). |
+| 9 | 3 | **function pointers** — `VK_EXT_debug_report`, `VK_EXT_device_memory_report`, and dependents. §1a: no encoding makes a pointer into the application's address space mean anything on the other side of a VM boundary. |
+
+**Two of those seven are the honest remainder**, and together they are 70
+commands: the union-of-handles class and the capture-replay class. Neither is a
+scope decision and each is one generator change. The other five are the design
+refusing on purpose, and closing them would mean breaking a stated invariant.
+
+**8. `vkMapMemory2` was the same bug this section is about, introduced by the
+commit that removed the others.** Core 1.4 arrived as fourteen generated commands
+and thirteen were right. `ppData` carries `VoidPolicy::NotSerialisable`, which
+drops a parameter from the wire — correct for `vkMapMemory`, whose stub is
+written by hand and never forwards — so the *generated* `vkMapMemory2` would have
+encoded the info struct, sent it, decoded an empty reply and returned
+`VK_SUCCESS` **without writing `*ppData`**. Silent, undetectable, and exactly the
+class item 1 counts six of.
+
+A void policy states what a member *means*; only `HAND_WRITTEN` states which side
+answers. Both it and `vkUnmapMemory2` are hand-written now and delegate to the
+same `IcdLocal::map_memory` as the 1.0 pair — `VkMemoryMapInfo` is
+`{flags, memory, offset, size}`, so the body is the delegation it looks like.
+`VK_EXT_map_memory_placed` is excluded from every profile, so
+`VK_MEMORY_MAP_PLACED_BIT_EXT` cannot appear.
+
+**9. `hostImageCopy` is withdrawn as a feature, not as an extension, and that
+distinction is new.** `INCOMPLETE_EXTENSIONS` can decline
+`VK_EXT_host_image_copy`. It cannot decline core 1.4's `hostImageCopy`, which is
+the same capability reached through `VkPhysicalDeviceVulkan14Features` with no
+extension string to withdraw. So `sv_icd::advertise::withdraw_gated_features`
+walks the `vkGetPhysicalDeviceFeatures2` reply's chain and clears the bit
+wherever it appears — core 1.4's struct, the promoted extension's, and the
+`…EXT` alias's — because an application may ask through any of the three and must
+not get two answers.
+
+The wire is right: `pHostPointer` is `ArenaOffset`, which is what §5.3 says a
+host pointer *is* here. What is not written is the case where the application's
+pointer is not arena memory — `vkCopyMemoryToImage` accepts a plain `malloc`
+buffer, and honouring that needs a bounce whose extent must be computed from
+`imageExtent`, `imageSubresource`, `memoryRowLength` and the format. Carry
+everything, advertise what works: the three commands stay on the wire and in the
+proc tables, and a conforming application that respects the feature bit never
+calls them.
+
+**10. A third instrument lied, and this one looked exactly like a protocol
+bug.** The first full-profile workspace run failed two generated round trips —
+`VkDependencyInfo` and `vkCmdWaitEvents2` — with a `pNext` chain nested inside a
+`pNext` link coming back empty. Read as data loss in barrier submission that
+would have been the most serious finding in this section.
+
+It is not a bug. In C a `pNext` chain is a *linked list*, and `lower_pnext` walks
+it iteratively and flattens it into one `Vec<PNextLink>`; `size_pnext`,
+`encode_pnext` and `decode_pnext` all use each link's `_self` form, which
+excludes its own `p_next`. All three agree with each other, which is what would
+matter. A `PNextLink` with a non-empty `p_next` is a value **the C boundary
+cannot produce**, and the sampler in `sv_codegen::emit::tests` was producing one
+and then asserting the codec preserved it. Clearing it there makes the round trip
+assert the contract the boundary actually has.
+
+Recorded rather than fixed, because it is waste and not error: each link's
+`lower_vk_*` calls `lower_pnext` on its own `pNext` as well, so lowering a chain
+of *n* links walks *n* tails and discards all but the outermost. Bounded by
+`MAX_PNEXT_LINKS` and invisible in behaviour; the fix is a `lower_*_self` for the
+walker's arms.
+
+**11. One instrument was added and it was wrong the first time.**
 `sv-codegen --audit` asks, per extension, whether the generator can carry it —
 resolve, plan the wire, plan the C ABI — and prints a verdict a line each, so
 the profile can be edited from facts rather than by bisecting a build failure.

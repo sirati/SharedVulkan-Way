@@ -1101,6 +1101,15 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkEnumerateDeviceLayerProperties",
     "vkMapMemory",
     "vkUnmapMemory",
+    // Core 1.4's promotion of the same two, and they are here for the same
+    // reason and one sharper one. `ppData` is `VoidPolicy::NotSerialisable`,
+    // which drops it from the wire — right for a command answered app-side,
+    // and *silently wrong* for a generated one, because the stub would forward
+    // the info struct and return `VK_SUCCESS` having never written `*ppData`.
+    // A void policy states what a member means; only this list states which
+    // side answers. See `crate::local::sv_vk_map_memory2`.
+    "vkMapMemory2",
+    "vkUnmapMemory2",
     // design.md §10. Presentation is the ICD's, entirely: a swapchain image is
     // a GPU-side `VkImage` the app side created out of ordinary forwarded
     // commands, and `vkQueuePresentKHR` is a copy into the arena followed by
