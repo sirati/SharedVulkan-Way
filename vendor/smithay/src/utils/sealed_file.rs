@@ -142,9 +142,25 @@ impl SealedFile {
     /// `name` is ignored: section names carry 128 bits from `BCryptGenRandom`
     /// (design §2.5) so that they cannot be guessed, and a caller-chosen name
     /// would defeat that.
+    ///
+    /// # `create_shared`, not `create_section` — STAGE 6
+    ///
+    /// This used to call `create_section`, and that was wrong the moment
+    /// anything actually sent one. A section is `Local\wc-…`, a name only the
+    /// NT object manager understands; the peer that opens a keymap is a Linux
+    /// process on the far side of the boundary, which can neither open nor
+    /// spell one. `create_shared` asks `wc_handle::publish` where objects made
+    /// for a peer should go, and lands the keymap in a directory both sides
+    /// reach when the compositor was told about one — falling back to a section
+    /// when it was not, which is right for two Windows processes.
+    ///
+    /// Nothing else about this function changes, including the honest note
+    /// above: the object is still writable by anyone who learns its name, and a
+    /// file in a shared directory is *more* reachable than a session-local
+    /// section, not less.
     #[cfg(windows)]
     pub fn with_data(_name: &CStr, data: &[u8]) -> Result<Self, std::io::Error> {
-        let handle = crate::utils::os::OwnedFd::create_section(data.len() as u64)?;
+        let handle = crate::utils::os::OwnedFd::create_shared(data.len() as u64)?;
         handle.write_at(0, data)?;
         Ok(Self {
             handle,

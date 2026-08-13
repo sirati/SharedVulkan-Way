@@ -284,6 +284,35 @@ the same reason.
 * **`wayland/commit_timing/mod.rs`** now takes `Timespec` from `crate::utils`
   instead of `rustix::fs`, which is the same type on Unix.
 
+### Stage 6: the two changes that make a keyboard possible
+
+Both are small, both are on the path upstream, and both are consequences of
+things this file already records rather than new positions.
+
+* **`input/keyboard/xkb_config.rs`: `XkbConfig` gains `keymap: Option<&'a str>`,
+  checked before the RMLVO fields.** `compile_keymap` otherwise calls
+  `xkb_keymap_new_from_names`, which resolves names against the
+  xkeyboard-config data tree and **must** fail on Windows (`docs/design.md`
+  §7.2 arranged for it to fail visibly). Since `Seat::add_keyboard` goes through
+  `compile_keymap`, there was no way to construct a `KeyboardHandle` at all;
+  `set_keymap_from_string` exists but only *after* one has been made. §7.2
+  predicted the shape of this exactly — *"an `XkbConfig` variant carrying a
+  keymap string, which is small and probably upstreamable"* — and it is nine
+  lines. `Option` so `..XkbConfig::default()` callers are untouched and Unix
+  behaviour is bit-identical.
+
+* **`utils/sealed_file.rs`: the Windows arm calls `Handle::create_shared`
+  instead of `Handle::create_section`.** One word, and it is the difference
+  between a keymap a client can open and one it cannot. A section is
+  `Local\wc-…`, a name only the NT object manager understands; the client that
+  opens a keymap is on the far side of the boundary. `create_shared` asks
+  `wc_handle::publish` where objects made for a peer go and falls back to a
+  section when nobody said — which is right for two Windows processes and is
+  what this file already documented. See `docs/design.md` §11.2.
+
+Nothing else in smithay changed for stage 6. The seat, the capabilities, the
+pointer and the keyboard are upstream code driven from `wc-compositor`.
+
 ### `cfg(unix)` where the API is Unix by subject matter
 
 Not "does not port yet" — cannot exist elsewhere:

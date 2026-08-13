@@ -1,0 +1,55 @@
+# wc-arena-host — the one place waycompose and shared_vulkan are linked into a
+# single binary.
+#
+# NOT A WORKSPACE MEMBER, and the reason is exactly the reason `vendor/smithay`
+# is not one (see the root Cargo.toml). A member is resolved by every
+# `cargo check --workspace`, `cargo test --workspace` and
+# `cargo clippy --workspace --target x86_64-pc-windows-gnu` this project runs —
+# and this crate has a path dependency on a *different repository*. Making it a
+# member would mean the Windows cross gate, which is the gate this whole project
+# exists to keep green, fails on a machine where `shared-vulkan-base` is not
+# checked out next to us. Excluding it means the coupling costs nothing until
+# somebody actually builds the locator, which only happens on the VM host.
+#
+# It is built and linted on its own:
+#
+#   cargo build   --manifest-path crates/wc-arena-host/Cargo.toml --release
+#   cargo clippy  --manifest-path crates/wc-arena-host/Cargo.toml --all-targets
+#   cargo test    --manifest-path crates/wc-arena-host/Cargo.toml
+#
+# WHY THE PATH IS ABSOLUTE. A relative one cannot be right from both
+# `waycompose-base/` and `wc-worktrees/<name>/`, which sit at different depths
+# under /mnt/datasets/builds. `scripts/wc-worktree.sh` already hard-codes that
+# root for the same reason, so this is the layout the project already assumes
+# rather than a new one. Override it by editing this line; there is nothing
+# subtle to preserve.
+[package]
+name = "wc-arena-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+description = "Locate the guest compositor's arena in QEMU's memory backend and write the plan wc-proxy maps"
+
+# Its own workspace root, so it inherits nothing from the parent and the parent
+# resolves nothing of it.
+[workspace]
+
+[dependencies]
+# THE WHOLE POINT. Guest-physical-address translation exists exactly once across
+# the two projects and it is here: `sv_hostd::qemu` finds QEMU, reads
+# `info mtree -f` over QMP and turns it into a region table; `sv_hostd::locate`
+# sweeps the backing object for the guest's stamps and coalesces what it finds.
+# Nothing in `waycompose` re-implements any of that, and this dependency is what
+# makes that statement checkable rather than aspirational.
+sv-hostd = { path = "/mnt/datasets/builds/shared-vulkan-base/crates/sv-hostd" }
+# `ExtentDesc`, which is how the arena is described to the locator.
+sv-transport = { path = "/mnt/datasets/builds/shared-vulkan-base/crates/sv-transport" }
+# `RunList`, the coalesced result.
+sv-arena = { path = "/mnt/datasets/builds/shared-vulkan-base/crates/sv-arena" }
+# The definitive stamp layout. Depended on here, and *only* here, so that the
+# twenty bytes `wc_handle::arena` spells out for itself can be asserted equal to
+# it — see the test in src/main.rs.
+arena-record = { path = "/mnt/datasets/builds/shared-vulkan-base/crates/arena-record" }
+# And our own side of the same twenty bytes.
+wc-handle = { path = "../wc-handle" }

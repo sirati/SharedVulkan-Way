@@ -2003,6 +2003,13 @@ computed from the wrong place after a splice.
    unexercised by a real client**. It is tested with a synthetic keymap event
    that a real descriptor round-trips through, so the code has executed; it has
    not met a compositor that sends one. §8.10 item 4 still stands underneath it.
+
+   > **[CLOSED BY STAGE 6 — §11.2, and the wording above was too kind.]**
+   > "Implemented and unexercised" reads as a coverage gap. It was not: the
+   > compositor published the keymap as a `Local\wc-…` section, which no Linux
+   > process can open, so the path **would have failed the first time anything
+   > used it**. The first real client to bind a seat is what found that, and it
+   > found it by dying at connect.
 6. **Clipboard and drag-and-drop are a named error, not a gap.**
    `wl_data_offer.receive` and `wl_data_source.send` carry an `h` that is a pipe
    rather than memory, and `Descriptor::Pipe` has no transport here. The proxy
@@ -2261,12 +2268,12 @@ distinction it exists to draw.
 
 ### 10.8 Wine was wrong a fifth time, and the clock is not the clock
 
-> **[HALF WITHDRAWN BY STAGE 8 — §11.6.]** The DPI paragraph below is wrong, and
+> **[HALF WITHDRAWN BY STAGE 8 — §13.6.]** The DPI paragraph below is wrong, and
 > the title of this section is wrong with it. The call was refused because it
 > was made in an ssh session's window station, where the process is *already*
 > per-monitor-aware before `main` runs; on the guest's real interactive desktop
 > the identical call succeeds, which is what Wine said. The clock paragraph
-> stands and is measured further in §11.8.
+> stands and is measured further in §13.8.
 
 Two things the guest said that Wine did not.
 
@@ -2365,15 +2372,27 @@ rather than in `cargo test`.
 5. **`SealedFile` is still not sealed on Windows**; `with_data_mut` is still
    unimplemented; `KeyboardHandle::new` still cannot succeed. Unchanged from
    §8.10 items 2–4, and untouched by this stage.
+
+   > **[PARTLY CLOSED BY STAGE 6 — §11.2.]** `KeyboardHandle::new` succeeds now:
+   > `XkbConfig` gained a keymap-string field, which is what §7.2 predicted.
+   > `SealedFile` is *still* not sealed and `with_data_mut` is still
+   > unimplemented — and stage 6 made the first of those matter more, because
+   > the keymap is now a file in a directory rather than a session-local
+   > section, which is more reachable rather than less.
 6. **One client, no input, no clipboard, no scene graph.** §9.10 items 4, 5, 6
    and §8.10 item 8 are all unchanged. Nothing in stage 5 went near them.
+
+   > **[INPUT CLOSED BY STAGE 6 — §11.]** One client, no clipboard and no scene
+   > graph stand. Input does not: there is a `wl_seat` with a pointer and a
+   > keyboard, driven by Win32 messages, and a third-party client has been typed
+   > into. §9.10 item 5 above has its own marker.
 7. **A hostile client can still fault the proxy** (§9.10 item 7), and now on a
    machine the compositor cannot see.
 
 ### 10.13 What to do next, in the order the evidence puts it
 
-> **[ITEMS 2, 3 AND 4 CLOSED BY STAGE 8 — §11.]** Item 1 is still open and is
-> still first. §11.12 is the current list.
+> **[ALL FOUR ITEMS NOW CLOSED.]** Item 1 by stage 7 (§12), items 2, 3 and 4 by
+> stage 8 (§13). §13.12 is the current list.
 
 1. **Give the arena a real region.** Guest RAM through QEMU's flat view, which is
    what `shared_vulkan` already does and what §9.10 item 3 always intended.
@@ -2389,32 +2408,1127 @@ rather than in `cargo test`.
 
 ---
 
-## 11. Stage 8: somebody looks at the window
+## 11. Stage 6: a seat, and a client you can type into
 
-Written 2026-08-13, against §10.12 item 3 and §10.13 items 2, 3 and 4. Stage 5
-put the compositor on real Windows; this is the stage where a human being sees
-what it produces.
+Written 2026-08-13. Stages 1-4 built something you could look at; this is the
+stage where it becomes something you can use.
+
+**Branched from stage 4 and merged after stage 5**, which is why nothing below
+carries a guest number: stage 5 was taking the earlier stages to the real
+hardware while this was being built, and the two did not meet until the merge.
+§10's findings are folded into §11.10 and §11.11 rather than re-measured, and
+where they change what this stage should expect — §10.3's coherency result most
+of all — that is said at the point it matters.
 
 ### 11.1 Status in one paragraph
+
+**`weston-eventdemo` and `weston-terminal`, unmodified, receive keystrokes that
+began as `WM_KEYDOWN` in a Win32 message queue.** `wc-compositor.exe` advertises
+a `wl_seat` with pointer and keyboard capabilities, compiles a keymap resolved
+on Linux at build time, and publishes it as a file **both sides can name** —
+which is `wl_keyboard.keymap`'s `h` argument travelling in the direction stage 4
+implemented and §9.10 item 5 admitted had never been exercised. Win32 scan codes
+become Linux evdev keycodes, `WM_SETFOCUS` becomes `wl_keyboard.enter`,
+`TrackMouseEvent` makes `WM_MOUSELEAVE` exist so `wl_pointer.leave` can, and
+`SetCapture` keeps a drag alive off the window. The milestone is
+`docs/stage6-typing.png`: `weston-terminal` in a window with Windows' own
+caption, with `echo waycompose types` in it, typed by `SendInput`. It is
+measured rather than admired — the window changed by **0** pixels in two idle
+seconds and by **337** after the keys, and the client committed **21** new
+frames. `scripts/wc-input.sh` is 22 checks on Linux, 24 under Wine and 6 for the
+terminal, 0 failures.
+
+### 11.2 The keymap is an `h` in the other direction, and that is the whole
+trap
+
+§9.3's table has four messages carrying an `h`, and stage 4 moved one of them:
+`wl_shm.create_pool`, which the **client** creates and the compositor opens. The
+proxy therefore owned every transport decision, because the proxy was the
+creator.
+
+`wl_keyboard.keymap` runs the other way. The **compositor** creates the object
+and the client opens it — and `Handle::create_section`, which is what
+`SealedFile` called, mints `Local\wc-…`. That is a name only the NT object
+manager understands. A Linux process cannot open one and cannot spell one.
+
+So §9.10 item 5's "implemented, unexercised" was not a coverage gap. **It was a
+path that would have failed the moment anything used it**, and the reason
+nothing had used it was that the compositor advertised no keyboard.
+
+The fix is the same shape as the arena's and the reasoning is §9.4's, restated:
+
+> "An arena is not a per-message fact and cannot be one. It is attached out of
+> band, before any protocol traffic… `wc_handle::arena` is a process-global
+> registry for that reason. Threading it through `Handle::map()` instead would
+> mean a diff through smithay's `ShmState`, its `Client` data and its `wl_shm`
+> dispatch."
+
+`wc_handle::publish` is that registry for the outbound direction: a directory
+this process writes into and the prefix a peer prepends to reach the same bytes,
+set once from `--shared-dir` / `--shared-peer-prefix`. `Handle::create_shared`
+asks it, and falls back to a section when nobody said — which is correct for two
+Windows processes and is what a same-machine deployment wants.
+
+**smithay's diff for all of this is one word**: `create_section` becomes
+`create_shared` in `utils/sealed_file.rs`. Threading a destination through
+`SealedFile` → `KeymapFile` → `KeyboardHandle` → `Seat` → `SeatState` would have
+been a parameter carried through five layers of upstream code so that one leaf
+could spell a path, and it is not a patch anybody merges.
+
+**The failure is now a diagnosis rather than a mystery, and that changed too.**
+`wc-proxy` used to *note* a descriptor it could not materialise and forward the
+message without it. For a keymap that is §2.4's silent desynchronisation in its
+purest form: the client receives a well-formed `wl_keyboard.keymap`, calls
+`mmap` on a descriptor it never received, and libwayland aborts it — with a
+correct-looking keymap event as the last thing in its log. It is now fatal, with
+the descriptor's kind and the flag to pass in the message.
+
+**And stage 6 broke stage 4's harness, which is the best evidence that the two
+directions are different problems.** `scripts/wc-proxy.sh` passed no
+`--shared-dir`, because until now the compositor never created an object for a
+client. The moment it had a keyboard, `weston-terminal` — which binds `wl_seat`
+— started failing at connect, while `weston-presentation-shm` — which does not —
+kept passing. One flag fixed it. Nothing about the pixel path changed.
+
+One stage-4 assertion had to change with it, and it was measuring the wrong
+thing. The harness demanded the proxy send **0** descriptors to the client, and
+that passed because there were none to send. It now sends one per keymap. That
+is not a violation: those fds are on the host side of the boundary, manufactured
+here by opening a path the compositor named, and §9.4's rule is about the
+boundary. What enforces the rule is that `wc-proxy`'s **upstream writer has no
+fd path at all** — by construction, not by a counter — and the harness now
+checks the thing that can actually go wrong: whether every name the compositor
+sent was openable here.
+
+### 11.3 Scan codes, not virtual keys, and why that is not a preference
+
+`WM_KEYDOWN` carries two descriptions of one keypress: a virtual-key code in
+`wParam` and a scan code in `lParam` bits 16-23 with an `E0` flag at bit 24.
+Only one of them can be translated correctly.
+
+**A virtual-key code has a layout baked into it.** On a German layout the key in
+the position of the American `Z` reports `VK_Y`; every `VK_OEM_*` names a
+different physical key on a different layout. **A scan code is positional** and
+says nothing about what is printed on the key.
+
+Wayland is positional too. `wl_keyboard.key` carries a keycode and the client
+runs *our keymap* over it — which is the entire reason a keymap is sent at all.
+So a compositor translating VK codes applies the layout twice: once in Windows
+to obtain the VK, and once in the client's xkb, over a keycode that already had
+one applied. **On `us` the two layouts agree and the bug is invisible. On `de`
+the `Z` and `Y` keys swap and it is not.**
+
+`WM_CHAR` is unused for the same reason one layer on: it is the result of
+Windows' own composition, and a Wayland client does its own with its own dead
+keys. `TranslateMessage` still runs — other parts of Win32 expect it to — and
+its `WM_CHAR` is simply not handled.
+
+**The table is mostly an identity, and that is history rather than luck.** Linux
+numbered its evdev keycodes from the IBM PC/XT scan codes, so for the whole base
+set — `0x01` Escape through `0x58` F12, 88 codes — **the scan code and the evdev
+keycode are the same number**. `KEY_A` is 30 and `A` is `0x1E`; `KEY_SPACE` is
+57 and space is `0x39`; `KEY_F11` is 87 and F11 is `0x57`. Asserted at eleven
+points spread across the range rather than claimed once, because "obviously an
+identity" is the kind of statement that is wrong at one end.
+
+What is not an identity is the 40 `E0`-prefixed codes — the arrow cluster, the
+right-hand modifiers, the keypad's Enter and slash, the Windows and media keys —
+because those were added to both schemes later and in different orders. That
+half is Linux's own `atkbd` table, copied. Seven unprefixed Japanese codes are
+likewise a table.
+
+**Three keys are genuinely ambiguous on Windows and are settled by the VK**,
+which is unambiguous for them precisely because no layout relabels them:
+
+| key | why | resolution |
+|---|---|---|
+| Pause | claims scan `0x45`, the `E1` prefix is swallowed before the message loop | `VK_PAUSE` → `KEY_PAUSE` |
+| NumLock | also claims `0x45`, with the extended bit going either way per driver | `VK_NUMLOCK` → `KEY_NUMLOCK` |
+| PrintScreen | sends `E0 2A E0 37` — a **phantom shift** first | `VK_SNAPSHOT` → `KEY_SYSRQ`, and `E0 2A`/`E0 36` are dropped |
+
+The phantom shift has its own test, because forwarding it is silent: the
+client believes Shift is held, every following key produces the shifted
+character, and all the keycodes look right.
+
+An untranslatable scan code produces **nothing**, and says so with the code in
+the log. Inventing a keycode would make the client's xkb produce a keysym for a
+key that does not exist.
+
+### 11.4 Layouts: what works, and exactly what does not
+
+The set is fixed at build time and cannot be otherwise. §7.2 established that
+`xkb_keymap_new_from_names` resolves against the xkeyboard-config tree, that the
+tree does not exist on Windows, and that `nix/libxkbcommon-mingw.nix` compiles
+in a config root nobody creates so that a `new_from_names` which silently
+started working would be a visible bug. Only `new_from_string` works there.
+
+So `scripts/gen-keymap.sh --all` resolves **us, gb, de, fr** on Linux and the
+compiled text is checked in at `crates/wc-compositor/keymaps/*.xkb` and
+`include_str!`ed. Checked in rather than generated by a `build.rs`, for two
+reasons: a build script calling `xkbcli` would make the build depend on
+xkeyboard-config, defeating the point of resolving elsewhere; and a keymap
+generated at build time is a keymap nobody has read, and these files are where a
+user's characters come from.
+
+Selection is `GetKeyboardLayout(0)`'s low word, a `LANGID`, matched whole and
+then on its primary language — FreeRDP's `xkb_layout_ids.c` cut down to the
+layouts that actually shipped, because a table naming a hundred layouts none of
+which are present is a table that lies. `WM_INPUTLANGCHANGE` re-runs it and
+`set_keymap_from_string` re-sends the keymap.
+
+**Measured, and it was not the expected answer.** Under Wine,
+`GetKeyboardLayout` returns `0x0809` — English (United Kingdom) — so the
+compositor selects `gb` unless told otherwise. That is the mechanism working; it
+is also why `scripts/wc-input.sh` passes `--layout us` rather than trusting the
+machine.
+
+**What this gets right for a non-US layout, stated precisely.** Because the
+mapping is positional and the keymap is the user's, a German user pressing the
+key labelled `Z` sends `KEY_Y` and the `de` keymap turns it into `z`. That is
+correct, and it is correct *because* the VK was not used. The same holds for
+every key on any of the four.
+
+**What it gets wrong.** The first two are **known defects and not merely gaps**,
+because in both cases the compositor keeps working and produces a wrong answer
+with no diagnostic anywhere. That is the property that makes them worth a
+heading rather than a bullet: a missing feature is discovered by the person who
+needs it, and a silent wrong answer is discovered by nobody.
+
+> **DEFECT 1: a layout outside the four gets American letters, silently.**
+>
+> `layout_for_langid` falls back to `us`. A Spanish, Polish, Czech or Nordic
+> user's keyboard therefore produces **plausible wrong letters** — the positions
+> are right, so the keyboard feels like it is working and the characters are not
+> the ones on the keys. Nothing errors, nothing is logged at a level anyone
+> reads, and the client cannot tell.
+>
+> It is a defect rather than a design limit because the fix is three lines — a
+> name in `gen-keymap.sh`'s `ALL_LAYOUTS`, an entry in `input.rs`'s `LAYOUTS`,
+> a row in `layout_for_langid` — and because the *fallback itself* is the wrong
+> shape: falling back to a layout that produces confidently wrong text is worse
+> than refusing the keyboard capability and saying which layout was asked for.
+> Neither is done. The startup line does name the layout it chose, which is the
+> only thread a user has to pull.
+
+> **DEFECT 2: there is no IME, so CJK input is impossible.**
+>
+> Not "degraded" and not "untested" — impossible. Composition on Windows happens
+> in `WM_IME_STARTCOMPOSITION` and friends and in `WM_CHAR`, and this compositor
+> handles none of them (§11.3 says why `WM_CHAR` is deliberately unused, and
+> that reasoning is right for a keymap and wrong for an IME). The Wayland answer
+> is `text-input-v3` plus `input-method-v2`, and neither is implemented, so
+> there is nowhere for a composed string to go even if one were collected.
+>
+> A Japanese, Chinese or Korean user gets the romaji keystrokes and no candidate
+> window: they can type ASCII and nothing else. `docs/goal-firefox.md` does not
+> ask for this, which is why it is not being built — but "the goal did not ask"
+> is not the same as "it works", and this is the sentence that says so.
+
+Two more, which are ordinary gaps:
+
+3. **AltGr is forwarded as Ctrl+AltGr.** Windows synthesises a left-Ctrl press
+   before the right-Alt of an AltGr, and both are forwarded, so a client sees
+   both. On `us` there is no AltGr level and it never shows; on `de` the third
+   level is exactly where the interesting characters live. Untested and expected
+   to be wrong. Dead keys are related and weaker: the four layouts' dead keys
+   work only insofar as the *client's* xkb composes them, which for a keyboard
+   with real dead keys is not the same thing.
+4. **Key repeat is Windows' rate only by coincidence.** `repeat_info` says 30/s
+   after 500 ms, which are Windows' defaults written down rather than read with
+   `SystemParametersInfo`. A user who changed theirs is not obeyed. Windows'
+   own repeats — `WM_KEYDOWN` with `lParam` bit 30 set — are dropped, which is
+   right: the protocol has the client run the timer, and forwarding both would
+   give it two repeat streams at different rates.
+
+### 11.5 The Win32 side, and the three omissions that are silent
+
+Each of these produces a compositor that looks like it works.
+
+* **`TrackMouseEvent`, or there is no `WM_MOUSELEAVE`.** Win32 sends
+  `WM_MOUSEMOVE` for free and sends *nothing at all* when the pointer leaves
+  unless the window has asked — once, per departure, because the request is
+  consumed when it fires. Without it a client believes the pointer is inside
+  forever: hover highlights that never turn off, a cursor that never changes
+  back. It is armed on the first move after an entry rather than on every move,
+  which would be a syscall per pixel of travel. `wl_pointer.leave` is checked on
+  the wire by the harness for this reason and not inferred.
+
+* **`SetCapture` on the first press, `ReleaseCapture` on the last release.**
+  Win32 delivers mouse messages to the window under the pointer, so a drag that
+  leaves the window loses its `WM_LBUTTONUP` — it goes to whatever was dragged
+  onto, or nowhere — and the client is left holding a button forever. Every
+  text selection and every scrollbar drag depends on this. Counted rather than a
+  flag, because two buttons can be down and releasing on the first would
+  reintroduce the bug for the second.
+
+* **`WM_SYSKEYDOWN` as well as `WM_KEYDOWN`.** Windows routes Alt, F10 and every
+  Alt-combination through the `SYS` pair. A compositor handling only
+  `WM_KEYDOWN` delivers **no Alt at all** — so no Alt-shortcut in any client —
+  while every other key works perfectly. The `SYS` cases return 0 rather than
+  falling through to `DefWindowProc`, which would open the window menu on Alt
+  and swallow the next key.
+
+Three smaller decisions, each an answer to a way of being wrong:
+
+* **`GetMessageTime`, not a clock read.** Clients use the differences between
+  input timestamps for double-click detection and gesture timing. Reading a
+  clock in the window procedure timestamps events with *when the compositor got
+  round to them*, which on a 5 ms poll loop is not when they happened.
+* **`lParam` halves are signed.** A pointer position during a drag off the left
+  edge is negative, and `lparam & 0xffff` reads -1 as 65535 — a plausible number
+  no clamp catches.
+* **`WM_MOUSEWHEEL`'s sign is inverted and `WM_MOUSEHWHEEL`'s is not.** Windows
+  counts a notch rolled away from the user as `+WHEEL_DELTA`; Wayland's vertical
+  axis is positive *downwards* and rolling away scrolls the content up. Both
+  are positive to the right horizontally. `WHEEL_DELTA` is 120 and
+  `wl_pointer.axis_value120` counts in hundred-and-twentieths, which is not a
+  coincidence — the protocol added v120 because Windows already spoke it — so
+  the raw delta *is* the v120 value once the sign is fixed. The harness asserts
+  the sign on both platforms, because a backwards mouse wheel is the most
+  reported and least diagnosable input bug there is.
+
+**Focus is `WM_SETFOCUS`, not `WM_ACTIVATE`.** They arrive together for a
+top-level window and they are different facts: activation says which window is
+frontmost and becomes `xdg_toplevel`'s `activated` state; focus says where a
+keystroke goes and becomes `wl_keyboard.enter`. The brief's item 4 is this pair,
+because **the user's window manager is Windows** and a compositor deciding its
+own keyboard focus would be fighting it. A `WM_KILLFOCUS` is honoured only if
+the window is still the focused one, because the two messages can arrive in
+either order and clearing on a stale kill would take focus from a window that
+had just been given it.
+
+### 11.6 The evidence, in three legs, and what each is worth
+
+§8.5 split the pixel evidence in two and had to apologise for it. The same split
+exists here for the same structural reason, and it is worth being explicit about
+which half each leg carries.
+
+**Leg 1 — Linux, direct.** `weston-eventdemo`, a Weston demo client, prints
+every input event it receives **including the Unicode codepoint its own
+libxkbcommon produced** by running our keymap over our keycode. That is a
+strictly stronger statement than "an event was sent": a wrong keycode, a wrong
+keymap, a wrong evdev/xkb offset or a keymap that failed to cross all produce a
+different letter, and none of them produce an error. `WAYLAND_DEBUG=1` runs
+beside it so libwayland decodes the same bytes independently. What this leg
+cannot say anything about is the translation, because there is no `WM_KEYDOWN`.
+
+**Leg 2 — Wine, through the proxy.** `wc-compositor.exe` in a virtual desktop,
+`wc-proxy` beside it, `weston-eventdemo` against the proxy, and
+`probe-input.exe` injecting with `SendInput` — so a keystroke starts as a scan
+code in the desktop's input queue and ends as a character in a Linux client.
+This leg carries `crates/wc-compositor/src/input.rs`, the focus messages,
+`TrackMouseEvent` and `SetCapture`, and it is held to **exactly** the assertions
+leg 1 is: `check_client_events` is one function called by both, so a weaker
+check cannot creep into the harder case.
+
+**Leg 3 — the terminal.** `weston-terminal` through the proxy, typed at with
+`SendInput`, photographed by `xwd` from outside every process involved. A
+terminal is the demonstration because §8.7 measured that it redraws **only** when
+its content changes, which is what makes "the picture changed" a statement about
+the keys. The harness takes two screenshots while it is idle *before* typing —
+without that, a blinking cursor would satisfy the check, and every terminal has
+one.
+
+| measurement | value |
+|---|---|
+| pixels changed in 2 idle seconds | **0** |
+| pixels changed by `echo waycompose types` | **337** |
+| frames the client committed after the keys | **21** (3 → 24) |
+| keymap the client received, `us` | 35,572 bytes |
+| keymap after the layout change, `de` | 37,532 bytes |
+| descriptors, proxy | 3 in from the client, 1 out to it |
+
+Three checks are worth naming because each catches something nothing else does.
+
+**`y` then `z` from the same keycode.** The layout change sends a second
+`wl_keyboard.keymap`, and evdev `KEY_Y` — the position of `Y` on an American
+board and of `Z` on a German one — is pressed either side of it. A second keymap
+*event* would not do: a compositor re-sending the same keymap produces one, and
+so does a client that ignores it. Only the character changing says a different
+keymap crossed the boundary, was opened from its name, and was compiled by the
+client's own library.
+
+**Shift + `KEY_Z` decoding as `Z`.** The one place the compositor's own xkb state
+is load-bearing — it tracks which modifiers are down and tells the client with
+`wl_keyboard.modifiers`. A compositor that forwarded keycodes and never sent a
+`modifiers` event produces a lower-case `z`, and every other assertion in the
+file still passes.
+
+**The scroll sign.** Both legs produce the same physical gesture — one notch away
+from the user — and both must yield `-10` and `axis_discrete -1`.
+
+### 11.7 What Wine got wrong on the way, and it was three things
+
+None of them were the compositor, and all three looked exactly like the
+compositor.
+
+1. **`FindWindowW` enumerates one desktop.** `wine explorer /desktop=wc-input`
+   creates a second one; a probe launched on the default desktop finds no window
+   of class `WaycomposeToplevel`, injects into the wrong input queue, and reports
+   a compositor that ignores input. The probe now runs inside the same desktop.
+2. **A console subsystem binary takes the foreground.** Launched inside the
+   desktop, the probe got a `WineConsoleClass` window, and *that* became the
+   foreground window — so `SetForegroundWindow(compositor)` was refused and every
+   keystroke went to the console. The probe reported
+   `foreground=… class 'WineConsoleClass'`, which is the only reason this was
+   half an hour rather than a day. Building it `-mwindows` means no console
+   exists to steal it, and is why `probe-input.c` writes to `--log`.
+   `AttachThreadInput` is needed as well: `SetForegroundWindow` is refused for a
+   process that is not already foreground, and `SetFocus`/`GetFocus` address the
+   *calling thread's* input queue.
+3. **A killed client does not flush stdio.** `weston-eventdemo`'s own output is
+   fully buffered to a file, so a run stopped with a signal contained every
+   `WAYLAND_DEBUG` line (stderr, unbuffered) and **none** of the decoded
+   characters — every wire assertion passing and every "what did the client make
+   of it" assertion failing, for no reason in the compositor. Fixed twice over:
+   `stdbuf -oL`, and stopping the compositor first so the client leaves through
+   `exit()`.
+
+### 11.8 The bug a client found and a test could not
+
+The first version handed smithay an evdev keycode. smithay's `Keycode` is an
+**XKB** keycode, which carries X11's eight-key offset, and it subtracts the
+eight on the way out — so every key reached the client eight too small.
+
+What that looks like from outside is the point. Nothing errored. Every key
+produced *a* character. `weston-eventdemo` printed `key 27, unicode 93` — a
+right square bracket — for a keypress the compositor believed was `h`, and the
+run typed `]9aaqt` for `hello`.
+
+**A unit test over `crates/wc-compositor/src/input.rs` could not have caught
+it**, because the table it checks was correct. The bug was one addition at the
+boundary between our numbering and smithay's, and only a client running the
+keymap could see it. That is the argument for §11.6's leg 1 in one paragraph,
+and it is why the harness asserts on decoded characters rather than on keycodes.
+
+### 11.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo clippy --workspace --all-targets` (Linux) | clean, no warnings |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo test --workspace` | **125 tests**, 0 failures (was 116) |
+| `scripts/wc-xkb.sh` (stage 2) | 5 passed, 0 failed |
+| `scripts/wc-xdg.sh all` (stage 2) | 10 passed, 0 failed |
+| `scripts/wc-window.sh all` (stage 3) | 37 passed, 0 failed |
+| `scripts/wc-proxy.sh window` (stage 4) | 36 passed, 0 failed |
+| `scripts/wc-input.sh linux` | **22 passed, 0 failed** |
+| `scripts/wc-input.sh wine` | **24 passed, 0 failed** |
+| `scripts/wc-input.sh term` | **6 passed, 0 failed** |
+
+The new tests are in `crates/wc-compositor/src/input.rs`, and the one worth
+naming is `each_embedded_keymap_compiles_and_maps_the_key_it_should`: it
+compiles all four checked-in keymaps with the same libxkbcommon the Windows
+binary links and asserts what `KEY_A` and `KEY_Z` produce in each. A truncated
+file, a keymap generated for the wrong layout, or one embedded under the wrong
+name all produce a compositor that starts, sends a keymap, and gives the user
+the wrong characters with no error anywhere. The `fr` row carries the test — if
+`de` were silently a copy of `us`, only azerty would notice.
+
+`crates/wc-compositor/src/input.rs` carries `#![allow(dead_code)]` and the
+reason is stated there: the scan-code half is called only from `win32.rs`, so a
+Linux build sees it as dead. It is not — it is what the tests exercise, and **a
+table that only compiles on the platform that cannot run the tests is a table
+nobody checks.**
+
+### 11.10 What is not proven
+
+1. **Nothing here has run on the real guest**, and for input that is a sharper
+   caveat than for pixels. The *transport* half of §9.11 item 3 is no longer the
+   obstacle — §10.5 assembled the proxy against the guest over an `ssh -L`
+   forward and `probe-relay.exe`, so the road exists. What has not been done is
+   driving input down it, and §10.12 item 3 says why that is harder than it
+   sounds: everything on the guest so far has run in an ssh session's
+   **non-interactive window station**, which has no foreground window to inject
+   into. Leg 2 needs the logged-in desktop that §10.13 item 2 asks for, and
+   which stage 8 is on right now.
+2. **`SendInput` under Wine is not `SendInput` on Windows**, and it is a worse
+   case than most of what Wine has been asked to stand in for. Real Windows
+   applies UIPI and a set of `SetForegroundWindow` restrictions that Wine does
+   not, and §11.7 shows the foreground rules already differ enough to change the
+   harness. A guest run may need the probe elevated, or may need `PostMessage`;
+   `probe-input.c` keeps `--post` for exactly that (`WC_PROBE_POST=1`), and the
+   two modes agree on the keyboard — **16 checks against 24**, both green.
+
+   **The fallback is keyboard-only, and that was measured rather than
+   assumed.** A posted `WM_MOUSEMOVE` does not move the cursor, and Win32's own
+   mouse tracking follows the real one: `TrackMouseEvent` fires `WM_MOUSELEAVE`
+   immediately after every posted move, and `GetCursorPos` — the only source of
+   coordinates for a posted button — reports somewhere else. On the wire that
+   was a `leave`/`enter` pair per motion and a click at (636, 482) of a 500x400
+   window, which the client correctly ignored. A keyboard message carries
+   everything it needs in its own `wParam` and `lParam`, so the probe now
+   refuses the mouse in that mode rather than injecting events the compositor
+   would be right to mishandle. For the fallback's purpose — telling "our
+   translation is wrong" from "the injection did not arrive" — the keyboard is
+   the half that matters.
+3. **`WM_INPUTLANGCHANGE` has never fired.** The layout-switch path is proven by
+   the headless simulation calling the same code, and by `GetKeyboardLayout`
+   selecting `gb` under Wine at startup — but no run has changed the layout of a
+   live Windows keyboard and watched the keymap follow.
+4. **Two known defects, both silent, both in §11.4.** Restated here rather than
+   only cross-referenced, because this is the list people read: **a layout
+   outside us/gb/de/fr produces American letters with no diagnostic**, and
+   **there is no IME at all, so CJK input is impossible**. AltGr is a third,
+   ordinary gap and is expected to be wrong.
+5. **Client cursors are not drawn.** `wl_pointer.set_cursor` arrives — the log
+   line proves it, `weston-terminal` sets one — and the system arrow is shown
+   instead. The conversion is the same shape as `set_icon`, which exists; what is
+   missing is the policy for hiding the system cursor while the client's is up.
+   A text field will have the wrong pointer shape.
+6. **One seat, one pointer, no touch and no tablet.** `wl_touch` is a capability
+   the seat could carry and nothing produces the events;
+   `WM_POINTER*`/`WM_TOUCH` are not handled at all.
+7. **Popups still are not shown** (§9's `new_popup` is unchanged), so no menu
+   can be clicked even though the click that would open it now arrives. This is
+   the next thing a usable client needs and it is a scene-graph problem rather
+   than an input one.
+8. **No compositor-level key bindings, deliberately.** Every key goes to the
+   client. That is right when the window manager is Windows — it has already
+   taken Alt-Tab and the Windows key before the message loop sees them — but it
+   means there is no way to reach the compositor itself, and nothing has decided
+   whether there should be.
+9. **Timestamps come from two clocks that do not agree.** Input carries
+   `GetMessageTime`'s tick count and frame callbacks carry §7.7 item 5's
+   process-start clock. Wayland requires only that each is comparable with
+   itself, which holds; a client correlating an input event with a frame
+   callback would be comparing epochs. Nothing does yet.
+10. **A second client's keymap costs a second file.** Every `KeymapFile` creates
+    its own object and there is one per seat, so this is bounded — but the
+    published directory now accumulates files whose lifetime is the compositor's,
+    and nothing sweeps it if the process is killed rather than exiting.
+
+### 11.11 What to re-check on the guest
+
+§9.11's list is answered by §10; this is what stage 6 adds to it, and input
+reaches the guest differently again. Item 1 is the one that gates the rest, and
+it is not a code problem: §10.12 item 3 records that everything on the guest so
+far has run in an **ssh session's non-interactive window station**, which has no
+foreground window and no desktop to inject into. Stage 8 is logging in.
+
+1. **Whether injected input reaches the compositor's window at all**, with the
+   real `SendInput` and the real foreground rules. This is the item most likely
+   to differ, and §11.7 is why. `probe-input.exe --post` is the fallback and its
+   *agreement* with `SendInput` is itself the measurement.
+2. **What `GetKeyboardLayout` returns on the real machine**, and whether it is
+   one of the four shipped. Wine says `0x0809`; the guest is a different
+   installation with different regional settings, and a user whose layout is not
+   in the list gets American letters silently.
+3. **Whether the published directory carries the keymap across the boundary.**
+   The first thing to check on the guest, because a compositor whose clients die
+   at connect is worse than one that shows nothing.
+
+   **§10.3 has already answered most of this, and the answer is encouraging for
+   exactly the reason it was discouraging for pixels.** Its three rows are worth
+   re-reading with a keymap in mind rather than a pool:
+
+   | §10.3's measurement | what it means for a keymap |
+   |---|---|
+   | two live mappings of the export disagree, 65280 wrong of 65536, both ways | a pool cannot use `SharedFile` here |
+   | host writes and **closes**, guest then opens for the first time — 0 wrong of 4096 | **this is the keymap's access pattern** |
+   | local NTFS, still mapped and unflushed — 0 wrong | the control, so the mismatch is the mount |
+
+   A pool is two simultaneously-mapped views of pages both sides keep writing
+   and reading. A keymap is written once and read once, and `write_section`
+   **maps a view, copies, and unmaps before returning** — so nothing is mapped
+   on the writing side by the time the reader opens the path. That is §10.3's
+   third row, which is the row that matched.
+
+   Two caveats keep this a re-check rather than a conclusion. **The direction is
+   the opposite of the one measured**: §10.3's third row is host-writes,
+   guest-reads, and a keymap is guest-writes, host-reads. And §2.5's lifetime
+   rule requires the compositor to hold the *section* — and therefore the file
+   handle — open for as long as the keymap exists, so the write is closed and
+   the file is not; whether that counts as closed is virtiofsd's business rather
+   than ours. `--cache=auto` caches on the guest, which is the side doing the
+   writing here.
+
+   **`scripts/wc-guest.sh` is already wired to answer this**, and it had to be:
+   its stage-4 blocks run `weston-terminal` through the proxy, `weston-terminal`
+   binds a seat, and without `--shared-dir` the run now dies at connect —
+   exactly what happened to `wc-proxy.sh` the moment stage 6 landed. The
+   compositor is launched with a `keymaps/` directory on the same share, so
+   whoever next runs the guest gets the measurement for free. A failure there is
+   a **result** rather than a regression, and the proxy names the descriptor
+   kind in the error so it can be told apart from anything else. Nobody has run
+   it: stage 8 has the guest.
+
+   If it does not hold, the fix is not a bigger hammer on `SharedFile`. It is
+   the arena — §10.12 item 4's conclusion for pixels, reached for the keymap by
+   the same route — and **stage 7 is giving the arena a real region right now**
+   (§10.13 item 1). The keymap needs no code to follow it there:
+   `Handle::create_shared` is the only place that decides where a
+   compositor-created object lands, which is why it is one function and not a
+   parameter threaded through smithay. Stage 7 should not need to know the
+   keymap exists.
+4. **Whether `WM_MOUSELEAVE` behaves.** `TrackMouseEvent` is a `comctl32`-era
+   API and Wine's implementation is its own; a guest run that never produces
+   `wl_pointer.leave` would mean the arm is not sticking.
+5. **The three ambiguous keys.** Pause, NumLock and PrintScreen are resolved by
+   VK precisely because their scan codes differ between drivers, and Wine is one
+   driver. The resolution should be driver-independent; that is a claim, and it
+   has been tested against one.
+
+---
+
+## 12. Stage 7: the arena stops being a file
+
+### 12.1 Status in one paragraph
+
+Written 2026-08-13, after stage 6. **The check stage 5 deliberately left failing
+now passes, and the substrate is the reason.** `weston-presentation-shm`,
+unmodified, on the real guest, over an arena that is **guest RAM located through
+QEMU's flat view**, presented **626 frames of which 60 were distinct and the
+commonest appeared 11 times** — against stage 5's 634 frames, 18 distinct, one
+image 453 of them, and against the Wine control on a coherent filesystem's
+780/60/13. The window is live by the same measurement that said it was frozen,
+and the predicate did not move. `scripts/wc-guest.sh stage4` is **42 passed,
+0 failed, 0 skipped** on real Windows. Getting there cost one new crate, one new
+provider on each side, and no new implementation of anything `shared_vulkan`
+already had: `crates/wc-arena-host` links `sv-hostd` and does the translation
+exactly once across the two projects. A pool over the real region costs
+**0.4–0.7 µs to reach and 5.4–7.1 µs to touch**, against 1.9–3.2 µs and
+1.9–2.6 ms for the same code over a file on the export.
+
+Five runs of the frame check, all after the substrate change: 555/60/10,
+577/60/10, 592/60/10, 606/60/11, 626/60/11. The 60 is the client's own
+repertoire of images and is the control's number exactly, in every run; the
+frame total varies with how much of the 20-second window the run actually got.
+
+### 12.2 What was built, in the order the bytes move
+
+Five pieces, and the shape is the one §9.10 item 3 promised: everything above
+`Arena::open_or_create` is untouched.
+
+| piece | where | what it does |
+|---|---|---|
+| `arena::attach_guest_ram` | `wc-handle`, both platforms | commits, pins and **stamps** a region; registers it as arena *n* |
+| `--arena-guest-ram id:size` | `wc-compositor` | calls it before the socket exists, prints the run id |
+| `wc-arena-host` | Linux, root, **not a workspace member** | `sv-hostd` finds the pages and translates; writes a plan |
+| `guestram::Plan` / `StitchedRegion` | `wc-proxy` | opens the named object, one `mmap(MAP_FIXED)` per run |
+| `Arena::from_plan` | `wc-proxy` | the same allocator, over the stitched view |
+
+The direction is the opposite of every other provider in `wc_handle::arena`, and
+that inversion is the whole design rather than a detail. `attach` *opens*
+something somebody else made. `attach_guest_ram` **makes** the region and waits
+to be found, because that is the only direction that works across a hypervisor:
+the host can read and write the guest's RAM through QEMU's memory backend, and
+the guest cannot name a host object at all. `shared_vulkan` states it as a rule —
+"the side inside the VM allocates, because only it can produce pages the
+hypervisor can locate" — and this is that rule arriving in the compositor.
+
+**No descriptor crosses, and the guest is now further from one than it was.**
+Over `SharedFile` the guest was handed a path and opened it. Over a file arena it
+was handed a path once. Over guest RAM it is handed **nothing**: it says a 64-bit
+run id and a page count, and the host goes and reads its memory.
+
+The counter that used to say this — `0 out` — no longer does, and that is stage
+6's doing rather than this stage's. `wl_keyboard.keymap` runs server-to-client,
+so the compositor now publishes a name and `wc-proxy` opens it locally and hands
+the client a descriptor **it manufactured**; every run with a seat-binding client
+reports `3 fds in, 1 out`. `scripts/wc-proxy.sh` was rewritten for that when
+stage 6 landed and `scripts/wc-guest.sh` was not, because nobody ran the guest
+blocks in between — so three of them failed on `0 out` the first time the two
+were run together, and §12.11 is what came of chasing it. The rule is unchanged
+and is enforced by construction: the proxy's *upstream* writer has no fd path at
+all. On the `weston-presentation-shm` run, which binds no seat, it is still
+`1 fds in, 0 out`.
+
+### 12.3 The integration decision, and why it is a dependency rather than a copy
+
+The brief allowed three ways to reuse `sv-hostd`'s translation — depend on it,
+invoke its binary, or vendor it with a note — and required that exactly one
+implementation exist across the two projects. It is a **dependency**, in a crate
+that is deliberately **excluded from the workspace**.
+
+Invoking the binary was the first choice and does not work as it stands:
+`sv-hostd qemu` prints a report for a human, not the backend's name and the full
+run list, and adding an output mode to it would mean editing the other
+repository. Vendoring is a copy by definition, and a copy of the one file whose
+header says a silent wrong answer is "the worst thing this codebase can
+produce" is the wrong file to copy.
+
+So `crates/wc-arena-host` has `sv-hostd`, `sv-transport`, `sv-arena` and
+`arena-record` as path dependencies and does none of the work itself. The reason
+it is not a workspace member is mechanical and is the same reason `vendor/smithay`
+is not one: **a member is resolved by every `--workspace` command, including
+`cargo clippy --workspace --target x86_64-pc-windows-gnu`**, which is the gate
+this whole project exists to keep green. A member with a path dependency on a
+sibling repository would make that gate fail on any machine where the sibling is
+not checked out. Excluded, the coupling costs nothing until somebody builds the
+locator — which can only happen on the VM host anyway.
+
+The path is absolute (`/mnt/datasets/builds/shared-vulkan-base/...`), which is
+ugly and is the honest option: a relative path cannot be correct from both
+`waycompose-base/` and `wc-worktrees/<name>/`, which sit at different depths, and
+`scripts/wc-worktree.sh` already hard-codes that root.
+
+**The one thing that is duplicated is twenty bytes**, and it is duplicated
+under protest and with a check. `wc_handle::arena` spells out the stamp layout —
+magic at 0, run id at 8, page index at 16 — rather than depending on
+`arena-record`, because depending on it would put a sibling repository in the
+*Windows* build's dependency graph. Two things make that safe. A disagreement is
+loud: the host accepts a page only if the magic and the run id both match and
+then requires the indices to be a permutation of `0..pages`, so a wrong offset
+finds zero pages or duplicates, never a wrong arena. And the two definitions are
+compared, in `wc-arena-host`'s only test — the one binary in either project that
+links both.
+
+### 12.4 The measurement §10.4's table was missing
+
+Per pool of 1 MiB, on the guest. The first four rows are §10.4's, re-measured in
+this session; the fifth is new.
+
+| transport | reach it | touch 1 MiB | release |
+|---|---|---|---|
+| `Section` (named, no filesystem) | 6.1 µs | 0.74 ms | 58 µs |
+| `SharedFile`, local NTFS | 45–47 µs | 0.70 ms | 100–110 µs |
+| `SharedFile`, the export | 539–546 µs (6966 µs cold) | 2.1–2.2 ms | 108 µs |
+| `ArenaSlice`, a file on the export | 1.9–2.0 µs | 1.9–2.33 ms | 0.2 µs |
+| **`ArenaSlice`, guest RAM** | **0.4–0.7 µs** | **5.4–7.1 µs** | **0.0–0.1 µs** |
+
+**The `reach it` column was never the interesting one and this is what shows
+it.** A file-backed arena already cost 2 µs to slice, so the last row improves it
+by a factor of three and that is nearly meaningless. The column that moves is
+`touch`, by **a factor of 270–430** — 5.4–7.1 µs against 1.9–2.33 ms for the
+identical loop over the identical amount of memory. That is the difference between reading
+pages that are the guest's own pinned RAM and reading pages that virtio-fs has to
+fetch, and §10.4 said the two transports were "equal" in that column precisely
+because they were both the same mount. They are not the same mount any more.
+
+Two caveats, because the number is flattering. The 6 µs or so is a *steady-state*
+touch: the guest stamped every page of the region when it created it, so nothing
+in the measurement is a first fault. And the attach is not free — `attach_guest_ram`
+commits, stamps and pins 64 MiB, measured at 746 µs–6.7 ms depending on how warm
+the guest is, once per process, and the *host's* half of the attach is the
+locate, which is seconds (§12.5). Both are one-off and neither is on the frame
+path, which is the whole property an arena has and a shared file does not.
+
+### 12.5 What the locate actually costs, and the two numbers that surprised us
+
+Measured on every run, nine runs:
+
+| | |
+|---|---|
+| pages located | **16384 of 16384**, every time |
+| sweep | 13312 MiB in **2.37–2.42 s** |
+| stamps from other runs found | 0–4 |
+| stamps outside guest RAM | **0**, every time |
+| coalesced runs | **1497–1517** per 64 MiB |
+| stitch | **4.16–4.24 ms** for ~1510 `mmap(MAP_FIXED)` calls |
+| verify (every page at its own index) | 16384 of 16384, every time |
+
+**The first surprise is that ~1500 runs is not a problem.** `shared_vulkan`
+measured 1471 for a `VirtualLock`ed 64 MiB window and treated the fragmentation
+as the reason to prefer large pages; we measured 1497–1517 for the same
+allocator and the stitch costs 4.2 ms. It is not on the frame path, it is 2.8 µs
+per `mmap`, and `vm.max_map_count` on this host is 1048576. Large pages would
+reduce it to ~22 and need `SeLockMemoryPrivilege`; on this evidence there is no
+reason to ask for the privilege yet. Reproducibility is worth noting too: the
+run count moved between 1497 and 1517 across nine runs of the same size, so it
+is a property of the guest's free-page state and not a constant.
+
+**The second is `0 outside guest RAM`, which is the one that would have hurt.**
+`sv-hostd`'s scan skips offsets in the backing object that the flat view does not
+map, and its header warns that a stamp found there is a stale one from a previous
+boot. Zero of ours landed there, on every run, which says the region table read
+off `info mtree -f` and the sweep agree about what this machine's RAM is. The
+flat view reported **13311 MiB in 4 aliases**, which is the below-4-GiB split, the
+ROM window and the SynIC pages the module header describes — this is the machine
+`sv-hostd`'s fixture was written against, and it behaves as the fixture says.
+
+The `verify` line is the one that is not optional. It re-reads every page of the
+stitched view and checks that the page at arena offset *n* is the page the guest
+stamped *n*. A stitcher that mapped the right pages in the wrong order would pass
+every other check in this document, produce a window full of plausible pixels,
+and be wrong.
+
+### 12.6 Coherency, measured live, in both directions
+
+§10.3 measured a virtio-fs export with both sides mapped and got **MISMATCH on
+65280 of 65536 bytes, both directions** — and block 7 reproduced exactly that,
+unchanged, in the same session as everything below. The same shape of experiment
+over guest RAM:
+
+| | result |
+|---|---|
+| host writes 32 bytes; guest holds a live mapping and polls | **seen** |
+| guest answers at another offset; host holds its stitched view and polls | **seen, after 20 ms** |
+
+The guest's number is the honest one to quote: 20 ms is one poll interval, i.e.
+the write was already there the first time anybody looked. The host→guest number
+the harness prints (about 3.2 s) is **not a latency** and must not be read as
+one — it is dominated by the host's own 2.4 s sweep before it could write at all,
+because the guest starts watching before the locate begins. What the pair
+establishes is the property, not the delay: two live mappings of this region see
+each other's stores, which is exactly what two live mappings of a file on that
+mount do not.
+
+This block exists separately from the frame count on purpose. If the frames ever
+go stale again, this says whether the region or the pixel path is the reason, and
+without it the two are indistinguishable — which is the trap §10.7 describes.
+
+### 12.7 The frame count, which is the point of the stage
+
+`weston-presentation-shm` redraws every frame. The distinct-frame count is
+therefore a direct measurement of whether the compositor is seeing the redraws,
+and it is the only check in the file that ever caught the freeze.
+
+| run | frames | distinct | commonest |
+|---|---|---|---|
+| §10.7, guest, file arena on the export | 645 | 18 | **462** |
+| §10.7, guest, `SharedFile` on the export | 642 | 18 | 459 |
+| §10.7, Wine on the workstation, coherent fs (the control) | 780 | 60 | 13 |
+| **stage 7, guest, guest-RAM arena** (five runs) | **555–626** | **60** | **10–11** |
+
+The guest run is now indistinguishable from the control, across five runs: the
+same 60 distinct images every time — which is the client's own repertoire, not
+ours — and a commonest of 10 or 11 against the control's 13. The check is
+unchanged. It was not relaxed, re-scoped, or moved to a note; it asserts what it
+asserted in stage 5, that no single image accounts for more than a quarter of
+the frames, and 11 of 626 is two orders of magnitude inside it.
+
+What is **not** re-run is `weston-presentation-shm` over the file arena. §10.3
+established that the incoherence belongs to the mount rather than to the
+transport, so running it again every time would be re-measuring virtio-fs at a
+cost of a minute a run. Its numbers stay in §10.7 where they were made.
+`weston-terminal` over the file arena and over `SharedFile` are both still run,
+because they exercise the other two transports and their three-frame lifetime
+never depended on coherency.
+
+### 12.8 Three things that cost real time, all worth writing down
+
+**`kill 0` is not a no-op.** The stage-4 driver ends with
+`kill $PROXY $FWD $RELAY $COMP`, and `PROXY` is zero when the proxy was not
+started in that shell — which used to be only the error path and is now the
+normal path for this transport. `kill 0` signals the whole *process group*, so
+the driver killed itself immediately after printing the client's exit code, and
+the symptom was a run that produced the locate report, one line of client status,
+and then silence. Nothing in it looks like a signal.
+
+**`systemd-run` gives a unit systemd's `PATH`, which on NixOS has no `bash`.**
+The host-side half runs in a transient unit (see §12.9), and a
+`#!/usr/bin/env bash` script in it exits 127 before its first line. The only
+trace is `env: 'bash': No such file or directory` in the journal, which nothing
+was reading — the harness now prints `journalctl -u <unit>` when the unit does
+not finish, which is how this was found on the second attempt rather than the
+fifth.
+
+**An image-name `taskkill` is not scoped to your experiment, and this is the
+paragraph to find before reaching for one.** The stage-4 driver ran
+`taskkill /F /IM wc-compositor.exe` before every run — correct for one
+experiment on one guest, hostile the moment two are running, because it takes
+down somebody else's compositor and the symptom lands in **their** log rather
+than yours. Stage 7 and stage 8 were on this guest at the same time and that is
+how it was noticed. Three things changed and they are the reason the per-experiment
+environment variables exist at all:
+
+* `WC_GUESTNAME` names the guest directory (`wctest` by default,
+  `wctest7` here), so one deploy cannot overwrite another's binaries mid-run —
+  which would present as the other run testing code nobody wrote.
+* `WC_HOST_SHARE` / `WC_GUEST_SHARE` name the share (`/srv/winshare/wc7`), so
+  frames, logs, keymaps and pool files do not collide.
+* The kill is gone from the driver entirely, and the one in `deploy` fires only
+  when `WC_GUESTNAME` is the default — i.e. only when this deploy owns the whole
+  guest. `$$`-unique socket names and `--timeout` already did its job; the cost
+  of dropping it is that a still-running `.exe` makes its own `scp` fail, which
+  is a message rather than a mystery.
+
+### 12.9 The proxy needs root on the VM host, and that is a deployment constraint
+
+This is not a footnote. It is a property the Firefox topology
+(`docs/goal-firefox.md`) inherits, and it is better discovered here than in the
+middle of that.
+
+**What needs it.** `wc-arena-host` connects to QEMU's QMP monitor
+(`/run/windows-vm/qmp.sock`) and reads `/proc/<qemu-pid>/fd` to find the memory
+backend. `wc-proxy` opens that backend at `/proc/<qemu-pid>/fd/<n>`. On
+testhost QEMU is a **system** service running as root, so all three are
+root-only: the socket is `srwxr-xr-x root:root`, and `/proc/<pid>/fd` of a root
+process is unreadable to anyone else.
+
+**It is the deployment, not the design.** `sv-hostd` hands the identical name to
+unprivileged ICD processes and that works in its lab because QEMU runs as the
+developer there. Nothing in the arena requires privilege; what requires it is
+reaching a descriptor table that belongs to root.
+
+**What it would take to avoid, in order of preference.**
+
+1. **Run QEMU as the user, or give its QMP socket and `/proc` entry a group.**
+   The cheapest fix by a wide margin and it is a NixOS change rather than a code
+   change — `windows-vm.nix` would need a `User=`/`Group=` and a socket mode.
+   The obstacle is that this VM does VFIO passthrough of the iGPU, which is why
+   it is a root service in the first place, so this is a real question about
+   that machine rather than a switch to flip.
+2. **A privileged helper that returns a *name* rather than a descriptor** — the
+   pattern the rest of this project uses. It does not exist for this case, and
+   the reason is worth stating because it looks like it should: **a memfd has no
+   name**. `/proc/<qemu-pid>/fd/<n>` *is* the name, and it is a name whose
+   openability is exactly the privilege in question. There is no second name to
+   hand over, so a helper of this shape cannot be written. (`memory-backend-file`
+   would have one — a path on tmpfs — and swapping the backend is another VM
+   change with its own consequences.)
+3. **A privileged helper that passes the descriptor over `SCM_RIGHTS`.**
+   Technically fine — both processes are on the host side, so no VM boundary is
+   crossed — and deliberately not done. This project's rule is stated as "no
+   file descriptor and no handle crosses the boundary, ever, **even when both
+   sides happen to be on one machine**", and the value of a rule with no
+   exceptions is that nobody has to adjudicate the next case. Buying a
+   permission bit with the only invariant the design has is a bad trade.
+
+So: recorded, not worked around. The mechanics in the harness are that it
+locates through `~/rootc` and runs the proxy and its client in a
+`systemd-run --collect` transient unit rather than a long-lived root shell,
+because a root call that blocks for a minute frequently returns no output at
+all. The unit's journal is the record and the harness prints it on failure.
+
+### 12.10 The region can be located exactly once, and a second attempt fails loudly
+
+The host writes pixels over the stamps as soon as the first pool is published —
+`wc-proxy`'s allocator hands out offset 0 first, and a 15 MB pool takes out the
+first 3662 pages of stamps with it. So the sweep works once per run, and the
+question that matters is not whether a second locate is *possible* but what it
+**reports**. `sv-hostd`'s own header names the failure mode this project keeps
+meeting: reading a memfd offset as a GPA "lands on valid, zeroed, unrelated
+memory and reports no error whatsoever — a silent wrong answer".
+
+Measured, rather than argued. A 16 MiB arena, held live by the guest, located
+twice with one page of stamps destroyed in between by an explicit 4096-byte
+write at offset 0:
+
+| | |
+|---|---|
+| locate 1 | 4096/4096 pages, verify 4096/4096, plan written (391 runs) |
+| overwrite page 0's stamp | one page, exactly what a published pool does to it |
+| locate 2 | **`located 4095 of 4096 pages after sweeping 13312 MiB (0 pages carried the magic with a different run id, 0 were outside guest RAM)`** — non-zero exit, **no plan written** |
+
+**It fails loudly, and the reason is structural rather than lucky.** The locator
+is a *content* search, so bytes that are no longer there are not found; it takes
+the expected page count from the descriptor, so "found fewer" is an error with
+both numbers in it; and `wc-proxy` reads a plan file, so a locate that produced
+none cannot hand it a stale one. One page short is refused, therefore 3662 pages
+short is refused a fortiori.
+
+The one way to get a *wrong* answer instead of a refusal would be stale stamps
+elsewhere in guest RAM carrying the **same** run id — a previous run's arena that
+had not been reused. Two things stop it: the run id is 64 bits from the system
+CSPRNG per attach, and `sv-hostd` refuses a duplicate page index rather than
+choosing between two claimants. The sweeps here reported 0–4 pages carrying the
+magic with a *different* run id, which is exactly that mechanism working:
+previous runs' stamps are still lying in the guest's free memory, seen, and
+correctly ignored.
+
+What is genuinely lost is recovery: a compositor whose host restarted has no way
+to be found again. The fix is a reserved, never-allocated stamp page that the
+allocator refuses to hand out, which is about ten lines and which nothing yet
+needs.
+
+### 12.11 The keymap, and whether stage 6's hand-off exists yet
+
+§11.11 item 3 left two questions for this stage. Both now have answers, and they
+are different answers.
+
+**Does the keymap survive the export? Yes — measured, on the guest, for the
+first time.** §11.11 predicted it would, on the grounds that a keymap is §10.3's
+*closed-write* row rather than its live-mapping row, with two caveats: the
+direction measured was host-writes/guest-reads and a keymap is the reverse, and
+`--cache=auto` caches on the writing side, which for a keymap is the guest. It
+holds. Every seat-binding run reports `3 fds in, 1 out` with no `cannot open`,
+`weston-terminal` gets past connect, reaches `xdg_toplevel` and draws — so the
+compositor wrote a keymap into `Z:\wc7\keymaps\` and `wc-proxy` opened the same
+bytes as `/srv/winshare/wc7/keymaps/…` and handed the client a descriptor made
+from them. `wc-guest.sh` now asserts it in both halves — the descriptor counts
+and the absence of `cannot open` — so it is a standing check rather than a
+one-off observation.
+
+**Is `Handle::create_shared` the hand-off §11.11 describes? Not yet, and it is
+worth being exact about the gap.** §11.11 says "stage 7 should not need to know
+the keymap exists", and that is true of everything built here — nothing in this
+stage went near `publish`, `SealedFile` or smithay. But the sentence it appears
+in also implies that if the export had failed, moving the keymap into the arena
+would have been a matter of teaching one function. It would not have been. Three
+things are missing, and the first two are real work:
+
+1. **There is no allocator on the compositor's side of an arena.**
+   `wc_handle::arena`'s header is explicit that this is deliberate — "Who owns
+   which bytes of an arena is the sender's problem — `sv_arena::alloc` on the
+   shared_vulkan side, `wc-proxy`'s pool allocator on this one." For a pool the
+   proxy is the sender and owns the free list. For a keymap the **compositor**
+   is the sender, and there is nothing on that side to ask for 71249 bytes.
+   Cutting from the same arena would mean two allocators handing out the same
+   offsets.
+2. **A compositor-side arena is read-only by contract.** `Handle::map` gives a
+   `Mapping`, never a `MappingMut`, and that is what stops a compositor writing
+   into a client's pixels. `attach_guest_ram` does make the compositor the owner
+   of those pages, and `arena::guest_write` can write them — but it is gated to
+   provided regions and documented as the coherency probe's only path, precisely
+   so that it does not quietly become a second way to write buffers.
+3. **Which arena, and which sub-range, is the compositor's to give away is not
+   expressed anywhere.** The wire is ready — `Descriptor::ArenaSlice` is
+   symmetric and the client side of `wc-proxy` already resolves one — so this is
+   a question of ownership, not of encoding, and it belongs in
+   `shared_vulkan`'s cold-path handshake alongside the arena id.
+
+So the honest statement is: **the hand-off is aspirational, and it did not need
+to be real.** The export carried the keymap, so nothing forced the question. If a
+future deployment's mount does not, the work is an allocator and a narrow
+writable path on the compositor side — one function's worth of *interface*, but
+not one function's worth of code.
+
+### 12.12 The gates
+
+| Gate | Result |
+|---|---|
+All of these are from **master's checkout after the merge**, not from the branch
+before it. Every one was re-run there rather than carried over.
+
+One thing about running them worth knowing, because it cost a confusing minute:
+the workstation lost its LAN route to the guest mid-session — `ssh: connect to
+host <guest-ip>: No route to host`, 18 checks failing at once, and green
+again on retry with nothing changed. Blocks 7–10 were unaffected throughout,
+because they reach the guest from the VM host over the host-only link at
+<guest-nat-ip>. **All-of-block-1 failing is a network symptom, not a code one**; a
+real regression does not take out `SIO_AF_UNIX_GETPEERPID` and the xkb probe
+together.
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **133 tests**, 0 failures (124 on the branch, 116 in stage 5) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed |
+| `scripts/wc-input.sh` (stage 6, Wine) | 52 passed, 0 failed |
+| `scripts/wc-guest.sh run` (blocks 1–6, the guest) | 18 passed, 0 failed, 4 skipped — unchanged |
+| `scripts/wc-guest.sh stage4` (blocks 7–10, the guest) | **42 passed, 0 failed, 0 skipped** |
+
+38 of those 42 were green before the merge and four are new: the keymap name
+being openable, asserted once per client (§12.11). The three that broke on the
+merge and are now green are §12.2's `0 out`.
+
+The test count moved this time, and where it moved is the interesting part.
+Four of the eight are in `wc-handle`'s `arena` module and run **on Linux**, over
+the Unix twin of the guest-RAM provider — `mmap(MAP_ANONYMOUS)` for
+`VirtualAlloc`, `mlock` for `VirtualLock`, the same stamping loop; the other four
+are `wc-proxy`'s plan parser and stitcher, which need no VM at all. The twin is
+not a mock and it is also not evidence about the thing that matters: it cannot
+say anything about whether the pages are findable from outside a VM, which is the
+entire claim. What it does cover is the stamp layout, the registry plumbing, the
+lifetime and the refusals — where the ordinary bugs live. The claim itself is
+`wc-guest.sh` block 10's and needs a hypervisor to make.
+
+### 12.13 What is not proven, updated
+
+§10.12's list, with this stage's changes:
+
+1. ~~The arena is still a file.~~ **Closed.** It is guest RAM, located through
+   QEMU's flat view, and the freeze it caused is gone by the measurement that
+   found it.
+2. **The window has still never been seen.** §10.12 item 3 is unchanged and is
+   still the largest single gap. Everything here ran in an ssh session's
+   non-interactive window station.
+3. **New: the region can be located exactly once.** §12.10 measured what a
+   second attempt does — it refuses, with both numbers, and writes no plan — so
+   this is a lost-recovery limitation and not a silent-wrong-answer one. A
+   compositor whose host restarted cannot be found again. Fixing it is a
+   reserved, never-allocated stamp page, and nothing yet needs one.
+4. **New: pinning is asserted, not proven over time.** `VirtualLock` succeeded on
+   every run and `shared_vulkan`'s R26 re-located an identical table 3m14s later,
+   but nothing here has provoked memory pressure and no run lasted more than a
+   minute. If the guest's pages moved after the locate, the symptom would be
+   exactly §10.7's — a window that goes stale — and the harness would catch it,
+   which is the reason the frame check stays where it is.
+5. **New: 64 MiB is a guess.** The arena is sized by a flag and the allocator
+   refuses when it is full. One `weston-presentation-shm` used a single 15 MB
+   pool; nothing has been measured about what a real application asks for, and
+   `docs/goal-firefox.md`'s client will ask for more.
+6. **New: one client at a time.** Every run has had exactly one client and one
+   arena. Two proxies against one compositor would need two arena ids and there
+   is no protocol for allocating them; `shared_vulkan`'s cold-path handshake is
+   where that belongs.
+7. **New: the compositor cannot put anything *into* an arena.** §12.11 item 1
+   and item 2. There is no allocator on the compositor's side and its view is
+   read-only by contract, so a server-created object — a keymap, a clipboard
+   offer, an icon — has no route into the region even though the wire has
+   carried `ArenaSlice` in that direction since stage 1. Nothing needs it while
+   the export carries the keymap; something will.
+8. **§11.10's whole list is unchanged.** Stage 7 went nowhere near input, and
+   in particular items 1 and 2 there — no input has run on the real guest, and
+   `SendInput` under Wine is not `SendInput` on Windows — are exactly as they
+   were. What stage 7 adds to them is only that the keymap's *transport* is now
+   measured on the guest (§12.11), which was §11.11 item 3.
+9. **A hostile client can still fault the proxy** (§9.10 item 7), on a machine
+   the compositor cannot see, and now with root.
+
+### 12.14 What to do next, in the order the evidence puts it
+
+> **[ITEMS 1, 4 AND 5 CLOSED BY STAGE 8 — §13.]** Item 1's first half is done
+> (§13.5); the typing half is not, and is carried forward as §13.11 item 8.
+> Item 4 has an answer that is not the one it expects — the call was refused
+> because the process was *already* aware, and on a real desktop it succeeds
+> (§13.6). Item 5 is measured and decided (§13.8). Items 2 and 3 are untouched
+> and stand. §13.12 is the current list.
+
+1. **Log in to the guest and look at a window, and type into it.** §10.13 item 2
+   and §11.10 item 1 are the same errand now, and stage 8 has the guest for it.
+   §8.11 items 2, 4, 5 and 6.
+2. **Settle the root question on testhost** (§12.9). It is one line of
+   `windows-vm.nix` if VFIO permits a non-root QEMU and a genuine investigation
+   if it does not, and the answer is a constraint on the Firefox topology either
+   way. Better decided now than during it.
+3. **Decide what a real application's arena costs.** Item 5 above. The number to
+   measure is what Firefox's `wl_shm` pools actually total, and the answer
+   changes the flag rather than the design.
+4. **`SetProcessDpiAwarenessContext` needs to report *why* it failed** (§10.8).
+   It reported `refused` again on every run of this stage.
+5. **Decide what to do about a 15 ms tick** (§10.8). Unchanged and still
+   unaddressed; `Sleep(1)` measured 15.464 ms on this stage's runs.
+
+---
+
+## 13. Stage 8: somebody looks at the window
+
+Written 2026-08-13, against §10.12 item 3 and §10.13 items 2, 3 and 4 — which
+are §12.14 items 1, 4 and 5 by the time this was merged. Stage 5 put the
+compositor on real Windows; this is the stage where a human being sees what it
+produces.
+
+**Branched from stage 4 and merged after stage 7**, the same arrangement stage 6
+had. Everything measured below was measured on the pre-merge tree unless it says
+otherwise, which matters in exactly one place and is dealt with there: the
+frame-rate number in §13.8 was taken over a **file-backed** arena, before stage 7
+put the arena in guest RAM, and §13.8 is explicit about why that does not
+confound it and what was re-run after the merge to check.
+
+### 13.1 Status in one paragraph
 
 **`weston-terminal`, running on a Linux machine on the other side of a
 hypervisor, is a window on the guest's real desktop with the system's own
 caption, its own title in that caption, and a button in the Windows taskbar.**
 There is a photograph of it (`docs/stage8/stage8-window.png`), a photograph of
-the taskbar with its button (`stage8-taskbar.png`), and a photograph of the same
-window part-way through Windows' modal sizing loop, still painting
-(`stage8-window-resizing-flower.png`). Two of the four clauses in
+the taskbar with its button (`stage8-taskbar.png`), and a second client in a
+second window (`stage8-window-flower.png`). Two of the four clauses in
 `docs/goal-firefox.md` — title correct, taskbar entry correct — are now
 answered by looking, and the third clause is answered *negatively* by the same
 photograph: the client's own decorations are in there too, offset by 32 pixels
 and clipped at the right and bottom, because the compositor ignores
-`xdg_surface.set_window_geometry`. That bug has been in the tree since stage 3
-and no measurement was ever going to find it. §10.13 item 3 turns out to have
-been a misreading rather than a bug, §10.13 item 4 has a number and an answer,
-and §8.11's item 5 is the one thing this stage could not settle, for a reason
-that is about the guest's monitor rather than about the code.
+`xdg_surface.set_window_geometry`. That bug has been in the tree since stage 3,
+no measurement was ever going to find it, and it is item 1 of §13.12 because
+Firefox is a GTK client with exactly that shape.
 
-### 11.2 An ssh session is not a desktop, and nothing says so
+The two questions this stage was also given: §10.13 item 3 turns out to have
+been a **misreading** rather than a bug — the DPI call was refused only in a
+window station where the question is meaningless, and Wine was right (§13.6).
+§10.13 item 4 has a number, a decision and a **retraction**: the poll loop no
+longer calls `Sleep`, which is worth doing for latency and was justified here on
+throughput grounds that turned out to be wrong (§13.8).
+
+§8.11 item 5 is the one thing this stage could not settle, for a reason that is
+about the guest's monitor rather than about the code.
+
+### 13.2 An ssh session is not a desktop, and nothing says so
 
 This is the fact the whole stage rests on, and it is worth stating as plainly as
 possible because every earlier stage's evidence was collected inside it.
@@ -2440,7 +3554,7 @@ that tries to read pixels back**, and nothing in stages 1–5 tried to.
 So §10.12 item 3 was not "we did not get round to looking". It was that the
 harness could not have looked, and could not have reported that it could not.
 
-### 11.3 Getting onto `WinSta0`, and the three routes that were not available
+### 13.3 Getting onto `WinSta0`, and the three routes that were not available
 
 A process cannot walk into another session's window station; something already
 inside that session has to start it. Four ways were considered:
@@ -2474,7 +3588,7 @@ Two things about it cost a round each:
   worktree is entitled to be driving the same guest at the same time, and
   `wc-guest.sh`'s blanket `taskkill /IM wc-compositor.exe` would reap it.
 
-### 11.4 The desktop is locked, and it did not matter
+### 13.4 The desktop is locked, and it did not matter
 
 The guest's session 1 is logged on: `explorer.exe` is running, `Shell_TrayWnd`
 is visible at 0,752–1280,800. On top of all of it is a full-screen lock-screen
@@ -2483,13 +3597,28 @@ erkennen…"* to an empty room. There is no password for this machine here, and
 none was looked for; the registry has `AutoAdminLogon = 0` and no
 `DefaultPassword`, which was checked once and then left alone.
 
-Worth recording, because it is a lie of the same family as Wine's:
-`WTSQuerySessionInformation(WTSSessionInfoEx)` reports `SessionFlags = 1`,
-which is `WTS_SESSIONSTATE_UNLOCK`, for a session that is displaying a Hello
-credential prompt. A synthetic keystroke dismissed the wallpaper and advanced
-the lock screen to that prompt rather than to the desktop, which is what
-actually settled it. **Do not trust `SessionFlags`; look at the foreground
-window.**
+#### `WTSQuerySessionInformation(WTSSessionInfoEx)` says the session is unlocked. It is not.
+
+This one gets its own heading, because it is the API the next person will reach
+for to decide whether a desktop is available, and it will tell them yes.
+
+Measured on this guest: `WTSSessionInfoEx` returns `SessionFlags = 1`, which is
+`WTS_SESSIONSTATE_UNLOCK`, for a session that is at that moment displaying a
+Windows Hello credential prompt over a lock screen. Not a stale value and not a
+race — it was read repeatedly, while a photograph of the same session showed the
+lock screen with a clock on it.
+
+**What to use instead:** the foreground window. `GetForegroundWindow` plus
+`GetWindowTextW` returned `"Windows-Standardsperrbildschirm"` — Windows' own
+name for the default lock screen — and after a synthetic keystroke it advanced
+to the Hello prompt rather than to the desktop, which is what actually settled
+it. `LogonUI.exe` being in the process list is a second, weaker signal.
+
+None of that stops any of the work below. It changes only what a program should
+believe when it asks the question, and this project has now been lied to about
+DPI by Wine (§13.6), about screen size by a service window station (§13.2) and
+about lock state by `wtsapi32` — all three in the shape of a plausible answer
+rather than an error.
 
 None of that turned out to matter, because a screen grab was the wrong
 instrument anyway. `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` does not read
@@ -2504,7 +3633,7 @@ claim here rests on either. `docs/stage8/stage8-screen.png` is the whole screen,
 kept precisely because it shows the lock screen: it is the control that says the
 window captures are *not* screen grabs.
 
-### 11.5 §8.11's list, answered
+### 13.5 §8.11's list, answered
 
 **Item 1 — a window appears outside a virtual desktop.** Yes, and now for the
 right reason. §10.12 closed this on the guest, but in the blind window station;
@@ -2543,7 +3672,7 @@ prints "the window is UPSIDE DOWN", and if neither wins it says the client moved
 and declines to decide.
 
 The same comparison establishes something the orientation question does not,
-and it is what §11.7 is about: the client area is the buffer's **top-left crop**.
+and it is what §13.7 is about: the client area is the buffer's **top-left crop**.
 Not a scaled version of it, not a sub-rectangle of it — the top-left corner.
 
 **Item 4 — the modal resize loop.** It works, and this is the first thing that
@@ -2605,7 +3734,7 @@ of not being scaled. (The adapter's *current mode* is 1920x1200 at 60 Hz, so
 something between Windows and the panel is scaling; whatever it is, it is not
 Windows' DPI scale factor, and there is nothing for the compositor to be
 virtualised by.) What did change is that the mechanism is now known to work —
-see §11.6 — and that the compositor prints the DPI of every window it maps, so
+see §13.6 — and that the compositor prints the DPI of every window it maps, so
 the first scaled display it meets will say so in its own log rather than needing
 this investigation again.
 
@@ -2617,9 +3746,9 @@ looks like on a taskbar. Pinned three buttons to the left of it, for whatever it
 is worth, is Firefox.
 
 **Item 7 — the system frame and the client's own decorations colliding.**
-Confirmed, and worse than predicted. See §11.7.
+Confirmed, and worse than predicted. See §13.7.
 
-### 11.6 `SetProcessDpiAwarenessContext`: a misreading, and Wine did not lie
+### 13.6 `SetProcessDpiAwarenessContext`: a misreading, and Wine did not lie
 
 §10.13 item 3 asked for the failure to report *why*, "because 'refused' is not
 enough to tell an already-aware process from an unavailable context, and one of
@@ -2646,7 +3775,7 @@ Two consequences, one of them uncomfortable.
 **§10.8's conclusion has to be withdrawn.** It said "the mechanism it depends on
 does not work as written, and a scaled display would virtualise the window".
 Neither clause is true. The mechanism works; what did not work was the *place*
-the measurement was taken, which is the same discovery as §11.2 arriving from a
+the measurement was taken, which is the same discovery as §13.2 arriving from a
 different direction.
 
 **Wine was not wrong the fifth time.** Wine reported `ok`; the real interactive
@@ -2661,7 +3790,7 @@ differently-named executable. That is a control rather than duplication: if the
 refusal had been an app-compat shim keyed on an image name or a manifest, the
 two binaries would have disagreed. They do not.
 
-### 11.7 What the picture actually shows, which is a bug
+### 13.7 What the picture actually shows, which is a bug
 
 `docs/stage8/stage8-window.png` is the deliverable of this stage and the most
 useful thing in it is wrong.
@@ -2676,7 +3805,7 @@ here is 882x491 at +32,+32 — and 491 is exactly the height that was configured
 so the client obeyed precisely.
 
 **The compositor does not implement `set_window_geometry` at all.** `grep` finds
-no reference to it in `wc-compositor` or `wc-proxy`, and §11.5 item 3's
+no reference to it in `wc-compositor` or `wc-proxy`, and §13.5 item 3's
 comparison shows the consequence directly: the client area is the buffer's
 top-left crop. So it blits the buffer from (0,0) into a client area sized for the
 geometry rectangle, and what lands on screen is:
@@ -2704,7 +3833,7 @@ not the DWM call: it is honouring the geometry rectangle, because until the
 compositor knows where the client thinks its window is, it cannot decide what to
 extend.
 
-### 11.8 The 15 ms tick, and the answer that is not `timeBeginPeriod`
+### 13.8 The 15 ms tick, and the answer that is not `timeBeginPeriod`
 
 §10.13 item 4. Forty samples each, on the interactive desktop
 (`docs/stage8/tick.txt`):
@@ -2727,10 +3856,8 @@ The three rows that matter:
   overhead: anything below one tick is rounded up to one tick, so the poll
   loop's 5 ms sleep has always been a 15.9 ms sleep and asking for 1 ms would
   not have been faster.
-* **`Sleep(16)` is 31.3 ms.** This is the row that decides it. One frame time at
-  60 Hz costs two ticks, so *any* cadence built on `Sleep` and aimed at a
-  display refresh gets half of it. A compositor that ever schedules a frame this
-  way runs at 32 Hz on this machine and cannot be debugged into running faster.
+* **`Sleep(16)` is 31.3 ms.** One frame time at 60 Hz costs two ticks, so any
+  cadence built on `Sleep` and aimed at a display refresh gets half of it.
 * **A high-resolution waitable timer is accurate to within 0.6 ms at 1 ms and
   0.15 ms at 5 ms.** `CreateWaitableTimerExW` with
   `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (Windows 10 1803) is the documented
@@ -2739,41 +3866,100 @@ The three rows that matter:
   process, not every process on the machine and its idle power. The user's
   ruling against `timeBeginPeriod` therefore costs nothing.
 
-**The consequence for frame delivery, measured rather than reasoned about**,
-because the brief asked for that specifically and because the arithmetic above
-would have got it wrong.
+**The decision, taken: the poll loop no longer calls `Sleep`.** `tick.rs`
+creates one high-resolution waitable timer per thread and waits on it, falling
+back to `Sleep` when the flag is refused — which is what a Windows older than
+1803 does, and is the old behaviour rather than a failure. The compositor prints
+which one it got at startup (`poll interval 5ms using high-resolution waitable
+timer`), because a run that silently fell back and one that did not differ by
+11 ms a turn and there is otherwise no way to tell them apart afterwards.
 
-`weston-presentation-shm` commits as fast as it is allowed to. Counted from
-`--dump-frames` over the modal-resize hold, the compositor presented **465
-frames in 12 seconds — 38.8 per second**, in three-second buckets of 93, 88,
-180 and 104 frames. Not 60, and not 63 either.
+#### The claim this section made first, and why it was wrong
 
-The reason is a beat, and it is between two numbers that were each chosen
-sensibly on their own. `State::tick_frames` answers frame callbacks at most once
-per 16 ms — a throttle, deliberately, "the difference between an animating client
-using a few percent of a core and using all of one". It is called once per turn
-of the poll loop, and a turn is 15.9 ms. So on most turns `elapsed` is 15.9 ms,
-which is *less than 16*, the callbacks are not answered, and the client waits a
-further whole turn: 31.8 ms, or 31 frames a second. Occasionally the sleep
-overshoots past 16 ms and one turn lands on time, which is the 180-frame bucket.
-**A 15.9 ms sampler against a 16 ms gate delivers a third of its frames late and
-loses a third of the frame rate**, and neither of the two constants is wrong by
-itself.
+Kept, because the mistake is more useful than the correction.
 
-Every UI event goes the other way through the same loop (§8.2's stated cost,
-"UI events reach the client on the next turn"), so a click-to-close or a resize
-configure is up to 15.9 ms late as well.
+The first version of this section said the poll interval was costing frame rate,
+and had a number for it: counted from `--dump-frames`, the compositor presented
+**465 frames in 12 seconds — 38.8 per second**, in three-second buckets of 93,
+88, 180 and 104. The explanation was a beat. `State::tick_frames` answers frame
+callbacks at most once per 16 ms; it is called once per turn; a turn was 15.9 ms;
+so on most turns `elapsed` is *just under* the gate, the callbacks are not
+answered, and the client waits another whole turn — 31.8 ms, or 31 frames a
+second, with the occasional turn landing on time and producing the 180 bucket.
+It fits the buckets almost too well.
 
-**The decision: replace the poll loop's `Sleep` with a high-resolution waitable
-timer.** A 5 ms turn that costs 5.1 ms clears the 16 ms gate on the first turn
-after it opens, which is what the throttle was written to mean. It is a small
-change to one loop and the numbers above are what justify it; `timeBeginPeriod`
-is not needed to get them and would have cost the whole machine its idle power
-to buy the same thing. What is *not* acceptable is leaving `Sleep` in the path
-and discovering the 32 Hz ceiling from a video that judders — this stage already
-found the ceiling, with a client that does nothing but ask for frames.
+**Then the timer landed, and the frame rate did not move.** Same client, same
+transport, same 12-second window, with the compositor's own startup line
+confirming the high-resolution timer was live: **34.6 frames a second**, against
+38.8 with `Sleep`. Inside the run-to-run noise. If the turn length had been the
+constraint, a turn going from 15.9 ms to 5.1 ms would have moved it and it did
+not.
 
-### 11.9 Two worktrees, one guest, and a window that was not ours
+The beat was a plausible story with an arithmetic that worked out, and it was
+not a finding.
+
+**What was actually being measured was the instrument.** `--dump-frames` writes
+a PPM per present, and in these runs that directory is on the **virtiofs
+export**: 187 KiB per frame at 250x250, several megabytes a second through a
+paravirtual filesystem, on the write path of the very thread whose cadence was in
+question. The measurement had the observer inside the loop. That is the same
+shape as §13.9's mistakes one layer down, and the tell was available all along —
+`Sleep(16)` predicts a 32 Hz ceiling and the observed rate was 38.8, *above* it,
+which should have been the end of the theory rather than a rounding error.
+
+**The replacement is a control rather than a better number.**
+`wc-compositor --poll-coarse` forces the `Sleep` path back on, so the two
+cadences can be compared in one binary with one flag, on one tree, over one
+transport, with nothing dumped: `scripts/wc-desktop.sh fps` runs the same client
+for the same wall time twice and reads the compositor's own closing counter,
+`(N frames presented)`, which costs an increment. That is the shape this
+question needed from the start.
+
+It has run, and it puts a number on the wait at last.
+`weston-presentation-shm`, 45 seconds each, nothing dumped
+(`docs/stage8/fps.txt`):
+
+| poll wait | frames presented | per second | the proxy's view |
+|---|---|---|---|
+| high-resolution timer | 1464 | 32.5 | 1465 commits, 1464 copies |
+| `--poll-coarse` (`Sleep`) | 1415 | 31.4 | 1416 commits, 1415 copies |
+
+**1.03x.** The wait is worth three per cent, not two-fold, and the withdrawn
+claim was not merely unproven but wrong by a factor of twenty.
+
+The same table says why, and that is the more useful half: **the compositor
+presented every commit it was given**, in both configurations — 1464 of 1465 and
+1415 of 1416, one frame behind at the cut, nothing dropped or coalesced anywhere
+in the loop. So the compositor is not the throttle at either cadence. The
+*client* committed 1465 times, and a Wayland client waiting on a frame callback
+commits exactly as often as one comes back. What paces this run is the round trip
+that carries the callback out and the commit back — compositor → `afunix.sys` →
+`probe-relay.exe` → TCP → two `ssh` forwards → proxy → client, and all the way
+back. About 30 ms of it, against a 5 ms turn at one end, which is why moving that
+end by 10 ms moves the total by 3%.
+
+What can be said, and what cannot:
+
+* **Certain:** a turn of the poll loop cost 15.9 ms and now costs 5.1 ms. That
+  is `docs/stage8/tick.txt`, measured directly, and it is a *latency* fact.
+  Every UI event crosses this loop — §8.2's stated cost, "UI events reach the
+  client on the next turn" — so a close, a resize configure and a keystroke were
+  all up to 15.9 ms late and are now up to 5.1 ms late. Nothing about that
+  depends on the frame-rate question, and it is the whole justification the
+  change needs.
+* **Measured, and small:** the wait is worth 3% of throughput. It was claimed
+  here as a halving; that claim is withdrawn and this is the number.
+* **Ruled out:** the compositor. It presents every commit it receives, 1464 of
+  1465, so nothing between `dispatch_clients` and `SetDIBitsToDevice` loses
+  frames at either cadence.
+* **Ruled out:** the copy. The proxy reports 126 µs per copy — three parts in a
+  thousand of the wall clock at this rate.
+* **Still open:** the **round trip**, which is what is left, and which is mostly
+  a property of *this test rig* rather than of the design: the real topology has
+  no `ssh -L` in it. Worth establishing before anything is optimised.
+  §13.12 item 3.
+
+### 13.9 Two worktrees, one guest, and a window that was not ours
 
 An operational lesson that cost three runs and is going to recur, because the
 project now has eight worktrees and one Windows machine.
@@ -2790,51 +3976,109 @@ compared a capture against our own frame dumps and got a large error in both
 directions, reported as "undecided"; and a resize check that intermittently did
 nothing. Both read as flakiness, and both were chased as flakiness first.
 
-Two rules came out of it, and they are in the code rather than here:
+Three rules came out of it, and they are in the code rather than here:
 
 * **Address windows by process id, never by class.** `wc-desk` takes `--pid`,
   `wc-desktop.sh` learns it from the compositor's own command line, and `--class`
   is a filter within that rather than a selector.
-* **Kill by socket name, not by image name.** `wc-guest.sh` does
-  `taskkill /IM wc-compositor.exe`, which was right when it was the only thing
-  driving the machine. A run that reaps another worktree's process is worse than
-  a run that leaves its own behind.
+* **Kill by socket name, not by image name.** `wc-desktop.sh` matches the socket
+  in the command line, so it can only ever reap its own.
+* **`wc-guest.sh`'s blanket kill is narrowed to an image *path*.** It used to do
+  `taskkill /IM wc-compositor.exe`; stage 7 guarded that behind "only when
+  `WC_GUESTNAME` is unset", which is the wrong way round — the default name is
+  exactly what a run that has not thought about sharing the guest uses, so the
+  blanket kill fired in precisely the case where two runs collide. It now kills
+  only processes whose `Win32_Process.ExecutablePath` starts with this deploy's
+  own directory, matched with a trailing separator so that `wctest` cannot match
+  `wctest7`. An image name is not an identity on this guest; the path is,
+  because every experiment deploys its own copy into its own directory.
 
-### 11.10 The gates
+There is a fourth thing that is not a rule but is worth saying: **a wipe and a
+kill have an order.** `do_window` emptied the frame-dump directory and *then*
+killed leftover compositors, so a compositor still alive from an interrupted run
+kept dumping into the directory that had just been emptied, and the next run
+counted its frames and read its log. The symptom was "the capture does not match
+the dump", which is indistinguishable from a blit bug, and it was chased as one
+twice.
+
+### 13.10 The gates
+
+Run from master's checkout after the merge. The two `window` rows are the
+per-check results seen on the merged tree; their run was cut short at the
+teardown by the unredirected `ssh -N -L` described below, after every check had
+reported, and the summary line is arithmetic over those.
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | 116 tests, 0 failures — unchanged |
+| `cargo test --workspace` | 135 tests, 0 failures (133 on master, +2 for `tick.rs`) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo build -p wc-desk --target x86_64-pc-windows-gnu` | builds alone |
 | `scripts/wc-desktop.sh probe` | 8 passed, 0 failed |
 | `scripts/wc-desktop.sh window` (`weston-terminal`) | 8 passed, 0 failed, 2 skipped |
 | `scripts/wc-desktop.sh window` (`weston-presentation-shm`) | 7 passed, 0 failed, 3 skipped |
+| `scripts/wc-desktop.sh fps` | 1 passed, 0 failed — 1464 frames against 1415 |
 
 The skips are the modal-loop block and, for the animating client, the
 orientation check — `weston-presentation-shm` draws a uniformly black surface at
 the moment of capture, so its flipped and unflipped crops are byte-identical and
 the check correctly declines to decide rather than passing on a coincidence.
 Both are the harness saying what it could not establish this run, which is the
-behaviour §11.5 item 4 argues for.
+behaviour §13.5 item 4 argues for.
 
-The test count did not move again, and for the same reason as §10.11: everything
-added here is a Windows-only binary or a harness, and its evidence is a
-photograph rather than an assertion. The photographs are checked in, under
-`docs/stage8/`, and `scripts/wc-desktop.sh` reproduces every one of them.
+**`fps` took three attempts and every failure printed as something else**, which
+is the pattern this whole stage keeps running into.
 
-### 11.11 What is not proven, updated
+* An `ssh -N -L` backgrounded on the far side with its stdout still attached to
+  the outer `ssh` **holds that connection open forever**. The run hung, and it
+  was still hanging when the guest hibernated underneath it, so it looked like
+  the guest being the problem. The same line exists in `do_window`'s driver and
+  has been fixed there too — it is why that block's teardown hung once as well.
+* Two back-to-back runs on **one TCP port** left the second with a listener in
+  `TIME_WAIT`, so its client never connected and it reported `0 commits` —
+  which looked exactly like `--poll-coarse` breaking the compositor.
+* Introducing a per-mode `$port` and reusing the name in a heredoc that
+  `do_window` also expands made `$port` unbound *there*, and `set -u` killed the
+  script one line after it had said which compositor it found.
+
+None of the three was what it looked like, and all three are one line.
+
+The test count moved by two, and only two, for the same reason as §10.11:
+everything else added here is a Windows-only binary or a harness, and its
+evidence is a photograph rather than an assertion. The two are `tick.rs`'s, and
+they are the ones that can run on the machine that runs `cargo test` — that a
+5 ms wait waits, and that it does not cost a scheduler tick. The photographs are
+checked in under `docs/stage8/`, and `scripts/wc-desktop.sh` reproduces them.
+
+Two things after the merge that were not true before it, both from
+`wc-desktop.sh` being written against a stage-4 tree:
+
+* **Stage 6's keymap.** The compositor advertises a `wl_seat` now, so
+  `weston-terminal` binds one and is sent a `wl_keyboard.keymap`. Without
+  `--shared-dir`/`--shared-peer-prefix` that keymap is a `Local\wc-…` section no
+  Linux process can open and the proxy ends the connection — so exactly one of
+  this script's two clients would have started failing and the other would not.
+  Added. This is the same trap stage 7 hit in `wc-guest.sh` when stage 6 landed
+  under it (§12.11), arriving here one merge later.
+* **Stage 7's arena.** `wc-desktop.sh` still uses the *file-backed* arena, and
+  that is now known to be the frozen one: a run of it reports **1749 frames
+  presented, 18 distinct**, which is §12.7's problem intact. It does not affect
+  any claim here — every window, caption, taskbar and DPI fact is about one
+  frame, and the frame-count claims are explicitly about the poll loop's cadence
+  rather than the pixels' freshness — and the harness now prints both numbers
+  side by side so that the two can never again be confused for each other.
+
+### 13.11 What is not proven, updated
 
 §10.12's list, with this stage's changes:
 
 1. ~~The window has never been seen.~~ **Closed.** §10.12 item 3 is what this
    stage was for.
 2. **New, and the largest single thing: `xdg_surface.set_window_geometry` is
-   not implemented** (§11.7). Every client with client-side decorations — which
+   not implemented** (§13.7). Every client with client-side decorations — which
    is every GTK client, which is Firefox — is being drawn offset by its shadow
    margin and clipped by it. It was invisible to every check that exists.
-3. **The modal sizing loop cannot be entered on demand** (§11.5 item 4). It has
+3. **The modal sizing loop cannot be entered on demand** (§13.5 item 4). It has
    been observed to work three times, each attributable to this compositor by its
    own log; the harness cannot make it happen when asked and now skips with its
    reason rather than guessing. The suspicion is that `DefWindowProc` will not
@@ -2851,27 +4095,74 @@ photograph rather than an assertion. The photographs are checked in, under
    right, the picture on it is not, and the interesting half of that problem —
    resolving an app-id to icon pixels on the *Linux* side and shipping them —
    has not been started.
-6. **The arena is still a file** (§10.12 item 4), and §10.13 item 1 is still the
-   first thing on the list. Nothing here touched it.
-7. **`SealedFile`, `with_data_mut`, `KeyboardHandle::new`** — unchanged from
+6. **What holds an animating client to ~32 frames a second is not known**
+   (§13.8). Three things are now ruled out by measurement rather than by
+   argument: the poll loop's wait (worth 3%, measured against its own control),
+   the compositor (it presents 1464 of 1465 commits), and the copy (126 µs).
+   What is left is the round trip out to the client and back, most of which is
+   this test rig's `ssh -L` rather than the design's.
+7. ~~The arena is still a file.~~ **Closed by stage 7** (§12), which landed
+   while this stage was being built. `wc-desktop.sh` itself still uses the file
+   arena and therefore still sees the freeze — 1749 presented, 18 distinct — but
+   that is this harness being behind rather than the project being.
+8. **`SealedFile`, `with_data_mut`, `KeyboardHandle::new`** — unchanged from
    §10.12 item 5.
-8. **No input reaches the client.** This stage synthesised keystrokes *to
-   Windows*, to drive the modal loop, and none of them was forwarded to the
-   Wayland client. The seat is still empty.
-9. **Nothing has been watched by a human on the glass.** The captures are DWM
+9. **Input reaches the client, but not from this stage.** Stage 6 built the
+   seat (§11); the keystrokes synthesised *here* went to Windows, to drive the
+   modal loop, and none of them was forwarded to a Wayland client. Nothing has
+   yet typed into a window on the interactive desktop, which is the half of
+   §12.14 item 1 this stage did not do.
+10. **Nothing has been watched by a human on the glass.** The captures are DWM
    redirection surfaces, which is the right instrument and not the same
    instrument. Whether the panel shows what DWM holds is untested, and the way
    to test it is to unlock the machine.
 
-### 11.12 What to do next, in the order the evidence puts it
+### 13.12 What to do next, in the order the evidence puts it
 
-1. **Implement `xdg_surface.set_window_geometry`** (§11.7). It is the difference
-   between a window that is nearly right and one that is right, it is on the
-   direct path to `docs/goal-firefox.md`'s third clause, and there is now a
-   picture of what it costs.
-2. **Give the arena a real region** — §10.13 item 1, unchanged and still first
-   among the things this stage did not do.
-3. **Swap the poll loop's `Sleep` for a high-resolution waitable timer**, at the
-   point something animates (§11.8).
-4. **Send a `WM_SETICON`**, which means deciding where icon pixels come from
-   (`xdg-toplevel-icon-v1`, or an app-id lookup on the host).
+**1. Implement `xdg_surface.set_window_geometry`. Nothing else on this list is
+close.**
+
+It is not implemented anywhere — `grep -r set_window_geometry crates/` finds
+nothing in `wc-compositor` or `wc-proxy` — and the consequence is that **every
+client with client-side decorations is drawn wrong**. Not subtly: offset by its
+whole shadow margin, and clipped by the same amount on the opposite two sides.
+
+The numbers, from `weston-terminal` on the guest (§13.7):
+
+| | |
+|---|---|
+| what the compositor configured | 886x491 |
+| the buffer the client committed | **946x555** |
+| the client's window-geometry rectangle | **882x491 at +32,+32** |
+| what the compositor blitted | the buffer's top-left 886x491 |
+| measured, capture against dump | RMSE **779** upright, **5853** flipped |
+
+So the geometry *height* the client chose, 491, is exactly the height that was
+configured — the client obeyed precisely and the compositor then read the wrong
+rectangle out of the reply. What lands on screen is 32 px of the client's drop
+shadow along the top and left, the client's own title bar immediately under
+Windows', and the right-hand and bottom 60x64 of the surface missing.
+
+**This will hit Firefox immediately.** Firefox is a GTK client, GTK uses
+client-side decorations with a shadow margin of exactly this shape, and stage 9
+is pointing it at this compositor now. The failure will look like a window
+that is offset and clipped, and it will look like a blit bug, and it is not one:
+the blit is correct and reads the wrong rectangle. The fix is in the commit
+path, where `xdg_surface`'s pending geometry has to become both the size the
+window is asked to be and the origin `Shadow::blit` copies from —
+`FrameStyle::content_origin` already exists and is the place it belongs.
+
+2. **Send a `WM_SETICON`** (§13.5 item 6), which means deciding where icon
+   pixels come from: `xdg-toplevel-icon-v1` if Firefox implements it, otherwise
+   an app-id lookup on the Linux side and the pixels shipped across.
+   `docs/goal-firefox.md`'s first clause is otherwise done.
+3. **Find out whether the frame rate is the rig's or the design's** (§13.8). The
+   poll loop's wait, the compositor and the copy are all measured and all ruled
+   out; what is left is a round trip that runs through `probe-relay.exe`, TCP and
+   two `ssh` forwards, none of which exist in the topology
+   `docs/goal-firefox.md` describes. Measure that before optimising anything, or
+   the optimisation will be of the harness.
+4. **Unlock the guest, or decide not to.** Three of this stage's remaining gaps
+   — the modal loop that will not start, whether the panel shows what DWM holds,
+   and a scaled display — are all downstream of a session sitting behind Windows
+   Hello (§13.11 items 3, 4 and 9).

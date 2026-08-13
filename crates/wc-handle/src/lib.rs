@@ -120,6 +120,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod arena;
 mod platform;
+pub mod publish;
 
 /// How many objects of each kind this process has mapped.
 ///
@@ -461,6 +462,38 @@ impl Handle {
             descriptor: Descriptor::Section { name, size },
             keepalive: Some(Arc::new(object)),
         })
+    }
+
+    /// Create an object of `size` bytes **for a peer to open**, wherever
+    /// [`publish`] says such objects go.
+    ///
+    /// ADDED FOR STAGE 6, and the difference from [`create_section`] is which
+    /// namespace the peer has to be able to reach:
+    ///
+    /// * With no published directory this *is* `create_section` — a
+    ///   pagefile-backed `Local\wc-…` on Windows, a file in the temporary
+    ///   directory on Unix. Right when both processes are on one machine.
+    /// * With one, the object is a file in that directory and the descriptor
+    ///   carries the path **as the peer spells it**. That is the only kind a
+    ///   process on the other side of the boundary can open, because an NT
+    ///   object name means nothing to a Linux process (docs/design.md §9.4).
+    ///
+    /// The caller does not choose, and that is deliberate: every call site that
+    /// creates an object for a peer wants the same answer, and the answer is a
+    /// property of the deployment rather than of the call. A caller that
+    /// genuinely wants a same-machine section still says so by name.
+    ///
+    /// **The lifetime rule applies unchanged** (docs/design.md §2.5): the
+    /// returned handle must be held for at least as long as the protocol object
+    /// it backs. For a file-backed object it is stronger than a courtesy —
+    /// dropping the handle deletes the file.
+    ///
+    /// [`create_section`]: Handle::create_section
+    pub fn create_shared(size: u64) -> io::Result<Self> {
+        match publish::mint() {
+            Some((local, peer)) => Self::create_shared_file(&local, &peer, size),
+            None => Self::create_section(size),
+        }
     }
 
     /// Create a shared-memory object at `local_path` and describe it to the

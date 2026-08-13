@@ -35,14 +35,28 @@
 //!
 //! No `calloop`. `Backend::poll_fd()` returns a wepoll handle on Windows and a
 //! wepoll handle is not a socket (docs/design.md §3.3), so the backend cannot
-//! nest inside it. The Wayland thread therefore polls on a 5 ms sleep, exactly
-//! as stages 1 and 2 did. That is a latency floor on input and on how fast a
-//! `WM_CLOSE` reaches the client, and it is honest about being one; it is not a
-//! throughput limit, because a single turn drains every pending message.
+//! nest inside it. The Wayland thread therefore polls on a 5 ms wait, exactly
+//! as stages 1 and 2 did — though on Windows it took until stage 8 for that to
+//! be 5 ms rather than `Sleep`'s 15.9 ms quantum (`tick.rs`). It is a latency
+//! floor on input and on how fast a `WM_CLOSE` reaches the client, and it is
+//! honest about being one; it is not a throughput limit, because a single turn
+//! drains every pending message.
 
+mod input;
 mod platform;
 mod state;
 mod surface;
+mod tick;
+
+/// How long the Wayland thread waits between turns.
+///
+/// 5 ms since stage 1, and unchanged — what changed in stage 8 is that it is
+/// now *actually* 5 ms. See `tick.rs` and docs/design.md §13.8: on Windows this
+/// number went through `Sleep`, whose quantum is 15.6 ms, so the loop had always
+/// been turning at 15.9 ms. That is a latency floor on every UI event; §13.8 is
+/// also the record of this comment once claiming it was a throughput floor, and
+/// of the measurement that said it was not.
+const POLL: Duration = Duration::from_millis(5);
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -60,6 +74,13 @@ struct Args {
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
     simulate_wm: bool,
+    /// Force the poll loop back onto `Sleep`, with its 15.6 ms quantum.
+    ///
+    /// The control for the cadence question (docs/design.md §13.8). One binary,
+    /// one flag, everything else identical -- which is the only way to attribute
+    /// a frame rate to the wait rather than to the tree, the transport or the
+    /// instrument, and §13.8 is a record of getting that wrong first.
+    poll_coarse: bool,
     log: Option<std::path::PathBuf>,
     /// Exit successfully only after this many frames have been presented.
     /// `--once` alone proves a window was made; this proves pixels reached it.
@@ -74,6 +95,33 @@ struct Args {
     /// compositor starts; here it is a flag, which is the same fact supplied
     /// the same way — out of band.
     arenas: Vec<(u32, u64, String)>,
+    /// Arenas to **provide** rather than open, as `id:size`.
+    ///
+    /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §12).
+    /// A `--arena` is a file both sides open; a `--arena-guest-ram` is memory
+    /// this process commits and pins inside the virtual machine, stamped so
+    /// that a process on the *host* can find those pages in QEMU's memory
+    /// backend and write into them. The compositor prints the run id, which is
+    /// the only thing the host needs and the only thing that crosses.
+    guest_arenas: Vec<(u32, u64)>,
+    /// Where objects this process creates **for a client to open** are put, and
+    /// how the client spells that directory.
+    ///
+    /// ADDED FOR STAGE 6, and it is the mirror image of stage 4's `--pool-dir`
+    /// / `--peer-prefix` on the proxy. A `wl_shm` pool is created by the client
+    /// and opened by the compositor; a `wl_keyboard` keymap is created by the
+    /// compositor and opened by the client. The second direction has no
+    /// transport at all without this: a keymap in a `Local\wc-…` section is
+    /// perfectly well-formed and cannot be opened by a Linux process
+    /// (docs/design.md §9.10 item 5).
+    ///
+    /// Two flags rather than one `local:peer` argument, because both values are
+    /// paths and one of them has a drive letter in it.
+    shared_dir: Option<String>,
+    shared_peer_prefix: String,
+    /// Which of `input::LAYOUTS` to compile. Empty means "ask Windows", which
+    /// is what a user wants and what a harness cannot depend on.
+    layout: Option<String>,
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -84,9 +132,14 @@ fn parse_args() -> Result<Args, u8> {
         dump_frames: None,
         debug_icon: false,
         simulate_wm: false,
+        poll_coarse: false,
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
+        guest_arenas: Vec::new(),
+        shared_dir: None,
+        shared_peer_prefix: String::new(),
+        layout: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -94,6 +147,7 @@ fn parse_args() -> Result<Args, u8> {
             "--once" => args.once = true,
             "--debug-icon" => args.debug_icon = true,
             "--simulate-wm" => args.simulate_wm = true,
+            "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--socket" => args.socket = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
@@ -118,6 +172,27 @@ fn parse_args() -> Result<Args, u8> {
                 };
                 args.arenas.push((id, size, path.to_owned()));
             }
+            // `id:size`. No path, because there is nothing to name: the region
+            // is this process's own guest RAM and the host finds it by content.
+            "--arena-guest-ram" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-guest-ram needs id:size");
+                    return Err(2);
+                };
+                let mut p = v.splitn(2, ':');
+                let (Some(id), Some(size)) = (p.next(), p.next()) else {
+                    eprintln!("wc-compositor: --arena-guest-ram wants id:size, got {v:?}");
+                    return Err(2);
+                };
+                let (Ok(id), Ok(size)) = (id.parse::<u32>(), size.parse::<u64>()) else {
+                    eprintln!("wc-compositor: --arena-guest-ram {v:?}: id and size must be numbers");
+                    return Err(2);
+                };
+                args.guest_arenas.push((id, size));
+            }
+            "--shared-dir" => args.shared_dir = it.next(),
+            "--shared-peer-prefix" => args.shared_peer_prefix = it.next().unwrap_or_default(),
+            "--layout" => args.layout = it.next(),
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
             }
@@ -232,6 +307,50 @@ fn main() -> std::process::ExitCode {
             }
         }
     }
+    // And the ones this process provides. The run id goes out on the *first*
+    // line of the report because the host's locator cannot start without it and
+    // a harness has to be able to grep for it; `locked=false` goes on the same
+    // line because a region that is findable now and movable later is the one
+    // failure mode that would look like a working arena for the first few
+    // seconds. See `wc_handle::arena::attach_guest_ram`.
+    for (id, size) in &args.guest_arenas {
+        match wc_handle::arena::attach_guest_ram(*id, *size) {
+            Ok(r) => println!(
+                "wc-compositor: arena {id} provided from guest RAM: \
+                 run 0x{:016x}, {} bytes, {} pages, locked={}",
+                r.run_id, r.len, r.pages, r.locked
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not provide arena {id} from guest RAM: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
+    // Where objects made for a client go. Before the socket exists, for the
+    // same reason the arenas are: a wrong path must be a startup failure with
+    // the path in it, not a client that connects and then dies on its first
+    // keymap.
+    if let Some(dir) = &args.shared_dir {
+        if args.shared_peer_prefix.is_empty() {
+            eprintln!(
+                "wc-compositor: --shared-dir needs --shared-peer-prefix: this process cannot \
+                 guess how the client spells that directory, and a guess would be wrong on \
+                 the deployment that matters"
+            );
+            return std::process::ExitCode::from(2);
+        }
+        match wc_handle::publish::set(dir, &args.shared_peer_prefix) {
+            Ok(()) => println!(
+                "wc-compositor: objects for clients go in {dir} ({:?} to them)",
+                args.shared_peer_prefix
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not use --shared-dir {dir}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
 
     // The two channels. `ui_events` goes UI -> Wayland; the command channel in
     // the other direction is owned by `platform::start`.
@@ -254,6 +373,16 @@ fn main() -> std::process::ExitCode {
     };
     let platform::Started { ui, pump } = started;
 
+    // Which layout the keyboard compiles. `--layout` wins so a harness is not
+    // at the mercy of the machine's regional settings; otherwise ask the
+    // platform, which on Windows is `GetKeyboardLayout` and everywhere else is
+    // the fallback. Done after `platform::start` because on Win32 the answer
+    // depends on the thread having a message queue.
+    let layout = args
+        .layout
+        .clone()
+        .unwrap_or_else(|| platform::current_layout().to_owned());
+
     // The Wayland side is built and run entirely inside this closure. Nothing
     // it creates is ever named on the main thread, which is what makes the
     // `!Send` smithay state a non-question rather than a fight with the
@@ -264,7 +393,7 @@ fn main() -> std::process::ExitCode {
         .name("wayland".into())
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
-                args.expect_presents, ui, event_rx);
+                args.expect_presents, args.poll_coarse, layout, ui, event_rx);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -293,6 +422,8 @@ fn wayland_thread(
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
+    poll_coarse: bool,
+    layout: String,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
 ) -> u8 {
@@ -307,7 +438,7 @@ fn wayland_thread(
         }
     };
     let dh = display.handle();
-    let mut state = State::new(&dh, ui, events, debug_icon);
+    let mut state = State::new(&dh, ui, events, debug_icon, &layout);
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
@@ -337,6 +468,13 @@ fn wayland_thread(
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
     let mut code = 1u8;
+
+    // One per thread, reused every turn. See `tick.rs`: on Windows a
+    // `thread::sleep(5ms)` is a 15.9 ms sleep, and 15.9 ms against
+    // `tick_frames`' 16 ms gate halves the frame rate of anything that animates.
+    let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
+    println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
+    let _ = std::io::stdout().flush();
 
     loop {
         match listener.accept() {
@@ -410,7 +548,7 @@ fn wayland_thread(
             break;
         }
 
-        std::thread::sleep(Duration::from_millis(5));
+        ticker.wait(POLL);
     }
 
     let _ = std::io::stdout().flush();

@@ -42,7 +42,17 @@ members = [
 # port, which is exactly what makes a fork hard to rebase and a patch series
 # hard to review. Our changes to them are reviewed by diff, not by clippy;
 # `vendor/PATCHES.md` is the index.
-exclude = ["vendor/smithay", "vendor/xkbcommon"]
+#
+# STAGE 7 adds a third, for the mechanical reason rather than the fork one.
+# `crates/wc-arena-host` has a path dependency on `shared-vulkan-base`, a
+# *different repository*, because guest-physical-address translation must exist
+# exactly once across the two projects and it exists there. A member is resolved
+# by every `--workspace` command including the Windows cross gate, so making it
+# one would mean the gate this project exists to keep green fails on any machine
+# without the sibling repo checked out. Excluded, the coupling costs nothing
+# until somebody builds the locator — which only happens on the VM host, which
+# is the only machine that can run it. See that crate's Cargo.toml.
+exclude = ["vendor/smithay", "vendor/xkbcommon", "crates/wc-arena-host"]
 
 # The forks are members of this workspace *and* the resolution target for
 # anything that asks crates.io for these names. Without the patch table a

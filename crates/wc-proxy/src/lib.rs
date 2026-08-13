@@ -65,6 +65,8 @@
 //! something with no reason to exist there.
 
 #[cfg(unix)]
+pub mod guestram;
+#[cfg(unix)]
 pub mod objects;
 #[cfg(unix)]
 pub mod pool;

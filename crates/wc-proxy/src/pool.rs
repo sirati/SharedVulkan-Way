@@ -269,10 +269,42 @@ impl PoolTransport for SharedFile {
 /// First fit rather than anything cleverer because a `wl_shm` client holds two
 /// or three pools at a time. If that changes the allocator is 60 lines and it
 /// is tested; replacing it does not touch the wire.
+/// Where an [`Arena`]'s bytes actually are.
+///
+/// STAGE 7 SPLIT THIS IN TWO, and docs/design.md §12 is why. Everything above
+/// this enum — the allocator, the free list, the descriptor, the compositor's
+/// side of it — is identical for both, which is exactly the claim §9.10 item 3
+/// made and this stage had to cash: "substituting the real provider changes
+/// `Arena::open_or_create` and nothing above it."
+enum Backing {
+    /// A file both sides open. The same-machine test shape, and — measured in
+    /// §10.3 and §10.7 — **not a usable live surface** on a virtio-fs export,
+    /// because two live mappings of one file on that mount do not see each
+    /// other's stores.
+    File {
+        /// Held for its lifetime rule, not for its bytes.
+        _handle: Handle,
+        view: MappingMut,
+    },
+    /// The guest's own RAM, found in QEMU's memory backend and stitched into
+    /// one view. Not a file, and therefore not subject to a mount's caching.
+    GuestRam(crate::guestram::StitchedRegion),
+}
+
+impl Backing {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Backing::File { view, .. } => view.as_mut_slice(),
+            Backing::GuestRam(r) => r.as_mut_slice(),
+        }
+    }
+}
+
 pub struct Arena {
     id: u32,
-    _handle: Handle,
-    view: MappingMut,
+    backing: Backing,
+    /// How the region was obtained, for the one log line that says it.
+    origin: String,
     free: Vec<(u64, u64)>,
     live: HashMap<u64, (u64, u64)>,
     next: u64,
@@ -315,20 +347,64 @@ impl Arena {
             Handle::create_shared_file(&path, &path, size)?
         };
         let view = handle.map_mut()?;
-        Ok(Arena {
+        Ok(Arena::over(id, Backing::File { _handle: handle, view }, &path, size))
+    }
+
+    /// Take the region `wc-arena-host` located in the guest as arena `id`.
+    ///
+    /// STAGE 7, and the whole of §10.13 item 1 on this side. The plan names an
+    /// object and a list of runs; [`crate::guestram`] opens the one and maps the
+    /// others. Nothing about the *arena* changes — the allocator below is the
+    /// same code, the descriptor is the same three integers, and the compositor
+    /// cannot tell which of these two constructors ran.
+    ///
+    /// # The size comes from the plan, not from a flag
+    ///
+    /// `--arena-size` is meaningless here: the guest allocated the region and
+    /// its length is a fact about what it allocated. A flag that disagreed
+    /// would either truncate the arena — leaving guest pages nobody uses — or
+    /// run off the end of it, and the second is a fault in the proxy on the
+    /// first large client. Taking it from the plan removes the disagreement.
+    pub fn from_plan(id: u32, plan_path: &Path) -> io::Result<Arena> {
+        let plan = crate::guestram::Plan::read(plan_path)?;
+        let size = plan.len;
+        if size % ARENA_GRANULARITY != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a {size}-byte arena is not a whole number of {ARENA_GRANULARITY}-byte pages"),
+            ));
+        }
+        let region = crate::guestram::StitchedRegion::attach(&plan)?;
+        let origin = format!(
+            "guest RAM, run 0x{:016x}, {} run(s) of {}",
+            plan.run_id,
+            region.runs(),
+            region.origin()
+        );
+        Ok(Arena::over(id, Backing::GuestRam(region), &origin, size))
+    }
+
+    fn over(id: u32, backing: Backing, origin: &str, size: u64) -> Arena {
+        Arena {
             id,
-            _handle: handle,
-            view,
+            backing,
+            origin: origin.to_owned(),
             free: vec![(0, size)],
             live: HashMap::new(),
             next: 0,
             published: 0,
             size,
-        })
+        }
     }
 
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Where the region came from, for the log line that is the only difference
+    /// a reader of the output can see between the two substrates.
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     pub fn size(&self) -> u64 {
@@ -415,7 +491,7 @@ impl PoolTransport for Arena {
         let (offset, _) = *self.live.get(&region.key)?;
         let start = usize::try_from(offset).ok()?;
         let len = usize::try_from(region.size).ok()?;
-        self.view.as_mut_slice().get_mut(start..start + len)
+        self.backing.as_mut_slice().get_mut(start..start + len)
     }
 
     fn published(&self) -> u64 {

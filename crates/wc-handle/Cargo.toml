@@ -20,6 +20,12 @@ windows-sys = { workspace = true, features = [
   "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
   "Win32_System_Memory",
+  # STAGE 7. `GetCurrentProcess`, `GetProcessWorkingSetSize` and
+  # `SetProcessWorkingSetSize` — the working-set quota `VirtualLock` is charged
+  # against when a guest-RAM arena is pinned. Added here rather than relying on
+  # a sibling crate enabling it, which is §10.10's lesson applied on the first
+  # occasion it could have been repeated.
+  "Win32_System_Threading",
 ] }
 
 [target.'cfg(unix)'.dependencies]

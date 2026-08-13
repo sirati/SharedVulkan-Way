@@ -4,7 +4,8 @@
 #   scripts/wc-desktop.sh deploy    cross-compile and copy wc-desk / wc-compositor
 #   scripts/wc-desktop.sh probe     station, windows, tick -- from both sessions
 #   scripts/wc-desktop.sh window    a real client's window, captured (needs WC_HOST)
-#   scripts/wc-desktop.sh all       deploy, probe, window
+#   scripts/wc-desktop.sh fps       does the poll interval decide the frame rate?
+#   scripts/wc-desktop.sh all       deploy, probe, window, fps
 #
 # Run from inside `nix develop`. Everything lands in docs/stage8/.
 #
@@ -397,6 +398,18 @@ do_window() {
 
   local arena=$((64 * 1024 * 1024))
   h ": >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
+  h "rm -rf $SHARE/keymaps; mkdir -p $SHARE/keymaps; chmod 777 $SHARE/keymaps" >/dev/null
+
+  # STAGE 6, and this block would not get a window without it. The compositor
+  # advertises a `wl_seat` now, so a client that binds one is sent a
+  # `wl_keyboard.keymap` — an `h` in the server-to-client direction. Published
+  # as a `Local\wc-…` section it is unopenable by a Linux process and `wc-proxy`
+  # ends the connection; `weston-terminal` binds a seat and
+  # `weston-presentation-shm` does not, so exactly one of this script's two
+  # clients would start failing and the other would not. That is the same shape
+  # stage 7 hit in `wc-guest.sh` when stage 6 landed under it (§12.11), arriving
+  # here one merge later. §11.2 is the mechanism.
+  local keymap_extra="--shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/"
 
   # The compositor, on the desktop, detached: a scheduled task is not a child of
   # this ssh session and does not die with it.
@@ -406,7 +419,7 @@ do_window() {
   # below, and it is why the frames go to the *host's* filesystem where they can
   # be counted while the guest is busy.
   int_bg wccomp "$DESKDIR_WIN\\wc-compositor.exe" \
-    "--socket $sock --timeout 210 --log $DESKDIR_WIN\\comp-$sock.log --arena 0:$arena:$SHARE_WIN\\arena --dump-frames $SHARE_WIN\\frames" \
+    "--socket $sock --timeout 210 --log $DESKDIR_WIN\\comp-$sock.log --arena 0:$arena:$SHARE_WIN\\arena --dump-frames $SHARE_WIN\\frames $keymap_extra" \
     >/dev/null 2>&1
   sleep 6
   # Everything below addresses windows by pid rather than by class. See
@@ -439,7 +452,7 @@ do_window() {
 set -uo pipefail
 RUN=\$(mktemp -d /tmp/wc-s8-XXXXXX); chmod 700 \"\$RUN\"
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
-    -N -L \"\$RUN/up.sock:127.0.0.1:$PORT\" $HOST_GUEST &
+    -N -L \"\$RUN/up.sock:127.0.0.1:$PORT\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
 sleep 4
 if [ -S \"\$RUN/up.sock\" ]; then
@@ -612,6 +625,28 @@ chmod +x s8.sh" >/dev/null
   note "frames presented: $f0 before the loop, then$series inside it, $f1 after"
   fetch drag.bmp "stage8-window-resizing$SUFFIX.png" "the window mid-resize, inside the modal loop"
 
+  # Presented and *distinct* are two different questions and this stage needs
+  # them apart.
+  #
+  # A dumped PPM is written once per `present`, on the UI thread, so counting
+  # files measures the **poll loop's cadence** — how often that thread woke up —
+  # and nothing else. Whether the pixels underneath were fresh is a property of
+  # the **transport**, and §12.7 is the stage that fixed it by putting the arena
+  # in guest RAM. Over a file-backed arena on an incoherent export the two
+  # failures look identical from outside: a client that appears to run at half
+  # rate, and a window that appears to freeze.
+  #
+  # So both numbers are printed, always. A low distinct count with a healthy
+  # presented count is a transport problem; a low presented count with every
+  # frame distinct is a cadence problem; and this stage's frame-rate claim
+  # (§13.8) is only about the second, which is why it has to be able to show the
+  # first is not what it measured.
+  local tot dis
+  tot=$(h "ls $SHARE/frames/*.ppm 2>/dev/null | wc -l")
+  dis=$(h "md5sum $SHARE/frames/*.ppm 2>/dev/null | cut -d' ' -f1 | sort -u | wc -l")
+  note "frames dumped $tot, distinct $dis  (presented = poll-loop cadence; distinct = transport)"
+  echo "presented=$tot distinct=$dis" >>"$OUT/frames$SUFFIX.txt"
+
   if grep -q "^drag.entered *yes" "$RUNDIR/drag.txt"; then
     grep -q "^drag.grew *yes" "$RUNDIR/drag.txt" \
       && ok "the window really entered Windows' modal sizing loop and grew" \
@@ -652,12 +687,118 @@ chmod +x s8.sh" >/dev/null
   kill_ours "$sock" >/dev/null 2>&1
 }
 
+# ------------------------------------------------------------------ fps -----
+# Does the poll loop's wait decide the frame rate? One binary, one flag.
+#
+# WHY THIS IS A SEPARATE MODE AND NOT A NUMBER FROM `window`
+#
+# Because `window` runs with `--dump-frames`, and `--dump-frames` writes a PPM
+# **over virtiofs** on every present. At 250x250 that is 187 KiB per frame, and
+# at the rates involved it is megabytes a second through a paravirtual
+# filesystem. The first version of this measurement counted those files and
+# attributed the result to the poll loop; it was measuring its own instrument.
+# See docs/design.md §13.8, which keeps the wrong number and the right one.
+#
+# So this mode dumps nothing and reads the compositor's own closing line --
+# `xdg_toplevel destroyed -> window 1 (N frames presented)` -- which costs a
+# counter increment per frame. It runs the same client for the same time twice,
+# changing exactly one flag, and prints both.
+do_fps() {
+  echo
+  echo "== 7. does the poll interval decide the frame rate? (§13.8) =="
+  if [ -z "$HOST" ] || [ -z "$HOST_WESTON" ]; then
+    miss "WC_HOST/WC_HOST_WESTON unset: no client, no frame rate"; return
+  fi
+  local secs="${WC_FPS_SECS:-45}" mode n
+  local pnum=0
+  for mode in fine coarse; do
+    local sock="wg-s8f-$$-$mode" extra=""
+    # A port per mode. Sharing one across two back-to-back runs left the second
+    # with a listener in TIME_WAIT and a client that never connected -- which
+    # printed as "0 commits" and looked exactly like `--poll-coarse` breaking
+    # the compositor.
+    local port=$((PORT + pnum)); pnum=$((pnum + 1))
+    [ "$mode" = coarse ] && extra=" --poll-coarse"
+    kill_ours "wg-s8f" >/dev/null 2>&1
+    h "mkdir -p $SHARE $HOST_DIR; rm -rf $SHARE/keymaps; mkdir -p $SHARE/keymaps; chmod 777 $SHARE/keymaps" >/dev/null
+    local arena=$((64 * 1024 * 1024))
+    h ": >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
+    int_bg wcfps "$DESKDIR_WIN\\wc-compositor.exe" \
+      "--socket $sock --timeout $((secs + 60)) --log $DESKDIR_WIN\\fps-$mode.log --arena 0:$arena:$SHARE_WIN\\arena --shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/$extra" \
+      >/dev/null 2>&1
+    sleep 8
+    ssh "${SSHOPT[@]}" "$GUEST" \
+      "export MSYS_NO_PATHCONV=1; cd wcdesk && ./probe-relay.exe $port '$APPDATA_WIN\\$sock' --timeout $((secs + 40))" \
+      >"$RUNDIR/relay-$mode.log" 2>&1 &
+    local relay=$!
+    sleep 3
+    # Written out and invoked rather than inlined, for the reason `do_window`'s
+    # `s8.sh` is: **every background process on the far side must have its
+    # stdout redirected or the outer `ssh` never returns.** An inlined version
+    # of this left `ssh -N -L` holding the connection open and the whole mode
+    # hung until the guest went away underneath it, which looked like the guest
+    # going away underneath it.
+    h "cat > $HOST_DIR/s8fps.sh <<'EOS'
+#!/usr/bin/env bash
+set -uo pipefail
+RUN=\$(mktemp -d /tmp/wc-fps-XXXXXX); chmod 700 \"\$RUN\"
+ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
+    -N -L \"\$RUN/up.sock:127.0.0.1:$port\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
+FWD=\$!
+sleep 4
+if [ -S \"\$RUN/up.sock\" ]; then
+  XDG_RUNTIME_DIR=\"\$RUN\" $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
+    --runtime-dir \"\$RUN\" --transport arena --arena-path $SHARE/arena --arena-id 0 \
+    --arena-size $arena --copy damage --accept-timeout 20 --timeout $((secs + 15)) \
+    >\"\$RUN/proxy.log\" 2>&1 &
+  PROXY=\$!
+  sleep 2
+  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy timeout $secs \
+    $HOST_WESTON/weston-presentation-shm >\"\$RUN/cli.log\" 2>&1
+  sleep 2
+  kill \$PROXY 2>/dev/null
+  grep -o '[0-9]* commits, [0-9]* copies' \"\$RUN/proxy.log\" | tail -1
+else
+  echo 'no forward socket'
+fi
+kill \$FWD 2>/dev/null
+wait 2>/dev/null
+rm -rf \"\$RUN\"
+EOS
+chmod +x $HOST_DIR/s8fps.sh" >/dev/null 2>&1
+    h "$HOST_DIR/s8fps.sh" >"$RUNDIR/fps-$mode.host" 2>&1
+    kill $relay 2>/dev/null; wait $relay 2>/dev/null
+    sleep 3
+    g "cat $DESKDIR/fps-$mode.log" >"$RUNDIR/fps-$mode.log" 2>&1
+    kill_ours "$sock" >/dev/null 2>&1
+    n=$(grep -oE "\([0-9]+ frames presented\)" "$RUNDIR/fps-$mode.log" | tail -1 | grep -oE "[0-9]+")
+    local turn; turn=$(grep -oE "poll interval .* using .*" "$RUNDIR/fps-$mode.log" | tail -1)
+    printf '        %-7s %-6s frames in %ss  (%s)  proxy: %s\n' \
+      "$mode" "${n:-?}" "$secs" "${turn:-no line}" "$(cat "$RUNDIR/fps-$mode.host" 2>/dev/null | tail -1)"
+    eval "fps_$mode=\${n:-0}"
+  done
+  {
+    echo "client weston-presentation-shm, ${secs}s, arena over virtiofs, no --dump-frames"
+    echo "fine   (high-resolution waitable timer) $fps_fine frames"
+    echo "coarse (--poll-coarse, Sleep)           $fps_coarse frames"
+  } >"$OUT/fps.txt"
+  if [ "${fps_fine:-0}" -gt 0 ] && [ "${fps_coarse:-0}" -gt 0 ]; then
+    note "$(awk -v a="$fps_fine" -v b="$fps_coarse" -v s="$secs" 'BEGIN{printf "%.1f fps with the timer, %.1f with Sleep (%.2fx)", a/s, b/s, a/b}')"
+    # Deliberately not an assertion in either direction. The point of this mode
+    # is to *find out*, and the answer changed the design doc once already.
+    ok "both cadences ran and are recorded in docs/stage8/fps.txt"
+  else
+    bad "one of the two runs produced no frame count"
+  fi
+}
+
 case "$MODE" in
   deploy) do_deploy ;;
   probe)  do_probe ;;
   window) do_window ;;
-  all)    do_deploy; do_probe; do_window ;;
-  *) echo "usage: $0 {deploy|probe|window|all}"; exit 2 ;;
+  fps)    do_fps ;;
+  all)    do_deploy; do_probe; do_window; do_fps ;;
+  *) echo "usage: $0 {deploy|probe|window|fps|all}"; exit 2 ;;
 esac
 
 echo

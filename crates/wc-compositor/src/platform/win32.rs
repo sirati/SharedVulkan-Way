@@ -61,19 +61,27 @@ use windows_sys::Win32::Graphics::Gdi::{
     HBRUSH, HDC, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW, GetSystemMetrics,
+    DestroyWindow, DispatchMessageW, GetClientRect, GetMessageTime, GetMessageW, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, ICONINFO, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MSG, SM_CXICON, SM_CXSCREEN, SM_CXSMICON, SM_CYICON, SM_CYSCREEN, SM_CYSMICON,
     SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_PAINT, WM_SETICON, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_OVERLAPPEDWINDOW,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
+    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, XBUTTON1,
 };
+
+use crate::input::{evdev, evdev_keycode};
 
 use super::{
     assemble, Commands, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
@@ -82,6 +90,16 @@ use crate::surface::{Rect, Shadow};
 
 /// "Drain the command queue." The only message this module posts.
 const WM_WC_COMMAND: u32 = WM_APP + 1;
+
+/// `WM_MOUSELEAVE`, 0x02A3.
+///
+/// Written out rather than imported, because `windows-sys` files it under
+/// `Win32::UI::Controls` — with the common controls, not with the other mouse
+/// messages — and pulling that whole feature in for one integer would add a
+/// large module to every build to say `675`. `winuser.h` declares it beside
+/// `WM_MOUSEHOVER` and `TrackMouseEvent`; the metadata's placement is a fact
+/// about the Windows SDK's headers rather than about the message.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -161,6 +179,24 @@ struct WindowState {
     /// How many frames this window has presented, for the dump filenames.
     frames: Cell<u32>,
     icon_small: Cell<isize>,
+
+    // --- input, stage 6 ---------------------------------------------------
+    /// Whether `TrackMouseEvent` is currently armed for this window.
+    ///
+    /// **`WM_MOUSELEAVE` does not exist unless it is.** Win32 sends
+    /// `WM_MOUSEMOVE` for free and sends nothing at all when the pointer
+    /// leaves, unless the window has asked — once, per departure, because the
+    /// request is consumed when it fires. The omission is silent and produces a
+    /// compositor whose clients believe the pointer is still inside forever:
+    /// a hover highlight that never turns off, a terminal that keeps its I-beam
+    /// cursor, and a `wl_pointer` that never sends `leave`.
+    tracking: Cell<bool>,
+    /// How many buttons are down, so the capture is released exactly once.
+    buttons_down: Cell<u32>,
+    /// The last surface position reported, so a `WM_MOUSEWHEEL` — whose
+    /// coordinates are *screen* coordinates, unlike every other mouse message
+    /// — does not have to convert them.
+    last_pos: Cell<(f64, f64)>,
 }
 
 impl WindowState {
@@ -339,6 +375,202 @@ impl WindowState {
             height: h,
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Input
+    // -----------------------------------------------------------------------
+
+    fn send(&self, e: FromUi) {
+        let _ = self.events.send(e);
+    }
+
+    /// A client-area point, in the surface's own coordinates.
+    ///
+    /// The subtraction is [`FrameStyle::content_origin`] and it is not
+    /// decoration: once `DwmExtendFrameIntoClientArea` moves the content origin
+    /// up into the caption, a click at client `y = 0` is *above* the surface and
+    /// the client must be told a negative number or told nothing. Routing every
+    /// coordinate through the same conversion the blit uses is what keeps the
+    /// pointer and the pixels agreeing about where the surface is.
+    fn to_surface(&self, x: i32, y: i32) -> (f64, f64) {
+        let (ox, oy) = self.frame.content_origin();
+        (f64::from(x - ox), f64::from(y - oy))
+    }
+
+    /// `WM_MOUSEMOVE`. Also where the pointer *enters*, because Win32 has no
+    /// enter message.
+    fn on_mouse_move(&self, lparam: LPARAM, time: u32) {
+        let (x, y) = (lo_i16(lparam), hi_i16(lparam));
+        let (sx, sy) = self.to_surface(x, y);
+        self.last_pos.set((sx, sy));
+
+        if !self.tracking.replace(true) {
+            // Arm the leave notification, and only now: `TrackMouseEvent` is a
+            // one-shot and re-arming it on every mouse-move would be a syscall
+            // per pixel of movement. The first move after an entry is the
+            // moment there is something to leave.
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd(),
+                dwHoverTime: 0,
+            };
+            // SAFETY: a fully initialised struct whose `cbSize` is truthful,
+            // and a live window handle.
+            unsafe {
+                TrackMouseEvent(&mut tme);
+            }
+            self.send(FromUi::PointerEnter { id: self.id, x: sx, y: sy, time });
+            return;
+        }
+        self.send(FromUi::PointerMotion { id: self.id, x: sx, y: sy, time });
+    }
+
+    fn on_mouse_leave(&self, time: u32) {
+        self.tracking.set(false);
+        self.send(FromUi::PointerLeave { id: self.id, time });
+    }
+
+    /// A button went down or came up.
+    ///
+    /// **`SetCapture` on the first press and `ReleaseCapture` on the last
+    /// release.** Without it a drag that leaves the window loses its release:
+    /// Win32 delivers mouse messages to the window under the pointer, so the
+    /// `WM_LBUTTONUP` goes to whatever the user dragged onto — or to nothing —
+    /// and the client is left with a button it believes is still held. Every
+    /// selection in a terminal and every scrollbar drag depends on this.
+    ///
+    /// Counting rather than a boolean because two buttons can be down at once
+    /// and releasing the capture on the first release would reintroduce the bug
+    /// for the second.
+    fn on_button(&self, button: u32, pressed: bool, lparam: LPARAM, time: u32) {
+        let (x, y) = (lo_i16(lparam), hi_i16(lparam));
+        let (sx, sy) = self.to_surface(x, y);
+        self.last_pos.set((sx, sy));
+        // The position first: `wl_pointer.button` carries no coordinates, so
+        // the client places the click wherever the last motion was, and a click
+        // on a control the pointer reached in the same event would otherwise
+        // land at the previous position.
+        self.send(FromUi::PointerMotion { id: self.id, x: sx, y: sy, time });
+
+        if pressed {
+            if self.buttons_down.replace(self.buttons_down.get() + 1) == 0 {
+                // SAFETY: a live window handle owned by this thread.
+                unsafe {
+                    SetCapture(self.hwnd());
+                }
+            }
+        } else {
+            let n = self.buttons_down.get().saturating_sub(1);
+            self.buttons_down.set(n);
+            if n == 0 {
+                // SAFETY: paired with the `SetCapture` above.
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+        }
+        self.send(FromUi::PointerButton { id: self.id, button, pressed, time });
+    }
+
+    /// `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL`.
+    ///
+    /// # Two conversions, both of which have a sign to get right
+    ///
+    /// * **Vertical.** Windows counts a wheel notch as `+WHEEL_DELTA` when it
+    ///   is rotated *away* from the user, and Wayland's vertical axis is
+    ///   positive *downwards* — which is the direction the content moves, not
+    ///   the wheel. So the sign is inverted. Getting this wrong is not subtle
+    ///   and is not caught by any test that only checks that scrolling happens.
+    /// * **Horizontal.** Both are positive to the right, so it is not inverted.
+    ///   The asymmetry is real and is the reason these are not one line.
+    ///
+    /// `WHEEL_DELTA` is 120 and `wl_pointer.axis_value120` counts in
+    /// hundred-and-twentieths of a notch, so the raw delta *is* the v120 value
+    /// with the sign fixed. That is not a coincidence: the protocol added v120
+    /// because Windows and every high-resolution wheel already spoke it.
+    ///
+    /// The `axis` value in surface units is ten per notch, which is Weston's
+    /// `DEFAULT_AXIS_STEP_DISTANCE` and what a client that ignores v120 will
+    /// scroll by.
+    fn on_wheel(&self, wparam: WPARAM, horizontal: bool, time: u32) {
+        let delta = ((wparam >> 16) & 0xffff) as u16 as i16;
+        let v120 = if horizontal { i32::from(delta) } else { -i32::from(delta) };
+        let value = f64::from(v120) * 10.0 / f64::from(WHEEL_DELTA);
+        let (h, v) = if horizontal { (value, 0.0) } else { (0.0, value) };
+        let (v120_h, v120_v) = if horizontal { (v120, 0) } else { (0, v120) };
+        self.send(FromUi::PointerAxis {
+            id: self.id,
+            horizontal: h,
+            vertical: v,
+            v120_h,
+            v120_v,
+            time,
+        });
+    }
+
+    /// A key, from its scan code.
+    ///
+    /// Returns whether it was consumed, which matters only for `WM_SYSKEYDOWN`:
+    /// letting `DefWindowProc` see an Alt press opens the (nonexistent) window
+    /// menu and swallows the following key, so the Alt combinations a client
+    /// expects would never arrive.
+    fn on_key(&self, wparam: WPARAM, lparam: LPARAM, pressed: bool, time: u32) {
+        // bit 30 of lParam is "the key was already down". Windows repeats a
+        // held key by resending `WM_KEYDOWN` with it set; Wayland's model is
+        // that the *client* repeats, from the rate in `repeat_info`. Forwarding
+        // both would give a client two repeat streams at different rates, which
+        // presents as a stuttering, doubled repeat — so the platform's is
+        // dropped here, at the only place it can be told apart.
+        if pressed && (lparam & (1 << 30)) != 0 {
+            return;
+        }
+        let scan = ((lparam >> 16) & 0xff) as u8;
+        let extended = (lparam & (1 << 24)) != 0;
+        let vk = (wparam & 0xffff) as u16;
+        let Some(keycode) = evdev_keycode(scan, extended, vk) else {
+            // Said out loud rather than dropped quietly: a key that produces
+            // nothing is the one thing a user cannot debug from the outside,
+            // and the scan code is what somebody would need to add it to the
+            // table in `crate::input`.
+            println!(
+                "wc-compositor: no evdev keycode for scan {scan:#04x}{} (vk {vk:#04x}); key dropped",
+                if extended { " e0" } else { "" }
+            );
+            return;
+        };
+        self.send(FromUi::Key { id: self.id, keycode, pressed, time });
+    }
+}
+
+/// The low and high halves of an `LPARAM`, **as signed 16-bit**.
+///
+/// Not a detail: a mouse position on a multi-monitor desktop or during a drag
+/// off the left edge is genuinely negative, and `lparam & 0xffff` reads -1 as
+/// 65535. The window then receives a pointer at x = 65535, which no clamp
+/// catches because it is a plausible number.
+fn lo_i16(lparam: LPARAM) -> i32 {
+    i32::from((lparam & 0xffff) as u16 as i16)
+}
+
+fn hi_i16(lparam: LPARAM) -> i32 {
+    i32::from(((lparam >> 16) & 0xffff) as u16 as i16)
+}
+
+/// Which of `crate::input::LAYOUTS` this thread's keyboard layout asks for.
+///
+/// `GetKeyboardLayout(0)` is the *calling thread's* layout, which is what a
+/// compositor wants: Windows keeps one per thread and switching it is per
+/// window in practice, so the thread that owns the windows is the thread whose
+/// answer matters.
+pub fn current_layout() -> &'static str {
+    // SAFETY: a documented query with no pointer arguments. 0 means "this
+    // thread".
+    let hkl = unsafe { GetKeyboardLayout(0) } as usize;
+    let langid = (hkl & 0xffff) as u16;
+    let name = crate::input::layout_for_langid(langid);
+    println!("wc-compositor: keyboard layout {langid:#06x} -> {name}");
+    name
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +609,25 @@ fn ui() -> Option<Rc<Ui>> {
 // ---------------------------------------------------------------------------
 // Window procedures
 // ---------------------------------------------------------------------------
+
+/// When the message being dispatched was posted, in milliseconds.
+///
+/// **`GetMessageTime`, not a clock read.** Wayland's input events carry a
+/// timestamp and clients use the differences between them — for double-click
+/// detection, for key repeat, for gesture timing. Reading a clock inside the
+/// window procedure would timestamp events with *when the compositor got round
+/// to them*, which on a busy poll loop is not when they happened; the queue
+/// already carries the real time and this is how to read it.
+///
+/// The epoch is the system tick count, which is a monotonic millisecond counter
+/// that wraps every 49.7 days. Wayland says only that the base is undefined and
+/// that the values are comparable, which this satisfies — the same statement
+/// `now_ms` makes in `state.rs`, from a different clock, and the two are not
+/// required to agree.
+fn message_time() -> u32 {
+    // SAFETY: a pure query with no arguments.
+    unsafe { GetMessageTime() as u32 }
+}
 
 /// UTF-16, NUL-terminated. Every `*W` entry point wants one.
 fn wide(s: &str) -> Vec<u16> {
@@ -426,6 +677,103 @@ unsafe extern "system" fn toplevel_proc(
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
+            0
+        }
+
+        // --- input, stage 6 ------------------------------------------------
+        //
+        // **Focus is `WM_SETFOCUS`, not `WM_ACTIVATE`.** They arrive together
+        // for a top-level window and they are different facts: activation says
+        // which window is frontmost and becomes `xdg_toplevel`'s `activated`
+        // state, focus says where a keystroke goes and becomes
+        // `wl_keyboard.enter`. The brief's item 4 is this message pair, because
+        // the user's window manager is Windows and a compositor that decided
+        // its own keyboard focus would be fighting it.
+        WM_SETFOCUS => {
+            state.send(FromUi::KeyboardFocus { id: state.id, on: true });
+            0
+        }
+        WM_KILLFOCUS => {
+            state.send(FromUi::KeyboardFocus { id: state.id, on: false });
+            0
+        }
+
+        // `WM_SYSKEYDOWN` as well as `WM_KEYDOWN`, and this is the classic
+        // omission on the keyboard side. Windows routes Alt, F10 and every
+        // Alt-combination through the `SYS` pair; a compositor that handles
+        // only `WM_KEYDOWN` delivers no Alt at all, and therefore no
+        // Alt-shortcut in any client, while every other key works perfectly.
+        //
+        // The `SYS` cases return 0 rather than falling through to
+        // `DefWindowProc`, which would open the window menu on Alt and swallow
+        // the next key.
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            state.on_key(wparam, lparam, true, message_time());
+            0
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            state.on_key(wparam, lparam, false, message_time());
+            0
+        }
+        WM_INPUTLANGCHANGE => {
+            // `lParam` is the new `HKL`. Handled rather than ignored because a
+            // user who switches layout under a running client and keeps getting
+            // the old one has no way to tell what went wrong.
+            let langid = (lparam as usize & 0xffff) as u16;
+            let name = crate::input::layout_for_langid(langid);
+            println!("wc-compositor: WM_INPUTLANGCHANGE {langid:#06x} -> {name}");
+            state.send(FromUi::Layout { name });
+            0
+        }
+
+        WM_MOUSEMOVE => {
+            state.on_mouse_move(lparam, message_time());
+            0
+        }
+        WM_MOUSELEAVE => {
+            state.on_mouse_leave(message_time());
+            0
+        }
+        WM_LBUTTONDOWN => {
+            state.on_button(evdev::BTN_LEFT, true, lparam, message_time());
+            0
+        }
+        WM_LBUTTONUP => {
+            state.on_button(evdev::BTN_LEFT, false, lparam, message_time());
+            0
+        }
+        WM_RBUTTONDOWN => {
+            state.on_button(evdev::BTN_RIGHT, true, lparam, message_time());
+            0
+        }
+        WM_RBUTTONUP => {
+            state.on_button(evdev::BTN_RIGHT, false, lparam, message_time());
+            0
+        }
+        WM_MBUTTONDOWN => {
+            state.on_button(evdev::BTN_MIDDLE, true, lparam, message_time());
+            0
+        }
+        WM_MBUTTONUP => {
+            state.on_button(evdev::BTN_MIDDLE, false, lparam, message_time());
+            0
+        }
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            // Which side button is in the *high* word of `wParam`, where every
+            // other button message keeps the modifier keys.
+            let which = ((wparam >> 16) & 0xffff) as u16;
+            let button = if which == XBUTTON1 { evdev::BTN_SIDE } else { evdev::BTN_EXTRA };
+            state.on_button(button, msg == WM_XBUTTONDOWN, lparam, message_time());
+            // Documented as requiring TRUE rather than 0, unlike every other
+            // button message.
+            1
+        }
+        WM_MOUSEWHEEL => {
+            state.on_wheel(wparam, false, message_time());
+            0
+        }
+        WM_MOUSEHWHEEL => {
+            state.on_wheel(wparam, true, message_time());
             0
         }
         WM_CLOSE => {
@@ -598,6 +946,9 @@ fn create_window(
         icon_big: Cell::new(0),
         frames: Cell::new(0),
         icon_small: Cell::new(0),
+        tracking: Cell::new(false),
+        buttons_down: Cell::new(0),
+        last_pos: Cell::new((0.0, 0.0)),
     });
 
     let class = wide(CLASS_TOPLEVEL);
