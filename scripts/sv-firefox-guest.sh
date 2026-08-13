@@ -60,7 +60,11 @@ BASH_BIN=$(command -v bash)
 GDIR=svffint
 BASE=${SVFF_BASE_PORT:-57360}
 WLPORT=${SVFF_WL_PORT:-57359}
-ARENA_PAGES=16384                 # the compositor's 64 MiB
+ARENA_PAGES=${SVFF_ARENA_PAGES:-196608}   # the compositor's arena, 768 MiB by default:
+                                  # 64 MiB fragments and a YouTube frame cannot be
+                                  # published ("arena 0 has no run of 2342912"), which
+                                  # kills Firefox instantly. Someone else owns the
+                                  # allocator fix; this is the knob until it lands.
 ARENA_OUTBOUND=1048576            # what it keeps for the objects it creates
 GPU_ARENA=$((64 << 20))           # each GPU session's arena
 OUTPUT=1600x1000                  # so Firefox's window is 1280x900, as in §15.6
@@ -141,7 +145,7 @@ sleep 2
 # ------------------------------------------------------------- compositor ---
 COMP_SECS=$((SECS + 150))
 say "starting wc-compositor.exe in the guest (guest-RAM arena, $OUTPUT output)"
-ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./wc-compositor.exe \
+ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./sv-guest.exe wayland \
   --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
   --log '$SHARE_WIN\\s.log' --output $OUTPUT \
   --arena-guest-ram '0:$((ARENA_PAGES * 4096))' --arena-outbound '0:$ARENA_OUTBOUND'" \
@@ -155,7 +159,7 @@ KIDS+=($!)
 # because it forks `glxtest` before the browser exists.
 say "starting $SESSIONS GPU side(s) in the guest"
 for i in $(seq 0 $((SESSIONS - 1))); do
-  ssh "${GK[@]}" "$G" "cd $GDIR && ./sv-gpu-server.exe guest --port $((BASE + i)) \
+  ssh "${GK[@]}" "$G" "cd $GDIR && ./sv-guest.exe gpu guest --port $((BASE + i)) \
     --arena $GPU_ARENA --idle $((SECS + 120)) 2>&1" </dev/null >"$DIR/gpu$i.log" 2>&1 &
   KIDS+=($!)
 done
