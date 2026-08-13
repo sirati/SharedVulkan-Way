@@ -115,6 +115,105 @@ impl RingLink {
         Ok(RingLink { control: Arc::new(control), links: Vec::new(), seen: Vec::new() })
     }
 
+    /// Publish the control region out of **guest RAM**, over the cold path, and
+    /// listen on its directory. The cross-VM form of [`RingLink::create`].
+    ///
+    /// This is `win_guest`'s bring-up with the arena left out, and it is the same
+    /// sequence for the same reasons (§4.3, §5.1, and the ordering note below):
+    ///
+    /// 1. commit a window of guest RAM and **stamp every page**, so the host can
+    ///    find it by content — the guest cannot enumerate its own frames, so the
+    ///    locator is `Scan`;
+    /// 2. publish an `ExtentDesc` in a `Hello` down the virtio-serial port;
+    /// 3. wait for `Accept`, which is the host saying it has located the pages;
+    /// 4. **only then** `Control::create`.
+    ///
+    /// Step 4 comes last and that is load-bearing: `Control::create` zeroes the
+    /// region, which would erase exactly the stamps step 2 asked the host to
+    /// sweep for. `sv-gpu-server` learned this by measurement — "located 8192 of
+    /// 12288 pages", the arena's present and every control page missing — and the
+    /// comment there is the one to read. Publishing first costs nothing because
+    /// `magic` is written last anyway, so an early attacher sees `NotReady` and
+    /// retries.
+    ///
+    /// **The arena is committed and never used**, and that is worth a sentence
+    /// because it looks like waste. `commit_and_stamp(control_size, 0)` is
+    /// refused — "an extent with no arena" — and rightly: an extent is the unit
+    /// the host locates and `sv-arena`'s geometry has no meaning without one.
+    /// The Wayland rings carry a byte stream and need no arena; the proxy's pools
+    /// are a separate mechanism with their own region. So the smallest legal
+    /// arena is committed, stamped along with everything else, and left alone.
+    /// The cost is guest RAM the host will map and nobody will write to, and the
+    /// alternative — a second shape of extent that means "control only" — would
+    /// put a special case in the locator to save 64 MiB in a fixture.
+    #[cfg(target_os = "linux")]
+    pub fn publish(port: &str) -> Result<RingLink, String> {
+        use sv_arena::guestram::{GuestRamProvider, Pages};
+        use sv_transport::cold::{ColdMessage, Hello};
+        use sv_transport::control::ENDIAN_MARKER;
+        use sv_transport::stream::{open_virtio_port, read_message, write_message};
+
+        let geometry = Geometry::for_arena(64 << 20);
+        let mut provider = GuestRamProvider::new(Pages::Small);
+        let extent = provider
+            .commit_and_stamp(geometry.control_size, geometry.arena_size)
+            .map_err(|e| format!("cannot commit guest RAM: {e}"))?;
+        println!(
+            "wc-compositor: {} MiB of guest RAM for the ring region, run 0x{:016x}, {} pages stamped",
+            extent.total_len() >> 20,
+            extent.desc.run_id,
+            extent.desc.control_pages + extent.desc.arena_pages
+        );
+        let window = provider.take_window().ok_or("the provider kept no window")?;
+        let base = unsafe { window.base_ptr() };
+        let region = Arc::new(unsafe {
+            sv_transport::region::SharedRegion::from_raw(base, geometry.control_size as usize)
+        });
+
+        let mut chan: Box<dyn sv_transport::stream::ColdChannel> =
+            if port.starts_with("/dev/virtio-ports/") {
+                Box::new(
+                    open_virtio_port(port.rsplit('/').next().unwrap_or(port))
+                        .map_err(|e| format!("{port}: {e}"))?,
+                )
+            } else {
+                Box::new(
+                    std::os::unix::net::UnixStream::connect(port)
+                        .map_err(|e| format!("{port}: {e}"))?,
+                )
+            };
+        let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+        write_message(
+            &mut chan,
+            &ColdMessage::Hello(Box::new(Hello {
+                ids,
+                generation: 1,
+                extent: extent.desc.clone(),
+                geometry,
+                endianness: ENDIAN_MARKER,
+                pointer_width: 64,
+            })),
+        )
+        .map_err(|e| format!("cannot publish the extent: {e}"))?;
+        let mut scratch = Vec::new();
+        match read_message(&mut chan, &mut scratch).map_err(|e| e.to_string())? {
+            ColdMessage::Accept { generation } => {
+                println!("wc-compositor: the host located the ring region, generation {generation}");
+            }
+            ColdMessage::Refuse { code, reason } => {
+                return Err(format!("the host refused {code}: {reason}"));
+            }
+            other => return Err(format!("unexpected cold-path reply {other:?}")),
+        }
+
+        let control = Control::create(region, geometry, ids, 1).map_err(|e| e.to_string())?;
+        control.stamp_epoch().map_err(|e| e.to_string())?;
+        // The window is the region's now; dropping it here would unmap the pages
+        // the host has just located.
+        std::mem::forget(window);
+        Ok(RingLink { control: Arc::new(control), links: Vec::new(), seen: Vec::new() })
+    }
+
     /// New connections since the last call — **this is `accept()`**.
     ///
     /// Returns the stream to hand to `insert_client` for each. A slot is only

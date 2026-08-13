@@ -1280,6 +1280,7 @@ dependencies = [
  "awe-probe",
  "libc",
  "smithay",
+ "sv-arena",
  "sv-proto",
  "sv-transport",
  "wayland-backend",
