@@ -14112,7 +14112,25 @@ been wrong about on this project before. §37.8 item 1.
    and reports what it received. The headless `--simulate-wm` gesture drives
    `weston-eventdemo`, which binds `wl_touch` and prints nothing about it
    (§24.6 says so), and there is no `--click` equivalent for a contact.
-5. **A hazard found the hard way, and it is not about this bug.** `git stash` is
+5. **The scheduled-task *name* is still shared between worktrees.** §33 made the
+   socket unique per run and the window selectable by pid, and `WC_DESKNAME`
+   has separated the binaries since §16.8 — but `runint.ps1` registers its task
+   as whatever `int`/`int_bg` was called with, and those names (`wccomp`,
+   `wcshot`, `wcwin`) are constants in the script. Every worktree therefore
+   registers `wccomp`, and `Register-ScheduledTask -Force` means the last run to
+   start silently redefines the others'. It is the same family as `wg-s8` and
+   `WaycomposeToplevel` and it is the one member still open.
+
+   Found by cleaning up rather than by failing: a `wccomp` was left `Ready` on
+   the guest pointing at this branch's deploy, from a run that started the
+   compositor with `int_bg` — which, unlike `int -Wait`, never unregisters.
+   Nothing broke, because a stale definition is inert and the next run
+   overwrites it. What it would cost is the case where two runs overlap and one
+   `Unregister-ScheduledTask`s a name the other is about to start. Removing a
+   task must therefore check that its `Actions.Execute` is under this run's
+   `DESKDIR` and that its `State` is not `Running`, which is what was done here
+   and is what the script does not yet do for itself.
+6. **A hazard found the hard way, and it is not about this bug.** `git stash` is
    shared across every worktree of this repository. A plain `git stash pop` in
    one worktree popped *another agent's* stash — 115 files from a branch this
    one has never seen — and left the tree in conflict. Nothing was lost, because
