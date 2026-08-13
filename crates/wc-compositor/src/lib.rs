@@ -42,6 +42,7 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+mod clipboard;
 /// The socket a conformance suite drives this compositor through, standing
 /// where Windows stands. Linux only, because WLCS is. See its header, and
 /// docs/waycompose-design.md §26.

@@ -75,6 +75,22 @@ windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_System_Console",
+  # ADDED FOR STAGE 13: the clipboard. `DataExchange` is where the Windows
+  # metadata files `OpenClipboard`, `SetClipboardData` and
+  # `AddClipboardFormatListener` — not with the other window messages, which is
+  # where one would look — and `Memory` is `GlobalAlloc`, because a clipboard
+  # format is handed over as a moveable global handle and not as a pointer.
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  # ADDED FOR THE DRAG SOURCE. Windows' drag and drop is OLE, so this is the
+  # first COM in the project: `FORMATETC` and `STGMEDIUM` are `Com` and
+  # `Com_StructuredStorage`, `DoDragDrop` and `OleInitialize` are `Ole`. No
+  # interface *definitions* come with them — `windows-sys` types every COM
+  # pointer as `*mut c_void` — so the three vtables are written out in
+  # `platform/drag.rs`, which is the honest shape of hand-rolled COM.
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Ole",
   "Win32_System_LibraryLoader",
   # ADDED FOR STAGE 8: the poll loop's wait is a high-resolution waitable timer
   # rather than `Sleep`, whose quantum on the guest is 15.6 ms (§13.8).
