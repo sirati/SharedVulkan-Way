@@ -43,6 +43,7 @@ members = [
   "crates/wc-server",
   "crates/wc-compositor",
   "crates/wc-desk",
+  "crates/wc-launch",
   "crates/wc-shmclient",
   "crates/wc-proxy",
   # The WLCS integration module (docs/waycompose-design.md §26). A member so that the
