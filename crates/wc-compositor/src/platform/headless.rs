@@ -223,9 +223,9 @@ struct Headless {
     aumid: String,
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
-    /// Surface size, as reported at `Map`. The *client area* size is this run
-    /// through [`FrameStyle::client_size_for`], which is what a real platform
-    /// would size its frame to and what a simulated resize has to speak in.
+    /// Surface size, as reported at `Map`, which on every platform is also the
+    /// client-area size — see [`FrameStyle`], where the tabs-in-title-bar stage recorded why the
+    /// two were once believed to differ by the extended strip and do not.
     surface: (i32, i32),
     frames: u64,
     mapped_at: Option<Instant>,
@@ -493,11 +493,14 @@ impl PumpInner {
                     w.mapped = true;
                     w.surface = (width, height);
                     w.mapped_at = Some(Instant::now());
-                    let (cw, ch) = self.frame.client_size_for(width, height);
-                    let (ox, oy) = self.frame.content_origin();
                     println!(
                         "wc-compositor: window {id} mapped surface {width}x{height} \
-                         client {cw}x{ch} content origin {ox},{oy}"
+                         client {width}x{height}{}",
+                        if self.frame.extend_top {
+                            " (the system caption folded in)"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }
@@ -710,13 +713,12 @@ impl PumpInner {
         }
         if !w.resized && self.simulate.resize.due(w.frames, w.mapped_at) {
             w.resized = true;
-            // A resize arrives from the platform as a *client area* size, which
-            // has to go back through the frame to become a surface size. With
-            // `extend_top` at 0 the two are equal, and routing it through the
-            // conversion anyway is what makes this a test of the arithmetic
-            // rather than of a coincidence.
-            let (cw, ch) = self.frame.client_size_for(w.surface.0 + 40, w.surface.1 + 20);
-            let (sw, sh) = self.frame.surface_size_for(cw, ch);
+            // A resize arrives from the platform as a *client area* size, and
+            // the client area is the surface — in both frame arrangements, for
+            // the reason [`FrameStyle`] now spells out. There is no conversion
+            // left to route it through, and saying so here is the point:
+            // stage 3 put one in, the tabs-in-title-bar stage measured that it was upside down.
+            let (sw, sh) = (w.surface.0 + 40, w.surface.1 + 20);
             println!("wc-compositor: [simulate-wm] window {id} resized to {sw}x{sh}");
             let _ = self.events.send(FromUi::Resized {
                 id,

@@ -121,7 +121,9 @@ use smithay::{
 };
 
 use crate::platform::{CursorSpec, Edge, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
-use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource};
+use crate::surface::{
+    bars, decorator, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource,
+};
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
@@ -141,9 +143,21 @@ pub enum Decorations {
     /// Windows draws the caption; the client draws none. **The default.**
     #[default]
     Server,
-    /// The client draws its own title bar, and the Win32 side is expected to
-    /// extend the frame into it (`FrameStyle::extend_top`).
+    /// The client draws its own title bar, and Windows draws its caption above
+    /// it. This is the two-title-bar arrangement every stage before 17 shipped,
+    /// kept as a flag because it is the control leg every claim about the other
+    /// two is measured against.
     Client,
+    /// ADDED FOR TABS IN THE TITLE BAR. The client draws its own title bar **and the system
+    /// caption is folded into the client area** (`FrameStyle::extend_top`), so
+    /// the client's tab strip is inside the window's own frame rather than
+    /// below it.
+    ///
+    /// On the wire this is `Client` — it has to be, because the tab strip only
+    /// exists when the client is decorating itself, and the one lever that
+    /// decides that is the manager's `default_mode` (§22.2). The difference is
+    /// entirely on the Win32 side, and it is `WM_NCCALCSIZE`.
+    Tabs,
 }
 
 impl Decorations {
@@ -152,8 +166,14 @@ impl Decorations {
         match s {
             "server" => Some(Self::Server),
             "client" => Some(Self::Client),
+            "tabs" => Some(Self::Tabs),
             _ => None,
         }
+    }
+
+    /// Whether the Win32 side should fold the caption into the client area.
+    pub fn extends_frame(self) -> bool {
+        matches!(self, Self::Tabs)
     }
 
     /// The KDE protocol's spelling, which is the one that decides GTK's
@@ -163,7 +183,11 @@ impl Decorations {
     fn kde(self) -> KdeDefaultMode {
         match self {
             Self::Server => KdeDefaultMode::Server,
-            Self::Client => KdeDefaultMode::Client,
+            // `Tabs` is `Client` here, and that is the whole reason it is not a
+            // third value on the wire: the tab strip this arrangement puts in
+            // the caption is drawn by the client, and it only exists at all
+            // when the manager's default says `Client`.
+            Self::Client | Self::Tabs => KdeDefaultMode::Client,
         }
     }
 
@@ -172,7 +196,7 @@ impl Decorations {
     fn xdg(self) -> DecorationMode {
         match self {
             Self::Server => DecorationMode::ServerSide,
-            Self::Client => DecorationMode::ClientSide,
+            Self::Client | Self::Tabs => DecorationMode::ClientSide,
         }
     }
 }
@@ -398,6 +422,16 @@ pub struct State {
     /// committed this frame.
     staging: HashMap<WlSurface, Shadow>,
     windows: HashMap<WlSurface, Window>,
+    /// Every surface that has created a decoration object, on either protocol.
+    ///
+    /// ADDED FOR STAGE 33, and it is one bit per window that could not be
+    /// recovered afterwards. The compositor's account of a run said which
+    /// decoration mode it *offered* and nothing about who took it up, so a
+    /// client that ignored both protocols and drew its own title bar was
+    /// indistinguishable in the log from one that accepted the system's — and
+    /// the difference is the whole of the bug the user reported. See
+    /// [`crate::surface::decorator`].
+    negotiated_decoration: std::collections::HashSet<WlSurface>,
     next_id: WindowId,
     started: Instant,
     last_frame: Instant,
@@ -752,6 +786,7 @@ impl State {
             sources: vec![Box::new(ShmSource)],
             staging: HashMap::new(),
             windows: HashMap::new(),
+            negotiated_decoration: std::collections::HashSet::new(),
             next_id: 1,
             started: Instant::now(),
             last_frame: Instant::now(),
@@ -1753,6 +1788,7 @@ impl State {
                 "wc-compositor: window {id} pixels served by {served_by} \
                  (mapped: {sections} section, {files} shared-file, {slices} arena-slice)"
             );
+            self.report_decorator(&root, id, &app_id);
             // ADDED FOR STAGE 9. `wl_surface.enter` is how a client learns
             // which output it is on, and therefore what scale to draw at and
             // what refresh rate to expect. It is sent at map because before a
@@ -2072,6 +2108,78 @@ impl State {
         self.ui.send(ToUi::Cursor {
             spec: CursorSpec::Image { image, hotspot_x, hotspot_y },
         });
+    }
+
+    /// Say, once per window, who this compositor believes is drawing its title
+    /// bar — and say it loudly when the answer is "both of us".
+    ///
+    /// ADDED FOR STAGE 33. The user's report was *"wayland terminal renders
+    /// also a double titlebar"*, and the reason it took a photograph to find is
+    /// that the compositor's own account of that run could not see it. Every
+    /// line was right: the manager's default was `Server`, the window mapped at
+    /// the geometry rectangle, the caption carried the client's title. The one
+    /// thing nothing recorded is that the client never read any of it.
+    ///
+    /// So this is a diagnostic and it is deliberately not a decision. What to
+    /// *do* about a client that decorates itself is §30's arrangement — fold
+    /// the caption into the client area with `WM_NCCALCSIZE` and
+    /// `DwmExtendFrameIntoClientArea` so that the bar the client is going to
+    /// draw anyway becomes the only one — and that is a per-window window
+    /// style, on the Win32 side, which this branch does not have. The one thing
+    /// that has to exist first is the ability to *tell*, and that is here.
+    fn report_decorator(&self, root: &WlSurface, id: WindowId, app_id: &str) {
+        use smithay::wayland::shell::xdg::SurfaceCachedState;
+        let inset = compositor::with_states(root, |states| {
+            states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry
+                .map_or((0, 0), |r| (r.loc.x, r.loc.y))
+        });
+        let negotiated = self.negotiated_decoration.contains(root);
+        let who = decorator(inset, negotiated);
+        // The verdict is the pair. See [`crate::surface::bars`]: §31's fold
+        // reverses which of these two clients is the correct one, so a message
+        // that named "two title bars" from `who` alone was right only while the
+        // caption was never folded — which was true when §33 was written and
+        // stopped being true when §31 merged.
+        let folded = self.decorations.extends_frame();
+        let app = if app_id.is_empty() { "<no app id>" } else { app_id };
+        match bars(who, folded) {
+            Bars::Agreed => println!(
+                "wc-compositor: window {id} ({app}) negotiated its decorations; \
+                 geometry inset {},{}",
+                inset.0, inset.1
+            ),
+            Bars::OneSystem => println!(
+                "wc-compositor: window {id} ({app}) bound no decoration protocol and has no \
+                 margin around its window; Windows' caption is the only title bar"
+            ),
+            Bars::OneClient => println!(
+                "wc-compositor: window {id} ({app}) draws its own title bar and this run folds \
+                 the caption into the client area ({:?}), so that bar is the window's -- \
+                 geometry inset {},{} (§31, §33.7)",
+                self.decorations, inset.0, inset.1
+            ),
+            // The two that are defect reports. Named as such, because the
+            // compositor is telling the truth about a window the user is about
+            // to find wrong, and a line that read like the other two would be
+            // read like the other two.
+            Bars::Two => println!(
+                "wc-compositor: window {id} ({app}) bound no decoration protocol and reports a \
+                 {},{} margin around its window -- it is drawing its own title bar and did not \
+                 read our default of {:?}, so THIS WINDOW HAS TWO TITLE BARS (§33)",
+                inset.0, inset.1, self.decorations
+            ),
+            Bars::None => println!(
+                "wc-compositor: window {id} ({app}) draws no title bar of its own and this run \
+                 folds the caption away ({:?}), so THIS WINDOW HAS NO TITLE BAR -- \
+                 `--decorations tabs` is right for a self-decorating client and wrong for this \
+                 one, and it is a per-run flag (§33.7)",
+                self.decorations
+            ),
+        }
     }
 
     /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
@@ -3304,6 +3412,9 @@ impl ServerDndGrabHandler for State {}
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         let mode = self.decorations.xdg();
+        // STAGE 33. This client has been told; whatever it draws afterwards it
+        // is not drawing in ignorance. See [`crate::surface::decorator`].
+        self.negotiated_decoration.insert(toplevel.wl_surface().clone());
         println!("wc-compositor: xdg-decoration: client created a decoration object, telling it {mode:?}");
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
@@ -3343,9 +3454,13 @@ impl KdeDecorationHandler for State {
 
     fn new_decoration(
         &mut self,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _decoration: &OrgKdeKwinServerDecoration,
     ) {
+        // STAGE 33, and this is the protocol GTK uses, so it is the one that
+        // fires for Firefox. `weston-terminal` never reaches this function at
+        // all, which is the measurement §33 is about.
+        self.negotiated_decoration.insert(surface.clone());
         println!("wc-compositor: kde-decoration: client created a decoration object");
     }
 

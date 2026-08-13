@@ -658,10 +658,13 @@ run_wine() {
   # the client-area point the probe aimed at, plus the inset the client itself
   # declared.
   #
-  # `to_surface` is currently the identity (`FrameStyle::extend_top` is 0 and
-  # `content_origin` is therefore `(0, 0)`; the compositor prints "content
-  # origin 0,0" at every map). This check is what would notice if it stopped
-  # being — which is exactly what §30's frame extension does to it.
+  # `to_surface` is the identity, and §31 is what turned that from an accident
+  # of `extend_top` being zero into a fact about **both** decoration
+  # arrangements: `WM_NCCALCSIZE` folds the caption in by moving the client
+  # rectangle's own top edge, so the client origin is the surface origin whether
+  # or not the fold happened. This check is what would notice if that stopped
+  # being true — nothing on the Win32 input path branches on it, so nothing else
+  # would.
   # The probe names both points it visited because Wine reorders them; see
   # `probe-input.c`. The click must be at one of them, converted — a compositor
   # that dropped or invented the inset would be at neither.

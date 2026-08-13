@@ -490,6 +490,197 @@ impl PixelSource for ShmSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// STAGE 33: telling a client that decorates itself from one that does not
+// ---------------------------------------------------------------------------
+
+/// What the compositor can say about who is drawing this window's title bar.
+///
+/// # Why this is a guess with a name rather than a fact
+///
+/// §33 measured `weston-terminal` against this compositor with
+/// `--decorations server`: it binds **neither** `org_kde_kwin_server_
+/// decoration_manager` nor `zxdg_decoration_manager_v1`, sends zero decoration
+/// requests, and draws its own title bar under Windows' — the double bar the
+/// user reported. `weston-flower`, the *same toolkit* against the *same*
+/// compositor in the same minute, comes out with one bar.
+///
+/// So the compositor cannot ask. The two protocols that carry the answer are
+/// the two this class of client ignores, and there is no third. What is left is
+/// one correlate, and it is the only thing on the wire that separated those two
+/// traces:
+///
+/// | | `weston-terminal` | `weston-flower` |
+/// |---|---|---|
+/// | globals bound | the same seven | the same seven |
+/// | decoration requests | 0 | 0 |
+/// | `set_window_geometry` | **(32, 32, 742, 427)** | **(0, 0, 200, 200)** |
+/// | title bars on screen | 2 | 1 |
+///
+/// A non-zero window-geometry **origin** means the buffer is bigger than the
+/// window on the top and the left: the client is painting something outside its
+/// own window, and in practice that something is a drop shadow, which is drawn
+/// by clients that decorate themselves and by nothing else. §22 measured
+/// Firefox under client-side decorations at (26, 23), which is the same signal
+/// from a toolkit that shares no code with weston's.
+///
+/// **Where it fails, stated rather than discovered later.** A `weston-terminal`
+/// that is *maximised* sets its margin to 0, so the inset goes to (0, 0) while
+/// the title bar stays — the tell vanishes and the symptom does not. And a
+/// client could draw a shadow and no title bar. So this is a diagnosis to
+/// print, and an input to a per-application decision, not a switch to hang a
+/// window style on by itself. §33.6 is the argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decorator {
+    /// The client used a decoration protocol, so it was *told* and agreed.
+    /// Whatever it draws, it is not drawing it in ignorance.
+    Negotiated,
+    /// No decoration protocol and no margin around the window: nothing suggests
+    /// this client is drawing a title bar. `weston-flower`.
+    ProbablySystem,
+    /// No decoration protocol, and a margin around the window. This client is
+    /// almost certainly drawing its own title bar, has never been told the
+    /// system would draw one, and the window has two. `weston-terminal`.
+    ProbablyItself,
+}
+
+/// Which of the three this window is, from the two facts a compositor has at
+/// map time.
+///
+/// `inset` is the window-geometry origin — `xdg_surface.set_window_geometry`'s
+/// x and y — and `negotiated` is whether this surface ever created a decoration
+/// object on either protocol.
+pub fn decorator(inset: (i32, i32), negotiated: bool) -> Decorator {
+    if negotiated {
+        return Decorator::Negotiated;
+    }
+    // Either axis. A client with a shadow on the top and none on the left is
+    // still a client with a shadow, and `> 0` on both would miss it.
+    if inset.0 > 0 || inset.1 > 0 {
+        Decorator::ProbablyItself
+    } else {
+        Decorator::ProbablySystem
+    }
+}
+
+/// How many title bars this window is going to have.
+///
+/// ADDED WHEN §31 MERGED, and it is the correction that merge forced. §33 was
+/// written against a tree where the caption was never folded, so
+/// [`Decorator::ProbablyItself`] and "two title bars" were the same statement
+/// and the report said so in as many words. §31's `--decorations tabs` makes
+/// `WM_NCCALCSIZE` fold the caption into the client area, and then a client that
+/// decorates itself is **exactly right** — its bar is the window's — while a
+/// client that decorates itself under `server` is the user's bug.
+///
+/// So the verdict is the pair, not either half. The case that reverses is the
+/// one worth having a name for: under `tabs`, a client with no bar of its own
+/// gets a window with **no title bar at all**, because the caption it would
+/// have been given has been folded away and there is nothing in the strip. §31's
+/// flag is per-run and a run has both kinds of client in it, so that is not a
+/// hypothetical; it is what `weston-flower` would get from a run configured for
+/// Firefox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bars {
+    /// One, and it is Windows'.
+    OneSystem,
+    /// One, and it is the client's, sitting in the folded caption. §31's
+    /// arrangement, working.
+    OneClient,
+    /// Two, one above the other. The bug the user reported.
+    Two,
+    /// **None.** The caption was folded away and the client draws nothing into
+    /// the strip it left.
+    None,
+    /// The client negotiated, so it agreed to whatever it is doing and this is
+    /// not a guess to be reported as a verdict.
+    Agreed,
+}
+
+/// The verdict, from who decorates and whether this run folds the caption.
+pub fn bars(who: Decorator, extends_frame: bool) -> Bars {
+    match (who, extends_frame) {
+        (Decorator::Negotiated, _) => Bars::Agreed,
+        (Decorator::ProbablyItself, false) => Bars::Two,
+        (Decorator::ProbablyItself, true) => Bars::OneClient,
+        (Decorator::ProbablySystem, false) => Bars::OneSystem,
+        (Decorator::ProbablySystem, true) => Bars::None,
+    }
+}
+
+#[cfg(test)]
+mod decorator_tests {
+    use super::*;
+
+    /// The two clients §33 measured, by their measured numbers.
+    #[test]
+    fn the_two_weston_clients_come_out_different() {
+        // weston-terminal: set_window_geometry(32, 32, 742, 427), no protocol.
+        assert_eq!(decorator((32, 32), false), Decorator::ProbablyItself);
+        // weston-flower: set_window_geometry(0, 0, 200, 200), no protocol.
+        assert_eq!(decorator((0, 0), false), Decorator::ProbablySystem);
+    }
+
+    /// §22's Firefox, from a toolkit that shares no code with weston's. The
+    /// inset is not square, which is why this is two numbers and not one.
+    #[test]
+    fn firefox_under_client_side_decorations() {
+        assert_eq!(decorator((26, 23), false), Decorator::ProbablyItself);
+    }
+
+    /// One axis is enough.
+    #[test]
+    fn a_margin_on_one_side_only_still_counts() {
+        assert_eq!(decorator((0, 23), false), Decorator::ProbablyItself);
+        assert_eq!(decorator((26, 0), false), Decorator::ProbablyItself);
+    }
+
+    /// A client that spoke a decoration protocol is never guessed about, even
+    /// when it has a shadow — Firefox under `--decorations client` is exactly
+    /// that, and it is drawing its own bar *because it was told to*.
+    #[test]
+    fn negotiation_beats_the_correlate() {
+        assert_eq!(decorator((26, 23), true), Decorator::Negotiated);
+        assert_eq!(decorator((0, 0), true), Decorator::Negotiated);
+    }
+
+    /// A negative inset is not a shadow. `set_window_geometry` is clamped to
+    /// the surface by smithay long before this, so this is a guard against the
+    /// arithmetic rather than against a client — but `!= 0` would call it a
+    /// shadow and that would be wrong.
+    #[test]
+    fn a_negative_origin_is_not_a_margin() {
+        assert_eq!(decorator((-4, -4), false), Decorator::ProbablySystem);
+    }
+
+    /// The two §33 clients under both of §31's arrangements, which is the whole
+    /// table and the reason `bars` is a pair rather than a property of the
+    /// client.
+    #[test]
+    fn the_verdict_reverses_when_the_caption_is_folded() {
+        let terminal = decorator((32, 32), false);
+        let flower = decorator((0, 0), false);
+
+        // `--decorations server`: what the user photographed.
+        assert_eq!(bars(terminal, false), Bars::Two);
+        assert_eq!(bars(flower, false), Bars::OneSystem);
+
+        // `--decorations tabs`: the terminal becomes right and the flower
+        // becomes wrong. Same two clients, same compositor, one flag.
+        assert_eq!(bars(terminal, true), Bars::OneClient);
+        assert_eq!(bars(flower, true), Bars::None);
+    }
+
+    /// A client that negotiated is never given a verdict, under either
+    /// arrangement: it agreed to what it is doing.
+    #[test]
+    fn a_negotiated_client_is_not_judged() {
+        let fx = decorator((26, 23), true);
+        assert_eq!(bars(fx, false), Bars::Agreed);
+        assert_eq!(bars(fx, true), Bars::Agreed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,7 +50,6 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
-#include <wchar.h>
 
 /* Set-1 scan codes for the letters this probe can type. Positional, so this
  * table says where a key is and not what is printed on it — the same claim the
@@ -215,45 +214,42 @@ static void wheel(int notches)
 	SendInput(1, &in, sizeof in);
 }
 
-/* ADDED FOR §37. `FindWindowW` returns the *first* window of a class, and on the
- * guest more than one compositor is routinely running — every worktree
- * registers `WaycomposeToplevel`. A probe that injected into somebody else's
- * window would produce a green run about a process nobody was testing, which is
- * the same failure `wc-desktop.sh`'s `comp_pid` exists to prevent from the other
- * end. With `--pid` the search walks the class chain and takes the first
- * visible window that belongs to the process named; without it, the old
- * behaviour exactly. */
-struct hunt {
-	const wchar_t *cls;
-	DWORD pid;
-	HWND found;
-};
+/* ADDED FOR §33. Which process the window must belong to, or 0 for "any".
+ *
+ * `FindWindowW(cls, NULL)` returns *a* window of the class, and on this guest
+ * that is not enough: several worktrees drive the same desktop at once and
+ * every one of their compositors registers `WaycomposeToplevel`. A probe that
+ * takes the first match steals the focus of somebody else's run and injects
+ * into their client, which presents as this run's compositor ignoring input —
+ * the same misdiagnosis `wc-desktop.sh`'s `comp_pid` exists to prevent, one
+ * program later. */
+static DWORD want_pid;
 
-static BOOL CALLBACK pick(HWND h, LPARAM param)
+static BOOL CALLBACK pick(HWND h, LPARAM lp)
 {
-	struct hunt *hu = (struct hunt *)param;
+	const wchar_t *cls = (const wchar_t *)lp;
 	wchar_t got[128] = L"";
 	DWORD owner = 0;
 
 	if (!IsWindowVisible(h))
 		return TRUE;
 	GetClassNameW(h, got, 128);
-	if (wcscmp(got, hu->cls))
+	if (wcscmp(got, cls) != 0)
 		return TRUE;
 	GetWindowThreadProcessId(h, &owner);
-	if (hu->pid && owner != hu->pid)
+	if (want_pid && owner != want_pid)
 		return TRUE;
-	hu->found = h;
+	target = h;
 	return FALSE;
 }
 
-static HWND find_target(const wchar_t *cls, DWORD pid, int seconds)
+static HWND find_target(const wchar_t *cls, int seconds)
 {
 	for (int i = 0; i < seconds * 10; i++) {
-		struct hunt hu = { cls, pid, NULL };
-		EnumWindows(pick, (LPARAM)&hu);
-		if (hu.found)
-			return hu.found;
+		target = NULL;
+		EnumWindows(pick, (LPARAM)cls);
+		if (target)
+			return target;
 		Sleep(100);
 	}
 	return NULL;
@@ -269,8 +265,6 @@ int main(int argc, char **argv)
 	 * client that draws its own title bar draws it at the top, and the whole
 	 * of §37 is about a click near the top landing in the wrong row. */
 	int at_x = -1, at_y = -1;
-	/* Which process's window to take, or 0 for the first of the class. */
-	long only_pid = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--log") && i + 1 < argc) {
@@ -300,12 +294,15 @@ int main(int argc, char **argv)
 				printf("probe-input: --at wants X,Y in client-area pixels\n");
 				return 2;
 			}
-		} else if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
-			only_pid = atol(argv[++i]);
 		} else if (!strcmp(argv[i], "--class") && i + 1 < argc) {
 			MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, cls, 128);
 		} else if (!strcmp(argv[i], "--wait") && i + 1 < argc) {
 			wait = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
+			/* See `find_target`: on a contended guest the class
+			 * alone selects somebody else's window as often as
+			 * ours. */
+			want_pid = (DWORD)strtoul(argv[++i], NULL, 10);
 		} else {
 			printf("probe-input: unknown argument %s\n", argv[i]);
 			return 2;
@@ -323,7 +320,7 @@ int main(int argc, char **argv)
 		do_mouse = 0;
 	}
 
-	target = find_target(cls, (DWORD)only_pid, wait);
+	target = find_target(cls, wait);
 	if (!target) {
 		printf("probe-input: no visible window of class '%ls' after %d s\n",
 		       cls, wait);
@@ -368,9 +365,31 @@ int main(int argc, char **argv)
 		GetClassNameW(fg, fgcls, 128);
 	printf("probe-input: attached=%d foreground=%p (class '%ls') focus=%p target=%p\n",
 	       (int)attached, (void *)fg, fgcls, (void *)GetFocus(), (void *)target);
-	if (fg != target)
-		printf("probe-input: WARNING the target is not the foreground window; "
-		       "injected input will go elsewhere\n");
+	if (fg != target) {
+		/* ADDED FOR §33. **Refused, not warned.** This used to print and
+		 * carry on, and on a guest several agents are driving that is
+		 * not a warning, it is a program about to type into somebody
+		 * else's window: `SendInput` goes to whatever has the
+		 * foreground, and during a §33 run that was another worktree's
+		 * `weston-terminal` running `htop`. The harness then
+		 * photographed *our* window, which of course showed nothing
+		 * typed, and the picture went into `docs/` as evidence about
+		 * this compositor.
+		 *
+		 * `SetForegroundWindow` is allowed to fail — Windows refuses it
+		 * for a process that is not already foreground and whose
+		 * `AttachThreadInput` did not win the race — so this is an
+		 * ordinary outcome on a busy desktop and the right answer is to
+		 * do nothing and say so. Exit 4 so the caller can tell it from
+		 * "no window found" (1). */
+		printf("probe-input: REFUSED to inject: the foreground window is %p, not our "
+		       "target %p -- input would go to another process\n",
+		       (void *)fg, (void *)target);
+		fflush(stdout);
+		if (attached)
+			AttachThreadInput(self, owner, FALSE);
+		return 4;
+	}
 	fflush(stdout);
 
 	/* The point to click, in client-area coordinates and then in screen
