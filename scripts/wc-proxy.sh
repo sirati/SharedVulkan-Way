@@ -539,6 +539,41 @@ run_cost() {
   else
     bad "no configuration produced a measurement"
   fi
+
+  # **The table is now checked and not only printed**, and that is §27's
+  # doing. `--copy damage` is the scope the guest runs; `--copy buffer` copies
+  # the whole extent every commit and is therefore the ceiling — no scope that
+  # copies a *subset* of a buffer may cost more than copying all of it.
+  #
+  # `weston-presentation-shm` damages its whole buffer every frame, so the two
+  # should land within noise of each other, and for six stages they did. Then a
+  # damage-tracking change made `damage` copy 8583 MiB against `buffer`'s 128
+  # for the same 700 commits — 51x — and this harness reported **37 passed, 0
+  # failed**, because six numbers were printed for a human who was not looking.
+  # A measurement nothing asserts on is a measurement that has stopped being a
+  # test, which is the same lesson §14.9 drew about comments.
+  #
+  # 1.5x rather than 1.0x: the two scopes copy the same pixels here but not the
+  # same *bytes* — `copy_damage` skips the padding between rows when a rectangle
+  # is not full-width, and the commit counts differ run to run because the
+  # client is timed rather than counted. The bound is loose enough never to be
+  # noise and tight enough that the regression above fails it by 34x.
+  local per_scope
+  for transport in shared-file arena; do
+    local mib_buffer mib_damage
+    mib_buffer=$(awk -v t="$transport" '$1==t && $2=="buffer" {print $7}' "$RUNDIR/cost.txt")
+    mib_damage=$(awk -v t="$transport" '$1==t && $2=="damage" {print $7}' "$RUNDIR/cost.txt")
+    if [ -z "$mib_buffer" ] || [ -z "$mib_damage" ]; then
+      note "$transport: no buffer/damage pair to compare"
+      continue
+    fi
+    per_scope=$(awk -v d="$mib_damage" -v b="$mib_buffer" 'BEGIN { printf "%.2f", (b > 0 ? d / b : 999) }')
+    if awk -v r="$per_scope" 'BEGIN { exit !(r <= 1.5) }'; then
+      ok "$transport: damage copied ${mib_damage} MiB against buffer's ${mib_buffer} (${per_scope}x) -- the subset is not more expensive than the whole"
+    else
+      bad "$transport: damage copied ${mib_damage} MiB against buffer's ${mib_buffer} (${per_scope}x); a scope that copies part of a buffer must not cost more than copying all of it"
+    fi
+  done
 }
 
 case "${1:-all}" in

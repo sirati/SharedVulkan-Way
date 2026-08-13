@@ -346,7 +346,7 @@ struct Surface {
     /// damage-scoped copy would leave the rows nobody damaged holding whatever
     /// the previous tenant of those arena bytes wrote.
     needs_full_copy: bool,
-    /// Per-buffer arrears, and the fix for docs/design.md §27.
+    /// Per-buffer arrears, and the fix for docs/waycompose-design.md §27.
     ///
     /// `wl_surface.damage` is defined against the **surface**: it is what
     /// changed on screen since the last commit, not what the client wrote into
@@ -1798,7 +1798,35 @@ impl Session {
                     _ if full => copy_extent(src, dst, &info, usable),
                     Stale::Everything => copy_extent(src, dst, &info, usable),
                     Stale::Rects(rects) if rects.is_empty() => 0,
-                    Stale::Rects(rects) => copy_damage(src, dst, &info, &rects, usable),
+                    // **Never pay more than the extent.** `copy_damage` copies
+                    // overlapping rectangles twice, deliberately, because
+                    // computing their union costs more than the duplicate copy
+                    // when there are two of them. Arrears can make there be
+                    // sixty, and sixty copies of the same rectangle is sixty
+                    // times the buffer.
+                    //
+                    // Measured, and it is the regression this branch shipped
+                    // for one commit: `weston-presentation-shm` damages its
+                    // whole 250x250 buffer every frame and cycles buffers, so a
+                    // buffer coming back round owed one full-buffer rectangle
+                    // per intervening frame. `scripts/wc-proxy.sh cost` went
+                    // from 168 MiB to 8583 MiB for the same 700 commits — 13
+                    // MiB per copy of a 244 KiB buffer — and every assertion in
+                    // that harness still passed, because the table is printed
+                    // and not checked.
+                    //
+                    // The bound is exact rather than a heuristic: the sum of
+                    // the rectangle areas is precisely what `copy_damage` will
+                    // move, so comparing it against the extent picks the
+                    // cheaper of the two every time and can never be wrong by
+                    // more than the padding between rows.
+                    Stale::Rects(rects) => {
+                        if damage_area(&rects, &info) >= extent_area(&info) {
+                            copy_extent(src, dst, &info, usable)
+                        } else {
+                            copy_damage(src, dst, &info, &rects, usable)
+                        }
+                    }
                 }
             }
         };
@@ -1902,6 +1930,22 @@ fn copy_extent(src: &[u8], dst: &mut [u8], info: &BufferInfo, usable: usize) -> 
     }
     dst[start..end].copy_from_slice(&src[start..end]);
     end - start
+}
+
+/// How many pixels `copy_damage` would move for `damage`, overlaps counted as
+/// many times as they would be copied — which is the point, because that is the
+/// number being compared against the extent.
+fn damage_area(damage: &[Rect], info: &BufferInfo) -> i64 {
+    damage
+        .iter()
+        .filter_map(|r| r.clip(info.width, info.height))
+        .map(|r| i64::from(r.w) * i64::from(r.h))
+        .sum()
+}
+
+/// The pixels in one buffer's extent.
+fn extent_area(info: &BufferInfo) -> i64 {
+    i64::from(info.width.max(0)) * i64::from(info.height.max(0))
 }
 
 /// Copy only the damaged rows of one buffer.
