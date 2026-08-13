@@ -14134,20 +14134,26 @@ argument for that work.
 This section is mechanism, tested, and not yet deployed. Leaving that vague
 would be worse than the TCP path it replaces, so:
 
-1. **No Windows `open_virtio_port`.** `stream.rs`'s is `#[cfg(target_os =
-   "linux")]` and opens `/dev/virtio-ports/<name>`. The Windows spelling is
-   `\\.\Global\<name>` via `CreateFileW`, and `winpipe.rs` already has that
-   machinery. `PortWake` and `serve_port` are written against `Read`/`Write`
-   precisely so filling this gap changes nothing in `vdoorbell`.
+1. ~~No Windows `open_virtio_port`.~~ **Done** — `winpipe::open_virtio_port`
+   opens `\\.\Global\<name>` with the same `CreateFileW(OPEN_EXISTING)` as
+   `Pipe::connect`, minus the `WaitNamedPipeW` retry, which on a port that is
+   not a named pipe fails with `ERROR_INVALID_NAME` rather than waiting. It is
+   compiled but **not exercised**: no Windows guest has opened one, because that
+   needs the QMP hot-add on testhost. `PortWake` and `serve_port` are written
+   against `Read`/`Write`, which is why filling this gap changed nothing in
+   `vdoorbell` — the port type was the only platform-specific thing in it.
 2. **No QMP hot-add.** Nobody has written `chardev-add`/`device_add`, and it
    needs root on the machine QEMU lives on. The development guest did not need
    it — its ports are declared in `nix/guest.nix` and it can be rebooted freely
    — so the hot-add remains the untested half of §36.7's finding. What is now
    known is that a second port on the existing controller *works*, which is the
    part the hot-add was going to establish.
-3. **No bring-up wiring.** `install_cross_wake` on both sides and a `Doorman`
-   per process. Everything under it is measured; nothing above it calls it yet,
-   so no running session is faster than it was.
+3. ~~No bring-up wiring.~~ **Done for the Vulkan half** — `sv-gpu-server guest
+   --bell <port>` and the ICD's `SV_BELL`, both optional, both degrading to a
+   warning. A real application's commands now cross a real hypervisor with a
+   doorbell under them. What is *not* done is showing that it made anything
+   faster in an application: see §36.10, where the instrument turned out to be
+   inadequate and the numbers say so.
 4. **The host half is done; the guest half is not.** `wc-proxy --upstream-ring
    <control-region>` claims a ring per client and pumps it, with the
    0/1/5/20 ms poll ladder described above. `wc-compositor`'s Wayland thread
@@ -14219,3 +14225,67 @@ On this branch, post-merge, five consecutive runs: **82 binaries, 1302 tests, 0
 failed binaries**, every time. The binary count is the thing that would have
 made the earlier 138 unmistakable in the moment rather than a week later —
 anything reporting a total should report how many binaries contributed to it.
+
+### 36.10 The doorbell is wired, and `vulkaninfo` cannot measure it
+
+§36.8 item 3 said "everything under the doorbell is measured; nothing above it
+calls it yet". That is now false, and the part of it that is now true is worth
+separating carefully from the part that is not.
+
+**Wired.** `sv-gpu-server guest --bell <port>` attaches a [`Doorman`] on the
+guest's second virtio-serial port after the control region is stamped; the ICD
+attaches to the host end of the same chardev when `SV_BELL` names it. Both are
+optional and both degrade to a warning, because a session without a doorbell is
+exactly the session that shipped and refusing to start because an *optimisation*
+is unavailable would be worse than not having built it. `scripts/sv-guest-e2e.sh
+--bell` runs the whole cross-VM topology with it, and both halves say so:
+
+```
+[gpu] doorbell attached on /dev/virtio-ports/org.sirati.svbell.0
+[icd] doorbell attached on /tmp/sv-guest/bell.sock
+cross-VM: PASS — the application read a driver that lives in another kernel
+```
+
+So a real Vulkan application's commands now cross a real hypervisor with a
+doorbell under them. That is the data path finished for the Vulkan half.
+
+**And it cannot be measured this way.** Six runs each, app-side wall clock, ms:
+
+| | samples | median | min | max |
+|---|---|---|---|---|
+| no doorbell | 167 146 93 398 264 148 | 157.5 | 93 | 398 |
+| doorbell | 111 115 111 346 267 770 | 191 | 111 | 770 |
+
+The median is *worse* with the doorbell and the ranges overlap almost entirely.
+**That is not a regression; it is an inadequate instrument**, and saying so is
+the only honest reading of those numbers. Three reasons, all identifiable
+without a better experiment:
+
+1. **`vulkaninfo --summary` is setup, not round trips.** It enumerates and
+   exits. The waits the doorbell shortens are a small part of what the timer
+   spans, and process startup, loader enumeration and arena import are most of
+   the rest. For scale, the *locate* in the same run took 166.72 ms — larger
+   than the whole quantity being measured, and outside the timer.
+2. **The baseline already has the ladder.** §36.6.1 shortened the first slice
+   from 20 ms to 25 µs, so "no doorbell" is not the 20 ms behaviour that cost
+   216.9 ms a present; it is the already-16×-better behaviour. The delta being
+   looked for here is ladder→doorbell, which is much smaller than
+   slice→doorbell.
+3. **Each sample includes a VM boot**, on a workstation several agents share.
+   A 4× spread within one condition is the machine.
+
+**What the latency evidence still is**: §36.6.3's ~9 µs against a 20 ms slice,
+measured directly and with a same-kernel control. Nothing here weakens that, and
+nothing here confirms it in an application either.
+
+**What a real measurement needs**, so that the next person does not repeat this:
+a command-heavy workload with a *fixed, known* number of round trips; timing
+taken in-process around the calls rather than around the process; the parker's
+`first_slice` settable at run time so that fixed-slice, ladder and doorbell are
+three conditions of one experiment rather than three builds; and enough
+repetitions to state a median with a spread. `frame-200` is the right shape of
+workload and is the obvious candidate.
+
+This is recorded as a section rather than deleted because a measurement that
+failed to resolve its effect is a result, and an unrecorded one gets taken
+again.

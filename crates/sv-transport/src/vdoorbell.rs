@@ -264,6 +264,72 @@ impl Drop for Doorman {
     }
 }
 
+/// Wire both halves of the doorbell onto one already-open port, and install it.
+///
+/// This is the whole bring-up, and it is one call because getting it wrong in
+/// two places was the likely alternative: the writer must be installed as the
+/// process's [`CrossWake`] *and* a reader thread must be answering, or the
+/// doorbell is half-built in a way that presents as "no faster than before"
+/// rather than as an error.
+///
+/// # One port, two threads, and why that is not the deadlock the docs warn about
+///
+/// [`crate::stream::open_virtio_port`] warns that **two descriptors** on one
+/// port deadlock — the driver serialises them, and a reader blocked in one stops
+/// the other making progress. That is about two `open()` calls. This takes one
+/// open handle and `try_clone`s it, which dups the descriptor and shares the
+/// *same open file description*: one reader thread and one writer thread on one
+/// description is ordinary, and it is what every socket in this tree already
+/// does.
+///
+/// The distinction matters enough to state, because "do not use the port from
+/// two threads" would be the wrong lesson to take from that warning and would
+/// make a doorbell impossible — a doorbell is by construction a thing you write
+/// while something else is blocked reading.
+pub fn attach(port: PortHandle, control: Arc<Control>) -> std::io::Result<Doorman> {
+    let (reader, writer) = port.split()?;
+    crate::park::install_cross_wake(Some(Arc::new(PortWake::new(writer)) as Arc<dyn CrossWake>));
+    Ok(Doorman::spawn(reader, control))
+}
+
+/// A port that can be split into a reader and a writer over one description.
+///
+/// Three shapes, because the port is a different type on each side and the
+/// bring-up should not care: a `File` on the Linux guest, a `UnixStream` on the
+/// host (the chardev's socket end), and a `Pipe` on the Windows guest.
+pub enum PortHandle {
+    /// `/dev/virtio-ports/<name>`, from [`crate::stream::open_virtio_port`].
+    File(std::fs::File),
+    /// The host end of the QEMU `-chardev socket`.
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl PortHandle {
+    /// Open the guest end by port name. Linux guest.
+    #[cfg(target_os = "linux")]
+    pub fn guest_port(name: &str) -> std::io::Result<PortHandle> {
+        crate::stream::open_virtio_port(name).map(PortHandle::File)
+    }
+
+    /// Connect to the host end of the chardev.
+    pub fn host_socket(path: &str) -> std::io::Result<PortHandle> {
+        std::os::unix::net::UnixStream::connect(path).map(PortHandle::Unix)
+    }
+
+    fn split(self) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+        Ok(match self {
+            PortHandle::File(f) => {
+                let w = f.try_clone()?;
+                (Box::new(f), Box::new(w))
+            }
+            PortHandle::Unix(s) => {
+                let w = s.try_clone()?;
+                (Box::new(s), Box::new(w))
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
