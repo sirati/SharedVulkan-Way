@@ -298,6 +298,30 @@ impl BufferInfo {
     }
 }
 
+/// How far one buffer's copy in the shared region has fallen behind the
+/// client's own copy of it.
+///
+/// See `Surface::stale` for why a per-buffer answer is needed at all.
+#[derive(Clone, Debug)]
+enum Stale {
+    /// Nothing is known about what the client has written into it — it has
+    /// never been attached to this surface, or the rectangle list grew past
+    /// the point where tracking it is cheaper than copying the extent. Copy
+    /// the whole extent.
+    Everything,
+    /// Every rectangle the *surface* has changed since this buffer's copy was
+    /// last brought up to date. Empty means the copy is current.
+    Rects(Vec<Rect>),
+}
+
+/// Past this many rectangles, the union is close enough to the extent that
+/// tracking it costs more than copying it. Firefox's scroll damage is one or
+/// two rectangles a frame and a buffer comes back round every two or three
+/// frames, so the real number is single digits; this only bounds the pathology
+/// of a buffer that is allocated, damaged around for a thousand frames and
+/// then attached once.
+const STALE_RECT_CAP: usize = 64;
+
 #[derive(Default)]
 struct Surface {
     pending_buffer: Option<u32>,
@@ -322,6 +346,54 @@ struct Surface {
     /// damage-scoped copy would leave the rows nobody damaged holding whatever
     /// the previous tenant of those arena bytes wrote.
     needs_full_copy: bool,
+    /// Per-buffer arrears, and the fix for docs/design.md §27.
+    ///
+    /// `wl_surface.damage` is defined against the **surface**: it is what
+    /// changed on screen since the last commit, not what the client wrote into
+    /// the buffer it is attaching. For a compositor that reads the buffer those
+    /// are interchangeable, because the attached buffer is required to hold the
+    /// whole current surface content. For a proxy that keeps a *copy* of each
+    /// buffer they are not, and the gap is exactly one buffer cycle: a client
+    /// that double-buffers puts the surface's full content into the back buffer
+    /// every frame, so its copy here is stale everywhere the surface changed
+    /// while the *other* buffer was on screen — and the client will never
+    /// mention those rectangles again.
+    ///
+    /// So each commit's damage is filed against every buffer of this surface,
+    /// and attaching one pays off its whole arrears rather than only this
+    /// frame's. Keyed on buffer id, which is also why a buffer that migrates to
+    /// another surface starts at `Everything` there and is copied whole: the
+    /// arrears are a property of the pair.
+    stale: HashMap<u32, Stale>,
+}
+
+impl Surface {
+    /// File `damage` against every buffer except `attached`, and hand back what
+    /// `attached` now owes — this frame's damage included.
+    fn arrears(&mut self, attached: u32, damage: &[Rect]) -> Stale {
+        for (id, stale) in self.stale.iter_mut() {
+            if *id == attached {
+                continue;
+            }
+            if let Stale::Rects(rects) = stale {
+                if rects.len() + damage.len() > STALE_RECT_CAP {
+                    *stale = Stale::Everything;
+                } else {
+                    rects.extend_from_slice(damage);
+                }
+            }
+        }
+        match self.stale.insert(attached, Stale::Rects(Vec::new())) {
+            // First sight of this buffer on this surface: nothing is known
+            // about what is in it, and the first commit of a buffer has nothing
+            // in the region yet either.
+            None | Some(Stale::Everything) => Stale::Everything,
+            Some(Stale::Rects(mut rects)) => {
+                rects.extend_from_slice(damage);
+                Stale::Rects(rects)
+            }
+        }
+    }
 }
 
 /// What the run did, for the report and for the harness.
@@ -378,6 +450,20 @@ pub struct Stats {
     pub fds_from_arena: u64,
     pub messages_client: u64,
     pub messages_server: u64,
+    /// §27, and only with `--verify-damage`. Commits whose copy was
+    /// checked against the client's own bytes.
+    pub verified: u64,
+    /// Of those, the ones where the region did **not** match — the number that
+    /// has to be zero, and the one that was not.
+    pub stale_commits: u64,
+    /// The worst single commit's count of disagreeing rows, which is what a
+    /// user sees as the height of the wrong band.
+    pub stale_rows_worst: u64,
+    /// Commits the check could not be applied to, because they attached no
+    /// buffer. Reported rather than dropped: it is the number that says how
+    /// much of the traffic the check has nothing to say about, and a check
+    /// whose coverage is unstated is a check nobody can size.
+    pub verify_skipped: u64,
 }
 
 impl Stats {
@@ -393,11 +479,22 @@ impl Stats {
         } else {
             "no copies".to_owned()
         };
+        // One grep-able line, with the number a harness can assert on spelled
+        // out even when it is zero — a check that only prints when it fails is
+        // indistinguishable from a check that never ran.
+        let verify = if self.verified > 0 || self.verify_skipped > 0 {
+            format!(
+                "; verified {} commits ({} state-only, unverifiable), {} stale (worst {} rows)",
+                self.verified, self.verify_skipped, self.stale_commits, self.stale_rows_worst
+            )
+        } else {
+            String::new()
+        };
         format!(
             "{} commits, {} copies, {mb:.2} MiB in {ms:.1} ms ({per}); \
              {} pools ({} released, {} reclaimed, {} republished, {} resizes, {} overflows, \
              {} refusals, {} attaches deferred); {} fds in, {} out{}; \
-             {} client msgs, {} server msgs",
+             {} client msgs, {} server msgs{verify}",
             self.commits,
             self.copies,
             self.pools_created,
@@ -536,7 +633,6 @@ pub struct Session {
     app_ids: Vec<String>,
     /// STAGE 16. Events this proxy invents for its own client, drained by the
     /// pump. Today there is exactly one kind: `wl_display.delete_id`.
-    ///
     /// # Why a proxy invents an event at all
     ///
     /// Because it now destroys objects the client still believes it owns, and
@@ -557,9 +653,23 @@ pub struct Session {
     /// STAGE 16. Whether the "nothing could be reclaimed" line has been said
     /// since the last time something was. See [`Session::reclaim_for`].
     pressure_noted: bool,
+    /// §27. After every copy, compare the attached buffer's visible rows in the
+    /// region against the client's own, and count the ones that differ.
+    /// The oracle is exact and it is the protocol's: between `commit` and
+    /// `wl_buffer.release` the client may not touch the buffer it attached, and
+    /// the attached buffer must hold the whole current surface content. So
+    /// immediately after the copy, "the region and the client disagree" has
+    /// exactly one cause — this proxy did not copy enough — and no race.
+    ///
+    /// Off by default and never on in a real run: it reads the whole extent
+    /// every commit, which is the cost `CopyScope::Damage` exists to avoid.
+    /// That makes it an instrument for correctness and not for cadence, and
+    /// docs/design.md §13.8's retraction is the reason to write that down: an
+    /// instrument inside the loop being timed produced a 2x that was really
+    /// 1.03x. Nothing here may be used to time anything.
+    verify: bool,
 }
 
-/// How recently a pool must have been used to be safe from the reclaimer.
 ///
 /// STAGE 16. Reclamation is demand-driven — nothing is taken back while there
 /// is room — so this is not a timer, it is a guard against thrash: a pool in
@@ -598,6 +708,7 @@ impl Session {
             to_client: Vec::new(),
             proxy_destroyed: std::collections::HashSet::new(),
             pressure_noted: false,
+            verify: false,
         }
     }
 
@@ -617,6 +728,11 @@ impl Session {
         self.to_client
             .extend_from_slice(&wire::message(1, op::DISPLAY_DELETE_ID, &id.to_ne_bytes()));
         self.objects.forget(id);
+    }
+
+    /// Turn the post-copy check on. See `Session::verify`.
+    pub fn set_verify(&mut self, on: bool) {
+        self.verify = on;
     }
 
     /// Log every message as it is walked. See the `trace` field.
@@ -738,6 +854,7 @@ impl Session {
                 };
                 let id = wire::word_at(body, &spans[0]).unwrap_or(0);
                 self.buffers.insert(id, b);
+                self.forget_buffer_arrears(id);
                 if let Some(pool) = self.pools.get_mut(&header.object) {
                     pool.buffers += 1;
                 }
@@ -812,6 +929,7 @@ impl Session {
                     }
                     self.release_pool_if_done(b.pool);
                 }
+                self.forget_buffer_arrears(header.object);
             }
             ("wl_surface", op::SURFACE_DESTROY) => {
                 self.surfaces.remove(&header.object);
@@ -934,7 +1052,7 @@ impl Session {
     ///
     /// The old version of this function noted the failure and moved on, and
     /// docs/design.md §17.8 described the consequence as "the client's window
-    /// stops updating". **That was wrong, and §19.2 is the correction.** An
+    /// stops updating". **That was wrong, and §20.2 is the correction.** An
     /// unannounced pool is an object the compositor does not have; the very
     /// next `wl_shm_pool.create_buffer` was forwarded to it anyway, and a
     /// request on an unknown object is a protocol error. The compositor dropped
@@ -1535,7 +1653,7 @@ impl Session {
         // STAGE 16: `!upstream()` rather than `region.is_none()`. A resize
         // forwarded to a pool the compositor is in the middle of destroying is
         // a request on an object that may already be gone, which is the same
-        // fatal shape as the `create_buffer` in §19.2.
+        // fatal shape as the `create_buffer` in §20.2.
         let deferred = !pool.upstream();
         if pool.upstream()
             && let Some(region) = &pool.region
@@ -1557,12 +1675,29 @@ impl Session {
         deferred
     }
 
+    /// Drop every surface's record of what buffer `id` owes.
+    ///
+    /// Called from both ends of a buffer's life, and the *creation* end is the
+    /// one that is load-bearing. `wl_display.delete_id` retires ids for reuse
+    /// — this proxy implements that deliberately (`delete_id_retires_an_id_for_
+    /// reuse`) — so id 12 can be a fresh buffer a frame after the old id 12 was
+    /// destroyed. A leftover "owes nothing" against a buffer whose extent has
+    /// never been copied would skip the one copy that had to happen, and it
+    /// would do it only on clients that recycle ids, which is the worst kind of
+    /// bug to find later.
+    fn forget_buffer_arrears(&mut self, id: u32) {
+        for surface in self.surfaces.values_mut() {
+            surface.stale.remove(&id);
+        }
+    }
+
     /// The frame path: apply the pending state and move the pixels.
     fn commit(&mut self, surface_id: u32) {
         self.stats.commits += 1;
         let Some(surface) = self.surfaces.get_mut(&surface_id) else {
             return;
         };
+        let attached_now = surface.pending_attached;
         if surface.pending_attached {
             surface.current = surface.pending_buffer;
             surface.pending_attached = false;
@@ -1608,6 +1743,31 @@ impl Session {
         };
         let usable = src.len().min(dst.len()).min(pool.size);
 
+        // Deliberately after every early return above: settling this buffer's
+        // arrears is only honest if the copy that settles them actually
+        // happens. `surfaces` is a different field from `pools` and
+        // `transport`, so this borrow is disjoint from `src` and `dst`.
+        let owed = match self.scope {
+            CopyScope::Damage => self
+                .surfaces
+                .get_mut(&surface_id)
+                .map_or(Stale::Everything, |s| s.arrears(buffer_id, &damage)),
+            // The other two scopes copy the extent or the pool every commit, so
+            // no buffer can fall behind and there is nothing to track.
+            _ => Stale::Everything,
+        };
+
+        // Only for the diagnostic below, and only when it is switched on: the
+        // shape of what was owed, before it is consumed.
+        let owed_kind = if self.verify {
+            match &owed {
+                Stale::Everything => "extent".to_owned(),
+                Stale::Rects(r) => format!("{} rects", r.len()),
+            }
+        } else {
+            String::new()
+        };
+
         let started = Instant::now();
         let copied = match self.scope {
             CopyScope::Pool => {
@@ -1615,32 +1775,117 @@ impl Session {
                 usable
             }
             CopyScope::Buffer => copy_extent(src, dst, &info, usable),
-            // STAGE 16: `full` forces the whole extent. After a gap in which
-            // nothing was copied — a refused pool, or a pool rebuilt into
-            // different arena bytes — the client's damage is declared against a
-            // state the compositor does not have, and honouring it would leave
-            // the undamaged rows holding the previous tenant's pixels.
             CopyScope::Damage => {
-                if full || damage.is_empty() {
-                    // An empty damage list on a commit with a buffer attached
-                    // means the client asserted nothing changed. Taking it at
-                    // its word is what the protocol means; second-guessing it
-                    // would defeat the point of damage tracking. But the
-                    // *first* commit of a buffer has nothing in the region yet,
-                    // so a buffer whose extent has never been copied is copied
-                    // whole regardless of what the client said.
-                    copy_extent(src, dst, &info, usable)
-                } else {
-                    copy_damage(src, dst, &info, &damage, usable)
+                // Not `damage` — what *this buffer's* copy owes, which is this
+                // frame's damage plus every frame's since it was last on
+                // screen. An empty result means the client asserted nothing
+                // has changed anywhere since this buffer was last copied, and
+                // taking it at its word is what the protocol means; the
+                // second-guessing that used to live here was hiding the arrears
+                // bug for single-buffered clients only.
+                //
+                // STAGE 16 adds one override, and it is a different fact from
+                // arrears. §27's `Stale` tracks what changed on the *surface*
+                // since this buffer was last copied, which is exactly right
+                // while the copy's destination stays put. It does not — a pool
+                // refused for want of room and later published, or one this
+                // stage's reclaimer tore down and rebuilt, lands in *different
+                // arena bytes*, and the previous tenant's pixels are in them.
+                // No amount of surface damage describes that, so the first copy
+                // after such a gap is the whole extent. See
+                // `Surface::needs_full_copy`.
+                match owed {
+                    _ if full => copy_extent(src, dst, &info, usable),
+                    Stale::Everything => copy_extent(src, dst, &info, usable),
+                    Stale::Rects(rects) if rects.is_empty() => 0,
+                    Stale::Rects(rects) => copy_damage(src, dst, &info, &rects, usable),
                 }
             }
         };
+        // Deliberately outside the timed span above: this is an instrument, and
+        // §13.8's retracted throughput number is what happens when one is left
+        // inside the measurement.
         self.stats.copy_nanos += started.elapsed().as_nanos() as u64;
+        // **Only a commit that attached a buffer can be checked**, and this is
+        // the instrument's own correctness rather than a convenience.
+        //
+        // A commit with no `attach` is a state-only commit — an `ack_configure`,
+        // an opaque region, a subsurface position — and it does not change what
+        // the surface shows. It also does not re-take ownership of the current
+        // buffer, which the compositor released frames ago, so the client is
+        // very likely drawing the *next* frame into it at this exact moment.
+        // Comparing then measures the client's work in progress and reports a
+        // difference that is nobody's fault. Measured before it was believed:
+        // applied to every commit, a *fixed* proxy still reported 91 stale of
+        // 936 on a scrolling Firefox, and every one logged in full carried no
+        // damage and no arrears — a commit that attached nothing. Gated, the
+        // same build reports 0 of 1360 and the pre-fix build still reports 3 of
+        // 1509, which is what says the gate removed noise and not the finding.
+        // That is also why the two are counted separately below rather than one
+        // being quietly dropped.
+        if self.verify {
+            if !attached_now {
+                self.stats.verify_skipped += 1;
+            } else {
+                let stale = stale_rows(src, dst, &info, usable);
+                self.stats.verified += 1;
+                if stale > 0 {
+                    self.stats.stale_commits += 1;
+                    self.stats.stale_rows_worst = self.stats.stale_rows_worst.max(stale as u64);
+                    // The first few in full. A count says a bug exists; these
+                    // say which one, and twenty is enough to see a pattern
+                    // without turning a 4000-commit run into a 4000-line log.
+                    if self.stats.stale_commits <= 20 {
+                        self.notes.push(format!(
+                            "stale: surface {surface_id} buffer {buffer_id} \
+                             {}x{} stride {} offset {} -- {stale} rows differ after copying \
+                             {owed_kind} (this commit damaged {} rects, first {:?})",
+                            info.width,
+                            info.height,
+                            info.stride,
+                            info.offset,
+                            damage.len(),
+                            damage.first(),
+                        ));
+                    }
+                }
+            }
+        }
         if copied > 0 {
             self.stats.copies += 1;
             self.stats.bytes_copied += copied as u64;
         }
     }
+}
+
+/// How many of the attached buffer's rows the region disagrees with the client
+/// about. Zero is the only acceptable answer; see `Session::verify`.
+///
+/// Only `width * 4` bytes of each row are compared. The rest of the stride is
+/// padding the client never draws and the compositor never reads, and
+/// `copy_damage` copies it only incidentally, when a rectangle happens to be
+/// full-width — so comparing it would report a difference that no eye could
+/// ever see and no code could ever use.
+fn stale_rows(src: &[u8], dst: &[u8], info: &BufferInfo, usable: usize) -> usize {
+    let (Ok(base), Ok(stride), Ok(width)) = (
+        usize::try_from(info.offset),
+        usize::try_from(info.stride),
+        usize::try_from(info.width),
+    ) else {
+        return 0;
+    };
+    let mut stale = 0;
+    for row in 0..info.height.max(0) as usize {
+        let from = base + row * stride;
+        let to = from + width * 4;
+        if to > usable || to > src.len() || to > dst.len() {
+            break;
+        }
+        if src[from..to] != dst[from..to] {
+            stale += 1;
+        }
+    }
+    stale
 }
 
 /// Copy the whole of one buffer's extent within the pool.

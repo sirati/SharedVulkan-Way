@@ -7,7 +7,7 @@
 #
 # # Why this exists, and why it is not `wc-firefox.sh` with a smaller number
 #
-# docs/design.md §19.2 is a correction to §17.8. §17.8 said that an arena with
+# docs/design.md §20.2 is a correction to §17.8. §17.8 said that an arena with
 # no room for a pool would leave "the client's window stops updating" — a
 # compositor that looks frozen. It does not. The pool goes unannounced, the
 # client's next `wl_shm_pool.create_buffer` is forwarded to a compositor that
@@ -32,7 +32,7 @@
 # Starving it further (`WC_ARENA_MIB=12`) is a different and much harsher test:
 # there the largest pool is bigger than the whole arena, so the client's main
 # surface can never be given memory at all and no policy can save it. That case
-# is worth running and is not worth asserting on -- see §19.7.
+# is worth running and is not worth asserting on -- see §20.7.
 set -u
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -112,7 +112,7 @@ verdict() {
   died=$(count 'channel error|Compositor .* crashed' "$dir/fx.log")
   refusals=$(count 'could not publish' "$dir/proxy.log")
   # The compositor's own words for "you sent a request about an object I do not
-  # have", which is §19.2's failure and the one thing this run can decide.
+  # have", which is §20.2's failure and the one thing this run can decide.
   unknown=$(count 'invalid object|Invalid object|no known interface' "$dir/srv.log")
   reclaimed=$(grep -aoE '[0-9]+ reclaimed' "$dir/proxy.log" 2>/dev/null \
     | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}')
@@ -160,19 +160,19 @@ main() {
       && ok "$label: the arena really did run out ($refusals refusal(s)) -- the run is a test of the response" \
       || bad "$label: nothing was refused, so this run measures nothing; lower WC_ARENA_MIB"
     # 2. The policy this stage is about ran in anger: guest memory came back
-    #    from a client that never asked to give it up. This is §19.5, and it is
+    #    from a client that never asked to give it up. This is §20.5, and it is
     #    the assertion the stage exists for.
     [ "$reclaimed" -gt 0 ] \
-      && ok "$label: $reclaimed pool(s) reclaimed without the client asking -- §19.5's policy ran" \
+      && ok "$label: $reclaimed pool(s) reclaimed without the client asking -- §20.5's policy ran" \
       || bad "$label: nothing was reclaimed under real pressure"
-    # 3. The specific desync of §19.2 is gone: an unbacked pool's requests are
+    # 3. The specific desync of §20.2 is gone: an unbacked pool's requests are
     #    absorbed, so the compositor never reports an unknown object. The unit
     #    tests assert the messages directly; this asserts the compositor's own
     #    verdict on them.
     [ "$survived" -eq 0 ] \
       && ok "$label: the compositor reported no request on an object it does not have" \
       || bad "$label: $survived unknown-object error(s) -- a message about an unbacked pool crossed"
-    # 4. What is NOT asserted, and §19.7 says why: whether the connection
+    # 4. What is NOT asserted, and §20.7 says why: whether the connection
     #    survives to the end, and whether a window is ever painted. Under Wine
     #    in a bare ssh session this compositor cannot create a window at all
     #    ("Invalid window handle", os error 1400), so a run here composites

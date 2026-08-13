@@ -411,7 +411,7 @@ impl SharedBacking {
 /// # STAGE 16, and it is a choice so that the choice could be measured
 ///
 /// Stage 12's allocator is [`Policy::FirstFit`] and it fragmented under a video
-/// (docs/design.md §19.3): `arena 0 has no run of 2342912 bytes (3932160 free,
+/// (docs/design.md §20.3): `arena 0 has no run of 2342912 bytes (3932160 free,
 /// largest 1744896)`. Two-thirds more free space than the request, in pieces
 /// none of which was big enough.
 ///
@@ -419,7 +419,7 @@ impl SharedBacking {
 /// the code rather than on a measurement, which is the §8.4 rule. So the old
 /// policy stays, reachable by `--arena-policy first-fit`, and
 /// `a_video_sized_churn_fragments_first_fit_and_not_the_default` runs the same
-/// synthetic churn through both in one process. §19.4 has the matrix that chose
+/// synthetic churn through both in one process. §20.4 has the matrix that chose
 /// between six candidates, and it is worth reading before changing this,
 /// because **the obvious answer was wrong**: rounding requests to size classes,
 /// TLSF-style, made every occupancy *worse*, and what did the work was
@@ -433,7 +433,7 @@ pub enum Policy {
     /// granularity, as before — the change is entirely in *which* run is
     /// chosen and from which end it is cut.
     ///
-    /// Two independent halves, both measured in §19.4's matrix:
+    /// Two independent halves, both measured in §20.4's matrix:
     ///
     /// * **Best fit.** The smallest adequate run rather than the lowest. First
     ///   fit shaves the low end of whatever large run it meets first, so a
@@ -450,7 +450,7 @@ pub enum Policy {
     ///
     /// The two together refuse nothing at the occupancy where first fit refuses
     /// 62 pools, and a fifth as many at the occupancy where first fit refuses
-    /// 633 (§19.4).
+    /// 633 (§20.4).
     #[default]
     BestFitSegregated,
 }
@@ -1343,7 +1343,7 @@ mod tests {
             assert!(
                 new_fail <= old_fail,
                 "at {live_max} live pools the default refused {new_fail} against first fit's \
-                 {old_fail}: the new policy is worse here and the matrix in §19.4 is wrong"
+                 {old_fail}: the new policy is worse here and the matrix in §20.4 is wrong"
             );
         }
     }
