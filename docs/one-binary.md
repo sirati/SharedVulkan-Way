@@ -1,6 +1,7 @@
 # One binary per side: the Wayland compositor inside the Vulkan program
 
-**Status: design, plus the first two pieces built. Written 2026-08-13.**
+**Status: merged. One workspace, `sv-guest` builds in all three feature
+configurations, 1125 tests green. Written 2026-08-13.**
 
 The brief, in the user's words, twice:
 
@@ -68,7 +69,7 @@ they are separate commits.
 ### After you rebase, run this rather than only `cargo test`
 
 ```
-cargo test --workspace                    # 1123 at the time of writing
+cargo test --workspace                    # 1125 at the time of writing
 bash scripts/wc-proxy.sh                  # 37/0 — the regression gate that matters
 ```
 
@@ -142,18 +143,31 @@ the physical merge should happen and what has to be true first.
 
 ## 0. Status in one paragraph
 
-Two things are built and are in this worktree: `sv_arena::handle`, which is
-`firefox-accel.md` §7's shared handle as a type that cannot represent a
-descriptor, and `sv_arena::shared`, which is one allocator serving several
-consumers with disjoint reserved windows. Together they are the part of the
-unification that makes shared handles *possible*, and they were chosen first
-because they are purely additive — they relocate no file, so none of the branches
-in flight (§8) becomes harder to merge. Two facts were measured that the split
-had made nobody check: **the whole arena stack already cross-compiles clean for
-`x86_64-pc-windows-gnu`**, and so does `sv-gpu-server`. There is no technical
-obstacle to the unified guest binary; the obstacle was only ever that the source
-lives in two repositories. Nothing here has been run on the guest, no frame has
-yet travelled by handle, and §8 says plainly what remains.
+**The two trees are one tree.** waycompose's full history is merged in;
+`crates/wc-*` and `vendor/*` are at the paths they always had; `wc-arena-host`
+is deleted; and `sv-guest` is one binary that is the Vulkan GPU server and the
+Wayland compositor, in all three feature configurations —
+`default`, `--features gpu` alone (exactly the old `sv-gpu-server`), and
+`--features wayland` alone (exactly the old `wc-compositor.exe`).
+**1125 tests, 0 failed; clippy clean.** Two pieces of the arena unification are
+built: `sv_arena::handle`, `firefox-accel.md` §7's shared handle as a type that
+cannot represent a descriptor, and `sv_arena::shared`, one allocator serving
+several consumers with disjoint reserved windows. Three definitions of `4096`
+across two repositories are now one.
+
+Two facts were measured that the split had made nobody check: **the whole arena
+stack already cross-compiles clean for `x86_64-pc-windows-gnu`**, and so does
+`sv-gpu-server`. The Windows gate was never what kept the trees apart; source
+reachability was.
+
+**What is NOT done, plainly.** `sv-host` — the symmetric outside-the-VM binary —
+is designed in §2 and not built. `wc_proxy::pool::Alloc` is not yet reconciled
+onto `SharedArena`: only the constant is shared, the free lists are still two
+(§3.1a says which part of that must *stay* two). `PfnLocator` is not wired, so
+`design.md` §0.14's 2.308 s → 0.064 s is measured but not yet in the product.
+And **no frame has travelled by handle** — the halves are one process and one
+build, which is the prerequisite, not the result. §8.5 is the standing caveat
+and it still applies.
 
 ---
 
@@ -379,6 +393,56 @@ a disjointness argument mean anything:
 | `Present` | the GPU side | the compositor | `svPresentBlit`'s destination — §4's whole subject |
 | `Inbound` | the host side | the compositor | pixels copied in from an unmodified `wl_shm` client (§5.2) |
 | `Outbound` | the compositor | the host side | keymaps and other server-minted objects (waycompose §14.8) |
+
+### 3.1a What is unified, and what must NOT be
+
+**Unify the granularity and the free-list code. Do not unify the ranges.** This
+is a correctness point rather than a preference, and it is easy to get wrong
+precisely because unifying looks obviously right everywhere else in this
+document.
+
+`wc_handle::arena`'s outbound window allocates only from a **tail sub-range that
+the pool allocator is explicitly told to exclude** — `reserve_outbound` shortens
+the pool allocator's free list, and the reserved size travels in the plan. The
+two ranges are separate on purpose (waycompose §14.5): one holds client pixels,
+the other holds objects the compositor has already handed to clients and which
+are **still live**. One free list over the whole arena would let a client's pool
+be allocated on top of a live keymap, silently — and that is the class of bug
+that has cost this project the most, because it produces wrong pixels rather
+than an error.
+
+[`Role`] is the shape that keeps them apart, and the distinction is the word
+*removed*: a window is taken **out of** the free list, not recorded beside it.
+`windows_do_not_overlap_and_the_general_pool_cannot_reach_them` drains the
+general pool completely and asserts that nothing it returns lands in any window,
+which is the test that fails if a future change makes a window advisory.
+
+### 3.1b The failure policy: the outbound side's manners, not the pool side's
+
+The two allocators being unified do not fail the same way, and the difference is
+not cosmetic.
+
+- `wc_handle::arena::give` returns `OutOfMemory` **with both the requested and
+  the available size in the message**. That propagates through `create_shared`
+  to smithay's `SealedFile::with_data`, and `state.rs` catches it: the seat comes
+  up **without a keyboard**, logging `seat0 has no keyboard: …`. Degraded, alive,
+  and it says why.
+- The pool allocator's exhaustion **closes the connection**. The user hit exactly
+  this today: Firefox died instantly on a YouTube video.
+
+**The unified allocator must have the outbound side's manners.** `Error::OutOfArena`
+already carries `{ requested, largest_free }` — §5.2 calls it "a normal condition
+rather than a fault" — so the type is right and what must not regress is the
+*caller* discipline: arena exhaustion is a thing a compositor survives in a
+degraded state, not a thing that kills a client. A client that dies on a full
+arena turns a capacity problem into a crash report about Firefox.
+
+**Not yet done:** the reconciliation of `wc_proxy::pool::Alloc` onto
+[`SharedArena`] itself. Only the *constant* is unified so far (§1.1); the free
+lists are still two. `scripts/wc-arena-pressure.sh` — the stage-16 fragmentation
+reproduction — is the gate that has to stay green across that change, because a
+synthetic pattern that fragments the old allocator is the only way to show the
+new one is not a regression.
 
 ### 3.2 Two properties the type enforces rather than documents
 
