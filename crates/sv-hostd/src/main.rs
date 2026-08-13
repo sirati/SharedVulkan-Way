@@ -5,9 +5,15 @@
 //! ```
 //!
 //! One extent, any number of clients. Each client that connects gets an
-//! [`Attachment`] describing the two views and the descriptor to map them from,
-//! passed by `SCM_RIGHTS` — the same handoff the real deployment uses, which is
-//! why the container harness exercises it rather than sharing a path.
+//! `Attachment` describing the two views and **the name of the object to map
+//! them from**, which it opens itself — design.md §1a. No descriptor crosses,
+//! which is what lets the same handoff work when the peer is a VM.
+//!
+//! Each client replies `Accept` once it has opened the object. The daemon waits
+//! for that before it counts the client served, and unlinks the name only when
+//! it exits: unlinking releases the *name*, not the memory, so a client that has
+//! opened is unaffected — but a client that has not opened yet would find
+//! nothing, and the reply is what rules that race out.
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
@@ -20,22 +26,22 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// The daemon opens a memfd and passes descriptors over a Unix socket, and
-/// neither exists on Windows. design.md requires either side to be either OS,
-/// and the *app* side is the one that runs `sv-hostd`; a Windows app side would
-/// need a named-pipe and `DuplicateHandle` implementation of exactly this file.
+/// The daemon creates a `/dev/shm` object and serves a Unix socket, and neither
+/// is spelled that way on Windows. design.md requires either side to be either
+/// OS, and the *app* side is the one that runs `sv-hostd`; a Windows app side
+/// needs a named section and a named pipe — and, since §1a, **no
+/// `DuplicateHandle`**, because the peer opens the section by name.
 #[cfg(not(target_os = "linux"))]
 fn main() -> std::process::ExitCode {
-    eprintln!("sv-hostd: the daemon is Linux-only; a Windows app side needs a named-pipe handoff");
+    eprintln!("sv-hostd: the daemon is Linux-only; a Windows app side needs a named-section handoff");
     std::process::ExitCode::FAILURE
 }
 
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
     use sv_hostd::{Hostd, demo_geometry};
-    use sv_transport::cold::{ColdMessage, recv, send_with_fd};
+    use sv_transport::cold::{ColdMessage, recv, send};
 
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| -> Option<String> {
@@ -90,6 +96,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         hostd.runs.len(),
         generation
     );
+    eprintln!("sv-hostd: shared object {} (opened by name; no descriptor is passed)", hostd.object);
 
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -100,26 +107,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..clients {
         let (sock, _) = listener.accept()?;
-        let (msg, _) = recv(&sock)?;
+        let msg = recv(&sock)?;
         match msg {
             ColdMessage::AttachRequest => {
-                let mut buf = Vec::new();
-                ColdMessage::Attach(hostd.attachment()).encode(&mut buf)?;
-                send_with_fd(&sock, &buf, Some(hostd.fd.as_fd()))?;
-                eprintln!("sv-hostd: client {i} attached");
+                send(&sock, &ColdMessage::Attach(hostd.attachment()))?;
+                // Wait for the client to say it has the object open. Only then
+                // is the name safe to unlink, and only then is "attached" true.
+                // A dead client must not hang the daemon, so the wait has a
+                // deadline — R4 applied to the handoff.
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                match recv(&sock) {
+                    Ok(ColdMessage::Accept { generation: g }) => {
+                        eprintln!("sv-hostd: client {i} attached by name, generation {g}");
+                    }
+                    Ok(other) => eprintln!("sv-hostd: client {i} said {other:?} rather than Accept"),
+                    Err(e) => eprintln!("sv-hostd: client {i} never acknowledged the name: {e}"),
+                }
             }
             other => {
-                let mut buf = Vec::new();
-                ColdMessage::Refuse { code: 1, reason: format!("expected AttachRequest, got {other:?}") }
-                    .encode(&mut buf)?;
-                send_with_fd(&sock, &buf, None)?;
+                send(
+                    &sock,
+                    &ColdMessage::Refuse {
+                        code: 1,
+                        reason: format!("expected AttachRequest, got {other:?}"),
+                    },
+                )?;
             }
         }
-        // The client keeps the descriptor; dropping our end of the socket is
-        // fine, because the memfd is refcounted by the kernel and the client's
-        // copy holds it alive independently.
+        // The client holds its own descriptor on the named object now, so
+        // dropping our end of the socket costs it nothing.
     }
-    eprintln!("sv-hostd: served {clients} client(s), exiting");
+    // The name has done its job: every client acknowledged, and each holds its
+    // own descriptor. Released here rather than only in `Hostd::drop` so that a
+    // daemon killed after this point leaves nothing behind in `/dev/shm` —
+    // `Drop` does not run for `SIGKILL`, and 64 MiB of tmpfs that outlives the
+    // process until the next reboot is the kind of leak a memfd could not have.
+    sv_transport::region::shm_unlink(&hostd.object);
+    eprintln!("sv-hostd: served {clients} client(s), released the name, exiting");
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -264,23 +288,29 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 ///  4. serve the stitched view to ICD processes over an ordinary Unix socket.
 ///
 /// Step 4 is where the two topologies converge. The ICD receives an
-/// `Attachment` and a descriptor exactly as it does from `Mode::Local`, and it
-/// never learns that the pages behind that descriptor are another machine's RAM
-/// found by sweeping thirteen gigabytes for a magic number.
+/// `Attachment` and a *name* exactly as it does from `Mode::Local`, and it never
+/// learns that the pages behind that name are another machine's RAM found by
+/// sweeping thirteen gigabytes for a magic number.
 ///
-/// **The descriptor handed to the ICD is not the memfd.** It cannot be: the
-/// extent is scattered through QEMU's backing object and the ICD needs one flat
-/// region whose offsets match the guest's. So the daemon stitches the runs into
-/// its own contiguous view and re-publishes *that* as a memfd of its own, which
-/// is the one place this design copies rather than shares — and it does not:
-/// the stitched view is `MAP_SHARED` over the same pages, so the memfd the ICD
-/// maps is the guest's memory reached through a second set of page tables.
+/// **The name is QEMU's backing object, and the ICD opens it itself**
+/// (`qemu::backend_name`): the `mem-path` when the guest is on
+/// `memory-backend-file`, and `/proc/<qemu-pid>/fd/<n>` when it is on
+/// `memory-backend-memfd`. design.md §1a calls the second case legal and says
+/// what it costs — it is a same-machine name, so it may only ever be given to
+/// the *app* side, which is where every reader of it is. The GPU side is inside
+/// the VM and never receives a name at all: it locates its own memory by content
+/// (§5.1), which is the strongest possible form of "no descriptor crosses".
+///
+/// The extent is scattered through that object, so the ICD also needs the run
+/// list — one `mmap` per run into one reservation. That is design.md §3's "hands
+/// **name + runs** to the ICDs", and it is a different boundary from §5.7's "the
+/// run list does not cross the wire", which is about guest↔host.
 #[cfg(target_os = "linux")]
 fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::fd::AsFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use sv_hostd::locate;
-    use sv_transport::cold::{Attachment, ColdMessage, recv, send_with_fd};
+    use sv_transport::cold::{Attachment, ColdMessage, recv, send};
     use sv_transport::region::PAGE;
     use sv_transport::stream::{read_message, write_message};
 
@@ -389,13 +419,11 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // sent only after the check above has passed.
     write_message(&mut port, &ColdMessage::Accept { generation: hello.generation })?;
 
-    // Serve the ICD. What it gets is a descriptor for the *stitched* view, not
-    // for QEMU's backing object: the extent is scattered through that object and
-    // an application needs one flat region whose offsets match the guest's.
-    //
-    // The descriptor is a memfd this daemon owns whose pages are the guest's,
-    // because `attach` mapped the runs `MAP_SHARED` into it — so nothing is
-    // copied and the ICD's `vkMapMemory` returns a pointer into the VM's RAM.
+    // Serve the ICD. What it gets is the *name* of QEMU's backing object and the
+    // run list; it opens the object and stitches its own flat view, whose
+    // offsets match the guest's. Nothing is copied: the runs are mapped
+    // `MAP_SHARED`, so the ICD's `vkMapMemory` returns a pointer into the VM's
+    // RAM.
     let runs_for_wire: Vec<sv_transport::cold::AttachRun> = hostd
         .runs
         .runs()
@@ -417,6 +445,8 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let attachment = Attachment {
+        object: hostd.object.clone(),
+        arena_object: hostd.object.clone(),
         control_offset: 0,
         control_len: hello.extent.control_pages * PAGE as u64,
         arena_offset: hello.extent.control_pages * PAGE as u64,
@@ -442,36 +472,48 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
-    eprintln!("sv-hostd: listening on {path} for {clients} ICD client(s)");
+    eprintln!(
+        "sv-hostd: listening on {path} for {clients} ICD client(s); \
+         they open {} by name",
+        attachment.object
+    );
     for i in 0..clients {
         let (sock, _) = listener.accept()?;
-        let (msg, _) = recv(&sock)?;
+        let msg = recv(&sock)?;
         match msg {
             ColdMessage::AttachRequest => {
-                let mut buf = Vec::new();
-                ColdMessage::Attach(attachment.clone()).encode(&mut buf)?;
-                // QEMU's own descriptor, not a copy of anything: the ICD maps
-                // the guest's RAM directly. What it needs on top is the run
-                // list, because a scattered extent has no single descriptor
-                // whose `mmap` reproduces it — design.md §3's "hands **fd +
-                // runs** to the ICDs", which is a different boundary from
-                // §5.7's "the run list does not cross the wire".
-                send_with_fd(&sock, &buf, Some(hostd.fd.as_fd()))?;
+                // QEMU's object by name, not a descriptor and not a copy: the
+                // ICD opens it and maps the guest's RAM directly. What it needs
+                // on top is the run list, because a scattered extent has no
+                // single offset whose `mmap` reproduces it.
+                send(&sock, &ColdMessage::Attach(attachment.clone()))?;
                 if attachment.run_count != 0 {
-                    let mut buf = Vec::new();
-                    ColdMessage::Runs(runs_for_wire.clone()).encode(&mut buf)?;
-                    send_with_fd(&sock, &buf, None)?;
+                    send(&sock, &ColdMessage::Runs(runs_for_wire.clone()))?;
+                }
+                // The same acknowledgement `Mode::Local` waits for. Nothing here
+                // needs unlinking — the object is QEMU's — but a client that
+                // could not open the name should say so *here*, where the
+                // daemon can print it, rather than dying three layers up with
+                // `NotConnected`.
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                match recv(&sock) {
+                    Ok(ColdMessage::Accept { .. }) => {}
+                    Ok(other) => eprintln!("sv-hostd: ICD client {i} said {other:?}"),
+                    Err(e) => eprintln!("sv-hostd: ICD client {i} never acknowledged: {e}"),
                 }
                 eprintln!(
-                    "sv-hostd: ICD client {i} attached ({} run(s))",
+                    "sv-hostd: ICD client {i} attached by name ({} run(s))",
                     hostd.runs.len()
                 );
             }
             other => {
-                let mut buf = Vec::new();
-                ColdMessage::Refuse { code: 1, reason: format!("expected AttachRequest, got {other:?}") }
-                    .encode(&mut buf)?;
-                send_with_fd(&sock, &buf, None)?;
+                send(
+                    &sock,
+                    &ColdMessage::Refuse {
+                        code: 1,
+                        reason: format!("expected AttachRequest, got {other:?}"),
+                    },
+                )?;
             }
         }
     }

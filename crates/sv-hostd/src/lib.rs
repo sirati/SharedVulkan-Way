@@ -10,9 +10,13 @@
 //! > degenerates to "create a memfd, `ftruncate`, hand it out"**, which is why
 //! > steps 1–6 of §13 need no VM at all.
 //!
+//! The last sentence of that quote is marked superseded in §3 as of §1a: "hand
+//! it out" meant `SCM_RIGHTS`, and what the daemon hands out now is a *name*.
+//! Everything else in it still holds.
+//!
 //! # Two modes, one daemon, and the second is not a mock
 //!
-//! - [`Mode::Local`] creates the memfd itself. This serves the same-machine
+//! - [`Mode::Local`] creates the named object itself. This serves the same-machine
 //!   development loop **and the Linux-host/Linux-guest topology**, where the two
 //!   sides are separate processes — or separate containers — on one kernel and
 //!   there is no hypervisor to hide the layout. The extent is contiguous in the
@@ -30,18 +34,29 @@
 //!   only then pointed at the production machine.
 //!
 //! The distinction the two modes share, and the reason they are one daemon:
-//! **everything above the run list is identical**. The client receives a
-//! descriptor and a file descriptor, maps two views, and never learns whether
-//! the extent was one `mmap` or forty-seven thousand (§5.3, §5.7).
+//! **everything above the run list is identical**. The client receives an
+//! `Attachment` and a *name*, opens the object itself, maps two views, and never
+//! learns whether the extent was one `mmap` or forty-seven thousand (§5.3,
+//! §5.7).
+//!
+//! # What the daemon does not do any more: pass a descriptor
+//!
+//! design.md §1a: **no file descriptor or handle ever crosses between the app
+//! side and the GPU side**, and a name crossing — which the peer then opens
+//! itself — is the mechanism that replaces it. This daemon used to hand its
+//! memfd out over `SCM_RIGHTS`. It now creates a *named* object under
+//! `/dev/shm` in [`Mode::Local`], and in [`Mode::Qemu`] it publishes the name of
+//! QEMU's backing object ([`qemu::backend_name`]). Both are text, both fit down
+//! a byte stream, and the daemon's own descriptor never leaves the process.
 //!
 //! # Why the daemon proper is Linux-only
 //!
-//! `sv-hostd` runs on the **app side**, and its job is to own a memfd and pass
-//! descriptors over a Unix socket. Neither primitive exists on Windows, so
-//! everything below that touches one is gated. What stays portable is the part
-//! that is genuinely about the protocol — the geometry, the identity and the
-//! publication step — because a Windows app side would reimplement the handoff
-//! with a named pipe and `DuplicateHandle` and reuse the rest unchanged.
+//! `sv-hostd` runs on the **app side**, and its job is to own a shared object
+//! and publish its name over a socket. What is Linux-specific is now only the
+//! *spelling* — `/dev/shm` and `/proc` — rather than the mechanism, and that is
+//! a real narrowing: a Windows app side needs a named section and a named pipe
+//! and **no `DuplicateHandle`**, exactly as `sv-gpu-server`'s Windows half
+//! already demonstrates.
 //!
 //! That split is checked by `cargo check --target x86_64-pc-windows-gnu`, which
 //! is why it is a `cfg` and not a comment.
@@ -52,8 +67,6 @@ use sv_arena::extent::{
 };
 #[cfg(target_os = "linux")]
 use sv_transport::cold::Attachment;
-#[cfg(target_os = "linux")]
-use sv_transport::region::memfd;
 use sv_transport::control::{Control, Geometry, ProtocolIds};
 use sv_transport::region::{PAGE, SharedRegion};
 use std::sync::Arc;
@@ -66,7 +79,8 @@ pub mod qemu;
 /// How the daemon obtained the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// The daemon created the backing itself: development loop, and the
+    /// The daemon created the backing itself — a **named** object under
+    /// `/dev/shm` — and hands out its name: development loop, and the
     /// Linux/Linux topology.
     Local,
     /// The extent is guest RAM, reached through QEMU's memory backend and
@@ -81,8 +95,30 @@ pub struct Hostd {
     pub geometry: Geometry,
     pub extent: Extent,
     pub runs: RunList,
+    /// The daemon's **own** descriptor on the object. It is never given away —
+    /// design.md §1a — and exists so the daemon can map and verify the extent
+    /// before it tells anyone the name.
     pub fd: std::os::fd::OwnedFd,
+    /// The name a client opens for itself: a `/dev/shm` path on [`Mode::Local`],
+    /// QEMU's backing name on [`Mode::Qemu`] ([`qemu::backend_name`]).
+    pub object: String,
+    /// Whether this daemon created `object` and must therefore unlink it.
+    /// False for [`Mode::Qemu`], where the object is the hypervisor's.
+    pub owns_name: bool,
     pub generation: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Hostd {
+    fn drop(&mut self) {
+        // Releasing the *name*, not the memory: every client that opened it
+        // holds its own descriptor and its mappings stay valid. Doing it here
+        // rather than on an exit path means a daemon that dies of an error
+        // leaves nothing behind in `/dev/shm` either.
+        if self.owns_name {
+            sv_transport::region::shm_unlink(&self.object);
+        }
+    }
 }
 
 /// Errors that are the daemon's rather than the transport's.
@@ -131,12 +167,24 @@ impl Hostd {
         let arena_len = geometry.arena_size;
         let total = control_len + arena_len;
 
-        // `MFD_ALLOW_SEALING` is not decoration: without it this memfd can never
-        // be wrapped by udmabuf, and a Linux GPU side needs a dma-buf because
-        // RADV and NVIDIA both refuse a shared host pointer (sv_arena::import).
-        // The flag has to be passed at creation, so a daemon that omitted it
-        // would have foreclosed the AMD path before the first allocation.
-        let fd = memfd("sv-arena", total)?;
+        // **A named object, not a memfd** (design.md §1a). A memfd has no name,
+        // so the only way to give one to the GPU side is `SCM_RIGHTS`, and a
+        // descriptor may not cross the boundary — on the topology this mode
+        // stands in for, the GPU side is a VM and there is nothing for a
+        // descriptor to cross.
+        //
+        // The name carries the run id so that two daemons on one machine cannot
+        // collide, and so that a leftover from a crash is identifiable.
+        //
+        // What this costs, measured and not guessed: a `/dev/shm` object cannot
+        // be sealed, so it can never be wrapped by `/dev/udmabuf`. The old
+        // comment here said `MFD_ALLOW_SEALING` "is not decoration" because it
+        // kept the AMD dma-buf path open; that path is closed on this handoff
+        // and the reason is in design.md §0.7. It is *not* closed on the
+        // cross-VM handoff, where the object is QEMU's own sealed memfd.
+        let object = sv_transport::region::shm_path(&format!("arena.{run_id:016x}"));
+        let file = sv_transport::region::shm_create(&object, total)?;
+        let fd = std::os::fd::OwnedFd::from(file);
 
         let extent = contiguous_extent(run_id, 0, control_len, arena_len)?;
         let locator = ContiguousLocator { file_offset: 0 };
@@ -146,7 +194,16 @@ impl Hostd {
         // client discover it at the 1048577th mapping.
         runs.check_map_count(max_map_count())?;
 
-        Ok(Hostd { mode: Mode::Local, geometry, extent, runs, fd, generation })
+        Ok(Hostd {
+            mode: Mode::Local,
+            geometry,
+            extent,
+            runs,
+            fd,
+            object,
+            owns_name: true,
+            generation,
+        })
     }
 
     /// Attach to an extent the *guest* allocated, located by content.
@@ -189,21 +246,38 @@ impl Hostd {
         // it as an `OwnedFd` so the mapping outlives the discovery.
         use std::os::fd::{AsFd, OwnedFd};
         let fd: OwnedFd = target.file.as_fd().try_clone_to_owned().map_err(HostdError::Io)?;
+        // The name a client will open. It is QEMU's, so this daemon must not
+        // unlink it.
+        let object = qemu::backend_name(&target.fd_path);
         let geometry = Geometry {
             control_size: desc.control_pages * PAGE as u64,
             arena_size: desc.arena_pages * PAGE as u64,
             ..Geometry::default()
         };
         Ok((
-            Hostd { mode: Mode::Qemu, geometry, extent, runs, fd, generation },
+            Hostd {
+                mode: Mode::Qemu,
+                geometry,
+                extent,
+                runs,
+                fd,
+                object,
+                owns_name: false,
+                generation,
+            },
             target.regions,
             report,
         ))
     }
 
-    /// The message a client gets, alongside the descriptor.
+    /// The message a client gets. It carries a **name**, not a descriptor.
     pub fn attachment(&self) -> Attachment {
         Attachment {
+            object: self.object.clone(),
+            // One object, two sub-ranges — §4.1's two independent mappings, from
+            // one name. The provider that needs two objects is the quarantined
+            // one, and this daemon is not it.
+            arena_object: self.object.clone(),
             control_offset: 0,
             control_len: self.geometry.control_size,
             arena_offset: self.geometry.control_size,
@@ -233,6 +307,21 @@ pub fn map_views(
     let control = SharedRegion::map_fd(fd, a.control_offset, a.control_len as usize)?;
     let arena = SharedRegion::map_fd(fd, a.arena_offset, a.arena_len as usize)?;
     Ok((Arc::new(control), Arc::new(arena)))
+}
+
+/// Open the object the [`Attachment`] names, and map the two views from it.
+///
+/// The client's whole half of the handoff, in one call: **a name in, two
+/// mappings out**, and no descriptor anywhere. Every attaching process in the
+/// project goes through this — the ICD, `sv-gpu-server attach`, `sv-loopback` —
+/// so "open it yourself" is written once.
+#[cfg(target_os = "linux")]
+pub fn open_and_map_views(
+    a: &Attachment,
+) -> sv_transport::Result<(Arc<SharedRegion>, Arc<SharedRegion>)> {
+    use std::os::fd::AsFd;
+    let file = sv_transport::region::open_named(&a.object)?;
+    map_views(file.as_fd(), a)
 }
 
 /// A geometry small enough for a test or a container demo to finish quickly,
@@ -286,6 +375,7 @@ mod tests {
         assert_eq!(h.runs.len(), 1);
         assert_eq!(h.runs.bytes(), h.total_len());
         let a = h.attachment();
+        assert!(a.object.starts_with("/dev/shm/sv."), "the handoff is a name: {:?}", a.object);
         assert_eq!(a.control_offset, 0);
         assert_eq!(a.arena_offset, g.control_size);
         assert_eq!(a.run_count, 0, "one run is reported as the contiguous case");
@@ -312,6 +402,41 @@ mod tests {
         let mut buf = [0u8; 5];
         control.read_bytes(0, &mut buf).unwrap();
         assert_eq!(&buf, b"\0\0\0\0\0");
+    }
+
+    /// design.md §1a, as the daemon's clients experience it: a *name* is enough.
+    ///
+    /// The client here shares nothing with the daemon but a string — no
+    /// descriptor, no `SCM_RIGHTS`, no `/proc` — and reaches the same pages.
+    /// That is the whole of the handoff and the reason the cold path can be a
+    /// virtio-serial port.
+    #[test]
+    fn a_client_reaches_the_same_pages_from_the_name_alone() {
+        let g = demo_geometry();
+        let h = Hostd::local(g, 0x5eed, 1).unwrap();
+        let at = h.attachment();
+
+        // Everything a client is given, as text.
+        let name = at.object.clone();
+        assert!(!name.is_empty());
+
+        let (_, mine) = open_and_map_views(&at).unwrap();
+        let (_, theirs) = open_and_map_views(&at).unwrap();
+        mine.write_bytes(4096, b"by name").unwrap();
+        let mut out = [0u8; 7];
+        theirs.read_bytes(4096, &mut out).unwrap();
+        assert_eq!(&out, b"by name");
+
+        // And when the daemon goes, the name goes with it.
+        drop(h);
+        assert!(
+            !std::path::Path::new(&name).exists(),
+            "the daemon must unlink the name it created"
+        );
+        // …while the mappings that were already made keep working, which is why
+        // unlinking early is safe once every client has opened.
+        theirs.read_bytes(4096, &mut out).unwrap();
+        assert_eq!(&out, b"by name");
     }
 
     #[test]

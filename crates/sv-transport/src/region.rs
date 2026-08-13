@@ -665,11 +665,99 @@ impl core::fmt::Debug for LockedWindow {
     }
 }
 
+/// Where a named shared-memory object lives on Linux.
+///
+/// `/dev/shm` is the directory `shm_open(3)` itself uses, so a path under it is
+/// a POSIX shared-memory object by any other name — and a path is the more
+/// useful spelling here, because the *other* named object this project opens is
+/// QEMU's memory backend, which is named by a filesystem path and not by an
+/// `shm_open` name. One resolver for both is one code path (see [`open_named`]).
+#[cfg(target_os = "linux")]
+pub const SHM_DIR: &str = "/dev/shm";
+
+/// The name of the shared object for a session, as both sides spell it.
+///
+/// The Linux counterpart of [`crate::winshm::section_name`], and deliberately
+/// the same shape: a name derived from a session string, which each side opens
+/// for itself. Nothing about it crosses a process boundary except as text.
+#[cfg(target_os = "linux")]
+pub fn shm_path(session: &str) -> String {
+    format!("{SHM_DIR}/sv.{session}")
+}
+
+/// Create a **named** shared-memory object of `len` bytes, and return it.
+///
+/// design.md §1a: the arena and the control region are reached by *name*, and
+/// the name is what crosses. This is the Linux half of that rule; the Windows
+/// half is [`crate::winshm::Section::create`], which has worked this way since
+/// the Windows platform layer was written.
+///
+/// # Why this is not a memfd, and what that costs
+///
+/// A memfd has no name, so the only ways to give one to another process are
+/// `SCM_RIGHTS` or `/proc/<pid>/fd/<n>` — the first is a descriptor crossing the
+/// boundary and is forbidden, and the second is a same-machine name that a VM
+/// boundary cannot carry. A file under `/dev/shm` is the same `shmem` memory
+/// with a name attached.
+///
+/// **The cost is sealing, and it is measured rather than assumed.** A file under
+/// `/dev/shm` is created with `F_SEAL_SEAL` already set — `F_GET_SEALS` returns
+/// 1 on this kernel — so `F_ADD_SEALS(F_SEAL_SHRINK)` fails with `EPERM`, and
+/// `/dev/udmabuf` refuses any object that does not carry `F_SEAL_SHRINK`. Only
+/// `memfd_create(MFD_ALLOW_SEALING)` produces a sealable object, and such an
+/// object has no name. So **a named shared-memory object can never back a
+/// udmabuf**, which is what decides that the local-dma-buf answer for RADV
+/// exists in the cross-VM topology (where the object is QEMU's own sealed memfd,
+/// opened by path) and nowhere else. design.md §0.7.
+#[cfg(target_os = "linux")]
+pub fn shm_create(path: &str, len: u64) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Unlink a leftover from a crashed run first: `O_EXCL` would otherwise turn
+    // "the last run died" into "this run cannot start", and the pages of the
+    // stale object are only freed when the last mapping of it goes away anyway.
+    let _ = std::fs::remove_file(path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| Error::Os { call: "open(shm, O_CREAT|O_EXCL)", errno: e.raw_os_error().unwrap_or(0) })?;
+    file.set_len(len)
+        .map_err(|e| Error::Os { call: "ftruncate", errno: e.raw_os_error().unwrap_or(0) })?;
+    Ok(file)
+}
+
+/// Open a named object the peer created, by the name it sent.
+///
+/// The whole of the attaching side's half of the handoff: no descriptor arrives,
+/// a name does, and this process opens it itself. The name is a path so that the
+/// same function serves both objects this project ever opens — a `/dev/shm`
+/// object made by [`shm_create`], and QEMU's memory backend, which `sv-hostd`
+/// names either by its `memory-backend-file` path or by `/proc/<pid>/fd/<n>`.
+#[cfg(target_os = "linux")]
+pub fn open_named(path: &str) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::Os { call: "open(named object)", errno: e.raw_os_error().unwrap_or(0) })
+}
+
+/// Remove the name. Mappings and open descriptors survive it, as they do for
+/// any unlinked file, so this is release of the *name* and not of the memory.
+#[cfg(target_os = "linux")]
+pub fn shm_unlink(path: &str) {
+    let _ = std::fs::remove_file(path);
+}
+
 /// Create a memfd of `len` bytes.
 ///
-/// This is design.md §3's "in the same-machine development loop it degenerates
-/// to *create a memfd, `ftruncate`, hand it out*", and it is the whole of
-/// `sv-hostd`'s dev mode's memory half.
+/// Still here because the *guest-side* provider and the tests want an anonymous
+/// object, and because it is the only sealable one (see [`shm_create`]). It is
+/// no longer what `sv-hostd` hands out: an object nobody can name is an object
+/// that can only be shared by passing a descriptor, and design.md §1a forbids
+/// that across the boundary.
 #[cfg(target_os = "linux")]
 pub fn memfd(name: &str, len: u64) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;

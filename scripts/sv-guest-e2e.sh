@@ -85,17 +85,58 @@ say "starting sv-hostd qemu-serve"
 HOSTD_PID=$!
 
 say "starting the GPU side inside the guest"
-# Typed at the guest's console, because there is no sshd in it — one fewer
-# service to configure, and the console is already a byte stream we own.
-GUEST_CMD="$ROOT/target/debug/sv-gpu-server guest --socket /dev/virtio-ports/org.sirati.svcold.0 --arena $ARENA"
-echo "$GUEST_CMD" > "$RUNDIR/guest-cmd.txt"
+# Left in the shared directory, not typed at the console. `nix/guest.nix`'s
+# `sv-payload` unit waits for `/sv/guest-cmd.sh` and runs it — "a file appearing
+# in a directory is a rendezvous both sides already understand" — and the console
+# cannot serve as one, because the harness is reading the boot log through the
+# same stdio it would have to type into.
+#
+# The binary is **copied** into the shared directory rather than named by its
+# path in this worktree: the guest sees `/nix/store` over 9p and `$RUNDIR` as
+# `/sv`, and nothing else. It is dynamically linked against the store, so a copy
+# runs there unchanged.
+cp "$ROOT/target/debug/sv-gpu-server" "$RUNDIR/sv-gpu-server"
+GUEST_CMD="/sv/sv-gpu-server guest --socket /dev/virtio-ports/org.sirati.svcold.0 --arena $ARENA"
+printf '%s\n' "$GUEST_CMD" > "$RUNDIR/guest-cmd.sh"
 say "  $GUEST_CMD"
 
-echo
-echo "--- run it in the guest console, then watch $RUNDIR/hostd.log ---"
-echo "$GUEST_CMD"
-echo
 [ "$KEEP" = 1 ] && { say "--keep: leaving the VM up. kill $QEMU_PID when done."; exit 0; }
+
+# The app side. This is the check the header describes and the script did not
+# make: `sv-hostd` served nobody, so the run ended when the daemon's client count
+# was never reached. Wait for the daemon to be listening — it prints the name the
+# ICD is to open, which is the §1a handoff in one line — and then run the real
+# loader against our ICD.
+say "waiting for sv-hostd to offer the extent to ICD clients"
+for _ in $(seq 1 300); do
+  grep -q "listening on .* for .* ICD client" "$RUNDIR/hostd.log" 2>/dev/null && break
+  kill -0 $HOSTD_PID 2>/dev/null || break
+  sleep 1
+done
+
+say "vulkaninfo through the real loader, our ICD, and a GPU side in the VM"
+env VK_DRIVER_FILES="$ROOT/target/debug/sv_icd.json" SV_SOCKET="$RUNDIR/icd.sock" \
+  vulkaninfo --summary > "$RUNDIR/app.log" 2>&1
+APP_RC=$?
 wait $HOSTD_PID
+HOSTD_RC=$?
+
+say "----- guest -----"
+sed 's/^/  /' "$RUNDIR/guest.log" 2>/dev/null
 say "----- sv-hostd -----"
-cat "$RUNDIR/hostd.log"
+sed 's/^/  /' "$RUNDIR/hostd.log"
+
+REPORTED=$(grep -m1 "deviceName" "$RUNDIR/app.log" | sed 's/.*= //')
+say "----- app side -----"
+echo "  app side sees: ${REPORTED:-<nothing>}"
+
+echo
+# The guest runs lavapipe, so the application must report llvmpipe. Anything
+# else means it answered from the app side rather than from the VM.
+if [ $APP_RC -eq 0 ] && [ $HOSTD_RC -eq 0 ] && [[ "$REPORTED" == *llvmpipe* ]]; then
+  echo "cross-VM: PASS — the application read a driver that lives in another kernel"
+  exit 0
+fi
+echo "cross-VM: FAIL (app=$APP_RC hostd=$HOSTD_RC device='${REPORTED:-none}')"
+tail -20 "$RUNDIR/app.log" | sed 's/^/  /'
+exit 1

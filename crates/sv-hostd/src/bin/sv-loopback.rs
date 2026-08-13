@@ -1,4 +1,4 @@
-//! `sv-loopback` — the two ends, as two processes, over one memfd.
+//! `sv-loopback` — the two ends, as two processes, over one named object.
 //!
 //! ```text
 //! sv-loopback gpu  --socket <path>     # the owner: publishes, consumes, replies
@@ -14,7 +14,9 @@
 //!
 //! and it is simultaneously the **Linux-host/Linux-guest topology**, not a
 //! stand-in for it. The two processes share nothing but a Unix socket and the
-//! descriptor that crosses it, so they run unchanged in two containers.
+//! *name* that crosses it — design.md §1a — so they run unchanged in two
+//! containers, and would run unchanged either side of a hypervisor if the socket
+//! were a virtio-serial port, because a name is text and a descriptor is not.
 //!
 //! # What it proves that a unit test cannot
 //!
@@ -27,7 +29,7 @@
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("sv-loopback: Linux-only (memfd and SCM_RIGHTS)");
+    eprintln!("sv-loopback: Linux-only (/dev/shm and Unix sockets)");
     std::process::exit(1);
 }
 
@@ -196,14 +198,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Connect to `sv-hostd` and get the descriptor and the view geometry.
+/// Connect to `sv-hostd`, learn the object's **name** and the view geometry, and
+/// map the two views by opening the object ourselves (design.md §1a).
+///
+/// Returns the mappings rather than a descriptor, because a descriptor is no
+/// longer what a client is given and there is nothing left for the caller to do
+/// with one.
 #[cfg(target_os = "linux")]
-fn attach(
-    socket: &str,
-) -> Result<
-    (std::os::fd::OwnedFd, sv_transport::cold::Attachment),
-    Box<dyn std::error::Error>,
-> {
+type Attached = (
+    std::sync::Arc<sv_transport::region::SharedRegion>,
+    std::sync::Arc<sv_transport::region::SharedRegion>,
+    sv_transport::cold::Attachment,
+);
+
+#[cfg(target_os = "linux")]
+fn attach(socket: &str) -> Result<Attached, Box<dyn std::error::Error>> {
     use std::os::unix::net::UnixStream;
     use sv_transport::cold::{ColdMessage, recv, send};
 
@@ -221,14 +230,20 @@ fn attach(
         }
     };
     send(&sock, &ColdMessage::AttachRequest)?;
-    let (msg, fd) = recv(&sock)?;
-    match msg {
-        ColdMessage::Attach(a) => {
-            Ok((fd.ok_or("sv-hostd sent no descriptor")?, a))
+    let at = match recv(&sock)? {
+        ColdMessage::Attach(a) => a,
+        ColdMessage::Refuse { code, reason } => {
+            return Err(format!("refused {code}: {reason}").into());
         }
-        ColdMessage::Refuse { code, reason } => Err(format!("refused {code}: {reason}").into()),
-        other => Err(format!("unexpected {other:?}").into()),
-    }
+        other => return Err(format!("unexpected {other:?}").into()),
+    };
+    // Open it ourselves. Nothing crossed the socket but text.
+    let (control, arena) = sv_hostd::open_and_map_views(&at)
+        .map_err(|e| format!("cannot open {}: {e}", at.object))?;
+    // Tell the daemon, so it knows the name has been resolved and may release
+    // it. Sent after the mapping, which is what makes the answer meaningful.
+    send(&sock, &ColdMessage::Accept { generation: at.generation })?;
+    Ok((control, arena, at))
 }
 
 /// The owner: publishes the control region, consumes commands, replies, and
@@ -239,15 +254,14 @@ fn gpu_side(
     expect_device: usize,
     expect_queue: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::fd::AsFd;
     use sv_arena::canary::{self, CanaryPolicy};
-    use sv_hostd::{demo_geometry, demo_ids, map_views};
+    use sv_hostd::{demo_geometry, demo_ids};
     use sv_transport::control::{Control, REVERSE_RING_SLOT, RingKind, RingStatus};
     use sv_transport::park::{Deadline, SpinYield, wait_until};
     use sv_transport::ring::{Lane, RingConsumer, RingCtrl, RingProducer, barrier_satisfied};
 
-    let (fd, at) = attach(socket)?;
-    let (control_region, arena) = map_views(fd.as_fd(), &at)?;
+    let (control_region, arena, at) = attach(socket)?;
+
     let g = demo_geometry();
     let control = Control::create(control_region, g, demo_ids(), at.generation)?;
     control.stamp_epoch()?;
@@ -410,16 +424,15 @@ fn gpu_side(
 /// The peer: attaches, allocates from the arena, writes patterns, submits.
 #[cfg(target_os = "linux")]
 fn app_side(socket: &str, wait_for_replies: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::fd::AsFd;
     use sv_arena::alloc::ArenaAllocator;
     use sv_arena::canary::CanaryPolicy;
-    use sv_hostd::{demo_geometry, demo_ids, map_views};
+    use sv_hostd::{demo_geometry, demo_ids};
     use sv_transport::control::{Control, Flags, REVERSE_RING_SLOT, RingKind};
     use sv_transport::park::{Deadline, SpinYield, wait_until};
     use sv_transport::ring::{BarrierTracker, Lane, RingConsumer, RingCtrl, RingProducer};
 
-    let (fd, at) = attach(socket)?;
-    let (control_region, arena) = map_views(fd.as_fd(), &at)?;
+    let (control_region, arena, _at) = attach(socket)?;
+
     let g = demo_geometry();
 
     // The owner may not have published yet. `NotReady` is the expected answer

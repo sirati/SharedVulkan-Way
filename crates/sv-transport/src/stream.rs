@@ -8,10 +8,16 @@
 //! > note an fd cannot cross this boundary, so the `SCM_RIGHTS` path in
 //! > `cold.rs` does not apply
 //!
-//! [`crate::cold`]'s `send_with_fd`/`recv_with_fd` are `sendmsg` with
-//! `SCM_RIGHTS`, which is a Unix-domain-socket facility and exists only between
-//! two processes on one kernel. A virtio-serial port is a byte pipe: it carries
-//! bytes and nothing else, in either direction, between a guest and its host.
+//! `cold.rs` used to carry a `sendmsg`/`SCM_RIGHTS` pair, which is a
+//! Unix-domain-socket facility and exists only between two processes on one
+//! kernel. A virtio-serial port is a byte pipe: it carries bytes and nothing
+//! else, in either direction, between a guest and its host.
+//!
+//! **That observation has since been promoted from "this module's reason to
+//! exist" to a rule for the whole project** — design.md §1a — and `cold.rs` has
+//! no ancillary data in it any more. What is left of the distinction is only the
+//! *transport*: this module frames for a character device and `cold.rs` frames
+//! for a socket, and the messages are the same messages.
 //!
 //! # What replaces the descriptor
 //!
@@ -27,9 +33,9 @@
 //! So what crosses is the [`ExtentDesc`](crate::cold::ExtentDesc): `run_id`,
 //! granularity, page counts, locator. Small, address-free, and already the only
 //! thing §4.3 puts in the `Hello`. The `SCM_RIGHTS` path is not being replaced
-//! by a Windows equivalent; it is simply not on this path at all, and the
-//! same-machine loop keeps it because there the arena really is one process's
-//! memfd.
+//! by a Windows equivalent; it is simply not on this path at all — and, since
+//! §1a, not on the same-machine path either, where the arena is now a *named*
+//! object the peer opens rather than one process's memfd.
 //!
 //! That is worth stating plainly because the obvious design — "find the Windows
 //! spelling of `SCM_RIGHTS`, it is `DuplicateHandle`" — is a real mechanism that

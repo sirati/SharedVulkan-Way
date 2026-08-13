@@ -768,6 +768,137 @@ driver is worth more than any amount of reading**, and it took two minutes.
   read that wall from the other side and concluded glxgears could not run; the
   wall is one layer higher than it looked.
 
+### 0.7 What enforcing the boundary rule settled
+
+Built 2026-08-13. **The cold path passes no descriptor.** §1a is now an invariant
+of the document rather than a property one axis happened to have, and the Linux
+axis was brought into line with the Windows one rather than the other way round:
+`sv-hostd` creates a **named** object under `/dev/shm` and sends its name;
+`sv-gpu-server attach` and the ICD open it themselves; `sv_transport::cold` has
+no `sendmsg`, no ancillary data and — for the first time — **no `unsafe` at
+all**. `scripts/sv-memfd-path.sh` passes over it unchanged, which is the
+statement that matters: the daemon logs the object it created, the GPU side logs
+the name it opened, and nothing was handed over.
+
+Six findings. The first three are the reason the rule was worth stating; the
+fourth is the one that stops it being satisfiable everywhere, and it is a
+measurement rather than an opinion.
+
+**1. `SCM_RIGHTS` was not an implementation detail of the same-machine loop, it
+was in the protocol.** `ColdMessage` was framed by a function that took a
+`BorrowedFd`, so every message on the cold path was a message only a Unix socket
+could deliver, on a path D10 says is virtio-serial first and vsock later. The
+Windows half had already noticed — `sv_transport::stream` exists because "an fd
+cannot cross this boundary" — and the conclusion drawn there was that the
+*cross-VM* path avoids descriptors, not that descriptors should not exist.
+Stating it as an invariant makes the difference visible: one file changed shape
+and four call sites simplified.
+
+**2. A name costs nothing at run time, and the acknowledgement it needs is worth
+having anyway.** The handoff happens once, at connect, so there is nothing for it
+to cost per call — but "should not move" is a prediction and predictions get
+checked. `scripts/sv-bench.sh` was run four times against each tree, alternating,
+so that a loaded machine hit both equally. Forwarded glxgears: **master 557, 613,
+560, 553 FPS; this branch 583, 592, 524, 713 FPS.** The difference is not
+measurable, and the reason it is not is visible in the *control* run of the same
+four pairs — zink on RADV with no forwarding at all measured 692, 697, 795, 721
+and 682, 665, 617, **357** FPS. A native control that varies by a factor of two
+is the measurement floor of a desktop with a load average of twelve, and it is
+wider than anything a once-per-connect handoff could do. **The absolute numbers
+here are not comparable with §0.6's**, which were taken on an idle machine; what
+is comparable is the pair, and the pair says nothing moved.
+
+What the name *does* need is a reply — the daemon must
+not unlink the object before a client has opened it — so the client now sends
+`Accept` after it has mapped, which is §4.3 step 5 finally being used for
+something. That reply also turns "the client could not open the name" into a
+line in the daemon's log rather than `NotConnected` three layers up.
+
+  **The reply is not optional and the cost of believing otherwise was an
+  afternoon.** The first version unlinked as soon as the client loop finished,
+  reasoning that unlinking releases the name and not the memory. It does — but a
+  client that has been *sent* the name and has not yet *opened* it is between the
+  two, and `sv-gpu-server serve` had no reply to wait for. The ICD reported
+  `open(named object) failed: errno 2`, Mesa reported
+  `ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)`, and
+  `sv-zink-gl.sh` failed with "a gear is missing" — three layers of message, none
+  of which mentions a name. **A named object needs an owner for its name in a way
+  a memfd never did**, and the two obligations that follow are: unlink at the
+  first moment every client has it open (not at exit — no `Drop` runs for
+  `SIGKILL`, and every harness kills the GPU side, which leaked a 16 MiB
+  `/dev/shm` object per run until this was found), and never before.
+
+**3. `sv-hostd`'s two modes needed two different kinds of name, and only one of
+them is free.** In `Mode::Local` the daemon creates the object, so it names it.
+In `Mode::Qemu` the object is QEMU's memory backend and the daemon does not own
+it: if the guest is on `memory-backend-file` the name is the `mem-path` and
+everything is tidy, and if it is on `memory-backend-memfd` — which is what every
+measurement in this project was made against — **the object has no name but
+`/proc/<qemu-pid>/fd/<n>`**. That is legal under §1a, and it is worth being
+explicit about what it costs rather than hiding behind the permission: it moves
+the `/proc` open from the daemon to every ICD, which weakens §3's argument that
+the daemon exists so that "an arbitrary application process" need not do it. It
+never reaches the GPU side on any topology — the GPU side is in the VM and
+locates its own memory by content (§5.1) — so the invariant holds, but a real
+deployment should prefer `memory-backend-file` and get a name that is a name.
+
+**4. The local-udmabuf answer for RADV works across a hypervisor and cannot work
+on one machine, and the reason is that a named object cannot be sealed.** §1a
+permits the GPU side to wrap memory it already maps in a dma-buf of its own —
+nothing crosses — and `/dev/udmabuf` is how Linux does that. But
+`UDMABUF_CREATE` requires `F_SEAL_SHRINK` on the object it is given, and a file
+under `/dev/shm` is created with `F_SEAL_SEAL` already set: `F_GET_SEALS` returns
+1 and `F_ADD_SEALS(F_SEAL_SHRINK)` returns `EPERM`. Only
+`memfd_create(MFD_ALLOW_SEALING)` produces a sealable object, and a memfd has no
+name. So the two properties the same-machine topology needs — *nameable* so that
+§1a's handoff works, and *sealable* so that udmabuf will take it — are mutually
+exclusive on Linux, and no amount of code changes that. Across a hypervisor the
+conflict does not arise, because there the object is QEMU's own memfd, sealed by
+QEMU, reached by path rather than by handoff. Measured 2026-08-13 and pinned by
+`cold::tests::a_named_object_cannot_be_sealed_and_therefore_cannot_back_a_udmabuf`.
+
+**5. `Provider::GpuExport` therefore survives, as a marked exception, and the
+honest statement is that the rule is not satisfiable for RADV on one machine.**
+The intention was to delete it: NVIDIA's refusal of host pointers was corrected
+in §0.5's stage (it imports a `MAP_SHARED` mapping of shmem, and a `/dev/shm`
+object is shmem), so the provider looked like a leftover. It is not, because on
+this host the only real GPU is RADV, and all three routes are closed:
+
+| route for RADV | measured, 2026-08-13 |
+|---|---|
+| host pointer into a named object | `vkAllocateMemory: ERROR_INVALID_EXTERNAL_HANDLE` — structural, `AMDGPU_GEM_USERPTR_ANONONLY` |
+| a dma-buf the GPU side makes locally from that object | impossible: the object cannot be sealed (finding 4) |
+| …from a sealable memfd instead | `/dev/udmabuf`: `Permission denied` — `root:kvm` 0660, this account is not in `kvm` |
+
+Five harnesses — `sv-end-to-end.sh`, `sv-zink-gl.sh`, `sv-dxvk-d3d11.sh`,
+`sv-present.sh`, `sv-bench.sh` — are the project's only evidence against a real
+GPU, and every one of them runs the GPU side on RADV through this provider.
+Deleting it would delete that evidence. So it stays, quarantined in
+`sv_transport::localfd`, which is a module whose documentation is mostly about
+why it should not exist; `Attachment::arena_object` is empty on exactly that path
+and nowhere else, so "which handoff is this" is a field rather than a habit. Two
+things narrowed while it stayed: the control region is a named object on *every*
+path, so the exception is one object rather than two, and NVIDIA moved to the
+named provider because it can.
+
+**The single change that would remove the exception is a group membership**, not
+a design change: `/dev/udmabuf` in the `kvm` group would let the GPU side wrap a
+sealable memfd locally — which the app side would have to name some other way, so
+it is not sufficient on its own — and, more usefully, would unblock the
+*cross-VM* AMD topology that `Provider::for_driver_across_a_vm` currently answers
+`None` for. That answer is a permission, not a limit, and §5.4 should be read
+that way.
+
+**6. An `Attachment` needed two names, and that is §4.1 becoming visible.** The
+control region and the arena are "two independent mappings with independent
+bases", and until now the wire hid whether they were one object or two behind
+*how many descriptors arrived* — a discriminator that only exists on a Unix
+socket. Two name fields say it outright, they are equal on every path where one
+object holds both, and the Windows path fills them in with the section names both
+sides already derive from the session string. A protocol that could not be
+described without saying "count the file descriptors" was a protocol with a
+same-machine assumption in it.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
@@ -791,6 +922,49 @@ The second invariant, from the requirement document: **the command stream
 carries offsets, never payloads.** A design that copies application data into
 the ring is rejected regardless of how fast the copy is.
 
+### 1a. The boundary invariant: no descriptor ever crosses
+
+**No file descriptor and no handle ever crosses between the app side and the GPU
+side. What crosses is a *name*, which the peer opens for itself.**
+
+This ranks with the two invariants above and constrains more of the design than
+either, so it is stated here rather than in §4.3 where it is implemented. It is
+not a security property and it is not about trust — `security-model.md` puts the
+two sides in one trust domain and nothing here changes that. It is about what a
+**VM boundary can physically carry**, and it applies *even when both sides are on
+one machine*, because the same-machine case is a development loop for a design
+whose deployment is a hypervisor. A mechanism that works only because the peer
+happens to share a kernel is a same-machine path wearing the design's clothes,
+and it will be discovered at the moment the design is finally run for real.
+
+The distinction, precisely, because it decides three separate questions below:
+
+- **Illegal: passing a descriptor *across* the boundary.** `SCM_RIGHTS`,
+  `DuplicateHandle`, an exported dma-buf fd handed to the peer. A virtio-serial
+  port and a vsock carry bytes; there is nothing for any of these to travel in.
+- **Legal: a descriptor created *locally*, by one side, out of memory that side
+  can already reach.** The host wrapping its own view of guest RAM with
+  `/dev/udmabuf` is fine — that fd is made on one side and never leaves it. So
+  is `sv-hostd` opening QEMU's memory backend through `/proc/<qemu-pid>/fd/<n>`:
+  the hypervisor's own child, reached by the machine that hosts it.
+- **Legal: a *name* crossing, which the peer then opens itself.** This is the
+  replacement mechanism, and the Windows↔Windows axis has done it correctly
+  since it was written — two named sections, no handle passed, and therefore no
+  `PROCESS_DUP_HANDLE` relationship between the GPU side and every application
+  that attaches (§8, `sv_transport::winshm`). Generalising that is what this
+  invariant asks for; `DuplicateHandle` is the *wrong* answer to `SCM_RIGHTS`
+  and a named object is the right one, in both directions.
+
+A name is text. That is the whole of why this works: the cold path (D10) is a
+byte stream, so a handshake that carries names fits down a virtio-serial port
+unchanged, and the same code serves the same-machine loop and the hypervisor.
+
+**What it costs, and where it is not satisfied**, is §0.7, which is a finding
+rather than a decision. One provider — the GPU side exporting a dma-buf — cannot
+be brought into line, because a dma-buf has no name to give; it survives as a
+marked exception on one host for one driver, and the measurements that pin it
+there are in §0.7.
+
 ---
 
 ## 2. Decisions at a glance
@@ -807,7 +981,7 @@ the ring is rejected regardless of how fast the copy is.
 | D7 | Handles | **Venus's app-side-assigned ids on the wire** + **gfxstream's rich per-object table on the GPU side**. Object creation costs no round trip. (fwd §4.3) |
 | D8 | Rings | **SPSC, per queue**, plus one per device and one per instance, plus one reverse ring. Spin-then-park, notification only when the consumer has parked. (fwd §1.2, §1.3) |
 | D9 | Doorbell | Polling first, behind a `Doorbell`/`Parker` trait. Interrupts are an optimisation to be justified by measurement, not an architecture. (sgl §7.5) |
-| D10 | Cold path | A socket: **virtio-serial** at first because it is already attached, **vsock** once `viosock` is installed. Handshake, capability negotiation, wakeups, teardown. Never data. (fwd §6.2, §6.3) |
+| D10 | Cold path | A socket: **virtio-serial** at first because it is already attached, **vsock** once `viosock` is installed. Handshake, capability negotiation, wakeups, teardown. Never data — and, since §1a, **never a descriptor**: what crosses is the *name* of a shared object the peer opens itself, which is text and therefore fits a byte pipe. (fwd §6.2, §6.3) |
 | D11 | Cache attributes | **Write-back on both sides, everywhere, in v1.** The mechanism to vary it exists in the slab descriptor and has exactly one legal value until measurement says otherwise. This retires R10 rather than managing it. (§5.6) |
 | D12 | Entry point | A **Vulkan ICD**, not a layer. Loader interface **7**, degrade to 5. (fwd §3.1) |
 | D13 | Codegen input | **Pure Rust**: `vk-parse` plus our own C-declarator parser and typed model, in `vk-registry`. Cross-checked once against Khronos's `vulkan_object.py` as a test fixture. (§7.1) |
@@ -844,7 +1018,7 @@ the ring is rejected regardless of how fast the copy is.
   │  • locates the extent's pages  │                        │
   │  • GPA → offset via mtree      │                        │
   │  • coalesces runs, stitches    │                        │
-  │  • hands fd + runs to the ICDs │                        │
+  │  • hands NAME + runs to ICDs   │                        │
   └──────┬─────────────────────────┘                        │
          │                                                  │
   ┌──────▼──────────────────────────────────────────────────▼───────────────────┐
@@ -861,9 +1035,19 @@ facts.** Mapping guest RAM means opening QEMU's memfd through
 `/proc/<qemu-pid>/fd/<n>`, which an arbitrary application process should not be
 able to do and often cannot (fwd §2.2, "GPA → memfd offset"). It also
 centralises the GPA→offset translation, which is the fragile part (R21), and
-lets several application processes share one attachment. In the same-machine
-development loop it degenerates to "create a memfd, `ftruncate`, hand it out",
-which is why steps 1–6 of §13 need no VM at all.
+lets several application processes share one attachment.
+
+> **[SUPERSEDED — 2026-08-13, §1a and §0.7]**
+> *In the same-machine development loop it degenerates to "create a memfd,
+> `ftruncate`, hand it out", which is why steps 1–6 of §13 need no VM at all.*
+>
+> "Hand it out" meant `SCM_RIGHTS`, and §1a forbids it. The daemon creates a
+> **named** object under `/dev/shm` and hands out the *name*; the steps still
+> need no VM. Two consequences §0.7 records: the object is no longer sealable, so
+> it can never back a udmabuf, and on `Mode::Qemu` the name the ICDs are given is
+> `/proc/<qemu-pid>/fd/<n>` unless the guest is on `memory-backend-file` — which
+> moves the `/proc` open from the daemon to the ICD and so weakens the first
+> sentence of this paragraph. It is legal (§1a) and it is not free.
 
 Step 0 made it a larger component than the box suggests. `sv-hostd` does not
 merely translate an address it was handed: on the paths that do not involve AWE
@@ -1012,6 +1196,14 @@ sequence:
    named error on any mismatch: magic, `layout_version`, `wire_version`,
    `protocol_hash`, endianness, `control_size` against the mapping length.
 5. The peer replies `Accept { generation }` and claims rings.
+
+**Step 5 does a second job since §1a**, on the `Attach` handoff rather than on
+the `Hello`: it is the client saying *I have opened the object by name and mapped
+it*. The daemon needs that before it may unlink the name — unlinking releases the
+name and not the memory, so a client that has already opened is unaffected, but
+one that has not yet opened would find nothing. It is also where "I could not
+open that name" is reported, in the daemon's log, instead of surfacing as a ring
+that never answers.
 
 **`generation` is the reconnect mechanism.** Every ring operation carries the
 generation it was created under; a mismatch means the peer restarted and every
@@ -1718,6 +1910,18 @@ Implementations:
 | `HostPointerImport` | `VkImportMemoryHostPointerInfoEXT` with `HOST_ALLOCATION_BIT_EXT` | Windows GPU side (measured available), Intel/NVIDIA Linux |
 | `DmaBufImport` | `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` | Linux GPU side, mandatory on AMD |
 | `NoopImport` | lavapipe adopts the pointer | Development only |
+
+**Where the dma-buf comes from is now a §1a question, and the answer differs by
+topology.** A dma-buf the GPU side receives is a descriptor that crossed the
+boundary and is forbidden; a dma-buf the GPU side **makes**, locally, out of
+memory it already maps, is not. Across a hypervisor the second is available and
+is the AMD answer: the GPU side wraps QEMU's memory backend with `/dev/udmabuf`
+and imports the result, and nothing crosses but the extent descriptor. On one
+machine it is *not* available, and §0.7 finding 4 has the measurement — the
+handoff object must be nameable and a udmabuf's must be sealable, and on Linux
+no object is both. `Provider::for_driver_across_a_vm` answering `None` for AMD is
+therefore a statement about a group membership (`/dev/udmabuf` is `root:kvm`
+0660) and not about the design.
 
 **Pluggability is not speculative refinement.** RADV rejects *every* shared
 mapping through this path — libdrm passes `AMDGPU_GEM_USERPTR_ANONONLY`
@@ -2899,7 +3103,7 @@ framing holds for GL and for older D3D, and does not hold for D3D12.
 | `sv-icd` | cdylib | The app side: instance/device/queue objects, memory, WSI, the hand-written half of the ICD |
 | `sv-gpu-server` | bin | The GPU side: ring consumers, `SlabImport`, semantic glue, submit path, validation forwarding |
 | ~~`sv-present`~~ | — | **Not built, and should not be.** It was to be "swapchain plumbing shared by both sides", and there is nothing to share: §0.6 found that presentation is expressible entirely in the forwarded API, so the GPU side has no half. What exists is `sv_icd::wsi` (the swapchain, out of ordinary Vulkan) and `sv_icd::present` (the blit, and the only module that knows what a window is), both inside `sv-icd`. |
-| `sv-hostd` | bin | App-side daemon: opens QEMU's memfd, GPA→offset, builds the contiguous view, hands fds to ICD processes |
+| `sv-hostd` | bin | App-side daemon: opens QEMU's memfd, GPA→offset, builds the contiguous view, publishes the object's **name** to ICD processes (§1a — it hands out no descriptor) |
 | `vk-probe` | bin | **Exists.** The GPU-side capability probe of `measured-gpu-side.md` |
 | `awe-probe` | bin, Windows | **Exists.** The guest half of step 0: commit, lock, stamp, import, verify. Cross-compiled to `x86_64-pc-windows-gnu` |
 | `arena-host` | bin | **Exists.** The host half of step 0: mtree region table, scan/translate, run coalescing, mmap stitching. **This is the seed of `sv-hostd`**, not a throwaway probe |

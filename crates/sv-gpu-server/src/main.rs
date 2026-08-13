@@ -82,7 +82,7 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
     let driver = Driver::open(device)?;
     let key = driver.driver_key();
     eprintln!(
-        "[gpu] {} ({key}), queue family {}, provider AppMemfd (named section)",
+        "[gpu] {} ({key}), queue family {}, provider AppNamedShm (named section)",
         driver.name, driver.queue_family
     );
 
@@ -131,6 +131,13 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
             write_message(
                 &mut pipe,
                 &ColdMessage::Attach(Attachment {
+                    // Both sides derive these from the session string
+                    // ([`winshm::section_name`]), so they are stated here for
+                    // the record rather than for the peer's benefit — the
+                    // Windows axis has obeyed design.md §1a since it was written
+                    // and is the pattern the Linux axis was generalised from.
+                    object: winshm::section_name(&format!("{session_name}.ctl")),
+                    arena_object: winshm::section_name(&format!("{session_name}.arena")),
                     control_offset: 0,
                     control_len: geometry.control_size,
                     arena_offset: 0,
@@ -246,22 +253,29 @@ fn serve(
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
     use sv_gpu_server::{arena, server::Shared, session, table::Objects};
-    use sv_transport::cold::{Attachment, ColdMessage, recv, send_with_fds};
+    use sv_transport::cold::{Attachment, ColdMessage, recv, send};
     use sv_transport::control::Control;
-    use sv_transport::region::{SharedRegion, memfd};
+    use sv_transport::localfd::send_with_fds;
+    use sv_transport::region::{SharedRegion, shm_create, shm_path, shm_unlink};
 
     let geometry = geometry_for(arena_size);
     let arena_size = geometry.arena_size;
 
     // The arena comes from the driver. The control region does not: §4.1 splits
     // the two by purpose and the control region is "the one only our code
-    // touches", so it stays an ordinary memfd. That also keeps the ring atomics
-    // on ordinary write-back RAM rather than on whatever a GPU's host-visible
-    // heap turns out to be, which is a question nobody has measured and which
-    // this design does not need to ask.
-    let control_fd = memfd("sv-control", geometry.control_size)?;
+    // touches", so it is a **named** object like every other region in this
+    // project. That also keeps the ring atomics on ordinary write-back RAM
+    // rather than on whatever a GPU's host-visible heap turns out to be, which
+    // is a question nobody has measured and which this design does not need to
+    // ask.
+    //
+    // Naming it is what reduces this path's violation of design.md §1a to
+    // exactly one object: the exported dma-buf, which has no name to give.
+    let control_name = shm_path(&format!("control.{}", std::process::id()));
+    let control_file = shm_create(&control_name, geometry.control_size)?;
+    let control_fd = control_file.as_fd();
     let control_region =
-        Arc::new(SharedRegion::map_fd(control_fd.as_fd(), 0, geometry.control_size as usize)?);
+        Arc::new(SharedRegion::map_fd(control_fd, 0, geometry.control_size as usize)?);
 
     let arena = arena::allocate_and_export(&driver, arena_size)?;
     eprintln!(
@@ -286,12 +300,16 @@ fn serve(
     control.stamp_epoch()?;
 
     let attachment = Attachment {
+        // The control region has a name; the arena does not, and that is what
+        // an empty `object` means on this path. It is the one sender in the
+        // project that leaves it empty, and design.md §0.7 says why.
+        object: control_name.clone(),
+        arena_object: String::new(),
         control_offset: 0,
         control_len: geometry.control_size,
         // The arena is its own object here, so it begins at offset 0 of the
-        // *second* descriptor. On the memfd path both regions are one file and
-        // the arena begins after the control region; the client is told which by
-        // how many descriptors arrive.
+        // descriptor that accompanies the message. On the named path both
+        // regions are one object and the arena begins after the control region.
         arena_offset: 0,
         arena_len: arena_size,
         generation,
@@ -304,25 +322,59 @@ fn serve(
 
     for i in 0..clients {
         let (sock, _) = listener.accept()?;
-        let (msg, _) = recv(&sock)?;
+        let msg = recv(&sock)?;
         match msg {
             ColdMessage::AttachRequest => {
                 let mut buf = Vec::new();
                 ColdMessage::Attach(attachment.clone()).encode(&mut buf)?;
-                send_with_fds(&sock, &buf, &[control_fd.as_fd(), arena_fd])?;
-                eprintln!("[gpu] client {i} attached (control + arena descriptors)");
+                // One descriptor, and it is the dma-buf. The control region
+                // crosses as a name like everything else.
+                send_with_fds(&sock, &buf, &[arena_fd])?;
+                // Wait for the client to say it has opened the control region
+                // *by name* before moving on, for the same reason `sv-hostd`
+                // does: the name is unlinked once the last client has it, and a
+                // client still between "received the message" and "opened the
+                // object" would find nothing.
+                //
+                // This was learned the expensive way. Unlinking straight after
+                // the loop, without the wait, produced
+                // `open(named object) failed: errno 2` in the ICD and
+                // `MESA: error: ZINK: vkCreateInstance failed
+                // (VK_ERROR_INCOMPATIBLE_DRIVER)` two layers up — a message that
+                // says nothing about names at all.
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                match recv(&sock) {
+                    Ok(ColdMessage::Accept { .. }) => {}
+                    Ok(other) => eprintln!("[gpu] client {i} said {other:?} rather than Accept"),
+                    Err(e) => eprintln!("[gpu] client {i} never acknowledged the name: {e}"),
+                }
+                eprintln!(
+                    "[gpu] client {i} attached (control region by name, arena as a dma-buf \
+                     descriptor — design.md §1a's one exception)"
+                );
             }
             other => {
-                let mut buf = Vec::new();
-                ColdMessage::Refuse {
-                    code: 1,
-                    reason: format!("expected AttachRequest, got {other:?}"),
-                }
-                .encode(&mut buf)?;
-                send_with_fds(&sock, &buf, &[])?;
+                send(
+                    &sock,
+                    &ColdMessage::Refuse {
+                        code: 1,
+                        reason: format!("expected AttachRequest, got {other:?}"),
+                    },
+                )?;
             }
         }
     }
+
+    // **Unlink as soon as the last client has it open, not at exit.**
+    //
+    // Unlinking releases the *name*; this process's descriptor and every
+    // client's keep the object alive, so nothing above notices. Doing it here
+    // rather than after `session::serve` is what stops a killed GPU side from
+    // leaving a 16 MiB object in `/dev/shm` until the next reboot — and every
+    // harness kills the GPU side, because it serves until the app side goes
+    // quiet. A named object needs an owner for its name in a way a memfd never
+    // did, and this is that obligation discharged at the first safe moment.
+    shm_unlink(&control_name);
 
     let mut objects = Objects::new();
     objects.set_arena(arena.memory, arena.len);
@@ -357,7 +409,7 @@ fn attach(
     use sv_gpu_server::{arena, server::Shared, session, table::Objects};
     use sv_transport::cold::{ColdMessage, recv, send};
     use sv_transport::control::Control;
-    use sv_transport::region::SharedRegion;
+    use sv_transport::region::{SharedRegion, open_named};
 
     // The daemon may not be listening yet; bounded, because R4 applies to
     // startup too.
@@ -372,18 +424,29 @@ fn attach(
         }
     };
     send(&sock, &ColdMessage::AttachRequest)?;
-    let (msg, fd) = recv(&sock)?;
-    let at = match msg {
+    let at = match recv(&sock)? {
         ColdMessage::Attach(a) => a,
         ColdMessage::Refuse { code, reason } => return Err(format!("refused {code}: {reason}").into()),
         other => return Err(format!("unexpected {other:?}").into()),
     };
-    let fd = fd.ok_or("sv-hostd sent no descriptor")?;
+    if at.object.is_empty() {
+        return Err("the daemon sent no object name; this build cannot take a descriptor \
+                    across the boundary (design.md §1a)"
+            .into());
+    }
+    // **The GPU side opens the object itself, by name.** This is the whole of
+    // design.md §1a on this path: what arrived over the socket was text, and it
+    // would have arrived identically down a virtio-serial port from a daemon on
+    // the other side of a hypervisor.
+    let fd = open_named(&at.object)?;
+    eprintln!("[gpu] opened {} by name (no descriptor was passed)", at.object);
 
     let control_region =
         Arc::new(SharedRegion::map_fd(fd.as_fd(), at.control_offset, at.control_len as usize)?);
     let arena_region =
         Arc::new(SharedRegion::map_fd(fd.as_fd(), at.arena_offset, at.arena_len as usize)?);
+    // Tell the daemon the name has been resolved, so it may release it.
+    send(&sock, &ColdMessage::Accept { generation: at.generation })?;
 
     let geometry = geometry_for(at.arena_len);
     let control = Control::create(

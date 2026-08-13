@@ -10,7 +10,7 @@
 //! | [`control`] | §4.2 layout, §4.3 handshake, generation, heartbeats |
 //! | [`ring`] | §4.4 rings, reply rings, the `RingBarrier`, §4.6 reverse ring |
 //! | [`park`] | §4.5 `Parker`/`Doorbell` behind a trait, timeouts on every wait |
-//! | [`cold`] | §4.3 step 2–3, the cold-path socket and the fd handoff |
+//! | [`cold`] | §4.3 step 2–3, the cold-path socket and the **name** handoff |
 //!
 //! # The three things this crate exists to get right
 //!
@@ -38,14 +38,21 @@
 //!
 //! R7 says confine it to a small number of reviewed modules with stated
 //! invariants. In this crate that is exactly [`region`] (the mapping) and the
-//! `SCM_RIGHTS` fd handoff in [`cold`]. `ring`, `control` and `park` contain
-//! none: they are safe code over [`region::SharedRegion`]'s atomic-and-copy API,
-//! which is the point of that API existing.
+//! quarantined `SCM_RIGHTS` handoff in `localfd`. **[`cold`] has none**, which
+//! is new: the cold path used to need `sendmsg` to pass a descriptor and now
+//! passes a name, so the module that defines the protocol is safe code over
+//! `sv-wire` and `std`. `ring`, `control` and `park` contain none either: they
+//! are safe code over [`region::SharedRegion`]'s atomic-and-copy API, which is
+//! the point of that API existing.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cold;
 pub mod control;
+/// The quarantined `SCM_RIGHTS` handoff — see the module's own documentation for
+/// what still needs it and what measurement would remove it.
+#[cfg(target_os = "linux")]
+pub mod localfd;
 pub mod park;
 pub mod region;
 pub mod ring;

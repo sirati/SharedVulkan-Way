@@ -112,6 +112,14 @@
     wantedBy = ["multi-user.target"];
     after = ["local-fs.target"];
     path = with pkgs; [bash coreutils];
+    # `environment.variables` below sets these for a *login shell*, and a systemd
+    # unit is not one. Without them the payload dies with "no Vulkan loader:
+    # libvulkan.so.1: cannot open shared object file" — which reads as a missing
+    # package rather than a missing environment, and the package is installed.
+    environment = {
+      LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
+      VK_ICD_FILENAMES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
+    };
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;

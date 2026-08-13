@@ -4,14 +4,18 @@
 //! `DuplicateHandle` implementation of exactly this file" is half right, and the
 //! half that is wrong is the interesting half.
 //!
-//! **The named pipe is needed. `DuplicateHandle` is not.** On Linux the cold
-//! path carries a *descriptor* by `SCM_RIGHTS`, because the arena is a memfd one
-//! process created and the other has no other way to reach it. On Windows the
-//! arena is a **named** section object ([`crate::winshm`]), so the peer opens it
-//! by name and nothing but text has to cross. That removes the requirement for
-//! the owner to hold `PROCESS_DUP_HANDLE` on every process that attaches, which
-//! is a real privilege relationship and one this design has no reason to
-//! establish.
+//! **The named pipe is needed. `DuplicateHandle` is not.** The arena is a
+//! **named** section object ([`crate::winshm`]), so the peer opens it by name
+//! and nothing but text has to cross. That removes the requirement for the owner
+//! to hold `PROCESS_DUP_HANDLE` on every process that attaches, which is a real
+//! privilege relationship and one this design has no reason to establish.
+//!
+//! **This axis got the rule right first, and design.md §1a is that observation
+//! generalised.** Linux used to pass a descriptor by `SCM_RIGHTS` here, on the
+//! grounds that the arena was a memfd one process created and the other had no
+//! other way to reach it. The answer was not a Windows equivalent of
+//! `SCM_RIGHTS` but a Linux equivalent of *this*: a named object under
+//! `/dev/shm` ([`crate::region::shm_create`]), and a name on the wire.
 //!
 //! So this module is the *transport* only, and it carries
 //! [`crate::stream`]'s framing — the same framing the virtio-serial path uses,

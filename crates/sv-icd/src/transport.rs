@@ -338,17 +338,22 @@ fn lower(e: sv_transport::Error) -> LowerError {
 impl RingTransport {
     /// Connect to whichever side is serving the cold path, attach, claim rings.
     ///
-    /// Accepts **one or two descriptors**, and that is how it tells the two
-    /// arena providers apart without a flag: `sv-hostd` sends one memfd holding
-    /// both regions at different offsets, while `sv-gpu-server serve` sends the
-    /// control memfd and the driver's exported arena as two separate objects.
-    /// The `Attachment`'s offsets are correct in both cases, so nothing below
-    /// this function knows which happened.
+    /// **The handoff is a name** (design.md §1a): the `Attachment` says what to
+    /// open and this process opens it, so nothing crosses the socket but text.
+    /// `sv-hostd` names one object holding both regions at different offsets;
+    /// its `Mode::Qemu` names QEMU's memory backend and sends the run list after
+    /// it, because a scattered extent needs one `mmap` per run.
+    ///
+    /// The one exception is `sv-gpu-server serve`, which leaves
+    /// `arena_object` empty because a dma-buf has no name, and sends a
+    /// descriptor. That path is same-machine-only by construction and cannot
+    /// exist across a hypervisor; `sv_transport::localfd` documents why it is
+    /// still here. Every other topology takes the name.
     #[cfg(target_os = "linux")]
     pub fn connect(socket: &str) -> Result<Attached, String> {
         use std::os::fd::AsFd;
         use std::os::unix::net::UnixStream;
-        use sv_transport::cold::{ColdMessage, recv_with_fds, send};
+        use sv_transport::cold::{ColdMessage, send};
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let sock = loop {
@@ -361,8 +366,12 @@ impl RingTransport {
             }
         };
         send(&sock, &ColdMessage::AttachRequest).map_err(|e| e.to_string())?;
+        // The nameless-arena provider sends its dma-buf with the message, so the
+        // read has to be able to collect one. Every other provider sends none,
+        // and `fds` is then empty.
         let mut buf = Vec::new();
-        let fds = recv_with_fds(&sock, &mut buf).map_err(|e| e.to_string())?;
+        let fds =
+            sv_transport::localfd::recv_with_fds(&sock, &mut buf).map_err(|e| e.to_string())?;
         let at = match ColdMessage::decode(&buf).map_err(|e| e.to_string())? {
             ColdMessage::Attach(a) => a,
             ColdMessage::Refuse { code, reason } => {
@@ -370,33 +379,21 @@ impl RingTransport {
             }
             other => return Err(format!("unexpected cold-path message {other:?}")),
         };
-        let control_fd = fds.first().ok_or("no descriptor for the control region")?;
-        let arena_fd = fds.get(1).unwrap_or(control_fd);
+
+        // Open the control region by name. Always: even the quarantined provider
+        // names it, which is what reduced that path to one nameless object.
+        let control_file =
+            sv_transport::region::open_named(&at.object).map_err(|e| e.to_string())?;
 
         // A non-zero `run_count` means the extent is scattered through the
-        // descriptor and the daemon is sending the runs next. That is the
-        // `Mode::Qemu` path: the descriptor is QEMU's memory backend, the pages
-        // are guest RAM, and a plain `map_fd` would map the wrong 64 MiB of a
-        // thirteen-gigabyte file. §3: `sv-hostd` "hands **fd + runs** to the
+        // object and the daemon is sending the runs next. That is the
+        // `Mode::Qemu` path: the object is QEMU's memory backend, the pages are
+        // guest RAM, and a plain `map_fd` would map the wrong 64 MiB of a
+        // thirteen-gigabyte file. §3: `sv-hostd` "hands **name + runs** to the
         // ICDs".
-        let (control_region, arena) = if at.run_count == 0 {
-            (
-                Arc::new(
-                    SharedRegion::map_fd(
-                        control_fd.as_fd(),
-                        at.control_offset,
-                        at.control_len as usize,
-                    )
-                    .map_err(|e| e.to_string())?,
-                ),
-                Arc::new(
-                    SharedRegion::map_fd(arena_fd.as_fd(), at.arena_offset, at.arena_len as usize)
-                        .map_err(|e| e.to_string())?,
-                ),
-            )
-        } else {
+        let (control_region, arena) = if at.run_count != 0 {
             let mut buf = Vec::new();
-            let _ = recv_with_fds(&sock, &mut buf).map_err(|e| e.to_string())?;
+            sv_transport::cold::recv_bytes(&sock, &mut buf).map_err(|e| e.to_string())?;
             let runs = match ColdMessage::decode(&buf).map_err(|e| e.to_string())? {
                 ColdMessage::Runs(r) => r,
                 other => return Err(format!("expected the run list, got {other:?}")),
@@ -408,8 +405,39 @@ impl RingTransport {
                     runs.len()
                 ));
             }
-            RingTransport::stitch_two(control_fd.as_fd(), &at, &runs)?
+            RingTransport::stitch_two(control_file.as_fd(), &at, &runs)?
+        } else {
+            let control = Arc::new(
+                SharedRegion::map_fd(control_file.as_fd(), at.control_offset, at.control_len as usize)
+                    .map_err(|e| e.to_string())?,
+            );
+            let arena = if at.arena_object.is_empty() {
+                // The one nameless object in the project: an exported dma-buf.
+                let fd = fds
+                    .first()
+                    .ok_or("the peer named no arena and sent no descriptor for one")?;
+                Arc::new(
+                    SharedRegion::map_fd(fd.as_fd(), at.arena_offset, at.arena_len as usize)
+                        .map_err(|e| e.to_string())?,
+                )
+            } else if at.arena_object == at.object {
+                Arc::new(
+                    SharedRegion::map_fd(control_file.as_fd(), at.arena_offset, at.arena_len as usize)
+                        .map_err(|e| e.to_string())?,
+                )
+            } else {
+                let f = sv_transport::region::open_named(&at.arena_object)
+                    .map_err(|e| e.to_string())?;
+                Arc::new(
+                    SharedRegion::map_fd(f.as_fd(), at.arena_offset, at.arena_len as usize)
+                        .map_err(|e| e.to_string())?,
+                )
+            };
+            (control, arena)
         };
+        // Acknowledge, so a daemon that created the name may release it. Sent
+        // after both mappings exist, which is what makes it mean anything.
+        let _ = send(&sock, &ColdMessage::Accept { generation: at.generation });
         RingTransport::finish_attach(control_region, arena, at.arena_len)
     }
 

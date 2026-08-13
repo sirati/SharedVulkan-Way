@@ -1,7 +1,21 @@
 //! Where the arena comes from, and how the GPU side ends up with a
 //! `VkDeviceMemory` over it.
 //!
-//! # The rule, and the measurement that produced it
+//! # The rule that overrides everything below
+//!
+//! > **No file descriptor or handle ever crosses between the app side and the
+//! > GPU side.** A descriptor created *locally*, out of memory that side can
+//! > already reach, is fine; a *name* crossing, which the peer opens itself, is
+//! > the mechanism. — design.md §1a
+//!
+//! [`Provider::AppNamedShm`] obeys it. [`Provider::GpuExport`] does not, cannot
+//! be made to — a dma-buf has no name — and survives only because of a measured
+//! dead end recorded in design.md §0.7 and in `sv_transport::localfd`. Read the
+//! next section knowing that its conclusion ("inverting the direction costs
+//! nothing") was reached before the rule was stated, and that the rule does not
+//! accept the trade.
+//!
+//! # The older rule, and the measurement that produced it
 //!
 //! **Whichever side can allocate memory the other can map, allocates.**
 //!
@@ -78,13 +92,31 @@ use sv_transport::region::SharedRegion;
 /// How this session obtained the arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
-    /// The app side allocated it — `sv-hostd`'s memfd, or guest RAM it located —
-    /// and the GPU side imports it with `VK_EXT_external_memory_host`.
-    /// design.md §5.4's `HostPointerImport`.
-    AppMemfd,
-    /// The GPU side allocated it from the driver and exported a descriptor for
-    /// the app side to map. Not in design.md §5.4's table, and the row that
-    /// unblocks RADV and NVIDIA.
+    /// The app side allocated it — a **named** object `sv-hostd` created, or
+    /// guest RAM it located — and the GPU side imports it with
+    /// `VK_EXT_external_memory_host`. design.md §5.4's `HostPointerImport`.
+    ///
+    /// The name is historical: since design.md §1a the object is *named* shared
+    /// memory rather than a memfd, because a memfd can only be handed over as a
+    /// descriptor and a descriptor may not cross the boundary. What the GPU side
+    /// does with it is unchanged — it opens the name, maps it, and imports the
+    /// pointer.
+    AppNamedShm,
+    /// The GPU side allocated it from the driver and exported a **descriptor**
+    /// for the app side to map.
+    ///
+    /// # This provider violates design.md §1a and is kept for a measured reason
+    ///
+    /// A dma-buf has no name, so this is a same-machine-only mechanism: it
+    /// cannot exist across a hypervisor in either direction. §1a says such a
+    /// mechanism does not belong in the design, and the honest conclusion would
+    /// be to delete it.
+    ///
+    /// It survives because on this host **RADV cannot obtain a named arena at
+    /// all**, and the alternatives are closed for reasons that are facts about
+    /// Linux rather than about this code — measured 2026-08-13, see
+    /// design.md §0.7 and `sv_transport::localfd`. Every harness that judges
+    /// this project against a real GPU runs through here.
     GpuExport,
 }
 
@@ -95,19 +127,27 @@ impl Provider {
     /// reason `sv_arena::import::path_for_driver` is: the arena has to know
     /// before it commits, and a wrong guess is discovered at the first
     /// allocation rather than at startup.
+    /// **The rule-compliant provider wherever the driver allows one.** This used
+    /// to prefer `GpuExport` for NVIDIA "because it needs no shmem-shaped arena
+    /// and puts the pages in memory the driver chose". Those are optimisations;
+    /// §1a is not, and NVIDIA was measured importing a `MAP_SHARED` mapping of
+    /// shmem — which is exactly what a `/dev/shm` object is — so it takes the
+    /// named path now. RADV is the only entry left on the wrong side of the rule
+    /// and it is there because nothing else works, not because it is better.
     pub fn for_driver(key: &str) -> Provider {
         match key {
-            // RADV refuses a shared host pointer whatever backs it, and exports
-            // a dma-buf. NVIDIA can do either; the export is preferred on one
-            // machine because it needs no shmem-shaped arena and puts the pages
-            // in memory the driver chose.
-            "radv" | "nvidia" => Provider::GpuExport,
+            // Refuses a shared host pointer whatever backs it
+            // (`AMDGPU_GEM_USERPTR_ANONONLY`), and cannot wrap a named object in
+            // a local dma-buf either, because a named object cannot be sealed
+            // and udmabuf requires `F_SEAL_SHRINK`. design.md §0.7.
+            "radv" => Provider::GpuExport,
+            // Imports a shared mapping of shmem; measured 2026-08-12.
+            "nvidia" => Provider::AppNamedShm,
             // Adopts a host pointer; its export is not the same pages.
-            "lavapipe" => Provider::AppMemfd,
+            "lavapipe" => Provider::AppNamedShm,
             // The measured-working Windows target, and the conservative default:
-            // an untried driver gets the path that is proven somewhere real and
-            // has no extra prerequisite.
-            _ => Provider::AppMemfd,
+            // an untried driver gets the path that obeys the rule.
+            _ => Provider::AppNamedShm,
         }
     }
 
@@ -118,21 +158,27 @@ impl Provider {
     /// however capable the driver is. The arena must be memory both sides can
     /// map, which is guest RAM, which the GPU side imports as a host pointer.
     ///
-    /// Returning `None` is the honest answer for RADV: it is not that the
-    /// project has not written the code, it is that libdrm's
+    /// Returning `None` is the honest answer for RADV, and the reason is a
+    /// *permission* rather than a design limit — which is a distinction §1a
+    /// makes it worth being precise about. libdrm's
     /// `AMDGPU_GEM_USERPTR_ANONONLY` refuses every shared mapping, so the only
-    /// route is `/dev/udmabuf` and that is a privilege this account does not
-    /// hold. Saying so in the type stops a caller from discovering it as an
-    /// `INVALID_EXTERNAL_HANDLE` three layers down.
+    /// route is a dma-buf; across a hypervisor that dma-buf is one the GPU side
+    /// makes **locally**, with `/dev/udmabuf`, out of QEMU's own memfd, which it
+    /// already maps. Nothing crosses, so the rule permits it — see design.md
+    /// §0.7 — and it is blocked here only because `/dev/udmabuf` is `root:kvm`
+    /// 0660 and this account is not in `kvm`. Saying so in the type stops a
+    /// caller from discovering it as an `INVALID_EXTERNAL_HANDLE` three layers
+    /// down.
     pub fn for_driver_across_a_vm(key: &str) -> Option<Provider> {
         match key {
-            // Structural refusal. Needs a dma-buf made from the guest's RAM by
-            // `/dev/udmabuf`, which is `root:kvm` 0660.
+            // Structural refusal of host pointers. The legal answer is a local
+            // udmabuf over QEMU's sealed memfd; `/dev/udmabuf` is `root:kvm`
+            // 0660 and this account is not in the group, measured 2026-08-13.
             "radv" | "amdgpu" => None,
             // Corrected 2026-08-12: imports a shared mapping of shmem, which is
             // what QEMU's `memory-backend-memfd` is.
-            "nvidia" => Some(Provider::AppMemfd),
-            _ => Some(Provider::AppMemfd),
+            "nvidia" => Some(Provider::AppNamedShm),
+            _ => Some(Provider::AppNamedShm),
         }
     }
 }
@@ -342,7 +388,7 @@ pub fn import_slab(
 pub fn map_lazy(region: Arc<SharedRegion>) -> Arena {
     let len = region.len() as u64;
     Arena {
-        provider: Provider::AppMemfd,
+        provider: Provider::AppNamedShm,
         region,
         memory: vk::DeviceMemory::null(),
         len,
@@ -398,7 +444,7 @@ pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena>
         .map_err(|e| DriverError::Vk("vkAllocateMemory(import host pointer)", e))?;
 
     Ok(Arena {
-        provider: Provider::AppMemfd,
+        provider: Provider::AppNamedShm,
         region,
         memory,
         len,
@@ -513,11 +559,14 @@ mod tests {
     /// columns fails a test rather than a session.
     #[test]
     fn each_measured_driver_gets_the_provider_that_works_for_it() {
+        // The only driver on the wrong side of design.md §1a, and the only one
+        // with no alternative: §0.7.
         assert_eq!(Provider::for_driver("radv"), Provider::GpuExport);
-        assert_eq!(Provider::for_driver("nvidia"), Provider::GpuExport);
-        assert_eq!(Provider::for_driver("lavapipe"), Provider::AppMemfd);
-        assert_eq!(Provider::for_driver("intel"), Provider::AppMemfd);
-        assert_eq!(Provider::for_driver("unknown"), Provider::AppMemfd);
+        // Moved to the named path when the rule was stated: it can, so it must.
+        assert_eq!(Provider::for_driver("nvidia"), Provider::AppNamedShm);
+        assert_eq!(Provider::for_driver("lavapipe"), Provider::AppNamedShm);
+        assert_eq!(Provider::for_driver("intel"), Provider::AppNamedShm);
+        assert_eq!(Provider::for_driver("unknown"), Provider::AppNamedShm);
     }
 
     /// The two tables have to agree about whether a host pointer is acceptable,
@@ -551,9 +600,9 @@ mod tests {
     /// nothing in this codebase can change that.
     #[test]
     fn across_a_vm_only_a_host_pointer_import_is_possible() {
-        assert_eq!(Provider::for_driver_across_a_vm("nvidia"), Some(Provider::AppMemfd));
-        assert_eq!(Provider::for_driver_across_a_vm("intel"), Some(Provider::AppMemfd));
-        assert_eq!(Provider::for_driver_across_a_vm("lavapipe"), Some(Provider::AppMemfd));
+        assert_eq!(Provider::for_driver_across_a_vm("nvidia"), Some(Provider::AppNamedShm));
+        assert_eq!(Provider::for_driver_across_a_vm("intel"), Some(Provider::AppNamedShm));
+        assert_eq!(Provider::for_driver_across_a_vm("lavapipe"), Some(Provider::AppNamedShm));
         assert_eq!(Provider::for_driver_across_a_vm("radv"), None);
         // …even though on one machine RADV is perfectly capable, which is the
         // point: the topology removes an option the driver has.

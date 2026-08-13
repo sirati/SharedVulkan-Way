@@ -86,7 +86,8 @@ fn gpu(socket: &str, device: usize, bytes: u64) -> Result<(), Box<dyn std::error
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
     use sv_gpu_server::{arena, driver::Driver, workload};
-    use sv_transport::cold::{Attachment, ColdMessage, recv, send, send_with_fds};
+    use sv_transport::cold::{Attachment, ColdMessage, recv, send};
+    use sv_transport::localfd::send_with_fds;
 
     let driver = Driver::open(device)?;
     println!("[gpu] {} ({})", driver.name, driver.driver_key());
@@ -109,11 +110,17 @@ fn gpu(socket: &str, device: usize, bytes: u64) -> Result<(), Box<dyn std::error
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
     let (sock, _) = listener.accept()?;
-    let (msg, _) = recv(&sock)?;
+    let msg = recv(&sock)?;
     if !matches!(msg, ColdMessage::AttachRequest) {
         return Err(format!("expected AttachRequest, got {msg:?}").into());
     }
     let at = Attachment {
+        // This probe is *about* the nameless path — an exported dma-buf has no
+        // name — so both fields are empty and the descriptor does the work. It
+        // is the only binary in the project for which that is the subject rather
+        // than a compromise.
+        object: String::new(),
+        arena_object: String::new(),
         control_offset: 0,
         control_len: 0,
         arena_offset: 0,
@@ -125,10 +132,10 @@ fn gpu(socket: &str, device: usize, bytes: u64) -> Result<(), Box<dyn std::error
     ColdMessage::Attach(at).encode(&mut buf)?;
     let fd = a.exported_fd.as_ref().ok_or("no exported descriptor")?.as_fd();
     send_with_fds(&sock, &buf, &[fd])?;
-    println!("[gpu] descriptor passed over SCM_RIGHTS");
+    println!("[gpu] dma-buf descriptor passed over SCM_RIGHTS — the quarantined path (design.md §1a)");
 
     // The app side says when it has written the input half.
-    let (msg, _) = recv(&sock)?;
+    let msg = recv(&sock)?;
     if !matches!(msg, ColdMessage::Ping) {
         return Err(format!("expected Ping, got {msg:?}").into());
     }
@@ -158,7 +165,8 @@ fn app(socket: &str) -> Result<(), Box<dyn std::error::Error>> {
     use arena_record::gpu as ref_gpu;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
-    use sv_transport::cold::{ColdMessage, recv, send};
+    use sv_transport::cold::{ColdMessage, send};
+    use sv_transport::localfd::recv_all;
     use sv_transport::region::{PAGE, SharedRegion};
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -172,12 +180,12 @@ fn app(socket: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     send(&sock, &ColdMessage::AttachRequest)?;
-    let (msg, fd) = recv(&sock)?;
+    let (msg, fds) = recv_all(&sock)?;
     let at = match msg {
         ColdMessage::Attach(a) => a,
         other => return Err(format!("unexpected {other:?}").into()),
     };
-    let fd = fd.ok_or("the GPU side sent no descriptor")?;
+    let fd = fds.into_iter().next().ok_or("the GPU side sent no descriptor")?;
 
     // Question 1: does the descriptor map here at all?
     let region = SharedRegion::map_fd(fd.as_fd(), 0, at.arena_len as usize).map_err(|e| {
@@ -209,7 +217,7 @@ fn app(socket: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("[app] wrote {} MiB of pattern and poisoned the output half", half >> 20);
 
     send(&sock, &ColdMessage::Ping)?;
-    let (msg, _) = recv(&sock)?;
+    let msg = sv_transport::cold::recv(&sock)?;
     if !matches!(msg, ColdMessage::Ping) {
         return Err(format!("expected Ping, got {msg:?}").into());
     }

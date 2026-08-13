@@ -311,9 +311,15 @@ unsafe impl Sync for Mapping {}
 impl Mapping {
     /// Create a `memfd` of `len` bytes and map it `MAP_SHARED`.
     ///
-    /// The development-loop arena of design.md §3. The descriptor is kept so
-    /// that `sv-hostd`, or a GPU-side process on the same machine, can be handed
-    /// it over the cold path once `sv-transport` lands.
+    /// The **standalone** arena of design.md §3: this ICD with no GPU side, where
+    /// the memory is this process's own and is shared with nobody. The descriptor
+    /// is kept only because it owns the pages.
+    ///
+    /// It is deliberately *not* a handoff: design.md §1a forbids a descriptor
+    /// crossing to the GPU side, and a connected ICD takes
+    /// [`MappingBacking::Shared`] over a region `sv-transport` mapped from a name
+    /// instead. A memfd is the right object here precisely because nobody else
+    /// ever needs to find it.
     #[cfg(target_os = "linux")]
     pub fn create(len: u64) -> io::Result<Mapping> {
         use std::os::fd::FromRawFd;

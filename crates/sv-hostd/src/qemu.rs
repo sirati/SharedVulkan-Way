@@ -435,6 +435,34 @@ pub fn open_backend(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().read(true).write(true).open(path)
 }
 
+/// The **name** an ICD is to open the backend by (design.md §1a).
+///
+/// A name rather than a descriptor, because a descriptor may not cross a
+/// boundary and this project no longer has a mechanism for one to. Two cases,
+/// and which one applies is a property of the deployment rather than of this
+/// code:
+///
+/// - `memory-backend-file` — the link resolves to a real path, and that path is
+///   the name. It is openable by anyone with permission on the file, it is
+///   stable across a QEMU restart, and it is what a real deployment should use.
+/// - `memory-backend-memfd` — the object has no path, and the only name it has
+///   is `/proc/<qemu-pid>/fd/<n>`. That is the name design.md §1a calls out as
+///   legal — the app side reaching the hypervisor's own backing object — and the
+///   cost of it is stated rather than hidden: it is a *same-machine* name, it
+///   requires the reader to have `PTRACE_MODE_READ` on QEMU, and it moves that
+///   requirement from `sv-hostd` to every ICD, which weakens §3's argument for
+///   the daemon existing. It never crosses to the GPU side, on any topology:
+///   the GPU side is in the VM and locates its own memory by content (§5.1).
+pub fn backend_name(fd_path: &Path) -> String {
+    if let Ok(target) = std::fs::read_link(fd_path)
+        && target.is_absolute()
+        && target.exists()
+    {
+        return target.to_string_lossy().into_owned();
+    }
+    fd_path.to_string_lossy().into_owned()
+}
+
 /// The backing object's size, which bounds the scan.
 pub fn backend_len(f: &std::fs::File) -> std::io::Result<u64> {
     Ok(f.metadata()?.len())

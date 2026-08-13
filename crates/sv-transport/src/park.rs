@@ -268,6 +268,26 @@ impl Parker for SpinYield {
 /// wait the producer can end in one syscall. A ring with nothing on it costs one
 /// blocked thread and no CPU at all, which is what the sleep was for; a ring
 /// that gets a packet answers in the time a futex wake takes.
+///
+/// # A shared futex is a same-kernel mechanism, and this degrades rather than
+/// breaks
+///
+/// design.md §1a forbids a *descriptor* crossing the boundary; a futex is not
+/// one, but it is worth being explicit that the wake is co-location-dependent
+/// in the same spirit. Two processes on one kernel hash a `MAP_SHARED` word to
+/// the same futex key and `FUTEX_WAKE` reaches the peer. Across a hypervisor
+/// they do not: the guest's kernel and the host's kernel each have their own
+/// futex hash, and a wake on one side reaches nobody on the other.
+///
+/// **What saves it is that `slice` is finite.** The wait is a loop that
+/// re-examines the readiness predicate every `slice`, so a doorbell that reaches
+/// nobody costs latency and not correctness — across a VM this parker *is*
+/// [`SpinYield`] with a 20 ms sleep, which is exactly what D9 says the design
+/// starts from ("polling first, behind a trait; interrupts are an optimisation
+/// to be justified by measurement, not an architecture"). The measured numbers
+/// above are same-machine numbers and should not be quoted for the cross-VM
+/// case; what that case needs is a doorbell the hypervisor carries — a
+/// virtio-serial byte or an ivshmem interrupt — behind this same trait.
 #[derive(Debug, Clone, Copy)]
 pub struct Futex {
     pub spins: u32,

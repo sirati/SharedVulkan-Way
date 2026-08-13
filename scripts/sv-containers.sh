@@ -5,10 +5,22 @@
 #   scripts/sv-containers.sh --no-build use whatever is in target/debug
 #
 # This is the Linux-host / Linux-guest topology, not a simulation of it. The two
-# sides share exactly one thing: a Unix socket, over which `sv-hostd` passes the
-# arena's memfd by SCM_RIGHTS. Everything else — PID namespace, IPC namespace,
-# UTS namespace, /tmp — is separate, so a side that reached for anything it was
-# not given would fail here rather than in a VM three stages later.
+# sides share two things and no more: a Unix socket, over which `sv-hostd` sends
+# the *name* of the arena object (design.md §1a — no descriptor crosses), and the
+# `/dev/shm` namespace that name is resolved in. Everything else — PID namespace,
+# IPC namespace, UTS namespace, /tmp — is separate, so a side that reached for
+# anything it was not given would fail here rather than in a VM three stages
+# later.
+#
+# THE /dev/shm BIND IS THE POINT, NOT PLUMBING. Before §1a the containers needed
+# no shared memory namespace at all, because the descriptor arrived over the
+# socket and a descriptor names nothing. A name is only worth anything to a peer
+# that can resolve it, so the rule that removed the descriptor added a
+# requirement: **the two sides must share a namespace in which the name means the
+# same object.** Two containers share `/dev/shm` by bind mount; two machines
+# share nothing, which is exactly why the cross-VM topology does not use a name
+# at all — there the guest allocates and the host *locates by content* (§5.1),
+# and that is the strongest form of the rule rather than an exception to it.
 #
 # WHY BUBBLEWRAP AND NOT PODMAN. The user asked for podman; this machine has
 # neither podman nor docker installed, and bubblewrap 0.11.2 is already present.
@@ -19,7 +31,7 @@
 # if podman is ever installed, and the socket bind mount is the only requirement.
 #
 # WHAT IT PROVES, which the single-process tests cannot:
-#   * the descriptor really does cross a process and namespace boundary, and the
+#   * a *name* really is enough across a process and namespace boundary, and the
 #     two sides really do map the same physical pages at different addresses;
 #   * the app side writes a pattern through its own mapping and sends only
 #     (offset, len) — the GPU side's checksum over its own mapping agrees;
@@ -47,7 +59,12 @@ BIN="$ROOT/target/debug"
 
 # One container. The nix store is read-only because the binaries link against
 # it; target/debug is read-only because a container has no business writing to
-# the build tree; $SOCKDIR is the only writable, *shared* thing.
+# the build tree; $SOCKDIR and /dev/shm are the only writable, *shared* things.
+#
+# ORDER MATTERS: `--dev /dev` mounts a fresh tmpfs over /dev, which would bury an
+# earlier /dev/shm bind. The bind comes after it, and the failure if it does not
+# is silent in the worst way — each container gets its *own* /dev/shm, the
+# daemon's name resolves in neither, and the client reports "cannot open".
 run_in_container() {
   local name="$1"; shift
   bwrap \
@@ -56,6 +73,7 @@ run_in_container() {
     --bind "$SOCKDIR" /run/sv \
     --proc /proc \
     --dev /dev \
+    --bind /dev/shm /dev/shm \
     --tmpfs /tmp \
     --unshare-pid --unshare-ipc --unshare-uts \
     --hostname "$name" \
@@ -64,7 +82,7 @@ run_in_container() {
     -- "$@"
 }
 
-echo "== two containers, one memfd =="
+echo "== two containers, one named object =="
 echo "   socket directory (shared): $SOCKDIR"
 
 run_in_container hostd /opt/sv/sv-hostd serve --socket /run/sv/hostd.sock --clients 2 \
