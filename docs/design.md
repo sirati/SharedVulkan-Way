@@ -2458,10 +2458,22 @@ nobody checks.**
    case than most of what Wine has been asked to stand in for. Real Windows
    applies UIPI and a set of `SetForegroundWindow` restrictions that Wine does
    not, and §10.7 shows the foreground rules already differ enough to change the
-   harness. A guest run may need the probe elevated, or may need
-   `PostMessage` — `probe-input.c` keeps `--post` for exactly that, and if the
-   two modes ever disagree the difference is Wine's rather than the
-   compositor's.
+   harness. A guest run may need the probe elevated, or may need `PostMessage`;
+   `probe-input.c` keeps `--post` for exactly that (`WC_PROBE_POST=1`), and the
+   two modes agree on the keyboard — **16 checks against 24**, both green.
+
+   **The fallback is keyboard-only, and that was measured rather than
+   assumed.** A posted `WM_MOUSEMOVE` does not move the cursor, and Win32's own
+   mouse tracking follows the real one: `TrackMouseEvent` fires `WM_MOUSELEAVE`
+   immediately after every posted move, and `GetCursorPos` — the only source of
+   coordinates for a posted button — reports somewhere else. On the wire that
+   was a `leave`/`enter` pair per motion and a click at (636, 482) of a 500x400
+   window, which the client correctly ignored. A keyboard message carries
+   everything it needs in its own `wParam` and `lParam`, so the probe now
+   refuses the mouse in that mode rather than injecting events the compositor
+   would be right to mishandle. For the fallback's purpose — telling "our
+   translation is wrong" from "the injection did not arrive" — the keyboard is
+   the half that matters.
 3. **`WM_INPUTLANGCHANGE` has never fired.** The layout-switch path is proven by
    the headless simulation calling the same code, and by `GetKeyboardLayout`
    selecting `gb` under Wine at startup — but no run has changed the layout of a

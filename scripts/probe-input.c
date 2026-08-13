@@ -26,7 +26,18 @@
  * `--post` is kept as a fallback because Wine's `SendInput` has been unreliable
  * before, and a harness that could not tell "our code is wrong" from "the
  * injection did not arrive" would be no use. If the two modes disagree, the
- * difference is Wine's, not the compositor's.
+ * difference is the platform's injection layer, not the compositor's.
+ *
+ * **`--post` is keyboard-only, and it is not a limitation that can be lifted.**
+ * Measured: posting `WM_MOUSEMOVE` does not move the cursor, and Win32's own
+ * mouse tracking follows the *real* one — so `TrackMouseEvent` fires
+ * `WM_MOUSELEAVE` immediately after every posted move, and `GetCursorPos` (the
+ * only source of coordinates for a posted button) reports somewhere else
+ * entirely. The result on the wire was a `leave`/`enter` pair per motion and a
+ * click at (636, 482) of a 500x400 window, which the client correctly ignored.
+ * A keyboard message carries everything it needs in its own `wParam` and
+ * `lParam` and has no such dependency, so the fallback does the half it can do
+ * faithfully and refuses the half it cannot.
  *
  * WHY SCAN CODES AND NOT VIRTUAL KEYS
  *
@@ -251,6 +262,17 @@ int main(int argc, char **argv)
 			printf("probe-input: unknown argument %s\n", argv[i]);
 			return 2;
 		}
+	}
+
+	if (use_post && do_mouse) {
+		/* Refused rather than done badly. See the header: a posted mouse
+		 * message is measurably a lie, and a harness that accepted one
+		 * would be asserting on events the compositor was right to
+		 * mishandle. */
+		printf("probe-input: --post is keyboard-only; the mouse is skipped "
+		       "because Win32 tracks the real cursor and PostMessage does "
+		       "not move it\n");
+		do_mouse = 0;
 	}
 
 	target = find_target(cls, wait);

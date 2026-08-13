@@ -172,8 +172,11 @@ run_linux() {
 # One function, called by both legs, so that the wine leg is held to exactly the
 # standard the linux leg is and a weaker check cannot creep into the harder
 # case.
+# `keyboard` as a third argument means the pointer assertions are skipped, which
+# is only ever right for the `--post` diagnostic — see `probe-input.c` for why
+# a posted mouse message cannot be faithful.
 check_client_events() {
-  local raw=$1 tag=$2
+  local raw=$1 tag=$2 scope=${3:-all}
   local log="$raw.clean"
 
   if [ ! -s "$raw" ]; then
@@ -204,16 +207,18 @@ check_client_events() {
   grep -q "wl_keyboard@[0-9]*\.enter(" "$log" \
     && ok "$tag: wl_keyboard.enter — focus followed the platform" \
     || bad "$tag: the keyboard never entered a surface"
-  grep -q "wl_pointer@[0-9]*\.enter(" "$log" \
-    && ok "$tag: wl_pointer.enter" || bad "$tag: the pointer never entered"
-  # The leave is the one that needs `TrackMouseEvent` on Win32 and is the
-  # classic omission, so it is checked on the wire rather than inferred.
-  grep -q "wl_pointer@[0-9]*\.leave(" "$log" \
-    && ok "$tag: wl_pointer.leave — the pointer left, so the platform noticed" \
-    || bad "$tag: no wl_pointer.leave (on Win32 this means TrackMouseEvent never armed)"
-  grep -q "wl_pointer@[0-9]*\.frame()" "$log" \
-    && ok "$tag: wl_pointer.frame — events are grouped as the protocol requires" \
-    || bad "$tag: no frame events; clients batching on frame would stall"
+  if [ "$scope" != keyboard ]; then
+    grep -q "wl_pointer@[0-9]*\.enter(" "$log" \
+      && ok "$tag: wl_pointer.enter" || bad "$tag: the pointer never entered"
+    # The leave is the one that needs `TrackMouseEvent` on Win32 and is the
+    # classic omission, so it is checked on the wire rather than inferred.
+    grep -q "wl_pointer@[0-9]*\.leave(" "$log" \
+      && ok "$tag: wl_pointer.leave — the pointer left, so the platform noticed" \
+      || bad "$tag: no wl_pointer.leave (on Win32 this means TrackMouseEvent never armed)"
+    grep -q "wl_pointer@[0-9]*\.frame()" "$log" \
+      && ok "$tag: wl_pointer.frame — events are grouped as the protocol requires" \
+      || bad "$tag: no frame events; clients batching on frame would stall"
+  fi
 
   # --- what the client made of it ---------------------------------------
   #
@@ -260,6 +265,11 @@ check_client_events() {
     *[1-9]*) ok "$tag: wl_keyboard.modifiers carried a depressed mask (values seen: $mods)" ;;
     *)       bad "$tag: every modifiers event had an empty mask (values seen: $mods)" ;;
   esac
+
+  if [ "$scope" = keyboard ]; then
+    note "$tag: pointer assertions skipped — --post cannot inject a faithful mouse"
+    return 0
+  fi
 
   # BTN_LEFT is 0x110 = 272, and it is a Linux evdev button code rather than
   # anything Win32 has a name for. A compositor forwarding Win32's own numbering
@@ -416,11 +426,18 @@ run_wine() {
   #
   # `--log` for the reason in `probe-input.c`: a program launched by
   # `wine explorer` has its console inside the desktop.
-  local probe_log_win
+  # `WC_PROBE_POST=1` swaps `SendInput` for `PostMessage`. Kept reachable from
+  # the harness rather than only from the probe, because the value of the
+  # fallback is that the two modes can be *compared*: if a guest run ever
+  # disagrees between them, the difference is the platform's injection layer and
+  # not the compositor's translation. Both modes are run here, so the fallback
+  # is measured rather than asserted.
+  local probe_log_win probe_mode=()
+  [ -n "${WC_PROBE_POST:-}" ] && probe_mode=(--post)
   probe_log_win=$(winepath -w "$dir/probe.log" 2>/dev/null || echo "$dir/probe.log")
   wine explorer "/desktop=wc-input,1280x1024" \
     "$dir/probe-input.exe" --class WaycomposeToplevel --wait 25 --type helloZ \
-    --log "$probe_log_win" >"$dir/probe-loader.log" 2>&1
+    "${probe_mode[@]}" --log "$probe_log_win" >"$dir/probe-loader.log" 2>&1
   local probe_rc=$?
   sleep 2
 
@@ -497,7 +514,7 @@ run_wine() {
   esac
 
   # --- and what the client received --------------------------------------
-  check_client_events "$dir/cli.log" wine
+  check_client_events "$dir/cli.log" wine "${WC_PROBE_POST:+keyboard}"
 }
 
 # ---------------------------------------------------------------------------
