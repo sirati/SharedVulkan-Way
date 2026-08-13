@@ -136,7 +136,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
-use windows_sys::Win32::Foundation::{GlobalFree, POINT, SIZE};
+// ADDED FOR STAGE 32: the taskbar identity. `SHGetPropertyStoreForWindow` is
+// the only entry point in this file that hands back a **COM interface**, and
+// the workspace manifest's "no COM" note stops being true here — see
+// `set_taskbar_identity` for what that costs and why nothing else will do.
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreForWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA};
+use windows_sys::Win32::Foundation::{GlobalFree, POINT, PROPERTYKEY, SIZE};
+use windows_sys::core::{GUID, HRESULT};
 // ADDED FOR THE CLIPBOARD. The clipboard lives in `DataExchange` rather than with
 // the window messages, and its payloads are moveable global handles rather than
 // pointers, which is why `Memory` comes with it. See `set_clipboard`.
@@ -292,6 +300,14 @@ struct WindowState {
     /// How many frames this window has presented, for the dump filenames.
     frames: Cell<u32>,
     icon_small: Cell<isize>,
+    /// The taskbar identity currently on this window's property store.
+    ///
+    /// ADDED FOR STAGE 32. Held so that a repeated `set_app_id` with the same
+    /// string — which is a thing clients do — does not rebuild a taskbar button
+    /// that is already right. A `RefCell` rather than a `Cell` because it has
+    /// to be *read* to answer that; it is borrowed only for the comparison and
+    /// never across a Win32 call, which is this module's rule.
+    aumid: RefCell<String>,
 
     // --- input, stage 6 ---------------------------------------------------
     /// Whether `TrackMouseEvent` is currently armed for this window.
@@ -1769,10 +1785,11 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             id,
             title,
             app_id,
+            aumid,
             shadow,
             kind,
         } => {
-            if let Err(e) = create_window(ui, id, &title, &app_id, shadow, kind) {
+            if let Err(e) = create_window(ui, id, &title, &app_id, &aumid, shadow, kind) {
                 eprintln!("wc-compositor: could not create a window for surface {id}: {e}");
             }
         }
@@ -1788,12 +1805,15 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 println!("wc-compositor: window {id} title -> {title:?}");
             }
         }
-        ToUi::AppId { id, app_id } => {
-            // Nothing to do on Win32. `set_app_id` names a desktop entry, and
-            // turning that into pixels happens on the machine the client is on
-            // (docs/design.md §16.4); by the time an icon reaches this thread
-            // it is a `ToUi::Icon`. Logged so the harness can see it arrive.
+        ToUi::AppId { id, app_id, aumid } => {
+            // The *pixels* for an app id are still somebody else's problem —
+            // they are resolved on the machine the client is on and arrive as a
+            // `ToUi::Icon` (§16.4). What arrives here is the identity, and
+            // until stage 32 this arm did nothing at all.
             println!("wc-compositor: window {id} app_id -> {app_id:?}");
+            if let Some(w) = window(ui, id) {
+                apply_identity(&w, &aumid);
+            }
         }
         ToUi::Icon { id, icons } => {
             if let Some(w) = window(ui, id) {
@@ -2116,6 +2136,7 @@ fn create_window(
     id: WindowId,
     title: &str,
     app_id: &str,
+    aumid: &str,
     shadow: Arc<Mutex<Shadow>>,
     kind: WindowKind,
 ) -> std::io::Result<()> {
@@ -2134,6 +2155,7 @@ fn create_window(
         icon_big: Cell::new(0),
         frames: Cell::new(0),
         icon_small: Cell::new(0),
+        aumid: RefCell::new(String::new()),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
@@ -2210,9 +2232,16 @@ fn create_window(
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(state.clone()) as isize);
     }
-    ui.windows.borrow_mut().insert(id, state);
+    ui.windows.borrow_mut().insert(id, state.clone());
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
+    // ADDED FOR STAGE 32, and *here* rather than at map for one reason: the
+    // window is still hidden. The shell has not seen it, so it has no taskbar
+    // button for it yet, so the identity it eventually reads is whatever is on
+    // the property store at `ShowWindow`. Doing it now costs nothing and makes
+    // the map-time call an idempotent no-op for every client that named itself
+    // before its first buffer.
+    apply_identity(&state, aumid);
     Ok(())
 }
 
@@ -2670,6 +2699,322 @@ fn set_window_state(w: &Rc<WindowState>, maximized: Option<bool>, minimized: Opt
         }
     }
     w.self_driven.set(false);
+}
+
+// ---------------------------------------------------------------------------
+// Taskbar identity, stage 32
+// ---------------------------------------------------------------------------
+//
+// WHY THERE IS COM IN A FILE WHOSE MANIFEST SAYS THERE IS NONE
+//
+// Every window this process makes is made by *this process*, and the shell
+// groups taskbar buttons by process unless a window says otherwise. Saying
+// otherwise is one property on one window — `PKEY_AppUserModel_ID` — and the
+// only way to set a property on an `HWND` is `SHGetPropertyStoreForWindow`,
+// which returns an `IPropertyStore`. There is no flat entry point for it.
+//
+// The process-wide alternative, `SetCurrentProcessExplicitAppUserModelID`, *is*
+// a flat entry point and is exactly the wrong shape: it gives the whole process
+// one identity, which is the state we are already in and the defect being
+// fixed.
+//
+// windows-sys 0.61 generates no COM interfaces at all — only functions,
+// structs and constants — so the vtable below is declared by hand from
+// `propsys.h`. That is eight function pointers in a fixed order and two GUIDs;
+// getting the order wrong is a call through the wrong slot, which is why the
+// declaration is a transcription with the header's own comments kept.
+
+/// `IID_IPropertyStore`, from `propsys.h`.
+const IID_PROPERTY_STORE: GUID = GUID::from_u128(0x886d8eeb_8cf2_4446_8d02_cdba1dbdcf99);
+
+/// The `fmtid` every `PKEY_AppUserModel_*` shares, from `propkey.h`.
+const FMTID_APP_USER_MODEL: GUID = GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3);
+
+/// `PKEY_AppUserModel_ID`: the string the shell groups taskbar buttons by.
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 5,
+};
+
+/// `PKEY_AppUserModel_PreventPinning`: no "Pin to taskbar" on this button.
+///
+/// **Set, deliberately, and this is a decision rather than caution.** Pinning
+/// writes a shortcut whose target is what the shell can work out about the
+/// window, and relaunching it would start `wc-compositor.exe` — not the Wayland
+/// client the button appears to be. The three properties that would make
+/// pinning honest (`PKEY_AppUserModel_RelaunchCommand`, `…IconResource`,
+/// `…DisplayNameResource`) cannot be filled in truthfully from here either: the
+/// application is a process on **another machine**, started by a person or a
+/// script that this compositor knows nothing about, and there is no command
+/// line on this side that would bring it back. A pinned button that silently
+/// does the wrong thing is worse than an absent affordance, so the affordance
+/// is removed and the reason is written down.
+const PKEY_PREVENT_PINNING: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 9,
+};
+
+/// `VT_LPWSTR`.
+const VT_LPWSTR: u16 = 31;
+/// `VT_BOOL`.
+const VT_BOOL: u16 = 11;
+/// `VARIANT_TRUE`, which is `-1` and not `1`.
+const VARIANT_TRUE: i16 = -1;
+
+/// `PROPVARIANT`, as much of it as two property types need.
+///
+/// The real union is sixteen bytes after an eight-byte header. Only the first
+/// eight of those are ever written here — a `LPWSTR` or a `VARIANT_BOOL` — and
+/// the rest is zero, which is what an unset `PROPVARIANT` looks like anyway.
+/// The size assertion is the check that this agrees with the ABI; it is written
+/// for a 64-bit target on purpose, because a 32-bit build would need a
+/// different one and should fail loudly rather than pass a mis-shaped struct to
+/// the shell.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PropVariant {
+    vt: u16,
+    reserved: [u16; 3],
+    value: [u64; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<PropVariant>() == 24);
+
+impl PropVariant {
+    const fn empty() -> Self {
+        PropVariant { vt: 0, reserved: [0; 3], value: [0; 2] }
+    }
+
+    /// A `VT_LPWSTR` **borrowing** `s`.
+    ///
+    /// Borrowing is sound because `IPropertyStore::SetValue` copies the value
+    /// it is given (it is a store, not a sink) and because this variant is
+    /// never handed to `PropVariantClear`. So the `Vec<u16>` behind `s` owns
+    /// the memory, frees it on drop, and no allocator crosses the boundary in
+    /// either direction.
+    fn lpwstr(s: *const u16) -> Self {
+        PropVariant { vt: VT_LPWSTR, reserved: [0; 3], value: [s as u64, 0] }
+    }
+
+    fn boolean(v: bool) -> Self {
+        let raw = if v { VARIANT_TRUE } else { 0 } as u16;
+        PropVariant { vt: VT_BOOL, reserved: [0; 3], value: [u64::from(raw), 0] }
+    }
+
+    /// The string out of a variant a `GetValue` filled in, and the shell's
+    /// allocation with it.
+    ///
+    /// Consuming, because the pointer is freed here: `PROPVARIANT` strings come
+    /// from `CoTaskMemAlloc`, which is exactly what `PropVariantClear` would
+    /// free, and taking the one case this file can produce is cheaper than
+    /// pulling in the whole of `Win32_System_Com_StructuredStorage` for it.
+    fn take_string(self) -> Option<String> {
+        if self.vt != VT_LPWSTR || self.value[0] == 0 {
+            return None;
+        }
+        let p = self.value[0] as *mut u16;
+        let mut n = 0usize;
+        // SAFETY: a NUL-terminated UTF-16 string from the property store.
+        unsafe {
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            CoTaskMemFree(p.cast());
+            Some(s)
+        }
+    }
+}
+
+#[repr(C)]
+struct PropertyStore {
+    vtbl: *const PropertyStoreVtbl,
+}
+
+/// `IPropertyStoreVtbl`, transcribed from `propsys.h` in its own order.
+#[repr(C)]
+struct PropertyStoreVtbl {
+    // IUnknown
+    query_interface:
+        unsafe extern "system" fn(*mut PropertyStore, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+    release: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+    // IPropertyStore
+    get_count: unsafe extern "system" fn(*mut PropertyStore, *mut u32) -> HRESULT,
+    get_at: unsafe extern "system" fn(*mut PropertyStore, u32, *mut PROPERTYKEY) -> HRESULT,
+    get_value:
+        unsafe extern "system" fn(*mut PropertyStore, *const PROPERTYKEY, *mut PropVariant)
+            -> HRESULT,
+    set_value:
+        unsafe extern "system" fn(*mut PropertyStore, *const PROPERTYKEY, *const PropVariant)
+            -> HRESULT,
+    commit: unsafe extern "system" fn(*mut PropertyStore) -> HRESULT,
+}
+
+thread_local! {
+    /// Whether this thread has called `CoInitializeEx`.
+    static COM_READY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Put this thread in a single-threaded apartment, once.
+///
+/// Lazy rather than at startup so that a compositor which never makes a window
+/// — the headless and the `--probe` paths — never initialises COM at all, and
+/// so that the HRESULT is logged next to the first thing that needed it.
+/// Apartment-threaded because this is a thread with a message loop, which is
+/// what an STA is; `RPC_E_CHANGED_MODE` (0x80010106) would mean somebody had
+/// already made it multi-threaded, and is reported rather than treated as
+/// fatal because the property store works either way.
+///
+/// There is no `CoUninitialize`. This thread runs until the process exits.
+fn com_init() {
+    COM_READY.with(|ready| {
+        if ready.replace(true) {
+            return;
+        }
+        // SAFETY: a plain call with a null reserved argument, on the thread
+        // that will use the apartment.
+        // `COINIT_*` is generated as a signed `COINIT`; the entry point takes
+        // an unsigned flag word. The cast is the whole of the difference.
+        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        println!("wc-compositor: COM apartment on the UI thread: hr 0x{:08x}", hr as u32);
+    });
+}
+
+/// Which taskbar button this window belongs on.
+///
+/// Returns the identity the property store reads back, which is a stronger
+/// claim than "`SetValue` returned `S_OK`" and costs one more call.
+///
+/// # Ordering, which is the part that is easy to get wrong
+///
+/// The shell creates a taskbar button when the window is **shown** and reads
+/// this property then. Setting it afterwards leaves the button where it was.
+/// So every call site here is before a `ShowWindow` — at creation, and at map
+/// just before `map_window` — and the one path that cannot be, a `set_app_id`
+/// that arrives after the window is up, rebuilds the button by hiding and
+/// re-showing it (see the `ToUi::AppId` arm).
+fn set_taskbar_identity(w: &Rc<WindowState>, aumid: &str) -> Result<String, (&'static str, HRESULT)> {
+    com_init();
+    let mut store: *mut PropertyStore = std::ptr::null_mut();
+    // SAFETY: a live window handle; the out pointer is written only on success
+    // and is checked below.
+    let hr = unsafe {
+        SHGetPropertyStoreForWindow(
+            w.hwnd(),
+            &IID_PROPERTY_STORE,
+            (&mut store as *mut *mut PropertyStore).cast(),
+        )
+    };
+    if hr < 0 || store.is_null() {
+        return Err(("SHGetPropertyStoreForWindow", hr));
+    }
+    let id = wide(aumid);
+    // SAFETY: `store` is a live `IPropertyStore` from the call above and is
+    // released on every path out. `id` outlives every use of the borrowed
+    // pointer inside it, because `SetValue` copies before returning.
+    unsafe {
+        let vtbl = &*(*store).vtbl;
+        let mut result = Ok(String::new());
+        let hr = (vtbl.set_value)(store, &PKEY_APP_USER_MODEL_ID, &PropVariant::lpwstr(id.as_ptr()));
+        if hr < 0 {
+            result = Err(("SetValue(PKEY_AppUserModel_ID)", hr));
+        }
+        if result.is_ok() {
+            let hr =
+                (vtbl.set_value)(store, &PKEY_PREVENT_PINNING, &PropVariant::boolean(true));
+            if hr < 0 {
+                result = Err(("SetValue(PKEY_AppUserModel_PreventPinning)", hr));
+            }
+        }
+        if result.is_ok() {
+            let hr = (vtbl.commit)(store);
+            if hr < 0 {
+                result = Err(("Commit", hr));
+            }
+        }
+        // The read-back. What the store answers is what the shell will read,
+        // and it is the difference between "the call succeeded" and "the
+        // property is there" — a distinction §16 paid for once already, where
+        // both `WM_SETICON`s succeeded and the taskbar showed neither.
+        if result.is_ok() {
+            let mut pv = PropVariant::empty();
+            let hr = (vtbl.get_value)(store, &PKEY_APP_USER_MODEL_ID, &mut pv);
+            result = if hr < 0 {
+                Err(("GetValue(PKEY_AppUserModel_ID)", hr))
+            } else {
+                Ok(pv.take_string().unwrap_or_default())
+            };
+        }
+        (vtbl.release)(store);
+        result
+    }
+}
+
+/// Stamp an identity on a window, and say what happened.
+///
+/// `rebuild` is for the late case: the window is already on screen, so the
+/// button exists and the property alone will not move it. Hiding and re-showing
+/// is what makes the shell drop the button and make a new one; it is done only
+/// when the identity actually changed, because it costs a flicker and — since
+/// hiding the foreground window gives the focus away — a deactivation the
+/// client can see.
+fn apply_identity(w: &Rc<WindowState>, aumid: &str) {
+    if aumid.is_empty() {
+        // A popup. `WS_EX_TOOLWINDOW` with an owner has no taskbar button at
+        // all, so there is nothing to group and nothing to say.
+        return;
+    }
+    if *w.aumid.borrow() == aumid {
+        return;
+    }
+    let rebuild = w.mapped.get();
+    match set_taskbar_identity(w, aumid) {
+        Ok(read_back) => {
+            w.aumid.replace(aumid.to_string());
+            if read_back == aumid {
+                println!("wc-compositor: window {} taskbar identity <- {aumid:?}", w.id);
+            } else {
+                // The store took something other than what it was given. Not
+                // seen, and said out loud if it ever is, because a truncated or
+                // rejected identity is a window quietly back on the shared
+                // button.
+                println!(
+                    "wc-compositor: window {} taskbar identity <- {aumid:?} but the store \
+                     reads back {read_back:?}",
+                    w.id
+                );
+            }
+        }
+        Err((call, hr)) => {
+            eprintln!(
+                "wc-compositor: window {} could not take the taskbar identity {aumid:?}: \
+                 {call} returned 0x{:08x}",
+                w.id, hr as u32
+            );
+            return;
+        }
+    }
+    if rebuild {
+        // SAFETY: a live window handle on its own thread. Both calls reenter
+        // `toplevel_proc` before returning, which is what `self_driven` is for:
+        // the `WM_SIZE` this provokes is ours and is not a user action.
+        //
+        // `SW_SHOWNA` rather than `SW_SHOWNORMAL`: hiding the window has
+        // already cost it the focus, and taking the foreground back would be a
+        // window stealing activation for a reason the user cannot see.
+        w.self_driven.set(true);
+        unsafe {
+            ShowWindow(w.hwnd(), SW_HIDE);
+            ShowWindow(w.hwnd(), SW_SHOWNA);
+        }
+        w.self_driven.set(false);
+        println!(
+            "wc-compositor: window {} was already on screen, so its taskbar button was \
+             rebuilt under the new identity",
+            w.id
+        );
+    }
 }
 
 /// Set the window and taskbar icon from pixels.

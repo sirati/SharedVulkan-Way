@@ -3601,6 +3601,35 @@ that tries to read pixels back**, and nothing in stages 1–5 tried to.
 So §10.12 item 3 was not "we did not get round to looking". It was that the
 harness could not have looked, and could not have reported that it could not.
 
+#### The same fact bites a second time, and it is not about pixels
+
+**A `wl_shm` pool does not cross a session either**, and the failure looks
+nothing like the one above. Measured in §32's harness, which started two Windows
+clients over ssh against a compositor on the logged-on desktop:
+
+```
+wc-compositor: window 1 created (HWND 0x40490) title="" app_id=""
+wc-compositor: could not map Section { name: "Local\\wc-1bbd6…", size: 960000 }:
+               Das System kann die angegebene Datei nicht finden. (os error 2)
+wc-compositor: client … disconnected: ProtocolError(… "wl_shm",
+               "Failed to mmap fd Handle { … }")
+```
+
+A pool on Windows is a **named section** (§2.3), and the `Local\` namespace is
+per *session*. The client in session 0 creates `Local\wc-…`; the compositor in
+session 1 opens the same string and there is no such object. Same machine, same
+path, same name, `ERROR_FILE_NOT_FOUND`. What a harness sees is windows that are
+created and never mapped, and a `wl_shm` protocol error that reads like a bug in
+the pool code.
+
+So the rule is wider than "a capture from ssh is blind": **anything the guest
+side of a run touches by kernel-object name has to be in the same session as the
+process that made it.** Both ends go through the scheduler, or neither does. It
+does not apply to the deployed topology, where the client is on the *Linux* side
+and its pool crosses as a file or an arena slice rather than as a name — which
+is exactly why it had gone unnoticed until a harness put a Windows client and a
+Windows compositor in different sessions.
+
 ### 13.3 Getting onto `WinSta0`, and the three routes that were not available
 
 A process cannot walk into another session's window station; something already
@@ -5707,6 +5736,14 @@ A fifth, smaller: registering two scheduled tasks with the same name in one run
 leaves `Start-ScheduledTask` with nothing to start and no error, which printed
 as "the compositor did not start" for the second pass only — with the
 compositor's own log on the guest proving that it had.
+
+A sixth, found by §32 and filed in §13.2 because it belongs with the fact it is
+a consequence of: **a client started over ssh cannot share memory with a
+compositor on the desktop.** A `wl_shm` pool is a named section and `Local\` is
+per session, so the name the client creates in session 0 does not exist in
+session 1 — `ERROR_FILE_NOT_FOUND`, a `wl_shm` protocol error, and windows that
+are created and never mapped. Any harness that runs a *Windows* client against a
+desktop compositor has to put both ends through the scheduler.
 
 **And the other half of the rule, which is about what a run leaves behind.**
 While this stage was running, the guest was found to be holding **six abandoned
@@ -11883,3 +11920,366 @@ it happens before any shared memory has been located, so it cannot itself ride
 shared memory without something else establishing the first region — and it has a
 different shape from this one. It should stop being ssh, and it is not this
 section's to fix.
+
+---
+
+## 32. Stage 32: two programs, two taskbar buttons
+
+*(Numbered 32 because that is what this stage was assigned and it was still free
+when the branch merged — master carried §28, §29 and §34 by then, and §30, §31
+and §33 are in flight. §17.1's convention: the next free number at merge time,
+renumbered if master moved first.)*
+
+### 32.1 Status in one paragraph
+
+**Two different applications running through this compositor now hold two
+separate taskbar buttons, and two windows of the *same* application still share
+one.** There is a photograph of each
+(`docs/stage32/stage32-taskbar-two-applications.png`, in which
+`weston-terminal` and `weston-flower` sit side by side with their own icons and
+their own captions, and `stage32-taskbar-same.png`, in which two windows of one
+application are one button), and a measurement that does not need an eye:
+`wc-desk windows` reads `PKEY_AppUserModel_ID` back off every window on the
+desktop and prints how many distinct taskbar groups they come to. In the
+two-application run the desktop's 8 taskbar windows come to **8 groups**, two of
+which are ours and are different from each other; in the two-windows-of-one-app
+run its 8 taskbar windows come to **7** — our pair collapsing into one is the
+whole of the negative check.
+
+The mechanism is one string per `HWND`: an **Application User Model ID**, set
+through `SHGetPropertyStoreForWindow` and committed to the window's property
+store before the window is ever shown. `crates/wc-compositor/src/taskbar.rs`
+decides what the string is and is unit-tested on Linux; `platform/win32.rs`
+sets it. The harness is `scripts/wc-taskbar.sh`.
+
+Two things are worth saying before the detail. First, this is the other half of
+§16: that stage measured the taskbar showing a *generic* icon while both
+`HICON`s were set correctly, diagnosed it as the shell grouping by process, and
+hid the console — which made the button take our window's icon but left every
+window this process makes on one button. The grouping itself is what stage 32
+removes. Second, the identity is derived from `xdg_toplevel.set_app_id`, which
+is the only thing in the protocol that means "which application is this", and
+the ordering of that against `ShowWindow` is the part that had to be measured
+rather than assumed (§32.5).
+
+### 32.2 Why every window shared one button, and why §16's fix could not have separated them
+
+The Windows shell groups taskbar buttons by the window's Application User Model
+ID, and when a window has none of its own it falls back to one derived from the
+**process** — its executable path, or whatever
+`SetCurrentProcessExplicitAppUserModelID` last set. Every window this project
+puts on screen is created by `wc-compositor.exe`, so every window fell into one
+group, and the group took the executable's icon rather than any window's.
+
+§16 hit exactly this from the other side and wrote it down:
+
+> Both `HICON`s were set successfully, the caption showed the icon, and the
+> taskbar button showed the generic one for a whole run: the shell groups
+> buttons by process, the scheduled task gives the compositor a console window,
+> and a grouped button takes the *executable's* icon.
+
+That stage's fix — hiding the console so the group had one window in it —
+made the button show the right icon. It could not have separated anything,
+because it changed which windows were in the group and not what the group *is*.
+
+The process-wide entry point is the obvious wrong answer and is worth naming so
+nobody reaches for it: `SetCurrentProcessExplicitAppUserModelID` gives the whole
+process one identity, which is the state being fixed, with a nicer name on it.
+
+### 32.3 What the identity is derived from, and the two collisions a sanitiser introduces
+
+`crates/wc-compositor/src/taskbar.rs` is one function and nine tests. The rules:
+
+| what the client did | identity |
+|---|---|
+| `set_app_id("firefox")` | `Waycompose.app.firefox` |
+| `set_app_id("org.freedesktop.weston.wayland-terminal")` | `Waycompose.app.org.freedesktop.weston.wayland-terminal` |
+| never called `set_app_id`, arrived on connection 3 | `Waycompose.unnamed.c3` |
+
+**A function of the app id, not of the window.** That is what gets both halves
+of the requirement at once: `set_app_id` is the same string for every window of
+one application, so two programs get two buttons and two windows of one program
+keep sharing one. Deriving it from the window id would give every window its own
+button, which is not a fix but a different bug — and it is the bug the negative
+check in §32.7 exists to catch.
+
+**A client that never names itself** exists — §16 measured
+`weston-presentation-shm` sending no app id at all — and the anonymous identity
+is also what *every* window wears for the moment between its creation and its
+first buffer, which the log shows for each one:
+`window 1 taskbar identity <- "Waycompose.unnamed.c1"` immediately before the
+named stamp. A window whose client never gets round to naming itself simply
+keeps it. Such windows cannot be told apart by name, so they are told apart by
+**connection**: `ClientState::index` is already counted for every client, and
+using it means two anonymous *programs* still get two buttons while two windows
+of one anonymous program still share one. That is the same guarantee the app-id
+path gives, one level coarser, which is as far as the information goes.
+
+**The prefix is not decoration.** A Wayland client chooses its own app id, and
+an AUMID that named a really-installed application — `Microsoft.Windows.Explorer`
+— would put our window on *that* application's button and inherit its jump list
+and its pinning. Everything is minted under `Waycompose.`, and the two
+sub-namespaces (`app.`, `unnamed.`) are separated so that a client calling
+itself `unnamed.c3` cannot land on connection 3's button.
+
+**The sanitiser is where this kind of fix quietly becomes the bug it was
+fixing.** Windows documents an AUMID as at most 128 characters with no spaces;
+an app id may be any UTF-8 at all. Mapping the one into the other merges names:
+`"my app"` and `"my_app"` both sanitise to `my_app`, and truncating at 96
+characters merges every pair that agrees for that long. Both are *the original
+defect*, reintroduced by the fix, for a smaller set of applications. So
+[`identity`] appends a 64-bit FNV-1a of the **original** string whenever it had
+to change anything — and only then, so that `firefox` and
+`org.freedesktop.weston.wayland-terminal`, which need no mapping, stay legible.
+Two of the nine tests are those two collisions and nothing else.
+
+### 32.4 The Win32 half, and the COM the workspace manifest says is not there
+
+`Cargo.toml` has said since stage 3 that this project uses `windows-sys` rather
+than `windows` because *"everything we call is a plain C entry point — no COM,
+no WinRT"*. That stops being true here, and there is no way around it: the only
+way to set a property on an `HWND` is `SHGetPropertyStoreForWindow`, which hands
+back an `IPropertyStore`. There is no flat entry point.
+
+windows-sys 0.61 generates no COM interfaces at all — functions, structs and
+constants only — so `IPropertyStoreVtbl` is transcribed by hand from
+`propsys.h` (eight function pointers in a fixed order), and `PROPVARIANT` is a
+24-byte `repr(C)` struct with a `const` size assertion rather than the whole of
+`Win32_System_Com_StructuredStorage`. Two GUIDs and one property key come from
+`propsys.h` and `propkey.h` in the mingw headers the cross build already uses.
+
+Three details that are not obvious and are load-bearing:
+
+1. **`raw-dylib`.** `windows-link` emits `#[link(kind = "raw-dylib")]`, so
+   `SHGetPropertyStoreForWindow` needs no import library and the mingw
+   toolchain's `libshell32.a` never has to have heard of it.
+2. **The `PROPVARIANT` borrows its string.** `SetValue` copies, and the variant
+   this file builds is never handed to `PropVariantClear`, so the `Vec<u16>`
+   behind the `LPWSTR` stays Rust's and no allocator crosses the boundary. The
+   one string that *is* allocated by the shell — the one `GetValue` writes on
+   read-back — is freed here with `CoTaskMemFree`, which is what
+   `PropVariantClear` would have done for that type.
+3. **COM is initialised lazily, on the UI thread, and never uninitialised.**
+   `CoInitializeEx(COINIT_APARTMENTTHREADED)` returned `0x00000000` on the guest
+   (Windows 11 build 26200) — it is printed, because `RPC_E_CHANGED_MODE` would
+   mean somebody had made the thread multi-threaded and that is worth knowing
+   even though the property store works either way. A compositor that never
+   makes a window never initialises COM at all.
+
+The call is checked at every step and the failure names *which* call refused:
+`SHGetPropertyStoreForWindow`, `SetValue(PKEY_AppUserModel_ID)`,
+`SetValue(PKEY_AppUserModel_PreventPinning)`, or `Commit`. None of them refused
+in any run of this stage. And the success path does not trust itself either: it
+**reads the property back** out of the store and logs what came back, because
+§16 already paid once for the difference between "the call succeeded" and "the
+shell shows it".
+
+### 32.5 The ordering, which is the part that had to be measured
+
+The shell reads the identity when it **creates the button**, and it creates the
+button when the window is shown. So the property has to be on the window before
+`ShowWindow`, and the compositor's message order decided whether it was:
+
+```
+    before                          after
+    ToUi::Create   (no app id)      ToUi::Create   (identity for the connection)
+    ToUi::Map      -> ShowWindow    ToUi::AppId    (the real identity)
+    ToUi::AppId                     ToUi::Map      -> ShowWindow
+    ToUi::Title                     ToUi::Title
+```
+
+Both the reorder and the unconditional send matter. `xdg_toplevel` is created
+before `set_app_id` is dispatched — a client sends `get_toplevel`, `set_title`,
+`set_app_id` and `commit` in one burst, and `new_toplevel` runs at the first of
+those — so the app id at `Create` is empty for every client measured here, and
+the identity that mattered was always the one sent at map. `AppId` was also
+sent only when the app id was non-empty, which would have left every nameless
+client's window with no identity and therefore back on the process's button;
+it is now sent always, because "this client never named itself" is an identity
+too.
+
+The compositor's log shows both stamps for every window:
+
+```
+wc-compositor: window 1 taskbar identity <- "Waycompose.unnamed.c1"
+wc-compositor: window 1 app_id -> "org.freedesktop.weston.wayland-terminal"
+wc-compositor: window 1 taskbar identity <- "Waycompose.app.org.freedesktop.weston.wayland-terminal"
+wc-compositor: window 1 icon set: 2 of 2 slots from 3 image(s) [48x48 32x32 16x16]
+```
+
+### 32.6 A `set_app_id` that arrives after the button exists
+
+`set_app_id` is not a one-off: the protocol allows it whenever the client likes,
+including long after the first buffer. The property can still be set then, but
+the button already exists and does not move — so the late path hides the window
+and re-shows it, which makes the shell drop the button and build a new one under
+the new identity. `SW_SHOWNA` rather than `SW_SHOWNORMAL`, because hiding has
+already cost the window its focus and taking the foreground back would be a
+window stealing activation for a reason the user cannot see. It runs only when
+the identity actually *changed*, which for every real client is never.
+
+**This could not be measured with any client that exists.** Every toolkit names
+itself before it draws. So `wc-shmclient` — the client this project already has
+to own, for §7.5's reason — grew `--late-app-id NAME --late-after N`, which
+sends one extra `xdg_toplevel.set_app_id` after N frames. With it:
+
+```
+wc-compositor: window 2 taskbar identity <- "Waycompose.app.org.waycompose.probe.early"
+wc-compositor: window 2 app_id -> "org.waycompose.probe.renamed"
+wc-compositor: window 2 taskbar identity <- "Waycompose.app.org.waycompose.probe.renamed"
+wc-compositor: window 2 was already on screen, so its taskbar button was rebuilt under the new identity
+```
+
+and `wc-desk` reads the new identity back off the window, and
+`stage32-taskbar-late.png` shows two buttons where the two windows had started
+on one. The cost is a visible flicker and one deactivation, once, for a client
+that renames itself late; the alternative — leaving the button stale until the
+window is next hidden — was rejected because a stale button is exactly the
+defect this stage exists to remove.
+
+### 32.7 What was run, and the two things that had to be fixed to run it
+
+`scripts/wc-taskbar.sh` has two experiments, because neither can do the other's
+job.
+
+**`local`** runs two copies of `wc-shmclient.exe` on the guest against one
+compositor. Same executable, same command line except `--app-id`, so nothing but
+the identity can split the buttons; `--debug-icon` gives each window a different
+generated icon so the photograph distinguishes them too. Three runs:
+
+| run | app ids | our windows | our groups | picture |
+|---|---|---|---|---|
+| `two` | two different | 2 | **2** | `stage32-taskbar-two.png` |
+| `same` | one, twice | 2 | **1** | `stage32-taskbar-same.png` |
+| `late` | one, then one renamed | 2 | **2** | `stage32-taskbar-late.png` |
+
+**`apps`** runs `weston-terminal` and `weston-flower` — two genuinely different
+programs, unmodified, on the Linux host, through wc-proxy, a relay and a
+hypervisor, with their icons resolved from the host's own files (`qemu` from
+hicolor for one, weston's own `icon_ivi_flower.png` for the other). That is
+`stage32-taskbar-two-applications.png`, and `wc-desk` agrees with it:
+
+```
+0x80170   no   WaycomposeToplevel  276x156+1160+632  ""
+0x70298   yes  WaycomposeToplevel  960x543+26+26     "Mozilla Firefox"
+0x5073e   yes  WaycomposeToplevel  216x239+52+52     "Flower"           aumid="Waycompose.app.org.freedesktop.weston.flower"
+0x50722   yes  WaycomposeToplevel  838x466+156+156   "Wayland Terminal" aumid="Waycompose.app.org.freedesktop.weston.wayland-terminal"
+0x110688  yes  WaycomposeToplevel  838x466+442+286   "Wayland Terminal"
+windows.groups    8
+```
+
+**Five `WaycomposeToplevel`s and only two of them ours**, which the shared guest
+supplied for free and which is the best control in this stage. `0x80170` is one
+of our own popups: no button, and no identity, which is what §32.7's second
+paragraph below is about. The other two belong to *other worktrees'*
+compositors — someone's Firefox and someone's terminal, running against builds
+that predate this change — and they carry **no identity at all**. That is the
+before and the after in one enumeration, taken at one instant on one desktop:
+the windows with an identity are grouped by it, and the windows without one are
+grouped by their process, which is where every window in this project used to
+be.
+
+Two things had to be fixed before any of it ran, and both are worth keeping.
+
+1. **A `wl_shm` named section does not cross a session.** The first `local` run
+   started its clients over ssh, which is session 0, while the compositor was on
+   the logged-on desktop. Every window was created and none was ever mapped:
+   `could not map Section { name: "Local\\wc-…" }: Das System kann die
+   angegebene Datei nicht finden`, then a `wl_shm` protocol error and a
+   disconnect. `Local\` is per **session**, so the name the client created is
+   not a name the compositor can open — same machine, same path, same string.
+   Both ends now go through the scheduler. This is §13.2's fact ("an ssh session
+   is not a desktop") arriving from a direction it had not been seen from: not
+   "the pixels go nowhere", but "the shared memory does not exist". **It is
+   written up there rather than only here**, with the log lines, because it will
+   catch the next harness that runs a Windows client against a desktop
+   compositor and that harness will not be reading this section.
+2. **`weston-editor` is not a usable second application on this host.** It
+   connects, binds the icon feed, allocates one 38,272-byte pool and exits
+   before mapping anything; `weston-flower` on the same host in the same run
+   maps and stays. Recorded rather than debugged — this stage needed *a* second
+   application, not that one — and the harness takes `WC_APP_B` so the next
+   person can try another.
+
+And one thing the first `apps` run found in our own code: **popups were being
+stamped too.** `weston-terminal`'s three context menus each took
+`Waycompose.unnamed.c1`, because the identity was sent from the shared
+first-map path and popups go through it. It was inert — a `WS_EX_TOOLWINDOW`
+window with an owner has no taskbar button for an identity to group — and it
+was still a property asserting something about a button that does not exist, so
+the map path now sends it only for toplevels. The photograph and the
+enumeration above are from the run *after* that change, and `0x80170` in it is
+a popup with no identity on it.
+
+### 32.8 Hover previews, jump lists and pinning — where a synthetic identity does and does not hold up
+
+The requirement asks for the honest limits, and these are the three places a
+made-up taskbar identity usually falls apart.
+
+**Hover previews are fine, and for a structural reason.** A thumbnail is DWM's
+picture of a *window*, not of an identity: the shell asks for one per `HWND` in
+the group. Two buttons therefore preview two windows and a grouped button
+previews both of its own, which is the behaviour of any application. Not
+photographed — the harness cannot hover — and not in doubt either.
+
+**Jump lists are empty, and that is a choice.** A jump list is built from
+`ITaskbarList` destinations or from the recent-documents list, keyed by the
+AUMID. Nothing here registers either, so a right-click gets the window commands
+(close, and on Windows 11 the app's own entry) and no tasks or recent files. The
+alternative would be to synthesise destinations for an application on another
+machine, which would be inventing user-facing content out of an app id string.
+
+**Pinning is switched off, deliberately.**
+`PKEY_AppUserModel_PreventPinning` is set to `VARIANT_TRUE` in the same store
+and the same `Commit` as the identity — the log line quoted in §32.5 is printed
+only when both `SetValue`s and the `Commit` returned `S_OK`, so a successful
+stamp is a measurement that the flag took. The reasoning is worth stating
+because the alternative looks friendlier:
+
+* Pinning writes a shortcut whose AUMID is ours and whose target is whatever the
+  shell can work out about the window — which is `wc-compositor.exe`, not the
+  application the button appears to be. Clicking it later would start a
+  compositor, or nothing.
+* The three properties that would make pinning honest —
+  `PKEY_AppUserModel_RelaunchCommand`, `…RelaunchIconResource` and
+  `…RelaunchDisplayNameResource` — cannot be filled in truthfully from here.
+  The application is a process on **another machine**, started by a person or a
+  script, over a transport that has to be brought up first. There is no command
+  line on the Windows side that would bring it back, and a relaunch command that
+  starts the wrong thing is worse than no relaunch command.
+* `…RelaunchDisplayNameResource` in particular wants a `@path,-id` resource
+  reference rather than a string, so a plain app id there is not merely
+  unhelpful, it is a value the shell may fail to load and show as nothing.
+
+So the button is a *running-window* button and nothing else, and the affordance
+that would lie has been removed rather than left to be discovered.
+
+One more honest limit, about the picture rather than the mechanism: **Windows 11
+combines buttons and hides their labels by default**, so what the photographs
+show is two icons rather than two labelled buttons. The titles are on the
+captions in `stage32-window-*.png` and in `wc-desk`'s table; a desktop set to
+"never combine" would show them on the buttons too. That is a shell setting,
+not something this compositor can assert.
+
+### 32.9 What is not done
+
+1. **The identity is not visible to the client.** A client cannot ask what
+   taskbar group it landed in, and nothing in the protocol lets it. Fine today;
+   worth remembering if a client ever wants to split its own windows across
+   buttons, which Explorer does and which would need an identity per *toplevel*
+   rather than per app id.
+2. **Nothing revisits a window whose client disconnects and reconnects.** The
+   anonymous identity is the connection ordinal, so a nameless client that
+   reconnects gets a new button. Correct — it is a new client — but it means the
+   ordinal is not stable across a proxy restart, which is a thing users will
+   notice before we do.
+3. **Icons and identity are still two independent mechanisms.** They agree
+   today because both key off the app id, and a client that sets its own icon
+   through `xdg-toplevel-icon-v1` (§16.2) still gets its identity from the name.
+   That is the right split — the icon is what the application says it looks
+   like, the identity is what the shell groups by — but it means a client can
+   present two windows with the same icon on two buttons, and nothing warns.
+4. **`SetCurrentProcessExplicitAppUserModelID` is still unset**, so any window
+   this process makes that somehow escapes `apply_identity` falls back to the
+   executable. Setting a process-wide default would give those a nicer name; it
+   would also hide exactly the bug that would have produced them.

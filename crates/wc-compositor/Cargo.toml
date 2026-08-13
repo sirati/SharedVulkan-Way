@@ -115,4 +115,12 @@ windows-sys = { workspace = true, features = [
   # Power rather than with the window APIs because it is a property of the
   # calling thread rather than of a window — see `win32::set_idle_inhibit`.
   "Win32_System_Power",
+  # ADDED FOR STAGE 32: the taskbar identity, which is the one place in this
+  # tree where the "no COM" note above stops holding. `SHGetPropertyStoreForWindow`
+  # hands back an `IPropertyStore`, and there is no flat entry point that sets a
+  # property on an `HWND`. windows-sys generates no interfaces, so the vtable is
+  # declared by hand in `win32.rs`; what these two features bring is the entry
+  # point, `CoInitializeEx`/`CoTaskMemFree`, and `PROPERTYKEY`.
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_System_Com",
 ] }
