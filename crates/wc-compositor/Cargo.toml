@@ -25,5 +25,21 @@ smithay = { path = "../../vendor/smithay", default-features = false, features = 
 wayland-server = { workspace = true }
 wc-transport = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Only for `dup2`, so `--log` means the same thing on both platforms. std has
+# no safe way to point an existing file descriptor at a file.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 wc-handle = { workspace = true }
+# The window half. Raw bindings rather than the `windows` crate for the reason
+# in the workspace manifest: everything called here is a plain C entry point —
+# `CreateWindowExW`, `SetDIBitsToDevice`, `GetMessageW` — with no COM and no
+# WinRT, so the generated bindings cost nothing to compile.
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_Console",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
+] }

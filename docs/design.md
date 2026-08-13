@@ -743,7 +743,9 @@ table (res §9.3), which this project is following.
 | `XkbConfig` variant taking a keymap string (so `KeyboardHandle::new` works on Windows) | 20–50 lines | **high** — `new_from_names` is one call site and `new_from_string` already works there (§7.2) |
 | A DACL on `wc_handle` sections, so `SealedFile` is actually sealed | 50–150 lines | **medium** — the mechanism (`SECURITY_ATTRIBUTES` on `CreateFileMappingW`) is standard; getting the SID right is the work. §7.7 item 6 |
 | `wl_shm` properly (pools, buffers, `SEC_RESERVE` growth) | 500–1,000 lines | **medium** — the `resize` problem is real (a Windows section's size is fixed at creation) and the two answers are both known |
-| Stage 4: `backend_win32`, one HWND per toplevel, shm blit, pointer + keyboard | 8,000–15,000 lines | **low** — this is the research's own estimate and nothing measured here bears on it |
+| ~~Stage 4: `backend_win32`, one HWND per toplevel, shm blit, pointer + keyboard~~ | ~~8,000–15,000 lines~~ | superseded — see the two rows below |
+| One HWND per toplevel, shm blit, damage, title, close, resize (stage 3, §8) | **done: ~2,400 lines of new code across 6 files, plus a 900-line test client and a 490-line harness** | **measured** — 5,290 lines of new files in total, of which roughly 40% is comment. The research's estimate covered this *and* input *and* a scene graph in one number |
+| Pointer and keyboard input, subsurfaces, popups (what is left of stage 4) | 2,000–5,000 lines | **low–medium** — the `XkbConfig` gap (§7.7 item 8) is small and known; a scene graph is not, and nothing measured yet bears on it |
 | Verification on the real guest | one afternoon | **high** |
 
 **The single largest risk is unchanged by this stage and is not in the
@@ -1163,3 +1165,417 @@ and not about Wine.
 Still not proven, and not a guest question: rendering, an HWND, presentation
 timing, and §7.7 items 6 and 7 — the unsealed `SealedFile` in particular is a
 design gap, not a platform one.
+
+> **Superseded in part by §8.** The HWND and the blit now exist and are
+> exercised under Wine; presentation timing and the two `SealedFile`/`with_data_mut`
+> gaps are unchanged. §8.11 is the stage-3 guest list.
+
+---
+
+## 8. Stage 3: a surface becomes a window
+
+Written 2026-08-13, on top of the guest verification in §7.8. Stages 1 and 2
+built a protocol server; this is the stage where it becomes a compositor.
+
+### 8.1 Status in one paragraph
+
+**One `HWND` per `xdg_toplevel`, with Windows' own caption, border and buttons,
+showing the client's `wl_shm` pixels blitted with GDI.** `set_title` reaches
+`SetWindowTextW`, the close button becomes `xdg_toplevel.close`, a `WM_SIZE`
+becomes a configure, and damage limits both the copy out of the client's buffer
+and the region written to the screen. The milestone is a screenshot taken by
+`xwd` from the X server — outside the process, by a tool that is not ours —
+showing a titled, decorated window containing an animation; and it is measured
+rather than admired, because the client paints known colours at known
+coordinates and ImageMagick finds them there. `scripts/wc-window.sh` is 19
+checks on Linux and 18 under Wine, 0 failures. The screenshot itself is
+`docs/stage3-window.png`, kept because it is the deliverable of the stage and a
+table of numbers is not the same as seeing the window.
+
+### 8.2 The two threads, and where the state lives
+
+The brief's first hard question. The two-thread design was settled in stage 1
+(§3.3: no `poll_fd`, so the backend cannot nest in `calloop`); this stage had to
+build it, and building it is mostly deciding what may touch what.
+
+**The main thread pumps Win32 messages; the Wayland dispatch loop is spawned,**
+and every smithay object is constructed *inside that thread's closure*. That
+last clause is the whole trick. smithay's state is thread-affine in practice —
+`Rc`, `RefCell`, `wayland_server`'s non-`Send` handles — and creating it inside
+the spawned closure means **the compiler enforces the boundary**: the only things
+that can cross are the plain-data messages in `platform/mod.rs`, because nothing
+else is `Send`. The reverse split does not compile, which is a good property for
+a rule to have.
+
+Three concrete decisions came out of it, each the answer to a way of getting it
+wrong:
+
+* **The wakeup is a `PostMessage` to a hidden message-only window, never
+  `PostThreadMessage`.** A thread message has no `hwnd`, so `DispatchMessage`
+  has nowhere to put it, and the modal loops `DefWindowProc` runs during a
+  window drag or resize discard it. The symptom would be a compositor that stops
+  repainting for exactly as long as the user holds the mouse on the title bar —
+  which reads as a rendering bug and is not one. Posting to a window works
+  because those same modal loops dispatch window messages for every window on
+  the thread.
+* **Pixels do not travel in a message.** Each window gets an
+  `Arc<Mutex<Shadow>>` at creation and both threads hold it; `ToUi::Present`
+  carries only damage rectangles. A client committing at 60 Hz would otherwise
+  allocate and copy a framebuffer into a queue sixty times a second.
+* **No `&mut` to per-window state exists anywhere in `win32.rs`.** This is the
+  one that would have bitten. Almost every interesting Win32 call sends a message
+  to our own window procedure *before returning* — `SetWindowPos` sends
+  `WM_SIZE`, `ShowWindow` sends `WM_SHOWWINDOW`, `SetWindowTextW` sends
+  `WM_SETTEXT`, `DestroyWindow` sends `WM_DESTROY` — so the window procedure runs
+  inside the command handler, on the same thread, with the same data reachable. A
+  `RefCell` borrowed across a `SetWindowPos` is a panic; a `&mut` handed through
+  `GWLP_USERDATA` is undefined behaviour. Both are *intermittent*, because they
+  need the reentrant path to be taken, which is the worst failure mode available.
+  The state is therefore an `Rc<WindowState>` whose mutable fields are `Cell`s,
+  and both sides take shared references, so the overlap is sound **by
+  construction** rather than by anyone being careful.
+
+The cost, stated: UI events reach the client on the next turn of the poll loop,
+which is a 5 ms sleep. §8.7 is why that number is not being changed.
+
+### 8.3 Resize is a negotiation, and something has to be on screen meanwhile
+
+The brief's second hard question, and the one with no free answer. Windows
+resizes the window and wants it painted *now*; Wayland requires the compositor to
+send a configure and wait, possibly for several frames, for the client to commit
+at the new size.
+
+**The window shows the client's last buffer at its true size, anchored at the
+content origin, with the remainder filled flat.** Not stretched. Three reasons,
+in the order they matter:
+
+* Stretching is a lie about the content. `StretchBlt` of text is unreadable, and
+  `HALFTONE` on a window-sized bitmap every mouse-move is real CPU.
+* Growing shows a band that fills in a frame later, which is what X11
+  compositors have always done and what users already read as "the application is
+  catching up". Shrinking clips, which is free and correct.
+* It makes the negotiation **visible**. If a client stops acking configures the
+  band never fills, and that is a bug somebody can see — where a smooth stretch
+  would hide a stuck client indefinitely.
+
+Two supporting details, both arrived at by getting them wrong first. The window
+class does **not** set `CS_HREDRAW | CS_VREDRAW`: those invalidate the whole
+client area on every resize message, which during a drag is a full repaint per
+mouse-move and a visible flash under content that did not change. And
+`WM_ERASEBKGND` is handled rather than left to a class brush, excluding the
+content rectangle first, so the only pixels written twice are the ones outside
+the buffer.
+
+On the Wayland side the whole negotiation is `send_pending_configure`, which
+sends nothing when the size is unchanged — necessary because Windows emits a
+`WM_SIZE` per pixel of a drag.
+
+**Measured end to end with a third-party client:** the simulated resize makes the
+compositor send a real `xdg_toplevel.configure`, and `weston-terminal` honours it
+— its first buffer is 806x491 and its last is 914x571, so it reallocated and
+recommitted at a new size, and the shadow reallocated and reported full damage.
+
+### 8.4 Where the pixels are, kept behind a seam
+
+Stage 3 has exactly one source of pixels, and a compositor that only ever wanted
+that could call `smithay::wayland::shm::with_buffer_contents` from its `commit`
+handler in four lines.
+
+It is a trait anyway (`crates/wc-compositor/src/surface.rs`), because
+`docs/goal-firefox.md` puts the client on the **other side of a hypervisor**. A
+Windows section name is not something a Linux process can create or open, so
+same-machine `wl_shm` is a stepping stone rather than the destination, and the
+buffer eventually has to live in shared_vulkan's arena. The cost of the seam now
+is one file; the cost of discovering later that the section-name assumption is
+spread through the commit path, the damage tracker and the blitter is not
+bounded. Everything downstream of `Shadow::blit` deals in bytes and rectangles
+and has never heard of a section, and the compositor logs which source served
+each window — a stage that added a second provider with no way to tell which one
+ran would not really have added it.
+
+**The shadow copy is the other load-bearing decision, and it is about
+`wl_buffer.release`.** Wayland lets a client reuse a buffer the moment it is
+released, and a single-buffered client stalls forever if the compositor holds
+its buffer. But Win32 asks for pixels at times Wayland knows nothing about:
+`WM_PAINT` fires when a window is uncovered, dragged back on-screen or restored,
+with no commit in sight. A compositor blitting straight from client memory would
+have to hold every buffer until the next `WM_PAINT` that might need it, which is
+"until the window closes". One `memcpy` per damaged row buys the right to release
+immediately, and it is what makes the pixels safe to hand to another thread.
+
+Two smaller facts worth recording:
+
+* **Wayland's `Xrgb8888` and a 32-bit `BI_RGB` DIB are the same bytes in the
+  same order** — B, G, R, X — because both are a little-endian `u32` of
+  `0x00RRGGBB`. That is why the blit is a per-row `memcpy` and not a swizzle, and
+  it is asserted in a test rather than trusted in a comment.
+* **`SetDIBitsToDevice` is passed the whole image with a zero source origin**,
+  and the clip region `BeginPaint` installs decides which pixels reach the
+  screen. `CreateDIBSection` + `BitBlt` would be faster, but
+  `SetDIBitsToDevice`'s `ySrc`/`uStartScan` are documented in terms of a
+  *bottom-up* DIB and their meaning for the top-down one we need (negative
+  `biHeight`, matching Wayland's origin) is genuinely ambiguous. So damage limits
+  two of the three things it should — how much is copied out of the client's
+  buffer, and how much is written to the framebuffer — and not the size of the
+  DIB handed to GDI. A known constant factor on an already-CPU path; the fix is
+  the DIB section when a measurement says it matters.
+
+### 8.5 The evidence, in two halves, and what each is worth
+
+This is the part to read sceptically, because the stage cannot make one claim
+with one experiment.
+
+§7.5's finding governs everything: **no third-party Wayland client can send a
+buffer to the Windows build**, because an `h` is out-of-band on Unix and in-band
+on Windows, and a stock libwayland client writes no descriptor bytes. So:
+
+**Linux — the pixels and the protocol, against clients that cannot share our
+bugs.** `weston-presentation-shm` and `weston-terminal`: C, libwayland, upstream
+xdg-shell, no knowledge of this project. They drive the whole buffer path — pool,
+buffer, attach, damage, commit, release, frame callback — and the harness reads
+the result back as PPM and measures it with ImageMagick. Twelve presents with
+**twelve distinct images** from the first (a client whose pixels never change
+would pass a present count and fail this — `weston-smoke` is exactly that, 244
+presents and one image, because it animates only under pointer input); a 914x571
+frame with 234 distinct colours from the second, which is a legible terminal
+window with text in it. What this half cannot do is produce an `HWND`.
+
+**Wine — the window, driven by a client that is ours.** `wc-shmclient.exe`
+speaks the dialect. **This is a real weakening and should be read as one:**
+`weston-terminal` cannot share a bug with the compositor and this program can.
+What it buys is the half nothing else can reach — a named section created by one
+Windows process, opened by name by another, blitted by GDI into a window with
+Windows' own caption.
+
+The screenshot is what makes the second half worth anything, and it is measured.
+The client paints a deliberately checkable picture: a flat field, a one-pixel
+border, and 16x16 markers in pure red, green and blue at three corners and
+**not** the fourth. On the captured X root:
+
+| measured on the screenshot | result |
+|---|---|
+| the client's background field | `418x298+5+31` — a 420x300 buffer less its 1 px border, so `AdjustWindowRectEx` was exact |
+| red marker | 256 px at `+5+31` → buffer `(1,1)` |
+| green marker | 256 px at `+407+31` → buffer `(403,1)` |
+| blue marker | 256 px at `+5+313` → buffer `(1,283)` |
+| bottom-right corner | unmarked, as drawn |
+| the moving bar | **exactly one**, `24x100+181+130` |
+| two shots 1.5 s apart | differ by 2610 px |
+
+Every marker is at the exact coordinate the client drew it, which rules out a row
+offset, a stride error, a flip and a mirror in one measurement — the asymmetric
+fourth corner exists precisely so a flip cannot pass. **Exactly one bar** is the
+damage result: the client ran with `--partial-damage`, erasing the old bar and
+damaging only the union, so a compositor that mishandled the rectangle would
+leave a trail or a stale band. Two differing shots rule out a window showing one
+frozen frame.
+
+`wc-shmclient` is double-buffered on purpose. A single-buffered client cannot
+tell a compositor that *holds* its buffer from one that copies and releases, so a
+use-after-release bug would look fine to it; two buffers and a strict "never draw
+into a buffer that has not been released" rule make the compositor's release
+timing observable at all.
+
+### 8.6 The brief asked about `weston-simple-shm`. The answer is no, and it is measured
+
+The brief proposed `weston-simple-shm` as the stage-3 client, reasoning that it
+is pure `wl_shm` with no toytoolkit so §2.4's framing problem should not apply —
+and asked for that to be checked rather than assumed.
+
+**It applies.** §2.4 is not about toytoolkit; it is about any `h` argument at
+all. `weston-flower` fails at its *first* request because toytoolkit allocates a
+pool during `display_create()`; a simple-client fails at its first *buffer*,
+which is later and no better. The ordering trick that carried stage 2 — surface
+and toplevel before any `h` — buys a window with nothing in it, which is exactly
+not this stage's milestone.
+
+`scripts/wc-window.sh`'s third block measures it rather than asserting it: a real
+Weston client reaches `xdg_toplevel` against `wc-compositor.exe` and then
+delivers **0 frames**. That is a negative result under Wine, which §7.8 warns
+against trusting — but it is corroborated from two directions. The mechanism is
+structural rather than platform behaviour (our parser requires bytes libwayland
+never writes, and Windows AF_UNIX carries no ancillary data by Microsoft's own
+documentation), and §7.8 already ran `weston-flower` against the **real Windows**
+compositor and saw it fail identically at `create_pool`.
+
+Incidentally, `weston-simple-shm` is not in nixpkgs' weston at all — it builds
+none of the `simple-*` clients. `weston-presentation-shm` is the closest
+available equivalent and is what the harness uses.
+
+### 8.7 The timer decision: deliberately not taken
+
+§7.8 measured `Sleep(1)` at 1.06 ms under Wine and **15.8 ms on real Windows**,
+so the poll loop's 5 ms sleep is really ~15.6 ms and dispatch caps near 64 Hz,
+and recorded that the two-thread design owed a decision.
+
+**The decision is to change nothing, and that is a decision rather than an
+omission.** 64 Hz is more than this compositor needs, nothing here has a frame
+deadline that misses, and the obvious fix is the wrong one: `timeBeginPeriod`
+raises the system-wide timer tick and costs battery on a laptop — a cost this
+project has already been criticised for in the sibling tray application. Raising
+the timer resolution to serve a compositor that is idle most of the time is a bad
+trade.
+
+If a cadence is ever needed it should come from the natural source rather than a
+shorter sleep: the message pump's own wait, or presentation. A compositor that
+wakes when a client commits, when input arrives, or when a window message appears
+is both correct and the battery-friendly shape, and it is what the two-thread
+design already points at — the UI thread already blocks in `GetMessage` and wakes
+on a `PostMessage`. The Wayland thread's poll loop is the remaining spinner, and
+the fix for it is the one §3.3 has always described, not a timer.
+
+The frame-callback throttle is a separate mechanism and is unaffected: callbacks
+are held and answered at most every 16 ms, which is what stops a client that
+draws in response to `frame` from becoming a spin loop. Measured with
+`weston-smoke`: 244 presents in 5 s (~49 Hz) with the throttle, against "as fast
+as the CPU allows" without it.
+
+### 8.8 What Wine could not tell us this time
+
+Two new entries in the running account of Wine's limits, both found by running.
+
+* **A headless Wine cannot create a window at all.** With no `DISPLAY`,
+  `CreateWindowExW` fails for **every** visible top-level window while a
+  message-only window succeeds, and `GetSystemMetrics(SM_CXSCREEN)` still
+  cheerfully answers 1024. `scripts/probe-window.c` isolates it: seven parameter
+  combinations, every visible one failing with error 1400 or 0, across two window
+  classes and both `hInstance` conventions. This is a Wine/X fact and not a
+  Windows one — but it is why `Xvfb` is now a dependency in `flake.nix` rather
+  than a convenience, and it is the third time Wine has produced a failure that
+  says nothing about Windows.
+* **Wine draws the window frame only inside a virtual desktop.** With no window
+  manager on a bare X server, an ordinary Wine window is left undecorated,
+  because Wine ordinarily asks the WM to decorate. `wine explorer /desktop=`
+  makes Wine draw the whole frame itself, which is what the screenshot shows. On
+  real Windows a `WS_OVERLAPPEDWINDOW` always gets the system frame, so the
+  virtual desktop is the closest available analogue — but **the caption in the
+  screenshot is Wine's rendering of a Windows caption, not Windows'**, and that
+  distinction belongs in §8.11 rather than in the milestone.
+
+One operational consequence, recorded because it cost real time: `wine explorer
+/desktop=` gives its child a console window *inside* the desktop, so a shell
+redirect on the outside captures the loader's chatter and nothing else. The
+harness asserted against an empty log while the compositor was working perfectly
+and printing into a console visible only in a screenshot. `wc-compositor --log`
+now points `STD_OUTPUT_HANDLE` at a file, which is needed on the guest too: a
+Windows process launched without a console has no standard output at all.
+
+### 8.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo clippy --workspace --all-targets` (Linux) | clean, no warnings |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo test --workspace` | **62 tests**, 0 failures (was 30) |
+| `scripts/wc-handshake.sh` (stage 1) | 6 passed, 0 failed |
+| `scripts/wc-xkb.sh` (stage 2) | 5 passed, 0 failed |
+| `scripts/wc-xdg.sh all` (stage 2) | 10 passed, 0 failed |
+| `scripts/wc-window.sh linux` (stage 3) | 19 passed, 0 failed |
+| `scripts/wc-window.sh wine` (stage 3) | 18 passed, 0 failed |
+
+One operational caveat, because it will be hit and it looks like a regression.
+**The four Wine harnesses share one `WINEPREFIX` and collide if run back to
+back.** Observed once: `wc-handshake.sh` reported 5/1 immediately after a
+`wc-window.sh wine` run and 6/0 on its own, and 6/0 again with a two-second gap
+between harnesses. The previous run's `wineserver` is still shutting down and
+holding the prefix. Either leave a gap or give each harness its own prefix; the
+failure is contention and not code.
+
+The 32 new tests are mostly in two places that exist because they *can* be
+tested: `surface.rs`'s blitter (damage clipping, stride padding, resize
+reallocation, refusing a short buffer) and `wc-shmclient`'s `proto` module. The
+second is deliberate structure rather than diligence — **`cargo test` cannot run
+for the Windows target** (§4.1), so anything behind `cfg(windows)` is checked by
+the compiler and by nothing else. `wc-shmclient` is therefore a library plus a
+thin binary, with every byte-composing function built on both platforms and only
+the socket loop behind the gate. Its tests walk each composed message stream the
+way a server's parser does and assert it ends exactly on a boundary, for titles
+and descriptors of every length mod 4 — precisely the class of bug that presents
+as §2.4's silent desynchronisation.
+
+One deliberate weakening of the Linux harness is worth naming, because it is the
+kind of thing that quietly becomes a lie. The reverse direction — resize,
+activation and close — has no real driver on Linux, since there is no window
+manager; `--simulate-wm` plays one on a schedule. The events it generates are
+real `FromUi` events taking the same path a `WM_SIZE` takes, and the *client's*
+response to them is entirely the client's, so "`weston-terminal` honoured the
+close and exited 0" is a genuine third-party result. What is synthetic is only
+the button press.
+
+That schedule was measured into its current shape twice. Frame-counted triggers
+alone never fired for `weston-terminal`, which presents five frames and stops
+because a terminal redraws only when its content changes; and once the close had
+a deadline, the earlier close meant its resize was never reached either. Both
+triggers are now "count **or** deadline, whichever first". **Static clients are
+the normal case, not the corner case** — a real application spends almost all its
+life not drawing — so a schedule that only advances on frames tests the reverse
+direction against animations and nothing else.
+
+### 8.10 What is not proven, updated
+
+§7.7's list, with this stage's changes:
+
+1. ~~Nothing has run on Windows.~~ **Closed by §7.8 — for stages 1 and 2.
+   Stage 3 has not.** Every window, every blit and every screenshot in this
+   section is Wine, and Wine's `user32` and `gdi32` are reimplementations. This
+   is the largest single caveat here, and §8.8 is two fresh reasons to take it
+   seriously.
+2. **`SealedFile` is still not sealed on Windows** (§7.7 item 6). Unchanged, and
+   still the only place this port is weaker than the Unix original.
+3. **`with_data_mut` is still unimplemented** (§7.7 item 7). Still no caller —
+   the compositor reads client buffers and never writes them.
+4. **`KeyboardHandle::new` still cannot succeed on Windows** (§7.7 item 8).
+   Untouched: this stage does no input and nothing in it calls `compile_keymap`.
+   It remains the first thing stage 4 needs.
+5. **New: alpha is discarded.** GDI treats a 32-bit `BI_RGB` DIB as opaque, so an
+   `Argb8888` surface is drawn solid. The compositor says so per window in its
+   log rather than hiding it. A translucent or shaped window will look wrong; the
+   fix is a layered window or `AlphaBlend`.
+6. **New: buffer scale and transform are honoured only in their identity form.**
+   Anything else needs damage mapped between surface and buffer coordinates and a
+   blit that rotates or subsamples, which is a renderer's job. The compositor
+   logs a warning rather than silently drawing the wrong thing.
+7. **New: the icon path is implemented and unexercised by any client.**
+   `WM_SETICON` works — `--debug-icon` synthesises one so the code has actually
+   executed — but nothing derives an icon from `set_app_id`, and per
+   `docs/goal-firefox.md` nothing can until something resolves the app-id on the
+   machine the *client* is on. The command carries **pixels and never a path**,
+   which is the part that had to be right now rather than later.
+8. **New: there is no scene graph.** Subsurfaces are accepted and ignored;
+   popups get a configure and no window. `weston-subsurfaces` maps its main
+   surface and presents one frame, which is correct for what exists. Stage 4.
+9. **New: DPI awareness is requested and unverified.**
+   `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is resolved by
+   `GetProcAddress` and reports `ok` under Wine, which says only that the call
+   was made. On a scaled desktop an unaware process gets virtualised windows and
+   a blurred buffer, which for this compositor is a correctness bug rather than
+   polish.
+
+### 8.11 What to re-check on the guest
+
+§7.8 closed the stage 1 and 2 list. This is the stage 3 one, and it is short
+because `scripts/wc-guest.sh` already does the deployment.
+
+1. **A window appears at all**, and `CreateWindowExW` succeeds outside a virtual
+   desktop. Everything in §8.5 rests on this and Wine is a poor witness for it.
+2. **The caption is Windows'.** The screenshot shows Wine's rendering of one; the
+   claim the brief asked for is that the title bar, borders and buttons are the
+   system's own. On the guest that is a screenshot and a glance.
+3. **`SetDIBitsToDevice` with a negative `biHeight`.** The top-down path is the
+   one place the documentation is ambiguous (§8.4) and the most likely to differ
+   between Wine's GDI and the real one. An upside-down window is the failure, and
+   the asymmetric corner markers make it unmissable.
+4. **The modal resize loop.** Dragging a border by hand is the thing the
+   message-only-window decision in §8.2 exists for, and nothing automated
+   exercises it. The failure is a window that stops repainting while the mouse is
+   held down.
+5. **`SetProcessDpiAwarenessContext` on a scaled display**, at 150% or 200%.
+6. **`WM_SETICON` in the real taskbar**, which is where an icon is actually seen
+   and where Wine's virtual desktop has nothing to show.
+7. **Whether the system frame and a client's own decorations collide.**
+   `weston-terminal`'s dumped frame contains a full toytoolkit title bar, so on
+   Windows that window would have two. That is the tension `docs/goal-firefox.md`
+   describes, arriving early and from an unexpected direction — a stage 4 design
+   question rather than a bug, and the reason `FrameStyle::extend_top` exists
+   already.

@@ -150,3 +150,65 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
 pub fn write_section(object: &OwnedObject, offset: usize, bytes: &[u8]) -> io::Result<()> {
     object.file.write_all_at(bytes, offset as u64)
 }
+
+/// Map an object this process owns, writable, and keep the mapping.
+///
+/// The Unix half of `Handle::map_mut`. `MAP_SHARED`, because the whole point is
+/// that the peer sees the writes; `MAP_PRIVATE` would compile, run, and quietly
+/// show the compositor an empty buffer forever.
+pub fn map_section_mut(object: &OwnedObject, len: usize) -> io::Result<WritableView> {
+    if len == 0 {
+        return Ok(WritableView {
+            ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+            len: 0,
+        });
+    }
+    // SAFETY: a live fd for an object of at least `len` bytes; the kernel
+    // chooses the address.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            object.file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(WritableView {
+        ptr: ptr.cast::<u8>(),
+        len,
+    })
+}
+
+/// A writable mapping of an object this process owns.
+#[derive(Debug)]
+pub struct WritableView {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is owned solely by this struct and moves with it. No
+// `Sync`: handing out `&mut [u8]` needs `&mut self`, which is exclusive.
+unsafe impl Send for WritableView {}
+
+impl WritableView {
+    pub fn ptr_mut(&mut self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for WritableView {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            // SAFETY: `ptr`/`len` are exactly what `mmap` returned, unmapped
+            // once.
+            unsafe {
+                libc::munmap(self.ptr.cast::<libc::c_void>(), self.len);
+            }
+        }
+    }
+}

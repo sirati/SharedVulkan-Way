@@ -1,0 +1,13 @@
+[package]
+name = "wc-shmclient"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A Wayland client that maps a toplevel and animates shm pixels, speaking the Windows dialect"
+
+[dependencies]
+wc-transport = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+wc-handle = { workspace = true }

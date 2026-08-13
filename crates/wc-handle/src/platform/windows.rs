@@ -240,3 +240,69 @@ pub fn write_section(object: &OwnedObject, offset: usize, bytes: &[u8]) -> io::R
     }
     Ok(())
 }
+
+/// Map a section this process created, **writable**, and keep the view.
+///
+/// # Why this exists alongside `write_section`
+///
+/// `write_section` maps and unmaps around every call, which is right for
+/// writing a keymap once. It is wrong for a client drawing frames: a partial
+/// update of one damaged row would map and unmap a view per row, and an
+/// animating client would spend its time in the memory manager rather than
+/// drawing.
+///
+/// Restricted to the creator by construction — it takes an [`OwnedObject`],
+/// which only `create_section` produces. A `Handle` decoded from the wire has
+/// no `OwnedObject` and therefore no way to reach this, which keeps the
+/// compositor's view of a client buffer read-only as `map_section` intends.
+pub fn map_section_mut(object: &OwnedObject, len: usize) -> io::Result<WritableView> {
+    if len == 0 {
+        return Ok(WritableView {
+            address: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            },
+            len: 0,
+        });
+    }
+    // SAFETY: mapping the whole of a section this process owns, for writing.
+    let address = unsafe { MapViewOfFile(object.section, FILE_MAP_WRITE, 0, 0, len) };
+    if address.Value.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(WritableView { address, len })
+}
+
+/// A writable view of a section, held open.
+pub struct WritableView {
+    address: MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+}
+
+impl std::fmt::Debug for WritableView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WritableView").field("len", &self.len).finish()
+    }
+}
+
+// SAFETY: the view is owned solely by this struct, and handing out `&mut [u8]`
+// requires `&mut self`, so Rust's own borrow rules serialise access from this
+// process. The *peer* may read concurrently — that is what shared memory is
+// for and is a `wl_shm` fact rather than a soundness claim.
+unsafe impl Send for WritableView {}
+
+impl WritableView {
+    pub fn ptr_mut(&mut self) -> *mut u8 {
+        self.address.Value.cast::<u8>()
+    }
+}
+
+impl Drop for WritableView {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            // SAFETY: exactly what `MapViewOfFile` returned, unmapped once.
+            unsafe {
+                UnmapViewOfFile(self.address);
+            }
+        }
+    }
+}

@@ -99,6 +99,30 @@
           # code paths are self-consistent, not evidence about afunix.sys.
           wineWow64Packages.staging
 
+          # --- Seeing what the Windows binary actually drew -----------------
+          # Stage 3 makes windows, and "it made a window" is not a claim a log
+          # line can support — the log is written by the code under test.
+          #
+          # These three are what make it checkable from outside. Measured, and
+          # the reason this is not optional: with no `DISPLAY`, Wine's
+          # `CreateWindowExW` fails for **every** visible top-level window
+          # (`scripts/probe-window.c` — error 1400 or 0, while a message-only
+          # window succeeds), because winex11.drv has no X server to talk to.
+          # So a headless Wine cannot run this stage at all, and Xvfb is a
+          # dependency rather than a testing convenience.
+          #
+          # `xwd` reads the root window of that server and `imagemagick`
+          # converts and measures it, so the screenshot is taken by tools that
+          # are not ours, from outside the process, of what X actually holds.
+          # A compositor that convinced itself it had painted cannot fake this.
+          # Both: `xvfb-run` is the wrapper, `xvfb` is the `Xvfb` binary it
+          # needs on `PATH`. Naming only the wrapper gets a shell in which the
+          # harness fails with "Xvfb: not found".
+          xvfb
+          xvfb-run
+          xwd
+          imagemagick
+
           # --- A real Wayland client, on the Linux side ---------------------
           # `wayland-info` is libwayland-client, written by someone else, with
           # no knowledge of this project. Running the Linux build of our server

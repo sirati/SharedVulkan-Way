@@ -1,0 +1,294 @@
+//! The boundary between the Wayland thread and whatever draws windows.
+//!
+//! # The two threads, and why the split is here
+//!
+//! Windows requires a window's messages to be pumped by the thread that
+//! created it, and the pump is a blocking `GetMessage` loop. The Wayland side
+//! is a `poll`-shaped dispatch loop that on Windows cannot be nested inside
+//! `calloop`, because `Backend::poll_fd()` returns a wepoll handle and a wepoll
+//! handle is not a socket (docs/design.md §3.3). Two blocking loops, neither of
+//! which can host the other, is two threads; that was settled in stage 1 and
+//! this stage is where it has to be built.
+//!
+//! **The main thread is the UI thread.** The Wayland dispatch loop is spawned.
+//! Three reasons, in order of how much they cost to get wrong:
+//!
+//! 1. Every smithay state object the compositor owns is thread-affine in
+//!    practice (`Rc`, `RefCell`, and `wayland_server`'s own non-`Send` handles).
+//!    Creating all of it inside the spawned thread's closure means **nothing has
+//!    to be `Send` except the plain-data messages in this file**, which the
+//!    compiler then checks for us. The reverse split would need the smithay
+//!    state moved onto a thread after construction, which does not compile, or
+//!    constructed on the UI thread and used from the other, which does not work.
+//! 2. On real Windows a process's first thread is the one the shell, the
+//!    taskbar and DDE-era APIs assume is the GUI thread. Nothing here depends on
+//!    that today; it costs nothing to not find out later.
+//! 3. Shutdown is a message. `WM_QUIT` ends the pump, `main` joins the Wayland
+//!    thread, and the exit code comes back through a channel. The other way
+//!    round, the UI thread has to be told to stop by something that is not a
+//!    window message, which is the classic way to end up with a process that
+//!    will not exit.
+//!
+//! # The handoff, in both directions
+//!
+//! Wayland -> UI is an `mpsc` queue plus a wakeup. **The wakeup is a
+//! `PostMessage` to a hidden window, never `PostThreadMessage`**, and that is
+//! not a style preference: thread messages have no window to be dispatched to,
+//! so they are silently discarded by the modal loops `DefWindowProc` runs
+//! during a window drag or resize. A compositor whose repaints stop the moment
+//! the user grabs the title bar is exactly the failure this avoids.
+//!
+//! UI -> Wayland is an `mpsc` queue drained on each turn of the dispatch loop.
+//! No wakeup: that loop already polls. The cost is that a click-to-close takes
+//! up to one poll interval to reach the client, and the poll interval is 5 ms.
+//!
+//! # What crosses, and what does not
+//!
+//! Pixels do not cross in a message. Each window gets an `Arc<Mutex<Shadow>>`
+//! at creation and both threads hold it: the Wayland thread locks it to blit a
+//! commit in, the UI thread locks it to paint. [`ToUi::Present`] carries only
+//! the damage rectangles, so a client committing at 60 Hz does not allocate and
+//! copy a framebuffer into a queue sixty times a second.
+
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+use crate::surface::{Rect, Shadow};
+
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
+pub use win32::start;
+
+#[cfg(not(windows))]
+mod headless;
+#[cfg(not(windows))]
+pub use headless::start;
+
+/// Identifies one toplevel, and therefore one window.
+///
+/// A `u64` counter rather than a pointer or a `WlSurface`: it has to cross to a
+/// thread that must not touch Wayland objects, and it has to stay unique after
+/// the surface is gone so a message in flight for a destroyed window is
+/// ignorable rather than a use-after-free.
+pub type WindowId = u64;
+
+/// How much of the window frame the system owns.
+///
+/// # Why this is a struct with a zero field rather than a constant
+///
+/// The goal (docs/goal-firefox.md) wants two things that are in tension: native
+/// Windows decorations, *and* the client painting its own UI into the title
+/// bar. Windows applications resolve that with
+/// `DwmExtendFrameIntoClientArea` — the system frame stays, and the client area
+/// is extended upward into it so the application draws where the title bar
+/// would be while Windows keeps the glass, the snap behaviour and the buttons.
+///
+/// Stage 3 does not do that. It builds a plain `WS_OVERLAPPEDWINDOW` and
+/// `extend_top` is always 0. The field exists so that the size arithmetic —
+/// which is the part that is fiddly and the part that would otherwise be
+/// written as "client rect == surface size" in six places — is **already
+/// parameterised**, and so that the conversion has one home. The unit tests
+/// exercise a non-zero value, so this is a tested path rather than a comment
+/// about a future one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct FrameStyle {
+    /// Pixels of system non-client area folded into the client area for the
+    /// client to draw into.
+    pub extend_top: i32,
+}
+
+impl FrameStyle {
+    /// Where the client's buffer origin sits inside the window's client area.
+    ///
+    /// `(0, 0)` while `extend_top` is 0. Once the frame is extended, the
+    /// surface starts at the top of the *extended* area, which is above the
+    /// ordinary client origin — so this is the number that stops the content
+    /// from being drawn under the title bar.
+    pub fn content_origin(self) -> (i32, i32) {
+        (0, -self.extend_top)
+    }
+
+    /// The client-area size that must be requested to give the client `w`x`h`
+    /// of surface.
+    ///
+    /// With the frame extended, the client area has to be taller than the
+    /// surface by the extended strip, because the strip is part of the client
+    /// area from Win32's point of view and part of the surface from Wayland's.
+    pub fn client_size_for(self, w: i32, h: i32) -> (i32, i32) {
+        (w, h.saturating_add(self.extend_top))
+    }
+
+    /// The inverse: the surface size implied by a client area of `w`x`h`.
+    ///
+    /// This is what a `WM_SIZE` has to go through before it becomes an
+    /// `xdg_toplevel.configure`, and it is the reason `WM_SIZE` does not
+    /// simply forward its `lParam`.
+    pub fn surface_size_for(self, w: i32, h: i32) -> (i32, i32) {
+        (w.max(0), (h - self.extend_top).max(0))
+    }
+}
+
+/// An icon, as pixels.
+///
+/// **Deliberately not a path or a resource id.** In the topology the project is
+/// aimed at, the client is on a different machine from the window: `set_app_id`
+/// names a desktop entry that exists in a Linux icon theme, and the pixels have
+/// to be resolved there and shipped across before `WM_SETICON` can be called
+/// with them (docs/goal-firefox.md). A command that carried a filename would
+/// work perfectly on this machine and be unimplementable on the one that
+/// matters.
+///
+/// Nothing sends this yet. It is in the enum so that the thing that eventually
+/// does has somewhere to send it that is not a redesign.
+#[derive(Clone, Debug)]
+pub struct IconImage {
+    pub width: i32,
+    pub height: i32,
+    /// BGRA, tightly packed, same layout as [`Shadow`].
+    pub pixels: Vec<u8>,
+}
+
+/// Wayland thread -> UI thread.
+#[derive(Debug)]
+pub enum ToUi {
+    /// Make a window for this toplevel. It starts hidden: Wayland says a
+    /// surface is not mapped until it has committed a buffer, and showing an
+    /// empty window first is a visible white flash.
+    Create {
+        id: WindowId,
+        title: String,
+        app_id: String,
+        shadow: Arc<Mutex<Shadow>>,
+    },
+    /// `xdg_toplevel.set_title`.
+    Title { id: WindowId, title: String },
+    /// `xdg_toplevel.set_app_id`. Not used for anything yet; recorded so the
+    /// window knows what it is when something has to resolve an icon for it.
+    AppId { id: WindowId, app_id: String },
+    /// Set the window and taskbar icon. Nothing sends this yet — see
+    /// [`IconImage`].
+    Icon {
+        id: WindowId,
+        icon: Option<IconImage>,
+    },
+    /// The shadow has new pixels in these rectangles, in surface coordinates.
+    Present { id: WindowId, damage: Vec<Rect> },
+    /// The surface has committed its first buffer and may now be shown, at
+    /// this surface size.
+    Map { id: WindowId, width: i32, height: i32 },
+    /// The client asked to be maximised, unmaximised or minimised.
+    SetWindowState {
+        id: WindowId,
+        maximized: Option<bool>,
+        minimized: Option<bool>,
+    },
+    /// The toplevel is gone.
+    Destroy { id: WindowId },
+    /// End the pump.
+    Quit,
+}
+
+/// UI thread -> Wayland thread.
+#[derive(Debug)]
+pub enum FromUi {
+    /// The window's client area changed; the numbers are already converted to
+    /// surface coordinates by [`FrameStyle::surface_size_for`].
+    Resized {
+        id: WindowId,
+        width: i32,
+        height: i32,
+    },
+    /// The user pressed the close button. This becomes `xdg_toplevel.close`,
+    /// which is a **request**: the window does not go away until the client
+    /// destroys the surface. That is Wayland's model and it is also why an
+    /// unresponsive client's window cannot be closed by clicking the X — the
+    /// same as on any Wayland compositor, and worth knowing before it is
+    /// reported as a bug.
+    CloseRequested { id: WindowId },
+    /// The window was maximised or restored by the user or the system.
+    Maximized { id: WindowId, on: bool },
+    /// The window was minimised or restored.
+    Minimized { id: WindowId, on: bool },
+    /// The window gained or lost activation.
+    Activated { id: WindowId, on: bool },
+    /// The pump has stopped. Nothing more is coming and no window will paint
+    /// again.
+    Stopped,
+}
+
+/// The Wayland thread's handle to the UI thread.
+///
+/// `send` is infallible-looking on purpose: once the pump has stopped there is
+/// nothing useful for a compositor to do about a failed window command, and
+/// making every call site handle it would bury the ones that matter. The
+/// [`FromUi::Stopped`] event is how the Wayland side learns to wind up.
+pub struct Ui {
+    tx: Sender<ToUi>,
+    wake: Wake,
+}
+
+impl Ui {
+    pub fn send(&self, cmd: ToUi) {
+        if self.tx.send(cmd).is_ok() {
+            self.wake.wake();
+        }
+    }
+}
+
+/// What `start` hands back to `main`: the thing that must be run on the calling
+/// thread.
+pub struct Pump {
+    inner: PumpInner,
+}
+
+impl Pump {
+    /// Run until [`ToUi::Quit`] or the platform decides to stop. Consumes the
+    /// pump; the calling thread is inside the platform's event loop until it
+    /// returns.
+    pub fn run(self) {
+        self.inner.run();
+    }
+}
+
+#[cfg(windows)]
+use win32::{PumpInner, Wake};
+
+#[cfg(not(windows))]
+use headless::{PumpInner, Wake};
+
+/// What every platform's `start` builds, so the two implementations agree on
+/// the plumbing and differ only in what a window is.
+pub(crate) struct Started {
+    pub ui: Ui,
+    pub pump: Pump,
+}
+
+pub(crate) fn assemble(tx: Sender<ToUi>, wake: Wake, inner: PumpInner) -> Started {
+    Started {
+        ui: Ui { tx, wake },
+        pump: Pump { inner },
+    }
+}
+
+/// The arguments every platform's `start` takes.
+pub struct PlatformConfig {
+    /// Where UI events are delivered.
+    pub events: Sender<FromUi>,
+    /// How much frame the system owns.
+    pub frame: FrameStyle,
+    /// Write every presented frame here as a PPM, for the harness to read back.
+    /// `None` in normal operation.
+    pub dump_frames: Option<std::path::PathBuf>,
+    /// Generate resize / activate / close events on a schedule.
+    ///
+    /// Only the headless platform honours this: on Windows those events come
+    /// from `WM_SIZE`, `WM_ACTIVATE` and `WM_CLOSE` and a synthetic source
+    /// would be testing the wrong thing. On Linux there is no window manager at
+    /// all, so without it the entire platform-to-client direction — the resize
+    /// negotiation and the close handshake — is never driven by anything.
+    pub simulate_wm: bool,
+}
+
+/// Shared by both platforms: the receiving end of the command queue.
+pub(crate) type Commands = Receiver<ToUi>;

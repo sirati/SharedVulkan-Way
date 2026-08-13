@@ -377,11 +377,38 @@ impl Handle {
         }
     }
 
+    /// Map the object this handle owns into the address space, **writable**,
+    /// and keep the mapping.
+    ///
+    /// # Why the creator only
+    ///
+    /// The rule is unchanged from [`write_at`](Handle::write_at): a handle
+    /// decoded from the wire owns nothing and gets no write path. That is what
+    /// keeps a compositor's view of a client's buffer read-only, which is the
+    /// correct default and is what `vendor/smithay`'s `shm/pool.rs` relies on
+    /// (docs/design.md §7.4). This is the *producer's* side of the same
+    /// section: a client drawing frames needs one persistent view, because
+    /// mapping and unmapping per damaged row would cost more than the drawing.
+    pub fn map_mut(&self) -> io::Result<MappingMut> {
+        let Some(object) = self.keepalive.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not the owner of this object",
+            ));
+        };
+        let Descriptor::Section { size, .. } = &self.descriptor else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a section"));
+        };
+        let len = usize::try_from(*size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "section too large"))?;
+        platform::map_section_mut(object, len).map(|inner| MappingMut { inner, len })
+    }
+
     /// Write into the object this handle owns.
     ///
     /// Only available to the creator: a handle decoded from the wire has no
     /// write path, which is the right default for a compositor reading client
-    /// buffers and is why there is no `map_mut`.
+    /// buffers.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
         let Some(object) = self.keepalive.as_ref() else {
             return Err(io::Error::new(
@@ -399,6 +426,45 @@ impl Handle {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "write past end of section"));
         }
         platform::write_section(object, offset as usize, bytes)
+    }
+}
+
+/// A writable view of a shared-memory object this process created.
+///
+/// See [`Handle::map_mut`]. There is no `Sync` here and there deliberately is
+/// on [`Mapping`]: a read-only view can be shared freely, a writable one is
+/// exclusive to whoever holds the `&mut`.
+pub struct MappingMut {
+    inner: platform::WritableView,
+    len: usize,
+}
+
+impl MappingMut {
+    /// The mapped bytes, for writing.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `inner` holds a live writable mapping of `len` bytes for as
+        // long as `self` lives, and `&mut self` means no other reference into
+        // it exists in this process.
+        //
+        // The peer may read these bytes concurrently. That is the entire point
+        // of a shared buffer and is exactly the race `wl_buffer.release`
+        // exists to arbitrate: a well-behaved client writes only into a buffer
+        // the compositor has released.
+        unsafe { std::slice::from_raw_parts_mut(self.inner.ptr_mut(), self.len) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl fmt::Debug for MappingMut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MappingMut").field("len", &self.len).finish()
     }
 }
 
@@ -544,6 +610,42 @@ mod tests {
             peer.write_at(0, b"x").unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn a_decoded_handle_cannot_map_writable() {
+        // The same rule as `write_at`, and the one that keeps a compositor's
+        // view of a client buffer read-only.
+        let owner = Handle::create_section(64).unwrap();
+        let peer = Handle::from_descriptor(owner.descriptor().clone());
+        assert_eq!(
+            peer.map_mut().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn a_writable_mapping_is_seen_through_a_separate_read_only_one() {
+        // The contract that makes `map_mut` worth having: the write must land
+        // in the *shared* object, not in a private copy. On Unix that is the
+        // difference between `MAP_SHARED` and `MAP_PRIVATE`, and `MAP_PRIVATE`
+        // would pass every test that only read back through the same mapping —
+        // so this deliberately reads through a different one, opened by name,
+        // exactly as the peer process does.
+        let owner = Handle::create_section(4096).unwrap();
+        {
+            let mut view = owner.map_mut().unwrap();
+            let bytes = view.as_mut_slice();
+            assert_eq!(bytes.len(), 4096);
+            bytes[0..4].copy_from_slice(b"HEAD");
+            bytes[4092..4096].copy_from_slice(b"TAIL");
+        }
+        let reader = Handle::from_descriptor(owner.descriptor().clone());
+        let mapping = reader.map().unwrap();
+        // Two offsets, as in the stage-1 shm probe: a wrong-length or zeroed
+        // mapping would still produce the first one by accident.
+        assert_eq!(&mapping.as_slice()[0..4], b"HEAD");
+        assert_eq!(&mapping.as_slice()[4092..4096], b"TAIL");
     }
 
     #[test]

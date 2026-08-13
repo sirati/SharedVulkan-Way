@@ -1,240 +1,267 @@
-//! waycompose, stage 2: a **smithay** compositor that runs as a Windows binary.
+//! waycompose, stage 3: **a Wayland surface becomes a real Windows window.**
 //!
-//! Stage 1 answered "does the `wayland-server` stack run as an `.exe`?" by
-//! hand-writing a server against the raw backend. This answers the next
-//! question, which is the one that decides whether the project writes a
-//! compositor or reuses one: **does smithay itself work there?**
+//! Stage 1 answered "does the `wayland-server` stack run as an `.exe`?"; stage
+//! 2 answered "does smithay?" and got a third-party C client to
+//! `xdg_toplevel`. Both stopped short of drawing anything, and the design
+//! called that out: *"There is no renderer, no HWND and no output. Pixels are
+//! the next stage."*
 //!
-//! The difference between the two is not size, it is what fails if the answer is
-//! no. Stage 1's server was ours; if it had broken we would have fixed it.
-//! smithay is 96,004 lines of somebody else's code, of which 44,728 already
-//! compiled for Windows and are exactly the compositor logic this project would
-//! otherwise have to write (docs/design.md §5.2). Standing it up is the
-//! difference between porting and reimplementing.
+//! This is that stage. One `HWND` per `xdg_toplevel`, with Windows' own
+//! caption, border and buttons; the client's `wl_shm` pixels blitted into it
+//! with GDI; damage honoured; buffers released; `set_title` to `SetWindowTextW`
+//! and the close button back to `xdg_toplevel.close`.
 //!
-//! What this binary does:
+//! # The shape of the program
 //!
-//! * creates a smithay `Display`, `CompositorState`, `ShmState` and
-//!   `XdgShellState`, so the globals a real client looks for are the ones
-//!   smithay itself advertises rather than hand-rolled stand-ins;
-//! * accepts clients on an AF_UNIX socket and inserts them;
-//! * runs smithay's own `xdg_shell` implementation, so a client that binds
-//!   `xdg_wm_base`, creates a `wl_surface`, wraps it in an `xdg_surface` and
-//!   asks for an `xdg_toplevel` gets the real protocol — including the
-//!   configure/ack handshake, which this sends;
-//! * prints one greppable line per protocol milestone so a test script can
-//!   assert on the sequence rather than on an exit code.
+//! Two threads, and the split is the interesting decision — see
+//! `platform/mod.rs` for the argument. **The main thread pumps Win32
+//! messages; the Wayland dispatch loop is spawned.** Every smithay object
+//! lives on the spawned thread and is created inside its closure, so the
+//! compiler enforces that nothing thread-affine escapes: the only things that
+//! cross are the plain-data messages in `platform`, plus one
+//! `Arc<Mutex<Shadow>>` of pixels per window.
 //!
-//! What it does not do: draw anything. There is no renderer, no HWND and no
-//! output. `wl_surface.commit` with a buffer attached is acknowledged and the
-//! buffer released. Pixels are the next stage.
+//! ```text
+//!   main thread                      wayland thread
+//!   ───────────                      ──────────────
+//!   GetMessage / DispatchMessage     accept, dispatch_clients, flush
+//!        │  ▲                             │  ▲
+//!        │  └── ToUi ── mpsc + PostMessage┘  │
+//!        └───── FromUi ── mpsc ──────────────┘
+//!                        (drained each turn of the poll loop)
+//! ```
 //!
 //! # The event loop is still a poll loop, and still deliberately
 //!
-//! Every smithay compositor nests its `Display` inside `calloop` as one source,
-//! using `Backend::poll_fd()`. That does not work on Windows: the Windows
-//! counterpart returns a wepoll handle, wepoll polls sockets, and a wepoll
-//! handle is not a socket (docs/design.md §3.3). The settled answer is the
-//! two-thread design — a Win32 message pump on one thread, Wayland dispatch on
-//! another — and it is not needed until there are windows to pump messages for.
-//! Until then this loop is honest about doing nothing clever, exactly as stage
-//! 1's was.
+//! No `calloop`. `Backend::poll_fd()` returns a wepoll handle on Windows and a
+//! wepoll handle is not a socket (docs/design.md §3.3), so the backend cannot
+//! nest inside it. The Wayland thread therefore polls on a 5 ms sleep, exactly
+//! as stages 1 and 2 did. That is a latency floor on input and on how fast a
+//! `WM_CLOSE` reaches the client, and it is honest about being one; it is not a
+//! throughput limit, because a single turn drains every pending message.
+
+mod platform;
+mod state;
+mod surface;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
-use smithay::reexports::wayland_server::{Client, Display, ListeningSocket};
-use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState,
-};
-use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-};
-use smithay::wayland::shm::{ShmHandler, ShmState};
-use smithay::{delegate_compositor, delegate_seat, delegate_shm, delegate_xdg_shell};
+use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
-/// Everything the compositor knows.
-///
-/// Four smithay state structs and two counters. The counters exist so `--once`
-/// can distinguish "no client yet" from "the client has gone", and so the test
-/// script can assert that a toplevel was actually created rather than merely
-/// that nothing crashed.
-struct State {
-    compositor: CompositorState,
-    shm: ShmState,
-    xdg_shell: XdgShellState,
-    seat_state: SeatState<Self>,
+use platform::{FrameStyle, PlatformConfig};
+use state::{ClientState, State};
 
-    clients_seen: usize,
-    toplevels: usize,
+struct Args {
+    once: bool,
+    socket: Option<String>,
+    idle_timeout: Duration,
+    dump_frames: Option<std::path::PathBuf>,
+    debug_icon: bool,
+    simulate_wm: bool,
+    log: Option<std::path::PathBuf>,
+    /// Exit successfully only after this many frames have been presented.
+    /// `--once` alone proves a window was made; this proves pixels reached it.
+    expect_presents: usize,
 }
 
-/// Per-client data.
-///
-/// `CompositorClientState` is not optional: smithay's compositor stores
-/// per-client protocol state in it and expects the compositor to hang it off
-/// its own `ClientData` so it is dropped with the client.
-#[derive(Default)]
-struct ClientState {
-    compositor_state: CompositorClientState,
-}
-
-impl ClientData for ClientState {
-    fn initialized(&self, client_id: ClientId) {
-        println!("wc-compositor: client {client_id:?} initialized");
-    }
-
-    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
-        println!("wc-compositor: client {client_id:?} disconnected: {reason:?}");
-    }
-}
-
-impl CompositorHandler for State {
-    fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor
-    }
-
-    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
-    }
-
-    fn new_surface(&mut self, _surface: &WlSurface) {
-        println!("wc-compositor: wl_surface created");
-    }
-
-    fn commit(&mut self, _surface: &WlSurface) {
-        // With no renderer there is nothing to do on commit but say so. The
-        // *interesting* part is that we get here at all: reaching `commit` means
-        // the surface, its role and its pending state all round-tripped through
-        // smithay's own `compositor` module on Windows.
-        println!("wc-compositor: wl_surface commit");
-    }
-}
-
-impl BufferHandler for State {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
-}
-
-impl ShmHandler for State {
-    fn shm_state(&self) -> &ShmState {
-        &self.shm
-    }
-}
-
-impl SeatHandler for State {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
-
-    fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seat_state
-    }
-
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
-    }
-}
-
-impl XdgShellHandler for State {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg_shell
-    }
-
-    fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        self.toplevels += 1;
-        println!("wc-compositor: xdg_toplevel created (#{})", self.toplevels);
-
-        // A client is not allowed to attach a buffer until it has been
-        // configured, so a compositor that never configures produces a client
-        // that hangs. Sending it here is the minimum that makes the protocol
-        // complete: the client gets `xdg_toplevel.configure` followed by
-        // `xdg_surface.configure`, and replies with `ack_configure`.
-        //
-        // No size is set, which tells the client to pick its own — correct for
-        // a compositor with no output and no window management.
-        surface.send_configure();
-        println!("wc-compositor: sent xdg_toplevel configure");
-    }
-
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        println!("wc-compositor: xdg_popup created");
-        let _ = surface.send_configure();
-    }
-
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: smithay::utils::Serial) {}
-
-    fn reposition_request(
-        &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
-    ) {
-    }
-}
-
-delegate_compositor!(State);
-delegate_shm!(State);
-delegate_xdg_shell!(State);
-delegate_seat!(State);
-
-fn main() -> std::process::ExitCode {
-    let mut once = false;
-    let mut socket_name: Option<String> = None;
-    let mut idle_timeout = Duration::from_secs(30);
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+fn parse_args() -> Result<Args, u8> {
+    let mut args = Args {
+        once: false,
+        socket: None,
+        idle_timeout: Duration::from_secs(30),
+        dump_frames: None,
+        debug_icon: false,
+        simulate_wm: false,
+        log: None,
+        expect_presents: 0,
+    };
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--once" => once = true,
-            "--socket" => socket_name = args.next(),
+            "--once" => args.once = true,
+            "--debug-icon" => args.debug_icon = true,
+            "--simulate-wm" => args.simulate_wm = true,
+            "--log" => args.log = it.next().map(Into::into),
+            "--socket" => args.socket = it.next(),
+            "--dump-frames" => args.dump_frames = it.next().map(Into::into),
+            "--expect-presents" => {
+                args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
+            }
             "--timeout" => {
-                idle_timeout = args
+                args.idle_timeout = it
                     .next()
                     .and_then(|s| s.parse().ok())
                     .map(Duration::from_secs)
-                    .unwrap_or(idle_timeout)
+                    .unwrap_or(args.idle_timeout)
             }
             other => {
                 eprintln!("wc-compositor: unknown argument {other}");
-                return std::process::ExitCode::from(2);
+                return Err(2);
             }
         }
     }
+    Ok(args)
+}
+
+/// Send this process's stdout and stderr to a file.
+///
+/// # Why a compositor needs this and a server did not
+///
+/// Stages 1 and 2 were console programs whose output a shell could redirect.
+/// This one puts up windows, and that changes where its output goes in two
+/// ways that both bite:
+///
+/// * Under Wine, `wine explorer /desktop=` — which is how the harness gets a
+///   virtual desktop, and therefore how the window gets a caption drawn at all
+///   — launches the program as a child of `explorer.exe` and gives it a console
+///   window **inside** the desktop. A shell redirect on the outside captures
+///   the loader's chatter and nothing else. Measured: `scripts/wc-window.sh`
+///   was asserting on an empty log while the compositor was working perfectly
+///   and printing to a console visible only in a screenshot.
+/// * On real Windows the same problem arrives from the other direction. A
+///   process launched without a console has no `STD_OUTPUT_HANDLE` at all, and
+///   `println!` goes nowhere. `scripts/wc-guest.sh` runs binaries over ssh
+///   today, which supplies one; a compositor launched from a shortcut or a
+///   service would not have that.
+///
+/// `SetStdHandle` before the first write rather than a logging framework:
+/// every `println!` in this program then lands in the file with no other
+/// change, and Rust's `Stdout` fetches the handle per write, so this is
+/// enough. It is called first thing in `main` for that reason.
+#[cfg(windows)]
+fn redirect_output(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{
+        SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    let file = std::fs::File::create(path)?;
+    let handle = file.as_raw_handle();
+    // SAFETY: a live handle to a file this process just opened. Both standard
+    // handles are pointed at it; the process keeps it open for its lifetime by
+    // leaking it, which is what `std::mem::forget` is doing and is correct
+    // here — closing it would leave the standard handles dangling.
+    unsafe {
+        if SetStdHandle(STD_OUTPUT_HANDLE, handle.cast()) == 0
+            || SetStdHandle(STD_ERROR_HANDLE, handle.cast()) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    std::mem::forget(file);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn redirect_output(path: &std::path::Path) -> std::io::Result<()> {
+    // Not needed on Unix — a shell redirect reaches this program — but
+    // supported so the harness can use one command line on both platforms.
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::create(path)?;
+    // SAFETY: `dup2` onto the two standard descriptors with a live fd. The
+    // file is leaked deliberately, as on Windows.
+    unsafe {
+        if libc::dup2(file.as_raw_fd(), 1) < 0 || libc::dup2(file.as_raw_fd(), 2) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(code) => return std::process::ExitCode::from(code),
+    };
+
+    // Before anything is printed, or the first lines land in the console this
+    // is trying to escape.
+    if let Some(path) = &args.log
+        && let Err(e) = redirect_output(path)
+    {
+        eprintln!("wc-compositor: could not redirect output to {}: {e}", path.display());
+        return std::process::ExitCode::from(2);
+    }
+
+    // The two channels. `ui_events` goes UI -> Wayland; the command channel in
+    // the other direction is owned by `platform::start`.
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+    let started = match platform::start(PlatformConfig {
+        events: event_tx,
+        // Stage 3 gives Windows the whole frame. The field is what
+        // `DwmExtendFrameIntoClientArea` will move, and every size conversion
+        // already goes through it — see `platform::FrameStyle`.
+        frame: FrameStyle { extend_top: 0 },
+        dump_frames: args.dump_frames,
+        simulate_wm: args.simulate_wm,
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wc-compositor: could not start the platform: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let platform::Started { ui, pump } = started;
+
+    // The Wayland side is built and run entirely inside this closure. Nothing
+    // it creates is ever named on the main thread, which is what makes the
+    // `!Send` smithay state a non-question rather than a fight with the
+    // compiler.
+    let exit = Arc::new(AtomicU8::new(1));
+    let thread_exit = exit.clone();
+    let wayland = std::thread::Builder::new()
+        .name("wayland".into())
+        .spawn(move || {
+            let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
+                args.expect_presents, ui, event_rx);
+            thread_exit.store(code, Ordering::SeqCst);
+        });
+    let wayland = match wayland {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("wc-compositor: could not spawn the wayland thread: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+
+    // Blocks until the Wayland thread sends `Quit`, or the platform stops.
+    pump.run();
+    let _ = wayland.join();
+
+    std::process::ExitCode::from(exit.load(Ordering::SeqCst))
+}
+
+/// Everything Wayland, on its own thread.
+///
+/// Returns the process exit code: 0 success, 1 loop error, 2 setup failure,
+/// 3 idle timeout, 4 the milestone was not reached.
+#[allow(clippy::too_many_arguments)]
+fn wayland_thread(
+    once: bool,
+    socket: Option<String>,
+    idle_timeout: Duration,
+    debug_icon: bool,
+    expect_presents: usize,
+    ui: platform::Ui,
+    events: std::sync::mpsc::Receiver<platform::FromUi>,
+) -> u8 {
+    use std::io::Write as _;
 
     let display: Display<State> = match Display::new() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("wc-compositor: could not create display: {e}");
-            return std::process::ExitCode::from(2);
+            ui.send(platform::ToUi::Quit);
+            return 2;
         }
     };
     let dh = display.handle();
+    let mut state = State::new(&dh, ui, events, debug_icon);
 
-    // Every one of these creates its globals through smithay, not through us.
-    // `ShmState::new` also advertises the mandatory `Argb8888`/`Xrgb8888`
-    // formats; the extra list is empty because there is no renderer to claim
-    // support for anything else.
-    let mut state = State {
-        compositor: CompositorState::new::<State>(&dh),
-        shm: ShmState::new::<State>(&dh, Vec::new()),
-        xdg_shell: XdgShellState::new::<State>(&dh),
-        seat_state: SeatState::new(),
-        clients_seen: 0,
-        toplevels: 0,
-    };
-    // A seat is not needed to reach `xdg_toplevel`, but a client that finds no
-    // `wl_seat` may decline to map a window at all, and it is one line.
-    let _seat: Seat<State> = state.seat_state.new_wl_seat(&dh, "seat0");
-
-    let listener = match socket_name {
+    let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
         None => ListeningSocket::bind_auto("wayland", 1..32),
     };
@@ -242,13 +269,14 @@ fn main() -> std::process::ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("wc-compositor: could not bind socket: {e}");
-            return std::process::ExitCode::from(2);
+            state.quit();
+            return 2;
         }
     };
 
-    // Fixed, greppable, and explicitly flushed. A Windows binary under Wine with
-    // a redirected stdout is fully buffered, so a harness waiting for this line
-    // would otherwise wait forever while the compositor worked perfectly.
+    // Fixed, greppable, and explicitly flushed. A Windows binary under Wine
+    // with a redirected stdout is fully buffered, so a harness waiting for this
+    // line would otherwise wait forever while the compositor worked perfectly.
     println!(
         "wc-compositor: listening on {}",
         listener
@@ -256,11 +284,11 @@ fn main() -> std::process::ExitCode {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
+    let mut code = 1u8;
 
     loop {
         match listener.accept() {
@@ -280,39 +308,64 @@ fn main() -> std::process::ExitCode {
             }
         }
 
+        // Order matters. UI events first, so a resize or a close reaches the
+        // client in the same turn it arrived; then dispatch, which is where
+        // commits land and where `present` runs; then frame callbacks, so a
+        // client is invited to draw the next frame only after this one has
+        // been handed to the platform; then flush.
+        state.pump_ui_events();
+        if state.stopped {
+            println!("wc-compositor: the platform stopped; winding up");
+            code = 0;
+            break;
+        }
+
         if let Err(e) = display.dispatch_clients(&mut state) {
             eprintln!("wc-compositor: dispatch failed: {e}");
             break;
         }
+        state.tick_frames();
         if let Err(e) = display.flush_clients() {
             eprintln!("wc-compositor: flush failed: {e}");
             break;
         }
 
         let mut live = 0;
-        display.handle().backend_handle().with_all_clients(|_| live += 1);
+        display
+            .handle()
+            .backend_handle()
+            .with_all_clients(|_| live += 1);
 
         if once && state.clients_seen > 0 && live == 0 {
             println!(
-                "wc-compositor: --once and the last client has gone; {} toplevel(s) seen",
-                state.toplevels
+                "wc-compositor: --once and the last client has gone; {} toplevel(s), {} frame(s) presented",
+                state.toplevels, state.presents
             );
-            let _ = std::io::stdout().flush();
-            return if state.toplevels > 0 {
-                std::process::ExitCode::SUCCESS
-            } else {
+            code = if state.toplevels == 0 {
                 eprintln!("wc-compositor: no xdg_toplevel was ever created");
-                std::process::ExitCode::from(4)
+                4
+            } else if state.presents < expect_presents {
+                eprintln!(
+                    "wc-compositor: {} frames presented, expected at least {expect_presents}",
+                    state.presents
+                );
+                4
+            } else {
+                0
             };
+            break;
         }
 
         if Instant::now() > deadline {
             eprintln!("wc-compositor: idle timeout reached; exiting");
-            return std::process::ExitCode::from(3);
+            code = 3;
+            break;
         }
 
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    std::process::ExitCode::from(1)
+    let _ = std::io::stdout().flush();
+    state.quit();
+    code
 }
