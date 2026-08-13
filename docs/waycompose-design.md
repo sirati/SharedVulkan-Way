@@ -10221,6 +10221,23 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    The teardown runs when the compositor exits, and a launcher killed by a deploy
    never gets there; `/tmp/wc-launch/` had three of them by the end of the day.
    Harmless, and the kind of thing that is only harmless until the disk is small.
+11. **No Firefox crashed in any run of this launcher, and the string that looks
+   like one is ambiguous.** The user has reported "a lot of crashed Firefox
+   instances" on this machine; nothing here reproduces it. Across a day's runs:
+   `coredumpctl` has no Firefox core at all (only QEMU's from July and a Weston
+   demo's from this morning), every connection in the proxy's log ends
+   `stopped: the client closed the connection` rather than with the compositor
+   dropping it, and the arena reports `0 overflows` throughout — on 768 MiB,
+   which is the point of §28.9 item 2.
+   **What is in the log and reads exactly like a crash is `Exiting due to channel
+   error.`, eighteen times.** That is Firefox's *content* processes noticing that
+   their parent went away, and their parent went away because this harness
+   `pkill`ed it between samples. The same line is what a client prints when the
+   compositor drops the connection after an allocation refusal, so the string
+   alone cannot tell the two apart: the thing that can is the **proxy's** log,
+   where a real exhaustion leaves `no run of N bytes` and a stop that says the
+   *compositor* closed the connection. Anyone chasing the user's report should
+   start there rather than in Firefox's output.
 
 ### 28.10 What to do next
 
