@@ -11526,13 +11526,12 @@ Requirements 1, 2 and 4 are the ones that need to exist in the interface; 3 and
   2334 and 949 witness changes across ~7130 commits, in the two `mozilla-ipc`
   rendering pools, with no crash. What remains unproven about it is narrower and
   is listed below.
-* **That object identity is safe against inode reuse.** `(st_dev, st_ino)` is a
-  far better key than a descriptor number, but it is not eternal either: once a
-  memfd is fully released its inode can be reissued, and a pool record outliving
-  its object would then match a stranger — §30.6d one level up. The pool record
-  must end at `wl_shm_pool.destroy`, which is the protocol's own statement that
-  the object is finished; the experiment leaks the record instead, which is fine
-  for four pools and not fine for a session.
+* ~~That object identity is safe against inode reuse.~~ **Closed** (§30.11).
+  `(st_dev, st_ino)` is not eternal — a released memfd's inode can be reissued —
+  so the record now ends at `wl_shm_pool.destroy`, the protocol's own statement
+  that the object is finished. Verified by `scripts/wc-pooltest.c`:
+  `create_pool=12 redirected=12 destroyed=12`, no record left behind, and the
+  freed slot reused each round rather than climbing.
 * **That it is faster.** No end-to-end timing was taken, because the arena path
   was not built. The claim "126 µs per copy becomes 0 µs" is arithmetic on a
   copy that no longer happens, not a measurement, and it ignores whatever the
@@ -11604,13 +11603,47 @@ fraction of a real budget and this becomes worth its hazards. Two independent
 arguments now converge on "not yet", which is a much better place to stand than
 one.
 
-One thing to do *before* any of it, and it is small: end the pool record at
-`wl_shm_pool.destroy`. The experiment leaks it, and §30.10 explains why that
-cannot ship — `(st_dev, st_ino)` is a much better identity than a descriptor
-number but a released memfd's inode can be reissued, so a leaked record
-eventually matches a stranger. That is §30.6d a third time, and the pattern by
-now is unmistakable: **every identity in this mechanism must end when the thing
-it names ends.** The protocol already says when that is.
+One thing that was to be done before any of it, and now is: **the pool record
+ends at `wl_shm_pool.destroy`.** The experiment used to leak it, which could not
+ship — `(st_dev, st_ino)` is a much better identity than a descriptor number but
+a released memfd's inode can be reissued, so a leaked record eventually matches
+a stranger. That was §30.6d a third time, and the pattern is now the section's
+one-line lesson: **every identity in this mechanism must end when the thing it
+names ends.** The protocol already says when that is, so the record is bound to
+the `wl_shm_pool` the constructor returns and dies with it, taking the witness
+mapping and our descriptor with it.
+
+Proving that needed a client of its own, and the reason is worth recording.
+Firefox holds its rendering pools for the life of the window: a 70-second
+session creates four pools, destroys none, and reports `destroyed=0`. The
+ending compiled, bound to all four proxies, and never ran — code that looks
+right because nothing reached it, which is the failure this section keeps
+finding. `scripts/wc-pooltest.c` exists to reach it: it creates and destroys
+pools in a loop and draws nothing, because `create_pool` and `destroy` are the
+whole experiment. Twelve rounds give `create_pool=12 redirected=12
+destroyed=12` with no record left behind, and the freed slot is reused every
+round rather than climbing, which is what says the record is gone rather than
+merely marked.
+
+That client also exposed something the Firefox runs could not have: **libwayland
+recycles proxy pointers within a session.** Across twelve rounds the
+`wl_shm_pool` alternates between just two addresses. So a proxy pointer is no
+more eternal than a descriptor number or an inode, and keying on one would be
+§30.6d a fourth time — *except* that this identity ends at the exact instant the
+protocol declares the object finished, before the address can be handed out
+again. That is the whole reason it is safe, and it is worth stating, because
+"use the proxy pointer" is otherwise advice that would fail the same way as
+everything else here.
+
+The same run found one more instrument fault, in the same family as §30.6's.
+Adding the signal handler that lets killed clients report had silently dropped
+the `destructor` attribute from the report itself, so every *cleanly exiting*
+client had been producing no summary at all. Firefox is always killed, so it
+never showed; `wc-pooltest` exits normally, so it showed immediately. Both
+endings are now wired. An instrument with one blind ending is how §30.6 went
+wrong the first time, and this is the third distinct instance of the same
+mistake in one section — which is the strongest argument it contains for
+§30.7's verifier existing before the copy is removed rather than after.
 
 And keep the ordering straight. The accelerated path — WebRender rendering
 through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all

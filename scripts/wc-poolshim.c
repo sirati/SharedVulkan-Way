@@ -100,6 +100,8 @@ static const char *backing_dir;
 
 /* Counters the harness asserts on. Printed at exit. */
 static unsigned long n_create_pool, n_redirected, n_resize, n_no_mapping, n_commit, n_retired;
+static int last_redirect_idx = -1; /* which pool record redirect_pool just filled */
+static unsigned long n_destroyed;
 static unsigned long long bytes_redirected;
 
 #define MAXMAP 65536
@@ -135,6 +137,12 @@ struct poolrec {
      * `(st_dev, st_ino)` is what names an object. */
     dev_t obj_dev;
     ino_t obj_ino;
+    /* The `wl_shm_pool` this record belongs to. It is the only identity that
+     * ends at a moment the protocol names, which is what §30.11 asks for: an
+     * object identity is better than a descriptor number but is not eternal
+     * either, because a released memfd's inode can be reissued. The proxy
+     * pointer is what says "this pool is over". */
+    void *pool_proxy;
 };
 static struct poolrec pools[MAXPOOL];
 
@@ -149,6 +157,24 @@ static struct poolrec *pool_by_addr(void *a) {
     for (int i = 0; i < MAXPOOL; i++)
         if (pools[i].used && pools[i].addr == a) return &pools[i];
     return NULL;
+}
+
+/* End a pool at the moment the protocol says it ends. Everything the record
+ * owns goes with it, so no identity outlives the thing it names: the witness
+ * mapping, our descriptor, and the record itself. */
+static void end_pool_by_proxy(void *proxy) {
+    for (int i = 0; i < MAXPOOL; i++) {
+        if (!pools[i].used || pools[i].pool_proxy != proxy) continue;
+        fprintf(stderr,
+                "wc-poolshim: pool=%d destroyed by the client after %lu commits, "
+                "%lu changed; releasing its object\n",
+                i, pools[i].checks, pools[i].changes);
+        if (pools[i].witness) real_munmap(pools[i].witness, pools[i].len);
+        if (real_close) real_close(pools[i].our_fd);
+        memset(&pools[i], 0, sizeof pools[i]);
+        n_destroyed++;
+        return;
+    }
 }
 
 /* §30.10: WHICH OF THE TWO CAUSES IS IT.
@@ -649,6 +675,8 @@ static int redirect_pool(int client_fd, int32_t size) {
             }
             void *w = real_mmap(NULL, size, PROT_READ, MAP_SHARED, ourfd, 0);
             pools[i].witness = (w == MAP_FAILED) ? NULL : (unsigned char *)w;
+            pools[i].pool_proxy = NULL; /* filled in once the call returns it */
+            last_redirect_idx = i;
             break;
         }
     if (m) m->fd = ourfd; /* the mapping now belongs to our object */
@@ -665,6 +693,7 @@ struct wl_proxy *wl_proxy_marshal_array_flags(struct wl_proxy *proxy,
                                               uint32_t version, uint32_t flags,
                                               union wl_argument *args) {
     init();
+    int claim_proxy = 0; /* set when this call is a create_pool we redirected */
     /* WHY THIS CANNOT BE RESOLVED ONCE AT STARTUP, WHICH COST AN AFTERNOON.
      * A preloaded library's constructor runs before the main executable's, but
      * Firefox does not link libxul — it `dlopen`s it, and libwayland-client
@@ -696,11 +725,27 @@ struct wl_proxy *wl_proxy_marshal_array_flags(struct wl_proxy *proxy,
                          args[2].i);
                 if (shim_diag) diagnose_pool(args[1].h, args[2].i);
                 if (shim_on) {
+                    last_redirect_idx = -1;
                     int ourfd = redirect_pool(args[1].h, args[2].i);
-                    if (ourfd >= 0) args[1].h = ourfd;
+                    if (ourfd >= 0) {
+                        args[1].h = ourfd;
+                        /* `create_pool` is a constructor, so the call returns
+                         * the new `wl_shm_pool`. Claim it below. */
+                        claim_proxy = 1;
+                    }
                 }
             } else if (!strcmp(pi->name, "wl_shm_pool") && !strcmp(method, "resize")) {
                 log_line("saw wl_shm_pool.resize size=%d", args[0].i);
+            } else if (!strcmp(pi->name, "wl_shm_pool") && !strcmp(method, "destroy")) {
+                /* THE ONLY ENDING THE PROTOCOL NAMES, AND THEREFORE THE ONLY ONE
+                 * WORTH USING. §30.11: `(st_dev, st_ino)` is a far better
+                 * identity than a descriptor number, but it is not eternal —
+                 * once a memfd is fully released its inode can be reissued, and
+                 * a pool record that outlived its object would then match a
+                 * stranger. That is §30.6d a third time. The client saying
+                 * `wl_shm_pool.destroy` is the client saying the object is
+                 * finished, so that is where the record ends. */
+                end_pool_by_proxy(proxy);
             } else if (!strcmp(pi->name, "wl_surface") && !strcmp(method, "commit")) {
                 /* WHAT REPLACES `--verify-damage`. With no copy there are no two
                  * buffers to compare, so the question changes from "do the
@@ -739,7 +784,16 @@ struct wl_proxy *wl_proxy_marshal_array_flags(struct wl_proxy *proxy,
             }
         }
     }
-    return real_marshal_array(proxy, opcode, interface, version, flags, args);
+    struct wl_proxy *created =
+        real_marshal_array(proxy, opcode, interface, version, flags, args);
+    if (claim_proxy && created && last_redirect_idx >= 0 &&
+        last_redirect_idx < MAXPOOL && pools[last_redirect_idx].used) {
+        pools[last_redirect_idx].pool_proxy = created;
+        log_line("pool=%d bound to wl_shm_pool %p; it ends at destroy",
+                 last_redirect_idx, (void *)created);
+    }
+    last_redirect_idx = -1;
+    return created;
 }
 
 static void report(void);
@@ -757,13 +811,20 @@ __attribute__((constructor)) static void arm_signals(void) {
     signal(SIGINT, on_signal);
 }
 
-static void report(void) {
+/* Both endings, because the shim has two kinds of client and each one loses the
+ * report the other keeps. Long-lived clients (Firefox, weston-terminal) are
+ * killed, so only the signal handler above ever runs. Short-lived ones
+ * (`wc-pooltest`) exit normally, so only this runs. Adding the handler is what
+ * dropped this attribute, and the summary then went silently missing for every
+ * clean exit — measured, and exactly the shape of everything else in §30: the
+ * instrument failing quietly while the thing it measures looks fine. */
+__attribute__((destructor)) static void report(void) {
     if (!n_create_pool && !n_redirected) return;
     fprintf(stderr, "wc-poolshim: commits_seen=%lu\n", n_commit);
     fprintf(stderr,
             "wc-poolshim: pid=%d create_pool=%lu redirected=%lu resize=%lu "
-            "no_mapping=%lu bytes=%llu\n",
-            (int)getpid(), n_create_pool, n_redirected, n_resize, n_no_mapping,
+            "no_mapping=%lu destroyed=%lu bytes=%llu\n",
+            (int)getpid(), n_create_pool, n_redirected, n_resize, n_no_mapping, n_destroyed,
             bytes_redirected);
     for (int i = 0; i < MAXPOOL; i++)
         if (pools[i].used)
