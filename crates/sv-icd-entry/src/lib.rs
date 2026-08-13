@@ -820,6 +820,41 @@ unsafe impl Sync for ProcEntry {}
 // SAFETY: as above.
 unsafe impl Send for ProcEntry {}
 
+/// Where a command's answer came from, as observed rather than as documented.
+///
+/// See [`AUDIT_PROBES`] and `sv_codegen::emit::icd_entry::emit_audit_probes`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Answered {
+    /// The generated default was in force: with no transport it refused by its
+    /// own name, which no hand-written body does. **This command forwards.**
+    ByTheGeneratedDefault,
+    /// `sv-icd` overrode the method and returned a reply without a GPU side.
+    Locally,
+    /// `sv-icd` overrode the method and returned an error of its own choosing.
+    /// Still a local answer — the point is that the default did not run.
+    LocallyWithError(LowerError),
+}
+
+impl Answered {
+    /// Did anything hand-written stand between this command and the wire?
+    pub fn is_local(self) -> bool {
+        !matches!(self, Answered::ByTheGeneratedDefault)
+    }
+}
+
+/// One forwarded command, callable with zeroed arguments.
+///
+/// The audit in `sv-icd` runs the whole table against a driver with no GPU side
+/// and sorts the profile into "forwards" and "answered here". A generated table
+/// rather than a hand-kept list for the same reason the API version is derived
+/// from the profile (design.md §0.18): a list of 239 names maintained beside the
+/// code it describes is a list that is wrong within a release.
+#[derive(Clone, Copy)]
+pub struct AuditProbe {
+    pub command: &'static str,
+    pub run: fn(&dyn Icd) -> Answered,
+}
+
 /// Look a name up in one of the generated tables.
 pub fn lookup(table: &[ProcEntry], name: &str) -> Option<*const c_void> {
     table.iter().find(|e| e.name == name).map(|e| e.pfn)

@@ -589,10 +589,14 @@ fn announce(how: Negotiated, advertised: u32, driver_device: u32) {
     }
 }
 
-/// Refuse, naming the command.
-pub fn unimplemented<T>(what: &'static str) -> IcdResult<T> {
-    Err(LowerError::NotImplemented(what))
-}
+// `pub fn unimplemented<T>(what) -> IcdResult<T>` used to live here, unused by
+// anything in the workspace and unused for long enough that the audit of §0.20
+// found it by looking for the opposite thing. It is deleted rather than wired
+// up: a helper whose name announces a convention, with no callers, reads as
+// evidence that refusals are marked when they are not. The one place that does
+// refuse spells it out — `LowerError::NotImplemented("vkCreateSwapchainKHR
+// without a GPU side")` in `crate::wsi` — and a spelled-out refusal carrying its
+// own reason is better than a shared helper that carries none.
 
 /// The memory table, with this ICD's arena size in it.
 pub fn memory_properties(icd: &SharedVulkan) -> sv_icd_entry::VkPhysicalDeviceMemoryProperties {

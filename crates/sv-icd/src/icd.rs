@@ -16,13 +16,26 @@
 //! - **Answered from app-side state.** Object ids, arena allocations, mapping.
 //!   These are the real implementation, not a placeholder: design.md §6.4 and
 //!   §5.3 put exactly this work on the app side.
-//! - **Accepted and dropped.** Anything that would need a GPU. Every one of them
-//!   is marked `// NO GPU:` and returns a success the application can proceed
-//!   through, because the alternative — failing — makes it impossible to see how
-//!   far an application gets.
+//! - **Accepted and dropped.** Anything that would need a GPU, in the standalone
+//!   configuration where there is no GPU to ask. These return a success the
+//!   application can proceed through, because the alternative — failing — makes
+//!   it impossible to see how far an application gets.
 //!
-//! The third group is the honest gap in this stage and it is deliberately easy
-//! to grep for.
+//! # How to find the third group, which is **not** by grepping
+//!
+//! This paragraph used to say "every one of them is marked `// NO GPU:` … and it
+//! is deliberately easy to grep for". That claim had rotted to one marker
+//! against roughly twenty-six sites, so the grep returned 1/26 and looked
+//! authoritative doing it — a worse outcome than no convention at all, because a
+//! reader who finds one hit concludes there is one gap.
+//!
+//! The convention is replaced by a derivation. `crates/sv-icd/tests/audit.rs`
+//! runs every generated `Icd` method against a driver with no GPU side and sorts
+//! the profile into "forwards" and "answered here" **mechanically** — the
+//! generated default refuses by its own name and no hand-written body does, so
+//! the two are distinguishable without reading anything. It then requires a
+//! classification for each local answer and fails if one is missing. That list
+//! cannot go stale the way a comment can, and design.md §0.20 is what it found.
 
 use crate::advertise;
 use crate::state::{Memory, PROTOCOL_API_VERSION, SharedVulkan};

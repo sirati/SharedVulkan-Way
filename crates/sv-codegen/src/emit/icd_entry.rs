@@ -1965,6 +1965,73 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
     }
 }
 
+/// One callable probe per forwarded command, for the carried-vs-implemented audit.
+///
+/// # The question this exists to answer mechanically
+///
+/// The profile says which commands are *carried*. It does not say which are
+/// *implemented*, and the two are not the same claim: a command whose generated
+/// forwarder exists but whose `Icd` method `sv-icd` overrides with a canned
+/// value never reaches a driver, and returns something plausible while doing so.
+/// That is worse than a missing command, because a missing one is diagnosable.
+///
+/// Reading 239 method bodies answers it and does not stay answered. This does,
+/// and it rests on one property of [`emit_icd_trait`] above: **the generated
+/// default, with no transport, returns
+/// `Err(LowerError::NotImplemented(<this command's own name>))` and nothing
+/// else does.** So calling every method on a driver with no GPU side sorts the
+/// set exactly in two:
+///
+/// - that precise error ⇒ the default is in force ⇒ the command *forwards* when
+///   there is a GPU side, and no hand-written code stands in its way;
+/// - anything else — a success, a different error, a panic ⇒ `sv-icd` overrode
+///   it and answered locally, and it needs classifying by hand.
+///
+/// The second set is small enough to read. The first is the one that would
+/// otherwise be taken on trust, and it is the larger by an order of magnitude.
+///
+/// `Default::default()` for the arguments is deliberate and is not a weakness of
+/// the probe: a zeroed `Args` names object id 0, which is `VK_NULL_HANDLE`, so
+/// nothing here can resolve to a real object and no probe can have an effect
+/// beyond minting an id. What is being measured is *which branch the
+/// implementation takes*, and that is decided before any argument is looked at.
+fn emit_audit_probes(cx: &Ctx<'_>) -> TokenStream {
+    let probes = cx.wire.commands.iter().filter_map(|c| {
+        if HAND_WRITTEN.contains(&c.name.as_str()) {
+            // On `IcdLocal`, with a hand-written signature that does not take an
+            // `Args`. There is nothing mechanical to call.
+            return None;
+        }
+        let m = naming::command_method(&c.name);
+        let cname = c.name.as_str();
+        Some(quote! {
+            crate::AuditProbe {
+                command: #cname,
+                run: |__icd| {
+                    match crate::Icd::#m(__icd, Default::default()) {
+                        Ok(_) => crate::Answered::Locally,
+                        // The command's own name, matched as a pattern rather
+                        // than compared in a guard: only the generated default
+                        // refuses with exactly this string, and a pattern says
+                        // so where a guard merely tests it.
+                        Err(crate::LowerError::NotImplemented(#cname)) => {
+                            crate::Answered::ByTheGeneratedDefault
+                        }
+                        Err(__e) => crate::Answered::LocallyWithError(__e),
+                    }
+                },
+            }
+        })
+    });
+    quote! {
+        /// Every forwarded command, callable, for `sv-icd`'s audit test.
+        ///
+        /// See `sv_codegen::emit::icd_entry::emit_audit_probes` for what the
+        /// outcomes mean and why a zeroed `Args` is the right argument.
+        pub static AUDIT_PROBES: &[crate::AuditProbe] = &[#(#probes),*];
+    }
+}
+
 /// Entry points that are hand-written **and not on the generated C surface**,
 /// which have to be put in the proc tables by name.
 ///
@@ -2345,6 +2412,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     let forward = emit_forward_module(cx);
     let icd_trait = emit_icd_trait(cx);
     let tables = emit_tables(cx, &refused_names);
+    let probes = emit_audit_probes(cx);
 
     // Sections are kept separate rather than concatenated, because when the
     // whole stream does not parse the only useful question is "which item", and
@@ -2370,6 +2438,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     sections.push(("forward".to_string(), forward));
     sections.push(("trait".to_string(), icd_trait));
     sections.push(("tables".to_string(), tables));
+    sections.push(("audit probes".to_string(), probes));
 
     let keep = |m: BTreeMap<String, String>| -> BTreeMap<String, String> {
         m.into_iter().filter(|(_, why)| why != NOT_NEEDED).collect()

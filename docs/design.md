@@ -2745,6 +2745,147 @@ re-deploy **both** sides from one tree.
 
 ---
 
+### 0.20 Carried is not implemented: where every command's answer comes from
+
+Derived 2026-08-14 on **devhost**. §0.19 answered "what does an *uncarried*
+command do?" and found the honest answer — absent, which is what an
+implementation is supposed to do — plus six genuinely silent ones, which it
+fixed. This section asks the question one layer down, which §0.19 did not:
+
+> Of the commands that **are** carried and **do** have a working entry point,
+> which of them actually reach a driver?
+
+The user's objection is the reason both sections exist:
+
+> also if we onlt carry 239 that means the others are all noop, thats also a
+> nogo, those ALL need to be properly implemented
+
+"Carried" and "implemented" are different claims, and a command that forwards on
+paper while a hand-written override answers it from a table is exactly the noop
+being objected to — worse than an absent one, because an absent one is
+diagnosable and this one returns a plausible value.
+
+#### 1. Derived, not read
+
+`crates/sv-icd/tests/audit.rs` sorts the profile mechanically, and the whole
+method rests on one property of the generated `Icd` trait: **its default method,
+with no transport, returns `Err(NotImplemented(<its own command name>))`, and no
+hand-written body does that.** So calling every method on a driver with no GPU
+side separates "the generated default is in force" from "`sv-icd` overrode this"
+without reading a line of source.
+
+`sv_codegen::emit::icd_entry::emit_audit_probes` emits the call sites —
+`AUDIT_PROBES`, one closure per command, invoked with `Default::default()`
+arguments, which is safe by construction because a zeroed `Args` names object id
+0 (`VK_NULL_HANDLE`) and so cannot resolve to anything. A maintained list of
+names would have been the same mistake §0.18 removed from the API version.
+
+Two independent derivations agree on the answer: the probe, and a separate
+source reading of `impl Icd for SharedVulkan` done without sight of it. Both say
+**36**.
+
+#### 2. The result
+
+| | zink (239 carried) | full (509 carried) |
+|---|---|---|
+| commands with a generated `Icd` method | 224 | 494 |
+| **untouched generated default — forwards** | **188** | **458** |
+| overridden by `sv-icd` | 36 | 36 |
+
+**The local set does not grow with the profile.** Widening from 239 to 509
+carried commands added 270 that forward untouched and not one new hand-written
+answer — so the hand-written surface is a fixed 36, and §0.19's coverage work
+did not quietly enlarge the thing this section is auditing.
+
+The 36, classified for the **connected** case, which is the one that matters:
+
+| classification | count | meaning |
+|---|---|---|
+| forwards when connected | 27 | the local arm exists only for the standalone driver of §13 step 5 |
+| legitimately client-side | 7 | a round trip would be **wrong**, not merely slow |
+| a correct cache | 1 | `vkGetBufferMemoryRequirements` |
+| **a canned value that should be a forward** | **1** | `vkQueueSubmit`'s `VkResult` |
+| **an outright stub** | **0** | — |
+
+The seven client-side are the arena and the tables this side owns:
+`vkAllocateMemory` and `vkFreeMemory` (§5.2 — arena memory is a sub-range of one
+imported `VkDeviceMemory`, and per-allocation round trips are the thing the arena
+exists to remove); `vkGetPhysicalDeviceMemoryProperties` and its `2` (§9.1 — the
+table describes *our* arena's heap and types, and forwarding it would describe
+memory the application cannot allocate from); and the three
+`vkGetPhysicalDeviceExternal*Properties`, whose all-zero answer is the
+specification's "not supported for this handle type" and is *true* here, because
+§1a says no handle crosses the boundary.
+
+#### 3. The one canned value, named
+
+**`vkQueueSubmit` sends its packet and synthesises its `VkResult`.** The work
+reaches the driver; what does not reach the application is the driver's opinion
+of it. Submission is fire-and-forget by design — §4.4 and D15 — so no reply is
+waited for, and `VK_SUCCESS` is returned unconditionally. A ring that goes fatal
+surfaces as `VK_ERROR_DEVICE_LOST` on the *next* call, not on this one.
+
+It is listed as `CannedShouldForward` rather than excused, because an application
+that checks `vkQueueSubmit`'s return learns nothing from it, and that is a real
+gap however good the reason. It is **not** fixed here: waiting for the reply
+would serialise submission against execution and undo the pipelining §6.5
+measured at 105 µs against 130 µs. The honest options are a deferred error
+channel or an explicit "submission errors surface at the next call" contract, and
+both are design decisions rather than a small forward.
+
+#### 4. Why there is no silent class left below this layer
+
+The layer under the `Icd` trait is the generated writeback, and that is where
+§0.19's six silent commands lived. They cannot recur, and the reason is
+structural rather than diligent: `emit_writeback` **returns an error** for an
+output it cannot store, `emit_command` turns that error into a `Refusal`, and a
+refused command gets a stub that fails by name plus an entry in
+`NOT_IMPLEMENTED`. There is no path from "the generator could not write this
+output back" to "return success anyway". A partial writeback is not something the
+generator can express.
+
+So the population of genuinely undiagnosable commands is **zero**, and the
+population of honestly-refused ones is the 12 in `NOT_IMPLEMENTED` —
+`vkGetDeviceQueue2`, the three buffer-device-address queries, the two debug-utils
+messenger commands, and six device-group/present-rectangle queries. Their
+extensions are kept out of the advertised list by `INCOMPLETE_EXTENSIONS`, so a
+conforming application never reaches them.
+
+#### 5. The other end of the wire
+
+Named for completeness and checked, not audited to the same depth: the GPU side
+has the same shape and the same guarantee. `sv_gpu_server`'s generated `Forward`
+calls a driver entry point through a loaded function pointer, and a pointer the
+driver did not provide produces `note_missing` plus an error return — never a
+synthesised success. That is why every session logs, at startup, a line like
+`[gpu] the driver is missing 4 of the profile's entry points`. The four are
+`vkCreateInstance` and the three instance-level enumerations, which are the
+loader's to answer and not the driver's, so the count is expected rather than
+alarming — but it is printed, which is the property that matters.
+
+#### 6. What was fixed here, and what was deliberately not
+
+Two things, both small and both about the audit itself rather than about a
+forward:
+
+- **`icd.rs`'s "every one of them is marked `// NO GPU:` … deliberately easy to
+  grep for" was false.** One marker survived against roughly twenty-six sites, so
+  the grep returned 1/26 *and looked authoritative doing it* — worse than no
+  convention, because a reader who finds one hit concludes there is one gap. The
+  claim is replaced by a pointer to the derivation, which cannot rot.
+- **`sv_icd::state::unimplemented` was dead** and had been for long enough that
+  this audit found it while looking for the opposite thing. A helper whose name
+  announces a convention, with no callers, is evidence that refusals are marked
+  when they are not. Deleted rather than wired up.
+
+**Not fixed: nothing was converted from local to forwarding**, because the audit
+found nothing that should be. That is the result, not an omission — the one
+`CannedShouldForward` is `vkQueueSubmit` and its fix is a design decision about
+error reporting, not a missing `forward::` call. An audit that produced a list of
+easy fixes would have been a more satisfying deliverable and a less honest one.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
