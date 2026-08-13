@@ -54,7 +54,6 @@ mod icon;
 mod input;
 mod platform;
 /// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
-#[cfg(unix)]
 mod ringlink;
 mod state;
 mod surface;
@@ -528,6 +527,16 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 return Err(2);
             }
         }
+    }
+    // A flag this build cannot honour fails **here**, where it was typed. It
+    // used to be dropped by a `#[cfg(unix)]` and reported only as an
+    // `unused variable` warning to whoever compiled the binary — which is never
+    // the person who needs to know. §36.14.
+    if let Err(e) =
+        ringlink::check_platform_flags(args.wayland_ring.as_deref(), args.wayland_cold.as_deref())
+    {
+        eprintln!("wc-compositor: {e}");
+        return Err(2);
     }
     Ok(args)
 }
@@ -1135,21 +1144,32 @@ fn wayland_thread(
     // §36. `accept()` on the ring directory, beside `accept()` on the socket.
     // Both produce a `wc_transport::Stream` for `insert_client`; only one of
     // them involves anything crossing the VM boundary.
-    #[cfg(unix)]
+    // **Not `#[cfg(unix)]`.** It was, and that was the bug: on Windows both
+    // flags were parsed, accepted and silently ignored, and the compositor fell
+    // through to the socket listener. So "the Wayland connection rides
+    // shared_vulkan's channel" was true on the fixture and false on the
+    // deployment, and the only thing that said so was an unused-variable
+    // warning. §36.14.
     let mut ring_link = {
         // Two ways to obtain the region and one directory to poll afterwards.
         // `--wayland-cold` is the cross-VM one: the region is guest RAM the host
-        // locates. `--wayland-ring` is a file, for one machine.
+        // locates. `--wayland-ring` is a named region, for one machine.
         let made = match (wayland_cold.as_deref(), wayland_ring.as_deref()) {
             (Some(port), _) => {
                 #[cfg(target_os = "linux")]
                 {
-                    Some(ringlink::RingLink::publish(port).map(|rl| (rl, format!("guest RAM published on {port}"))))
+                    Some(
+                        ringlink::RingLink::publish(port)
+                            .map(|rl| (rl, format!("guest RAM published on {port}"))),
+                    )
                 }
+                // Unreachable: `check_platform_flags` refuses this at parse.
+                // Kept so the arm exists on every platform and the reason lives
+                // in one place rather than being implied by a `cfg`.
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _ = port;
-                    Some(Err("--wayland-cold needs the Linux guest-RAM provider".to_string()))
+                    Some(Err(ringlink::COLD_NEEDS_LINUX.to_string()))
                 }
             }
             (None, Some(path)) => {
@@ -1175,7 +1195,6 @@ fn wayland_thread(
     loop {
         // The ring's accept, first, so a connection that arrived between turns
         // is dispatched in the same turn as one that arrived on the socket.
-        #[cfg(unix)]
         if let Some(rl) = ring_link.as_mut() {
             for (slot, stream) in rl.accept() {
                 let index = (state.clients_seen + 1) as u32;
@@ -1261,7 +1280,6 @@ fn wayland_thread(
         // the local socket *before* smithay reads it, or they wait a whole 5 ms
         // tick. `pump` also drains what smithay wrote last turn, which is why it
         // is one call and not two.
-        #[cfg(unix)]
         if let Some(rl) = ring_link.as_mut() {
             rl.pump();
         }

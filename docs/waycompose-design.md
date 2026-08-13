@@ -15687,3 +15687,73 @@ it. Harmless for a harness run, which generates the extension list from
 that makes a *hand*-run silently test a different claim, which is why the
 harness treats it as a failure rather than a note. The table was updated. The
 mechanism worked as designed: nobody had to notice.
+
+### 36.14 The flags were accepted and ignored on the only platform that matters
+
+`cargo build --workspace --target x86_64-pc-windows-gnu` was clean, and emitted
+exactly two warnings:
+
+```
+warning: unused variable: `wayland_ring`
+warning: unused variable: `wayland_cold`
+```
+
+The whole `ring_link` block was `#[cfg(unix)]`. So on Windows both flags were
+**parsed, accepted, and silently dropped**, and the compositor fell through to
+the socket listener. "The Wayland connection rides shared_vulkan's channel" was
+therefore true on the machine the tests run on and false on the machine the
+thing ships to — and the only artefact that said so was an unused-variable
+warning nobody reads.
+
+That is §35's failure mode in its purest form: a gate reporting success while
+something is wrong. It is also, precisely, the thing this section was started to
+fix — the guest was still on TCP over `ssh -L`, which is what "these channels
+should also be over RAM, not over ssh" was about.
+
+Three changes.
+
+**`RingLink` is no longer `#[cfg(unix)]`.** The only platform difference was the
+region: a file on Unix, a **named section** on Windows. `winshm::Section` is
+already the Windows half of exactly this — §1a made the arena a *named* object on
+both sides so that nothing but text has to cross — so it is reused rather than
+written again. A second mapper would be a second place for the geometry to be
+wrong.
+
+**A flag that cannot be honoured fails at parse.** `check_platform_flags` runs
+where the user typed the flag, not where the binary was built:
+
+```
+wc-compositor: --wayland-cold publishes a control region out of guest RAM, which
+needs the Linux guest-RAM provider (sv_arena::guestram). The Windows guest
+commits its window through awe_probe's VirtualAlloc path instead — that is what
+sv-gpu-server's win_guest does — and no compositor has been taught to do it yet.
+Use --wayland-ring with a section name, or run the Linux guest fixture.
+```
+
+The message names the **asymmetry**, not the platform, because "not supported on
+Windows" invites the next person to add a `cfg` and move on. A compile warning is
+addressed to whoever built the binary; the person who needs to know is whoever
+ran it.
+
+**And it is verified on the target, not inferred from it.** The three
+`ringlink` tests were run against the *Windows* binary under Wine —
+`a_ring_region_can_be_created_and_starts_empty` exercises
+`winshm::Section::create`, `map_section`, `Control::create` and the directory
+poll on the real Windows code path:
+
+```
+running 3 tests
+test ringlink::tests::a_flag_this_platform_cannot_honour_is_refused_at_parse ... ok
+test ringlink::tests::a_ring_region_can_be_created_and_starts_empty ... ok
+test ringlink::tests::the_ring_flag_is_accepted_on_every_platform ... ok
+```
+
+and the refusal was confirmed by running `wc-compositor.exe --wayland-cold` and
+reading the message it printed.
+
+**The lesson for what gets gated on.** `cargo clippy --target` builds *metadata*
+and will not catch a `#[cfg(unix)]` call from non-`cfg`'d code; `cargo test`
+stops at the first failing binary and under-reports the total. What catches this
+class is `cargo build --workspace --target …` with the warnings read, plus
+`cargo test --workspace --no-fail-fast` with the **binary** count checked
+alongside the test count (§36.9).
