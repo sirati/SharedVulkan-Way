@@ -129,6 +129,29 @@ impl FrameStyle {
     }
 }
 
+/// Which edge an interactive resize is being driven from.
+///
+/// ADDED FOR STAGE 17. Spelled out here rather than passing Wayland's
+/// `xdg_toplevel::ResizeEdge` through, for the reason the whole file exists: the
+/// Wayland thread must not have to know what an `HWND` is and the platform must
+/// not have to link a protocol crate. The two encodings are the same idea with
+/// different numbers — Wayland's is a bitmask, Win32's `WMSZ_*` is an ordinal —
+/// and the translation happens once at each end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    /// The client named no edge, which the protocol allows and which means the
+    /// resize is not being driven by a pointer on a border.
+    None,
+    Top,
+    Bottom,
+    Left,
+    TopLeft,
+    BottomLeft,
+    Right,
+    TopRight,
+    BottomRight,
+}
+
 /// An icon, as pixels.
 ///
 /// **Deliberately not a path or a resource id.** In the topology the project is
@@ -262,6 +285,7 @@ pub enum ToUi {
         maximized: Option<bool>,
         minimized: Option<bool>,
     },
+
     /// The pointer should look like this from now on.
     ///
     /// ADDED FOR STAGE 12. Sent on every `wl_pointer.set_cursor`, every
@@ -269,6 +293,28 @@ pub enum ToUi {
     /// client is using as its cursor, and — from smithay, without any client
     /// asking — on every pointer leave, which is what puts the arrow back.
     Cursor { spec: CursorSpec },
+
+    /// `xdg_toplevel.move`: a drag has begun somewhere the client considers a
+    /// title bar, and it wants the window manager to take over.
+    ///
+    /// ADDED FOR STAGE 17, and it is the **only** way a client-decorated window
+    /// can be moved here. Wayland has no protocol by which a client publishes
+    /// its draggable region: Firefox's `mDraggableRegion` is internal and is
+    /// observable only *after* a click, as this request. So `WM_NCHITTEST` can
+    /// never answer `HTCAPTION` over the tab strip, the whole surface stays
+    /// `HTCLIENT`, and every drag arrives here instead. §22.8 records what that
+    /// costs, which is Windows 11's snap-layout flyout.
+    BeginMove { id: WindowId },
+    /// `xdg_toplevel.resize`, with the edge the client named.
+    BeginResize { id: WindowId, edge: Edge },
+    /// `xdg_toplevel.show_window_menu`, at a point in **surface** coordinates.
+    ///
+    /// The menu belongs to the compositor, which here means it belongs to
+    /// Windows: `GetSystemMenu` is the same menu the caption's right-click and
+    /// Alt+Space produce, so a client that asks for one gets the system's
+    /// rather than an imitation of it.
+    WindowMenu { id: WindowId, x: i32, y: i32 },
+
     /// The toplevel is gone.
     Destroy { id: WindowId },
 

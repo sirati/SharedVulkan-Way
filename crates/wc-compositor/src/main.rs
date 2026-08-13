@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
 use platform::{FrameStyle, PlatformConfig};
-use state::{ClientState, State};
+use state::{ClientState, Decorations, State};
 
 struct Args {
     once: bool,
@@ -158,6 +158,11 @@ struct Args {
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
     #[cfg(not(windows))]
     click: Option<platform::Click>,
+    /// Which decoration mode to advertise, as `server` or `client`.
+    ///
+    /// ADDED FOR STAGE 17. See [`Decorations`] for why it defaults to `server`
+    /// and what a run that asks for `client` is for.
+    decorations: Decorations,
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -181,6 +186,7 @@ fn parse_args() -> Result<Args, u8> {
         output: (1920, 1080),
         #[cfg(not(windows))]
         click: None,
+        decorations: Decorations::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -327,6 +333,18 @@ fn parse_args() -> Result<Args, u8> {
             }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
+            }
+            // ADDED FOR STAGE 17, and it is the flag §22.2 is about.
+            "--decorations" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --decorations needs server or client");
+                    return Err(2);
+                };
+                let Some(d) = Decorations::parse(&v) else {
+                    eprintln!("wc-compositor: --decorations {v}: expected server or client");
+                    return Err(2);
+                };
+                args.decorations = d;
             }
             "--timeout" => {
                 args.idle_timeout = it
@@ -595,7 +613,8 @@ fn main() -> std::process::ExitCode {
         .name("wayland".into())
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
-                args.expect_presents, args.poll_coarse, layout, args.output, ui, event_rx);
+                args.expect_presents, args.poll_coarse, layout, args.output,
+                args.decorations, ui, event_rx);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -627,6 +646,7 @@ fn wayland_thread(
     poll_coarse: bool,
     layout: String,
     output: (i32, i32),
+    decorations: Decorations,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
 ) -> u8 {
@@ -641,7 +661,7 @@ fn wayland_thread(
         }
     };
     let dh = display.handle();
-    let mut state = State::new(&dh, ui, events, debug_icon, &layout, output);
+    let mut state = State::new(&dh, ui, events, debug_icon, &layout, output, decorations);
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
