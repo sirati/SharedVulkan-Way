@@ -9692,3 +9692,358 @@ share, to re-learn a fact that does not depend on the platform).
    control-socket verb and a `FromUi` variant, and it should be done at the
    same time as `wl_touch` itself so that neither is scored against the other's
    absence.
+
+## 30. Stage 30: can the client's pool be *our* memory, so that nothing is copied
+
+The requirement is one sentence from the user: "we want to avoid memory being
+copied it should normally be directly written". Today it is not. Every client
+frame is copied by `wc-proxy` out of the client's `wl_shm` pool into an arena
+slice. `--copy damage` narrowed that to the damaged rows and §27 cut it 2.05×,
+but the shape is unchanged — **126 µs per 4.5 MiB copy, 262 copies and 1158 MiB
+in one Firefox session** — and none of that is what "directly written" means.
+
+`crates/wc-proxy/src/pool.rs`'s module header already argues why the copy is
+there, and this section does not overturn it. It says `wl_shm.create_pool` is
+the client handing the server memory it has *already* allocated, that the
+protocol has no request in the other direction, and that by the time the proxy
+learns of a pool the pages are chosen. All of that is true, and it is true about
+the protocol, which is the level it claims. It identifies one escape — a client
+that allocates from the arena, which is the accelerated path where WebRender
+renders through `shared_vulkan` and no `wl_shm` pool exists at all.
+
+This section is about the escape it does not consider: **leave the protocol
+alone and change where libwayland's pool memory comes from**, without changing
+Firefox. The client is on the host. The arena is guest RAM already mapped into
+the host process — that is how `wc-proxy` writes into it. So host-side code can
+already write into the memory the compositor reads. The only reason a copy
+happens is that Firefox's pool is a *different object*. If the pool's pages were
+arena pages, a commit would cost nothing.
+
+The result of this stage is: **the mechanism exists, it is not forbidden by
+anything, and it is not yet proven to carry a Firefox frame.** The copy stays
+for now. What follows is what was measured, because the hazards found are worth
+more than the conclusion.
+
+### 30.1 One correction to the module header, and it is narrow
+
+The header says: "Nothing on Linux can re-point an existing mapping at another
+object's pages." As written that is right, and it stays right. But it is used to
+carry more weight than it can, because the thing needed here is not re-pointing.
+
+`mmap(MAP_FIXED)` over an address that is already mapped **atomically replaces**
+the mapping there with another object's pages. The old mapping is not
+re-pointed; it is destroyed and a new one is put in its place in the same
+operation, with no window in which the address is unmapped. Every pointer the
+client has already handed out stays valid, because a pointer names an address
+and the address still resolves. That is measured below, not argued: an
+unmodified `weston-flower` kept drawing through an address whose backing object
+had been swapped underneath it.
+
+So the honest form of the header's claim is: *the protocol* gives the server no
+say in where a pool lives, and once the client has drawn, the bytes it drew are
+in the object it chose. Neither sentence forbids arranging, before or at
+`create_pool`, that the object it chose is ours.
+
+### 30.2 The interposition point, and why there is exactly one
+
+A shim has to see `wl_shm.create_pool` and change the descriptor in it. Three
+candidates, and only the third survives:
+
+* **`wl_shm_create_pool`** is generated as a `static inline` in
+  `wayland-client-protocol.h`. It is compiled into every client and exported by
+  nobody, so it cannot be interposed at all.
+* **`wl_proxy_marshal_flags`** is exported and is what that inline calls. It is
+  variadic, and a variadic function cannot be forwarded portably in C — there is
+  no way to pass a received `va_list` on to another variadic function.
+* **`wl_proxy_marshal_array_flags`** is exported, is **not** variadic, and takes
+  its arguments as `union wl_argument *args` — a mutable array. Rewriting
+  `args[1].h` in place is the whole mechanism.
+
+The third is only useful if `wl_proxy_marshal_flags` reaches it through the PLT
+rather than a direct internal call. It does, and that was checked rather than
+assumed, against the wayland 1.24 in this tree:
+
+```
+$ objdump -d libwayland-client.so.0 | grep -A60 '<wl_proxy_marshal_flags>:'
+    9052:  call   61c0 <wl_proxy_marshal_array_flags@plt>
+```
+
+That single `@plt` is what makes the whole route possible; without it there is
+no interposition point and this section would end here.
+
+Identification does not have to guess at opcode numbers either.
+`wl_proxy_get_interface` is exported in 1.24, so the shim reads the proxy's own
+`wl_interface` and compares `pi->name` against `"wl_shm"` and
+`pi->methods[opcode].name` against `"create_pool"` — names, from the client's own
+protocol tables, rather than a number that moves between versions.
+
+Firefox is reachable this way. `libxul.so` imports all of it as *undefined*
+symbols, which is to say through the PLT:
+
+```
+$ nm -D --undefined-only libxul.so | grep -E 'marshal|shm|mmap|memfd'
+  U memfd_create@GLIBC_2.27      U mmap@GLIBC_2.2.5
+  U shm_open@GLIBC_2.34          U mmap64@GLIBC_2.2.5
+  U wl_proxy_marshal_flags       U wl_shm_interface
+  U wl_proxy_marshal_array_flags U wl_shm_pool_interface
+```
+
+### 30.3 The fd rule, stated where the mechanism is, the way §14.7 states the count
+
+No descriptor and no handle crosses the boundary, ever. This mechanism creates a
+descriptor and passes it, so it has to say plainly why that is not a violation.
+
+The client, the shim inside it, and `wc-proxy` are **three host processes**. The
+shim creates the substitute object on the host; the descriptor travels exactly
+one `SCM_RIGHTS` hop over the local Wayland socket — the same hop `wl_shm` makes
+today, in the same direction, carrying the same kind of object — and is consumed
+by `wc-proxy` on the host. It never approaches the VM boundary. What crosses the
+boundary is unchanged and remains what §12 and §17 say it is: an arena id, an
+offset and a length, which are integers.
+
+The rule was never "no descriptors anywhere". `pool.rs` states it precisely: "A
+descriptor created locally out of memory that side already reaches is fine; a
+descriptor *passed* is not" — meaning passed *across*. The client's own pool fd
+is already created by the client and consumed by this proxy today. Substituting
+which object that fd names changes nothing about what crosses.
+
+### 30.4 The experiment, and why it uses a plain file
+
+`scripts/wc-poolshim.c` is the standalone half: an `LD_PRELOAD` shim that
+intercepts `create_pool`, allocates a backing object of its own, moves the
+client onto it, and substitutes the descriptor. It backs pools with **a plain
+file**, deliberately, so that the only thing under test is the interposition and
+never the allocator. It touches no arena, no region lifecycle and no proxy code
+— which is also why it could be built while the dynamic-arena work is in flight.
+
+The rig is `weston --backend=headless --fake-seat`. The `--fake-seat` is not
+incidental: without it the headless backend has no seat, GTK's
+`gdk_seat_get_keyboard` asserts, and Firefox silently falls back to headless
+mode where it creates no `wl_shm` pools at all. An hour went into a measurement
+that was measuring nothing.
+
+### 30.5 What is proven: an unmodified libwayland client, fully redirected
+
+Against `weston-flower` and `weston-terminal`, with the shim armed:
+
+| | |
+|---|---|
+| pools intercepted | 2 of 2 |
+| pools redirected onto our object | 2 of 2 |
+| resizes carried across (4 KiB → 4.19 MiB) | 9 of 9 |
+| client crashes | 0 |
+| witness saw the client's drawing | yes |
+
+"Witness" is the instrument described in §30.7. The client kept rendering
+through an address whose backing object had been replaced underneath it, across
+nine pool growths, and the bytes it drew appeared in the object the compositor
+had been handed. For this class of client the mechanism is not in doubt.
+
+### 30.6 What is proven for Firefox, and what is not
+
+Firefox 151.0.1, unmodified, on the same rig, rendering an animated page for
+70 seconds:
+
+| | |
+|---|---|
+| `wl_shm.create_pool` intercepted | **4 of 4** |
+| pools redirected onto our object | 4 of 4 (14.3 MB) |
+| `wl_surface.commit` seen | 8110 |
+| crashes, protocol errors, content-process losses | 0 |
+| **witness confirmed Firefox drew into our object** | **not established** |
+
+The first row is the one that mattered most going in, and it is the answer to
+"does GTK's shm path go through an interposable symbol": **it does**. Firefox's
+pools are seen, named and rewritten, and Firefox runs a full session afterwards
+without noticing.
+
+The last row is the honest gap and it is an instrument failure, not a mechanism
+failure. Firefox closes the pool descriptor immediately after `create_pool` —
+the ordinary pattern, since the compositor now holds its own reference. The
+shim's `close` handler retires the record at that moment (it must; see §30.6d),
+and retiring the record also drops the witness mapping, so the instrument stops
+looking exactly when the frames start. Of the four pools, only the 36 KiB one
+was still being watched when commits began, and it changed once. **No frame of
+Firefox's actual rendering has been shown to travel through a redirected pool.**
+That is the single thing standing between this section and a result.
+
+Four hazards were found on the way, each of which produced a wrong answer before
+it was understood. They are recorded because every one of them fails silently or
+misleadingly, and anyone building the real thing will meet all four.
+
+**(a) The resize path is not `ftruncate`.** On x86-64 every client compiles
+`ftruncate` to `ftruncate64`, so a shim interposing `ftruncate` catches nothing;
+and libwayland's `os_resize_anonymous_file` prefers `posix_fallocate` anyway,
+because it wants the failure up front instead of a SIGBUS later. Nine pool
+growths went past the first version of the shim completely untouched, leaving
+the compositor holding a 4 KiB object for a 4.19 MiB pool. Nothing reported an
+error.
+
+**(b) Clients do not grow a pool with `mremap`.** They `munmap` and then `mmap`
+*their own descriptor* again. A shim that redirects once, at `create_pool`, is
+therefore correct only until the first resize, after which the client is quietly
+writing into its own memfd while the compositor still reads the substituted
+object and shows a frozen picture. The substitution has to be reasserted on
+**every** `mmap` of a pool descriptor, not established once.
+
+**(c) Firefox `dlopen`s libxul, so libwayland does not exist at constructor
+time.** A preloaded library's constructor runs before the main executable's, and
+resolving `wl_proxy_marshal_array_flags` there yields NULL. Cache that NULL and
+the first request Firefox marshals calls through it and segfaults before the
+shim has intercepted anything. The weston clients hide this perfectly — they
+link libwayland the ordinary way — so the shim looked correct right up until it
+met the only client anyone cares about. Resolve on first use.
+
+**(d) Descriptor numbers are recycled, and the cost of forgetting that is
+Firefox's IPC.** A pool remembered by descriptor *number* leaves a record
+matching fd 21; fd 21 is closed; the next unrelated object the client opens
+becomes fd 21 and is silently re-pointed at the dead pool's pages. In Firefox
+that landed on its own IPC shared memory and killed the content process with
+`[GFX1-]: Replay failure: Magic`. This is precisely the failure class this
+project calls its most expensive — nothing reports an error anywhere near the
+place the wrong thing happened. Watching `close` fixes it, and is necessary; it
+is not obviously *sufficient*, because a client may `dup` the descriptor, in
+which case the number being watched is not the last reference.
+
+### 30.7 What replaces `--verify-damage`, because with no copy there is nothing to compare
+
+`wc-proxy --verify-damage` compares the region against the client's own bytes
+after every copy, and it is what caught the buffer-vs-surface damage bug in §27.
+It cannot survive this change: it takes two buffers and there is now one. The
+replacement has to exist before the copy is removed, not after.
+
+The question changes shape. With a copy, the question is *did the bytes arrive*.
+With no copy, the bytes cannot fail to arrive — they were never moved. The
+question becomes **is the client writing where the compositor reads**, and that
+is a question about identity, not content. Three answers, in increasing strength:
+
+1. **The witness mapping**, which the shim implements. An independent, read-only
+   mapping of the substituted object, held by the shim and mapped separately
+   from the client's. A commit whose pixels changed must change the witness too;
+   if a resize ever puts the client back on its own memfd, the witness goes
+   quiet and says so. It is cheap enough to run per commit (sampled FNV-1a) and
+   it is what turns "the client did not crash" into evidence. Its blind spot is
+   §30.6's: it must outlive the descriptor, so it has to be keyed on the pool
+   object rather than retired with the fd.
+2. **Page identity via the PFN locator.** The strongest available check, and the
+   machinery already exists — `943a16b` wired a locator that asks where the
+   pages are instead of searching for them. If the client's pool VA and
+   `wc-proxy`'s arena mapping resolve to the same physical frames, zero-copy is
+   not inferred but demonstrated. This should be a startup and
+   region-transition assertion rather than a per-frame one.
+3. **Differential replay.** Run the same client twice, once copying and once
+   redirected, and compare the compositor's output. This is what actually
+   answers "are the pixels right", and it subsumes the damage verifier rather
+   than replacing it — the copying run *is* the reference.
+
+Recommendation: (1) per commit behind a flag, (2) at every pool creation and
+every region transition, (3) in the harness. Do not remove `--verify-damage`;
+the copying path remains the reference implementation that (3) needs.
+
+### 30.8 The problem the plain-file experiment deliberately excluded
+
+The experiment backs pools with a plain file. A real one must back them with the
+arena, and that is strictly harder for a reason that has nothing to do with
+interposition: **`wl_shm.create_pool` takes one descriptor and the pool starts at
+its offset 0**, while an arena slice is contiguous only in *arena* space.
+`guestram.rs` is explicit — the guest's pages are scattered, and `shared_vulkan`
+measured 1471 runs per 64 MiB for `VirtualLock`ed 4 KiB pages and 22 for large
+pages. There is no `(fd, offset)` that names an arena slice.
+
+This is survivable, and the shape of the answer is already visible in the
+experiment. The client's mapping does not have to come from the descriptor the
+protocol carries. The shim can compose the client's view exactly as
+`guestram.rs` composes the proxy's — reserve `PROT_NONE`, `mmap(MAP_FIXED)` one
+run at a time — so the client sees one contiguous pool that happens to be
+scattered across QEMU's backing object. The descriptor handed to `create_pool`
+then carries no pixels at all: it is a **decoy**, a small object naming the arena
+region, offset and length, which `wc-proxy` reads (with `read`, not `mmap`) and
+binds to the region it has already mapped. The compositor never maps the client's
+descriptor.
+
+That is worth noticing, because it means **route 1 and route 2 converge**. Once
+the descriptor is a token rather than memory, an `LD_PRELOAD` shim and a private
+"arena-backed pool" protocol are the same mechanism with different spellings of
+the handshake — and the protocol version is the honest one for clients that can
+ask, with the shim as the way to serve Firefox, which never will.
+
+### 30.9 What the arena has to promise, as a requirement rather than a workaround
+
+An arena-backed pool **pins its region**, and this is the interface the dynamic
+arena work should accommodate rather than something to be worked around
+afterwards. Stated as requirements:
+
+1. **A region with a live pool cannot be reclaimed.** Not deferred, not
+   reclaimed-and-repointed: refused. Idle-frame counting sees no drawing in a
+   pool a client merely stopped painting into, and reclaiming it frees memory a
+   client still has mapped. That is a use-after-free with pixels on top.
+2. **The pin is taken at `create_pool` and released at `wl_shm_pool.destroy`**,
+   not at last-attach and not on a frame counter. The pool object's lifetime is
+   the protocol's own answer to "is this still in use" and it is authoritative.
+3. **A pool may not straddle two regions.** Allocation must come from one
+   region or fail; there is no offset arithmetic that reaches from one region
+   into another (§12), which is exactly why the region id travels in every
+   descriptor.
+4. **Refusal must be expressible.** If no region can satisfy a pool, the shim
+   has to be told so it can leave the client on its own memory and let the
+   existing copy path run. A silent partial success here is the §30.6d failure
+   again, one layer down.
+5. **Region release needs a pinned-bytes number in the log.** Reclamation that
+   silently does nothing because everything is pinned looks identical to
+   reclamation that is working, until the arena runs out (§20).
+
+Requirements 1, 2 and 4 are the ones that need to exist in the interface; 3 and
+5 are properties of the allocator and the log.
+
+### 30.10 What is not proven
+
+* **That a Firefox frame reaches the compositor through a redirected pool.** The
+  interception is proven, the redirection is proven, the survival is proven; the
+  pixel path is not, for the instrument reason in §30.6. This is the next thing
+  to do and it is small: key the witness on the pool object rather than the
+  descriptor.
+* **That it is faster.** No end-to-end timing was taken, because the arena path
+  was not built. The claim "126 µs per copy becomes 0 µs" is arithmetic on a
+  copy that no longer happens, not a measurement, and it ignores whatever the
+  scattered-run composition of §30.8 costs at pool creation. That cost is paid
+  per pool rather than per frame, which is why it is expected to be small, but
+  expected is not measured.
+* **Peak resident arena bytes.** The user's concern is memory as much as
+  copying, and this trade is not free: an arena-backed pool makes the *client's*
+  pool resident in arena memory for the pool's whole life, where today the arena
+  holds one slice and the client's memfd is the client's problem. 14.3 MB of
+  Firefox pool would move into the arena. Whether that is a win depends on the
+  arena's headroom (§20) and it has not been measured.
+* **That the sandbox permits it.** Firefox's content processes are sandboxed;
+  the parent owns the Wayland connection, so this worked, but the backing object
+  in a real deployment is guest RAM opened through `/proc/<qemu-pid>/fd/<n>`,
+  and nothing here tested whether that open is permitted from inside a Firefox
+  that has entered its sandbox.
+* **`dup`.** §30.6d's fix is necessary and possibly not sufficient.
+
+### 30.11 The position
+
+The `LD_PRELOAD` route is **not killed**, which was the question asked, and the
+kill criteria it was given — an uninterposable shm path, or a libwayland that
+caches something that defeats the substitution — were both checked and neither
+holds. Firefox's pools are interposable by name, rewritable in place, and the
+client survives having its memory moved underneath it.
+
+It is also not cheap. Four silent-failure hazards surfaced in a day of building
+the simplest possible version against a plain file, three of which produce
+either a frozen picture or a dead content process with no error anywhere near
+the cause. The arena version has to add scattered-run composition and a pinning
+contract on top of that.
+
+So: **leave the copy in place.** It is correct, it is measured, and §27 made it
+2.05× cheaper. Take the arena-backed pool when the region lifecycle has settled
+and the pinning contract of §30.9 exists, and take it with the verifier of
+§30.7 built first — with a firm memory of what the module header says, which
+remains the best short statement of why this is hard, and which this section
+narrows in exactly one place (§30.1) and contradicts nowhere.
+
+And keep the ordering straight. The accelerated path — WebRender rendering
+through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all
+— remains the better answer, because it removes the pool rather than relocating
+it. This section's mechanism is what serves the clients that will never take
+that path, which is most of them.
