@@ -9719,10 +9719,13 @@ already write into the memory the compositor reads. The only reason a copy
 happens is that Firefox's pool is a *different object*. If the pool's pages were
 arena pages, a commit would cost nothing.
 
-The result of this stage is: **the mechanism exists, it is not forbidden by
-anything, and it is not yet proven to carry a Firefox frame.** The copy stays
-for now. What follows is what was measured, because the hazards found are worth
-more than the conclusion.
+The result of this stage is: **the mechanism exists, nothing forbids it, and at
+the obvious interception point it carries none of Firefox's pixels while looking
+entirely healthy.** The copy stays. What follows is what was measured, because
+the hazards found are worth more than the conclusion — and because the last of
+them is the shim producing a clean, crash-free, protocol-error-free session with
+the wrong memory in it, which is this project's most expensive failure mode
+arriving exactly where it was predicted.
 
 ### 30.1 One correction to the module header, and it is narrow
 
@@ -9850,22 +9853,66 @@ Firefox 151.0.1, unmodified, on the same rig, rendering an animated page for
 | pools redirected onto our object | 4 of 4 (14.3 MB) |
 | `wl_surface.commit` seen | 8110 |
 | crashes, protocol errors, content-process losses | 0 |
-| **witness confirmed Firefox drew into our object** | **not established** |
+| `wl_surface.attach` / `damage_buffer` | 2284 / 2281 |
+| `wl_shm_pool.create_buffer` | 4 (reused across every attach) |
+| `zwp_linux_dmabuf` used | no — this is genuinely the `wl_shm` path |
+| **witness saw Firefox draw into our object** | **no: 1 change in 7683 commits** |
 
 The first row is the one that mattered most going in, and it is the answer to
 "does GTK's shm path go through an interposable symbol": **it does**. Firefox's
 pools are seen, named and rewritten, and Firefox runs a full session afterwards
 without noticing.
 
-The last row is the honest gap and it is an instrument failure, not a mechanism
-failure. Firefox closes the pool descriptor immediately after `create_pool` —
-the ordinary pattern, since the compositor now holds its own reference. The
-shim's `close` handler retires the record at that moment (it must; see §30.6d),
-and retiring the record also drops the witness mapping, so the instrument stops
-looking exactly when the frames start. Of the four pools, only the 36 KiB one
-was still being watched when commits began, and it changed once. **No frame of
-Firefox's actual rendering has been shown to travel through a redirected pool.**
-That is the single thing standing between this section and a result.
+The last row is the result, and it took two attempts to earn, because the first
+attempt was the instrument lying rather than the mechanism working.
+
+**The instrument was blind first.** Firefox closes the pool descriptor
+immediately after `create_pool` — the ordinary pattern, since the compositor now
+holds its own reference. The `close` handler has to retire the record at that
+moment (it must; see §30.6d), and the first version retired the witness mapping
+along with it, so the instrument stopped looking at the exact moment the frames
+started. Three of the four pools reported `commits=0` and the fourth reported
+one change, which reads like "almost working" and is in fact "not looking". The
+fix is a distinction rather than a workaround: **retirement is about the
+descriptor *number*, not about the object.** An `mmap` holds its own reference
+to a file, so the witness mapping stays valid after the descriptor is gone.
+Retire the number, keep the mapping, keep checking it.
+
+**With the instrument fixed, the answer is negative.** All four pools are
+watched across the whole session — 7683 commits each — and each one's contents
+change exactly **once**, at the first commit, and never again. Meanwhile Firefox
+issues 2284 `wl_surface.attach` and 2281 `wl_surface.damage_buffer` against 4
+buffers, and binds no `zwp_linux_dmabuf` at all. So Firefox is painting, it is
+painting through `wl_shm`, and **it is not painting into the objects this shim
+substituted**. The pixels are going somewhere else.
+
+That is a real result and it is worth more than the optimistic reading it
+replaced. It says the redirection is *accepted* by Firefox — no crash, no
+protocol error, buffers created from the substituted pools and attached 2284
+times — while carrying none of the pixels. Which is to say: this mechanism, at
+this interception point, is capable of producing **exactly the silent wrong
+answer the project fears most**, and it produced it here. A screenshot would
+have shown a blank or stale window and nothing anywhere would have logged an
+error.
+
+Two candidate causes remain, and the experiment does not separate them:
+
+* **The drawing may not happen in the process that owns the Wayland
+  connection.** Only one process ever calls `create_pool`, and that process
+  never `mmap`s two of the four pools at all (`no_mapping=2`, and `re-pointed=0`
+  — no `mmap` of a pool descriptor happened after `create_pool` either). A
+  buffer allocated and painted in a content process and handed to the parent as
+  a descriptor would look exactly like this, and would mean an `LD_PRELOAD` shim
+  has to act where the memory is *allocated*, not where the pool is announced.
+* **A client may hold more than one mapping of the same descriptor.** The shim
+  replaces the first mapping it recorded; if Firefox mapped the object twice,
+  the other mapping still names the client's own memfd and every write goes
+  there.
+
+Both are testable and neither is tested. Until one of them is, the honest
+statement is the one in §30.10: **no frame of Firefox's rendering has been shown
+to travel through a redirected pool, and the measurement now says positively
+that none did.**
 
 Four hazards were found on the way, each of which produced a wrong answer before
 it was understood. They are recorded because every one of them fails silently or
@@ -9922,9 +9969,13 @@ is a question about identity, not content. Three answers, in increasing strength
    from the client's. A commit whose pixels changed must change the witness too;
    if a resize ever puts the client back on its own memfd, the witness goes
    quiet and says so. It is cheap enough to run per commit (sampled FNV-1a) and
-   it is what turns "the client did not crash" into evidence. Its blind spot is
-   §30.6's: it must outlive the descriptor, so it has to be keyed on the pool
-   object rather than retired with the fd.
+   it is what turns "the client did not crash" into evidence — and in §30.6 it
+   was the *only* signal that dissented, while every other observable said the
+   redirection was working. It must outlive the descriptor: key it on the pool
+   object and never retire it with the fd. A witness retired alongside the
+   descriptor stops looking precisely when a real client starts drawing, which
+   is not a small bug in the instrument but a total one, and it is the
+   difference between the first reading of §30.6 and the correct one.
 2. **Page identity via the PFN locator.** The strongest available check, and the
    machinery already exists — `943a16b` wired a locator that asks where the
    pages are instead of searching for them. If the client's pool VA and
@@ -9997,11 +10048,15 @@ Requirements 1, 2 and 4 are the ones that need to exist in the interface; 3 and
 
 ### 30.10 What is not proven
 
-* **That a Firefox frame reaches the compositor through a redirected pool.** The
-  interception is proven, the redirection is proven, the survival is proven; the
-  pixel path is not, for the instrument reason in §30.6. This is the next thing
-  to do and it is small: key the witness on the pool object rather than the
-  descriptor.
+* **That a Firefox frame can reach the compositor through a redirected pool.**
+  This is no longer merely unproven — it was measured and it did **not** happen
+  (§30.6). Interception, rewriting and survival are all proven; the pixel path
+  is refuted for this interception point. What is not known is whether that is
+  fatal to the route or only to the *placement* of the interception, and the two
+  candidate causes in §30.6 are the fork in that road. Deciding between them is
+  the next thing to do and it is cheap: log every `mmap` of every descriptor
+  Firefox later passes to `create_pool`, in every process, and see whether the
+  writing mapping is in another process or merely a second mapping in this one.
 * **That it is faster.** No end-to-end timing was taken, because the arena path
   was not built. The claim "126 µs per copy becomes 0 µs" is arithmetic on a
   copy that no longer happens, not a measurement, and it ignores whatever the
@@ -10029,11 +10084,20 @@ caches something that defeats the substitution — were both checked and neither
 holds. Firefox's pools are interposable by name, rewritable in place, and the
 client survives having its memory moved underneath it.
 
+But it does not work yet, and the failure is the dangerous kind. Redirecting at
+`create_pool` in the process that owns the Wayland connection is *accepted* by
+Firefox and carries none of its pixels (§30.6). Everything observable short of
+the pixels themselves says success: no crash, no protocol error, buffers created
+from the substituted pools and attached 2284 times. Only the witness says
+otherwise. Anyone building this without §30.7's verifier in place first would
+have shipped a blank window and gone looking for the bug in the compositor.
+
 It is also not cheap. Four silent-failure hazards surfaced in a day of building
 the simplest possible version against a plain file, three of which produce
 either a frozen picture or a dead content process with no error anywhere near
-the cause. The arena version has to add scattered-run composition and a pinning
-contract on top of that.
+the cause — and the fifth, the one above, is the shim producing a perfectly
+healthy-looking session with the wrong memory in it. The arena version has to
+add scattered-run composition and a pinning contract on top of that.
 
 So: **leave the copy in place.** It is correct, it is measured, and §27 made it
 2.05× cheaper. Take the arena-backed pool when the region lifecycle has settled

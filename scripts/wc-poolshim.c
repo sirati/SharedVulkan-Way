@@ -227,7 +227,17 @@ static int substitute_fd(int fd) {
  *
  * Retiring the record on `close` is necessary. It is not obviously sufficient,
  * and §30 says so: the client may `dup` the fd, in which case the number the
- * shim watches is not the last reference. */
+ * shim watches is not the last reference.
+ *
+ * WHAT RETIREMENT MUST NOT TAKE WITH IT. Retirement is about the descriptor
+ * *number* — it stops a recycled number matching a dead pool. It is not about
+ * the object. Dropping the witness here as well is what blinded the first
+ * measurement: Firefox closes the pool fd immediately after `create_pool`,
+ * because the compositor now holds its own reference, so the instrument stopped
+ * looking at the exact moment the frames started and every pool but one
+ * reported `commits=0`. The witness mapping is an independent `mmap`, and an
+ * `mmap` holds its own reference to the file, so it stays valid after the
+ * descriptor is gone. Keep it, and keep checking it. */
 int close(int fd) {
     if (!real_close) {
         init();
@@ -235,12 +245,10 @@ int close(int fd) {
     }
     struct poolrec *p = pool_by_client_fd(fd);
     if (p) {
-        if (p->witness) real_munmap(p->witness, p->len);
         real_close(p->our_fd);
         p->retired = 1;
-        p->witness = NULL;
         n_retired++;
-        log_line("close: pool fd=%d retired with its object", fd);
+        log_line("close: pool fd=%d retired, witness kept on the object", fd);
     }
     for (int i = 0; i < MAXMAP; i++)
         if (maps[i].used && maps[i].fd == fd) maps[i].used = 0;
@@ -520,7 +528,10 @@ struct wl_proxy *wl_proxy_marshal_array_flags(struct wl_proxy *proxy,
                     fprintf(stderr, "wc-poolshim: commits=%lu pools=%lu\n",
                             n_commit, n_redirected);
                 for (int i = 0; i < MAXPOOL; i++) {
-                    if (!pools[i].used || !pools[i].witness || pools[i].retired) continue;
+                    /* Deliberately not skipping retired pools: a retired pool
+                     * is one whose descriptor is gone, not one whose pixels
+                     * are. Those are the pools Firefox actually paints into. */
+                    if (!pools[i].used || !pools[i].witness) continue;
                     unsigned long long s =
                         witness_sum(pools[i].witness, pools[i].len);
                     pools[i].checks++;
