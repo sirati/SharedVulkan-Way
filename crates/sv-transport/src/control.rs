@@ -139,7 +139,7 @@ pub enum RingKind {
     Queue = 3,
     /// GPU→app. design.md §4.6: built from day one, not retrofitted.
     Reverse = 4,
-    /// One Wayland connection. waycompose-design.md §35.
+    /// One Wayland connection. waycompose-design.md §36.
     ///
     /// The odd one out in this enum, and deliberately in it anyway. The first
     /// four carry an `sv-wire` command stream; this one carries an opaque byte
@@ -148,7 +148,7 @@ pub enum RingKind {
     /// queue are the same kind of thing to this layer**: a claim on a ring slot
     /// in one session's control region, with one lane each way and a doorbell
     /// per lane. Giving Wayland its own directory would have been giving it its
-    /// own transport, which is exactly the correction §35 exists to record.
+    /// own transport, which is exactly the correction §36 exists to record.
     ///
     /// A ring of this kind is claimed once per *connection*, never once per
     /// client — §0.12's `--clients N` lesson, applied one level down.

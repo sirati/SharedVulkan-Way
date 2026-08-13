@@ -36,7 +36,7 @@
 //! **Not implemented: SVG.** A scalable icon needs a renderer, and a renderer
 //! is a dependency this crate does not have. A theme with only SVG resolves to
 //! nothing, which degrades to the generic Windows icon — recorded in
-//! docs/design.md §16.4 rather than hidden here, because "Adwaita is
+//! docs/waycompose-design.md §16.4 rather than hidden here, because "Adwaita is
 //! SVG-first" is exactly the kind of thing that makes a feature look broken on
 //! somebody else's machine.
 
@@ -167,7 +167,7 @@ const CLIENT_PREFIX_DEPTH: usize = 4;
 /// appears in `XDG_DATA_DIRS` only if somebody put the package in a profile.
 /// Measured: `/run/current-system/sw/share` on the VM host has no
 /// `firefox.desktop` and no `firefox.png`, and
-/// `/nix/store/…-firefox-151.0.2/share` has both. See docs/design.md §18.5.
+/// `/nix/store/…-firefox-151.0.2/share` has both. See docs/waycompose-design.md §18.5.
 ///
 /// So: walk up from the executable and take every ancestor that has a `share`.
 /// That is the FHS relationship between `bin/` and `share/`, it is the same

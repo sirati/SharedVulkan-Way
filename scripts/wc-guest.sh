@@ -806,10 +806,26 @@ do_coherency() {
   local w2l l2w
   grep -q "SAW the peer's write" "$RUNDIR/coh-win.log" && l2w=yes || l2w=no
   grep -q "peer\] pattern from the Windows side: MATCH" "$RUNDIR/coh-lin.log" && w2l=yes || w2l=no
-  if [ "$w2l" = yes ] && [ "$l2w" = yes ]; then
-    ok "the export is coherent in both directions: \`SharedFile\` is a live transport here"
+  # **§31: what is asserted here is that the probes ran**, and the coherency
+  # answer is recorded rather than scored.
+  #
+  # Both arms of this used to call `ok`, so the check could not fail: whichever
+  # way the mount behaved, the scoreboard gained a pass. That is the right
+  # *instinct* — an incoherent export really is a result rather than a defect,
+  # §9.10 item 2 predicted it, and block 9 prices it — but a result belongs in a
+  # `note`. A pass is a claim that something was checked, and "the mount did
+  # one of the two things a mount can do" is not one.
+  #
+  # What can genuinely fail is the pair of probes producing no determination at
+  # all, which is what an empty log looks like and which the old code reported
+  # as "NOT coherent" — a broken probe wearing a finding's clothes.
+  if ! [ -s "$RUNDIR/coh-win.log" ] || ! [ -s "$RUNDIR/coh-lin.log" ]; then
+    bad "the coherency probes produced no output on one or both sides; there is no measurement here"
+  elif [ "$w2l" = yes ] && [ "$l2w" = yes ]; then
+    ok "both coherency probes reported, and the export is coherent in both directions: \`SharedFile\` is a live transport here"
   else
-    ok "measured: the export is NOT coherent while mapped (guest->host $w2l, host->guest $l2w)"
+    ok "both coherency probes reported a determination"
+    note "measured: the export is NOT coherent while mapped (guest->host $w2l, host->guest $l2w)"
     note "This is a result, not a failure: virtio-fs without DAX gives each side its own"
     note "pages, exactly as docs/design.md §9.10 item 2 predicted. Block 9 measures what"
     note "it costs a real client."
@@ -877,11 +893,21 @@ do_poolcost() {
   # The decision, stated as a ratio so it can come out either way. On one
   # machine §9.5 measured these the same; if they are the same here too, the
   # arena has no cost argument and this must say so.
+  #
+  # **§31: only one of the two outcomes is a pass.** Both arms called `ok`, so
+  # this check could not fail; the second arm is a finding — "there is no cost
+  # argument for the arena" — and a finding is a `note`. What is asserted is
+  # that the arena slice is never the *slower* of the two, which is the one
+  # answer that would mean the arena is doing something wrong rather than
+  # something unnecessary, and which nothing here was watching for.
   if [ -n "$sf" ] && [ -n "$ar" ]; then
     if [ "$sf" -gt $((ar * 20 + 20)) ]; then
       ok "the decision: a pool costs ${sf} us as a shared file and ${ar} us as an arena slice (~$((sf / (ar + 1)))x)"
+    elif [ "$ar" -le "$sf" ]; then
+      ok "the arena slice is no more expensive than the shared file (${ar} us vs ${sf} us)"
+      note "measured: the two transports cost the same here -- no cost argument for either"
     else
-      ok "measured: the two transports cost the same here (${sf} us vs ${ar} us) -- no cost argument for either"
+      bad "an arena slice costs ${ar} us against a shared file's ${sf} us; resolving an offset must not be dearer than opening a name"
     fi
   else
     bad "the cost measurement produced no numbers"
@@ -1061,6 +1087,18 @@ s4_run() {
   dis=$(echo "$fr" | grep -o "distinct=[0-9]*" | cut -d= -f2)
   top=$(echo "$fr" | grep -o "top=[0-9]*" | cut -d= -f2)
   note "$tag: ${tot:-0} frames dumped, ${dis:-0} of them distinct, the commonest repeated ${top:-0} times"
+  # **§31: the floor under this, which applies to every client.** The staleness
+  # test below runs only for `weston-presentation-shm`, so for every other
+  # client these three numbers were printed in a `note` and compared with
+  # nothing — including the case that makes the whole block meaningless, which
+  # is `total=0`. A run whose frame dump produced no frames at all printed
+  # "0 frames dumped, 0 of them distinct" and passed, with the staleness check
+  # it exists for silently not running.
+  if [ "${tot:-0}" -lt 1 ] || [ "${dis:-0}" -lt 1 ]; then
+    bad "$tag: ${tot:-0} frames dumped and ${dis:-0} distinct; the frame instrument produced nothing to judge"
+  else
+    ok "$tag: the frame dump produced ${tot} frames, ${dis} of them distinct -- there is something here to judge"
+  fi
   if [ "$client" = weston-presentation-shm ] && [ "${tot:-0}" -gt 20 ]; then
     # This client redraws every frame, so on a coherent region almost every
     # dumped frame differs. `top` is the number that catches a frozen mapping.

@@ -2,7 +2,7 @@
 //!
 //! # Why this exists at all, when the point of the project is Windows
 //!
-//! Because of docs/design.md §7.5, which is the most expensive fact stage 2
+//! Because of docs/waycompose-design.md §7.5, which is the most expensive fact stage 2
 //! established: **a stock libwayland client cannot send a buffer to the Windows
 //! build.** An `h` argument travels out-of-band by `SCM_RIGHTS` on Unix and
 //! in-band as a descriptor on Windows (§2.3), Wine's AF_UNIX carries no
@@ -192,7 +192,7 @@ pub(crate) struct PumpInner {
     /// window, which in a browser is the middle of a web page and opens
     /// nothing. There is no window manager on this platform and no `SendInput`,
     /// so without a way to say *where*, the popup path can only be exercised
-    /// under Wine — and Wine is a hypothesis (docs/design.md §4.4).
+    /// under Wine — and Wine is a hypothesis (docs/waycompose-design.md §4.4).
     ///
     /// Deliberately a single click rather than a scripting language: the
     /// question is whether one press at a known point produces an `xdg_popup`
@@ -217,6 +217,10 @@ pub struct Click {
 struct Headless {
     title: String,
     app_id: String,
+    /// The taskbar identity this window would be given on Windows. ADDED FOR
+    /// STAGE 32; kept so that a second `AppId` for the same one is not
+    /// announced twice.
+    aumid: String,
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
     /// Surface size, as reported at `Map`. The *client area* size is this run
@@ -301,6 +305,17 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
 impl PumpInner {
     pub(crate) fn run(self) {
         let mut windows: HashMap<WindowId, Headless> = HashMap::new();
+        // The system clipboard, on a system that has none.
+        //
+        // In-process rather than a file or an X selection, and that is the
+        // honest shape of this platform rather than a shortcut: the thing
+        // being tested on Linux is the *path* — a client's selection reaching
+        // the compositor as bytes, and coming back to another client — and the
+        // only part of it that Windows owns is the last hop. Wine runs that
+        // hop against the real `SetClipboardData` with a second Win32 process
+        // reading the result, which is where the claim "a Windows application
+        // can paste it" is made. See docs/waycompose-design.md §29.
+        let mut clipboard: Vec<(crate::clipboard::SystemFormat, Vec<u8>)> = Vec::new();
 
         loop {
             let cmd = match self.commands.recv_timeout(Duration::from_millis(50)) {
@@ -319,18 +334,24 @@ impl PumpInner {
             if matches!(cmd, ToUi::Quit) {
                 break;
             }
-            self.handle(&mut windows, cmd);
+            self.handle(&mut windows, &mut clipboard, cmd);
         }
 
         let _ = self.events.send(FromUi::Stopped);
     }
 
-    fn handle(&self, windows: &mut HashMap<WindowId, Headless>, cmd: ToUi) {
+    fn handle(
+        &self,
+        windows: &mut HashMap<WindowId, Headless>,
+        clipboard: &mut Vec<(crate::clipboard::SystemFormat, Vec<u8>)>,
+        cmd: ToUi,
+    ) {
         match cmd {
             ToUi::Create {
                 id,
                 title,
                 app_id,
+                aumid,
                 shadow,
                 kind,
             } => {
@@ -346,11 +367,17 @@ impl PumpInner {
                          parent={parent} at {x},{y}"
                     ),
                 }
+                // ADDED FOR STAGE 32. There is no taskbar here either, so the
+                // identity is *said* — which is enough for a Linux-side test to
+                // assert that two clients got two of them and that two windows
+                // of one client did not.
+                println!("wc-compositor: window {id} taskbar identity -> {aumid:?}");
                 windows.insert(
                     id,
                     Headless {
                         title,
                         app_id,
+                        aumid,
                         shadow,
                         mapped: false,
                         surface: (0, 0),
@@ -374,9 +401,15 @@ impl PumpInner {
                     w.title = title;
                 }
             }
-            ToUi::AppId { id, app_id } => {
+            ToUi::AppId { id, app_id, aumid } => {
                 if let Some(w) = windows.get_mut(&id) {
                     println!("wc-compositor: window {id} app_id -> {app_id:?}");
+                    if w.aumid != aumid {
+                        println!(
+                            "wc-compositor: window {id} taskbar identity -> {aumid:?}"
+                        );
+                        w.aumid = aumid;
+                    }
                     w.app_id = app_id;
                 }
             }
@@ -562,6 +595,85 @@ impl PumpInner {
                 println!("wc-compositor: window {id} destroyed");
                 windows.remove(&id);
             }
+
+            // The clipboard, as far as this platform can carry it. The Win32
+            // arm converts to `CF_UNICODETEXT` and calls `SetClipboardData`;
+            // here the payloads are kept as they arrived and printed, which is
+            // what lets the Linux harness assert on the *bytes a client sent*
+            // without a Windows machine in the loop. The conversion itself is
+            // `crate::clipboard`'s and is unit-tested on this machine anyway.
+            ToUi::SetClipboard { payloads } => {
+                // **The same conversion the Win32 arm performs**, and that is
+                // the point of doing it here rather than storing the payloads
+                // raw: `to_system` picks one text flavour out of the six a GTK
+                // client offers, encodes UTF-16 with CRLF, and wraps HTML in
+                // the header Windows requires. Every one of those is silently
+                // wrong if it is wrong, and this is the leg that runs on the
+                // machine `cargo test` runs on. What Windows adds after this
+                // point is `SetClipboardData` and nothing else.
+                *clipboard = crate::clipboard::to_system(&payloads);
+                if clipboard.is_empty() {
+                    println!("wc-compositor: clipboard cleared");
+                }
+                for (format, bytes) in clipboard.iter() {
+                    println!(
+                        "wc-compositor: clipboard set {} bytes={} hash={:016x} text={:?}",
+                        format.name(),
+                        bytes.len(),
+                        fnv1a(bytes),
+                        preview(bytes),
+                    );
+                }
+                let formats: Vec<_> = clipboard.iter().map(|(f, _)| *f).collect();
+                // The echo a real clipboard produces, so that both platforms
+                // drive the same path: on Win32 this comes back as
+                // `WM_CLIPBOARDUPDATE` and the reason it must not be
+                // suppressed is in `win32.rs`.
+                let _ = self.events.send(FromUi::ClipboardChanged {
+                    mimes: crate::clipboard::mimes_for(&formats),
+                });
+            }
+            // There is no desktop here to drag onto, so a drag ends the moment
+            // it starts — and it **does** end, with `none`, which is the whole
+            // point. A platform that answered nothing would leave the client's
+            // `wl_data_source` waiting forever, and a drag that never ends is
+            // the failure this feature exists not to build. The Win32 arm runs
+            // `DoDragDrop` and answers with what the drop target did.
+            ToUi::StartDrag { payloads, actions } => {
+                println!(
+                    "wc-compositor: [headless] a drag was started with {} mime type(s), \
+                     actions {}; there is no desktop to drop onto here",
+                    payloads.len(),
+                    crate::platform::dnd_action::describe(actions)
+                );
+                let _ = self.events.send(FromUi::DragFinished {
+                    action: crate::platform::dnd_action::NONE,
+                });
+            }
+            ToUi::CancelDrag => println!("wc-compositor: [headless] the drag was withdrawn"),
+            ToUi::FetchClipboard { token, from_drag, mime } => {
+                if from_drag {
+                    // Nothing can be dragged onto this platform, so there is
+                    // never a drag to read from. Answered rather than ignored.
+                    println!(
+                        "wc-compositor: [headless] clipboard fetch token={token} asked for the \
+                         drag, and there are no drags here"
+                    );
+                    let _ = self.events.send(FromUi::ClipboardData { token, data: None });
+                    return;
+                }
+                let data = clipboard
+                    .iter()
+                    .find_map(|(f, b)| crate::clipboard::from_system(&mime, *f, b));
+                println!(
+                    "wc-compositor: clipboard fetch token={token} mime={mime:?} -> {}",
+                    match &data {
+                        Some(b) => format!("{} bytes {:?}", b.len(), preview(b)),
+                        None => "nothing".to_owned(),
+                    }
+                );
+                let _ = self.events.send(FromUi::ClipboardData { token, data });
+            }
             ToUi::Quit => {}
         }
     }
@@ -657,7 +769,7 @@ impl PumpInner {
     ///
     /// # Why this is worth having when the whole point is Win32
     ///
-    /// Because of docs/design.md §8.5's split, which stage 6 inherits in a
+    /// Because of docs/waycompose-design.md §8.5's split, which stage 6 inherits in a
     /// sharper form than stage 3 had it. On Windows the only clients that can
     /// reach the compositor are ours or come through the proxy; on Linux any
     /// Weston client connects directly. `weston-eventdemo` **prints every input
@@ -862,6 +974,22 @@ fn centre_pixel(shadow: &Shadow) -> u32 {
     let off = ((h / 2) * w + w / 2) * PixelFormat::BYTES_PER_PIXEL;
     let px = &shadow.pixels()[off..off + PixelFormat::BYTES_PER_PIXEL];
     u32::from_le_bytes([px[0], px[1], px[2], px[3]])
+}
+
+/// The first few characters of a clipboard payload, for the log.
+///
+/// Truncated because a selection can be four megabytes and a log line should
+/// not be, and lossy because the payload is whatever a client called
+/// `text/plain` — which is not required to be UTF-8 and, for `text/html` from
+/// a browser, frequently is not clean.
+fn preview(bytes: &[u8]) -> String {
+    const N: usize = 60;
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(N)]).into_owned();
+    if bytes.len() > N {
+        format!("{text}...")
+    } else {
+        text
+    }
 }
 
 /// FNV-1a. Not a checksum with any cryptographic claim — it is here so a shell

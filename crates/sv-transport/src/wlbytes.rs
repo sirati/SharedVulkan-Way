@@ -1,6 +1,6 @@
 //! A bidirectional byte stream over **one ring slot** of an existing session.
 //!
-//! waycompose-design.md §35. This is what carries the Wayland wire protocol
+//! waycompose-design.md §36. This is what carries the Wayland wire protocol
 //! across the VM boundary now, in place of `wc-proxy → ssh -L → TCP →
 //! probe-relay.exe → afunix.sys`.
 //!
@@ -27,7 +27,7 @@
 //! lines that turn "packets of at most `max_payload` bytes" into "a byte stream",
 //! which is chunking on the way in and reassembly on the way out.
 //!
-//! That is the point of the correction §35 records. The previous design would
+//! That is the point of the correction §36 records. The previous design would
 //! have grown a second locator on the cold path, a second control region and a
 //! second doorbell convention for Wayland, in a tree that already had one of
 //! each working. The cold path already delivered this session's control region;

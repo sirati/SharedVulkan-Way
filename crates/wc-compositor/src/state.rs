@@ -49,7 +49,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::Res
 use smithay::wayland::shm::{ShmHandler, ShmState};
 // ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
 // than guessed at, and they are requirements for different reasons — see
-// docs/design.md §13.3.
+// docs/waycompose-design.md §13.3.
 //
 // `Output` is the monitor. Without one a GTK client has an empty
 // `GdkDisplay` monitor list, sizes its first window from a fallback and never
@@ -75,7 +75,7 @@ use smithay::wayland::selection::SelectionHandler;
 // instead. That is checkable two ways and both were done: `libgdk-3.so`
 // contains the string `org_kde_kwin_server_decoration_manager` and does not
 // contain `zxdg_decoration_manager_v1`, and a compositor that offers both is
-// told which one is bound. docs/design.md §13.7 has the answer and what it
+// told which one is bound. docs/waycompose-design.md §13.7 has the answer and what it
 // costs.
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server
     ::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -87,7 +87,7 @@ use smithay::reexports::wayland_server::WEnum;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 
-// ADDED FOR STAGE 12 (docs/design.md §23), the cursor.
+// ADDED FOR STAGE 12 (docs/waycompose-design.md §23), the cursor.
 //
 // `CursorShapeManagerState` is `wp_cursor_shape_v1`: a client names a shape
 // instead of shipping pixels, which is what GTK4 binds and is the half of the
@@ -105,7 +105,7 @@ use smithay::wayland::seat::CURSOR_IMAGE_ROLE;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 // ADDED FOR STAGE 21: three protocols whose implementation is a Win32 call, and
 // which are here because the Win32 call exists rather than because the protocol
-// is short. docs/design.md §25 has the argument for each and — for the two that
+// is short. docs/waycompose-design.md §25 has the argument for each and — for the two that
 // were considered and left out — for their absence.
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use smithay::wayland::keyboard_shortcuts_inhibit::{
@@ -125,7 +125,7 @@ use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSour
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
-/// ADDED FOR STAGE 17, and it is the whole of docs/design.md §22.2. Until this
+/// ADDED FOR STAGE 17, and it is the whole of docs/waycompose-design.md §22.2. Until this
 /// stage the answer was hard-coded to `Client`, on the reasoning that
 /// docs/goal-firefox.md wants Firefox painting its tabs into the title bar and
 /// only a client that draws a title bar can do that. The reasoning was right
@@ -225,6 +225,14 @@ struct Window {
     minimized: bool,
     title: String,
     app_id: String,
+    /// Which connection this window's client arrived on.
+    ///
+    /// ADDED FOR STAGE 32, and it is the whole of the answer for a client that
+    /// never calls `set_app_id`: there is no name to group such windows by, so
+    /// they are grouped by the thing that is still true of them. Cached here
+    /// rather than looked up per use, because a window outlives the moments at
+    /// which its surface is convenient to ask.
+    client: u32,
     /// Callbacks the client is waiting on before it draws its next frame.
     ///
     /// Held rather than answered immediately. Answering at once is legal and is
@@ -346,6 +354,15 @@ pub struct State {
     /// [`FromUi::KeyboardFocus`]. See [`Self::sync_locked_modifiers`].
     locks: (bool, bool),
 
+    /// The connection, for the two smithay entry points that take one and are
+    /// called from outside a handler: `set_data_device_focus` when Windows
+    /// moves the focus, and `set_data_device_selection` when the Win32
+    /// clipboard changes. Both are events that originate on the UI thread, so
+    /// there is no `&DisplayHandle` in scope to borrow.
+    display: DisplayHandle,
+    /// The one seat, for the same two calls. `SeatState` owns it and this is an
+    /// `Arc` handle to it, so holding one here does not duplicate anything.
+    seat: Seat<Self>,
 
     ui: Ui,
     events: Receiver<FromUi>,
@@ -402,6 +419,25 @@ pub struct State {
     pub icons_applied: usize,
     pub icons_missing: usize,
 
+    /// Kept alive so `wc_clipboard_manager_v1` stays advertised.
+    _clipboard_manager: smithay::reexports::wayland_server::backend::GlobalId,
+    /// Fetches in flight: the token the UI thread will answer with, and who to
+    /// answer.
+    ///
+    /// Keyed by a token this compositor mints rather than by the one the client
+    /// sent, because two proxies are two clients and their tokens are allowed
+    /// to collide. The client's own number is carried alongside and echoed
+    /// back.
+    clip_fetches: HashMap<u64, (crate::clipboard::proto::wc_clipboard_manager_v1::WcClipboardManagerV1, u32)>,
+    next_clip_token: u64,
+    /// Who to tell when the system drag ends. One at a time, because there is
+    /// one mouse.
+    clip_drag_source: Option<crate::clipboard::proto::wc_clipboard_manager_v1::WcClipboardManagerV1>,
+    pub clip_published: usize,
+    pub clip_fetched: usize,
+    pub clip_offered: usize,
+    pub clip_drags: usize,
+
     pub clients_seen: usize,
     pub toplevels: usize,
     /// ADDED FOR STAGE 9, so the harness can assert that a menu opened rather
@@ -417,7 +453,7 @@ pub struct ClientState {
     compositor_state: CompositorClientState,
     /// Which connection this is, counted from 1 in accept order.
     ///
-    /// ADDED FOR STAGE 26 (docs/design.md §26). A conformance suite driving
+    /// ADDED FOR STAGE 26 (docs/waycompose-design.md §26). A conformance suite driving
     /// this compositor from outside knows a client-side `wl_surface*` and
     /// nothing about our window ids, so the only handle it can name a window
     /// by is *which connection* plus *which object id on it*. The connection
@@ -460,7 +496,7 @@ impl ClientData for ClientState {
 // well would give a client two repeat streams at different rates. So they are
 // dropped, in `win32.rs`, and this is the only rate anyone sees.
 //
-// > **[SUPERSEDED — 2026-08-13, see docs/design.md §23.5]** The numbers are
+// > **[SUPERSEDED — 2026-08-13, see docs/waycompose-design.md §23.5]** The numbers are
 // > Windows' own defaults expressed the way Wayland wants them:
 // > `SPI_GETKEYBOARDDELAY` 1 is 500 ms, `SPI_GETKEYBOARDSPEED` is around 30/s
 // > at its default. Reading the real values is a `SystemParametersInfo` call
@@ -489,9 +525,11 @@ impl State {
         decorations: Decorations,
     ) -> Self {
         let mut seat_state = SeatState::new();
-        // The local is dropped at the end of this function and that is safe:
-        // `SeatState` keeps every seat it makes, and `Seat` is an `Arc` handle
-        // rather than the seat itself.
+        // `SeatState` keeps every seat it makes and `Seat` is an `Arc` handle
+        // rather than the seat itself, so this local used to be dropped here.
+        // The clipboard work keeps it: `set_data_device_focus` and
+        // `set_data_device_selection` both take one and are called from the UI
+        // event pump, where there is no seat in scope.
         let mut seat: Seat<State> = seat_state.new_wl_seat(dh, "seat0");
 
         // **Capabilities are advertised by adding them, and only then.**
@@ -595,11 +633,19 @@ impl State {
         //
         // `xdg-toplevel-icon-v1` is the protocol; a client that implements it
         // is the authority on its own icon and needs nothing else. Measured
-        // against real clients (docs/design.md §15.3) that is GTK 4.20 and not
+        // against real clients (docs/waycompose-design.md §15.3) that is GTK 4.20 and not
         // Firefox 151, weston 15 or GTK 3 — so the second global exists for the
         // ones that do not, and is bound by the resolver rather than by them.
         let icon_manager = dh
             .create_global::<State, crate::icon::proto::wc_icon_manager_v1::WcIconManagerV1, _>(
+                1,
+                (),
+            );
+        // §29. The clipboard's side door, for the one thing
+        // `wl_data_device` cannot express across this boundary: the bytes
+        // themselves. See `protocols/wc-clipboard-v1.xml` and `crate::clipboard`.
+        let clipboard_manager = dh
+            .create_global::<State, crate::clipboard::proto::wc_clipboard_manager_v1::WcClipboardManagerV1, _>(
                 1,
                 (),
             );
@@ -679,6 +725,8 @@ impl State {
             cursor_surface: None,
             popup_grab: None,
             locks: (false, false),
+            display: dh.clone(),
+            seat,
             ui,
             events,
             sources: vec![Box::new(ShmSource)],
@@ -701,6 +749,14 @@ impl State {
             shortcuts_inhibit: KeyboardShortcutsInhibitState::new::<State>(dh),
             icons_applied: 0,
             icons_missing: 0,
+            _clipboard_manager: clipboard_manager,
+            clip_fetches: HashMap::new(),
+            next_clip_token: 1,
+            clip_drag_source: None,
+            clip_published: 0,
+            clip_fetched: 0,
+            clip_offered: 0,
+            clip_drags: 0,
             clients_seen: 0,
             toplevels: 0,
             popups: 0,
@@ -712,7 +768,7 @@ impl State {
     /// Milliseconds since the compositor started, which is what a frame
     /// callback carries.
     ///
-    /// Note the known wrongness, recorded in docs/design.md §7.7 item 5: the
+    /// Note the known wrongness, recorded in docs/waycompose-design.md §7.7 item 5: the
     /// epoch is process start rather than boot, which is right for every
     /// current consumer (a client comparing successive callbacks) and wrong for
     /// `wp_presentation`. Not fixed here because nothing yet compares this
@@ -888,6 +944,14 @@ impl State {
                     self.pointer_axis(id, horizontal, vertical, v120_h, v120_v, time)
                 }
                 FromUi::Layout { name } => self.set_layout(name),
+                FromUi::ClipboardChanged { mimes } => self.on_clipboard_changed(mimes),
+                FromUi::ClipboardData { token, data } => self.on_clipboard_data(token, data),
+                FromUi::DragFinished { action } => {
+                    println!("wc-compositor: the drag ended with action {action:#x}");
+                    if let Some(source) = self.clip_drag_source.take() {
+                        source.drag_finished(action);
+                    }
+                }
                 FromUi::TouchDown { id, slot, x, y, shape, time } => {
                     self.touch_down(id, slot, x, y, shape, time)
                 }
@@ -909,6 +973,71 @@ impl State {
                         touch.cancel(self);
                     }
                 }
+            }
+        }
+    }
+
+    /// The Win32 clipboard changed: offer it to Wayland.
+    ///
+    /// This is the *whole* of the announcement, and it goes out over ordinary
+    /// `wl_data_device` rather than over `wc_clipboard_v1`. That is deliberate
+    /// and it is what keeps the side interface small: smithay already knows how
+    /// to mint a `wl_data_offer`, list its mime types on it, and send
+    /// `selection` to whichever client has the focus — and wc-proxy forwards
+    /// every one of those messages verbatim, because none of them carries a
+    /// descriptor. The only message in the family that does is
+    /// `wl_data_offer.receive`, and that one never reaches this compositor.
+    fn on_clipboard_changed(&mut self, mimes: Vec<String>) {
+        if mimes.is_empty() {
+            println!("wc-compositor: the system clipboard is empty; clearing the selection");
+            smithay::wayland::selection::data_device::clear_data_device_selection(
+                &self.display,
+                &self.seat.clone(),
+            );
+            return;
+        }
+        self.clip_offered += 1;
+        println!(
+            "wc-compositor: the system clipboard changed; offering {} mime type(s): {}",
+            mimes.len(),
+            mimes.join(", ")
+        );
+        smithay::wayland::selection::data_device::set_data_device_selection(
+            &self.display,
+            &self.seat.clone(),
+            mimes,
+            (),
+        );
+    }
+
+    /// The UI thread has read the clipboard. Send it back to whoever asked.
+    ///
+    /// Chunked at [`crate::clipboard::CHUNK`] for the reason §16.5 gives about
+    /// icons and which is not specific to icons: `wayland-backend`'s buffers
+    /// are 4096 bytes, and a message that does not fit in one cannot be sent at
+    /// all. A clipboard payload is routinely larger than an icon.
+    fn on_clipboard_data(&mut self, token: u64, data: Option<Vec<u8>>) {
+        let Some((manager, client_token)) = self.clip_fetches.remove(&token) else {
+            // The publisher went away while the UI thread was reading. Not an
+            // error: a proxy whose client exited mid-paste is the ordinary
+            // case, and there is nobody left to tell.
+            return;
+        };
+        match data {
+            Some(bytes) => {
+                self.clip_fetched += 1;
+                println!(
+                    "wc-compositor: clipboard fetch {client_token} answered with {} bytes",
+                    bytes.len()
+                );
+                for part in bytes.chunks(crate::clipboard::CHUNK) {
+                    manager.chunk(client_token, part.to_vec());
+                }
+                manager.done(client_token);
+            }
+            None => {
+                println!("wc-compositor: clipboard fetch {client_token} has no such format");
+                manager.fail(client_token, "the clipboard holds nothing of that type".into());
             }
         }
     }
@@ -982,6 +1111,15 @@ impl State {
             let Some(surface) = self.surface_of(id) else { return };
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
+            // **The clipboard follows the keyboard, and until §29 nothing
+            // said so.** `wl_data_device`'s selection is offered to the client
+            // with *data device focus*, which smithay keeps separately and
+            // which nothing here had ever set — so a compositor-provided
+            // selection would have been announced to nobody, and a client's
+            // `wl_data_device` would have sat silent forever. It is one call,
+            // it is the same rule every compositor uses, and its absence is
+            // invisible until something actually has a selection to offer.
+            self.set_clipboard_focus(Some(&surface));
             keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
             // STAGE 13. The locks are Windows', and they are the half of the
             // modifier state that key events cannot carry.
@@ -1038,6 +1176,7 @@ impl State {
             for keycode in keyboard.pressed_keys() {
                 keyboard.input_intercept::<(), _>(self, keycode, KeyState::Released, |_, _, _| ());
             }
+            self.set_clipboard_focus(None);
             keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
     }
@@ -1063,6 +1202,16 @@ impl State {
         mods.caps_lock = caps;
         mods.num_lock = num;
         keyboard.set_modifier_state(mods);
+    }
+
+    /// Who may see the selection. See the call site in [`Self::set_keyboard_focus`].
+    fn set_clipboard_focus(&mut self, surface: Option<&WlSurface>) {
+        let client = surface.and_then(|s| self.display.get_client(s.id()).ok());
+        smithay::wayland::selection::data_device::set_data_device_focus(
+            &self.display,
+            &self.seat.clone(),
+            client,
+        );
     }
 
     /// One key, in evdev numbering, to whatever has focus.
@@ -1458,7 +1607,7 @@ impl State {
         // client-side-decoration surface, which is **transparent**, and every
         // pixel of the browser is in a `wl_subsurface` of it. A compositor with
         // no scene graph does not draw Firefox badly — it draws a black
-        // rectangle. docs/design.md §13.5 has the measurement.
+        // rectangle. docs/waycompose-design.md §13.5 has the measurement.
         //
         // So a commit now lands in a per-surface staging shadow, and the
         // window's shadow is the composite of the tree.
@@ -1542,6 +1691,14 @@ impl State {
         let first = !window.mapped;
         window.mapped = true;
         let (title, app_id) = (window.title.clone(), window.app_id.clone());
+        let client = window.client;
+        // ADDED FOR STAGE 32. A popup has no taskbar button — it is
+        // `WS_EX_TOOLWINDOW` with an owner — so there is nothing for an
+        // identity to group, and stamping one on a menu would be a claim about
+        // a button that does not exist. Measured, and not hypothetical: the
+        // first run of the `apps` experiment put `Waycompose.unnamed.c1` on
+        // three of `weston-terminal`'s context menus, harmlessly and wrongly.
+        let toplevel = window.role.toplevel().is_some();
         self.presents += 1;
 
         if first {
@@ -1569,6 +1726,29 @@ impl State {
             // smithay's `Output::enter` walks the surface's client list, which
             // needs the surface to be alive on the wire.
             self.output.enter(&root);
+            // BEFORE `Map`, AND THAT IS THE WHOLE OF STAGE 32'S ORDERING.
+            //
+            // `Map` is what shows the window, and the shell makes the taskbar
+            // button when the window is shown — it reads the identity property
+            // then. Until stage 32 this went out *after* `Map`, which was
+            // harmless when nothing read it and is not harmless now: the button
+            // would be created under whatever identity the window was created
+            // with, and a client that called `set_app_id` between creation and
+            // its first buffer — which is every client, because `set_app_id`
+            // costs no round trip and drawing does — would have its real name
+            // arrive one message too late.
+            //
+            // Sent unconditionally, empty app id included: "this client never
+            // named itself" is an identity too (`crate::taskbar`), and skipping
+            // it would leave the nameless windows sharing whatever the shell
+            // decided for the process.
+            if toplevel {
+                self.ui.send(ToUi::AppId {
+                    id,
+                    app_id: app_id.clone(),
+                    aumid: crate::taskbar::identity(&app_id, client),
+                });
+            }
             self.ui.send(ToUi::Map {
                 id,
                 width: w,
@@ -1576,12 +1756,6 @@ impl State {
             });
             if !title.is_empty() {
                 self.ui.send(ToUi::Title { id, title });
-            }
-            if !app_id.is_empty() {
-                self.ui.send(ToUi::AppId {
-                    id,
-                    app_id: app_id.clone(),
-                });
             }
             // At map, and not before: a window that is not on screen has no
             // taskbar button to put an icon on, and `WM_SETICON` to a hidden
@@ -2119,7 +2293,7 @@ impl CompositorHandler for State {
 
         match buffer {
             Some(BufferAssignment::NewBuffer(buffer)) => {
-                // ADDED FOR STAGE 12 (docs/design.md §23). A cursor surface's
+                // ADDED FOR STAGE 12 (docs/waycompose-design.md §23). A cursor surface's
                 // buffer is read for the `HCURSOR` and then handed on
                 // unchanged — this reads and does not divert, so what the
                 // scene graph does with a cursor surface stays the scene
@@ -2188,7 +2362,7 @@ impl SeatHandler for State {
 
     /// What the pointer should look like.
     ///
-    /// IMPLEMENTED IN STAGE 12 (docs/design.md §23); before it, this logged
+    /// IMPLEMENTED IN STAGE 12 (docs/waycompose-design.md §23); before it, this logged
     /// once and the user saw the Win32 arrow over everything — no I-beam over
     /// text, no hand over a link.
     ///
@@ -2268,6 +2442,26 @@ fn metadata(toplevel: &ToplevelSurface) -> (String, String) {
     })
 }
 
+/// Which connection a surface belongs to, counted from 1 in accept order.
+///
+/// ADDED FOR STAGE 32. [`ClientState::index`] already exists and is already
+/// counted for every client; this is the one place outside the control socket
+/// that needs it, because a window whose client never named itself still has to
+/// be told apart from a *different* client that never named itself
+/// (`crate::taskbar`).
+///
+/// `0` for a surface whose client is gone, which cannot happen on the paths
+/// that call this — the surface is live enough to have a role — and is a
+/// deliberate non-panic if it ever does: a wrong taskbar group is a cosmetic
+/// defect and killing the compositor over one is not.
+fn client_index(surface: &WlSurface) -> u32 {
+    use smithay::reexports::wayland_server::Resource as _;
+    surface
+        .client()
+        .and_then(|c| c.get_data::<ClientState>().map(|d| d.index))
+        .unwrap_or(0)
+}
+
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell
@@ -2279,6 +2473,7 @@ impl XdgShellHandler for State {
         self.toplevels += 1;
 
         let (title, app_id) = metadata(&surface);
+        let client = client_index(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
         println!(
             "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
@@ -2289,6 +2484,14 @@ impl XdgShellHandler for State {
             id,
             title: title.clone(),
             app_id: app_id.clone(),
+            // ADDED FOR STAGE 32. Stamped at creation, while the window is
+            // still hidden, because that is the only moment that is certainly
+            // before the shell has made a button for it. Most clients have not
+            // called `set_app_id` yet at this point and get their connection's
+            // identity here and their real one at map; a client that set it
+            // before the first round trip — `weston-terminal` does — gets the
+            // real one immediately.
+            aumid: crate::taskbar::identity(&app_id, client),
             shadow: shadow.clone(),
             kind: WindowKind::Toplevel,
         });
@@ -2310,6 +2513,7 @@ impl XdgShellHandler for State {
                 minimized: false,
                 title,
                 app_id,
+                client,
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 icon_from_client: false,
@@ -2337,10 +2541,17 @@ impl XdgShellHandler for State {
         };
         window.app_id = app_id.clone();
         let (id, mapped, own) = (window.id, window.mapped, window.icon_from_client);
+        let client = window.client;
         if mapped {
             self.ui.send(ToUi::AppId {
                 id,
                 app_id: app_id.clone(),
+                // ADDED FOR STAGE 32, and this is the *late* case: the window
+                // is already on screen, so the shell has already made a button
+                // for it under the old identity. What that costs is measured in
+                // docs/waycompose-design.md §32.6; the platform is told, and
+                // the platform decides what it can do about it.
+                aumid: crate::taskbar::identity(&app_id, client),
             });
             // A new app id is a new answer to "what is this application", so
             // the icon is looked up again — unless the client has said what its
@@ -2504,7 +2715,7 @@ impl XdgShellHandler for State {
         // the compositor's job, and on Windows the compositor that owns the
         // monitor is Windows. Letting `SetWindowPos` place it and reporting no
         // constraint back is honest; recomputing it here would be a second,
-        // disagreeing, opinion. See docs/design.md §13.6.
+        // disagreeing, opinion. See docs/waycompose-design.md §13.6.
         let rect = positioner.get_geometry();
         let parent = surface.get_parent_surface().map(|s| root_of(&s));
         let parent_id = parent.as_ref().and_then(|p| self.windows.get(p)).map(|w| w.id);
@@ -2527,6 +2738,11 @@ impl XdgShellHandler for State {
             id,
             title: String::new(),
             app_id: String::new(),
+            // A popup is `WS_EX_TOOLWINDOW` with an owner, so the shell gives
+            // it no taskbar button at all and there is nothing for an identity
+            // to group. Empty rather than invented: a string here would be a
+            // claim about a button that does not exist.
+            aumid: String::new(),
             shadow: shadow.clone(),
             kind: WindowKind::Popup {
                 parent: parent_id,
@@ -2543,6 +2759,7 @@ impl XdgShellHandler for State {
         });
         let _ = surface.send_configure();
 
+        let client = client_index(surface.wl_surface());
         self.windows.insert(
             surface.wl_surface().clone(),
             Window {
@@ -2553,6 +2770,7 @@ impl XdgShellHandler for State {
                 minimized: false,
                 title: String::new(),
                 app_id: String::new(),
+                client,
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 // A popup has no taskbar button and no caption, so neither of
@@ -2789,6 +3007,138 @@ impl Dispatch<WcIconManagerV1, PublisherState> for State {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The clipboard: the side door for the bytes
+// ---------------------------------------------------------------------------
+
+use crate::clipboard::proto::wc_clipboard_manager_v1::{self, WcClipboardManagerV1};
+
+/// Per-publisher staging, on the resource rather than on the compositor, so two
+/// proxies building selections at once cannot interleave into each other.
+#[derive(Debug, Default)]
+pub struct ClipboardState(std::sync::Mutex<crate::clipboard::Staging>);
+
+impl GlobalDispatch<WcClipboardManagerV1, ()> for State {
+    fn bind(
+        _state: &mut State,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WcClipboardManagerV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        println!(
+            "wc-compositor: a client bound wc_clipboard_manager_v1 \
+             (the clipboard's byte path)"
+        );
+        data_init.init(resource, ClipboardState::default());
+    }
+}
+
+impl Dispatch<WcClipboardManagerV1, ClipboardState> for State {
+    fn request(
+        state: &mut State,
+        _client: &Client,
+        resource: &WcClipboardManagerV1,
+        request: wc_clipboard_manager_v1::Request,
+        data: &ClipboardState,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State>,
+    ) {
+        use crate::clipboard::StageError;
+        use wc_clipboard_manager_v1::{Error, Request};
+
+        // Every failure here ends the *publisher's* connection, which in this
+        // topology is wc-proxy's third socket and not the application's. A
+        // proxy that miscounts its bytes costs a paste, not a window — the same
+        // property the icon feed has and for the same reason.
+        let fail = |e: StageError| match e {
+            StageError::TooBig => (Error::TooBig, "more staged bytes than the compositor holds"),
+            StageError::TooMany => (Error::TooMany, "more mime types than a clipboard holds"),
+        };
+
+        match request {
+            Request::Chunk { data: bytes } => {
+                if let Err(e) = data.0.lock().unwrap().chunk(&bytes) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Data { mime_type } => {
+                if let Err(e) = data.0.lock().unwrap().data(mime_type) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Publish => {
+                let payloads = data.0.lock().unwrap().take();
+                let system = crate::clipboard::to_system(&payloads);
+                state.clip_published += 1;
+                println!(
+                    "wc-compositor: a client published a selection: {} mime type(s) -> {} \
+                     system format(s) [{}]",
+                    payloads.len(),
+                    system.len(),
+                    system
+                        .iter()
+                        .map(|(f, b)| format!("{} {} bytes", f.name(), b.len()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // The *payloads*, not the converted formats, cross to the UI
+                // thread: the conversion belongs to `crate::clipboard` and the
+                // headless platform has no `CF_UNICODETEXT` to convert to.
+                // `win32.rs` calls `to_system` itself.
+                state.ui.send(ToUi::SetClipboard { payloads });
+            }
+            Request::Fetch { token, source, mime_type } => {
+                let internal = state.next_clip_token;
+                state.next_clip_token += 1;
+                state.clip_fetches.insert(internal, (resource.clone(), token));
+                state.ui.send(ToUi::FetchClipboard {
+                    token: internal,
+                    // The `source` enum's `drag` entry. Compared as a number
+                    // rather than through the generated type because the arg
+                    // is a plain `uint` in the XML: an `enum=` attribute would
+                    // make the generated signature a `WEnum`, which buys
+                    // nothing for a two-value flag and costs a match arm for a
+                    // value that cannot occur.
+                    from_drag: source == 1,
+                    mime: mime_type,
+                });
+            }
+            // Drag and drop, from a Wayland client outward. §29 stages the
+            // payload through exactly the same `chunk`/`data` path a publish
+            // uses (see the XML) and hands it to the platform; a platform with
+            // no OLE drag source answers `none` at once.
+            //
+            // **Answered unconditionally, on every path.** A `start_drag` that
+            // produced no `drag_finished` would leave the client's
+            // `wl_data_source` waiting forever, which is the half-implemented
+            // drag this stage exists not to build.
+            Request::StartDrag { actions } => {
+                let payloads = data.0.lock().unwrap().take();
+                state.clip_drags += 1;
+                println!(
+                    "wc-compositor: a client started a drag with {} mime type(s), \
+                     actions {actions:#x}",
+                    payloads.len()
+                );
+                state.clip_drag_source = Some(resource.clone());
+                state.ui.send(ToUi::StartDrag { payloads, actions });
+            }
+            Request::CancelDrag => {
+                state.ui.send(ToUi::CancelDrag);
+            }
+            Request::Destroy => {
+                // Fetches this resource was waiting on are abandoned rather
+                // than answered into a dead object, which the XML says.
+                state.clip_fetches.retain(|_, (r, _)| r != resource);
+            }
+        }
+    }
+}
+
 // ADDED FOR STAGE 9 -----------------------------------------------------------
 //
 // `OutputHandler` has no required methods: smithay's output global does all its
@@ -2796,25 +3146,53 @@ impl Dispatch<WcIconManagerV1, PublisherState> for State {
 // client binds one. Nothing here needs to know.
 impl OutputHandler for State {}
 
-/// The clipboard, implemented as far as **refusing honestly**.
+/// The clipboard, from `wl_data_device`'s side.
 ///
-/// Every method here is smithay's default, which is to say the selection is
-/// tracked between clients on this compositor and nothing is offered from
-/// outside it. That is not the finished feature and it is not a stub either:
-/// two Wayland clients on this compositor can already copy and paste through
-/// it, because smithay's `wl_data_device` implementation does that work itself.
+/// # What §29 changed, and what it deliberately did not
 ///
-/// **What cannot work here, and will not until something is built for it, is a
-/// clipboard shared with Windows.** The two halves of that are
-/// `SelectionHandler::send_selection` — hand the compositor an fd and have it
-/// write the Win32 clipboard's bytes into it — and the reverse. On the guest
-/// that fd is a `wc_handle::Handle` (the fork makes `OwnedFd` mean that), and a
-/// `Handle` written by the compositor is exactly the object docs/design.md
-/// §12.13 item 7 says has no route to a client on the other side of the
-/// hypervisor. So this is not laziness deferred; it is the same missing
-/// allocator, arriving from a third direction.
+/// This used to be smithay's defaults with a paragraph saying a Windows
+/// clipboard could not be built on them, because `send_selection` hands the
+/// compositor **a file descriptor to write into** and on the guest an `OwnedFd`
+/// is a `wc_handle::Handle` — an object docs/waycompose-design.md §12.13 item 7 says has
+/// no route to a client across the hypervisor. That paragraph was right about
+/// the descriptor and wrong about the feature.
+///
+/// The way out is that the descriptor never has to exist here. `wc-proxy` runs
+/// on the client's own machine, where the client's pipe is a real Linux pipe;
+/// it terminates the transfer there and carries the **bytes** over
+/// `wc_clipboard_v1`. So this compositor's part of the clipboard is: announce
+/// what Windows holds (`on_clipboard_changed`, over ordinary `wl_data_device`),
+/// and answer for the bytes (the `Dispatch` above). Neither needs an fd.
+///
+/// `send_selection` is therefore **unreachable in this topology** and is still
+/// implemented, because "unreachable" is a claim about the proxy and this trait
+/// is reachable by anything that connects directly. It refuses by closing the
+/// descriptor, which the client reads as an empty selection — a failed paste,
+/// which is recoverable, rather than a protocol error, which is not.
 impl SelectionHandler for State {
     type SelectionUserData = ();
+
+    fn send_selection(
+        &mut self,
+        _ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: smithay::utils::os::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        // Dropped, not written. On Windows this "fd" is a `wc_handle::Handle`
+        // the client named, and there is no writer for one here; on Linux it is
+        // a pipe from a client that bypassed the proxy. Both get an empty
+        // paste and a line saying why.
+        drop(fd);
+        println!(
+            "wc-compositor: a client asked for the selection as {mime_type:?} through \
+             wl_data_offer.receive. That request carries a file descriptor and this \
+             compositor has no way to write into one across the boundary; the bytes go \
+             through wc_clipboard_v1 instead, which wc-proxy binds. Closing the \
+             descriptor: the paste comes back empty rather than killing the client."
+        );
+    }
 }
 
 impl DataDeviceHandler for State {
@@ -2827,6 +3205,15 @@ impl DataDeviceHandler for State {
 // and nothing is done with them. A drag *within* one client works because
 // smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
 // is not started here.
+//
+// §29 left this alone on purpose. Drag and drop is the same interface
+// family as the clipboard and it is **not implemented**, which is a decision
+// and not an oversight: a half-built DnD is a drag that starts, offers a
+// format, and then hangs on the drop, and that failure — a client waiting
+// forever on a transfer nobody will finish — is precisely what this stage
+// exists to remove. wc-proxy answers `wl_data_device.start_drag` with an
+// immediate `wl_data_source.cancelled`, so a client that tries gets a drag that
+// does not begin instead of one that does not end. docs/waycompose-design.md §29.8.
 impl ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 

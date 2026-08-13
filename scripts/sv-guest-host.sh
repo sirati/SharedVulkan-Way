@@ -186,6 +186,59 @@ sed 's/^/  /' "$DIR/app.log" 2>/dev/null
 say "---- sv-hostd, after ----"
 sed 's/^/  /' "$DIR/hostd.log" 2>/dev/null
 
+# ------------------------------------------------------------- the verdict ---
+# **§31. This script used to `exit 0` here, unconditionally.**
+#
+# Everything above it is infrastructure: sockets, a transient unit, a root
+# shell. The *result* — what `vk-probe` and `eglinfo` said — was written to
+# `app.log`, printed for a person, and never read by the script. So a run in
+# which the loader found no driver at all, or in which Mesa quietly fell back to
+# llvmpipe, exited 0 and looked exactly like a run that worked. The comments in
+# the heredoc above spell out precisely what a bad answer looks like ("NO
+# PHYSICAL DEVICES", "eglInitialize failed", llvmpipe "silently, and reporting
+# GL 4.6 while doing it") — every one of them was described and none of them was
+# checked.
+fail=0
+ok()  { echo "  ok   $*"; }
+bad() { echo "  FAIL $*"; fail=1; }
+say "---- the verdict ----"
+
+if [ ! -s "$DIR/app.log" ]; then
+  bad "the app side produced no log at all"
+else
+  if grep -q "^app rc=0$" "$DIR/app.log"; then
+    ok "the app side exited 0"
+  else
+    bad "the app side exited $(grep -o '^app rc=.*' "$DIR/app.log" | tail -1 | cut -d= -f2)"
+  fi
+
+  # The loader finding our ICD is the whole topology in one line. `vk-probe`
+  # says so in words when it does not.
+  if grep -q "NO PHYSICAL DEVICES" "$DIR/app.log"; then
+    bad "the loader found no driver: the ICD did not reach the extent sv-hostd served"
+  elif grep -q "^=== device 0:" "$DIR/app.log"; then
+    ok "the loader enumerated a device through the ICD: $(grep -m1 '^=== device 0:' "$DIR/app.log" | cut -d: -f2-)"
+  else
+    bad "vk-probe printed neither a device nor a refusal; it did not run"
+  fi
+
+  if [ "$MODE" = gl ]; then
+    # llvmpipe is the failure this whole exercise exists to avoid, and it is
+    # also this machine's *default*, which is why it has to be named rather
+    # than inferred from a missing error.
+    if grep -qi "eglInitialize failed" "$DIR/app.log"; then
+      bad "eglinfo could not reach a device"
+    elif grep -qi "llvmpipe" "$DIR/app.log"; then
+      bad "Zink fell back to llvmpipe; the renderer is software and the measurement is its opposite"
+    elif grep -qi "OpenGL renderer string" "$DIR/app.log"; then
+      ok "GL through Zink through the ICD: $(grep -m1 -i 'OpenGL renderer string' "$DIR/app.log" | cut -d: -f2-)"
+    else
+      bad "eglinfo reported no renderer at all"
+    fi
+  fi
+fi
+
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 pkill -f '$DIR/sv-hostd' 2>/dev/null; systemctl stop $UNIT 2>/dev/null; true" | "$ROOTC" >/dev/null 2>&1
-exit 0
+[ "$fail" -eq 0 ] && say "sv-guest-host: PASS" || say "sv-guest-host: FAIL"
+exit "$fail"

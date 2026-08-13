@@ -26,18 +26,15 @@ use wc_proxy::spec::Spec;
 struct Args {
     /// The compositor's `AF_UNIX` node. Under Wine this is a real host socket
     /// inside the prefix, which is what lets a Linux process reach a `.exe`
-    /// (docs/design.md §4.2); on the guest it is the far end of a relay.
+    /// (docs/waycompose-design.md §4.2); on the guest it is the far end of a relay.
     upstream: PathBuf,
-    /// §35. The control region of the shared_vulkan session whose rings carry
+    /// §36. The control region of the shared_vulkan session whose rings carry
     /// the Wayland stream. When set, `--upstream` is not used at all and no
     /// socket, no TCP and no ssh is in the data path.
     ///
     /// A path rather than a cold-path endpoint, deliberately and for now: this
     /// is the region as `sv-hostd` or `sv-gpu-server` published it, and opening
-    /// it by name is what `Attach` would have told us to do anyway. The
-    /// cold-path handshake belongs here eventually — see §35.8 item 3 — and
-    /// putting it in before a client has driven a window through a ring would be
-    /// building the bring-up for a mechanism nobody has watched work.
+    /// it by name is what `Attach` would have told us to do anyway. §36.8.
     upstream_ring: Option<PathBuf>,
     runtime_dir: PathBuf,
     socket: String,
@@ -72,7 +69,7 @@ struct Args {
     /// **Off by default, and that is a decision rather than caution.** An arena
     /// that grew whenever it was tight would make [`Policy`] untestable — every
     /// measurement of how well runs are chosen would be contaminated by memory
-    /// that was added instead of used — and `docs/design.md` §20.4's matrix
+    /// that was added instead of used — and `docs/waycompose-design.md` §20.4's matrix
     /// compares policies at a fixed size. Growth is what happens after the
     /// allocator has already failed, and a run has to say it wants it.
     arena_grow: bool,
@@ -113,6 +110,11 @@ struct Args {
     /// is how this proxy runs on the VM host, gets systemd's environment and
     /// not a login shell's.
     icon_dirs: Vec<std::path::PathBuf>,
+    /// THE CLIPBOARD. Carry the clipboard across on a third connection
+    /// (`crate::clip`). Off, a client that copies or pastes gets nothing —
+    /// which is what the compositor did before this stage, minus the part
+    /// where the connection died.
+    clipboard: bool,
 }
 
 fn usage() -> &'static str {
@@ -121,7 +123,7 @@ usage: wc-proxy --upstream <path> [options]
 
   --upstream PATH        the compositor's AF_UNIX socket (required unless
                          --upstream-ring is given)
-  --upstream-ring PATH   §35: the shared_vulkan session's control region. Each
+  --upstream-ring PATH   §36: the shared_vulkan session's control region. Each
                          client claims a ring of RingKind::Wayland in it and the
                          bytes cross as shared memory -- no socket, no TCP and
                          no ssh in the data path. --upstream is then unused.
@@ -162,7 +164,7 @@ usage: wc-proxy --upstream <path> [options]
                          cannot tell a cold region from a paused video.
   --arena-policy KIND    arena: first-fit | best-fit    (default best-fit)
                          which run of free bytes a pool takes. best-fit is
-                         stage 16's, measured in docs/design.md 20.4; first-fit
+                         stage 16's, measured in docs/waycompose-design.md 20.4; first-fit
                          is stage 12's, kept so a live run can be compared
                          against the synthetic one without a rebuild.
 
@@ -176,6 +178,8 @@ usage: wc-proxy --upstream <path> [options]
 
   --icon-theme NAME      the icon theme to search before hicolor
                          (default $WC_ICON_THEME, else hicolor)
+  --no-clipboard         do not carry the clipboard: no third connection to the
+                         compositor, and copy and paste do nothing
   --no-icons             do not resolve app ids to icons at all: no second
                          connection to the compositor, no directory walk
   --icon-data-dir DIR    an extra XDG data directory to search first; may be
@@ -215,6 +219,7 @@ fn parse_args() -> Result<Args, String> {
         icons: true,
         icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
         icon_dirs: Vec::new(),
+        clipboard: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -258,6 +263,7 @@ fn parse_args() -> Result<Args, String> {
             "--trace" => a.trace = true,
             "--verify-damage" => a.verify = true,
             "--no-icons" => a.icons = false,
+            "--no-clipboard" => a.clipboard = false,
             "--icon-theme" => a.icon_theme = next()?,
             "--icon-data-dir" => a.icon_dirs.push(next()?.into()),
             "--pool-headroom" => {
@@ -346,7 +352,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // client exists, and each session gets a handle on the same region and the
     // same allocator (`Arena::share`). Stage 9 refused the second call by name —
     // one region, one allocator, no protocol for a second arena id
-    // (docs/design.md §12.13 item 6) — and that refusal was the reason Firefox,
+    // (docs/waycompose-design.md §12.13 item 6) — and that refusal was the reason Firefox,
     // which opens four connections, had never touched an arena (§15.14). The
     // premise was right and the conclusion was not: what must not be duplicated
     // is the *allocator*, and one allocator serves four connections for exactly
@@ -492,16 +498,16 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // real. Against a one-shot proxy the throwaway is the only connection that
     // is ever served; the real one finds a closed socket, and Firefox reports
     // `Wayland protocol error: Compositor () crashed` and dumps core. Measured,
-    // and it is docs/design.md §13.8.
+    // and it is docs/waycompose-design.md §13.8.
     //
     // Each client gets its **own upstream connection**, which is what a
     // compositor expects: object ids are per-connection, and multiplexing two
     // clients onto one would need an id-rewriting layer that this deliberately
     // is not (§9.3).
-    // §35. The session's control region, when the Wayland stream is riding
+    // §36. The session's control region, when the Wayland stream is riding
     // shared_vulkan's rings. Attached once for the whole proxy and shared by
     // every client thread, because the *region* is one session — it is the
-    // *rings* that are per connection, which is the distinction §35.3 is about.
+    // *rings* that are per connection, which is the distinction §36.3 is about.
     let ring: Option<std::sync::Arc<sv_transport::control::Control>> = match &args.upstream_ring {
         None => None,
         Some(path) => {
@@ -554,48 +560,67 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // being accepted into a proxy with nowhere to forward to; that is still
         // true and is now handled by failing the connection immediately, which
         // is a closed socket at the same moment either way.
-        // §35. A ring claim is this connection's `connect()`: it is a CAS on the
-        // ring directory of the session's control region, and the compositor's
-        // poll of that directory is the matching `accept()`. Nothing is
-        // negotiated and nothing rides the cold path, because the directory is
-        // inside the region the cold path already located.
+        //
+        // **Retried on `ECONNREFUSED`, for the reason `wc-wlcs` retries.** `bind`
+        // creates the filesystem node and `listen` makes it accept; between the
+        // two, `connect` is refused. Every harness that starts a compositor and
+        // then a proxy waits for the *node*, which does not close that window,
+        // and the symptom is one leg of a run failing with "cannot reach the
+        // compositor" while an identical tree passes — a red that is not a
+        // regression, which teaches everyone to re-run until green.
+        //
+        // Bounded and reported: the retry is printed, so a run that needed it
+        // says so rather than hiding a slow compositor behind a pass. A refusal
+        // that outlives the deadline is still a failure, because a compositor
+        // that is not listening after five seconds is not a race.
+        //
+        // §36. On a ring there is nothing to refuse and nothing to race: a
+        // connection is a CAS on the ring directory of a control region that is
+        // already mapped. The `bind`/`listen` window this grace exists for is a
+        // property of sockets, and a ring has no equivalent — which is one small
+        // way the design is simpler than the thing it replaces.
         let upstream = match ring.as_ref() {
-            Some(control) => {
-                match sv_transport::wlbytes::ByteChannel::claim(control, n as u64) {
-                    Ok(ch) => {
+            Some(control) => match sv_transport::wlbytes::ByteChannel::claim(control, n as u64) {
+                Ok(ch) => {
+                    println!(
+                        "[proxy] client {n} connected, upstream ring slot {} \
+                         (no socket, no TCP, no ssh)",
+                        ch.slot()
+                    );
+                    proxy::Upstream::Ring(Box::new(ch))
+                }
+                Err(e) => {
+                    println!("[proxy] client {n}: no free Wayland ring: {e}");
+                    continue;
+                }
+            },
+            None => {
+                match proxy::connect_upstream(&args.upstream, |refusals, ms| {
+                    println!(
+                        "[proxy] client {n}: the compositor refused {refusals} connect(s) over \
+                         {ms:.0} ms before it was listening"
+                    );
+                }) {
+                    Ok(u) => {
                         println!(
-                            "[proxy] client {n} connected, upstream ring slot {} \
-                             (no socket, no TCP, no ssh)",
-                            ch.slot()
+                            "[proxy] client {n} connected, upstream {} connected",
+                            args.upstream.display()
                         );
-                        proxy::Upstream::Ring(Box::new(ch))
+                        proxy::Upstream::Socket(u)
                     }
                     Err(e) => {
-                        println!("[proxy] client {n}: no free Wayland ring: {e}");
+                        println!(
+                            "[proxy] client {n}: cannot reach the compositor at {}: {e}",
+                            args.upstream.display()
+                        );
                         continue;
                     }
                 }
             }
-            None => match std::os::unix::net::UnixStream::connect(&args.upstream) {
-                Ok(u) => {
-                    println!(
-                        "[proxy] client {n} connected, upstream {} connected",
-                        args.upstream.display()
-                    );
-                    proxy::Upstream::Socket(u)
-                }
-                Err(e) => {
-                    println!(
-                        "[proxy] client {n}: cannot reach the compositor at {}: {e}",
-                        args.upstream.display()
-                    );
-                    continue;
-                }
-            },
         };
 
         // A transport per session: a fresh `SharedFile`, or a handle on the one
-        // arena. docs/design.md §16.2.
+        // arena. docs/waycompose-design.md §16.2.
         let transport = match make_transport(n) {
             Ok(t) => t,
             Err(e) => {
@@ -628,6 +653,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .map(wc_proxy::icons::dirs_for_pid)
             .unwrap_or_default();
         let extra_dirs = args.icon_dirs.clone();
+        let want_clipboard = args.clipboard;
         threads.push(std::thread::spawn(move || {
             // The `+ Send` is only needed to cross this boundary; `Session`
             // itself has no opinion, and widening its signature would push the
@@ -660,15 +686,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 // is cosmetic: a compositor too old to have the global, or a
                 // socket that will not take a second connection, must cost a
                 // picture rather than a window.
+                //
+                // §36: on a ring upstream this would be a *second* ring claim,
+                // which is right and is not built. Said out loud rather than
+                // skipped silently, because a generic icon looks like a bug in
+                // the icon code.
                 if on_ring {
-                    // §35. The icon feed is a *second* connection to the
-                    // compositor (`iconlink`, and §16.7's argument for why it
-                    // cannot ride the first), so on the ring it would be a
-                    // second ring claim — which is right, and is not built. It
-                    // is said out loud rather than silently skipped because a
-                    // generic icon looks like a bug in the icon code.
                     println!(
-                        "[proxy] client {n}: no icon feed on the ring upstream (§35.8); \
+                        "[proxy] client {n}: no icon feed on the ring upstream (§36.8); \
                          icons will be generic"
                     );
                     None
@@ -686,11 +711,49 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            // THE CLIPBOARD. The byte path's byte path, one per served connection
+            // and for the same reasons the icon feed is per connection: the
+            // state is per client, a feed that fails takes only its own
+            // client's clipboard with it, and a socket is cheap.
+            //
+            // **A separate connection from the icon feed on purpose.**
+            // `--no-icons` exists, and an icon resolver that cannot reach the
+            // theme must not be the reason copy and paste stop working.
+            let mut clip = if want_clipboard && !on_ring {
+                match wc_proxy::clip::ClipLink::connect(&upstream_path, &spec) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!(
+                            "[proxy] client {n}: no clipboard feed ({e}); copy and paste will \
+                             do nothing rather than failing"
+                        );
+                        None
+                    }
+                }
+            } else {
+                if want_clipboard {
+                    // §36.8, same as the icon feed: a third connection to the
+                    // compositor is a third ring claim, and it is not built.
+                    println!(
+                        "[proxy] client {n}: no clipboard feed on the ring upstream (§36.8); \
+                         copy and paste will do nothing rather than failing"
+                    );
+                }
+                None
+            };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
             session.set_verify(verify);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
-            match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
+            match proxy::pump(
+                &mut session,
+                client,
+                upstream,
+                icons.as_mut(),
+                clip.as_mut(),
+                idle,
+                &mut log,
+            ) {
                 Ok(why) => println!("[proxy] client {n} stopped: {why}"),
                 Err(e) => println!("[proxy] client {n} failed: {e}"),
             }
@@ -700,6 +763,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 println!("[proxy] client {n} {m}");
             }
             if let Some(link) = &icons {
+                println!("[proxy] client {n} {}", link.summary());
+            }
+            if let Some(link) = &clip {
                 println!("[proxy] client {n} {}", link.summary());
             }
         }));

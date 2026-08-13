@@ -9,7 +9,7 @@
 //!
 //! # Why this exists
 //!
-//! docs/design.md §9.11 item 2 asks what `SharedFile` costs per pool across the
+//! docs/waycompose-design.md §9.11 item 2 asks what `SharedFile` costs per pool across the
 //! hypervisor boundary against `ArenaSlice`'s arithmetic, and calls it "the
 //! measurement that turns a preference into a decision". §9.5 had already
 //! observed that on one machine the two are indistinguishable — both end in a
@@ -75,7 +75,7 @@ mod imp {
         guest_arena: Option<u64>,
         /// `offset:seconds` — after the arena exists, hold a live mapping and
         /// watch these 32 bytes for the host's write. The live half of the
-        /// coherency measurement docs/design.md §10.3 made against a file.
+        /// coherency measurement docs/waycompose-design.md §10.3 made against a file.
         watch: Option<(u64, u64)>,
         /// `offset:text` — write this once the watch fires, so the host can
         /// measure the other direction while this process still holds the
@@ -523,7 +523,7 @@ usage: wc-poolcost [options]
         // The same measurement over the region the shipping deployment
         // actually has. Everything above this point maps *somebody else's*
         // object; this commits guest RAM and pins it, which is the substrate
-        // docs/design.md §10.13 item 1 exists to install. The per-pool numbers
+        // docs/waycompose-design.md §10.13 item 1 exists to install. The per-pool numbers
         // should be indistinguishable from the file-backed arena's — the work
         // per pool is a registry lookup either way — and the interesting column
         // is `touch`, which no longer crosses a filesystem daemon.

@@ -14,7 +14,32 @@
 # It also reports `glxgears`. A microbenchmark that improves while glxgears does
 # not is not an improvement, and glxgears is the one number here that comes from
 # a program nobody wrote for this project.
+#
+# **THIS FILE IS AN INSTRUMENT, NOT A GATE, AND §31 MAKES THAT EXPLICIT RATHER
+# THAN IMPLICIT.**
+#
+# Every headline number here — microseconds a call, the forwarded/native ratio,
+# frames a second — is a *rate*, measured on a shared machine whose GPU other
+# people are using. §0.13 retracted a headline for measuring Xvfb, and the
+# lesson §31 draws from that is not "assert on the rate anyway" but "say which
+# numbers a harness has an opinion about". This one has an opinion about
+# exactly two things, and they are both properties of the code rather than of
+# the load:
+#
+#   * every measurement it prints was actually produced — a benchmark that
+#     silently measured nothing is worse than one that failed;
+#   * forwarded glxgears beats **llvmpipe**. Mesa's fallback to software is
+#     silent and reports GL 4.6 while doing it (`sv-guest-host.sh` names the
+#     same trap), so "a number came out" does not mean a GPU produced it. An
+#     order of magnitude separates the two, so this is a bound no amount of
+#     load can cross.
+#
+# Everything else is printed for a person to read, and that is now a stated
+# decision rather than an omission. It used to have no `ok`/`bad` at all and
+# exited 0 whatever it measured.
 set -uo pipefail
+
+fail=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The other harnesses hard-code `target/debug` and this one follows them by
@@ -121,8 +146,24 @@ else
     LIBGL_KOPPER_DRI2=1 vblank_mode=0
   run_gears soft env LIBGL_ALWAYS_SOFTWARE=1 vblank_mode=0
 
-  printf "  shared_vulkan : %s FPS\n" "$(gears_fps "$RUNDIR/sv.log")"
-  printf "  zink on RADV  : %s FPS\n" "$(gears_fps "$RUNDIR/zink.log")"
-  printf "  llvmpipe      : %s FPS\n" "$(gears_fps "$RUNDIR/soft.log")"
+  SV_FPS=$(gears_fps "$RUNDIR/sv.log")
+  ZINK_FPS=$(gears_fps "$RUNDIR/zink.log")
+  SOFT_FPS=$(gears_fps "$RUNDIR/soft.log")
+  printf "  shared_vulkan : %s FPS\n" "$SV_FPS"
+  printf "  zink on RADV  : %s FPS\n" "$ZINK_FPS"
+  printf "  llvmpipe      : %s FPS\n" "$SOFT_FPS"
   kill "$XPID" 2>/dev/null; wait "$XPID" 2>/dev/null
+
+  # See the header: the rates are informational. These two are not.
+  if [ -z "$SV_FPS" ] || [ -z "$ZINK_FPS" ] || [ -z "$SOFT_FPS" ]; then
+    echo "  FAIL one of the three glxgears runs produced no FPS line; there is no comparison here"
+    fail=1
+  elif awk -v s="$SV_FPS" -v l="$SOFT_FPS" 'BEGIN { exit !(s > l) }'; then
+    echo "  ok   forwarded glxgears beats llvmpipe ($SV_FPS vs $SOFT_FPS FPS) — a real device is on the other end"
+  else
+    echo "  FAIL forwarded glxgears ($SV_FPS FPS) does not beat llvmpipe ($SOFT_FPS FPS); this is software rendering wearing a GPU's name"
+    fail=1
+  fi
 fi
+
+exit "$fail"

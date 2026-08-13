@@ -6,7 +6,7 @@
 //! created it, and the pump is a blocking `GetMessage` loop. The Wayland side
 //! is a `poll`-shaped dispatch loop that on Windows cannot be nested inside
 //! `calloop`, because `Backend::poll_fd()` returns a wepoll handle and a wepoll
-//! handle is not a socket (docs/design.md §3.3). Two blocking loops, neither of
+//! handle is not a socket (docs/waycompose-design.md §3.3). Two blocking loops, neither of
 //! which can host the other, is two threads; that was settled in stage 1 and
 //! this stage is where it has to be built.
 //!
@@ -55,6 +55,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::surface::{Rect, Shadow};
 
+#[cfg(windows)]
+mod drag;
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
@@ -170,7 +172,7 @@ pub enum Edge {
 ///
 /// Stage 11 is where something started sending it: `xdg-toplevel-icon-v1` from
 /// a client that implements it, or `wc_icon_manager_v1` from a resolver on the
-/// Linux side for one that does not (docs/design.md §15).
+/// Linux side for one that does not (docs/waycompose-design.md §15).
 #[derive(Clone, Debug)]
 pub struct IconImage {
     pub width: i32,
@@ -181,7 +183,7 @@ pub struct IconImage {
 
 /// What the pointer should look like.
 ///
-/// ADDED FOR STAGE 12 (docs/design.md §23). One message for both halves of the
+/// ADDED FOR STAGE 12 (docs/waycompose-design.md §23). One message for both halves of the
 /// protocol, because Win32 has one mechanism: `wl_pointer.set_cursor` sends a
 /// surface and `wp_cursor_shape_v1.set_shape` sends a name, and both end as a
 /// single `SetCursor` with a single `HCURSOR`.
@@ -245,16 +247,36 @@ pub enum ToUi {
         id: WindowId,
         title: String,
         app_id: String,
+        /// Which taskbar button this window belongs on. ADDED FOR STAGE 32;
+        /// see [`ToUi::AppId`] and `crate::taskbar`.
+        aumid: String,
         shadow: Arc<Mutex<Shadow>>,
         kind: WindowKind,
     },
     /// `xdg_toplevel.set_title`.
     Title { id: WindowId, title: String },
-    /// `xdg_toplevel.set_app_id`. Not used for anything on the platform side;
-    /// recorded so the window knows what it is, and so the Wayland side can
-    /// match it against an icon somebody published for that app id
-    /// (`crate::icon`).
-    AppId { id: WindowId, app_id: String },
+    /// `xdg_toplevel.set_app_id`, and what the platform is to do about it.
+    ///
+    /// The app id itself is recorded so the window knows what it is; the
+    /// **`aumid`** is `crate::taskbar::identity` of it, and it is what the
+    /// Windows shell groups taskbar buttons by. ADDED FOR STAGE 32, which is
+    /// where this message stopped being informational: before it, every window
+    /// this process made shared one button, because a window with no identity
+    /// of its own inherits the *process*'s.
+    ///
+    /// The two are carried together rather than one being derived from the
+    /// other at this end, because the derivation needs something the platform
+    /// does not have — which connection a nameless client arrived on.
+    ///
+    /// **Ordering matters.** The shell reads the property when the button is
+    /// created, which is at `ShowWindow`, so this has to reach a window before
+    /// [`ToUi::Map`] does. `set_app_id` may arrive later than that anyway, and
+    /// then the button already exists; see `win32::set_taskbar_identity`.
+    AppId {
+        id: WindowId,
+        app_id: String,
+        aumid: String,
+    },
     /// Set the window and taskbar icon.
     ///
     /// **A set of sizes, not an image.** Windows asks for two — `ICON_SMALL`
@@ -343,9 +365,89 @@ pub enum ToUi {
     /// `win32::activate_window` for exactly when it is allowed to succeed and
     /// what happens when it is not.
     Activate { id: WindowId },
+    // --- the clipboard, §29 -------------------------------------------
+    //
+    // Bytes, in both directions, and **never a descriptor**. That is the whole
+    // shape of the clipboard feature and it is visible here: `wl_data_offer.
+    // receive` hands a compositor a pipe to write into, and there is no pipe
+    // between a Wayland client on Linux and a compositor in a VM, so the
+    // transfer is terminated in wc-proxy and only the payload crosses. By the
+    // time it reaches this queue it is a `Vec<u8>` with a mime type on it.
+    //
+    /// Replace the system clipboard's contents.
+    ///
+    /// One payload per mime type, already in the client's own encoding. The
+    /// conversion to `CF_UNICODETEXT` and friends is `crate::clipboard`'s, so
+    /// that it is unit-tested on the machine that runs `cargo test`; what
+    /// crosses here is what the Wayland client said.
+    SetClipboard { payloads: Vec<(String, Vec<u8>)> },
+    /// Read the system clipboard — or the drag currently over a window — and
+    /// answer with [`FromUi::ClipboardData`].
+    ///
+    /// **Asynchronous, and it has to be.** The clipboard can only be read on
+    /// the thread that owns a window, and the Wayland thread does not own one;
+    /// a synchronous call would be the Wayland thread blocking on the UI
+    /// thread, which is the deadlock this file's whole design avoids.
+    FetchClipboard {
+        token: u64,
+        /// Read the drag in progress rather than the clipboard. Two sources,
+        /// because Windows keeps them apart and reading the wrong one is how a
+        /// paste picks up the last thing dragged.
+        from_drag: bool,
+        mime: String,
+    },
+    /// Begin a system drag carrying these payloads.
+    ///
+    /// The same bytes a [`ToUi::SetClipboard`] would carry, staged the same
+    /// way, because a drag's data and a selection's data are the same thing
+    /// with a different gesture attached. Answered exactly once with
+    /// [`FromUi::DragFinished`].
+    StartDrag {
+        payloads: Vec<(String, Vec<u8>)>,
+        /// `wl_data_device_manager.dnd_action` bits the source permits.
+        actions: u32,
+    },
+    /// The Wayland source withdrew its drag.
+    CancelDrag,
 
     /// End the pump.
     Quit,
+}
+
+/// `wl_data_device_manager.dnd_action`, which both sides of the boundary speak.
+///
+/// Wayland's numbering rather than `DROPEFFECT`'s, because the Wayland client
+/// is the one that has to understand it and the platform is the one that has to
+/// convert — the same rule that puts evdev keycodes rather than virtual-key
+/// codes in [`FromUi::Key`].
+pub mod dnd_action {
+    pub const NONE: u32 = 0;
+    pub const COPY: u32 = 1;
+    pub const MOVE: u32 = 2;
+    pub const ASK: u32 = 4;
+
+    /// The bits by name, for a log.
+    ///
+    /// Worth a function rather than `{actions:#x}`: the two vocabularies either
+    /// side of this boundary use the *same numbers for different things* —
+    /// `ask` is 4 here and `DROPEFFECT_LINK` is 4 on Win32 — so a trace that
+    /// prints only the number is a trace in which the one mistake that matters
+    /// is invisible. See `drag::to_dropeffect`.
+    pub fn describe(actions: u32) -> String {
+        if actions == NONE {
+            return "none".to_owned();
+        }
+        let mut out = Vec::new();
+        for (bit, name) in [(COPY, "copy"), (MOVE, "move"), (ASK, "ask")] {
+            if actions & bit != 0 {
+                out.push(name);
+            }
+        }
+        if out.is_empty() {
+            return format!("unknown ({actions:#x})");
+        }
+        out.join("|")
+    }
 }
 
 /// UI thread -> Wayland thread.
@@ -448,6 +550,25 @@ pub enum FromUi {
     /// of `crate::input::LAYOUTS`.
     Layout { name: &'static str },
 
+    // --- the clipboard, §29 -------------------------------------------
+    /// The system clipboard changed, and now holds these mime types.
+    ///
+    /// On Win32 this is `WM_CLIPBOARDUPDATE`, which arrives for **every**
+    /// change including this compositor's own — see the note in
+    /// `win32.rs::on_clipboard_update` for why that echo is kept rather than
+    /// filtered, and what breaks if it is not.
+    ClipboardChanged { mimes: Vec<String> },
+    /// The answer to a [`ToUi::FetchClipboard`]. `None` is "the clipboard has
+    /// nothing convertible to that mime type", which is an ordinary outcome
+    /// rather than an error: the user copied a bitmap and the client wanted
+    /// text.
+    ClipboardData { token: u64, data: Option<Vec<u8>> },
+    /// A drag started with [`ToUi::StartDrag`] has ended, with the action the
+    /// drop target actually took. Exactly one per `StartDrag`, on every path
+    /// including "the drag could not be started" — a client waiting forever on
+    /// a drag that never ends is the failure this whole feature exists not to
+    /// build.
+    DragFinished { action: u32 },
     // --- touch, stage 20 ---------------------------------------------------
     //
     // Already in Wayland's units, like everything above: surface-local

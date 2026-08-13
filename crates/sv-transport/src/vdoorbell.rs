@@ -43,7 +43,7 @@
 //! arriving byte into an ordinary same-kernel [`Bell::ring_local`] — and every
 //! existing waiter is woken by the mechanism it already uses, with **not one
 //! call site changed**. `session::serve`'s drain threads, the ICD's
-//! `Transport::call`, and §35's Wayland rings all benefit without knowing this
+//! `Transport::call`, and §36's Wayland rings all benefit without knowing this
 //! module exists.
 //!
 //! # Framing: there is none, and that is deliberate

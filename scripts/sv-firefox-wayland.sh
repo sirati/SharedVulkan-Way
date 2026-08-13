@@ -29,6 +29,7 @@ RUN=$(mktemp -d /tmp/svwl-XXXXXX)
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
 DPPX=${SVWL_DPPX:-0.4}
+XDISPLAY=${SVWL_XDISPLAY:-:78}
 # This machine has Mesa and its ICDs in `/run/opengl-driver` but no
 # `libvulkan.so.1` on the default search path, so both the GPU side and Zink
 # fail to find a loader at all. Named rather than searched for, because a
@@ -107,17 +108,35 @@ if [ "$MODE" = probe ]; then
 fi
 
 if [ "$MODE" = x11 ]; then
+  # **Reap this display number first.** An Xwayland outlives the harness that
+  # started it whenever the run does not reach its teardown, and the next run
+  # then connects to a server whose compositor is gone: the X client gets a
+  # swapchain, presents once, and kopper polls the surface forever. That looks
+  # exactly like the stall this mode exists to measure, and it cost two
+  # measurements here before it was recognised.
+  #
+  # **`pkill -f` is not usable for this** and the reason is `waycompose-design.md`
+  # §16.8 a third time: the pattern would have to contain the display number,
+  # and the command line it matches against includes *this script's own*, which
+  # also contains it. The script kills itself, exit 143, and the run reports
+  # nothing at all. A process **name** is an identity `pgrep -x` matches
+  # exactly and can never match a shell; the display number then comes from
+  # that process's own argv rather than from a pattern over every process.
+  for p in $(pgrep -x Xwayland 2>/dev/null); do
+    tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- " $XDISPLAY " && kill "$p"
+  done
+  sleep 1
   # Xwayland on top of the shm-only weston, and Firefox on X11 inside it. The
   # X server gets a *clean* GL environment — it is itself a GL program and an X
   # server that cannot initialise its own GL offers no fbconfig to anybody.
   say "rootful Xwayland on the shm-only weston, then Firefox on X11"
   env -u GALLIUM_DRIVER -u MESA_LOADER_DRIVER_OVERRIDE -u VK_DRIVER_FILES \
       -u SV_SOCKET -u EGL_PLATFORM LIBGL_ALWAYS_SOFTWARE=1 \
-    Xwayland :78 -geometry 1600x1000 -noreset >"$RUN/xwayland.log" 2>&1 &
+    Xwayland $XDISPLAY -geometry 1600x1000 -noreset >"$RUN/xwayland.log" 2>&1 &
   KIDS+=($!)
-  for _ in $(seq 1 60); do [ -S /tmp/.X11-unix/X78 ] && break; sleep 0.5; done
-  [ -S /tmp/.X11-unix/X78 ] || { echo "FAIL: Xwayland never listened"; tail -5 "$RUN/xwayland.log"; exit 1; }
-  export DISPLAY=:78 EGL_PLATFORM=x11 MOZ_ENABLE_WAYLAND=0 GDK_BACKEND=x11
+  for _ in $(seq 1 60); do [ -S "/tmp/.X11-unix/X${XDISPLAY#:}" ] && break; sleep 0.5; done
+  [ -S "/tmp/.X11-unix/X${XDISPLAY#:}" ] || { echo "FAIL: Xwayland never listened"; tail -5 "$RUN/xwayland.log"; exit 1; }
+  export DISPLAY=$XDISPLAY EGL_PLATFORM=x11 MOZ_ENABLE_WAYLAND=0 GDK_BACKEND=x11
   # **The override this whole mode exists to test.** `platform_x11.c` refuses
   # Zink outright when the X server has no DRI3 multibuffer support — which an
   # Xwayland with no DRM device never has — *unless* `LIBGL_KOPPER_DRI2` is
@@ -151,3 +170,55 @@ grep -iE "GFX1|EGL|webrender|sv-icd|zink" "$RUN/ff.log" | head -30 | sed 's/^/  
 say "---- the GPU side ----"; grep -iE "attached|serving" "$RUN/gpu.log" | head -6 | sed 's/^/  /'
 say "---- screenshots ----"; ls -la "$RUN/shots" 2>/dev/null | tail -3
 echo "run dir: $RUN"
+
+# ------------------------------------------------------------------ verdict --
+# **§35. This script had no `ok`, no `bad`, no scoreboard and no exit code.**
+#
+# It started weston, `sv-gpu-server` and Firefox, waited, grepped four logs and
+# dumped them — and then exited with whatever the `ls -la` above returned, which
+# is 0 whenever the directory exists. `wait $FF` discards Firefox's own status on
+# the line before. So the run could not fail: every number that would let anyone
+# judge it was printed for a human to read, which is the maximal form of the
+# defect §35 is about, and the one that is easiest to miss because there is no
+# `ok` call to look wrong.
+#
+# Three things are asserted, and all three are properties of the code rather
+# than of the machine — no timing, no rate, nothing this contended box can move:
+#
+#  * **the GPU side served the session.** Without it Firefox reached no device
+#    through us and everything below is about something else.
+#  * **WebRender is on the GPU.** Firefox's `GFX1` lines are how it reports
+#    falling back, and the whole point of this file is the difference between
+#    accelerated and not. A fallback is silent in every other respect.
+#  * **a screenshot exists and is not empty.** The screenshooter timing out
+#    leaves the directory in place, which is exactly what the old exit status
+#    was reading as success.
+fail=0
+ok()  { echo "  ok   $*"; }
+bad() { echo "  FAIL $*"; fail=1; }
+say "---- the verdict ----"
+
+if grep -qiE "attached|serving" "$RUN/gpu.log" 2>/dev/null; then
+  ok "the GPU side attached and served the session"
+else
+  bad "the GPU side never reported a session; Firefox did not reach a device through us"
+fi
+
+if grep -qiE "GFX1.*(fail|error|disabl|blocklist|blacklist)" "$RUN/ff.log" 2>/dev/null; then
+  bad "Firefox reported a GFX1 failure and fell back; the run measured software"
+  grep -iE "GFX1.*(fail|error|disabl|blocklist|blacklist)" "$RUN/ff.log" | head -3 | sed 's/^/        /'
+elif grep -qiE "webrender" "$RUN/ff.log" 2>/dev/null; then
+  ok "Firefox composited with WebRender and reported no GFX1 failure"
+else
+  bad "Firefox said nothing about WebRender either way; there is no evidence here to judge"
+fi
+
+shot=$(find "$RUN/shots" -type f -size +1k 2>/dev/null | head -1)
+if [ -n "$shot" ]; then
+  ok "a screenshot came back: $(basename "$shot"), $(wc -c <"$shot") bytes"
+else
+  bad "no screenshot over 1 KiB in $RUN/shots -- weston-screenshooter produced nothing"
+fi
+
+[ "$fail" -eq 0 ] && say "sv-firefox-wayland: PASS" || say "sv-firefox-wayland: FAIL"
+exit "$fail"

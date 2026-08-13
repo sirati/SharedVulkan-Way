@@ -7,7 +7,7 @@
 //!   `SCM_RIGHTS` control message, matched positionally across the stream.
 //! * **ours**, which the Windows compositor speaks: an `h` argument is encoded
 //!   exactly like an `array` — a `u32` length, the bytes, padded to 4 — and
-//!   there is no control message at all (docs/design.md §2.3).
+//!   there is no control message at all (docs/waycompose-design.md §2.3).
 //!
 //! Everything else about the two is identical, byte for byte, which is what
 //! makes a translating proxy a matter of splicing rather than of re-encoding.
@@ -20,7 +20,7 @@
 //! The wire format is native-endian because a Unix socket cannot cross an
 //! endianness boundary and the protocol takes advantage. The *descriptor*
 //! spliced into it is little-endian, because it may cross a proxy — which is
-//! precisely this program. docs/design.md §2.3 predicted that this is where
+//! precisely this program. docs/waycompose-design.md §2.3 predicted that this is where
 //! that decision would be cashed in, and it is: `wc_handle::Descriptor::encode`
 //! writes little-endian bytes and this module carries them without looking
 //! inside.
@@ -33,7 +33,7 @@ pub enum FdEncoding {
     /// libwayland: zero bytes, the descriptor is out of band. What the local
     /// client writes and what it expects to read.
     OutOfBand,
-    /// docs/design.md §2.3: `array`-shaped, in the body. What the Windows
+    /// docs/waycompose-design.md §2.3: `array`-shaped, in the body. What the Windows
     /// compositor writes and what it expects to read.
     InBand,
 }
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(word_at(&ours, &spans2[2]), Some(4096));
     }
 
-    /// The class of bug docs/design.md §8.9 names: a length that is not a
+    /// The class of bug docs/waycompose-design.md §8.9 names: a length that is not a
     /// multiple of 4 must still land the next argument on a boundary. Every
     /// length mod 4, as `wc-shmclient`'s tests do for the same reason.
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         //
         // It moved from 354 to 376 in stage 9, when the two decoration
         // protocols were added — eleven messages between them, and the reason
-        // is docs/design.md §13.7: the compositor advertises both to find out
+        // is docs/waycompose-design.md §13.7: the compositor advertises both to find out
         // which one Firefox uses, and a global that is advertised can be bound.
         //
         // 376 to 426 in stage 21, for four protocols and the same reason
@@ -533,7 +533,7 @@ mod tests {
         // than a missing feature.
         //
         // 426 to 436 in stage 12, when `wp_cursor_shape_v1` was added
-        // (docs/design.md §23): five requests — `destroy`, `get_pointer` and
+        // (docs/waycompose-design.md §23): five requests — `destroy`, `get_pointer` and
         // `get_tablet_tool_v2` on the manager, `destroy` and `set_shape` on the
         // device — and no events at all, which is what a protocol that only
         // ever tells the compositor something looks like.

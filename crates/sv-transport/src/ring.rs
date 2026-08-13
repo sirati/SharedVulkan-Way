@@ -107,7 +107,7 @@ const FLAG_PAD_MASK: u16 = 0x0F00;
 ///
 /// # Why a third kind exists, and why it is not a second ring
 ///
-/// waycompose-design.md §35 moves the Wayland connection off TCP and onto this
+/// waycompose-design.md §36 moves the Wayland connection off TCP and onto this
 /// ring. A Wayland connection is an **opaque byte stream**: the bytes are a
 /// wayland-protocol message stream, and nothing in this crate parses them or is
 /// allowed to. That collides with exactly one thing above — the deviation-1

@@ -4,7 +4,7 @@
 //!
 //! # The problem this exists to solve, stated exactly
 //!
-//! docs/design.md §2.3 made `h` arguments in-band on Windows, because Windows
+//! docs/waycompose-design.md §2.3 made `h` arguments in-band on Windows, because Windows
 //! AF_UNIX carries no ancillary data and `DuplicateHandle` would mean a
 //! compositor holding `PROCESS_DUP_HANDLE` over every client. That decision is
 //! right and it has one consequence, measured twice independently (§7.5, §7.8,
@@ -52,7 +52,7 @@
 //! | [`proxy`] | the sockets and the pump | nothing |
 //!
 //! Everything above `proxy` is free of I/O, which is deliberate and is the same
-//! structure stage 3 gave `wc-shmclient` for the same reason (docs/design.md
+//! structure stage 3 gave `wc-shmclient` for the same reason (docs/waycompose-design.md
 //! §8.9): the encoding is the part most likely to be quietly wrong, and a bug
 //! in it presents as §2.4's silent desynchronisation rather than as an error.
 
@@ -66,6 +66,12 @@
 //! library on the Windows target rather than to a second implementation of
 //! something with no reason to exist there.
 
+/// THE CLIPBOARD. The byte path's byte path: a third connection to the compositor,
+/// because `wl_data_offer.receive` hands over a pipe and no descriptor may
+/// cross the boundary. Unix-only for the same reason `iconlink` is — it is a
+/// Wayland client of the far end and only the host side has one.
+#[cfg(unix)]
+pub mod clip;
 #[cfg(unix)]
 pub mod guestram;
 #[cfg(unix)]
