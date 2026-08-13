@@ -59,6 +59,8 @@ pub mod ring;
 pub mod stream;
 pub mod winpipe;
 pub mod winshm;
+/// The Wayland byte stream, on the same rings as everything else (§35).
+pub mod wlbytes;
 
 use core::fmt;
 
