@@ -122,7 +122,7 @@ use smithay::{
 
 use crate::platform::{CursorSpec, Edge, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
 use crate::surface::{
-    decorator, Decorator, PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource,
+    bars, decorator, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource,
 };
 
 /// Which decoration mode the compositor advertises, and answers with.
@@ -143,9 +143,21 @@ pub enum Decorations {
     /// Windows draws the caption; the client draws none. **The default.**
     #[default]
     Server,
-    /// The client draws its own title bar, and the Win32 side is expected to
-    /// extend the frame into it (`FrameStyle::extend_top`).
+    /// The client draws its own title bar, and Windows draws its caption above
+    /// it. This is the two-title-bar arrangement every stage before 17 shipped,
+    /// kept as a flag because it is the control leg every claim about the other
+    /// two is measured against.
     Client,
+    /// ADDED FOR TABS IN THE TITLE BAR. The client draws its own title bar **and the system
+    /// caption is folded into the client area** (`FrameStyle::extend_top`), so
+    /// the client's tab strip is inside the window's own frame rather than
+    /// below it.
+    ///
+    /// On the wire this is `Client` — it has to be, because the tab strip only
+    /// exists when the client is decorating itself, and the one lever that
+    /// decides that is the manager's `default_mode` (§22.2). The difference is
+    /// entirely on the Win32 side, and it is `WM_NCCALCSIZE`.
+    Tabs,
 }
 
 impl Decorations {
@@ -154,8 +166,14 @@ impl Decorations {
         match s {
             "server" => Some(Self::Server),
             "client" => Some(Self::Client),
+            "tabs" => Some(Self::Tabs),
             _ => None,
         }
+    }
+
+    /// Whether the Win32 side should fold the caption into the client area.
+    pub fn extends_frame(self) -> bool {
+        matches!(self, Self::Tabs)
     }
 
     /// The KDE protocol's spelling, which is the one that decides GTK's
@@ -165,7 +183,11 @@ impl Decorations {
     fn kde(self) -> KdeDefaultMode {
         match self {
             Self::Server => KdeDefaultMode::Server,
-            Self::Client => KdeDefaultMode::Client,
+            // `Tabs` is `Client` here, and that is the whole reason it is not a
+            // third value on the wire: the tab strip this arrangement puts in
+            // the caption is drawn by the client, and it only exists at all
+            // when the manager's default says `Client`.
+            Self::Client | Self::Tabs => KdeDefaultMode::Client,
         }
     }
 
@@ -174,7 +196,7 @@ impl Decorations {
     fn xdg(self) -> DecorationMode {
         match self {
             Self::Server => DecorationMode::ServerSide,
-            Self::Client => DecorationMode::ClientSide,
+            Self::Client | Self::Tabs => DecorationMode::ClientSide,
         }
     }
 }
@@ -2083,26 +2105,45 @@ impl State {
         });
         let negotiated = self.negotiated_decoration.contains(root);
         let who = decorator(inset, negotiated);
+        // The verdict is the pair. See [`crate::surface::bars`]: §31's fold
+        // reverses which of these two clients is the correct one, so a message
+        // that named "two title bars" from `who` alone was right only while the
+        // caption was never folded — which was true when §33 was written and
+        // stopped being true when §31 merged.
+        let folded = self.decorations.extends_frame();
         let app = if app_id.is_empty() { "<no app id>" } else { app_id };
-        match who {
-            Decorator::Negotiated => println!(
+        match bars(who, folded) {
+            Bars::Agreed => println!(
                 "wc-compositor: window {id} ({app}) negotiated its decorations; \
                  geometry inset {},{}",
                 inset.0, inset.1
             ),
-            Decorator::ProbablySystem => println!(
+            Bars::OneSystem => println!(
                 "wc-compositor: window {id} ({app}) bound no decoration protocol and has no \
                  margin around its window; Windows' caption is the only title bar"
             ),
-            // The one that is a defect report. Named as one, because the
+            Bars::OneClient => println!(
+                "wc-compositor: window {id} ({app}) draws its own title bar and this run folds \
+                 the caption into the client area ({:?}), so that bar is the window's -- \
+                 geometry inset {},{} (§31, §33.7)",
+                self.decorations, inset.0, inset.1
+            ),
+            // The two that are defect reports. Named as such, because the
             // compositor is telling the truth about a window the user is about
-            // to find wrong, and a line that reads like the other two would be
+            // to find wrong, and a line that read like the other two would be
             // read like the other two.
-            Decorator::ProbablyItself => println!(
+            Bars::Two => println!(
                 "wc-compositor: window {id} ({app}) bound no decoration protocol and reports a \
                  {},{} margin around its window -- it is drawing its own title bar and did not \
                  read our default of {:?}, so THIS WINDOW HAS TWO TITLE BARS (§33)",
                 inset.0, inset.1, self.decorations
+            ),
+            Bars::None => println!(
+                "wc-compositor: window {id} ({app}) draws no title bar of its own and this run \
+                 folds the caption away ({:?}), so THIS WINDOW HAS NO TITLE BAR -- \
+                 `--decorations tabs` is right for a self-decorating client and wrong for this \
+                 one, and it is a per-run flag (§33.7)",
+                self.decorations
             ),
         }
     }

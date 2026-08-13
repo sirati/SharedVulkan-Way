@@ -83,58 +83,82 @@ pub type WindowId = u64;
 
 /// How much of the window frame the system owns.
 ///
-/// # Why this is a struct with a zero field rather than a constant
+/// # A flag rather than a pixel count, and stage 3 had it the wrong way round
 ///
 /// The goal (docs/goal-firefox.md) wants two things that are in tension: native
 /// Windows decorations, *and* the client painting its own UI into the title
-/// bar. Windows applications resolve that with
+/// bar. Windows applications resolve that with `WM_NCCALCSIZE` and
 /// `DwmExtendFrameIntoClientArea` — the system frame stays, and the client area
-/// is extended upward into it so the application draws where the title bar
-/// would be while Windows keeps the glass, the snap behaviour and the buttons.
+/// is extended upward over the caption so the application draws where the title
+/// bar would be while Windows keeps the border, the shadow, the snap behaviour
+/// and the resize edges.
 ///
-/// Stage 3 does not do that. It builds a plain `WS_OVERLAPPEDWINDOW` and
-/// `extend_top` is always 0. The field exists so that the size arithmetic —
-/// which is the part that is fiddly and the part that would otherwise be
-/// written as "client rect == surface size" in six places — is **already
-/// parameterised**, and so that the conversion has one home. The unit tests
-/// exercise a non-zero value, so this is a tested path rather than a comment
-/// about a future one.
+/// Stage 3 anticipated that with an `extend_top: i32` and three conversions
+/// built on it: the surface would sit at client `y = -extend_top`, the client
+/// area would be *taller* than the surface, and a `WM_SIZE` would subtract the
+/// strip again. **Every one of those is the wrong shape**, and the tabs-in-title-bar stage found
+/// it out by writing the `WM_NCCALCSIZE` this field was reserved for. In the
+/// arrangement Win32 actually has:
+///
+/// * The client area is not a fixed window with content shifted up out of it.
+///   `WM_NCCALCSIZE` moves the *client rectangle's own top edge* up to the top
+///   of the window, so the client area grows and its origin stays at `(0, 0)`.
+///   There is no `-extend_top`; nothing can be painted above a client origin,
+///   because `BeginPaint` clips to the client area.
+/// * The surface therefore **fills** the client area, exactly as it does with
+///   the system caption in place. `client_size_for` and `surface_size_for` were
+///   the identity in both arrangements, not only in the unextended one.
+/// * The pixel count is not knowable here at all. It is
+///   `AdjustWindowRectEx`'s top inset, which depends on the theme, on the DPI
+///   *of the monitor the window is on*, and on whether the window is maximised
+///   — so it is measured per window, per message, on the Win32 side, and never
+///   carried across this boundary. `win32::top_inset` is the one place it is
+///   computed.
+///
+/// What is left to say across the thread boundary is the decision, which is a
+/// `bool`. The conversions are gone rather than kept as identities: three
+/// functions that return their arguments are harder to read than their absence,
+/// and their presence was what made the wrong model look tested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct FrameStyle {
-    /// Pixels of system non-client area folded into the client area for the
-    /// client to draw into.
-    pub extend_top: i32,
-}
-
-impl FrameStyle {
-    /// Where the client's buffer origin sits inside the window's client area.
+    /// Fold the system's caption into the client area, so the client's own
+    /// pixels reach the top of the window and its tab strip is *inside* the
+    /// frame rather than below it.
     ///
-    /// `(0, 0)` while `extend_top` is 0. Once the frame is extended, the
-    /// surface starts at the top of the *extended* area, which is above the
-    /// ordinary client origin — so this is the number that stops the content
-    /// from being drawn under the title bar.
-    pub fn content_origin(self) -> (i32, i32) {
-        (0, -self.extend_top)
-    }
-
-    /// The client-area size that must be requested to give the client `w`x`h`
-    /// of surface.
+    /// `false` is stage 17's arrangement and the default: Windows draws the
+    /// caption, the client draws under it.
+    pub extend_top: bool,
+    /// Also call `DwmExtendFrameIntoClientArea`, so DWM keeps drawing its frame
+    /// behind the strip the caption used to occupy.
     ///
-    /// With the frame extended, the client area has to be taller than the
-    /// surface by the extended strip, because the strip is part of the client
-    /// area from Win32's point of view and part of the surface from Wayland's.
-    pub fn client_size_for(self, w: i32, h: i32) -> (i32, i32) {
-        (w, h.saturating_add(self.extend_top))
-    }
-
-    /// The inverse: the surface size implied by a client area of `w`x`h`.
+    /// A separate switch from `extend_top`, and it is a switch rather than an
+    /// implied consequence because the two are separable and only one of them
+    /// is load-bearing. `WM_NCCALCSIZE` is what moves the client rectangle;
+    /// the DWM call only decides whether there is glass *behind* pixels this
+    /// compositor is about to overwrite. It also makes the extended strip
+    /// alpha-sensitive, which is a way for a client's own translucency to
+    /// become a hole in the title bar — so being able to run the same window
+    /// both ways, minutes apart, is what turns that from a worry into a
+    /// measurement (§31.6). Ignored entirely when `extend_top` is `false`.
+    pub dwm_glass: bool,
+    /// Leave the strip where DWM drew its minimise, maximise and close buttons
+    /// transparent, and forward the frame's mouse messages to
+    /// `DwmDefWindowProc`, so the window keeps **the system's own** caption
+    /// buttons while the client paints the rest of the caption.
     ///
-    /// This is what a `WM_SIZE` has to go through before it becomes an
-    /// `xdg_toplevel.configure`, and it is the reason `WM_SIZE` does not
-    /// simply forward its `lParam`.
-    pub fn surface_size_for(self, w: i32, h: i32) -> (i32, i32) {
-        (w.max(0), (h - self.extend_top).max(0))
-    }
+    /// This is what makes the arrangement the Windows one rather than a
+    /// picture of it. Without it the client's pixels cover the whole strip and
+    /// the window has no caption buttons at all — no minimise, no maximise, no
+    /// snap layouts, and nothing but the client's own drawing in the corner.
+    /// With it, the buttons are the ones Windows drew, so their hover states,
+    /// their theme and their `HTMAXBUTTON` hit test are Windows' too, and
+    /// Windows 11's snap-layouts flyout works for the same reason it works
+    /// anywhere else (§31.5).
+    ///
+    /// Needs `dwm_glass`: the transparency is only transparency inside a region
+    /// `DwmExtendFrameIntoClientArea` extended, and outside one the same
+    /// `FillRect` is an opaque black rectangle. §31.6 is that measurement.
+    pub caption_buttons: bool,
 }
 
 /// Which edge an interactive resize is being driven from.

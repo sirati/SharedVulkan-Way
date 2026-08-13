@@ -12802,6 +12802,655 @@ desktop shortcut) and of `c7ec2c0` (§32's taskbar identity), not before them.
    running the harness on a tree where the value has moved finds the ones
    reading misses. Both are needed and neither is sufficient.
 
+
+## 31. Tabs in the title bar: Firefox's, inside Windows' own caption
+
+*(Numbered 31 at the third attempt, which is §17.1's convention working rather
+than failing: this was written as §29, the clipboard merged as §29 first, it
+became §30, "can the client's pool be our memory" merged as §30, and 31 was the
+next free number. The assets moved with it — `docs/stage29/` is now
+`docs/tabs-in-titlebar/`, topic-named like `docs/clipboard/`, which is what the
+last few sections have settled on and what stops the fourth renumber from
+touching any filenames.)*
+
+### 31.1 Status in one paragraph
+
+**`docs/tabs-in-titlebar/tabs.png` is Firefox on the guest's real desktop with
+its tab strip inside the window's own title bar, and Windows' own minimise,
+maximise and close buttons drawn in the corner of that same strip.** It is the
+other half of the goal clause §22 stopped at: §22 removed the second title bar
+by making Windows draw the only one, which is the *server-side* answer, and
+this is the client-side one — Firefox keeps its own decorations, its tab strip
+occupies the frame, and the frame stays the system's, with a real border, a
+real shadow, real resize edges and real caption buttons. Three Win32 pieces do
+it: `WM_NCCALCSIZE` moves the client rectangle's top edge up to the top of the
+window and is the whole of the fold (§31.3); `DwmExtendFrameIntoClientArea`
+keeps DWM compositing its frame — buttons included — behind the strip; and
+`DwmDefWindowProc` gives those buttons their behaviour, which is what brings
+back Windows 11's snap layouts that §22.8 wrote off (§31.5). The compositor
+draws no caption buttons of its own and that is the point: it leaves the
+rectangle `DWMWA_CAPTION_BUTTON_BOUNDS` reports at `alpha = 0` and **uncovers**
+the ones Windows already drew. The plan §22.8 killed was to draw three; this
+draws none. The measured
+numbers on the guest: `nonclient 16x8` — eight pixels of border on each side,
+eight at the bottom and **zero at the top** — and `folds 31 px of caption into
+its client area`. What is still not solved is that Firefox does not know the
+corner is occupied, because no Wayland protocol can tell it, and §31.9 is that
+account.
+
+### 31.2 What stage 3 reserved for this was the wrong shape
+
+`platform::FrameStyle` has carried an `extend_top: i32` since stage 3, with
+three conversions built on it and a doc comment saying the arithmetic was
+"already parameterised" so that the frame extension would be a value change
+rather than a rework. Writing the extension is what showed that the parameter
+described an arrangement Win32 does not have.
+
+The stage-3 model was: the client area stays where it is, and the client's
+content is drawn *above* its origin, at `y = -extend_top`, so the client area is
+taller than the surface and a `WM_SIZE` has to subtract the strip again. Every
+clause of that is wrong, and one of them is not merely wrong but impossible:
+
+* **Nothing can be painted above the client origin.** `BeginPaint` installs a
+  clip region that is the client area. A `SetDIBitsToDevice` at `y = -31` puts
+  thirty-one rows of the client's buffer nowhere at all.
+* **`WM_NCCALCSIZE` moves the client rectangle, not the content inside it.**
+  The client area *grows upward*; its origin stays `(0, 0)`. So the surface
+  fills the client area in both arrangements and `content_origin` is `(0, 0)`
+  either way.
+* **`client_size_for` and `surface_size_for` were the identity all along**, not
+  only while the field was zero. The client area is the surface; that is what
+  `WM_SIZE` reports and what a configure carries.
+* **The pixel count cannot cross the thread boundary.** It is
+  `AdjustWindowRectEx`'s top inset, and it depends on the theme, on the DPI of
+  the monitor the window is currently on, and on whether the window is
+  maximised. A number sampled once on the Wayland thread would be right until
+  the user dragged the window to the other display.
+
+So the field is now a `bool` and the three conversions are gone rather than kept
+as identities — three functions that return their arguments are harder to read
+than their absence, and their presence is what made the wrong model look tested.
+The one place a pixel count is needed on the Win32 side takes it from
+`DefWindowProc`'s own answer (§31.3), which is correct at any DPI by
+construction.
+
+This is worth the paragraph because the reasoning that produced it was good.
+Stage 3 parameterised the arithmetic rather than hard-coding it, which is the
+right instinct; it then guessed which way the parameter pointed, wrote the guess
+into three functions and a doc comment, and nothing could disagree with it for
+twenty-six stages because the value was zero. **A parameter that is only ever
+set to its identity is not a tested path.** It is a hypothesis with test
+coverage.
+
+### 31.3 `WM_NCCALCSIZE`, which is the whole of it
+
+```rust
+let window_top = (*params).rgrc[0].top;                       // before
+let r = DefWindowProcW(hwnd, WM_NCCALCSIZE, wparam, lparam);  // the ordinary answer
+let inset = if is_maximized(hwnd) { frame_border().1 } else { 0 };
+(*params).rgrc[0].top = window_top + inset;                   // after
+```
+
+Three lines, and each one is a decision.
+
+**The requested window rectangle is read before `DefWindowProc` runs**, because
+`DefWindowProc` overwrites `rgrc[0]` in place: on entry it is the window
+rectangle Windows is proposing, on exit it is the client rectangle it decided
+on. The number this needs — where the *window* starts — exists only before the
+call.
+
+**`DefWindowProc` still runs.** Synthesising a client rectangle from nothing
+would mean reproducing the side and bottom insets, which are the theme's and the
+DPI's. Letting Windows do the ordinary arithmetic and then moving one edge is
+the smallest change that can be right, and it is why the side borders, the
+bottom border, the shadow, the rounded corners, the snap-to-edge behaviour and
+the system menu are all still Windows' without a line of code.
+
+**A maximised window is inset by the border and a restored one is not**, and
+this is the case a single screenshot does not catch. A maximised
+`WS_OVERLAPPEDWINDOW` is deliberately *larger* than the work area by the resize
+border on every side — that is how Windows hides the border off the edge of the
+screen — so a client rectangle whose top is the window's top starts eight pixels
+above the monitor and the first eight rows of the tab strip are gone. **Both
+cases have been photographed**, minutes apart and by accident rather than by
+design: an early run of this leg came out maximised — the window was wider than
+the guest's 1280x800 screen — and reported `hwnd at -8,-8`, which is what a
+maximised `WS_OVERLAPPEDWINDOW` looks like, with the tab strip intact and
+starting at the top of the monitor. `tabs.png` is a restored window at
+`130,130`. The branch is small and the case it covers is invisible in the
+picture that does not need it, which is the argument for having run both.
+
+`map_window` needs one line for the same reason, and it is one line because
+`AdjustWindowRectEx` has already measured the thing that has to be undone: its
+`rc.top` is the negative of the top inset, and `rc.top = 0` says "do not grow
+the window by a caption Windows is about to hand back". Without it every window
+maps a caption taller than the client asked for.
+
+### 31.4 `WM_NCHITTEST`, and what §22.8 still gets right
+
+Folding the caption in takes the top resize edge with it, because that edge was
+non-client. `nchittest` puts it back: `DefWindowProc` answers first, its answer
+is kept for everything it still owns, and the only case overridden is a band at
+the top of a restored window that now reports `HTCLIENT`.
+
+**No `HTCAPTION`, and §22.8's argument is unchanged.** Wayland has no protocol
+by which a client publishes its draggable region; Firefox's `mDraggableRegion`
+is internal and observable only *after* a click, as an `xdg_toplevel.move`
+request. So the tab strip stays `HTCLIENT`, a drag on it reaches Firefox as a
+pointer event, and Firefox asks for the move — which §22.7 wired to
+`SC_MOVE`, and which is why the window can be dragged by its tabs at all.
+
+What changed is the *other* half of §22.8, and it changed because the question
+was different from the one that paragraph answered.
+
+### 31.5 The caption buttons are Windows', and that is why snap layouts work
+
+§22.8 recorded Windows 11's snap layouts as unreachable, and the reasoning was
+sound: the flyout is raised by a hover that hit-tests as `HTMAXBUTTON`, this
+compositor cannot know where Firefox drew its maximise button, and there is no
+protocol that would tell it. §22.9 then measured the obvious way out — free the
+corner with `gtk-decoration-layout` and draw real caption buttons there — and
+killed it, because Firefox draws a close button in that corner whatever GTK is
+told.
+
+Both are true and both are about **drawing our own buttons**. The arrangement
+here does not draw any. DWM is already compositing the window's frame behind the
+extended strip, buttons included, and the mechanism that reveals them is the
+oldest wart in the Win32 graphics stack:
+
+> Inside a region handed to `DwmExtendFrameIntoClientArea`, DWM composites the
+> window's pixels over the frame it drew using the **per-pixel alpha** in the
+> redirection surface. GDI has no notion of alpha: every drawing call writes
+> zero into the fourth byte. So a `FillRect` over the button strip writes
+> `alpha = 0`, DWM's own buttons show through it, and the client keeps the rest
+> of the caption because `SetDIBitsToDevice` copied its own `alpha = 255` there.
+
+Where the strip is is not guessed. `DwmGetWindowAttribute` with
+`DWMWA_CAPTION_BUTTON_BOUNDS` is the documented question and it answered
+`146x30` at 100% on the guest, translated from window-relative to client
+coordinates through `ClientToScreen` because the client origin is not the window
+origin — the side border is still Windows'. Every hard-coded `3 * SM_CXSIZE` in
+the wild is wrong on some machine; this is not one of them.
+
+`DwmDefWindowProc` supplies the behaviour: it is consulted first for
+`WM_NCHITTEST` and forwarded `WM_NCMOUSEMOVE`, `WM_NCMOUSELEAVE`,
+`WM_NCLBUTTONDOWN`, `WM_NCLBUTTONUP` and `WM_NCRBUTTONUP`, which is the hover
+highlight, the pressed state, the click and the caption's right-click menu. A
+window that hit-tests DWM's buttons and does not forward those messages has
+buttons that respond to nothing, which is worse than not having them.
+
+**So snap layouts are not a casualty of this arrangement.** They are raised by
+`HTMAXBUTTON`, `DwmDefWindowProc` returns `HTMAXBUTTON` over the maximise button
+it drew, and none of that requires this compositor to know anything at all about
+where Firefox thinks its own buttons are. §22.8's conclusion was right about the
+route it examined and wrong about the destination, and the difference is one
+call: **do not draw the buttons — uncover them.**
+
+> **What is claimed and what is not.** The buttons are in the photograph and
+> `DwmGetWindowAttribute` reported their rectangle, so they are drawn and the
+> compositor knows where. The flyout itself has **not** been photographed: it
+> needs a pointer parked on the maximise button for about a second while a
+> capture is taken, and `wc-desk.exe shot` photographs a window rather than the
+> screen, so the flyout — which is a separate, unowned window — would not be in
+> the frame. It is §31.13 item 1 and it is one run of `wc-desk.exe drag`'s trick
+> pointed at a hover.
+
+### 31.6 The caption colour, and why it is pushed the other way
+
+The button strip is transparent, so what shows through it is the colour **DWM**
+paints — and DWM's is Windows' caption colour while the rest of the strip is
+Firefox's tab-strip colour. They are close in a light theme and nowhere near
+each other in a dark one, and the seam is exactly where a user's eye goes,
+because it is a straight vertical edge in the middle of a title bar.
+
+The obvious statement of the problem is *tell Firefox what colour Windows' title
+bar is*. There is no way to do that, and it is §31.9 for the third time in this
+section: Wayland carries sizes and states, not a palette, and GTK 3 takes its
+colours from a theme on the client's own machine — the far side of a boundary
+this compositor cannot reach across. Anything built that way is a launcher
+writing a `gtk.css`, out of band, per client, per theme, and wrong the moment
+the user switches to dark mode.
+
+**Reversing it makes the problem disappear**, and the reversal is the correct
+ownership rather than a trick. The frame is the compositor's. The client's
+pixels are already in this process's address space — they have to be, they are
+about to be blitted. And Windows 11 has an attribute for precisely this:
+
+| attribute | set to |
+|---|---|
+| `DWMWA_CAPTION_COLOR` (35) | the client's title-bar colour, sampled |
+| `DWMWA_TEXT_COLOR` (36) | black or white, by Rec. 601 luma of that colour |
+| `DWMWA_BORDER_COLOR` (34) | the same as the caption, or the window keeps a hairline of the system's around a frame that is now the client's |
+
+What is sampled is eight pixels immediately to the **left** of the button strip,
+halfway down it, averaged. Left, because that is the pixel the caption is
+continuing from and the one a seam would show against. Halfway down, because the
+top row of a GTK header bar is a one-pixel highlight and the bottom row is a
+border. Averaged, because a single sample that lands on an anti-aliased glyph
+edge gives a caption that is subtly the wrong colour on some frames and not
+others — which is worse than being wrong consistently.
+
+It is re-sampled on every paint and the three DWM calls happen only when the
+answer changes, so it costs nothing on the frames of an animation and it follows
+the client into dark mode, a different GTK theme or a different page **with no
+protocol, no configuration and no launcher**. That is the part worth keeping:
+the version of this that was asked for needs a channel that does not exist, and
+the version that works needs no channel at all, because the two things that have
+to agree are already on the same side of the boundary.
+
+`COLORREF` is `0x00BBGGRR` and a client's buffer is `BGRA`. The byte orders are
+opposite, and getting it backwards produces a caption that is a plausible colour
+and the wrong one — a failure that does not look like one.
+
+> **The bounds check has to come before the clamps, and this cost a guest run.**
+> A window that has been created and has not yet committed a buffer has a 0x0
+> shadow. `blit` returns early for it; this ran anyway, so `clamp(0, h - 1)` was
+> `clamp(0, -1)` — a min that exceeds its max, which `clamp` answers with a
+> **panic** rather than a wrong number. On the UI thread, inside `WM_PAINT`,
+> across an `extern "system"` boundary, that is a non-unwinding panic: the
+> process aborts. What came back from the guest was a truncated compositor log,
+> two assertions failing for lines that were never written, and a photograph of
+> a window that had stopped existing — none of which points at a clamp. The
+> lesson is the module header's, arriving somewhere new: **this file's code runs
+> where a panic is an abort**, and a fallible index into a client-controlled
+> buffer belongs behind a guard rather than inside a saturating helper that
+> looks like one.
+
+### 31.7 What `DwmExtendFrameIntoClientArea` is actually worth here
+
+The DWM call is a separate switch, `--dwm-glass on|off`, and it is separate
+because the two halves of the arrangement are separable and only one of them
+moves the client rectangle. `WM_NCCALCSIZE` alone produces the picture; the DWM
+call decides whether there is anything *behind* the pixels the compositor is
+about to overwrite.
+
+That is not a distinction anybody has to take on trust, because the harness runs
+the same window both ways, minutes apart, one flag apart:
+`scripts/wc-titlebar.sh noglass`. It is the leg that turns "GDI writes alpha
+zero and DWM composites the frame through it" from folklore into a measurement,
+and **it was run and it is a picture**: `docs/tabs-in-titlebar/noglass.png` has a
+solid black rectangle exactly where `tabs.png` has three caption
+buttons. Same `FillRect`, same rectangle from `DwmGetWindowAttribute` — the log
+line for that leg still reads `keeps Windows' own caption buttons: client rect
+799,0 146x30 left transparent for DWM` — and nothing behind it to show through.
+
+Two things follow that are worth having in writing. The transparency is a
+property of the *extended region* and not of the window, so the arrangement
+degrades to a black hole rather than to a missing feature if the DWM call ever
+fails; and the compositor cannot detect that from the `HRESULT`, because in this
+leg the `HRESULT` was never asked for. A run that extends the frame and finds
+`dwmapi` stubbed would look exactly like `noglass.png` and would report
+success. That is the one failure mode of this arrangement with no diagnostic,
+and it is here rather than in §31.13 because it now has a photograph of itself.
+
+The call was made through `LoadLibraryW`/`GetProcAddress` rather than linked,
+and its `HRESULT` is printed rather than discarded, for the reason the brief for
+this stage gave: `dwmapi.dll` is the library a non-Windows implementation of
+Win32 is likeliest to answer with a stub. **Every claim in this section is from
+the guest's real desktop, not from Wine.** On real Windows the log line is
+`folds 31 px of caption into its client area, DwmExtendFrameIntoClientArea ok`.
+
+### 31.8 The three legs, and what each picture is for
+
+`scripts/wc-titlebar.sh` grew from two legs to five rather than acquiring a
+script of its own, because the plumbing below it *is* the other half of the
+claim — a compositor as a scheduled task on `WinSta0\Default`, an arena in the
+guest's own RAM, `wc-arena-host` sweeping QEMU's backing object from outside the
+VM, a relay, an `ssh -L`, and the proxy and Firefox in a root transient unit on
+the VM host. Duplicating that would fork it.
+
+| leg | flags | what its picture answers |
+|---|---|---|
+| `tabs` | `--decorations tabs` | the claim: tabs inside the caption, Windows' buttons in the corner |
+| `server` | `--decorations server` + the env var | §22's arrangement, for the pair |
+| `client` | `--decorations client` | two title bars — what every stage before 17 shipped |
+| `noglass` | `tabs --dwm-glass off` | §31.7: the same `FillRect` with nothing behind it — a black rectangle |
+| `nobuttons` | `tabs --caption-buttons off` | the same window with no caption buttons at all: what `DwmDefWindowProc` is worth |
+
+All three `tabs` legs have been run, all three pictures are in
+`docs/tabs-in-titlebar/`, and `docs/tabs-in-titlebar/corner-three.png` is the same 210x50
+rectangle of the same corner from all three, stacked: Windows' three buttons, a
+black rectangle, and Firefox's own chevron and close button. Three flags, one
+picture, and it is the whole of §31.5 and §31.7 in one look.
+
+The `nobuttons` leg is the sharper control of the two: it is
+the same fold, the same extended frame and the same client, and the only thing
+missing is the transparent rectangle — so what it shows in the corner is
+Firefox's own tab-list chevron and its own close button, alone, with no way to
+minimise or maximise the window except the system menu. That is also the
+picture this stage would have shipped if §31.5 had accepted §22.8's conclusion.
+
+The pair is the evidence and a single picture is not, for §22.6's reason
+sharpened: a window whose tab strip is inside the caption and a window whose tab
+strip is under one differ by about thirty pixels of vertical offset, which is
+also roughly what a client that started at a different size looks like. So the
+`server` leg was re-run in the same session, on the same guest, over the same
+arena, at the same `--output 1100x700`, minutes apart and one flag apart, and
+`docs/tabs-in-titlebar/pair-topstrip.png` is the top hundred rows of both stacked:
+Windows' caption with Firefox's icon and title in it and the tab strip below,
+over Firefox's tab strip with Windows' three buttons in the corner of it. That
+capture is `docs/tabs-in-titlebar/server.png` rather than stage 17's file;
+`docs/stage17/stage17-server.png` is that stage's own evidence and this stage
+does not overwrite it.
+
+### 31.9 What cannot be told to Firefox, and it is a protocol fact again
+
+Windows now paints three buttons over the last 146 pixels of Firefox's tab
+strip, and **Firefox does not know**. There is no Wayland protocol by which a
+compositor says *this rectangle of your surface is mine*. `xdg_toplevel` has
+`configure_bounds` for a maximum size and a state list for tiling; neither can
+express a reserved region, and GTK 3's Wayland backend has no client-side notion
+of one to receive it. It is §22.8's shape a second time — the protocol carries
+sizes and states, not geometry the two sides share — and it is the reason this
+section cannot end with "solved".
+
+What that costs, precisely:
+
+1. **Firefox's own widgets sit under Windows'.** The tab-list chevron and
+   Firefox's close button are drawn in the same corner and are covered by the
+   button strip. Covered rather than fighting, because DWM composites its
+   buttons over pixels the blit made transparent — so the result is the right
+   thing being on top, by luck rather than by agreement.
+2. **A window with enough tabs will put a tab under the buttons.** Nothing
+   stops it. On a wide window it does not arise; it is not fixed, it is
+   unreached.
+3. **The two title bars are different heights.** Firefox's tab strip is about
+   46 px and the system caption it is sitting in is 31; Firefox centres its own
+   widgets in 46 and Windows centres its buttons in 31, so they do not line up
+   vertically and no amount of arithmetic on this side can make them.
+
+The one lever that exists is the client's own GTK configuration, delivered
+exactly the way §22.3's environment variable is — out of band, on the machine
+the client runs on, by whatever launches it, in a `gtk-3.0/settings.ini` under a
+private `XDG_CONFIG_HOME`, which is the form §22.9 established works (setting
+`HOME` alone does not).
+
+**The plan was to make Firefox reserve the corner, and it was measured and it
+does not work.** The reasoning was sound and is worth keeping because the
+refutation is the useful part. `gtk-decoration-layout` is what Firefox reads to
+decide which window buttons to draw in its tab strip (§22.9), and a toolkit that
+draws three buttons *reserves space for three buttons* — so naming
+`:minimize,maximize,close` should make Firefox stop its tab strip 140-odd pixels
+short of the right edge, exactly where Windows is painting. The transparent
+rectangle would then cover three buttons nobody needs instead of covering
+something that has to be reachable.
+
+Run twice, with the file verified to have arrived both times:
+
+| where | `gtk-decoration-layout` | what Firefox drew in the corner |
+|---|---|---|
+| the guest, `--decorations tabs` | `:minimize,maximize,close` | tab-list chevron, **close** |
+| the workstation, same layout, `--dump-frames` | `:minimize,maximize,close` | tab-list chevron, **close** |
+
+So Firefox 151 draws one close button in that corner and `gtk-decoration-layout`
+does not change it — which is §22.9's finding arriving from the other direction
+and generalising it. §22.9 could remove buttons and not move them; this cannot
+*add* them either. The corner is not reserved, and the honest description of
+what the picture shows is that the tab-list chevron and Firefox's close button
+are **underneath** Windows' three, hidden by them and unreachable, because a
+click there hit-tests as `HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` and goes to
+Windows.
+
+> §22.9's table has `icon:minimize,maximize,close` producing three buttons, and
+> that is not a contradiction so much as an unfinished thread: that run used a
+> **copy of the real desktop's configuration directory** with one line changed,
+> and §22.9 noted at the time that the copy mattered. These two used a minimal
+> `settings.ini` with nothing else in it. Something else in a full GTK
+> configuration is also required, and this stage did not find out what. It is
+> §31.14 item 7.
+
+The setting is still delivered and the leg still asserts that it arrived,
+because that assertion is what makes the measurement above reproducible rather
+than a memory — and because a lever that is delivered out of band and never
+checked is how the first two attempts at delivering it passed while doing
+nothing.
+
+The heights make it visible, which is the one artefact left in the picture.
+Firefox's tab strip is about 46 px and the system caption it is sitting in is
+31; Firefox centres its own close button in 46 and Windows centres its buttons
+in 31, so a few pixels of the top of Firefox's close button show below the
+transparent rectangle. It cannot be covered by making the rectangle taller: the
+rectangle is
+transparent only inside the region `DwmExtendFrameIntoClientArea` extended,
+which is exactly `nc_top` tall, and a `FillRect` one pixel below that is opaque
+black (§31.7's `noglass` measurement, arriving in a second place). What *would*
+cover it is extending the frame further than the caption and taking the hole
+down with it — legal, and a guess at Firefox's header-bar height, which is the
+kind of number this section has spent its length arguing should not be guessed.
+It is left visible and named rather than papered over.
+
+> **This is a deployment requirement and not a fix**, and it is now the second
+> one on this list (§22.3's box is the first). A deployment that starts Firefox
+> without it gets a tab-list chevron under the maximise button and no other
+> symptom. The honest place for both is a launcher script beside whatever starts
+> the client, and the honest thing to say is that a compositor which cannot
+> reach into its client's settings cannot make this arrangement right on its
+> own. §31.6's caption colour is the counter-example worth reading next to this
+> one: the same problem, solved completely, because it turned out not to need
+> the client's cooperation at all.
+
+> **The first two attempts at delivering it were green and had no effect.** The
+> `settings.ini` is written by a `printf` interpolated into a double-quoted
+> argument that lands inside a *quoted* heredoc on the VM host, and both
+> plausible escapings of that — `\\\$RUN` for the path, `\\\\n` for the newline
+> — produce a file with a literal `\$RUN` in its name and a literal backslash-n
+> in its body. Every assertion in the leg still passed, and the picture was
+> still a plausible picture, because the compositor does not know or care
+> whether the client read a setting. It was caught by looking for the file on
+> the host afterwards, and the leg now asserts its contents for exactly that
+> reason. A lever that is delivered out of band needs a check that it arrived;
+> §22.11 item 3 said the same thing about `MOZ_GTK_TITLEBAR_DECORATION` and it
+> is still true of that one.
+
+### 31.10 `wc-arena-host` has now been deleted twice and restored twice, by two people who did not know about each other
+
+This is not a footnote. It is the most reliably repeated failure in this
+repository's history and it has cost four stages a debugging round each.
+
+`b448807 unify: delete wc-arena-host` removed the crate on the grounds that it
+existed only to hold an absolute path dependency on what used to be a sibling
+repository, and that the repository split no longer exists. Both clauses are
+true. Neither is a reason to delete the **program**: it is the only
+implementation of "sweep QEMU's backing object for the guest's arena stamps and
+write the plan `wc-proxy --arena-plan` maps", and four harnesses call it by
+name —
+
+```
+scripts/wc-titlebar.sh   scripts/wc-desktop.sh
+scripts/wc-guest.sh      scripts/sv-firefox-guest.sh
+```
+
+— so on the tree as `b448807` left it all four fail at the locate step with
+`manifest path crates/wc-arena-host/Cargo.toml does not exist`. That is **every
+run this project has that puts a real client's pixels in the guest's own RAM**,
+which is the standing rule §12 set and the rule every photograph in §22 and in
+this section depends on.
+
+**It was restored twice, independently, within days.** §28 (stage 14) hit it
+first, from a desktop shortcut that got `--fd is required` — `crates/arena-host`
+is a *different* tool with a different argument set, which is exactly the
+resemblance that makes this crate look redundant — and restored it as an
+ordinary workspace member with `cfg(unix)` around the whole program. This stage
+hit it second, from a photograph that could not be taken, and restored it again
+out of `b448807^` as a non-member with relative paths, having no way to know the
+other restoration existed until the two branches met. **The merge keeps stage
+14's**, which is the better of the two: a member with a `cfg(unix)` gate is
+honest about why the Windows cross gate is not the constraint, where an
+exclusion merely arranges for nobody to find out.
+
+The reason it keeps happening is worth naming precisely, because the next
+cleanup will meet the same evidence:
+
+> **Nothing in this tree depends on `wc-arena-host` at compile time.** No crate
+> imports it, no test links it, no `--workspace` command resolves it. Every
+> automated signal a cleanup consults says *dead*. Its only callers are four
+> shell scripts, and they call it by path, on a different machine, as root,
+> under `systemd-run`. A crate whose Cargo.toml carries three paragraphs of
+> justification and whose `src/main.rs` is never mentioned in the commit that
+> deletes it is a crate that was read at the wrong end.
+
+So `crates/wc-arena-host/src/main.rs` now opens with a paragraph saying that in
+as many words, naming the four scripts and both deletions. That comment is the
+whole mitigation available: there is no test that can fail when this crate is
+missing, because the thing that breaks is a run on a Windows VM on another
+machine, and the failure surfaces as a photograph that cannot be taken.
+
+### 31.11 `Start-ScheduledTask` returns success for a task it never runs
+
+This is an operational finding rather than a design one, and it is here because
+it will cost somebody else a session otherwise — it has probably cost one
+already. It applies to every harness in this repository that reaches
+`WinSta0\Default`, which is `wc-titlebar.sh`, `wc-desktop.sh`, `wc-guest.sh` and
+`wc-icon.sh`.
+
+All four start the compositor as a scheduled task with an **`Interactive`**
+principal, and that is not a convenience: a task with any other principal lands
+on session 0, where every Win32 call succeeds and nothing is ever on a screen
+(§10.12 item 3). The consequence nobody had met is that with **nobody logged on
+to the guest** there is no interactive desktop for such a task to run on, and
+`Start-ScheduledTask` **returns success anyway**. No error, no exception, a
+cheerful `started <name>`, and a task that never runs. The tells, and neither is
+in the harness's output:
+
+```
+schtasks /Query /TN <name> /V   ->  Letzte Laufzeit:    30.11.1999 00:00:00
+                                    Letztes Ergebnis:   267011
+```
+
+`267011` is `0x41303`, `SCHED_S_TASK_HAS_NOT_RUN`, and it is an `S_`-prefixed
+**success** code. From the workstation this is indistinguishable from a
+compositor that crashed on startup, which is what it was taken for: this stage
+lost two runs and a session of staring at a binary that ran perfectly when
+started by hand over ssh.
+
+The cheap test is `explorer.exe`, which is per-session and is what a logged-on
+desktop has:
+
+```
+ssh <guest> 'powershell.exe -NoProfile -Command "(Get-Process explorer).Count"'
+```
+
+`scripts/wc-titlebar.sh` now runs exactly that on the failure path and prints
+which of the two cases it is, so the diagnostic is in the harness rather than in
+this paragraph. The other three still report "the compositor never started" and
+mean two different things by it; adding the same four lines to each is the
+obvious follow-on and is §31.14 item 5.
+
+### 31.12 The gates
+
+Every row was run **after** the merge with master at `e3409ba`, from this
+checkout, and the guest legs were re-run rather than carried over — which is
+§22.10's own discipline and is not ceremony here: the merge brought the
+clipboard's `WM_DROPFILES` and drag handling into the same `toplevel_proc` that
+this stage taught to answer `WM_NCCALCSIZE` and `WM_NCHITTEST`, and those three
+messages arrive on one window procedure. Every picture in
+`docs/tabs-in-titlebar/` is from the merged binary.
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace && cargo test --workspace` | **1284 tests**, 0 failures — master's count at `e3409ba`, unchanged |
+| `cargo clippy --workspace --all-targets` (Linux) | clean of anything this branch added; the three warnings are master's — `identity_op` in `sv-hostd/src/qemu.rs`, `manual_is_multiple_of` in `sv-icd/src/wsi.rs`, `redundant redefinition` in `sv-transport/src/park.rs` |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same three, and nothing else |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-firefox.sh tabs` (new, Linux) | **6 passed, 0 failed** — the client half: a real `26,23` shadow inset, and the window is the geometry rectangle |
+| `scripts/wc-firefox.sh titlebar` | 9 passed, 0 failed — §22's, unchanged |
+| **`scripts/wc-titlebar.sh tabs` (new, the guest's interactive desktop)** | **11 passed, 0 failed** |
+| `scripts/wc-titlebar.sh noglass` (new) | 10 passed, 0 failed |
+| `scripts/wc-titlebar.sh nobuttons` (new) | 11 passed, 0 failed |
+| `scripts/wc-titlebar.sh server` (§22's leg, re-run for the pair) | 8 passed, 0 failed |
+| `scripts/wc-proxy.sh` | 39 passed, 0 failed |
+
+**`cargo build && cargo test`, in that order, was a requirement while this
+branch was being written and is not one any more.** On the tree this branch
+started from, a clean checkout reported 172 rather than the full count, because
+`sv-icd`'s loader test failed before its artefact existed and a failing binary
+stops the run — so every gate here was run build-first and the number in the
+table is the build-first number. §35 fixed that between this branch's first
+merge and its last: the loader test now skips rather than fails when the
+artefact is absent, and the count is the same either way. The row above is
+therefore both numbers, and nothing in this section depends on which order it
+was produced in.
+
+The stage adds no unit test, and that is a statement rather than an omission for
+§22.10's reason applied harder: everything it changed is an answer to a Win32
+message, and there is no way to ask `WM_NCCALCSIZE` a question without a real
+window on a real desktop. The `tabs` leg is the test. It asserts the two log
+lines that make the picture believable — `folds 31 px of caption into its client
+area` and `keeps Windows' own caption buttons: client rect 799,0 146x30 left
+transparent for DWM` — and it asserts their **absence** in the `server` and
+`client` legs, which is what makes their presence mean something.
+
+### 31.13 What is not proven
+
+1. **The snap-layouts flyout has not been photographed.** §31.5's box. The
+   mechanism is there and the buttons are Windows' own, so the flyout follows
+   from `HTMAXBUTTON` in the same way it does for any other application; nobody
+   has hovered the button and taken a picture of the result.
+2. **Nothing has been dragged, still.** §22.11 item 1 is inherited whole. The
+   tab strip is `HTCLIENT` and a drag arrives as `xdg_toplevel.move`, which
+   §22.7 wired and no run has exercised on a desktop.
+3. **One DPI.** Every number here is from a 96-DPI guest. `WM_DPICHANGED` calls
+   `apply_frame` again and `caption_button_rect` is asked per paint, so the
+   arithmetic is per-monitor by construction — and "by construction" is exactly
+   the phrase §31.2 is a warning about.
+4. **The `HTTOP` band has no evidence at all.** The maximised and restored
+   cases have both been photographed (§31.3), which covers the `WM_NCCALCSIZE`
+   branch; nothing has grabbed the top edge of a restored window and dragged it,
+   so the one thing `nchittest` exists for is asserted rather than measured. It
+   is the same run as §31.13 item 2 and should be done with it.
+5. **The title is no longer on the screen, by construction.** `SetWindowTextW`
+   still runs and the text is still what the taskbar and alt-tab show, which is
+   what the goal clause asks for, but there is no caption left to draw it in.
+   That is what a custom caption means and it is what Firefox on Windows does
+   natively; it is recorded here because "the title still works" and "you can
+   see the title" stopped being the same claim at this stage.
+6. **One theme, for the caption colour.** §31.6 samples whatever the client is
+   painting, so a dark theme should carry through with no change; it has not
+   been run. The luma threshold that picks between black and white caption
+   glyphs is 140 and is a guess with a citation, not a measurement.
+7. **The corner is not reserved at all**, and that is measured rather than
+   feared — §31.9's table. Firefox's tab-list chevron and its own close button
+   are underneath Windows' three buttons: hidden, and unreachable, because a
+   click there hit-tests as Windows'. The tab-list chevron is a real control
+   that a user has lost, and calling it cosmetic would be wrong.
+
+### 31.14 What to do next
+
+1. **Photograph the snap-layouts flyout**, which closes §31.13 item 1 and is the
+   only remaining piece of §22.8's retraction that is assertion rather than
+   picture.
+2. **Drag the window by its tab strip on the guest's desktop.** §22.12 item 1,
+   still open, and now more interesting: the drag has to arrive as a request
+   while the pointer is over pixels Windows believes are the client's.
+3. **A protocol for the reserved region.** §31.9. This compositor already ships
+   an interface of its own (`wc_icon_manager_v1`, §16) so the cost is known and
+   small; what is not small is that nothing would implement it, and a protocol
+   with no client is a design document with a wire format. Worth writing down
+   as a proposal before it is worth writing as XML.
+4. **Warn when the two levers disagree**, which is §22.12 item 3 and is now
+   three levers: the decoration mode, `MOZ_GTK_TITLEBAR_DECORATION` and
+   `gtk-decoration-layout`. Each is set outside this process and each has a
+   silent failure mode.
+5. **Give `wc-desktop.sh`, `wc-guest.sh` and `wc-icon.sh` §31.11's four lines.**
+   All three start an `Interactive` scheduled task, all three report "the
+   compositor never started" for two different causes, and one of the two is
+   "nobody is logged on to the guest" — which is not a bug in anything and
+   cannot be diagnosed from the workstation without asking.
+6. **`wc-desk.exe shot --screen`.** Two items on this list need a picture of
+   something that is not a window: the snap-layouts flyout (item 1) and any
+   future context menu the system owns. `shot` is `PrintWindow` and cannot take
+   either.
+7. **Find out what else a full GTK configuration supplies**, because
+   `gtk-decoration-layout` alone does not reproduce §22.9's three buttons
+   (§31.9's box) and the corner cannot be reserved until something does. It is
+   one run with the real configuration directory copied rather than a minimal
+   `settings.ini`, which is what §22.9 did and what these two runs did not.
+8. **Give the tab-list chevron back.** It is §31.13 item 7 and it is the only
+   thing in this arrangement a user actively loses. The cheapest honest fix is
+   probably not on the GTK side at all: the compositor knows the button
+   rectangle, so it could refuse to hit-test the leftmost part of it and let
+   the client keep a strip — which trades a slice of Windows' minimise button
+   for Firefox's chevron and needs somebody to decide that is the right trade.
 ---
 ---
 
@@ -12819,14 +13468,13 @@ compositor's `default_mode(2)` and Firefox's own
 protocol, so `default_mode(2)` is never read, and weston's toytoolkit has no
 environment variable that suppresses its frame. The bar it draws cannot be
 turned off by anything a compositor can send. What a self-decorating client
-needs instead is the arrangement §15.15 item 1 has been asking for since stage 9
-and §22.12 item 2 still lists as the last piece of the goal clause —
-`WM_NCCALCSIZE` plus `DwmExtendFrameIntoClientArea`, the system caption folded
-into the client area so that the bar the client is going to draw anyway *is* the
-window's. That is unwritten; `FrameStyle::extend_top` is still zero. This
-stage's contribution is the half that has to exist first: the measurement that
-says **which** clients need it, because the same toolkit ships clients that do
-and clients that do not.
+needs instead is **§31's arrangement, which exists** — `WM_NCCALCSIZE` folding
+the caption into the client area so that the bar the client is going to draw
+anyway *is* the window's — and §33.7 measures whether it fits this client. It
+does, better than it fits the client it was built for. What is missing is the
+one thing §31 could not supply, because it is not a Win32 question:
+`--decorations tabs` is a **per-run** flag and this has to be a **per-window**
+fact. This stage is that fact, and §33.7 is what it costs to do without it.
 
 ### 33.2 What `weston-terminal` binds, which is the whole answer
 
@@ -12952,10 +13600,10 @@ ever *said* it.
 
 ### 33.6 What was added, and what deliberately was not
 
-`crate::surface::decorator(inset, negotiated) -> Decorator`, four lines of
-arithmetic with five tests (1284 to 1289 on the merge; 1262 to 1267 on the
-branch it was written on), and one call at map time. Three
-answers:
+`crate::surface::decorator(inset, negotiated) -> Decorator` and
+`bars(who, extends_frame) -> Bars` — seven lines of arithmetic with seven tests,
+1284 to 1291, and one call at map time. `decorator` has three answers, about the
+client alone:
 
 * **`Negotiated`** — the surface created a decoration object on either
   protocol, so it was told and agreed. Never guessed about, even with a shadow:
@@ -12980,13 +13628,18 @@ That is the whole of the change to the compositor, and the restraint is the
 point. **It reports; it does not decide.** Two reasons, and the second is the
 one that matters:
 
-1. What to *do* about a self-decorating client is §22.12 item 2 —
-   `WM_NCCALCSIZE` plus `DwmExtendFrameIntoClientArea`, so the system frame
-   stays and the client's bar occupies the caption strip. Nobody has written it
-   for Firefox, which is the client the goal document is about; writing a second
-   arrangement here for the client that is a *stand-in* for Firefox would be
-   putting the demo ahead of the goal, and the two would then have to be
-   reconciled.
+1. What to *do* about a self-decorating client is **§31, which is built** —
+   `WM_NCCALCSIZE` folds the caption into the client area, DWM keeps compositing
+   its own buttons through a hole the blit leaves at `alpha = 0`, and
+   `DwmDefWindowProc` gives them their behaviour. §33.7 measures whether it fits
+   this client and the answer is yes. But the switch is `--decorations tabs`,
+   which sets one `FrameStyle` for the *whole run* (`lib.rs`:
+   `extend_top: args.decorations.extends_frame()`, copied into every
+   `WindowState` at creation), and a run has both kinds of client in it. Turning
+   this heuristic straight into that flag would be turning a per-window fact
+   into a per-run switch, which is the wrong direction. Joining them is §31's
+   `FrameStyle` becoming per-window, which is §31's file and §31's author's
+   call.
 
    This section is also, unexpectedly, **§22.12 item 3** — *"Warn when the two
    levers disagree… and it is four lines."* §22.11 item 3 framed that as
@@ -13012,7 +13665,82 @@ stated by the thing that deploys the application. This stage does not add the
 list, because a list with one entry that nothing reads is a list nobody
 maintains.
 
-### 33.7 What a user should expect from a self-decorating client
+### 33.7 Would §31's arrangement actually fit this client? Measured, and it fits better than Firefox
+
+§31 landed while this section was being merged, so the question stopped being
+hypothetical. The numbers are all in `docs/stage8/stage33-window-term.png`,
+which is a photograph rather than a claim: reading the rows of column 100 down
+from the top of the window,
+
+| rows | what | height |
+|---|---|---|
+| 0–30 | Windows' caption, `#F3F3F3` | **31 px** |
+| 31–57 | weston's own title bar, `#BFBFBF` | **27 px** |
+| 58– | the terminal, black | — |
+
+31 is the same `nc_top` §31.1 measured on this guest, arrived at independently,
+which is the cheapest possible check that the two sections are describing the
+same window frame.
+
+So under `--decorations tabs` the fold would move 31 px of caption into the
+client area, and weston's entire 27 px bar would sit inside it with **4 px to
+spare**. §31.9's height problem is Firefox's tab strip being 46 px in a 31 px
+caption — 15 px of client widget hanging *below* the fold, which is why a sliver
+of Firefox's close button shows and cannot be covered. This client's mismatch
+runs the other way and is a quarter the size: 4 px of black terminal content
+sitting in the caption strip, above the bar rather than below it, with nothing
+of the client's protruding.
+
+**And §31.9's one real cost does not apply here at all.** Windows composites its
+three buttons over the last 146 px of the strip, and what is underneath them in
+this client is — cropped out of the same photograph —
+
+> `[_] [□] [X]`
+
+weston's own minimise, maximise and close, in that order, in exactly that
+corner. Covering them loses nothing: Windows' three do the same three jobs
+through `DwmDefWindowProc`, and better, since they bring the snap-layouts flyout
+with them (§31.5). Firefox's corner holds a **tab-list chevron**, which is a
+control with no Windows equivalent, and §31.13 item 7 is right to call losing it
+a real cost. The client this arrangement was built for is the one it fits worst.
+
+Two things it does not settle, and neither is about weston-terminal:
+
+* **The 27 px is one client at one DPI with one theme**, exactly as §31.13 item
+  3 says of every number in that section. Another self-decorating client will
+  have another height, and 46-into-31 is the case that has already been seen, so
+  the *general* answer still has to tolerate a bar taller than the caption.
+* **`--decorations tabs` is per-run.** Giving it to `weston-flower` — which
+  draws no bar at all (§33.4) — folds the caption into a client area with
+  nothing in it to occupy the strip, and takes the top resize edge and the drag
+  handle with it; §31.4 hands the top band back as `HTCLIENT`, and a client that
+  never sends `xdg_toplevel.move` has no way to ask for the move that would
+  follow. The window loses its title bar and gains nothing. That is the concrete
+  harm of a per-run switch, and it is why the fact in §33.6 has to stay
+  per-window even though the flag it would feed is not.
+
+#### The merge changed the verdict, and the report had to change with it
+
+§33.6's line said "THIS WINDOW HAS TWO TITLE BARS" from the *client* alone,
+which was correct only while the caption was never folded. Under `tabs` a
+self-decorating client is the one that comes out right. So the verdict is now
+the pair — `surface::bars(who, extends_frame)` — and the four cases were run
+against the two real clients rather than reasoned about:
+
+| `--decorations` | client | what the compositor says |
+|---|---|---|
+| `server` | `weston-terminal` | `THIS WINDOW HAS TWO TITLE BARS` |
+| `server` | `weston-flower` | `Windows' caption is the only title bar` |
+| `tabs` | `weston-terminal` | `that bar is the window's` |
+| `tabs` | `weston-flower` | **`THIS WINDOW HAS NO TITLE BAR`** |
+
+The fourth row is the one that did not exist before this merge and is the
+harm above, stated by the compositor at map time. §31 could not have seen it:
+that stage ran Firefox, and Firefox is `Negotiated` — it binds KDE's manager, so
+it is never guessed about at all. It takes a client that binds nothing to reach
+the row, and both of the clients that do are weston's.
+
+### 33.8 What a user should expect from a self-decorating client
 
 `weston-terminal` will not be the last one, so the general statement, in the
 order a user meets it:
@@ -13024,16 +13752,22 @@ order a user meets it:
   own, and needs nothing from anybody. `weston-flower` is here, and so is most
   of `weston`'s demo suite, `wc-shmclient`, and anything written against raw
   `xdg-shell`.
-* **A client that binds nothing and draws its own bar gets two, today.** The
-  compositor now says so at map time instead of leaving it to a photograph, and
-  the fix is §22.12 item 2's frame extension, made per-window and keyed on the
-  app id. Until that lands, the honest expectation is two bars, and the window
-  is otherwise
+* **A client that binds nothing and draws its own bar gets two, today** — and
+  §31's arrangement is what it should get instead, keyed on its app id rather
+  than on a run-wide flag. `weston-terminal` is here. The compositor now says so
+  at map time instead of leaving it to a photograph. Until the flag becomes
+  per-window the honest expectation is two bars, and the window is otherwise
   entirely correct — right size, right caption text, right taskbar button, right
   pixels — because the geometry rectangle is being honoured. It is one bar too
   many, not a broken window.
 
-### 33.8 What this stage did not do, and one thing it found on the way
+The order of that list is also the order of how much anyone can do about it, and
+the last line is the one worth carrying away: **`--decorations tabs` is not a
+setting a user should ever be asked for.** It is right for exactly the third
+kind of client and harmful for the second (§33.7), and only the compositor is in
+a position to tell them apart — which is what §33.6 is for.
+
+### 33.9 What this stage did not do, and one thing it found on the way
 
 The typing half of the user's report — *"typing in wayland terminal does not
 seem to work"* — is **not** this stage's, and the reason is worth recording
@@ -13061,7 +13795,7 @@ visible bar is delivered inside it, and a press there is `xdg_toplevel.move`.
 Two title bars and a 32-pixel pointer offset are the same measurement read
 twice, which is the only reason this section mentions the second one.
 
-### 33.9 The harness, and three things it was doing to other people's runs (§16.8, instances five to seven)
+### 33.10 The harness, and three things it was doing to other people's runs (§16.8, instances five to seven)
 
 `scripts/wc-desktop.sh window` could not run at all on this branch, and the
 other three are contention bugs the guest has enough of already. **They are

@@ -563,6 +563,51 @@ pub fn decorator(inset: (i32, i32), negotiated: bool) -> Decorator {
     }
 }
 
+/// How many title bars this window is going to have.
+///
+/// ADDED WHEN §31 MERGED, and it is the correction that merge forced. §33 was
+/// written against a tree where the caption was never folded, so
+/// [`Decorator::ProbablyItself`] and "two title bars" were the same statement
+/// and the report said so in as many words. §31's `--decorations tabs` makes
+/// `WM_NCCALCSIZE` fold the caption into the client area, and then a client that
+/// decorates itself is **exactly right** — its bar is the window's — while a
+/// client that decorates itself under `server` is the user's bug.
+///
+/// So the verdict is the pair, not either half. The case that reverses is the
+/// one worth having a name for: under `tabs`, a client with no bar of its own
+/// gets a window with **no title bar at all**, because the caption it would
+/// have been given has been folded away and there is nothing in the strip. §31's
+/// flag is per-run and a run has both kinds of client in it, so that is not a
+/// hypothetical; it is what `weston-flower` would get from a run configured for
+/// Firefox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bars {
+    /// One, and it is Windows'.
+    OneSystem,
+    /// One, and it is the client's, sitting in the folded caption. §31's
+    /// arrangement, working.
+    OneClient,
+    /// Two, one above the other. The bug the user reported.
+    Two,
+    /// **None.** The caption was folded away and the client draws nothing into
+    /// the strip it left.
+    None,
+    /// The client negotiated, so it agreed to whatever it is doing and this is
+    /// not a guess to be reported as a verdict.
+    Agreed,
+}
+
+/// The verdict, from who decorates and whether this run folds the caption.
+pub fn bars(who: Decorator, extends_frame: bool) -> Bars {
+    match (who, extends_frame) {
+        (Decorator::Negotiated, _) => Bars::Agreed,
+        (Decorator::ProbablyItself, false) => Bars::Two,
+        (Decorator::ProbablyItself, true) => Bars::OneClient,
+        (Decorator::ProbablySystem, false) => Bars::OneSystem,
+        (Decorator::ProbablySystem, true) => Bars::None,
+    }
+}
+
 #[cfg(test)]
 mod decorator_tests {
     use super::*;
@@ -606,6 +651,33 @@ mod decorator_tests {
     #[test]
     fn a_negative_origin_is_not_a_margin() {
         assert_eq!(decorator((-4, -4), false), Decorator::ProbablySystem);
+    }
+
+    /// The two §33 clients under both of §31's arrangements, which is the whole
+    /// table and the reason `bars` is a pair rather than a property of the
+    /// client.
+    #[test]
+    fn the_verdict_reverses_when_the_caption_is_folded() {
+        let terminal = decorator((32, 32), false);
+        let flower = decorator((0, 0), false);
+
+        // `--decorations server`: what the user photographed.
+        assert_eq!(bars(terminal, false), Bars::Two);
+        assert_eq!(bars(flower, false), Bars::OneSystem);
+
+        // `--decorations tabs`: the terminal becomes right and the flower
+        // becomes wrong. Same two clients, same compositor, one flag.
+        assert_eq!(bars(terminal, true), Bars::OneClient);
+        assert_eq!(bars(flower, true), Bars::None);
+    }
+
+    /// A client that negotiated is never given a verdict, under either
+    /// arrangement: it agreed to what it is doing.
+    #[test]
+    fn a_negotiated_client_is_not_judged() {
+        let fx = decorator((26, 23), true);
+        assert_eq!(bars(fx, false), Bars::Agreed);
+        assert_eq!(bars(fx, true), Bars::Agreed);
     }
 }
 
