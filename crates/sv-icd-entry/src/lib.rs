@@ -523,7 +523,7 @@ pub trait IcdLocal {
     /// `vkQueueBindSparse` — sent the app-side id raw. The GPU side then said
     /// `no VkDeviceMemory with id 8` and took the ring fatal, and every CTS test
     /// that binds an image to host-visible memory lost the device
-    /// (design.md §0.17). Generating the pass is what makes the set closed: it
+    /// (design.md §0.20). Generating the pass is what makes the set closed: it
     /// is the same fold the GPU side already runs, applied one boundary earlier.
     fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
         Ok((memory, offset))
@@ -1109,7 +1109,7 @@ mod tests {
             "vkEnumeratePhysicalDeviceGroups",
             "vkGetDeviceQueue2",
             // **`vkGetBufferDeviceAddress` and its two friends left this list**
-            // (design.md §0.17). §0.3 finding 5 put them here — a command
+            // (design.md §0.20). §0.3 finding 5 put them here — a command
             // returning a value that is neither `void` nor `VkResult` had no
             // reply to carry it — and called the hole latent because "§9.2 does
             // not advertise `bufferDeviceAddress`, so a conforming application
@@ -1140,6 +1140,24 @@ mod tests {
     /// belongs to an extension puts that extension out of the advertised set,
     /// and `sv_icd::SharedVulkan::ask_device_extensions` subtracts it. It holds
     /// under every profile, which is the point.
+    ///
+    /// # It named its motivating case, and the name expired
+    ///
+    /// As first written this test asserted, under the `zink` profile, that
+    /// `VK_KHR_buffer_device_address` and `VK_EXT_buffer_device_address` **must**
+    /// be in [`INCOMPLETE_EXTENSIONS`] — true when written, because
+    /// `vkGetBufferDeviceAddress` was a stub returning a silent zero. design.md
+    /// §0.20 implemented all three entry points, the derivation correctly stopped
+    /// listing the extensions, and the assertion failed **demanding that a fixed
+    /// bug still be present**. A hand-named case in a test about an invariant is
+    /// a fact with an expiry date, and this one expired against a fix.
+    ///
+    /// So the pairing is derived now: the generator emits
+    /// [`INCOMPLETE_EXTENSION_REASONS`], and what is checked is that every
+    /// entry is there *because of* an entry point that is genuinely refused.
+    /// That is strictly stronger than the named case — it would have caught the
+    /// original bug, it catches an extension listed for no reason, and it cannot
+    /// go stale when a stub becomes an implementation.
     #[test]
     fn no_extension_is_advertised_with_a_stubbed_entry_point() {
         assert!(
@@ -1168,23 +1186,80 @@ mod tests {
         //
         // That is precisely the defect design.md §0.19 and §0.20 are about,
         // arriving in the test written to prevent it. So the property is stated
-        // instead, and it is the one that is actually load-bearing: **the table
-        // is a table of extension names**, and `sv_icd::ask_device_extensions`
-        // subtracts it from what the GPU side reports. A malformed entry there
-        // silently subtracts nothing, which is the failure mode that matters and
-        // the one no compiler catches.
+        // instead. **Two properties, because the two branches that hit this
+        // reached for different ones and both are real**: this one is about the
+        // table's *shape*, and the block after it is about the table's
+        // *agreement with `NOT_IMPLEMENTED`*.
         //
-        // What the table *contains* is not restated here, because the generator
-        // derives it from the registry ("any command this extension introduces
-        // is refused") and re-asserting a derivation against itself tests
-        // nothing. `sv-codegen`'s `emit_tables` is where that logic lives and
-        // where it belongs.
+        // The table is a table of extension names, and
+        // `sv_icd::ask_device_extensions` subtracts it from what the GPU side
+        // reports. A malformed entry there silently subtracts nothing, which is
+        // the failure mode that matters and the one no compiler catches.
         for ext in INCOMPLETE_EXTENSIONS {
             assert!(
                 ext.starts_with("VK_") && ext.len() > 3,
                 "{ext:?} is not an extension name; sv-icd looks these up by \
                  binary_search against what the GPU side reports, so a malformed \
                  entry subtracts nothing and does it silently"
+            );
+        }
+
+        // **And the pairing, which is not the derivation re-asserted against
+        // itself.** `INCOMPLETE_EXTENSIONS` and `NOT_IMPLEMENTED` are two tables
+        // emitted separately and consumed by different code — `sv-icd` subtracts
+        // the first, and the second is the documented list of what refuses — so
+        // "every exclusion names a stub that is genuinely there" is a statement
+        // about *both* and is checkable without repeating the registry walk.
+        // `INCOMPLETE_EXTENSION_REASONS` is what the generator emits to make it
+        // sayable, under the name that is actually in `NOT_IMPLEMENTED`: for a
+        // promoted extension that is the core spelling, not the suffixed alias,
+        // which is the indirection the original bug hid behind.
+        let named: Vec<&str> = INCOMPLETE_EXTENSION_REASONS.iter().map(|(e, _)| *e).collect();
+        assert_eq!(
+            named, INCOMPLETE_EXTENSIONS,
+            "INCOMPLETE_EXTENSION_REASONS and INCOMPLETE_EXTENSIONS are emitted from one \
+             set and must not disagree"
+        );
+
+        // An extension listed without a refused entry point is a promise
+        // withdrawn for no reason, which costs an application a feature the
+        // device has; an extension *not* listed while one of its entry points
+        // refuses is §9.2's promise broken, which costs it a silent wrong
+        // answer. This checks the first directly and the second by construction,
+        // since the generator builds both tables from one `refused` set.
+        for (ext, why) in INCOMPLETE_EXTENSION_REASONS {
+            assert!(
+                NOT_IMPLEMENTED.contains(why),
+                "{ext} is excluded because of {why}, which is not in NOT_IMPLEMENTED — \
+                 either the reason is stale or the exclusion is"
+            );
+        }
+
+        // And the direction that has no derivation behind it: if nothing is
+        // refused, nothing may be excluded.
+        if NOT_IMPLEMENTED.is_empty() {
+            assert!(
+                INCOMPLETE_EXTENSIONS.is_empty(),
+                "no entry point refuses, so no extension can be incomplete"
+            );
+        }
+
+        // The buffer-device-address case, kept and **inverted** rather than
+        // deleted, because it is the case the table was built for and the
+        // direction it points in is now the interesting one. design.md §0.20
+        // implemented `vkGetBufferDeviceAddress`,
+        // `vkGetBufferOpaqueCaptureAddress` and
+        // `vkGetDeviceMemoryOpaqueCaptureAddress`, so none of the three may be a
+        // stub again — and a merge that reintroduced one would fail on the
+        // pairing loop above with the command's own name.
+        for cmd in [
+            "vkGetBufferDeviceAddress",
+            "vkGetBufferOpaqueCaptureAddress",
+            "vkGetDeviceMemoryOpaqueCaptureAddress",
+        ] {
+            assert!(
+                !NOT_IMPLEMENTED.contains(&cmd),
+                "{cmd} is implemented as of design.md §0.20 and must not be a stub again"
             );
         }
     }

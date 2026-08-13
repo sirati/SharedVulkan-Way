@@ -906,7 +906,7 @@ impl Icd for SharedVulkan {
     /// being here was the bug: §5.3's app-side half was one hand-written line in
     /// this one command, so the six other commands that carry a memory id across
     /// — `vkBindImageMemory` first among them — sent the app-side id raw and the
-    /// GPU side took a ring fatal on it (design.md §0.17). It is now generated
+    /// GPU side took a ring fatal on it (design.md §0.20). It is now generated
     /// for every forwarded command, in `sv_icd_entry::forward`, and this
     /// override is left only for the property the generated default does not
     /// have: with no GPU side there is nothing to bind to, and saying so is

@@ -663,7 +663,7 @@ pub mod profiles {
                 // What the conformance suite asked for, in its own words
                 // ---------------------------------------------------------
                 //
-                // design.md §0.17. Everything above this line is here because
+                // design.md §0.20. Everything above this line is here because
                 // Zink, DXVK or the WSI needs it; everything below is here
                 // because `scripts/sv-cts.sh` counted a test that **passes on
                 // the control** and skips forwarded, and printed deqp's own

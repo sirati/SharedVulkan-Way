@@ -2961,6 +2961,66 @@ Four things were needed and all four are §0.3 item 5's own prescription:
   `vkGetPhysicalDeviceFeatures2`, so `vulkaninfo` printed it true throughout; the
   guard could never have fired.
 
+  **"Do we support buffer device address" has two answers, and which one you get
+  depends on the profile.** Asked as *the core 1.2 feature* —
+  `bufferDeviceAddress` in `VkPhysicalDeviceVulkan12Features`, used through
+  `vkGetBufferDeviceAddress` — the answer is **yes** under every profile, and
+  this section is what makes it true. Asked as *the extension*, in
+  `vkEnumerateDeviceExtensionProperties`:
+
+  - under **`full`**, which §0.19 made the default, `VK_KHR_buffer_device_address`
+    and `VK_EXT_buffer_device_address` are carried, so all three spellings —
+    `vkGetBufferDeviceAddress`, `…KHR` and `…EXT` — are in the proc tables and
+    all three are implemented, because an alias is one entry point under three
+    names. The two answers agree;
+  - under **`zink`**, neither extension is in the profile, so
+    `PROFILE_DEVICE_EXTENSIONS` does not carry them,
+    `driver::forwardable_device_extensions` intersects them away, and the ICD
+    never advertises them. The suffixed entry points are correspondingly absent
+    from the proc tables, which is not a hole: an application may only call
+    `vkGetBufferDeviceAddressKHR` after enabling an extension it cannot see. The
+    two answers differ, and they are consistent because the extension is
+    unreachable rather than because they agree.
+
+  **That paragraph was written the other way round two days ago and was already
+  wrong when `full` landed**, which is the same mistake as the one below it one
+  level up: a statement about a *particular profile* dressed as a statement about
+  the implementation. It is left visible rather than quietly corrected.
+
+  This is what §0.19's `no_extension_is_advertised_with_a_stubbed_entry_point`
+  caught, from the wrong end. That guard is right and its derivation resolves a
+  promoted extension through its alias to the core command — but it also **named
+  `VK_KHR_buffer_device_address` by hand** as the case that motivated it, and
+  when the three entry points here stopped being stubs the assertion was left
+  demanding that a fixed bug still be present. It failed on master for exactly
+  that reason. The fix is not an exclusion: the generator now emits
+  `INCOMPLETE_EXTENSION_REASONS`, pairing every excluded extension with the
+  refused entry point that excluded it, and the test asserts *that* pairing. It
+  is strictly stronger — it would have caught the original bug, it catches an
+  extension excluded for no reason, and it cannot expire when a stub becomes an
+  implementation. **A hand-named case inside a test about an invariant is a fact
+  with an expiry date**, and this one expired against a fix, which is the best
+  way for it to have happened and still a gate that went red for everyone.
+
+  Two agents reached that conclusion independently and reached for different
+  properties, so both are kept: `noop-audit`'s asks that every entry be a
+  **well-formed extension name**, which is the part no compiler checks —
+  `ask_device_extensions` subtracts by `binary_search`, so a malformed entry
+  subtracts *nothing, silently* — and this one asks that every entry **name a
+  stub that is genuinely in `NOT_IMPLEMENTED`**. They are not the same
+  assertion and neither implies the other.
+
+  **And the shape is now better evidence than any instance of it.** This is the
+  third time in one night that a check recorded a *fact* where it meant to state
+  a *property*: the size gate that could never pass, the arena's
+  one-connection sentence, and this. §0.16 item 1 is the same shape one layer
+  down — a catch-all arm whose comment asserted four things about a type, all
+  four true when written and none true when it fired. A recorded fact is
+  indistinguishable from a property on the day it is written and diverges
+  silently afterwards, and the tell is grammatical: a check that names a
+  specific command, extension or number in its assertion is describing the tree
+  it was written against, not the rule it believes in.
+
 **3. The profile was widened by what CTS asked for, and the cheap half of the
 gap is not commands.** `sv-codegen gap` reports the registry's side — 740
 commands defined, 239 carried — and check 4 reports the suite's side, in deqp's
@@ -2995,6 +3055,14 @@ that badly misdescribes the work: much of the reachable gap is feature bits,
 segmentation fault.** `VK_KHR_push_descriptor` was added, measured, and taken
 back out — the one entry in that list that is a measurement rather than a
 judgement, and the most useful finding in it.
+
+  **It is excluded because it is unimplemented, not because it is unwanted**,
+  and the distinction is load-bearing: `VK_EXT_descriptor_buffer`, the
+  ray-tracing pair and `VK_KHR_external_semaphore_fd` are excluded on *policy*
+  and must stay out; this one is excluded on *state* and should come back in the
+  moment somebody writes the expansion below. Ten of the wider run's 198 skips
+  are waiting on it. A mechanical widening that restores it without the
+  expansion restores the segmentation fault with it.
 
   `exceptions::void_policy` already declared
   `VoidPolicy::ArenaOffset` for `vkCmdPushDescriptorSetWithTemplate`'s `pData`,

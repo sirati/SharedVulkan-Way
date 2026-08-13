@@ -334,7 +334,7 @@ impl Driver {
         let mut nscm = vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT::default();
         let mut pgq = vk::PhysicalDevicePrimitivesGeneratedQueryFeaturesEXT::default();
         let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
-        // The six extensions design.md §0.17 added to the profile that carry a
+        // The six extensions design.md §0.20 added to the profile that carry a
         // feature struct. Without the struct chained the feature comes back
         // false and is *enabled* false, so an application that asks for
         // `VK_EXT_graphics_pipeline_library` finds the extension present and the

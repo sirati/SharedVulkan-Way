@@ -469,7 +469,7 @@ mod tests {
     /// now **implemented** — all three of `vkGetBufferDeviceAddress`,
     /// `vkGetBufferOpaqueCaptureAddress` and
     /// `vkGetDeviceMemoryOpaqueCaptureAddress` forward and return the GPU side's
-    /// real address (§0.17) — so advertising it is honest and the check that
+    /// real address (§0.20) — so advertising it is honest and the check that
     /// belongs here is the one the body actually makes.
     #[test]
     fn the_ten_zero_feature_set_is_empty() {
