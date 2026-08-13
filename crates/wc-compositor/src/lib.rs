@@ -48,6 +48,7 @@
 #[cfg(unix)]
 mod control;
 mod cursor;
+pub mod grow;
 mod icon;
 mod input;
 mod platform;
