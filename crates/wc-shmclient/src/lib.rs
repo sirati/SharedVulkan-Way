@@ -74,6 +74,26 @@ pub struct Config {
     pub partial: bool,
     pub title: String,
     pub app_id: String,
+    /// A second `xdg_toplevel.set_app_id`, sent after the window is on screen.
+    ///
+    /// ADDED FOR STAGE 32. The protocol allows `set_app_id` at any time and the
+    /// taskbar identity has to follow it, but no toolkit does it late — they
+    /// all name themselves before they draw. So the late case cannot be
+    /// measured with a client anybody ships, and this is the flag that makes it
+    /// measurable with one we wrote. See [`proto::set_app_id`].
+    pub late_app_id: Option<String>,
+    /// How many frames to draw before sending it.
+    pub late_after: u32,
+    /// How long the loop may run before it gives up, in seconds.
+    ///
+    /// There has always been a deadline here — a client that hangs waiting for
+    /// a compositor that will never answer has to end by itself. Sixty seconds
+    /// was the constant; it is a flag as of STAGE 32 because a photograph of
+    /// the guest's desktop is taken by a scheduled task and registering,
+    /// starting, waiting for and unregistering one costs the better part of a
+    /// minute (§16.6). A window that is gone before the camera arrives makes a
+    /// picture of the wrong thing, which that stage paid for once.
+    pub seconds: u64,
     pub path_arg: Option<String>,
 }
 
@@ -86,6 +106,9 @@ impl Default for Config {
             partial: false,
             title: "waycompose shm client".to_string(),
             app_id: "org.waycompose.shmclient".to_string(),
+            late_app_id: None,
+            late_after: 30,
+            seconds: 60,
             path_arg: None,
         }
     }

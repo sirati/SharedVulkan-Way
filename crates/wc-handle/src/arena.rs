@@ -954,6 +954,44 @@ pub fn attached() -> Vec<(u32, usize, String)> {
     out
 }
 
+/// Where a region this process **provided** starts in this process's address
+/// space, for the one caller that needs an address rather than bytes.
+///
+/// # Why a raw address is exported at all, when nothing else here is
+///
+/// Every other accessor in this module hands out bytes, because the whole point
+/// of an arena id is that neither side has to know where the other put
+/// anything. This one exists for `SuperfetchPfnQuery`, which is a *reverse*
+/// lookup: it enumerates the machine's page frames and keeps the ones whose
+/// recorded virtual address falls inside a window (`awe_probe::superfetch`).
+/// The window has to be named by its address because that is the only name the
+/// PFN database knows it by — there is no id to give it.
+///
+/// It is `provided` only, and that is the same rule [`guest_write`] and
+/// [`release_guest_ram`] are under: a region this process merely *opened* is
+/// somebody else's memory, its frames belong to whoever committed them, and
+/// asking Windows which frames back a foreign mapping would produce an answer
+/// about a different process's pages.
+///
+/// # What this makes possible, and it is the whole of §0.14 item 4
+///
+/// The content sweep can only find a region whose pages still carry their
+/// stamps, and the first pool allocated into a region overwrites them
+/// ([`attach_guest_ram`]'s own note says so: "this region cannot be re-found
+/// later"). The frame list does not care what is in the pages — measured, on a
+/// window whose every byte had been overwritten, as the *same* frame list where
+/// the sweep found zero pages. So this is not an optimisation of locating; it
+/// is what makes locating a region twice possible, and growth is the first
+/// thing that needs it.
+pub fn region_base(arena: u32) -> Option<usize> {
+    let guard = registry().read().ok()?;
+    let a = guard.get(&arena)?;
+    if !a.provided {
+        return None;
+    }
+    Some(a.view.ptr() as usize)
+}
+
 /// Give a guest-RAM region back to the operating system.
 ///
 /// DYNAMIC ARENA, and this is the half of release that actually returns

@@ -29,6 +29,7 @@ RUN=$(mktemp -d /tmp/svwl-XXXXXX)
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
 DPPX=${SVWL_DPPX:-0.4}
+XDISPLAY=${SVWL_XDISPLAY:-:78}
 # This machine has Mesa and its ICDs in `/run/opengl-driver` but no
 # `libvulkan.so.1` on the default search path, so both the GPU side and Zink
 # fail to find a loader at all. Named rather than searched for, because a
@@ -107,17 +108,35 @@ if [ "$MODE" = probe ]; then
 fi
 
 if [ "$MODE" = x11 ]; then
+  # **Reap this display number first.** An Xwayland outlives the harness that
+  # started it whenever the run does not reach its teardown, and the next run
+  # then connects to a server whose compositor is gone: the X client gets a
+  # swapchain, presents once, and kopper polls the surface forever. That looks
+  # exactly like the stall this mode exists to measure, and it cost two
+  # measurements here before it was recognised.
+  #
+  # **`pkill -f` is not usable for this** and the reason is `waycompose-design.md`
+  # §16.8 a third time: the pattern would have to contain the display number,
+  # and the command line it matches against includes *this script's own*, which
+  # also contains it. The script kills itself, exit 143, and the run reports
+  # nothing at all. A process **name** is an identity `pgrep -x` matches
+  # exactly and can never match a shell; the display number then comes from
+  # that process's own argv rather than from a pattern over every process.
+  for p in $(pgrep -x Xwayland 2>/dev/null); do
+    tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- " $XDISPLAY " && kill "$p"
+  done
+  sleep 1
   # Xwayland on top of the shm-only weston, and Firefox on X11 inside it. The
   # X server gets a *clean* GL environment — it is itself a GL program and an X
   # server that cannot initialise its own GL offers no fbconfig to anybody.
   say "rootful Xwayland on the shm-only weston, then Firefox on X11"
   env -u GALLIUM_DRIVER -u MESA_LOADER_DRIVER_OVERRIDE -u VK_DRIVER_FILES \
       -u SV_SOCKET -u EGL_PLATFORM LIBGL_ALWAYS_SOFTWARE=1 \
-    Xwayland :78 -geometry 1600x1000 -noreset >"$RUN/xwayland.log" 2>&1 &
+    Xwayland $XDISPLAY -geometry 1600x1000 -noreset >"$RUN/xwayland.log" 2>&1 &
   KIDS+=($!)
-  for _ in $(seq 1 60); do [ -S /tmp/.X11-unix/X78 ] && break; sleep 0.5; done
-  [ -S /tmp/.X11-unix/X78 ] || { echo "FAIL: Xwayland never listened"; tail -5 "$RUN/xwayland.log"; exit 1; }
-  export DISPLAY=:78 EGL_PLATFORM=x11 MOZ_ENABLE_WAYLAND=0 GDK_BACKEND=x11
+  for _ in $(seq 1 60); do [ -S "/tmp/.X11-unix/X${XDISPLAY#:}" ] && break; sleep 0.5; done
+  [ -S "/tmp/.X11-unix/X${XDISPLAY#:}" ] || { echo "FAIL: Xwayland never listened"; tail -5 "$RUN/xwayland.log"; exit 1; }
+  export DISPLAY=$XDISPLAY EGL_PLATFORM=x11 MOZ_ENABLE_WAYLAND=0 GDK_BACKEND=x11
   # **The override this whole mode exists to test.** `platform_x11.c` refuses
   # Zink outright when the X server has no DRI3 multibuffer support — which an
   # Xwayland with no DRM device never has — *unless* `LIBGL_KOPPER_DRI2` is

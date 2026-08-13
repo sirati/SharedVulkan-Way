@@ -56,6 +56,17 @@ wc-handle = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# GROWTH. `SuperfetchPfnQuery`, which is how a region this process has just
+# committed says *where its pages are* without the host having to search 13 GiB
+# of backing object for stamps. ~330 ms of guest CPU whatever the window, and
+# 0.064 s on the host afterwards, against 2832–3101 ms for the sweep — which is
+# the difference between growing under load and stalling a video for three
+# seconds. See `src/grow.rs`.
+#
+# `cfg(windows)` rather than unconditional because the crate depends on `ash`
+# for a probe module this does not use, and a Linux build of `wc-compositor`
+# (which is the one `cargo test` runs) has no PFN database to ask anyway.
+awe-probe = { path = "../awe-probe" }
 # The window half. Raw bindings rather than the `windows` crate for the reason
 # in the workspace manifest: everything called here is a plain C entry point —
 # `CreateWindowExW`, `SetDIBitsToDevice`, `GetMessageW` — with no COM and no
@@ -104,4 +115,12 @@ windows-sys = { workspace = true, features = [
   # Power rather than with the window APIs because it is a property of the
   # calling thread rather than of a window — see `win32::set_idle_inhibit`.
   "Win32_System_Power",
+  # ADDED FOR STAGE 32: the taskbar identity, which is the one place in this
+  # tree where the "no COM" note above stops holding. `SHGetPropertyStoreForWindow`
+  # hands back an `IPropertyStore`, and there is no flat entry point that sets a
+  # property on an `HWND`. windows-sys generates no interfaces, so the vtable is
+  # declared by hand in `win32.rs`; what these two features bring is the entry
+  # point, `CoInitializeEx`/`CoTaskMemFree`, and `PROPERTYKEY`.
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_System_Com",
 ] }

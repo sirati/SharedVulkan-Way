@@ -116,7 +116,20 @@ fn instance() -> Option<&'static state::SharedVulkan> {
                 Ok(icd) => {
                     let leaked: &'static state::SharedVulkan = Box::leak(Box::new(icd));
                     sv_icd_entry::set_icd(leaked);
-                    eprintln!("sv-icd: connected to the GPU side at {sock}");
+                    // The hash goes on the line that always prints, not behind
+                    // `SV_DEBUG`. `Control::attach` already refuses a mismatch
+                    // loudly and by name (`ProtocolHashMismatch { ours,
+                    // theirs }`), so the failure is never silent — but it is
+                    // read as a *transport* fault, and it never is one: it means
+                    // one of the two binaries is older than the other. Printing
+                    // ours beside the socket puts the number in every run's log,
+                    // so the first question after a handshake failure is "are
+                    // these the same build" rather than "is the ring broken".
+                    // This project has lost time to a stale binary twice.
+                    eprintln!(
+                        "sv-icd: connected to the GPU side at {sock} (protocol {:#018x})",
+                        sv_proto::PROTOCOL_HASH
+                    );
                     Some(leaked)
                 }
                 Err(e) => {

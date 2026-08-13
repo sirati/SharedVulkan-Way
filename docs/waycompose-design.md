@@ -3601,6 +3601,35 @@ that tries to read pixels back**, and nothing in stages 1–5 tried to.
 So §10.12 item 3 was not "we did not get round to looking". It was that the
 harness could not have looked, and could not have reported that it could not.
 
+#### The same fact bites a second time, and it is not about pixels
+
+**A `wl_shm` pool does not cross a session either**, and the failure looks
+nothing like the one above. Measured in §32's harness, which started two Windows
+clients over ssh against a compositor on the logged-on desktop:
+
+```
+wc-compositor: window 1 created (HWND 0x40490) title="" app_id=""
+wc-compositor: could not map Section { name: "Local\\wc-1bbd6…", size: 960000 }:
+               Das System kann die angegebene Datei nicht finden. (os error 2)
+wc-compositor: client … disconnected: ProtocolError(… "wl_shm",
+               "Failed to mmap fd Handle { … }")
+```
+
+A pool on Windows is a **named section** (§2.3), and the `Local\` namespace is
+per *session*. The client in session 0 creates `Local\wc-…`; the compositor in
+session 1 opens the same string and there is no such object. Same machine, same
+path, same name, `ERROR_FILE_NOT_FOUND`. What a harness sees is windows that are
+created and never mapped, and a `wl_shm` protocol error that reads like a bug in
+the pool code.
+
+So the rule is wider than "a capture from ssh is blind": **anything the guest
+side of a run touches by kernel-object name has to be in the same session as the
+process that made it.** Both ends go through the scheduler, or neither does. It
+does not apply to the deployed topology, where the client is on the *Linux* side
+and its pool crosses as a file or an arena slice rather than as a name — which
+is exactly why it had gone unnoticed until a harness put a Windows client and a
+Windows compositor in different sessions.
+
 ### 13.3 Getting onto `WinSta0`, and the three routes that were not available
 
 A process cannot walk into another session's window station; something already
@@ -5643,11 +5672,39 @@ more ways for that to be true and two ways to photograph the wrong instant.
 >    side reads `close requested`, which is what a user clicking the X looks
 >    like. Kills-by-name are not made safe by being gentle.
 >
-> The three instances so far: §12.8's image-name kill, which stage 8 narrowed to
-> an image *path* (§13.9); this stage's `WM_CLOSE` (below); and stage 12's
+> The four instances so far: §12.8's image-name kill, which stage 8 narrowed to
+> an image *path* (§13.9); this stage's `WM_CLOSE` (below); stage 12's
 > `clean` step running an unscoped `rm -f …/wg-*` over eight live sockets
-> belonging to this stage's runs. Each was diagnosed as flakiness first, and
-> each cost more than the fix.
+> belonging to this stage's runs; and the WSI stage's, which is the first to be
+> found by reading rather than by losing a run and is written out below. Each of
+> the first three was diagnosed as flakiness first, and each cost more than the
+> fix.
+>
+> **The fourth: `scripts/sv-firefox-guest.sh`, and it is rule 1 twice over.**
+> Its `clean` step runs
+>
+> ```
+> systemctl stop 'svff-run-*' 'svff-hostd-*' 'svff-app-*'
+> systemctl reset-failed 'svff-*'
+> ```
+>
+> and kills guest processes by the prefix `C:\Users\<guest-user>\svffint\` — while the
+> unit name it later starts is `svff-run-$$`, so the glob matches **every
+> concurrent run of this harness, not this one**. Two runs of it destroy each
+> other, and the symptom lands in the *other* run: a host-side unit that
+> vanishes mid-Firefox, which reads as a crash. The same is true of the guest
+> kill, of `/srv/winshare/svff`, of `/tmp/svff-int` where the binaries live, and
+> of the fixed TCP ports 57359–57363 — five shared identities, none of them
+> derived from the run.
+>
+> **The fix is not "use your own prefix", it is that the prefix is a
+> parameter.** `SVFF_DIR`, `SVFF_GDIR`, `SVFF_SHARE`, `SVFF_UNIT_PREFIX` and
+> `SVFF_BASE_PORT` now default to what they were, so an existing invocation is
+> unchanged, and a second experiment overrides the five and collides with
+> nothing. The globs remain — a `clean` step exists precisely to reap leftovers
+> whose pids nobody recorded — but they are now scoped to one experiment's own
+> namespace, which is the narrowest a glob can honestly be. Working around this
+> by hand, as this stage nearly did, is how it survives to a fifth instance.
 
 * **`taskkill /IM wc-compositor.exe` without `/F` sends `WM_CLOSE`.** Another
   worktree running an older `wc-guest.sh` reaps nothing of ours — our process
@@ -5679,6 +5736,14 @@ A fifth, smaller: registering two scheduled tasks with the same name in one run
 leaves `Start-ScheduledTask` with nothing to start and no error, which printed
 as "the compositor did not start" for the second pass only — with the
 compositor's own log on the guest proving that it had.
+
+A sixth, found by §32 and filed in §13.2 because it belongs with the fact it is
+a consequence of: **a client started over ssh cannot share memory with a
+compositor on the desktop.** A `wl_shm` pool is a named section and `Local\` is
+per session, so the name the client creates in session 0 does not exist in
+session 1 — `ERROR_FILE_NOT_FOUND`, a `wl_shm` protocol error, and windows that
+are created and never mapped. Any harness that runs a *Windows* client against a
+desktop compositor has to put both ends through the scheduler.
 
 **And the other half of the rule, which is about what a run leaves behind.**
 While this stage was running, the guest was found to be holding **six abandoned
@@ -9777,6 +9842,7 @@ share, to re-learn a fact that does not depend on the platform).
    control-socket verb and a `FromUi` variant, and it should be done at the
    same time as `wl_touch` itself so that neither is scored against the other's
    absence.
+
 ---
 
 ## 28. Stage 14: a shortcut on the Windows desktop
@@ -11022,9 +11088,1205 @@ those numbers. In particular `the_reverse_direction_has_fds_too` still lists
 `wl_data_offer.receive` and `wl_data_source.send`, which is correct: they still
 carry an `h`, and the point of this work is that neither one is ever forwarded.
 
-## 32. Gates that reported success while something was wrong
+## 30. Stage 30: can the client's pool be *our* memory, so that nothing is copied
+
+The requirement is one sentence from the user: "we want to avoid memory being
+copied it should normally be directly written". Today it is not. Every client
+frame is copied by `wc-proxy` out of the client's `wl_shm` pool into an arena
+slice. `--copy damage` narrowed that to the damaged rows and §27 cut it 2.05×,
+but the shape is unchanged — **126 µs per 4.5 MiB copy, 262 copies and 1158 MiB
+in one Firefox session** — and none of that is what "directly written" means.
+
+**Read those numbers next to the one that arrived while this section was being
+written, because it changes what they are worth.** §34 decomposed Firefox's
+first-frame stall and found a cross-VM present costs **216.9 ms** median against
+1.7–2.1 ms for the same present locally, essentially all of it because
+`sv_transport::park`'s futex doorbell cannot cross a hypervisor: every waiter
+runs out a 20 ms scheduler slice instead of being woken, and 216.9 / 20 = 10.8 —
+about **eleven waits per present**, each one missing its doorbell and paying the
+slice. Set the copy against that. One copy is 126 µs, so it is 0.06% of one
+present; and the *entire* session's copying — all 262 of them, all 1158 MiB — is
+33 ms, which is **about a seventh of a single present**. A day spent removing
+every copy in this document would be invisible next to one doorbell that wakes.
+
+That does not make this section pointless, and it is not an argument for
+sloppiness about memory: the user asked for two things, copying *and* memory,
+and §30.10 records that the memory side of this trade is still unmeasured. But
+it does settle the ordering. The doorbell is being fixed as top priority, and it
+should be; this is the work that comes after it, when microseconds are the units
+that remain.
+
+`crates/wc-proxy/src/pool.rs`'s module header already argues why the copy is
+there, and this section does not overturn it. It says `wl_shm.create_pool` is
+the client handing the server memory it has *already* allocated, that the
+protocol has no request in the other direction, and that by the time the proxy
+learns of a pool the pages are chosen. All of that is true, and it is true about
+the protocol, which is the level it claims. It identifies one escape — a client
+that allocates from the arena, which is the accelerated path where WebRender
+renders through `shared_vulkan` and no `wl_shm` pool exists at all.
+
+This section is about the escape it does not consider: **leave the protocol
+alone and change where libwayland's pool memory comes from**, without changing
+Firefox. The client is on the host. The arena is guest RAM already mapped into
+the host process — that is how `wc-proxy` writes into it. So host-side code can
+already write into the memory the compositor reads. The only reason a copy
+happens is that Firefox's pool is a *different object*. If the pool's pages were
+arena pages, a commit would cost nothing.
+
+The result of this stage is: **the mechanism exists, nothing forbids it, and it
+works — an unmodified Firefox paints its frames straight into memory this side
+chose — but only once a pool is identified by the object it *is* rather than by
+the descriptor number it arrived on.** Keyed the obvious way instead, on that
+number, the whole thing is accepted by Firefox and carries none of its pixels
+while looking entirely healthy: no crash, no protocol error, thousands of
+buffers attached, and a blank window.
+
+The copy still stays, for the reasons in §30.11, none of which is any longer
+about whether the mechanism works. What follows is what was measured, because
+the hazards are worth more than the conclusion — three of the five are the same
+mistake wearing different clothes, and the one distinction that dissolves all
+three is the only thing in this section anyone needs to remember.
+
+### 30.1 One correction to the module header, and it is narrow
+
+The header says: "Nothing on Linux can re-point an existing mapping at another
+object's pages." As written that is right, and it stays right. But it is used to
+carry more weight than it can, because the thing needed here is not re-pointing.
+
+`mmap(MAP_FIXED)` over an address that is already mapped **atomically replaces**
+the mapping there with another object's pages. The old mapping is not
+re-pointed; it is destroyed and a new one is put in its place in the same
+operation, with no window in which the address is unmapped. Every pointer the
+client has already handed out stays valid, because a pointer names an address
+and the address still resolves. That is measured below, not argued: an
+unmodified `weston-flower` kept drawing through an address whose backing object
+had been swapped underneath it.
+
+So the honest form of the header's claim is: *the protocol* gives the server no
+say in where a pool lives, and once the client has drawn, the bytes it drew are
+in the object it chose. Neither sentence forbids arranging, before or at
+`create_pool`, that the object it chose is ours.
+
+### 30.2 The interposition point, and why there is exactly one
+
+A shim has to see `wl_shm.create_pool` and change the descriptor in it. Three
+candidates, and only the third survives:
+
+* **`wl_shm_create_pool`** is generated as a `static inline` in
+  `wayland-client-protocol.h`. It is compiled into every client and exported by
+  nobody, so it cannot be interposed at all.
+* **`wl_proxy_marshal_flags`** is exported and is what that inline calls. It is
+  variadic, and a variadic function cannot be forwarded portably in C — there is
+  no way to pass a received `va_list` on to another variadic function.
+* **`wl_proxy_marshal_array_flags`** is exported, is **not** variadic, and takes
+  its arguments as `union wl_argument *args` — a mutable array. Rewriting
+  `args[1].h` in place is the whole mechanism.
+
+The third is only useful if `wl_proxy_marshal_flags` reaches it through the PLT
+rather than a direct internal call. It does, and that was checked rather than
+assumed, against the wayland 1.24 in this tree:
+
+```
+$ objdump -d libwayland-client.so.0 | grep -A60 '<wl_proxy_marshal_flags>:'
+    9052:  call   61c0 <wl_proxy_marshal_array_flags@plt>
+```
+
+That single `@plt` is what makes the whole route possible; without it there is
+no interposition point and this section would end here.
+
+Identification does not have to guess at opcode numbers either.
+`wl_proxy_get_interface` is exported in 1.24, so the shim reads the proxy's own
+`wl_interface` and compares `pi->name` against `"wl_shm"` and
+`pi->methods[opcode].name` against `"create_pool"` — names, from the client's own
+protocol tables, rather than a number that moves between versions.
+
+Firefox is reachable this way. `libxul.so` imports all of it as *undefined*
+symbols, which is to say through the PLT:
+
+```
+$ nm -D --undefined-only libxul.so | grep -E 'marshal|shm|mmap|memfd'
+  U memfd_create@GLIBC_2.27      U mmap@GLIBC_2.2.5
+  U shm_open@GLIBC_2.34          U mmap64@GLIBC_2.2.5
+  U wl_proxy_marshal_flags       U wl_shm_interface
+  U wl_proxy_marshal_array_flags U wl_shm_pool_interface
+```
+
+### 30.3 The fd rule, stated where the mechanism is, the way §14.7 states the count
+
+No descriptor and no handle crosses the boundary, ever. This mechanism creates a
+descriptor and passes it, so it has to say plainly why that is not a violation.
+
+The client, the shim inside it, and `wc-proxy` are **three host processes**. The
+shim creates the substitute object on the host; the descriptor travels exactly
+one `SCM_RIGHTS` hop over the local Wayland socket — the same hop `wl_shm` makes
+today, in the same direction, carrying the same kind of object — and is consumed
+by `wc-proxy` on the host. It never approaches the VM boundary. What crosses the
+boundary is unchanged and remains what §12 and §17 say it is: an arena id, an
+offset and a length, which are integers.
+
+The rule was never "no descriptors anywhere". `pool.rs` states it precisely: "A
+descriptor created locally out of memory that side already reaches is fine; a
+descriptor *passed* is not" — meaning passed *across*. The client's own pool fd
+is already created by the client and consumed by this proxy today. Substituting
+which object that fd names changes nothing about what crosses.
+
+### 30.4 The experiment, and why it uses a plain file
+
+`scripts/wc-poolshim.c` is the standalone half: an `LD_PRELOAD` shim that
+intercepts `create_pool`, allocates a backing object of its own, moves the
+client onto it, and substitutes the descriptor. It backs pools with **a plain
+file**, deliberately, so that the only thing under test is the interposition and
+never the allocator. It touches no arena, no region lifecycle and no proxy code
+— which is also why it could be built while the dynamic-arena work is in flight.
+
+The rig is `weston --backend=headless --fake-seat`. The `--fake-seat` is not
+incidental: without it the headless backend has no seat, GTK's
+`gdk_seat_get_keyboard` asserts, and Firefox silently falls back to headless
+mode where it creates no `wl_shm` pools at all. An hour went into a measurement
+that was measuring nothing.
+
+### 30.5 What is proven: an unmodified libwayland client, fully redirected
+
+Against `weston-flower` and `weston-terminal`, with the shim armed:
+
+| | |
+|---|---|
+| pools intercepted | 2 of 2 |
+| pools redirected onto our object | 2 of 2 |
+| resizes carried across (4 KiB → 4.19 MiB) | 9 of 9 |
+| client crashes | 0 |
+| witness saw the client's drawing | yes |
+
+"Witness" is the instrument described in §30.7. The client kept rendering
+through an address whose backing object had been replaced underneath it, across
+nine pool growths, and the bytes it drew appeared in the object the compositor
+had been handed. For this class of client the mechanism is not in doubt.
+
+### 30.6 What is proven for Firefox, and the identity that decided it
+
+Firefox 151.0.1, unmodified, on the same rig, rendering an animated page for
+70 seconds:
+
+| | |
+|---|---|
+| `wl_shm.create_pool` intercepted | **4 of 4** |
+| pools redirected onto our object | 4 of 4 (14.3 MB) |
+| `wl_surface.commit` seen | 8110 |
+| crashes, protocol errors, content-process losses | 0 |
+| `wl_surface.attach` / `damage_buffer` | 2284 / 2281 |
+| `wl_shm_pool.create_buffer` | 4 (reused across every attach) |
+| `zwp_linux_dmabuf` used | no — this is genuinely the `wl_shm` path |
+| witness, keyed on the *descriptor* | no: 1 change in 7683 commits |
+| **witness, keyed on the *object*** | **yes: 2334 and 949 changes in ~7130 commits** |
+
+The first row is the one that mattered most going in, and it is the answer to
+"does GTK's shm path go through an interposable symbol": **it does**. Firefox's
+pools are seen, named and rewritten, and Firefox runs a full session afterwards
+without noticing.
+
+The last row is the result, and it took two attempts to earn, because the first
+attempt was the instrument lying rather than the mechanism working.
+
+**The instrument was blind first.** Firefox closes the pool descriptor
+immediately after `create_pool` — the ordinary pattern, since the compositor now
+holds its own reference. The `close` handler has to retire the record at that
+moment (it must; see §30.6d), and the first version retired the witness mapping
+along with it, so the instrument stopped looking at the exact moment the frames
+started. Three of the four pools reported `commits=0` and the fourth reported
+one change, which reads like "almost working" and is in fact "not looking". The
+fix is a distinction rather than a workaround: **retirement is about the
+descriptor *number*, not about the object.** An `mmap` holds its own reference
+to a file, so the witness mapping stays valid after the descriptor is gone.
+Retire the number, keep the mapping, keep checking it.
+
+**With the instrument fixed, the answer is negative.** All four pools are
+watched across the whole session — 7683 commits each — and each one's contents
+change exactly **once**, at the first commit, and never again. Meanwhile Firefox
+issues 2284 `wl_surface.attach` and 2281 `wl_surface.damage_buffer` against 4
+buffers, and binds no `zwp_linux_dmabuf` at all. So Firefox is painting, it is
+painting through `wl_shm`, and **it is not painting into the objects this shim
+substituted**. The pixels are going somewhere else.
+
+Two of those counts are worth keeping for another section's sake. 4590 commits
+against 2284 attaches is very close to half, which is §26.12 item 3's open
+question — "why half of Firefox's commits carry no buffer", 1708 of 3343 there —
+reproduced on a completely different rig, against weston rather than
+`wc-compositor`, with a different Firefox profile. That makes it a property of
+what Firefox does rather than of anything this project built, which is most of
+the answer that item was asking for.
+
+That is a real result and it is worth more than the optimistic reading it
+replaced. It says the redirection is *accepted* by Firefox — no crash, no
+protocol error, buffers created from the substituted pools and attached 2284
+times — while carrying none of the pixels. Which is to say: this mechanism, at
+this interception point, is capable of producing **exactly the silent wrong
+answer the project fears most**, and it produced it here. A screenshot would
+have shown a blank or stale window and nothing anywhere would have logged an
+error.
+
+Two candidate causes were proposed at that point: that the drawing does not
+happen in the process owning the Wayland connection, or that the client holds a
+second mapping of the same descriptor. **Both are wrong**, and the way to find
+that out was to stop reasoning about it and ask the kernel who maps the object.
+Take the pool's inode from the descriptor with `fstat`, walk every readable
+`/proc/<pid>/maps`, and count. Observation only, with the redirection disarmed,
+so it measures what Firefox does rather than what the shim did to it:
+
+```
+DIAG create_pool pid=3948252 fd=20 size=36864   ino=231537   -> 0 mappings
+DIAG create_pool pid=3948252 fd=88 size=4608000 ino=212570   -> 0 mappings
+... once frames are flowing, the same inodes:
+DIAG ino=212570 mapped by pid=3778952 (weston)              /memfd:mozilla-ipc
+DIAG ino=212570 mapped by pid=3948252 (.firefox-wrappe) [SELF] /memfd:mozilla-ipc
+DIAG ino=212570 total mappings: 2
+```
+
+Two mappings, and both are accounted for: the compositor, which maps every pool
+it is given, and **the very process that called `create_pool`**. There is no
+third process, so the painting is not happening elsewhere; and there is one
+mapping per process, so there is no second mapping to have missed. The name is
+the tell — `/memfd:mozilla-ipc`, which is `mozilla::ipc::SharedMemory`, whose
+descriptor is duplicated and passed around Firefox freely.
+
+So the cause is a third one, and it is the caveat §30.6d already flagged as
+"necessary but not obviously sufficient" arriving as the thing that actually
+breaks it:
+
+**(e) The client maps the pool through a *different descriptor* than the one it
+passes to `create_pool`.** Same object, different number. A shim keyed on the
+descriptor number is watching a number the mapping is never made from, so it
+sees no `mmap` to intercept (`re-pointed=0`) and substitutes an object nobody
+writes to. Everything else about the mechanism was already right.
+
+**The fix is a distinction, and it is the same shape as the one that unblinded
+the witness: identity is the object, not the number.** `(st_dev, st_ino)` names
+an object; `fstat` the descriptor on every `mmap` and match on that. With that
+one change, against unmodified Firefox on the same rig:
+
+| | descriptor-keyed | **object-keyed** |
+|---|---|---|
+| pool `mmap`s intercepted | 0 | **2** |
+| witness changes, 4.6 MB pool #1 | 1 | **2334** in 7137 commits |
+| witness changes, 4.6 MB pool #2 | 1 | **949** in 7126 commits |
+| crashes | 0 | 0 |
+
+**Firefox's frames travel through the redirected pools.** The two pools that
+change are exactly the two 4.6 MB `mozilla-ipc` rendering pools; the two that
+still change once are `wayland-cursor` and `gdk-wayland`, which is correct,
+because a cursor and a decoration pool have no reason to repaint.
+
+The distinction pays a second time, and this is the part worth keeping. Keying
+on the object **retires hazard §30.6d entirely**: a recycled descriptor number
+now names a different object and simply fails to match, so there is nothing left
+for the `close` handler to defend against — and since the `close` handler was
+what blinded the witness in the first place, removing the need for it removes
+that failure too. One correct notion of identity dissolved three bugs: the IPC
+corruption, the instrument blindness, and this.
+
+It also produced one more measurement of the cost of getting identity wrong.
+An intermediate build kept the descriptor-number lookup as a *fallback* after
+the object lookup, while retirement had already been removed — so a recycled
+number matched a live pool forever. That killed Firefox in one run. There is no
+safe fallback: the object is the identity or there is no identity.
+
+Four hazards were found on the way, each of which produced a wrong answer before
+it was understood. They are recorded because every one of them fails silently or
+misleadingly, and anyone building the real thing will meet all four.
+
+**(a) The resize path is not `ftruncate`.** On x86-64 every client compiles
+`ftruncate` to `ftruncate64`, so a shim interposing `ftruncate` catches nothing;
+and libwayland's `os_resize_anonymous_file` prefers `posix_fallocate` anyway,
+because it wants the failure up front instead of a SIGBUS later. Nine pool
+growths went past the first version of the shim completely untouched, leaving
+the compositor holding a 4 KiB object for a 4.19 MiB pool. Nothing reported an
+error.
+
+**(b) Clients do not grow a pool with `mremap`.** They `munmap` and then `mmap`
+*their own descriptor* again. A shim that redirects once, at `create_pool`, is
+therefore correct only until the first resize, after which the client is quietly
+writing into its own memfd while the compositor still reads the substituted
+object and shows a frozen picture. The substitution has to be reasserted on
+**every** `mmap` of a pool descriptor, not established once.
+
+**(c) Firefox `dlopen`s libxul, so libwayland does not exist at constructor
+time.** A preloaded library's constructor runs before the main executable's, and
+resolving `wl_proxy_marshal_array_flags` there yields NULL. Cache that NULL and
+the first request Firefox marshals calls through it and segfaults before the
+shim has intercepted anything. The weston clients hide this perfectly — they
+link libwayland the ordinary way — so the shim looked correct right up until it
+met the only client anyone cares about. Resolve on first use.
+
+**(d) Descriptor numbers are recycled, and the cost of forgetting that is
+Firefox's IPC.** A pool remembered by descriptor *number* leaves a record
+matching fd 21; fd 21 is closed; the next unrelated object the client opens
+becomes fd 21 and is silently re-pointed at the dead pool's pages. In Firefox
+that landed on its own IPC shared memory and killed the content process with
+`[GFX1-]: Replay failure: Magic`. This is precisely the failure class this
+project calls its most expensive — nothing reports an error anywhere near the
+place the wrong thing happened. Watching `close` fixes it, and is necessary; it
+is not obviously *sufficient*, because a client may `dup` the descriptor, in
+which case the number being watched is not the last reference.
+
+### 30.7 What replaces `--verify-damage`, because with no copy there is nothing to compare
+
+`wc-proxy --verify-damage` compares the region against the client's own bytes
+after every copy, and it is what caught the buffer-vs-surface damage bug in §27.
+It cannot survive this change: it takes two buffers and there is now one. The
+replacement has to exist before the copy is removed, not after.
+
+The question changes shape. With a copy, the question is *did the bytes arrive*.
+With no copy, the bytes cannot fail to arrive — they were never moved. The
+question becomes **is the client writing where the compositor reads**, and that
+is a question about identity, not content. Three answers, in increasing strength:
+
+1. **The witness mapping**, which the shim implements. An independent, read-only
+   mapping of the substituted object, held by the shim and mapped separately
+   from the client's. A commit whose pixels changed must change the witness too;
+   if a resize ever puts the client back on its own memfd, the witness goes
+   quiet and says so. It is cheap enough to run per commit (sampled FNV-1a) and
+   it is what turns "the client did not crash" into evidence — and in §30.6 it
+   was the *only* signal that dissented, while every other observable said the
+   redirection was working. It must outlive the descriptor: key it on the pool
+   object and never retire it with the fd. A witness retired alongside the
+   descriptor stops looking precisely when a real client starts drawing, which
+   is not a small bug in the instrument but a total one, and it is the
+   difference between the first reading of §30.6 and the correct one.
+2. **Page identity via the PFN locator.** The strongest available check, and the
+   machinery already exists — `943a16b` wired a locator that asks where the
+   pages are instead of searching for them. If the client's pool VA and
+   `wc-proxy`'s arena mapping resolve to the same physical frames, zero-copy is
+   not inferred but demonstrated. This should be a startup and
+   region-transition assertion rather than a per-frame one.
+3. **Differential replay.** Run the same client twice, once copying and once
+   redirected, and compare the compositor's output. This is what actually
+   answers "are the pixels right", and it subsumes the damage verifier rather
+   than replacing it — the copying run *is* the reference.
+
+Recommendation: (1) per commit behind a flag, (2) at every pool creation and
+every region transition, (3) in the harness. Do not remove `--verify-damage`;
+the copying path remains the reference implementation that (3) needs.
+
+### 30.8 The problem the plain-file experiment deliberately excluded
+
+The experiment backs pools with a plain file. A real one must back them with the
+arena, and that is strictly harder for a reason that has nothing to do with
+interposition: **`wl_shm.create_pool` takes one descriptor and the pool starts at
+its offset 0**, while an arena slice is contiguous only in *arena* space.
+`guestram.rs` is explicit — the guest's pages are scattered, and `shared_vulkan`
+measured 1471 runs per 64 MiB for `VirtualLock`ed 4 KiB pages and 22 for large
+pages. There is no `(fd, offset)` that names an arena slice.
+
+This is survivable, and the shape of the answer is already visible in the
+experiment. The client's mapping does not have to come from the descriptor the
+protocol carries. The shim can compose the client's view exactly as
+`guestram.rs` composes the proxy's — reserve `PROT_NONE`, `mmap(MAP_FIXED)` one
+run at a time — so the client sees one contiguous pool that happens to be
+scattered across QEMU's backing object. The descriptor handed to `create_pool`
+then carries no pixels at all: it is a **decoy**, a small object naming the arena
+region, offset and length, which `wc-proxy` reads (with `read`, not `mmap`) and
+binds to the region it has already mapped. The compositor never maps the client's
+descriptor.
+
+That is worth noticing, because it means **route 1 and route 2 converge**. Once
+the descriptor is a token rather than memory, an `LD_PRELOAD` shim and a private
+"arena-backed pool" protocol are the same mechanism with different spellings of
+the handshake — the shim being the spelling that serves Firefox, which will
+never ask.
+
+**This survives the transport change, and it is worth saying why.** The Wayland
+byte stream is moving off `probe-relay` and TCP onto shared_vulkan's existing
+channel, on the principle that Wayland is an addon to shared_vulkan and must use
+the channel that already exists. Nothing in this section rests on that. The
+scattering that forces the decoy is a property of **the arena** — of how the
+guest's pages sit in QEMU's backing object — not of how bytes reach the
+compositor, and `wl_shm.create_pool` will still take one descriptor mapped from
+offset 0 whatever carries the stream. The one descriptor this section moves goes
+client → proxy over the local Wayland socket, on the host, upstream of the
+boundary entirely (§30.3); it never touches the transport under discussion.
+
+What the change *does* settle is ownership, and this section should not be read
+as a claim on it. The handshake has two halves and they sit at different layers.
+The client-facing half — how a client asks for an arena-backed pool — is a
+Wayland-level affair between the client and `wc-proxy`, host-side. The
+allocating half — asking the guest, which owns the arena, for a region and being
+told yes or no — is a message class on shared_vulkan's channel, and belongs to
+the agents on that plumbing rather than here. **Neither is to be built from this
+section.** §30.9 states what the allocating half has to promise; it deliberately
+does not state how it is spelled.
+
+### 30.9 What the arena has to promise, as a requirement rather than a workaround
+
+An arena-backed pool **pins its region**, and this is the interface the dynamic
+arena work should accommodate rather than something to be worked around
+afterwards.
+
+These are requirements about **lifetime**, not about wire format, and they are
+deliberately stated that way so they survive the transport moving onto
+shared_vulkan's channel. Every one of them is a statement about when a region
+may be taken away relative to when a Wayland object exists; none of them says
+who asks whom, or how. A contract written against a particular transport would
+have to be rewritten when the transport moved, which is exactly the failure this
+phrasing avoids. Stated as requirements:
+
+1. **A region with a live pool cannot be reclaimed.** Not deferred, not
+   reclaimed-and-repointed: refused. Idle-frame counting sees no drawing in a
+   pool a client merely stopped painting into, and reclaiming it frees memory a
+   client still has mapped. That is a use-after-free with pixels on top.
+2. **The pin is taken at `create_pool` and released at `wl_shm_pool.destroy`**,
+   not at last-attach and not on a frame counter. The pool object's lifetime is
+   the protocol's own answer to "is this still in use" and it is authoritative.
+3. **A pool may not straddle two regions.** Allocation must come from one
+   region or fail; there is no offset arithmetic that reaches from one region
+   into another (§12), which is exactly why the region id travels in every
+   descriptor.
+4. **Refusal must be expressible**, and it is the clause that keeps a failure
+   recoverable rather than fatal. If no region can satisfy a pool, the shim has
+   to be *told so*, as an answer — not left to infer it from a timeout, a zero,
+   or a reply that never comes. Given the answer, it leaves the client on its
+   own memory and the existing copy path runs; the frame is slower and correct.
+   Without it the only options are to guess and to hang, and §30.6 is the
+   measurement of what guessing looks like: a session with no crash, no protocol
+   error, 2284 attaches and none of the pixels. A refusal that cannot be spoken
+   turns a recoverable allocation failure into a blank window.
+5. **Region release needs a pinned-bytes number in the log.** Reclamation that
+   silently does nothing because everything is pinned looks identical to
+   reclamation that is working, until the arena runs out (§20).
+
+Requirements 1, 2 and 4 are the ones that need to exist in the interface; 3 and
+5 are properties of the allocator and the log.
+
+### 30.10 What is not proven
+
+* ~~That a Firefox frame can reach the compositor through a redirected pool.~~
+  **Closed, and affirmatively** (§30.6). The interception point was right and
+  needed one more hook: identity by object rather than by descriptor number.
+  2334 and 949 witness changes across ~7130 commits, in the two `mozilla-ipc`
+  rendering pools, with no crash. What remains unproven about it is narrower and
+  is listed below.
+* **That object identity is safe against inode reuse.** `(st_dev, st_ino)` is a
+  far better key than a descriptor number, but it is not eternal either: once a
+  memfd is fully released its inode can be reissued, and a pool record outliving
+  its object would then match a stranger — §30.6d one level up. The pool record
+  must end at `wl_shm_pool.destroy`, which is the protocol's own statement that
+  the object is finished; the experiment leaks the record instead, which is fine
+  for four pools and not fine for a session.
+* **That it is faster.** No end-to-end timing was taken, because the arena path
+  was not built. The claim "126 µs per copy becomes 0 µs" is arithmetic on a
+  copy that no longer happens, not a measurement, and it ignores whatever the
+  scattered-run composition of §30.8 costs at pool creation. That cost is paid
+  per pool rather than per frame, which is why it is expected to be small, but
+  expected is not measured.
+* **Peak resident arena bytes.** The user's concern is memory as much as
+  copying, and this trade is not free: an arena-backed pool makes the *client's*
+  pool resident in arena memory for the pool's whole life, where today the arena
+  holds one slice and the client's memfd is the client's problem. 14.3 MB of
+  Firefox pool would move into the arena. Whether that is a win depends on the
+  arena's headroom (§20) and it has not been measured.
+* **That the sandbox permits it.** Firefox's content processes are sandboxed;
+  the parent owns the Wayland connection, so this worked, but the backing object
+  in a real deployment is guest RAM opened through `/proc/<qemu-pid>/fd/<n>`,
+  and nothing here tested whether that open is permitted from inside a Firefox
+  that has entered its sandbox.
+* **`dup`.** §30.6d's fix is necessary and possibly not sufficient.
+
+### 30.11 The position
+
+The `LD_PRELOAD` route is **not killed**, which was the question asked, and the
+kill criteria it was given — an uninterposable shm path, or a libwayland that
+caches something that defeats the substitution — were both checked and neither
+holds. Firefox's pools are interposable by name, rewritable in place, and the
+client survives having its memory moved underneath it.
+
+**And it works**: with pools keyed on the object rather than the descriptor,
+unmodified Firefox paints its frames directly into memory this shim chose, and
+the witness counts 2334 and 949 changes across ~7130 commits to prove it (§30.6).
+That is the requirement — "it should normally be directly written" — reached for
+a real client on a plain-file stand-in for the arena.
+
+What that costs to get wrong is the reason this section is long. Keyed on the
+descriptor instead, the same mechanism is *accepted* by Firefox and carries none
+of its pixels: no crash, no protocol error, buffers created from the substituted
+pools and attached 2284 times, and a blank window. Only the witness dissented.
+Anyone building this without §30.7's verifier in place first would have shipped
+that and gone looking for the bug in the compositor.
+
+It is also not cheap. Five silent-failure hazards surfaced in building the
+simplest possible version against a plain file, and every one of them either
+freezes the picture, kills a content process, or hands the compositor the wrong
+memory with nothing anywhere reporting an error. Three of the five were the same
+mistake — taking a descriptor number for an identity — and were dissolved by one
+distinction rather than three fixes, which is the most useful thing this section
+learned. The arena version still has to add scattered-run composition and a
+pinning contract on top.
+
+So: **leave the copy in place, for now, and for reasons that are no longer about
+whether this works.** It works. But it works against a plain file, in a rig
+whose compositor is weston rather than `wc-compositor`; the arena version has
+§30.8's scattering to solve and §30.9's pinning contract to be given; the
+region lifecycle is still settling; and §30.7's verifier does not exist in
+`wc-proxy` yet, which §30.6 is the argument for building before rather than
+after. None of those is a reason to doubt the mechanism and all of them are
+reasons not to switch to it this week — with a firm memory of what the module
+header says, which remains the best short statement of why this is hard, and
+which this section narrows in exactly one place (§30.1) and contradicts nowhere.
+
+**A second argument arrives at the same place from a completely different
+direction, and it is the stronger one.** §34's 216.9 ms doorbell is not a
+reason to build this carefully; it is a reason not to build it *yet*. Every
+hazard in §30.6 is a way to lose a frame silently, and the whole prize for
+running that risk is 126 µs against a 217 ms present. Taking a silent-corruption
+risk to win 0.06% would be a bad trade at any level of care. When the doorbell
+wakes and a present costs single-digit milliseconds, the same 126 µs is a real
+fraction of a real budget and this becomes worth its hazards. Two independent
+arguments now converge on "not yet", which is a much better place to stand than
+one.
+
+One thing to do *before* any of it, and it is small: end the pool record at
+`wl_shm_pool.destroy`. The experiment leaks it, and §30.10 explains why that
+cannot ship — `(st_dev, st_ino)` is a much better identity than a descriptor
+number but a released memfd's inode can be reissued, so a leaked record
+eventually matches a stranger. That is §30.6d a third time, and the pattern by
+now is unmistakable: **every identity in this mechanism must end when the thing
+it names ends.** The protocol already says when that is.
+
+And keep the ordering straight. The accelerated path — WebRender rendering
+through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all
+— remains the better answer, because it removes the pool rather than relocating
+it. This section's mechanism is what serves the clients that will never take
+that path, which is most of them.
+
+## 34. Growth on guest RAM: the two absences, and the direction that was the hard part
+
+Stage 20 built arena growth and §28.12 recorded that it did not work. The
+mechanism was right — a multi-region allocator, `RegionSource`, `PlanGrowth`, a
+plan format with `region <id>` in it, the outbound window in a region of its own
+— and over the file fixture it grew. Over guest RAM it was inert, and inert in
+the only mode that matters: the file-backed arena is a Wine-only test scaffold
+(§28.2), so growth that worked there and nowhere else was growth that had not
+been built.
+
+The diagnosis was already written down and it was correct. Over guest RAM
+`PlanGrowth` obtains a region by **re-reading the plan**, and two things that
+would put one there did not exist:
+
+1. nothing made the guest commit a second region. `attach_guest_ram` was called
+   once per `--arena-guest-ram` at start-up and from nowhere else; the
+   compositor's only growth flag was `--arena-grow-dir`, the fixture's.
+2. nothing appended to the plan. `wc-arena-host` wrote one for a run id and a
+   page count and truncated the file next time.
+
+### 34.1 A plan is a log, because a region can only be located once
+
+`--append` and `--region N`, and the reason it has to be an append rather than a
+rewrite is §12.10: **the first pool allocated into a region writes pixels over
+the stamps the sweep locates it by**. A locator that rebuilt the file from
+scratch would have to re-locate regions whose stamps are gone, and for a region
+in use there is nothing left to find — the sweep would report `located 0 of 4096
+pages` for memory that is working perfectly. So each region is written exactly
+once, at the one moment it is findable.
+
+The region id is on the command line rather than counted from the file, and that
+is not a detail. The id is **decided by the host's allocator** — `Arena::grow`
+passes its `next_id` to `RegionSource::provide` — because that number is what
+every `Descriptor::ArenaSlice { arena, .. }` into the new region will carry. A
+locator that numbered regions itself would write a plan naming a region the
+compositor had never heard of.
+
+The pre-growth spelling is byte-for-byte unchanged, and `Plan::read_all` still
+reads a file with no `region` line as one region numbered zero.
+
+### 34.2 The sweep costs what the guest costs, which is why growth needed the PFN locator
+
+This is the number that decides whether growth is a feature:
+
+| locator | cost | can it re-locate an overwritten region? |
+|---|---|---|
+| content sweep | **2832–3101 ms**, across a 24× range of arena sizes | no |
+| `SuperfetchPfnQuery` | **~330 ms** guest-side, **0.064 s** host-side | yes |
+
+The sweep's cost is flat in the *arena* and linear in the *guest*, because it is
+a content search across the whole 13 GiB backing object. Paid per growth, that is
+a three-second stall in the middle of whatever the user was doing. It is not a
+tuning problem; it is the reason stage 16 rejected growth outright.
+
+So `wc-arena-host --frames PATH` takes a frame list and locates by translating
+it — a table lookup per page against `info mtree -f`, which is
+`sv_hostd::LocatorChoice::Pfns`, already written and cross-checked in this tree
+since §0.14 and **never once executed on a guest**. Growth is the thing that
+makes it necessary rather than nice.
+
+There is deliberately **no flag that prefers a locator**. The guest sends a frame
+list or it does not; a fallback that can be selected by configuration is one that
+gets selected by accident, which is design.md §5.1's objection to fallbacks
+generally. When there is no frame list the sweep runs, and it *works* — a freshly
+committed region still carries its stamps — it merely costs three seconds, and
+the guest's reason for not having one travels with the answer so that the three
+seconds has its cause next to it in the log.
+
+`--verify` is left on for both, and over a frame list it is worth more than it
+costs: it is `security-model.md` R28's cross-check without R28's price, because a
+region is located at the one moment nothing has been allocated into it, so the
+stamps are still there to check the *trusting* locator against, and the read is
+one pass over the region rather than over all of guest RAM.
+
+### 34.3 The direction, and the two wrong answers before the right one
+
+Growth needs a signal that travels **host to guest**. That is the direction
+nothing in this project had: the arena handshake is the guest saying a 64-bit run
+id and the host going to find the memory, and the launcher's ssh channel has the
+*guest* as the client with the host's key behind a forced command.
+
+Two candidates were proposed and both were wrong, in instructive ways.
+
+**A request on the Wayland connection the proxy holds to the compositor.** It is
+host→guest by construction and invents no transport, and it is the same family
+as `wc_icon_manager_v1` (§16) and the clipboard's side channel (§28). It is also
+carried over a TCP relay through an `ssh -L` tunnel — so it is a control path
+over the network, on a guest whose networking is proxy-ARPed over WiFi and has
+been fragile. This project's premise is shared memory across the VM boundary. A
+control channel over ssh is the wrong architecture however convenient the socket.
+
+**A new control ring in shared memory.** Right substrate, wrong instinct: there
+already is one. shared_vulkan's control region and rings carry `deqp-vk` and
+Firefox's GL across this exact boundary today. Waycompose is an addition to
+shared_vulkan, not a second system beside it, so a growth request is **a message
+on that channel** and not a mechanism of its own.
+
+### 34.4 What using the existing channel actually required, which was nothing
+
+This was the thing worth checking rather than assuming, and it came back better
+than expected. `sv_transport::region::SharedRegion::from_raw(base, len)` already
+exists, and its own doc comment already names this case:
+
+> The one caller is the guest-side arena provider, which commits **one** pinned
+> window covering both regions … Slicing that window into a control region and an
+> arena is what this constructor is for.
+
+So both sides build a `SharedRegion` over a sub-range of memory they already
+hold, one calls `Control::create` and the other `Control::attach`, and that is
+the bring-up. No new constructor, no protocol change, no extension of
+`sv-transport` at all.
+
+**The control region is the first 272 KiB of the compositor's outbound window.**
+Four properties made that the only candidate needing nothing new:
+
+* **Already located.** The window is a sub-range of a region the host swept at
+  start-up, so the channel costs no second run id and no second ~3 s sweep.
+* **Already the compositor's to write** (§12.11 item 3).
+* **Already excluded from the host's pool allocator**, by the `outbound` line the
+  plan has carried since stage 10. A control region anywhere else in the arena
+  would need a hole in a free list that is deliberately a sorted run list with no
+  holes in it.
+* **Never reclaimed.** §20's release returns data regions and exempts the one
+  holding the window, so the channel cannot be unmapped under a request in
+  flight.
+
+It costs the gift allocator 272 KiB of its 1 MiB and does not move the floor: the
+window is a tail of the startup region either way. Neither side is *told* where
+the control region is — both derive it from the plan's `outbound` line and one
+shared constant, for the same reason the outbound window itself has one origin
+(§14.7): a number typed into two command lines is a number that can differ, and
+the symptom here would be two `Control`s at two addresses each waiting for a peer
+writing somewhere else.
+
+### 34.5 Two things about that channel that are not ours to choose
+
+**`Control::create` zeroes the control region, and those bytes are stamp pages.**
+This is not hypothetical; `sv-gpu-server`'s own bring-up records the run it cost:
+*"located 8192 of 12288 pages — the 8192 arena pages present and all 4096 control
+pages missing. Nothing said why; the count was simply short."* So the compositor
+may not create the channel until the host's locate has finished — and it needs no
+new signal for that, because §12.10 already built one for exactly this hazard.
+`release_gifts` is called when the first client is accepted, and a client can only
+have arrived through a proxy started from a plan, and the plan exists only if the
+sweep succeeded. Same event, same argument.
+
+**The ring cross-checks a length declared inside the payload.** Its consumer
+compares each packet's framed length against a `u32` at byte 8 on the command
+lane and byte 4 on the reply lane, and refuses the packet if they disagree — so
+both messages carry `sv-wire`'s `CommandHeader`/`ReplyHeader` rather than a
+private framing. A constraint discovered rather than chosen, and a good one: a
+growth request is now a well-formed command on the same ring as everything else.
+
+The geometry is the smallest that works with one exception, and the exception is
+measured. `ring_data_bytes` is 64 KiB because the reply carries the new region's
+**frame list**, and a test holds the *worst* case — one run per page of a 16 MiB
+region — to fitting in one packet. Measured fragmentation of `VirtualLock`ed
+4 KiB pages is 1471 runs per 64 MiB, about a quarter of that. `ring_slot_count`
+is 2 rather than 1 because slot 0 is pre-claimed as the reverse ring by
+`Control`'s own directory writer. `arena_size` and `timeline_count` are 0 and
+honestly so: the arena here is `wc_proxy::pool`'s, and there is no `vkQueueSubmit`
+on this side of the tree.
+
+**The doorbell does not ring across a hypervisor, and that is the most expensive
+sentence in this document.** `sv_transport::park` says it itself: the guest's
+kernel and the host's each hash the shared word into their own table, so a rung
+doorbell reaches nobody and the waiter runs out its `slice` instead. `slice` is
+`Duration::from_millis(20)`.
+
+This section first recorded that as *"a doorbell that reaches nobody costs
+latency and not correctness"*, cited D9's decision to ship polling, and moved on.
+**The observation was right and the conclusion was too mild**, and it was too
+mild for a reason worth naming: growth is a rare operation, so the number was
+judged against the only caller in front of it. One 20 ms wait per region is
+genuinely nothing next to a locate. That made the slice look like a cost this
+stage had accepted, when it was a cost the *project* was paying everywhere.
+
+An hour later the WSI work decomposed Firefox's ~15 s first-frame stall and
+priced it (`docs/firefox-accel.md` §3, "Candidate 1, the cross-VM present: all of
+it, and it is 20 ms at a time"):
+
+| `vkQueuePresentKHR` | ms/frame |
+|---|---|
+| same machine | 1.7–2.1 |
+| across the VM boundary | **216.9 median**, min 213.9, max 228.7, over 480 frames |
+
+A 7% spread over 480 frames is what rules out a contended guest: contention is
+bursty and this is a constant. And **216.9 / 20 = 10.8** — a present on that path
+is `vkResetFences`, `vkQueueSubmit` and `vkWaitForFences`, each a forwarded round
+trip with a wait at both ends, plus kopper's per-frame surface query and the
+acquire. About eleven waits, every one missing its doorbell and paying the slice
+in full. The arithmetic closes exactly.
+
+So the honest statement is: **it is not a correctness-of-protocol problem and it
+is a correctness-of-product one.** Nothing is ever wrong, no message is ever
+lost, and the transport is doing precisely what D9 specified — and the result is
+that GPU rendering across this boundary is unusable, by two orders of magnitude,
+for this one reason. "Bounded latency" is true and is the wrong frame: a bound of
+20 ms multiplied by every wait in a frame is not a bound anybody can ship behind.
+
+What it needs is what `park.rs`'s own comment named before any of this was
+measured — *"a doorbell the hypervisor carries — a virtio-serial byte or an
+ivshmem interrupt — behind this same trait"*. Behind the trait, so no caller
+changes. That fix belongs to whoever owns the plumbing and not to this section;
+what §34 owes it is the measurement and the corrected reading, because the
+milder version of this paragraph is exactly the kind of sentence that lets a
+20 ms constant sit unexamined for a month.
+
+**For growth specifically the slice is still nothing, and that distinction is the
+point rather than an excuse.** A growth is one round trip per region — three or
+four in a session — against a locate of 0.064 s and a commit of tens of
+milliseconds. 20 ms of doorbell latency is under 3% of a growth even in the best
+case, and it does not scale with anything: growth pays the slice once where a
+frame pays it eleven times. So this channel can ship on the polling parker today
+and the GPU path cannot, and when the doorbell lands growth gets the improvement
+for free without a line changing on either side of it.
+
+The compositor pays nothing extra to service the ring either way: its poll loop
+already turns every 5 ms for the UI (§13.8), and a turn is one atomic load.
+
+### 34.6 What is built, and what is not
+
+Built, tested, and building for both targets:
+
+* `wc-arena-host --append`, `--region N`, `--frames PATH` — the host half of a
+  plan that grows, and the PFN locator reached from waycompose for the first
+  time. Tested: a second region appended leaves the first record byte-for-byte
+  intact.
+* `wc_compositor::grow::commit` — the guest committing a region **on demand**
+  under an id the host chose, and answering with the page frames behind it.
+  `wc_handle::arena::region_base` is what it needed, and it is the only raw
+  address this codebase exports: the PFN query is a reverse lookup keyed by the
+  window's virtual address, which is the only name the frame database knows it
+  by.
+* `wc_handle::grow` — the request and the reply, on shared_vulkan's rings, with
+  the framing the ring will check and the geometry the frame list needs.
+
+**Not built: the two ends of the ring, and the `RegionSource` that drives them.**
+The compositor does not yet call `Control::create` at `release_gifts` and does not
+yet service the ring in its poll loop; `wc-proxy` does not yet have a
+`GuestGrowth` that attaches, sends a `Request`, waits for the `Reply`, writes the
+frame list out and spawns `wc-arena-host --append --frames`. Every piece each of
+those needs now exists and the call sequences are §34.4's; what is missing is the
+wiring, and until it lands `--arena-grow` over guest RAM still refuses. **The
+launcher is therefore still at 64 MiB and must stay there**: dropping it to 16
+before the wiring exists would produce exactly §28.12's ten refusals and its
+2144–2777 ms clicks, which is worse than 48 MiB of RAM.
+
+Nothing here has run on a guest. The numbers quoted above are all from earlier
+measurements in this tree — the sweep's 2832–3101 ms, the query's ~330 ms and
+0.064 s, the 1471 runs per 64 MiB — and none of them was taken on a growth. In
+particular **the PFN locator has still never executed on a guest**, and the first
+thing the wiring will produce is the measurement that says whether a growth costs
+what §34.2's table predicts. Peak resident arena bytes on a 16 MiB start, against
+the 64 MiB the launcher reserves, is the number this stage exists to produce and
+it has not been produced.
+
+### 34.7 The launcher's own channel is still ssh, and it is a different problem
+
+`wc-session` is a forced command over ssh, guest→host, and it is how the run id,
+the page count and the outbound size reach the locator. That is a *bootstrap* —
+it happens before any shared memory has been located, so it cannot itself ride
+shared memory without something else establishing the first region — and it has a
+different shape from this one. It should stop being ssh, and it is not this
+section's to fix.
+
+---
+
+## 32. Stage 32: two programs, two taskbar buttons
+
+*(Numbered 32 because that is what this stage was assigned and it was still free
+when the branch merged — master carried §28, §29 and §34 by then, and §30, §31
+and §33 are in flight. §17.1's convention: the next free number at merge time,
+renumbered if master moved first.)*
 
 ### 32.1 Status in one paragraph
+
+**Two different applications running through this compositor now hold two
+separate taskbar buttons, and two windows of the *same* application still share
+one.** There is a photograph of each
+(`docs/stage32/stage32-taskbar-two-applications.png`, in which
+`weston-terminal` and `weston-flower` sit side by side with their own icons and
+their own captions, and `stage32-taskbar-same.png`, in which two windows of one
+application are one button), and a measurement that does not need an eye:
+`wc-desk windows` reads `PKEY_AppUserModel_ID` back off every window on the
+desktop and prints how many distinct taskbar groups they come to. In the
+two-application run the desktop's 8 taskbar windows come to **8 groups**, two of
+which are ours and are different from each other; in the two-windows-of-one-app
+run its 8 taskbar windows come to **7** — our pair collapsing into one is the
+whole of the negative check.
+
+The mechanism is one string per `HWND`: an **Application User Model ID**, set
+through `SHGetPropertyStoreForWindow` and committed to the window's property
+store before the window is ever shown. `crates/wc-compositor/src/taskbar.rs`
+decides what the string is and is unit-tested on Linux; `platform/win32.rs`
+sets it. The harness is `scripts/wc-taskbar.sh`.
+
+Two things are worth saying before the detail. First, this is the other half of
+§16: that stage measured the taskbar showing a *generic* icon while both
+`HICON`s were set correctly, diagnosed it as the shell grouping by process, and
+hid the console — which made the button take our window's icon but left every
+window this process makes on one button. The grouping itself is what stage 32
+removes. Second, the identity is derived from `xdg_toplevel.set_app_id`, which
+is the only thing in the protocol that means "which application is this", and
+the ordering of that against `ShowWindow` is the part that had to be measured
+rather than assumed (§32.5).
+
+### 32.2 Why every window shared one button, and why §16's fix could not have separated them
+
+The Windows shell groups taskbar buttons by the window's Application User Model
+ID, and when a window has none of its own it falls back to one derived from the
+**process** — its executable path, or whatever
+`SetCurrentProcessExplicitAppUserModelID` last set. Every window this project
+puts on screen is created by `wc-compositor.exe`, so every window fell into one
+group, and the group took the executable's icon rather than any window's.
+
+§16 hit exactly this from the other side and wrote it down:
+
+> Both `HICON`s were set successfully, the caption showed the icon, and the
+> taskbar button showed the generic one for a whole run: the shell groups
+> buttons by process, the scheduled task gives the compositor a console window,
+> and a grouped button takes the *executable's* icon.
+
+That stage's fix — hiding the console so the group had one window in it —
+made the button show the right icon. It could not have separated anything,
+because it changed which windows were in the group and not what the group *is*.
+
+The process-wide entry point is the obvious wrong answer and is worth naming so
+nobody reaches for it: `SetCurrentProcessExplicitAppUserModelID` gives the whole
+process one identity, which is the state being fixed, with a nicer name on it.
+
+### 32.3 What the identity is derived from, and the two collisions a sanitiser introduces
+
+`crates/wc-compositor/src/taskbar.rs` is one function and nine tests. The rules:
+
+| what the client did | identity |
+|---|---|
+| `set_app_id("firefox")` | `Waycompose.app.firefox` |
+| `set_app_id("org.freedesktop.weston.wayland-terminal")` | `Waycompose.app.org.freedesktop.weston.wayland-terminal` |
+| never called `set_app_id`, arrived on connection 3 | `Waycompose.unnamed.c3` |
+
+**A function of the app id, not of the window.** That is what gets both halves
+of the requirement at once: `set_app_id` is the same string for every window of
+one application, so two programs get two buttons and two windows of one program
+keep sharing one. Deriving it from the window id would give every window its own
+button, which is not a fix but a different bug — and it is the bug the negative
+check in §32.7 exists to catch.
+
+**A client that never names itself** exists — §16 measured
+`weston-presentation-shm` sending no app id at all — and the anonymous identity
+is also what *every* window wears for the moment between its creation and its
+first buffer, which the log shows for each one:
+`window 1 taskbar identity <- "Waycompose.unnamed.c1"` immediately before the
+named stamp. A window whose client never gets round to naming itself simply
+keeps it. Such windows cannot be told apart by name, so they are told apart by
+**connection**: `ClientState::index` is already counted for every client, and
+using it means two anonymous *programs* still get two buttons while two windows
+of one anonymous program still share one. That is the same guarantee the app-id
+path gives, one level coarser, which is as far as the information goes.
+
+**The prefix is not decoration.** A Wayland client chooses its own app id, and
+an AUMID that named a really-installed application — `Microsoft.Windows.Explorer`
+— would put our window on *that* application's button and inherit its jump list
+and its pinning. Everything is minted under `Waycompose.`, and the two
+sub-namespaces (`app.`, `unnamed.`) are separated so that a client calling
+itself `unnamed.c3` cannot land on connection 3's button.
+
+**The sanitiser is where this kind of fix quietly becomes the bug it was
+fixing.** Windows documents an AUMID as at most 128 characters with no spaces;
+an app id may be any UTF-8 at all. Mapping the one into the other merges names:
+`"my app"` and `"my_app"` both sanitise to `my_app`, and truncating at 96
+characters merges every pair that agrees for that long. Both are *the original
+defect*, reintroduced by the fix, for a smaller set of applications. So
+[`identity`] appends a 64-bit FNV-1a of the **original** string whenever it had
+to change anything — and only then, so that `firefox` and
+`org.freedesktop.weston.wayland-terminal`, which need no mapping, stay legible.
+Two of the nine tests are those two collisions and nothing else.
+
+### 32.4 The Win32 half, and the COM the workspace manifest says is not there
+
+`Cargo.toml` has said since stage 3 that this project uses `windows-sys` rather
+than `windows` because *"everything we call is a plain C entry point — no COM,
+no WinRT"*. That stops being true here, and there is no way around it: the only
+way to set a property on an `HWND` is `SHGetPropertyStoreForWindow`, which hands
+back an `IPropertyStore`. There is no flat entry point.
+
+windows-sys 0.61 generates no COM interfaces at all — functions, structs and
+constants only — so `IPropertyStoreVtbl` is transcribed by hand from
+`propsys.h` (eight function pointers in a fixed order), and `PROPVARIANT` is a
+24-byte `repr(C)` struct with a `const` size assertion rather than the whole of
+`Win32_System_Com_StructuredStorage`. Two GUIDs and one property key come from
+`propsys.h` and `propkey.h` in the mingw headers the cross build already uses.
+
+Three details that are not obvious and are load-bearing:
+
+1. **`raw-dylib`.** `windows-link` emits `#[link(kind = "raw-dylib")]`, so
+   `SHGetPropertyStoreForWindow` needs no import library and the mingw
+   toolchain's `libshell32.a` never has to have heard of it.
+2. **The `PROPVARIANT` borrows its string.** `SetValue` copies, and the variant
+   this file builds is never handed to `PropVariantClear`, so the `Vec<u16>`
+   behind the `LPWSTR` stays Rust's and no allocator crosses the boundary. The
+   one string that *is* allocated by the shell — the one `GetValue` writes on
+   read-back — is freed here with `CoTaskMemFree`, which is what
+   `PropVariantClear` would have done for that type.
+3. **COM is initialised lazily, on the UI thread, and never uninitialised.**
+   `CoInitializeEx(COINIT_APARTMENTTHREADED)` returned `0x00000000` on the guest
+   (Windows 11 build 26200) — it is printed, because `RPC_E_CHANGED_MODE` would
+   mean somebody had made the thread multi-threaded and that is worth knowing
+   even though the property store works either way. A compositor that never
+   makes a window never initialises COM at all.
+
+The call is checked at every step and the failure names *which* call refused:
+`SHGetPropertyStoreForWindow`, `SetValue(PKEY_AppUserModel_ID)`,
+`SetValue(PKEY_AppUserModel_PreventPinning)`, or `Commit`. None of them refused
+in any run of this stage. And the success path does not trust itself either: it
+**reads the property back** out of the store and logs what came back, because
+§16 already paid once for the difference between "the call succeeded" and "the
+shell shows it".
+
+### 32.5 The ordering, which is the part that had to be measured
+
+The shell reads the identity when it **creates the button**, and it creates the
+button when the window is shown. So the property has to be on the window before
+`ShowWindow`, and the compositor's message order decided whether it was:
+
+```
+    before                          after
+    ToUi::Create   (no app id)      ToUi::Create   (identity for the connection)
+    ToUi::Map      -> ShowWindow    ToUi::AppId    (the real identity)
+    ToUi::AppId                     ToUi::Map      -> ShowWindow
+    ToUi::Title                     ToUi::Title
+```
+
+Both the reorder and the unconditional send matter. `xdg_toplevel` is created
+before `set_app_id` is dispatched — a client sends `get_toplevel`, `set_title`,
+`set_app_id` and `commit` in one burst, and `new_toplevel` runs at the first of
+those — so the app id at `Create` is empty for every client measured here, and
+the identity that mattered was always the one sent at map. `AppId` was also
+sent only when the app id was non-empty, which would have left every nameless
+client's window with no identity and therefore back on the process's button;
+it is now sent always, because "this client never named itself" is an identity
+too.
+
+The compositor's log shows both stamps for every window:
+
+```
+wc-compositor: window 1 taskbar identity <- "Waycompose.unnamed.c1"
+wc-compositor: window 1 app_id -> "org.freedesktop.weston.wayland-terminal"
+wc-compositor: window 1 taskbar identity <- "Waycompose.app.org.freedesktop.weston.wayland-terminal"
+wc-compositor: window 1 icon set: 2 of 2 slots from 3 image(s) [48x48 32x32 16x16]
+```
+
+### 32.6 A `set_app_id` that arrives after the button exists
+
+`set_app_id` is not a one-off: the protocol allows it whenever the client likes,
+including long after the first buffer. The property can still be set then, but
+the button already exists and does not move — so the late path hides the window
+and re-shows it, which makes the shell drop the button and build a new one under
+the new identity. `SW_SHOWNA` rather than `SW_SHOWNORMAL`, because hiding has
+already cost the window its focus and taking the foreground back would be a
+window stealing activation for a reason the user cannot see. It runs only when
+the identity actually *changed*, which for every real client is never.
+
+**This could not be measured with any client that exists.** Every toolkit names
+itself before it draws. So `wc-shmclient` — the client this project already has
+to own, for §7.5's reason — grew `--late-app-id NAME --late-after N`, which
+sends one extra `xdg_toplevel.set_app_id` after N frames. With it:
+
+```
+wc-compositor: window 2 taskbar identity <- "Waycompose.app.org.waycompose.probe.early"
+wc-compositor: window 2 app_id -> "org.waycompose.probe.renamed"
+wc-compositor: window 2 taskbar identity <- "Waycompose.app.org.waycompose.probe.renamed"
+wc-compositor: window 2 was already on screen, so its taskbar button was rebuilt under the new identity
+```
+
+and `wc-desk` reads the new identity back off the window, and
+`stage32-taskbar-late.png` shows two buttons where the two windows had started
+on one. The cost is a visible flicker and one deactivation, once, for a client
+that renames itself late; the alternative — leaving the button stale until the
+window is next hidden — was rejected because a stale button is exactly the
+defect this stage exists to remove.
+
+### 32.7 What was run, and the two things that had to be fixed to run it
+
+`scripts/wc-taskbar.sh` has two experiments, because neither can do the other's
+job.
+
+**`local`** runs two copies of `wc-shmclient.exe` on the guest against one
+compositor. Same executable, same command line except `--app-id`, so nothing but
+the identity can split the buttons; `--debug-icon` gives each window a different
+generated icon so the photograph distinguishes them too. Three runs:
+
+| run | app ids | our windows | our groups | picture |
+|---|---|---|---|---|
+| `two` | two different | 2 | **2** | `stage32-taskbar-two.png` |
+| `same` | one, twice | 2 | **1** | `stage32-taskbar-same.png` |
+| `late` | one, then one renamed | 2 | **2** | `stage32-taskbar-late.png` |
+
+**`apps`** runs `weston-terminal` and `weston-flower` — two genuinely different
+programs, unmodified, on the Linux host, through wc-proxy, a relay and a
+hypervisor, with their icons resolved from the host's own files (`qemu` from
+hicolor for one, weston's own `icon_ivi_flower.png` for the other). That is
+`stage32-taskbar-two-applications.png`, and `wc-desk` agrees with it:
+
+```
+0x80170   no   WaycomposeToplevel  276x156+1160+632  ""
+0x70298   yes  WaycomposeToplevel  960x543+26+26     "Mozilla Firefox"
+0x5073e   yes  WaycomposeToplevel  216x239+52+52     "Flower"           aumid="Waycompose.app.org.freedesktop.weston.flower"
+0x50722   yes  WaycomposeToplevel  838x466+156+156   "Wayland Terminal" aumid="Waycompose.app.org.freedesktop.weston.wayland-terminal"
+0x110688  yes  WaycomposeToplevel  838x466+442+286   "Wayland Terminal"
+windows.groups    8
+```
+
+**Five `WaycomposeToplevel`s and only two of them ours**, which the shared guest
+supplied for free and which is the best control in this stage. `0x80170` is one
+of our own popups: no button, and no identity, which is what §32.7's second
+paragraph below is about. The other two belong to *other worktrees'*
+compositors — someone's Firefox and someone's terminal, running against builds
+that predate this change — and they carry **no identity at all**. That is the
+before and the after in one enumeration, taken at one instant on one desktop:
+the windows with an identity are grouped by it, and the windows without one are
+grouped by their process, which is where every window in this project used to
+be.
+
+Two things had to be fixed before any of it ran, and both are worth keeping.
+
+1. **A `wl_shm` named section does not cross a session.** The first `local` run
+   started its clients over ssh, which is session 0, while the compositor was on
+   the logged-on desktop. Every window was created and none was ever mapped:
+   `could not map Section { name: "Local\\wc-…" }: Das System kann die
+   angegebene Datei nicht finden`, then a `wl_shm` protocol error and a
+   disconnect. `Local\` is per **session**, so the name the client created is
+   not a name the compositor can open — same machine, same path, same string.
+   Both ends now go through the scheduler. This is §13.2's fact ("an ssh session
+   is not a desktop") arriving from a direction it had not been seen from: not
+   "the pixels go nowhere", but "the shared memory does not exist". **It is
+   written up there rather than only here**, with the log lines, because it will
+   catch the next harness that runs a Windows client against a desktop
+   compositor and that harness will not be reading this section.
+2. **`weston-editor` is not a usable second application on this host.** It
+   connects, binds the icon feed, allocates one 38,272-byte pool and exits
+   before mapping anything; `weston-flower` on the same host in the same run
+   maps and stays. Recorded rather than debugged — this stage needed *a* second
+   application, not that one — and the harness takes `WC_APP_B` so the next
+   person can try another.
+
+And one thing the first `apps` run found in our own code: **popups were being
+stamped too.** `weston-terminal`'s three context menus each took
+`Waycompose.unnamed.c1`, because the identity was sent from the shared
+first-map path and popups go through it. It was inert — a `WS_EX_TOOLWINDOW`
+window with an owner has no taskbar button for an identity to group — and it
+was still a property asserting something about a button that does not exist, so
+the map path now sends it only for toplevels. The photograph and the
+enumeration above are from the run *after* that change, and `0x80170` in it is
+a popup with no identity on it.
+
+### 32.8 Hover previews, jump lists and pinning — where a synthetic identity does and does not hold up
+
+The requirement asks for the honest limits, and these are the three places a
+made-up taskbar identity usually falls apart.
+
+**Hover previews are fine, and for a structural reason.** A thumbnail is DWM's
+picture of a *window*, not of an identity: the shell asks for one per `HWND` in
+the group. Two buttons therefore preview two windows and a grouped button
+previews both of its own, which is the behaviour of any application. Not
+photographed — the harness cannot hover — and not in doubt either.
+
+**Jump lists are empty, and that is a choice.** A jump list is built from
+`ITaskbarList` destinations or from the recent-documents list, keyed by the
+AUMID. Nothing here registers either, so a right-click gets the window commands
+(close, and on Windows 11 the app's own entry) and no tasks or recent files. The
+alternative would be to synthesise destinations for an application on another
+machine, which would be inventing user-facing content out of an app id string.
+
+**Pinning is switched off, deliberately.**
+`PKEY_AppUserModel_PreventPinning` is set to `VARIANT_TRUE` in the same store
+and the same `Commit` as the identity — the log line quoted in §32.5 is printed
+only when both `SetValue`s and the `Commit` returned `S_OK`, so a successful
+stamp is a measurement that the flag took. The reasoning is worth stating
+because the alternative looks friendlier:
+
+* Pinning writes a shortcut whose AUMID is ours and whose target is whatever the
+  shell can work out about the window — which is `wc-compositor.exe`, not the
+  application the button appears to be. Clicking it later would start a
+  compositor, or nothing.
+* The three properties that would make pinning honest —
+  `PKEY_AppUserModel_RelaunchCommand`, `…RelaunchIconResource` and
+  `…RelaunchDisplayNameResource` — cannot be filled in truthfully from here.
+  The application is a process on **another machine**, started by a person or a
+  script, over a transport that has to be brought up first. There is no command
+  line on the Windows side that would bring it back, and a relaunch command that
+  starts the wrong thing is worse than no relaunch command.
+* `…RelaunchDisplayNameResource` in particular wants a `@path,-id` resource
+  reference rather than a string, so a plain app id there is not merely
+  unhelpful, it is a value the shell may fail to load and show as nothing.
+
+So the button is a *running-window* button and nothing else, and the affordance
+that would lie has been removed rather than left to be discovered.
+
+One more honest limit, about the picture rather than the mechanism: **Windows 11
+combines buttons and hides their labels by default**, so what the photographs
+show is two icons rather than two labelled buttons. The titles are on the
+captions in `stage32-window-*.png` and in `wc-desk`'s table; a desktop set to
+"never combine" would show them on the buttons too. That is a shell setting,
+not something this compositor can assert.
+
+### 32.9 What is not done
+
+1. **The identity is not visible to the client.** A client cannot ask what
+   taskbar group it landed in, and nothing in the protocol lets it. Fine today;
+   worth remembering if a client ever wants to split its own windows across
+   buttons, which Explorer does and which would need an identity per *toplevel*
+   rather than per app id.
+2. **Nothing revisits a window whose client disconnects and reconnects.** The
+   anonymous identity is the connection ordinal, so a nameless client that
+   reconnects gets a new button. Correct — it is a new client — but it means the
+   ordinal is not stable across a proxy restart, which is a thing users will
+   notice before we do.
+3. **Icons and identity are still two independent mechanisms.** They agree
+   today because both key off the app id, and a client that sets its own icon
+   through `xdg-toplevel-icon-v1` (§16.2) still gets its identity from the name.
+   That is the right split — the icon is what the application says it looks
+   like, the identity is what the shell groups by — but it means a client can
+   present two windows with the same icon on two buttons, and nothing warns.
+4. **`SetCurrentProcessExplicitAppUserModelID` is still unset**, so any window
+   this process makes that somehow escapes `apply_identity` falls back to the
+   executable. Setting a process-wide default would give those a nicer name; it
+   would also hide exactly the bug that would have produced them.
+
+## 35. Gates that reported success while something was wrong
+
+### 35.1 Status in one paragraph
 
 **A check that cannot fail is not a check, and this section started as four of
 them and finished as sixteen.** The four given: `cargo test --workspace`
@@ -11038,10 +12300,10 @@ failing because it teaches everyone to re-run until green; and 113 comments
 named the wrong design document, which had already landed three agents' sections
 in the wrong file during rebases.
 
-All four are fixed, and looking for the shape found twelve more — §32.6, and
+All four are fixed, and looking for the shape found twelve more — §35.6, and
 they are the more valuable half. Two of them were found by this section's own
-work rather than by reading: a stale binary (§32.4) and a second test that
-truncates the workspace run (§32.2). Two more arrived with the merge that
+work rather than by reading: a stale binary (§35.4) and a second test that
+truncates the workspace run (§35.2). Two more arrived with the merge that
 brought §29's clipboard, one of them in `wc-proxy.sh` itself.
 
 `cargo test --workspace` on a tree that has never been built reports **1266** —
@@ -11053,7 +12315,7 @@ fixed `sleep` that guarded a *state* is a bounded wait that prints when it had
 to wait; and one script's primary metric — the list of tests the forwarder loses
 — was computed, printed, written to a file and never compared with anything.
 
-### 32.2 `cargo test` cannot run the loader test, and said so as a failure
+### 35.2 `cargo test` cannot run the loader test, and said so as a failure
 
 `sv-icd` is `crate-type = ["cdylib", "rlib"]`. An integration test links the
 `rlib`, so `cargo test` builds **only** the `rlib`: nothing in the test's
@@ -11112,7 +12374,7 @@ test, which `O_EXCL` on a fixed name otherwise guarantees.
 That is the §26.9 standard read the other way round. A noise floor of one test
 is bad enough when one test is what it costs; here one test costs 1,097.
 
-### 32.3 Every number `wc-proxy.sh` prints, and what it is now
+### 35.3 Every number `wc-proxy.sh` prints, and what it is now
 
 The 51x regression is the case that matters. `--copy damage` and `--copy buffer`
 copy the same pixels for a client that damages its whole buffer every frame, and
@@ -11139,7 +12401,7 @@ here is why**.
 
 `wc-proxy.sh all` goes from **39 passed, 0 failed** to **54 passed, 0 failed**.
 
-### 32.4 The negative test: the 51x regression, re-injected
+### 35.4 The negative test: the 51x regression, re-injected
 
 The §27 fix is one arm of one `match`: `Stale::Rects` compares the summed
 rectangle area against the extent and copies the cheaper of the two. Reverting
@@ -11188,7 +12450,7 @@ for. It fires on the exact condition that produced the false twelve:
 It is the only check here that was written because it had already caught
 something, which is the best reason a check can have.
 
-### 32.5 Waiting for a state instead of sleeping past it
+### 35.5 Waiting for a state instead of sleeping past it
 
 `wc-proxy.sh` failed 6 once and passed 37/0 twice afterwards on identical trees.
 A red that is not reliably a regression is corrosive: it teaches everyone to
@@ -11224,7 +12486,7 @@ rather than for a state: the gap before `wine explorer` (§8.9's wineserver
 shutdown, which nothing observable reports) and the 1.5 s between the two
 screenshots, which *is* the measurement.
 
-### 32.6 The sweep: fourteen more numbers nobody was watching
+### 35.6 The sweep: fourteen more numbers nobody was watching
 
 The same audit across the other harnesses. Ordered by how badly it mattered.
 
@@ -11308,7 +12570,7 @@ The same audit across the other harnesses. Ordered by how badly it mattered.
    actually produced, and that forwarded `glxgears` beats **llvmpipe**, since
    Mesa's fallback to software is silent and reports GL 4.6 while doing it.
 
-10. **`wc-inhibit.sh` slept two seconds where it should have waited.** §32.5.
+10. **`wc-inhibit.sh` slept two seconds where it should have waited.** §35.5.
 
 11. **`wc-cursor.sh`'s hand-sent `WM_SETCURSOR` return codes** are printed in a
     `note` and deliberately not asserted, with the reason written above them.
@@ -11334,7 +12596,7 @@ being told about.
     thing this project's rule is about. The byte counts are asserted non-zero
     rather than by value: a transfer that was counted and moved nothing is the
     case every other check in that file passes. Measured: exactly those, at 41
-    and 54 bytes. 11 passed → **15**, with `fresh()` (§32.4) as the other two.
+    and 54 bytes. 11 passed → **15**, with `fresh()` (§35.4) as the other two.
 
 13. **`wc-proxy.sh`'s own client exit code**, which the audit missed because it
     passed on every run before the merge. `ok` on 0 and **`note` on anything
@@ -11346,10 +12608,10 @@ being told about.
     and 124 are both correct endings for a client the harness kills; 139 and 1
     are not, and now say so.
 
-14. **`sv-hostd`'s colliding `/dev/shm` name** — §32.2, and it is on master
+14. **`sv-hostd`'s colliding `/dev/shm` name** — §35.2, and it is on master
     rather than on this branch.
 
-### 32.7 The rename, and why it was one commit on its own
+### 35.7 The rename, and why it was one commit on its own
 
 After the unification `docs/design.md` is the *Vulkan* side's document. 138
 references in `crates/wc-*` still said `docs/design.md` while meaning
@@ -11369,7 +12631,7 @@ resolve.
 touched, because widening the blast radius was not what the change was for.
 `vendor/smithay` is left alone on purpose.
 
-### 32.8 The gates
+### 35.8 The gates
 
 | Gate | Result |
 |---|---|
@@ -11379,7 +12641,7 @@ desktop shortcut), not before it.
 | Gate | Result |
 |---|---|
 | `cargo test --workspace`, **on a tree with no `cdylib` built** | **1266 tests**, 0 failures, 3 ignored, 81 test binaries of which 39 carry tests — master's 1262 plus this section's four, and the number this section exists to make true |
-| the same, repeated | 1266 again. Master `c229a4b` gave 169, 169 and 1266 on three attempts, which is §32.2's second half |
+| the same, repeated | 1266 again. Master `c229a4b` gave 169, 169 and 1266 on three attempts, which is §35.2's second half |
 | `sv_hostd` test binary, `--test-threads=16`, 40 runs | **0 failures**, against 1 in 40 with the shared run id |
 | `cargo test -p wc-proxy --lib proxy::` | 9 passed, of which 4 are new (the `bind`/`listen` window) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean but for the two pre-existing warnings |
@@ -11391,13 +12653,13 @@ desktop shortcut), not before it.
 | `scripts/wc-input.sh linux` | 29 passed, 0 failed, unchanged, with the keymap sizes now asserted |
 | `scripts/wc-inhibit.sh` | PASS, and it finishes sooner: the 2 s sleep is now a wait that returns as soon as the sweep has run |
 
-### 32.9 What this does not settle
+### 35.9 What this does not settle
 
 1. **The guest-side harnesses were changed without being run.** `wc-guest.sh`,
    `wc-titlebar.sh`, `sv-cts.sh` and `sv-guest-host.sh` need a contended guest
    or a GPU. Their edits are argued from the logs' own formats and from the
    code that writes them, and the extracted predicates were exercised against
-   doctored inputs — the four in §32.6 items 1, 5, 6 and 7 each fail on the
+   doctored inputs — the four in §35.6 items 1, 5, 6 and 7 each fail on the
    defect they exist to catch and pass on the good case — but that is not the
    same as a run. **`sv-cts.sh`'s budgets are the assumption most likely to be
    wrong**: 80% is read off design.md §0.15's two recorded runs, and the first
@@ -11413,10 +12675,10 @@ desktop shortcut), not before it.
    check.** It runs inside `cargo test`, which works because cargo does not hold
    the target-directory lock while tests execute. That was measured here and is
    not documented by cargo.
-5. **`scripts/*.sh` still say `docs/design.md`** — §32.7.
+5. **`scripts/*.sh` still say `docs/design.md`** — §35.7.
 6. **Only `wc-proxy.sh` and `wc-clip.sh` refuse to measure a stale binary.**
    Every other harness in `scripts/` checks that its binaries *exist* and not
-   that they are newer than the tree, and §32.4 is the demonstration that the
+   that they are newer than the tree, and §35.4 is the demonstration that the
    difference is not theoretical. `fresh()` is eleven lines, it is copied rather
    than shared because these scripts have no common file, and it belongs in all
    of them — `wc-guest.sh`, `wc-titlebar.sh`, `wc-damage.sh`, `wc-input.sh`,
@@ -11425,7 +12687,7 @@ desktop shortcut), not before it.
    `sv-bench.sh`, `sv-present.sh`. That is the next piece of work rather than a
    footnote.
 7. **`wc-launch.sh` and `sv-firefox-wayland.sh` arrived with the merge and were
-   not audited.** 685 and 153 lines. The sweep in §32.6 covers what existed when
+   not audited.** 685 and 153 lines. The sweep in §35.6 covers what existed when
    it was written plus `wc-clip.sh`; these two are outstanding, and the shape to
    look for is a number in an `ok` message that no comparison guards, or a
    failing arm that is a `note`.

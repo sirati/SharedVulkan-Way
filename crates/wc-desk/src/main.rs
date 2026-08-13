@@ -86,6 +86,14 @@ mod imp {
         QueryPerformanceCounter, QueryPerformanceFrequency,
     };
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    // ADDED FOR STAGE 32: reading a window's taskbar identity back out of the
+    // shell. See `aumid`.
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED,
+    };
+    use windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreForWindow;
+    use windows_sys::Win32::Foundation::PROPERTYKEY;
+    use windows_sys::core::{GUID, HRESULT};
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW,
         OpenInputDesktop, UOI_NAME,
@@ -442,6 +450,113 @@ usage: wc-desk <command> [options]
         v
     }
 
+    // ------------------------------------------------------- taskbar identity --
+    //
+    // ADDED FOR STAGE 32, and it is the instrument rather than the fix: the fix
+    // is in `wc-compositor`'s `win32.rs`, and this is how a run says what the
+    // shell will actually read. The two declarations are deliberately
+    // duplicated — this binary depends on nothing but `windows-sys`, which is
+    // what lets it run on a guest where the compositor cannot, and a shared
+    // crate for eight function pointers would cost that.
+    //
+    // windows-sys 0.61 generates no COM interfaces, so `IPropertyStore` is
+    // transcribed from `propsys.h`; the GUID and the property key are from
+    // `propsys.h` and `propkey.h`.
+
+    const IID_PROPERTY_STORE: GUID = GUID::from_u128(0x886d8eeb_8cf2_4446_8d02_cdba1dbdcf99);
+    const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+        pid: 5,
+    };
+    const VT_LPWSTR: u16 = 31;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PropVariant {
+        vt: u16,
+        reserved: [u16; 3],
+        value: [u64; 2],
+    }
+
+    #[repr(C)]
+    struct PropertyStore {
+        vtbl: *const PropertyStoreVtbl,
+    }
+
+    #[repr(C)]
+    struct PropertyStoreVtbl {
+        query_interface: unsafe extern "system" fn(
+            *mut PropertyStore,
+            *const GUID,
+            *mut *mut core::ffi::c_void,
+        ) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+        release: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+        get_count: unsafe extern "system" fn(*mut PropertyStore, *mut u32) -> HRESULT,
+        get_at: unsafe extern "system" fn(*mut PropertyStore, u32, *mut PROPERTYKEY) -> HRESULT,
+        get_value: unsafe extern "system" fn(
+            *mut PropertyStore,
+            *const PROPERTYKEY,
+            *mut PropVariant,
+        ) -> HRESULT,
+        set_value: unsafe extern "system" fn(
+            *mut PropertyStore,
+            *const PROPERTYKEY,
+            *const PropVariant,
+        ) -> HRESULT,
+        commit: unsafe extern "system" fn(*mut PropertyStore) -> HRESULT,
+    }
+
+    /// The Application User Model ID set on this window, if it has one.
+    ///
+    /// `None` covers three different things and does not distinguish them,
+    /// because for this instrument they mean the same: no property, an empty
+    /// property, or a shell that refused the question. All three leave the
+    /// window grouped by its process, which is the state this stage is about.
+    fn aumid(hwnd: HWND) -> Option<String> {
+        // Once per process, on this thread; `wc-desk` is a one-shot command and
+        // never uninitialises.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a plain call with a null reserved argument.
+        ONCE.call_once(|| unsafe {
+            CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        });
+        let mut store: *mut PropertyStore = std::ptr::null_mut();
+        // SAFETY: a live handle from `EnumWindows`; the out pointer is checked.
+        let hr = unsafe {
+            SHGetPropertyStoreForWindow(
+                hwnd,
+                &IID_PROPERTY_STORE,
+                (&mut store as *mut *mut PropertyStore).cast(),
+            )
+        };
+        if hr < 0 || store.is_null() {
+            return None;
+        }
+        // SAFETY: `store` is live until `release`, which every path takes. The
+        // string the store writes is `CoTaskMemAlloc`ed and freed here, which
+        // is what `PropVariantClear` would do for the one type read.
+        unsafe {
+            let vtbl = &*(*store).vtbl;
+            let mut pv = PropVariant { vt: 0, reserved: [0; 3], value: [0; 2] };
+            let hr = (vtbl.get_value)(store, &PKEY_APP_USER_MODEL_ID, &mut pv);
+            let out = if hr < 0 || pv.vt != VT_LPWSTR || pv.value[0] == 0 {
+                None
+            } else {
+                let p = pv.value[0] as *mut u16;
+                let mut n = 0usize;
+                while *p.add(n) != 0 {
+                    n += 1;
+                }
+                let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+                CoTaskMemFree(p.cast());
+                if s.is_empty() { None } else { Some(s) }
+            };
+            (vtbl.release)(store);
+            out
+        }
+    }
+
     /// Does Windows give this window a taskbar button?
     ///
     /// This is the shell's documented rule rather than a guess, and it is worth
@@ -469,7 +584,7 @@ usage: wc-desk <command> [options]
                 continue;
             }
             println!(
-                "0x{:<10x} {:<5} {:<26} {:<20} {:?}{}",
+                "0x{:<10x} {:<5} {:<26} {:<20} {:?}{}{}",
                 w.hwnd as usize,
                 if taskbar_entry(w) { "yes" } else { "no" },
                 w.class,
@@ -481,8 +596,33 @@ usage: wc-desk <command> [options]
                     w.rect.top
                 ),
                 w.title,
-                if w.iconic { " [minimised]" } else { "" }
+                if w.iconic { " [minimised]" } else { "" },
+                // ADDED FOR STAGE 32, and appended rather than columned so that
+                // every harness already grepping this table keeps working.
+                match aumid(w.hwnd) {
+                    Some(id) => format!(" aumid={id:?}"),
+                    None => String::new(),
+                }
             );
+        }
+        // The claim stage 32 exists to make, counted rather than looked at: how
+        // many taskbar *buttons* the windows on this desktop come to. Windows
+        // with an identity of their own group by it; windows without one fall
+        // back to their process, which is what every window this compositor
+        // makes used to do.
+        let mut groups: Vec<String> = all
+            .iter()
+            .filter(|w| taskbar_entry(w))
+            .map(|w| match aumid(w.hwnd) {
+                Some(id) => id,
+                None => format!("(process {})", pid_of(w.hwnd)),
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+        println!("windows.groups    {}", groups.len());
+        for g in &groups {
+            println!("  group           {g}");
         }
         println!("windows.total     {}", all.len());
         println!(
