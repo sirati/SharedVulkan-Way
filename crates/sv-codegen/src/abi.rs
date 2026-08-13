@@ -183,6 +183,15 @@ pub struct AbiCommand {
     pub forwarded: bool,
     pub returns_result: bool,
     pub returns_void: bool,
+    /// Whether the specification requires external synchronisation of a
+    /// `VkQueue` for this command — carried across from
+    /// `vk_registry::model::Command::externally_synchronizes_a_queue`, because
+    /// the emitters see an [`AbiCommand`] and never the registry's own.
+    ///
+    /// Pass 12 turns it into a lock around the driver call (design.md §0.12
+    /// item 4). Nothing on the C ABI reads it: the app side's caller *is* the
+    /// application, which Vulkan already obliges to synchronise itself.
+    pub externsync_queue: bool,
 }
 
 impl AbiCommand {
@@ -316,6 +325,7 @@ pub fn build(model: &Model, profile: &Profile, forwarded: &BTreeSet<String>) -> 
             forwarded: forwarded.contains(name),
             returns_result,
             returns_void,
+            externsync_queue: cmd.externally_synchronizes_a_queue(),
         });
     }
 
