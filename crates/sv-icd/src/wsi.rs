@@ -688,12 +688,28 @@ pub fn queue_present(
 /// second, so it reads one pixel per 4 KiB — enough to tell "all zero" from
 /// "an image" and cheap enough to leave in.
 fn frame_note(swapchain: u64, bytes: &[u8], width: u32, height: u32) {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    const EVERY: u64 = 60;
     static COUNT: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    if n % 60 != 0 {
+    if n % EVERY != 0 {
         return;
     }
+    // The rate is the other half, and it is what turns "Firefox gave up" into a
+    // number that can be attributed. It is measured between notes rather than
+    // around one present, so it includes everything a frame costs on this side:
+    // the submit, the fence wait, the round trip that carries them, and the
+    // display target's own work.
+    let now = std::time::Instant::now();
+    let per_frame = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let d = last.map(|t| now.duration_since(t).as_secs_f64() / EVERY as f64);
+        *last = Some(now);
+        d
+    };
     let mut nonzero = 0usize;
     let mut sampled = 0usize;
     for px in bytes.chunks_exact(4).step_by(1024) {
@@ -702,10 +718,18 @@ fn frame_note(swapchain: u64, bytes: &[u8], width: u32, height: u32) {
             nonzero += 1;
         }
     }
-    trace!(
-        "vkQueuePresentKHR: swapchain {swapchain:#x} frame {n} {width}x{height} — \
-         {nonzero}/{sampled} sampled pixels are not black"
-    );
+    match per_frame {
+        Some(s) => trace!(
+            "vkQueuePresentKHR: swapchain {swapchain:#x} frame {n} {width}x{height} — \
+             {nonzero}/{sampled} sampled pixels are not black, {:.1} ms/frame ({:.1} fps)",
+            s * 1e3,
+            1.0 / s
+        ),
+        None => trace!(
+            "vkQueuePresentKHR: swapchain {swapchain:#x} frame {n} {width}x{height} — \
+             {nonzero}/{sampled} sampled pixels are not black, first frame"
+        ),
+    }
 }
 
 /// `vkDestroySwapchainKHR`.

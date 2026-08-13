@@ -732,7 +732,44 @@ distinguished "the application rendered nothing" from "the display target is
 broken". It said the frame had content — **and that there was exactly one of
 them**, which is the fact that turns a rendering question into a lifecycle one.
 
-## 6. Still not proven
+## 6. Two things about the harness that cost other people runs
+
+Neither is about the WSI. Both are stated here rather than worked around,
+because working around them is how they reach a fifth instance.
+
+**`scripts/sv-firefox-guest.sh` destroys concurrent runs of itself.** Its
+`clean` step ran `systemctl stop 'svff-run-*' 'svff-hostd-*' 'svff-app-*'` and
+`systemctl reset-failed 'svff-*'`, while the unit it starts is `svff-run-$$` —
+so the glob matches every *other* run of the harness and not merely the stale
+one it is aiming at. The same held for the guest-side kill, which matches the
+prefix `C:\Users\<guest-user>\svffint\`; for `/srv/winshare/svff`; for `/tmp/svff-int`,
+where the binaries live; and for the fixed ports 57359–57363. Five shared
+identities, none derived from the run, on a machine the project's own
+`waycompose-design.md` §16.8 says is shared by as many experiments as there are
+worktrees — and whose rule is "an identity is a process id or a full path; never
+an image name, never a window class, **never a glob**". The symptom lands in the
+victim's run as a host-side unit that disappears mid-Firefox, which reads as a
+crash.
+
+All five are now parameters — `SVFF_DIR`, `SVFF_GDIR`, `SVFF_SHARE`,
+`SVFF_UNIT_PREFIX`, `SVFF_BASE_PORT` — defaulting to exactly what they were, so
+an existing invocation is unchanged and a second experiment overrides them and
+collides with nothing. The globs stay, because a `clean` step exists to reap
+leftovers whose pids nobody recorded; they are now scoped to one experiment's
+own namespace, which is as narrow as a glob can honestly be. This is the fourth
+instance of cross-experiment interference in this project and the first found by
+reading rather than by losing a run.
+
+**The wire hash moved, and a stale GPU side does not say so in those words.**
+This commit's profile gained `VK_KHR_wayland_surface`, so `sv-proto`'s hash goes
+from `0x44c19f913c79a5fa` to `0x164ac6ce35b32883`, and a `sv-guest.exe` built
+before it refuses the handshake. What that looks like from the harness is a
+transport failure, which is exactly the wrong place to start looking — and this
+project has lost time to a stale binary twice already. Both harnesses now print
+the hash the ICD was built with next to the GPU side they start, so the two
+numbers are in the same log.
+
+## 7. Still not proven
 
 - **`about:support` reading `WebRender`.** The arbiter named in the brief. On
   testhost Firefox does not survive to have one; on devhost it survives,
@@ -742,3 +779,175 @@ them**, which is the fact that turns a rendering question into a lifecycle one.
 - **The Wayland WSI end to end.** It is built, it is tested, and no Mesa on this
   topology will call it. It is the right answer for a compositor that can
   advertise a device, and a `wc-proxy` that could is a different piece of work.
+
+---
+
+# The stall, decomposed — and it bottoms out in a `Duration` this tree already documents
+
+Measured 2026-08-13. Three candidates were named for Firefox's ~15 s first-frame
+stall. They are separable, so they were separated, cheapest-and-most-ours first.
+**Two are innocent and the third is a 20 ms constant that `sv_transport::park`
+already predicts in prose.**
+
+The instrument is `sv_icd::wsi::frame_note`, which reports the interval between
+every sixtieth present as well as whether the frame is black. It measures
+*between notes* rather than around one call, so it includes everything a frame
+costs on the app side: the submit, the fence wait, the round trips that carry
+them, and the display target's own work.
+
+## 1. Candidate 2, the per-frame `XSync`: measurably nothing
+
+`sv_icd::present::x11::quietly` swapped the process-global Xlib error handler
+around every request and ended in an `XSync` — a full round trip to the X server
+per presented frame, on top of the round trip to the GPU side the frame had
+already cost. It looked like the obvious suspect and it is the cheapest to test,
+which is why it was tested first.
+
+`eglgears_x11` through kopper on a DRM-less Xwayland, devhost, three runs
+each, median of the per-note intervals:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| with the `XSync` | 2.00 ms | 1.80 ms | 1.70 ms |
+| without it | 2.10 ms | 1.80 ms | 1.60 ms |
+
+**Indistinguishable.** The suspect is innocent, and saying so is the whole point
+of having measured instead of reasoning about round trips.
+
+The change was kept anyway, and not as a consolation prize. Installing the
+handler **once** and dispatching on the `Display*` — which `XErrorEvent` carries
+and Xlib passes as the first argument — is strictly safer than what it replaced:
+the old code hid *every* X error in the process for the duration of each call,
+including the application's own. Removing the swap removes the reason for the
+sync; the sync going with it is a side effect, not the justification.
+
+## 2. Candidate 3, a contended guest: also innocent, and the spread says so
+
+`eglgears_x11` at 300×300 through the full cross-VM stack, 480 frames:
+
+```
+median 216.9 ms/frame, min 213.9, max 228.7, over 8 notes
+20:06:54  up 2 days, 1 user, load average: 0.60, 0.98, 1.19
+```
+
+**A 7 % spread over 480 frames is not a contended machine.** Queueing behind a
+dozen experiments produces a long tail; this has none, and the load average on
+the two-core host is about one. An earlier run on a busier afternoon gave
+219.6 ms — the same number. So the cost is fixed, and it belongs to the path
+rather than to the neighbours.
+
+## 3. Candidate 1, the cross-VM present: all of it, and it is 20 ms at a time
+
+Same program, same instrument, same frame size — 300×300, 360 KiB, chosen small
+enough that bytes cannot be the answer:
+
+| GPU side | ms per present | fps |
+|---|---|---|
+| devhost, same machine | **1.7 – 2.1** | ~500 |
+| testhost, in the Windows guest | **216.9** | **4.6** |
+
+Two orders of magnitude on a frame with no pixels in it. At 217 ms a present,
+Firefox's compositor is fifteen seconds late after a few dozen of them, which is
+exactly what `WaitFlushedEvent::Run: is delayed: 14608` says. **The stall is not
+in the WSI, in kopper, or in the display target. It is the cost of a synchronous
+present across the VM boundary — and that cost is quantised.**
+
+`sv_transport::park::Futex` documents why, before any of this was measured:
+
+> **What saves it is that `slice` is finite.** […] across a VM this parker *is*
+> `SpinYield` with a 20 ms sleep […] The measured numbers above are same-machine
+> numbers and should not be quoted for the cross-VM case; what that case needs
+> is a doorbell the hypervisor carries — a virtio-serial byte or an ivshmem
+> interrupt — behind this same trait.
+
+A futex wake does not cross a hypervisor: the guest's kernel and the host's each
+hash the shared word into their own table, so a rung doorbell reaches nobody and
+the waiter runs out its `slice` instead. `slice` is `Duration::from_millis(20)`.
+
+**216.9 / 20 = 10.8.** A `vkQueuePresentKHR` on this path is `vkResetFences`,
+`vkQueueSubmit` and `vkWaitForFences`, each a forwarded round trip with a wait
+at both ends, plus kopper's per-frame surface query and the acquire — about
+eleven waits, every one of which misses its doorbell and pays the slice in full.
+The arithmetic closes.
+
+So the decomposition is complete and the answer was written down before the
+question was asked. What it needs is the thing that paragraph names — a doorbell
+the hypervisor carries — and, independently, a `vkQueuePresentKHR` that signals
+a timeline instead of waiting (§9.3, which `wsi.rs` records as deliberately
+deferred and which is now the thing in the way). Either alone is worth an order
+of magnitude; neither is a change to the WSI.
+
+---
+
+# What the two projects have to share, and what it is worth
+
+The brief also asks for shared_vulkan and waycompose to be wired so that copies
+are avoided. Here is the copy count as it stands, what removing it takes, and —
+the part that decides the order of work — what it is worth against §3 above.
+
+## The copies today
+
+**Wayland path** (`VK_KHR_wayland_surface`, this stage):
+
+| # | where | what |
+|---|---|---|
+| 1 | guest, GPU | `vkCmdCopyImageToBuffer`, tiled render target → linear arena buffer |
+| 2 | host, CPU | arena → the ICD's own `memfd`, which is the `wl_shm` pool |
+| 3 | host, CPU | `wc-proxy`: that pool → a slice of the compositor's arena |
+| 4 | guest, CPU | the compositor: arena slice → its composited output |
+
+**X11 path** — the one that actually renders today — inserts two more:
+`XPutImage` writes the arena bytes into an `XImage` and then over a socket to
+Xwayland, and Xwayland copies its pixmap into a `wl_shm` buffer of its own. Six
+touches of every pixel, four of them on a host that has no GPU.
+
+## The one change that removes three of them
+
+The enabling fact is not a protocol, it is a deployment: **`sv-guest` is one
+binary running both the GPU side and the compositor inside the guest**
+(`docs/one-binary.md`), and both arenas are guest RAM. The frame does not need
+to travel to the host and back at all.
+
+If the swapchain's readback `VkBuffer` is allocated **from the compositor's
+arena** rather than from the GPU session's own, copy 1 writes straight into the
+pages the compositor reads, and copies 2, 3 and 4 have nothing left to do. One
+copy remains and it is the necessary one: the render target is tiled and the
+compositor needs it linear (§0.11's copy 1, which stays for the reason
+`crate::wsi`'s header gives).
+
+What the `wl_buffer` becomes is then not a `wl_shm` buffer at all. It is the
+triple `wc_proxy::pool`'s `Arena` transport already carries — `(arena id,
+offset, len)` plus a layout — and **no descriptor is involved on either side**,
+which is what makes it admissible under §1a rather than a dmabuf wearing a hat.
+
+Four pieces, none of them large:
+
+1. **A protocol between the ICD and `wc-proxy`**: `create_buffer(arena, offset,
+   stride, width, height, format) -> wl_buffer`, with no fd. The only new wire
+   format, and the seam the two projects meet at.
+2. **A bounds check in `wc-proxy`, which is the security half.** A client that
+   names an offset is a client that can name *someone else's* frame unless the
+   range is checked against the slice it owns. `security-model.md` R3 is the
+   argument, and it is the same one §0.12 used to reject a partitioned arena:
+   isolation has to be a fact rather than a convention.
+3. **A way for the GPU side to allocate out of the compositor's arena.** Inside
+   one process that is an allocation from a region it already owns; across two
+   it is what `sv_arena::handle`'s descriptor-free `[u32; 12]` exists for.
+4. **A way for the ICD to ask for it** — a readback allocation that says "in the
+   presentation arena" rather than "in my session arena". A memory type, or a
+   flag on the single allocation in `wsi::create_readback`.
+
+## And what it is worth, stated before it is built rather than after
+
+**At 300×300 the frame is 360 KiB and it costs 217 ms.** Removing three host
+copies of 360 KiB removes tens of microseconds from a 217 ms budget. `wc-proxy`
+measures its own copy at 126 µs per 4.5 MiB, so even at 1080p the whole of copy
+3 is a fifth of a millisecond — against eleven 20 ms sleeps.
+
+**So this is not the fix for §3 and must not be sold as one.** It is worth
+building for the reason it was worth building before the stall was measured: at
+4K60 the copies *are* the bandwidth, and it is the difference between a stack
+that can carry video and one that cannot. But it belongs after the doorbell and
+after an asynchronous present, not instead of them. Getting that order wrong
+would be §0.13's mistake in its most expensive form — a real improvement,
+honestly measured, aimed at the wrong bottleneck.
