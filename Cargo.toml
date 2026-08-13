@@ -1,26 +1,116 @@
 [workspace]
 resolver = "3"
+
+# ONE WORKSPACE, TWO BINARIES, ONE PER SIDE OF THE VM BOUNDARY
+#
+# docs/one-binary.md. The Wayland compositor and the Vulkan GPU server are two
+# halves of the program that runs *inside* the guest; the Wayland proxy and the
+# arena daemon are two halves of the program that runs outside it. They were two
+# repositories, and the cost of that was four copies of every frame and two
+# crossings of the hypervisor boundary in opposite directions, because two
+# programs cannot name the same memory. See one-binary.md's opening table.
+#
+# `crates/wc-*` and `vendor/*` arrived here at the paths they already had — of
+# 502 files, six collided, and only `docs/design.md` had to be renamed (to
+# `docs/waycompose-design.md`). That is deliberate, and it is what makes the
+# rebase recipe at the top of one-binary.md three lines long.
 members = [
-  "crates/vk-registry",
-  "crates/vk-probe",
-  "crates/arena-record",
-  "crates/awe-probe",
-  "crates/gpu-probe",
-  "crates/arena-host",
+  # Shared primitives. Both sides use these, and none of them may ever grow a
+  # cargo feature: they are what "one arena" means, and a feature on one of them
+  # would make the arena mean two different things depending on who built it.
   "crates/sv-wire",
+  "crates/sv-transport",
+  "crates/sv-arena",
+  "crates/arena-record",
+
+  # The Vulkan side.
+  "crates/vk-registry",
   "crates/sv-codegen",
   "crates/sv-proto",
   "crates/sv-icd-entry",
   "crates/sv-gpu-entry",
   "crates/sv-icd",
   "crates/sv-testkit",
-  "crates/sv-transport",
-  "crates/sv-arena",
   "crates/sv-hostd",
   "crates/sv-gpu-server",
+
+  # The Wayland side.
+  "crates/wc-transport",
+  "crates/wc-handle",
+  "crates/wc-server",
+  "crates/wc-compositor",
+  "crates/wc-desk",
+  "crates/wc-shmclient",
+  "crates/wc-proxy",
+  "vendor/wayland-backend",
+  "vendor/wayland-scanner",
+  "vendor/wayland-server",
+
+  # Probes and instruments.
+  "crates/vk-probe",
+  "crates/awe-probe",
+  "crates/gpu-probe",
+  "crates/arena-host",
   "crates/dmabuf-probe",
   "crates/video-probe",
+  "crates/wc-probe",
+  "crates/wc-xkb-probe",
 ]
+
+# WHICH FORKS ARE MEMBERS, AND WHY THE OTHERS ARE NOT
+#
+# `wayland-backend`, `wayland-server` and `wayland-scanner` are members. They
+# are ours — stage 1 rewrote their transport, their fd type and their poll loop,
+# and `vendor/PATCHES.md` says outright to treat them as this project's code.
+# They are held to this project's gates: `cargo clippy --workspace
+# --all-targets` lints them and they are clean.
+#
+# `smithay` and `xkbcommon` are not members, for two different reasons that
+# happen to point the same way.
+#
+# smithay, the mechanical reason: a member is built by `cargo check --workspace`
+# with its *own* default features, and smithay's defaults are `backend_drm`,
+# `backend_gbm`, `backend_libinput`, `backend_udev`, `backend_session_libseat`,
+# `backend_x11`, `backend_winit`, `renderer_gl`, `renderer_multi`, `xwayland`
+# and `backend_vulkan` — the Linux graphics stack, top to bottom. Excluding it
+# means the only way smithay is ever built is through `wc-compositor`, which
+# names the feature set we actually ship, so the Windows gate tests the
+# configuration that exists rather than one nobody uses.
+#
+# Both, the real reason: these two are near-upstream forks that we intend to
+# send patches back to (waycompose-design.md §5.3 — smithay has merged this
+# patch class three times). Holding somebody else's crate to this project's lint
+# standard would mean carrying a dozen hunks that have nothing to do with the
+# port, which is exactly what makes a fork hard to rebase and a patch series
+# hard to review. Our changes to them are reviewed by diff, not by clippy;
+# `vendor/PATCHES.md` is the index.
+#
+# `crates/wc-arena-host` USED TO BE HERE, AND IS NOW DELETED. It was excluded
+# because it had an absolute path dependency on this repository back when this
+# was a different repository, and a member is resolved by every `--workspace`
+# command including the Windows cross gate. That argument was measured and found
+# not to bite — the whole arena stack cross-compiles clean for
+# `x86_64-pc-windows-gnu`, and `sv-hostd` already `cfg`s down to a shell there —
+# so the constraint was never the gate. It was source reachability, i.e. the
+# repository split, which no longer exists. one-binary.md §1.3.
+exclude = ["vendor/smithay", "vendor/xkbcommon"]
+
+# The forks are members of this workspace *and* the resolution target for
+# anything that asks crates.io for these names. Without the patch table a
+# transitive `wayland-server -> wayland-backend = "0.3"` would silently pull the
+# unpatched crates.io copy, which does not build for Windows, and the failure
+# would look like our fork being wrong rather than being bypassed.
+#
+# See vendor/PATCHES.md for what was changed and why. Nothing in `vendor/` is
+# upstream code any more; treat it as ours.
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }
+wayland-server = { path = "vendor/wayland-server" }
+wayland-scanner = { path = "vendor/wayland-scanner" }
+# smithay depends on `xkbcommon` non-optionally, so without this entry a
+# smithay build resolves the crates.io copy, whose `use std::os::unix::io` fails
+# for Windows before the linker is ever reached.
+xkbcommon = { path = "vendor/xkbcommon" }
 
 [workspace.package]
 edition = "2024"
@@ -53,5 +143,29 @@ sv-codegen = { path = "crates/sv-codegen" }
 sv-proto = { path = "crates/sv-proto" }
 sv-transport = { path = "crates/sv-transport" }
 sv-arena = { path = "crates/sv-arena" }
+arena-record = { path = "crates/arena-record" }
 sv-icd-entry = { path = "crates/sv-icd-entry" }
 sv-gpu-entry = { path = "crates/sv-gpu-entry" }
+sv-hostd = { path = "crates/sv-hostd" }
+
+wc-transport = { path = "crates/wc-transport" }
+wc-handle = { path = "crates/wc-handle" }
+
+wayland-backend = { path = "vendor/wayland-backend" }
+wayland-server = { path = "vendor/wayland-server" }
+wayland-scanner = { path = "vendor/wayland-scanner" }
+xkbcommon = { path = "vendor/xkbcommon" }
+# smithay is deliberately absent from this table. It is declared inline by
+# `crates/wc-compositor`, because a `workspace.dependencies` entry cannot be
+# overridden with `default-features = false` by the crate that inherits it, and
+# `default-features = false` is the entire point. See the `exclude` note above.
+
+# The Windows half. `windows-sys` rather than `windows` because everything we
+# call is a plain C entry point — no COM, no WinRT — and the raw bindings cost
+# nothing to compile. Version 0.61 is what `uds_windows` 1.2.1 accepts, so
+# pinning the same one keeps a single copy in the tree.
+windows-sys = "0.61"
+# AF_UNIX on Windows. See waycompose-design.md §2.2 for why this rather than a
+# named pipe; the short version is that wepoll can poll a socket and cannot poll
+# a pipe, and calloop on Windows is wepoll.
+uds_windows = "1.2"

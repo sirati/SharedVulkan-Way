@@ -1,0 +1,39 @@
+Only include <BaseTsd.h> where it is used (MSVC), so mingw can build
+
+`src/utils.h` includes <BaseTsd.h> unconditionally under _WIN32, but the only
+symbol it takes from that header is SSIZE_T, used two lines later inside
+`#ifdef _MSC_VER`.
+
+mingw-w64 installs that header as `basetsd.h`, lower case, and only that
+spelling. Windows filesystems are case-insensitive, so MSVC and clang-cl
+building *on Windows* never notice the mismatch. Cross-compiling with
+x86_64-w64-mingw32-gcc from a case-sensitive filesystem, the include is not
+found and every translation unit that reaches utils.h fails:
+
+    ../src/utils.h:28:11: fatal error: BaseTsd.h: No such file or directory
+
+Measured against libxkbcommon 1.13.2, x86_64-w64-mingw32-gcc 15.3.0, meson
+cross build: 250+ of the 290 ninja targets fail this way.
+
+mingw already provides ssize_t via <sys/types.h>, so it needs neither the
+include nor the typedef -- moving the include inside the existing _MSC_VER
+guard is sufficient and changes nothing for MSVC.
+
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -25,7 +25,6 @@
+ #ifdef _WIN32
+ # include <direct.h>
+ # include <io.h>
+-# include <BaseTsd.h>
+ # ifndef S_ISDIR
+ #  define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+ # endif
+@@ -33,6 +32,7 @@
+ #  define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+ # endif
+ #ifdef _MSC_VER
++# include <BaseTsd.h>
+ typedef SSIZE_T ssize_t;
+ #endif
+ #endif

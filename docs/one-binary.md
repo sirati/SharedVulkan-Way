@@ -16,12 +16,64 @@ and the requirement that gives it its point:
 > we want direct memory mapping but we do want to preserve that we allocate
 > direct gpu memory if we want to, and that there is no copying between the two
 
-This document is the design. §1 is what the split costs, measured rather than
-asserted, because that is what decides the order of the work. §2 is the crate
-layout and the feature gating. §3–§5 are the arena, the handle and the ownership
-rule that replaces the copy. §6 is what one arena costs — there is a real loss
-and it is named. §7 is the boundary rule, which gets *harder* under unification.
-§8 is when the physical merge should happen and what has to be true first.
+---
+
+## The requirement, as a measurement
+
+The third quote is the requirement, and it can be stated as a number rather than
+as a preference. This is the argument for unification; everything else in this
+document is how to get it.
+
+`firefox-accel.md` §7 counted two copies and called the second "the one that
+should not exist". **That count was made from shared_vulkan's side alone and it
+is an undercount**, because the compositor's side has copies of its own and the
+two documents could not see each other. The full path a Firefox frame takes
+today, on the testhost topology:
+
+| # | step | where | crosses the hypervisor? |
+|---|---|---|---|
+| — | WebRender renders into a `VkImage` | **guest** GPU memory | — |
+| 1 | `vkCmdCopyImageToBuffer` into a linear arena buffer (§0.6) | **guest** → shared_vulkan's arena, which is guest RAM | no |
+| 2 | `sv-icd` reads the arena and writes Firefox's `wl_shm` pool | arena → **host** RAM | **out** |
+| 3 | `wc-proxy` copies the client's pool into waycompose's arena (§9.5) | host RAM → **guest** RAM | **back in** |
+| 4 | `wc-compositor` blits the arena slice into the Win32 window | **guest** | no |
+
+**Four copies, and the pixels leave the guest and come back.** They are rendered
+by the guest's GPU, into the guest's own RAM, to be displayed by a compositor
+running in the guest — and on the way they make a round trip to a host that has
+no GPU at all (`design.md` §0.10) and does nothing to them. At 4.6 MB per frame
+for Firefox's content subsurface (waycompose §15.10), twice, per frame.
+
+Steps 2 and 3 exist for exactly one reason: **shared_vulkan's arena and
+waycompose's arena are two different regions, and neither program can name a
+range of the other's.** The client's `wl_shm` pool in the middle is the only
+place the two could meet, and it is on the wrong side of the boundary.
+
+With one arena in one guest process:
+
+| # | step | where | crosses? |
+|---|---|---|---|
+| — | WebRender renders into a `VkImage` | **guest** GPU memory | — |
+| 1 | `vkCmdCopyImageToBuffer` into a linear arena buffer | **guest** → the arena | no |
+| 2 | the compositor blits that range into the window | **guest** | no |
+
+**Two copies, zero crossings.** Copy 1 stays and should: the frame is rendered
+tiled and the compositor needs it linear, which is the hardware's requirement and
+not our architecture's. Copy 2 is a composite into a window, which is what a
+compositor *is*. What disappears is the pair that existed only because two
+programs could not name the same memory.
+
+That is the whole of "there is no copying between the two". It is not one memcpy
+saved; it is **two full-frame transits of a hypervisor boundary, deleted.**
+
+---
+
+This document is the design. §1 is what the split costs *besides* the copies,
+because that decides the order of the work. §2 is the crate layout and the
+feature gating. §3–§5 are the arena, the handle and the ownership rule that
+replaces the copy. §6 is what one arena costs — there is a real loss and it is
+named. §7 is the boundary rule, which gets *harder* under unification. §8 is when
+the physical merge should happen and what has to be true first.
 
 ---
 
@@ -42,55 +94,12 @@ yet travelled by handle, and §8 says plainly what remains.
 
 ---
 
-## 1. What the split costs, measured
+## 1. What else the split costs, measured
 
-Five consequences, in descending order of how much they cost. The first is the
-one the requirement is about and it is worse than the earlier documents say.
+The copies are above, because they are the requirement. Four more consequences,
+in descending order of how much they cost.
 
-### 1.1 The frame crosses the VM boundary twice, in opposite directions
-
-`firefox-accel.md` §7 counted two copies and called the second "the one that
-should not exist". That count was made from shared_vulkan's side alone, and it is
-an undercount, because the compositor's side has copies of its own. The full path
-a Firefox frame takes today, on the testhost topology:
-
-| # | step | where | crosses? |
-|---|---|---|---|
-| — | WebRender renders into a `VkImage` | **guest** GPU memory | — |
-| 1 | `vkCmdCopyImageToBuffer` into a linear arena buffer (§0.6) | **guest** → shared_vulkan's arena, which is guest RAM | no |
-| 2 | `sv-icd` reads the arena and writes Firefox's `wl_shm` pool | arena → **host** RAM | **out** |
-| 3 | `wc-proxy` copies the client's pool into waycompose's arena (§9.5) | host RAM → **guest** RAM | **back in** |
-| 4 | `wc-compositor` blits the arena slice into the Win32 window | **guest** | no |
-
-**Four copies, and the pixels leave the guest and come back.** They are rendered
-by the guest's GPU, into the guest's own RAM, to be displayed by a compositor
-running in the guest — and on the way they make a round trip to a host that has
-no GPU at all (`design.md` §0.10) and does nothing to them.
-
-Steps 2 and 3 exist for exactly one reason: **shared_vulkan's arena and
-waycompose's arena are two different regions, and neither program can name a
-range of the other's.** The client's `wl_shm` pool in the middle is the only
-place both could meet.
-
-With one arena and one guest process the path is:
-
-| # | step | where | crosses? |
-|---|---|---|---|
-| — | WebRender renders into a `VkImage` | **guest** GPU memory | — |
-| 1 | `vkCmdCopyImageToBuffer` into a linear arena buffer | **guest** → the arena | no |
-| 2 | the compositor blits that range into the window | **guest** | no |
-
-**Two copies, zero crossings.** Copy 1 stays and should: the frame is rendered in
-tiled GPU memory and the compositor needs it linear, which is a property of the
-hardware and not of our architecture. Copy 2 is a composite into a window and is
-what a compositor *is*. What disappears is the pair that existed only because two
-programs could not name the same memory.
-
-This is the whole of "there is no copying between the two". It is not one memcpy
-saved; it is two full-frame transits of a hypervisor boundary, at 4.6 MB a frame
-for Firefox's content subsurface (waycompose §15.10).
-
-### 1.2 The allocator was written three times
+### 1.1 The allocator was written three times
 
 Not twice. Over what the topology wants to be one region there are three free
 lists:
@@ -105,7 +114,7 @@ The middle one is the tell. Its own comment records that it copies the constant
 by hand, which means somebody stood at the boundary, saw the shared value, and
 could not reach it. §3 replaces all three.
 
-### 1.3 The locator was reached for instead of the allocator
+### 1.2 The locator was reached for instead of the allocator
 
 waycompose consumes `sv_hostd::Hostd::qemu` and `sv_hostd::locate::attach` — root,
 QMP, `/proc/<qemu-pid>/fd`, a 13 GiB content sweep at 2.37–2.42 s (§12.5) — and
@@ -116,9 +125,32 @@ a mapping, which is a thing you can hand across a process boundary. An
 
 So the deployment acquired root, a second 13 GiB sweep and a second set of
 stamps-that-pixels-later-overwrite, in order to get a region it then allocated
-from with a different allocator. One arena means one locate.
+from with a different allocator.
 
-### 1.4 `wc-arena-host` is a workaround for a split that should not exist
+**One of the two costs in that sentence has just been paid off, and saying so is
+more useful than keeping the bigger number.** `design.md` §0.14, merged into this
+branch, measures `NtQuerySystemInformation(SystemSuperfetchInformation)`
+returning the PFN database to user mode: the host's share of a locate drops from
+**2.308 s to 0.064 s**, needs no root and no `/proc/<qemu-pid>/fd/<n>`, and costs
+~330 ms of guest CPU. So "a second 13 GiB sweep" is no longer what a second arena
+costs. A second arena costs ~0.4 s and a second region, which is real but is not
+an argument on its own.
+
+**The argument that does not weaken is the one that was always the point.** Two
+regions cannot share an allocation whatever they cost to find, so the copies at
+the top of this document are unaffected by §0.14, and the reason waycompose
+reached past `sv-arena` for `sv-hostd` is unaffected too: a locate is
+transferable between programs and an allocation is not. One arena is right
+because of what it makes possible, not because locating is expensive.
+
+The other cost §0.14 does pay off outright is the one this brief named
+explicitly — *"stamps that pixels later overwrite"*. The scan cannot re-locate a
+window once the arena's own data has covered the stamps (**measured: 0 pages
+located after an overwrite**); the query returns the same 16384 frames and 26
+runs regardless. In the unified design that stops being a hazard to work around
+and becomes the ordinary re-attach path.
+
+### 1.3 `wc-arena-host` is a workaround for a split that should not exist
 
 `crates/wc-arena-host` has `sv-hostd`, `sv-transport`, `sv-arena` and
 `arena-record` as **absolute** path dependencies on a sibling repository, declares

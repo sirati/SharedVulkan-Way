@@ -1,0 +1,13 @@
+[package]
+name = "wc-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The waycompose Wayland server — stage 1: accepts a client and completes a handshake"
+
+[dependencies]
+wayland-server = { workspace = true }
+wc-handle = { workspace = true }
+# `report_pool_contents` needs it on Windows only; on Unix the `h` is a real fd.
+wc-transport = { workspace = true }

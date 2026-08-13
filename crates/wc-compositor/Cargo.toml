@@ -1,0 +1,70 @@
+[package]
+name = "wc-compositor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A smithay compositor that stands up wl_display and xdg_shell as a Windows binary"
+
+[dependencies]
+# The feature set is the whole point of this crate existing separately from the
+# vendored fork. `vendor/smithay` is deliberately NOT a workspace member: as a
+# member, `cargo check --workspace` would build it with its own `default`
+# features, which are DRM, GBM, libinput, libseat, X11, winit, XWayland and
+# Vulkan — none of which exist on Windows and none of which we want on Linux
+# either. Declaring the features here, at the one place that consumes smithay,
+# keeps the fork's manifest identical to upstream's on that point and keeps the
+# gate honest.
+#
+# `wayland_frontend` is the protocol implementations. `desktop` is the space and
+# window management (4,768 lines, docs/design.md §5.2).
+smithay = { path = "../../vendor/smithay", default-features = false, features = [
+  "wayland_frontend",
+  "desktop",
+] }
+wayland-server = { workspace = true }
+# STAGE 11. `protocols/wc-icon-v1.xml` is this project's own interface — icon
+# pixels keyed by application id, for a resolver that is not the toplevel's
+# client (see `src/icon.rs` for why that cannot be `xdg-toplevel-icon-v1`).
+# The scanner generates the server half from the XML at compile time, and
+# `wayland-backend` is named because the generated code refers to it; it is
+# already in the tree as the transport fork, so this adds nothing to build.
+wayland-scanner = { workspace = true }
+wayland-backend = { workspace = true }
+wc-transport = { workspace = true }
+# Unconditional as of stage 4, where it was `cfg(windows)` before. Two things
+# moved it: `--arena` attaches regions on both platforms, and `map_counts()` is
+# how a run says which of the three shared-memory mechanisms actually carried
+# its pixels. Both are facts about the *boundary* rather than about Windows,
+# and the Unix build of `wc-handle` exists precisely so that the shim is
+# testable on the machine that builds it (see that crate's `platform/unix.rs`).
+wc-handle = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Only for `dup2`, so `--log` means the same thing on both platforms. std has
+# no safe way to point an existing file descriptor at a file.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# The window half. Raw bindings rather than the `windows` crate for the reason
+# in the workspace manifest: everything called here is a plain C entry point —
+# `CreateWindowExW`, `SetDIBitsToDevice`, `GetMessageW` — with no COM and no
+# WinRT, so the generated bindings cost nothing to compile.
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_Console",
+  "Win32_System_LibraryLoader",
+  # ADDED FOR STAGE 8: the poll loop's wait is a high-resolution waitable timer
+  # rather than `Sleep`, whose quantum on the guest is 15.6 ms (§13.8).
+  # `Win32_Security` comes with it because `CreateWaitableTimerExW` takes a
+  # pointer to `SECURITY_ATTRIBUTES`.
+  "Win32_Security",
+  "Win32_System_Threading",
+  # ADDED FOR STAGE 6: `TrackMouseEvent` (without which there is no
+  # `WM_MOUSELEAVE` at all), `SetCapture`/`ReleaseCapture` (without which a
+  # drag off the window loses its release), and `GetKeyboardLayout` (which
+  # chooses the keymap).
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,2218 @@
+//! The compositor's Wayland-side state, and the handlers that turn protocol
+//! into window commands.
+//!
+//! Everything in this file runs on the Wayland thread and only there. Nothing
+//! here touches Win32; the only way out is [`Ui::send`].
+
+use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
+};
+use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
+// smithay's own input vocabulary rather than `wayland_server`'s protocol enums.
+// They have the same names and are different types: the protocol ones are the
+// wire encoding of one interface's argument, and these are what the input
+// handles take, because a `KeyState` also has to describe a key from a
+// libinput device that never touched the protocol. Naming the wrong one
+// compiles nowhere, which is the good case — but the compiler's message says
+// only "similar names", so the reason they are two types is worth recording.
+use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
+use smithay::reexports::wayland_server::protocol::{
+    wl_buffer, wl_output, wl_seat, wl_surface::WlSurface,
+};
+use smithay::utils::SERIAL_COUNTER;
+use smithay::reexports::wayland_server::{Client, DisplayHandle};
+use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::compositor::{
+    self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, Damage,
+    SurfaceAttributes,
+};
+use smithay::wayland::shell::xdg::{
+    PopupSurface, PositionerState, ToplevelState, ToplevelSurface, XdgShellHandler, XdgShellState,
+    XdgToplevelSurfaceData,
+};
+use smithay::wayland::shm::{ShmHandler, ShmState};
+// ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
+// than guessed at, and they are requirements for different reasons — see
+// docs/design.md §13.3.
+//
+// `Output` is the monitor. Without one a GTK client has an empty
+// `GdkDisplay` monitor list, sizes its first window from a fallback and never
+// learns a scale factor; Firefox came up 552x172 in a run where the compositor
+// advertised no `wl_output` at all.
+//
+// `DataDeviceState` is the clipboard, and it is load-bearing for something that
+// has nothing to do with clipboards: GTK 3 **defers creating a seat** until
+// `wl_data_device_manager` appears, so a compositor with a perfectly good
+// `wl_seat` and no data device gives a GTK client no keyboard and no pointer
+// at all. §13.4 has the trace.
+use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::utils::Transform;
+use smithay::wayland::output::OutputHandler;
+use smithay::wayland::selection::data_device::{
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+};
+use smithay::wayland::selection::SelectionHandler;
+// ADDED FOR STAGE 9: **both** decoration protocols, advertised together, so
+// that which one Firefox honours is a measurement and not a belief.
+//
+// The research said GTK does not implement `xdg-decoration` and uses KDE's
+// instead. That is checkable two ways and both were done: `libgdk-3.so`
+// contains the string `org_kde_kwin_server_decoration_manager` and does not
+// contain `zxdg_decoration_manager_v1`, and a compositor that offers both is
+// told which one is bound. docs/design.md §13.7 has the answer and what it
+// costs.
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server
+    ::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::reexports::wayland_protocols_misc::server_decoration::server
+    ::org_kde_kwin_server_decoration::{Mode as KdeMode, OrgKdeKwinServerDecoration};
+use smithay::reexports::wayland_protocols_misc::server_decoration::server
+    ::org_kde_kwin_server_decoration_manager::Mode as KdeDefaultMode;
+use smithay::reexports::wayland_server::WEnum;
+use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+use smithay::{
+    delegate_compositor, delegate_data_device, delegate_kde_decoration, delegate_output,
+    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+};
+
+use crate::platform::{
+    FromUi, IconImage, ToUi, Ui, WindowId, WindowKind,
+};
+use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource};
+
+/// What kind of shell surface a window is.
+///
+/// ADDED FOR STAGE 9. Before this stage a window was always an `xdg_toplevel`
+/// and the field could be one. Firefox is menus: the hamburger, every dropdown,
+/// the URL bar's autocomplete and every tooltip is an `xdg_popup`, and stage 6
+/// recorded the symptom of not having them — *"the click which would open a
+/// menu now arrives and nothing happens"*.
+enum Role {
+    Toplevel(ToplevelSurface),
+    /// A menu, dropdown or tooltip. Its geometry comes from an
+    /// `xdg_positioner` rather than from a window manager, and it is placed
+    /// relative to its parent's window-geometry rectangle.
+    Popup(PopupSurface),
+}
+
+impl Role {
+    fn surface(&self) -> &WlSurface {
+        match self {
+            Role::Toplevel(t) => t.wl_surface(),
+            Role::Popup(p) => p.wl_surface(),
+        }
+    }
+
+    fn toplevel(&self) -> Option<&ToplevelSurface> {
+        match self {
+            Role::Toplevel(t) => Some(t),
+            Role::Popup(_) => None,
+        }
+    }
+}
+
+/// One toplevel or popup, from the Wayland side.
+struct Window {
+    id: WindowId,
+    role: Role,
+    /// Shared with the UI thread; see `platform`'s header for why pixels live
+    /// here rather than in the command queue.
+    shadow: Arc<Mutex<Shadow>>,
+    mapped: bool,
+    title: String,
+    app_id: String,
+    /// Callbacks the client is waiting on before it draws its next frame.
+    ///
+    /// Held rather than answered immediately. Answering at once is legal and is
+    /// what a naive compositor does; it also turns every client that draws in
+    /// response to `frame` into a spin loop that renders as fast as the CPU
+    /// allows, which is `weston-simple-shm` at several thousand frames a second
+    /// and a machine that sounds broken.
+    frame_callbacks: Vec<WlCallback>,
+    presented: u64,
+    /// The client has set an icon of its own through `xdg-toplevel-icon-v1`.
+    ///
+    /// Once it has, a publish on `wc_icon_manager_v1` for the same app id must
+    /// not overwrite it: the client is the authority on its own icon, and the
+    /// resolver is a guess made from a name. The reverse is not true — a
+    /// client that sets an icon *after* the resolver's guess has been applied
+    /// replaces it.
+    icon_from_client: bool,
+    /// The client called `xdg_toplevel_icon_manager_v1.set_icon` and the state
+    /// it named becomes current at the next commit.
+    ///
+    /// A flag rather than reading the cached state on every commit: the icon is
+    /// double-buffered like everything else, so "has it changed" is not a
+    /// question the current value can answer, and an animating client commits
+    /// sixty times a second with the same icon attached.
+    icon_dirty: bool,
+}
+
+pub struct State {
+    compositor: CompositorState,
+    shm: ShmState,
+    xdg_shell: XdgShellState,
+    /// ADDED FOR STAGE 9. Kept as a field rather than dropped after
+    /// `create_global` because every surface that maps has to be sent
+    /// `wl_surface.enter` for it: a client that is never told which output it
+    /// is on does not know its scale, and GTK's is the code that asks.
+    output: Output,
+    /// ADDED FOR STAGE 9. Held only to keep the global alive; nothing reads it.
+    /// See the note on the import for why a clipboard is a prerequisite for
+    /// input.
+    _data_device: DataDeviceState,
+    /// ADDED FOR STAGE 9. Both decoration protocols; see the import.
+    _xdg_decoration: XdgDecorationState,
+    kde_decoration: KdeDecorationState,
+    /// Owns the seat: `SeatState` keeps every `Seat` it makes, so there is no
+    /// separate field for the one seat and dropping the local from `new` does
+    /// not destroy the global.
+    seat_state: SeatState<Self>,
+    /// `None` only if the keymap failed to compile, which is a hard startup
+    /// error everywhere it can be one — but *not* here, because a compositor
+    /// that refuses to run because a keymap is bad is worse than one that runs
+    /// without a keyboard and says so.
+    keyboard: Option<KeyboardHandle<Self>>,
+    pointer: PointerHandle<Self>,
+    /// Which window the platform says has keyboard focus, and which one the
+    /// pointer is over. Kept as ids rather than surfaces because that is what
+    /// arrives from the UI thread, and resolved to a surface at the moment of
+    /// use so a message about a window that has since been destroyed is
+    /// ignorable rather than a dangling reference.
+    keyboard_focus: Option<WindowId>,
+    pointer_focus: Option<WindowId>,
+    /// Where the pointer is, in surface coordinates of [`Self::pointer_focus`].
+    /// `wl_pointer.button` and `.axis` carry no coordinates — the protocol says
+    /// they happen wherever the last motion was — so the compositor has to
+    /// remember.
+    pointer_at: (f64, f64),
+    /// Said once, the first time a client sets a cursor. See [`SeatHandler`].
+    cursor_noted: bool,
+    /// The surface the client last handed to `wl_pointer.set_cursor`, if it
+    /// handed one over rather than naming a shape.
+    ///
+    /// ADDED FOR STAGE 13, and it exists for two jobs that are really one.
+    ///
+    /// A cursor surface arrives *empty*: `set_cursor` names it before the
+    /// client has attached a buffer to it, so the pixels turn up on a later
+    /// commit and there is no way to build an `HCURSOR` at the moment of the
+    /// request. Remembering which surface it was is what lets that commit be
+    /// recognised when it comes.
+    ///
+    /// And recognising it is also what makes the guarantee legible: a surface
+    /// in here is a cursor, is **never** composited into any window, and
+    /// it says so in the log the first time a client sets one. It was
+    /// *nearly* true by accident already — a cursor surface is nobody's
+    /// subsurface, so the tree walk in `compose_tree` never reached it — but
+    /// its pixels were still blitted into `staging` and kept there forever,
+    /// and "not reached by the current traversal" is not a property anybody
+    /// can rely on while the scene graph is still growing.
+    cursor_surface: Option<WlSurface>,
+    /// The popup that called `xdg_popup.grab`, if one is up.
+    ///
+    /// ADDED FOR STAGE 13. See [`XdgShellHandler::grab`] for what it is and
+    /// [`Self::dismiss_grab_if_outside`] for what it does.
+    popup_grab: Option<WindowId>,
+    /// Caps Lock and Num Lock as the system last reported them, carried in on
+    /// [`FromUi::KeyboardFocus`]. See [`Self::sync_locked_modifiers`].
+    locks: (bool, bool),
+
+    ui: Ui,
+    events: Receiver<FromUi>,
+    /// Tried in order until one recognises the buffer. One entry today; see
+    /// `surface.rs` for why it is a list.
+    sources: Vec<Box<dyn PixelSource>>,
+    /// ADDED FOR STAGE 9: one shadow per **surface**, not per window.
+    ///
+    /// A commit copies the client's buffer in here; `compose_tree` copies these
+    /// into the window's shadow in stacking order. The extra copy is what buys
+    /// the right to release the client's buffer immediately (the argument in
+    /// `surface.rs`) while still being able to redraw a subsurface that has not
+    /// committed this frame.
+    staging: HashMap<WlSurface, Shadow>,
+    windows: HashMap<WlSurface, Window>,
+    next_id: WindowId,
+    started: Instant,
+    last_frame: Instant,
+    /// Synthesise an icon at map time, so the platform's icon path is executed
+    /// by something rather than merely compiled.
+    debug_icon: bool,
+    /// Icons published by app id, by something that is not the window's client
+    /// — in practice wc-proxy, which is the only thing in the topology that can
+    /// read a Linux icon theme (`crate::icon`).
+    icons: crate::icon::IconStore,
+    /// Kept alive so the global stays advertised, and so `Display::global_id`
+    /// is not the only handle to it.
+    _icon_manager: smithay::reexports::wayland_server::backend::GlobalId,
+    /// The same, for the standard protocol; it also owns the size list that
+    /// every binding client is told about.
+    _toplevel_icon: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+    /// Icons this compositor has actually put on a window, and how many were
+    /// asked for and had nothing to answer with. Printed at shutdown, because
+    /// "the icon is generic" is otherwise indistinguishable from "the icon
+    /// never arrived".
+    pub icons_applied: usize,
+    pub icons_missing: usize,
+
+    pub clients_seen: usize,
+    pub toplevels: usize,
+    /// ADDED FOR STAGE 9, so the harness can assert that a menu opened rather
+    /// than inferring it from a picture.
+    pub popups: usize,
+    pub presents: usize,
+    pub stopped: bool,
+}
+
+/// Per-client data.
+#[derive(Default)]
+pub struct ClientState {
+    compositor_state: CompositorClientState,
+}
+
+impl ClientData for ClientState {
+    fn initialized(&self, client_id: ClientId) {
+        println!("wc-compositor: client {client_id:?} initialized");
+    }
+
+    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
+        println!("wc-compositor: client {client_id:?} disconnected: {reason:?}");
+    }
+}
+
+/// How fast a held key repeats, and how long before it starts.
+///
+/// **The compositor does not repeat anything.** `wl_keyboard.repeat_info` is
+/// advertised and the *client* runs the timer, which is how the protocol is
+/// specified and is why a Wayland client's key repeat keeps working while the
+/// compositor is busy. Windows repeats too — a held key produces a stream of
+/// `WM_KEYDOWN` with the "previous state" bit set — and forwarding those as
+/// well would give a client two repeat streams at different rates. So they are
+/// dropped, in `win32.rs`, and this is the only rate anyone sees.
+///
+/// The numbers are Windows' own defaults expressed the way Wayland wants them:
+/// `SPI_GETKEYBOARDDELAY` 1 is 500 ms, `SPI_GETKEYBOARDSPEED` is around 30/s at
+/// its default. Reading the real values is a `SystemParametersInfo` call and is
+/// noted in the design as not done, rather than guessed at silently.
+const REPEAT_DELAY_MS: i32 = 500;
+const REPEAT_RATE_HZ: i32 = 30;
+
+impl State {
+    pub fn new(
+        dh: &DisplayHandle,
+        ui: Ui,
+        events: Receiver<FromUi>,
+        debug_icon: bool,
+        layout: &str,
+        output_size: (i32, i32),
+    ) -> Self {
+        let mut seat_state = SeatState::new();
+        // The local is dropped at the end of this function and that is safe:
+        // `SeatState` keeps every seat it makes, and `Seat` is an `Arc` handle
+        // rather than the seat itself.
+        let mut seat: Seat<State> = seat_state.new_wl_seat(dh, "seat0");
+
+        // **Capabilities are advertised by adding them, and only then.**
+        // smithay recomputes `wl_seat.capabilities` from what the seat has and
+        // sends it to every bound `wl_seat`, so the ordering requirement — a
+        // capability must not be announced before the thing it names exists —
+        // is met by construction rather than by getting a sequence right. A
+        // client that binds later gets the current set in its `bind`.
+        let pointer = seat.add_pointer();
+
+        // The keyboard is the one that can fail, because it compiles a keymap.
+        // On Windows this is the *only* way it can succeed: `XkbConfig`'s RMLVO
+        // fields go through `xkb_keymap_new_from_names`, which resolves against
+        // an xkeyboard-config tree that does not exist there (design §7.2). The
+        // `keymap` field is this project's patch to smithay and is what makes
+        // the build-time-resolved string reachable from `add_keyboard`.
+        let chosen = crate::input::layout(layout).or_else(|| {
+            eprintln!(
+                "wc-compositor: no keymap for layout {layout:?}; falling back to {}",
+                crate::input::FALLBACK
+            );
+            crate::input::layout(crate::input::FALLBACK)
+        });
+        let keyboard = chosen.and_then(|l| {
+            match seat.add_keyboard(
+                XkbConfig { keymap: Some(l.keymap), ..XkbConfig::default() },
+                REPEAT_DELAY_MS,
+                REPEAT_RATE_HZ,
+            ) {
+                Ok(k) => {
+                    println!(
+                        "wc-compositor: seat0 keyboard: layout {} ({} bytes of keymap), \
+                         repeat {REPEAT_RATE_HZ}/s after {REPEAT_DELAY_MS} ms",
+                        l.name,
+                        l.keymap.len()
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    // Not fatal, and the line says which capability is missing
+                    // rather than leaving a client to discover it.
+                    eprintln!("wc-compositor: seat0 has no keyboard: {e}");
+                    None
+                }
+            }
+        });
+        println!("wc-compositor: seat0 capabilities: pointer{}", if keyboard.is_some() { ", keyboard" } else { "" });
+
+        // Said at startup, on the side that created the object, because the
+        // failure it predicts happens later and somewhere else. A keyboard on
+        // Windows with no published directory means the keymap will be a
+        // `Local\wc-…` section; that is right for a Windows client and
+        // unopenable by anything across the boundary, and the first a proxy
+        // knows about it is when it has to end a connection. One line here
+        // turns "the client died on connect" into "we were told this at
+        // startup".
+        //
+        // STAGE 10 added a third possibility and the line has to know about it,
+        // because saying "the keymap will be a Windows section" on a run where
+        // it is an arena slice is worse than saying nothing: it is a true
+        // sentence about a code path that did not run, printed at exactly the
+        // moment somebody is looking for the reason a client died.
+        if cfg!(windows) && keyboard.is_some() {
+            match (wc_handle::arena::outbound(), wc_handle::publish::get()) {
+                (Some(w), _) => println!(
+                    "wc-compositor: the keymap will be a slice of arena {} \
+                     (its outbound window is {}+{}), so nothing is opened and no filesystem \
+                     is involved.",
+                    w.arena, w.offset, w.len
+                ),
+                (None, Some(_)) => {}
+                (None, None) => println!(
+                    "wc-compositor: no --shared-dir and no --arena-outbound, so the keymap \
+                     will be a Windows section. That is correct for a client on this machine \
+                     and unopenable by one across the boundary."
+                ),
+            }
+        }
+
+        // Two icon globals, and they are not alternatives.
+        //
+        // `xdg-toplevel-icon-v1` is the protocol; a client that implements it
+        // is the authority on its own icon and needs nothing else. Measured
+        // against real clients (docs/design.md §15.3) that is GTK 4.20 and not
+        // Firefox 151, weston 15 or GTK 3 — so the second global exists for the
+        // ones that do not, and is bound by the resolver rather than by them.
+        let icon_manager = dh
+            .create_global::<State, crate::icon::proto::wc_icon_manager_v1::WcIconManagerV1, _>(
+                1,
+                (),
+            );
+        let mut toplevel_icon =
+            smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<State>(dh);
+        // The sizes Windows will ask for, told to the client at bind time:
+        // `SM_CXSMICON` and `SM_CXICON` are 16 and 32 at 96 dpi, and 48 is what
+        // a scaled display's `ICON_BIG` becomes. A client that honours these
+        // sends exactly the images that will be used and none that will not.
+        for size in [16, 32, 48] {
+            toplevel_icon.add_icon_size(size);
+        }
+
+        // ADDED FOR STAGE 9: one output, describing the desktop the windows
+        // will live on.
+        //
+        // **The numbers are a flag, and the flag is not the same claim as a
+        // measurement.** In the deployment this is aimed at, the right values
+        // come from `GetSystemMetrics` / `EnumDisplayMonitors` on the guest and
+        // change when a monitor is plugged in; here they are `--output`,
+        // defaulting to a size no real client will find surprising. What is
+        // *not* a guess is that the object has to exist: see the import.
+        //
+        // The physical size is reported as 0x0, which is the protocol's own
+        // spelling for "unknown" and is what every headless and virtual
+        // compositor sends. Inventing millimetres would make a client compute a
+        // DPI that is fiction.
+        let (ow, oh) = output_size;
+        let mode = Mode {
+            size: (ow, oh).into(),
+            refresh: 60_000,
+        };
+        let output = Output::new(
+            "WC-1".to_owned(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "waycompose".to_owned(),
+                model: "virtual".to_owned(),
+            },
+        );
+        output.create_global::<State>(dh);
+        output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+        output.set_preferred(mode);
+        println!("wc-compositor: output WC-1 {ow}x{oh} at 60 Hz, scale 1");
+
+        State {
+            compositor: CompositorState::new::<State>(dh),
+            shm: ShmState::new::<State>(dh, Vec::new()),
+            xdg_shell: XdgShellState::new::<State>(dh),
+            output,
+            _data_device: DataDeviceState::new::<State>(dh),
+            _xdg_decoration: XdgDecorationState::new::<State>(dh),
+            // **`Client` is the default mode this compositor advertises, and
+            // that is the goal document's decision rather than a shrug.**
+            // docs/goal-firefox.md wants Firefox painting its tabs into the
+            // title bar, which is only possible if Firefox is drawing the title
+            // bar — a server-decorated window has a caption the client cannot
+            // touch. So the compositor asks for client-side decorations and the
+            // Win32 side's job becomes extending the frame into them
+            // (`FrameStyle::extend_top`), which is the shape
+            // `DwmExtendFrameIntoClientArea` wants.
+            kde_decoration: KdeDecorationState::new::<State>(dh, KdeDefaultMode::Client),
+            seat_state,
+            keyboard,
+            pointer,
+            keyboard_focus: None,
+            pointer_focus: None,
+            pointer_at: (0.0, 0.0),
+            cursor_noted: false,
+            cursor_surface: None,
+            popup_grab: None,
+            locks: (false, false),
+            ui,
+            events,
+            sources: vec![Box::new(ShmSource)],
+            staging: HashMap::new(),
+            windows: HashMap::new(),
+            next_id: 1,
+            started: Instant::now(),
+            last_frame: Instant::now(),
+            debug_icon,
+            icons: crate::icon::IconStore::default(),
+            _icon_manager: icon_manager,
+            _toplevel_icon: toplevel_icon,
+            icons_applied: 0,
+            icons_missing: 0,
+            clients_seen: 0,
+            toplevels: 0,
+            popups: 0,
+            presents: 0,
+            stopped: false,
+        }
+    }
+
+    /// Milliseconds since the compositor started, which is what a frame
+    /// callback carries.
+    ///
+    /// Note the known wrongness, recorded in docs/design.md §7.7 item 5: the
+    /// epoch is process start rather than boot, which is right for every
+    /// current consumer (a client comparing successive callbacks) and wrong for
+    /// `wp_presentation`. Not fixed here because nothing yet compares this
+    /// against a clock it did not get from us.
+    fn now_ms(&self) -> u32 {
+        self.started.elapsed().as_millis() as u32
+    }
+
+    /// Answer frame callbacks, at most once per vsync-ish interval.
+    ///
+    /// 16 ms rather than a real vblank because there is no output object yet
+    /// and nothing to synchronise to. It is a throttle, not a timing guarantee,
+    /// and it is the difference between an animating client using a few percent
+    /// of a core and using all of one.
+    pub fn tick_frames(&mut self) {
+        if self.last_frame.elapsed().as_millis() < 16 {
+            return;
+        }
+        self.last_frame = Instant::now();
+        let now = self.now_ms();
+        for window in self.windows.values_mut() {
+            for cb in window.frame_callbacks.drain(..) {
+                cb.done(now);
+            }
+        }
+    }
+
+    /// Drain everything the UI thread has said since the last turn.
+    pub fn pump_ui_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                FromUi::Stopped => self.stopped = true,
+                FromUi::Resized { id, width, height } => self.on_resized(id, width, height),
+                FromUi::CloseRequested { id } => {
+                    if let Some(w) = self.by_id(id) {
+                        match &w.role {
+                            Role::Toplevel(t) => {
+                                println!(
+                                    "wc-compositor: window {id} close requested -> \
+                                     xdg_toplevel.close"
+                                );
+                                t.send_close();
+                            }
+                            // A popup is dismissed rather than closed: the
+                            // protocol's word for it is `popup_done`, and the
+                            // client is required to destroy it.
+                            Role::Popup(p) => {
+                                println!(
+                                    "wc-compositor: window {id} dismissed -> xdg_popup.popup_done"
+                                );
+                                p.send_popup_done();
+                            }
+                        }
+                    }
+                }
+                FromUi::Maximized { id, on } => {
+                    self.set_state(id, |s| toggle(s, xdg_state::Maximized, on))
+                }
+                FromUi::Minimized { id, on } => self.set_state(id, |s| {
+                    // xdg-shell has **no minimised state**. `set_minimized` is a
+                    // request a client makes; there is no matching entry in the
+                    // `state` enum for the compositor to report back, which is a
+                    // genuine asymmetry in the protocol rather than an oversight
+                    // here.
+                    //
+                    // `suspended` (xdg_toplevel v6) is the nearest true thing:
+                    // "the content is not visible, you may stop drawing".
+                    // smithay filters it out for clients that predate v6, which
+                    // then keep drawing into a window nobody can see —
+                    // wasteful, and correct.
+                    toggle(s, xdg_state::Suspended, on)
+                }),
+                FromUi::Activated { id, on } => {
+                    self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
+                }
+                FromUi::KeyboardFocus { id, on, caps, num } => {
+                    self.locks = (caps, num);
+                    self.set_keyboard_focus(id, on)
+                }
+                FromUi::Key { id, keycode, pressed, time } => {
+                    self.key(id, keycode, pressed, time)
+                }
+                FromUi::PointerEnter { id, x, y, time } => self.pointer_motion(Some(id), x, y, time),
+                FromUi::PointerMotion { id, x, y, time } => self.pointer_motion(Some(id), x, y, time),
+                FromUi::PointerLeave { id, time } => {
+                    if self.pointer_focus == Some(id) {
+                        self.pointer_motion(None, 0.0, 0.0, time);
+                    }
+                }
+                FromUi::PointerButton { id, button, pressed, time } => {
+                    self.pointer_button(id, button, pressed, time)
+                }
+                FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, time } => {
+                    self.pointer_axis(id, horizontal, vertical, v120_h, v120_v, time)
+                }
+                FromUi::Layout { name } => self.set_layout(name),
+            }
+        }
+    }
+
+    fn by_id(&self, id: WindowId) -> Option<&Window> {
+        self.windows.values().find(|w| w.id == id)
+    }
+
+    fn surface_of(&self, id: WindowId) -> Option<WlSurface> {
+        self.by_id(id).map(|w| w.role.surface().clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Input
+    // -----------------------------------------------------------------------
+
+    /// Keyboard focus follows the **foreground window**, because the user's
+    /// window manager is Windows.
+    ///
+    /// A Wayland compositor normally decides this itself — click-to-focus,
+    /// follow-mouse, a keyboard shortcut — and here it has no business
+    /// deciding. There is one focus on the desktop, Windows owns it, and the
+    /// only correct answer is to mirror it. `WM_SETFOCUS`/`WM_KILLFOCUS` is the
+    /// message pair that carries it, and it is deliberately not `WM_ACTIVATE`:
+    /// activation is about which top-level window is frontmost and focus is
+    /// about where a keystroke goes, and `xdg_toplevel`'s `activated` state
+    /// wants the first while `wl_keyboard.enter` wants the second.
+    fn set_keyboard_focus(&mut self, id: WindowId, on: bool) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        if on {
+            let Some(surface) = self.surface_of(id) else { return };
+            self.keyboard_focus = Some(id);
+            println!("wc-compositor: window {id} has keyboard focus");
+            keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+            // STAGE 13. The locks are Windows', and they are the half of the
+            // modifier state that key events cannot carry.
+            //
+            // Caps Lock and Num Lock are *locked* modifiers: their state is a
+            // property of the machine, it persists while our window is not
+            // focused, and the user can change it while we are not looking —
+            // pressing Caps Lock in another application changes it for
+            // everything, us included, and we see no key event at all. Inferred
+            // from the events we happen to have seen, our idea of the lock
+            // drifts out of step with the keyboard light, and the symptom is
+            // capital letters with the light off.
+            //
+            // So it is read from the system on every focus gain rather than
+            // tracked. The platform supplies it because only the platform can
+            // (`GetKeyState(VK_CAPITAL) & 1`), and it is carried on the focus
+            // event rather than polled, so that the headless platform can state
+            // it too.
+            self.sync_locked_modifiers();
+        } else {
+            // Only if it is *still* ours. A focus change is two messages, and
+            // they can arrive in either order: Windows sends `WM_KILLFOCUS` to
+            // the old window and `WM_SETFOCUS` to the new one, and clearing on
+            // a stale kill would take the focus away from a window that had
+            // just been given it.
+            if self.keyboard_focus != Some(id) {
+                return;
+            }
+            self.keyboard_focus = None;
+            println!("wc-compositor: window {id} lost keyboard focus");
+            // STAGE 13, and it must happen **before** `set_focus(None)`.
+            //
+            // `wl_keyboard.leave` tells the *client* to treat every key as
+            // released, and that part was always right. What was wrong is that
+            // the compositor's own xkb state went on believing the keys were
+            // down — and it is the compositor's state that decides what the
+            // next `modifiers` event says.
+            //
+            // The sequence that bites: the user holds Ctrl, focus moves away
+            // (alt-tab, or a popup taking the foreground), the user releases
+            // Ctrl and the `WM_KEYUP` goes to whoever has focus now rather than
+            // to us, and focus comes back. smithay then sends `enter` with a
+            // pressed-keys array and a `modifiers` event that still has Ctrl
+            // depressed, and every keystroke from then on is Ctrl-modified
+            // until the user happens to press and release Ctrl over our window.
+            //
+            // `input_intercept` rather than `input`: this must not reach the
+            // client as ordinary key-up events. `leave` has already said what
+            // the client needs to hear, and a released key aimed at a surface
+            // that is losing focus is a key event with nowhere legitimate to
+            // go. The pressed set is read from smithay rather than tracked
+            // here, because a second copy is a second thing that can disagree —
+            // and disagreeing about which keys are down is the bug.
+            for keycode in keyboard.pressed_keys() {
+                keyboard.input_intercept::<(), _>(self, keycode, KeyState::Released, |_, _, _| ());
+            }
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// Take Caps Lock and Num Lock from the system rather than from history.
+    ///
+    /// ADDED FOR STAGE 13. See the call site in [`Self::set_keyboard_focus`]
+    /// for why this is read and not tracked. The depressed modifiers are left
+    /// alone: those *are* ours, they follow from key events we received, and
+    /// the focus-loss release above is what keeps them honest.
+    fn sync_locked_modifiers(&mut self) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        let (caps, num) = self.locks;
+        let mut mods = keyboard.modifier_state();
+        if mods.caps_lock == caps && mods.num_lock == num {
+            return;
+        }
+        println!(
+            "wc-compositor: locked modifiers from the system: caps {caps}, num {num} \
+             (were caps {}, num {})",
+            mods.caps_lock, mods.num_lock
+        );
+        mods.caps_lock = caps;
+        mods.num_lock = num;
+        keyboard.set_modifier_state(mods);
+    }
+
+    /// One key, in evdev numbering, to whatever has focus.
+    ///
+    /// `id` is not used to route: `wl_keyboard` events go to the focused
+    /// surface and to nothing else, and smithay's `KeyboardHandle` owns that
+    /// focus. It is checked instead — a key from a window that does not have
+    /// focus is a bug in the platform layer and is worth not delivering
+    /// silently to whoever does.
+    fn key(&mut self, id: WindowId, keycode: u16, pressed: bool, time: u32) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        if self.keyboard_focus != Some(id) {
+            return;
+        }
+        let state = if pressed { KeyState::Pressed } else { KeyState::Released };
+        keyboard.input::<(), _>(
+            self,
+            // **Plus eight, and this is the one number in the stage that was
+            // wrong and was caught by a client rather than by a test.**
+            //
+            // smithay's `Keycode` is an *XKB* keycode, which carries X11's
+            // eight-key offset; `wl_keyboard.key` carries an *evdev* keycode,
+            // which does not. smithay subtracts the eight on the way out
+            // (`wayland/seat/keyboard.rs`), so a caller that hands it an evdev
+            // number is handing it one that is eight too small, and every key
+            // reaches the client eight too small.
+            //
+            // What that looks like from outside is the reason it is worth
+            // recording: nothing errors, every key produces *a* character, and
+            // the characters are wrong. `weston-eventdemo` printed
+            // `key 27, unicode 93` — a right square bracket — for a keypress
+            // this compositor believed was `h`. A unit test over
+            // `crate::input` could not have caught it, because the table it
+            // checks was correct; only a client running the keymap could.
+            (u32::from(keycode) + 8).into(),
+            state,
+            SERIAL_COUNTER.next_serial(),
+            time,
+            // No compositor-level bindings. Every key goes to the client, which
+            // is the right default for a compositor whose window manager is
+            // somebody else: Windows has already taken the combinations it
+            // reserves (Alt-Tab, the Windows key) before the message loop sees
+            // them, and intercepting more here would silently steal keys the
+            // application expects.
+            |_, _, _| FilterResult::Forward,
+        );
+    }
+
+    /// Move the pointer, which is also how it enters and leaves.
+    ///
+    /// `PointerHandle::motion` with `Some(surface)` sends `enter` when the
+    /// surface changes and `motion` when it does not; with `None` it sends
+    /// `leave`. So there is one function here rather than three, and the
+    /// enter/leave bookkeeping the protocol requires is smithay's rather than
+    /// something this file could get subtly wrong.
+    fn pointer_motion(&mut self, id: Option<WindowId>, x: f64, y: f64, time: u32) {
+        let pointer = self.pointer.clone();
+        let focus = id.and_then(|id| self.surface_of(id).map(|s| (id, s)));
+        match &focus {
+            Some((id, _)) => {
+                self.pointer_focus = Some(*id);
+                self.pointer_at = (x, y);
+            }
+            None => self.pointer_focus = None,
+        }
+        pointer.motion(
+            self,
+            // The second element is the surface's origin in compositor space.
+            // Every window here is its own `HWND` with its own coordinate
+            // system and the platform has already subtracted the frame, so the
+            // surface origin *is* the compositor origin and this is `(0, 0)`.
+            // It is written out rather than assumed because the moment a scene
+            // graph exists — subsurfaces, popups — it stops being true, and a
+            // hard-coded zero somewhere else would be found by a popup landing
+            // in the wrong place.
+            focus.map(|(_, s)| (s, (0.0, 0.0).into())),
+            &MotionEvent {
+                location: (x, y).into(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        // Every logical group of pointer events ends in a `frame`. `wl_pointer`
+        // version 5 made it required, clients batch on it, and omitting it
+        // leaves a client holding a half-delivered event until the next one
+        // arrives — which for a mouse that has stopped moving is forever.
+        pointer.frame(self);
+    }
+
+    fn pointer_button(&mut self, id: WindowId, button: u32, pressed: bool, time: u32) {
+        let pointer = self.pointer.clone();
+        if pressed {
+            self.dismiss_grab_if_outside(id);
+        }
+        if self.pointer_focus != Some(id) {
+            // A button from a window the pointer is not over. Reachable on
+            // Win32 during a drag, where `SetCapture` keeps sending us the
+            // release after the pointer has left; the release still has to be
+            // delivered, so the pointer is put back over the window first.
+            let (x, y) = self.pointer_at;
+            self.pointer_motion(Some(id), x, y, time);
+        }
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+                button,
+                state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn pointer_axis(
+        &mut self,
+        id: WindowId,
+        horizontal: f64,
+        vertical: f64,
+        v120_h: i32,
+        v120_v: i32,
+        time: u32,
+    ) {
+        let pointer = self.pointer.clone();
+        // MADE DELIBERATE IN STAGE 13. This used to `return` silently, and that
+        // silence is why "the scroll wheel does nothing in Firefox" took a user
+        // report to find.
+        //
+        // The two systems disagree about who a wheel belongs to. **Win32 sends
+        // `WM_MOUSEWHEEL` to the window with keyboard focus**, not to the
+        // window under the cursor; Wayland delivers `wl_pointer.axis` to the
+        // surface with pointer focus, which *is* the one under the cursor. So
+        // `id` here is the focused window and need not be the window being
+        // pointed at.
+        //
+        // The root cause of the reported bug was not this line — it was leaked
+        // popup `HWND`s (see [`XdgShellHandler::popup_destroyed`]) sitting
+        // under the cursor, so `pointer_focus` was a stale menu while the wheel
+        // arrived for the toplevel. Fixing the popups fixed the scrolling, and
+        // that was confirmed by the user before this was touched. But a wheel
+        // arriving for a window that is not the pointer focus is a legitimate
+        // situation on Windows, and eating it without a word is what turned a
+        // one-line symptom into a hunt.
+        //
+        // So: deliver to whatever the pointer is actually over — which is what
+        // `pointer.axis` would do anyway, since `id` was never used to route —
+        // and say when the two disagree. A wheel with no pointer focus at all
+        // has nowhere to go and is still dropped.
+        let Some(over) = self.pointer_focus else {
+            return;
+        };
+        if over != id {
+            println!(
+                "wc-compositor: wheel addressed to window {id} (Win32 focus), \
+                 delivered to window {over} (pointer focus)"
+            );
+        }
+        let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+        if v120_v != 0 || vertical != 0.0 {
+            frame = frame.value(Axis::Vertical, vertical).v120(Axis::Vertical, v120_v);
+        }
+        if v120_h != 0 || horizontal != 0.0 {
+            frame = frame.value(Axis::Horizontal, horizontal).v120(Axis::Horizontal, v120_h);
+        }
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
+    /// Dismiss the grabbing popup if the press landed anywhere else.
+    ///
+    /// ADDED FOR STAGE 13. A menu is closed by the compositor and not by the
+    /// client, because the client cannot see a click outside its own surfaces.
+    /// Without this a menu stays up until the application decides to take it
+    /// down, which for a click on the page behind it is never.
+    ///
+    /// The popup itself is not destroyed here. `popup_done` is a *request* —
+    /// the client destroys the object, and that arrives as
+    /// [`XdgShellHandler::popup_destroyed`], which is the only place a window
+    /// is removed. Tearing the `HWND` down from here as well would race the
+    /// client and leave the protocol object pointing at nothing.
+    fn dismiss_grab_if_outside(&mut self, clicked: WindowId) {
+        let Some(grabbing) = self.popup_grab else { return };
+        if grabbing == clicked {
+            return;
+        }
+        if let Some(Window { role: Role::Popup(p), .. }) = self.by_id(grabbing) {
+            println!(
+                "wc-compositor: click on window {clicked} outside the grab -> \
+                 window {grabbing} dismissed (xdg_popup.popup_done)"
+            );
+            p.send_popup_done();
+        }
+        self.popup_grab = None;
+    }
+
+    /// The user changed their Windows keyboard layout under a running client.
+    ///
+    /// `set_keymap_from_string` re-sends `wl_keyboard.keymap` to every bound
+    /// keyboard, which is the protocol's own answer to this and is why the
+    /// keymap is an event rather than a one-off — clients are required to
+    /// handle it arriving again.
+    fn set_layout(&mut self, name: &'static str) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        let Some(l) = crate::input::layout(name) else { return };
+        match keyboard.set_keymap_from_string(self, l.keymap.to_owned()) {
+            Ok(()) => println!("wc-compositor: keyboard layout -> {}", l.name),
+            Err(e) => eprintln!("wc-compositor: could not switch to layout {}: {e}", l.name),
+        }
+    }
+
+    /// Tell the platform to stop pumping. Sending this rather than dropping the
+    /// channel is what makes shutdown ordered: the UI thread destroys its own
+    /// windows, from the thread that owns them, before it returns.
+    pub fn quit(&self) {
+        self.ui.send(ToUi::Quit);
+    }
+
+    fn on_resized(&mut self, id: WindowId, width: i32, height: i32) {
+        let Some(window) = self.by_id(id) else { return };
+        // **This is the whole of the resize negotiation on the Wayland side.**
+        // Windows has already resized the frame and is painting something (see
+        // `WindowState::paint` for what); all that can be done here is tell the
+        // client the new size and wait for it to commit at that size.
+        // `send_pending_configure` sends nothing when the size is unchanged,
+        // which matters because Windows emits a `WM_SIZE` for every pixel of a
+        // drag and a configure per pixel is legal but pointless.
+        // Only a toplevel is resized by the system. A popup's size is the
+        // client's, arrived at through the positioner, and a compositor that
+        // configured one to a different size would be answering a question
+        // nobody asked.
+        let Some(toplevel) = window.role.toplevel() else { return };
+        toplevel.with_pending_state(|state| {
+            state.size = Some((width, height).into());
+        });
+        if let Some(serial) = toplevel.send_pending_configure() {
+            println!(
+                "wc-compositor: window {id} configure {width}x{height} (serial {})",
+                u32::from(serial)
+            );
+        }
+    }
+
+    fn set_state<F: FnOnce(&mut ToplevelState)>(&mut self, id: WindowId, f: F) {
+        let Some(window) = self.by_id(id) else { return };
+        let Some(toplevel) = window.role.toplevel() else { return };
+        toplevel.with_pending_state(f);
+        toplevel.send_pending_configure();
+    }
+
+    /// Copy a committed buffer into the shadow and tell the platform.
+    fn present(&mut self, surface: &WlSurface, buffer: &wl_buffer::WlBuffer, damage: Vec<Rect>) {
+        // REWRITTEN FOR STAGE 9. Until this stage a window's shadow *was* one
+        // client buffer, and every surface that was not a toplevel had its
+        // pixels thrown away. That is exactly wrong for the client this project
+        // exists to run: Firefox's toplevel `wl_surface` is GTK's
+        // client-side-decoration surface, which is **transparent**, and every
+        // pixel of the browser is in a `wl_subsurface` of it. A compositor with
+        // no scene graph does not draw Firefox badly — it draws a black
+        // rectangle. docs/design.md §13.5 has the measurement.
+        //
+        // So a commit now lands in a per-surface staging shadow, and the
+        // window's shadow is the composite of the tree.
+        let root = root_of(surface);
+        let is_root_of_a_window = self.windows.contains_key(&root);
+
+        let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
+        let mut result: Option<(Vec<Rect>, i32, i32)> = None;
+        let mut served_by = "";
+        // Ask each source in turn. Today there is one; the loop is what lets a
+        // buffer that lives in an arena rather than a `wl_shm` pool arrive
+        // without this function changing (docs/goal-firefox.md).
+        for source in &self.sources {
+            let read = source.with_pixels(buffer, &mut |bytes, spec| {
+                result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+            });
+            match read {
+                Ok(()) => {
+                    served_by = source.name();
+                    break;
+                }
+                Err(PixelError::UnknownSource) => continue,
+                Err(e) => {
+                    eprintln!("wc-compositor: surface commit: {e}");
+                    break;
+                }
+            }
+        }
+
+        // **Release before presenting, and unconditionally.** The client may
+        // reuse the buffer the instant this returns, which is exactly what a
+        // single-buffered client is waiting to do; the pixels it might overwrite
+        // are already in the shadow. Releasing only on success would deadlock
+        // any client whose buffer we failed to read.
+        buffer.release();
+
+        let Some((written, _, _)) = result else {
+            eprintln!("wc-compositor: no pixel source could read the committed buffer");
+            return;
+        };
+        if written.is_empty() {
+            return;
+        }
+        // STAGE 13. A cursor surface leaves here and never reaches
+        // `compose_tree`. Checked before the window test rather than after it,
+        // and by identity rather than by "it has no window", because the
+        // guarantee this stage owes the user is *this* one: a cursor is never
+        // content. The staging entry is dropped as well, so there is nothing
+        // left for a future traversal to find.
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.staging.remove(surface);
+            return;
+        }
+        if !is_root_of_a_window {
+            // A subsurface of a window that has not mapped yet, or a cursor
+            // surface for a seat that has since been given a different one.
+            // The pixels are kept; there is nowhere to put them.
+            return;
+        }
+
+        // Composite the tree, and find out what that changed. `Some(rects)` is
+        // the damage in window coordinates; `None` means the canvas itself was
+        // reshaped and everything is new.
+        let (composited, cw, ch) = self.compose_tree(&root, surface, &written);
+        if cw <= 0 || ch <= 0 {
+            // The tree has no canvas yet. This is not a corner case: Firefox
+            // commits the **subsurface** holding the browser before it commits
+            // the toplevel surface behind it, so the first commit of a window's
+            // life arrives when the root has no buffer, no geometry and
+            // therefore no size. Mapping here sent `ToUi::Map` with 0x0, which
+            // the platform dutifully made a zero-sized window out of. The
+            // pixels are already in staging and the root's own commit is a
+            // millisecond behind.
+            return;
+        }
+
+        let window = self.windows.get_mut(&root).expect("checked above");
+        let id = window.id;
+        let (w, h) = (cw, ch);
+        window.presented += 1;
+        let first = !window.mapped;
+        window.mapped = true;
+        let (title, app_id) = (window.title.clone(), window.app_id.clone());
+        self.presents += 1;
+
+        if first {
+            // Which source served this surface, said once per window. When
+            // there is a second one — an arena for a client on the other side
+            // of a hypervisor (docs/goal-firefox.md) — this line is how anyone
+            // tells which path a window actually took, and a stage that added a
+            // provider without that would not really have added it.
+            // The counters come from `wc_handle::Handle::map`, which is the
+            // function that actually opened the object, rather than from
+            // anything this file could infer. Stage 4 gives a `wl_shm` pool
+            // three possible homes — a named section, a path both sides can
+            // reach, and a window into an arena — and all three arrive through
+            // the same smithay code, so `served_by` alone stopped being enough
+            // to answer "which mechanism carried these pixels".
+            let (sections, files, slices) = wc_handle::map_counts();
+            println!(
+                "wc-compositor: window {id} pixels served by {served_by} \
+                 (mapped: {sections} section, {files} shared-file, {slices} arena-slice)"
+            );
+            // ADDED FOR STAGE 9. `wl_surface.enter` is how a client learns
+            // which output it is on, and therefore what scale to draw at and
+            // what refresh rate to expect. It is sent at map because before a
+            // surface has content it is not on any output — and because
+            // smithay's `Output::enter` walks the surface's client list, which
+            // needs the surface to be alive on the wire.
+            self.output.enter(&root);
+            self.ui.send(ToUi::Map {
+                id,
+                width: w,
+                height: h,
+            });
+            if !title.is_empty() {
+                self.ui.send(ToUi::Title { id, title });
+            }
+            if !app_id.is_empty() {
+                self.ui.send(ToUi::AppId {
+                    id,
+                    app_id: app_id.clone(),
+                });
+            }
+            // At map, and not before: a window that is not on screen has no
+            // taskbar button to put an icon on, and `WM_SETICON` to a hidden
+            // window is a message the shell never reads. The resolver may have
+            // published long before this — it sees `set_app_id` on the wire,
+            // which is several round trips ahead of the first buffer — which is
+            // exactly why the store is keyed by app id and not by window.
+            self.apply_stored_icon(id, &app_id);
+        }
+        self.ui.send(ToUi::Present {
+            id,
+            damage: composited,
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Icons, stage 11
+    // -----------------------------------------------------------------------
+
+    /// Put whatever has been published for `app_id` on window `id`.
+    ///
+    /// **Always sends something.** An app id nobody has published for sends an
+    /// *empty* set, which the platform turns into "leave the class icon
+    /// alone" — the generic Windows application icon, which is what stage 8
+    /// photographed. A missing icon has to degrade to that rather than to a
+    /// blank button or a silence, and making the empty case an ordinary message
+    /// rather than a `return` is what keeps the two paths the same length.
+    fn apply_stored_icon(&mut self, id: WindowId, app_id: &str) {
+        if self.debug_icon {
+            self.ui.send(ToUi::Icon {
+                id,
+                icons: vec![debug_icon(id)],
+            });
+            return;
+        }
+        let icons = self.icons.get(app_id).map(<[IconImage]>::to_vec);
+        match icons {
+            Some(icons) => {
+                self.icons_applied += 1;
+                println!(
+                    "wc-compositor: window {id} icon <- {} image(s) published for {app_id:?}",
+                    icons.len()
+                );
+                self.ui.send(ToUi::Icon { id, icons });
+            }
+            None => {
+                self.icons_missing += 1;
+                // Both halves of the sentence matter: an empty app id is a
+                // client that never called `set_app_id` and cannot be resolved
+                // by anybody, and a non-empty one is a resolver that has not
+                // answered — one is the client's doing and the other is ours.
+                if app_id.is_empty() {
+                    println!(
+                        "wc-compositor: window {id} has no app id and no icon; \
+                         nothing can be resolved for it"
+                    );
+                } else {
+                    println!(
+                        "wc-compositor: window {id} app id {app_id:?} has no published icon \
+                         (the store holds {})",
+                        self.icons.len()
+                    );
+                }
+                self.ui.send(ToUi::Icon {
+                    id,
+                    icons: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Has anything at all been published this run? The difference between a
+    /// resolver that answered "no icon" and a resolver that was never there.
+    pub fn icons_is_empty(&self) -> bool {
+        self.icons.is_empty()
+    }
+
+    /// A publisher has spoken: install the set and update every window that is
+    /// already showing that app id.
+    ///
+    /// Windows whose client has set an icon of its own are skipped —
+    /// `xdg-toplevel-icon-v1` beats a name lookup, always, because one is the
+    /// application saying what it looks like and the other is a guess made from
+    /// a string.
+    fn publish_icons(&mut self, app_id: String, icons: Vec<IconImage>) {
+        println!(
+            "wc-compositor: icon published for {app_id:?}: {} image(s) [{}]",
+            icons.len(),
+            icons
+                .iter()
+                .map(|i| format!("{}x{}", i.width, i.height))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        self.icons.publish(app_id.clone(), icons);
+        let targets: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.mapped && !w.icon_from_client && w.app_id == app_id)
+            .map(|w| w.id)
+            .collect();
+        for id in targets {
+            self.apply_stored_icon(id, &app_id);
+        }
+    }
+
+    /// The client set its own icon through `xdg-toplevel-icon-v1`, and this
+    /// commit is where the double-buffered state became current.
+    ///
+    /// The buffers are read through the same [`PixelSource`] list the window's
+    /// content goes through, which is not tidiness: an icon buffer from a
+    /// client on the other side of a hypervisor arrives in the arena like any
+    /// other, and a second reader that only understood `wl_shm` would work on
+    /// this machine and not on the one that matters.
+    fn take_client_icon(&mut self, surface: &WlSurface) {
+        use smithay::wayland::xdg_toplevel_icon::ToplevelIconCachedState;
+
+        let (name, buffers) = compositor::with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<ToplevelIconCachedState>();
+            let current = guard.current();
+            (
+                current.icon_name().map(str::to_owned),
+                current.buffers().to_vec(),
+            )
+        });
+        let Some(window) = self.windows.get(surface) else {
+            return;
+        };
+        let (id, app_id) = (window.id, window.app_id.clone());
+
+        let mut icons = Vec::new();
+        for (buffer, scale) in &buffers {
+            let mut got = None;
+            for source in &self.sources {
+                let mut taken = None;
+                match source.with_pixels(buffer, &mut |bytes, spec| {
+                    taken = crate::icon::image_from_bytes(bytes, spec);
+                }) {
+                    Ok(()) => {
+                        got = taken;
+                        break;
+                    }
+                    Err(PixelError::UnknownSource) => continue,
+                    Err(e) => {
+                        eprintln!("wc-compositor: window {id}: icon buffer: {e}");
+                        break;
+                    }
+                }
+            }
+            match got {
+                Some(image) => icons.push(image),
+                None => eprintln!(
+                    "wc-compositor: window {id}: an xdg_toplevel_icon buffer (scale {scale}) \
+                     could not be read; skipping it"
+                ),
+            }
+        }
+
+        if icons.is_empty() {
+            // A name and no buffers is the other half of the protocol, and it
+            // is the half this compositor cannot honour on its own: the icon
+            // theme is on the client's machine. The name is looked up in the
+            // store anyway, because the resolver publishes under names it took
+            // from desktop entries and an application's icon name is usually
+            // its app id — when it is not, this is a miss and says so.
+            if let Some(name) = name {
+                println!(
+                    "wc-compositor: window {id} set an icon *name*, {name:?}; \
+                     there is no icon theme on this machine, so it is looked up as an app id"
+                );
+                if let Some(window) = self.windows.get_mut(surface) {
+                    window.icon_from_client = false;
+                }
+                self.apply_stored_icon(id, &name);
+                return;
+            }
+            // `set_icon(null)` — the client took its icon back.
+            println!("wc-compositor: window {id} cleared its icon; falling back to {app_id:?}");
+            if let Some(window) = self.windows.get_mut(surface) {
+                window.icon_from_client = false;
+            }
+            self.apply_stored_icon(id, &app_id);
+            return;
+        }
+
+        if let Some(window) = self.windows.get_mut(surface) {
+            window.icon_from_client = true;
+        }
+        self.icons_applied += 1;
+        println!(
+            "wc-compositor: window {id} icon <- {} buffer(s) from the client's own \
+             xdg_toplevel_icon_v1",
+            icons.len()
+        );
+        self.ui.send(ToUi::Icon { id, icons });
+    }
+    /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
+    /// what that changed and how big the result is.
+    ///
+    /// ADDED FOR STAGE 9. This is the whole scene graph, and it is deliberately
+    /// the smallest one that is *correct* rather than the fastest one:
+    ///
+    /// * The canvas is the **window geometry rectangle**
+    ///   (`xdg_surface.set_window_geometry`), not the root buffer. A GTK client
+    ///   commits a buffer that is larger than its window on every side — 26 px
+    ///   of invisible resize margin and drop shadow — and says so with a
+    ///   geometry rectangle. Drawing the buffer instead of the rectangle offsets
+    ///   the window, shows the client's own title bar under the system one and
+    ///   clips the opposite edges away. Stage 8 measured that with
+    ///   `weston-terminal`; Firefox has it for the same reason, since it is
+    ///   GTK's code in both.
+    /// * Surfaces are drawn parent first, in the order the protocol stacks
+    ///   them, which is what `with_surface_tree_upward` promises.
+    /// * The whole tree is redrawn on every commit. One `memcpy` per surface
+    ///   per frame, on the machine with spare CPU; the alternative is tracking
+    ///   which regions of the canvas each surface owns, which is a renderer.
+    ///   The **damage** reported is still only what the committing surface
+    ///   changed, so the Win32 side does not repaint the world.
+    fn compose_tree(
+        &mut self,
+        root: &WlSurface,
+        committed: &WlSurface,
+        committed_damage: &[Rect],
+    ) -> (Vec<Rect>, i32, i32) {
+        use smithay::wayland::compositor::{
+            SubsurfaceCachedState, TraversalAction, SUBSURFACE_ROLE,
+        };
+        use smithay::wayland::shell::xdg::SurfaceCachedState;
+
+        // Where each surface of the tree sits, relative to the root surface's
+        // own origin. Collected first because composing needs `&mut` on the
+        // window's shadow while `staging` is read, and because the traversal
+        // closure cannot borrow `self`.
+        let mut placed: Vec<(WlSurface, (i32, i32))> = Vec::new();
+        compositor::with_surface_tree_upward(
+            root,
+            (0i32, 0i32),
+            |_, states, loc| {
+                let mut loc = *loc;
+                if states.role == Some(SUBSURFACE_ROLE) {
+                    let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+                    loc = (loc.0 + p.x, loc.1 + p.y);
+                }
+                TraversalAction::DoChildren(loc)
+            },
+            |surface, states, loc| {
+                let mut loc = *loc;
+                if states.role == Some(SUBSURFACE_ROLE) {
+                    let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+                    loc = (loc.0 + p.x, loc.1 + p.y);
+                }
+                placed.push((surface.clone(), loc));
+            },
+            |_, _, _| true,
+        );
+
+        // The window geometry rectangle, in root-surface coordinates. Absent
+        // means "the whole buffer", which is what the protocol says and what
+        // every non-GTK client relies on.
+        let geometry = compositor::with_states(root, |states| {
+            states.cached_state.get::<SurfaceCachedState>().current().geometry
+        });
+        let root_size = self
+            .staging
+            .get(root)
+            .map(|s| (s.width(), s.height()))
+            .unwrap_or((0, 0));
+        let (gx, gy, gw, gh) = match geometry {
+            Some(r) if r.size.w > 0 && r.size.h > 0 => (r.loc.x, r.loc.y, r.size.w, r.size.h),
+            _ => (0, 0, root_size.0, root_size.1),
+        };
+        let format = self
+            .staging
+            .get(root)
+            .map(|s| s.format())
+            .unwrap_or(PixelFormat::Xrgb8888);
+
+        let window = self.windows.get(root).expect("caller checked");
+        let shadow = window.shadow.clone();
+        let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
+        let reshaped = shadow.reset(gw, gh, format);
+        for (surface, (x, y)) in &placed {
+            if let Some(src) = self.staging.get(surface) {
+                shadow.compose(src, (x - gx, y - gy));
+            }
+        }
+        drop(shadow);
+
+        if reshaped {
+            return (vec![Rect::new(0, 0, gw, gh)], gw, gh);
+        }
+        // Translate the committing surface's damage into window coordinates.
+        let (cx, cy) = placed
+            .iter()
+            .find(|(s, _)| s == committed)
+            .map(|(_, l)| *l)
+            .unwrap_or((0, 0));
+        let damage: Vec<Rect> = committed_damage
+            .iter()
+            .filter_map(|r| {
+                Rect::new(r.x + cx - gx, r.y + cy - gy, r.w, r.h).clip(gw, gh)
+            })
+            .collect();
+        (damage, gw, gh)
+    }
+}
+
+/// The root of `surface`'s subsurface tree — the surface that has the
+/// `xdg_toplevel`, if any.
+///
+/// ADDED FOR STAGE 9.
+fn root_of(surface: &WlSurface) -> WlSurface {
+    let mut s = surface.clone();
+    while let Some(parent) = compositor::get_parent(&s) {
+        s = parent;
+    }
+    s
+}
+
+/// Shorthand so the state names below read as protocol rather than as paths.
+mod xdg_state {
+    pub use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::*;
+}
+
+type XdgState = smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
+
+fn toggle(states: &mut ToplevelState, which: XdgState, on: bool) {
+    if on {
+        states.states.set(which);
+    } else {
+        states.states.unset(which);
+    }
+}
+
+/// A recognisable icon, so the platform's icon path runs under `--debug-icon`.
+///
+/// Four quadrants in flat colours, one of them white, chosen by the window id —
+/// so a screenshot shows *which* window's icon it is rather than merely that an
+/// icon exists.
+fn debug_icon(id: WindowId) -> IconImage {
+    const N: i32 = 32;
+    let mut pixels = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let o = ((y * N + x) * 4) as usize;
+            let quadrant = u8::from(x >= N / 2) | (u8::from(y >= N / 2) << 1);
+            let (b, g, r) = match quadrant {
+                0 => (0x40u8, 0x40u8, 0xE0u8),
+                1 => (0x40, 0xE0, 0x40),
+                2 => (0xE0, 0x40, 0x40),
+                _ => (0x20, 0xC0, 0xC0),
+            };
+            let lit = (id % 4) == u64::from(quadrant);
+            pixels[o] = if lit { 0xFF } else { b };
+            pixels[o + 1] = if lit { 0xFF } else { g };
+            pixels[o + 2] = if lit { 0xFF } else { r };
+            pixels[o + 3] = 0xFF;
+        }
+    }
+    IconImage {
+        width: N,
+        height: N,
+        pixels,
+    }
+}
+
+impl CompositorHandler for State {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        &client.get_data::<ClientState>().unwrap().compositor_state
+    }
+
+    fn new_surface(&mut self, _surface: &WlSurface) {
+        println!("wc-compositor: wl_surface created");
+    }
+
+    fn commit(&mut self, surface: &WlSurface) {
+        println!("wc-compositor: wl_surface commit");
+
+        // Take everything this commit carried, and **clear it**. smithay's
+        // documentation on `SurfaceAttributes` is explicit that `buffer`,
+        // `damage` and `frame_callbacks` accumulate from commit to commit until
+        // the compositor empties them; leaving them would replay the first
+        // frame's damage forever and answer each frame callback repeatedly.
+        let (buffer, damage, callbacks, scale, transform) =
+            compositor::with_states(surface, |states| {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                let attrs = guard.current();
+                (
+                    attrs.buffer.take(),
+                    std::mem::take(&mut attrs.damage),
+                    std::mem::take(&mut attrs.frame_callbacks),
+                    attrs.buffer_scale,
+                    attrs.buffer_transform,
+                )
+            });
+
+        if let Some(window) = self.windows.get_mut(surface) {
+            window.frame_callbacks.extend(callbacks);
+        } else {
+            // A surface with no window of its own — a cursor, or a subsurface.
+            // Its callbacks still have to be answered or its client stops
+            // drawing, and answering at once is right because nothing is
+            // throttling it to a display.
+            let now = self.now_ms();
+            for cb in callbacks {
+                cb.done(now);
+            }
+        }
+
+        // Buffer scale and transform are honoured only in their identity form.
+        // Anything else would need the damage rectangles mapped between surface
+        // and buffer coordinates and the blit to rotate or subsample, which is
+        // a renderer's job and not this stage's. Saying so out loud beats
+        // silently drawing the wrong thing.
+        if scale != 1 || transform != wl_output::Transform::Normal {
+            eprintln!(
+                "wc-compositor: buffer scale {scale} / transform {transform:?} is not implemented; \
+                 drawing the buffer unscaled"
+            );
+        }
+
+        let rects: Vec<Rect> = damage
+            .into_iter()
+            .map(|d| match d {
+                // With scale 1 and no transform these two coordinate spaces are
+                // identical, which is why they can be merged here and could not
+                // be in general.
+                Damage::Buffer(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h),
+                Damage::Surface(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h),
+            })
+            .collect();
+
+        // After the buffer, deliberately. The first commit is what maps the
+        // window, and a window that is not mapped has no taskbar button for an
+        // icon to be on; doing this first would send a `WM_SETICON` for a
+        // window the platform has not shown yet, which is legal, invisible and
+        // impossible to tell from a broken icon.
+        let icon_dirty = self
+            .windows
+            .get_mut(surface)
+            .map(|w| std::mem::take(&mut w.icon_dirty))
+            .unwrap_or(false);
+
+        match buffer {
+            Some(BufferAssignment::NewBuffer(buffer)) => self.present(surface, &buffer, rects),
+            Some(BufferAssignment::Removed) => {
+                if let Some(window) = self.windows.get_mut(surface) {
+                    // A null buffer unmaps the surface. The toplevel still
+                    // exists, so the window is not destroyed — it has nothing
+                    // to show, which on Win32 is a minimised window.
+                    let id = window.id;
+                    println!("wc-compositor: window {id} unmapped (null buffer)");
+                    window.mapped = false;
+                    self.ui.send(ToUi::SetWindowState {
+                        id,
+                        maximized: None,
+                        minimized: Some(true),
+                    });
+                }
+            }
+            // A commit with no new buffer: state-only, or an ack. Damage
+            // without a buffer means nothing.
+            None => {}
+        }
+
+        if icon_dirty {
+            self.take_client_icon(surface);
+        }
+    }
+}
+
+impl BufferHandler for State {
+    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+impl ShmHandler for State {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm
+    }
+}
+
+impl SeatHandler for State {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<Self> {
+        &mut self.seat_state
+    }
+
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // smithay's own view of the focus, after the `enter`/`leave` pair has
+        // been sent. Logged rather than acted on: the decision was made in
+        // `set_keyboard_focus` from a Win32 message, and doing anything here
+        // would be a second source of truth for the same fact.
+        println!(
+            "wc-compositor: keyboard focus -> {}",
+            if focused.is_some() { "a surface" } else { "nothing" }
+        );
+    }
+
+    /// The client wants to draw the cursor itself.
+    ///
+    /// **Not implemented, and the reason is worth stating rather than leaving
+    /// as an empty body.** `wl_pointer.set_cursor` hands over a surface whose
+    /// buffer is the cursor image, and turning that into something Win32 shows
+    /// means `CreateIconIndirect` per frame plus a `SetCursor` from the window
+    /// procedure's `WM_SETCURSOR` — the same shape as `set_icon` in
+    /// `win32.rs`, which already exists. What is missing is not the conversion
+    /// but the *policy*: hiding the system arrow while the client's cursor is
+    /// up, and putting it back on leave, is state that belongs to the window
+    /// and there is nothing to test it against until a client that sets one is
+    /// in the harness.
+    ///
+    /// The visible consequence is that the arrow the user sees is Windows',
+    /// which for a terminal is the same arrow the client would have drawn, and
+    /// for a text field is the wrong shape. Said once so it is in the log of
+    /// any run where it matters.
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        if !self.cursor_noted {
+            self.cursor_noted = true;
+            println!(
+                "wc-compositor: a client set a cursor; cursor surfaces are never composited, \
+                 the pointer on screen is Windows'"
+            );
+        }
+        // The surface is *recorded*, not drawn. `commit` uses this to recognise
+        // a cursor's pixels and drop them before they can reach a window; see
+        // the check in `commit`, which also drops the staged pixels.
+        self.cursor_surface = match image {
+            CursorImageStatus::Surface(surface) => Some(surface),
+            CursorImageStatus::Hidden | CursorImageStatus::Named(_) => None,
+        };
+    }
+}
+
+/// Read the title and app id a client has set, if any.
+fn metadata(toplevel: &ToplevelSurface) -> (String, String) {
+    compositor::with_states(toplevel.wl_surface(), |states| {
+        let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+            return (String::new(), String::new());
+        };
+        let attrs = data.lock().unwrap();
+        (
+            attrs.title.clone().unwrap_or_default(),
+            attrs.app_id.clone().unwrap_or_default(),
+        )
+    })
+}
+
+impl XdgShellHandler for State {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell
+    }
+
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.toplevels += 1;
+
+        let (title, app_id) = metadata(&surface);
+        let shadow = Arc::new(Mutex::new(Shadow::empty()));
+        println!(
+            "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
+            self.toplevels
+        );
+
+        self.ui.send(ToUi::Create {
+            id,
+            title: title.clone(),
+            app_id: app_id.clone(),
+            shadow: shadow.clone(),
+            kind: WindowKind::Toplevel,
+        });
+
+        // The initial configure carries no size: the client picks, which is
+        // right for a window that has not been placed yet and is what lets
+        // `weston-simple-shm` choose its own 250x250. The size comes back at
+        // the first commit, and the window frame is built from there.
+        surface.send_configure();
+        println!("wc-compositor: sent xdg_toplevel configure");
+
+        self.windows.insert(
+            surface.wl_surface().clone(),
+            Window {
+                id,
+                role: Role::Toplevel(surface),
+                shadow,
+                mapped: false,
+                title,
+                app_id,
+                frame_callbacks: Vec::new(),
+                presented: 0,
+                icon_from_client: false,
+                icon_dirty: false,
+            },
+        );
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        let (title, _) = metadata(&surface);
+        let Some(window) = self.windows.get_mut(surface.wl_surface()) else {
+            return;
+        };
+        window.title = title.clone();
+        let (id, mapped) = (window.id, window.mapped);
+        if mapped {
+            self.ui.send(ToUi::Title { id, title });
+        }
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        let (_, app_id) = metadata(&surface);
+        let Some(window) = self.windows.get_mut(surface.wl_surface()) else {
+            return;
+        };
+        window.app_id = app_id.clone();
+        let (id, mapped, own) = (window.id, window.mapped, window.icon_from_client);
+        if mapped {
+            self.ui.send(ToUi::AppId {
+                id,
+                app_id: app_id.clone(),
+            });
+            // A new app id is a new answer to "what is this application", so
+            // the icon is looked up again — unless the client has said what its
+            // icon is itself, in which case the name is not evidence about it.
+            if !own {
+                self.apply_stored_icon(id, &app_id);
+            }
+        }
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            self.ui.send(ToUi::SetWindowState {
+                id: window.id,
+                maximized: Some(true),
+                minimized: None,
+            });
+        }
+        // xdg-shell requires a configure in response to `set_maximized` even if
+        // the compositor declines. The real state arrives a moment later from
+        // `WM_SIZE`; this meets the protocol obligation on time rather than
+        // making it conditional on a round trip through Win32.
+        surface.send_configure();
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            self.ui.send(ToUi::SetWindowState {
+                id: window.id,
+                maximized: Some(false),
+                minimized: None,
+            });
+        }
+        surface.send_configure();
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            self.ui.send(ToUi::SetWindowState {
+                id: window.id,
+                maximized: None,
+                minimized: Some(true),
+            });
+        }
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Drop the focus **before** the window goes, and unconditionally.
+        // smithay holds the focused `WlSurface` in the keyboard handle, and a
+        // handle still pointing at a destroyed surface sends `leave` to a dead
+        // object on the next focus change. Doing it here rather than waiting
+        // for a `WM_KILLFOCUS` matters because a client that destroys its
+        // surface without the window being defocused first — which is what
+        // happens when a client exits — never produces one.
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let id = window.id;
+            if self.keyboard_focus == Some(id) {
+                self.set_keyboard_focus(id, false);
+            }
+            if self.pointer_focus == Some(id) {
+                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+            }
+        }
+        if let Some(window) = self.windows.remove(surface.wl_surface()) {
+            println!(
+                "wc-compositor: xdg_toplevel destroyed -> window {} ({} frames presented)",
+                window.id, window.presented
+            );
+            self.ui.send(ToUi::Destroy { id: window.id });
+        }
+    }
+
+    /// REWRITTEN FOR STAGE 9. Stage 4 sent a configure and drew nothing, and
+    /// said so: *"a popup rendered as its own top-level `HWND` would be wrong
+    /// in a way that is hard to undo."* It is its own `HWND`, and it is not a
+    /// top-level one — `WS_POPUP`, owned by its parent, no caption, no taskbar
+    /// button and no activation. That is the same shape Win32 menus have, and
+    /// on this side of the boundary it is the only shape that can leave the
+    /// parent window's bounds, which a menu near the bottom of a window must.
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.popups += 1;
+
+        // Where the popup goes, in the parent's window-geometry coordinates.
+        // `get_geometry` is the positioner's own arithmetic — anchor rectangle,
+        // anchor edge, gravity and offset — which smithay implements from the
+        // XML. What is deliberately **not** used here is
+        // `get_unconstrained_geometry`: constraining a menu to the monitor is
+        // the compositor's job, and on Windows the compositor that owns the
+        // monitor is Windows. Letting `SetWindowPos` place it and reporting no
+        // constraint back is honest; recomputing it here would be a second,
+        // disagreeing, opinion. See docs/design.md §13.6.
+        let rect = positioner.get_geometry();
+        let parent = surface.get_parent_surface().map(|s| root_of(&s));
+        let parent_id = parent.as_ref().and_then(|p| self.windows.get(p)).map(|w| w.id);
+
+        println!(
+            "wc-compositor: xdg_popup created (#{}) -> window {id} at {},{} {}x{} parent {:?}",
+            self.popups, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h, parent_id
+        );
+
+        let Some(parent_id) = parent_id else {
+            // A popup whose parent is not a window we know about. Legal to
+            // refuse, and the client is told rather than left waiting.
+            eprintln!("wc-compositor: xdg_popup has no mapped parent; dismissing it");
+            surface.send_popup_done();
+            return;
+        };
+
+        let shadow = Arc::new(Mutex::new(Shadow::empty()));
+        self.ui.send(ToUi::Create {
+            id,
+            title: String::new(),
+            app_id: String::new(),
+            shadow: shadow.clone(),
+            kind: WindowKind::Popup {
+                parent: parent_id,
+                x: rect.loc.x,
+                y: rect.loc.y,
+            },
+        });
+
+        // The popup's configure carries the positioner's rectangle, which is
+        // the protocol's way round: the client asked for a size and the
+        // compositor either agrees or moves it. We agree.
+        surface.with_pending_state(|state| {
+            state.geometry = rect;
+        });
+        let _ = surface.send_configure();
+
+        self.windows.insert(
+            surface.wl_surface().clone(),
+            Window {
+                id,
+                role: Role::Popup(surface),
+                shadow,
+                mapped: false,
+                title: String::new(),
+                app_id: String::new(),
+                frame_callbacks: Vec::new(),
+                presented: 0,
+                // A popup has no taskbar button and no caption, so neither of
+                // these can ever be true of one. They are here because `Window`
+                // is one type for both roles, which is stage 9's decision.
+                icon_from_client: false,
+                icon_dirty: false,
+            },
+        );
+    }
+
+    /// The client destroyed an `xdg_popup`.
+    ///
+    /// ADDED FOR STAGE 13, and its absence made the desktop unusable.
+    /// **`XdgShellHandler::popup_destroyed` has an empty default body**, so
+    /// from stage 9 to here every popup Firefox opened left its `HWND` on the
+    /// screen forever. A live session accumulated three stale "New Tab"
+    /// tooltips at three positions, a context menu, an account panel and the
+    /// hamburger menu, all visible at once, over the page being read.
+    ///
+    /// Nothing errored and nothing was logged. The windows were real, mapped
+    /// and correctly painted; they were simply never taken away, and the frame
+    /// dumps looked healthy throughout. It is the clearest example this project
+    /// has produced of a defect that only a person looking at a screen can
+    /// find — and it caused two further symptoms that would have been chased
+    /// separately (§18.4).
+    ///
+    /// The body is [`Self::toplevel_destroyed`]'s and that is the point: the
+    /// two roles differ in how a window is *made* and not at all in how it is
+    /// unmade. A popup can hold the pointer focus — it is the window under the
+    /// cursor while a menu is open — and a pointer handle still pointing at a
+    /// destroyed surface sends `leave` to a dead object.
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let id = window.id;
+            if self.keyboard_focus == Some(id) {
+                self.set_keyboard_focus(id, false);
+            }
+            if self.pointer_focus == Some(id) {
+                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+            }
+            if self.popup_grab == Some(id) {
+                self.popup_grab = None;
+            }
+        }
+        if let Some(window) = self.windows.remove(surface.wl_surface()) {
+            self.staging.remove(surface.wl_surface());
+            println!(
+                "wc-compositor: xdg_popup destroyed -> window {} ({} frames presented)",
+                window.id, window.presented
+            );
+            self.ui.send(ToUi::Destroy { id: window.id });
+        }
+    }
+
+    /// `xdg_popup.grab`: the client wants this popup to own the pointer until
+    /// something outside it is clicked.
+    ///
+    /// IMPLEMENTED IN STAGE 13, and it is the other half of the stale-menu bug.
+    /// A menu is dismissed by *the compositor* — the client cannot see a click
+    /// that lands outside its own surfaces, so if nobody sends `popup_done` the
+    /// menu has no way to know it should go, and clicking elsewhere leaves it
+    /// on screen.
+    ///
+    /// What is recorded is the innermost grabbing popup only, not a stack. A
+    /// stack is what a submenu needs and it is more than this stage can prove:
+    /// dismissing the innermost popup makes the client destroy it, which
+    /// arrives at [`Self::popup_destroyed`] and clears the record, so a second
+    /// click dismisses the next one out. That is one click per level rather
+    /// than one click for all of them — a real difference from how a Linux
+    /// compositor behaves, written down rather than hidden.
+    fn grab(
+        &mut self,
+        surface: PopupSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+    ) {
+        if let Some(id) = self.windows.get(surface.wl_surface()).map(|w| w.id) {
+            println!("wc-compositor: xdg_popup grab -> window {id} owns the pointer");
+            self.popup_grab = Some(id);
+        }
+    }
+
+    /// `xdg_popup.reposition` (xdg-shell v3): move a popup that is already up.
+    ///
+    /// IMPLEMENTED IN STAGE 13. The empty body meant `xdg_popup.repositioned`
+    /// was never sent and the popup never moved, so a submenu that GTK
+    /// repositions because it would fall off the screen stayed where it was
+    /// first placed — off-screen, or on top of its parent.
+    ///
+    /// The protocol's order is fixed and all three parts are required:
+    /// `repositioned` with the client's token, then a `configure` with the new
+    /// rectangle, then the parent surface's `commit` applies it. A compositor
+    /// that sends only the configure leaves the client unable to match the
+    /// answer to its request, which for GTK means it ignores the move.
+    ///
+    /// The positioner's own arithmetic is used unchanged, exactly as
+    /// [`Self::new_popup`] does — anchor rectangle, anchor edge, gravity and
+    /// offset, which smithay implements from the XML. The constraint
+    /// adjustments are still not applied here (§18.6): this compositor does not
+    /// know where the parent window is on the Windows desktop, so it cannot
+    /// tell whether the result would be off-screen. Windows keeps an owned
+    /// `WS_POPUP` on the monitor by itself, which is why that has not bitten.
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
+        let rect = positioner.get_geometry();
+        let Some(&Window { id, .. }) = self.windows.get(surface.wl_surface()) else {
+            // A reposition for a popup we never mapped. Answering the token
+            // anyway is better than silence: the client is waiting for it.
+            surface.send_repositioned(token);
+            return;
+        };
+        println!(
+            "wc-compositor: xdg_popup reposition -> window {id} to {},{} {}x{} (token {token})",
+            rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+        );
+        surface.with_pending_state(|state| {
+            state.geometry = rect;
+        });
+        surface.send_repositioned(token);
+        let _ = surface.send_configure();
+        self.ui.send(ToUi::MovePopup {
+            id,
+            x: rect.loc.x,
+            y: rect.loc.y,
+            width: rect.size.w,
+            height: rect.size.h,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Icons: the client's own, and somebody else's
+// ---------------------------------------------------------------------------
+
+impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for State {
+    /// The icon is *pending* here, not current: `set_icon` is double-buffered
+    /// and takes effect at the surface's next commit, which is where
+    /// [`State::take_client_icon`] reads it. All this does is remember that
+    /// there is something to read.
+    fn set_icon(
+        &mut self,
+        _toplevel: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+        wl_surface: WlSurface,
+    ) {
+        if let Some(window) = self.windows.get_mut(&wl_surface) {
+            println!(
+                "wc-compositor: window {} set an icon through xdg_toplevel_icon_v1",
+                window.id
+            );
+            window.icon_dirty = true;
+        }
+    }
+}
+
+smithay::delegate_xdg_toplevel_icon!(State);
+
+use crate::icon::proto::wc_icon_manager_v1::{self, WcIconManagerV1};
+use smithay::reexports::wayland_server::{DataInit, Dispatch, GlobalDispatch, New, Resource};
+
+/// Per-publisher staging. One publisher builds one icon set at a time, and two
+/// of them cannot get in each other's way because the state is on the resource
+/// rather than on the compositor.
+#[derive(Debug, Default)]
+pub struct PublisherState(std::sync::Mutex<crate::icon::Staging>);
+
+impl GlobalDispatch<WcIconManagerV1, ()> for State {
+    fn bind(
+        _state: &mut State,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WcIconManagerV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        // Worth saying out loud once per publisher: this global is how a
+        // machine that is not this one decides what a window looks like, and a
+        // run where nobody binds it is a run where every icon will be generic.
+        println!("wc-compositor: a client bound wc_icon_manager_v1 (an icon resolver)");
+        data_init.init(resource, PublisherState::default());
+    }
+}
+
+impl Dispatch<WcIconManagerV1, PublisherState> for State {
+    fn request(
+        state: &mut State,
+        _client: &Client,
+        resource: &WcIconManagerV1,
+        request: wc_icon_manager_v1::Request,
+        data: &PublisherState,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State>,
+    ) {
+        use crate::icon::StageError;
+        use wc_icon_manager_v1::{Error, Request};
+
+        // Every arm that can fail ends the *publisher's* connection rather than
+        // the window's client's, which is the one real advantage of the icon
+        // feed being a separate client: a resolver that miscounts its bytes
+        // costs an icon, not a window.
+        let fail = |e: StageError| match e {
+            StageError::TooBig => (Error::TooBig, "more staged bytes than the compositor holds"),
+            StageError::Short => (Error::ShortImage, "image named more pixels than were staged"),
+            StageError::BadSize => (Error::BadSize, "implausible icon size"),
+        };
+
+        match request {
+            Request::Chunk { data: bytes } => {
+                if let Err(e) = data.0.lock().unwrap().chunk(&bytes) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Image { width, height } => {
+                if let Err(e) = data.0.lock().unwrap().image(width, height) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Publish { app_id } => {
+                let images = data.0.lock().unwrap().take();
+                state.publish_icons(app_id, images);
+            }
+            Request::Forget { app_id } => {
+                println!("wc-compositor: icon for {app_id:?} forgotten");
+                state.icons.forget(&app_id);
+            }
+            Request::Destroy => {}
+        }
+    }
+}
+
+// ADDED FOR STAGE 9 -----------------------------------------------------------
+//
+// `OutputHandler` has no required methods: smithay's output global does all its
+// own bookkeeping and the trait exists so a compositor can be told when a
+// client binds one. Nothing here needs to know.
+impl OutputHandler for State {}
+
+/// The clipboard, implemented as far as **refusing honestly**.
+///
+/// Every method here is smithay's default, which is to say the selection is
+/// tracked between clients on this compositor and nothing is offered from
+/// outside it. That is not the finished feature and it is not a stub either:
+/// two Wayland clients on this compositor can already copy and paste through
+/// it, because smithay's `wl_data_device` implementation does that work itself.
+///
+/// **What cannot work here, and will not until something is built for it, is a
+/// clipboard shared with Windows.** The two halves of that are
+/// `SelectionHandler::send_selection` — hand the compositor an fd and have it
+/// write the Win32 clipboard's bytes into it — and the reverse. On the guest
+/// that fd is a `wc_handle::Handle` (the fork makes `OwnedFd` mean that), and a
+/// `Handle` written by the compositor is exactly the object docs/design.md
+/// §12.13 item 7 says has no route to a client on the other side of the
+/// hypervisor. So this is not laziness deferred; it is the same missing
+/// allocator, arriving from a third direction.
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self._data_device
+    }
+}
+
+// Drag and drop, both directions, at their defaults: the events are accepted
+// and nothing is done with them. A drag *within* one client works because
+// smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
+// is not started here.
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+
+/// `xdg-decoration`, which is the standard one and — measured — the one Firefox
+/// does not use.
+///
+/// Implemented anyway, and answered honestly: a client that asks for
+/// `ServerSide` is told `ClientSide`, because this compositor has no frame of
+/// its own to draw and Windows' caption is not something the Wayland side can
+/// promise. Saying `ServerSide` and drawing nothing is how a client ends up
+/// with a window that has no way to be moved.
+impl XdgDecorationHandler for State {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        println!("wc-compositor: xdg-decoration: client created a decoration object");
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ClientSide);
+        });
+        toplevel.send_pending_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        println!("wc-compositor: xdg-decoration: client asked for {mode:?}, answering ClientSide");
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ClientSide);
+        });
+        toplevel.send_pending_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        println!("wc-compositor: xdg-decoration: client unset its mode, answering ClientSide");
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ClientSide);
+        });
+        toplevel.send_pending_configure();
+    }
+}
+
+/// KDE's `org_kde_kwin_server_decoration`, which is the one GTK actually binds.
+///
+/// smithay's default `request_mode` echoes the client's request straight back,
+/// which is the right behaviour and is also silent. This one says what
+/// happened, because "which protocol did Firefox use and what did it ask for"
+/// is the question the stage exists to answer.
+impl KdeDecorationHandler for State {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration
+    }
+
+    fn new_decoration(
+        &mut self,
+        _surface: &WlSurface,
+        _decoration: &OrgKdeKwinServerDecoration,
+    ) {
+        println!("wc-compositor: kde-decoration: client created a decoration object");
+    }
+
+    fn request_mode(
+        &mut self,
+        _surface: &WlSurface,
+        decoration: &OrgKdeKwinServerDecoration,
+        mode: WEnum<KdeMode>,
+    ) {
+        println!("wc-compositor: kde-decoration: client asked for {mode:?}");
+        // Echo, which is what smithay's default does: the client has told us
+        // how it intends to decorate itself and there is nothing to negotiate
+        // when the answer is always "you draw it".
+        if let WEnum::Value(mode) = mode {
+            decoration.mode(mode);
+        }
+    }
+}
+
+delegate_compositor!(State);
+delegate_shm!(State);
+delegate_xdg_shell!(State);
+delegate_seat!(State);
+delegate_output!(State);
+delegate_data_device!(State);
+delegate_xdg_decoration!(State);
+delegate_kde_decoration!(State);

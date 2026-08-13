@@ -1,0 +1,17 @@
+[package]
+name = "wc-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A Wayland client that speaks the wire protocol by hand, to prove a server's handshake"
+
+[dependencies]
+wc-transport = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Only for `--shm`, which creates a real section object and sends its
+# descriptor. The probe still writes every protocol byte by hand; what it
+# borrows from `wc-handle` is the kernel object and the descriptor encoding,
+# which is precisely the thing under test.
+wc-handle = { workspace = true }

@@ -1,0 +1,36 @@
+# FORKED from wayland-server 0.31.13. See ../PATCHES.md.
+#
+# Two manifest changes. `rustix` moves behind `cfg(unix)` — it is used for
+# exactly one thing here, the `flock` on the socket lockfile, which has a
+# different answer on Windows. And the `libwayland_1_22`/`libwayland_1_23`
+# features are dropped, because they forward to features of the `sys` backend
+# that this fork no longer builds.
+
+[package]
+name = "wayland-server"
+version = "0.31.13"
+authors = ["Elinor Berger <elinor@safaradeg.net>"]
+license = "MIT"
+description = "Server-side Wayland bindings (waycompose fork: builds for Windows)"
+edition = "2021"
+rust-version = "1.71"
+
+[dependencies]
+wayland-backend = { version = "0.3.15", path = "../wayland-backend" }
+wayland-scanner = { version = "0.31.10", path = "../wayland-scanner" }
+bitflags = "2"
+log = { version = "0.4", optional = true }
+downcast-rs = "1.2"
+wc-transport = { path = "../../crates/wc-transport" }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0.2", features = ["fs"] }
+
+[features]
+system = ["wayland-backend/server_system"]
+dlopen = ["wayland-backend/dlopen"]
+# WAYCOMPOSE FORK: inert, as in the backend. They gated API mirroring newer
+# libwayland releases; the rust backend implements it regardless of what
+# libwayland is installed, and on Windows none is.
+libwayland_1_22 = ["wayland-backend/libwayland_server_1_22"]
+libwayland_1_23 = ["libwayland_1_22", "wayland-backend/libwayland_server_1_23"]
