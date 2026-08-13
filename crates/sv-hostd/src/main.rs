@@ -56,7 +56,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "usage:\n  \
                  sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]\n  \
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n  \
-                 sv-hostd qemu-serve --qmp <sock> --cold <sock> --socket <path> [--vm <hint>] [--clients N]"
+                 sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N]"
             );
             return Err("no subcommand".into());
         }
@@ -307,21 +307,150 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// run list does not cross the wire", which is about guest↔host.
 #[cfg(target_os = "linux")]
 fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::fd::AsFd;
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use sv_hostd::locate;
-    use sv_transport::cold::{Attachment, ColdMessage, recv, send};
-    use sv_transport::region::PAGE;
-    use sv_transport::stream::{read_message, write_message};
+    use std::os::unix::net::UnixListener;
+    use sv_transport::cold::{ColdMessage, recv, send};
 
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
+    // **`--cold` may be given more than once, and each one is a whole session.**
+    //
+    // A cross-VM session is one pinned window in the guest, one extent for this
+    // daemon to locate, and one control region — so N sessions are N guests
+    // publishing on N cold paths, and this daemon locates each and hands the
+    // i-th to the i-th ICD client. §0.12 made the same split on the
+    // same-machine path for the same reason and it arrives here unchanged:
+    // Firefox is a multi-process application, `glxtest` takes the first session
+    // before the browser exists, and a second client onto the first client's
+    // rings is the failure §0.11 spent a day diagnosing.
+    //
+    // One `--cold` behaves exactly as it did, which is what every existing
+    // harness passes.
+    let colds: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == "--cold")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect();
+    if colds.is_empty() {
+        return Err("--cold is required".into());
+    }
     let qmp = arg("--qmp").ok_or("--qmp is required")?;
-    let cold = arg("--cold").ok_or("--cold is required")?;
     let path = arg("--socket").ok_or("--socket is required")?;
     let hint = arg("--vm").unwrap_or_else(|| "sv-guest".into());
-    let clients: usize = arg("--clients").map_or(Ok(1), |s| s.parse())?;
+    // Defaulted from the number of sessions rather than to 1, because asking
+    // for more clients than there are sessions is the one arrangement that
+    // cannot work and should not be spellable by accident.
+    let clients: usize = arg("--clients").map_or(Ok(colds.len()), |s| s.parse())?;
+    if clients > colds.len() {
+        return Err(format!(
+            "{clients} ICD client(s) asked for and only {} session(s) offered; \
+             each client needs its own control region",
+            colds.len()
+        )
+        .into());
+    }
+
+    let mut sessions = Vec::new();
+    for cold in &colds {
+        sessions.push(qemu_session(&qmp, &hint, cold)?);
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    eprintln!(
+        "sv-hostd: listening on {path} for {clients} ICD client(s) over {} session(s); \
+         they open {} by name",
+        sessions.len(),
+        sessions[0].attachment.object
+    );
+    // **The i-th client gets the i-th session, never a shared one.** Handing two
+    // clients one attachment would put two ICDs on one control region and one
+    // ring set, which is precisely the arrangement §0.11 measured: the first is
+    // served, the second waits forever, and Firefox exits with `Exiting due to
+    // channel error` two layers up.
+    for (i, session) in sessions.iter().enumerate().take(clients) {
+        let (sock, _) = listener.accept()?;
+        let attachment = &session.attachment;
+        let msg = recv(&sock)?;
+        match msg {
+            ColdMessage::AttachRequest => {
+                // QEMU's object by name, not a descriptor and not a copy: the
+                // ICD opens it and maps the guest's RAM directly. What it needs
+                // on top is the run list, because a scattered extent has no
+                // single offset whose `mmap` reproduces it.
+                send(&sock, &ColdMessage::Attach(attachment.clone()))?;
+                if attachment.run_count != 0 {
+                    send(&sock, &ColdMessage::Runs(session.runs_for_wire.clone()))?;
+                }
+                // The same acknowledgement `Mode::Local` waits for. Nothing here
+                // needs unlinking — the object is QEMU's — but a client that
+                // could not open the name should say so *here*, where the
+                // daemon can print it, rather than dying three layers up with
+                // `NotConnected`.
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                match recv(&sock) {
+                    Ok(ColdMessage::Accept { .. }) => {}
+                    Ok(other) => eprintln!("sv-hostd: ICD client {i} said {other:?}"),
+                    Err(e) => eprintln!("sv-hostd: ICD client {i} never acknowledged: {e}"),
+                }
+                eprintln!(
+                    "sv-hostd: ICD client {i} attached by name to session {i} ({} run(s))",
+                    session.hostd.runs.len()
+                );
+            }
+            other => {
+                send(
+                    &sock,
+                    &ColdMessage::Refuse {
+                        code: 1,
+                        reason: format!("expected AttachRequest, got {other:?}"),
+                    },
+                )?;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// One located cross-VM session: a guest's extent, found in QEMU's memory and
+/// stitched into a flat view, with the attachment an ICD client needs to map
+/// the same bytes.
+///
+/// Held together rather than returned as a tuple because two of the four fields
+/// exist only to be kept alive: dropping `hostd` closes the descriptor the
+/// attachment names, and dropping `port` closes the cold path the guest is
+/// still holding its pinned window against.
+#[cfg(target_os = "linux")]
+struct QemuSession {
+    attachment: sv_transport::cold::Attachment,
+    runs_for_wire: Vec<sv_transport::cold::AttachRun>,
+    hostd: sv_hostd::Hostd,
+    /// The guest's cold path, kept open for the life of the daemon.
+    #[allow(dead_code)]
+    port: std::os::unix::net::UnixStream,
+}
+
+/// Connect to one cold path, take the guest's `Hello`, find its pages in QEMU's
+/// memory, check the stitched view, and tell it so.
+///
+/// This is the whole of what used to be the first half of [`qemu_serve`], moved
+/// out unchanged so that it can happen once per session rather than once per
+/// daemon. Every comment in it is about a step that is per-session — the scan,
+/// the stitch, the page-index check — and none of them were about the daemon.
+#[cfg(target_os = "linux")]
+fn qemu_session(
+    qmp: &str,
+    hint: &str,
+    cold: &str,
+) -> Result<QemuSession, Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    use sv_hostd::locate;
+    use sv_transport::cold::{Attachment, ColdMessage};
+    use sv_transport::region::PAGE;
+    use sv_transport::stream::{read_message, write_message};
 
     // The cold path. QEMU is listening on this socket as the host end of the
     // guest's virtio-serial port, so connecting to it puts us on the other end
@@ -329,7 +458,7 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("sv-hostd: waiting for the guest on the cold path {cold}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut port = loop {
-        match UnixStream::connect(&cold) {
+        match UnixStream::connect(cold) {
             Ok(s) => break s,
             Err(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(100))
@@ -355,7 +484,7 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let located = sv_hostd::Hostd::qemu(
         std::path::Path::new(&qmp),
-        &hint,
+        hint,
         &hello.extent,
         hello.generation,
     );
@@ -470,54 +599,6 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         run_count: hostd.runs.len() as u64,
     };
 
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    eprintln!(
-        "sv-hostd: listening on {path} for {clients} ICD client(s); \
-         they open {} by name",
-        attachment.object
-    );
-    for i in 0..clients {
-        let (sock, _) = listener.accept()?;
-        let msg = recv(&sock)?;
-        match msg {
-            ColdMessage::AttachRequest => {
-                // QEMU's object by name, not a descriptor and not a copy: the
-                // ICD opens it and maps the guest's RAM directly. What it needs
-                // on top is the run list, because a scattered extent has no
-                // single offset whose `mmap` reproduces it.
-                send(&sock, &ColdMessage::Attach(attachment.clone()))?;
-                if attachment.run_count != 0 {
-                    send(&sock, &ColdMessage::Runs(runs_for_wire.clone()))?;
-                }
-                // The same acknowledgement `Mode::Local` waits for. Nothing here
-                // needs unlinking — the object is QEMU's — but a client that
-                // could not open the name should say so *here*, where the
-                // daemon can print it, rather than dying three layers up with
-                // `NotConnected`.
-                sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-                match recv(&sock) {
-                    Ok(ColdMessage::Accept { .. }) => {}
-                    Ok(other) => eprintln!("sv-hostd: ICD client {i} said {other:?}"),
-                    Err(e) => eprintln!("sv-hostd: ICD client {i} never acknowledged: {e}"),
-                }
-                eprintln!(
-                    "sv-hostd: ICD client {i} attached by name ({} run(s))",
-                    hostd.runs.len()
-                );
-            }
-            other => {
-                send(
-                    &sock,
-                    &ColdMessage::Refuse {
-                        code: 1,
-                        reason: format!("expected AttachRequest, got {other:?}"),
-                    },
-                )?;
-            }
-        }
-    }
-    let _ = std::fs::remove_file(&path);
-    Ok(())
+    Ok(QemuSession { attachment, runs_for_wire, hostd, port })
 }
 
