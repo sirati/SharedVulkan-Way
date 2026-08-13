@@ -5,7 +5,7 @@
  * no digitiser behind it, so a pass says the `WM_POINTER*` path in
  * `crates/wc-compositor/src/platform/win32.rs` is reachable, decodes what
  * Windows puts in front of it and produces the right `wl_touch` stream. It
- * does **not** say a finger works. See docs/design.md §24.6 for the division.
+ * does **not** say a finger works. See docs/waycompose-design.md §24.6 for the division.
  *
  *   x86_64-w64-mingw32-gcc -O1 -o probe-touch.exe probe-touch.c -luser32
  *   wine probe-touch.exe --class WaycomposeToplevel

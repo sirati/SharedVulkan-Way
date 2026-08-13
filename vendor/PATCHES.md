@@ -337,7 +337,10 @@ an unframed event outstanding, and never in the case the event exists for.
 
 Found by measurement, not by reading: `weston-eventdemo` against this
 compositor received the `down` and the `frame` and then nothing, while the
-compositor's own log said it had cancelled. See `docs/design.md` §24.4.
+compositor's own log said it had cancelled. See `docs/waycompose-design.md`
+§24.4 — this file's other references still say `docs/design.md`, which is the
+Vulkan side's document since the two repositories became one, and sweeping them
+belongs to whoever owns that rename rather than to this entry.
 
 The guard goes; `state.focus.take()` already skips contacts that `up` has
 released, which is the condition that was wanted. `current` is still stamped so

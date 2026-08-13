@@ -254,7 +254,7 @@ pub fn current_layout() -> &'static str {
 /// advertises a touch that never fires, which is exactly what a Windows machine
 /// with a digitiser nobody touches also does.
 ///
-/// This leg is where a third-party client is the arbiter (docs/design.md §24.6):
+/// This leg is where a third-party client is the arbiter (docs/waycompose-design.md §24.6):
 /// on Windows there is no Weston client to connect directly, and here there is.
 pub fn has_touch() -> bool {
     true

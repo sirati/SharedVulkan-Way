@@ -190,7 +190,7 @@ run_linux() {
 # arbiter here is one step weaker than it is for the keyboard — "libwayland
 # decoded these events and the client did not disconnect in protocol error" and
 # not "the client told us what it made of them". That is the honest strength of
-# this leg and is stated in docs/design.md §24.6.
+# this leg and is stated in docs/waycompose-design.md §24.6.
 #
 # Silent when no touch events were driven, because both legs call this and only
 # the one with `--simulate-wm` drives any; the caller that expected them asserts

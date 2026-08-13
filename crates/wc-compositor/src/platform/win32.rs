@@ -1021,7 +1021,7 @@ unsafe extern "system" fn toplevel_proc(
 /// It is an environment variable rather than a flag so that a run which used it
 /// is visible in the process environment of the thing under test, and the
 /// startup line says so — a synthetic run must not be mistakable for a hardware
-/// one (docs/design.md §24.6).
+/// one (docs/waycompose-design.md §24.6).
 pub fn has_touch() -> bool {
     if std::env::var_os("WC_FORCE_TOUCH").is_some() {
         println!(

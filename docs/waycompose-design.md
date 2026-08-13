@@ -7458,23 +7458,64 @@ hardware nobody here has.
 
 ### 24.7 The gates
 
+Run from the **unified** tree, after the rebase onto `one-binary`.
+
 | gate | result |
 |---|---|
-| `cargo test --workspace` | 169 passed (master `9ae2223` measured at 160; 9 new, all in `input::touch_tests`) |
-| `cargo clippy --workspace --all-targets` | clean |
-| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
-| `cargo build --target x86_64-pc-windows-gnu -p wc-compositor` | links an `.exe`, not just metadata |
+| `cargo test --workspace` | 1134 passed (base `020022d` at 1125; the 9 new are exactly `input::touch_tests`, counted by name) |
+| `cargo clippy --workspace --all-targets` | one warning, not this stage's — see below |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same one |
+| `cargo build --workspace` and the same `--target x86_64-pc-windows-gnu` | both link |
+| `sv-guest`, all three feature configurations, both targets | build (`default`, `--features gpu`, `--features wayland`) |
+| `scripts/wc-proxy.sh` | 37 passed, 0 failed — on the second run; see below |
 | `scripts/wc-input.sh linux` | 29 passed, 0 failed |
 | `scripts/wc-input.sh wine` | 26 passed, 0 failed; seat correctly `capabilities(3)` |
 | `probe-touch.exe` under Wine | exit 4, "this user32 has no touch injection" |
 | `probe-touch.exe` on the guest's interactive desktop | exit 0, contacts decoded (§24.6) |
 
-Every row above except the last was re-run from the merged tree. The guest row
-is the one carried over from the branch, and the reason is worth stating rather
-than hiding: re-running it means putting a window on a desktop where somebody is
-working, and the merges touched no touch code — the conflicts were an import
-block, two adjacent-but-unrelated statements in `pointer_button`, and section
-ordering in this file.
+**The guest row is carried over and every other row is not**, which is worth
+stating rather than hiding: re-running the guest means putting a window on a
+desktop where somebody is working, and nothing between that run and this tree
+touched touch code — the conflicts across four merges and one rebase were an
+import block, two adjacent-but-unrelated statements in `pointer_button`, and
+section ordering in this file.
+
+`scripts/wc-proxy.sh` is in the table because a green `cargo test` does not
+imply it: it drives weston's own clients over both transports and three
+compositors and is the gate for anything touching `Spec::builtin`. **This stage
+touches no proxy file and adds no XML**, which is also why the three exact-count
+protocol tests below pass unchanged — so it is run to confirm the absence of an
+effect rather than to demonstrate one.
+
+**And it did not pass first time, which is worth recording rather than quietly
+re-running until green.** The first run on this tree was **31 passed, 6
+failed**; the second, on the *identical* tree with nothing changed between them,
+was 37 passed, 0 failed. So the six were not this stage's — the same code
+produced both numbers — and the honest conclusion is that this gate is
+timing-sensitive under load. That is a plausible thing for it to be: it starts
+an Xvfb, a compositor, a proxy and a real weston client per configuration, and
+several of its assertions are frame counts and screenshot comparisons taken 1.5
+seconds apart. This machine had five other agents and a user on it at the time.
+
+Two things follow, and the second is the one that matters. A green run here is
+weaker evidence than its 37/0 suggests, because a red run is not reliably a
+regression. And **the failure detail was lost** — the first run's output was
+truncated to its summary — so what actually failed is unknown, which is the part
+that should not happen twice. Anything re-running this gate should keep the full
+log; whoever owns the script should consider whether the frame-count and
+screenshot assertions want a retry or a load-independent formulation, because a
+gate that cries wolf under contention gets ignored exactly when it is right.
+
+**The clippy warning, named rather than rounded to "clean".** It is
+`clippy::identity_op` on `crates/sv-hostd/src/qemu.rs:666`,
+`(0xcb000 - 0xcb000) + (0x100000 - 0xe8000)`, and it is present on the base
+commit `020022d` in a crate this stage never touches — the diff against
+`crates/sv-hostd/` is empty. It is left alone rather than fixed, because the
+zero-width term looks deliberate: it is a memory-hole calculation written so the
+holes line up with a table, and collapsing it would delete the documentation the
+arithmetic is carrying. Whoever owns that crate should decide. Recorded here so
+that "clippy is clean apart from one thing" does not become "clippy is clean"
+and then quietly acquire company.
 
 **Two other stages touch something this stage depends on**, and both are worth
 naming because in one case the answer is "nothing to do" and in the other it is
@@ -7565,6 +7606,15 @@ noted only because the next merge into this branch may.
 4. **Reconsider `GetPointerFrameTouchInfo`** if a digitiser ever appears. The
    reason for not using it is "no hardware to establish that
    `SkipPointerFrameMessages` is safe", which is a reason that expires.
+5. **Two things to carry across when `waycompose-base` `49f9d7b` reaches this
+   tree**, both worked out already and neither obvious enough to want
+   rediscovering. The cursor interaction in §24.7 — `on_pointer` must keep
+   consuming `WM_POINTERENTER`/`LEAVE` so a finger never sets
+   `Ui::pointer_inside`, and the field deserves the comment that says why. And
+   the standalone "Upstreamable" section in `vendor/PATCHES.md`, which should
+   absorb the maintenance rule now in the stage-20 entry rather than sit beside
+   it saying the same thing twice. Both exist in `waycompose-base` `daf5af8` and
+   can be lifted verbatim.
 
 ## 25. Stage 21: four protocols, one of which was a trap
 

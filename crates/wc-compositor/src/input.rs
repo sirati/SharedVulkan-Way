@@ -258,7 +258,7 @@ pub mod touch {
     /// * **The angle's range.** Windows says 0..359, Wayland says -180..=180
     ///   clockwise from +y. So anything over 180 is that value minus 360. Both
     ///   are clockwise from the vertical, which is the assumption in this
-    ///   function that no test here can check — see docs/design.md §24.5.
+    ///   function that no test here can check — see docs/waycompose-design.md §24.5.
     ///
     /// The known imprecision, stated rather than hidden: when Windows *does*
     /// report a non-zero orientation, `rcContact` is the bounding box of an
