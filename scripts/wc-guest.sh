@@ -161,6 +161,21 @@ g()  { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 gq() { ssh "${SSHOPT[@]}" "$GUEST" "$@" 2>&1; }
 h()  { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
 
+# Kill every process running out of one directory on the guest, and nothing
+# else. See the call site in `do_deploy` for why an image name will not do.
+#
+# The prefix is matched with a trailing backslash so that `wctest` cannot match
+# `wctest7`, which is a real directory belonging to a real other experiment.
+kill_in_dir() {
+  local dir="$1"
+  g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -Command \
+     \"\\\$p = '${dir}\\\\'; Get-CimInstance Win32_Process | \
+      Where-Object { \\\$_.ExecutablePath -and \\\$_.ExecutablePath.StartsWith(\\\$p) } | \
+      ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
+    >/dev/null 2>&1
+  true
+}
+
 # ------------------------------------------------- the stage-4 driver --------
 #
 # One experiment, run on WC_HOST: the Windows compositor on the guest, the relay
@@ -460,12 +475,20 @@ do_deploy() {
   # `dest open ...: Failure` -- which reads as a permissions or disk problem and
   # is neither. A compositor left behind by a killed ssh session is the usual
   # cause; so is one that survived a guest reboot, which has been seen.
-  # Only when this deploy owns the whole guest. With WC_GUESTNAME set there is a
-  # second experiment on this machine and an image-name kill would take its
-  # compositor down too; the cost is that a `.exe` of ours still running makes
-  # its own scp fail, which is a message rather than a mystery.
-  [ "$GUESTNAME" = wctest ] &&
-    g "taskkill //F //IM wc-compositor.exe //IM wc-server.exe //IM probe-relay.exe >/dev/null 2>&1; true" >/dev/null 2>&1
+  # Only the copies in *this* deploy's directory.
+  #
+  # `taskkill //IM wc-compositor.exe` was the original, and stage 7 narrowed it
+  # to "only when `WC_GUESTNAME` is unset". That guard is the wrong way round:
+  # the default name is exactly what an agent that has not thought about sharing
+  # the guest uses, so the blanket kill fired in precisely the case where two
+  # runs collide. Stage 8 watched it happen from the other side — a compositor
+  # in `wcdesk` photographed and driven into a resize loop by a run that
+  # believed it owned the machine (docs/design.md §13.9).
+  #
+  # An image name is not an identity here; the image *path* is, because every
+  # experiment deploys its own copy into its own directory. `taskkill` cannot
+  # filter on it and `Win32_Process.ExecutablePath` can.
+  kill_in_dir "$GUESTDIR_WIN"
 
   g "mkdir -p $GUESTDIR" || exit 1
   scp "${SSHOPT[@]}" "$STAGE"/*.exe "$STAGE/us.xkb" "$GUEST:$GUESTNAME/" >/dev/null || exit 1

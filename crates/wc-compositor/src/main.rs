@@ -35,15 +35,28 @@
 //!
 //! No `calloop`. `Backend::poll_fd()` returns a wepoll handle on Windows and a
 //! wepoll handle is not a socket (docs/design.md §3.3), so the backend cannot
-//! nest inside it. The Wayland thread therefore polls on a 5 ms sleep, exactly
-//! as stages 1 and 2 did. That is a latency floor on input and on how fast a
-//! `WM_CLOSE` reaches the client, and it is honest about being one; it is not a
-//! throughput limit, because a single turn drains every pending message.
+//! nest inside it. The Wayland thread therefore polls on a 5 ms wait, exactly
+//! as stages 1 and 2 did — though on Windows it took until stage 8 for that to
+//! be 5 ms rather than `Sleep`'s 15.9 ms quantum (`tick.rs`). It is a latency
+//! floor on input and on how fast a `WM_CLOSE` reaches the client, and it is
+//! honest about being one; it is not a throughput limit, because a single turn
+//! drains every pending message.
 
 mod input;
 mod platform;
 mod state;
 mod surface;
+mod tick;
+
+/// How long the Wayland thread waits between turns.
+///
+/// 5 ms since stage 1, and unchanged — what changed in stage 8 is that it is
+/// now *actually* 5 ms. See `tick.rs` and docs/design.md §13.8: on Windows this
+/// number went through `Sleep`, whose quantum is 15.6 ms, so the loop had always
+/// been turning at 15.9 ms. That is a latency floor on every UI event; §13.8 is
+/// also the record of this comment once claiming it was a throughput floor, and
+/// of the measurement that said it was not.
+const POLL: Duration = Duration::from_millis(5);
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -61,6 +74,13 @@ struct Args {
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
     simulate_wm: bool,
+    /// Force the poll loop back onto `Sleep`, with its 15.6 ms quantum.
+    ///
+    /// The control for the cadence question (docs/design.md §13.8). One binary,
+    /// one flag, everything else identical -- which is the only way to attribute
+    /// a frame rate to the wait rather than to the tree, the transport or the
+    /// instrument, and §13.8 is a record of getting that wrong first.
+    poll_coarse: bool,
     log: Option<std::path::PathBuf>,
     /// Exit successfully only after this many frames have been presented.
     /// `--once` alone proves a window was made; this proves pixels reached it.
@@ -133,6 +153,7 @@ fn parse_args() -> Result<Args, u8> {
         dump_frames: None,
         debug_icon: false,
         simulate_wm: false,
+        poll_coarse: false,
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
@@ -149,6 +170,7 @@ fn parse_args() -> Result<Args, u8> {
             "--once" => args.once = true,
             "--debug-icon" => args.debug_icon = true,
             "--simulate-wm" => args.simulate_wm = true,
+            "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--socket" => args.socket = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
@@ -476,7 +498,7 @@ fn main() -> std::process::ExitCode {
         .name("wayland".into())
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
-                args.expect_presents, layout, ui, event_rx);
+                args.expect_presents, args.poll_coarse, layout, ui, event_rx);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -505,6 +527,7 @@ fn wayland_thread(
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
+    poll_coarse: bool,
     layout: String,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
@@ -550,6 +573,13 @@ fn wayland_thread(
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
     let mut code = 1u8;
+
+    // One per thread, reused every turn. See `tick.rs`: on Windows a
+    // `thread::sleep(5ms)` is a 15.9 ms sleep, and 15.9 ms against
+    // `tick_frames`' 16 ms gate halves the frame rate of anything that animates.
+    let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
+    println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
+    let _ = std::io::stdout().flush();
 
     loop {
         match listener.accept() {
@@ -623,7 +653,7 @@ fn wayland_thread(
             break;
         }
 
-        std::thread::sleep(Duration::from_millis(5));
+        ticker.wait(POLL);
     }
 
     let _ = std::io::stdout().flush();

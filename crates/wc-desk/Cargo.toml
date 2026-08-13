@@ -1,0 +1,39 @@
+[package]
+name = "wc-desk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Look at the guest's interactive desktop: which station, which window, what it looks like, how long a sleep takes"
+
+[target.'cfg(windows)'.dependencies]
+# Everything this binary does is a plain C entry point, as everywhere else in
+# the tree. The feature list is deliberately long and deliberately declared
+# here rather than inherited: docs/design.md §10.10 is the stage where a crate
+# built only because a *sibling* enabled its features, and `cargo build -p
+# wc-desk --target x86_64-pc-windows-gnu` is now part of the gate.
+windows-sys = { workspace = true, features = [
+  # HWND, RECT, GetLastError.
+  "Win32_Foundation",
+  # The capture: CreateDIBSection, BitBlt, the DIB headers, EnumDisplayMonitors.
+  "Win32_Graphics_Gdi",
+  # PrintWindow lives in the XPS module, which is where the printing-era API
+  # it grew out of was filed. It is a user32 export like any other.
+  "Win32_Storage_Xps",
+  # LoadLibraryW / GetProcAddress, for the entry points that must not be
+  # link-time references (see `dpi_report`).
+  "Win32_System_LibraryLoader",
+  # QueryPerformanceCounter: the clock §10.8 measured and found sound.
+  "Win32_System_Performance",
+  # SECURITY_ATTRIBUTES, which `CreateWaitableTimerExW` takes a pointer to.
+  "Win32_Security",
+  # ProcessIdToSessionId — which session are we actually in.
+  "Win32_System_RemoteDesktop",
+  # GetProcessWindowStation / GetThreadDesktop / OpenInputDesktop: the whole
+  # question this stage exists to answer.
+  "Win32_System_StationsAndDesktops",
+  # Sleep, and the high-resolution waitable timer that is the alternative to it.
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging",
+] }

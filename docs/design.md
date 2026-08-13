@@ -2268,6 +2268,13 @@ distinction it exists to draw.
 
 ### 10.8 Wine was wrong a fifth time, and the clock is not the clock
 
+> **[HALF WITHDRAWN BY STAGE 8 — §13.6.]** The DPI paragraph below is wrong, and
+> the title of this section is wrong with it. The call was refused because it
+> was made in an ssh session's window station, where the process is *already*
+> per-monitor-aware before `main` runs; on the guest's real interactive desktop
+> the identical call succeeds, which is what Wine said. The clock paragraph
+> stands and is measured further in §13.8.
+
 Two things the guest said that Wine did not.
 
 **`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is refused.** §8.10 item
@@ -2383,6 +2390,9 @@ rather than in `cargo test`.
    machine the compositor cannot see.
 
 ### 10.13 What to do next, in the order the evidence puts it
+
+> **[ALL FOUR ITEMS NOW CLOSED.]** Item 1 by stage 7 (§12), items 2, 3 and 4 by
+> stage 8 (§13). §13.12 is the current list.
 
 1. **Give the arena a real region.** Guest RAM through QEMU's flat view, which is
    what `shared_vulkan` already does and what §9.10 item 3 always intended.
@@ -3494,6 +3504,13 @@ lifetime and the refusals — where the ordinary bugs live. The claim itself is
 
 ### 12.14 What to do next, in the order the evidence puts it
 
+> **[ITEMS 1, 4 AND 5 CLOSED BY STAGE 8 — §13.]** Item 1's first half is done
+> (§13.5); the typing half is not, and is carried forward as §13.11 item 8.
+> Item 4 has an answer that is not the one it expects — the call was refused
+> because the process was *already* aware, and on a real desktop it succeeds
+> (§13.6). Item 5 is measured and decided (§13.8). Items 2 and 3 are untouched
+> and stand. §13.12 is the current list.
+
 1. **Log in to the guest and look at a window, and type into it.** §10.13 item 2
    and §11.10 item 1 are the same errand now, and stage 8 has the guest for it.
    §8.11 items 2, 4, 5 and 6.
@@ -3511,11 +3528,695 @@ lifetime and the refusals — where the ordinary bugs live. The claim itself is
 
 ---
 
+## 13. Stage 8: somebody looks at the window
+
+Written 2026-08-13, against §10.12 item 3 and §10.13 items 2, 3 and 4 — which
+are §12.14 items 1, 4 and 5 by the time this was merged. Stage 5 put the
+compositor on real Windows; this is the stage where a human being sees what it
+produces.
+
+**Branched from stage 4 and merged after stage 7**, the same arrangement stage 6
+had. Everything measured below was measured on the pre-merge tree unless it says
+otherwise, which matters in exactly one place and is dealt with there: the
+frame-rate number in §13.8 was taken over a **file-backed** arena, before stage 7
+put the arena in guest RAM, and §13.8 is explicit about why that does not
+confound it and what was re-run after the merge to check.
+
+### 13.1 Status in one paragraph
+
+**`weston-terminal`, running on a Linux machine on the other side of a
+hypervisor, is a window on the guest's real desktop with the system's own
+caption, its own title in that caption, and a button in the Windows taskbar.**
+There is a photograph of it (`docs/stage8/stage8-window.png`), a photograph of
+the taskbar with its button (`stage8-taskbar.png`), and a second client in a
+second window (`stage8-window-flower.png`). Two of the four clauses in
+`docs/goal-firefox.md` — title correct, taskbar entry correct — are now
+answered by looking, and the third clause is answered *negatively* by the same
+photograph: the client's own decorations are in there too, offset by 32 pixels
+and clipped at the right and bottom, because the compositor ignores
+`xdg_surface.set_window_geometry`. That bug has been in the tree since stage 3,
+no measurement was ever going to find it, and it is item 1 of §13.12 because
+Firefox is a GTK client with exactly that shape.
+
+The two questions this stage was also given: §10.13 item 3 turns out to have
+been a **misreading** rather than a bug — the DPI call was refused only in a
+window station where the question is meaningless, and Wine was right (§13.6).
+§10.13 item 4 has a number, a decision and a **retraction**: the poll loop no
+longer calls `Sleep`, which is worth doing for latency and was justified here on
+throughput grounds that turned out to be wrong (§13.8).
+
+§8.11 item 5 is the one thing this stage could not settle, for a reason that is
+about the guest's monitor rather than about the code.
+
+### 13.2 An ssh session is not a desktop, and nothing says so
+
+This is the fact the whole stage rests on, and it is worth stating as plainly as
+possible because every earlier stage's evidence was collected inside it.
+
+`wc-desk station` prints the same eight lines in both places. Side by side:
+
+| | over ssh | scheduled task |
+|---|---|---|
+| session | 0 | 1 |
+| window station | `Service-0x0-18f160f$` | `WinSta0` |
+| desktop | `Default` | `Default` |
+| input desktop | `<unreachable: ERROR_INVALID_FUNCTION>` | `Default` |
+| `SM_CXSCREEN` | 1024x768 | 1280x800 |
+| screen capture | **fails, `ERROR_ACCESS_DENIED`** | ok |
+
+Every one of those left-hand answers is an answer rather than an error. The
+window station has a `Default` desktop with the same name as the real one. It
+reports a screen size, and 1024x768 is a plausible screen. `CreateWindowExW`
+succeeds on it, `ShowWindow` succeeds, `SetDIBitsToDevice` succeeds, and
+`GetLastError` is 0 throughout. **The only call in the set that fails is the one
+that tries to read pixels back**, and nothing in stages 1–5 tried to.
+
+So §10.12 item 3 was not "we did not get round to looking". It was that the
+harness could not have looked, and could not have reported that it could not.
+
+### 13.3 Getting onto `WinSta0`, and the three routes that were not available
+
+A process cannot walk into another session's window station; something already
+inside that session has to start it. Four ways were considered:
+
+* **RDP.** The guest is Windows 11 **Home**, which has no RDP host. It also has
+  no `qwinsta.exe` and no `tscon.exe` — both are simply absent from `System32`,
+  which is a faster way to find out than reading the edition table.
+* **A service, `WTSQueryUserToken`, `CreateProcessAsUser`.** The textbook route,
+  and it works. It also means installing a service on a machine whose job is
+  something else, to run a test binary.
+* **`psexec -i 1`.** Not installed, and it is the same mechanism with somebody
+  else's binary in front of it.
+* **The task scheduler.** A task whose principal has
+  `-LogonType Interactive` runs in the session its user is already logged on in,
+  on that session's real window station, with no password and no service. This
+  is what `scripts/wc-desktop.sh` uses, and it is eleven lines of PowerShell.
+
+Two things about it cost a round each:
+
+* **`$env:USERDOMAIN` is `WORKGROUP` under sshd**, not the machine name. So
+  `-UserId "$env:USERDOMAIN\$env:USERNAME"` fails with *"No mapping between
+  account names and security IDs"*, which reads as a broken account and is a
+  wrong environment variable. Asking the token —
+  `[Security.Principal.WindowsIdentity]::GetCurrent().Name` — is correct and is
+  what the generated `runint.ps1` does.
+* **A task's process does not die with the ssh session that started it.** That
+  is the exact opposite of `wc-guest.sh`'s first operational lesson, and it is
+  what makes the compositor startable at all here — but it also means a
+  compositor left behind survives a torn-down connection, so `wc-desktop.sh`
+  kills only its own, matched on the socket name in the command line. Another
+  worktree is entitled to be driving the same guest at the same time, and
+  `wc-guest.sh`'s blanket `taskkill /IM wc-compositor.exe` would reap it.
+
+### 13.4 The desktop is locked, and it did not matter
+
+The guest's session 1 is logged on: `explorer.exe` is running, `Shell_TrayWnd`
+is visible at 0,752–1280,800. On top of all of it is a full-screen lock-screen
+window, with Windows Hello politely reporting *"Ich versuche, Sie zu
+erkennen…"* to an empty room. There is no password for this machine here, and
+none was looked for; the registry has `AutoAdminLogon = 0` and no
+`DefaultPassword`, which was checked once and then left alone.
+
+#### `WTSQuerySessionInformation(WTSSessionInfoEx)` says the session is unlocked. It is not.
+
+This one gets its own heading, because it is the API the next person will reach
+for to decide whether a desktop is available, and it will tell them yes.
+
+Measured on this guest: `WTSSessionInfoEx` returns `SessionFlags = 1`, which is
+`WTS_SESSIONSTATE_UNLOCK`, for a session that is at that moment displaying a
+Windows Hello credential prompt over a lock screen. Not a stale value and not a
+race — it was read repeatedly, while a photograph of the same session showed the
+lock screen with a clock on it.
+
+**What to use instead:** the foreground window. `GetForegroundWindow` plus
+`GetWindowTextW` returned `"Windows-Standardsperrbildschirm"` — Windows' own
+name for the default lock screen — and after a synthetic keystroke it advanced
+to the Hello prompt rather than to the desktop, which is what actually settled
+it. `LogonUI.exe` being in the process list is a second, weaker signal.
+
+None of that stops any of the work below. It changes only what a program should
+believe when it asks the question, and this project has now been lied to about
+DPI by Wine (§13.6), about screen size by a service window station (§13.2) and
+about lock state by `wtsapi32` — all three in the shape of a plausible answer
+rather than an error.
+
+None of that turned out to matter, because a screen grab was the wrong
+instrument anyway. `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` does not read
+the framebuffer: it reads the window's DWM redirection surface, which exists and
+is current for every composited window regardless of what is on top of it. So
+the pictures below are of the real windows, drawn by the real theme at the real
+DPI, on the real desktop — and one of them is of `Shell_TrayWnd` itself, which
+is how the taskbar claim is made without anything being visible.
+
+What that instrument cannot show is z-order, or whether the panel is lit. No
+claim here rests on either. `docs/stage8/stage8-screen.png` is the whole screen,
+kept precisely because it shows the lock screen: it is the control that says the
+window captures are *not* screen grabs.
+
+### 13.5 §8.11's list, answered
+
+**Item 1 — a window appears outside a virtual desktop.** Yes, and now for the
+right reason. §10.12 closed this on the guest, but in the blind window station;
+it is now `WaycomposeToplevel` on `WinSta0\Default` alongside `explorer.exe`.
+
+**Item 2 — the caption is Windows'.** Yes.
+`docs/stage8/stage8-window.png` is a `WS_OVERLAPPEDWINDOW` with a Windows 11
+caption bar: system font, the system's minimise / maximise / close glyphs at the
+right, an 8-pixel border and a 39-pixel caption (`nonclient 16x39` in the
+compositor's own log). Nothing in this project drew any of it, which is the
+claim. It carries the client's title —
+`"Wayland Terminal"` — and the caption *tracks* it: `weston-presentation-shm`
+rewrites its own title on every frame with the delay it just measured, and the
+window in the enumeration reads
+`"presentation-shm: feedback [Delay 0 msecs]"`. So `set_title` →
+`SetWindowTextW` is a live path and not a one-shot at map, which is what
+`docs/goal-firefox.md` needs of it (Firefox retitles on every tab switch).
+
+**Item 3 — `SetDIBitsToDevice` with a negative `biHeight`.** Not upside down,
+and the evidence is a number rather than a glance. §8.4 says the project needs
+both halves of the pixel path to see a blit bug at all: `--dump-frames` writes
+the compositor's *last view of the client's pixels*, before GDI, and the
+`PrintWindow` capture is what came out the other end. Crop the window's client
+area out of the capture and compare it against the top-left crop of that dump,
+and against the same crop of the **flipped** dump:
+
+```
+RMSE upright  778.8  (1.2%)
+RMSE flipped 5852.7  (8.9%)
+```
+
+Upright by a factor of 7.5, and the residual 1.2% is a blinking cursor between
+the two instants. `wc-desktop.sh` makes this a check rather than an anecdote,
+including the negative case: if the flipped crop ever wins by the same margin it
+prints "the window is UPSIDE DOWN", and if neither wins it says the client moved
+and declines to decide.
+
+The same comparison establishes something the orientation question does not,
+and it is what §13.7 is about: the client area is the buffer's **top-left crop**.
+Not a scaled version of it, not a sub-rectangle of it — the top-left corner.
+
+**Item 4 — the modal resize loop.** It works, and this is the first thing that
+has ever been inside it. `wc-desk drag` posts `WM_SYSCOMMAND`/`SC_SIZE` — the
+same entry point the system menu's *Size* uses — and then arrow keys, all
+through the window's own message queue, so this is the real modal loop entered
+the real way rather than a simulation. From inside it:
+
+* the window really resizes (266x289 → 530x498 for `weston-presentation-shm`,
+  902x530 → 1166x794 for `weston-terminal`);
+* the UI thread still answers a `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)`
+  while it is in there;
+* the compositor sends a real `xdg_toplevel.configure` for the new size, and the
+  client reallocates against it;
+* **and it keeps presenting frames — 566 of them.** Sampled every three seconds
+  across the hold, the `--dump-frames` count goes 809 → 910, 1003, 1091, 1271,
+  1375 while the window is inside the loop. Those files are written from
+  `present`, on the UI thread, so the count is literally the number of times that
+  thread woke up and repainted.
+
+That last one is §8.2's `PostMessage`-to-a-message-only-window decision being
+right, measured rather than reasoned, three stages after it was made.
+
+It took three clients to get there, and the reason is worth keeping. The first
+attempt used `weston-terminal`, took **one** sample four seconds in, saw no new
+frames and passed anyway on a before/after comparison — it could not distinguish
+"the wake was discarded" from "an idle terminal had nothing to draw".
+`weston-flower` was the obvious fix and is not one: it draws its flower once and
+stops, which is why it produced four commits in two minutes. Only
+`weston-presentation-shm` commits continuously. **A measurement that cannot tell
+its failure from its null result is not a measurement**, and the harness now
+takes a series across the hold rather than a pair around it.
+
+**The honest caveat, and it is a real one.** The three runs above are what the
+numbers come from, and each is attributable: the compositor's own log records
+`configure 1150x755`, `464x464` and `514x459` for windows it had mapped at
+886x491, 200x200 and 250x250, so it was *this* compositor's window that Windows
+resized in each case. But `wc-desktop.sh` cannot reproduce the loop on demand.
+Six later runs posted the same `WM_SYSCOMMAND`/`SC_SIZE` to the same window,
+confirmed the thread was still answering, and came back with the window exactly
+the size it started — and the harness now reports that as a **skip with its
+reason** rather than a pass or a failure, because it is neither. What changed
+between the working runs and the rest is not known; the leading suspicion is
+that `DefWindowProc` declines to start a sizing loop for a window that is not
+the active one, and on this desktop the active window is the lock screen.
+
+So the modal loop is *observed to work* and *not reliably drivable from here*.
+The three failed attempts to build a probe for it are in `cmd_drag`'s comment,
+because each of them was a plausible idea that a subsequent run showed to be
+measuring the wrong thing — and the last of them, "post `SC_SIZE`, tap one arrow
+key, did the frame move", reported "the loop would not start" about loops that
+had started, because Windows' keyboard sizing does not move the frame until
+Return and spends the first key choosing an edge.
+
+**Item 5 — a scaled display.** **Not answered, and it cannot be on this
+machine.** The guest's desktop is 1280x800 at 96 dpi — a per-monitor-aware
+process and a DPI-unaware one report the same numbers, which is the definition
+of not being scaled. (The adapter's *current mode* is 1920x1200 at 60 Hz, so
+something between Windows and the panel is scaling; whatever it is, it is not
+Windows' DPI scale factor, and there is nothing for the compositor to be
+virtualised by.) What did change is that the mechanism is now known to work —
+see §13.6 — and that the compositor prints the DPI of every window it maps, so
+the first scaled display it meets will say so in its own log rather than needing
+this investigation again.
+
+**Item 6 — `WM_SETICON` in the real taskbar.** The window gets a taskbar button;
+the icon on it is Windows' generic application icon, because **nothing calls
+`WM_SETICON`**. `platform/mod.rs` says as much about `IconImage` — "nothing
+sends this yet" — and `docs/stage8/stage8-taskbar.png` is what that sentence
+looks like on a taskbar. Pinned three buttons to the left of it, for whatever it
+is worth, is Firefox.
+
+**Item 7 — the system frame and the client's own decorations colliding.**
+Confirmed, and worse than predicted. See §13.7.
+
+### 13.6 `SetProcessDpiAwarenessContext`: a misreading, and Wine did not lie
+
+§10.13 item 3 asked for the failure to report *why*, "because 'refused' is not
+enough to tell an already-aware process from an unavailable context, and one of
+those is fine and the other is a bug". `announce_dpi_awareness` now prints
+`GetLastError` and the process awareness either side of the call. The answer is
+the fine one, and §10.8's inference from it was wrong:
+
+```
+over ssh:  -> refused: awareness was already set (ERROR_ACCESS_DENIED)
+           awareness per-monitor-aware -> per-monitor-aware
+on WinSta0: -> ok (err 0)
+           awareness unaware -> per-monitor-aware
+```
+
+A process in the ssh session is **already per-monitor-aware before `main` runs**
+— session 0's window station has no display to virtualise against, so Windows
+does not bother — and `SetProcessDpiAwarenessContext` documents
+`ERROR_ACCESS_DENIED` for "the default API awareness mode for the process has
+already been set". So the call was refused because the answer was already the
+one being asked for. The same binary, on the real desktop, succeeds.
+
+Two consequences, one of them uncomfortable.
+
+**§10.8's conclusion has to be withdrawn.** It said "the mechanism it depends on
+does not work as written, and a scaled display would virtualise the window".
+Neither clause is true. The mechanism works; what did not work was the *place*
+the measurement was taken, which is the same discovery as §13.2 arriving from a
+different direction.
+
+**Wine was not wrong the fifth time.** Wine reported `ok`; the real interactive
+desktop also reports `ok`. The disagreement was between Wine and a window
+station in which the question is meaningless. The count of things Wine has
+actually lied about goes back to four, and the lesson is not "trust Wine less"
+— it is that a negative result from the guest is only evidence if the guest was
+asked in the place the code will really run.
+
+`wc-desk` makes the same call as the compositor, deliberately, from a
+differently-named executable. That is a control rather than duplication: if the
+refusal had been an app-compat shim keyed on an image name or a manifest, the
+two binaries would have disagreed. They do not.
+
+### 13.7 What the picture actually shows, which is a bug
+
+`docs/stage8/stage8-window.png` is the deliverable of this stage and the most
+useful thing in it is wrong.
+
+The compositor configured `weston-terminal` at 886x491. The client committed a
+buffer of **946x555**, whose ink — its own client-side decorations — sits at
++32,+83 and stops 32 pixels short of the bottom. That is not the client being
+disobedient: with client-side decorations, `xdg_toplevel.configure` names the
+*window geometry*, and the buffer is larger by the shadow and frame margins the
+client declares with `xdg_surface.set_window_geometry`. The geometry rectangle
+here is 882x491 at +32,+32 — and 491 is exactly the height that was configured,
+so the client obeyed precisely.
+
+**The compositor does not implement `set_window_geometry` at all.** `grep` finds
+no reference to it in `wc-compositor` or `wc-proxy`, and §13.5 item 3's
+comparison shows the consequence directly: the client area is the buffer's
+top-left crop. So it blits the buffer from (0,0) into a client area sized for the
+geometry rectangle, and what lands on screen is:
+
+* 32 pixels of the client's shadow margin along the top and left, as a border
+  that is not a border;
+* the client's own title bar, immediately under Windows' title bar — §8.11 item
+  7's "two title bars", arriving exactly as predicted;
+* and the right-hand and bottom 60x64 of the surface, including the other two
+  sides of the client's frame, **clipped off**, which is why the outline in the
+  screenshot has a left edge and no right one.
+
+Nothing in stages 3, 4 or 5 could have caught this. Every check on the pixel
+path compares the shadow against the client's buffer, and the shadow is a
+faithful copy of the buffer — the copy is not where the mistake is. The mistake
+is in which sub-rectangle of a correct buffer is the window, and the only
+instrument that shows it is a picture of the window.
+
+It is also the concrete form of the tension `docs/goal-firefox.md` describes.
+The third clause of the goal — *Firefox painting its UI into the titlebar* —
+needs the compositor to negotiate decorations with the client and then extend
+the frame with `DwmExtendFrameIntoClientArea`. `FrameStyle::extend_top` exists
+for that and is still 0. What this screenshot adds is that the *first* step is
+not the DWM call: it is honouring the geometry rectangle, because until the
+compositor knows where the client thinks its window is, it cannot decide what to
+extend.
+
+### 13.8 The 15 ms tick, and the answer that is not `timeBeginPeriod`
+
+§10.13 item 4. Forty samples each, on the interactive desktop
+(`docs/stage8/tick.txt`):
+
+| wait | mean | median | max |
+|---|---|---|---|
+| `Sleep(0)` | 0.000 ms | 0.000 ms | 0.003 ms |
+| `Sleep(1)` | 15.813 ms | 15.781 ms | 18.300 ms |
+| `Sleep(5)` | 15.882 ms | 15.840 ms | 18.467 ms |
+| `Sleep(16)` | 31.299 ms | 31.682 ms | 39.615 ms |
+| high-resolution timer, 1 ms | 1.595 ms | 1.591 ms | 2.652 ms |
+| high-resolution timer, 5 ms | 5.141 ms | 5.094 ms | 5.866 ms |
+
+`Sleep(0)` is the control and it costs nothing, so the harness is measuring the
+scheduler and not itself. `QueryPerformanceCounter` is 10 MHz, as §10.8 found.
+
+The three rows that matter:
+
+* **`Sleep(1)` and `Sleep(5)` are the same number.** It is a quantum, not an
+  overhead: anything below one tick is rounded up to one tick, so the poll
+  loop's 5 ms sleep has always been a 15.9 ms sleep and asking for 1 ms would
+  not have been faster.
+* **`Sleep(16)` is 31.3 ms.** One frame time at 60 Hz costs two ticks, so any
+  cadence built on `Sleep` and aimed at a display refresh gets half of it.
+* **A high-resolution waitable timer is accurate to within 0.6 ms at 1 ms and
+  0.15 ms at 5 ms.** `CreateWaitableTimerExW` with
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (Windows 10 1803) is the documented
+  way to wait for less than a tick, and unlike `timeBeginPeriod` it is scoped to
+  the wait rather than raising the *global* timer resolution — it costs this
+  process, not every process on the machine and its idle power. The user's
+  ruling against `timeBeginPeriod` therefore costs nothing.
+
+**The decision, taken: the poll loop no longer calls `Sleep`.** `tick.rs`
+creates one high-resolution waitable timer per thread and waits on it, falling
+back to `Sleep` when the flag is refused — which is what a Windows older than
+1803 does, and is the old behaviour rather than a failure. The compositor prints
+which one it got at startup (`poll interval 5ms using high-resolution waitable
+timer`), because a run that silently fell back and one that did not differ by
+11 ms a turn and there is otherwise no way to tell them apart afterwards.
+
+#### The claim this section made first, and why it was wrong
+
+Kept, because the mistake is more useful than the correction.
+
+The first version of this section said the poll interval was costing frame rate,
+and had a number for it: counted from `--dump-frames`, the compositor presented
+**465 frames in 12 seconds — 38.8 per second**, in three-second buckets of 93,
+88, 180 and 104. The explanation was a beat. `State::tick_frames` answers frame
+callbacks at most once per 16 ms; it is called once per turn; a turn was 15.9 ms;
+so on most turns `elapsed` is *just under* the gate, the callbacks are not
+answered, and the client waits another whole turn — 31.8 ms, or 31 frames a
+second, with the occasional turn landing on time and producing the 180 bucket.
+It fits the buckets almost too well.
+
+**Then the timer landed, and the frame rate did not move.** Same client, same
+transport, same 12-second window, with the compositor's own startup line
+confirming the high-resolution timer was live: **34.6 frames a second**, against
+38.8 with `Sleep`. Inside the run-to-run noise. If the turn length had been the
+constraint, a turn going from 15.9 ms to 5.1 ms would have moved it and it did
+not.
+
+The beat was a plausible story with an arithmetic that worked out, and it was
+not a finding.
+
+**What was actually being measured was the instrument.** `--dump-frames` writes
+a PPM per present, and in these runs that directory is on the **virtiofs
+export**: 187 KiB per frame at 250x250, several megabytes a second through a
+paravirtual filesystem, on the write path of the very thread whose cadence was in
+question. The measurement had the observer inside the loop. That is the same
+shape as §13.9's mistakes one layer down, and the tell was available all along —
+`Sleep(16)` predicts a 32 Hz ceiling and the observed rate was 38.8, *above* it,
+which should have been the end of the theory rather than a rounding error.
+
+**The replacement is a control rather than a better number.**
+`wc-compositor --poll-coarse` forces the `Sleep` path back on, so the two
+cadences can be compared in one binary with one flag, on one tree, over one
+transport, with nothing dumped: `scripts/wc-desktop.sh fps` runs the same client
+for the same wall time twice and reads the compositor's own closing counter,
+`(N frames presented)`, which costs an increment. That is the shape this
+question needed from the start.
+
+It has run, and it puts a number on the wait at last.
+`weston-presentation-shm`, 45 seconds each, nothing dumped
+(`docs/stage8/fps.txt`):
+
+| poll wait | frames presented | per second | the proxy's view |
+|---|---|---|---|
+| high-resolution timer | 1464 | 32.5 | 1465 commits, 1464 copies |
+| `--poll-coarse` (`Sleep`) | 1415 | 31.4 | 1416 commits, 1415 copies |
+
+**1.03x.** The wait is worth three per cent, not two-fold, and the withdrawn
+claim was not merely unproven but wrong by a factor of twenty.
+
+The same table says why, and that is the more useful half: **the compositor
+presented every commit it was given**, in both configurations — 1464 of 1465 and
+1415 of 1416, one frame behind at the cut, nothing dropped or coalesced anywhere
+in the loop. So the compositor is not the throttle at either cadence. The
+*client* committed 1465 times, and a Wayland client waiting on a frame callback
+commits exactly as often as one comes back. What paces this run is the round trip
+that carries the callback out and the commit back — compositor → `afunix.sys` →
+`probe-relay.exe` → TCP → two `ssh` forwards → proxy → client, and all the way
+back. About 30 ms of it, against a 5 ms turn at one end, which is why moving that
+end by 10 ms moves the total by 3%.
+
+What can be said, and what cannot:
+
+* **Certain:** a turn of the poll loop cost 15.9 ms and now costs 5.1 ms. That
+  is `docs/stage8/tick.txt`, measured directly, and it is a *latency* fact.
+  Every UI event crosses this loop — §8.2's stated cost, "UI events reach the
+  client on the next turn" — so a close, a resize configure and a keystroke were
+  all up to 15.9 ms late and are now up to 5.1 ms late. Nothing about that
+  depends on the frame-rate question, and it is the whole justification the
+  change needs.
+* **Measured, and small:** the wait is worth 3% of throughput. It was claimed
+  here as a halving; that claim is withdrawn and this is the number.
+* **Ruled out:** the compositor. It presents every commit it receives, 1464 of
+  1465, so nothing between `dispatch_clients` and `SetDIBitsToDevice` loses
+  frames at either cadence.
+* **Ruled out:** the copy. The proxy reports 126 µs per copy — three parts in a
+  thousand of the wall clock at this rate.
+* **Still open:** the **round trip**, which is what is left, and which is mostly
+  a property of *this test rig* rather than of the design: the real topology has
+  no `ssh -L` in it. Worth establishing before anything is optimised.
+  §13.12 item 3.
+
+### 13.9 Two worktrees, one guest, and a window that was not ours
+
+An operational lesson that cost three runs and is going to recur, because the
+project now has eight worktrees and one Windows machine.
+
+Another worktree was driving the same guest at the same time. Its compositor
+registers the same `WaycomposeToplevel` window class, runs the same
+`weston-terminal`, and produces a window of very nearly the same size with
+exactly the same caption. `wc-desk shot --class WaycomposeToplevel` therefore
+photographed **its** window about as often as ours — and `wc-desk drag` put
+*its* window into a modal resize loop.
+
+The symptoms were not "wrong window". They were: an orientation check that
+compared a capture against our own frame dumps and got a large error in both
+directions, reported as "undecided"; and a resize check that intermittently did
+nothing. Both read as flakiness, and both were chased as flakiness first.
+
+Three rules came out of it, and they are in the code rather than here:
+
+* **Address windows by process id, never by class.** `wc-desk` takes `--pid`,
+  `wc-desktop.sh` learns it from the compositor's own command line, and `--class`
+  is a filter within that rather than a selector.
+* **Kill by socket name, not by image name.** `wc-desktop.sh` matches the socket
+  in the command line, so it can only ever reap its own.
+* **`wc-guest.sh`'s blanket kill is narrowed to an image *path*.** It used to do
+  `taskkill /IM wc-compositor.exe`; stage 7 guarded that behind "only when
+  `WC_GUESTNAME` is unset", which is the wrong way round — the default name is
+  exactly what a run that has not thought about sharing the guest uses, so the
+  blanket kill fired in precisely the case where two runs collide. It now kills
+  only processes whose `Win32_Process.ExecutablePath` starts with this deploy's
+  own directory, matched with a trailing separator so that `wctest` cannot match
+  `wctest7`. An image name is not an identity on this guest; the path is,
+  because every experiment deploys its own copy into its own directory.
+
+There is a fourth thing that is not a rule but is worth saying: **a wipe and a
+kill have an order.** `do_window` emptied the frame-dump directory and *then*
+killed leftover compositors, so a compositor still alive from an interrupted run
+kept dumping into the directory that had just been emptied, and the next run
+counted its frames and read its log. The symptom was "the capture does not match
+the dump", which is indistinguishable from a blit bug, and it was chased as one
+twice.
+
+### 13.10 The gates
+
+Run from master's checkout after the merge. The two `window` rows are the
+per-check results seen on the merged tree; their run was cut short at the
+teardown by the unredirected `ssh -N -L` described below, after every check had
+reported, and the summary line is arithmetic over those.
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | 135 tests, 0 failures (133 on master, +2 for `tick.rs`) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build -p wc-desk --target x86_64-pc-windows-gnu` | builds alone |
+| `scripts/wc-desktop.sh probe` | 8 passed, 0 failed |
+| `scripts/wc-desktop.sh window` (`weston-terminal`) | 8 passed, 0 failed, 2 skipped |
+| `scripts/wc-desktop.sh window` (`weston-presentation-shm`) | 7 passed, 0 failed, 3 skipped |
+| `scripts/wc-desktop.sh fps` | 1 passed, 0 failed — 1464 frames against 1415 |
+
+The skips are the modal-loop block and, for the animating client, the
+orientation check — `weston-presentation-shm` draws a uniformly black surface at
+the moment of capture, so its flipped and unflipped crops are byte-identical and
+the check correctly declines to decide rather than passing on a coincidence.
+Both are the harness saying what it could not establish this run, which is the
+behaviour §13.5 item 4 argues for.
+
+**`fps` took three attempts and every failure printed as something else**, which
+is the pattern this whole stage keeps running into.
+
+* An `ssh -N -L` backgrounded on the far side with its stdout still attached to
+  the outer `ssh` **holds that connection open forever**. The run hung, and it
+  was still hanging when the guest hibernated underneath it, so it looked like
+  the guest being the problem. The same line exists in `do_window`'s driver and
+  has been fixed there too — it is why that block's teardown hung once as well.
+* Two back-to-back runs on **one TCP port** left the second with a listener in
+  `TIME_WAIT`, so its client never connected and it reported `0 commits` —
+  which looked exactly like `--poll-coarse` breaking the compositor.
+* Introducing a per-mode `$port` and reusing the name in a heredoc that
+  `do_window` also expands made `$port` unbound *there*, and `set -u` killed the
+  script one line after it had said which compositor it found.
+
+None of the three was what it looked like, and all three are one line.
+
+The test count moved by two, and only two, for the same reason as §10.11:
+everything else added here is a Windows-only binary or a harness, and its
+evidence is a photograph rather than an assertion. The two are `tick.rs`'s, and
+they are the ones that can run on the machine that runs `cargo test` — that a
+5 ms wait waits, and that it does not cost a scheduler tick. The photographs are
+checked in under `docs/stage8/`, and `scripts/wc-desktop.sh` reproduces them.
+
+Two things after the merge that were not true before it, both from
+`wc-desktop.sh` being written against a stage-4 tree:
+
+* **Stage 6's keymap.** The compositor advertises a `wl_seat` now, so
+  `weston-terminal` binds one and is sent a `wl_keyboard.keymap`. Without
+  `--shared-dir`/`--shared-peer-prefix` that keymap is a `Local\wc-…` section no
+  Linux process can open and the proxy ends the connection — so exactly one of
+  this script's two clients would have started failing and the other would not.
+  Added. This is the same trap stage 7 hit in `wc-guest.sh` when stage 6 landed
+  under it (§12.11), arriving here one merge later.
+* **Stage 7's arena.** `wc-desktop.sh` still uses the *file-backed* arena, and
+  that is now known to be the frozen one: a run of it reports **1749 frames
+  presented, 18 distinct**, which is §12.7's problem intact. It does not affect
+  any claim here — every window, caption, taskbar and DPI fact is about one
+  frame, and the frame-count claims are explicitly about the poll loop's cadence
+  rather than the pixels' freshness — and the harness now prints both numbers
+  side by side so that the two can never again be confused for each other.
+
+### 13.11 What is not proven, updated
+
+§10.12's list, with this stage's changes:
+
+1. ~~The window has never been seen.~~ **Closed.** §10.12 item 3 is what this
+   stage was for.
+2. **New, and the largest single thing: `xdg_surface.set_window_geometry` is
+   not implemented** (§13.7). Every client with client-side decorations — which
+   is every GTK client, which is Firefox — is being drawn offset by its shadow
+   margin and clipped by it. It was invisible to every check that exists.
+3. **The modal sizing loop cannot be entered on demand** (§13.5 item 4). It has
+   been observed to work three times, each attributable to this compositor by its
+   own log; the harness cannot make it happen when asked and now skips with its
+   reason rather than guessing. The suspicion is that `DefWindowProc` will not
+   start a sizing loop for a window that is not the active one, and on this
+   desktop the active window is the lock screen — which would make it a property
+   of the locked session rather than of the compositor, and would go away with a
+   credential.
+4. **A scaled display is still unmeasured** (§8.11 item 5). Not because it was
+   skipped: this guest's desktop is 96 dpi and there is nothing to measure. The
+   call now demonstrably works and the DPI of every mapped window is logged, so
+   the next machine answers it for free.
+5. **`WM_SETICON` is still never called**, so the taskbar icon is the system
+   default. `docs/goal-firefox.md`'s first clause is half-done: the button is
+   right, the picture on it is not, and the interesting half of that problem —
+   resolving an app-id to icon pixels on the *Linux* side and shipping them —
+   has not been started.
+6. **What holds an animating client to ~32 frames a second is not known**
+   (§13.8). Three things are now ruled out by measurement rather than by
+   argument: the poll loop's wait (worth 3%, measured against its own control),
+   the compositor (it presents 1464 of 1465 commits), and the copy (126 µs).
+   What is left is the round trip out to the client and back, most of which is
+   this test rig's `ssh -L` rather than the design's.
+7. ~~The arena is still a file.~~ **Closed by stage 7** (§12), which landed
+   while this stage was being built. `wc-desktop.sh` itself still uses the file
+   arena and therefore still sees the freeze — 1749 presented, 18 distinct — but
+   that is this harness being behind rather than the project being.
+8. **`SealedFile`, `with_data_mut`, `KeyboardHandle::new`** — unchanged from
+   §10.12 item 5.
+9. **Input reaches the client, but not from this stage.** Stage 6 built the
+   seat (§11); the keystrokes synthesised *here* went to Windows, to drive the
+   modal loop, and none of them was forwarded to a Wayland client. Nothing has
+   yet typed into a window on the interactive desktop, which is the half of
+   §12.14 item 1 this stage did not do.
+10. **Nothing has been watched by a human on the glass.** The captures are DWM
+   redirection surfaces, which is the right instrument and not the same
+   instrument. Whether the panel shows what DWM holds is untested, and the way
+   to test it is to unlock the machine.
+
+### 13.12 What to do next, in the order the evidence puts it
+
+**1. Implement `xdg_surface.set_window_geometry`. Nothing else on this list is
+close.**
+
+It is not implemented anywhere — `grep -r set_window_geometry crates/` finds
+nothing in `wc-compositor` or `wc-proxy` — and the consequence is that **every
+client with client-side decorations is drawn wrong**. Not subtly: offset by its
+whole shadow margin, and clipped by the same amount on the opposite two sides.
+
+The numbers, from `weston-terminal` on the guest (§13.7):
+
+| | |
+|---|---|
+| what the compositor configured | 886x491 |
+| the buffer the client committed | **946x555** |
+| the client's window-geometry rectangle | **882x491 at +32,+32** |
+| what the compositor blitted | the buffer's top-left 886x491 |
+| measured, capture against dump | RMSE **779** upright, **5853** flipped |
+
+So the geometry *height* the client chose, 491, is exactly the height that was
+configured — the client obeyed precisely and the compositor then read the wrong
+rectangle out of the reply. What lands on screen is 32 px of the client's drop
+shadow along the top and left, the client's own title bar immediately under
+Windows', and the right-hand and bottom 60x64 of the surface missing.
+
+**This will hit Firefox immediately.** Firefox is a GTK client, GTK uses
+client-side decorations with a shadow margin of exactly this shape, and stage 9
+is pointing it at this compositor now. The failure will look like a window
+that is offset and clipped, and it will look like a blit bug, and it is not one:
+the blit is correct and reads the wrong rectangle. The fix is in the commit
+path, where `xdg_surface`'s pending geometry has to become both the size the
+window is asked to be and the origin `Shadow::blit` copies from —
+`FrameStyle::content_origin` already exists and is the place it belongs.
+
+2. **Send a `WM_SETICON`** (§13.5 item 6), which means deciding where icon
+   pixels come from: `xdg-toplevel-icon-v1` if Firefox implements it, otherwise
+   an app-id lookup on the Linux side and the pixels shipped across.
+   `docs/goal-firefox.md`'s first clause is otherwise done.
+3. **Find out whether the frame rate is the rig's or the design's** (§13.8). The
+   poll loop's wait, the compositor and the copy are all measured and all ruled
+   out; what is left is a round trip that runs through `probe-relay.exe`, TCP and
+   two `ssh` forwards, none of which exist in the topology
+   `docs/goal-firefox.md` describes. Measure that before optimising anything, or
+   the optimisation will be of the harness.
+4. **Unlock the guest, or decide not to.** Three of this stage's remaining gaps
+   — the modal loop that will not start, whether the panel shows what DWM holds,
+   and a scaled display — are all downstream of a session sitting behind Windows
+   Hello (§13.11 items 3, 4 and 9).
+
+---
+
 ## 14. Stage 10: the compositor can put something *into* the arena
 
 ### 14.1 Status in one paragraph
 
-Written 2026-08-13, after stage 7. **§12.13 item 7 is closed.** A
+Written 2026-08-13, branched from stage 7 and **merged after stage 8** — so
+§13 is stage 8's and this is §14, and every gate below was re-run from master's
+checkout after that merge rather than carried over from the branch.
+**§12.13 item 7 is closed.** A
 `wl_keyboard.keymap` now crosses as `Descriptor::ArenaSlice` — three integers,
 naming nothing — and `weston-eventdemo`, which has never heard of this project,
 decoded `helloZ` from it with its own libxkbcommon on a run where the compositor
@@ -3904,9 +4605,10 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
 > `--outbound` on the locator, **no `--shared-dir` at all** on the guest-RAM
 > path, and three assertions in the checker — that a descriptor came from the
 > arena, that the export's `keymaps` directory stayed empty, and that the
-> compositor reported the window. It needs a guest, and stages 8 and 9 have it.
-> The harness being wired and the assertions being written is the right stopping
-> point; taking the guest from them would not be.
+> compositor reported the window. It needs a guest; stage 8 has finished with
+> it and stage 9 has not. The harness being wired and the assertions being
+> written is the right stopping point — taking the guest from a stage that is
+> mid-run would not be, and §12.8 exists because somebody already did.
 
 §12.13's list, with the rest of this stage's changes:
 
@@ -3934,27 +4636,50 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
    asserted rather than proven over time (item 4), 64 MiB is still a guess and
    this stage produced a client that would have exhausted 4 MiB (item 5), and
    §11.10's whole list is unchanged.
-6. **Wine would be lying an eighth time if it lies here.** The arena leg is a
-   Wine pass and therefore a hypothesis. What it can say is that the wire
-   format, the allocator, the ownership split and the client's own libxkbcommon
-   all agree; what it cannot say is anything about guest RAM, which is the
-   boxed item. (The running count is **seven**, not eight: stage 8 withdrew the
-   `SetProcessDpiAwarenessContext` entry — a process in session 0 is already
-   per-monitor-aware because there is no display to virtualise, which is not a
-   Wine discrepancy at all. Same operational conclusion, one fewer data point,
-   and worth correcting because a count that only ever goes up is not a
-   measurement.)
+6. **The arena leg is a Wine pass and therefore a hypothesis.** What it can say
+   is that the wire format, the allocator, the ownership split and the client's
+   own libxkbcommon all agree; what it cannot say is anything about guest RAM,
+   which is the boxed item.
+
+   **On the count of times Wine has been wrong, this stage was handed three
+   different numbers and is not going to add a fourth.** The number in the brief
+   for this stage was eight; the number in the handover correcting it was seven;
+   **§13.6, written this week and now merged, says four** — it withdrew the
+   `SetProcessDpiAwarenessContext` entry on the grounds that a process in session
+   0 is already per-monitor-aware because there is no display to virtualise, so
+   Wine and the real desktop agreed all along and the disagreement was with a
+   window station in which the question is meaningless.
+
+   §13.6 is the authority here, because it is the only one of the three that
+   comes with the measurement attached. The discrepancy is worth a paragraph
+   rather than a silent correction, for the same reason §14.7 exists: **a number
+   that is passed between people rather than derived from the document drifts,
+   and it drifts upward**, because withdrawals are remembered by whoever made
+   them and additions are remembered by everybody. The operational conclusion is
+   the one §13.6 draws and it does not depend on the count at all — a negative
+   result from Wine, or from the guest, is only evidence if the question was
+   asked in the place the code will really run. For this stage that place has a
+   hypervisor in it and Wine does not.
 
 ### 14.13 What to do next
 
 1. **Run `scripts/wc-guest.sh stage4` on the guest, over `guest-ram`.** This is
    the boxed item in §14.12 and there is no second thing on this list until it is
    done: everything above is evidence about a file arena, and the deployment this
-   project exists for does not have one. Do it when stages 8 and 9 are finished
-   with the guest; `WC_GUESTNAME` and `WC_HOST_SHARE` keep it out of their way
-   (§12.8). The run also settles §14.12 item 1.
+   project exists for does not have one. Stage 8 has finished with the guest;
+   stage 9 has not, and `WC_GUESTNAME` and `WC_HOST_SHARE` keep this out of its
+   way (§12.8). The run also settles §14.12 item 1.
+
+   Stage 8 makes one part of it easier and one part harder. Easier: §13.2
+   established that the interactive desktop is reachable and that a run in an
+   ssh session's window station is measuring the wrong place — so if the arena
+   leg is ever re-run for anything other than the transport, it should be run
+   there. Harder: §13.6's lesson applies to this stage's own evidence with no
+   translation. A file arena on a workstation is a window station in which the
+   question is meaningless, in exactly the sense §13.6 means.
 2. **§12.14's list is otherwise unchanged**, and its item 1 — log in and look at
-   a window — is stage 8's, which is landing as §13.
+   a window — is **closed by §13**, which is why it is no longer the largest gap
+   in the project and the boxed item in §14.12 is.
 3. **Give the file-arena case one origin for its number too.** The plan carries
    it for guest RAM and a flag carries it on both sides for a file, which is the
    disagreement this design otherwise avoids. The fix is probably a header in the

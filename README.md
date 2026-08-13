@@ -115,6 +115,20 @@ QEMU's flat view and the same check now reports 626 frames, 60 distinct, the
 commonest 11 — the control's numbers. `docs/design.md` §10.7 is the failure and
 §12 is the fix.
 
+```
+WC_HOST=you@vm-host WC_HOST_WESTON=/path/to/weston/bin scripts/wc-desktop.sh all
+```
+
+The same compositor on the guest's **interactive desktop**, and photographs of
+what it puts there. Everything above this line runs inside an ssh session, whose
+window station has no display behind it — `CreateWindowExW` succeeds, the blits
+succeed, and nothing is ever on a screen. This is the script that gets onto
+`WinSta0` and looks; `docs/stage8/` holds what it saw, one image per claim, and
+`docs/design.md` §13 is the argument. The most useful thing in it is a bug the
+picture shows and no check could: `xdg_surface.set_window_geometry` is not
+implemented, so every client with its own decorations is drawn offset by its
+shadow margin and clipped by it.
+
 ## Layout
 
 ```
@@ -134,6 +148,10 @@ crates/
   wc-proxy       stage 4, **Linux only**: a Wayland server to an unmodified
                  local client and a client of the Windows compositor, so a
                  `wl_shm` buffer crosses the boundary with nothing passed
+  wc-desk        stage 8, **Windows only**: which window station a process is
+                 on, which windows the shell gives a taskbar button, and
+                 `PrintWindow` captures that work through a lock screen. Also
+                 what `Sleep` costs against a high-resolution waitable timer
   wc-xkb-probe   proves the xkbcommon crate links and runs as a Windows binary
 vendor/
   wayland-backend    forked 0.3.16      | ours; workspace members, linted
@@ -165,6 +183,10 @@ scripts/
                      coherency, what a pool costs per transport, and stage 4
                      across a real VM boundary; block 10 is stage 7's arena --
                      guest RAM, located from outside the VM
+  wc-desktop.sh      the stage-8 acceptance test — the compositor on the guest's
+                     **interactive desktop** rather than in an ssh session, and
+                     photographs of what it puts on screen; `fps` is the
+                     poll-cadence A/B. Everything it produces is in docs/stage8/
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)
