@@ -1328,6 +1328,8 @@ dependencies = [
  "png",
  "quick-xml",
  "sv-arena",
+ "sv-proto",
+ "sv-transport",
  "wc-handle",
 ]
 

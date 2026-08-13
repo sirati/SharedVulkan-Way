@@ -29,11 +29,17 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 RUNDIR=${SV_RUNDIR:-/tmp/sv-guest}
 ARENA=$((32 << 20))
 KEEP=0
+# §36.6. With --bell the guest attaches a doorbell on the second virtio-serial
+# port and the ICD attaches to the host end of the same chardev; without it,
+# every cross-VM wait runs out its 20 ms slice. The flag exists so the two can
+# be measured against each other in one script rather than by editing it.
+BELL=
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --arena) ARENA=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --bell) BELL=1; shift ;;
     *) echo "unknown argument $1"; exit 2 ;;
   esac
 done
@@ -96,7 +102,7 @@ say "starting the GPU side inside the guest"
 # `/sv`, and nothing else. It is dynamically linked against the store, so a copy
 # runs there unchanged.
 cp "$ROOT/target/debug/sv-gpu-server" "$RUNDIR/sv-gpu-server"
-GUEST_CMD="/sv/sv-gpu-server guest --socket /dev/virtio-ports/org.sirati.svcold.0 --arena $ARENA"
+GUEST_CMD="/sv/sv-gpu-server guest --socket /dev/virtio-ports/org.sirati.svcold.0 --arena $ARENA${BELL:+ --bell org.sirati.svbell.0}"
 printf '%s\n' "$GUEST_CMD" > "$RUNDIR/guest-cmd.sh"
 say "  $GUEST_CMD"
 
@@ -114,10 +120,17 @@ for _ in $(seq 1 300); do
   sleep 1
 done
 
-say "vulkaninfo through the real loader, our ICD, and a GPU side in the VM"
+say "vulkaninfo through the real loader, our ICD, and a GPU side in the VM${BELL:+, with a doorbell}"
+# Timed, because §36.6 is a latency claim and this is the only place in the tree
+# where a real application's commands cross a real hypervisor. Every one of them
+# is a round trip the app side parks for, so the wall clock here *is* the sum of
+# those waits plus the work — which is exactly the quantity the doorbell changes.
+APP_T0=$(date +%s.%N)
 env VK_DRIVER_FILES="$ROOT/target/debug/sv_icd.json" SV_SOCKET="$RUNDIR/icd.sock" \
+  ${BELL:+SV_BELL="$RUNDIR/bell.sock"} \
   vulkaninfo --summary > "$RUNDIR/app.log" 2>&1
 APP_RC=$?
+APP_MS=$(awk "BEGIN{printf \"%.0f\", ($(date +%s.%N) - $APP_T0) * 1000}")
 wait $HOSTD_PID
 HOSTD_RC=$?
 
@@ -135,6 +148,7 @@ echo
 # else means it answered from the app side rather than from the VM.
 if [ $APP_RC -eq 0 ] && [ $HOSTD_RC -eq 0 ] && [[ "$REPORTED" == *llvmpipe* ]]; then
   echo "cross-VM: PASS — the application read a driver that lives in another kernel"
+  echo "  app side took ${APP_MS} ms${BELL:+ (doorbell attached)}${BELL:- (no doorbell: every wait runs out its 20 ms slice)}"
   exit 0
 fi
 echo "cross-VM: FAIL (app=$APP_RC hostd=$HOSTD_RC device='${REPORTED:-none}')"

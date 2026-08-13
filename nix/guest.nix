@@ -66,6 +66,20 @@
       "-chardev socket,id=svcold,path=\${SV_RUNDIR:-/tmp/sv-guest}/cold.sock,server=on,wait=off"
       "-device virtserialport,bus=svserial.0,chardev=svcold,name=org.sirati.svcold.0"
 
+      # (3b) THE DOORBELL (§36.6). A second port on the same controller, and it
+      # is a second port rather than a second use of the first for one reason:
+      # the cold path carries framed `ColdMessage`s and the doorbell carries
+      # bare bytes with no framing at all, deliberately (§36.6.3), so sharing
+      # one port would mean giving the doorbell a frame purely to coexist —
+      # which is the property `vdoorbell` argues it must not have.
+      #
+      # A port costs nothing here: the controller already exists, so this is one
+      # more `virtserialport` on it. On `testhost` the same addition can be
+      # made to a *running* guest over QMP `device_add`, which is why measuring
+      # it here transfers rather than being a local convenience.
+      "-chardev socket,id=svbell,path=\${SV_RUNDIR:-/tmp/sv-guest}/bell.sock,server=on,wait=off"
+      "-device virtserialport,bus=svserial.0,chardev=svbell,name=org.sirati.svbell.0"
+
       # A name the harness can match on, so `sv-hostd --vm` finds this QEMU and
       # not another one. `find_qemu_pid` refuses rather than guesses when two
       # match, which is exactly why the name has to be distinctive.

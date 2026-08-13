@@ -477,12 +477,13 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "guest" => {
             let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
             let huge = args.iter().any(|a| a == "--huge");
-            guest(driver, &socket, arena_size, huge)
+            let bell = arg("--bell");
+            guest(driver, &socket, arena_size, huge, bell.as_deref())
         }
         _ => {
             eprintln!(
                 "usage: sv-gpu-server <serve|attach|guest> --socket <path> \
-                 [--device N] [--arena BYTES] [--clients N] [--huge]"
+                 [--device N] [--arena BYTES] [--clients N] [--huge] [--bell PORT]"
             );
             Err("no subcommand".into())
         }
@@ -825,6 +826,7 @@ fn guest(
     socket: &str,
     arena_size: u64,
     huge: bool,
+    bell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use sv_arena::guestram::{GuestRamProvider, Pages};
@@ -943,6 +945,36 @@ fn guest(
     control.stamp_epoch()?;
     eprintln!("[gpu] control region published, generation {generation}");
 
+    // THE DOORBELL (waycompose-design.md §36.6). Wired here and not earlier:
+    // `Doorman` rings bells in this control region, so the region has to exist
+    // and be stamped before anything can answer the door.
+    //
+    // Without it, every wait on this side runs out its slice, because a
+    // `FUTEX_WAKE` from the host reaches nobody across the hypervisor —
+    // 216.9 ms a present against 1.7-2.1 ms local. With it, a wake crosses in
+    // ~9 µs (measured, §36.6.3).
+    //
+    // Optional, and a failure to open the port is a warning rather than an
+    // error: a session without a doorbell is exactly the session that shipped,
+    // and refusing to start because the *optimisation* is unavailable would
+    // make this strictly worse than not having built it.
+    let control = Arc::new(control);
+    let _doorman = match bell {
+        None => None,
+        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(name)
+            .and_then(|p| sv_transport::vdoorbell::attach(p, Arc::clone(&control)))
+        {
+            Ok(d) => {
+                eprintln!("[gpu] doorbell attached on /dev/virtio-ports/{name}");
+                Some(d)
+            }
+            Err(e) => {
+                eprintln!("[gpu] no doorbell on {name} ({e}); waits will run out their slice");
+                None
+            }
+        },
+    };
+
     let fns = driver.load_fns();
     report_missing(&fns);
 
@@ -956,7 +988,7 @@ fn guest(
         queue_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
-        Arc::new(control),
+        control,
         shared,
         geometry.ring_slot_count,
         std::time::Duration::from_secs(30),
