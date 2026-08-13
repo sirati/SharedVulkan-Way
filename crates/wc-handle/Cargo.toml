@@ -48,3 +48,10 @@ libc = "0.2"
 # Windows binary. A `cfg(unix)` gate here would mean the Windows build kept its
 # own copy of the number, which is the thing being deleted.
 sv-arena = { workspace = true }
+# GROWTH. The control region and the rings the growth channel rides on.
+# Nothing in `src/grow.rs` extends them: `SharedRegion::from_raw` already
+# exists for the guest-RAM case and its own doc comment names it, and
+# `Control`/`Ring` are used exactly as `sv-gpu-server` and `sv-icd` use them.
+# Waycompose is an addition to shared_vulkan rather than a second system
+# beside it, so a growth request is a message on that channel.
+sv-transport = { workspace = true }

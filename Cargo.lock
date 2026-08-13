@@ -1301,6 +1301,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sv-arena",
+ "sv-transport",
  "windows-sys",
 ]
 
