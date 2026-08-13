@@ -163,6 +163,66 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
     Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len })
 }
 
+/// The granularity every stamp and every locate step works in. Not a host page
+/// size: it is the *guest-physical* page size the host's scan sweeps in, and it
+/// stays 4096 whatever the allocator did (shared_vulkan design.md §5.1).
+pub const REGION_PAGE: usize = 4096;
+
+/// Commit `len` bytes of this process's own memory, pin them, and let the caller
+/// stamp every 4096-byte page before the region is handed back read-only.
+///
+/// STAGE 7. The Windows implementation is the shipping one — a guest-RAM arena
+/// only means anything inside the VM — and this is its Unix twin, for the same
+/// reason every other function in this file has one: it is what makes the path
+/// testable on the machine that builds it. `mmap(MAP_ANONYMOUS)` for
+/// `VirtualAlloc`, `mlock` for `VirtualLock`, the same stamping loop, the same
+/// "locked is a report and not a requirement" contract.
+///
+/// It is **not** a mock. What it cannot reproduce is the only part that matters
+/// on the guest — that these pages are inside a VM and findable from outside it
+/// — and no amount of Linux-side testing would have said anything about that.
+/// What it does reproduce is the registry plumbing, the stamp layout and the
+/// lifetime, which are where the ordinary bugs live.
+pub fn alloc_locked_region(
+    len: usize,
+    stamp: &dyn Fn(u32, &mut [u8]),
+) -> io::Result<(MappedView, bool)> {
+    if len == 0 || !len.is_multiple_of(REGION_PAGE) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
+        ));
+    }
+    // SAFETY: an anonymous mapping with a null address hint and a length checked
+    // non-zero above; no descriptor is involved. The result is checked.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // Owns the mapping from here, so every early return unmaps it.
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`, and
+    // no other reference to it exists yet.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+    for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
+        stamp(i as u32, page);
+    }
+    // Best effort, exactly as on Windows: `RLIMIT_MEMLOCK` is small for an
+    // ordinary account and a region that is merely resident is still a region.
+    // SAFETY: the mapping is live and `len` bytes long.
+    let locked = unsafe { libc::mlock(ptr, len) } == 0;
+    Ok((view, locked))
+}
+
 /// Create an object named by a filesystem path.
 ///
 /// On Unix this is `create_section` under another name, and that identity is

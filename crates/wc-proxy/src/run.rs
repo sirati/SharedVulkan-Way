@@ -34,6 +34,10 @@ struct Args {
     arena_id: u32,
     arena_size: u64,
     arena_path: PathBuf,
+    /// STAGE 7. The plan `wc-arena-host` wrote: an object to open and the runs
+    /// of it that are the guest's arena. Set, `--transport arena` maps guest
+    /// RAM; unset, it opens `--arena-path` as a file.
+    arena_plan: PathBuf,
     scope: CopyScope,
     headroom: u64,
     trace: bool,
@@ -54,8 +58,12 @@ usage: wc-proxy --upstream <path> [options]
   --peer-prefix S        shared-file: how the peer spells --pool-dir,
                          e.g. 'Z:\\tmp\\wc-pools\\'
   --arena-path PATH      arena: the region's file on this side
+  --arena-plan PATH      arena: instead of a file, the guest-RAM plan written by
+                         wc-arena-host -- the object to open and the runs of it
+                         that are the guest's own pinned pages
   --arena-id N           arena: the number both sides call it (default 0)
-  --arena-size BYTES     arena: how big (default 64 MiB)
+  --arena-size BYTES     arena: how big (default 64 MiB; with --arena-plan the
+                         guest's allocation decides and this is ignored)
 
   --copy pool|buffer|damage   how much to copy per commit (default damage)
   --trace                log every message in both directions\n  --pool-headroom N      over-allocate each region N-fold so resize fits
@@ -78,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         arena_id: 0,
         arena_size: 64 << 20,
         arena_path: PathBuf::new(),
+        arena_plan: PathBuf::new(),
         scope: CopyScope::Damage,
         headroom: 1,
         trace: false,
@@ -95,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
             "--pool-dir" => a.pool_dir = next()?.into(),
             "--peer-prefix" => a.peer_prefix = next()?,
             "--arena-path" => a.arena_path = next()?.into(),
+            "--arena-plan" => a.arena_plan = next()?.into(),
             "--arena-id" => a.arena_id = next()?.parse().map_err(|e| format!("--arena-id: {e}"))?,
             "--arena-size" => {
                 a.arena_size = next()?.parse().map_err(|e| format!("--arena-size: {e}"))?
@@ -172,6 +182,22 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 "[proxy] transport shared-file: {} here, {:?} there",
                 args.pool_dir.display(),
                 args.peer_prefix
+            );
+            Box::new(t)
+        }
+        // STAGE 7. The region is the guest's RAM, and the compositor is the side
+        // that *provided* it — so there is no path to tell it about and nothing
+        // for it to open. What it was started with is
+        // `--arena-guest-ram <id>:<size>`, and what it printed is the run id
+        // this plan was made from.
+        "arena" if !args.arena_plan.as_os_str().is_empty() => {
+            let t = Arena::from_plan(args.arena_id, &args.arena_plan)?;
+            println!(
+                "[proxy] transport arena {}: {} bytes of {} \
+                 (nothing is opened per pool, and the compositor opened nothing at all)",
+                t.id(),
+                t.size(),
+                t.origin(),
             );
             Box::new(t)
         }

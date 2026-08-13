@@ -83,14 +83,16 @@ WC_HOST=you@vm-host WC_HOST_WESTON=/path/to/weston/bin scripts/wc-guest.sh all
 ```
 
 The same thing on **real Windows**, in a VM. Blocks 1-6 run from here; blocks
-7-9 are stage 4 and run the proxy and the client on `WC_HOST`, the machine that
-shares a filesystem with the guest, because a pixel has to land in memory both
-sides can name and protocol bytes do not. Without `WC_HOST` those three blocks
-skip and say why.
+7-10 run the proxy, the client and the arena locator on `WC_HOST`, the machine
+the VM is on, because a pixel has to land in memory both sides can name and
+protocol bytes do not. Without `WC_HOST` those four blocks skip and say why.
 
-One check is expected to fail: the shared mount is not coherent while mapped, so
-a client that redraws every frame gets a frozen window and `wc-guest.sh` says
-so. `docs/design.md` §10.7 is the measurement and why it must keep failing.
+Everything passes. It did not in stage 5: the shared mount is not coherent while
+mapped, so a client that redraws every frame got a frozen window and
+`wc-guest.sh` said so. Stage 7 replaced the region with guest RAM located through
+QEMU's flat view and the same check now reports 606 frames, 60 distinct, the
+commonest 11 — the control's numbers. `docs/design.md` §10.7 is the failure and
+§11 is the fix.
 
 ## Layout
 
@@ -98,6 +100,9 @@ so. `docs/design.md` §10.7 is the measurement and why it must keep failing.
 crates/
   wc-handle      the `h`-argument shim — what an fd becomes with no SCM_RIGHTS
                  (and `wc-poolcost`, which measures what reaching one costs)
+  wc-arena-host  finds the guest compositor's arena in QEMU's memory backend.
+                 NOT a workspace member: it path-depends on shared-vulkan-base,
+                 which must stay out of the Windows cross gate. See §11.3
   wc-transport   AF_UNIX on both platforms, peer credentials, accept
   wc-server      the stage-1 server
   wc-probe       a client that writes the wire format by hand
@@ -129,7 +134,8 @@ scripts/
                      and measured again across the hypervisor in stage 5
   wc-guest.sh        the same acceptance tests on the real guest, plus stage 5:
                      coherency, what a pool costs per transport, and stage 4
-                     across a real VM boundary
+                     across a real VM boundary; block 10 is stage 7's arena --
+                     guest RAM, located from outside the VM
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)

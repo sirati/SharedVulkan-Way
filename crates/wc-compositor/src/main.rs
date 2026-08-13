@@ -74,6 +74,15 @@ struct Args {
     /// compositor starts; here it is a flag, which is the same fact supplied
     /// the same way — out of band.
     arenas: Vec<(u32, u64, String)>,
+    /// Arenas to **provide** rather than open, as `id:size`.
+    ///
+    /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §11).
+    /// A `--arena` is a file both sides open; a `--arena-guest-ram` is memory
+    /// this process commits and pins inside the virtual machine, stamped so
+    /// that a process on the *host* can find those pages in QEMU's memory
+    /// backend and write into them. The compositor prints the run id, which is
+    /// the only thing the host needs and the only thing that crosses.
+    guest_arenas: Vec<(u32, u64)>,
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -87,6 +96,7 @@ fn parse_args() -> Result<Args, u8> {
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
+        guest_arenas: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -117,6 +127,24 @@ fn parse_args() -> Result<Args, u8> {
                     return Err(2);
                 };
                 args.arenas.push((id, size, path.to_owned()));
+            }
+            // `id:size`. No path, because there is nothing to name: the region
+            // is this process's own guest RAM and the host finds it by content.
+            "--arena-guest-ram" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-guest-ram needs id:size");
+                    return Err(2);
+                };
+                let mut p = v.splitn(2, ':');
+                let (Some(id), Some(size)) = (p.next(), p.next()) else {
+                    eprintln!("wc-compositor: --arena-guest-ram wants id:size, got {v:?}");
+                    return Err(2);
+                };
+                let (Ok(id), Ok(size)) = (id.parse::<u32>(), size.parse::<u64>()) else {
+                    eprintln!("wc-compositor: --arena-guest-ram {v:?}: id and size must be numbers");
+                    return Err(2);
+                };
+                args.guest_arenas.push((id, size));
             }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -228,6 +256,25 @@ fn main() -> std::process::ExitCode {
             Ok(()) => println!("wc-compositor: arena {id} attached: {size} bytes at {path}"),
             Err(e) => {
                 eprintln!("wc-compositor: could not attach arena {id} at {path}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+    // And the ones this process provides. The run id goes out on the *first*
+    // line of the report because the host's locator cannot start without it and
+    // a harness has to be able to grep for it; `locked=false` goes on the same
+    // line because a region that is findable now and movable later is the one
+    // failure mode that would look like a working arena for the first few
+    // seconds. See `wc_handle::arena::attach_guest_ram`.
+    for (id, size) in &args.guest_arenas {
+        match wc_handle::arena::attach_guest_ram(*id, *size) {
+            Ok(r) => println!(
+                "wc-compositor: arena {id} provided from guest RAM: \
+                 run 0x{:016x}, {} bytes, {} pages, locked={}",
+                r.run_id, r.len, r.pages, r.locked
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not provide arena {id} from guest RAM: {e}");
                 return std::process::ExitCode::from(2);
             }
         }

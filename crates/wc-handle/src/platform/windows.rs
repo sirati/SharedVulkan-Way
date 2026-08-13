@@ -26,8 +26,13 @@ use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
-    FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, VirtualAlloc, VirtualFree,
+    VirtualLock, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
+};
+// STAGE 7: the working-set quota that `VirtualLock` is charged against.
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
 };
 
 /// A section object held open by its creator.
@@ -75,7 +80,24 @@ impl Drop for OwnedObject {
     }
 }
 
-/// A read-only view of a section.
+/// How a [`MappedView`]'s bytes were obtained, which is the only thing that
+/// decides how they are given back.
+///
+/// STAGE 7. Until now every view was a view *of an object*: `MapViewOfFile`
+/// gave it and `UnmapViewOfFile` takes it away. A guest-RAM arena is not — it is
+/// this process's own committed memory, pinned, and `UnmapViewOfFile` on it
+/// fails harmlessly while leaking 64 MiB of the guest's RAM for the life of the
+/// process. Recording which one it is here rather than in the caller means the
+/// wrong release call cannot be made at all.
+enum Backing {
+    /// `MapViewOfFile` — a window onto a section or a file.
+    View,
+    /// `VirtualAlloc(MEM_COMMIT)` — memory this process owns, released with
+    /// `VirtualFree(MEM_RELEASE)`. See [`alloc_locked_region`].
+    Region,
+}
+
+/// A read-only view of a section, or of a region this process allocated.
 ///
 /// No `derive(Debug)`: `MEMORY_MAPPED_VIEW_ADDRESS` is a bare `*mut c_void`
 /// newtype and does not implement it. Printing the address would be of no use
@@ -84,6 +106,7 @@ impl Drop for OwnedObject {
 pub struct MappedView {
     address: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    backing: Backing,
 }
 
 impl std::fmt::Debug for MappedView {
@@ -105,15 +128,104 @@ impl MappedView {
 
 impl Drop for MappedView {
     fn drop(&mut self) {
-        if self.len > 0 {
+        if self.len == 0 {
+            return;
+        }
+        match self.backing {
             // SAFETY: `address` is exactly what `MapViewOfFile` returned and
             // this runs once, in `Drop`.
-            unsafe {
+            Backing::View => unsafe {
                 UnmapViewOfFile(self.address);
-            }
+            },
+            // SAFETY: `address` is exactly what `VirtualAlloc` returned. The
+            // size argument to `MEM_RELEASE` must be 0 and the address must be
+            // the base of the reservation, which both hold here. Any
+            // `VirtualLock` on the region is undone by the release.
+            Backing::Region => unsafe {
+                VirtualFree(self.address.Value, 0, MEM_RELEASE);
+            },
         }
     }
 }
+
+/// Commit `len` bytes of this process's own memory, pin them into the working
+/// set, and let the caller stamp every 4096-byte page before the region is
+/// handed back **read-only**.
+///
+/// STAGE 7, and the whole substrate change. Returns `(view, locked)`: `locked`
+/// is false when `VirtualLock` failed, which is a real and survivable state —
+/// the pages are still guest RAM and still findable, they are merely allowed to
+/// move — and the caller reports it rather than this function pretending.
+///
+/// # Why the working set is resized first
+///
+/// `VirtualLock` fails with `ERROR_WORKING_SET_QUOTA` (1453) unless the
+/// process's minimum working set is large enough to hold the region as well as
+/// everything else it has. The default minimum is on the order of a megabyte,
+/// so a 64 MiB arena fails without this call and the failure reads as "locking
+/// is not permitted" rather than "the quota is too small". Same recipe as
+/// `shared_vulkan`'s `awe_probe::alloc::try_locked`, and it is deliberate that
+/// the numbers match: this is the same allocation its step-0 experiment made.
+///
+/// # Why the caller stamps here rather than afterwards
+///
+/// The region is handed out as a [`MappedView`], which is read-only by
+/// contract — every other view in this file is a `FILE_MAP_READ` mapping and the
+/// compositor must not be able to write a client's pixels. The stamp is the one
+/// write this process ever makes, it happens exactly once, and doing it inside
+/// this function is what lets the contract stay unconditional.
+pub fn alloc_locked_region(
+    len: usize,
+    stamp: &dyn Fn(u32, &mut [u8]),
+) -> io::Result<(MappedView, bool)> {
+    if len == 0 || !len.is_multiple_of(REGION_PAGE) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
+        ));
+    }
+    // SAFETY: a null base asks the kernel to choose the address; the size is
+    // checked non-zero above. The result is checked for null before use.
+    let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    if base.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let view = MappedView {
+        address: MEMORY_MAPPED_VIEW_ADDRESS { Value: base },
+        len,
+        backing: Backing::Region,
+    };
+    // From here on `view` owns the reservation, so every early return releases
+    // it. That ordering is why the `MappedView` is built before the region is
+    // touched rather than after.
+    let (mut lo, mut hi) = (0usize, 0usize);
+    // SAFETY: both out-parameters are live locals; the pseudo-handle from
+    // `GetCurrentProcess` needs no closing.
+    unsafe {
+        if GetProcessWorkingSetSize(GetCurrentProcess(), &mut lo, &mut hi) != 0 {
+            // Twice the region, as shared_vulkan does: the arena has to fit and
+            // so does everything the process already had resident.
+            SetProcessWorkingSetSize(GetCurrentProcess(), lo + len * 2, hi + len * 2);
+        }
+    }
+    // Stamp before locking. Touching every page is what commits it in practice,
+    // and locking pages that have never been touched is a slower way to reach
+    // the same state.
+    // SAFETY: `base` is a live `len`-byte read-write region owned by `view`, and
+    // no other reference to it exists yet.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
+    for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
+        stamp(i as u32, page);
+    }
+    // SAFETY: the region is live and `len` bytes long.
+    let locked = unsafe { VirtualLock(base, len) } != 0;
+    Ok((view, locked))
+}
+
+/// The granularity every stamp and every locate step works in. Not a Windows
+/// constant: it is the *guest-physical* page size the host's scan sweeps in, and
+/// it stays 4096 whatever the allocator did (shared_vulkan design.md §5.1).
+pub const REGION_PAGE: usize = 4096;
 
 /// NUL-terminated UTF-16, which is what every `*W` entry point wants.
 fn wide(s: &str) -> Vec<u16> {
@@ -219,6 +331,7 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
                 Value: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
             },
             len: 0,
+            backing: Backing::View,
         });
     }
     // SAFETY: mapping the whole section we just opened, read-only.
@@ -232,7 +345,7 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
     if address.Value.is_null() {
         return Err(io::Error::last_os_error());
     }
-    Ok(MappedView { address, len })
+    Ok(MappedView { address, len, backing: Backing::View })
 }
 
 /// Create a shared-memory object named by a **filesystem path**.
@@ -388,6 +501,7 @@ pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
                 Value: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
             },
             len: 0,
+            backing: Backing::View,
         });
     }
     // Size 0 means "the whole file", which is what a receiver wants: it was
@@ -416,7 +530,7 @@ pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
     if address.Value.is_null() {
         return Err(io::Error::last_os_error());
     }
-    Ok(MappedView { address, len })
+    Ok(MappedView { address, len, backing: Backing::View })
 }
 
 /// Write into a section this process created.

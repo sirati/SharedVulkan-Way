@@ -69,6 +69,18 @@ mod imp {
         size: u64,
         files: Option<String>,
         arena: Option<(String, u64)>,
+        /// STAGE 7. Provide an arena out of this process's own guest RAM and
+        /// measure pools cut from it. No path, because there is nothing to
+        /// name — see `wc_handle::arena::attach_guest_ram`.
+        guest_arena: Option<u64>,
+        /// `offset:seconds` — after the arena exists, hold a live mapping and
+        /// watch these 32 bytes for the host's write. The live half of the
+        /// coherency measurement docs/design.md §10.3 made against a file.
+        watch: Option<(u64, u64)>,
+        /// `offset:text` — write this once the watch fires, so the host can
+        /// measure the other direction while this process still holds the
+        /// mapping.
+        reply: Option<(u64, String)>,
         sections: bool,
         prepare: Option<String>,
     }
@@ -83,6 +95,12 @@ usage: wc-poolcost [options]
   --files DIR            SharedFile: DIR holds pc-000000.bin .. pc-<N>.bin,
                          created by whoever owns the filesystem
   --arena PATH:BYTES     ArenaSlice: attach PATH once, then cut --iters slices
+  --arena-guest-ram N    ArenaSlice over a region this process commits and pins
+                         inside the VM, stamped so the host can find it. Prints
+                         the run id the host's locator needs.
+  --watch OFF:SECS       hold the guest arena mapped and wait for the host to
+                         change 32 bytes at OFF (live coherency, this direction)
+  --reply OFF:TEXT       and answer at OFF once it does (the other direction)
   --sections             also measure a named section, as the control
   --prepare DIR          create the pool files in DIR and exit
 "
@@ -94,6 +112,9 @@ usage: wc-poolcost [options]
             size: 1 << 20,
             files: None,
             arena: None,
+            guest_arena: None,
+            watch: None,
+            reply: None,
             sections: false,
             prepare: None,
         };
@@ -115,6 +136,26 @@ usage: wc-poolcost [options]
                     a.arena = Some((
                         path.to_owned(),
                         size.parse().map_err(|e| format!("--arena size: {e}"))?,
+                    ));
+                }
+                "--arena-guest-ram" => {
+                    a.guest_arena =
+                        Some(next()?.parse().map_err(|e| format!("--arena-guest-ram: {e}"))?)
+                }
+                "--watch" => {
+                    let v = next()?;
+                    let (off, secs) = v.split_once(':').ok_or("--watch wants OFFSET:SECONDS")?;
+                    a.watch = Some((
+                        off.parse().map_err(|e| format!("--watch offset: {e}"))?,
+                        secs.parse().map_err(|e| format!("--watch seconds: {e}"))?,
+                    ));
+                }
+                "--reply" => {
+                    let v = next()?;
+                    let (off, text) = v.split_once(':').ok_or("--reply wants OFFSET:TEXT")?;
+                    a.reply = Some((
+                        off.parse().map_err(|e| format!("--reply offset: {e}"))?,
+                        text.to_owned(),
                     ));
                 }
                 "-h" | "--help" => return Err(String::new()),
@@ -331,6 +372,131 @@ usage: wc-poolcost [options]
             }
             std::hint::black_box(acc);
             report("arena-slice", m, t, d);
+        }
+
+        // ------------------------------------------------------------ 7 ----
+        // The same measurement over the region the shipping deployment
+        // actually has. Everything above this point maps *somebody else's*
+        // object; this commits guest RAM and pins it, which is the substrate
+        // docs/design.md §10.13 item 1 exists to install. The per-pool numbers
+        // should be indistinguishable from the file-backed arena's — the work
+        // per pool is a registry lookup either way — and the interesting column
+        // is `touch`, which no longer crosses a filesystem daemon.
+        if let Some(size) = args.guest_arena {
+            let t0 = Instant::now();
+            let region = match arena::attach_guest_ram(1, size) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  guest arena: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            println!(
+                "  guest arena    {:9.1} us, once, for all pools \
+                 (run 0x{:016x}, {} pages, locked={})",
+                t0.elapsed().as_secs_f64() * 1e6,
+                region.run_id,
+                region.pages,
+                region.locked
+            );
+            // The line the harness greps for, and the only thing the host is
+            // told. Printed before anything else happens with the region,
+            // because the stamps are already written by the time `attach_guest_ram`
+            // returns and the host may start sweeping the instant it sees this.
+            println!("GUESTARENA-READY: run=0x{:016x} pages={}", region.run_id, region.pages);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+
+            let mut m = Vec::new();
+            let mut t = Vec::new();
+            let mut d = Vec::new();
+            let mut acc = 0u64;
+            for i in 0..args.iters {
+                let offset = (i as u64) * args.size;
+                if offset + args.size > size {
+                    eprintln!("  guest arena: {} pools of {} do not fit in {size}", args.iters, args.size);
+                    bad += 1;
+                    break;
+                }
+                let h = Handle::from_descriptor(Descriptor::ArenaSlice {
+                    arena: 1,
+                    offset,
+                    len: args.size,
+                });
+                let t0 = Instant::now();
+                let mapping = match h.map() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("  guest arena: window at {offset}: {e}");
+                        bad += 1;
+                        break;
+                    }
+                };
+                m.push(t0.elapsed());
+                let t1 = Instant::now();
+                acc += touch(mapping.as_slice());
+                t.push(t1.elapsed());
+                let t2 = Instant::now();
+                std::mem::drop(mapping);
+                d.push(t2.elapsed());
+            }
+            std::hint::black_box(acc);
+            report("arena-guest-ram", m, t, d);
+
+            // The live half. One mapping, held, watched — which is exactly the
+            // configuration `probe-filemap` measured as MISMATCH on 65280 of
+            // 65536 bytes over the export (§10.3), and the configuration a
+            // window animating depends on.
+            if let Some((off, secs)) = args.watch {
+                let win = match Handle::from_descriptor(Descriptor::ArenaSlice {
+                    arena: 1,
+                    offset: off,
+                    len: 32,
+                })
+                .map()
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("  guest arena: watch window at {off}: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+                let before: Vec<u8> = win.as_slice().to_vec();
+                let started = Instant::now();
+                let deadline = Duration::from_secs(secs);
+                let mut saw = None;
+                while started.elapsed() < deadline {
+                    if win.as_slice() != before.as_slice() {
+                        saw = Some(started.elapsed());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                match saw {
+                    Some(dt) => println!(
+                        "COH-GUEST-SAW: offset={off} after_ms={} bytes={:?}",
+                        dt.as_millis(),
+                        String::from_utf8_lossy(win.as_slice())
+                            .trim_end_matches(|c: char| c as u32 == 0xAB || c == '\0')
+                            .to_string()
+                    ),
+                    None => {
+                        println!("COH-GUEST-SAW: offset={off} after_ms=never nothing changed in {secs}s");
+                        bad += 1;
+                    }
+                }
+                // And answer, through the one write path a provided arena has,
+                // while this mapping is still live. The host is watching.
+                if let Some((roff, text)) = &args.reply {
+                    match arena::guest_write(1, *roff, text.as_bytes()) {
+                        Ok(()) => println!("COH-GUEST-WROTE: offset={roff} text={text:?}"),
+                        Err(e) => {
+                            eprintln!("  guest arena: reply at {roff}: {e}");
+                            bad += 1;
+                        }
+                    }
+                }
+            }
         }
 
         let (s, f, a) = wc_handle::map_counts();

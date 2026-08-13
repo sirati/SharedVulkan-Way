@@ -2376,3 +2376,331 @@ rather than in `cargo test`.
    unavailable context, and one of those is fine and the other is a bug.
 4. **Decide what to do about a 15 ms tick** (§10.8) before anything depends on
    the poll loop's cadence.
+
+---
+
+## 11. Stage 7: the arena stops being a file
+
+### 11.1 Status in one paragraph
+
+**The check stage 5 deliberately left failing now passes, and the substrate is
+the reason.** `weston-presentation-shm`, unmodified, on the real guest, over an
+arena that is **guest RAM located through QEMU's flat view**, presented **606
+frames of which 60 were distinct and the commonest appeared 11 times** — against
+stage 5's 634 frames, 18 distinct, one image 453 of them, and against the Wine
+control on a coherent filesystem's 780/60/13. The window is live by the same
+measurement that said it was frozen, and `scripts/wc-guest.sh` is **38 passed,
+0 failed, 0 skipped** on real Windows for the first time. Getting there cost one
+new crate, one new provider on each side, and no new implementation of anything
+`shared_vulkan` already had: `crates/wc-arena-host` links `sv-hostd` and does the
+translation exactly once across the two projects. A pool over the real region
+costs **0.5–0.7 µs to reach and 6.4–7.1 µs to touch**, against 2.0–3.2 µs and
+2.3–2.6 ms for the same code over a file on the export.
+
+### 11.2 What was built, in the order the bytes move
+
+Five pieces, and the shape is the one §9.10 item 3 promised: everything above
+`Arena::open_or_create` is untouched.
+
+| piece | where | what it does |
+|---|---|---|
+| `arena::attach_guest_ram` | `wc-handle`, both platforms | commits, pins and **stamps** a region; registers it as arena *n* |
+| `--arena-guest-ram id:size` | `wc-compositor` | calls it before the socket exists, prints the run id |
+| `wc-arena-host` | Linux, root, **not a workspace member** | `sv-hostd` finds the pages and translates; writes a plan |
+| `guestram::Plan` / `StitchedRegion` | `wc-proxy` | opens the named object, one `mmap(MAP_FIXED)` per run |
+| `Arena::from_plan` | `wc-proxy` | the same allocator, over the stitched view |
+
+The direction is the opposite of every other provider in `wc_handle::arena`, and
+that inversion is the whole design rather than a detail. `attach` *opens*
+something somebody else made. `attach_guest_ram` **makes** the region and waits
+to be found, because that is the only direction that works across a hypervisor:
+the host can read and write the guest's RAM through QEMU's memory backend, and
+the guest cannot name a host object at all. `shared_vulkan` states it as a rule —
+"the side inside the VM allocates, because only it can produce pages the
+hypervisor can locate" — and this is that rule arriving in the compositor.
+
+**No descriptor crosses, and the guest is now further from one than it was.**
+Over `SharedFile` the guest was handed a path and opened it. Over a file arena it
+was handed a path once. Over guest RAM it is handed **nothing**: it says a 64-bit
+run id and a page count, and the host goes and reads its memory. `wc-proxy` still
+reports `0 out`, and on the `weston-presentation-shm` run it reported `1 fds in,
+0 out` — one pool, one descriptor, consumed where it arrived.
+
+### 11.3 The integration decision, and why it is a dependency rather than a copy
+
+The brief allowed three ways to reuse `sv-hostd`'s translation — depend on it,
+invoke its binary, or vendor it with a note — and required that exactly one
+implementation exist across the two projects. It is a **dependency**, in a crate
+that is deliberately **excluded from the workspace**.
+
+Invoking the binary was the first choice and does not work as it stands:
+`sv-hostd qemu` prints a report for a human, not the backend's name and the full
+run list, and adding an output mode to it would mean editing the other
+repository. Vendoring is a copy by definition, and a copy of the one file whose
+header says a silent wrong answer is "the worst thing this codebase can
+produce" is the wrong file to copy.
+
+So `crates/wc-arena-host` has `sv-hostd`, `sv-transport`, `sv-arena` and
+`arena-record` as path dependencies and does none of the work itself. The reason
+it is not a workspace member is mechanical and is the same reason `vendor/smithay`
+is not one: **a member is resolved by every `--workspace` command, including
+`cargo clippy --workspace --target x86_64-pc-windows-gnu`**, which is the gate
+this whole project exists to keep green. A member with a path dependency on a
+sibling repository would make that gate fail on any machine where the sibling is
+not checked out. Excluded, the coupling costs nothing until somebody builds the
+locator — which can only happen on the VM host anyway.
+
+The path is absolute (`/mnt/datasets/builds/shared-vulkan-base/...`), which is
+ugly and is the honest option: a relative path cannot be correct from both
+`waycompose-base/` and `wc-worktrees/<name>/`, which sit at different depths, and
+`scripts/wc-worktree.sh` already hard-codes that root.
+
+**The one thing that is duplicated is twenty bytes**, and it is duplicated
+under protest and with a check. `wc_handle::arena` spells out the stamp layout —
+magic at 0, run id at 8, page index at 16 — rather than depending on
+`arena-record`, because depending on it would put a sibling repository in the
+*Windows* build's dependency graph. Two things make that safe. A disagreement is
+loud: the host accepts a page only if the magic and the run id both match and
+then requires the indices to be a permutation of `0..pages`, so a wrong offset
+finds zero pages or duplicates, never a wrong arena. And the two definitions are
+compared, in `wc-arena-host`'s only test — the one binary in either project that
+links both.
+
+### 11.4 The measurement §10.4's table was missing
+
+Per pool of 1 MiB, on the guest. The first four rows are §10.4's, re-measured in
+this session; the fifth is new.
+
+| transport | reach it | touch 1 MiB | release |
+|---|---|---|---|
+| `Section` (named, no filesystem) | 6.1 µs | 0.74 ms | 58 µs |
+| `SharedFile`, local NTFS | 47.3 µs | 0.70 ms | 100 µs |
+| `SharedFile`, the export | 539 µs (6966 µs cold) | 2.1 ms | 108 µs |
+| `ArenaSlice`, a file on the export | 2.0 µs | 2.33 ms | 0.2 µs |
+| **`ArenaSlice`, guest RAM** | **0.5–0.7 µs** | **6.4–7.1 µs** | **0.0–0.1 µs** |
+
+**The `reach it` column was never the interesting one and this is what shows
+it.** A file-backed arena already cost 2 µs to slice, so the last row improves it
+by a factor of three and that is nearly meaningless. The column that moves is
+`touch`, by **a factor of about 330** — 6.7 µs against 2.33 ms for the identical
+loop over the identical amount of memory. That is the difference between reading
+pages that are the guest's own pinned RAM and reading pages that virtio-fs has to
+fetch, and §10.4 said the two transports were "equal" in that column precisely
+because they were both the same mount. They are not the same mount any more.
+
+Two caveats, because the number is flattering. The 6.7 µs is a *steady-state*
+touch: the guest stamped every page of the region when it created it, so nothing
+in the measurement is a first fault. And the attach is not free — `attach_guest_ram`
+commits, stamps and pins 64 MiB, measured at 828 µs–6.7 ms depending on how warm
+the guest is, once per process, and the *host's* half of the attach is the
+locate, which is seconds (§11.5). Both are one-off and neither is on the frame
+path, which is the whole property an arena has and a shared file does not.
+
+### 11.5 What the locate actually costs, and the two numbers that surprised us
+
+Measured on every run, five runs:
+
+| | |
+|---|---|
+| pages located | **16384 of 16384**, every time |
+| sweep | 13312 MiB in **2.37–2.42 s** |
+| stamps from other runs found | 0–4 |
+| stamps outside guest RAM | **0**, every time |
+| coalesced runs | **1506–1517** per 64 MiB |
+| stitch | **4.20–4.24 ms** for ~1512 `mmap(MAP_FIXED)` calls |
+| verify (every page at its own index) | 16384 of 16384, every time |
+
+**The first surprise is that 1512 runs is not a problem.** `shared_vulkan`
+measured 1471 for a `VirtualLock`ed 64 MiB window and treated the fragmentation
+as the reason to prefer large pages; we measured 1506–1517 for the same
+allocator and the stitch costs 4.2 ms. It is not on the frame path, it is 2.8 µs
+per `mmap`, and `vm.max_map_count` on this host is 1048576. Large pages would
+reduce it to ~22 and need `SeLockMemoryPrivilege`; on this evidence there is no
+reason to ask for the privilege yet. Reproducibility is worth noting too: the
+run count moved between 1506 and 1517 across five runs of the same size, so it
+is a property of the guest's free-page state and not a constant.
+
+**The second is `0 outside guest RAM`, which is the one that would have hurt.**
+`sv-hostd`'s scan skips offsets in the backing object that the flat view does not
+map, and its header warns that a stamp found there is a stale one from a previous
+boot. Zero of ours landed there, on every run, which says the region table read
+off `info mtree -f` and the sweep agree about what this machine's RAM is. The
+flat view reported **13311 MiB in 4 aliases**, which is the below-4-GiB split, the
+ROM window and the SynIC pages the module header describes — this is the machine
+`sv-hostd`'s fixture was written against, and it behaves as the fixture says.
+
+The `verify` line is the one that is not optional. It re-reads every page of the
+stitched view and checks that the page at arena offset *n* is the page the guest
+stamped *n*. A stitcher that mapped the right pages in the wrong order would pass
+every other check in this document, produce a window full of plausible pixels,
+and be wrong.
+
+### 11.6 Coherency, measured live, in both directions
+
+§10.3 measured a virtio-fs export with both sides mapped and got **MISMATCH on
+65280 of 65536 bytes, both directions** — and block 7 reproduced exactly that,
+unchanged, in the same session as everything below. The same shape of experiment
+over guest RAM:
+
+| | result |
+|---|---|
+| host writes 32 bytes; guest holds a live mapping and polls | **seen** |
+| guest answers at another offset; host holds its stitched view and polls | **seen, after 20 ms** |
+
+The guest's number is the honest one to quote: 20 ms is one poll interval, i.e.
+the write was already there the first time anybody looked. The host→guest number
+the harness prints (about 3.2 s) is **not a latency** and must not be read as
+one — it is dominated by the host's own 2.4 s sweep before it could write at all,
+because the guest starts watching before the locate begins. What the pair
+establishes is the property, not the delay: two live mappings of this region see
+each other's stores, which is exactly what two live mappings of a file on that
+mount do not.
+
+This block exists separately from the frame count on purpose. If the frames ever
+go stale again, this says whether the region or the pixel path is the reason, and
+without it the two are indistinguishable — which is the trap §10.7 describes.
+
+### 11.7 The frame count, which is the point of the stage
+
+`weston-presentation-shm` redraws every frame. The distinct-frame count is
+therefore a direct measurement of whether the compositor is seeing the redraws,
+and it is the only check in the file that ever caught the freeze.
+
+| run | frames | distinct | commonest |
+|---|---|---|---|
+| §10.7, guest, file arena on the export | 645 | 18 | **462** |
+| §10.7, guest, `SharedFile` on the export | 642 | 18 | 459 |
+| §10.7, Wine on the workstation, coherent fs (the control) | 780 | 60 | 13 |
+| **stage 7, guest, guest-RAM arena** | **606** | **60** | **11** |
+
+The guest run is now indistinguishable from the control: the same 60 distinct
+images — which is the client's own repertoire, not ours — and a commonest count
+of 11 against the control's 13. The check is unchanged. It was not relaxed,
+re-scoped, or moved to a note; it asserts what it asserted in stage 5, that no
+single image accounts for more than a quarter of the frames, and 11 of 606 is two
+orders of magnitude inside it.
+
+What is **not** re-run is `weston-presentation-shm` over the file arena. §10.3
+established that the incoherence belongs to the mount rather than to the
+transport, so running it again every time would be re-measuring virtio-fs at a
+cost of a minute a run. Its numbers stay in §10.7 where they were made.
+`weston-terminal` over the file arena and over `SharedFile` are both still run,
+because they exercise the other two transports and their three-frame lifetime
+never depended on coherency.
+
+### 11.8 Three things that cost real time, all worth writing down
+
+**`kill 0` is not a no-op.** The stage-4 driver ends with
+`kill $PROXY $FWD $RELAY $COMP`, and `PROXY` is zero when the proxy was not
+started in that shell — which used to be only the error path and is now the
+normal path for this transport. `kill 0` signals the whole *process group*, so
+the driver killed itself immediately after printing the client's exit code, and
+the symptom was a run that produced the locate report, one line of client status,
+and then silence. Nothing in it looks like a signal.
+
+**`systemd-run` gives a unit systemd's `PATH`, which on NixOS has no `bash`.**
+The host-side half runs in a transient unit (see §11.9), and a
+`#!/usr/bin/env bash` script in it exits 127 before its first line. The only
+trace is `env: 'bash': No such file or directory` in the journal, which nothing
+was reading — the harness now prints `journalctl -u <unit>` when the unit does
+not finish, which is how this was found on the second attempt rather than the
+fifth.
+
+**An image-name `taskkill` is not scoped to your experiment.** The driver used
+to run `taskkill /F /IM wc-compositor.exe` before every run, which is correct for
+one experiment on one guest and hostile the moment two are running: it takes down
+somebody else's compositor and the symptom lands in *their* log. The guest
+directory and the share are now named per experiment (`WC_GUESTNAME`,
+`WC_HOST_SHARE`) and the kill is gone; unique socket names and `--timeout`
+already did its job.
+
+### 11.9 The one ugly thing, stated plainly
+
+**`wc-arena-host` and `wc-proxy` both need root on the VM host, and only for
+this deployment.** `wc-arena-host` connects to QEMU's QMP monitor and reads
+`/proc/<qemu-pid>/fd`; `wc-proxy` opens the backing object at
+`/proc/<qemu-pid>/fd/<n>`. On testhost QEMU is a *system* service running as
+root, so all three are root-only.
+
+That is a property of how this machine starts the VM and not of the design.
+`sv-hostd` hands the identical name to unprivileged ICD processes and it works
+there because QEMU runs as the developer. The fix is a permission on the VM, not
+code — and the alternative that does not need one is passing a descriptor from a
+root helper to the proxy, which the rule forbids even between two processes on
+the same machine. So it is recorded rather than worked around.
+
+The mechanics: the harness locates through `~/rootc`, and runs the proxy and its
+client in a `systemd-run --collect` transient unit rather than in a long-lived
+root shell, because a root call that blocks for a minute frequently returns no
+output at all. The unit's journal is the record, and the harness prints it on
+failure.
+
+### 11.10 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **124 tests**, 0 failures (116 in stage 5) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 33 passed, 0 failed |
+| `scripts/wc-guest.sh run` (blocks 1–6, the guest) | 18 passed, 0 failed, 4 skipped — unchanged |
+| `scripts/wc-guest.sh stage4` (blocks 7–10, the guest) | **38 passed, 0 failed, 0 skipped** |
+
+The test count moved this time, and where it moved is the interesting part.
+Four of the eight are in `wc-handle`'s `arena` module and run **on Linux**, over
+the Unix twin of the guest-RAM provider — `mmap(MAP_ANONYMOUS)` for
+`VirtualAlloc`, `mlock` for `VirtualLock`, the same stamping loop; the other four
+are `wc-proxy`'s plan parser and stitcher, which need no VM at all. The twin is
+not a mock and it is also not evidence about the thing that matters: it cannot
+say anything about whether the pages are findable from outside a VM, which is the
+entire claim. What it does cover is the stamp layout, the registry plumbing, the
+lifetime and the refusals — where the ordinary bugs live. The claim itself is
+`wc-guest.sh` block 10's and needs a hypervisor to make.
+
+### 11.11 What is not proven, updated
+
+§10.12's list, with this stage's changes:
+
+1. ~~The arena is still a file.~~ **Closed.** It is guest RAM, located through
+   QEMU's flat view, and the freeze it caused is gone by the measurement that
+   found it.
+2. **The window has still never been seen.** §10.12 item 3 is unchanged and is
+   still the largest single gap. Everything here ran in an ssh session's
+   non-interactive window station.
+3. **New: the region cannot be re-located.** The host writes pixels over the
+   stamps as soon as the first pool is allocated, so the sweep works exactly
+   once per run. A compositor that lost its host — or a host that restarted —
+   would have no way to find the region again. Fixing it is a reserved,
+   never-allocated stamp page, and nothing yet needs one.
+4. **New: pinning is asserted, not proven over time.** `VirtualLock` succeeded on
+   every run and `shared_vulkan`'s R26 re-located an identical table 3m14s later,
+   but nothing here has provoked memory pressure and no run lasted more than a
+   minute. If the guest's pages moved after the locate, the symptom would be
+   exactly §10.7's — a window that goes stale — and the harness would catch it,
+   which is the reason the frame check stays where it is.
+5. **New: 64 MiB is a guess.** The arena is sized by a flag and the allocator
+   refuses when it is full. One `weston-presentation-shm` used a single 15 MB
+   pool; nothing has been measured about what a real application asks for, and
+   `docs/goal-firefox.md`'s client will ask for more.
+6. **New: one client at a time.** Every run has had exactly one client and one
+   arena. Two proxies against one compositor would need two arena ids and there
+   is no protocol for allocating them; `shared_vulkan`'s cold-path handshake is
+   where that belongs.
+7. **`SealedFile` is still not sealed on Windows**, `with_data_mut` is still
+   unimplemented, `KeyboardHandle::new` still cannot succeed. Unchanged.
+8. **No input, no clipboard, no scene graph, and a hostile client can still
+   fault the proxy.** All unchanged.
+
+### 11.12 What to do next, in the order the evidence puts it
+
+1. **Log in to the guest and look at a window.** §10.13 item 2, now the oldest
+   thing on the list and the only one that is a glance. §8.11 items 2, 4, 5 and 6.
+2. **Decide what a real application's arena costs.** Item 5 above. The number to
+   measure is what Firefox's `wl_shm` pools actually total, and the answer
+   changes the flag rather than the design.
+3. **`SetProcessDpiAwarenessContext` needs to report *why* it failed** (§10.8).
+   It reported `refused` again on every run of this stage.
+4. **Decide what to do about a 15 ms tick** (§10.8). Unchanged and still
+   unaddressed.
