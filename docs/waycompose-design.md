@@ -5951,6 +5951,16 @@ set correctly on a window whose button the shell was not drawing.
    make on purpose. `wc-icon.sh` now runs on guest RAM by default, cannot reach
    a file at all, and asserts on the substrate it used, so the next run of it
    will say `SUBSTRATE guest-ram` in its own output or fail.
+
+   **RE-TAKEN, §41.9.** That run has now happened: 21 passed, 0 failed, on the
+   real guest over guest RAM, with `SUBSTRATE guest-ram: … 0 sections, 0 shared
+   files` on both passes. **The result reproduces** — the subimage search that
+   read RMSE 595 against 26741 on the fixture reads **590.611 against 46691.5**
+   on guest RAM, the icon figure the same to within 0.8%. The images in
+   `docs/stage11/` are now the guest-RAM ones. This paragraph stays because the
+   fixture-era numbers are what makes that comparison possible, and because the
+   next person to find a harness measuring the wrong substrate should be able to
+   see what it cost to establish that it had not mattered.
    The right test is a GTK 4.20 application, which needs `wl_output`,
    `wl_subcompositor` and a data device — all of which stage 9 added — and one
    was not run here.
@@ -12441,6 +12451,16 @@ not something this compositor can assert.
    the guest itself with no proxy and no arena, so it has no substrate to
    declare.
 
+   **RE-TAKEN, §41.9.** 9 passed, 0 failed, on the real guest over guest RAM:
+   two distinct taskbar identities over two windows, both icons resolved on the
+   host, `SUBSTRATE guest-ram: 4 arena slice(s) … 0 sections, 0 shared files`,
+   and the claim the shared-file version could not make — **both clients on one
+   region and one allocator**, `client 2: joins arena 0 (2 connection(s) on it
+   now)`, with the buttons coming apart while both clients' pixels sit in that
+   one 64 MiB of guest RAM. The images in `docs/stage32/` are now the guest-RAM
+   ones. Re-running it also found §41.8: the taskbar photograph had been failing
+   a geometry gate that could never pass for a 1280x48 strip.
+
 ## 35. Gates that reported success while something was wrong
 
 ### 35.1 Status in one paragraph
@@ -15346,17 +15366,14 @@ Three, and the test for each is the same: can a run reach it *silently*.
 
 ### 41.7 What is not done
 
-1. **Nothing here was run against the guest.** This stage is a change to what
-   five harnesses *can* do, verified by unit tests, by shell syntax, by
-   exercising `wc-substrate.sh`'s decision table directly, and by running the
-   built `wc-proxy` against a file arena with and without the permission to
-   confirm both arms. The two converted harnesses have not been driven end to
-   end on the guest, and the first agent to do so should expect the locate to be
-   the interesting part — see item 3.
-2. **The recorded results are still the fixture's.** Deliberately: §16.11 item 6
-   and §32.9 item 5 say so, and a silent re-run would replace evidence somebody
-   might want to compare against. Re-taking them is a measurement, and it is
-   somebody's to make on purpose.
+1. ~~**Nothing here was run against the guest.**~~ **CLOSED — §41.9.** Both
+   converted harnesses have now been driven end to end on the real guest, on
+   guest RAM, and both are green: `wc-icon.sh taskbar` 21 passed / 0 failed,
+   `wc-taskbar.sh apps` 9 passed / 0 failed.
+2. ~~**The recorded results are still the fixture's.**~~ **CLOSED — §41.9.**
+   Re-taken on purpose rather than silently, which is why §16.11 item 6 and
+   §32.9 item 5 were written first: the fixture-era numbers were on the record
+   before the guest-RAM ones replaced the images, so the two can be compared.
 3. **The `--frames` arm is used when the guest manages to publish a list, and
    the sweep is still reachable.** That asymmetry is deliberate and is not a
    substrate fallback — both arms locate guest RAM and differ only in how its
@@ -15436,6 +15453,154 @@ Three, and the test for each is the same: can a run reach it *silently*.
    so it has no substrate to declare. Worth stating because "every block of
    every harness" is the kind of claim that is easy to make and wrong.
 
+### 41.8 A §35 check that could never pass, in the picture the stage exists to produce
+
+Found by running `wc-taskbar.sh apps` on the guest for the first time, and it
+failed:
+
+```
+FAIL  the taskbar, two applications: the capture is 1280x48, too small to be a desktop
+```
+
+The image was correct. `fetch`'s gate was `w < 200 || h < 200`, with the comment
+"this is a screenshot of a Windows desktop" — and `fetch` has **two** callers.
+One photographs a client's window; the other photographs `Shell_TrayWnd`, which
+on this guest's 1280x1024 screen is **1280x48**. Forty-eight is less than two
+hundred, so the taskbar photograph — the single picture stage 32 exists to
+produce — has been failing on its geometry since §35 added the gate, for a
+reason with nothing to do with taskbars. The same 1280x48 strip is what
+`wc-icon.sh` photographs and calls a taskbar, in the same run of the same guest.
+
+**This is §35's own shape turned around.** §35 is about checks that cannot fail;
+this is a check that cannot *pass*, and it is worse than useless because it puts
+a red line against the stage's headline evidence. Both failure modes come from
+the same root — the bound was never run against the thing it bounds.
+
+The fix is a bound per shape, so `fetch` takes a `kind`:
+
+* `tray` — wide, short, and **bounded above** in height: a full-desktop capture
+  arriving here would mean `--class Shell_TrayWnd` selected the wrong window,
+  which is a real failure this now catches and the old bound could not express.
+* `window` — no fixed size, but not a sliver.
+
+And the reverse gap, in the other harness: **`wc-icon.sh`'s `fetch` asserts
+nothing at all.** It gates on `magick` converting the file and *prints* the
+geometry, which is exactly the §35.6 shape — a 1x1 or all-black capture converts
+fine and reads as a pass. It is left as it is here only because it is a second
+change to a second harness in a run whose purpose was the substrate, and it is
+written down rather than done: §41.10 item 3.
+
+### 41.9 The two annotated results, re-taken on guest RAM
+
+§16's icon work and §32's taskbar photographs were both measured on the file
+arena by harnesses that never said so (§16.11 item 6, §32.9 item 5). Both are
+now re-run on the real guest over guest RAM. **The annotations stay**: the point
+was never that the results were wrong, it was that nobody could tell what they
+were measured on, and the fixture-era numbers are worth keeping next to these.
+
+**The locate, which was the part five agents could not get past.** `--frames`
+and `--arena-frames` had landed by the time this ran, and the difference is not
+marginal:
+
+```
+arena 0 provided from guest RAM: run 0xbd58a8246c44db7b, 67108864 bytes,
+  16384 pages, locked=true, frames=C:\Users\<guest-user>\wcicon\arena-icons.frames (16384 in 559 ms)
+guest RAM in the flat view: 13311 MiB in 4 alias(es)
+located 16384 of 16384 pages in 8.99ms by frame list (swept 0 MiB; 1487 frame
+  run(s) became 1487 file run(s), first frame 0x31e4f8)
+stitched 64 MiB into one view with 1487 mmap(MAP_FIXED) call(s) in 3.70ms
+verify: 16384/16384 pages of the stitched view carry their own arena index
+```
+
+**`swept 0 MiB`** is the whole of it: no stamp was read, so `page index claimed
+twice` is not expressible. Four locates across the three runs, every one
+16384/16384 — **8.99 ms, 7.85 ms** and the rest, against the sweep's 2.308 s.
+That is ~260x, and more importantly it is deterministic where the sweep was a
+coin flip. The guest's own side of it costs 559–579 ms to enumerate the frames,
+which is real and is paid once per run rather than per locate.
+
+**§16, `wc-icon.sh taskbar` — 21 passed, 0 failed:**
+
+```
+PASS  icons:   SUBSTRATE guest-ram: 2 arena slice(s) over 16384 pages located by frames, 0 sections, 0 shared files
+PASS  generic: SUBSTRATE guest-ram: 2 arena slice(s) over 16384 pages located by frames, 0 sections, 0 shared files
+PASS  WM_SETICON was sent for both ICON_BIG and ICON_SMALL
+PASS  the icon run's caption contains the host's icon and the control run's does not (590.611 against 46691.5)
+```
+
+and the proxy's line, which is the substrate stated by the process that opened
+the memory:
+
+```
+[proxy] transport arena 0: 67108864 bytes of guest RAM, run 0xbd58a8246c44db7b,
+  1487 run(s) of /proc/1709630/fd/35 in 1 region(s)
+  (nothing is opened per pool, and the compositor opened nothing at all)
+```
+
+**The icon result reproduces.** §16.9's fixture-era subimage search was RMSE
+**595** for the icon run against **26741** for the control; on guest RAM it is
+**590.611** against **46691.5**. The figure that matters — how well the host's
+`qemu` icon is found in the guest's window caption — is the same to within 0.8%,
+which is the answer §16.11 item 6 was honest about not knowing. The control's
+number moved a long way and that is expected and harmless: it measures the
+*absence* of the icon, so a larger number is a stronger negative, and it is the
+best match of a 16x16 icon against a caption that does not contain it.
+
+**§32, `wc-taskbar.sh apps` — 9 passed, 0 failed:**
+
+```
+PASS  apps: SUBSTRATE guest-ram: 4 arena slice(s) over 16384 pages located by frames, 0 sections, 0 shared files
+PASS  apps: both clients share one guest-RAM arena and one allocator (2 joined)
+PASS  two real applications -> 2 distinct taskbar identities over 2 windows
+        Waycompose.app.org.freedesktop.weston.flower
+        Waycompose.app.org.freedesktop.weston.wayland-terminal
+PASS  and both windows carry an icon resolved on the host (icon set: 2 of 2 slots)
+```
+
+**The claim the shared-file version could not make, made:**
+
+```
+[proxy] client 1: joins arena 0 (1 connection(s) on it now, 0 of 67108864 bytes out)
+[proxy] client 1: pool 3:  38272 bytes from the client -> arena 0 slice 66019328+38272
+[proxy] client 1: pool 19: 1740104 bytes from the client -> arena 0 slice 0+1740104
+[proxy] client 2: joins arena 0 (2 connection(s) on it now, 1781760 of 67108864 bytes out)
+```
+
+Two unmodified Linux applications, two connections, **one region of guest RAM
+and one allocator**, and the two taskbar buttons come apart while both clients'
+pixels are in that one region. §12.13 item 6's one-connection limit — the stale
+sentence that put this experiment on a file for four stages (§41.3) — is now
+disproved by the very experiment it misdirected.
+
+Nothing was opened by name on either run: `0 sections, 0 shared files`, no
+`--shared-dir`, and the keymap cut from the compositor's outbound window. The
+only file that crossed is the frame list, 267300 bytes of `pfn <index> <frame>`
+— 16 bytes a page, as §41.5 said — and it carries where the pages are, not the
+pages.
+
+### 41.10 What is still not done
+
+1. **`local` in `wc-taskbar.sh` and the Wine legs were not re-run.** `local` has
+   no arena and needed none; the Wine harnesses are fixtures by construction and
+   their behaviour is unchanged by any of this.
+2. **The guest's leftover sweep found one thing the harnesses miss.** After the
+   runs, a `probe-relay.exe` of this run's own was still up — `wctb32`'s, with
+   its `--timeout 360` still to expire — and `wc-taskbar.sh`'s closing "nothing
+   of wctb32's is still running" had already passed, because that check looks
+   for the *compositor* and the relay is a different executable. Killed by pid.
+   The check should cover every process the harness starts on the guest, not the
+   one it starts last; it is one `-match` away and is not done here.
+3. **`wc-icon.sh`'s `fetch` still asserts nothing about its images** — §41.8's
+   second half. It prints the geometry it should be checking, which is the
+   §35.6 shape, and it is the reason `wc-icon.sh` did not catch the bound bug
+   that `wc-taskbar.sh` did.
+4. **Four stale scheduled tasks under `wcicon` were left alone, deliberately.**
+   They point at `C:\Users\<guest-user>\wcicon\wc-compositor.exe` — the *pre-rename*
+   executable, from a session before §16.8's rename — so they are not this
+   run's, and §16.8's own rule is that unregistering a name another run may be
+   about to start loses that run's step with no error on either side. This run's
+   own two, `wciconcomp-icons` and `wciconcomp-generic`, were verified by their
+   `Actions.Execute` path and removed.
 ## 40. The scene had no lookup, and half the suite was one call site
 
 The standing requirement is that the Windows Wayland server passes the Wayland
@@ -15687,3 +15852,550 @@ it. Harmless for a harness run, which generates the extension list from
 that makes a *hand*-run silently test a different claim, which is why the
 harness treats it as a failure rather than a note. The table was updated. The
 mechanism worked as designed: nobody had to notice.
+
+---
+
+## 38. Stage 38: the compositor learns where the screen is
+
+A user reported this:
+
+> "when opening a window close to a screen boundary the menu opens so that part
+> of it is outside of the display. ik that there is a wayland protocol for this
+> because on my native linux machine it knows how to place the menu, tooltips
+> and popups so that they stay on screen"
+
+They are right about the protocol. `xdg_positioner.set_constraint_adjustment`
+is how a client says which ways it is willing to have a popup moved —
+`slide_x`, `slide_y`, `flip_x`, `flip_y`, `resize_x`, `resize_y`, in that
+precedence, per axis — and **the compositor does the moving.** This compositor
+was not doing it, and the reason it was not doing it was written down.
+
+### 38.1 The comment was wrong, and the report is the disproof
+
+`state.rs`'s `new_popup` said:
+
+> What is deliberately **not** used here is `get_unconstrained_geometry`:
+> constraining a menu to the monitor is the compositor's job, and on Windows
+> the compositor that owns the monitor is Windows. Letting `SetWindowPos` place
+> it and reporting no constraint back is honest; recomputing it here would be a
+> second, disagreeing, opinion.
+
+The first sentence is right and the second does not follow. **`SetWindowPos`
+does not constrain anything.** It puts a window exactly where it is told, off
+the edge of the desktop if that is what the numbers say. Windows keeps a menu
+on screen only for menus *it* owns — the ones put up through `TrackPopupMenu`,
+which is a different API with a modal loop and a constraining placement policy
+of its own. An arbitrary `WS_POPUP`, which is what an `xdg_popup` is here
+(§15.6), gets no such treatment.
+
+So "the compositor that owns the monitor is Windows" is a true statement about
+*ownership* and a false statement about *behaviour*, and the code depended on
+the second. Nothing constrained the popup, and the user watched a menu hang off
+the side of their screen. `reposition_request` carried the same reasoning in
+its own words — *"this compositor does not know where the parent window is on
+the Windows desktop, so it cannot tell whether the result would be
+off-screen"* — and that sentence was the actually true one. It was a statement
+about a missing input, not about whose job it was. This stage supplies the
+input.
+
+### 38.2 The naming trap, stated before anything else
+
+smithay's two functions read backwards, and getting them the wrong way round
+produces a compositor that looks like it is trying:
+
+* **`PositionerState::get_geometry()`** is the *unconstrained* rectangle — the
+  positioner's raw arithmetic, anchor rectangle and anchor edge and gravity and
+  offset, with the constraint adjustment ignored.
+* **`PositionerState::get_unconstrained_geometry(target)`** is the
+  *constrained* one. "Unconstrained" means "adjusted until it no longer
+  violates the constraint", i.e. the popup is no longer constrained *by* the
+  target. It is the one that applies `slide`, `flip` and `resize`.
+
+`constrain()` in `state.rs` is now the only caller of either, and its doc
+comment says this again, because the next person to read the two names will
+have the same problem.
+
+### 38.3 Where the constraint is applied, and why it cannot be anywhere else
+
+In `state.rs`, on the Wayland thread, before the first `configure`.
+
+Not in `win32.rs` at `SetWindowPos` time, which is where the monitor is known
+and where it would be one line. The protocol has the compositor *tell the
+client* where the popup ended up: the `xdg_popup.configure` carries the
+rectangle, and the client draws its menu, positions its submenus and does its
+keyboard navigation against that rectangle. A compositor that moved the `HWND`
+and reported the unmoved rectangle would have the pixels in one place and the
+client's idea of them in another, which is a worse bug than the one being
+fixed, because it is invisible until a submenu opens in the wrong place.
+
+And the precedence is **not reimplemented**. `get_unconstrained_geometry`
+implements the order the XML fixes — flip, then slide, then resize, per axis,
+with a flip that fails to help reverted — and the one implementation of that
+rule in this tree should be the one generated from the same XML the client
+read. A client that declared only `slide_x` must never be flipped, and that
+rule is the whole of the protocol's contract here.
+
+### 38.4 So the monitor has to reach the Wayland thread
+
+`MonitorFromWindow` needs an `HWND`, and an `HWND` belongs to the thread that
+created it (§8's header). The Wayland thread may not call it. A
+request-and-wait across the boundary would deadlock the first time the UI
+thread was inside a modal loop — a window drag, a system menu, `TrackPopupMenu`
+itself.
+
+So it is a **cache**, `platform::PopupBounds`, which is an
+`Arc<Mutex<Option<Rect>>>` per window: the same shape as the `Shadow` that
+already crosses (§8), created by `state.rs` at `ToUi::Create`, written by the
+UI thread, read by the Wayland thread when a popup is parented to that window.
+It holds **the rectangle that window's popups must stay inside, in that
+window's own window-geometry coordinates** — already converted, so the Wayland
+side does no geometry at all.
+
+The UI thread refreshes it at four moments, and each is a way the answer can
+change:
+
+| when | what changed |
+|---|---|
+| `create_window` | there is now a window to ask about |
+| `WM_WINDOWPOSCHANGED` | it moved, possibly onto another monitor |
+| `WM_DISPLAYCHANGE` | the resolution or the monitor layout changed |
+| `WM_SETTINGCHANGE` | the taskbar moved, resized, or became auto-hiding |
+
+The last two are the ones a "refresh it when the window moves" design would
+miss: `rcWork` changes without any window moving. All three messages fall
+through to `DefWindowProc` rather than returning 0 — `WM_WINDOWPOSCHANGED`'s
+default handler is what generates `WM_SIZE` and `WM_MOVE`, and swallowing it
+would take the whole resize negotiation with it.
+
+**What the cache costs is stated rather than hidden**: a menu opened in the
+same millisecond that its window is dragged onto a second monitor can be
+constrained against the monitor it just left. Windows sends
+`WM_WINDOWPOSCHANGED` for every step of a drag, so the cache is at most one
+message stale. `None` — nothing has said yet — means *do not constrain*, which
+is the pre-stage-38 behaviour and is a known-wrong answer rather than a guess.
+
+### 38.5 Three ways to get the rectangle wrong, all silent
+
+**`MonitorFromWindow(parent)`, not the primary monitor.** `GetSystemMetrics`
+with `SM_CXSCREEN` is shorter, and it describes the *primary* display: on a
+two-monitor desktop every menu on the second screen would be shoved back
+towards the first. That is invisible on a single-monitor test machine, which is
+every test machine this project has. `MONITOR_DEFAULTTONEAREST` also answers
+for a window dragged mostly off the desktop, where `MONITOR_DEFAULTTONULL`
+would answer nothing.
+
+**`rcWork`, not `rcMonitor`.** The work area is the monitor minus the taskbar
+and any other appbar. A menu slid until its last row is behind the taskbar is
+exactly as unusable as one off the screen, and it looks deliberate. `rcWork` is
+also what Windows' own menus respect, so this is the choice that makes our
+menus behave like the ones next to them.
+
+**The coordinates are converted, not assumed.** `rcWork` is in screen
+coordinates; `xdg_positioner` works in the parent's window-geometry
+coordinates. Both corners go through `ScreenToClient` and then through
+`WindowState::to_surface` — *the same* conversion the pointer and the touch
+paths use (§6, §20), not a second one. This is the part that would fail
+plausibly: with the conversion wrong, a menu is constrained against a rectangle
+that is the right size and in the wrong place, so it looks right in the common
+case where the window is near the top left of the screen and is wrong
+everywhere else. Sharing the conversion with the input paths means a menu
+cannot be constrained against a rectangle that disagrees with where the clicks
+are.
+
+### 38.6 `reposition_request` needed the same treatment, for a reason worth naming
+
+`xdg_popup.reposition` (§18.6) had the same raw call, and fixing only
+`new_popup` would have produced a compositor that was right once. GTK opens a
+submenu wherever the positioner first says and *then* repositions it with a
+second positioner carrying the constraint adjustment; a compositor that
+constrains at creation and not at reposition moves the menu on screen and then
+puts it back off again on the next keystroke.
+
+The bounds used there belong to the **parent**, not to the popup being moved:
+the positioner's rectangle is in the parent's coordinates and so is the answer.
+A popup cannot be reparented, but its parent can certainly have been dragged to
+another monitor since it was mapped.
+
+### 38.7 The synthetic Win32 could not see a popup at all
+
+`crate::control` (§26.4) is the stand-in for Windows that the conformance suite
+drives. It knew where every window was **except** the ones whose position this
+compositor chooses: WLCS positions the windows *it* creates, and it never
+positions a popup, because in Wayland a popup's position is not the suite's to
+choose. So every popup sat at (0, 0) in the stand-in's hit test.
+
+That is why the whole `XdgPopupPositionerTest` family failed even for cases
+with no constraint in them at all: the suite's `surface_actually_at_location`
+moves the pointer to where it expects the menu and asks the client what is
+under the cursor, and it was being told about whatever was at the top left of
+the screen. Two facts had to reach `control.rs` for the family to mean
+anything:
+
+1. **where a popup is** — `Rect::popup_at` now carries `(parent, x, y)`, and
+   `origin()` walks up the chain, so a submenu three levels deep resolves
+   through its menu and its window;
+2. **where the screen is** — `publish_bounds` writes the same
+   `PopupBounds` cell the real platform writes, from the one advertised output
+   minus the window's position. A window at (5, 5) on a 1920x1080 output is
+   told `(-5, -5, 1920, 1080)`, and a popup of that window at (-60, -40) is
+   then visibly 55 pixels off the left edge and can be slid back on.
+
+This is the shape the harness is supposed to have (§26.4): the stand-in does
+what Windows does, at the same seam, and when it does not, it is a statement
+about the stand-in rather than about the compositor.
+
+### 38.8 The measurement: 47 verdicts moved, all of them the right way
+
+`scripts/wc-wlcs.sh headless`, the same command before and after, on this tree:
+
+| | before | after |
+|---|---:|---:|
+| passed | 351 | **398** |
+| failed | 115 | **68** |
+| skipped | 759 | 759 |
+
+1,225 verdicts joined by test name: **47 moved, every one of them FAIL to
+PASS, and nothing regressed.** The before column is `d3240e3`'s, measured by
+checking master's `crates/wc-compositor` out over this branch's and building
+again, so the two runs differ in nothing but this change.
+
+The same measurement was taken five times more, at `7da9a58` (230 -> 277),
+`e3409ba` (231 -> 278), `4a5dfb4` (231 -> 278), `a7210e8` (232 -> 279) and
+`8cb82b1` (232 -> 279), with **the same 47 tests** moving each time. Six trees,
+one number, and the last pair is the one that means something: §40 landed a
+scene lookup between them and took the baseline from 232 passing to 351 — a
+larger change to this scoreboard than this section is — and the 47 are still
+the same 47, still disjoint from it. Two sections fixed two different halves of
+"where is this", and neither number is doing the other's work.
+
+| suite | failures before | after |
+|---|---:|---:|
+| `Gravity/XdgPopupPositionerTest` | 9 | 0 |
+| `Anchor/XdgPopupPositionerTest` | 8 | 0 |
+| `AnchorRect/XdgPopupPositionerTest` | 6 | 0 |
+| `ConstraintAdjustmentSlide/XdgPopupPositionerTest` | 5 | 0 |
+| `ConstraintAdjustmentFlip/XdgPopupPositionerTest` | 5 | 0 |
+| `ConstraintAdjustmentResize/XdgPopupPositionerTest` | 5 | 0 |
+| `ConstraintAdjustmentNone/XdgPopupPositionerTest` | 5 | 0 |
+| `Default/XdgPopupPositionerTest` | 1 | 0 |
+| `XdgPopupStable/XdgPopupTest` | 6 | 4 |
+| `XdgPopupTest` | 4 | 3 |
+
+**The 44-failure `xdg_positioner` cluster — §26.12 item 2, and the second
+largest on the scoreboard when that list was written — is gone entirely.**
+Three more went with it, and the 44 were still 44 on every tree this was
+measured on, including the one where §40 had already closed the largest
+cluster: the two do not overlap by a single test.
+
+The `ConstraintAdjustmentSlide` cases are the ones that show the fix rather
+than the bookkeeping: before, the compositor answered `(-60, -40)` where the
+suite wanted `(-5, -5)`; the popup was off the top left of the output and the
+client had declared `slide_x | slide_y`. That is the user's bug, in a
+conformance suite, and it had been failing since stage 9.
+
+Seven popup failures remain and none of them is placement:
+
+* `zero_size_anchor_rect_stable` — a **protocol error** test: the positioner is
+  invalid and the compositor must raise `invalid_input`. §26.12 item 3.
+* `when_parent_surface_is_moved_a_reactive_popup_is_moved` and
+  `..._a_nonreactive_popup_is_not_moved` — both drive
+  `xdg_toplevel.move` and expect the *parent* to move. On the headless leg
+  nothing implements an interactive move, so the parent never moves and the
+  test cannot pass for a reason that has nothing to do with popups. `reactive`
+  is also unimplemented: this compositor does not re-run a positioner when the
+  parent moves, and after this stage it finally *could* — see 33.12.
+* four `grabbed_popup*` cases — popup grab semantics: dismissal order,
+  keyboard focus, and the one-click-per-level behaviour §18.6 already records.
+
+### 38.9 The desktop, which is where the report came from
+
+**And Wine is not it.** The Win32 half of this section is two system calls, and
+under Wine both of them answer about Wine's own virtual desktop rather than
+about a Windows machine with a taskbar on it: `GetMonitorInfo`'s `rcWork` there
+is the X window `wine explorer` was given. So a green Wine run says the code
+path executes and computes *something* — which is worth having, and the Windows
+build's own unit tests are run that way (`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine
+cargo test --target x86_64-pc-windows-gnu`, 96 passing, the placement arithmetic
+among them) — and says nothing at all about whether the rectangle is the right
+one. Every claim below needed the guest.
+
+WLCS runs against the Linux build and a synthetic Win32. The bug was reported
+against a real screen with a real taskbar, so it is checked there too, with
+`scripts/wc-popup.sh` — the compositor on the guest's interactive desktop
+(§13), Firefox on the other side of the hypervisor, the parent window moved to
+the bottom right corner of the work area, and a **real** right-click from
+`SetCursorPos` plus `mouse_event`, so the press is routed by Windows exactly as
+a hand's would be.
+
+The work area on that guest is 1280x752: a 1280x800 screen with a 48-pixel
+taskbar.
+
+| | menu rectangle, in screen coordinates | inside the work area |
+|---|---|---|
+| before | 214x236 at 1213, 688 | **no** — 147 px past the right edge, 172 px below the work area |
+| after | 214x236 at 1024, 474 | **yes** |
+
+`docs/stage38/stage38-screen-before.png` is the user's report, photographed:
+Firefox's context menu with only the first few pixels of "Save Page As…" and
+"Select All" visible at the edge of the screen and the rest of the menu
+nowhere. `docs/stage38/stage38-screen-after.png` is the same click on the same
+machine with this stage's binary: the whole menu, flipped up and to the left,
+sitting above the taskbar — **and the window it belongs to fits the screen
+too**, which is §38.10 and is in the same photograph.
+
+This mode moves a window and clicks on a desktop somebody may be using, so it
+wants a machine that is free; the window measurements in §38.10 need no input
+at all and were taken against a *locked* screen, where a click would reach
+Winlogon's secure desktop rather than ours.
+
+**And the negative check, which is the same bug wearing different clothes.** A
+constraint that fires when it should not is not better than one that never
+fires — it moves a menu the client placed deliberately. Two things check it:
+
+* `weston-terminal` sets anchor, size and gravity and **no constraint
+  adjustment at all** (measured with `WAYLAND_DEBUG=1`; Firefox sets 63, which
+  is all six bits). Its menu is therefore entitled to hang off the screen, and
+  on the guest it does, at exactly the rectangle the positioner asked for and
+  not one pixel from it. The script knows the difference and scores it as the
+  control rather than as a failure.
+* `a_menu_that_fits_is_placed_exactly_where_the_positioner_asked` in
+  `state.rs`'s tests asserts equality with `get_geometry()` for a menu in the
+  middle of the screen, so the "does not fire" case is in the ordinary gate and
+  not only on a guest.
+
+The compositor now logs what the client declared on every popup —
+`adjust ConstraintAdjustment(SlideX | ... )` — because that is the first
+question to ask of any future report that a menu is in the wrong place, and
+without it the answer needs a Wayland trace.
+
+### 38.10 The same knowledge fixes the window, not only the menu
+
+Once a window can be asked which monitor it is on, two things that were nobody's
+job become one line each, and both were visible in the "before" photograph: our
+Firefox window is 1296x820 at (-16, -68) on a 1280x800 screen — wider than the
+display, with its title bar above the top of it. `CreateWindowExW` passes
+`CW_USEDEFAULT` for all four of x, y, width and height, so until this stage
+*nothing in this project had an opinion about either*: the position was
+Windows' cascade and the size was whatever the client asked for.
+
+Measured on the guest with `scripts/wc-popup.sh spawn`, which needs no input at
+all and therefore runs against a locked screen:
+
+| | Firefox's window | inside the work area |
+|---|---|---|
+| before | 1296x820 at 26, 26 | **no** — 42 px past the right edge, 94 px below the work area |
+| after | 1220x752 at 0, 0 | **yes**, caption and all |
+
+`docs/stage38/stage38-window-before.png` and `-after.png` are those two
+windows, captured with `PrintWindow` on their own `HWND`s; `spawn-before.txt`
+and `spawn-after.txt` are the numbers. The 1296x820 is the same window in every
+run — it is what Firefox asks for when it is told the output is 1920x1080 —
+but *where* it lands is `CW_USEDEFAULT`'s cascade and moves from run to run: at
+26, 26 here, and at -16, -68 in the run
+`docs/stage38/stage38-screen-before.png` was taken during, with its title bar
+above the top of the screen. Either way it does not fit.
+
+**Both halves are in the "after" number, and they can be told apart in the
+log.** Told that the output is 1280x752, Firefox now asks for a window of
+1220x767 rather than 1296x820 — most of the fix, and the client's own doing.
+That is still 15 pixels too tall for the work area, because 752 is the
+*window's* budget and Firefox sized its *content* against the output, so the
+clamp fires and takes it to 1220x752 at 0, 0:
+
+```
+window 1 asked for 1220x767 at -8,-8 and the work area is 1280x752 at 0,0
+                              -> 1220x752 at 0,0
+```
+
+An honest output alone would have left the window 15 px into the taskbar; the
+clamp alone would have shrunk a 1296x820 window by 68 px after it had laid
+itself out. Neither is redundant, and the order matters — the client is told
+the truth first and corrected second, because a browser reflowing after a
+correction is visible and a browser that was told the truth does not have to.
+
+**The `wl_output` is now the work area.** Until this stage the one output was
+`--output WxH` and nothing else, with a default of 1920x1080 that was true of
+no particular machine — and the comment on that argument named the debt: *"the
+Win32 platform ought to override it with the real monitor and does not yet"*.
+It does now, from `SPI_GETWORKAREA` at startup, and `--output` still wins so a
+conformance run gets the desktop it asked for. This is the fix that arrives
+*first*: a client sizes itself against the output, so telling it the truth
+prevents the bad size instead of correcting it, and a browser reflowing after a
+correction is visible.
+
+**And the window is fitted to the work area at map time**, because a client may
+ask for any size regardless of what the output says. `fit_to_work_area` caps
+the size and then *bounds* — never chooses — the position. A window that
+already fits is not moved at all: `CW_USEDEFAULT`'s cascade is not wrong, it is
+merely unbounded, and a few windows into it the next one is off the bottom
+right corner.
+
+Fitting the whole outer rectangle is deliberately stronger than "keep the title
+bar on screen", and cheaper: there is no arrangement in which the frame fits
+inside the work area and the caption does not, so it needs no knowledge of
+where the caption is or how tall it is at this DPI and this theme. The
+arithmetic is in `platform/mod.rs` rather than in `win32.rs` so that it is
+tested by the ordinary gate on a machine with no monitor; the Win32 side is
+then only the two system calls that say where the work area is.
+
+Two details in that path cost more thought than the clamp:
+
+* **`AdjustWindowRectEx` is given the window's live style**, read with
+  `GetWindowLongPtrW(GWL_STYLE)`, not the constant `create_window` used. They
+  are the same today and would silently stop being the same the moment a window
+  is given a different frame — §22's title-bar work is exactly that — and the
+  failure would be a non-client inset wrong by a caption's height.
+* **A window that was made smaller must be told.** `map_window` sets
+  `self_driven` around its `SetWindowPos` so that the `WM_SIZE` it provokes is
+  not echoed back to the client as a configure — which is right when the size
+  is the one the client asked for and *wrong* when it is not. It is now
+  suppressed only when nothing changed, and `last_configured` records what the
+  window actually got, so the next real resize is compared against a size this
+  window has had.
+
+### 38.11 What was learned about monitor geometry, since two other sections asked
+
+`EnumDisplayMonitors` and `GetDpiForWindow` appeared nowhere in this tree
+before this stage; `GetSystemMetrics(SM_CXSCREEN)` was printed once at startup
+and used for nothing. §15.15 item 3, §18.11 item 5 and §26.12 item 2 all ask
+for somebody to go and ask Windows where things are. This is the first section
+that did, so what it found is worth writing down plainly:
+
+1. **A window's monitor is a question with a cheap answer.**
+   `MonitorFromWindow` + `GetMonitorInfoW` is two calls, no allocation, no
+   registration, and it is safe to make on every `WM_WINDOWPOSCHANGED`. There
+   is no reason for anything in this tree to reason about "the screen" from
+   `SM_CXSCREEN` again.
+2. **The work area is a different rectangle from the monitor, and it is
+   usually the one you want.** Everything user-visible — where a window opens,
+   how large a maximised window is, where a menu may go — is `rcWork`.
+   `rcMonitor` is for full-screen.
+3. **The compositor still advertises exactly one `wl_output`, and now it is a
+   truthful one.** That is not multi-monitor support. A second monitor needs a
+   second `wl_output` with its own position in a global compositor coordinate
+   space, `wl_surface.enter`/`leave` as a window is dragged between them, and a
+   scale factor per output; this stage adds none of it and does not pretend to.
+   What it does add is the first place where the answer is measured rather than
+   assumed, which is where that work would start.
+4. **Scale is still hard-coded to 1** and this stage does not touch it. It is
+   now visibly the *next* untrue number: `GetDpiForWindow` exists, the
+   compositor already prints the per-window DPI at map (§13), and
+   `wp_fractional_scale_manager_v1` is a recorded gap on the scoreboard. A
+   150% desktop would want all of it at once, and half of it would be worse
+   than none.
+
+Both are deliberately out of scope and both are unowned. The one thing this
+stage does for them is that `PopupBounds` is per-window rather than global, so
+a second monitor changes what is written into it and nothing that reads it.
+
+### 38.12 What is left
+
+**The seven popup failures this section did not close**, named individually
+because "seven remain" is not a handover. They are three different pieces of
+work and none of them is placement:
+
+1. **`reactive` popups** — `XdgPopupTest.when_parent_surface_is_moved_a_reactive_popup_is_moved`
+   and `..._a_nonreactive_popup_is_not_moved`. `xdg_positioner.set_reactive`
+   asks the compositor to re-run the positioner when the parent moves. Before
+   this stage there was nothing to re-run it *against*; now there is, and the
+   input is already refreshed on `WM_WINDOWPOSCHANGED` — the same message that
+   would trigger it. Both tests also drive `xdg_toplevel.move`, which nothing
+   implements on the headless leg, so they need that too. One real behaviour: a
+   menu that stays on screen while its window is dragged towards an edge.
+2. **The protocol errors** — `XdgPopupTest.zero_size_anchor_rect_stable`, which
+   wants `invalid_input` for a zero-sized anchor rectangle. §26.12 item 3, and
+   still the cheapest thing on that list.
+3. **A popup stack rather than one grabbing popup** (§18.6) — the four
+   `XdgPopupStable/XdgPopupTest.grabbed_popup*` cases: dismissal order,
+   keyboard focus, and `does_not_get_popup_done_event_before_button_press`.
+
+**And the two numbers this section made honest without making complete.** Both
+are named in §38.11 and neither is owned by anyone:
+
+4. **One `wl_output`, now truthful.** It is the real work area of the real
+   primary monitor, which is a fact about *one* screen. A second monitor needs
+   a second `wl_output` with a position in a global coordinate space,
+   `wl_surface.enter`/`leave` as a window crosses between them, and a scale per
+   output. `PopupBounds` is already per-window, so the constraint side of that
+   work is done; nothing else is.
+5. **Scale is still hard-coded to 1**, and it is now the *next* untrue number
+   rather than one of several. `GetDpiForWindow` exists, the compositor already
+   prints the per-window DPI at map (§13), and
+   `wp_fractional_scale_manager_v1` is a recorded gap on the scoreboard. A 150%
+   desktop wants all of it at once and half of it would be worse than none.
+**Two things this section had to fix to build at all, and both were fixed
+upstream in the same hours**, which is worth recording as a finding about the
+*gate* rather than about the code:
+
+6. **`cargo build --workspace --target x86_64-pc-windows-gnu` was broken by
+   §36's doorbell**, in two places, four errors each, at `8cb82b1`.
+   `crates/sv-hostd/src/bin/sv-bell-probe.rs` used `std::os::unix` at the top
+   level, and `crates/sv-icd/src/transport.rs` called
+   `sv_transport::vdoorbell`, which was `#[cfg(unix)]`, unconditionally. This
+   branch gated both to be able to build a guest binary at all; by `d3240e3`
+   master had fixed both **better**, so this branch's patches were dropped at
+   that merge and neither survives. The probe now gates only its *host* half,
+   because the guest half has a Windows form (`winpipe::open_virtio_port`), and
+   `vdoorbell` stopped being `#[cfg(unix)]` at the module level instead of
+   being avoided at the call site. Both of those are the right fix and neither
+   is what a compiler error suggests.
+
+   **The finding is that nothing caught it for a whole day.** The Windows cross
+   build is the gate between a change and a guest; `cargo clippy --target`
+   does not catch this class at all, because it builds *metadata* and a
+   `#[cfg(unix)]` item referenced from non-`cfg`'d code is only a hard error
+   when something has to be emitted. A Linux-only gate is green throughout, and
+   so is a clippy gate that names the target. That is §35's own subject — a
+   check that reports success while something is wrong — and the answer is that
+   `cargo build --workspace --target x86_64-pc-windows-gnu` has to be run, as a
+   build, before anything is claimed to be deployable.
+7. **`crates/wc-wlcs/src/imp.rs`'s fallback extension table had drifted** —
+   the compositor advertises `wc_clipboard_manager_v1` and the table did not
+   list it, so `scripts/wc-wlcs.sh globals` was failing on master. Fixed here
+   and, again, independently on master (§41), where it was found by the same
+   check. The duplicate entry the merge produced was removed rather than
+   deduplicated silently: two identical rows in that table would pass the
+   harness and mean nothing.
+
+**And the harness notes, for whoever runs this next.**
+
+8. **`scripts/wc-popup.sh` uses the shared-file transport, not the arena.** At
+   the checkout this stage started from, `crates/wc-arena-host` had been
+   deleted by the unified merge, so `wc-desktop.sh window` — which builds it —
+   could not run at all; master has since restored the crate as a workspace
+   member. The script was written against the shared-file transport instead
+   and stays there, because this section is about *where a window is put* and
+   not about how its pixels arrive: the popup's `HWND` is placed from a
+   rectangle `state.rs` computed, whatever carried the buffer. It also needs no
+   QMP and no root, which is two fewer things between a placement question and
+   its answer. **The third reason has since been removed by somebody else**:
+   master's `--arena-frames` has the guest publish its own page-frame list, so
+   the locate reads the kernel's PFN database instead of sweeping for stamps —
+   0.064 s against 2.308 s, and "page index claimed twice" stops being
+   expressible. A future run of this harness that *wants* the arena — one that
+   is measuring pixels rather than rectangles — should use that rather than
+   what this script was written against.
+9. **Three harness lessons, each of which produced a wrong green or a wrong
+   picture before it was understood.**
+   * A capture that fails writes nothing, so the previous run's file gets
+     fetched and reported as this run's — the only tell was a four-minute-old
+     clock in the corner of a screenshot. Delete the old file before the run
+     rather than trusting the new one.
+   * **A menu is a grab**: it is gone the moment anything else takes the focus,
+     so the photograph has to be taken by the same process that clicked,
+     polling for the popup, rather than by a second scheduled task two seconds
+     later.
+   * **A locked guest can still be measured, but not clicked.** With the lock
+     screen up, `mouse_event` goes to Winlogon's secure desktop and a screen
+     grab returns the lock screen — but scheduled tasks still run on
+     `WinSta0\Default`, `GetWindowRect` still answers, and `PrintWindow` still
+     reads DWM's redirection surface (§13). That is why `spawn` is a mode of
+     its own: the toplevel half of this section is measurable at any hour, and
+     the popup half needs an unlocked screen and a user who is not at it.
+10. **A stash is shared by every worktree of a repository.** `git stash push`
+   here is visible to `git stash pop` there, and one worktree popping "its"
+   stash can land a hundred files of somebody else's work in a tree that never
+   asked for them. It also silently drops `MERGE_HEAD`, so a merge in progress
+   commits as an ordinary commit with one parent. Neither is recoverable by
+   noticing later. Use `git checkout <ref> -- <path>` to swap a subtree for a
+   measurement, which is what §38.8's before-and-after runs do.

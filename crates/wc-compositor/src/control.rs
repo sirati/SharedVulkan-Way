@@ -97,6 +97,20 @@ pub struct Rect {
     /// a menu that stole the focus would dismiss itself). See
     /// [`Control::follow_focus`].
     pub toplevel: bool,
+    /// For an `xdg_popup`: the window it is parented to, and where the
+    /// compositor put it inside that parent's window geometry.
+    ///
+    /// ADDED FOR STAGE 38. **A popup is the one window this stand-in cannot be
+    /// told the position of.** WLCS positions the windows it creates, and it
+    /// never positions a popup, because in Wayland a popup's position is not
+    /// the suite's to choose — the compositor computes it from the
+    /// `xdg_positioner` and reports it in the configure. Until this field
+    /// existed, every popup sat at (0, 0) in the hit test below, so
+    /// `surface_actually_at_location` — which is how the whole
+    /// `XdgPopupPositionerTest` family checks placement — asked whether the
+    /// menu was under the cursor and was told about whatever was at the top
+    /// left of the screen.
+    pub popup_at: Option<(WindowId, i32, i32)>,
 }
 
 /// What the Wayland side must be able to answer for the hit test to work.
@@ -106,11 +120,23 @@ pub struct Rect {
 pub trait Windows {
     /// Every **mapped** window, in stacking order, bottom first.
     fn mapped(&self) -> Vec<Rect>;
+    /// Record the rectangle this window's popups must be constrained to, in
+    /// that window's own window-geometry coordinates.
+    ///
+    /// ADDED FOR STAGE 38, and it is the stand-in's half of
+    /// [`crate::platform::PopupBounds`]: on Windows the UI thread answers this
+    /// from `MonitorFromWindow` and `GetMonitorInfo`, and here it is the one
+    /// output minus wherever the suite put the window.
+    fn set_popup_bounds(&self, id: WindowId, bounds: crate::surface::Rect);
 }
 
 impl Windows for crate::state::State {
     fn mapped(&self) -> Vec<Rect> {
         self.mapped_windows()
+    }
+
+    fn set_popup_bounds(&self, id: WindowId, bounds: crate::surface::Rect) {
+        self.set_popup_bounds(id, bounds);
     }
 }
 
@@ -172,6 +198,15 @@ pub struct Control {
     /// input event needs a timestamp and there is no message queue here to
     /// take one from.
     started: std::time::Instant,
+    /// The one output, in compositor coordinates.
+    ///
+    /// ADDED FOR STAGE 38. This is the stand-in for the monitor: on Windows a
+    /// popup is constrained to `GetMonitorInfo`'s `rcWork`, and here there is
+    /// no monitor, no taskbar and no second screen — only the rectangle the
+    /// compositor advertises as its `wl_output`, which is what WLCS positions
+    /// its windows within and what its positioner tests expect a popup to be
+    /// kept inside.
+    output: (i32, i32),
 }
 
 impl Control {
@@ -181,7 +216,7 @@ impl Control {
     /// accepts one connection at a time and serves it to end of file, which is
     /// what the shim does: one connection per compositor, held for the life of
     /// the test.
-    pub fn bind(path: &str, events: Sender<FromUi>) -> std::io::Result<Control> {
+    pub fn bind(path: &str, events: Sender<FromUi>, output: (i32, i32)) -> std::io::Result<Control> {
         // A stale socket from a killed run is the normal case on a machine
         // running ten worktrees, and `bind` on an existing path is
         // `EADDRINUSE` rather than anything more helpful.
@@ -203,6 +238,7 @@ impl Control {
             touching: None,
             focus: None,
             started: std::time::Instant::now(),
+            output,
         })
     }
 
@@ -215,6 +251,7 @@ impl Control {
     /// half a second doing nothing.
     pub fn service(&mut self, windows: &impl Windows) {
         self.follow_focus(windows);
+        self.publish_bounds(windows);
         loop {
             let job = match self.jobs.try_recv() {
                 Ok(j) => j,
@@ -299,8 +336,55 @@ impl Control {
         }
     }
 
+    /// Tell every mapped window where the screen is, from its own point of
+    /// view.
+    ///
+    /// ADDED FOR STAGE 38. The compositor constrains a popup in its parent's
+    /// coordinates, so the rectangle handed over is the output translated by
+    /// minus the parent's position: a window at (5, 5) on a 1920x1080 output is
+    /// told `(-5, -5, 1920, 1080)`, and a popup of that window at (-60, -40)
+    /// is then visibly 55 pixels off the left edge and can be slid back on.
+    ///
+    /// Every turn rather than only when something moves. It is a handful of
+    /// integers per window and it is the honest shape: on Win32 the answer can
+    /// change without any window moving — the taskbar can be resized, a monitor
+    /// can be unplugged — so a cache that is only refreshed on a move would be
+    /// a promise this stand-in could not keep either.
+    fn publish_bounds(&self, windows: &impl Windows) {
+        let mapped = windows.mapped();
+        let (ow, oh) = self.output;
+        for r in &mapped {
+            let (x, y) = self.origin(r, &mapped);
+            windows.set_popup_bounds(r.id, crate::surface::Rect::new(-x, -y, ow, oh));
+        }
+    }
+
     fn now_ms(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
+    }
+
+    /// Where a window's top left corner is, in compositor coordinates.
+    ///
+    /// A toplevel is wherever the suite put it. **A popup is wherever the
+    /// compositor put it**, which is an offset inside its parent — so the walk
+    /// goes up the chain, and a submenu three levels deep resolves through its
+    /// menu and its window. The recursion terminates because a popup's parent
+    /// is always an older window and window ids only increase.
+    fn origin(&self, r: &Rect, mapped: &[Rect]) -> (i32, i32) {
+        let Some((parent, dx, dy)) = r.popup_at else {
+            return self.position_of(r.client, r.surface);
+        };
+        match mapped.iter().find(|p| p.id == parent) {
+            Some(p) => {
+                let (px, py) = self.origin(p, mapped);
+                (px + dx, py + dy)
+            }
+            // The parent is not mapped, which happens between a menu's
+            // creation and its parent's first buffer. Its own offset is the
+            // best available answer and is right whenever the parent is at the
+            // origin, which is where an unpositioned window is.
+            None => (dx, dy),
+        }
     }
 
     fn handle(&mut self, line: &str, windows: &impl Windows) -> String {
@@ -313,8 +397,9 @@ impl Control {
             "ping" => "ok\n".to_owned(),
             "windows" => {
                 let mut out = String::new();
-                for r in windows.mapped() {
-                    let (x, y) = self.position_of(r.client, r.surface);
+                let mapped = windows.mapped();
+                for r in &mapped {
+                    let (x, y) = self.origin(r, &mapped);
                     out.push_str(&format!(
                         "window {} {} {} {x} {y} {} {}\n",
                         r.id, r.client, r.surface, r.w, r.h
@@ -510,7 +595,7 @@ impl Control {
         // Win32 and as `wl_pointer` allows.
         let hit = if self.held.is_empty() {
             mapped.iter().rev().find(|r| {
-                let (wx, wy) = self.position_of(r.client, r.surface);
+                let (wx, wy) = self.origin(r, &mapped);
                 px >= wx as f64
                     && py >= wy as f64
                     && px < (wx + r.w) as f64
@@ -522,7 +607,7 @@ impl Control {
 
         match hit {
             Some(r) => {
-                let (wx, wy) = self.position_of(r.client, r.surface);
+                let (wx, wy) = self.origin(r, &mapped);
                 let (lx, ly) = (px - wx as f64, py - wy as f64);
                 if self.over != Some(r.id) {
                     if let Some(old) = self.over {
@@ -589,10 +674,18 @@ mod tests {
     use super::*;
     use std::sync::mpsc::channel;
 
-    struct Fake(Vec<Rect>);
+    struct Fake(Vec<Rect>, std::cell::RefCell<Vec<(WindowId, crate::surface::Rect)>>);
+    impl Fake {
+        fn new(windows: Vec<Rect>) -> Fake {
+            Fake(windows, std::cell::RefCell::new(Vec::new()))
+        }
+    }
     impl Windows for Fake {
         fn mapped(&self) -> Vec<Rect> {
             self.0.clone()
+        }
+        fn set_popup_bounds(&self, id: WindowId, bounds: crate::surface::Rect) {
+            self.1.borrow_mut().push((id, bounds));
         }
     }
 
@@ -610,19 +703,34 @@ mod tests {
                 touching: None,
                 focus: None,
                 started: std::time::Instant::now(),
+                output: (800, 600),
             },
             rx,
         )
     }
 
     fn win(id: WindowId, client: u32, surface: u32, w: i32, h: i32) -> Rect {
-        Rect { id, client, surface, w, h, toplevel: true }
+        Rect { id, client, surface, w, h, toplevel: true, popup_at: None }
+    }
+
+    /// A popup of `parent`, at `(x, y)` inside it — what the compositor's
+    /// positioner decided, which is the only place this position exists.
+    fn popup(id: WindowId, parent: WindowId, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            id,
+            client: 1,
+            surface: 100 + id as u32,
+            w,
+            h,
+            toplevel: false,
+            popup_at: Some((parent, x, y)),
+        }
     }
 
     #[test]
     fn a_move_over_a_window_enters_it_in_surface_coordinates() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(1, 1, 3, 100, 50)]);
+        let f = Fake::new(vec![win(1, 1, 3, 100, 50)]);
         assert_eq!(c.handle("position 1 3 200 100", &f), "ok\n");
         assert_eq!(c.handle("pointer-move 210 120", &f), "ok\n");
         match rx.try_recv() {
@@ -637,7 +745,7 @@ mod tests {
     #[test]
     fn a_second_move_inside_the_same_window_is_a_motion_not_an_enter() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(1, 1, 3, 100, 50)]);
+        let f = Fake::new(vec![win(1, 1, 3, 100, 50)]);
         c.handle("pointer-move 10 10", &f);
         c.handle("pointer-move 20 20", &f);
         assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { .. })));
@@ -647,7 +755,7 @@ mod tests {
     #[test]
     fn leaving_the_rectangle_leaves_the_window() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(7, 1, 3, 100, 50)]);
+        let f = Fake::new(vec![win(7, 1, 3, 100, 50)]);
         c.handle("pointer-move 10 10", &f);
         c.handle("pointer-move 10 400", &f);
         assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { .. })));
@@ -658,7 +766,7 @@ mod tests {
     fn the_topmost_window_wins_and_stacking_order_is_the_list_order() {
         let (mut c, rx) = control();
         // Both at the origin and overlapping; the later one is on top.
-        let f = Fake(vec![win(1, 1, 3, 100, 100), win(2, 1, 4, 100, 100)]);
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100), win(2, 1, 4, 100, 100)]);
         c.handle("pointer-move 50 50", &f);
         assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { id: 2, .. })));
     }
@@ -666,7 +774,7 @@ mod tests {
     #[test]
     fn a_held_button_captures_the_pointer_across_the_edge() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(1, 1, 3, 100, 100)]);
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100)]);
         c.handle("pointer-move 50 50", &f);
         c.handle("pointer-button 272 1", &f);
         // Off the right-hand edge. Win32 with `SetCapture` keeps delivering,
@@ -680,7 +788,7 @@ mod tests {
     #[test]
     fn a_release_ends_the_capture() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(1, 1, 3, 100, 100)]);
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100)]);
         c.handle("pointer-move 50 50", &f);
         c.handle("pointer-button 272 1", &f);
         c.handle("pointer-button 272 0", &f);
@@ -697,7 +805,7 @@ mod tests {
     #[test]
     fn a_click_with_nothing_under_the_cursor_is_answered_rather_than_sent() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(1, 1, 3, 10, 10)]);
+        let f = Fake::new(vec![win(1, 1, 3, 10, 10)]);
         c.handle("pointer-move 500 500", &f);
         assert_eq!(c.handle("pointer-button 272 1", &f), "ok no-window\n");
         assert!(rx.try_recv().is_err());
@@ -706,7 +814,7 @@ mod tests {
     #[test]
     fn windows_reports_the_position_that_was_set() {
         let (mut c, _rx) = control();
-        let f = Fake(vec![win(1, 1, 3, 64, 48)]);
+        let f = Fake::new(vec![win(1, 1, 3, 64, 48)]);
         c.handle("position 1 3 12 34", &f);
         assert_eq!(c.handle("windows", &f), "window 1 1 3 12 34 64 48\nok\n");
     }
@@ -714,14 +822,14 @@ mod tests {
     #[test]
     fn an_unmoved_window_is_at_the_origin() {
         let (mut c, _rx) = control();
-        let f = Fake(vec![win(9, 2, 5, 1, 1)]);
+        let f = Fake::new(vec![win(9, 2, 5, 1, 1)]);
         assert_eq!(c.handle("windows", &f), "window 9 2 5 0 0 1 1\nok\n");
     }
 
     #[test]
     fn moving_a_window_out_from_under_the_pointer_leaves_it() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(4, 1, 3, 50, 50)]);
+        let f = Fake::new(vec![win(4, 1, 3, 50, 50)]);
         c.handle("pointer-move 10 10", &f);
         c.handle("position 1 3 900 900", &f);
         assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { .. })));
@@ -731,7 +839,7 @@ mod tests {
     #[test]
     fn a_newly_mapped_toplevel_takes_the_activation_and_the_focus() {
         let (mut c, rx) = control();
-        c.follow_focus(&Fake(vec![win(3, 1, 2, 10, 10)]));
+        c.follow_focus(&Fake::new(vec![win(3, 1, 2, 10, 10)]));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 3, .. })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 3, on: true })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::KeyboardFocus { id: 3, on: true, .. })));
@@ -743,7 +851,7 @@ mod tests {
     #[test]
     fn showing_a_window_tells_it_its_size_the_way_win32_does() {
         let (mut c, rx) = control();
-        c.follow_focus(&Fake(vec![win(1, 1, 2, 200, 320)]));
+        c.follow_focus(&Fake::new(vec![win(1, 1, 2, 200, 320)]));
         assert!(matches!(
             rx.try_recv(),
             Ok(FromUi::Resized { id: 1, width: 200, height: 320 })
@@ -753,7 +861,7 @@ mod tests {
     #[test]
     fn the_focus_is_not_re_sent_every_turn() {
         let (mut c, rx) = control();
-        let f = Fake(vec![win(3, 1, 2, 10, 10)]);
+        let f = Fake::new(vec![win(3, 1, 2, 10, 10)]);
         c.follow_focus(&f);
         while rx.try_recv().is_ok() {}
         c.follow_focus(&f);
@@ -763,9 +871,9 @@ mod tests {
     #[test]
     fn a_second_toplevel_takes_it_off_the_first() {
         let (mut c, rx) = control();
-        c.follow_focus(&Fake(vec![win(1, 1, 2, 10, 10)]));
+        c.follow_focus(&Fake::new(vec![win(1, 1, 2, 10, 10)]));
         while rx.try_recv().is_ok() {}
-        c.follow_focus(&Fake(vec![win(1, 1, 2, 10, 10), win(2, 1, 3, 10, 10)]));
+        c.follow_focus(&Fake::new(vec![win(1, 1, 2, 10, 10), win(2, 1, 3, 10, 10)]));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 1, on: false })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::KeyboardFocus { id: 1, on: false, .. })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 2, .. })));
@@ -777,7 +885,7 @@ mod tests {
         let (mut c, rx) = control();
         let mut popup = win(2, 1, 3, 10, 10);
         popup.toplevel = false;
-        c.follow_focus(&Fake(vec![win(1, 1, 2, 10, 10), popup]));
+        c.follow_focus(&Fake::new(vec![win(1, 1, 2, 10, 10), popup]));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 1, .. })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 1, on: true })));
     }
@@ -785,16 +893,104 @@ mod tests {
     #[test]
     fn the_last_window_going_away_takes_the_focus_with_it() {
         let (mut c, rx) = control();
-        c.follow_focus(&Fake(vec![win(1, 1, 2, 10, 10)]));
+        c.follow_focus(&Fake::new(vec![win(1, 1, 2, 10, 10)]));
         while rx.try_recv().is_ok() {}
-        c.follow_focus(&Fake(vec![]));
+        c.follow_focus(&Fake::new(vec![]));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 1, on: false })));
+    }
+
+    // --- popups, stage 38 --------------------------------------------------
+
+    #[test]
+    fn a_popup_is_hit_tested_where_the_compositor_put_it() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 400, 400), popup(2, 1, 30, 40, 60, 50)]);
+        c.handle("position 1 3 200 100", &f);
+        // 200+30+5, 100+40+5: inside the popup, and inside the parent too, so
+        // this also proves the popup is on top.
+        c.handle("pointer-move 235 145", &f);
+        match rx.try_recv() {
+            Ok(FromUi::PointerEnter { id, x, y, .. }) => {
+                assert_eq!(id, 2, "the pointer entered the parent, not the menu");
+                assert_eq!((x, y), (5.0, 5.0));
+            }
+            other => panic!("expected an enter on the popup, got {other:?}"),
+        }
+    }
+
+    /// Before stage 38 every popup was at the origin here, so this is also the
+    /// regression: a click at the top left of the screen must no longer land on
+    /// a menu that is in the middle of it.
+    #[test]
+    fn a_popup_is_not_at_the_origin_merely_because_nobody_positioned_it() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 10, 10), popup(2, 1, 300, 300, 60, 50)]);
+        c.handle("position 1 3 500 500", &f);
+        c.handle("pointer-move 5 5", &f);
+        assert!(
+            rx.try_recv().is_err(),
+            "something was under a cursor at the origin, with both windows far from it"
+        );
+    }
+
+    #[test]
+    fn a_submenu_resolves_through_the_menu_it_hangs_off() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![
+            win(1, 1, 3, 400, 400),
+            popup(2, 1, 30, 40, 60, 50),
+            popup(3, 2, 60, 10, 60, 50),
+        ]);
+        c.handle("position 1 3 200 100", &f);
+        // 200 + 30 + 60 + 1, 100 + 40 + 10 + 1.
+        c.handle("pointer-move 291 151", &f);
+        assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { id: 3, .. })));
+    }
+
+    #[test]
+    fn windows_reports_a_popup_at_its_place_on_the_screen() {
+        let (mut c, _rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 400, 400), popup(2, 1, -30, 40, 60, 50)]);
+        c.handle("position 1 3 200 100", &f);
+        assert_eq!(
+            c.handle("windows", &f),
+            "window 1 1 3 200 100 400 400\nwindow 2 1 102 170 140 60 50\nok\n"
+        );
+    }
+
+    /// The rectangle the compositor constrains against, in the window's own
+    /// coordinates. The sign is the thing: a window at (200, 100) has the
+    /// screen starting 200 pixels to its left.
+    #[test]
+    fn a_window_is_told_where_the_screen_is_from_where_it_stands() {
+        let (mut c, _rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 400, 400)]);
+        c.handle("position 1 3 200 100", &f);
+        c.publish_bounds(&f);
+        assert_eq!(
+            f.1.borrow().last(),
+            Some(&(1, crate::surface::Rect::new(-200, -100, 800, 600)))
+        );
+    }
+
+    /// A menu's own submenus are constrained against the same screen, and the
+    /// menu is not at the origin either.
+    #[test]
+    fn a_popup_is_told_where_the_screen_is_too() {
+        let (mut c, _rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 400, 400), popup(2, 1, 30, 40, 60, 50)]);
+        c.handle("position 1 3 200 100", &f);
+        c.publish_bounds(&f);
+        assert_eq!(
+            f.1.borrow().last(),
+            Some(&(2, crate::surface::Rect::new(-230, -140, 800, 600)))
+        );
     }
 
     #[test]
     fn an_unknown_request_is_an_error_rather_than_a_silent_ok() {
         let (mut c, _rx) = control();
-        let f = Fake(vec![]);
+        let f = Fake::new(vec![]);
         assert!(c.handle("teleport 1 2", &f).starts_with("err "));
     }
 }

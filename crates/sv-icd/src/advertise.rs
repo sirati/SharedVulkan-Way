@@ -412,12 +412,25 @@ mod tests {
         );
     }
 
+    /// The 1.0 feature set is the fallback with no GPU side, and it stays empty.
+    ///
+    /// **This test used to be called `we_do_not_advertise_buffer_device_address`
+    /// and it never checked that.** `bufferDeviceAddress` is not in
+    /// `VkPhysicalDeviceFeatures` at all — it arrives through
+    /// `VkPhysicalDeviceVulkan12Features`, which is forwarded whole from the
+    /// physical device — so the assertion below was true, the name was false,
+    /// and design.md §9.2's claim that we do not advertise the feature rested on
+    /// a test about a different structure. `vulkaninfo` printed
+    /// `bufferDeviceAddress = true` throughout (design.md §0.16 item 3).
+    ///
+    /// The name is corrected rather than the assertion, because the feature is
+    /// now **implemented** — all three of `vkGetBufferDeviceAddress`,
+    /// `vkGetBufferOpaqueCaptureAddress` and
+    /// `vkGetDeviceMemoryOpaqueCaptureAddress` forward and return the GPU side's
+    /// real address (§0.17) — so advertising it is honest and the check that
+    /// belongs here is the one the body actually makes.
     #[test]
-    fn we_do_not_advertise_buffer_device_address() {
-        // The feature is not in `VkPhysicalDeviceFeatures` at all — it arrives
-        // through `VkPhysicalDeviceVulkan12Features` — so what this checks is
-        // that the base feature set is empty and nothing has quietly turned
-        // something on.
+    fn the_ten_zero_feature_set_is_empty() {
         let f = features();
         assert_eq!(f.robust_buffer_access, 0);
         assert_eq!(f.shader_int64, 0);

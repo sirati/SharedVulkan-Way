@@ -33,7 +33,7 @@ use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::reexports::wayland_server::protocol::{
     wl_buffer, wl_output, wl_seat, wl_surface::WlSurface,
 };
-use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -120,7 +120,9 @@ use smithay::{
     delegate_shm, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
-use crate::platform::{CursorSpec, Edge, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
+use crate::platform::{
+    CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
+};
 use crate::surface::{
     bars, decorator, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource,
 };
@@ -282,6 +284,22 @@ struct Window {
     /// question the current value can answer, and an animating client commits
     /// sixty times a second with the same icon attached.
     icon_dirty: bool,
+    /// Where this window's *own* popups may go, in this window's coordinates.
+    ///
+    /// ADDED FOR STAGE 38. Filled in by whatever can see the desktop — Windows
+    /// through `platform/win32.rs`, the synthetic Win32 in `crate::control` on
+    /// the conformance leg — and read here when a popup is parented to this
+    /// window. See [`crate::platform::PopupBounds`] for why it is a cell and
+    /// not a message.
+    popup_bounds: PopupBounds,
+    /// For a popup: the window it is parented to, and where it sits inside that
+    /// parent's window geometry.
+    ///
+    /// ADDED FOR STAGE 38 for one reader, `crate::control`: the synthetic Win32
+    /// has to know where a popup is in order to hit-test it, and a popup is the
+    /// one window whose position the *compositor* chooses rather than the
+    /// window manager. `None` for a toplevel, which Windows places.
+    popup_at: Option<(WindowId, i32, i32)>,
     /// The window-geometry rectangle's origin, in root-surface coordinates —
     /// the number that turns a pixel of the window into a point of the surface.
     ///
@@ -1227,11 +1245,74 @@ impl State {
                     w: shadow.width(),
                     h: shadow.height(),
                     toplevel: w.role.toplevel().is_some(),
+                    popup_at: w.popup_at,
                 })
             })
             .collect();
         out.sort_by_key(|r| r.id);
         out
+    }
+
+    /// ADDED FOR STAGE 38. Told by the synthetic Win32 where a window is on the
+    /// one output, so that a popup of that window can be constrained to it.
+    ///
+    /// The real platform writes the same cell from the UI thread, from
+    /// `MonitorFromWindow`; this is the same fact arriving from the stand-in.
+    #[cfg(unix)]
+    pub fn set_popup_bounds(&self, id: WindowId, bounds: Rect) {
+        let Some(w) = self.windows.values().find(|w| w.id == id) else {
+            return;
+        };
+        let mut cell = w.popup_bounds.lock().unwrap_or_else(|e| e.into_inner());
+        *cell = Some(bounds);
+    }
+
+    /// Where a popup goes, in its parent's window-geometry coordinates.
+    ///
+    /// **REWRITTEN FOR STAGE 38, and the previous behaviour was a bug the user
+    /// reported**: a menu opened near the right or bottom edge of the screen
+    /// had the part that did not fit simply hanging off the display.
+    ///
+    /// `get_geometry` is the positioner's own arithmetic — anchor rectangle,
+    /// anchor edge, gravity and offset — and nothing more. Up to this stage it
+    /// was the whole answer, and the comment that said so argued that
+    /// *"constraining a menu to the monitor is the compositor's job, and on
+    /// Windows the compositor that owns the monitor is Windows"*. The first
+    /// half is right and the second is false: `SetWindowPos` places a window
+    /// exactly where it is told and constrains nothing. Windows keeps a menu on
+    /// screen only for menus **it** owns, put up through `TrackPopupMenu`; an
+    /// arbitrary `WS_POPUP` is placed literally, off the edge and all. Owning
+    /// the monitor and constraining to it are different claims, and the code
+    /// relied on the second while only the first was true.
+    ///
+    /// So the compositor does it, which is what `xdg_positioner`'s
+    /// `set_constraint_adjustment` asks of it. The client declares which moves
+    /// it will tolerate — `slide_x`, `flip_y`, `resize_x` and the rest — and
+    /// `get_unconstrained_geometry` applies exactly those, in the precedence
+    /// the XML fixes (flip, then slide, then resize, per axis, and a flip that
+    /// fails to help is reverted). **That precedence is not reimplemented here
+    /// on purpose**: a client that asked for `slide_x` alone must never be
+    /// flipped, and the one implementation of that rule in the tree should be
+    /// smithay's, which is generated from the same XML the client read.
+    ///
+    /// The naming is a trap worth restating, because it reads backwards:
+    /// `get_geometry` is the *unconstrained* rectangle and
+    /// `get_unconstrained_geometry` is the *constrained* one — "unconstrained"
+    /// there means "adjusted until it no longer violates the constraint".
+    ///
+    /// `bounds` of `None` means nothing has told us where the monitor is, and
+    /// then the answer is the raw arithmetic again — the pre-stage-38
+    /// behaviour, which is wrong but is not a guess. A degenerate rectangle is
+    /// treated the same way: fitting a menu into a zero-width monitor would
+    /// produce a zero-width menu, and no answer is better than that one.
+    fn constrain(positioner: PositionerState, bounds: Option<Rect>) -> Rectangle<i32, Logical> {
+        match bounds {
+            Some(b) if b.w > 0 && b.h > 0 => positioner.get_unconstrained_geometry(Rectangle::new(
+                Point::from((b.x, b.y)),
+                Size::from((b.w, b.h)),
+            )),
+            _ => positioner.get_geometry(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2398,6 +2479,16 @@ impl State {
     }
 }
 
+/// What a window's popups have to fit inside, if anything has said.
+///
+/// ADDED FOR STAGE 38. A poisoned lock is treated as "nothing has said" rather
+/// than unwrapped: the cell is written by the UI thread, and a panic there must
+/// not take the Wayland thread with it — the worst it can cost is one menu
+/// placed the way every menu was placed before this stage.
+fn popup_bounds_of(window: &Window) -> Option<Rect> {
+    *window.popup_bounds.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Every surface of `root`'s subsurface tree, with its position relative to
 /// `root`'s own origin, **in paint order**: parent before child, and siblings
 /// in the order `wl_subsurface.place_above`/`place_below` put them.
@@ -2952,6 +3043,7 @@ impl XdgShellHandler for State {
         let (title, app_id) = metadata(&surface);
         let client = client_index(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
+        let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
         println!(
             "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
             self.toplevels
@@ -2971,6 +3063,7 @@ impl XdgShellHandler for State {
             aumid: crate::taskbar::identity(&app_id, client),
             shadow: shadow.clone(),
             kind: WindowKind::Toplevel,
+            bounds: popup_bounds.clone(),
         });
 
         // The initial configure carries no size: the client picks, which is
@@ -2995,6 +3088,8 @@ impl XdgShellHandler for State {
                 presented: 0,
                 icon_from_client: false,
                 icon_dirty: false,
+                popup_bounds,
+                popup_at: None,
                 // Zero until the first commit, which is the only honest value:
                 // a window with no buffer has no geometry rectangle either, and
                 // no input can reach it before it has mapped.
@@ -3188,22 +3283,36 @@ impl XdgShellHandler for State {
         self.next_id += 1;
         self.popups += 1;
 
-        // Where the popup goes, in the parent's window-geometry coordinates.
-        // `get_geometry` is the positioner's own arithmetic — anchor rectangle,
-        // anchor edge, gravity and offset — which smithay implements from the
-        // XML. What is deliberately **not** used here is
-        // `get_unconstrained_geometry`: constraining a menu to the monitor is
-        // the compositor's job, and on Windows the compositor that owns the
-        // monitor is Windows. Letting `SetWindowPos` place it and reporting no
-        // constraint back is honest; recomputing it here would be a second,
-        // disagreeing, opinion. See docs/waycompose-design.md §13.6.
-        let rect = positioner.get_geometry();
         let parent = surface.get_parent_surface().map(|s| root_of(&s));
-        let parent_id = parent.as_ref().and_then(|p| self.windows.get(p)).map(|w| w.id);
+        let parent_window = parent.as_ref().and_then(|p| self.windows.get(p));
+        let parent_id = parent_window.map(|w| w.id);
+        let bounds = parent_window.and_then(popup_bounds_of);
 
+        // Where the popup goes, in the parent's window-geometry coordinates.
+        // See [`Self::constrain`]: the rectangle is the positioner's own
+        // arithmetic, fitted to the monitor if anything has told us where the
+        // monitor is.
+        let rect = Self::constrain(positioner, bounds);
+
+        // The declared adjustment is logged, and it is the first question to
+        // ask of any report that a menu is in the wrong place: a client that
+        // declared nothing is **entitled** to a popup that hangs off the
+        // screen, and moving it would be the bug. `weston-terminal` declares
+        // nothing; Firefox declares all six.
         println!(
-            "wc-compositor: xdg_popup created (#{}) -> window {id} at {},{} {}x{} parent {:?}",
-            self.popups, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h, parent_id
+            "wc-compositor: xdg_popup created (#{}) -> window {id} at {},{} {}x{} parent {:?} \
+             adjust {:?} bounds {}",
+            self.popups,
+            rect.loc.x,
+            rect.loc.y,
+            rect.size.w,
+            rect.size.h,
+            parent_id,
+            positioner.constraint_adjustment,
+            match bounds {
+                Some(b) => format!("{},{} {}x{}", b.x, b.y, b.w, b.h),
+                None => "unknown".to_owned(),
+            }
         );
 
         let Some(parent_id) = parent_id else {
@@ -3215,6 +3324,7 @@ impl XdgShellHandler for State {
         };
 
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
+        let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
         self.ui.send(ToUi::Create {
             id,
             title: String::new(),
@@ -3230,6 +3340,10 @@ impl XdgShellHandler for State {
                 x: rect.loc.x,
                 y: rect.loc.y,
             },
+            // A popup is a window like any other and a submenu is parented to
+            // it, so it gets a cell of its own; the platform fills it in from
+            // the popup's own `HWND`.
+            bounds: popup_bounds.clone(),
         });
 
         // The popup's configure carries the positioner's rectangle, which is
@@ -3259,6 +3373,8 @@ impl XdgShellHandler for State {
                 // is one type for both roles, which is stage 9's decision.
                 icon_from_client: false,
                 icon_dirty: false,
+                popup_bounds,
+                popup_at: Some((parent_id, rect.loc.x, rect.loc.y)),
                 // A popup has an inset of its own — GTK gives its menus the
                 // same shadow margin it gives its windows — and it is found the
                 // same way, at its first commit. The *position* above is
@@ -3355,26 +3471,37 @@ impl XdgShellHandler for State {
     /// that sends only the configure leaves the client unable to match the
     /// answer to its request, which for GTK means it ignores the move.
     ///
-    /// The positioner's own arithmetic is used unchanged, exactly as
-    /// [`Self::new_popup`] does — anchor rectangle, anchor edge, gravity and
-    /// offset, which smithay implements from the XML. The constraint
-    /// adjustments are still not applied here (§18.6): this compositor does not
-    /// know where the parent window is on the Windows desktop, so it cannot
-    /// tell whether the result would be off-screen. Windows keeps an owned
-    /// `WS_POPUP` on the monitor by itself, which is why that has not bitten.
+    /// The positioner goes through [`Self::constrain`], exactly as
+    /// [`Self::new_popup`] does. **REWRITTEN FOR STAGE 38**, and this is the
+    /// half that is easy to forget: a submenu that GTK opens near the bottom of
+    /// the screen is *first* mapped wherever the positioner says and *then*
+    /// repositioned with a second positioner carrying `slide_y`, so a
+    /// compositor that constrains only at creation moves the menu on screen and
+    /// then puts it back off again on the next keystroke.
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
         positioner: PositionerState,
         token: u32,
     ) {
-        let rect = positioner.get_geometry();
         let Some(&Window { id, .. }) = self.windows.get(surface.wl_surface()) else {
             // A reposition for a popup we never mapped. Answering the token
             // anyway is better than silence: the client is waiting for it.
             surface.send_repositioned(token);
             return;
         };
+        // The bounds belong to the **parent**, not to the popup being moved:
+        // the positioner's rectangle is in the parent's coordinates, and so is
+        // the answer. Resolved the same way `new_popup` resolves it, because a
+        // popup can be reparented in neither protocol nor practice but can
+        // certainly be repositioned after its parent has moved to another
+        // monitor.
+        let bounds = surface
+            .get_parent_surface()
+            .map(|s| root_of(&s))
+            .and_then(|p| self.windows.get(&p))
+            .and_then(popup_bounds_of);
+        let rect = Self::constrain(positioner, bounds);
         println!(
             "wc-compositor: xdg_popup reposition -> window {id} to {},{} {}x{} (token {token})",
             rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
@@ -3384,6 +3511,14 @@ impl XdgShellHandler for State {
         });
         surface.send_repositioned(token);
         let _ = surface.send_configure();
+        // The synthetic Win32 hit-tests popups by this, so a popup that moved
+        // and did not say so would keep taking clicks at its old position.
+        if let Some(w) = self.windows.get_mut(surface.wl_surface())
+            && let Some(at) = w.popup_at.as_mut()
+        {
+            at.1 = rect.loc.x;
+            at.2 = rect.loc.y;
+        }
         self.ui.send(ToUi::MovePopup {
             id,
             x: rect.loc.x,
@@ -3963,6 +4098,127 @@ delegate_xdg_decoration!(State);
 delegate_kde_decoration!(State);
 // ADDED FOR STAGE 12. `wp_cursor_shape_manager_v1` and its per-pointer device.
 delegate_cursor_shape!(State);
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// ADDED FOR STAGE 38, for [`State::constrain`] — the placement arithmetic, in
+/// isolation.
+///
+/// A `PositionerState` is a plain struct of public fields, so the whole of
+/// `xdg_positioner` can be exercised here without a client, a socket or a
+/// window. What is being tested is **which** of smithay's two functions is
+/// called and with what rectangle; the adjustment rules inside
+/// `get_unconstrained_geometry` are smithay's and are tested there.
+///
+/// The negative cases are the point. A constraint that fires when it should not
+/// is the same bug as one that never fires, wearing different clothes: it moves
+/// a menu the client placed deliberately, and it does it in the common case
+/// where nobody is looking for it.
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+
+    /// A menu of `w`x`h` hung off the bottom right corner of a 10x10 anchor at
+    /// `(x, y)` — the shape of a context menu, and the one that runs off the
+    /// right and the bottom of a screen.
+    fn menu(x: i32, y: i32, w: i32, h: i32, adjust: ConstraintAdjustment) -> PositionerState {
+        PositionerState {
+            rect_size: Size::from((w, h)),
+            anchor_rect: Rectangle::new(Point::from((x, y)), Size::from((10, 10))),
+            anchor_edges: Anchor::BottomRight,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: adjust,
+            ..Default::default()
+        }
+    }
+
+    /// The 800x600 work area of a window whose own origin is the screen's.
+    const SCREEN: Rect = Rect { x: 0, y: 0, w: 800, h: 600 };
+
+    #[test]
+    fn a_menu_that_fits_is_placed_exactly_where_the_positioner_asked() {
+        let p = menu(100, 100, 60, 40, ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
+        let got = State::constrain(p, Some(SCREEN));
+        assert_eq!((got.loc.x, got.loc.y), (110, 110));
+        assert_eq!((got.size.w, got.size.h), (60, 40));
+        assert_eq!(got, p.get_geometry(), "an unconstrained menu was moved anyway");
+    }
+
+    #[test]
+    fn a_menu_off_the_right_edge_slides_back_on() {
+        // Anchored at 760: the raw arithmetic puts it at 770 and 30 pixels of
+        // it are past 800.
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::SlideX);
+        assert_eq!(p.get_geometry().loc.x, 770);
+        let got = State::constrain(p, Some(SCREEN));
+        assert_eq!(got.loc.x, 740, "the menu did not slide back onto the screen");
+        assert_eq!(got.loc.y, 110, "an x constraint moved it in y");
+        assert_eq!((got.size.w, got.size.h), (60, 40), "a slide resized it");
+    }
+
+    #[test]
+    fn a_menu_off_the_bottom_edge_slides_up() {
+        let p = menu(100, 580, 60, 40, ConstraintAdjustment::SlideY);
+        assert_eq!(p.get_geometry().loc.y, 590);
+        let got = State::constrain(p, Some(SCREEN));
+        assert_eq!((got.loc.x, got.loc.y), (110, 560));
+    }
+
+    /// The client's declaration is the whole of the protocol's contract here.
+    /// A menu that asked to be slid and was flipped instead is on screen and
+    /// in the wrong place — under the cursor that opened it, typically.
+    #[test]
+    fn a_client_that_asked_only_to_slide_is_not_flipped() {
+        let slide = State::constrain(menu(760, 100, 60, 40, ConstraintAdjustment::SlideX), Some(SCREEN));
+        let flip = State::constrain(menu(760, 100, 60, 40, ConstraintAdjustment::FlipX), Some(SCREEN));
+        assert_eq!(slide.loc.x, 740);
+        assert_eq!(flip.loc.x, 700, "a flip should mirror the anchor, not slide");
+        assert_ne!(slide.loc.x, flip.loc.x);
+    }
+
+    /// `ConstraintAdjustment::None` is a client saying "leave it where I put
+    /// it", and it is entitled to that even when the result is off screen.
+    #[test]
+    fn a_client_that_declared_nothing_is_left_alone() {
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::None);
+        assert_eq!(State::constrain(p, Some(SCREEN)), p.get_geometry());
+    }
+
+    #[test]
+    fn without_bounds_the_answer_is_the_raw_arithmetic() {
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::SlideX);
+        assert_eq!(State::constrain(p, None), p.get_geometry());
+    }
+
+    /// A window whose monitor answered with nothing measurable. Fitting a menu
+    /// into it would produce a menu of no size at all.
+    #[test]
+    fn a_degenerate_work_area_is_ignored_rather_than_fitted_into() {
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::SlideX);
+        let empty = Rect { x: 0, y: 0, w: 0, h: 0 };
+        assert_eq!(State::constrain(p, Some(empty)), p.get_geometry());
+    }
+
+    /// The work area is in the **parent's** coordinates, so a window at (300,
+    /// 200) on the desktop is told the screen starts at (-300, -200). Getting
+    /// that sign wrong is the failure mode that looks right on a maximised
+    /// window and is wrong everywhere else.
+    #[test]
+    fn the_work_area_is_relative_to_the_parent_window() {
+        let bounds = Rect { x: -300, y: -200, w: 800, h: 600 };
+        // 40 pixels from the right-hand edge of the screen, in the window's
+        // coordinates: -300 + 800 = 500.
+        let p = menu(450, 100, 60, 40, ConstraintAdjustment::SlideX);
+        assert_eq!(p.get_geometry().loc.x, 460);
+        let got = State::constrain(p, Some(bounds));
+        assert_eq!(got.loc.x, 440, "the screen's right edge is at 500 in these coordinates");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // §37: the window-geometry inset, which is the only thing between a window

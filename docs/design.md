@@ -1860,7 +1860,10 @@ writes it into a buffer, a shader dereferences it, and the GPU faults.
   GPU-side fill, the app-side fold, and the boundary translation. That is a
   stage, and it is the next one.
 
-**What is not settled.** Five wedges remain and they cluster into two families
+**What is not settled** — and **§0.20 settles all of it**: the five wedges below
+turned out to be two defects, not two families, and the rate is re-measured on a
+fresh sample there. Left as written, because the shape of the guess is the point.
+Five wedges remain and they cluster into two families
 that share no obvious mechanism with the above: four
 `query_pool.statistics_query.*` (all of them `cmdcopyquerypoolresults` or
 `host_query_reset` variants) and one
@@ -2742,6 +2745,308 @@ refusal now names the cause and the fix in `RingTransport::finish_attach`
 harnesses that deploy into a guest (`sv-windows-e2e.sh`, `sv-guest-e2e.sh`,
 `sv-guest-host.sh`, `sv-firefox-guest.sh`) say it in their headers. Rebuild and
 re-deploy **both** sides from one tree.
+### 0.20 The wedge rate, re-measured; and the one pass that was written once
+
+Measured 2026-08-13/14 on **devhost** in `nix develop`, RADV
+RAPHAEL_MENDOCINO, CTS 1.4.6.1, `scripts/sv-cts.sh`. §0.16 ended with two
+admissions: five device losses remained undiagnosed, and *"the rate itself has
+not been re-measured on a fresh CTS sample — the paired 12 → 5 is on the
+known-wedging set, which is not a random sample of anything"*. This section is
+that measurement, and what it turned up.
+
+**The headline, on a sample chosen before anything was fixed.** A fresh
+1-in-19997 selection — 164 tests, disjoint from §0.15's 1-in-20000 except by
+coincidence — run against this tree at the start of the work and again at the
+end, control and forwarded both:
+
+| | control | forwarded, before | forwarded, after |
+|---|---|---|---|
+| Pass | **93** / 93 | 36 | **58** |
+| NotSupported | 71 / 71 | 121 | 106 |
+| DeviceLost | 0 / 0 | **7** | **0** |
+| ring fatals | — | **4** | **0** |
+| hard GPU recoveries | 0 / 0 | 0 | 0 |
+| lost against the control | — | 57 (61.3%) | **35 (37.6%)** |
+| of those, `NotSupported` | — | 50 | **35 — all of them** |
+
+**`sv-cts: PASS`**, for the first time, with all three budgets at the values
+§31 recorded and none of them raised. Every remaining loss is the profile
+declining something it does not carry; **not one is a defect**. The wedge rate on
+this sample went 7/164 to 0/164, and item 5's wider run — 820 tests, **two device
+losses, no GPU reset at all** — is what turns "zero on 164" into a rate rather
+than an anecdote: **§0.15's 7% is now 0.24%.**
+
+**Two of the seven were §0.16's `bufferDeviceAddress`, and five were one bug.**
+
+---
+
+**1. `vkBindImageMemory` never had the app-side half of pass 6, and neither did
+five other commands.** design.md §5.3 splits the `(memory, offset)` rewrite in
+two: the app side turns *allocation* coordinates into *arena* coordinates, and
+the GPU side turns arena coordinates into a `VkDeviceMemory` plus an offset. §7.2
+lists the pass as GPU-side, which is half true, and the app-side half existed as
+**one hand-written line inside `vkBindBufferMemory`**.
+
+So every other command that carries a memory id across sent the app-side id raw:
+`vkBindImageMemory`, `vkBindBufferMemory2`, `vkBindImageMemory2`,
+`vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges` and
+`vkQueueBindSparse`. The GPU side's `resolve_memory` looked the id up, did not
+find it, and the ring went fatal with `no VkDeviceMemory with id 8` — which is
+**§0.15 item 8's first unexplained ring fatal, arrived at from the other end**.
+That item guessed at a missing `RingBarrier`; it was not an ordering fault at
+all.
+
+  **Why it did not break everything.** An image bound to *device-local* memory
+  crosses fine, because heap 0 is a real GPU-side allocation under the
+  application's own id — §9.1's two heaps are what made the bug intermittent.
+  Only a buffer or image bound to **host-visible arena memory** hits it, which is
+  a readback target, a staging image, a query result buffer, a linear
+  multi-planar image. That is why the wedging set spanned fifteen unrelated
+  groups with no feature in common (§0.16's opening observation) and why `ycbcr`,
+  `query_pool.statistics_query`, `renderpasses.multisample_resolve`,
+  `glsl.operator.mul` and `memory_model.message_passing` were all the same
+  defect. **Five of §0.16's remaining wedges, including both of the two families
+  it named as sharing no obvious mechanism, were this one line.**
+
+  The fix is `IcdLocal::rewrite_memory` plus a generated pass in
+  `sv_icd_entry::forward`, reusing `passes::transform_walk_pub` and
+  `exceptions::memory_offset_sibling` — **the same fold the GPU side already
+  ran**, applied one boundary earlier, so the two cannot disagree about what a
+  pair is. It is emitted into `forward::*` rather than into the C stub, and the
+  seam matters: a stub rewrite would reach `vkAllocateMemory`, `vkMapMemory` and
+  `vkFreeMemory`, which are answered out of the app-side allocator and never
+  cross, and would hand those overrides arena coordinates in place of the ids
+  their own tables are keyed by. `forward::*` is exactly "about to become bytes
+  on a ring", so the sentence *every memory id that crosses is rewritten* is
+  stated where it is true.
+
+  An id the allocator never handed out is now `WireError::NoSuchMemory` **before
+  the packet leaves**, and the difference is the whole point: caught here it
+  costs the application one failed call, missed it costs a ring fatal on the far
+  side and `VK_ERROR_DEVICE_LOST` out of an unrelated `vkWaitForFences` several
+  calls later. `every_forwarded_memory_pair_is_rewritten` asserts the bind
+  commands together, precisely because their being different was the bug.
+
+**2. `bufferDeviceAddress` is implemented, not retracted.** §0.16 item 3 found
+the feature advertised and all three query commands sitting in
+`NOT_IMPLEMENTED`, and recorded that clamping the feature to false had been
+tried, measured, and reverted — *"converting a goal into a skip is not a fix"*.
+Four things were needed and all four are §0.3 item 5's own prescription:
+
+- `plan.rs` generates a reply **whenever a command returns anything at all**,
+  which is the one-line correction §0.3 named and never made;
+- the reply carries a `ret: u64`, sized, encoded and decoded like any other
+  field;
+- the GPU side fills it from the driver's return value;
+- the ICD's stub reads it back out *before* the writeback consumes the reply and
+  casts it to whatever the C header spells the return type.
+
+  **And a fifth thing nobody had named, which is where the work actually was.**
+  `VUID-VkBufferDeviceAddressInfo-buffer-02601` requires the buffer's *memory* to
+  have been allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. **The arena
+  is one allocation made at startup, before any application exists to ask**, so
+  either every arena-backed buffer can have its address taken or none can, and
+  the decision has to be taken in `sv_gpu_server::arena` or not at all. Without
+  it the three commands are implemented, legal, and useless. It is conditional on
+  the driver reporting the feature, because setting the bit without it is invalid
+  usage and the allocation fails outright.
+
+  `NOT_IMPLEMENTED` went from twelve entries to nine.
+  `dEQP-VK.binding_model.buffer_device_address.*` and `dEQP-VK.ssbo.phys.*` went
+  from `DeviceLost` to `Pass`, one test per process. §11's caveat is what holds
+  it together and is now load-bearing rather than hypothetical: *we return the
+  GPU side's true device address and never relocate*, so R3 is intact — a device
+  address is not a host pointer, it is a number the **GPU's** page tables
+  interpret, and nothing on the app side dereferences it.
+
+  The test that was supposed to guard §9.2's claim was called
+  `we_do_not_advertise_buffer_device_address` and **asserted about
+  `VkPhysicalDeviceFeatures`, where the feature does not live**. It is renamed to
+  what it checks. The feature is mirrored from the physical device through
+  `vkGetPhysicalDeviceFeatures2`, so `vulkaninfo` printed it true throughout; the
+  guard could never have fired.
+
+**3. The profile was widened by what CTS asked for, and the cheap half of the
+gap is not commands.** `sv-codegen gap` reports the registry's side — 740
+commands defined, 239 carried — and check 4 reports the suite's side, in deqp's
+own words, restricted to tests the control passes. Nine extensions were added,
+each with the number of tests that asked for it beside it in `profiles::zink()`,
+and **between them they carry five new commands**. `VK_EXT_graphics_pipeline_-
+library` is seven tests and *no commands at all*; so are
+`VK_KHR_shader_subgroup_uniform_control_flow`, `VK_EXT_depth_range_-
+unrestricted`, `VK_KHR_fragment_shader_barycentric` and
+`VK_EXT_shader_image_atomic_int64`. "501 commands not carried" is a true number
+that badly misdescribes the work: much of the reachable gap is feature bits,
+`pNext` structures and enum values.
+
+  Adding an extension string is not sufficient. The GPU side opens its device
+  before any application connects, so a feature struct that is not chained into
+  `vkGetPhysicalDeviceFeatures2` comes back false and is *enabled* false — and
+  the application then finds the extension present and the feature off, which
+  fails at `vkCreateGraphicsPipelines` instead of at `vkCreateDevice`. Six of the
+  nine needed a `chain_if!`.
+
+  **Four extensions CTS asked for are deliberately still out**, and the reasons
+  are in the profile beside the names rather than here:
+  `VK_EXT_shader_object` (fourteen tests, the largest single line in the skip
+  list, and a second parallel model of the whole pipeline);
+  `VK_EXT_descriptor_buffer` and the ray-tracing pair (§9.2's exclusion — they
+  put raw device addresses in *application-visible* data, which is a different
+  thing from `vkGetBufferDeviceAddress` returning one); and
+  **`VK_KHR_external_semaphore_fd`, refused on principle — its entire purpose is
+  to move a file descriptor between processes, and §1a says none crosses.**
+
+**4. A `void*` policy is not an implementation, and the difference cost a
+segmentation fault.** `VK_KHR_push_descriptor` was added, measured, and taken
+back out — the one entry in that list that is a measurement rather than a
+judgement, and the most useful finding in it.
+
+  `exceptions::void_policy` already declared
+  `VoidPolicy::ArenaOffset` for `vkCmdPushDescriptorSetWithTemplate`'s `pData`,
+  with a paragraph explaining why it is the hardest `void*` in the registry.
+  What it does not say is that **only `vkUpdateDescriptorSetWithTemplate` has the
+  app-side expansion that makes the policy true** (§0.4 item 10, rewritten into
+  `vkUpdateDescriptorSets`); the push variants have none, so the application's
+  own pointer was lowered as though it were an offset into our arena. Measured:
+  two `DeviceLost`, a ring fatal reading `no VkDescriptorUpdateTemplate with id
+  20`, and **a segmentation fault in `sv-gpu-server` itself** — the driver
+  walking a descriptor layout at an offset that never meant anything.
+
+  That is strictly worse than an unimplemented command, and the general form is
+  worth keeping: **a declared exception with no implementation behind it reads
+  like a solved problem in every file that mentions it.** The work is the mirror
+  of §0.4 item 10 and is named in the profile.
+
+**5. The wider sample, which is what turns "zero on 164" into a rate.** A
+1-in-4001 selection — **820 tests**, five times the table above and disjoint from
+it — on the same machine, same shell, same driver:
+
+| | control | forwarded |
+|---|---|---|
+| Pass | **444** | 242 |
+| NotSupported | 376 | 571 |
+| Fail | 0 | 3 |
+| DeviceLost | **0** | **2** |
+| Timeout | 0 | 2 |
+| ring fatals | — | 2 |
+| hard GPU recoveries | **0** | **0** |
+| total | 820 | 820 |
+| wall | 11 s | 533 s |
+
+**Two device losses in 820 forwarded tests — 0.24%.** §0.15 item 10's figure was
+"about 7% of forwarded tests hang the GPU", from twelve isolated losses in 164
+and an upper bound of 71/661 in the abandoned wider run. Both are gone. **And
+the number that mattered most is zero: no hard GPU recovery, against 313
+`amdgpu: ring gfx_0.0.0 timeout … device wedged` messages in ten minutes** the
+last time a run this size was attempted. That run was stopped because it was
+resetting somebody else's GPU every twenty seconds; this one finished.
+
+  Of the 202 tests the forwarder loses here, **198 are `NotSupported`** — the
+  profile declining something it does not carry — and **four are defects**: two
+  `DeviceLost`, two `Fail`. Two further `Timeout` are the hang class §0.15 item
+  5's watchdog exists to survive rather than to explain, and one of them,
+  `dEQP-VK.memory.device_group_allocation.*`, is a neighbour of the case that
+  section named.
+
+  `sv-cts` reports **FAIL** on this run, on the ring-fatal budget, and the budget
+  is not being raised. Two fatals is what the tree does; item 6 is what they are.
+
+**6. `no VkPipelineLayout with id 46` — §0.15 item 8's second shape, and the R22
+annotation on it is wrong.** Both ring fatals in the wider run have that shape,
+inside a command blob, and one is reproducible by name
+(`dEQP-VK.pipeline.fast_linked_library.multisample.misc.dynamic_rendering.*`).
+`SV_TRACE=1` puts the mechanism beyond argument — the last four things the GPU
+side does before the fatal are:
+
+```
+[trace] vkCreatePipelineLayout
+[trace] vkDestroyPipelineLayout
+[trace] vkCreatePipelineLayout
+[trace] vkDestroyPipelineLayout
+[gpu] ring 2 seqno 84 FATAL: in a command blob: no VkPipelineLayout with id 46
+```
+
+  **It is a lifetime bug, not an ordering one.** `VK_KHR_maintenance4` — core
+  1.3, which this ICD advertises — permits an application to destroy a pipeline
+  layout as soon as the command buffer that used it *leaves the recording state*;
+  it does not have to survive execution. Our architecture moves execution to
+  `vkQueueSubmit` (§6.5: the blob carries ids and they are resolved when the blob
+  is replayed), so an object whose lifetime the specification ends at end-of-
+  recording has to live, on our side, until end-of-*execution*. The destroy rides
+  the device ring, unbinds the id, and the queue ring then replays a blob naming
+  it.
+
+  So the message's own suggestion — *"if the app side created it on another ring,
+  the packet needed a `RingBarrier` (R22)"* — is a guess that has now been
+  falsified twice: §0.16 item 2 traced the `VkBuffer` shape to an out-of-bounds
+  read of the application's memory, item 1 above traced the `VkDeviceMemory`
+  shape to a missing pass, and this is the third and none of the three was a
+  barrier. A diagnostic that names one cause teaches everyone who reads it to
+  look in the wrong place.
+
+  **The fix is a mechanism this design already wants and has not built.** §5.5's
+  deferred free — *"defers this until the timelines an allocation could be
+  referenced by have passed"* — is recorded in `sv_icd::icd::free_memory` as
+  still immediate because "the timeline mirror is not wired to submissions yet".
+  This is the same gap met from the object table's side: a destroy must not
+  unbind an id while any published blob still names it, and the ring already
+  publishes the fact needed to decide, in the `completed_seqno` that
+  `transport::Blob::in_flight` compares against. Diagnosed, reproducible, and
+  deliberately not fixed here, because deferring destruction touches every
+  destroy command and wants its own measurement.
+
+**7. The one synthesised queue family is now the largest thing left that is not
+an extension**, and it is unchanged. Of the 198 skips in the wider run, **40 are
+it**: eighteen `No matching queue found:
+findQueueFamilyIndexWithCaps(requiredCaps=0x2; excludedCaps=0x1)`, fifteen
+`Exclusive compute queue not supported`, seven `Concurrent requires more than 1
+queue family`. Only `VK_EXT_shader_object` (67) is larger, and that is an
+extension somebody could add; this is not. §0.15 item 6 sized it at eleven of
+fifty-nine on a sample a fifth as large, and the share has grown as the
+extension gaps have closed.
+
+  Nothing here changed it, deliberately: the GPU side opens **one** device with
+  **one** queue on **one** family, `server::one_queue_family` reports that
+  family's real flags with `queueCount` forced to 1, and advertising a second
+  family without opening a second queue is exactly the failure §0.4 item 7
+  recorded — an application selects family 3 and gets family 0's queue in
+  silence. The change is a real one and its parts are known: a second queue at
+  driver open, a per-queue rather than per-device lock, and a family/queue
+  mapping in the object table.
+
+---
+
+**What is not settled.**
+
+- **0.24% is a rate on 820 tests, not a proof of anything about 3.28 million.**
+  Two losses is two; the interval around it is wide and one more sample could
+  put it at four. What is *not* fragile is the direction and the size of the
+  step — 7% to a fraction of one percent, with the control at zero in both runs
+  and the kernel silent in the second where it produced 313 ring resets in the
+  first.
+- **This is still a sample.** 164 and 820 tests of 3,279,369; the word
+  "conformant" applies to nothing in this section. What the instrument costs to
+  scale is wall time on a machine eleven other agents are using. The forwarded
+  wall time is 48× the control at this size and that figure is not a performance
+  measurement: it is a GPU-side restart per chunk, twenty-six isolations, and two
+  tests that had to time out.
+- **`sv-cts` ends FAIL on the wider run and that is the honest state**, on two
+  ring fatals of one diagnosed shape (item 6). The budget is
+  `SV_CTS_MAX_RING_FATALS=0` and it was not touched.
+- **The `NotSupported` half is honest and the `Fail` half is untested at scale.**
+  Every loss in the final column is the profile declining something. That is the
+  best shape this number can have — it means the remaining work is *scope*, which
+  is addable, rather than *correctness*, which has to be found — but it is only
+  established at this sample size.
+- **Nothing here ran on testhost, and nothing ran on NVIDIA.** Every number is
+  devhost, RADV, same machine, over a Unix socket, in `nix develop`. §0.15
+  said this and it is still true. The RTX 5090 does not enumerate in the dev
+  shell and the cause is still unknown, so a measurement taken there would be
+  taken where NVIDIA is absent.
+- **The wire moved.** The reply grew a `ret` field for three commands and the
+  profile grew seven, so the protocol hash changed twice on this branch. Both
+  sides are built together here; a GPU side built before this branch will not
+  understand one built on it, and the handshake is what says so.
 
 ---
 

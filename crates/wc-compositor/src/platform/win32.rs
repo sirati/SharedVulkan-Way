@@ -70,6 +70,11 @@ use windows_sys::Win32::Graphics::Gdi::{
     // because `POINTER_INFO` reports in **screen** coordinates while every
     // other input message this file handles reports in client ones.
     ScreenToClient,
+    // ADDED FOR STAGE 38, and the first time this project asks Windows where
+    // anything is. `MonitorFromWindow` picks the monitor a window is on and
+    // `GetMonitorInfoW` gives its work area; both are filed under GDI, which
+    // is not where a reader looks for them either.
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 // ADDED FOR STAGE 20. See `on_pointer`: the `WM_POINTER*` family rather than
 // `RegisterTouchWindow`/`WM_TOUCH`, and this is the whole of the extra API.
@@ -92,6 +97,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 // code that decides whether the client's cursor applies or the system's frame
 // keeps its own.
 use windows_sys::Win32::UI::WindowsAndMessaging::{
+    // ADDED FOR STAGE 38: the primary monitor's work area, before any window
+    // exists. See `primary_work_area`.
+    SPI_GETWORKAREA,
     DestroyCursor, SetCursor, SystemParametersInfoW, HTCLIENT, SPI_GETKEYBOARDDELAY,
     SPI_GETKEYBOARDSPEED, WM_SETCURSOR,
 };
@@ -102,6 +110,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, ICONINFO, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MSG, SM_CXICON, SM_CXSCREEN, SM_CXSMICON, SM_CYICON, SM_CYSCREEN, SM_CYSMICON,
+    // ADDED FOR STAGE 38: the three messages that change where a window's
+    // popups may go. See `toplevel_proc`. (`GWL_STYLE`, which stage 38 also
+    // needs, is imported with the title-bar group below.)
+    WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGED,
     // ADDED FOR STAGE 13, for per-pixel alpha on popups. See `update_layered`.
     UpdateLayeredWindow, ULW_ALPHA, WS_EX_LAYERED,
     SIZE_MAXIMIZED,
@@ -172,8 +184,8 @@ use crate::clipboard::SystemFormat;
 use crate::input::{evdev, evdev_keycode};
 
 use super::{
-    assemble, Commands, CursorSpec, Edge, FrameStyle, FromUi, IconImage, PlatformConfig, Started,
-    ToUi, WindowId, WindowKind,
+    assemble, Commands, CursorSpec, Edge, FrameStyle, FromUi, IconImage, PlatformConfig,
+    PopupBounds, Started, ToUi, WindowId, WindowKind,
 };
 use crate::surface::{Rect, Shadow};
 
@@ -347,6 +359,12 @@ struct WindowState {
     /// coordinates are *screen* coordinates, unlike every other mouse message
     /// — does not have to convert them.
     last_pos: Cell<(f64, f64)>,
+
+    // --- popups, stage 38 --------------------------------------------------
+    /// The rectangle this window's popups must stay inside, shared with the
+    /// Wayland thread. See [`crate::platform::PopupBounds`] and
+    /// [`WindowState::publish_popup_bounds`].
+    bounds: PopupBounds,
 }
 
 impl WindowState {
@@ -701,6 +719,66 @@ impl WindowState {
     /// branch. See [`FrameStyle`] for what stage 3 assumed instead.
     fn to_surface(&self, x: i32, y: i32) -> (f64, f64) {
         (f64::from(x), f64::from(y))
+    }
+
+    /// Ask Windows where this window's monitor is, and write the answer where
+    /// the Wayland thread can constrain a popup against it.
+    ///
+    /// ADDED FOR STAGE 38 (docs/waycompose-design.md §38), and it is the first
+    /// call in this project that asks Windows where anything is on the desktop.
+    ///
+    /// # Three choices, each of which can be got wrong silently
+    ///
+    /// **`MonitorFromWindow`, not the primary monitor.** `GetSystemMetrics`
+    /// with `SM_CXSCREEN` is shorter and describes the *primary* display, so on
+    /// a two-monitor desktop it would push every menu on the second screen back
+    /// towards the first — a bug that is invisible on the machine most people
+    /// test on. The monitor that matters is the one the parent window is on,
+    /// and `MONITOR_DEFAULTTONEAREST` also answers for a window that has been
+    /// dragged half off the desktop, where `MONITOR_DEFAULTTONULL` would give
+    /// nothing and this would fall back to not constraining at all.
+    ///
+    /// **`rcWork`, not `rcMonitor`.** The work area is the monitor minus the
+    /// taskbar and any other appbar. A menu constrained to `rcMonitor` at the
+    /// bottom of the screen is slid until its last row is behind the taskbar,
+    /// which is exactly as unusable as being off the screen and looks
+    /// deliberate. This is also the number Windows' own menus respect.
+    ///
+    /// **The coordinates are converted, not assumed.** `rcWork` is in screen
+    /// coordinates and `xdg_positioner` works in the parent's window-geometry
+    /// coordinates, so both corners go through `ScreenToClient` and then
+    /// through [`WindowState::to_surface`] — the same conversion the pointer
+    /// and touch paths use, so a menu cannot be constrained against a rectangle
+    /// that disagrees with where the clicks are. Getting this wrong would place
+    /// popups plausibly and incorrectly, which is worse than not constraining
+    /// them, because it looks right in the common case where the window is near
+    /// the top left.
+    fn publish_popup_bounds(&self) {
+        let hwnd = self.hwnd();
+        if hwnd.is_null() {
+            return;
+        }
+        let Some(work) = work_area_of(hwnd) else { return };
+        // SAFETY: a live window handle on the thread that owns it; both points
+        // are written in place by `ScreenToClient`.
+        let (topleft, bottomright) = unsafe {
+            let mut tl = POINT { x: work.left, y: work.top };
+            let mut br = POINT { x: work.right, y: work.bottom };
+            ScreenToClient(hwnd, &mut tl);
+            ScreenToClient(hwnd, &mut br);
+            (tl, br)
+        };
+        let (sx, sy) = self.to_surface(topleft.x, topleft.y);
+        let (ex, ey) = self.to_surface(bottomright.x, bottomright.y);
+        let rect = Rect::new(sx as i32, sy as i32, (ex - sx) as i32, (ey - sy) as i32);
+        let mut cell = self.bounds.lock().unwrap_or_else(|e| e.into_inner());
+        if *cell != Some(rect) {
+            *cell = Some(rect);
+            println!(
+                "wc-compositor: window {} may put popups in {},{} {}x{} (its own coordinates)",
+                self.id, rect.x, rect.y, rect.w, rect.h
+            );
+        }
     }
 
     /// `WM_MOUSEMOVE`. Also where the pointer *enters*, because Win32 has no
@@ -1096,6 +1174,27 @@ unsafe extern "system" fn toplevel_proc(
             let h = ((lparam >> 16) & 0xffff) as i32;
             state.on_size(wparam, w, h);
             0
+        }
+        // ADDED FOR STAGE 38. The three ways the answer to "where may this
+        // window's popups go" changes, and none of them is a message this
+        // compositor already handled:
+        //
+        //   `WM_WINDOWPOSCHANGED`  the window moved, possibly onto another
+        //                          monitor. Sent for every step of a drag, so
+        //                          the cache is at most one message stale.
+        //   `WM_DISPLAYCHANGE`     the resolution or the monitor layout
+        //                          changed under it.
+        //   `WM_SETTINGCHANGE`     the taskbar moved, was resized, or was set
+        //                          to auto-hide, which changes `rcWork` while
+        //                          nothing moves at all.
+        //
+        // All three fall through to `DefWindowProc` rather than returning 0:
+        // `WM_WINDOWPOSCHANGED`'s default handler is what generates `WM_SIZE`
+        // and `WM_MOVE`, and swallowing it would silently take the resize
+        // negotiation with it.
+        WM_WINDOWPOSCHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            state.publish_popup_bounds();
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;
@@ -2003,8 +2102,9 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             aumid,
             shadow,
             kind,
+            bounds,
         } => {
-            if let Err(e) = create_window(ui, id, &title, &app_id, &aumid, shadow, kind) {
+            if let Err(e) = create_window(ui, id, &title, &app_id, &aumid, shadow, kind, bounds) {
                 eprintln!("wc-compositor: could not create a window for surface {id}: {e}");
             }
         }
@@ -2351,10 +2451,12 @@ fn create_window(
     aumid: &str,
     shadow: Arc<Mutex<Shadow>>,
     kind: WindowKind,
+    bounds: PopupBounds,
 ) -> std::io::Result<()> {
     let state = Rc::new(WindowState {
         id,
         kind,
+        bounds,
         hwnd: Cell::new(0),
         shadow,
         events: ui.events.clone(),
@@ -2452,6 +2554,17 @@ fn create_window(
     // `DefWindowProc` build an ordinary frame. This is the first moment the
     // window can be asked the question again with an answer available.
     apply_frame(&state);
+    // STAGE 38: before the window is ever shown, because the first popup can
+    // arrive before the first `WM_WINDOWPOSCHANGED` does. `CW_USEDEFAULT` has
+    // put the window somewhere already, so `MonitorFromWindow` has an answer,
+    // and it is refreshed on every move from here on.
+    //
+    // **After `apply_frame`**, and for the same reason it is after the
+    // `GWLP_USERDATA` line: the frame decides where the client area is, and
+    // this converts a screen rectangle *into* client coordinates. Publishing
+    // first would publish a rectangle measured against a frame the window is
+    // about to stop having.
+    state.publish_popup_bounds();
     ui.windows.borrow_mut().insert(id, state.clone());
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
@@ -2956,10 +3069,19 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // window has to be grown by whatever the current theme's border and caption
     // come to, which is what `AdjustWindowRectEx` is for and is why hard-coding
     // `GetSystemMetrics(SM_CYCAPTION)` would be wrong on a themed desktop.
-    // SAFETY: `rc` is written in place; the style must match the window's.
+    //
+    // STAGE 38: the window's **live** style rather than the constant
+    // `create_window` used. The two are the same today and would silently stop
+    // being the same the moment a window is given a different frame — §31's
+    // tabs-in-title-bar arrangement is exactly that — and the failure would be
+    // a non-client inset that is wrong by a caption's height, which reads as a
+    // window that is slightly too tall for no reason.
+    // SAFETY: `rc` is written in place; a live window handle.
+    let style = unsafe { GetWindowLongPtrW(w.hwnd(), GWL_STYLE) } as u32;
     unsafe {
-        AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0);
+        AdjustWindowRectEx(&mut rc, style, 0, 0);
     }
+
     // ADDED FOR TABS IN THE TITLE BAR, and it is one line because `AdjustWindowRectEx` has
     // already measured the thing that has to be undone. Its `rc.top` is the
     // negative of the top inset the theme wants — caption, buttons and top
@@ -2970,27 +3092,135 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     if w.frame.extend_top {
         rc.top = 0;
     }
-    w.self_driven.set(true);
+
+    // STAGE 38: fit the window to the monitor's work area before it is shown.
+    //
+    // Two requirements, and the second is the sharper one:
+    //
+    //   * a window must not open larger than the work area, so it does not
+    //     spill behind the taskbar or off the screen;
+    //   * a window must open with its **title bar completely visible**,
+    //     because a caption that is off the top or past an edge cannot be
+    //     grabbed, and a window that cannot be grabbed cannot be moved back.
+    //
+    // Fitting the *whole* outer rectangle inside `rcWork` satisfies both, and
+    // it is a stronger guarantee than "the caption is visible": there is no
+    // arrangement in which the frame fits and the caption does not.
+    //
+    // `CW_USEDEFAULT` chose where this window is (`create_window`), and that
+    // cascade is not wrong — it is simply unbounded, and a few windows into it
+    // the next one is off the bottom right. So the position is *bounded* here
+    // rather than replaced: a window that already fits is not moved at all.
+    let (ox, oy) = window_origin(w.hwnd());
+    let asked = (ox, oy, rc.right - rc.left, rc.bottom - rc.top);
+    let mut got = asked;
+    if let Some(work) = work_area_of(w.hwnd()) {
+        got = crate::platform::fit_to_work_area(
+            asked,
+            (work.left, work.top, work.right, work.bottom),
+        );
+        if got != asked {
+            println!(
+                "wc-compositor: window {} asked for {}x{} at {},{} and the work area is \
+                 {}x{} at {},{} -> {}x{} at {},{}",
+                w.id,
+                asked.2,
+                asked.3,
+                asked.0,
+                asked.1,
+                work.right - work.left,
+                work.bottom - work.top,
+                work.left,
+                work.top,
+                got.2,
+                got.3,
+                got.0,
+                got.1
+            );
+        }
+    }
+    let (x, y, ww, wh) = got;
+    let fitted = got != asked;
+    // The client is told, and this is the half that is easy to miss. If the
+    // window was made smaller than the client asked for, `self_driven` must
+    // **not** suppress the `WM_SIZE` that `SetWindowPos` provokes: the whole
+    // point of an `xdg_toplevel.configure` is that the client lays out for the
+    // size it actually got. It is only suppressed when nothing changed, which
+    // is the original reason it was here — a client being told its own request
+    // back is noise that makes toolkits resend.
+    // **`ShowWindow` first, then place it, and that order was measured.**
+    //
+    // Until stage 38 this was the other way round, and it worked because the
+    // `SetWindowPos` kept `SWP_NOMOVE`: only the size was being set, and a
+    // window created with `CW_USEDEFAULT` keeps a size somebody has given it.
+    // Setting a *position* as well does not survive the first `ShowWindow`.
+    // `CW_USEDEFAULT` for x and y means "decide when it is first shown", and
+    // `SW_SHOWNORMAL` decides — for the whole placement, size included. The
+    // first guest run of this stage has it in the log: the window was fitted
+    // to `1220x752 at 0,0` and appeared at `960x543 at 104,104`, which is the
+    // cascade, and the client was configured twice for its trouble.
+    //
+    // So: show it, then place it. The window is only shown at all once its
+    // shadow has pixels, and the placement lands before the first `WM_PAINT`.
+    //
+    // `self_driven` covers the `SetWindowPos`: the `WM_SIZE` it produces is
+    // the client's own request unless the work area forced a change, and then
+    // it is exactly what the client has to be told.
+    //
+    // **A client is still configured twice at map, and it is not this.** The
+    // guest's logs show `1280x729`, then the cascade size, then the fitted one
+    // — the last is right and the middle one is noise. A flag that dropped
+    // every `WM_SIZE` across `ShowWindow` was tried and changed the sequence by
+    // nothing at all, so whatever sends it is not this call, and guessing again
+    // would be shipping a fix with no measurement behind it. Written down here
+    // rather than left for the next reader to rediscover.
     // SAFETY: live window handle; both calls send messages to `toplevel_proc`
     // on this thread before returning.
     unsafe {
-        SetWindowPos(
-            w.hwnd(),
-            std::ptr::null_mut(),
-            0,
-            0,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
         if !w.mapped.replace(true) {
             ShowWindow(w.hwnd(), SW_SHOWNORMAL);
         }
+        w.self_driven.set(!fitted);
+        SetWindowPos(
+            w.hwnd(),
+            std::ptr::null_mut(),
+            x,
+            y,
+            ww,
+            wh,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
     w.self_driven.set(false);
     // The size we just imposed is the size the client already has, so recording
-    // it here stops the `WM_SIZE` above from being echoed back as a configure.
-    w.last_configured.set((width, height));
+    // it here stops the `WM_SIZE` above from being echoed back as a configure —
+    // unless it is *not* the size the client asked for, in which case the
+    // `WM_SIZE` has already gone out as a configure and the recorded value has
+    // to be that one, or the next resize would be compared against a size this
+    // window never had.
+    if !fitted {
+        w.last_configured.set((width, height));
+    }
+    // What the window actually turned out to be, once, in the log — because
+    // the placement above is the one thing here that Windows is entitled to
+    // overrule, and a line that says so is the difference between finding that
+    // out in a minute and finding it out in a run.
+    {
+        let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window handle; the rectangle is written in place.
+        unsafe { GetWindowRect(w.hwnd(), &mut rc) };
+        if (rc.right - rc.left, rc.bottom - rc.top, rc.left, rc.top) != (ww, wh, x, y) {
+            println!(
+                "wc-compositor: window {} was placed at {ww}x{wh} at {x},{y} and Windows made \
+                 it {}x{} at {},{}",
+                w.id,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                rc.left,
+                rc.top
+            );
+        }
+    }
 
     // TABS IN THE TITLE BAR, and after `ShowWindow` on purpose: DWM has no caption buttons
     // to report the bounds of until the window has been shown, and asking in
@@ -3069,6 +3299,57 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
         wr.0 - cr.0,
         wr.1 - cr.1
     );
+}
+
+/// The work area of the monitor this window is on, in **screen** coordinates.
+///
+/// ADDED FOR STAGE 38, and the first thing in this project that asks Windows
+/// where anything is. Three choices, each of which can be got wrong silently:
+///
+/// **`MonitorFromWindow`, not the primary monitor.** `GetSystemMetrics` with
+/// `SM_CXSCREEN` is shorter and describes the *primary* display, so on a
+/// two-monitor desktop every window on the second screen would be pushed back
+/// towards the first — a bug that is invisible on the machine most people test
+/// on.
+///
+/// **`MONITOR_DEFAULTTONEAREST`.** A window dragged mostly off the desktop
+/// belongs to the monitor it is nearest; `MONITOR_DEFAULTTONULL` would answer
+/// nothing and every caller here would then decline to do anything, which is
+/// the pre-stage-38 behaviour arriving by accident.
+///
+/// **`rcWork`, not `rcMonitor`.** The work area is the monitor minus the
+/// taskbar and any other appbar. It is the number Windows' own menus and its
+/// own window placement respect, and using `rcMonitor` would put the bottom of
+/// every maximised-ish window and every long menu behind the taskbar.
+fn work_area_of(hwnd: HWND) -> Option<RECT> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        rcMonitor: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        rcWork: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        dwFlags: 0,
+    };
+    // SAFETY: a live window handle. `cbSize` is set, which `GetMonitorInfoW`
+    // requires and whose absence is the documented way it fails.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+    }
+    if info.rcWork.right <= info.rcWork.left || info.rcWork.bottom <= info.rcWork.top {
+        return None;
+    }
+    Some(info.rcWork)
+}
+
+/// Where a window's outer rectangle starts, in screen coordinates.
+fn window_origin(hwnd: HWND) -> (i32, i32) {
+    let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: a live window handle; the rectangle is written in place.
+    unsafe {
+        GetWindowRect(hwnd, &mut rc);
+    }
+    (rc.left, rc.top)
 }
 
 /// `(dpi, (window w, h), (client w, h))` for a live window.
@@ -4341,7 +4622,48 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             hwnd: controller as isize,
         },
         PumpInner { ui },
+        primary_work_area(),
     ))
+}
+
+/// The primary monitor's work area, for the one `wl_output` to describe.
+///
+/// ADDED FOR STAGE 38. `SPI_GETWORKAREA` rather than `MonitorFromWindow`
+/// because this runs before any window exists, and it answers for the
+/// **primary** monitor — which is the right one and the only one, since this
+/// compositor advertises exactly one output. A second monitor would need a
+/// second `wl_output` and everything that follows from one, and that is not
+/// this stage (§38.6).
+///
+/// `SM_CXSCREEN`/`SM_CYSCREEN` are what `announce_dpi_awareness` prints and
+/// they are deliberately **not** used here: they are the full screen, taskbar
+/// included, so a client that filled the output would have its bottom rows
+/// behind the taskbar.
+fn primary_work_area() -> Option<(i32, i32)> {
+    let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: `SPI_GETWORKAREA` writes a `RECT` through `pvParam`; the other
+    // two arguments are unused for this action.
+    let got = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            (&mut rc as *mut RECT).cast::<c_void>(),
+            0,
+        )
+    };
+    if got == 0 {
+        return None;
+    }
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    println!(
+        "wc-compositor: the primary monitor's work area is {w}x{h} at {},{} \
+         (the screen minus the taskbar)",
+        rc.left, rc.top
+    );
+    Some((w, h))
 }
 
 impl PumpInner {

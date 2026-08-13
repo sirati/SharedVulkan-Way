@@ -206,10 +206,19 @@ struct Args {
     ///
     /// ADDED FOR STAGE 9. A flag rather than `GetSystemMetrics` because the
     /// harness has to be able to ask for a known desktop, and because the
-    /// headless platform has no desktop to ask. The Win32 platform ought to
-    /// override it with the real monitor and does not yet; that is named in
-    /// docs/waycompose-design.md §13.9 rather than left for someone to find.
+    /// headless platform has no desktop to ask.
+    ///
+    /// **STAGE 38 closed the debt this comment used to name.** It said "the
+    /// Win32 platform ought to override it with the real monitor and does not
+    /// yet"; it does now, with the primary monitor's *work area* rather than
+    /// its full size — see [`Started::work_area`] — and only when the flag was
+    /// not given. The default of 1920x1080 was true of no particular machine,
+    /// and a client that sizes itself to the output was opening a window
+    /// larger than a 1280x800 screen because of it.
     output: (i32, i32),
+    /// Whether `--output` was given. STAGE 38: a real monitor may replace the
+    /// default, and must never replace an answer the harness asked for.
+    output_explicit: bool,
     /// One scripted click, as `X,Y[,BUTTON][,MS]`. Headless only.
     ///
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
@@ -265,9 +274,10 @@ pub struct ControlHook;
 fn open_control(
     path: Option<&str>,
     events: std::sync::mpsc::Sender<platform::FromUi>,
+    output: (i32, i32),
 ) -> Result<ControlHook, u8> {
     let Some(path) = path else { return Ok(None) };
-    match control::Control::bind(path, events) {
+    match control::Control::bind(path, events, output) {
         Ok(c) => Ok(Some(c)),
         Err(e) => {
             eprintln!("wc-compositor: could not bind --control {path}: {e}");
@@ -283,6 +293,7 @@ fn open_control(
 fn open_control(
     path: Option<&str>,
     _events: std::sync::mpsc::Sender<platform::FromUi>,
+    _output: (i32, i32),
 ) -> Result<ControlHook, u8> {
     if path.is_some() {
         eprintln!("wc-compositor: --control is a Linux-only hook; there is no AF_UNIX listener here");
@@ -314,6 +325,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         shared_peer_prefix: String::new(),
         layout: None,
         output: (1920, 1080),
+        output_explicit: false,
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
@@ -474,6 +486,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                     return Err(2);
                 }
                 args.output = (w, h);
+                args.output_explicit = true;
             }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -751,7 +764,7 @@ pub fn run() -> std::process::ExitCode {
 /// each half re-reading a process-wide `env::args` that has one extra token in
 /// it. one-binary.md §2.2.
 pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
-    let args = match parse_args(&argv) {
+    let mut args = match parse_args(&argv) {
         Ok(a) => a,
         Err(code) => return std::process::ExitCode::from(code),
     };
@@ -986,7 +999,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // Before the platform, because it takes the same sender: the control
     // socket is a *second* source of `FromUi`, sitting exactly where the
     // platform sits, which is the whole of what makes it honest.
-    let control = match open_control(args.control.as_deref(), event_tx.clone()) {
+    let control = match open_control(args.control.as_deref(), event_tx.clone(), args.output) {
         Ok(c) => c,
         Err(code) => return std::process::ExitCode::from(code),
     };
@@ -1014,7 +1027,29 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let platform::Started { ui, pump } = started;
+    let platform::Started { ui, pump, work_area } = started;
+
+    // STAGE 38. The one `wl_output` describes the **work area** of the real
+    // monitor, unless the harness asked for a particular size.
+    //
+    // The output is what a client sizes itself against, so the honest number
+    // has to be the one it can actually use: the screen minus the taskbar. The
+    // alternative — letting the client open whatever it likes and resizing the
+    // window afterwards (`map_window`) — still happens, because a client may
+    // ask for anything, but it arrives after the client has laid out for a size
+    // it will not get, and a browser reflows visibly when that happens.
+    //
+    // `--output` wins. A conformance run asks for a known desktop and must not
+    // be given this machine's.
+    if let Some((w, h)) = work_area
+        && !args.output_explicit
+    {
+        println!(
+            "wc-compositor: wl_output is the monitor's work area, {w}x{h} \
+             (--output would override it)"
+        );
+        args.output = (w, h);
+    }
 
     // Which layout the keyboard compiles. `--layout` wins so a harness is not
     // at the mercy of the machine's regional settings; otherwise ask the
