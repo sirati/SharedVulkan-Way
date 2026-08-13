@@ -1949,6 +1949,229 @@ the one being chased.
 
 ---
 
+### 0.18 The API version, negotiated instead of asserted
+
+Built and measured 2026-08-13 on **devhost**. The requirement, in the user's
+words:
+
+> previously i once saw that shared vulkan impl a smaller subset than the iGPU —
+> iirc one was vulkan 4, the other was vulkan 5. we want to support the full
+> feature set. yes there are gpus that do not support the newer version; what we
+> do is we advertise and forward what the gpu supports. so graceful fallback
+
+The observation is correct and the diagnosis is exact. `sv-icd` advertised
+
+```rust
+pub const API_VERSION: u32 = (1 << 22) | (3 << 12);   // 1.3.0, hard-coded
+```
+
+while every device on this machine reports 1.4 — RADV RAPHAEL_MENDOCINO
+**1.4.348**, the RTX 5090 **1.4.329**, and the testhost guest's Intel UHD
+**1.4.323** (`docs/video-decode.md`). One number was a constant and the other was
+the truth, and they were never compared.
+
+**But the fix is not "report 1.4".** §7's `clamp_api_version` already records, in
+detail, what happened the last time this ICD claimed a version it did not
+implement: Zink reads `screen->vk_version` from
+`VkPhysicalDeviceProperties::apiVersion`, and at 1.4 it stops chaining
+`VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT` into
+`vkGetPhysicalDeviceFeatures2` and reads the promoted feature out of
+`VkPhysicalDeviceVulkan14Features` instead — a struct this wire does not carry,
+which therefore came back false, which cost `GL_ARB_instanced_arrays` and two GL
+versions. Over-promising is not the safe direction; it is the direction that
+already cost something measurable.
+
+So the defect is not the number 1.3. It is that **1.3 was a constant**: it could
+not rise when the wire rose, it could not fall when the driver was older, and
+when it disagreed with the device nothing said so. Three separate wrongs, and
+this section fixes all three.
+
+#### 1. The ceiling is derived, not declared
+
+`vk_registry::profile::Profile::core_api_version` reads the highest
+`VK_VERSION_1_x` out of the profile's own feature list; the generator hands it to
+`sv-proto` as `SV_PROTOCOL_CORE_VERSION`, and `sv_icd::state::PROTOCOL_API_VERSION`
+*is* `sv_proto::CORE_API_VERSION`. The ICD can no longer advertise a version its
+own command table does not back, because there is nowhere left to write a
+different number. `sv-gpu-server`'s `Driver::open` takes the same constant as its
+instance cap, so the two sides rise together in one edit.
+
+#### 2. The driver's real version crosses, over `svDriverVersions`
+
+A new hand-written protocol command (`sv_proto::sv`, opcode `PROTOCOL_BASE + 2`),
+asked once on the instance ring inside `SharedVulkan::connected`, answered by the
+GPU side from `driver.instance_api_version` and `driver.props.api_version`,
+**unclamped**. Clamping there would make the negotiation a tautology: the app
+side would learn its own ceiling back and could never notice that the driver is
+richer than the wire.
+
+The cold-path handshake was tried first and does not work, for two ordering
+reasons that are worth recording because both look like they should be fine:
+
+- On the cross-VM path the guest sends its `Hello` **before it opens the
+  driver**, deliberately — "bound before the driver is opened so that a host
+  waiting on the port sees it come up promptly". There is no `apiVersion` yet.
+- On the `sv-hostd` path the process that sends the `Attachment` is not the one
+  holding the driver. In `Mode::Local` the GPU side is one of the daemon's
+  *clients*.
+
+A ring command has neither problem: by the time any ring is served, the GPU side
+has a `Driver`. It is the pattern `ask_device_extensions` already uses, and for
+the same reason — the answer belongs to whoever holds the driver.
+
+#### 3. `min(driver, ceiling)`, and it says which one it took
+
+`sv_icd::state::negotiate` is a pure function of two numbers with four outcomes,
+and `announce` prints the reason on the loader's diagnostic channel — **on the
+line that always prints, not behind `SV_DEBUG`**. A demotion nobody can see is
+how this defect survived long enough to cost two GL versions.
+
+| driver reports | advertised | outcome | measured |
+| --- | --- | --- | --- |
+| nothing (no GPU side, or no answer) | ceiling | `Unknown` | standalone driver |
+| below the ceiling | **the driver's number** | `Fallback` | 1.1.0, below |
+| equal on major.minor | the driver's, patch kept | `Exact` | — |
+| above the ceiling | ceiling | `Clamped` | 1.4.348 → 1.3.0 |
+
+Two details that are decisions rather than arithmetic. The comparison **ignores
+the patch**: 1.3.290 against a 1.3.0 ceiling is the same *contract*, and treating
+it as "newer than we can carry" would print a demotion notice on every ordinary
+run and mean nothing by it. And the `Exact` case keeps the **driver's** patch
+digits, because `vulkaninfo` prints them and the acceptance test is that the
+forwarded report and the direct one are the same text.
+
+The instance number is additionally bounded by the device's. §8 gives this ICD
+exactly one physical device, so an application told "instance 1.3" and then
+handed a 1.1 device learns nothing from the first number that the second does not
+contradict — and the GPU side's instance number is its *loader's*, which on this
+machine is 1.4.350 whichever driver is selected. Taking the smaller is what stops
+the loader's version from becoming our answer.
+
+#### 4. The manifest: what the loader actually does with it
+
+**This is the part that cannot be negotiated**, and the constraint had to be
+established rather than guessed. The manifest is a file on disk; the loader
+parses it before a line of this crate runs.
+
+Read out of `Vulkan-Loader`'s `loader/loader.c` (main; this tree links
+vulkan-loader 1.4.350.0): the manifest's `api_version` is stored verbatim as
+`scanned_icd->api_version` in `loader_scanned_icd_add` and is **never** refreshed
+from a runtime query on the manifest path. Only the
+`VkDirectDriverLoadingLUNARG` path — which has no manifest — takes its number
+from `vkEnumerateInstanceVersion` at scan time. It is then read in exactly three
+places, all in `terminator_CreateInstance`:
+
+1. `if (icd_term->scanned_icd->api_version >= VK_API_VERSION_1_1)` — the gate on
+   whether the loader asks us for `vkEnumerateInstanceVersion` **at all**. Below
+   1.1 our runtime answer is never read and we are a 1.0 driver forever.
+2. the same test again, for whether `khr_get_physical_device_properties2` is
+   marked enabled on this ICD.
+3. a `== 1.0` test, on `LOADER_ENABLE_LINUX_SORT` builds, that force-enables
+   `VK_KHR_get_physical_device_properties2`.
+
+**Nothing compares the manifest number with the application's requested version,
+and nothing clamps `VkApplicationInfo::apiVersion` down to it.** The only rewrite
+of the application's requested version is guarded by
+`icd_version_nopatch == api_version_1_0`, where `icd_version` is what *our*
+`vkEnumerateInstanceVersion` returned. So:
+
+> **The manifest must state the ceiling — the highest version this build could
+> ever advertise — and the runtime number does the real work.** The manifest is a
+> floor-gate and an upper bound on nothing. There is no reading of the loader
+> under which it could carry a negotiated number anyway: one file serves every
+> GPU the machine has.
+
+And graceful fallback is safe under that rule, which is the thing worth checking
+rather than assuming. A driver that only does 1.1 gives a runtime answer of 1.1
+against this 1.3 manifest; the gate passes, no demotion fires (1.1 is not 1.0),
+and the application's requested version reaches us untouched. Per the loader's
+own policy **LDP_DRIVER_10**, at interface version ≥ 5 a driver must *not* return
+`VK_ERROR_INCOMPATIBLE_DRIVER` for a version it does not support — "This check is
+performed by the loader on the drivers behalf" — so the 1.1 device reports 1.1
+and the application decides. We negotiate 7 and degrade to 5 (§8), so this is our
+case.
+
+The one coupling that survives is `build.rs`'s `MANIFEST_API_VERSION` string
+against `PROTOCOL_API_VERSION`, and `the_manifest_agrees_with_what_we_report`
+fails the build's tests if they part company. A build script cannot read the
+library's constants — it runs first, and a build-dependency on `sv-proto` would
+compile the ~100,000 generated lines a second time for the host — so the check is
+a test rather than an impossibility.
+
+#### 5. Measured, both directions
+
+`vulkaninfo --summary` against the real driver, and through the forwarder on the
+same machine, same driver:
+
+| shell | driver | direct | forwarded | sv-icd said |
+| --- | --- | --- | --- | --- |
+| `nix develop` | RADV RAPHAEL_MENDOCINO | **1.4.348** | **1.3.0** | `Clamped` |
+| clean `nix shell` | NVIDIA RTX 5090, 595.71.05 | **1.4.329** | **1.3.0** | `Clamped` |
+| `nix develop` | RADV, `SV_DRIVER_VERSION_MAX=1.1` | — | **1.1.0** | `Fallback` |
+
+The NVIDIA row is from a clean `nix shell nixpkgs#vulkan-tools` with
+`LD_LIBRARY_PATH` pointing at a store `vulkan-loader`, never the dev shell, per
+`hardware-constraints.md`; the 5090 enumerates there and the GPU side served
+rings on it.
+
+The third row is the graceful-fallback path, and it needed a knob because **no
+GPU on this machine is older than the ceiling** — every ICD here reports 1.4.
+`SV_DRIVER_VERSION_MAX` on the *GPU side* lowers what `svDriverVersions` reports;
+it **can only lower**, and a value above the driver's own is ignored rather than
+honoured, because the one thing it must never become is a way to make the app
+side advertise a version nothing implements. With it, `vulkaninfo` through the
+forwarder reports `apiVersion = 1.1.0` — the whole driver, instance and device,
+one consistent claim — which is exactly what the requirement asks for and what a
+unit test alone could not have shown.
+
+Making that row come out right forced one further correction: `clamp_api_version`
+now bounds the forwarded `apiVersion` by the **negotiated** device version rather
+than by the bare ceiling. The two are identical on every ordinary run. Where they
+part is where it matters — the first measurement of the fallback path produced an
+ICD whose `vkEnumerateInstanceVersion` said 1.1 and whose physical device said
+1.3, a driver contradicting itself one call apart.
+
+#### 6. The honest statement: what "1.4" would actually cost
+
+Advertising 1.4 while the wire cannot carry a 1.4 command is the same defect
+wearing the other hat, so the number belongs next to the claim. `sv-codegen gap`:
+**740 commands in the registry, 239 carried by the zink profile**, 501 not (23 of
+those unreachable by any profile).
+
+Resolving the zink profile with `VK_VERSION_1_4` added, against
+vulkan-headers 1.4.350.0:
+
+- **239 → 253 commands (+14)**: `vkCmdBindDescriptorSets2`, `vkCmdPushConstants2`,
+  `vkCmdPushDescriptorSet`, `vkCmdPushDescriptorSet2`,
+  `vkCmdPushDescriptorSetWithTemplate`, `vkCmdPushDescriptorSetWithTemplate2`,
+  `vkCmdSetRenderingAttachmentLocations`,
+  `vkCmdSetRenderingInputAttachmentIndices`, `vkCopyImageToImage`,
+  `vkCopyImageToMemory`, `vkCopyMemoryToImage`, `vkMapMemory2`,
+  `vkTransitionImageLayout`, `vkUnmapMemory2`.
+- **618 → 662 types (+44)**, including `VkPhysicalDeviceVulkan14Features` and
+  `VkPhysicalDeviceVulkan14Properties` — the two the Zink regression above turned
+  on — plus the host-image-copy family (`VkCopyMemoryToImageInfo`,
+  `VkHostImageLayoutTransitionInfo`, `VkMemoryToImageCopy`, …), the
+  maintenance-6 and push-descriptor structs, and eight promoted `…Features`
+  blocks.
+- Nothing is removed: the 1.4 `<remove>` block takes nothing this profile has.
+
+So the answer is: **this build can advertise 1.4 once those fourteen commands
+cross the wire and those forty-four types are generated** — and, separately, once
+`vkMapMemory2`/`vkUnmapMemory2` are reconciled with §5's arena, which owns
+`vkMapMemory` locally and would have to own its successor too. Until then 1.3 is
+not a limitation being hidden; it is the number, and the ICD now says so out loud
+on every run against a 1.4 device.
+
+**Out of scope and named as such.** The ICD also *over*-promises in the other
+direction: features are mirrored wholesale from the driver, so
+`bufferDeviceAddress` is advertised while `vkGetBufferDeviceAddress` and two
+friends sit in `NOT_IMPLEMENTED`. That is the same "advertise a constant, not the
+truth" shape and it is a live bug, but it is owned elsewhere and nothing in this
+section touches the feature-mirroring path.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`

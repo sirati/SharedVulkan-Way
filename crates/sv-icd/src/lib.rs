@@ -52,8 +52,8 @@ pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
     sv_transport::control::ProtocolIds::new(WIRE_VERSION, sv_proto::PROTOCOL_HASH)
 }
 
-/// See `sv_gpu_server::WIRE_VERSION`.
-pub const WIRE_VERSION: u32 = 1;
+/// See `sv_gpu_server::WIRE_VERSION`, which says why this is 2 and not 1.
+pub const WIRE_VERSION: u32 = 2;
 
 /// The environment variable that points at a GPU side.
 ///
@@ -324,7 +324,18 @@ mod tests {
     fn the_manifest_exists_and_points_at_this_build() {
         let text = std::fs::read_to_string(MANIFEST_PATH).expect("the build wrote a manifest");
         assert!(text.contains("\"file_format_version\""));
-        assert!(text.contains("\"api_version\": \"1.3.0\""), "1.0 would demote us silently");
+        // Derived, not a literal: the manifest states the *ceiling*, and the
+        // ceiling comes from the wire profile. A literal here would pass on the
+        // day the profile moved and the manifest did not, which is the exact
+        // drift design.md §0.18 removed everywhere else.
+        assert!(
+            text.contains(&format!(
+                "\"api_version\": \"{}\"",
+                state::version_string(state::PROTOCOL_API_VERSION)
+            )),
+            "the manifest must state the ceiling; below 1.1 would demote us silently, \
+             and build.rs says what the loader does with the number"
+        );
         assert!(
             text.contains("\"is_portability_driver\": false"),
             "true would make us invisible to almost every application"

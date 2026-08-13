@@ -71,6 +71,15 @@ pub struct Driver {
     pub queue_family: u32,
     pub props: vk::PhysicalDeviceProperties,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// What the loader on *this* side answers `vkEnumerateInstanceVersion` with,
+    /// before [`Driver::open`] clamps it down to what the profile uses.
+    ///
+    /// Kept unclamped and reported unclamped over `svDriverVersions`, because
+    /// this side's job is to say what the driver is, not what the app side may
+    /// advertise. The clamp is `sv_gpu_server`'s business only for the instance
+    /// it creates for itself; the *advertised* number is negotiated on the app
+    /// side, once, in `sv_icd::state::negotiate` — see design.md §0.18.
+    pub instance_api_version: u32,
     pub name: String,
     /// `VK_KHR_external_memory_fd`, and its dispatch table.
     pub external_fd: Option<ash::khr::external_memory_fd::Device>,
@@ -91,14 +100,23 @@ impl Driver {
         // `scalarBlockLayout` and `timelineSemaphore` live in
         // `VkPhysicalDeviceVulkan12Features` and `dynamicRendering` in the 1.3
         // block, and a 1.1 instance cannot even name those structures. Ask for
-        // what the loader says is available, capped at 1.3 — asking for more
-        // than the driver has makes `vkCreateInstance` fail outright, and asking
-        // for 1.4 buys nothing the profile uses.
+        // what the loader says is available, capped at what the wire carries —
+        // asking for more than the driver has makes `vkCreateInstance` fail
+        // outright, and asking for more than the profile knows buys nothing.
+        //
+        // The cap used to be the literal 1.3 and is now
+        // [`sv_proto::CORE_API_VERSION`], which *is* 1.3 today and is derived
+        // from the profile. The difference matters the day the profile gains
+        // `VK_VERSION_1_4`: this instance rises with it in the same edit rather
+        // than being the one place that was forgotten. `max` against 1.1 because
+        // a profile below that is a profile this side cannot serve at all, and
+        // `clamp` panics rather than saturating when its bounds cross.
         let available = unsafe { entry.try_enumerate_instance_version() }
             .ok()
             .flatten()
             .unwrap_or(vk::API_VERSION_1_0);
-        let want = available.clamp(vk::API_VERSION_1_1, vk::API_VERSION_1_3);
+        let ceiling = sv_proto::CORE_API_VERSION.max(vk::API_VERSION_1_1);
+        let want = available.clamp(vk::API_VERSION_1_1, ceiling);
         let app = vk::ApplicationInfo::default()
             .application_name(c"sv-gpu-server")
             .api_version(want);
@@ -145,7 +163,7 @@ impl Driver {
         let instance =
             unsafe { entry.create_instance(&ci, None) }.map_err(vkerr("vkCreateInstance"))?;
 
-        let opened = Driver::open_on(entry, instance, index);
+        let opened = Driver::open_on(entry, instance, index, available);
         if opened.is_err() {
             // Nothing else holds the instance if device creation failed, and
             // leaking it would keep the driver's own threads alive for the life
@@ -157,7 +175,12 @@ impl Driver {
         opened
     }
 
-    fn open_on(entry: ash::Entry, instance: ash::Instance, index: usize) -> Result<Driver> {
+    fn open_on(
+        entry: ash::Entry,
+        instance: ash::Instance,
+        index: usize,
+        instance_api_version: u32,
+    ) -> Result<Driver> {
         let r = Driver::open_inner(&entry, &instance, index);
         match r {
             Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host)) => {
@@ -179,6 +202,7 @@ impl Driver {
                     queue_family,
                     props,
                     mem_props,
+                    instance_api_version,
                     name,
                     external_fd,
                     has_dma_buf,

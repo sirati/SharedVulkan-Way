@@ -61,6 +61,11 @@ fn main() -> Result<()> {
     // Make the hash available to the handshake without a second parse.
     println!("cargo:rustc-env=SV_PROTOCOL_HASH={}", generated.protocol_hash);
     println!("cargo:rustc-env=SV_PROTOCOL_PROFILE={}", profile.name);
+    // The highest core Vulkan version the generated wire carries, which is what
+    // the app side is allowed to advertise (design.md §0.18). It is *not* in the
+    // protocol hash and does not need to be: a profile that changes its core
+    // version changes its command table, and the hash is over that.
+    println!("cargo:rustc-env=SV_PROTOCOL_CORE_VERSION={}", profile.core_api_version());
     println!(
         "cargo:warning=sv-proto: profile {}, {} commands, {} structs, hash {:#018x}",
         profile.name,

@@ -20,11 +20,73 @@
 //!   application that has not set
 //!   `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`, which is almost all of
 //!   them.
+//!
+//! # The constraint design.md §0.18 had to establish, from the loader's source
+//!
+//! §0.18 makes the advertised Vulkan version **negotiated** — the app side
+//! reports `min(what the driver behind it supports, what the wire carries)`
+//! instead of a constant. This file is the part that cannot be negotiated: the
+//! manifest is a file on disk and the loader parses it before a line of ours
+//! runs. So what, exactly, does the loader do with the number?
+//!
+//! Read out of `Vulkan-Loader`'s `loader/loader.c` (main, 8253 lines; this tree
+//! links vulkan-loader 1.4.350.0), the manifest's `api_version` is stored
+//! verbatim as `scanned_icd->api_version` in `loader_scanned_icd_add` and is
+//! **never** refreshed from a runtime query on the manifest path. It is then
+//! read in exactly three places, all in `terminator_CreateInstance`:
+//!
+//!  1. `if (icd_term->scanned_icd->api_version >= VK_API_VERSION_1_1)` — the
+//!     gate on whether the loader asks us for `vkEnumerateInstanceVersion` **at
+//!     all**. Below 1.1 our runtime answer is never read and we are a 1.0 driver
+//!     forever.
+//!  2. the same test again, for whether to mark
+//!     `khr_get_physical_device_properties2` enabled on this ICD.
+//!  3. a `== 1.0` test, on Linux-sort builds, that force-enables
+//!     `VK_KHR_get_physical_device_properties2`.
+//!
+//! Three consequences, and they are the whole of the answer:
+//!
+//! - **Nothing compares the manifest number with the application's requested
+//!   version, and nothing clamps `VkApplicationInfo::apiVersion` down to it.**
+//!   The only rewrite of the application's requested version is guarded by
+//!   `icd_version_nopatch == api_version_1_0`, where `icd_version` is what *our*
+//!   `vkEnumerateInstanceVersion` returned. The runtime number does the real
+//!   work; the manifest only decides whether the loader bothers to ask.
+//! - So **the manifest must state the ceiling — the highest version this build
+//!   could ever advertise — and not the negotiated one.** Understating it is
+//!   the trap above; a manifest of 1.1 with a runtime answer of 1.3 would still
+//!   be asked and still work, but a manifest below the ceiling buys nothing and
+//!   a manifest below 1.1 is catastrophic. Overstating it is what a lower
+//!   runtime number then corrects, at no cost. There is no reading of the loader
+//!   under which a per-driver manifest could carry a negotiated number anyway:
+//!   one file serves every GPU the machine has.
+//! - **Graceful fallback is safe.** A driver that only does 1.1 gives a runtime
+//!   answer of 1.1 against this 1.3 manifest; the loader's gate passes, no
+//!   demotion fires (1.1 is not 1.0), and the application's requested version
+//!   reaches us untouched. Per the loader's own policy `LDP_DRIVER_10`, at
+//!   interface version ≥ 5 we must **not** answer `VK_ERROR_INCOMPATIBLE_DRIVER`
+//!   for a version we do not support — that check is the loader's — so the
+//!   1.1 device simply reports 1.1 and the application decides.
+//!
+//! The one coupling that survives is this constant and
+//! `sv_icd::state::PROTOCOL_API_VERSION`, which is derived from the wire profile
+//! (`sv_proto::CORE_API_VERSION`). `the_manifest_agrees_with_what_we_report`
+//! fails the build's tests if they part company. A build script cannot read the
+//! library's constants — it runs first, and depending on `sv-proto` from here
+//! would compile the ~100,000 generated lines a second time for the host — so
+//! the check is a test rather than an impossibility.
 
 use std::path::PathBuf;
 
-/// Must equal `advertise::API_VERSION`, checked by a test in the library.
-const API_VERSION: &str = "1.3.0";
+/// The **ceiling**, as a string: it must equal
+/// `sv_icd::state::PROTOCOL_API_VERSION`, which is `sv_proto::CORE_API_VERSION`,
+/// which the generator derived from the wire profile's core versions.
+///
+/// Move this line when the profile gains a core version, and not before. The
+/// module docs above say why the manifest states the ceiling rather than
+/// whatever the machine's GPU happens to be, and
+/// `the_manifest_agrees_with_what_we_report` is the test that notices.
+const MANIFEST_API_VERSION: &str = "1.3.0";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -59,7 +121,7 @@ fn main() {
 
     let manifest = format!(
         "{{\n  \"file_format_version\": \"1.0.1\",\n  \"ICD\": {{\n    \
-         \"library_path\": \"{library_path}\",\n    \"api_version\": \"{API_VERSION}\",\n    \
+         \"library_path\": \"{library_path}\",\n    \"api_version\": \"{MANIFEST_API_VERSION}\",\n    \
          \"library_arch\": \"64\",\n    \"is_portability_driver\": false\n  }}\n}}\n",
     );
 
@@ -70,7 +132,7 @@ fn main() {
     }
     println!("cargo:warning=sv-icd: manifest at {}", manifest_path.display());
     println!("cargo:rustc-env=SV_ICD_MANIFEST={}", manifest_path.display());
-    println!("cargo:rustc-env=SV_ICD_MANIFEST_API_VERSION={API_VERSION}");
+    println!("cargo:rustc-env=SV_ICD_MANIFEST_API_VERSION={MANIFEST_API_VERSION}");
 
     // The absolute path of the `cdylib` the manifest names, and the profile it
     // belongs to, so that `tests/loader.rs` can tell "the driver is broken"

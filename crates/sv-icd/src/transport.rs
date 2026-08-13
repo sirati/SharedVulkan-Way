@@ -1187,6 +1187,26 @@ impl RingTransport {
         Ok(())
     }
 
+    /// Ask the GPU side which Vulkan version its driver actually is (§0.18).
+    ///
+    /// On the **instance** ring, because it is asked before any device exists —
+    /// `vkEnumerateInstanceVersion` is a global command and the loader may call
+    /// it before `vkCreateInstance`.
+    ///
+    /// `None` for any failure, and that is deliberate rather than lazy: a GPU
+    /// side built before this command existed answers "unknown protocol command"
+    /// and its ring is then fatal, so the *only* correct handling of a failure
+    /// here is to fall back to the ceiling. `WIRE_VERSION` is what actually
+    /// keeps such a peer away; this is the belt to that pair of braces.
+    pub fn driver_versions(&self) -> Option<(u32, u32)> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::DriverVersions.encode(&mut cmd).ok()?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Instance, sv_proto::sv::SV_DRIVER_VERSIONS, &cmd, &mut reply).ok()?;
+        let r = sv_proto::sv::DriverVersionsReply::decode(&reply).ok()?;
+        Some((r.instance_api_version, r.device_api_version))
+    }
+
     /// `vkFreeCommandBuffers`: give the block back to the reserve.
     ///
     /// Separate from [`Transport::discard_blob`] because the two mean different

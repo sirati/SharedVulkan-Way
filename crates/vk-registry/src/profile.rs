@@ -81,6 +81,34 @@ impl ResolvedProfile {
 }
 
 impl Profile {
+    /// The highest core Vulkan version this profile declares, as
+    /// `VK_MAKE_API_VERSION(0, major, minor, 0)`.
+    ///
+    /// **This is the number the app side may advertise**, and deriving it here
+    /// rather than writing it down twice is the point: an ICD's
+    /// `vkEnumerateInstanceVersion` is a promise that the entry points and
+    /// structures of that version exist, and the only thing that can keep the
+    /// promise is the wire profile. `sv-icd` calls this its *ceiling* and
+    /// advertises `min(what the driver supports, this)`; see design.md §0.18.
+    ///
+    /// A profile with no `VK_VERSION_*` feature carries no core Vulkan at all,
+    /// which is the §13-step-3 tiny profile, and 1.0 is the honest answer for
+    /// it: an ICD cannot report less.
+    pub fn core_api_version(&self) -> u32 {
+        let mut best = (1u32, 0u32);
+        for f in &self.features {
+            let Some(rest) = f.strip_prefix("VK_VERSION_") else { continue };
+            let Some((major, minor)) = rest.split_once('_') else { continue };
+            let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+                continue;
+            };
+            if (major, minor) > best {
+                best = (major, minor);
+            }
+        }
+        (best.0 << 22) | (best.1 << 12)
+    }
+
     /// Resolve the profile: gather what the listed features and extensions
     /// require, then close over type dependencies.
     pub fn resolve(&self, model: &Model) -> Result<ResolvedProfile> {
@@ -748,6 +776,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The ceiling `sv-icd` advertises comes from here and from nowhere else.
+    ///
+    /// Needs no registry: it reads the declaration, not the resolution, which is
+    /// what makes it usable from a build script.
+    #[test]
+    fn the_core_version_is_the_highest_one_declared() {
+        // The real one. Bump this line and the ICD's manifest together — that is
+        // the whole coupling, and `sv_icd::state`'s manifest test enforces it.
+        assert_eq!(profiles::zink().core_api_version(), (1 << 22) | (3 << 12), "zink is 1.0-1.3");
+
+        let mk = |minor: u32| (1u32 << 22) | (minor << 12);
+        let with = |features: &[&str]| Profile {
+            features: features.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+        .core_api_version();
+
+        // Out of order, because `features` is a declaration and not a ladder.
+        assert_eq!(with(&["VK_VERSION_1_3", "VK_VERSION_1_0", "VK_VERSION_1_2"]), mk(3));
+        assert_eq!(with(&["VK_VERSION_1_4"]), mk(4));
+        // Two digits must not sort as text: 1.10 is above 1.9, and a profile
+        // that compared strings would say the opposite.
+        assert_eq!(with(&["VK_VERSION_1_9", "VK_VERSION_1_10"]), mk(10));
+        // A profile with no core version at all is still a 1.0 ICD; there is no
+        // lower thing an ICD may report.
+        assert_eq!(with(&[]), mk(0));
+        assert_eq!(with(&["VK_KHR_swapchain"]), mk(0));
     }
 
     #[test]

@@ -25,7 +25,7 @@
 //! to grep for.
 
 use crate::advertise;
-use crate::state::{Memory, SharedVulkan, API_VERSION};
+use crate::state::{Memory, PROTOCOL_API_VERSION, SharedVulkan};
 use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError, forward};
 use sv_proto as p;
 
@@ -68,8 +68,10 @@ fn record_into_blob(
 }
 
 impl IcdLocal for SharedVulkan {
+    /// `vkEnumerateInstanceVersion`, and it is the negotiated number rather than
+    /// a constant (design.md §0.18).
     fn api_version(&self) -> u32 {
-        API_VERSION
+        self.advertised_api_version()
     }
 
     fn transport(&self) -> Option<&dyn sv_icd_entry::Transport> {
@@ -143,7 +145,10 @@ impl IcdLocal for SharedVulkan {
             s.physical_devices.insert(phys, id);
             s.instances.insert(
                 id,
-                crate::state::Instance { api_version: API_VERSION, physical_devices: vec![phys] },
+                crate::state::Instance {
+                    api_version: self.advertised_api_version(),
+                    physical_devices: vec![phys],
+                },
             );
             (id, phys)
         };
@@ -500,12 +505,12 @@ impl Icd for SharedVulkan {
         if let Some(t) = self.wire() {
             let mut reply = forward::get_physical_device_properties(t, args)?;
             if let Some(p) = reply.p_properties.as_mut() {
-                clamp_api_version(&mut p.api_version);
+                clamp_api_version(self, &mut p.api_version);
             }
             return Ok(reply);
         }
         Ok(p::VkGetPhysicalDevicePropertiesReply {
-            p_properties: Some(Box::new(device_properties())),
+            p_properties: Some(Box::new(device_properties(self))),
         })
     }
 
@@ -516,12 +521,12 @@ impl Icd for SharedVulkan {
         if let Some(t) = self.wire() {
             let mut reply = forward::get_physical_device_properties2(t, args)?;
             if let Some(p) = reply.p_properties.as_mut() {
-                clamp_api_version(&mut p.properties.api_version);
+                clamp_api_version(self, &mut p.properties.api_version);
             }
             return Ok(reply);
         }
         let mut out = p::VkPhysicalDeviceProperties2::default();
-        out.properties = device_properties();
+        out.properties = device_properties(self);
         // The application's own chain links are left exactly as it left
         // them: answering a link we have no answer for would be inventing
         // data. See `store_pnext` in `sv-icd-entry` for the direction that
@@ -1277,6 +1282,34 @@ impl Icd for SharedVulkan {
 /// says 1.3 — so a physical device reporting the driver's 1.4 was reporting a
 /// version its own ICD does not implement.
 ///
+/// **The bound is [`PROTOCOL_API_VERSION`] and it is derived, not written
+/// down** (design.md §0.18). What changed when §0.18 was done is not this
+/// function — clamping *is* the right thing and the paragraphs below are why —
+/// but three facts around it: the bound now comes from the wire profile so it
+/// cannot disagree with the command table; the driver's number is learned over
+/// `svDriverVersions` rather than assumed; and a clamp that actually fires is
+/// printed at startup by `sv_icd::state::announce`. A demotion that nobody can
+/// see is how this defect survived long enough to cost the two GL versions
+/// described below.
+///
+/// Note what this is *not*: it is not a floor. A driver reporting **less** than
+/// the bound passes through untouched and the application is told the driver's
+/// smaller number — which is the whole of "graceful fallback", and it needs no
+/// code here because `min` already does it.
+///
+/// **The bound is the negotiated device version, not the bare ceiling**, and the
+/// difference is not cosmetic. The two numbers are the same on every ordinary
+/// run — the negotiated one *is* `min(driver, ceiling)` and the forwarded reply
+/// carries that same driver — so the clamp is unchanged in practice. Where they
+/// part is where it matters: a driver that answered `svDriverVersions` with 1.1
+/// and this reply with 1.4 would otherwise produce an ICD whose
+/// `vkEnumerateInstanceVersion` says 1.1 and whose physical device says 1.3,
+/// which is a driver contradicting itself one call apart. Settling the number
+/// once at connect and bounding every later answer by it is what makes the
+/// driver's report a single consistent claim. It is also what makes
+/// `SV_DRIVER_VERSION_MAX` on the GPU side a faithful stand-in for an old
+/// device, and therefore what makes the fallback path testable at all.
+///
 /// It is not a cosmetic inconsistency, and the cost was two GL versions. Mesa's
 /// Zink takes `screen->vk_version` from exactly this field, and its device-info
 /// pass stops chaining an extension's feature struct into
@@ -1290,12 +1323,15 @@ impl Icd for SharedVulkan {
 /// `VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT` we *do* answer, and which
 /// says `true`, went unasked. Claiming a version above what you implement makes
 /// an honest answer unreachable rather than wrong.
-fn clamp_api_version(v: &mut u32) {
-    *v = (*v).min(API_VERSION);
+fn clamp_api_version(icd: &SharedVulkan, v: &mut u32) {
+    // `min` of the two rather than the negotiated number outright: if this
+    // driver ever reported *less* here than it did at connect, the smaller
+    // answer is still the honest one and raising it would be inventing support.
+    *v = (*v).min(icd.advertised_device_api_version()).min(PROTOCOL_API_VERSION);
 }
 
-fn device_properties() -> p::VkPhysicalDeviceProperties {
-    let c = advertise::device_properties(API_VERSION);
+fn device_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceProperties {
+    let c = advertise::device_properties(icd.advertised_device_api_version());
     let mut w = p::VkPhysicalDeviceProperties::default();
     w.api_version = c.api_version;
     w.driver_version = c.driver_version;
