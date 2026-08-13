@@ -11021,3 +11021,292 @@ one to a private side channel are different acts, and only the first should move
 those numbers. In particular `the_reverse_direction_has_fds_too` still lists
 `wl_data_offer.receive` and `wl_data_source.send`, which is correct: they still
 carry an `h`, and the point of this work is that neither one is ever forwarded.
+
+
+---
+---
+
+## 33. Two title bars, and the client that cannot be told
+
+### 33.1 Status in one paragraph
+
+The user ran `weston-terminal` — the client this project used as its stand-in
+for eleven stages — on the guest's real desktop and reported *"wayland terminal
+renders also a double titlebar"*. It does. **And the compositor is not doing
+anything wrong.** §22 fixed Firefox's second title bar with two levers, the
+compositor's `default_mode(2)` and Firefox's own
+`MOZ_GTK_TITLEBAR_DECORATION=none`, and the honest finding here is that
+`weston-terminal` has **neither half available**: it binds no decoration
+protocol, so `default_mode(2)` is never read, and weston's toytoolkit has no
+environment variable that suppresses its frame. The bar it draws cannot be
+turned off by anything a compositor can send. What a self-decorating client
+needs instead is §30's arrangement — the system caption folded into the client
+area so the client's own bar *is* the window's — and this stage's contribution
+is the measurement that says which clients need it, because the same toolkit
+ships clients that do and clients that do not.
+
+### 33.2 What `weston-terminal` binds, which is the whole answer
+
+`WAYLAND_DEBUG=1`, `weston-terminal` against `target/debug/wc-compositor` with
+`--decorations server`, the compositor's own log beside it:
+
+```
+wc-compositor: decorations: manager default is Server
+```
+
+and, from libwayland's decode of what crossed the socket:
+
+```
+wl_registry#2.global(11, "zxdg_decoration_manager_v1", 1)
+wl_registry#2.global(12, "org_kde_kwin_server_decoration_manager", 1)
+```
+
+Those two lines are the **only** occurrences of the string "decoration" in the
+entire trace. Sixteen globals were advertised; seven were bound:
+
+```
+wl_compositor  wl_data_device_manager  wl_output  wl_seat
+wl_shm  wl_subcompositor  xdg_wm_base
+```
+
+Neither decoration manager is among them. So the question "does it honour
+`default_mode(2)`" has no answer, because the event is sent on a manager the
+client never binds and therefore never receives. This is not §22's Firefox case
+— Firefox binds KDE's manager, reads the default, and asks for `Client` anyway
+(§22.2). `weston-terminal` does not participate at all.
+
+Corroborated statically, because a trace is one run: the binary contains no
+`org_kde_kwin_*`, no `zxdg_decoration_*` and no `xdg_toplevel_decoration_*`
+symbol of any kind. There is no code in it for either protocol.
+
+### 33.3 And there is no `MOZ_GTK_TITLEBAR_DECORATION` for it either
+
+§22's second lever was client-specific, so the obvious next question is what
+weston's equivalent is. There is none, and this is from weston's own
+`clients/window.c` rather than from experiment, because the negative is easier
+to establish in source than by trying variables. (The source read is 15.0.0,
+which is what nixpkgs fetches for `weston.src`; the binary in the dev shell is
+16.0.0. The three facts below are load-bearing and all three are visible in the
+16.0.0 binary's own symbols and behaviour, so the version gap does not carry
+the claim.)
+
+* `clients/terminal.c` calls `window_frame_create()` unconditionally, at
+  construction, with nothing consulted first — no environment, no config, no
+  protocol.
+* `frame_redraw_handler()` has exactly one early return:
+
+  ```c
+  if (window->fullscreen)
+          return;
+  ```
+
+* `maximized` is *not* that lever. It sets `FRAME_FLAG_MAXIMIZED`, which drops
+  the shadow margin to zero and **keeps the title bar**.
+
+So the only configuration under which `weston-terminal` does not draw a title
+bar is a fullscreen toplevel, which is not a window. **`weston-terminal` cannot
+be server-decorated.** That is the answer to the stage's first question and it
+is a property of the client, not a defect in this compositor.
+
+### 33.4 The control leg, which was already on disk
+
+The above would be a weaker claim on its own, because "the compositor is fine"
+is exactly what a compositor's author wants to conclude. §32 had already
+photographed the disproof and did not know it: `docs/stage32/stage32-window-apps.png`
+is `weston-flower` on the same guest desktop, through the same compositor, in
+the same session — with **one** title bar, Windows' own, captioned "Flo…".
+
+Two clients of the *same toolkit*, linked against the same `libwayland`, given
+the same sixteen globals and the same `default_mode(2)` by the same binary, and
+one of them comes out right. Nothing global can be the cause. Traced side by
+side (`/tmp` scratch, both against `--decorations server`, one minute apart):
+
+| | `weston-terminal` | `weston-flower` |
+|---|---|---|
+| globals bound | the same seven | the same seven |
+| decoration objects created | 0 | 0 |
+| `xdg_surface.set_window_geometry` | **(32, 32, 742, 427)** | **(0, 0, 200, 200)** |
+| title bars on screen | **2** | **1** |
+| `window_frame_create()` in its source | yes | no |
+
+Both photographs were then re-taken on this branch, minutes apart, by the same
+harness against the same compositor build, so that the pair is one exhibit
+rather than two stages' worth of circumstance:
+
+* `docs/stage8/stage33-window-term.png` — Windows' caption saying "Wayland
+  Terminal" with weston's own bar, also saying "Wayland Terminal", directly
+  beneath it. Two bars.
+* `docs/stage8/stage33-window-flower.png` — one bar, captioned "Flo…", with
+  Windows' own minimise, maximise and close, and nothing of the client's above
+  the black.
+* `docs/stage8/stage33-compositor-term.log` and
+  `stage33-compositor-flower.log` — each run's compositor log, containing the
+  §33.6 line that says which it was **before** anyone looks at the picture.
+
+(Renamed by hand from what `wc-desktop.sh` writes. Its output names are
+`stage8-window$WC_SUFFIX.png` and are overwritten by the next run with the same
+suffix — `stage8-window-flower.png` is stage 8's own exhibit and this stage
+clobbered it once already. An exhibit a later run can silently replace is not an
+exhibit.)
+
+### 33.5 The one thing on the wire that separates them
+
+The table has exactly one row that differs and is visible to a compositor: the
+**window-geometry origin**. `xdg_surface.set_window_geometry` says which
+rectangle of the buffer is the window; a non-zero origin means the client is
+painting something above and to the left of its own window, and in practice
+that something is a drop shadow. Drop shadows are drawn by clients that
+decorate themselves and by nothing else.
+
+It is not a weston artefact. §22 measured Firefox's inset under client-side
+decorations at **(26, 23)**, from a toolkit that shares no code with weston's,
+and a GTK client under server-side decorations reports **(0, 0)**.
+
+`compose_tree` has honoured this rectangle since stage 9 — it is why the window
+is not offset and why the client's opposite edges are not clipped — so the
+number was already being read every frame. What was missing is that nothing
+ever *said* it.
+
+### 33.6 What was added, and what deliberately was not
+
+`crate::surface::decorator(inset, negotiated) -> Decorator`, four lines of
+arithmetic with five tests (1262 to 1267), and one call at map time. Three
+answers:
+
+* **`Negotiated`** — the surface created a decoration object on either
+  protocol, so it was told and agreed. Never guessed about, even with a shadow:
+  Firefox under `--decorations client` has an inset *and* an agreement, and it
+  is drawing its own bar because it was asked to.
+* **`ProbablySystem`** — no protocol, no margin. `weston-flower`.
+* **`ProbablyItself`** — no protocol, and a margin. `weston-terminal`, and the
+  log line says so in as many words:
+
+```
+wc-compositor: window 1 (org.freedesktop.weston.wayland-terminal) bound no decoration
+protocol and reports a 32,32 margin around its window -- it is drawing its own title
+bar and did not read our default of Server, so THIS WINDOW HAS TWO TITLE BARS (§33)
+```
+
+```
+wc-compositor: window 1 (org.freedesktop.weston.flower) bound no decoration protocol
+and has no margin around its window; Windows' caption is the only title bar
+```
+
+That is the whole of the change to the compositor, and the restraint is the
+point. **It reports; it does not decide.** Two reasons, and the second is the
+one that matters:
+
+1. What to *do* about a self-decorating client is §30's arrangement —
+   `WM_NCCALCSIZE` plus `DwmExtendFrameIntoClientArea`, so the system frame
+   stays and the client's bar occupies the caption strip. That is a per-window
+   Win32 window style and it lives on the other branch. Reimplementing it here
+   would be two of them.
+2. **The heuristic is not good enough to hang a window style on**, and saying so
+   is more useful than shipping it and finding out. A *maximised*
+   `weston-terminal` sets its margin to zero: the inset goes to (0, 0) while the
+   title bar stays, so the tell vanishes and the symptom does not. A client
+   could also draw a shadow and no bar. A window style that flipped on this
+   would flip *back* when the user maximised the window, which is worse than
+   either state.
+
+So the reliable key for the decision is the **app id** — `weston-terminal`'s is
+`org.freedesktop.weston.wayland-terminal` and it arrives before the first map —
+with the inset as corroboration and as the thing to warn on when the two
+disagree. That is the same shape §28's launcher already has for
+`MOZ_GTK_TITLEBAR_DECORATION`: a per-application fact that no protocol carries,
+stated by the thing that deploys the application. This stage does not add the
+list, because a list with one entry that nothing reads is a list nobody
+maintains.
+
+### 33.7 What a user should expect from a self-decorating client
+
+`weston-terminal` will not be the last one, so the general statement, in the
+order a user meets it:
+
+* **A client that binds a decoration protocol gets one title bar**, whichever
+  side draws it, because it read our default and either accepted it or told us
+  it would not. Firefox is here, and §22 is what it took.
+* **A client that binds nothing and has no margin gets one title bar**, Windows'
+  own, and needs nothing from anybody. `weston-flower` is here, and so is most
+  of `weston`'s demo suite, `wc-shmclient`, and anything written against raw
+  `xdg-shell`.
+* **A client that binds nothing and draws its own bar gets two, today.** The
+  compositor now says so at map time instead of leaving it to a photograph, and
+  the fix is §30's per-window frame extension keyed on the app id. Until that
+  lands, the honest expectation is two bars, and the window is otherwise
+  entirely correct — right size, right caption text, right taskbar button, right
+  pixels — because the geometry rectangle is being honoured. It is one bar too
+  many, not a broken window.
+
+### 33.8 What this stage did not do, and one thing it found on the way
+
+The typing half of the user's report — *"typing in wayland terminal does not
+seem to work"* — is **not** this stage's, and the reason is worth recording
+because the investigation started here and the measurement is the useful part.
+On the guest's real desktop, on `terminal-bugs` at `c229a4b`, typing into
+`weston-terminal` works: `probe-input.exe --type waycomposetypes` by `SendInput`
+on `WinSta0`, through the arena, into the client, photographed at
+`docs/stage8/stage33-typed-term.png`. The picture reads `wazcomposetzpes`, and
+that is **correct**: the guest's layout is German (`current_layout()` resolved
+langid `0x0407` to `de`), the probe injects positional scan codes, and scan
+`0x15` is `Z` on a German board and `Y` on an American one. So "no key events"
+and "a keymap that never arrived" are both ruled out by one photograph — the
+client compiled our keymap and applied the right layout to it.
+
+What is left is a *pointer* fault, and it is being fixed on `pointer-offset`:
+`compose_tree` subtracts the geometry origin from every surface it blits, so the
+HWND client area is the geometry rectangle with its origin at surface (32, 32) —
+but `State::pointer_motion` passes the surface origin as `(0.0, 0.0)`, so every
+pointer event reaches the client 32 px up and 32 px left of where the user
+clicked. That is a direct consequence of the same number this stage is about,
+and it predicts the reported symptom exactly: `weston-terminal`'s title bar
+occupies surface *y* 32 to about 58, so a click in the strip **below** the
+visible bar is delivered inside it, and a press there is `xdg_toplevel.move`.
+
+Two title bars and a 32-pixel pointer offset are the same measurement read
+twice, which is the only reason this section mentions the second one.
+
+### 33.9 The harness, and three things it was doing to other people's runs
+
+`scripts/wc-desktop.sh window` could not run at all on this branch, and the
+other two are contention bugs the guest has enough of already:
+
+1. **`wc-arena-host` moved.** It was excluded from the workspace when this
+   script was written and stage 14 made it a member again, so its artefact is in
+   `target/debug/` and the hard-coded `crates/wc-arena-host/target/debug/` path
+   no longer exists. The run failed at the `scp` with `stat local …: No such
+   file or directory`, which reads like the proxy being held open by a previous
+   run rather than like a build layout that changed underneath. Now the
+   workspace path with the private one as a fallback.
+2. **`kill_ours wg-s8`.** Every worktree's copy of this script names its socket
+   `wg-s8-$$`, so that call reaped *other runs'* compositors — the exact thing
+   `comp_pid`'s own comment says must not happen, in the one call still doing
+   it. Now `kill_ours "$DESKNAME"`, which is unique per worktree because §16.8
+   made it so. Likewise `rm -f …\waycompose\wg-s8-*` deleted every worktree's
+   rendezvous file including ones a live compositor was listening on; it now
+   removes only this run's.
+3. **`probe-input.exe` took the first `WaycomposeToplevel` it found.**
+   `FindWindowW(class, NULL)` returns *a* window of the class, and during this
+   stage's run there was a Firefox window of that class on the desktop belonging
+   to another agent. A probe that stole its focus and typed into it would have
+   reported *this* compositor ignoring input — a harness manufacturing the
+   symptom it was built to diagnose. `--pid` was added, `EnumWindows` replaces
+   `FindWindowW`, and `wc-desktop.sh` passes the pid it already resolved with
+   `comp_pid`.
+4. **And selecting the right window is not enough.** `SendInput` does not go to
+   a window, it goes to *the foreground*, and `SetForegroundWindow` is allowed
+   to fail. The probe printed a warning and typed anyway; on the second §33 run
+   it did exactly that, and the harness then photographed our window — correctly
+   showing nothing typed — while the keystrokes had gone into another
+   worktree's `weston-terminal` running `htop`. That picture was written into
+   `docs/` as evidence about this compositor before it was noticed. The probe
+   now **refuses**, exits 4, and injects nothing; the harness takes no
+   photograph and claims nothing. A run on a busy desktop that says "another
+   window held the foreground" is worth more than one that produces a picture of
+   the bug it was looking for.
+
+`WC_TYPE` and `WC_CLIENT_ARGS` are new: the first injects a string with
+`SendInput` on the interactive desktop and photographs the window afterwards,
+the second exists for `weston-eventdemo`, whose every log is off by default and
+which is silent without `--log-key` in a way that looks exactly like a client
+receiving nothing.

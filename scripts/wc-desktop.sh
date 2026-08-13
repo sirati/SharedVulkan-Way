@@ -140,6 +140,18 @@ OUTPUT_SIZE="${WC_OUTPUT:-1600x1000}"
 # looks like the right choice and is not one: it draws its flower once.
 CLIENT="${WC_CLIENT:-weston-terminal}"
 CLIENT_TITLE="${WC_CLIENT_TITLE:-Wayland Terminal}"
+# STAGE 33. Arguments for that client, and text to type into it once it is up.
+#
+# `WC_CLIENT_ARGS` exists for `weston-eventdemo`, whose every log is off by
+# default: run without `--log-key` it is silent and looks exactly like a client
+# that received nothing, which is the failure this block is here to tell apart.
+#
+# `WC_TYPE` is the whole of §33's second bug. With it set, `probe-input.exe`
+# runs **on the interactive desktop** and injects the string with `SendInput`,
+# so a keystroke starts in the real desktop's input queue — the same place the
+# user's does — and the window is photographed again afterwards.
+CLIENT_ARGS="${WC_CLIENT_ARGS:-}"
+TYPE_TEXT="${WC_TYPE:-}"
 # STAGE 13. With `WC_HOST_FIREFOX` set the client is Firefox and the caption
 # assertion has to move with it: Firefox's title is the page's, not a constant.
 # Set here rather than at the call site so that a run cannot end up starting
@@ -368,6 +380,13 @@ do_deploy() {
     x86_64-w64-mingw32-gcc -O1 -o "$stage/probe-relay.exe" "$ROOT/scripts/probe-relay.c" -lws2_32 \
       2>"$stage/cc.log" || { echo "  FAILED to build probe-relay.exe"; cat "$stage/cc.log"; }
   fi
+  # STAGE 33. `probe-input.exe`, which stage 6 built only for Wine. It is
+  # `-mwindows` — a GUI subsystem binary — because a scheduled task that starts
+  # a console program flashes a console window onto the desktop being
+  # photographed, and its own `--log` is how its output is recovered.
+  x86_64-w64-mingw32-gcc -O1 -mwindows -o "$stage/probe-input.exe" "$ROOT/scripts/probe-input.c" \
+    -luser32 2>"$stage/cci.log" \
+    || { echo "  FAILED to build probe-input.exe"; cat "$stage/cci.log"; }
   write_runint "$stage/runint.ps1"
   write_killours "$stage/killours.ps1"
 
@@ -508,8 +527,18 @@ do_window() {
   # happens before the kill leaves the new run counting the old run's frames and
   # reading the old run's log. That was diagnosed twice as "the capture does not
   # match the dump" before it was diagnosed as this.
-  kill_ours wg-s8 >/dev/null 2>&1
-  g "rm -f $APPDATA_WIN/wg-s8-* 2>/dev/null; true" >/dev/null 2>&1
+  # STAGE 33: `$DESKNAME`, not `wg-s8`. Every worktree's copy of this script
+  # names its socket `wg-s8-$$`, so matching on that substring reaps *other
+  # runs'* compositors — the exact thing `comp_pid` and `kill_ours`'s own
+  # comments say must not happen, in the one call that was still doing it. The
+  # compositor's command line begins with `C:\Users\<guest-user>\<DESKNAME>\`, which is
+  # unique per worktree because §16.8 made it so.
+  kill_ours "$DESKNAME" >/dev/null 2>&1
+  # And the same reasoning one line down: `wg-s8-*` in the shared
+  # `AppData\Local\waycompose` is *every* worktree's rendezvous file, including
+  # the ones a live compositor is still listening on. A per-pid name is already
+  # unique, so there is nothing here this run needs to clear.
+  g "rm -f $APPDATA_WIN/$sock 2>/dev/null; true" >/dev/null 2>&1
   sleep 2
   h "mkdir -p $HOST_DIR $SHARE; rm -rf $SHARE/frames; mkdir -p $SHARE/frames; chmod 777 $SHARE/frames" \
     >/dev/null
@@ -528,7 +557,15 @@ do_window() {
   # (see the comment there). So it is built by its own manifest, exactly as
   # `wc-guest.sh` does, and a run that forgot to would fail at the locate with
   # a missing file rather than at the copy.
-  local locator="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
+  # STAGE 33: the workspace's `target/`, with the private one as the fallback.
+  # `wc-arena-host` was excluded from the workspace when this line was written
+  # and stage 14 made it a member again (see the paragraph in `Cargo.toml`), so
+  # its artefact moved and this path stopped existing — which failed the run at
+  # the `scp` with `stat local ...: No such file or directory`, a message that
+  # reads like the *proxy* being held open rather than like a build layout that
+  # changed underneath.
+  local locator="$LINUX_BIN/wc-arena-host"
+  [ -x "$locator" ] || locator="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
   if ! cargo build --manifest-path "$ROOT/crates/wc-arena-host/Cargo.toml" >"$RUNDIR/loc.log" 2>&1; then
     bad "could not build wc-arena-host"; sed 's/^/        /' "$RUNDIR/loc.log" | tail -10; return
   fi
@@ -619,7 +656,7 @@ do_window() {
   #
   # The `ssh -L` forward stays with the *user*, outside the unit: root has no
   # `$HOME/.ssh/wc_guest`, and root can open a user-owned socket node anyway.
-  local ffenv="" ffcmd="$HOST_WESTON/$CLIENT"
+  local ffenv="" ffcmd="$HOST_WESTON/$CLIENT $CLIENT_ARGS"
   if [ -n "$HOST_FIREFOX" ]; then
     # `wc-guest.sh`'s block-11 environment, arriving here for the same reasons,
     # each of which cost a run there: `env -u DISPLAY` because with an X server
@@ -687,7 +724,7 @@ fi
 kill \$FWD 2>/dev/null
 sleep 1
 echo S8-PROXY-BEGIN; cat \"\$RUN/proxy.log\" 2>/dev/null; echo S8-PROXY-END
-echo S8-CLIENT-BEGIN; head -20 \"\$RUN/cli.log\" 2>/dev/null; echo S8-CLIENT-END
+echo S8-CLIENT-BEGIN; head -400 \"\$RUN/cli.log\" 2>/dev/null; echo S8-CLIENT-END
 EOS
 chmod +x s8.sh" >/dev/null
   h "$HOST_DIR/s8.sh" >"$RUNDIR/s8.log" 2>&1 &
@@ -708,6 +745,51 @@ chmod +x s8.sh" >/dev/null
   int wcshot "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DESKDIR_WIN\\win.bmp > $DESKDIR_WIN\\shot.txt 2>&1" \
     >/dev/null 2>&1
+
+  # --------------------------------------------------------------- STAGE 33 --
+  # Type into it, on the desktop the user types on.
+  #
+  # `--pid`, added to `probe-input.c` for this, and it is the same rule
+  # `comp_pid` follows one function up: several worktrees drive this guest and
+  # every compositor on it registers `WaycomposeToplevel`, so a probe that took
+  # the first window of that class would steal another run's focus and inject
+  # into their client — and this run would then report a compositor that
+  # ignores input, which is precisely the bug being investigated. A harness
+  # that can manufacture its own symptom is worse than no harness.
+  #
+  # The probe is a scheduled task like everything else here, because `SendInput`
+  # reaches the *session's* input queue and an ssh session has none.
+  if [ -n "$TYPE_TEXT" ]; then
+    echo
+    echo "== 5b. typing into it, with SendInput, on WinSta0 =="
+    int wctype "$DESKDIR_WIN\\probe-input.exe" \
+      "--pid $CPID --class WaycomposeToplevel --wait 20 --type $TYPE_TEXT --log $DESKDIR_WIN\\typed.txt" \
+      >/dev/null 2>&1
+    g "cat $DESKDIR/typed.txt" >"$RUNDIR/typed.txt" 2>&1
+    sed 's/^/        /' "$RUNDIR/typed.txt"
+    cp "$RUNDIR/typed.txt" "$OUT/typed$SUFFIX.txt" 2>/dev/null
+    grep -q "target HWND" "$RUNDIR/typed.txt" \
+      && ok "probe-input found our window: $(grep -o 'target HWND [^,]*' "$RUNDIR/typed.txt")" \
+      || bad "probe-input found no window of ours to type into"
+    # **No photograph unless the keys actually went into our window.** The probe
+    # now refuses to inject when it did not win the foreground, and this is the
+    # other half: a shot taken after a refused injection is a picture of our
+    # window with nothing typed in it, which is indistinguishable from the bug
+    # and would go into `docs/` as evidence about this compositor. Measured on
+    # the guest — another worktree's `weston-terminal` held the foreground and
+    # the first version of this block shipped a photograph of *their* `htop`.
+    if grep -q "REFUSED to inject" "$RUNDIR/typed.txt"; then
+      miss "another window held the foreground; nothing was injected and nothing is claimed"
+      note "$(grep -o 'REFUSED.*' "$RUNDIR/typed.txt" | head -1)"
+    else
+      note "$(grep -o 'foreground=.*' "$RUNDIR/typed.txt" | head -1)"
+      sleep 2
+      int wcshot "cmd.exe" \
+        "/c $DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DESKDIR_WIN\\typed.bmp >> $DESKDIR_WIN\\shot.txt 2>&1" \
+        >/dev/null 2>&1
+      fetch typed.bmp "stage33-typed$SUFFIX.png" "the window after $TYPE_TEXT was typed into it"
+    fi
+  fi
   int wcshot "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe shot --class Shell_TrayWnd --out $DESKDIR_WIN\\tray2.bmp >> $DESKDIR_WIN\\shot.txt 2>&1" \
     >/dev/null 2>&1
@@ -801,6 +883,13 @@ chmod +x s8.sh" >/dev/null
   fi
 
   echo
+  # STAGE 33: skipped under `WC_TYPE`. The drag holds the window in a modal
+  # loop for 17 s of a client that lives 130, and this mode has already spent
+  # its budget on the injection; a run that timed out here would lose the
+  # keyboard evidence it came for.
+  if [ -n "$TYPE_TEXT" ]; then
+    note "== 6 skipped: WC_TYPE is set and the run is about the keyboard"
+  else
   echo "== 6. the modal resize loop (§8.11 item 4) =="
   # Count the frames the UI thread has repainted, put the window into the loop,
   # and keep counting *while it is in there*. §8.2 predicted that a
@@ -891,6 +980,7 @@ chmod +x s8.sh" >/dev/null
     miss "the modal sizing loop would not start (the lock screen owns the foreground); retried 3 times"
     miss "so the in-loop repaint count says nothing this run"
   fi
+  fi   # STAGE 33: end of the block `WC_TYPE` skips
 
   wait $drv 2>/dev/null
   kill $relay 2>/dev/null; wait $relay 2>/dev/null
@@ -899,7 +989,39 @@ chmod +x s8.sh" >/dev/null
   grep -iE "dpi|screen|window .* (created|mapped)|caption|arena|configure" "$RUNDIR/comp.log" 2>/dev/null \
     | sed 's/^/        /' | head -20
   cp "$RUNDIR/comp.log" "$OUT/compositor$SUFFIX.log" 2>/dev/null
-  sed -n '/S8-PROXY-BEGIN/,/S8-CLIENT-END/p' "$RUNDIR/s8.log" | sed 's/^/        /' | head -25
+  cp "$RUNDIR/s8.log" "$OUT/hostside$SUFFIX.log" 2>/dev/null
+
+  # STAGE 33. Who drew the title bar, out of the compositor's own mouth.
+  #
+  # Asserted rather than printed, and asserted in **both** directions, because
+  # the whole of §33.4 is that the same toolkit ships a client that needs the
+  # warning and a client that must not get it. A check that only looked for the
+  # warning would pass a compositor that emitted it for everything.
+  local decor
+  decor=$(grep -oE "wc-compositor: window [0-9]+ \([^)]*\) (bound no decoration protocol|negotiated) .*" \
+          "$RUNDIR/comp.log" 2>/dev/null | head -1)
+  if [ -z "$decor" ]; then
+    bad "the compositor said nothing about who decorates this window (§33.6)"
+  elif echo "$decor" | grep -q "TWO TITLE BARS"; then
+    # Not a failure of this run: it is the true answer for a client that binds
+    # no decoration protocol and draws its own bar, and §33.3 is why no
+    # compositor can change it. The harness records which kind of client it
+    # photographed so the picture can be attributed later.
+    note "§33: this client decorates itself and the photograph has two title bars"
+    echo "        $decor"
+  else
+    ok "§33: the system's caption is the only title bar on this window"
+    echo "        $decor"
+  fi
+  # STAGE 33. The keyboard half of the compositor's account, printed separately
+  # because the grep above cannot match it and because its *absence* is the
+  # finding when nothing can be typed.
+  if [ -n "$TYPE_TEXT" ]; then
+    echo "        --- and what it made of the keyboard:"
+    grep -iE "keyboard|keymap|no evdev|layout" "$RUNDIR/comp.log" 2>/dev/null \
+      | sed 's/^/        /' | head -20
+  fi
+  sed -n '/S8-PROXY-BEGIN/,/S8-CLIENT-END/p' "$RUNDIR/s8.log" | sed 's/^/        /' | head -40
   kill_ours "$sock" >/dev/null 2>&1
 }
 

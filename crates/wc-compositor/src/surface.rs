@@ -490,6 +490,125 @@ impl PixelSource for ShmSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// STAGE 33: telling a client that decorates itself from one that does not
+// ---------------------------------------------------------------------------
+
+/// What the compositor can say about who is drawing this window's title bar.
+///
+/// # Why this is a guess with a name rather than a fact
+///
+/// §33 measured `weston-terminal` against this compositor with
+/// `--decorations server`: it binds **neither** `org_kde_kwin_server_
+/// decoration_manager` nor `zxdg_decoration_manager_v1`, sends zero decoration
+/// requests, and draws its own title bar under Windows' — the double bar the
+/// user reported. `weston-flower`, the *same toolkit* against the *same*
+/// compositor in the same minute, comes out with one bar.
+///
+/// So the compositor cannot ask. The two protocols that carry the answer are
+/// the two this class of client ignores, and there is no third. What is left is
+/// one correlate, and it is the only thing on the wire that separated those two
+/// traces:
+///
+/// | | `weston-terminal` | `weston-flower` |
+/// |---|---|---|
+/// | globals bound | the same seven | the same seven |
+/// | decoration requests | 0 | 0 |
+/// | `set_window_geometry` | **(32, 32, 742, 427)** | **(0, 0, 200, 200)** |
+/// | title bars on screen | 2 | 1 |
+///
+/// A non-zero window-geometry **origin** means the buffer is bigger than the
+/// window on the top and the left: the client is painting something outside its
+/// own window, and in practice that something is a drop shadow, which is drawn
+/// by clients that decorate themselves and by nothing else. §22 measured
+/// Firefox under client-side decorations at (26, 23), which is the same signal
+/// from a toolkit that shares no code with weston's.
+///
+/// **Where it fails, stated rather than discovered later.** A `weston-terminal`
+/// that is *maximised* sets its margin to 0, so the inset goes to (0, 0) while
+/// the title bar stays — the tell vanishes and the symptom does not. And a
+/// client could draw a shadow and no title bar. So this is a diagnosis to
+/// print, and an input to a per-application decision, not a switch to hang a
+/// window style on by itself. §33.6 is the argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decorator {
+    /// The client used a decoration protocol, so it was *told* and agreed.
+    /// Whatever it draws, it is not drawing it in ignorance.
+    Negotiated,
+    /// No decoration protocol and no margin around the window: nothing suggests
+    /// this client is drawing a title bar. `weston-flower`.
+    ProbablySystem,
+    /// No decoration protocol, and a margin around the window. This client is
+    /// almost certainly drawing its own title bar, has never been told the
+    /// system would draw one, and the window has two. `weston-terminal`.
+    ProbablyItself,
+}
+
+/// Which of the three this window is, from the two facts a compositor has at
+/// map time.
+///
+/// `inset` is the window-geometry origin — `xdg_surface.set_window_geometry`'s
+/// x and y — and `negotiated` is whether this surface ever created a decoration
+/// object on either protocol.
+pub fn decorator(inset: (i32, i32), negotiated: bool) -> Decorator {
+    if negotiated {
+        return Decorator::Negotiated;
+    }
+    // Either axis. A client with a shadow on the top and none on the left is
+    // still a client with a shadow, and `> 0` on both would miss it.
+    if inset.0 > 0 || inset.1 > 0 {
+        Decorator::ProbablyItself
+    } else {
+        Decorator::ProbablySystem
+    }
+}
+
+#[cfg(test)]
+mod decorator_tests {
+    use super::*;
+
+    /// The two clients §33 measured, by their measured numbers.
+    #[test]
+    fn the_two_weston_clients_come_out_different() {
+        // weston-terminal: set_window_geometry(32, 32, 742, 427), no protocol.
+        assert_eq!(decorator((32, 32), false), Decorator::ProbablyItself);
+        // weston-flower: set_window_geometry(0, 0, 200, 200), no protocol.
+        assert_eq!(decorator((0, 0), false), Decorator::ProbablySystem);
+    }
+
+    /// §22's Firefox, from a toolkit that shares no code with weston's. The
+    /// inset is not square, which is why this is two numbers and not one.
+    #[test]
+    fn firefox_under_client_side_decorations() {
+        assert_eq!(decorator((26, 23), false), Decorator::ProbablyItself);
+    }
+
+    /// One axis is enough.
+    #[test]
+    fn a_margin_on_one_side_only_still_counts() {
+        assert_eq!(decorator((0, 23), false), Decorator::ProbablyItself);
+        assert_eq!(decorator((26, 0), false), Decorator::ProbablyItself);
+    }
+
+    /// A client that spoke a decoration protocol is never guessed about, even
+    /// when it has a shadow — Firefox under `--decorations client` is exactly
+    /// that, and it is drawing its own bar *because it was told to*.
+    #[test]
+    fn negotiation_beats_the_correlate() {
+        assert_eq!(decorator((26, 23), true), Decorator::Negotiated);
+        assert_eq!(decorator((0, 0), true), Decorator::Negotiated);
+    }
+
+    /// A negative inset is not a shadow. `set_window_geometry` is clamped to
+    /// the surface by smithay long before this, so this is a guard against the
+    /// arithmetic rather than against a client — but `!= 0` would call it a
+    /// shadow and that would be wrong.
+    #[test]
+    fn a_negative_origin_is_not_a_margin() {
+        assert_eq!(decorator((-4, -4), false), Decorator::ProbablySystem);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
