@@ -1,5 +1,7 @@
 //! ```text
 //! sv-gpu-server serve   --socket <path> [--device N] [--arena BYTES] [--clients N]
+//!                       --clients N = accept up to N *sessions*, each served as
+//!                       it arrives, each with its own arena (design.md §0.12)
 //! sv-gpu-server attach  --socket <path> [--device N]
 //! ```
 //!
@@ -166,10 +168,11 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
     let mut objects = Objects::new();
     objects.set_arena(arena.memory, arena.len);
     let shared = Arc::new(Shared {
-        driver,
+        driver: Arc::new(driver),
         arena,
         objects: std::sync::Mutex::new(objects),
-        fns,
+        fns: Arc::new(fns),
+        queue_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         Arc::new(control),
@@ -260,6 +263,10 @@ fn serve(
 
     let geometry = geometry_for(arena_size);
     let arena_size = geometry.arena_size;
+    let driver = Arc::new(driver);
+    let fns = Arc::new(driver.load_fns());
+    report_missing(&fns);
+    let queue_lock = Arc::new(std::sync::Mutex::new(()));
 
     // The arena comes from the driver. The control region does not: §4.1 splits
     // the two by purpose and the control region is "the one only our code
@@ -271,112 +278,130 @@ fn serve(
     //
     // Naming it is what reduces this path's violation of design.md §1a to
     // exactly one object: the exported dma-buf, which has no name to give.
-    let control_name = shm_path(&format!("control.{}", std::process::id()));
-    let control_file = shm_create(&control_name, geometry.control_size)?;
-    let control_fd = control_file.as_fd();
-    let control_region =
-        Arc::new(SharedRegion::map_fd(control_fd, 0, geometry.control_size as usize)?);
-
-    let arena = arena::allocate_and_export(&driver, arena_size)?;
-    eprintln!(
-        "[gpu] arena {} MiB from the driver, memory type {}, exported as a descriptor",
-        arena.len >> 20,
-        arena.memory_type
-    );
-    arena::check_external_buffers_keep_the_arena(&driver, &arena)?;
-    let arena_fd = arena
-        .exported_fd
-        .as_ref()
-        .ok_or("the export path produced no descriptor")?
-        .as_fd();
-
-    let generation = 1u32;
-    let control = Control::create(
-        Arc::clone(&control_region),
-        geometry,
-        sv_gpu_server::protocol_ids(),
-        generation,
-    )?;
-    control.stamp_epoch()?;
-
-    let attachment = Attachment {
-        // The control region has a name; the arena does not, and that is what
-        // an empty `object` means on this path. It is the one sender in the
-        // project that leaves it empty, and design.md §0.7 says why.
-        object: control_name.clone(),
-        arena_object: String::new(),
-        control_offset: 0,
-        control_len: geometry.control_size,
-        // The arena is its own object here, so it begins at offset 0 of the
-        // descriptor that accompanies the message. On the named path both
-        // regions are one object and the arena begins after the control region.
-        arena_offset: 0,
-        arena_len: arena_size,
-        generation,
-        run_count: 0,
-    };
-
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
-    eprintln!("[gpu] listening on {socket} for {clients} client(s)");
+    eprintln!("[gpu] listening on {socket} for up to {clients} session(s)");
 
-    // **`--clients N` is one *shared* session, not N sessions.**
+    // **One session per client, each served as it arrives.**
     //
-    // The loop below gathers N attach handshakes into the *one* control region
-    // and ring set built above, and nothing is served until all N have arrived;
-    // then a single `session::serve` runs until 30 s of idle and the process
-    // exits. So this process serves exactly one session in its lifetime, and a
-    // client that arrives after `session::serve` has started finds a socket that
-    // exists and is never answered.
+    // This used to gather `clients` handshakes into *one* control region and one
+    // ring set, serve none of them until all had arrived, and then run a single
+    // `session::serve` until 30 s of idle. So the process served exactly one
+    // session in its lifetime, and a client that connected afterwards found a
+    // socket that existed and was never answered.
     //
-    // That is fine for every harness in this tree and for `vulkaninfo`,
-    // `eglinfo`, `glxgears` and `video-probe` — all of which are one process —
-    // and it is the whole of what stops a real application. Measured 2026-08-13
-    // (design.md §0.11, docs/firefox-accel.md): Firefox forks `glxtest` before
-    // the browser exists, that child takes the session, the browser is never
-    // served, and Firefox exits. A respawn loop does not help, because this
-    // process does not exit when its client disconnects. Two ordinary GL
-    // programs run one after another against one GPU side give one attach, not
-    // two.
+    // That was fine for every harness in this tree and for `vulkaninfo`,
+    // `eglinfo`, `glxgears` and `video-probe`, all of which are one process, and
+    // it was the whole of what stopped a real application: Firefox forks
+    // `glxtest` before the browser exists, that child took the session, the
+    // browser was never served, and Firefox exited (design.md §0.11,
+    // `docs/firefox-accel.md`). Two ordinary GL programs run one after another
+    // gave one attach, not two.
     //
-    // Serving independent sessions needs a control region and ring set per
-    // client, an accept loop that spawns rather than falling through, and a
-    // decision about sharing the arena between them. It is written down here so
-    // that the next person to read `--clients` does not read it as "serves N".
+    // `--clients N` now means "accept up to N sessions", which for `N = 1` — what
+    // every existing harness passes — is the same observable behaviour as before.
+    //
+    // # Why each session gets its own arena
+    //
+    // The obvious reading of "one arena per device" is that the sessions share
+    // one, and that is not available without more than a lock. **The arena's
+    // allocator lives on the app side**, one per client (`sv-arena`), so two
+    // clients over one arena would both allocate from offset zero. Handing each a
+    // disjoint sub-range would fix that and needs no lock at all — the
+    // `Attachment` already carries `arena_offset` — but it would still hand every
+    // client a descriptor for the *whole* object, so isolation between clients
+    // would be a convention rather than a fact.
+    //
+    // A separate allocation per session makes it a fact: a client's descriptor
+    // names its own memory and no other's. That is `security-model.md`'s R3
+    // argument applied one level up, and it is the reason to prefer it over the
+    // partitioned arena, which is otherwise the tidier answer. **The cost is
+    // real and is stated rather than hidden**: `N` × `--arena` bytes of device
+    // memory, so `--clients 8 --arena 256M` is 2 GiB. `--arena` is the knob.
+    let mut sessions: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for i in 0..clients {
         let (sock, _) = listener.accept()?;
-        let msg = recv(&sock)?;
-        match msg {
-            ColdMessage::AttachRequest => {
+
+        // Everything below is per session, and it is built *after* the accept so
+        // that a client that never comes costs nothing.
+        let control_name = shm_path(&format!("control.{}.{i}", std::process::id()));
+        let control_file = shm_create(&control_name, geometry.control_size)?;
+        let control_region = Arc::new(SharedRegion::map_fd(
+            control_file.as_fd(),
+            0,
+            geometry.control_size as usize,
+        )?);
+        let arena = arena::allocate_and_export(&driver, arena_size)?;
+        eprintln!(
+            "[gpu] session {i}: arena {} MiB from the driver, memory type {}, exported as a \
+             descriptor",
+            arena.len >> 20,
+            arena.memory_type
+        );
+        arena::check_external_buffers_keep_the_arena(&driver, &arena)?;
+        let arena_fd = arena
+            .exported_fd
+            .as_ref()
+            .ok_or("the export path produced no descriptor")?
+            .as_fd();
+
+        let generation = 1u32;
+        let control = Control::create(
+            Arc::clone(&control_region),
+            geometry,
+            sv_gpu_server::protocol_ids(),
+            generation,
+        )?;
+        control.stamp_epoch()?;
+
+        let attachment = Attachment {
+            // The control region has a name; the arena does not, and that is
+            // what an empty `object` means on this path. It is the one sender in
+            // the project that leaves it empty, and design.md §0.7 says why.
+            object: control_name.clone(),
+            arena_object: String::new(),
+            control_offset: 0,
+            control_len: geometry.control_size,
+            // The arena is its own object here, so it begins at offset 0 of the
+            // descriptor that accompanies the message. On the named path both
+            // regions are one object and the arena begins after the control
+            // region.
+            arena_offset: 0,
+            arena_len: arena_size,
+            generation,
+            run_count: 0,
+        };
+
+        match recv(&sock) {
+            Ok(ColdMessage::AttachRequest) => {
                 let mut buf = Vec::new();
-                ColdMessage::Attach(attachment.clone()).encode(&mut buf)?;
+                ColdMessage::Attach(attachment).encode(&mut buf)?;
                 // One descriptor, and it is the dma-buf. The control region
                 // crosses as a name like everything else.
                 send_with_fds(&sock, &buf, &[arena_fd])?;
                 // Wait for the client to say it has opened the control region
                 // *by name* before moving on, for the same reason `sv-hostd`
-                // does: the name is unlinked once the last client has it, and a
+                // does: the name is unlinked once the client has it, and a
                 // client still between "received the message" and "opened the
                 // object" would find nothing.
                 //
-                // This was learned the expensive way. Unlinking straight after
-                // the loop, without the wait, produced
-                // `open(named object) failed: errno 2` in the ICD and
-                // `MESA: error: ZINK: vkCreateInstance failed
+                // This was learned the expensive way. Unlinking without the
+                // wait produced `open(named object) failed: errno 2` in the ICD
+                // and `MESA: error: ZINK: vkCreateInstance failed
                 // (VK_ERROR_INCOMPATIBLE_DRIVER)` two layers up — a message that
                 // says nothing about names at all.
                 sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
                 match recv(&sock) {
                     Ok(ColdMessage::Accept { .. }) => {}
-                    Ok(other) => eprintln!("[gpu] client {i} said {other:?} rather than Accept"),
-                    Err(e) => eprintln!("[gpu] client {i} never acknowledged the name: {e}"),
+                    Ok(other) => eprintln!("[gpu] session {i} said {other:?} rather than Accept"),
+                    Err(e) => eprintln!("[gpu] session {i} never acknowledged the name: {e}"),
                 }
                 eprintln!(
-                    "[gpu] client {i} attached (control region by name, arena as a dma-buf \
+                    "[gpu] session {i} attached (control region by name, arena as a dma-buf \
                      descriptor — design.md §1a's one exception)"
                 );
             }
-            other => {
+            Ok(other) => {
                 send(
                     &sock,
                     &ColdMessage::Refuse {
@@ -384,43 +409,57 @@ fn serve(
                         reason: format!("expected AttachRequest, got {other:?}"),
                     },
                 )?;
+                shm_unlink(&control_name);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[gpu] session {i}: no attach request: {e}");
+                shm_unlink(&control_name);
+                continue;
             }
         }
+
+        // **Unlink as soon as this client has it open, not at exit.**
+        //
+        // Unlinking releases the *name*; this process's descriptor and the
+        // client's keep the object alive, so nothing above notices. Doing it
+        // here is what stops a killed GPU side from leaving a 16 MiB object in
+        // `/dev/shm` until the next reboot — and every harness kills the GPU
+        // side, because it serves until the app side goes quiet.
+        shm_unlink(&control_name);
+
+        let mut objects = Objects::new();
+        objects.set_arena(arena.memory, arena.len);
+        let shared = Arc::new(Shared {
+            driver: Arc::clone(&driver),
+            arena,
+            objects: std::sync::Mutex::new(objects),
+            fns: Arc::clone(&fns),
+            queue_lock: Arc::clone(&queue_lock),
+        });
+        let control = Arc::new(control);
+        let slot_count = geometry.ring_slot_count;
+        // The socket is held for the session's lifetime rather than dropped
+        // here: closing it is how the client learns the GPU side is gone, and a
+        // client whose cold path closed under it while its rings were live would
+        // read that as a crash.
+        sessions.push(std::thread::spawn(move || {
+            let _sock = sock;
+            let _region = control_region;
+            let _file = control_file;
+            match session::serve(control, shared, slot_count, std::time::Duration::from_secs(30)) {
+                Ok(n) => eprintln!("[gpu] session {i} finished, {n} commands dispatched"),
+                Err(e) => eprintln!("[gpu] session {i} ended: {e}"),
+            }
+        }));
     }
 
-    // **Unlink as soon as the last client has it open, not at exit.**
-    //
-    // Unlinking releases the *name*; this process's descriptor and every
-    // client's keep the object alive, so nothing above notices. Doing it here
-    // rather than after `session::serve` is what stops a killed GPU side from
-    // leaving a 16 MiB object in `/dev/shm` until the next reboot — and every
-    // harness kills the GPU side, because it serves until the app side goes
-    // quiet. A named object needs an owner for its name in a way a memfd never
-    // did, and this is that obligation discharged at the first safe moment.
-    shm_unlink(&control_name);
-
-    let mut objects = Objects::new();
-    objects.set_arena(arena.memory, arena.len);
-    let fns = driver.load_fns();
-    report_missing(&fns);
-    let shared = Arc::new(Shared {
-        driver,
-        arena,
-        objects: std::sync::Mutex::new(objects),
-        fns,
-    });
-    let handled = session::serve(
-        Arc::new(control),
-        shared,
-        geometry.ring_slot_count,
-        std::time::Duration::from_secs(30),
-    )?;
-    eprintln!("[gpu] {handled} commands dispatched");
+    for s in sessions {
+        let _ = s.join();
+    }
     let _ = std::fs::remove_file(socket);
     Ok(())
 }
-
-/// The app-allocated path: attach to `sv-hostd`'s memfd and import it.
 #[cfg(target_os = "linux")]
 fn attach(
     driver: sv_gpu_server::driver::Driver,
@@ -503,10 +542,11 @@ fn attach(
     let fns = driver.load_fns();
     report_missing(&fns);
     let shared = Arc::new(Shared {
-        driver,
+        driver: Arc::new(driver),
         arena,
         objects: std::sync::Mutex::new(objects),
-        fns,
+        fns: Arc::new(fns),
+        queue_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         Arc::new(control),
@@ -664,10 +704,11 @@ fn guest(
     let mut objects = Objects::new();
     objects.set_arena(gpu_arena.memory, gpu_arena.len);
     let shared = Arc::new(Shared {
-        driver,
+        driver: Arc::new(driver),
         arena: gpu_arena,
         objects: std::sync::Mutex::new(objects),
-        fns,
+        fns: Arc::new(fns),
+        queue_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         Arc::new(control),

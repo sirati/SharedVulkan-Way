@@ -44,19 +44,55 @@ use crate::driver::Driver;
 use crate::table::{Objects, TableError};
 use ash::vk;
 use ash::vk::Handle as _;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use sv_gpu_entry::{DriverFns, GpuHost};
 use sv_proto::{self as p, HandleType};
 use sv_wire::{Result as WireResult, WireError};
 
-/// Everything the ring threads share.
+/// One session's view of the GPU side.
+///
+/// # What is per session and what is per device
+///
+/// Since design.md §0.11 this process serves **several independent sessions**,
+/// one per connected client, each on its own threads. The split is by whether
+/// two clients could tread on each other:
+///
+/// - `driver` and `fns` are **per device** and shared behind an `Arc`. They are
+///   immutable once opened, so sharing them needs no lock at all.
+/// - `arena` and `objects` are **per session**, and that is the isolation. Handle
+///   ids are assigned by the app side from its own counter (§6.4), so two
+///   clients hand out the same ids and a shared table would alias them; and the
+///   arena's allocator lives on the *app side*, per client, so two clients over
+///   one arena would both allocate from offset 0. Giving each session its own
+///   arena makes both structural rather than a convention — see
+///   `main.rs`'s `serve` for the alternative that was rejected.
+/// - `queue_lock` is **per device** and is the one thing that is shared *and*
+///   mutable. See its own documentation.
 pub struct Shared {
-    pub driver: Driver,
+    pub driver: Arc<Driver>,
     pub arena: Arena,
     pub objects: Mutex<Objects>,
     /// The driver's entry points, resolved once by name from the same `vk.xml`
     /// the wire format is generated from (design.md §7.2, pass 12).
-    pub fns: DriverFns,
+    pub fns: Arc<DriverFns>,
+    /// External synchronisation for the one `VkQueue` this device has.
+    ///
+    /// Vulkan requires the application to synchronise access to a `VkQueue`
+    /// externally: `vkQueueSubmit`, `vkQueueWaitIdle` and `vkQueueBindSparse`
+    /// are all "externally synchronized" on the queue parameter. The driver
+    /// opens exactly one queue (`driver.rs`), so **every session shares it**.
+    ///
+    /// This lock is here for whoever hand-writes a queue call on this side, and
+    /// it is deliberately not claimed to be more than that. **The generated
+    /// dispatch does not take it**, and neither does anything today: the
+    /// objects table is locked per lookup and released before the driver call,
+    /// so two ring threads of one session could already reach `vkQueueSubmit`
+    /// concurrently before any of this. Multi-session does not create that race;
+    /// it widens it from "two rings of one client" to "two clients". It is
+    /// written down here, next to the thing it protects, rather than in a
+    /// document, and closing it is a change to pass 12 rather than to this
+    /// struct.
+    pub queue_lock: Arc<Mutex<()>>,
 }
 
 impl Shared {

@@ -1309,6 +1309,65 @@ triple the protocol already carries — with the `wl_buffer` bound to that range
 rather than to a copy of it. §1a permits that because nothing crosses; what is
 missing is the two sides agreeing on one allocator.
 
+### 0.12 One session per client, and Firefox rendering through it
+
+Built and measured 2026-08-13 on **devhost** in `nix develop`,
+`docs/firefox-accel.md`. §0.11's blocker is gone and the fourth clause of
+`goal-firefox.md` has moved.
+
+**1. `sv-gpu-server` serves one session per client, each as it arrives.**
+`--clients N` now means "accept up to N sessions"; at `N = 1` — what every
+existing harness passes — the observable behaviour is unchanged. Per session: a
+control region created *after* the accept, a `Control`, a ring set, an `Objects`
+table, an arena, and a thread. Per device, behind an `Arc`: the driver, its
+entry points, and a queue lock.
+
+**2. The measurement that diagnosed the problem now passes.** Three `glxinfo`
+runs one after another against one GPU side gave **three** sessions, where §0.11
+measured one. `scripts/sv-zink-gl.sh` still passes all four of its checks —
+64.12 dB and 69.82 dB against llvmpipe, glxgears matching — so nothing regressed.
+
+**3. Each session gets its own arena, and that is a departure from "one arena
+per device" with a reason.** The tidy answer is one arena partitioned by offset,
+and it needs no lock: the `Attachment` already carries `arena_offset` and
+disjointness would be established once, single-threaded. It was still rejected,
+because **the descriptor names the whole object** — a partitioned arena hands
+every client an fd it can map in full, so isolation between clients would be a
+convention. A separate allocation makes it a fact, which is R3's argument one
+level up. The cost is `N` × `--arena` bytes of device memory and is stated rather
+than hidden.
+
+**4. The one shared mutable thing is the queue, and the honest statement is that
+the lock does not yet cover it.** Vulkan requires external synchronisation of a
+`VkQueue`; the driver opens one, so every session shares it. `Shared::queue_lock`
+exists for hand-written queue calls and **the generated dispatch does not take
+it** — the objects table is locked per lookup and released before the driver
+call, so two ring threads of one session could already race before any of this.
+Multi-session widens the race from "two rings of one client" to "two clients"; it
+does not create it. Closing it is a change to pass 12. A lock that looked like it
+covered the generated path would be worse than one that says it does not.
+
+**5. Firefox renders through the forwarder.** It survives the whole run, attaches
+two sessions, gets a **WebGL 2.0** context, and reads `clearColor(0.2,0.6,0.9,1)`
+back as exactly `51,153,230,255`. `WEBGL_debug_renderer_info` returns
+`Radeon HD 3200 Graphics, or similar` — Firefox's *sanitised* name for a hardware
+AMD device — where the software control on the same machine returns
+`llvmpipe, or similar`. Firefox is deciding, not being told, and it decided
+hardware.
+
+**6. The cost is measured and must not be over-read.** A `gl.clear` +
+`gl.finish` loop at 256×256: **7711/s forwarded against 12588/s on llvmpipe,
+0.61×**. That is a *latency* benchmark — `finish` is a full round trip — at a
+resolution where llvmpipe's rasterisation costs nothing, so it is the forwarder's
+worst case and llvmpipe's best. 130 µs per round trip is already well under
+RADV's 0.651 ms submit floor, so glthread and Zink's batching are absorbing most
+of it. **How much acceleration is worth here is not yet measured**, and §0.10
+makes testhost the venue where it matters, because there llvmpipe is the only
+alternative.
+
+Not attempted, deliberately: the second copy (§0.11's copy 2). Two copies that
+render beat one copy that does not exist.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on

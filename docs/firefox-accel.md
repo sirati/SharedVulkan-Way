@@ -212,3 +212,132 @@ The harness is not checked in, deliberately: it is thirty lines of Xvfb, a
 respawn loop and a `nc` listener whose only purpose was to establish §4, and §4
 says the respawn loop does not work. It is worth rewriting once the GPU side
 serves more than one session, and not before.
+
+---
+
+# The fix, and Firefox rendering
+
+Built and measured 2026-08-13, same day, same machine (**devhost**,
+`nix develop`, GPU side on the system RADV, Firefox 151.0.2).
+
+## What changed
+
+`sv-gpu-server serve` now accepts **one session per client and serves each as it
+arrives**. `--clients N` means "accept up to N sessions"; for `N = 1`, which is
+what every existing harness passes, the observable behaviour is what it was.
+
+The split is by whether two clients could tread on each other:
+
+| | scope | why |
+|---|---|---|
+| `driver`, `fns` | **per device**, `Arc` | immutable once opened; sharing needs no lock |
+| `arena` | **per session** | see below |
+| `objects` (handle table, slabs) | **per session** | ids are assigned app-side from its own counter (§6.4), so two clients hand out the same ids |
+| `queue_lock` | **per device**, `Arc<Mutex<()>>` | one `VkQueue` per device, and Vulkan requires external synchronisation |
+
+Each session gets its own control region — created *after* the accept, so a
+client that never comes costs nothing — its own `Control`, its own ring set, and
+its own thread running `session::serve`.
+
+### Why each session gets its own arena
+
+The tidy answer is one arena per device, partitioned. It is not available for
+free, and the reason is not a lock: **the arena's allocator lives on the app
+side**, one per client (`sv-arena`), so two clients over one arena both allocate
+from offset zero. Handing each a disjoint sub-range fixes that and needs no lock
+at all — the `Attachment` already carries `arena_offset`, and disjointness would
+be established once, single-threaded, in the accept loop.
+
+It was still rejected, for a reason that is about isolation rather than races:
+**the descriptor names the whole object.** A partitioned arena would hand every
+client an fd it could map in full, so one client not reading another's buffers
+would be a convention. A separate allocation per session makes it a fact —
+`security-model.md`'s R3 argument one level up.
+
+The cost is real and is not hidden: **`N` × `--arena` bytes of device memory**,
+so `--clients 8 --arena 256M` is 2 GiB. `--arena` is the knob.
+
+### The one thing that is shared and mutable
+
+`Shared::queue_lock`, and its documentation is deliberately modest. Vulkan
+requires the application to synchronise a `VkQueue` externally; the driver opens
+exactly one, so every session shares it. **The generated dispatch does not take
+the lock, and nothing does today**: the objects table is locked per lookup and
+released before the driver call, so two ring threads *of one session* could
+already reach `vkQueueSubmit` concurrently before any of this. Multi-session does
+not create that race — it widens it from "two rings of one client" to "two
+clients". The lock exists, next to the thing it protects, for whoever
+hand-writes a queue call; closing it properly is a change to pass 12.
+
+Saying that plainly is better than a `Mutex` that looks like it covers the
+generated path and does not.
+
+## The measurement that failed before
+
+Three `glxinfo` runs, one after another, against one GPU side:
+
+```
+--- run 1 --- OpenGL renderer string: zink Vulkan 1.3(… RADV RAPHAEL_MENDOCINO …)
+--- run 2 --- OpenGL renderer string: zink Vulkan 1.3(… RADV RAPHAEL_MENDOCINO …)
+--- run 3 --- OpenGL renderer string: zink Vulkan 1.3(… RADV RAPHAEL_MENDOCINO …)
+--- sessions attached: 3 ---
+```
+
+**Three, where §4 measured one.** That is the whole of the fix, checked by the
+same measurement that diagnosed the problem.
+
+## Firefox renders through the forwarder
+
+Same harness as §3, `--clients 16`:
+
+| | llvmpipe | **forwarded (zink → RADV)** |
+|---|---|---|
+| Firefox survived the run | yes | **yes** (was: exited in seconds) |
+| sessions attached | — | **2** |
+| WebGL version | WebGL 2.0 | **WebGL 2.0** |
+| `WEBGL_debug_renderer_info` | `llvmpipe, or similar` | **`Radeon HD 3200 Graphics, or similar`** |
+| `clearColor(0.2,0.6,0.9,1)` read back | `51,153,230,255` | **`51,153,230,255`** |
+
+The renderer string is Firefox's *sanitised* one — it buckets real devices to
+generic names for fingerprinting reasons — and that is exactly why it is the
+right arbiter here. Firefox classified the forwarded device as **an AMD hardware
+GPU**, not as software. On the same machine, in the same harness, the software
+run says `llvmpipe, or similar`. Firefox is not being told which it is by us; it
+is deciding, and it decided hardware.
+
+And the pixel is exact, so this is a frame and not a context.
+
+## What it costs
+
+A microbenchmark run inside the page: `gl.clear` + `gl.finish` on a 256×256
+canvas, for two seconds, counted.
+
+| | clears+finishes per second |
+|---|---|
+| llvmpipe | **12588** |
+| forwarded (zink → shared_vulkan → RADV) | **7711** |
+
+**0.61× of llvmpipe, and the number should not be read as a rendering
+comparison.** `gl.finish()` is a full round trip, so this measures *latency*, at
+a resolution where llvmpipe's rasterisation costs almost nothing — it is the
+forwarder's worst case and llvmpipe's best. 7711/s is 130 µs per round trip,
+which is well under RADV's 0.651 ms submit floor (`video-decode.md` §2), so
+`mesa_glthread` and Zink's batching are already absorbing most of it.
+
+The number that would matter is a fill-heavy or geometry-heavy frame, where
+llvmpipe pays CPU per pixel and the forwarder does not. `sv-zink-gl.sh` has that
+shape and reports 64.12 dB and 69.82 dB agreement with llvmpipe on the frames,
+but it is not timed against it. **So the honest statement is: Firefox renders
+accelerated through the forwarder, and how much that is worth is not yet
+measured.** §0.10 makes testhost the venue where it matters, because there
+llvmpipe is the only alternative.
+
+## Still not done
+
+- **Copy 2.** Deliberately not attempted in this round: two copies that render
+  beat one copy that does not exist. The design answer is §7 and is unchanged.
+- **`about:support`.** Firefox now stays up long enough to have one, and reading
+  it still needs a route that is not a screenshot. WebGL's renderer string is a
+  weaker arbiter than the graphics feature table and it is the one measured here.
+- **testhost.** Everything above is devhost, which has a real local GPU.
+- **The queue race**, above.
