@@ -1539,23 +1539,33 @@ are what say which implementation ran.
 before it was stopped is item 10, and it is the most important number in this
 section.)*
 
-| | control (RADV direct) | forwarded |
-|---|---|---|
-| Pass | **96** | **24** |
-| NotSupported | 68 | 126 |
-| Fail | 0 | 1 |
-| DeviceLost | 0 | 12 |
-| ResourceError | 0 | 1 |
-| total | 164 | 164 |
-| wall | 1 s | 52 s |
+Two independent runs of the same 164 tests, because one run of a thing that
+loses devices is a sample of one:
 
-**The join is the answer and the totals are not.** 72 tests pass on RADV and
-not through the forwarder; **0** go the other way. Of those 72: **59 are
+| | control (RADV direct) | forwarded, run A | forwarded, run B |
+|---|---|---|---|
+| Pass | **96** / 96 | **24** | **29** |
+| NotSupported | 68 / 68 | 126 | 126 |
+| Fail | 0 / 0 | 1 | 1 |
+| DeviceLost | 0 / 0 | 12 | 8 |
+| ResourceError | 0 / 0 | 1 | 0 |
+| total | 164 | 164 | 164 |
+| wall | 1 s / 5 s | 52 s | 91 s |
+
+**The control is identical to the test between the two runs and the forwarded
+column is not.** 96/68/0/0 both times, against 24 versus 29 passes and 12
+versus 8 device losses — *the same tests, same binary, same driver, minutes
+apart*. Whatever loses the device is timing-dependent, and any single forwarded
+number here carries a variance of about five tests in 164.
+
+**The join is the answer and the totals are not.** Run A: 72 tests pass on RADV
+and not through the forwarder; **0** go the other way. Of those 72, **59 are
 `NotSupported`** — the forwarded device declining something it does not
 advertise, which is the profile and not a defect — **12 are `DeviceLost`** and
-**1 is `Fail`**. So the honest sentence is *thirteen forwarding defects and
-fifty-nine gaps in the declared scope*, and no arrangement of the totals says
-that.
+**1 is `Fail`**. Run B: 67, of which 58 `NotSupported`, 8 `DeviceLost`, 1
+`Fail`. So the honest sentence is *nine to thirteen forwarding defects and
+fifty-eight to fifty-nine gaps in the declared scope*, and no arrangement of the
+totals says that. The skip half is stable to one test; the defect half is not.
 
 Ten findings. The first four are about the instrument, and they are here
 because each was a wrong number first; the tenth is the one that decides what
@@ -1650,15 +1660,26 @@ least one of the two is a handle reaching the GPU side unmapped rather than an
 ordering fault. Recorded rather than fixed; they are the first defects CTS has
 found that no other harness in this tree could reach.
 
-**9. The multi-session property survives the suite, which is what §0.12 item 4
-was waiting for.** Eight concurrent clients on **one** GPU side — one driver,
-one `VkDevice`, one `VkQueue`, three ring threads each — over
-`dEQP-VK.api.smoke.*` and `compute.basic`: **48/48 Pass**, no ring fatal. The
-generated dispatch takes the device queue lock as of this branch; the set of
-commands it takes it for is derived from the registry's `externsync=` *and* its
-`<implicitexternsyncparams>` prose, which is the only place `vkDeviceWaitIdle`
-is marked, and `vkDeviceWaitIdle` is precisely the one that rides a different
-ring from `vkQueueSubmit`.
+**9. The multi-session property holds — and the check that said otherwise was
+measuring the check before it.** Concurrent clients on **one** GPU side — one
+driver, one `VkDevice`, one `VkQueue`, three ring threads each — over
+`dEQP-VK.api.smoke.*` and `compute.basic`: **48/48 Pass** at eight clients,
+**36/36** at six, no ring fatal. The generated dispatch takes the device queue
+lock as of this branch, and the command set it takes it for comes from the
+registry's `externsync=` *and* its `<implicitexternsyncparams>` prose — the only
+place `vkDeviceWaitIdle` is marked, and `vkDeviceWaitIdle` is precisely the one
+that rides a different ring from `vkQueueSubmit`.
+
+  In between those two results the same check reported **six `DeviceLost` at
+  `vkWaitForFences` across six clients**, and it would have been recorded as a
+  concurrency defect. It was not one. That run had the concurrency check *last*,
+  after a sweep that had lost eight devices and put RADV through as many ring
+  resets; repeated on a quiescent GPU the identical six clients gave 36/36. So
+  the check now runs **before** the sweep, and the finding is a rule rather than
+  a fix: **a check placed after a phase that resets the GPU is measuring that
+  phase.** It is §0's recurring shape once more — a true observation attached to
+  the wrong cause — and it survived one run in each direction, 48/48 and then
+  12/18, which is exactly long enough to be believed.
 
 **10. The forwarder hangs the GPU on about one in ten of the tests RADV
 passes, and that is what stopped the wider run.** The 1-in-2000 sample — 1640

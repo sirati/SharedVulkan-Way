@@ -19,6 +19,9 @@
 # measure — `sv-zink-gl.sh` renders a correct frame through 239 forwarded
 # commands without saying a word about the other 501.
 #
+# ## Five checks, in this order: the control, concurrency, the sweep, the join,
+# ## and the gap. That order is part of the experiment — see check 2.
+#
 # ## Four verdicts, and only three of them are about us
 #
 # deqp reports Pass, Fail, NotSupported and a handful of others; this script
@@ -26,7 +29,7 @@
 # NotSupported is the interesting one and it is **not a failure**: a test that
 # asks for `VK_KHR_ray_tracing_pipeline` and is told the device does not have it
 # has been answered correctly. What the skip count measures is the *profile*,
-# which is design.md §11's declared scope — check 4 turns that into data.
+# which is design.md §11's declared scope — check 5 turns that into data.
 #
 # ## The control is not optional
 #
@@ -450,7 +453,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-say "2. the forwarded run: the same tests through sv-icd and sv-gpu-server"
+say "2. several sessions on one GPU side, at once"
+# ---------------------------------------------------------------------------
+# Check 3 gives every chunk its own GPU side, for the device-loss reason given
+# there, and that removes the property design.md §0.12 is about: **one driver,
+# one queue, several clients**. This puts it back, on a group the forwarder is
+# known to pass, so that a failure here is concurrency and not coverage.
+#
+# It is also the test that would notice the `vkQueueSubmit` race §0.12 item 4
+# records — three ring threads per session times N sessions, all reaching one
+# `VkQueue`. That race is closed in the generated dispatch as of this branch;
+# this is the instrument that would say if it were not.
+#
+# # It runs **before** the sweep, and that is not cosmetic
+#
+# It used to run last, and it reported six `DeviceLost` at `vkWaitForFences`
+# across six clients on a run whose sweep had just lost eight devices and put
+# RADV through as many ring resets. Repeated on a quiescent GPU, the identical
+# six clients gave **36/36 Pass**. So the failure was the *previous check's*
+# damage, not concurrency, and a check placed after a phase that resets the GPU
+# is measuring the phase. Ordering is part of the experiment.
+#
+# The general form of this is the one design.md §0 keeps restating: a true
+# observation attached to the wrong cause. It survived one run in each
+# direction — 48/48 the first time, 12/18 the second — which is exactly long
+# enough to be believed.
+STRESS="dEQP-VK.api.smoke.*"
+grep -E '^dEQP-VK\.(api\.smoke|compute\.basic)\.' "$CASELIST" > "$RUNDIR/stress.txt"
+NSTRESS=$(wc -l < "$RUNDIR/stress.txt")
+echo "  $NSTRESS tests ($STRESS and compute.basic), $JOBS concurrent clients, one GPU side"
+SPID="$(start_gpu_side "$RUNDIR/stress.sock" "$RUNDIR/stress-gpu.log")"
+if [ -z "$SPID" ]; then
+  bad "the GPU side never came up for the concurrency check"
+else
+  GPUPID="$SPID"
+  spids=()
+  for ((j = 0; j < JOBS; j++)); do
+    ( timeout "$TIMEOUT" env "VK_DRIVER_FILES=$MANIFEST" "SV_SOCKET=$RUNDIR/stress.sock" \
+        deqp-vk --deqp-caselist-file="$RUNDIR/stress.txt" --deqp-log-filename=/dev/null \
+        --deqp-surface-width=64 --deqp-surface-height=64 --deqp-shadercache=disable \
+        > "$RUNDIR/stress-$j.log" 2>&1
+      awk "$PARSE" "$RUNDIR/stress-$j.log" > "$RUNDIR/stress-$j.csv" ) &
+    spids+=($!)
+  done
+  wait "${spids[@]}"
+  kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; GPUPID=""
+  cat "$RUNDIR"/stress-*.csv > "$RUNDIR/stress.csv" 2>/dev/null
+  score "$RUNDIR/stress.csv"
+  BAD=$(awk -F, '$2!="Pass" && $2!="NotSupported"' "$RUNDIR/stress.csv" | wc -l)
+  SSESS=$(grep -c 'attached (control region' "$RUNDIR/stress-gpu.log")
+  if [ "$BAD" -eq 0 ] && [ "$SSESS" -ge "$JOBS" ]; then
+    ok "$SSESS concurrent sessions on one device, one queue, nothing lost"
+  else
+    bad "$BAD non-pass verdict(s) across $SSESS concurrent session(s)"
+    awk -F, '$2!="Pass" && $2!="NotSupported"' "$RUNDIR/stress.csv" | head -10 | sed 's/^/    /'
+    grep FATAL "$RUNDIR/stress-gpu.log" | head -5 | sed 's/^/    /'
+  fi
+fi
+# ---------------------------------------------------------------------------
+say "3. the forwarded run: the same tests through sv-icd and sv-gpu-server"
 # ---------------------------------------------------------------------------
 FWD_START=$SECONDS
 run_suite forwarded gpu "VK_DRIVER_FILES=$MANIFEST"
@@ -495,7 +556,7 @@ LOST=$(grep -c 'hard recovery' "$RUNDIR/gpu.log")
 [ "$LOST" -gt 0 ] && echo "  RADV reported $LOST hard GPU recovery/recoveries under the forwarded run"
 
 # ---------------------------------------------------------------------------
-say "3. the join: which tests the forwarder alone loses"
+say "4. the join: which tests the forwarder alone loses"
 # ---------------------------------------------------------------------------
 # The only column with information in it. A test failing on both sides is not
 # ours, and a pass rate that does not separate the two says nothing.
@@ -542,50 +603,6 @@ else
   bad "cannot join: one of the two runs is missing"
 fi
 
-# ---------------------------------------------------------------------------
-say "4. several sessions on one GPU side, at once"
-# ---------------------------------------------------------------------------
-# Check 2 gives every chunk its own GPU side, for the device-loss reason above,
-# and that removes the property design.md §0.12 is about: **one driver, one
-# queue, several clients**. This puts it back, on a group the forwarder is known
-# to pass, so that a failure here is concurrency and not coverage.
-#
-# It is also the test that would notice the `vkQueueSubmit` race §0.12 item 4
-# records — three ring threads per session times N sessions, all reaching one
-# `VkQueue`. That race is closed in the generated dispatch as of this branch;
-# this is the instrument that would say if it were not.
-STRESS="dEQP-VK.api.smoke.*"
-grep -E '^dEQP-VK\.(api\.smoke|compute\.basic)\.' "$CASELIST" > "$RUNDIR/stress.txt"
-NSTRESS=$(wc -l < "$RUNDIR/stress.txt")
-echo "  $NSTRESS tests ($STRESS and compute.basic), $JOBS concurrent clients, one GPU side"
-SPID="$(start_gpu_side "$RUNDIR/stress.sock" "$RUNDIR/stress-gpu.log")"
-if [ -z "$SPID" ]; then
-  bad "the GPU side never came up for the concurrency check"
-else
-  GPUPID="$SPID"
-  spids=()
-  for ((j = 0; j < JOBS; j++)); do
-    ( timeout "$TIMEOUT" env "VK_DRIVER_FILES=$MANIFEST" "SV_SOCKET=$RUNDIR/stress.sock" \
-        deqp-vk --deqp-caselist-file="$RUNDIR/stress.txt" --deqp-log-filename=/dev/null \
-        --deqp-surface-width=64 --deqp-surface-height=64 --deqp-shadercache=disable \
-        > "$RUNDIR/stress-$j.log" 2>&1
-      awk "$PARSE" "$RUNDIR/stress-$j.log" > "$RUNDIR/stress-$j.csv" ) &
-    spids+=($!)
-  done
-  wait "${spids[@]}"
-  kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; GPUPID=""
-  cat "$RUNDIR"/stress-*.csv > "$RUNDIR/stress.csv" 2>/dev/null
-  score "$RUNDIR/stress.csv"
-  BAD=$(awk -F, '$2!="Pass" && $2!="NotSupported"' "$RUNDIR/stress.csv" | wc -l)
-  SSESS=$(grep -c 'attached (control region' "$RUNDIR/stress-gpu.log")
-  if [ "$BAD" -eq 0 ] && [ "$SSESS" -ge "$JOBS" ]; then
-    ok "$SSESS concurrent sessions on one device, one queue, nothing lost"
-  else
-    bad "$BAD non-pass verdict(s) across $SSESS concurrent session(s)"
-    awk -F, '$2!="Pass" && $2!="NotSupported"' "$RUNDIR/stress.csv" | head -10 | sed 's/^/    /'
-    grep FATAL "$RUNDIR/stress-gpu.log" | head -5 | sed 's/^/    /'
-  fi
-fi
 
 # ---------------------------------------------------------------------------
 say "5. the gap, as data: what the profile does not carry"
