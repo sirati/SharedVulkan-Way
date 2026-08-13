@@ -50,7 +50,9 @@ use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{assemble, Commands, FrameStyle, FromUi, PlatformConfig, Started, ToUi, WindowId};
+use super::{
+    assemble, Commands, CursorSpec, FrameStyle, FromUi, PlatformConfig, Started, ToUi, WindowId,
+};
 use crate::surface::{PixelFormat, Shadow};
 
 /// Nothing to wake: [`PumpInner::run`] blocks in `Receiver::recv_timeout`,
@@ -242,6 +244,20 @@ pub fn current_layout() -> &'static str {
     crate::input::FALLBACK
 }
 
+/// What `wl_keyboard.repeat_info` advertises when there is no Windows to ask.
+///
+/// ADDED FOR STAGE 12, as the mirror of `win32.rs`'s `SystemParametersInfo`
+/// call. **Windows' defaults, not Linux's**, and that is deliberate: this
+/// platform exists so the compositor's own logic can be exercised on the
+/// machine that builds it, and a headless run that advertised whatever
+/// `xset q` says on the build host would make the harness's output depend on
+/// the developer's desktop settings. The numbers are `SPI_GETKEYBOARDDELAY` 1
+/// and `SPI_GETKEYBOARDSPEED` 31 put through the same arithmetic, which is
+/// what a stock Windows install returns.
+pub fn keyboard_repeat() -> (i32, i32) {
+    (500, 30)
+}
+
 pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(dir) = &config.dump_frames {
@@ -376,6 +392,44 @@ impl PumpInner {
                     }
                 }
             }
+
+            // ADDED FOR STAGE 12. There is no pointer here to put a cursor on,
+            // so the command is reported — and reported in the terms the Win32
+            // side would act on, including the `IDC_*` a named shape resolves
+            // to. That table is arithmetic rather than Win32 (see
+            // `crate::cursor`), so running it here means the mapping every
+            // client actually depends on is exercised by `cargo test` on Linux
+            // rather than only on the guest.
+            ToUi::Cursor { spec } => match spec {
+                CursorSpec::Hidden => {
+                    println!("wc-compositor: cursor -> hidden");
+                }
+                CursorSpec::Named(icon) => {
+                    let stock = crate::cursor::stock_for(icon);
+                    println!(
+                        "wc-compositor: cursor -> {} ({})",
+                        icon.name(),
+                        stock.name
+                    );
+                }
+                CursorSpec::Image {
+                    image,
+                    hotspot_x,
+                    hotspot_y,
+                } => {
+                    // The hash for the same reason `ToUi::Icon` carries one: it
+                    // is how a test asserts that the pixels which arrived are
+                    // the client's, with no Windows in the loop.
+                    println!(
+                        "wc-compositor: cursor -> {}x{} pixels hotspot {hotspot_x},{hotspot_y} \
+                         hash={:016x}",
+                        image.width,
+                        image.height,
+                        fnv1a(&image.pixels)
+                    );
+                }
+            },
+
             // ADDED FOR STAGE 13. Printed rather than acted on: there is no
             // window manager here to move anything, and the thing worth
             // asserting is that `xdg_popup.reposition` produced a move at all,
@@ -383,6 +437,7 @@ impl PumpInner {
             ToUi::MovePopup { id, x, y, width, height } => println!(
                 "wc-compositor: window {id} repositioned to {x},{y} {width}x{height}"
             ),
+
             ToUi::Map { id, width, height } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;

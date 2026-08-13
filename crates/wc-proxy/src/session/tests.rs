@@ -322,6 +322,198 @@ fn every_copy_scope_produces_the_same_image() {
     }
 }
 
+/// A client that cycles buffers, the way every real toolkit does.
+///
+/// The distinction this exercises is the one that broke scrolling — see
+/// docs/design.md §27. `wl_surface.damage` is "what changed on the **surface**
+/// since the last commit", not "what I wrote into this **buffer**". A client
+/// that double-buffers repaints the whole back buffer (or copies the front
+/// buffer into it and then repaints the delta) and still reports only the
+/// frame's delta, because that is all that changed on screen. A compositor
+/// reading the buffer directly is fine. A proxy keeping a *per-buffer* shadow
+/// is not: the back buffer's shadow is stale everywhere the surface changed
+/// while some *other* buffer was on screen.
+///
+/// `canvas` is what the client believes the surface looks like. Every frame it
+/// changes one band, writes the **whole** canvas into the next buffer in the
+/// cycle, and damages only the band. So the attached buffer is always exactly
+/// right, and any disagreement in the region is the proxy's alone.
+struct Cycler {
+    frame: Frame,
+    buffers: Vec<u32>,
+    canvas: Vec<u8>,
+}
+
+impl Cycler {
+    /// The colour of band `tick`, chosen so that a band from the wrong frame is
+    /// a different colour rather than a plausible one.
+    fn band_colour(tick: u8) -> [u8; 4] {
+        [tick.wrapping_mul(37), tick.wrapping_mul(91), tick.wrapping_mul(13), 0xff]
+    }
+
+    /// The band frame `tick` repaints: full width, four rows, walking down.
+    fn band(&self, tick: u8) -> (i32, i32) {
+        let y = (i32::from(tick) * 4) % (self.frame.h - 4);
+        (y, 4)
+    }
+
+    fn tick(&mut self, h: &mut Harness, surface: u32, pixels: &mut [u8], tick: u8) {
+        let (y0, bh) = self.band(tick);
+        let c = Self::band_colour(tick);
+        for y in y0..y0 + bh {
+            for x in 0..self.frame.w {
+                let at = (y * self.frame.stride + x * 4) as usize;
+                self.canvas[at..at + 4].copy_from_slice(&c);
+            }
+        }
+        // Write the whole canvas into the buffer about to be attached. Legal,
+        // and what a front-to-back copy amounts to.
+        let buffer = self.buffers[usize::from(tick) % self.buffers.len()];
+        let base = (usize::from(tick) % self.buffers.len()) * self.canvas.len();
+        pixels[base..base + self.canvas.len()].copy_from_slice(&self.canvas);
+
+        h.send_words(surface, 1, &[buffer, 0, 0]); // attach
+        h.send_words(surface, 9, &[0, y0 as u32, self.frame.w as u32, bh as u32]); // damage_buffer
+        h.send_words(surface, 6, &[]); // commit
+    }
+}
+
+/// Run a buffer-cycling client and hand back the harness, the cycler and the
+/// byte offset of the buffer that was attached last.
+fn run_cycling_client(
+    transport: Box<dyn PoolTransport>,
+    scope: CopyScope,
+    nbuf: usize,
+    frames: u8,
+) -> (Harness, Cycler, usize) {
+    let frame = Frame { w: 200, h: 120, stride: 200 * 4, offset: 0 };
+    let one = (frame.stride * frame.h) as usize;
+    let pool_size = one * nbuf;
+
+    let mut h = Harness::new(transport, scope, 1);
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let compositor = h.bind(registry, 1, "wl_compositor", 6);
+    let shm = h.bind(registry, 2, "wl_shm", 2);
+
+    let surface = h.id();
+    h.send_words(compositor, 0, &[surface]);
+
+    let (fd, ptr) = client_pool(pool_size);
+    // SAFETY: `ptr`/`pool_size` are what `mmap` returned in `client_pool`, and
+    // this slice is the only reference to them for the rest of the test.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(ptr, pool_size) };
+
+    let pool = h.id();
+    let mut fds = VecDeque::from([fd]);
+    let mut body = Vec::new();
+    body.extend_from_slice(&pool.to_ne_bytes());
+    body.extend_from_slice(&(pool_size as u32).to_ne_bytes());
+    h.send(shm, 0, &body, &mut fds);
+
+    let mut buffers = Vec::new();
+    for i in 0..nbuf {
+        let buffer = h.id();
+        h.send_words(
+            pool,
+            0,
+            &[
+                buffer,
+                (i * one) as u32,
+                frame.w as u32,
+                frame.h as u32,
+                frame.stride as u32,
+                1,
+            ],
+        );
+        buffers.push(buffer);
+    }
+
+    let mut c = Cycler { frame, buffers, canvas: vec![0x20; one] };
+    for tick in 0..frames {
+        c.tick(&mut h, surface, pixels, tick);
+    }
+    let last = (usize::from(frames - 1) % nbuf) * one;
+    (h, c, last)
+}
+
+/// **The bug this stage exists for.** A buffer-cycling client's last frame must
+/// be readable in full from the region, and it was not: everything the surface
+/// changed while a *different* buffer was on screen was missing from this
+/// buffer's shadow. On a scrolling page that is a band of two-frames-ago
+/// content per frame, which is what "blank slides in about:support" was.
+///
+/// `Pool` and `Buffer` scope copy the whole extent every commit, so they cannot
+/// have the bug. That makes them the control: if `Damage` disagrees with them,
+/// the disagreement is damage tracking's and nothing else's.
+#[test]
+fn a_buffer_cycling_client_is_not_left_with_a_stale_shadow() {
+    for nbuf in [2usize, 3] {
+        let mut images = Vec::new();
+        for scope in [CopyScope::Pool, CopyScope::Buffer, CopyScope::Damage] {
+            let d = tmpdir(&format!("cycle-{nbuf}-{}", scope.as_str()));
+            let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
+            let (h, c, last) = run_cycling_client(Box::new(t), scope, nbuf, 12);
+            let peer = wc_handle::Handle::from_descriptor(h.pool_descriptor());
+            let map = peer.map().unwrap();
+            let seen = map.as_slice()[last..last + c.canvas.len()].to_vec();
+            images.push((scope, seen, c.canvas.clone()));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        for (scope, seen, canvas) in &images {
+            // Count and locate the disagreeing rows rather than dumping 96000
+            // bytes. The count is the measurement docs/design.md §27 quotes.
+            let stride = 200 * 4usize;
+            let rows: Vec<usize> = (0..120)
+                .filter(|y| seen[y * stride..(y + 1) * stride] != canvas[y * stride..(y + 1) * stride])
+                .collect();
+            assert!(
+                rows.is_empty(),
+                "{nbuf} buffers, {} scope: {} of 120 rows in the region are not what the client \
+                 drew (rows {:?})",
+                scope.as_str(),
+                rows.len(),
+                &rows[..rows.len().min(12)]
+            );
+        }
+    }
+}
+
+/// Paying off the arrears must not degenerate into copying the extent.
+///
+/// There is a trivially correct fix for the staleness above — copy the whole
+/// buffer every commit — and it is `CopyScope::Buffer`, which already exists.
+/// This is the test that says the damage scope is still the cheap one after the
+/// fix: the arrears of a two-buffer cycle are one extra frame's damage, not a
+/// whole buffer. Without it, a later "just to be safe" would quietly make the
+/// three scopes the same code again.
+#[test]
+fn paying_off_the_arrears_still_costs_less_than_the_extent() {
+    let mut bytes = Vec::new();
+    for scope in [CopyScope::Buffer, CopyScope::Damage] {
+        let d = tmpdir(&format!("arrears-{}", scope.as_str()));
+        let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
+        let (h, _, _) = run_cycling_client(Box::new(t), scope, 2, 24);
+        bytes.push((scope, h.session.stats.bytes_copied));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let get = |s: CopyScope| bytes.iter().find(|(k, _)| *k == s).unwrap().1;
+    // The arithmetic, because a ratio with no derivation is a number nobody can
+    // check. The client damages 4 rows of 120 a frame and cycles two buffers,
+    // so a steady-state frame owes 8 rows — 15x cheaper than the extent. The
+    // run also pays two unavoidable full extents, one per buffer's first
+    // commit, which nothing can avoid because the region has never held those
+    // bytes: 2 x 96000 + 22 x 8 x 800 = 332800 against 24 x 96000 = 2304000,
+    // which is 6.9x. The bound is 4x, loose enough to survive a change in the
+    // frame count and tight enough that "copy the extent to be safe" fails it.
+    assert!(
+        get(CopyScope::Damage) * 4 < get(CopyScope::Buffer),
+        "damage {} vs buffer {} -- the arrears fix has eaten the saving",
+        get(CopyScope::Damage),
+        get(CopyScope::Buffer)
+    );
+}
+
 /// Damage-scoped copying really does copy less. Without this the scope is a
 /// setting that changes nothing, and the measurement it exists for would be
 /// measuring the same code three times.
@@ -882,6 +1074,398 @@ fn the_opcodes_this_file_hard_codes_are_the_right_ones() {
         assert_eq!(s.request(iface, opcode).unwrap().name, name, "{iface} opcode {opcode}");
     }
     assert_eq!(s.event("wl_display", op::DISPLAY_DELETE_ID).unwrap().name, "delete_id");
+}
+
+// -------------------------------------------------------------------- 16 ---
+// Running out of arena, and getting the guest's memory back.
+
+/// A client with a surface, an arena of a stated size, and a way to drive one
+/// pool's worth of traffic at a time.
+///
+/// Separate from `run_client` because these tests care about *which messages
+/// reached the compositor* rather than about which pixels arrived, and they
+/// have to be able to run out of room half way through.
+struct Pressure {
+    h: Harness,
+    dir: std::path::PathBuf,
+    shm: u32,
+    compositor: u32,
+}
+
+impl Pressure {
+    fn new(tag: &str, arena_id: u32, arena_bytes: u64) -> Pressure {
+        let dir = tmpdir(tag);
+        let path = dir.join("arena");
+        let t = Arena::open_or_create(arena_id, &path, arena_bytes).unwrap();
+        wc_handle::arena::attach(arena_id, &path.to_string_lossy(), t.size()).unwrap();
+        let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+        let registry = h.id();
+        h.send_words(1, 1, &[registry]);
+        let compositor = h.bind(registry, 1, "wl_compositor", 6);
+        let shm = h.bind(registry, 2, "wl_shm", 2);
+        Pressure { h, dir, shm, compositor }
+    }
+
+    fn surface(&mut self) -> u32 {
+        let s = self.h.id();
+        self.h.send_words(self.compositor, 0, &[s]);
+        s
+    }
+
+    /// `wl_shm.create_pool` with a real client object behind it, then one
+    /// buffer covering the whole thing.
+    fn pool_with_buffer(&mut self, bytes: usize, w: i32, hgt: i32) -> (u32, u32) {
+        let (fd, _) = client_pool(bytes);
+        let pool = self.h.id();
+        let mut body = Vec::new();
+        body.extend_from_slice(&pool.to_ne_bytes());
+        body.extend_from_slice(&(bytes as u32).to_ne_bytes());
+        self.h.send(self.shm, 0, &body, &mut VecDeque::from([fd]));
+        let buffer = self.h.id();
+        self.h.send_words(pool, 0, &[buffer, 0, w as u32, hgt as u32, (w * 4) as u32, 1]);
+        (pool, buffer)
+    }
+
+    fn attach_and_commit(&mut self, surface: u32, buffer: u32, w: i32, hgt: i32) {
+        self.h.send_words(surface, 1, &[buffer, 0, 0]);
+        self.h.send_words(surface, 9, &[0, 0, w as u32, hgt as u32]);
+        self.h.send_words(surface, 6, &[]);
+    }
+
+    /// An event from the compositor, the way `pump` would deliver one.
+    fn deliver_event(&mut self, object: u32, opcode: u16, words: &[u32]) {
+        let body: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        let (bytes, fds) = self
+            .h
+            .session
+            .server_message(Header { object, opcode, size: 8 + body.len() }, &body)
+            .unwrap_or_else(|e| panic!("event {object}.{opcode}: {e}"));
+        assert!(fds.is_empty());
+        let _ = bytes;
+    }
+
+    /// How many times `buffer` was created out of `pool` upstream.
+    ///
+    /// A separate method from [`Pressure::mentions`] because `create_buffer` is
+    /// addressed to the *pool* and carries the buffer as its first argument,
+    /// and because `wl_shm_pool.create_buffer` and `wl_buffer.destroy` are both
+    /// opcode 0 — so counting "opcode 0 messages about this buffer" would count
+    /// two different things.
+    fn created(&self, pool: u32, buffer: u32) -> usize {
+        self.h
+            .upstream_messages()
+            .iter()
+            .filter(|(obj, opcode, body)| {
+                *obj == pool
+                    && *opcode == op::POOL_CREATE_BUFFER
+                    && body.len() >= 4
+                    && u32::from_ne_bytes(body[..4].try_into().unwrap()) == buffer
+            })
+            .count()
+    }
+
+    /// Every message the compositor received that names `object` — as the
+    /// message's own target, or as the buffer argument of a `wl_surface.attach`.
+    ///
+    /// This is the assertion the whole stage turns on. A message naming an
+    /// object the compositor does not have is a protocol error, and a protocol
+    /// error is a dead client.
+    fn mentions(&self, object: u32) -> Vec<(u32, u16)> {
+        self.h
+            .upstream_messages()
+            .into_iter()
+            .filter(|(obj, opcode, body)| {
+                *obj == object
+                    || (*opcode == op::SURFACE_ATTACH
+                        && body.len() >= 4
+                        && u32::from_ne_bytes(body[..4].try_into().unwrap()) == object)
+            })
+            .map(|(obj, opcode, _)| (obj, opcode))
+            .collect()
+    }
+}
+
+impl Drop for Pressure {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// **The bug, and the fix.** docs/design.md §20.2.
+///
+/// An arena with no room for a pool used to kill the client, and the log line
+/// said so in three steps: `could not publish 2340864 bytes`, then
+/// `client 2 stopped: the compositor closed the connection`, then Firefox's
+/// `Exiting due to channel error`. The middle step is the one that was not
+/// understood — the allocation failure left the pool unannounced, and the
+/// client's very next `wl_shm_pool.create_buffer` was forwarded to a compositor
+/// that had never heard of that object.
+///
+/// So this asserts the property rather than the symptom: **not one byte
+/// naming an unbacked pool, or a buffer cut from it, reaches the compositor.**
+/// And then that the surface recovers when there is room, because a fix that
+/// froze the surface for ever would be a different bug.
+#[test]
+fn a_full_arena_degrades_one_surface_and_never_the_connection() {
+    // 32 pages. The outbound window is not reserved here, so all of it is the
+    // pool allocator's.
+    let mut p = Pressure::new("full", 7400, 32 * 4096);
+    let surface = p.surface();
+
+    // 24 pages, published, drawn. This is the pool that fills the arena.
+    let (_big, big_buf) = p.pool_with_buffer(24 * 4096, 64, 384);
+    p.attach_and_commit(surface, big_buf, 64, 384);
+    assert_eq!(p.h.session.stats.pools_created, 1);
+    assert!(p.h.session.stats.copies > 0, "the first pool must have worked");
+
+    // 16 pages, and only 8 are left. Everything the client does with it from
+    // here is legal and none of it may cross.
+    let second = p.surface();
+    let (pool_b, buf_b) = p.pool_with_buffer(16 * 4096, 64, 256);
+    p.attach_and_commit(second, buf_b, 64, 256);
+    p.h.send_words(pool_b, 2, &[16 * 4096]); // a resize, for good measure
+    p.attach_and_commit(second, buf_b, 64, 256);
+
+    assert!(p.h.session.stats.alloc_refusals > 0, "the arena should have refused");
+    assert!(p.h.session.stats.attaches_deferred > 0, "the attach should have been held");
+    assert_eq!(
+        p.mentions(pool_b),
+        Vec::new(),
+        "the compositor was told about a pool that has no memory behind it"
+    );
+    assert_eq!(
+        p.mentions(buf_b),
+        Vec::new(),
+        "the compositor was told about a buffer cut from a pool it does not have -- \
+         this is the exact message that killed Firefox"
+    );
+    // The first surface is untouched by any of it, which is the difference
+    // between degrading and dying.
+    let copies_before = p.h.session.stats.copies;
+    p.attach_and_commit(surface, big_buf, 64, 384);
+    assert!(p.h.session.stats.copies > copies_before, "the healthy surface stopped working");
+
+    // --- and now there is room ------------------------------------------
+    //
+    // The client finishes with the first pool: buffer, then pool, then the
+    // compositor's acknowledgement, which is the only point at which the bytes
+    // are safe to reuse (docs/design.md §2.5).
+    p.h.send_words(big_buf, 0, &[]); // wl_buffer.destroy
+    p.h.send_words(surface, 1, &[0, 0, 0]); // attach nil, so nothing holds it
+    p.h.send_words(surface, 6, &[]);
+    let big = p.h.session.buffers.get(&big_buf).map(|b| b.pool);
+    assert!(big.is_none(), "the buffer should be gone from the table");
+    let big_pool = p.mentions(0); // silence the unused warning path
+    let _ = big_pool;
+
+    p.h.send_words(
+        p.h.session
+            .pools
+            .keys()
+            .copied()
+            .find(|id| *id != pool_b)
+            .expect("the first pool is still here"),
+        1, // wl_shm_pool.destroy
+        &[],
+    );
+    let first_pool = *p
+        .h
+        .session
+        .pools
+        .keys()
+        .find(|id| **id != pool_b)
+        .expect("still tracked until acknowledged");
+    p.deliver_event(1, op::DISPLAY_DELETE_ID, &[first_pool]);
+
+    // One more message, and the pool that could not fit now fits.
+    p.attach_and_commit(second, buf_b, 64, 256);
+    assert!(
+        !p.mentions(pool_b).is_empty(),
+        "the pool never recovered: {:?}",
+        p.h.session.take_notes()
+    );
+    assert!(
+        p.mentions(buf_b).iter().any(|(_, opcode)| *opcode == op::SURFACE_ATTACH),
+        "the held attach was never replayed, so the surface would stay frozen for ever"
+    );
+}
+
+/// **Reclamation.** docs/design.md §20.5, and the answer to §17.10 item 1.
+///
+/// Firefox destroys one buffer in three and no pools at all, so a policy that
+/// waits to be asked gets nothing back. This one is not asked: it destroys the
+/// upstream objects of a pool nothing is using, keeps the client's own mapping,
+/// and rebuilds the objects from the client's own requests when it comes back.
+///
+/// The re-attach at the end is the case §17.10 warned about — "a client may
+/// legitimately re-attach an old buffer" — and it is the reason the rebuild
+/// exists rather than a note saying it cannot happen.
+#[test]
+fn a_cold_pool_is_reclaimed_under_pressure_and_rebuilt_when_the_client_returns() {
+    // 40 pages, and three pools that cannot all fit at once. The sizes are
+    // chosen so that every step below is forced rather than incidental.
+    let mut p = Pressure::new("reclaim", 7401, 40 * 4096);
+    let idle = p.surface();
+    let held = p.surface();
+    let busy = p.surface();
+
+    // 16 pages that stay in use throughout, so that the reclaimer has an
+    // obvious candidate it must *not* take.
+    //
+    // **It is allocated first on purpose.** With the cold pool at the bottom
+    // instead, reclaiming it leaves two 12-page holes with the kept pool
+    // wedged between them, and the 20-page pool below does not fit into either
+    // — which is §20.4's fragmentation, arriving uninvited in §20.5's test and
+    // worth leaving this note about rather than only the ordering.
+    let (keep_pool, keep_buf) = p.pool_with_buffer(16 * 4096, 64, 256);
+    p.attach_and_commit(held, keep_buf, 64, 256);
+    assert_eq!(p.h.session.stats.pools_created, 1);
+
+    // 12 pages, used once and then let go of — the shape of every one of the
+    // 88 pools §15.10 measured Firefox holding for the life of the process.
+    let (cold_pool, cold_buf) = p.pool_with_buffer(12 * 4096, 64, 192);
+    p.attach_and_commit(idle, cold_buf, 64, 192);
+    assert_eq!(p.h.session.stats.pools_created, 2);
+
+    // Nothing holds it any more: not the surface, and not the compositor. Both
+    // are required and both are observable without asking the client, which is
+    // the whole reason this policy can work where §15.11's could not.
+    p.h.send_words(idle, 1, &[0, 0, 0]); // attach nil
+    p.h.send_words(idle, 6, &[]);
+    p.deliver_event(cold_buf, op::BUFFER_RELEASE, &[]);
+
+    // 20 pages, and 12 are left. Not yet cold, so the floor refuses.
+    let (_hot, hot_buf) = p.pool_with_buffer(20 * 4096, 64, 320);
+    p.attach_and_commit(busy, hot_buf, 64, 320);
+    assert!(p.h.session.stats.alloc_refusals > 0, "20 pages must not fit in 12");
+    assert_eq!(p.h.session.stats.pools_reclaimed, 0, "a warm pool must not be reclaimed");
+
+    // Now it is cold, and the next message that needs room takes it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    p.attach_and_commit(busy, hot_buf, 64, 320);
+    assert!(
+        p.mentions(cold_pool).iter().any(|(_, opcode)| *opcode == op::POOL_DESTROY),
+        "the cold pool was never taken apart"
+    );
+    assert!(
+        p.mentions(cold_buf).iter().any(|(_, opcode)| *opcode == op::BUFFER_DESTROY),
+        "its buffer must go first, or the compositor keeps reading bytes we hand away"
+    );
+    // The one in use was left alone, which is the condition that stops this
+    // policy from blanking a window.
+    assert_eq!(
+        p.mentions(keep_pool).iter().filter(|(_, o)| *o == op::POOL_DESTROY).count(),
+        0,
+        "a pool whose buffer is attached to a surface was reclaimed"
+    );
+    // And the bytes are not free until the compositor says so (§2.5).
+    assert_eq!(p.h.session.stats.pools_reclaimed, 0, "freed before the acknowledgement");
+    p.deliver_event(1, op::DISPLAY_DELETE_ID, &[cold_pool]);
+    assert_eq!(p.h.session.stats.pools_reclaimed, 1, "the acknowledgement did not free it");
+
+    // The pool stays gone rather than being rebuilt by the next message that
+    // happens along, which is the whole point of taking it apart. The message
+    // below publishes the *hot* pool, into the bytes just recovered.
+    let republished = p.h.session.stats.pools_republished;
+    p.attach_and_commit(busy, hot_buf, 64, 320);
+    assert_eq!(p.h.session.stats.pools_created, 3, "the hot pool should have fitted now");
+    assert_eq!(
+        p.h.session.stats.pools_republished, republished,
+        "a reclaimed pool was rebuilt by a message that had nothing to do with it"
+    );
+
+    // The client finishes with the pool it was holding, which makes room.
+    p.h.send_words(held, 1, &[0, 0, 0]);
+    p.h.send_words(held, 6, &[]);
+    p.h.send_words(keep_buf, 0, &[]); // wl_buffer.destroy
+    p.h.send_words(keep_pool, 1, &[]); // wl_shm_pool.destroy
+    p.deliver_event(1, op::DISPLAY_DELETE_ID, &[keep_pool]);
+
+    // And now it comes back for a buffer it never destroyed. §17.10's warning —
+    // "a client may legitimately re-attach an old buffer" — and the reason the
+    // rebuild exists rather than a note saying it cannot happen.
+    p.attach_and_commit(idle, cold_buf, 64, 192);
+    let why = p.h.session.take_notes();
+    assert_eq!(
+        p.h.session.stats.pools_republished,
+        republished + 1,
+        "the pool was not rebuilt: {why:?}"
+    );
+    let after: Vec<(u32, u16)> = p.mentions(cold_buf);
+    assert_eq!(
+        p.created(cold_pool, cold_buf),
+        2,
+        "the buffer must be created out of the rebuilt pool a second time, or the compositor \
+         has a pool with nothing cut from it and the attach below is a protocol error"
+    );
+    assert!(
+        after.last().is_some_and(|(_, opcode)| *opcode == op::SURFACE_ATTACH),
+        "the attach must follow the rebuild, not precede it: {after:?}"
+    );
+    // And the pixels really moved again, which no message count can show.
+    assert!(p.h.session.stats.copies >= 4, "{}", p.h.session.stats.summary());
+}
+
+/// The two objects a proxy destroys on its own initiative, and the two
+/// acknowledgements that must not go the wrong way.
+///
+/// A `delete_id` for something *this* proxy destroyed is the compositor
+/// answering the proxy, and forwarding it would tell libwayland-client to
+/// recycle an id its own application still holds. In the other direction, a
+/// destructor the proxy absorbed will never be acknowledged by anybody unless
+/// the proxy does it, and libwayland does not reuse an id until it is.
+#[test]
+fn an_acknowledgement_goes_to_whoever_asked_for_the_destruction() {
+    let mut p = Pressure::new("ack", 7402, 32 * 4096);
+    let surface = p.surface();
+    let (cold_pool, cold_buf) = p.pool_with_buffer(24 * 4096, 64, 384);
+    p.attach_and_commit(surface, cold_buf, 64, 384);
+    p.h.send_words(surface, 1, &[0, 0, 0]);
+    p.h.send_words(surface, 6, &[]);
+    p.deliver_event(cold_buf, op::BUFFER_RELEASE, &[]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Force the teardown.
+    let (_hot, hot_buf) = p.pool_with_buffer(16 * 4096, 64, 256);
+    p.attach_and_commit(surface, hot_buf, 64, 256);
+    assert!(p.h.session.stats.alloc_refusals > 0);
+    assert!(p.mentions(cold_pool).iter().any(|(_, o)| *o == op::POOL_DESTROY));
+
+    // The compositor's answer to *our* destructor is swallowed: the client
+    // still owns that id and must not be told to recycle it.
+    let _ = p.h.session.take_client_bytes();
+    p.deliver_event(1, op::DISPLAY_DELETE_ID, &[cold_pool]);
+    assert!(
+        p.h.session.take_client_bytes().is_empty(),
+        "a delete_id for an object the proxy destroyed was forwarded to the client"
+    );
+
+    // One message to let the pool that caused the pressure take the recovered
+    // bytes, so that the count below measures the destructors and not that.
+    p.attach_and_commit(surface, hot_buf, 64, 256);
+    assert_eq!(p.h.session.stats.pools_created, 2);
+
+    // Now the client destroys the buffer and the pool it still believes in.
+    // Neither may be forwarded, and both are owed an acknowledgement.
+    let before = p.h.upstream_messages().len();
+    p.h.send_words(cold_buf, 0, &[]);
+    p.h.send_words(cold_pool, 1, &[]);
+    assert_eq!(
+        p.h.upstream_messages().len(),
+        before,
+        "a destructor for an object the compositor does not have was forwarded"
+    );
+    let invented = p.h.session.take_client_bytes();
+    let mut seen = Vec::new();
+    let mut at = 0;
+    while let Some(hdr) = Header::parse(&invented[at..]) {
+        assert_eq!(hdr.object, 1, "only wl_display may be invented");
+        assert_eq!(hdr.opcode, op::DISPLAY_DELETE_ID);
+        seen.push(u32::from_ne_bytes(invented[at + 8..at + 12].try_into().unwrap()));
+        at += hdr.size;
+    }
+    assert_eq!(at, invented.len(), "the invented stream is not framed");
+    assert_eq!(seen, vec![cold_buf, cold_pool], "both ids must be released to the client");
 }
 
 /// The four protocols stage 21 added, driven the way a client drives them.
