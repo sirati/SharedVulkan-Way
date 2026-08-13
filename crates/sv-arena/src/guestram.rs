@@ -164,14 +164,23 @@ impl ArenaProvider for GuestRamProvider {
     /// `SuperfetchPfnQuery` reports the frame behind every page of an ordinary
     /// mapped window in ~330 ms, measured against the live guest and agreeing
     /// with the host's scan on 16384 of 16384 pages, with no privilege the
-    /// account does not already hold. `awe_probe::superfetch` is the measured
-    /// implementation; this is where it would be called, and `desc.locator`
-    /// would become [`Locator::Pfns`] — which the wire already carries.
+    /// account does not already hold.
     ///
-    /// Not done here yet, deliberately: the query is undocumented (R28) and the
-    /// arrangement §5.1 settles on runs the scan *once* as its cross-check, so
-    /// wiring it up is a change to both sides of the handshake rather than to
-    /// this function alone.
+    /// **That path is now wired, and it does not run through here.** A provider
+    /// that can ask its kernel where its pages are calls
+    /// [`crate::extent::Extent::locate_by_frames`], which sets `desc.locator` to
+    /// [`Locator::Pfns`]; `awe_probe::superfetch::pfn_locator` is the Windows
+    /// side of it and `sv_hostd::locate::PfnLocator` the host side. This
+    /// provider is Linux and still returns `None`, for the reason at the top of
+    /// the module: `/proc/self/pagemap` has returned zeroed frame numbers to
+    /// unprivileged processes since 4.0, and reading it as root would make the
+    /// guest half need privilege — which is the property that would stop this
+    /// being a topology an ordinary application can use.
+    ///
+    /// The return type is also the wrong shape for the frame path and that is
+    /// not an oversight: a [`RunList`] is *file* offsets, which is a fact about
+    /// the host's backing object, and a guest that knew those would not need a
+    /// locator at all.
     fn frames(&self, _extent: &Extent) -> Option<RunList> {
         None
     }
@@ -245,11 +254,12 @@ mod tests {
         assert!(p.commit(0, 0).is_err());
     }
 
-    /// This provider does not enumerate its own frames. That was once "cannot"
-    /// and is now "does not": design.md §0.14 measured that Windows will report
-    /// them through `SuperfetchPfnQuery`, and this provider has not been taught
-    /// to ask. `None` stays the honest encoding of what it currently knows, and
-    /// `ScanLocator` stays the locator (D21).
+    /// This provider does not enumerate its own frames, and on Linux it cannot:
+    /// `/proc/self/pagemap` zeroes them for an unprivileged process. design.md
+    /// §0.14 measured that *Windows* will report them through
+    /// `SuperfetchPfnQuery`, and that path exists —
+    /// [`Extent::locate_by_frames`] is where it lands — but it is not this
+    /// provider's, so `None` and `Locator::Scan` stay the honest answers here.
     #[test]
     fn the_guest_does_not_claim_to_know_its_frames() {
         let mut p = provider();

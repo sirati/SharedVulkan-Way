@@ -55,7 +55,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!(
                 "usage:\n  \
                  sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]\n  \
-                 sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n  \
+                 sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
+                 [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N]"
             );
             return Err("no subcommand".into());
@@ -163,9 +164,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// pass over the extent and it is the check that would catch a stitcher that
 /// mapped the right pages in the wrong order — which reads as "the arena works"
 /// on every test that does not look at the index.
+///
+/// `--locator scan|pfns|both` picks which of §5.1's locators runs, and defaults
+/// to `scan` — the behaviour every measurement in the design was taken with.
+/// `pfns` and `both` need `--frames <guest-status.txt>`, the file the guest's
+/// `sf-probe` writes, because a run driven by hand has no cold path to carry the
+/// frame list. `both` is R28's attach-time cross-check and is the mode that
+/// proves the frame path: it locates the same extent twice, by two mechanisms
+/// with nothing in common, and refuses if they disagree about any page.
 #[cfg(target_os = "linux")]
 fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use sv_hostd::locate;
+    use sv_hostd::{LocatorChoice, locate};
     use sv_transport::cold::{ExtentDesc, Granularity, Locator};
     use sv_transport::region::PAGE;
 
@@ -179,6 +188,30 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let control_pages: u64 = arg("--control-pages").map_or(Ok(0), |s| s.parse())?;
     let arena_pages: u64 = arg("--arena-pages").ok_or("--arena-pages is required")?.parse()?;
     let large = args.iter().any(|a| a == "--large");
+    let choice = match arg("--locator") {
+        Some(s) => LocatorChoice::parse(&s).ok_or(format!("--locator wants scan|pfns|both, not {s:?}"))?,
+        None => LocatorChoice::default(),
+    };
+
+    // The locator the descriptor carries *is* the frame list, so it is built
+    // here rather than passed alongside: a descriptor that says `Pfns` and has
+    // no frames is not a thing that should be representable this far in.
+    let locator = match (choice, arg("--frames")) {
+        (LocatorChoice::Scan, _) => Locator::Scan,
+        (_, Some(path)) => {
+            let frames = locate::parse_frame_list(&std::fs::read_to_string(&path)?)
+                .map_err(|e| format!("{path}: {e}"))?;
+            println!(
+                "read {} frame(s) from {path}; first 0x{:x}",
+                frames.len(),
+                frames.first().copied().unwrap_or(0)
+            );
+            Locator::from_frames(&frames)
+        }
+        (_, None) => {
+            return Err("--locator pfns|both needs --frames <guest-status.txt>".into());
+        }
+    };
 
     let desc = ExtentDesc {
         run_id,
@@ -189,12 +222,12 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         granularity: if large { Granularity::Large2M } else { Granularity::Small4K },
         control_pages,
         arena_pages,
-        locator: Locator::Scan,
+        locator,
     };
 
     let started = std::time::Instant::now();
-    let (hostd, regions, report) =
-        sv_hostd::Hostd::qemu(std::path::Path::new(&qmp), &hint, &desc, 1)?;
+    let (hostd, regions, outcome) =
+        sv_hostd::Hostd::qemu_located(std::path::Path::new(&qmp), &hint, &desc, 1, choice)?;
     let located = started.elapsed();
 
     println!(
@@ -210,20 +243,40 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             a.file_offset
         );
     }
-    println!(
-        "located {}/{} pages in {:.2?} (swept {} MiB; {} other-run stamps, {} outside guest RAM)",
-        report.pages_found,
-        report.pages_expected,
-        located,
-        report.bytes_swept >> 20,
-        report.other_runs,
-        report.outside_ram
-    );
+    println!("located by `{}` in {:.2?}", choice.as_str(), located);
+    if let Some(r) = &outcome.scan {
+        println!(
+            "  scan: {}/{} pages (swept {} MiB; {} other-run stamps, {} outside guest RAM)",
+            r.pages_found,
+            r.pages_expected,
+            r.bytes_swept >> 20,
+            r.other_runs,
+            r.outside_ram
+        );
+    }
+    if let Some(r) = &outcome.pfns {
+        println!(
+            "  frame list: {} pages, {} run(s) of frames -> {} run(s) of file, first frame 0x{:x}",
+            r.pages, r.frame_runs, r.file_runs, r.first_frame
+        );
+    }
+    // R28: the frame list is believed *because* this agreed, and a run that
+    // took it on trust has to look different in the log from one that checked.
+    match &outcome.cross_check {
+        Some(c) => println!(
+            "  R28 cross-check: the scan and the frame list agree about {}/{} pages",
+            c.agreed, c.pages
+        ),
+        None if outcome.pfns.is_some() => {
+            println!("  R28 cross-check: NOT RUN — the frame list was taken on trust")
+        }
+        None => {}
+    }
     println!(
         "coalesced into {} run(s) covering {} MiB — {:.1} pages per run",
         hostd.runs.len(),
         hostd.runs.bytes() >> 20,
-        report.pages_found as f64 / hostd.runs.len() as f64
+        (desc.control_pages + desc.arena_pages) as f64 / hostd.runs.len() as f64
     );
     if let Some(first) = hostd.runs.runs().first() {
         println!(

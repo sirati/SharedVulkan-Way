@@ -45,6 +45,8 @@
 #![allow(non_camel_case_types, non_snake_case)]
 #![allow(clippy::upper_case_acronyms)]
 
+use sv_transport::cold::Locator;
+
 /// `MEMORY_FRAME_INFORMATION.UseDescription`, the `MMPFNUSE_*` constants.
 pub const MMPFNUSE_PROCESSPRIVATE: u64 = 0;
 pub const MMPFNUSE_FILE: u64 = 1;
@@ -238,6 +240,21 @@ impl Located {
             .copied()
             .filter(|f| f.owner == pid)
             .collect()
+    }
+
+    /// The frame list as the cold path carries it: [`Locator::Pfns`].
+    ///
+    /// The conversion is a widening and a delegation, and it is written that way
+    /// on purpose. Run-length encoding the list here as well as in
+    /// [`Locator::from_frames`] would be the same arithmetic in two places, and
+    /// the failure mode of the two disagreeing is a descriptor that names the
+    /// right number of pages and the wrong ones — which nothing downstream of
+    /// the locator can detect. [`Located::runs`] stays because the *count* is
+    /// what §5.7 prices attaching in and a probe reports it without building a
+    /// wire message; the test below holds the two to the same answer.
+    pub fn locator(frames: &[usize]) -> Locator {
+        let wide: Vec<u64> = frames.iter().map(|f| *f as u64).collect();
+        Locator::from_frames(&wide)
     }
 
     /// Contiguous runs of frames, in the units §5.7 counts attach cost in.
@@ -526,6 +543,35 @@ mod sys {
         Ok((l, ms))
     }
 
+    /// Locate a window and return **one frame per page, in page order**, or say
+    /// why not.
+    ///
+    /// This is [`locate_timed`] with the two checks a caller must not be
+    /// trusted to remember applied: the pages are reduced to this process's own
+    /// (or, failing that, to the elected owner's), and the result is checked as
+    /// a permutation of `0..pages` by [`Located::frames`] before any of it is
+    /// believed. A window that comes back short is an error with the missing
+    /// count in it rather than a shorter list, because a frame list with a hole
+    /// translates into an arena with a hole and nothing downstream notices.
+    pub fn locate_frames(base: usize, pages: usize, chunk: usize) -> Result<(Vec<usize>, u128), String> {
+        let (located, ms) = locate_timed(base, pages, chunk)?;
+        Ok((located.frames(pages)?, ms))
+    }
+
+    /// The same, as the thing that actually crosses the cold path.
+    ///
+    /// design.md §0.14: this is the call that turns "Windows will tell us where
+    /// the pages are" into a descriptor the host can act on. What comes back is
+    /// run-length encoded — 26 runs per 64 MiB on the large-page path, up to one
+    /// per page on the 4 KiB one — and it is the *whole* of what the guest has
+    /// to say about where its memory is. No handle, no descriptor, no pointer:
+    /// a frame number is an integer, which is the property that lets it cross a
+    /// VM boundary at all.
+    pub fn pfn_locator(base: usize, pages: usize, chunk: usize) -> Result<(Locator, u128), String> {
+        let (frames, ms) = locate_frames(base, pages, chunk)?;
+        Ok((Located::locator(&frames), ms))
+    }
+
     /// Ask the same question the other way: bound the work by looking only at
     /// the frames a previous answer named.
     ///
@@ -659,6 +705,57 @@ mod tests {
         );
         assert_eq!(Located::runs(&[]), vec![]);
         assert_eq!(Located::runs(&[5]), vec![(5, 1)]);
+    }
+
+    /// The probe's run counter and the wire's run-length encoder must be the
+    /// same function seen twice, because they are what the two sides of the
+    /// handshake each believe about the same window. If they ever parted, the
+    /// guest would report a run count the host could not reproduce from the
+    /// descriptor it was sent — and the descriptor is the one that gets mapped.
+    #[test]
+    fn the_run_count_a_probe_reports_is_the_run_count_the_wire_carries() {
+        for frames in [
+            vec![10usize, 11, 12, 20, 21],
+            // Reversed: contiguous by the loose test, three runs by the right
+            // one. This is the case that would silently map an extent backwards.
+            vec![12, 11, 10],
+            vec![5],
+            vec![],
+            // A 64 MiB large-page window as measured: one block of frames.
+            (0..16384).collect(),
+        ] {
+            let counted = Located::runs(&frames);
+            let carried = Located::locator(&frames);
+            let runs = carried.pfn_runs().expect("locator() always produces Pfns");
+            assert_eq!(runs.len(), counted.len(), "run counts differ for {frames:?}");
+            for (r, (first, len)) in runs.iter().zip(&counted) {
+                assert_eq!((r.first_frame, r.frames), (*first as u64, *len as u64));
+            }
+            // …and the wire form expands back to the frame list it came from,
+            // so nothing is lost between the two spellings.
+            assert_eq!(
+                carried.frame_numbers().collect::<Vec<_>>(),
+                frames.iter().map(|f| *f as u64).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A dump is turned into a descriptor's locator by way of the permutation
+    /// check, not around it: the frame list that crosses the wire is the one
+    /// [`Located::frames`] has already vouched for.
+    #[test]
+    fn a_dump_becomes_a_locator_only_after_it_survives_the_permutation_check() {
+        let good = Located {
+            pages: vec![hit(1, 41, 7), hit(0, 40, 7), hit(2, 99, 7)],
+            ..Default::default()
+        };
+        let frames = good.frames(3).unwrap();
+        let l = Located::locator(&frames);
+        assert_eq!(l.frame_count(), 3);
+        assert_eq!(l.pfn_runs().unwrap().len(), 2, "40,41 coalesce; 99 does not");
+
+        let holed = Located { pages: vec![hit(0, 40, 7), hit(2, 99, 7)], ..Default::default() };
+        assert!(holed.frames(3).is_err(), "a hole must not reach the wire at all");
     }
 
     /// Knowing one's own process id turns the majority vote into an identity

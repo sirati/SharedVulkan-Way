@@ -156,6 +156,18 @@ impl PageMap {
         self.offsets.is_empty()
     }
 
+    /// The offsets themselves, in extent order.
+    ///
+    /// Exposed for exactly one caller: `security-model.md` R28's cross-check,
+    /// which compares the map the scan built against the map the frame list
+    /// translated to, page for page. Comparing the *coalesced* run lists would
+    /// not do — two different page maps can coalesce to run lists that differ
+    /// only in ways a reader has to reconstruct, and the number R28 needs is
+    /// "which page index disagreed".
+    pub fn offsets(&self) -> &[u64] {
+        &self.offsets
+    }
+
     /// Coalesce consecutive pages into runs.
     ///
     /// This is `arena-host`'s coalescer, which step 0 wrote and which design.md
@@ -198,6 +210,44 @@ impl Extent {
 
     pub fn total_len(&self) -> u64 {
         self.control_len() + self.arena_len()
+    }
+
+    /// Pages in the extent, control region and arena together.
+    pub fn pages(&self) -> u64 {
+        self.desc.control_pages + self.desc.arena_pages
+    }
+
+    /// Publish this extent as located by its **frame list** rather than by its
+    /// contents: `desc.locator` becomes [`Locator::Pfns`] (design.md §0.14).
+    ///
+    /// This is the guest-side half of the frame path, and it is deliberately
+    /// separate from [`ArenaProvider::commit`]: a provider that cannot ask its
+    /// own kernel where the pages are must not be able to express a frame list,
+    /// and one that can — `awe_probe::superfetch` on Windows, measured at
+    /// ~330 ms whatever the window is — should not have to build an `ExtentDesc`
+    /// by hand to say so.
+    ///
+    /// **The stamps are not skipped, and the caller must not skip them.** R28
+    /// makes the content scan the cross-check that the undocumented query is
+    /// telling the truth, run once at attach while the stamps still exist. A
+    /// guest that published a frame list *instead* of stamping would leave the
+    /// far side with a locator it cannot check and no way to notice a shifted
+    /// field — R21's silent wrong answer, arrived at by a shortcut.
+    ///
+    /// `frames` is one frame number per 4 KiB page of the extent, in extent
+    /// order. A list of the wrong length is refused rather than truncated: a
+    /// short frame list translates into an arena with a hole in it, and nothing
+    /// downstream of the locator would notice.
+    pub fn locate_by_frames(&mut self, frames: &[u64]) -> Result<()> {
+        let pages = self.pages();
+        if frames.len() as u64 != pages {
+            return Err(Error::BadGeometry("the frame list is not one frame per page"));
+        }
+        if pages == 0 {
+            return Err(Error::BadGeometry("an extent with no pages"));
+        }
+        self.desc.locator = Locator::from_frames(frames);
+        Ok(())
     }
 
     /// Does this extent need the R26 canary?
@@ -437,6 +487,44 @@ mod tests {
 
         assert!(contiguous_extent(7, 0, 100, 4096).is_err(), "not a whole page");
         assert!(contiguous_extent(7, 0, 4096, 0).is_err(), "no arena");
+    }
+
+    /// The guest-side half of design.md §0.14: an extent that *was* going to be
+    /// found by content is re-described as one whose frames are known, and the
+    /// descriptor then carries the frame list instead of nothing.
+    #[test]
+    fn an_extent_can_be_republished_as_located_by_its_frame_list() {
+        let mut e = contiguous_extent(7, 0, PAGE as u64, 3 * PAGE as u64).unwrap();
+        assert_eq!(e.desc.locator, Locator::Scan, "the locating path is the default");
+        assert_eq!(e.pages(), 4);
+
+        // Three pages on adjacent frames and one elsewhere: two runs, which is
+        // the shape a real window has and the reason the wire form is runs.
+        e.locate_by_frames(&[0x4_2000, 0x4_2001, 0x4_2002, 0x9_9999]).unwrap();
+        let runs = e.desc.locator.pfn_runs().expect("the descriptor now carries frames");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(e.desc.locator.frame_count(), e.pages());
+
+        // Nothing else about the extent moved: the locator says how to find the
+        // pages and not which pages they are.
+        assert_eq!(e.desc.run_id, 7);
+        assert_eq!(e.desc.control_pages, 1);
+        assert_eq!(e.desc.arena_pages, 3);
+    }
+
+    /// A frame list of the wrong length translates into an arena with a hole in
+    /// it, and nothing downstream of the locator would notice — so the refusal
+    /// has to happen here, where the page count is still known.
+    #[test]
+    fn a_frame_list_that_is_not_one_frame_per_page_is_refused() {
+        let mut e = contiguous_extent(7, 0, PAGE as u64, 3 * PAGE as u64).unwrap();
+        assert!(e.locate_by_frames(&[1, 2, 3]).is_err(), "one page short");
+        assert!(e.locate_by_frames(&[1, 2, 3, 4, 5]).is_err(), "one page long");
+        assert!(e.locate_by_frames(&[]).is_err());
+        // …and the descriptor is untouched by a refusal, rather than left
+        // half-updated with a list it already rejected.
+        assert_eq!(e.desc.locator, Locator::Scan);
+        e.locate_by_frames(&[1, 2, 3, 4]).unwrap();
     }
 
     /// design.md §4.3: the descriptor "carries no addresses at all" on the
