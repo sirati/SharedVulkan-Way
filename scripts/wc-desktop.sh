@@ -790,6 +790,88 @@ chmod +x s8.sh" >/dev/null
       fetch typed.bmp "stage33-typed$SUFFIX.png" "the window after $TYPE_TEXT was typed into it"
     fi
   fi
+
+  # --------------------------------------------------------------- STAGE 37 --
+  # Where the click landed, on the desktop the user clicks on.
+  #
+  # `weston-terminal` draws its own title bar, and a click that lands in it
+  # answers with `xdg_toplevel.move` — which this compositor hands to Windows as
+  # `SC_MOVE`, and `SC_MOVE` with no mouse point is the *keyboard* move mode,
+  # which warps the cursor to the caption. That is the whole of the reported
+  # symptom: "clicking under the second titlebar instead starts moving the
+  # window", "and in fact it snaps the mouse there".
+  #
+  # So the assertion is one line of the compositor's own log. A click 40 px down
+  # the client area is below the bar the terminal drew, for any inset up to its
+  # 32, and must produce no move at all. Before §37 the same click produced one
+  # every time, because the click arrived 32 px high.
+  #
+# **Click first, then type, in one invocation** — `probe-input` does the mouse
+  # before the keys, which is the order a user produces and the order the
+  # question needs. §33's block above types into a window nobody has clicked in;
+  # that is a different question and it keeps its own answer. This one is the
+  # user's sequence, and it is the only way to find out whether the reported
+  # dead keyboard was a consequence of the spurious move or a bug of its own:
+  # Wine reproduces the move and still delivers the keys, so it cannot decide it
+  # (§37.7).
+  #
+  # `--pid` for §33's reason, unchanged: several worktrees drive this guest and
+  # every compositor on it registers `WaycomposeToplevel`.
+  if [ "$CLIENT" = "weston-terminal" ]; then
+    echo
+    echo "== 5c. §37: a click below the bar the client drew, and then typing =="
+    local moves_before moves_after frames_before frames_after
+    g "cat $DESKDIR/comp-$sock.log" >"$RUNDIR/comp-click0.log" 2>&1
+    moves_before=$(grep -c "handed a move to Windows" "$RUNDIR/comp-click0.log")
+    frames_before=$(h "ls $SHARE/frames/*.ppm 2>/dev/null | wc -l")
+    int wcclick "$DESKDIR_WIN\\probe-input.exe" \
+      "--pid $CPID --class WaycomposeToplevel --wait 15 --at 200,40 --no-leave --type echo_waycompose_types --log $DESKDIR_WIN\\clicked.txt" \
+      >/dev/null 2>&1
+    g "cat $DESKDIR/clicked.txt" >"$RUNDIR/clicked.txt" 2>&1
+    sed 's/^/        /' "$RUNDIR/clicked.txt" | head -8
+    cp "$RUNDIR/clicked.txt" "$OUT/clicked$SUFFIX.txt" 2>/dev/null
+    sleep 3
+    g "cat $DESKDIR/comp-$sock.log" >"$RUNDIR/comp-click1.log" 2>&1
+    moves_after=$(grep -c "handed a move to Windows" "$RUNDIR/comp-click1.log")
+    frames_after=$(h "ls $SHARE/frames/*.ppm 2>/dev/null | wc -l")
+
+    # The same refusal §33 added, for the same reason: a click that went into
+    # somebody else's window proves nothing about ours, and reporting it as a
+    # pass would be the harness manufacturing its own green.
+    if grep -q "REFUSED to inject" "$RUNDIR/clicked.txt"; then
+      miss "§37: another window held the foreground; nothing was clicked and nothing is claimed"
+    elif ! grep -q "target HWND" "$RUNDIR/clicked.txt"; then
+      bad "§37: probe-input found no window of pid $CPID to click in"
+    else
+      if [ "$moves_after" -gt "$moves_before" ]; then
+        bad "§37: a click 40 px down the client area started $((moves_after - moves_before)) window move(s) — it landed above where it was aimed"
+      else
+        ok "§37: a click 40 px down the client area started no window move, so it landed below the bar the client drew"
+      fi
+      # The keyboard, after the click. **The frame count and not the
+      # photograph** is the assertion, for the reason §37.7 records: with the
+      # bug present the "picture changed" check was green because the *window
+      # had moved*, 95034 pixels against 463 for one line of glyphs. A terminal
+      # redraws only when its content changes, so new frames after keys are
+      # about the keys — and if the click had wedged Windows in a modal move
+      # loop there would be no frames at all.
+      if [ "${frames_after:-0}" -gt "${frames_before:-0}" ]; then
+        ok "§37: the terminal repainted $((frames_after - frames_before)) times after being clicked in and typed at"
+      else
+        bad "§37: nothing repainted after the click and the keys ($frames_before -> $frames_after) — the keyboard is dead after a click, and it is not the coordinate bug"
+      fi
+      grep -q "no evdev keycode for scan" "$RUNDIR/comp-click1.log" \
+        && bad "§37: a scan code had no evdev keycode" \
+        || note "§37: every scan code of the typed word translated"
+      sleep 2
+      int wcshot "cmd.exe" \
+        "/c $DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DESKDIR_WIN\\clicked.bmp >> $DESKDIR_WIN\\shot.txt 2>&1" \
+        >/dev/null 2>&1
+      fetch clicked.bmp "stage37-clicked-then-typed$SUFFIX.png" \
+        "the terminal after a click 40 px down and then typing"
+    fi
+  fi
+
   int wcshot "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe shot --class Shell_TrayWnd --out $DESKDIR_WIN\\tray2.bmp >> $DESKDIR_WIN\\shot.txt 2>&1" \
     >/dev/null 2>&1

@@ -282,6 +282,26 @@ struct Window {
     /// question the current value can answer, and an animating client commits
     /// sixty times a second with the same icon attached.
     icon_dirty: bool,
+    /// The window-geometry rectangle's origin, in root-surface coordinates —
+    /// the number that turns a pixel of the window into a point of the surface.
+    ///
+    /// ADDED FOR §37, and it is the whole of that section's bug. `compose_tree`
+    /// blits the tree at `-(gx, gy)`, so the window's top-left pixel **is**
+    /// surface point `(gx, gy)`; a pointer at window pixel `(x, y)` is
+    /// therefore at surface point `(x + gx, y + gy)`. Every input event took
+    /// the window pixel and called it a surface point, which for any client
+    /// that declares an inset — every GTK client, every Weston toytoolkit
+    /// client — put the click `(gx, gy)` up and to the left of the pixel the
+    /// user aimed at.
+    ///
+    /// Written by `compose_tree`, from the same `(gx, gy)` the blit used,
+    /// rather than read again from the cached state at input time. That is
+    /// deliberate and it is the point of the field: **the pointer and the
+    /// pixels must use the same number**, and two independent reads of a
+    /// double-buffered value can disagree by one commit — which is a click that
+    /// lands in the wrong place for exactly one frame, the least debuggable
+    /// version of this bug.
+    content_offset: (i32, i32),
 }
 
 pub struct State {
@@ -1085,6 +1105,19 @@ impl State {
         self.by_id(id).map(|w| w.role.surface().clone())
     }
 
+    /// A window's surface **and where that surface's origin is**, which is what
+    /// every input event needs and what none of them had until §37.
+    ///
+    /// Returned together on purpose. The two are read from the same `Window` in
+    /// the same borrow, so there is no call site that can pick up the surface
+    /// and forget the origin — which is precisely the bug §37 fixes, committed
+    /// once in `pointer_motion` and copied from there into `touch_down` and
+    /// `touch_motion` with the comment "`(0, 0)` for the same reason".
+    fn surface_and_origin(&self, id: WindowId) -> Option<(WindowId, WlSurface, (f64, f64))> {
+        self.by_id(id)
+            .map(|w| (id, w.role.surface().clone(), surface_origin(w.content_offset)))
+    }
+
     /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
     /// bottom of the stack first.
     ///
@@ -1304,9 +1337,9 @@ impl State {
     /// something this file could get subtly wrong.
     fn pointer_motion(&mut self, id: Option<WindowId>, x: f64, y: f64, time: u32) {
         let pointer = self.pointer.clone();
-        let focus = id.and_then(|id| self.surface_of(id).map(|s| (id, s)));
+        let focus = id.and_then(|id| self.surface_and_origin(id));
         match &focus {
-            Some((id, _)) => {
+            Some((id, _, _)) => {
                 self.pointer_focus = Some(*id);
                 self.pointer_at = (x, y);
             }
@@ -1314,15 +1347,14 @@ impl State {
         }
         pointer.motion(
             self,
-            // The second element is the surface's origin in compositor space.
-            // Every window here is its own `HWND` with its own coordinate
-            // system and the platform has already subtracted the frame, so the
-            // surface origin *is* the compositor origin and this is `(0, 0)`.
-            // It is written out rather than assumed because the moment a scene
-            // graph exists — subsurfaces, popups — it stops being true, and a
-            // hard-coded zero somewhere else would be found by a popup landing
-            // in the wrong place.
-            focus.map(|(_, s)| (s, (0.0, 0.0).into())),
+            // The second element is the surface's origin in compositor space,
+            // and smithay subtracts it from `location` to get the surface-local
+            // point the client is sent. Compositor space here is the window's
+            // client area in pixels — one `HWND` per window, the platform has
+            // already subtracted the frame — so the only thing left in it is
+            // the client's own window-geometry inset, and that is
+            // [`Window::content_offset`] negated. See `surface_and_origin`.
+            focus.map(|(_, s, origin)| (s, origin.into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial: SERIAL_COUNTER.next_serial(),
@@ -1486,7 +1518,7 @@ impl State {
         time: u32,
     ) {
         let Some(touch) = self.touch.clone() else { return };
-        let Some(surface) = self.surface_of(id) else { return };
+        let Some((_, surface, origin)) = self.surface_and_origin(id) else { return };
         // Logged, unlike pointer motion, because a contact is rare — a few per
         // gesture rather than one per pixel — and because "touch does nothing"
         // is otherwise indistinguishable from "no touch message ever arrived",
@@ -1507,10 +1539,12 @@ impl State {
         );
         touch.down(
             self,
-            // The surface origin in compositor space, `(0, 0)` for the same
-            // reason it is in `pointer_motion`: one `HWND` per window, and the
-            // platform has already subtracted the frame.
-            Some((surface, (0.0, 0.0).into())),
+            // The surface origin in compositor space, found the same way it is
+            // in `pointer_motion` and for the same reason — §24 said touch
+            // reuses the pointer's conversion rather than doing its own
+            // arithmetic, and the way to keep that promise is to call the same
+            // function rather than to write the same expression.
+            Some((surface, origin.into())),
             &DownEvent {
                 slot: Some(slot as u32).into(),
                 location: (x, y).into(),
@@ -1537,7 +1571,7 @@ impl State {
         // contact. Which is why a motion for a window that has gone away is
         // still worth delivering — the contact's focus is the surface it landed
         // on, not this one.
-        let focus = self.surface_of(id).map(|s| (s, (0.0, 0.0).into()));
+        let focus = self.surface_and_origin(id).map(|(_, s, origin)| (s, origin.into()));
         touch.motion(
             self,
             focus,
@@ -2229,7 +2263,10 @@ impl State {
             .map(|s| s.format())
             .unwrap_or(PixelFormat::Xrgb8888);
 
-        let window = self.windows.get(root).expect("caller checked");
+        let window = self.windows.get_mut(root).expect("caller checked");
+        // The one place this number is decided, for the pixels *and* for the
+        // pointer. See `Window::content_offset`.
+        window.content_offset = (gx, gy);
         let shadow = window.shadow.clone();
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
         let reshaped = shadow.reset(gw, gh, format);
@@ -2257,6 +2294,33 @@ impl State {
             .collect();
         (damage, gw, gh)
     }
+}
+
+/// Where a surface's origin sits in its window's pixels, given the window
+/// geometry offset the blit used.
+///
+/// ADDED FOR §37, as one function rather than one expression in three places.
+///
+/// # The sign, worked out rather than guessed
+///
+/// `compose_tree` blits every surface of the tree at `(x - gx, y - gy)`, so
+/// window pixel `(0, 0)` shows the buffer's pixel `(gx, gy)`. Equivalently the
+/// buffer's origin — surface point `(0, 0)` — is at window pixel `(-gx, -gy)`,
+/// which is off the top-left of the window and is exactly right: an inset says
+/// the client committed more buffer than window, and the extra is above and to
+/// the left.
+///
+/// smithay takes the origin in that form and subtracts it
+/// (`event.location - loc`), so a pointer at window pixel `(x, y)` reaches the
+/// client as surface point `(x + gx, y + gy)` — the same arithmetic the blit
+/// did, in the same direction.
+///
+/// **The numbers this is wrong by, when it is missing.** Weston's toytoolkit —
+/// `weston-terminal`, `weston-eventdemo` — declares `(32, 32)`; Firefox under
+/// client-side decorations declares `(26, 23)` and under server-side ones
+/// `(0, 0)`, which is why the bug was invisible in half of the desktop.
+pub(crate) fn surface_origin(content_offset: (i32, i32)) -> (f64, f64) {
+    (-f64::from(content_offset.0), -f64::from(content_offset.1))
 }
 
 /// The root of `surface`'s subsurface tree — the surface that has the
@@ -2626,6 +2690,10 @@ impl XdgShellHandler for State {
                 presented: 0,
                 icon_from_client: false,
                 icon_dirty: false,
+                // Zero until the first commit, which is the only honest value:
+                // a window with no buffer has no geometry rectangle either, and
+                // no input can reach it before it has mapped.
+                content_offset: (0, 0),
             },
         );
     }
@@ -2886,6 +2954,13 @@ impl XdgShellHandler for State {
                 // is one type for both roles, which is stage 9's decision.
                 icon_from_client: false,
                 icon_dirty: false,
+                // A popup has an inset of its own — GTK gives its menus the
+                // same shadow margin it gives its windows — and it is found the
+                // same way, at its first commit. The *position* above is
+                // already in the parent's window-geometry coordinates, which is
+                // the parent's `content_offset` applied by the client rather
+                // than by us; this is the popup's own.
+                content_offset: (0, 0),
             },
         );
     }
@@ -3583,3 +3658,76 @@ delegate_xdg_decoration!(State);
 delegate_kde_decoration!(State);
 // ADDED FOR STAGE 12. `wp_cursor_shape_manager_v1` and its per-pointer device.
 delegate_cursor_shape!(State);
+
+// ---------------------------------------------------------------------------
+// §37: the window-geometry inset, which is the only thing between a window
+// pixel and a surface point
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::surface_origin;
+
+    /// What smithay does with the origin, written out so the test asserts on
+    /// the number the *client* sees rather than on the one this file returns.
+    ///
+    /// `PointerHandle::motion` and `TouchHandle::down` both compute
+    /// `event.location - loc` (vendor/smithay/src/input/pointer/mod.rs:795,
+    /// input/touch/mod.rs:566), so this is that subtraction and nothing else.
+    fn delivered(content_offset: (i32, i32), window_pixel: (f64, f64)) -> (f64, f64) {
+        let origin = surface_origin(content_offset);
+        (window_pixel.0 - origin.0, window_pixel.1 - origin.1)
+    }
+
+    /// The case that hid the bug for twenty-six stages: a client with no inset.
+    ///
+    /// Every check written before §37 used one of these — `wc-shmclient`,
+    /// `weston-simple-shm`, the WLCS suite, Firefox under **server-side**
+    /// decorations — and for all of them the conversion is the identity, so a
+    /// missing term is invisible.
+    #[test]
+    fn a_client_with_no_inset_is_the_identity() {
+        assert_eq!(delivered((0, 0), (200.0, 150.0)), (200.0, 150.0));
+    }
+
+    /// **The measurement, from `scripts/wc-input.sh pointer`.**
+    ///
+    /// `weston-eventdemo` declares `set_window_geometry(32, 32, 436, 336)` and
+    /// was clicked at window pixel `(200, 150)`. Before §37 it printed
+    /// `x: 200, y: 150`; the pixel under the cursor is the buffer's
+    /// `(232, 182)`, because that is where `compose_tree` blitted it from.
+    #[test]
+    fn the_weston_toytoolkit_inset_is_thirty_two_each_way() {
+        assert_eq!(delivered((32, 32), (200.0, 150.0)), (232.0, 182.0));
+    }
+
+    /// Firefox under client-side decorations, whose inset is not square — so a
+    /// fix that carried one number for both axes would pass the test above and
+    /// fail here.
+    #[test]
+    fn firefox_under_csd_is_offset_by_twenty_six_and_twenty_three() {
+        assert_eq!(delivered((26, 23), (0.0, 0.0)), (26.0, 23.0));
+    }
+
+    /// The sign, stated as the thing a user can see.
+    ///
+    /// `weston-terminal`'s title bar is drawn in the first ~30 px of the
+    /// *window*, which is surface rows 32..62. A click 8 px **below** the bar,
+    /// at window pixel `(200, 40)`, must not be inside it — before §37 it
+    /// arrived as surface `(200, 40)`, which is inside, and the terminal
+    /// answered with `xdg_toplevel.move` and warped the pointer to the bar.
+    #[test]
+    fn a_click_below_the_title_bar_is_below_the_title_bar() {
+        let (_, y) = delivered((32, 32), (200.0, 40.0));
+        assert_eq!(y, 72.0);
+        assert!(y >= 62.0, "a click at window y=40 landed in the title bar at surface y={y}");
+    }
+
+    /// An inset can be negative — `set_window_geometry` takes a signed origin,
+    /// and a client whose window is *larger* than its buffer is legal. The
+    /// conversion is arithmetic rather than a clamp, so it is symmetric.
+    #[test]
+    fn a_negative_inset_shifts_the_other_way() {
+        assert_eq!(delivered((-5, -7), (100.0, 100.0)), (95.0, 93.0));
+    }
+}
