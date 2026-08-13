@@ -240,6 +240,18 @@ fn wide(s: &str) -> Vec<u16> {
 /// which matters because Wine is the only place this code can currently be run
 /// at all.
 pub fn random_section_name() -> String {
+    format!("Local\\{}", random_token())
+}
+
+/// The unguessable part of a name, without deciding what namespace it goes in.
+///
+/// Split out of [`random_section_name`] for `crate::publish`, which mints file
+/// names in a directory the caller chose rather than in the NT object
+/// namespace. The randomness requirement is identical and so is the degraded
+/// path; only the prefix differs, and having one source of the bytes means a
+/// future change to how they are drawn cannot apply to one caller and not the
+/// other.
+pub fn random_token() -> String {
     let mut bytes = [0u8; 16];
     // SAFETY: a live 16-byte buffer whose length we pass truthfully. The null
     // algorithm handle is required by `BCRYPT_USE_SYSTEM_PREFERRED_RNG`.
@@ -259,9 +271,9 @@ pub fn random_section_name() -> String {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         bytes.copy_from_slice(&now.to_le_bytes());
-        return format!("Local\\wc-weak-{}", hex(&bytes));
+        return format!("wc-weak-{}", hex(&bytes));
     }
-    format!("Local\\wc-{}", hex(&bytes))
+    format!("wc-{}", hex(&bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {

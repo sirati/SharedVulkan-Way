@@ -12,9 +12,30 @@ mingw-built smithay compositor lets a real C client create an `xdg_toplevel`.**
 with it — that was the prerequisite, and it needed one upstream patch. Still no
 pixels; that is stage 3.
 
+**Stage 6 is done: you can type into it.** `wc-compositor.exe` advertises a
+`wl_seat` with a pointer and a keyboard, turns Win32 scan codes into Linux evdev
+keycodes, and gets a keymap across the boundary — which is `wl_keyboard.keymap`'s
+`h` argument going the *other* way from a `wl_shm` pool, and is the direction
+stage 4 implemented without ever exercising. `weston-terminal`, unmodified, in a
+window with Windows' own caption, with text typed into it by `SendInput`:
+[`docs/stage6-typing.png`](docs/stage6-typing.png). Under Wine — stage 5 put the
+earlier stages on the real guest, and no input has run there yet.
+
+**Two known defects of the keyboard, stated here because both are silent**
+(`docs/design.md` §11.4):
+
+* **A layout outside `us`/`gb`/`de`/`fr` produces American letters.** The key
+  *positions* are right, so the keyboard feels like it works and the characters
+  are not the ones printed on the keys. Nothing errors. Adding a layout is three
+  lines.
+* **There is no IME, so CJK input is impossible** — not degraded, impossible.
+  `WM_IME_*` is not handled and `text-input-v3` is not implemented, so there is
+  nowhere for a composed string to go.
+
 Read [`docs/design.md`](docs/design.md) first. It decides things and says why —
-§7 is stage 2. [`vendor/PATCHES.md`](vendor/PATCHES.md) is the inventory of what
-was changed in the forked upstream crates.
+§7 is stage 2, §11 is stage 6, §12 is stage 7.
+[`vendor/PATCHES.md`](vendor/PATCHES.md) is the inventory of what was
+changed in the forked upstream crates.
 
 ## Getting a shell
 
@@ -90,9 +111,9 @@ protocol bytes do not. Without `WC_HOST` those four blocks skip and say why.
 Everything passes. It did not in stage 5: the shared mount is not coherent while
 mapped, so a client that redraws every frame got a frozen window and
 `wc-guest.sh` said so. Stage 7 replaced the region with guest RAM located through
-QEMU's flat view and the same check now reports 606 frames, 60 distinct, the
+QEMU's flat view and the same check now reports 626 frames, 60 distinct, the
 commonest 11 — the control's numbers. `docs/design.md` §10.7 is the failure and
-§11 is the fix.
+§12 is the fix.
 
 ## Layout
 
@@ -102,11 +123,13 @@ crates/
                  (and `wc-poolcost`, which measures what reaching one costs)
   wc-arena-host  finds the guest compositor's arena in QEMU's memory backend.
                  NOT a workspace member: it path-depends on shared-vulkan-base,
-                 which must stay out of the Windows cross gate. See §11.3
+                 which must stay out of the Windows cross gate. See §12.3
   wc-transport   AF_UNIX on both platforms, peer credentials, accept
   wc-server      the stage-1 server
   wc-probe       a client that writes the wire format by hand
-  wc-compositor  the smithay compositor — xdg_shell, one HWND per toplevel, GDI
+  wc-compositor  the smithay compositor — xdg_shell, one HWND per toplevel, GDI,
+                 and a wl_seat driven by Win32 input (`src/input.rs` is the
+                 scan-code-to-evdev table and the build-time keymaps)
   wc-shmclient   a Windows client that speaks the dialect, for stage 3
   wc-proxy       stage 4, **Linux only**: a Wayland server to an unmodified
                  local client and a client of the Windows compositor, so a
@@ -129,6 +152,12 @@ scripts/
   wc-proxy.sh        the stage-4 acceptance test — an **unmodified** third-party
                      client painting into a Windows window; `cost` measures what
                      a commit costs per copy scope and per transport
+  wc-input.sh        the stage-6 acceptance test — `linux` is the seat against
+                     Weston clients, `wine` is real WM_KEYDOWN across the
+                     boundary, `term` types into weston-terminal and photographs
+                     the result
+  probe-input.c      SendInput/PostMessage into the compositor's window, so the
+                     keystrokes in that test are Win32's rather than ours
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux
   probe-filemap-peer.c   MAP_SHARED mmap? Measured before stage 4 depended on it,
                      and measured again across the hypervisor in stage 5

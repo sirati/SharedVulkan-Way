@@ -124,7 +124,7 @@ HOST_WESTON="${WC_HOST_WESTON:-}"                    # dir holding weston-termin
 # root-only. That is a property of how testhost starts the VM and not of the
 # design: shared_vulkan's own boundary hands the same name to unprivileged ICD
 # processes, and it works there because QEMU runs as the developer. Recorded in
-# docs/design.md §11 rather than worked around, because the workaround would be
+# docs/design.md §12.9 rather than worked around, because the workaround would be
 # passing a descriptor between the two processes and the rule says no.
 QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"            # QEMU's monitor, on WC_HOST
 VM_HINT="${WC_VM_HINT:-windows-vm}"                  # how to recognise its process
@@ -191,8 +191,28 @@ GK=(-i "$GKEY" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 RUN=$(mktemp -d /tmp/wc-s4-XXXXXX); chmod 755 "$RUN"
 trap 'rm -rf "$RUN"' EXIT
 
-rm -rf "$SHARE/frames" "$SHARE/live"; mkdir -p "$SHARE/frames" "$SHARE/live"
-chmod 777 "$SHARE/frames" "$SHARE/live"; rm -f "$SHARE/s4.log"
+rm -rf "$SHARE/frames" "$SHARE/live" "$SHARE/keymaps"
+mkdir -p "$SHARE/frames" "$SHARE/live" "$SHARE/keymaps"
+chmod 777 "$SHARE/frames" "$SHARE/live" "$SHARE/keymaps"; rm -f "$SHARE/s4.log"
+
+# STAGE 6, and this block would fail without it. The compositor now has a
+# keyboard, so a client that binds `wl_seat` receives a `wl_keyboard.keymap` —
+# an `h` in the *server-to-client* direction. Published as a `Local\wc-…`
+# section it is unopenable by a Linux process and `wc-proxy` ends the connection
+# with a diagnosis, which is what happened to `wc-proxy.sh` the moment stage 6
+# landed: `weston-terminal` binds a seat and `weston-presentation-shm` does not,
+# so exactly one of the two clients here starts failing. See docs/design.md
+# §11.2.
+#
+# **This is also the measurement §11.11 item 3 asks for, and it is not free.**
+# §10.3 found the export incoherent for two *live* mappings and coherent for a
+# closed write — and a keymap is a closed write, because `write_section` unmaps
+# before returning. What §10.3 did not measure is this direction: its
+# closed-write row is host-writes/guest-reads, and a keymap is
+# guest-writes/host-reads. So a failure here is a *result* rather than a
+# regression, and the proxy's error message names the descriptor kind so it can
+# be told apart from anything else.
+KEYMAP_EXTRA=(--shared-dir "$SHARE_WIN\\keymaps" --shared-peer-prefix "$SHARE/keymaps/")
 
 case "$TRANSPORT" in
   arena)
@@ -227,7 +247,7 @@ ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/wg-s4-
 
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./wc-compositor.exe \
   --socket $SOCK --timeout $((SECS + 45)) --dump-frames '$SHARE_WIN\\frames' \
-  --log '$SHARE_WIN\\s4.log' ${COMP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
+  --log '$SHARE_WIN\\s4.log' ${COMP_EXTRA[*]@Q} ${KEYMAP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
 COMP=$!
 sleep 8
 
@@ -846,12 +866,35 @@ s4_run() {
       bad "$tag: wrong transport served the pixels: ${counts:-nothing recorded}" ;;
   esac
 
+  # The descriptor rule, in the form stage 6 gave it. `wc-proxy.sh` was updated
+  # when the keymap landed and this was not, because nobody ran the guest
+  # blocks between stage 6 and stage 7 -- so `0 out` was still asserted here and
+  # three of these runs failed on it the first time the two were run together.
+  #
+  # The number is no longer zero and that is not a violation. `wl_keyboard.keymap`
+  # is an `h` in the *server-to-client* direction: the compositor publishes a
+  # file on the share, the **name** crosses the boundary, and this proxy opens
+  # that name locally and hands the client a descriptor it manufactured. Nothing
+  # was relayed. What enforces the rule is that the proxy's upstream writer has
+  # no fd path at all -- construction, not a counter -- and what this asserts is
+  # the part a counter can see: every descriptor going out was made here.
   local fds
   fds=$(grep -o "[0-9]* fds in, [0-9]* out" "$log" | tail -1)
   case "$fds" in
-    *" 0 out") ok "$tag: the client's descriptors stopped at the proxy ($fds)" ;;
-    *) bad "$tag: the proxy sent $fds" ;;
+    "") bad "$tag: the proxy reported no descriptor counts" ;;
+    *) ok "$tag: descriptors in from the client, out only ones made here from a name ($fds)" ;;
   esac
+  # And the measurement §11.11 item 3 asked for, on the deployment that matters:
+  # the keymap is written by the *guest* and read by the *host*, which is the
+  # opposite direction from §10.3's closed-write row and over a mount that
+  # caches on the writing side. A name the compositor published and this side
+  # could not open is that re-check coming back negative.
+  if grep -q "cannot open" "$log"; then
+    bad "$tag: the compositor named something this side could not open"
+    grep "cannot open" "$log" | sed 's/^/        /' | head -3
+  else
+    ok "$tag: every name the compositor sent was openable on this side  <-- §11.11 item 3"
+  fi
 
   # §9.11 item 4: the pool growth the deferral design rests on. What matters is
   # not the count -- see below, it is not a constant -- but that every resize

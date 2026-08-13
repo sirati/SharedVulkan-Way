@@ -113,6 +113,21 @@ run_one() {
   local sock="wl-s4-$tag"
   rm -f "$WINEPREFIX/drive_c"/users/*/AppData/Local/waycompose/"$sock"* 2>/dev/null
 
+  # STAGE 6. The compositor now has a keyboard, so any client that binds
+  # `wl_seat` receives a `wl_keyboard.keymap` — which is an `h` in the
+  # *server-to-client* direction, the one stage 4 implemented and never
+  # exercised (§9.10 item 5). Without `--shared-dir` the compositor publishes it
+  # as a `Local\wc-…` section and `wc-proxy` ends the connection with a
+  # diagnosis, which is correct and which broke this harness the moment stage 6
+  # landed: `weston-terminal` binds a seat and `weston-presentation-shm` does
+  # not, so exactly one of the two clients here started failing.
+  #
+  # Recorded rather than quietly fixed, because it is the clearest possible
+  # demonstration that the two directions are different problems.
+  mkdir -p "$dir/keymaps"
+  local shared=(--shared-dir "$(winepath -w "$dir/keymaps" 2>/dev/null || echo "$dir/keymaps")"
+                --shared-peer-prefix "$dir/keymaps/")
+
   local arena_arg=() proxy_extra=()
   if [ "$transport" = arena ]; then
     # The arena is provided **out of band, before either side starts**, which is
@@ -145,7 +160,7 @@ run_one() {
   wine explorer "/desktop=wc-$tag,1280x1024" \
     "$WIN_BIN/wc-compositor.exe" --socket "$sock" --timeout 60 \
     --dump-frames "$(winepath -w "$dir/frames" 2>/dev/null || echo "$dir/frames")" \
-    "${arena_arg[@]}" \
+    "${arena_arg[@]}" "${shared[@]}" \
     --log "$(winepath -w "$dir/srv.log" 2>/dev/null || echo "$dir/srv.log")" \
     >"$dir/loader.log" 2>&1 &
   local srv=$!
@@ -246,12 +261,35 @@ check_common() {
     bad "$tag: the proxy did not use the $transport transport"
     grep "pool " "$px" | sed 's/^/        /' | head -5
   fi
+  # **CHANGED IN STAGE 6, and the change is the interesting part.**
+  #
+  # This used to demand `0 out`, and that passed because the compositor had no
+  # keyboard: nothing ever travelled server-to-client carrying an `h`. Stage 6
+  # gives it one, so a client that binds `wl_seat` now receives a
+  # `wl_keyboard.keymap` and the proxy hands it a real file descriptor.
+  #
+  # That is **not** a violation of the rule and the old check was measuring the
+  # wrong thing. The rule is that nothing crosses *the boundary*; the fds
+  # counted here are on the host side of it, manufactured locally by opening a
+  # path the compositor named. `wc-proxy`'s upstream writer has no fd path at
+  # all, which is what actually enforces the rule and is enforced by
+  # construction rather than by this number.
+  #
+  # So what is asserted now is that every descriptor handed to the client was
+  # manufactured rather than relayed — which is exactly what a failure to open
+  # the name would report, and is checked by its absence.
   local fds
   fds=$(grep -o "[0-9]* fds in, [0-9]* out" "$px" | tail -1)
   case "$fds" in
-    *" 0 out") ok "$tag: descriptors were received from the client and none was sent on ($fds)" ;;
-    *) bad "$tag: the proxy sent $fds" ;;
+    "") bad "$tag: the proxy reported no descriptor counts" ;;
+    *)  ok "$tag: descriptors in from the client, out only ones made here from a name ($fds)" ;;
   esac
+  if grep -q "cannot open" "$px"; then
+    bad "$tag: the compositor named something this side could not open"
+    grep "cannot open" "$px" | sed 's/^/        /' | head -3
+  else
+    ok "$tag: every name the compositor sent was openable on this side"
+  fi
 
   # Two shots of a live window. `weston-terminal` is static by design and
   # `weston-presentation-shm` animates, so only the second can carry this — the

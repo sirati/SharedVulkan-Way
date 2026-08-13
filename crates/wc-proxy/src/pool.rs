@@ -271,7 +271,7 @@ impl PoolTransport for SharedFile {
 /// is tested; replacing it does not touch the wire.
 /// Where an [`Arena`]'s bytes actually are.
 ///
-/// STAGE 7 SPLIT THIS IN TWO, and docs/design.md §11 is why. Everything above
+/// STAGE 7 SPLIT THIS IN TWO, and docs/design.md §12 is why. Everything above
 /// this enum — the allocator, the free list, the descriptor, the compositor's
 /// side of it — is identical for both, which is exactly the claim §9.10 item 3
 /// made and this stage had to cash: "substituting the real provider changes

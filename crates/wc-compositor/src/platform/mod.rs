@@ -58,12 +58,12 @@ use crate::surface::{Rect, Shadow};
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
-pub use win32::start;
+pub use win32::{current_layout, start};
 
 #[cfg(not(windows))]
 mod headless;
 #[cfg(not(windows))]
-pub use headless::start;
+pub use headless::{current_layout, start};
 
 /// Identifies one toplevel, and therefore one window.
 ///
@@ -212,6 +212,75 @@ pub enum FromUi {
     Minimized { id: WindowId, on: bool },
     /// The window gained or lost activation.
     Activated { id: WindowId, on: bool },
+
+    // --- input, stage 6 ----------------------------------------------------
+    //
+    // Everything below is already in Wayland's units by the time it crosses:
+    // **Linux evdev keycodes and button codes**, surface-local coordinates, and
+    // a millisecond timestamp. The translation from Win32's scan codes and
+    // client-area pixels happens on the platform side, in `crate::input` and
+    // `FrameStyle`, for the reason the whole file exists — the Wayland thread
+    // must not have to know what an `HWND` is, and the headless platform must
+    // be able to produce the same events without inventing a Win32.
+    /// Keyboard focus followed the foreground window.
+    ///
+    /// **Separate from [`FromUi::Activated`]**, which is `WM_ACTIVATE` and
+    /// becomes `xdg_toplevel`'s `activated` state. This one is
+    /// `WM_SETFOCUS`/`WM_KILLFOCUS` and becomes `wl_keyboard.enter`/`leave`.
+    /// They usually move together and they are not the same thing: a window can
+    /// be the active one while a child control holds the focus, and only the
+    /// focus decides where a key goes.
+    KeyboardFocus { id: WindowId, on: bool },
+    /// A key went down or came up, in evdev numbering.
+    Key {
+        id: WindowId,
+        /// Linux evdev keycode — the number `wl_keyboard.key` carries, and the
+        /// number `crate::input` produces. XKB's numbering is this plus eight
+        /// and smithay's `Keycode` is the XKB one, so `state.rs` adds it back
+        /// at the one place that talks to smithay. See the note there: the
+        /// offset was got wrong first and a third-party client is what found
+        /// it.
+        keycode: u16,
+        pressed: bool,
+        /// Milliseconds, from `GetMessageTime` on Win32.
+        time: u32,
+    },
+    /// The pointer entered the window, at surface coordinates.
+    PointerEnter { id: WindowId, x: f64, y: f64, time: u32 },
+    /// The pointer left the window. Needs `TrackMouseEvent` on Win32 — there is
+    /// no `WM_MOUSELEAVE` without it, and its absence is silent.
+    PointerLeave { id: WindowId, time: u32 },
+    PointerMotion { id: WindowId, x: f64, y: f64, time: u32 },
+    PointerButton {
+        id: WindowId,
+        /// Linux evdev button code: `BTN_LEFT` is 0x110.
+        button: u32,
+        pressed: bool,
+        time: u32,
+    },
+    /// A scroll. Both axes in one message because one wheel event is one
+    /// `wl_pointer.frame`, and splitting them would let a diagonal scroll
+    /// arrive as two frames — which clients are entitled to treat as two
+    /// separate gestures.
+    PointerAxis {
+        id: WindowId,
+        /// Surface-local units, positive down / right, as `wl_pointer.axis`
+        /// requires.
+        horizontal: f64,
+        vertical: f64,
+        /// Hundred-and-twentieths of a wheel detent, which is exactly what
+        /// Win32's `WHEEL_DELTA` counts in. `wl_pointer.axis_value120` takes
+        /// these numbers unchanged, which is not a coincidence — the protocol
+        /// added v120 because Windows and every high-resolution wheel already
+        /// spoke it.
+        v120_h: i32,
+        v120_v: i32,
+        time: u32,
+    },
+    /// The keyboard layout changed under us (`WM_INPUTLANGCHANGE`), naming one
+    /// of `crate::input::LAYOUTS`.
+    Layout { name: &'static str },
+
     /// The pump has stopped. Nothing more is coming and no window will paint
     /// again.
     Stopped,

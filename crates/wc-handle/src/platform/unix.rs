@@ -83,6 +83,17 @@ impl Drop for MappedView {
 /// so it has to be unguessable rather than merely unique. See the security note
 /// in the crate docs.
 pub fn random_section_name() -> String {
+    format!("{}/{}", std::env::temp_dir().display(), random_token())
+}
+
+/// The unguessable part of a name, without deciding what namespace it goes in.
+///
+/// Split out of [`random_section_name`] for `crate::publish`, which mints file
+/// names in a directory the caller chose rather than in the platform's default
+/// one. The randomness requirement is identical and so is the degraded path;
+/// only the prefix differs, and having one source of the bytes means a future
+/// change to how they are drawn cannot apply to one caller and not the other.
+pub fn random_token() -> String {
     let mut bytes = [0u8; 16];
     if File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
@@ -96,9 +107,9 @@ pub fn random_section_name() -> String {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         bytes[..16].copy_from_slice(&now.to_le_bytes());
-        return format!("{}/wc-weak-{}", std::env::temp_dir().display(), hex(&bytes));
+        return format!("wc-weak-{}", hex(&bytes));
     }
-    format!("{}/wc-{}", std::env::temp_dir().display(), hex(&bytes))
+    format!("wc-{}", hex(&bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {

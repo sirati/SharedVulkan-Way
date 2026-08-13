@@ -40,6 +40,7 @@
 //! `WM_CLOSE` reaches the client, and it is honest about being one; it is not a
 //! throughput limit, because a single turn drains every pending message.
 
+mod input;
 mod platform;
 mod state;
 mod surface;
@@ -76,13 +77,31 @@ struct Args {
     arenas: Vec<(u32, u64, String)>,
     /// Arenas to **provide** rather than open, as `id:size`.
     ///
-    /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §11).
+    /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §12).
     /// A `--arena` is a file both sides open; a `--arena-guest-ram` is memory
     /// this process commits and pins inside the virtual machine, stamped so
     /// that a process on the *host* can find those pages in QEMU's memory
     /// backend and write into them. The compositor prints the run id, which is
     /// the only thing the host needs and the only thing that crosses.
     guest_arenas: Vec<(u32, u64)>,
+    /// Where objects this process creates **for a client to open** are put, and
+    /// how the client spells that directory.
+    ///
+    /// ADDED FOR STAGE 6, and it is the mirror image of stage 4's `--pool-dir`
+    /// / `--peer-prefix` on the proxy. A `wl_shm` pool is created by the client
+    /// and opened by the compositor; a `wl_keyboard` keymap is created by the
+    /// compositor and opened by the client. The second direction has no
+    /// transport at all without this: a keymap in a `Local\wc-…` section is
+    /// perfectly well-formed and cannot be opened by a Linux process
+    /// (docs/design.md §9.10 item 5).
+    ///
+    /// Two flags rather than one `local:peer` argument, because both values are
+    /// paths and one of them has a drive letter in it.
+    shared_dir: Option<String>,
+    shared_peer_prefix: String,
+    /// Which of `input::LAYOUTS` to compile. Empty means "ask Windows", which
+    /// is what a user wants and what a harness cannot depend on.
+    layout: Option<String>,
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -97,6 +116,9 @@ fn parse_args() -> Result<Args, u8> {
         expect_presents: 0,
         arenas: Vec::new(),
         guest_arenas: Vec::new(),
+        shared_dir: None,
+        shared_peer_prefix: String::new(),
+        layout: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -146,6 +168,9 @@ fn parse_args() -> Result<Args, u8> {
                 };
                 args.guest_arenas.push((id, size));
             }
+            "--shared-dir" => args.shared_dir = it.next(),
+            "--shared-peer-prefix" => args.shared_peer_prefix = it.next().unwrap_or_default(),
+            "--layout" => args.layout = it.next(),
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
             }
@@ -280,6 +305,31 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // Where objects made for a client go. Before the socket exists, for the
+    // same reason the arenas are: a wrong path must be a startup failure with
+    // the path in it, not a client that connects and then dies on its first
+    // keymap.
+    if let Some(dir) = &args.shared_dir {
+        if args.shared_peer_prefix.is_empty() {
+            eprintln!(
+                "wc-compositor: --shared-dir needs --shared-peer-prefix: this process cannot \
+                 guess how the client spells that directory, and a guess would be wrong on \
+                 the deployment that matters"
+            );
+            return std::process::ExitCode::from(2);
+        }
+        match wc_handle::publish::set(dir, &args.shared_peer_prefix) {
+            Ok(()) => println!(
+                "wc-compositor: objects for clients go in {dir} ({:?} to them)",
+                args.shared_peer_prefix
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not use --shared-dir {dir}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     // The two channels. `ui_events` goes UI -> Wayland; the command channel in
     // the other direction is owned by `platform::start`.
     let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -301,6 +351,16 @@ fn main() -> std::process::ExitCode {
     };
     let platform::Started { ui, pump } = started;
 
+    // Which layout the keyboard compiles. `--layout` wins so a harness is not
+    // at the mercy of the machine's regional settings; otherwise ask the
+    // platform, which on Windows is `GetKeyboardLayout` and everywhere else is
+    // the fallback. Done after `platform::start` because on Win32 the answer
+    // depends on the thread having a message queue.
+    let layout = args
+        .layout
+        .clone()
+        .unwrap_or_else(|| platform::current_layout().to_owned());
+
     // The Wayland side is built and run entirely inside this closure. Nothing
     // it creates is ever named on the main thread, which is what makes the
     // `!Send` smithay state a non-question rather than a fight with the
@@ -311,7 +371,7 @@ fn main() -> std::process::ExitCode {
         .name("wayland".into())
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
-                args.expect_presents, ui, event_rx);
+                args.expect_presents, layout, ui, event_rx);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -340,6 +400,7 @@ fn wayland_thread(
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
+    layout: String,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
 ) -> u8 {
@@ -354,7 +415,7 @@ fn wayland_thread(
         }
     };
     let dh = display.handle();
-    let mut state = State::new(&dh, ui, events, debug_icon);
+    let mut state = State::new(&dh, ui, events, debug_icon, &layout);
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),

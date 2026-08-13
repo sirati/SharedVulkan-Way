@@ -276,10 +276,12 @@ pub fn guest_write(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
 /// clock would make that collision likely after a restart; this makes it not
 /// worth thinking about.
 fn random_run_id() -> u64 {
-    // `random_section_name` ends in 32 hex characters from the system CSPRNG,
-    // after the last `-` on both platforms. Half of them is a run id.
-    let name = platform::random_section_name();
-    let tail = name.rsplit('-').next().unwrap_or_default();
+    // `random_token` is the unguessable part of a name without the namespace
+    // prefix — stage 6 split it out of `random_section_name` for `publish`, and
+    // it is the right thing here for the same reason: a run id belongs to no
+    // namespace at all. `wc-<32 hex>`, so half of the hex is a run id.
+    let token = platform::random_token();
+    let tail = token.rsplit('-').next().unwrap_or_default();
     let hex: String = tail.chars().filter(char::is_ascii_hexdigit).take(16).collect();
     // Never zero: zero is what an unstamped page reads as, and a run id equal
     // to it would make every zeroed page in guest RAM a candidate.
