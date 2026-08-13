@@ -364,6 +364,15 @@ do_deploy() {
 
   local stage; stage=$(mktemp -d /tmp/wc-desk-stage-XXXXXX)
   cp "$WIN_BIN/wc-desk.exe" "$WIN_BIN/wc-compositor.exe" "$stage/"
+  # ADDED FOR §37. `probe-input.exe` is the only mouse this harness has: the
+  # compositor's `--click` is Linux-only, on purpose, because on Windows a click
+  # comes from a mouse. Built here rather than shipped because it is a C probe
+  # like `probe-relay.exe`, and unconditionally because mingw is in the dev
+  # shell that every other leg already requires.
+  x86_64-w64-mingw32-gcc -O1 -mwindows -o "$stage/probe-input.exe" \
+    "$ROOT/scripts/probe-input.c" -luser32 2>"$stage/cc-input.log" \
+    || { echo "  FAILED to build probe-input.exe"; cat "$stage/cc-input.log"; }
+  rm -f "$stage/cc-input.log"
   if [ -n "${WC_XKB_MINGW:-}" ]; then
     x86_64-w64-mingw32-gcc -O1 -o "$stage/probe-relay.exe" "$ROOT/scripts/probe-relay.c" -lws2_32 \
       2>"$stage/cc.log" || { echo "  FAILED to build probe-relay.exe"; cat "$stage/cc.log"; }
@@ -501,15 +510,23 @@ do_window() {
   [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || {
     miss "WC_HOST_WESTON and WC_HOST_FIREFOX both unset: no client to run"; return; }
 
-  local sock="wg-s8-$$"
+  # ADDED FOR §37. The prefix carries `WC_SUFFIX`, and the sweep below matches
+  # the *prefixed* name. Without it `kill_ours wg-s8` matches every worktree's
+  # socket — `wg-s8-1712266` belonging to somebody else's live run is killed by
+  # a run that only meant to clear its own leftovers, and the other run then
+  # presents as a compositor that died for no reason. `WC_DESKNAME` already
+  # separates the binaries (§16.8's rule); this separates the processes.
+  # Unset `WC_SUFFIX` reproduces the old names exactly.
+  local prefix="wg-s8${SUFFIX:+-$SUFFIX}"
+  local sock="$prefix-$$"
   # Stale compositors go **first**, before the frame directory is emptied. An
   # interrupted run leaves one alive for up to its `--timeout`, still dumping
   # into the same directory and still holding the same log file, and a wipe that
   # happens before the kill leaves the new run counting the old run's frames and
   # reading the old run's log. That was diagnosed twice as "the capture does not
   # match the dump" before it was diagnosed as this.
-  kill_ours wg-s8 >/dev/null 2>&1
-  g "rm -f $APPDATA_WIN/wg-s8-* 2>/dev/null; true" >/dev/null 2>&1
+  kill_ours "$prefix" >/dev/null 2>&1
+  g "rm -f $APPDATA_WIN/$prefix-* 2>/dev/null; true" >/dev/null 2>&1
   sleep 2
   h "mkdir -p $HOST_DIR $SHARE; rm -rf $SHARE/frames; mkdir -p $SHARE/frames; chmod 777 $SHARE/frames" \
     >/dev/null
@@ -532,6 +549,12 @@ do_window() {
   if ! cargo build --manifest-path "$ROOT/crates/wc-arena-host/Cargo.toml" >"$RUNDIR/loc.log" 2>&1; then
     bad "could not build wc-arena-host"; sed 's/^/        /' "$RUNDIR/loc.log" | tail -10; return
   fi
+  # STAGE 14 made the crate an ordinary workspace member (see its `Cargo.toml`),
+  # so the binary comes out in the *workspace* target directory and the path
+  # above is where it used to be. Both are checked rather than the comment being
+  # updated, because the crate is still buildable by its own manifest and a
+  # checkout that has done that has the file in the old place.
+  [ -x "$locator" ] || locator="$LINUX_BIN/wc-arena-host"
   scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOST_DIR/" >/dev/null || {
     bad "could not copy wc-proxy/wc-arena-host to $HOST -- something is still holding one"; return; }
   h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
@@ -720,6 +743,64 @@ chmod +x s8.sh" >/dev/null
   fetch win.bmp    "stage8-window$SUFFIX.png"  "the client's window, frame and all"
   fetch tray2.bmp  "stage8-taskbar$SUFFIX.png" "the taskbar with the window's button in it"
   fetch screen.bmp "stage8-screen$SUFFIX.png"  "the screen, which is the lock screen"
+
+  # ------------------------------------------------------ §37: the click ------
+  #
+  # ADDED FOR §37, and it is the only check in this script that touches the
+  # machine rather than photographing it.
+  #
+  # THE BUG, AS A THING A USER DID. `weston-terminal` draws its own title bar,
+  # and a click that lands in it answers with `xdg_toplevel.move` — which this
+  # compositor hands to Windows as `SC_MOVE`, and `SC_MOVE` with no mouse point
+  # is the *keyboard* move mode, which warps the cursor to the caption and then
+  # eats every keystroke until Escape. That is both halves of what was reported:
+  # "clicking under the second titlebar starts moving the window", "it snaps the
+  # mouse there", and a window that cannot be typed into afterwards.
+  #
+  # So the assertion is: a click 40 px down the client area — below the bar the
+  # terminal drew, for any inset up to 32 — must **not** produce a move. The
+  # compositor says so itself, in one line per gesture: "handed a move to
+  # Windows". Before §37 the same click produced one every time.
+  #
+  # And then it types, and the frame dump has to grow. A compositor wedged in a
+  # modal move loop repaints nothing, so "frames after the keys" is the same
+  # measurement `wc-input.sh`'s `term` leg makes and is what says the window is
+  # still usable after having been clicked in.
+  #
+  # `--pid` rather than `--class`: every worktree's compositor registers
+  # `WaycomposeToplevel`, and injecting into another run's window would be a
+  # green result about a process nobody was testing.
+  if [ "$CLIENT" = "weston-terminal" ]; then
+    local moves_before moves_after frames_before frames_after
+    g "cat $DESKDIR/comp-$sock.log" >"$RUNDIR/comp-click0.log" 2>&1
+    moves_before=$(grep -c "handed a move to Windows" "$RUNDIR/comp-click0.log")
+    frames_before=$(h "ls $SHARE/frames/*.ppm 2>/dev/null | wc -l")
+    int wcclick "$DESKDIR_WIN\\probe-input.exe" \
+      "--pid $CPID --wait 15 --at 200,40 --no-leave --type waycompose --log $DESKDIR_WIN\\probe-$sock.log" \
+      >/dev/null 2>&1
+    sleep 4
+    g "cat $DESKDIR/probe-$sock.log" >"$RUNDIR/probe.log" 2>&1
+    g "cat $DESKDIR/comp-$sock.log" >"$RUNDIR/comp-click1.log" 2>&1
+    moves_after=$(grep -c "handed a move to Windows" "$RUNDIR/comp-click1.log")
+    frames_after=$(h "ls $SHARE/frames/*.ppm 2>/dev/null | wc -l")
+    sed 's/^/        /' "$RUNDIR/probe.log" | head -6
+
+    if grep -q "no visible window of class" "$RUNDIR/probe.log" 2>/dev/null; then
+      bad "§37: probe-input found no window of our own pid ($CPID) to click in"
+    elif [ "$moves_after" -gt "$moves_before" ]; then
+      bad "§37: a click 40 px down the client area started a window move ($((moves_after - moves_before)) of them) — the click landed above where it was aimed"
+    else
+      ok "§37: a click 40 px down the client area did not start a window move, so it landed below the bar the client drew"
+    fi
+    if [ "${frames_after:-0}" -gt "${frames_before:-0}" ]; then
+      ok "§37: the client repainted $((frames_after - frames_before)) times after being clicked in and typed at — the compositor is not wedged in a modal move loop"
+    else
+      bad "§37: no new frames after the click and the keys ($frames_before -> $frames_after)"
+    fi
+    grep -q "no evdev keycode for scan" "$RUNDIR/comp-click1.log" \
+      && bad "§37: a scan code had no evdev keycode" \
+      || note "§37: every scan code of the typed word translated"
+  fi
 
   # Is the blit the right way up (§8.11 item 3), and is it the right rectangle?
   #
@@ -928,14 +1009,14 @@ do_fps() {
   local secs="${WC_FPS_SECS:-45}" mode n
   local pnum=0
   for mode in fine coarse; do
-    local sock="wg-s8f-$$-$mode" extra=""
+    local sock="wg-s8f${SUFFIX:+-$SUFFIX}-$$-$mode" extra=""
     # A port per mode. Sharing one across two back-to-back runs left the second
     # with a listener in TIME_WAIT and a client that never connected -- which
     # printed as "0 commits" and looked exactly like `--poll-coarse` breaking
     # the compositor.
     local port=$((PORT + pnum)); pnum=$((pnum + 1))
     [ "$mode" = coarse ] && extra=" --poll-coarse"
-    kill_ours "wg-s8f" >/dev/null 2>&1
+    kill_ours "wg-s8f${SUFFIX:+-$SUFFIX}" >/dev/null 2>&1
     h "mkdir -p $SHARE $HOST_DIR" >/dev/null
     # STAGE 13: guest RAM here too. This mode is about the poll loop's cadence
     # and the transport is incidental to it -- which is exactly the argument

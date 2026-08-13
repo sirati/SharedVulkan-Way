@@ -12764,3 +12764,253 @@ desktop shortcut) and of `c7ec2c0` (§32's taskbar identity), not before them.
    past twice, in a file being audited for exactly that. Reading finds these;
    running the harness on a tree where the value has moved finds the ones
    reading misses. Both are needed and neither is sufficient.
+
+## 37. The pointer and the pixels disagreed by the client's own inset
+
+A user reported it before any harness did:
+
+> "there is something wrong with mouse offset in the compositor... it happens
+> that mouse clicks and actions go to an offset location. i noticed that earlier
+> in firefox already, but in wayland terminal its very obvious that clicking
+> under the second titlebar instead starts moving the window as if the titlebar
+> were clicked, and in fact it snaps the mouse there"
+
+That is one defect with three visible faces: clicks land above where they were
+aimed, a click *below* a client-drawn title bar drags the window, and the
+pointer jumps to the caption. It had been in the tree since stage 9 and 1284
+tests did not see it.
+
+### 37.1 The bug, in two lines that were written a thousand lines apart
+
+`compose_tree` (stage 9) draws the window from the **window-geometry
+rectangle**, not from the buffer — a GTK client commits a buffer larger than its
+window on every side and says so with `xdg_surface.set_window_geometry`:
+
+```rust
+shadow.compose(src, (x - gx, y - gy));
+```
+
+So the window's top-left pixel *is* the surface's point `(gx, gy)`.
+
+`State::pointer_motion` said the opposite, and said it in a comment that was
+right when it was written and never revisited:
+
+```rust
+// Every window here is its own `HWND` with its own coordinate system and the
+// platform has already subtracted the frame, so the surface origin *is* the
+// compositor origin and this is `(0, 0)`.
+focus.map(|(_, s)| (s, (0.0, 0.0).into())),
+```
+
+Both halves of that sentence are true. The conclusion does not follow, because
+the frame Win32 subtracts is not the only offset in the path: the *client*
+declares one too, and it is per-surface rather than a property of the window
+system. `touch_down` and `touch_motion` carried the same zero, copied with the
+comment "`(0, 0)` for the same reason it is in `pointer_motion`" — §24's promise
+that touch reuses the pointer's conversion, kept faithfully, including the
+error.
+
+### 37.2 The measurement
+
+`weston-eventdemo` prints the coordinate it received, so the offset is a number
+rather than an impression. `--click 200,150` against it, on the headless
+platform:
+
+| | declared origin | clicked at (window px) | client received | should have been |
+|---|---|---|---|---|
+| `weston-eventdemo` | `(32, 32)` | `200,150` | **`200,150`** | `232,182` |
+| `weston-terminal` | `(32, 32)` | `200,40` | **`200,40`** | `232,72` |
+| `weston-flower` | `(0, 0)` | `100,60` | `100,60` | `100,60` |
+| Firefox, CSD (§22) | `(26, 23)` | — | — | — |
+| Firefox, SSD (§22) | `(0, 0)` | — | — | — |
+
+**32 pixels, up and to the left, for every Weston toytoolkit client.** The last
+two rows are why the user saw it "earlier in firefox" and only found it obvious
+in the terminal: under server-side decorations Firefox declares no inset at all
+and the bug does not exist, under client-side decorations it declares `(26, 23)`
+and the bug is a few pixels of misaimed clicking in a browser that mostly has
+large targets. `weston-terminal`'s title bar is about 30 px tall and its inset
+is 32, so the offset is larger than the bar — which turns a subtle aiming error
+into a window that drags when you click below its title bar.
+
+### 37.3 The symptom, reproduced and then removed
+
+`weston-terminal` draws its own frame, so it is the instrument for the reported
+behaviour rather than for the number. A click at window pixel `(200, 40)` —
+eight pixels below the bar it drew:
+
+```
+before   -> xdg_toplevel#17.move(wl_seat#4, 6)
+after    wl_pointer#12.enter(4, wl_surface#15, 232.00, 72.00)   [no move]
+```
+
+And the control in the other direction, a click at `(200, 12)`, *on* the drawn
+bar:
+
+```
+before   (nothing; surface y=12 is above the geometry rectangle entirely)
+after    -> xdg_toplevel#17.move(wl_seat#4, 6)
+```
+
+The two clicks swapped meanings. That is the whole bug seen from the user's
+chair, and it is why "it snaps the mouse there": the compositor hands
+`xdg_toplevel.move` to Windows as `SC_MOVE` with no mouse point, which is the
+**keyboard** move mode — Windows warps the cursor to the caption to start it.
+
+### 37.4 The fix, and why the number is stored rather than looked up again
+
+`Window::content_offset` is written by `compose_tree`, from the same `(gx, gy)`
+the blit used, and `surface_origin` negates it into the surface origin smithay
+subtracts (`event.location - loc`, `input/pointer/mod.rs:795`):
+
+```rust
+pub(crate) fn surface_origin(content_offset: (i32, i32)) -> (f64, f64) {
+    (-f64::from(content_offset.0), -f64::from(content_offset.1))
+}
+```
+
+Passing it as the **origin** rather than adding it to the location is deliberate:
+`location` stays in the coordinate space the platform sent and `pointer_at`
+stores, the geometry goes where smithay's model wants it, and there is one
+subtraction rather than two additions to keep in step.
+
+Storing it, rather than re-reading the cached state at input time, is the point
+of the field. The geometry is double-buffered like everything else; two
+independent reads can disagree by one commit, which is a click that lands in the
+wrong place for exactly one frame — the least debuggable version of this bug.
+One number, written where the pixels are decided, read where the pointer is
+delivered.
+
+`State::surface_and_origin` returns the surface and the origin together, so
+there is no call site that can take one and forget the other. That is what the
+three call sites did.
+
+### 37.5 What was suspected and was innocent
+
+The first hypothesis was `FrameStyle::extend_top` and `win32.rs`'s
+`to_surface`, whose `y - (-extend_top)` looks like a sign error. It is not this
+bug, and checking cost less than arguing about it: `extend_top` is `0` in every
+`FrameStyle` master constructs, `content_origin()` is therefore `(0, 0)`, and
+the compositor prints `content origin 0,0` at every map. The three conversions
+are identities.
+
+The distinction that matters, and it is the reason the wrong suspect looked
+right: **`extend_top` is a constant of the window system and the geometry origin
+is a property of the surface.** A frame constant cannot explain an offset that
+is 32 in one client, 26 by 23 in another, and 0 in a third. Any hypothesis that
+did not predict *different offsets for different clients* was refuted by the
+first two measurements.
+
+§30's own note that the `extend_top` parameterisation "pointed the wrong way"
+stands, and belongs to that section rather than to this one.
+
+### 37.6 The negative tests, which are the deliverable
+
+Three instruments, none of which existed before, each failing on the tree
+without the fix and passing with it.
+
+**`scripts/wc-input.sh pointer`** — the measurement. Drives `--click` at a known
+window pixel and compares what the client says it received against that pixel
+plus the inset the client itself declared on the wire. The expected number is
+never written down in the harness: hard-coding 32 would pass against a toolkit
+that changed its shadow margin and would say nothing about any other client.
+
+```
+without the fix                                   with it
+FAIL  reached the client at [200 150],            PASS  reached the client at
+      expected 232 182 -- off by the inset              surface 232 182
+FAIL  clicking the drawn title bar did nothing    PASS  clicking the title bar
+FAIL  clicking 40 px down started a move          PASS  40 px down: no move
+PASS  a client whose origin is 0,0 is untouched   PASS  (unchanged)
+```
+
+The fourth line is `weston-flower`, and it is the reason the set is worth
+having rather than decoration. Its declared origin is `(0, 0)`, so it passes
+*with the bug present* and must keep passing: a fix that added a constant, or
+added the inset twice, or applied a parent's inset to a popup would satisfy the
+first three lines and break this one.
+
+**`scripts/wc-input.sh wine`** — the same conversion with real Win32 messages
+under it. `SendInput` moves a real cursor, `WM_LBUTTONDOWN` arrives at the real
+window procedure, `to_surface` runs, and the click must reach the client at the
+injected client-area point plus the inset. `probe-input.exe` now prints the
+points it visited; it prints **both**, because measured under Wine the two
+`SendInput` moves reach the window procedure out of order and the click is
+reported from the first. Asserting an order the platform does not guarantee
+would be a flaky test about Wine's input queue rather than a test of the
+arithmetic.
+
+**`scripts/wc-input.sh term`** — the user's sequence. This leg used to pass
+`--no-mouse`: it typed into a window nobody had clicked in, which is not what a
+user does, and is a large part of why the defect survived a harness that
+photographs a terminal being typed into. It now clicks at `(200, 40)` first —
+the click that used to drag the window — and asserts on the compositor's own log
+that no move was started.
+
+**Five unit tests** in `state.rs` pin the conversion itself, including the
+asymmetric case (`(26, 23)`, so a fix carrying one number for both axes fails),
+the negative case (`set_window_geometry` takes a signed origin), and the
+identity. 1284 → 1289.
+
+### 37.7 Typing: one cause, and the second symptom is *not* settled
+
+The user also reported that the terminal could not be typed into, and the
+obvious story is that it follows from this: `SC_MOVE`'s keyboard move mode
+swallows every key until Escape, so a window that spuriously entered one would
+be dead to the keyboard.
+
+**Wine does not reproduce it, and that has to be said plainly rather than
+smoothed over.** With the bug present, the click starts the move — the new
+assertion fails, correctly — and the keystrokes still arrive: 21 new frames,
+every scan code translated. So on this instrument typing works before and after
+the fix, and the instrument cannot decide the question.
+
+One number from that run is worth keeping. The picture check "typing changed N
+pixels" reported **463** with the fix and **95034** without it. 463 pixels is
+one line of an 8×17 monospace font. 95034 is a window that moved. The check was
+passing in both runs and was measuring two different events — which is why the
+move is now asserted separately and by name, above the picture checks, so that
+everything below it is known to be a statement about a compositor that is not in
+a modal loop.
+
+What this leaves: the spurious move-drag is gone, which removes the most likely
+cause of the dead keyboard; whether the keyboard comes back is a claim only the
+guest can settle, and Wine's modal loops are exactly the class of thing Wine has
+been wrong about on this project before. §37.8 item 1.
+
+### 37.8 What is not done
+
+1. **No guest run.** Everything above is the headless platform and Wine. The
+   specific things worth checking on the guest, in order: that a click below
+   `weston-terminal`'s bar no longer drags the window with a real mouse; that
+   typing into it works after that click; and that Firefox under
+   `--decorations client` (inset `(26, 23)`) and under `--decorations server`
+   (inset `(0, 0)`) are both right, since those are the two arrangements master
+   has and they exercise the non-zero and zero paths through the same code.
+   `scripts/wc-desktop.sh window` grew the block that does the first two —
+   `probe-input.exe --pid --at`, then the compositor's log — and it has never
+   been run to completion: the one attempt failed in the arena locate (16377 of
+   16384 pages, a contended sweep) before the client started, and the machine
+   was then embargoed by its owner.
+2. **Subsurfaces still route to the root.** `surface_and_origin` gives the
+   root surface's origin, and every pointer event goes to the toplevel's surface
+   with no hit test — `control.rs`'s header says so and it is unchanged. For a
+   client whose subsurfaces are children of one window that is correct, because
+   the client does its own routing; it is wrong the moment a subsurface has its
+   own geometry, and nothing here would notice.
+3. **Popups are trusted rather than measured.** A popup's position comes from
+   the positioner in the parent's window-geometry coordinates, which is the same
+   space the parent's pixels occupy, so the popup path was already right and is
+   untouched. Its *own* inset now goes through `content_offset` like any other
+   window's. Neither statement has a click behind it; `weston-terminal` opens no
+   menus and the WLCS popup tests do not declare insets.
+4. **`FrameStyle::extend_top` is still an `i32` with three identity
+   conversions.** §37.5 establishes it is inert. Removing it is §30's business
+   and doing it from here would be two branches editing the same lines.
+5. **A hazard found the hard way, and it is not about this bug.** `git stash` is
+   shared across every worktree of this repository. A plain `git stash pop` in
+   one worktree popped *another agent's* stash — 115 files from a branch this
+   one has never seen — and left the tree in conflict. Nothing was lost, because
+   a conflicted pop does not drop the stash, but the recovery was manual. Stash
+   by explicit ref (`git stash pop stash@{N}`) after reading `git stash list`,
+   or do not stash at all in a shared checkout.

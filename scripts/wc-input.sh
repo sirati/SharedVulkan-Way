@@ -3,6 +3,7 @@
 # into and clicked on**, with the keystrokes coming from Win32.
 #
 #   scripts/wc-input.sh linux    the seat and the keymap, against Weston clients
+#   scripts/wc-input.sh pointer  §37: *where* a click lands, as a number
 #   scripts/wc-input.sh wine     real WM_KEYDOWN, through the proxy, into a client
 #   scripts/wc-input.sh arena    the same, with the keymap cut from the arena
 #                                and no shared directory at all (stage 10)
@@ -648,6 +649,48 @@ run_wine() {
   grep -q "foreground=.*focus=" "$dir/probe.log" \
     && note "$(grep -o 'foreground=.* focus=.*' "$dir/probe.log" | head -1)"
 
+  # --- §37: where the click landed, on the Win32 side of the seam --------
+  #
+  # The pointer leg above measures everything from `FromUi` upwards. This
+  # measures the half it cannot reach: a real `SendInput`, a real
+  # `WM_LBUTTONDOWN`, `win32.rs`'s `to_surface`, and only then the same Wayland
+  # path. Both are needed, and the number they must produce is the same one —
+  # the client-area point the probe aimed at, plus the inset the client itself
+  # declared.
+  #
+  # `to_surface` is currently the identity (`FrameStyle::extend_top` is 0 and
+  # `content_origin` is therefore `(0, 0)`; the compositor prints "content
+  # origin 0,0" at every map). This check is what would notice if it stopped
+  # being — which is exactly what §30's frame extension does to it.
+  # The probe names both points it visited because Wine reorders them; see
+  # `probe-input.c`. The click must be at one of them, converted — a compositor
+  # that dropped or invented the inset would be at neither.
+  local sent inset_x inset_y
+  sed -e 's/\x1b\[[0-9;]*m//g' "$dir/cli.log" >"$dir/cli.geom" 2>/dev/null
+  sent=$(grep -o "client points [0-9]*,[0-9]* and [0-9]*,[0-9]*" "$dir/probe.log" | head -1 \
+         | sed 's/client points //; s/ and / /')
+  inset_x=$(grep -o "set_window_geometry([-0-9]*, [-0-9]*," "$dir/cli.geom" | head -1 \
+            | sed 's/.*(\([-0-9]*\), \([-0-9]*\),/\1/')
+  inset_y=$(grep -o "set_window_geometry([-0-9]*, [-0-9]*," "$dir/cli.geom" | head -1 \
+            | sed 's/.*(\([-0-9]*\), \([-0-9]*\),/\2/')
+  if [ -z "$sent" ] || [ -z "$inset_x" ]; then
+    note "wine: no click coordinate to compare (probe said [$sent], inset [$inset_x,$inset_y])"
+  else
+    local got want=""
+    got=$(grep -o "^button time: [0-9]*, button: 272, state: pressed, x: [-0-9]*, y: [-0-9]*" \
+          "$dir/cli.log" | head -1 | sed 's/.*x: \([-0-9]*\), y: \([-0-9]*\)/\1,\2/')
+    local p
+    for p in $sent; do
+      want="$want $(( ${p%,*} + inset_x )),$(( ${p#*,} + inset_y ))"
+    done
+    case " $want " in
+      *" $got "*)
+        ok "wine: a SendInput click at client point ${sent%% *} reached the client at surface $got — WM_LBUTTONDOWN, to_surface, and the inset, all agreeing" ;;
+      *)
+        bad "wine: the click reached the client at [$got]; the points injected were $sent and the inset is $inset_x,$inset_y, so it should have been one of$want" ;;
+    esac
+  fi
+
   # --- the compositor's own view ----------------------------------------
   #
   # These are the lines that say the *Win32 half* ran: a scan code became an
@@ -744,6 +787,159 @@ run_wine() {
 }
 
 # ---------------------------------------------------------------------------
+# pointer: where the click landed, as a number the client says out loud
+# ---------------------------------------------------------------------------
+#
+# ADDED FOR §37, and it is the check whose absence let the bug ship. Every
+# pointer assertion above this line says an event *arrived* — a motion happened,
+# a button was 272, the axis had the right sign. None of them says **where**,
+# and the bug was entirely in the where.
+#
+# THE CONVERSION UNDER TEST, IN ONE LINE
+#
+#   surface point = window pixel + the client's own `set_window_geometry` origin
+#
+# because `compose_tree` blits the tree at `-(gx, gy)`, so the window's top-left
+# pixel *is* surface point `(gx, gy)`. The pointer and the pixels must use the
+# same number; before §37 the pointer used zero and the pixels used `(gx, gy)`,
+# so a click landed `(gx, gy)` up and to the left of the thing under the cursor.
+#
+# WHY THE EXPECTED NUMBER IS NOT WRITTEN DOWN HERE
+#
+# It is read out of the client's own `xdg_surface.set_window_geometry` request,
+# off the wire, in the same run. A hard-coded 32 would pass against a toolkit
+# that changed its shadow margin and would say nothing about a client with a
+# different inset; taking it from the wire makes this an assertion about the
+# *conversion* rather than about Weston's taste in shadows.
+#
+# TWO CLIENTS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS
+#
+#   * `weston-eventdemo` prints the coordinate it received. That is the
+#     measurement: a number to compare against a number.
+#   * `weston-terminal` is the *symptom* the user reported — it draws its own
+#     title bar, and a click that lands in it answers with `xdg_toplevel.move`.
+#     So this leg clicks twice, once on the bar and once eight pixels below it,
+#     and asserts that exactly one of them starts a move. Before §37 it was the
+#     wrong one: the drawn bar did nothing and the row below it dragged the
+#     window, which is what "it snaps the mouse there" was.
+#
+# Linux only, because `--click` is (see `lib.rs`): on Windows a click comes from
+# a mouse. What this leg cannot say anything about is `WM_MOUSEMOVE` and
+# `FrameStyle` — the same division of evidence §13.6 drew, and the guest run in
+# docs/waycompose-design.md §37 is the other half.
+
+pointer_probe() {
+  # $1 tag, $2 client command, $3 click x, $4 click y -> sets PP_GX/PP_GY/PP_LOG
+  local tag=$1 client=$2 cx=$3 cy=$4
+  local dir="$RUNDIR/pointer-$tag"
+  mkdir -p "$dir/rt"; chmod 700 "$dir/rt"
+  XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-compositor" --socket "wl-ptr-$tag" --once \
+    --timeout 14 --click "$cx,$cy,272,2500" >"$dir/srv.log" 2>&1 &
+  local srv=$!
+  sleep 1
+  # `stdbuf -oL` because the client's own printf is block-buffered into a pipe,
+  # and a client killed by `timeout` never flushes it — which reads as a client
+  # that received nothing, i.e. as the failure this leg exists to detect.
+  ( cd "$dir" && XDG_RUNTIME_DIR="$dir/rt" WAYLAND_DISPLAY="wl-ptr-$tag" WAYLAND_DEBUG=1 \
+    stdbuf -oL -eL timeout 12 $client ) >"$dir/cli.log" 2>&1
+  wait "$srv" 2>/dev/null
+  sed -e 's/\x1b\[[0-9;]*m//g' "$dir/cli.log" >"$dir/cli.clean"
+  PP_LOG="$dir/cli.clean"
+  PP_GX=$(grep -o "set_window_geometry([-0-9]*, [-0-9]*," "$PP_LOG" | head -1 \
+          | sed 's/.*(\([-0-9]*\), \([-0-9]*\),/\1/')
+  PP_GY=$(grep -o "set_window_geometry([-0-9]*, [-0-9]*," "$PP_LOG" | head -1 \
+          | sed 's/.*(\([-0-9]*\), \([-0-9]*\),/\2/')
+}
+
+run_pointer() {
+  echo "== where the click landed =="
+  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+
+  # --- eventdemo: the measurement ----------------------------------------
+  if command -v weston-eventdemo >/dev/null; then
+    local cx=200 cy=150
+    pointer_probe demo "weston-eventdemo --log-motion --log-button" $cx $cy
+    if [ -z "$PP_GX" ]; then
+      bad "pointer: the client never set a window geometry -- nothing to compare against"
+    else
+      note "pointer: eventdemo declared an inset of $PP_GX,$PP_GY"
+      local want_x=$((cx + PP_GX)) want_y=$((cy + PP_GY))
+      local got
+      got=$(grep -o "^button time: [0-9]*, button: 272, state: pressed, x: [-0-9]*, y: [-0-9]*" "$PP_LOG" \
+            | head -1 | sed 's/.*x: \([-0-9]*\), y: \([-0-9]*\)/\1 \2/')
+      if [ "$got" = "$want_x $want_y" ]; then
+        ok "pointer: a click at window pixel $cx,$cy reached the client at surface $got, which is the pixel under the cursor"
+      else
+        bad "pointer: a click at window pixel $cx,$cy reached the client at [$got], expected $want_x $want_y -- off by the window-geometry inset"
+      fi
+    fi
+  else
+    note "SKIP weston-eventdemo (not installed) -- this is the leg that measures"
+  fi
+
+  # --- flower: the control, and it is not decoration ----------------------
+  #
+  # `weston-flower` declares **no** window geometry, so its origin is `(0, 0)`
+  # and the conversion must be the identity. Without it this leg cannot tell a
+  # fix from an over-correction: a compositor that added a constant, or added
+  # the inset twice, or added the *parent's* inset to a popup, would pass every
+  # check above and move every click in a client that has no inset at all.
+  #
+  # Read off the wire rather than out of the client, because flower prints
+  # nothing: it draws a flower and has no input logging. `wl_pointer.enter`
+  # carries the surface-local point, and libwayland decodes it under
+  # `WAYLAND_DEBUG`.
+  #
+  # Flower does send `set_window_geometry`, with an origin of `(0, 0)` — so the
+  # control is "the origin is zero", not "there is no geometry", and it is
+  # asserted rather than assumed: a run where flower grew an inset would be
+  # controlling for nothing and has to say so instead of passing quietly.
+  if command -v weston-flower >/dev/null; then
+    pointer_probe flower "weston-flower" 100 60
+    local ent
+    # `[#@]` because libwayland spells object ids with `#` and this file's older
+    # checks read a copy that `check_client_events` has already rewritten to
+    # `@`. Matching one spelling here found nothing and reported a client that
+    # never received a pointer, which is the most misleading possible way for a
+    # control to fail.
+    ent=$(grep -o "wl_pointer[#@][0-9]*\.enter([0-9]*, wl_surface[#@][0-9]*, [-0-9.]*, [-0-9.]*)" "$PP_LOG" \
+          | head -1 | sed 's/.*, \([-0-9.]*\), \([-0-9.]*\))/\1 \2/')
+    if [ -n "${PP_GX:-}" ] && [ "$PP_GX,$PP_GY" != "0,0" ]; then
+      note "pointer: flower declared an inset of $PP_GX,$PP_GY; the control is only meaningful at 0,0"
+    else
+      case "$ent" in
+        "100.00000000 60.00000000")
+          ok "pointer: a client whose origin is 0,0 is untouched — the click arrived at exactly 100,60" ;;
+        "") bad "pointer: weston-flower never received a pointer enter" ;;
+        *) bad "pointer: a client whose origin is 0,0 had its click moved to [$ent], expected 100 60" ;;
+      esac
+    fi
+  else
+    note "SKIP weston-flower (not installed) -- no zero-inset control this run"
+  fi
+
+  # --- terminal: the symptom the user reported ---------------------------
+  if command -v weston-terminal >/dev/null; then
+    # 12 px down is inside a toytoolkit title bar; 40 px down is below it for
+    # any inset up to 32, which is what Weston uses. Both are read back against
+    # the inset the client actually declared rather than assumed.
+    pointer_probe bar "weston-terminal" 200 12
+    local on_bar=no; grep -q "xdg_toplevel#[0-9]*\.move(" "$PP_LOG" && on_bar=yes
+    pointer_probe below "weston-terminal" 200 40
+    local below_bar=no; grep -q "xdg_toplevel#[0-9]*\.move(" "$PP_LOG" && below_bar=yes
+
+    [ "$on_bar" = yes ] \
+      && ok "pointer: clicking the title bar weston-terminal drew starts a move" \
+      || bad "pointer: clicking the drawn title bar did nothing -- the click landed above the window"
+    [ "$below_bar" = no ] \
+      && ok "pointer: clicking below the title bar does not start a move" \
+      || bad "pointer: clicking 40 px down started a move -- this is the reported bug, the click landed $PP_GY px high"
+  else
+    note "SKIP weston-terminal (not installed) -- this is the leg with the symptom"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # term: type into a terminal and watch the characters appear
 # ---------------------------------------------------------------------------
 #
@@ -823,8 +1019,22 @@ run_term() {
   xwd -root -silent -out "$dir/still.xwd" 2>/dev/null \
     && magick "$dir/still.xwd" "$dir/still.png" 2>/dev/null
 
+  # **Clicked first, and that is §37's change to this leg.** It used to pass
+  # `--no-mouse`, so it typed into a window nobody had clicked in — which is not
+  # what a user does and is why it stayed green while the user could not type.
+  #
+  # The click is at client-area `(200, 40)`: below the title bar `weston-terminal`
+  # draws for itself, for any inset up to its 32. Before §37 that click arrived
+  # 32 px high, inside the bar, and the terminal answered `xdg_toplevel.move` —
+  # which this compositor hands to Windows as `SC_MOVE`, and `SC_MOVE` with no
+  # mouse point is the keyboard move mode: it warps the cursor to the caption
+  # and swallows every key until Escape. So a run with the bug loses the
+  # keystrokes *and* the repaints, and this leg's existing "the picture changed"
+  # and "new frames appeared" checks both fail — the user's two symptoms, from
+  # one cause, on one instrument.
   wine explorer "/desktop=wc-term,1280x1024" \
-    "$dir/probe-input.exe" --class WaycomposeToplevel --wait 20 --no-mouse \
+    "$dir/probe-input.exe" --class WaycomposeToplevel --wait 20 \
+    --at 200,40 --no-leave \
     --type "echo waycompose types" --log "$(win_path "$dir/probe.log")" \
     >"$dir/probe-loader.log" 2>&1
   local probe_rc=$?
@@ -846,6 +1056,13 @@ run_term() {
   grep -q 'title -> "Wayland Terminal"' "$dir/srv.log" \
     && ok "term: it is weston-terminal, with its own title in the Windows caption" \
     || bad "term: no title from the client"
+
+  # §37. Named separately from the picture checks below because it is the
+  # *cause* and they are the effect: if the click started a move, everything
+  # after it is a statement about a compositor in a modal loop.
+  grep -q "handed a move to Windows" "$dir/srv.log" \
+    && bad "term: the click 40 px down the client area started a window move — it landed inside the bar the client drew, and SC_MOVE is now eating the keys" \
+    || ok "term: the click 40 px down the client area started no window move, so the keys below went to the terminal"
 
   # The still pair, first. A terminal that is redrawing on a timer would fail
   # here and every claim below it would be worthless.
@@ -901,14 +1118,16 @@ run_term() {
 }
 
 case "${1:-all}" in
-  linux) run_linux ;;
-  wine)  run_wine shared-file ;;
-  arena) run_wine arena ;;
-  term)  run_term ;;
-  all)   run_linux; echo; run_wine shared-file; echo; run_wine arena; echo
+  linux)   run_linux ;;
+  pointer) run_pointer ;;
+  wine)    run_wine shared-file ;;
+  arena)   run_wine arena ;;
+  term)    run_term ;;
+  all)   run_linux; echo; run_pointer; echo; run_wine shared-file; echo
+         run_wine arena; echo
          kill "${XPID:-0}" 2>/dev/null; unset XPID; unset DISPLAY
          run_term ;;
-  *) echo "usage: $0 [linux|wine|arena|term|all]"; exit 2 ;;
+  *) echo "usage: $0 [linux|pointer|wine|arena|term|all]"; exit 2 ;;
 esac
 
 echo
