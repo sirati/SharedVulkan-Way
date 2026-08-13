@@ -84,6 +84,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, ULW_ALPHA, WS_EX_LAYERED,
     SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
+    // ADDED FOR STAGE 17: the three toplevel requests a client-decorated
+    // window makes, handed to Windows' own modal loops.
+    GetSystemMenu, TrackPopupMenu, SC_MOVE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
@@ -109,13 +112,20 @@ use windows_sys::Win32::Foundation::{POINT, SIZE};
 use crate::input::{evdev, evdev_keycode};
 
 use super::{
-    assemble, Commands, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
+    assemble, Commands, Edge, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
     WindowKind,
 };
 use crate::surface::{Rect, Shadow};
 
 /// "Drain the command queue." The only message this module posts.
 const WM_WC_COMMAND: u32 = WM_APP + 1;
+/// "Put up the system menu", with the screen position packed into the `LPARAM`
+/// the way `WM_CONTEXTMENU` packs one.
+///
+/// ADDED FOR STAGE 17. A message of its own rather than a call from `drain`,
+/// for the reason the `ToUi::WindowMenu` arm gives: `TrackPopupMenu` does not
+/// return until the menu closes.
+const WM_WC_SYSMENU: u32 = WM_APP + 2;
 
 /// `WM_MOUSELEAVE`, 0x02A3.
 ///
@@ -732,6 +742,55 @@ unsafe extern "system" fn toplevel_proc(
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
             0
         }
+        // ADDED FOR STAGE 17. `xdg_toplevel.show_window_menu`, arriving as a
+        // posted message so that the modal `TrackPopupMenu` is entered from the
+        // pump rather than from inside `drain`.
+        //
+        // **The system menu, not an imitation of it.** `GetSystemMenu` returns
+        // the very menu the caption's right-click and Alt+Space put up, with
+        // Windows' own strings, its own accelerators and its own greying — a
+        // maximised window's *Maximize* is disabled and a fixed-size window has
+        // no *Size*, and none of that has to be reimplemented. `TPM_RETURNCMD`
+        // asks for the chosen item back instead of a `WM_COMMAND`, and it is
+        // then posted as the `WM_SYSCOMMAND` the caption would have produced,
+        // so *Close* on this menu is the same code path as the close button.
+        WM_WC_SYSMENU => {
+            let x = (lparam & 0xffff) as i16 as i32;
+            let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+            // SAFETY: live window handle on its own thread. `GetSystemMenu`
+            // with `revert = 0` returns a handle owned by the window, which
+            // must not be destroyed here. `TrackPopupMenu` runs a modal loop
+            // and returns the command id because of `TPM_RETURNCMD`.
+            let chosen = unsafe {
+                let menu = GetSystemMenu(hwnd, 0);
+                if menu.is_null() {
+                    0
+                } else {
+                    TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        x,
+                        y,
+                        0,
+                        hwnd,
+                        std::ptr::null(),
+                    )
+                }
+            };
+            if chosen != 0 {
+                // SAFETY: live handle; posted rather than sent for the same
+                // reason the gesture is — `SC_MOVE` and `SC_SIZE` are among the
+                // things this menu can choose.
+                unsafe {
+                    PostMessageW(hwnd, WM_SYSCOMMAND, chosen as usize, 0);
+                }
+            }
+            println!(
+                "wc-compositor: window {} system menu at {x},{y} chose 0x{chosen:04x}",
+                state.id
+            );
+            0
+        }
 
         // ADDED FOR STAGE 21: the second half of `zwp_idle_inhibit`.
         //
@@ -1011,6 +1070,69 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         } => {
             if let Some(w) = window(ui, id) {
                 set_window_state(&w, maximized, minimized);
+            }
+        }
+        // ADDED FOR STAGE 17. All three **post** rather than send, and that is
+        // the only interesting thing about them.
+        //
+        // `SC_MOVE`, `SC_SIZE` and `TrackPopupMenu` each enter a modal loop
+        // that does not return until the user lets go. This code runs inside
+        // `drain`, which sets `ui.draining` for its duration and re-posts
+        // `WM_WC_COMMAND` whenever another arrives while it is set — so a
+        // `SendMessageW` here would hold `draining` for the whole gesture and
+        // spin the pump re-posting a wake it cannot service. Posting lets the
+        // drain finish; the loop is then entered from the pump, where §8.2's
+        // finding applies and a posted wake still reaches the window.
+        ToUi::BeginMove { id } => {
+            if let Some(w) = window(ui, id) {
+                begin_sysmenu_gesture(&w, SC_MOVE, "move");
+            }
+        }
+        ToUi::BeginResize { id, edge } => {
+            if let Some(w) = window(ui, id) {
+                // Win32 encodes the edge in the low four bits of the
+                // `WM_SYSCOMMAND` argument, as `WMSZ_*` + 1. Wayland encodes it
+                // as a bitmask. Neither is derivable from the other, so this is
+                // a table.
+                let wmsz = match edge {
+                    Edge::Left => 1,
+                    Edge::Right => 2,
+                    Edge::Top => 3,
+                    Edge::TopLeft => 4,
+                    Edge::TopRight => 5,
+                    Edge::Bottom => 6,
+                    Edge::BottomLeft => 7,
+                    Edge::BottomRight => 8,
+                    // No edge: `SC_SIZE` on its own is the keyboard-driven
+                    // resize, which is what the protocol's `none` means.
+                    Edge::None => 0,
+                };
+                begin_sysmenu_gesture(&w, SC_SIZE | wmsz, "resize");
+            }
+        }
+        ToUi::WindowMenu { id, x, y } => {
+            if let Some(w) = window(ui, id) {
+                // Surface coordinates to screen coordinates, through the same
+                // origin the input path uses in reverse.
+                let (ox, oy) = w.frame.content_origin();
+                let mut p = POINT {
+                    x: x + ox,
+                    y: y + oy,
+                };
+                // SAFETY: a live window handle; `ClientToScreen` converts in
+                // place. The result is packed into an `LPARAM` the way
+                // `WM_CONTEXTMENU` packs one, because that is what the handler
+                // in `toplevel_proc` unpacks.
+                unsafe {
+                    ClientToScreen(w.hwnd(), &mut p);
+                    PostMessageW(
+                        w.hwnd(),
+                        WM_WC_SYSMENU,
+                        0,
+                        ((p.x as u32 as isize) & 0xffff) | (((p.y as u32 as isize) & 0xffff) << 16),
+                    );
+                }
+                println!("wc-compositor: window {id} window menu at {},{} on screen", p.x, p.y);
             }
         }
         // ADDED FOR STAGE 21.
@@ -1308,6 +1430,26 @@ fn create_window(
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
     Ok(())
+}
+
+/// Hand a gesture the client started over to Windows' own modal loop.
+///
+/// ADDED FOR STAGE 17, and it is the whole of `xdg_toplevel.move` and
+/// `xdg_toplevel.resize` on this platform.
+///
+/// `ReleaseCapture` first, and it is not optional: the client's drag began with
+/// a `WM_LBUTTONDOWN` that `toplevel_proc` answered with `SetCapture`, and
+/// `DefWindowProc` refuses to start a sizing or moving loop for a window that
+/// holds the capture. The symptom is a window that simply does not move, with
+/// nothing in any log.
+fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
+    // SAFETY: a live window handle, on the thread that created it.
+    // `ReleaseCapture` is a no-op when this thread holds no capture.
+    unsafe {
+        ReleaseCapture();
+        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, 0);
+    }
+    println!("wc-compositor: window {} handed a {what} to Windows", w.id);
 }
 
 /// Show the window for the first time, at the size the client chose.
