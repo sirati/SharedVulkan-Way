@@ -265,6 +265,23 @@
           # test convenience.
           libxkbcommon
 
+          # --- The conformance suite ----------------------------------------
+          # WLCS, the Wayland Conformance Suite (docs/design.md §26). It is
+          # C++ with a CMake build, and it is already in nixpkgs at 1.8.1 and
+          # already in the binary cache — so there is no CMake invocation
+          # anywhere in this tree and no vendored copy to keep in step. That is
+          # worth stating because it was the part of the job that looked
+          # expensive: the runner is a **binary**, `libexec/wlcs/wlcs`, which
+          # dlopens a compositor integration module and runs 1,228 gtest cases
+          # against whatever that module connects it to. Our module is
+          # `crates/wc-wlcs`, and it is Rust, because the integration API is
+          # plain C.
+          #
+          # It is put on PATH by the shellHook below rather than named here,
+          # because nixpkgs installs the runner under `libexec` — there is no
+          # `bin/wlcs` for `packages` to pick up.
+          wlcs
+
           gdb
         ];
 
@@ -322,10 +339,17 @@
           export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
           export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
 
+          # The WLCS runner and its headers. `libexec` rather than `bin` is
+          # nixpkgs' own layout for it, and the header path is what a future C
+          # or bindgen consumer would want; `scripts/wc-wlcs.sh` reads both.
+          export WC_WLCS_RUNNER="${pkgs.wlcs}/libexec/wlcs/wlcs"
+          export WC_WLCS_INCLUDE="${pkgs.wlcs}/include"
+
           echo "shared_vulkan + waycompose dev shell — one binary per side"
           echo "  rustc    $(rustc --version 2>/dev/null | cut -d' ' -f2)"
           echo "  targets  x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-unknown-linux-musl"
           echo "  vk.xml   $VK_XML"
+          echo "  wlcs     ${pkgs.wlcs.version}"
           echo "  wine     $(wine --version 2>/dev/null || echo 'unavailable')"
         '';
       };
