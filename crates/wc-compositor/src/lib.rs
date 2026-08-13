@@ -42,6 +42,7 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+mod clipboard;
 /// The socket a conformance suite drives this compositor through, standing
 /// where Windows stands. Linux only, because WLCS is. See its header, and
 /// docs/waycompose-design.md §26.
@@ -102,6 +103,9 @@ struct Args {
     /// compositor starts; here it is a flag, which is the same fact supplied
     /// the same way — out of band.
     arenas: Vec<(u32, u64, String)>,
+    /// DYNAMIC ARENA, fixture only: where to find regions the peer grew into.
+    /// See `wc_handle::arena::set_grow_dir` for why the deployment needs none.
+    arena_grow_dir: Option<String>,
     /// Arenas to **provide** rather than open, as `id:size`.
     ///
     /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §12).
@@ -165,20 +169,20 @@ struct Args {
     click: Option<platform::Click>,
     /// Which decoration mode to advertise, as `server`, `client` or `tabs`.
     ///
-    /// ADDED FOR STAGE 17, and given a third value by STAGE 29. See
+    /// ADDED FOR STAGE 17, and given a third value by TABS IN THE TITLE BAR. See
     /// [`Decorations`] for why it defaults to `server`, what a run that asks
     /// for `client` is for, and what `tabs` changes on the Win32 side.
     decorations: Decorations,
     /// Whether `--decorations tabs` also calls `DwmExtendFrameIntoClientArea`.
     ///
-    /// ADDED FOR STAGE 29, defaulting to on, and the reason it can be turned
+    /// ADDED FOR TABS IN THE TITLE BAR, defaulting to on, and the reason it can be turned
     /// off is in [`platform::FrameStyle`]: the DWM call is the half of the
     /// arrangement that is *not* load-bearing, and a run with it off is how
     /// that claim was measured rather than asserted.
     dwm_glass: bool,
     /// Whether `--decorations tabs` keeps Windows' own caption buttons.
     ///
-    /// ADDED FOR STAGE 29, defaulting to on, and it is what makes the
+    /// ADDED FOR TABS IN THE TITLE BAR, defaulting to on, and it is what makes the
     /// arrangement Windows' rather than an imitation — see
     /// [`platform::FrameStyle::caption_buttons`]. `off` is the control leg: the
     /// same window with the client's pixels over the whole caption and no
@@ -251,6 +255,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
+        arena_grow_dir: None,
         guest_arenas: Vec::new(),
         provide_arenas: Vec::new(),
         outbound: None,
@@ -298,6 +303,13 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             }
             // `id:size`. No path, because there is nothing to name: the region
             // is this process's own guest RAM and the host finds it by content.
+            "--arena-grow-dir" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-grow-dir needs a directory");
+                    return Err(2);
+                };
+                args.arena_grow_dir = Some(v.to_owned());
+            }
             "--arena-guest-ram" => {
                 let Some(v) = it.next() else {
                     eprintln!("wc-compositor: --arena-guest-ram needs id:size");
@@ -426,7 +438,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 args.decorations = d;
             }
-            // ADDED FOR STAGE 29. Only meaningful with `--decorations tabs`.
+            // ADDED FOR TABS IN THE TITLE BAR. Only meaningful with `--decorations tabs`.
             "--dwm-glass" => {
                 let v = it.next().unwrap_or_default();
                 match v.as_str() {
@@ -438,7 +450,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                     }
                 }
             }
-            // ADDED FOR STAGE 29. Only meaningful with `--decorations tabs`.
+            // ADDED FOR TABS IN THE TITLE BAR. Only meaningful with `--decorations tabs`.
             "--caption-buttons" => {
                 let v = it.next().unwrap_or_default();
                 match v.as_str() {
@@ -579,6 +591,20 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             }
         }
     }
+    // DYNAMIC ARENA. On the file fixture the peer can grow into regions this
+    // process was never told about, because `--arena` names one and there is no
+    // request in the protocol for a second. This says where to find them. On
+    // the guest-RAM deployment it is never needed: the regions are this
+    // process's own memory and are attached before the host can locate them.
+    if let Some(dir) = &args.arena_grow_dir {
+        match wc_handle::arena::set_grow_dir(std::path::Path::new(dir)) {
+            Ok(()) => println!("wc-compositor: regions the peer grows will be read from {dir}"),
+            Err(e) => {
+                eprintln!("wc-compositor: could not set the arena growth directory {dir}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
     // And the ones this process provides. The run id goes out on the *first*
     // line of the report because the host's locator cannot start without it and
     // a harness has to be able to grep for it; `locked=false` goes on the same
@@ -620,12 +646,38 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // line is what the peer's allocator has to be told to stay out of.
     if let Some((id, bytes)) = args.outbound {
         match wc_handle::arena::reserve_outbound(id, bytes) {
-            Ok(w) => println!(
-                "wc-compositor: arena {id} outbound window: offset {}, {} bytes \
-                 (objects made for clients are arena slices; wc-proxy needs \
-                 --arena-outbound {} to leave them alone)",
-                w.offset, w.len, w.len
-            ),
+            Ok(w) => {
+                // DYNAMIC ARENA. A run id here means `reserve_outbound` had to
+                // commit a region of its own for the window, because `id` named
+                // an arena this process had not provided. The run id goes out on
+                // its own line and in the same shape as the data regions',
+                // because the host's locator cannot find a region it has not
+                // been told the run id of — and a region nobody can locate is
+                // one the compositor writes keymaps into that no client ever
+                // reads.
+                if let Some(run) = w.run_id {
+                    println!(
+                        "wc-compositor: arena {id} provided from guest RAM: \
+                         run 0x{run:016x}, {} bytes, {} pages, locked=true \
+                         (the outbound window's own region)",
+                        w.len,
+                        w.len / wc_handle::arena::GIFT_GRANULARITY,
+                    );
+                }
+                println!(
+                    "wc-compositor: arena {id} outbound window: offset {}, {} bytes{} \
+                     (objects made for clients are arena slices; wc-proxy needs \
+                     --arena-outbound {} to leave them alone)",
+                    w.offset,
+                    w.len,
+                    if w.run_id.is_some() {
+                        ", the whole of its own region, so every data region can be reclaimed"
+                    } else {
+                        ", a tail of the data region, which therefore cannot be reclaimed"
+                    },
+                    w.len
+                );
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not reserve an outbound window in arena {id}: {e}");
                 return std::process::ExitCode::from(2);

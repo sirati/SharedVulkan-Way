@@ -5,7 +5,7 @@
 #   scripts/wc-titlebar.sh deploy   cross-compile and copy what this run needs
 #   scripts/wc-titlebar.sh server   one caption: default_mode(2) + the env var
 #   scripts/wc-titlebar.sh client   the arrangement before this stage, for the pair
-#   scripts/wc-titlebar.sh tabs     STAGE 29: the caption folded into the client
+#   scripts/wc-titlebar.sh tabs     TABS IN THE TITLE BAR: the caption folded into the client
 #                                   area, so the tab strip is *inside* the frame
 #   scripts/wc-titlebar.sh noglass  the same, without DwmExtendFrameIntoClientArea
 #   scripts/wc-titlebar.sh both     deploy, then server and client
@@ -13,13 +13,13 @@
 #   scripts/wc-titlebar.sh clean    remove what this script put on the guest
 #
 # Run from inside `nix develop`. Pictures land in docs/stage17/ and, for the
-# two legs stage 29 added, docs/stage29/.
+# two legs the tabs-in-title-bar stage added, docs/tabs-in-titlebar/.
 #
-# WHY STAGE 29's LEGS ARE HERE AND NOT IN A SCRIPT OF THEIR OWN
+# WHY TABS IN THE TITLE BAR's LEGS ARE HERE AND NOT IN A SCRIPT OF THEIR OWN
 #
 # Because the plumbing below is the claim's other half and duplicating it would
 # fork it. §22.6's argument was that a picture of a window with one caption
-# proves nothing on its own, and stage 29's is the same shape but stronger: a
+# proves nothing on its own, and the tabs-in-title-bar stage's is the same shape but stronger: a
 # window whose tab strip is inside the caption and a window whose tab strip is
 # under a caption differ by about thirty pixels of vertical offset, so the pair
 # — the *same* client, the same arena, the same desktop, minutes apart, one
@@ -76,7 +76,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage17"
-OUT29="$ROOT/docs/stage29"
+OUTTB="$ROOT/docs/tabs-in-titlebar"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
@@ -253,7 +253,7 @@ do_deploy() {
 # (§22.4) and a run that changed one without the other would be the control
 # rather than the result.
 #
-# STAGE 29 turned the leg name and the `--decorations` value into two different
+# TABS IN THE TITLE BAR turned the leg name and the `--decorations` value into two different
 # things, because `noglass` is `tabs` with one more flag and giving it a name of
 # its own is what keeps its socket, its port, its log and its picture separate
 # from the leg it is being compared with.
@@ -261,14 +261,14 @@ do_run() {
   local leg=$1 mode glass_arg="" outdir="$OUT" picture
   case "$leg" in
     server|client) mode=$leg ;;
-    tabs)          mode=tabs; outdir="$OUT29" ;;
-    noglass)       mode=tabs; glass_arg="--dwm-glass off"; outdir="$OUT29" ;;
-    nobuttons)     mode=tabs; glass_arg="--caption-buttons off"; outdir="$OUT29" ;;
+    tabs)          mode=tabs; outdir="$OUTTB" ;;
+    noglass)       mode=tabs; glass_arg="--dwm-glass off"; outdir="$OUTTB" ;;
+    nobuttons)     mode=tabs; glass_arg="--caption-buttons off"; outdir="$OUTTB" ;;
     *) bad "unknown leg $leg"; return ;;
   esac
   case "$leg" in
     server|client) picture="$outdir/stage17-$leg.png" ;;
-    *)             picture="$outdir/stage29-$leg.png" ;;
+    *)             picture="$outdir/$leg.png" ;;
   esac
   echo
   echo "== $leg: Firefox on the guest's desktop, over the guest's own RAM =="
@@ -298,7 +298,7 @@ do_run() {
   # variable turns off (§22.3).
   [ "$leg" = server ] && fxenv="MOZ_GTK_TITLEBAR_DECORATION=none"
 
-  # ----- STAGE 29: the corner Windows' own caption buttons are drawn in -------
+  # ----- TABS IN THE TITLE BAR: the corner Windows' own caption buttons are drawn in -------
   #
   # **There is no Wayland protocol that carries this**, and the shape of the
   # problem is §22.8's again rather than a new one: the protocol has no way for
@@ -349,7 +349,36 @@ do_run() {
     cpid=$(ours "$sock" -PidOnly | head -1)
     [ -n "$cpid" ] && break
   done
-  [ -n "$cpid" ] || { bad "$leg: the compositor never started on the interactive desktop"; return; }
+  # NOBODY IS LOGGED ON IS THE COMMONEST CAUSE, AND IT IS SILENT.
+  #
+  # `runint.ps1` registers the task with an `Interactive` principal — which is
+  # the whole point, because a task with any other principal lands on session 0
+  # and nothing it draws is ever on a screen (§10.12 item 3). With no logged-on
+  # session there is no interactive desktop for such a task to run on, and
+  # **`Start-ScheduledTask` returns success anyway**: no error, no exception, a
+  # cheerful `started <name>`, and a task whose `Letzte Laufzeit` stays
+  # `30.11.1999` and whose `Letztes Ergebnis` is 267011 —
+  # `SCHED_S_TASK_HAS_NOT_RUN`. From this side that is indistinguishable from a
+  # compositor that crashed on startup, and it cost this stage two runs and a
+  # session of staring at a binary that ran perfectly when started by hand.
+  #
+  # So the failure says which one it is. `explorer.exe` is the cheap test: it is
+  # per-session and it is what a logged-on desktop has.
+  if [ -z "$cpid" ]; then
+    local shell_n
+    shell_n=$(g 'powershell.exe -NoProfile -Command "(Get-Process -Name explorer -ErrorAction SilentlyContinue | Measure-Object).Count"' 2>/dev/null | tr -d '\r ')
+    if [ "${shell_n:-0}" -eq 0 ]; then
+      bad "$leg: nobody is logged on to the guest, so an Interactive scheduled task cannot run"
+      note "     Start-ScheduledTask reported success regardless; the tell is no explorer.exe"
+      note "     and 'Letztes Ergebnis: 267011' (SCHED_S_TASK_HAS_NOT_RUN) in schtasks /Query /V."
+      note "     Log on to the guest's console and re-run this leg."
+    else
+      bad "$leg: the compositor never started on the interactive desktop"
+      note "     the guest has a logged-on session ($shell_n explorer.exe), so this is not §30.10's"
+      note "     no-session case: look at $SHARE/tb-$leg.log and at schtasks /Query /TN $TBNAME-comp /V"
+    fi
+    return
+  fi
   note "$leg: our compositor is pid $cpid, socket $sock"
 
   # ----- 2. find the guest's pages from outside the guest --------------------
@@ -487,7 +516,7 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
   case "$mode:$asked" in
     "server:Value(Server)") ok "$leg: Firefox asked for Server, on real Windows" ;;
     "client:Value(Client)") ok "$leg: Firefox asked for Client, on real Windows" ;;
-    # STAGE 29. `Tabs` is `Client` on the wire and has to be: the tab strip this
+    # TABS IN THE TITLE BAR. `Tabs` is `Client` on the wire and has to be: the tab strip this
     # leg is putting in the caption is drawn by the client, and it only exists
     # when the manager's default says so. A `tabs` leg where Firefox asked for
     # Server has lost the thing it is photographing.
@@ -501,7 +530,7 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
     && ok "$leg: a real HWND, sized from the geometry rectangle: $mapped" \
     || bad "$leg: the window never mapped"
 
-  # ----- STAGE 29: the frame arithmetic, from the compositor's own log --------
+  # ----- TABS IN THE TITLE BAR: the frame arithmetic, from the compositor's own log --------
   #
   # The picture is the claim, and these two lines are what stop a *pretty*
   # picture from being believed on its own. The first says Win32 answered
@@ -584,7 +613,7 @@ case "$MODE" in
   noglass)   do_run noglass ;;
   nobuttons) do_run nobuttons ;;
   both)    do_deploy; do_run server; do_run client ;;
-  # STAGE 29's pair, and the order is deliberate: `tabs` first, so that a run
+  # TABS IN THE TITLE BAR's pair, and the order is deliberate: `tabs` first, so that a run
   # which has to be abandoned because the guest is contended has produced the
   # picture the section is about rather than its control.
   pair)    do_deploy; do_run tabs; do_run server ;;

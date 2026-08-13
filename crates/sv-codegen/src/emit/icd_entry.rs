@@ -722,6 +722,22 @@ fn lower_expr(
             let inner =
                 lower_expr(cx, elem, abi, &quote!(*(#access).add(__i)), member_access, owner)?;
             let ty = wire_type(elem);
+            // A pointer that a *sibling* decides the validity of. Non-null is
+            // not permission to read it — see `exceptions::SIBLING_SELECTED`,
+            // which is entirely about `VkWriteDescriptorSet` and cost a GPU
+            // hang. The guard comes first so that a `descriptorType` naming a
+            // different arm makes this one an empty array without the pointer
+            // ever being dereferenced.
+            let n = match crate::exceptions::sibling_selected(owner, &abi.name) {
+                Some((sel, vals)) => {
+                    let s = member_access(sel);
+                    let vals = vals.iter().copied();
+                    // `member_access` already unwraps a newtyped enum to its
+                    // integer, so this is the value and not the wrapper.
+                    quote!(if !matches!((#s) as i64, #(#vals)|*) { 0usize } else { #n })
+                }
+                None => n,
+            };
             quote!({
                 let __n = if (#access).is_null() { 0usize } else { #n };
                 let mut __v: Vec<#ty> = Vec::with_capacity(__n);
@@ -1096,12 +1112,14 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkCreateHeadlessSurfaceEXT",
     "vkCreateXlibSurfaceKHR",
     "vkCreateXcbSurfaceKHR",
+    "vkCreateWaylandSurfaceKHR",
     "vkGetPhysicalDeviceSurfaceSupportKHR",
     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
     "vkGetPhysicalDeviceSurfaceFormatsKHR",
     "vkGetPhysicalDeviceSurfacePresentModesKHR",
     "vkGetPhysicalDeviceXlibPresentationSupportKHR",
     "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+    "vkGetPhysicalDeviceWaylandPresentationSupportKHR",
     "vkCreateSwapchainKHR",
     "vkDestroySwapchainKHR",
     "vkGetSwapchainImagesKHR",
@@ -1950,7 +1968,7 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
 /// Entry points that are hand-written **and not on the generated C surface**,
 /// which have to be put in the proc tables by name.
 ///
-/// Three, all surface creators, and they are here for two facts that only make
+/// Four, all surface creators, and they are here for two facts that only make
 /// sense together.
 ///
 /// **The registry cannot give them a signature.** `vkCreateXcbSurfaceKHR` takes
@@ -1979,6 +1997,7 @@ const EXTRA_LOCAL: &[(&str, &str)] = &[
     ("vkCreateHeadlessSurfaceEXT", "sv_vk_create_headless_surface_ext"),
     ("vkCreateXlibSurfaceKHR", "sv_vk_create_xlib_surface_khr"),
     ("vkCreateXcbSurfaceKHR", "sv_vk_create_xcb_surface_khr"),
+    ("vkCreateWaylandSurfaceKHR", "sv_vk_create_wayland_surface_khr"),
 ];
 
 fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {

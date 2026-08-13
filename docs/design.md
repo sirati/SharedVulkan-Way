@@ -1520,6 +1520,433 @@ the query is what re-locates and re-validates afterwards — 2 s paid once,
 1 ms per re-check thereafter, and a broken interface caught loudly on the one
 occasion the stamps still exist.
 
+### 0.15 The conformance suite, and what the control did to its number
+
+Built and measured 2026-08-13 on **devhost** in `nix develop`,
+`scripts/sv-cts.sh` against `vulkan-cts-1.4.6.1` on RADV RAPHAEL_MENDOCINO.
+**`deqp-vk` runs against the forwarded ICD.** Every instrument in this project
+until now judged one workload; this one judges the API, which is the only thing
+that can answer a claim about *surface area*. `sv-zink-gl.sh` renders a correct
+frame through 239 forwarded commands without saying a word about the other 501.
+
+`dEQP-VK.api.smoke.*` — the traditional first target — is **6/6 through the
+forwarder**, identical to the same six on the same RADV with no forwarding, and
+the ICD's `sv-icd: connected to the GPU side` plus the GPU side's session log
+are what say which implementation ran.
+
+*(The numbers in the table are the 1-in-20000 sample, which completes. The
+1-in-2000 run was attempted and **stopped deliberately**; what it measured
+before it was stopped is item 10, and it is the most important number in this
+section.)*
+
+Two independent runs of the same 164 tests, because one run of a thing that
+loses devices is a sample of one:
+
+| | control (RADV direct) | forwarded, run A | forwarded, run B |
+|---|---|---|---|
+| Pass | **96** / 96 | **24** | **29** |
+| NotSupported | 68 / 68 | 126 | 126 |
+| Fail | 0 / 0 | 1 | 1 |
+| DeviceLost | 0 / 0 | 12 | 8 |
+| ResourceError | 0 / 0 | 1 | 0 |
+| total | 164 | 164 | 164 |
+| wall | 1 s / 5 s | 52 s | 91 s |
+
+**The control is identical to the test between the two runs and the forwarded
+column is not.** 96/68/0/0 both times, against 24 versus 29 passes and 12
+versus 8 device losses — *the same tests, same binary, same driver, minutes
+apart*. Whatever loses the device is timing-dependent, and any single forwarded
+number here carries a variance of about five tests in 164.
+
+**The join is the answer and the totals are not.** Run A: 72 tests pass on RADV
+and not through the forwarder; **0** go the other way. Of those 72, **59 are
+`NotSupported`** — the forwarded device declining something it does not
+advertise, which is the profile and not a defect — **12 are `DeviceLost`** and
+**1 is `Fail`**. Run B: 67, of which 58 `NotSupported`, 8 `DeviceLost`, 1
+`Fail`. So the honest sentence is *nine to thirteen forwarding defects and
+fifty-eight to fifty-nine gaps in the declared scope*, and no arrangement of the
+totals says that. The skip half is stable to one test; the defect half is not.
+
+Ten findings. The first four are about the instrument, and they are here
+because each was a wrong number first; the tenth is the one that decides what
+the next stage of this project is.
+
+**1. The standard runner reported zero passes for a driver that passes.**
+`deqp-runner` 0.18.0 is what Mesa CI uses and it does not know deqp's
+`DeviceLost` status: `Failure getting run results: unknown dEQP status
+'DeviceLost'` abandons the entire group, and every test in it is written out as
+`Missing`. On this machine that happened to four groups out of four in a
+**control** run against unforwarded RADV — 0 Pass, 0 Fail, 33 Missing, for a
+configuration that had just passed 6/6. A tool that turns a driver's honest
+answer into an absence of data is worse than no tool, and the chunking that
+replaced it is thirty lines.
+
+**2. The mustpass lists shipped beside the binary are not the binary's tests.**
+362 of a 1451-test sample of `vk-default/*.txt` name tests the `deqp-vk` in the
+same derivation does not have — all format combinations, e.g.
+`…astc_10x10_srgb_block.b8g8r8_srgb.linear_optimal_nearest` where only the
+`optimal_optimal_*` variants are generated. A quarter of the first scoreboard
+was that. The caselist is now `--deqp-runmode=stdout-caselist` — 3,279,369
+tests, the binary describing itself — and is cached under the store hash it came
+from so a flake bump invalidates it by name.
+
+**3. `DeviceLost` is contagious, and the first attempt to correct for it was a
+heuristic that was wrong.** deqp holds **one** `VkDevice` for a whole
+invocation, so the test that loses it takes every test after it in that process.
+The first forwarded run reported twelve `DeviceLost` verdicts including
+`dEQP-VK.ubo.3_level_array.std140.mat3x2.vertex_comp_access`, which passes on
+its own every time. The fix attempted was "keep the first `DeviceLost` of a
+round as the culprit, retry the rest", and the next run said plainly that it was
+wrong: sixteen of them, the same innocent test among them. **The culprit does
+not have to report `DeviceLost`; it can report `Pass` and leave the device
+wedged for whoever comes next**, so no ordering heuristic can find it. What
+works is exact and dull: every non-benign verdict is re-run **alone**, one
+process and one GPU side per test, and the isolated verdict is the one that
+counts. Eight verdicts of twenty changed under isolation.
+
+**4. A GPU side that outlives its client wedges the machine, and the symptom
+accuses the wrong thing.** An interrupted run left four `sv-gpu-server`
+processes behind. `amdgpu: ring gfx_0.0.0 timeout, signaled seq=875426, emitted
+seq=875428` then appeared on *every* subsequent invocation, and plain
+unforwarded `dEQP-VK.api.smoke.*` went from 6/6 to 2/4 and aborted — which reads
+as "CTS breaks RADV" and is not that. Killing the four restored 6/6 immediately.
+The harness now records every server's pid and kills them on exit. Two things
+follow: a leaked GPU side is not a leaked process, it is a leaked *driver
+context with work queued on it*; and the control is what made the accusation
+falsifiable in ten seconds.
+
+**5. Presented as a deadline, a timeout is the wrong instrument for a hang.**
+A chunk of 200 forwarded tests legitimately takes ten minutes and a hang is one
+test that never returns, so a deadline generous enough for the first costs
+fifteen minutes per instance of the second. Two tests hang the forwarder at this
+sample — `dEQP-VK.memory.allocation.random.79` and a
+`synchronization.timeline_semaphore.device_host…` case — and they turned a
+25-minute run into an open-ended one. What distinguishes work from a hang is
+*progress*, and deqp announces every test before running it, so the watchdog is
+"no new output for `--stall` seconds". `stdbuf -oL` is what makes that
+measurable at all: a redirected stdout is block-buffered, and without it a stall
+is indistinguishable from ordinary buffering.
+
+**6. The one synthesised queue family is the largest single non-extension gap
+CTS finds.** §0.4 item 7 chose it deliberately — a GPU side has one queue on one
+family, and passing RADV's five through had an application select family 3 and
+get family 0's queue in silence. The cost is now a number: of the 59 tests that
+skip forwarded and pass on RADV, **11 skip for the queue family alone** —
+8 `No matching queue found: findQueueFamilyIndexWithCaps(requiredCaps=0x2;
+excludedCaps=0x1)` and 3 `Exclusive compute queue not supported`. That is second
+only to `VK_EXT_shader_object` (12) and ahead of
+`VK_EXT_graphics_pipeline_library` (7) and the whole ray-tracing family (6).
+§0.8 item 3 predicted a workload that would break the one-family decision;
+this is it, and unlike video decode it is not one extension away.
+
+**7. The gap is data now, on both sides of the boundary.** `sv-codegen gap`
+reports it from the registry — **740 commands defined, 239 carried by the zink
+profile, 501 not, 23 of those unreachable by any profile** — grouped by the
+extension that introduces each, because nobody adds `vkCmdTraceRaysKHR`, they
+add `VK_KHR_ray_tracing_pipeline`. The suite reports the other half, in deqp's
+own words, restricted to tests the control passes. The intersection is the work
+list and it is short: `VK_EXT_shader_object`,
+`VK_EXT_graphics_pipeline_library`, `VK_KHR_maintenance6`,
+`VK_KHR_push_descriptor`, `VK_EXT_sample_locations`,
+`VK_EXT_depth_range_unrestricted` — and a second queue family, which is not an
+extension at all.
+
+**8. Two ring fatals, and both name the same suspicion.** The GPU side declined
+to continue three times across the run, with two shapes:
+`no VkDeviceMemory with id 129` and `no VkBuffer with id 140737343632080` —
+both annotated by the code that raised them as a possible missing `RingBarrier`
+(R22). The second id is `0x7FFF…`, a **host pointer**, not an app-side id, so at
+least one of the two is a handle reaching the GPU side unmapped rather than an
+ordering fault. Recorded rather than fixed; they are the first defects CTS has
+found that no other harness in this tree could reach.
+
+**9. The multi-session property holds — and the check that said otherwise was
+measuring the check before it.** Concurrent clients on **one** GPU side — one
+driver, one `VkDevice`, one `VkQueue`, three ring threads each — over
+`dEQP-VK.api.smoke.*` and `compute.basic`: **48/48 Pass** at eight clients,
+**36/36** at six, no ring fatal. The generated dispatch takes the device queue
+lock as of this branch, and the command set it takes it for comes from the
+registry's `externsync=` *and* its `<implicitexternsyncparams>` prose — the only
+place `vkDeviceWaitIdle` is marked, and `vkDeviceWaitIdle` is precisely the one
+that rides a different ring from `vkQueueSubmit`.
+
+  In between those two results the same check reported **six `DeviceLost` at
+  `vkWaitForFences` across six clients**, and it would have been recorded as a
+  concurrency defect. It was not one. That run had the concurrency check *last*,
+  after a sweep that had lost eight devices and put RADV through as many ring
+  resets; repeated on a quiescent GPU the identical six clients gave 36/36. So
+  the check now runs **before** the sweep, and the finding is a rule rather than
+  a fix: **a check placed after a phase that resets the GPU is measuring that
+  phase.** It is §0's recurring shape once more — a true observation attached to
+  the wrong cause — and it survived one run in each direction, 48/48 and then
+  12/18, which is exactly long enough to be believed.
+
+**10. The forwarder hangs the GPU on about one in ten of the tests RADV
+passes, and that is what stopped the wider run.** The 1-in-2000 sample — 1640
+tests, ten times the table above — was run and abandoned. Its control finished
+in **11 s: 904 Pass, 736 NotSupported, and not one device lost**. Its forwarded
+pass reached **661 of 1640** before it was stopped, with **86 Pass, 503
+NotSupported, 1 Fail and 71 DeviceLost** — and the reason for stopping was in
+the kernel log rather than in the scoreboard:
+
+```
+amdgpu 0000:72:00.0: amdgpu: ring gfx_0.0.0 timeout, signaled seq=887853, emitted seq=887857
+amdgpu 0000:72:00.0: amdgpu: Starting gfx_0.0.0 ring reset
+amdgpu 0000:72:00.0: [drm] device wedged, but recovered through reset
+```
+
+— 313 `amdgpu` messages in ten minutes, on a shared machine at load average 86.
+Every reset succeeded and `dEQP-VK.api.smoke.*` was back to 6/6 within seconds
+of stopping, so nothing was damaged; but a harness that resets somebody else's
+GPU every twenty seconds is not one to leave running, and the rate is the
+finding rather than the inconvenience.
+
+Two things follow, and they are not the same claim. **The upper bound is
+71/661 ≈ 11%**, which is a *batch* figure and therefore includes collateral:
+at the smaller sample, isolation reduced 19 batch `DeviceLost` to 12 real ones,
+about 63%. Scaling that gives roughly **7% of forwarded tests hanging the GPU**,
+which matches the isolated 12/164 directly. And **the control does not do it at
+all** — zero device losses in 1640 tests, and zero in the 164 — so this is not
+CTS being hard on RADV. It is ours.
+
+That is the single largest defect this project has, it was invisible to all six
+existing harnesses, and finding it is the whole return on building this one.
+Nothing about it is diagnosed yet: the twelve isolated names are in
+`/tmp/sv-cts-regressions.txt`, they span `ubo`, `ssbo`, `renderpasses`,
+`subgroups`, `ycbcr`, `query_pool` and `spirv_assembly`, and no two of them
+obviously share a mechanism.
+
+**What is not settled**, and is the honest state of this stage:
+
+- **This is a 1-in-20000 sample of 3.28 million tests, not a conformance run.**
+  164 tests is enough to find defects and to size the gap; it is not enough to
+  claim anything about the suite, and the word "conformant" does not apply to
+  any number in this section. The instrument scales — `--fraction` is the only
+  knob — and what it costs is wall time on a machine with a GPU other people are
+  using.
+- **The forwarded pass is 52× the control's wall time**, and that number is
+  worth almost nothing as a performance figure: it includes a GPU-side restart
+  per chunk, an isolation phase the control barely uses, and twelve device
+  losses at ten seconds of kernel ring reset each. §0.13's sweep is the
+  performance measurement; this is not one.
+- **The device losses of item 10 are undiagnosed.** Each is reproducible by name
+  and none has been reduced to a command. Two hangs are separate from them —
+  `dEQP-VK.memory.allocation.random.79` and a
+  `synchronization.timeline_semaphore.device_host…` case — and are what item 5's
+  watchdog exists to survive rather than to explain.
+- **The wider run has to be re-run on a machine nobody else is using**, and
+  until then the 1-in-2000 column is 661 tests of 1640 and is quoted as such.
+- **Nothing has run on testhost.** The Intel iGPU in the guest is the device
+  the north-star goal needs and the cross-VM stack is what would have to be
+  stood up to reach it; every number here is same-machine RADV over a Unix
+  socket. §0.13 said the same thing about the resolution sweep and it is still
+  true.
+
+### 0.16 Why the forwarder was hanging the GPU
+
+Measured 2026-08-13 on **devhost** in `nix develop`, RADV RAPHAEL_MENDOCINO,
+CTS 1.4.6.1. §0.15 item 10 left "about 7% of forwarded tests hang the GPU" as
+the largest open defect and undiagnosed. It is three defects, and the diagnosis
+begins with the shape of the list rather than with any one test.
+
+**The names were the diagnosis.** The 84 tests that ever reported `DeviceLost`
+spread across fifteen top-level groups — 18 `api`, 12 `renderpasses`, 12
+`pipeline`, 10 `spirv_assembly`, 7 `glsl`, 6 `binding_model`, 4 each of `ssbo`,
+`query_pool` and `draw`. `api.copy_and_blit` and `api.image_clearing` do not
+run shaders at all; `spirv_assembly` is nothing but shaders. Nothing about a
+*feature* is common to that set, which is what said the cause was in the
+transport or in something every test does — and every test writes descriptors.
+
+**The measurement that matters is paired and per-test**, because most of those
+84 names are collateral: deqp holds one `VkDevice` per invocation, so a test
+that loses it takes the rest of the process with it (§0.15 item 3). Run one test
+per process, before and after:
+
+| | before | after |
+|---|---|---|
+| Pass | 72 | 75 |
+| DeviceLost | **12** | **5** |
+| NotSupported | 0 | 4 |
+| Fail | 0 | — |
+
+Twelve genuine wedges, of which **seven are accounted for and five are not**.
+
+**1. Inline uniform block writes were being dropped, silently.**
+`expand_descriptor_template` — the app-side rewrite of
+`vkUpdateDescriptorSetWithTemplate` into `vkUpdateDescriptorSets` (§0.4 item 10)
+— had a catch-all arm whose comment read *"an inline uniform block's data is
+carried in a `VkWriteDescriptorSetInlineUniformBlock` chain link rather than in
+an array. Not in this profile's feature set; dropped rather than guessed at, and
+said so."* All three clauses were false. `VK_EXT_inline_uniform_block` was
+promoted to core in **1.3**, the zink profile carries `VK_VERSION_1_3`, the ICD
+advertises 1.3, and the generator had emitted
+`VkWriteDescriptorSetInlineUniformBlock` and its `PNextLink` variant all along —
+nothing had to be guessed at. And it did not say so: the complaint went through
+`report_transport_failure`, which is gated behind `SV_DEBUG`, so in an ordinary
+run **64 descriptor writes per test vanished in silence**, the set was left
+holding uninitialised inline data, and the shader that read it hung the GPU.
+
+  The type is the one place in that function where `descriptorCount` is a
+  **byte count** and `dstArrayElement` a **byte offset**, with `stride` ignored,
+  which is why it cannot be one more arm of the same loop. `report_always` is
+  new and its reserved use is stated: **data this ICD is about to discard**.
+  Everything else stays behind `SV_DEBUG`, because an ICD that chatters gets
+  silenced; a descriptor that does not arrive produces no error, no `VkResult`
+  and no validation message.
+
+**2. The generated lowering read descriptor arms the application never filled
+in.** This is the one that did the damage. `VkWriteDescriptorSet` carries
+`pImageInfo`, `pBufferInfo` and `pTexelBufferView`; exactly one is used and
+`descriptorType` says which, and **the specification permits the other two to
+hold anything at all** — an uninitialised stack slot, a stale pointer, a pointer
+to an array of a different element type or a shorter length. The registry marks
+all three `noautovalidity="true"`, which is its way of saying a sibling decides
+and it cannot express how, and nothing read it. The generated lowering read
+whichever were non-null.
+
+  That is an out-of-bounds read of the *application's* memory — §0.3 item 2's
+  hazard, met for the second time and this time live. What it put on the wire
+  was a `VkBuffer` id of `0xFFFFFFFF00000001`, and the GPU side said `no VkBuffer
+  with id …` and took the ring fatal. **That is the lucky outcome.** An id that
+  fails to map is reported; an id that happens to collide with a live object maps
+  successfully, the driver is handed a descriptor pointing at the wrong resource,
+  and the GPU hangs with no diagnostic anywhere. `exceptions::SIBLING_SELECTED`
+  is the fix and `an_unselected_descriptor_arm_is_never_read` is the negative
+  control — the unselected pointers there address a one-element array while
+  `descriptorCount` is 4, so a lowering that reads them runs off the end.
+
+  **Why nothing had caught it in six harnesses:** Zink uses descriptor update
+  *templates* unconditionally in its default mode (§0.4 item 10), and this
+  project expands those app-side into wire structs directly, never touching this
+  lowering. DXVK leans on templates too. So the direct `vkUpdateDescriptorSets`
+  path — the one an ordinary Vulkan application uses — had never been executed by
+  anything in this tree. §0.15's argument for owning a CTS harness, in one
+  struct.
+
+  The wire format does not move: the struct still has all three arrays and the
+  protocol hash is unchanged at `0x44c19f913c79a5fa`. What changed is what we
+  put in them.
+
+**3. We advertise `bufferDeviceAddress` and do not implement it.** Four of the
+remaining wedges were `binding_model.buffer_device_address.*` and `ssbo.phys.*`
+— physical storage buffers, every one. `vulkaninfo` against this ICD prints
+`bufferDeviceAddress = true`, because §0.4 item 9 has the GPU side enable
+everything the physical device reports and `vkGetPhysicalDeviceFeatures2` is
+forwarded whole, so RADV's answer is ours. Meanwhile all three of
+`vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress` and
+`vkGetDeviceMemoryOpaqueCaptureAddress` sit in `sv_icd_entry`'s
+`NOT_IMPLEMENTED` list. The application asks for an address, gets nothing back,
+writes it into a buffer, a shader dereferences it, and the GPU faults.
+
+  So **§0.3 item 5's "latent rather than live" is falsified**: it reasoned that
+  the protocol hole behind those three commands — a command returning a value
+  that is neither `void` nor `VkResult` has no reply to put it in — could not be
+  reached because "§9.2 does not advertise `bufferDeviceAddress`, so a conforming
+  application never calls them". §9.2 says that; no code implements it; and a
+  conforming application called them on the first afternoon anyone asked.
+  `advertise::we_do_not_advertise_buffer_device_address` passes and asserts about
+  the 1.0 feature struct, where the feature does not live.
+
+  **This is not to be fixed by advertising `false`.** Buffer device address
+  support is a stated goal of the project, translation at the boundary is
+  expected, and §11's own "honest caveat" already says the address itself is
+  workable — *"if we return the GPU side's true device address from
+  `vkGetBufferDeviceAddress` and never relocate, an address the application
+  writes into arena memory is dereferenceable by a GPU-side shader"*. Reporting
+  the feature false was tried, measured (it turns all four device losses into
+  `NotSupported`), and **reverted**, because converting a goal into a skip is not
+  a fix. The work is the one `plan.rs` change §0.3 item 5 already named — a reply
+  exists whenever a command returns anything at all — plus the reply field, the
+  GPU-side fill, the app-side fold, and the boundary translation. That is a
+  stage, and it is the next one.
+
+**What is not settled.** Five wedges remain and they cluster into two families
+that share no obvious mechanism with the above: four
+`query_pool.statistics_query.*` (all of them `cmdcopyquerypoolresults` or
+`host_query_reset` variants) and one
+`ycbcr.copy.g8_b8r8_2plane_444_unorm…linear_disjoint_buffer_linear`. Each is
+reproducible by name with `scripts/sv-cts.sh --include`. And the rate itself has
+not been re-measured on a fresh CTS sample — the paired 12 → 5 is on the
+known-wedging set, which is not a random sample of anything, so it says these
+three defects are real and does **not** say the 7% is now 3%.
+
+---
+
+### 0.15 The Wayland WSI, and the gate that turned out to be Mesa's
+
+Built and measured 2026-08-13 on **devhost** and on **testhost** against
+the live guest, `docs/firefox-accel.md`, "The Wayland WSI, and the gate that is
+not ours". §0.14's section named `VK_KHR_wayland_surface` as the one thing
+between this project and Firefox's hardware WebRender. It was built. It is not
+the one thing, and the correction is the point of this entry.
+
+**1. The extension exists and works as designed.** `sv-icd` advertises
+`VK_KHR_wayland_surface` and implements it app-side, like the rest of §10:
+`vkCreateWaylandSurfaceKHR` reads a `wl_display*` and a `wl_surface*` out of the
+loader's `VkIcdSurfaceWayland`, and `vkQueuePresentKHR` attaches a `wl_shm`
+buffer to that surface **on the application's own connection**, from an event
+queue of ours. The X11 target could open a connection of its own because an X
+window id is global to the display; a `wl_surface` is a proxy private to one
+connection and has no such name, so there is no choice. libwayland is `dlopen`ed
+and driven through `wl_proxy_marshal_array_flags`, because the functions that
+would be linked are `static inline` in the protocol header and only the
+marshaller is an exported symbol. **No descriptor crosses**: the `memfd` is
+created on the host, consumed by `wc-proxy` on the host, and what reaches the
+guest is the `(slab, offset, len)` triple `wc_proxy::pool` already carries.
+
+**2. And Mesa will not call it, for a reason above this project.**
+`dri2_initialize_wayland` reaches Zink through two doors. The DRM one needs a
+render node advertised *by the compositor* — `zwp_linux_dmabuf_v1` or `wl_drm` —
+which a `wl_shm`-only proxy on a host with no `/dev/dri` cannot give it, and
+`eglapi.c`'s retry then clears `Options.Zink` outright. The swrast one honours
+`Options.Zink` but only runs under `LIBGL_ALWAYS_SOFTWARE`, and Zink's
+`choose_pdev` reads that same variable and then accepts only a device that says
+`VK_PHYSICAL_DEVICE_TYPE_CPU` — measured, as `ZINK: CPU device requested but
+none found!`. **On this topology no Vulkan driver is reachable from the Wayland
+EGL platform, whatever it advertises.**
+
+**3. So §0.14's control was not a control.** It compared real RADV on a pixman
+weston against our ICD on `wc-proxy` and concluded that the variable was the
+extension. The second, unheld variable was `/dev/dri`: devhost has one and
+testhost has none, so the two runs went through different doors. The lesson is
+§0.13's exactly — a control that does not hold the venue fixed answers a
+different question — and it is recorded here rather than quietly fixed.
+
+**4. The X11 path does reach the GPU, and needed one environment variable.**
+`platform_x11.c` has the override the Wayland platform lacks: with
+`LIBGL_KOPPER_DRI2=1` Mesa skips the DRI3-multibuffer and render-device checks
+and goes straight to `dri2_initialize_x11_kopper`, which presents through
+`VK_KHR_xcb_surface` — an extension this ICD has had since §0.4. Under a rootful
+Xwayland with no DRM device, on a compositor that speaks only `wl_shm`,
+`eglgears_x11` renders on the real GPU through the forwarder, and **Firefox
+stops reporting `Failed to create EGLConfig for WebRender!` and
+`Fallback WR to SW-WR` and builds a swapchain on this ICD instead**. Without the
+variable the same Xwayland yields `DRI3 not available` and `couldn't find RGB
+GLX visual or fbconfig`, which is what three runs measured before it was found.
+
+**5. On testhost that path puts GL on the guest's desktop, and Firefox still
+stalls.** `eglgears_x11` through the same harness renders on the guest's Intel
+iGPU, is presented by this ICD into a DRM-less Xwayland, reaches the guest as
+`wl_shm` over `wc-proxy` into the guest-RAM arena, and appears in the
+compositor's dumped frame on the Windows desktop — every layer of
+`goal-firefox.md` except the browser, on the machine the goal is about. Firefox
+gets further than it ever has and no further:
+`vkCreateSwapchainKHR: X11 { window: 6291472 } 512x416` on the guest's
+Intel iGPU from a host with no GPU, then `WaitFlushedEvent::Run: is delayed:
+14608` and `Exiting due to channel error`, twice, at four sessions and at eight.
+What is *not* separated is how much of that is the cross-VM round trip per
+present, how much is the `XSync` per frame that `sv_icd::present::x11::quietly`
+pays on top of it, and how much is a guest a dozen other experiments were using.
+**So `about:support` still has no answer, and there is still no frame rate.**
+
+**6. One instrument was added, and it is the one that made §5 sayable.**
+`sv_icd::wsi::frame_note` samples every sixtieth presented frame and reports how
+many pixels are not black, under `SV_DEBUG`. A swapchain whose every entry point
+returns `VK_SUCCESS` and whose window is nonetheless black is indistinguishable
+from a broken display target without it; with it the answer was "the frame has
+content, and there is exactly one of them", which is a different problem from
+the one being chased.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
@@ -1797,7 +2224,20 @@ sequence:
    the AWE path the frame list is run-length encoded — though AWE frames were
    measured to sort into 5863–16339 runs per 64 MiB, so "run-length encoded" is
    not the saving it sounds like, which is one more reason that path is not
-   taken (§5.1). `locator` is `Scan` in v1 on every path.
+   taken (§5.1).
+
+   **`locator` was `Scan` on every path and is now chosen** (§0.14, 2026-08-13).
+   `Pfns` is no longer AWE-only: the guest asks the PFN database where its own
+   pages are (`awe_probe::superfetch::pfn_locator`) and publishes the run-length
+   encoded answer, and the attaching side translates it
+   (`sv_hostd::locate::PfnLocator`) instead of sweeping thirteen gigabytes. It
+   is opt-in — `sv-hostd qemu --locator scan|pfns|both`, `arena-host locate
+   --locator …`, defaulting to `scan` — because R28 makes the scan the
+   cross-check that the undocumented interface is telling the truth, and `both`
+   is that cross-check: the same extent located twice by two mechanisms with
+   nothing in common, and a disagreement about any page fatal to the session.
+   On the large-page path a 64 MiB window is 26 runs, so the descriptor is 416
+   bytes rather than a page list.
 
    **`granularity` is asserted, never assumed.** The GPU side calls
    `QueryWorkingSetEx` on the extent and publishes the `LargePage` bit it
@@ -2235,8 +2675,8 @@ Four locators, one trait:
 | Locator | Mechanism | Cost | Status |
 |---|---|---|---|
 | `ScanLocator` | Sweep the whole memfd for the magic. Works for any granularity | **1.8 s at 64 MiB, 2.02 s at 1 GiB, 2.32 s at 2 GiB, measured** | **v1, and the cross-check on every path** |
-| `SuperfetchPfnLocator` | The guest asks the PFN database where its own pages are and reports the frames; the host translates them | **~330 ms in the guest for any window; 0.064 s on the host; 0–22 ms to re-check a list already held. Measured** | **Measured working, agrees with the scan 16384/16384. Not yet wired into `sv-gpu-server`** |
-| `PfnLocator` | Translate the reported frame list. AWE only | O(pages) arithmetic, no I/O | Implemented and tested in `arena-host`; **16384/16384 frames verified**, unused here |
+| `SuperfetchPfnLocator` | The guest asks the PFN database where its own pages are and reports the frames; the host translates them | **~330 ms in the guest for any window; 0.064 s on the host; 0–22 ms to re-check a list already held. Measured** | **Measured working, agrees with the scan 16384/16384.** Wired: `awe_probe::superfetch::pfn_locator` → `Locator::Pfns` → `sv_hostd::locate::PfnLocator`, selected by `--locator scan\|pfns\|both`. Not yet published by `sv-gpu-server`, which has no Windows provider |
+| `PfnLocator` | Translate a reported frame list through the region table. **No longer AWE-only** — the mechanism above feeds it | O(pages) arithmetic, no I/O | Implemented in `sv_hostd::locate` and unit-tested; the `arena-host` seed remains as `arena-host locate`. **16384/16384 frames verified** against a live guest |
 | `ProbeLocator` | Read one record every 2 MiB. Large pages only, because only they are guaranteed 2 MiB-aligned in GPA | ~6656 probes for 13 GiB, ~1/512 of a scan | Not implemented, and now pointless |
 
 **Decision, revised 2026-08-13: the scan locates an extent once, and the query

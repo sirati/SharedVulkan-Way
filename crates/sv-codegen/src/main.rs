@@ -14,6 +14,7 @@ fn main() -> Result<()> {
     let mut stats_only = false;
     let mut icd_entry = false;
     let mut gpu_entry = false;
+    let mut gap = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -26,6 +27,7 @@ fn main() -> Result<()> {
             }
             "--icd-entry" => icd_entry = true,
             "--gpu-entry" => gpu_entry = true,
+            "--gap" | "gap" => gap = true,
             "--check-determinism" => check_determinism = true,
             "--stats" => stats_only = true,
             "--list-profiles" => {
@@ -51,6 +53,85 @@ fn main() -> Result<()> {
     let profile = sv_codegen::profile_by_name(&profile_name).with_context(|| {
         format!("unknown profile {profile_name:?}; try one of {:?}", sv_codegen::PROFILE_NAMES)
     })?;
+
+    // What the profile does not carry, as data rather than as prose.
+    //
+    // design.md §11 declares the scope and `vk_registry::profiles::zink` *is*
+    // the declaration, but until now the only way to ask "which commands are
+    // out?" was to read the list and subtract it from the registry in your head.
+    // That is the question `goal.md`'s "a lot of functions are still missing"
+    // asks, and it deserves a number, an ordering, and a reason per line.
+    //
+    // The grouping is by the extension or core version that *introduces* each
+    // missing command, because that is the unit a profile is edited in: nobody
+    // adds `vkCmdTraceRaysKHR`, they add `VK_KHR_ray_tracing_pipeline`. A flat
+    // list of 500 names would be true and useless.
+    if gap {
+        let registry = vk_registry::Registry::load()?;
+        let model = registry.model()?;
+        let resolved = profile.resolve(&model)?;
+
+        // Every command the registry defines for `vulkan`, and where it first
+        // appears. A command can be required by several features; the first
+        // wins, and the sort makes "first" mean the same thing on every run.
+        let mut origin: std::collections::BTreeMap<&str, &str> = Default::default();
+        let sets = model.features.iter().chain(model.extensions.iter());
+        for f in sets.filter(|f| f.supported_for_vulkan) {
+            for b in &f.requires {
+                for it in &b.items {
+                    if let vk_registry::InterfaceRef::Command(c) = it {
+                        origin.entry(c.as_str()).or_insert(f.name.as_str());
+                    }
+                }
+            }
+        }
+
+        let defined: Vec<&str> = model.commands.keys().map(String::as_str).collect();
+        let carried: Vec<&str> =
+            defined.iter().copied().filter(|c| resolved.has_command(c)).collect();
+        let mut missing_by_set: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        let mut unreachable = 0usize;
+        for c in defined.iter().copied() {
+            if resolved.has_command(c) {
+                continue;
+            }
+            match origin.get(c) {
+                Some(set) => missing_by_set.entry(set).or_default().push(c),
+                // Defined but required by nothing this registry supports for
+                // `vulkan` — a Vulkan SC command, or one behind a `disabled`
+                // extension. Counted, not listed: no profile can reach it.
+                None => unreachable += 1,
+            }
+        }
+
+        println!("profile               {}", profile.name);
+        println!("registry commands     {}", defined.len());
+        println!("carried by profile    {}", carried.len());
+        println!(
+            "not carried           {} ({} of them unreachable by any profile)",
+            defined.len() - carried.len(),
+            unreachable
+        );
+        println!();
+        println!("what would have to be added, by the thing that introduces it:");
+        let mut rows: Vec<(&str, Vec<&str>)> = missing_by_set.into_iter().collect();
+        // Largest first — the ordering a person editing the profile wants.
+        rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+        for (set, mut cmds) in rows {
+            cmds.sort_unstable();
+            let platform = model
+                .extensions
+                .iter()
+                .chain(model.features.iter())
+                .find(|f| f.name == set)
+                .and_then(|f| f.platform.clone())
+                .map(|p| format!(" [{p}]"))
+                .unwrap_or_default();
+            println!("  {:>3}  {set}{platform}", cmds.len());
+            println!("       {}", cmds.join(", "));
+        }
+        return Ok(());
+    }
 
     if gpu_entry {
         let registry = vk_registry::Registry::load()?;

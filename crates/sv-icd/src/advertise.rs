@@ -292,6 +292,22 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
     ("VK_EXT_headless_surface", 1),
     ("VK_KHR_xlib_surface", 6),
     ("VK_KHR_xcb_surface", 6),
+    // **The one that decides whether Firefox renders in hardware.** Without it
+    // `zink_kopper` cannot create a `VkSurfaceKHR` on the Wayland platform, so
+    // Mesa loads the *swrast* DRI driver with Zink behind it and Firefox's
+    // hardware WebRender rejects the EGL configs that arrangement produces
+    // (`docs/firefox-accel.md`). With it, Mesa takes the same kopper path it
+    // takes on a real RADV against a `wl_shm`-only compositor, which is
+    // measured to satisfy Firefox.
+    //
+    // Advertising it obliges the same two things the X11 pair oblige — a
+    // `vkGetPhysicalDeviceWaylandPresentationSupportKHR`, or the loader
+    // `abort()`s, and a `vkCreateWaylandSurfaceKHR`, or every surface query
+    // silently answers "not supported" — and one thing they do not: the ICD
+    // must actually speak `wl_shm` on the application's connection, because a
+    // `wl_surface` has no id a second connection could name. See
+    // `crate::present::wayland`.
+    ("VK_KHR_wayland_surface", 6),
     // **Wine asks for these three on every instance it creates**, whatever the
     // application asked for, and `vkCreateInstance` fails with
     // `VK_ERROR_EXTENSION_NOT_PRESENT` if the host ICD does not have them. That

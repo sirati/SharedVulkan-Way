@@ -1,38 +1,30 @@
-# wc-arena-host — find the guest compositor's arena in QEMU's memory backend and
-# write the plan `wc-proxy` maps. See `src/main.rs` for what it does and why it
-# is a program rather than a module.
+# wc-arena-host — locate the guest compositor's arena in QEMU's memory backend
+# and write the plan `wc-proxy --arena-plan` maps.
 #
-# RESTORED BY STAGE 29, AND THIS COMMENT IS THE ACCOUNT.
+# RESTORED IN STAGE 14, AND AS AN ORDINARY MEMBER THIS TIME.
 #
-# `b448807 unify: delete wc-arena-host` removed this crate on the grounds that
-# it existed only to hold an absolute path dependency on what used to be a
-# sibling repository, and that the repository split no longer exists. Both
-# clauses are true and neither is a reason to delete the program: it is the
-# **only** implementation of "sweep QEMU's backing object for the guest's arena
-# stamps and write a plan", and every harness that runs a client over guest RAM
-# calls it by name —
+# `unify: delete wc-arena-host` removed this crate on the grounds that it existed
+# only to hold an absolute path dependency on a sibling repository, and that the
+# sibling is now this tree. **The first half of that is right and the second half
+# deleted a program nothing replaced.** `crates/arena-host` is a different tool
+# with a different argument set — `scan`, `translate`, `write1` — and it panics
+# with `--fd is required` when handed this one's arguments, which is what a
+# desktop shortcut got instead of a window. Nothing else in the tree turns a
+# compositor's run id into a plan, and `scripts/wc-guest.sh` still called for it
+# by name.
 #
-#   scripts/wc-titlebar.sh   scripts/wc-desktop.sh
-#   scripts/wc-guest.sh      scripts/sv-firefox-guest.sh
+# It comes back with its paths made **relative**, which is what the merge made
+# possible and was the whole of the original objection, and as a **member**
+# rather than an exclusion, which is what the merge's own comment in the root
+# manifest says is now correct.
 #
-# — so on the unified tree all four of them fail at the locate step, with
-# `manifest path crates/wc-arena-host/Cargo.toml does not exist`. That is every
-# run this project has that puts a real client's pixels in the guest's own RAM,
-# which is the standing rule §12 set. Stage 29 found it by trying to take a
-# photograph. docs/waycompose-design.md §29.9.
-#
-# NOT A WORKSPACE MEMBER, and it is left that way rather than promoted, for the
-# smallest reason available: the root manifest lists its members explicitly, a
-# directory with its own `[workspace]` table is invisible to `--workspace`, and
-# a stage whose subject is `WM_NCCALCSIZE` should not be the one that changes
-# what `cargo clippy --workspace --target x86_64-pc-windows-gnu` resolves. The
-# path dependencies below are **relative now**, which is the part of b448807's
-# argument that was right and is the whole of what the join actually changed.
-#
-# It is built and linted on its own:
-#
-#   cargo build   --manifest-path crates/wc-arena-host/Cargo.toml
-#   cargo clippy  --manifest-path crates/wc-arena-host/Cargo.toml --all-targets
+# THE DEPENDENCY IS STILL THE WHOLE POINT. Guest-physical-address translation
+# exists exactly once across what used to be two projects, and it is
+# `sv_hostd::qemu` (find QEMU, read `info mtree -f` over QMP, build a region
+# table) plus `sv_hostd::locate` (sweep the backing object for the guest's stamps
+# and coalesce what is found). Nothing on the waycompose side re-implements any
+# of it, and this dependency is what makes that statement checkable rather than
+# aspirational.
 [package]
 name = "wc-arena-host"
 version = "0.1.0"
@@ -41,25 +33,13 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.90"
 description = "Locate the guest compositor's arena in QEMU's memory backend and write the plan wc-proxy maps"
 
-# Its own workspace root, so it inherits nothing from the parent and the parent
-# resolves nothing of it.
-[workspace]
-
 [dependencies]
-# THE WHOLE POINT. Guest-physical-address translation exists exactly once across
-# this tree and it is here: `sv_hostd::qemu` finds QEMU, reads `info mtree -f`
-# over QMP and turns it into a region table; `sv_hostd::locate` sweeps the
-# backing object for the guest's stamps and coalesces what it finds. Nothing on
-# the waycompose side re-implements any of that, and this dependency is what
-# makes that statement checkable rather than aspirational.
 sv-hostd = { path = "../sv-hostd" }
 # `ExtentDesc`, which is how the arena is described to the locator.
 sv-transport = { path = "../sv-transport" }
 # `RunList`, the coalesced result.
 sv-arena = { path = "../sv-arena" }
-# The definitive stamp layout. Depended on here, and *only* here, so that the
-# twenty bytes `wc_handle::arena` spells out for itself can be asserted equal to
-# it — see the test in src/main.rs.
+# The definitive stamp layout.
 arena-record = { path = "../arena-record" }
 # And our own side of the same twenty bytes.
 wc-handle = { path = "../wc-handle" }

@@ -257,6 +257,31 @@ mod body {
         }
 
         // ---- 7. hand the frame list to the host -------------------------------
+        //
+        // The frame list is a *wire* object before it is a text file: it is
+        // `Locator::Pfns` in the `ExtentDesc` a guest publishes on the cold path
+        // (design.md §0.14, §4.3). Building it here rather than only writing the
+        // text means this probe exercises the same encoding the handshake uses,
+        // and the run count printed below is the one the host will reconstruct
+        // from the descriptor rather than a second count that happens to agree.
+        //
+        // Nothing in it is a handle. A frame number is an integer, which is what
+        // lets this cross a VM boundary at all (§1a).
+        let locator = sf::Located::locator(&frames);
+        log!(
+            "wire locator: {} run(s) of frames for {pages} pages, {} bytes of ExtentDesc",
+            locator.pfn_runs().map_or(0, |r| r.len()),
+            // 16 bytes per run, which is the figure §4.3 prices the frame path
+            // in and the reason large pages matter to the *handshake* and not
+            // only to the attacher.
+            locator.pfn_runs().map_or(0, |r| r.len()) * 16
+        );
+        assert_eq!(
+            locator.frame_count(),
+            pages as u64,
+            "the wire form must describe every page of the window"
+        );
+
         let mut status = String::new();
         status.push_str(&format!("run_id={run_id:016x}\n"));
         status.push_str(&format!("mode={}\n", mode.as_str()));

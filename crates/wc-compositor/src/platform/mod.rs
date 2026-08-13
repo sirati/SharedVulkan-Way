@@ -56,6 +56,8 @@ use std::sync::{Arc, Mutex};
 use crate::surface::{Rect, Shadow};
 
 #[cfg(windows)]
+mod drag;
+#[cfg(windows)]
 mod win32;
 #[cfg(windows)]
 pub use win32::{current_layout, has_touch, keyboard_repeat, start};
@@ -94,7 +96,7 @@ pub type WindowId = u64;
 /// Stage 3 anticipated that with an `extend_top: i32` and three conversions
 /// built on it: the surface would sit at client `y = -extend_top`, the client
 /// area would be *taller* than the surface, and a `WM_SIZE` would subtract the
-/// strip again. **Every one of those is the wrong shape**, and stage 29 found
+/// strip again. **Every one of those is the wrong shape**, and the tabs-in-title-bar stage found
 /// it out by writing the `WM_NCCALCSIZE` this field was reserved for. In the
 /// arrangement Win32 actually has:
 ///
@@ -137,7 +139,7 @@ pub struct FrameStyle {
     /// alpha-sensitive, which is a way for a client's own translucency to
     /// become a hole in the title bar — so being able to run the same window
     /// both ways, minutes apart, is what turns that from a worry into a
-    /// measurement (§29.6). Ignored entirely when `extend_top` is `false`.
+    /// measurement (§30.6). Ignored entirely when `extend_top` is `false`.
     pub dwm_glass: bool,
     /// Leave the strip where DWM drew its minimise, maximise and close buttons
     /// transparent, and forward the frame's mouse messages to
@@ -151,11 +153,11 @@ pub struct FrameStyle {
     /// With it, the buttons are the ones Windows drew, so their hover states,
     /// their theme and their `HTMAXBUTTON` hit test are Windows' too, and
     /// Windows 11's snap-layouts flyout works for the same reason it works
-    /// anywhere else (§29.7).
+    /// anywhere else (§30.5).
     ///
     /// Needs `dwm_glass`: the transparency is only transparency inside a region
     /// `DwmExtendFrameIntoClientArea` extended, and outside one the same
-    /// `FillRect` is an opaque black rectangle. §29.6 is that measurement.
+    /// `FillRect` is an opaque black rectangle. §30.6 is that measurement.
     pub caption_buttons: bool,
 }
 
@@ -367,9 +369,89 @@ pub enum ToUi {
     /// `win32::activate_window` for exactly when it is allowed to succeed and
     /// what happens when it is not.
     Activate { id: WindowId },
+    // --- the clipboard, §29 -------------------------------------------
+    //
+    // Bytes, in both directions, and **never a descriptor**. That is the whole
+    // shape of the clipboard feature and it is visible here: `wl_data_offer.
+    // receive` hands a compositor a pipe to write into, and there is no pipe
+    // between a Wayland client on Linux and a compositor in a VM, so the
+    // transfer is terminated in wc-proxy and only the payload crosses. By the
+    // time it reaches this queue it is a `Vec<u8>` with a mime type on it.
+    //
+    /// Replace the system clipboard's contents.
+    ///
+    /// One payload per mime type, already in the client's own encoding. The
+    /// conversion to `CF_UNICODETEXT` and friends is `crate::clipboard`'s, so
+    /// that it is unit-tested on the machine that runs `cargo test`; what
+    /// crosses here is what the Wayland client said.
+    SetClipboard { payloads: Vec<(String, Vec<u8>)> },
+    /// Read the system clipboard — or the drag currently over a window — and
+    /// answer with [`FromUi::ClipboardData`].
+    ///
+    /// **Asynchronous, and it has to be.** The clipboard can only be read on
+    /// the thread that owns a window, and the Wayland thread does not own one;
+    /// a synchronous call would be the Wayland thread blocking on the UI
+    /// thread, which is the deadlock this file's whole design avoids.
+    FetchClipboard {
+        token: u64,
+        /// Read the drag in progress rather than the clipboard. Two sources,
+        /// because Windows keeps them apart and reading the wrong one is how a
+        /// paste picks up the last thing dragged.
+        from_drag: bool,
+        mime: String,
+    },
+    /// Begin a system drag carrying these payloads.
+    ///
+    /// The same bytes a [`ToUi::SetClipboard`] would carry, staged the same
+    /// way, because a drag's data and a selection's data are the same thing
+    /// with a different gesture attached. Answered exactly once with
+    /// [`FromUi::DragFinished`].
+    StartDrag {
+        payloads: Vec<(String, Vec<u8>)>,
+        /// `wl_data_device_manager.dnd_action` bits the source permits.
+        actions: u32,
+    },
+    /// The Wayland source withdrew its drag.
+    CancelDrag,
 
     /// End the pump.
     Quit,
+}
+
+/// `wl_data_device_manager.dnd_action`, which both sides of the boundary speak.
+///
+/// Wayland's numbering rather than `DROPEFFECT`'s, because the Wayland client
+/// is the one that has to understand it and the platform is the one that has to
+/// convert — the same rule that puts evdev keycodes rather than virtual-key
+/// codes in [`FromUi::Key`].
+pub mod dnd_action {
+    pub const NONE: u32 = 0;
+    pub const COPY: u32 = 1;
+    pub const MOVE: u32 = 2;
+    pub const ASK: u32 = 4;
+
+    /// The bits by name, for a log.
+    ///
+    /// Worth a function rather than `{actions:#x}`: the two vocabularies either
+    /// side of this boundary use the *same numbers for different things* —
+    /// `ask` is 4 here and `DROPEFFECT_LINK` is 4 on Win32 — so a trace that
+    /// prints only the number is a trace in which the one mistake that matters
+    /// is invisible. See `drag::to_dropeffect`.
+    pub fn describe(actions: u32) -> String {
+        if actions == NONE {
+            return "none".to_owned();
+        }
+        let mut out = Vec::new();
+        for (bit, name) in [(COPY, "copy"), (MOVE, "move"), (ASK, "ask")] {
+            if actions & bit != 0 {
+                out.push(name);
+            }
+        }
+        if out.is_empty() {
+            return format!("unknown ({actions:#x})");
+        }
+        out.join("|")
+    }
 }
 
 /// UI thread -> Wayland thread.
@@ -472,6 +554,25 @@ pub enum FromUi {
     /// of `crate::input::LAYOUTS`.
     Layout { name: &'static str },
 
+    // --- the clipboard, §29 -------------------------------------------
+    /// The system clipboard changed, and now holds these mime types.
+    ///
+    /// On Win32 this is `WM_CLIPBOARDUPDATE`, which arrives for **every**
+    /// change including this compositor's own — see the note in
+    /// `win32.rs::on_clipboard_update` for why that echo is kept rather than
+    /// filtered, and what breaks if it is not.
+    ClipboardChanged { mimes: Vec<String> },
+    /// The answer to a [`ToUi::FetchClipboard`]. `None` is "the clipboard has
+    /// nothing convertible to that mime type", which is an ordinary outcome
+    /// rather than an error: the user copied a bitmap and the client wanted
+    /// text.
+    ClipboardData { token: u64, data: Option<Vec<u8>> },
+    /// A drag started with [`ToUi::StartDrag`] has ended, with the action the
+    /// drop target actually took. Exactly one per `StartDrag`, on every path
+    /// including "the drag could not be started" — a client waiting forever on
+    /// a drag that never ends is the failure this whole feature exists not to
+    /// build.
+    DragFinished { action: u32 },
     // --- touch, stage 20 ---------------------------------------------------
     //
     // Already in Wayland's units, like everything above: surface-local

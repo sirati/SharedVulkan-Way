@@ -9,3 +9,10 @@ description = "Guest half of step 0: AWE window, shared with the host, imported 
 [dependencies]
 arena-record = { path = "../arena-record" }
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
+# The frame list the PFN query produces is a *wire* object — `Locator::Pfns` in
+# the `ExtentDesc` the guest publishes (design.md §0.14) — so this crate builds
+# the real type rather than a `Vec<(usize, usize)>` that something else converts.
+# A second run-length encoding, one here and one on the wire, is exactly the kind
+# of duplicated arithmetic that makes a locator right about how many pages it
+# found and wrong about which.
+sv-transport = { workspace = true }

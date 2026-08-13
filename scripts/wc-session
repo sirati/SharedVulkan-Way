@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# wc-session -- the VM host's half of the launcher. Stage 14.
+#
+# It is installed on the VM host at ~/wc-launch/wc-session and is the **forced
+# command** of the guest's key in ~/.ssh/authorized_keys:
+#
+#   restrict,port-forwarding,command="~/wc-launch/wc-session" ssh-ed25519 ...
+#
+# So the guest cannot run anything on this machine except the verbs below, and
+# the command it asked for arrives in $SSH_ORIGINAL_COMMAND rather than as this
+# script's argv. That is the whole reason the key can live on a Windows guest
+# that anybody with the screen unlocked can read: it opens a Wayland session and
+# starts applications, and it is not a shell.
+#
+#   wc-session ping
+#   wc-session up   ID RUNID PAGES OUTBOUND   locate the guest-RAM arena, write the plan
+#   wc-session proxy ID                       start wc-proxy on the plan, as root
+#   wc-session run  ID BASE64CMD              run a Wayland client against that proxy
+#   wc-session icon APPID                     the app's icon from this machine's theme
+#   wc-session down ID                        stop the proxy and remove the run directory
+#   wc-session status ID
+#
+# THE ARENA IS GUEST RAM AND THERE IS NO OTHER KIND HERE
+#
+# `up` takes a run id and a page count that only a compositor which has pinned
+# and stamped its own memory can produce, and `proxy` starts wc-proxy with
+# `--transport arena --arena-plan`, spelled in this file and reachable from no
+# argument. There is no verb that names a file-backed arena and no flag that
+# selects one. docs/waycompose-design.md §28.2: a file arena is a Wine-only fixture, and a
+# launcher that could quietly fall back to one is how tearing reaches a screen.
+#
+# WHY ROOT, AND ONLY FOR TWO STEPS
+#
+# QEMU is a *system* service on this machine, so its QMP socket and its
+# /proc/<pid>/fd are root-only (§12.9). `wc-arena-host` reads both to find the
+# arena's pages, and `wc-proxy` opens the backing object by that path. Nothing
+# else here is privileged: the application runs as the invoking user, with that
+# user's home and that user's Firefox cache, and reaches the proxy through a
+# socket the proxy's unit chowns to them.
+#
+# $ROOTC is how this deployment becomes root and is the deployment's business.
+# On testhost it is ~/rootc (docs/waycompose-design.md §12.9). A machine that ran QEMU as
+# the developer -- which is how shared_vulkan's own boundary is deployed --
+# would set ROOTC=bash and lose nothing.
+set -uo pipefail
+
+BASE="${WC_LAUNCH_BASE:-$HOME/wc-launch}"
+BIN="$BASE/bin"
+RUNROOT="${WC_LAUNCH_RUN:-/tmp/wc-launch}"
+ROOTC="${WC_LAUNCH_ROOTC:-$HOME/rootc}"
+QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
+VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
+UID_=$(id -u)
+GID_=$(id -g)
+
+# The forced command puts the request here. Fall back to argv so the script can
+# be driven by hand on this machine.
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+  # shellcheck disable=SC2086
+  set -- $SSH_ORIGINAL_COMMAND
+fi
+VERB="${1:-}"; shift 2>/dev/null || true
+
+die() { echo "wc-session: $*" >&2; exit 1; }
+
+# An id is ours if it is [A-Za-z0-9_-]. It becomes a directory name and a
+# systemd unit name, and this is a script the guest can reach.
+check_id() {
+  case "$1" in
+    *[!A-Za-z0-9_-]*|"") die "bad id" ;;
+  esac
+}
+
+dir_of() { echo "$RUNROOT/$1"; }
+
+# WHERE AN APPLICATION ACTUALLY IS, WHICH IS NOT A CONSTANT
+#
+# The brief for this stage named Firefox at
+# `/nix/store/9ndgaj…-system-path/bin/firefox` and said not to ship that string,
+# because it changes on every rebuild. It was already wrong four hours later --
+# and not in the way anybody expected: the *current* system path has no
+# `bin/firefox` at all, so `/run/current-system/sw/bin/firefox` does not resolve
+# either and neither does `command -v firefox`. Firefox is on this machine, in
+# the store, in a generation that is still a GC root.
+#
+# So a name is resolved here, in this order, and the answer is printed with the
+# window so that a run always says which binary it got:
+#
+#   1. an absolute path, if it is one and it is executable -- an operator who
+#      names a build gets that build;
+#   2. `command -v`, which is the right answer on any ordinary machine;
+#   3. the newest `/nix/store/*-<name>-<version>/bin/<name>`, which is the
+#      answer on this one. `-[0-9]` in the glob so that `firefox-unwrapped` is
+#      not mistaken for `firefox`.
+#
+# Step 3 is a store search and it is deliberate: the alternative is a path in a
+# configuration file that a garbage collection silently invalidates, and the
+# symptom of that is a shortcut that does nothing.
+resolve_exec() {
+  local want="$1"
+  case "$want" in
+    /*) [ -x "$want" ] && { echo "$want"; return 0; } ;;
+  esac
+  local base; base=$(basename "$want")
+  local p; p=$(command -v "$base" 2>/dev/null)
+  [ -n "$p" ] && { echo "$p"; return 0; }
+  p=$(ls -d /nix/store/*-"$base"-[0-9]*/bin/"$base" 2>/dev/null | sort -V | tail -1)
+  [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return 0; }
+  return 1
+}
+
+case "$VERB" in
+
+ping)
+  echo "wc-session ok $(hostname)"
+  ;;
+
+# ---------------------------------------------------------------------- up ---
+# The locate. The guest has already pinned and stamped its arena and told us the
+# run id it stamped with; this sweeps QEMU's memfd for those stamps and writes
+# the plan that says where each guest page landed in the host's flat view.
+#
+# ~2.4 s for a 13 GiB guest (§12.5), and this is the cost the whole design is
+# arranged around: it is paid once per session here, not once per launch.
+up)
+  ID="${1:-}"; RUNID="${2:-}"; PAGES="${3:-}"; OUTBOUND="${4:-1048576}"
+  check_id "$ID"
+  case "$RUNID" in 0x*[!0-9a-fA-Fx]*|"") die "bad run id" ;; esac
+  case "$PAGES$OUTBOUND" in *[!0-9]*|"") die "bad page count" ;; esac
+  D=$(dir_of "$ID")
+  rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
+  [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host"
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
+    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
+    "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
+    "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
+    | "$ROOTC" >/dev/null 2>&1
+  if ! grep -q '^rc=0$' "$D/locate.log" 2>/dev/null; then
+    echo "wc-session: the locate failed" >&2
+    sed 's/^/  /' "$D/locate.log" 2>/dev/null >&2
+    exit 1
+  fi
+  grep -o 'located [0-9]* of [0-9]* pages[^$]*' "$D/locate.log" | tail -1
+  echo "up ok $D"
+  ;;
+
+# ------------------------------------------------------------------- proxy ---
+# wc-proxy, on the plan, in a root transient unit -- root because it opens the
+# arena's backing object at /proc/<qemu-pid>/fd/<n>, and a transient unit rather
+# than a long-lived root shell because a root call that blocks for a session's
+# lifetime comes back with no output at all (testhost's rootc habits).
+#
+# `--arena-grow` IS ARMED AND THE APPENDER DOES NOT EXIST YET.
+#
+# The launcher starts a **32 MiB** region rather than the 768 MiB it reserved for
+# one afternoon, because those pages are `VirtualLock`ed — non-pageable, gone
+# from Windows entirely — and because the startup region is the one that can
+# never be given back: it holds the outbound window. So the size of it is a
+# floor for the whole session and the only safe direction is small.
+#
+# `--arena-grow` says what to do when 32 MiB is not enough: take another region
+# instead of refusing. Over guest RAM the proxy's `PlanGrowth` obtains one by
+# **re-reading the plan** — "the guest commits and stamps another region and the
+# locator appends it to this same plan". Nothing on this deployment does either
+# of those things yet. Growth is therefore armed and inert: a pool that does not
+# fit gets `the guest has not committed one, or the locator has not appended it
+# yet`, which since §20 is a refusal the client survives rather than a dead
+# window.
+#
+# It is passed anyway, deliberately. The flag is where the behaviour turns on,
+# the appender is one `wc-session` verb away — commit a region in the guest, run
+# the locator with `--append`, and this proxy picks it up on its next pool — and
+# a launcher that quietly did not ask for growth would make that verb look
+# unnecessary. See docs/waycompose-design.md §28.12.
+#
+# The socket it creates is chowned to the invoking user, so the *application*
+# is not privileged. §17.7 gave the run its own root-owned home instead; this is
+# the other half of the same problem and the cheaper answer, because a Firefox
+# with the user's own warm profile starts in a second and a root one with a
+# fresh home does not.
+proxy)
+  ID="${1:-}"; check_id "$ID"
+  D=$(dir_of "$ID")
+  [ -f "$D/arena.plan" ] || die "no plan for $ID -- call up first"
+  [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+  [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
+  UNIT="wc-launch-$ID"
+  cat >"$D/proxy.sh" <<EOF
+#!/usr/bin/env bash
+export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+rm -f "$D/wl-proxy"
+"$BIN/wc-proxy" --upstream "$D/up.sock" --socket wl-proxy --runtime-dir "$D" \\
+  --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage \\
+  --arena-grow --arena-grow-step ${WC_LAUNCH_GROW_STEP:-16777216} \\
+  --accept-timeout ${WC_LAUNCH_SESSION_SECS:-43200} --timeout ${WC_LAUNCH_SESSION_SECS:-43200} \\
+  >"$D/proxy.log" 2>&1 &
+P=\$!
+for _ in \$(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
+chown $UID_:$GID_ "$D/wl-proxy" 2>/dev/null
+wait \$P
+EOF
+  chmod 755 "$D/proxy.sh"
+  BASH=$(command -v bash)
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl reset-failed %q 2>/dev/null\nsystemd-run --unit=%q --collect %q %q >/dev/null 2>&1\necho started\n' \
+    "$UNIT" "$UNIT" "$BASH" "$D/proxy.sh" | "$ROOTC" >/dev/null 2>&1
+  for _ in $(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
+  if [ ! -S "$D/wl-proxy" ]; then
+    echo "wc-session: the proxy never bound its socket" >&2
+    tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
+    exit 1
+  fi
+  echo "proxy ok $D/wl-proxy"
+  ;;
+
+# --------------------------------------------------------------------- run ---
+# One Wayland client, against the session's proxy. The command arrives base64'd
+# because it comes through $SSH_ORIGINAL_COMMAND and a quoting bug here would be
+# a shell injection rather than a wrong window.
+#
+# The environment is §17.7's, minus the root: `env -u DISPLAY` because with an X
+# server reachable MOZ_ENABLE_WAYLAND is a *preference* and Firefox will quietly
+# use X11 instead, and an absolute WAYLAND_DISPLAY because the socket and the
+# runtime directory are separate here (libwayland takes a leading '/' as a path).
+# DBUS is passed so that a second launch reaches the first one's instance
+# instead of colliding on its profile lock -- which is what a second click on a
+# Windows application does too.
+run)
+  ID="${1:-}"; check_id "$ID"; B64="${2:-}"
+  B64PROFILE="${3:-}"; B64PREFS="${4:-}"; B64TITLEBAR="${5:-}"
+  D=$(dir_of "$ID")
+  [ -S "$D/wl-proxy" ] || die "no session $ID"
+  CMD=$(printf '%s' "$B64" | base64 -d 2>/dev/null) || die "run: bad base64"
+  [ -n "$CMD" ] || die "run: empty command"
+  # The first word is the application; the rest is its own business.
+  WANT=${CMD%% *}; REST=${CMD#"$WANT"}
+  EXE=$(resolve_exec "$WANT") || die "run: cannot find $WANT on this machine"
+  CMD="$EXE$REST"
+  # An application's data directory, created on demand -- and *only* under this
+  # launcher's own tree, so this can never be asked to make a directory
+  # somewhere else.
+  #
+  # It is here because the first run of the shortcut produced a window in 680 ms
+  # and the window said **"Your Firefox profile cannot be loaded"**: `--profile`
+  # names a directory Firefox will not create, and a modal dialog is a mapped
+  # toplevel like any other. Every number in that run was real and measured the
+  # wrong window, which is why §28 has a photograph next to every one of them.
+  for w in $REST; do
+    case "$w" in
+      "$HOME"/.wc-launch/*) mkdir -p "$w" 2>/dev/null ;;
+    esac
+  done
+
+  # THE PREFERENCES THE DEPLOYMENT SETS, RE-APPLIED ON EVERY START.
+  #
+  # `user.js` rather than a one-off edit of `prefs.js`, because "the deployment
+  # says so" has to survive the user changing it in the UI and the application
+  # writing its settings back out. The file is rendered by `wc_launch::plan::
+  # user_js` on the guest, where it is tested; nothing here parses it.
+  #
+  # The one that made this necessary is `middlemouse.paste=false`: on Linux a
+  # middle click pastes the primary selection, and this window is on a Windows
+  # desktop where a middle click does not — which is a difference between the two
+  # sides that no protocol expresses and only the deployment can settle.
+  #
+  # Written **only** under this launcher's own tree, so a profile somewhere else
+  # is never touched.
+  PROFILE=$(printf '%s' "$B64PROFILE" | base64 -d 2>/dev/null)
+  case "$PROFILE" in
+    "$HOME"/.wc-launch/*)
+      mkdir -p "$PROFILE" 2>/dev/null
+      printf '%s' "$B64PREFS" | base64 -d > "$PROFILE/user.js" 2>/dev/null
+      ;;
+  esac
+
+  # And what the application is told about its own title bar. §22 established
+  # that one bar takes two levers and this is the client's; `none` stops Firefox
+  # drawing a second one under Windows'. It is passed rather than hard-coded
+  # because the *goal* is `client` plus a compositor that extends the frame into
+  # the client area, and that compositor does not exist yet.
+  TITLEBAR=$(printf '%s' "$B64TITLEBAR" | base64 -d 2>/dev/null)
+  [ -n "$TITLEBAR" ] || TITLEBAR=none
+  DBUS=""
+  [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
+  # MOZ_GTK_TITLEBAR_DECORATION=none is a **deployment assumption and there is no
+  # protocol that carries it**. Without it Firefox draws its own titlebar on top
+  # of the one the compositor's HWND already has, with no diagnostic anywhere:
+  # two title bars, and nothing in either log saying so. The compositor's half of
+  # the fix -- answering the KDE decoration manager's bind with `default_mode(2)`
+  # -- is necessary and not sufficient; both levers are needed, and this is the
+  # one that lives where the client is started. So it lives here, in the launcher
+  # that *is* the deployment.
+  # shellcheck disable=SC2086
+  setsid env -u DISPLAY \
+    XDG_RUNTIME_DIR="$D/xdg" \
+    WAYLAND_DISPLAY="$D/wl-proxy" \
+    MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
+    MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
+    $CMD >>"$D/app.log" 2>&1 &
+  echo "run ok $!"
+  ;;
+
+# -------------------------------------------------------------------- icon ---
+# The application's icon, from *this* machine's theme, because that is the only
+# machine that has one -- §16's whole finding, and the same reason the taskbar
+# icon has to cross. Emitted as base64 PNG; the guest wraps it in an .ico for
+# the shortcut. Largest first, because a shortcut is drawn at 48 and Windows
+# would rather downscale than blow up a 16.
+icon)
+  APPID="${1:-}"; case "$APPID" in *[!A-Za-z0-9_.+-]*|"") die "bad app id" ;; esac
+  # The second argument is the application's own executable, and it is the one
+  # that works on this machine.
+  #
+  # §17.2 recorded that stage 11's resolver published `0 image(s)` for
+  # "firefox", "because the resolver runs where the proxy runs and the VM host
+  # has no icon theme carrying Firefox's pixels". That is true of the *system*
+  # theme and false of the package: on NixOS a program's icons live under its
+  # own store path, next to its bin. So the first place looked at is the prefix
+  # of the executable this launcher is about to run — which is exact by
+  # construction, needs no theme, and cannot resolve to a different Firefox.
+  EXEC=$(resolve_exec "${2:-$APPID}" 2>/dev/null || true)
+  DIRS=""
+  if [ -n "$EXEC" ]; then
+    P=$(dirname "$(dirname "$(readlink -f "$EXEC")")")
+    DIRS="$P/share"
+    # A wrapped program is a shell script in one store path while its icons are
+    # in the package's own, so the executable's prefix is not always enough.
+    # The package by name is, and this is install time -- a store listing here
+    # costs nothing anybody waits for.
+    for extra in $(ls -d /nix/store/*-"$(basename "$EXEC")"-[0-9]*/share 2>/dev/null | sort -V | tail -2); do
+      DIRS="$DIRS $extra"
+    done
+  fi
+  DIRS="$DIRS /run/current-system/sw/share $HOME/.nix-profile/share /usr/share"
+  NAME="$APPID"
+  for d in $DIRS; do
+    [ -f "$d/applications/$APPID.desktop" ] || continue
+    I=$(grep -m1 '^Icon=' "$d/applications/$APPID.desktop" | cut -d= -f2-)
+    [ -n "$I" ] && NAME="$I"
+    break
+  done
+  for size in 256x256 128x128 96x96 64x64 48x48; do
+    for d in $DIRS; do
+      f="$d/icons/hicolor/$size/apps/$NAME.png"
+      [ -f "$f" ] || continue
+      echo "icon $NAME $size"
+      base64 -w0 <"$f"; echo
+      exit 0
+    done
+  done
+  die "no icon for $APPID"
+  ;;
+
+# -------------------------------------------------------------------- down ---
+down)
+  ID="${1:-}"; check_id "$ID"
+  D=$(dir_of "$ID")
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
+    "wc-launch-$ID" "wc-launch-$ID" | "$ROOTC" >/dev/null 2>&1
+  rm -rf "$D"
+  echo "down ok"
+  ;;
+
+status)
+  ID="${1:-}"; check_id "$ID"
+  D=$(dir_of "$ID")
+  [ -S "$D/wl-proxy" ] && echo "status up $D" || echo "status down $D"
+  ;;
+
+logs)
+  ID="${1:-}"; check_id "$ID"
+  D=$(dir_of "$ID")
+  for f in locate.log proxy.log app.log; do
+    [ -f "$D/$f" ] || continue
+    echo "=== $f"
+    tail -60 "$D/$f"
+  done
+  ;;
+
+*)
+  die "unknown verb ${VERB:-<none>}; try ping|up|proxy|run|icon|down|status|logs"
+  ;;
+esac

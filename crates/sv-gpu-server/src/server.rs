@@ -82,16 +82,19 @@ pub struct Shared {
     /// are all "externally synchronized" on the queue parameter. The driver
     /// opens exactly one queue (`driver.rs`), so **every session shares it**.
     ///
-    /// This lock is here for whoever hand-writes a queue call on this side, and
-    /// it is deliberately not claimed to be more than that. **The generated
-    /// dispatch does not take it**, and neither does anything today: the
-    /// objects table is locked per lookup and released before the driver call,
-    /// so two ring threads of one session could already reach `vkQueueSubmit`
-    /// concurrently before any of this. Multi-session does not create that race;
-    /// it widens it from "two rings of one client" to "two clients". It is
-    /// written down here, next to the thing it protects, rather than in a
-    /// document, and closing it is a change to pass 12 rather than to this
-    /// struct.
+    /// **The generated dispatch takes it**, as of the CTS stage. Pass 12 asks
+    /// `vk_registry`'s `Command::externally_synchronizes_a_queue` — which reads
+    /// both spellings the registry uses, `externsync=` on a `VkQueue` parameter
+    /// and the `<implicitexternsyncparams>` prose that catches `vkDeviceWaitIdle`
+    /// — and wraps exactly the driver call in `GpuHost::lock_queue`.
+    ///
+    /// Until then it was here for hand-written callers only, and the honest note
+    /// in its place said so: the objects table is locked per lookup and released
+    /// before the driver call, so two ring threads of *one* session could reach
+    /// `vkQueueSubmit` concurrently — the race predates multi-session, which
+    /// widened it from "two rings of one client" to "two clients". It is closed
+    /// in the generator rather than here because that is where every call site
+    /// is.
     pub queue_lock: Arc<Mutex<()>>,
 }
 
@@ -199,6 +202,10 @@ impl GpuHost for GpuServer {
     fn note_missing(&mut self, command: &'static str) {
         self.last_error =
             Some(format!("the driver has no {command}; the profile is wider than this driver"));
+    }
+
+    fn lock_queue(&self) -> sv_gpu_entry::QueueGuard<'_> {
+        sv_gpu_entry::QueueGuard::held(&self.shared.queue_lock)
     }
 
     // -- 1. the session -----------------------------------------------------

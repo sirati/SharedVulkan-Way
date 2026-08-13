@@ -325,9 +325,9 @@ fn every_copy_scope_produces_the_same_image() {
 /// A client that cycles buffers, the way every real toolkit does.
 ///
 /// The distinction this exercises is the one that broke scrolling — see
-/// docs/design.md §27. `wl_surface.damage` is "what changed on the **surface**
-/// since the last commit", not "what I wrote into this **buffer**". A client
-/// that double-buffers repaints the whole back buffer (or copies the front
+/// docs/waycompose-design.md §27. `wl_surface.damage` is "what changed on the
+/// **surface** since the last commit", not "what I wrote into this **buffer**".
+/// A client that double-buffers repaints the whole back buffer (or copies the front
 /// buffer into it and then repaints the delta) and still reports only the
 /// frame's delta, because that is all that changed on screen. A compositor
 /// reading the buffer directly is fine. A proxy keeping a *per-buffer* shadow
@@ -339,6 +339,10 @@ fn every_copy_scope_produces_the_same_image() {
 /// cycle, and damages only the band. So the attached buffer is always exactly
 /// right, and any disagreement in the region is the proxy's alone.
 struct Cycler {
+    /// Damage the whole buffer every frame, the way `weston-presentation-shm`
+    /// does. The arrears of such a client are N copies of the extent, which is
+    /// the case that has to collapse to one.
+    damage_all: bool,
     frame: Frame,
     buffers: Vec<u32>,
     canvas: Vec<u8>,
@@ -373,7 +377,9 @@ impl Cycler {
         pixels[base..base + self.canvas.len()].copy_from_slice(&self.canvas);
 
         h.send_words(surface, 1, &[buffer, 0, 0]); // attach
-        h.send_words(surface, 9, &[0, y0 as u32, self.frame.w as u32, bh as u32]); // damage_buffer
+        let (dy, dh) =
+            if self.damage_all { (0, self.frame.h) } else { (y0, bh) };
+        h.send_words(surface, 9, &[0, dy as u32, self.frame.w as u32, dh as u32]); // damage_buffer
         h.send_words(surface, 6, &[]); // commit
     }
 }
@@ -385,6 +391,7 @@ fn run_cycling_client(
     scope: CopyScope,
     nbuf: usize,
     frames: u8,
+    damage_all: bool,
 ) -> (Harness, Cycler, usize) {
     let frame = Frame { w: 200, h: 120, stride: 200 * 4, offset: 0 };
     let one = (frame.stride * frame.h) as usize;
@@ -429,7 +436,7 @@ fn run_cycling_client(
         buffers.push(buffer);
     }
 
-    let mut c = Cycler { frame, buffers, canvas: vec![0x20; one] };
+    let mut c = Cycler { damage_all, frame, buffers, canvas: vec![0x20; one] };
     for tick in 0..frames {
         c.tick(&mut h, surface, pixels, tick);
     }
@@ -453,7 +460,7 @@ fn a_buffer_cycling_client_is_not_left_with_a_stale_shadow() {
         for scope in [CopyScope::Pool, CopyScope::Buffer, CopyScope::Damage] {
             let d = tmpdir(&format!("cycle-{nbuf}-{}", scope.as_str()));
             let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
-            let (h, c, last) = run_cycling_client(Box::new(t), scope, nbuf, 12);
+            let (h, c, last) = run_cycling_client(Box::new(t), scope, nbuf, 12, false);
             let peer = wc_handle::Handle::from_descriptor(h.pool_descriptor());
             let map = peer.map().unwrap();
             let seen = map.as_slice()[last..last + c.canvas.len()].to_vec();
@@ -462,7 +469,7 @@ fn a_buffer_cycling_client_is_not_left_with_a_stale_shadow() {
         }
         for (scope, seen, canvas) in &images {
             // Count and locate the disagreeing rows rather than dumping 96000
-            // bytes. The count is the measurement docs/design.md §27 quotes.
+            // bytes. The count is the measurement docs/waycompose-design.md §27 quotes.
             let stride = 200 * 4usize;
             let rows: Vec<usize> = (0..120)
                 .filter(|y| seen[y * stride..(y + 1) * stride] != canvas[y * stride..(y + 1) * stride])
@@ -493,7 +500,7 @@ fn paying_off_the_arrears_still_costs_less_than_the_extent() {
     for scope in [CopyScope::Buffer, CopyScope::Damage] {
         let d = tmpdir(&format!("arrears-{}", scope.as_str()));
         let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
-        let (h, _, _) = run_cycling_client(Box::new(t), scope, 2, 24);
+        let (h, _, _) = run_cycling_client(Box::new(t), scope, 2, 24, false);
         bytes.push((scope, h.session.stats.bytes_copied));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -512,6 +519,44 @@ fn paying_off_the_arrears_still_costs_less_than_the_extent() {
         get(CopyScope::Damage),
         get(CopyScope::Buffer)
     );
+}
+
+/// **A client that damages everything must never cost more than `Buffer`.**
+///
+/// This is the test the arrears fix shipped without, and the regression it let
+/// through is the reason it exists. `weston-presentation-shm` damages its whole
+/// 250x250 buffer every frame and cycles buffers, so a buffer coming back round
+/// owes one *full-buffer* rectangle per intervening frame — and `copy_damage`
+/// copies overlapping rectangles as many times as it is given them, on purpose,
+/// because unioning two of them costs more than copying twice. Sixty is not
+/// two. `scripts/wc-proxy.sh cost` went from 168 MiB to 8583 MiB for the same
+/// 700 commits, 13 MiB per copy of a 244 KiB buffer, and the harness still
+/// reported 37 passed 0 failed because it prints that table and does not check
+/// it.
+///
+/// `<=` rather than `<`: with whole-buffer damage the two scopes are copying
+/// the same pixels, and the honest assertion is that damage never costs *more*.
+/// The strict inequality belongs to the partial-damage test above.
+#[test]
+fn whole_buffer_damage_never_costs_more_than_the_extent() {
+    for nbuf in [2usize, 4] {
+        let mut bytes = Vec::new();
+        for scope in [CopyScope::Buffer, CopyScope::Damage] {
+            let d = tmpdir(&format!("whole-{nbuf}-{}", scope.as_str()));
+            let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
+            let (h, _, _) = run_cycling_client(Box::new(t), scope, nbuf, 40, true);
+            bytes.push((scope, h.session.stats.bytes_copied));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        let get = |s: CopyScope| bytes.iter().find(|(k, _)| *k == s).unwrap().1;
+        assert!(
+            get(CopyScope::Damage) <= get(CopyScope::Buffer),
+            "{nbuf} buffers: damage copied {} bytes against buffer's {} -- arrears are \
+             being copied once per rectangle instead of collapsing to the extent",
+            get(CopyScope::Damage),
+            get(CopyScope::Buffer)
+        );
+    }
 }
 
 /// Damage-scoped copying really does copy less. Without this the scope is a
@@ -1556,4 +1601,523 @@ fn every_protocol_stage_21_added_survives_its_first_request() {
         "a note means the proxy did not recognise an interface it was handed"
     );
     let _ = std::fs::remove_dir_all(&d);
+}
+// ---------------------------------------------------------------------------
+// The clipboard
+// ---------------------------------------------------------------------------
+//
+// These are the tests for the defect §29 exists to remove and for the
+// feature that replaces it, and neither needs a compositor: the whole point of
+// the design is that the transfer is **terminated in this process**, so both
+// ends of every pipe in these tests are real and local, exactly as they are in
+// a running proxy.
+
+/// A request's opcode, by name, out of the vendored XML — because the messages
+/// below are the client's and a hand-written opcode here would be testing this
+/// file's arithmetic against itself.
+fn rq(iface: &str, name: &str) -> u16 {
+    let s = Spec::builtin().unwrap();
+    s.interface(iface)
+        .unwrap_or_else(|| panic!("no {iface}"))
+        .requests
+        .iter()
+        .position(|m| m.name == name)
+        .unwrap_or_else(|| panic!("{iface} has no {name}")) as u16
+}
+
+fn ev(iface: &str, name: &str) -> u16 {
+    let s = Spec::builtin().unwrap();
+    s.interface(iface)
+        .unwrap()
+        .events
+        .iter()
+        .position(|m| m.name == name)
+        .unwrap_or_else(|| panic!("{iface} has no {name} event")) as u16
+}
+
+fn nul_bytes(s: &str) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.push(0);
+    v
+}
+
+fn string_body(s: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    wire::push_bytes(&mut b, &nul_bytes(s));
+    b
+}
+
+/// A session with a `wl_data_device_manager` and a `wl_data_device` bound, which
+/// is what every GTK client does before it has a seat at all (docs/design.md
+/// §15.4).
+fn clipboard_harness() -> (Harness, u32, u32) {
+    let d = tmpdir("clip");
+    let t = SharedFile::new(&d, "Z:\\").unwrap();
+    let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let seat = h.bind(registry, 3, "wl_seat", 7);
+    let manager = h.bind(registry, 4, "wl_data_device_manager", 3);
+    let device = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "get_data_device"), &[device, seat]);
+    (h, manager, device)
+}
+
+/// Everything the proxy sent its own client on its own account, re-walked from
+/// the concatenated stream so that the framing is asserted rather than assumed.
+fn client_messages(bytes: &[u8]) -> Vec<(u32, u16, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(hdr) = Header::parse(&bytes[at..]) {
+        assert!(hdr.size >= 8 && at + hdr.size <= bytes.len(), "stream is not framed");
+        out.push((hdr.object, hdr.opcode, bytes[at + 8..at + hdr.size].to_vec()));
+        at += hdr.size;
+    }
+    assert_eq!(at, bytes.len(), "trailing bytes toward the client");
+    out
+}
+
+/// **The defect, gone.**
+///
+/// Before the clipboard work this exact message returned `Error::UnsupportedFd`, which
+/// `proxy.rs` turns into a failed drain, which closes the connection. A client
+/// that pasted did not fail to paste — it died. The assertion is therefore on
+/// `is_ok` first and on the feature second.
+#[test]
+fn a_paste_is_answered_here_instead_of_ending_the_connection() {
+    let (mut h, _manager, device) = clipboard_harness();
+
+    // The compositor announces a selection: data_offer, offer, selection. All
+    // three are forwarded verbatim, which is why they are driven through
+    // `server_message` rather than invented.
+    let offer = 0xff00_0001u32;
+    let (to_client, fds) = h
+        .session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+            &offer.to_ne_bytes(),
+        )
+        .expect("a data_offer is an ordinary event");
+    assert!(fds.is_empty(), "an announcement carries no descriptor");
+    assert!(!to_client.is_empty());
+    assert_eq!(h.session.objects.interface(offer), Some("wl_data_offer"));
+
+    // The client pastes. Its pipe is real, because the whole design is that
+    // this fd stops here.
+    let (read, write) = pipe().unwrap();
+    let mut fds = VecDeque::from([write]);
+    let body = string_body("text/plain;charset=utf-8");
+    let hdr = Header {
+        object: offer,
+        opcode: rq("wl_data_offer", "receive"),
+        size: 8 + body.len(),
+    };
+    let out = h.session.client_message(hdr, &body, &mut fds);
+    assert!(out.is_ok(), "a paste must not be an error: {:?}", out.err());
+    assert!(out.unwrap().is_empty(), "receive must not reach the compositor");
+    assert!(fds.is_empty(), "the client's descriptor must be consumed, not left to desync");
+
+    // One fetch is pending, for the clipboard rather than for a drag.
+    let fetches = h.session.take_fetches();
+    assert_eq!(fetches.len(), 1);
+    assert_eq!(fetches[0].1, Source::Clipboard);
+    assert_eq!(fetches[0].2, "text/plain;charset=utf-8");
+
+    // The compositor answers, and the bytes appear in the client's pipe.
+    h.session.deliver(fetches[0].0, Answer::Bytes(b"from Notepad".to_vec()));
+    h.session.pump_transfers();
+    assert!(!h.session.clip_busy(), "the transfer is finished and the pipe closed");
+
+    use std::io::Read as _;
+    let mut f = std::fs::File::from(read);
+    let mut got = String::new();
+    f.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "from Notepad", "and EOF arrived, or read_to_string would hang");
+    assert_eq!(h.session.stats.pastes_served, 1);
+    assert_eq!(h.session.stats.clip_bytes_in, 12);
+}
+
+/// A fetch the compositor refuses closes the pipe rather than leaving it open.
+///
+/// The difference matters more than it looks: a client blocked in `read` on a
+/// descriptor nobody will ever write to or close is hung, and hung is the one
+/// outcome worse than the connection error this stage removed.
+#[test]
+fn a_refused_paste_closes_the_pipe_rather_than_hanging_the_client() {
+    let (mut h, _m, device) = clipboard_harness();
+    let offer = 0xff00_0002u32;
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+            &offer.to_ne_bytes(),
+        )
+        .unwrap();
+
+    let (read, write) = pipe().unwrap();
+    let body = string_body("image/png");
+    h.session
+        .client_message(
+            Header { object: offer, opcode: rq("wl_data_offer", "receive"), size: 8 + body.len() },
+            &body,
+            &mut VecDeque::from([write]),
+        )
+        .unwrap();
+    let token = h.session.take_fetches()[0].0;
+    h.session.deliver(token, Answer::Failed("the clipboard holds no such format".into()));
+    h.session.pump_transfers();
+
+    use std::io::Read as _;
+    let mut f = std::fs::File::from(read);
+    let mut got = Vec::new();
+    f.read_to_end(&mut got).unwrap();
+    assert!(got.is_empty(), "a refusal is an empty paste");
+}
+
+/// The other direction: the client copies, and the proxy reads the bytes out of
+/// it through a pipe it made itself.
+#[test]
+fn a_copy_pulls_the_clients_bytes_out_through_a_pipe_this_side_made() {
+    let (mut h, manager, device) = clipboard_harness();
+
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    assert_eq!(
+        h.session.objects.interface(source),
+        Some("wl_data_source"),
+        "the id is tracked here even though the compositor never hears of it"
+    );
+    // The five names GTK offers one string under, plus HTML.
+    for mime in [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+        "text/html",
+    ] {
+        let body = string_body(mime);
+        h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    }
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    // **`set_selection` did not reach the compositor, and nothing else in the
+    // family was held back.** That pair is the whole design: the object graph
+    // upstream stays identical to the client's, so no id sequence is broken,
+    // and the compositor still never holds a source — which is what makes
+    // `wl_data_source.send`, the event that cannot cross, unreachable.
+    let upstream = h.upstream_messages();
+    let spec = Spec::builtin().unwrap();
+    let mut forwarded = Vec::new();
+    for (object, opcode, _) in &upstream {
+        if let Some(iface) = h.session.objects.interface(*object)
+            && iface.starts_with("wl_data_")
+        {
+            let name = spec.request(iface, *opcode).map(|m| m.name.clone()).unwrap_or_default();
+            assert_ne!(name, "set_selection", "set_selection reached the compositor");
+            assert_ne!(name, "receive", "receive reached the compositor");
+            forwarded.push(name);
+        }
+    }
+    assert_eq!(forwarded.iter().filter(|n| *n == "create_data_source").count(), 1);
+    assert_eq!(
+        forwarded.iter().filter(|n| *n == "offer").count(),
+        6,
+        "every offer is forwarded, so the compositor's object graph matches the client's"
+    );
+
+    // Two pipes went to the client: one text flavour and one HTML, which is
+    // `WANTED_TEXT` doing its job — five names for one string is one pipe.
+    let (bytes, fds) = h.session.take_client_messages();
+    assert_eq!(fds.len(), 2, "one pipe per mime type actually wanted");
+    let msgs = client_messages(&bytes);
+    let send = ev("wl_data_source", "send");
+    let sent: Vec<String> = msgs
+        .iter()
+        .filter(|(o, op, _)| *o == source && *op == send)
+        .map(|(_, _, b)| {
+            let len = u32::from_ne_bytes(b[0..4].try_into().unwrap()) as usize;
+            String::from_utf8_lossy(&b[4..4 + len - 1]).into_owned()
+        })
+        .collect();
+    assert_eq!(sent, ["text/plain;charset=utf-8", "text/html"]);
+
+    // The client writes and closes, exactly as libwayland's own clipboard code
+    // does. The order of the fds is the order of the messages, which is what
+    // libwayland's positional matching requires.
+    {
+        use std::io::Write as _;
+        let mut it = fds.into_iter();
+        let mut text = std::fs::File::from(it.next().unwrap());
+        text.write_all(b"hello from Firefox").unwrap();
+        let mut html = std::fs::File::from(it.next().unwrap());
+        html.write_all(b"<b>hello from Firefox</b>").unwrap();
+        // Both dropped here: the client closing its end is the EOF the proxy
+        // waits for.
+    }
+    for _ in 0..8 {
+        h.session.pump_transfers();
+        if !h.session.clip_busy() {
+            break;
+        }
+    }
+    let pulled = h.session.take_selection().expect("the pull completed");
+    assert!(!pulled.for_drag);
+    assert_eq!(
+        pulled.payloads,
+        vec![
+            ("text/plain;charset=utf-8".to_owned(), b"hello from Firefox".to_vec()),
+            ("text/html".to_owned(), b"<b>hello from Firefox</b>".to_vec()),
+        ]
+    );
+    assert_eq!(h.session.stats.selections_copied, 1);
+    assert_eq!(h.session.stats.clip_bytes_out, 18 + 25);
+
+    // And the client is told it no longer owns the selection, which is what
+    // lets a clipboard tool exit instead of waiting to serve a `send` that
+    // will never come.
+    let (after, _) = h.session.take_client_messages();
+    let cancelled = ev("wl_data_source", "cancelled");
+    assert!(
+        client_messages(&after).iter().any(|(o, op, _)| *o == source && *op == cancelled),
+        "the source must be cancelled once the system holds the bytes"
+    );
+}
+
+/// A selection this clipboard cannot carry leaves the system clipboard alone.
+///
+/// Publishing an empty set instead would be *destructive*: a client that copied
+/// an image would silently wipe whatever the user had copied in a Windows
+/// application a moment earlier.
+#[test]
+fn a_selection_of_formats_we_cannot_carry_does_not_wipe_the_clipboard() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("image/png");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    assert!(h.session.take_selection().is_none(), "nothing to publish");
+    assert!(!h.session.clip_busy(), "and no pipe was opened");
+    let (bytes, fds) = h.session.take_client_messages();
+    assert!(fds.is_empty());
+    assert!(client_messages(&bytes).is_empty());
+
+    // A null source, by contrast, is an explicit clear and must publish one.
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[0, 2]);
+    let pulled = h.session.take_selection().expect("clearing publishes an empty selection");
+    assert!(pulled.payloads.is_empty());
+}
+
+/// **A swallowed `new_id` breaks the client's id sequence**, so none is
+/// swallowed.
+///
+/// This is a regression test for a design that was tried and measured wrong.
+/// `wayland-backend`'s server-side object map accepts a new id only when it is
+/// the next free one (`rs/map.rs`), so a proxy that keeps a `create_data_source`
+/// to itself makes the client's *next* request fail — `wl-copy` died with
+/// `wl_display#1: error 0: Invalid new_id: 10.` on the message after the one
+/// that was held back. The assertion is therefore on the shape of the upstream
+/// stream: every id the client allocated is allocated upstream too, in order,
+/// with no gaps.
+#[test]
+fn every_id_the_client_allocates_reaches_the_compositor_in_sequence() {
+    let (mut h, manager, _device) = clipboard_harness();
+    let spec = Spec::builtin().unwrap();
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        let source = h.id();
+        expected.push(source);
+        h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+        let body = string_body("text/plain");
+        h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+        h.send_words(source, rq("wl_data_source", "destroy"), &[]);
+    }
+    let create = rq("wl_data_device_manager", "create_data_source");
+    let got: Vec<u32> = h
+        .upstream_messages()
+        .into_iter()
+        .filter(|(o, op, _)| *o == manager && *op == create)
+        .map(|(_, _, b)| u32::from_ne_bytes(b[0..4].try_into().unwrap()))
+        .collect();
+    assert_eq!(got, expected, "an id the client allocated did not reach the compositor");
+
+    // And the destructor is forwarded too, so `wl_display.delete_id` comes from
+    // the compositor as it does for every other object rather than being
+    // manufactured here and racing it.
+    let destroy = rq("wl_data_source", "destroy");
+    assert_eq!(
+        h.upstream_messages()
+            .into_iter()
+            .filter(|(o, op, _)| expected.contains(o) && *op == destroy)
+            .count(),
+        3
+    );
+    // Nothing was sent to the client on its own account by any of that.
+    let (bytes, fds) = h.session.take_client_messages();
+    assert!(bytes.is_empty() && fds.is_empty());
+    assert!(spec.request("wl_data_source", destroy).unwrap().destructor);
+}
+
+/// A drag is the same pull with a different destination, and it **always
+/// ends**.
+///
+/// The second half is the point. A `wl_data_source` that starts a drag and is
+/// never told what happened leaves the client waiting forever, and a drag that
+/// does not end is worse than one that does not start.
+#[test]
+fn a_drag_uses_the_same_pull_and_is_always_answered() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("text/uri-list");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    let body = string_body("text/plain");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    // start_drag(source, origin, icon, serial)
+    h.send_words(device, rq("wl_data_device", "start_drag"), &[source, 0, 0, 1]);
+
+    let (_, fds) = h.session.take_client_messages();
+    assert_eq!(fds.len(), 1, "one pipe, for the one text flavour offered");
+    drop(fds);
+    for _ in 0..8 {
+        h.session.pump_transfers();
+        if !h.session.clip_busy() {
+            break;
+        }
+    }
+    let pulled = h.session.take_selection().expect("the pull completed");
+    assert!(pulled.for_drag, "and it is marked as a drag rather than a copy");
+
+    // The platform says the drag ended with nothing. The source is told.
+    h.session.drag_finished(0);
+    let (bytes, _) = h.session.take_client_messages();
+    let cancelled = ev("wl_data_source", "cancelled");
+    assert!(
+        client_messages(&bytes).iter().any(|(o, op, _)| *o == source && *op == cancelled),
+        "a drag that dropped nowhere must cancel its source"
+    );
+
+    // And a drop is the other answer, in the order the protocol requires.
+    let source2 = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source2]);
+    let body = string_body("text/plain");
+    h.send(source2, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "start_drag"), &[source2, 0, 0, 2]);
+    let _ = h.session.take_client_messages();
+    h.session.drag_finished(1); // copy
+    let (bytes, _) = h.session.take_client_messages();
+    let names: Vec<u16> = client_messages(&bytes)
+        .into_iter()
+        .filter(|(o, _, _)| *o == source2)
+        .map(|(_, op, _)| op)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ev("wl_data_source", "action"),
+            ev("wl_data_source", "dnd_drop_performed"),
+            ev("wl_data_source", "dnd_finished"),
+        ]
+    );
+}
+
+/// A client that holds its pipe open forever is published anyway, once.
+#[test]
+fn a_client_that_never_closes_its_pipe_is_not_a_selection_lost_forever() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("text/plain");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    let (_, fds) = h.session.take_client_messages();
+    let mut it = fds.into_iter();
+    let held = std::fs::File::from(it.next().unwrap());
+    {
+        use std::io::Write as _;
+        let mut w = &held;
+        w.write_all(b"half a sentence").unwrap();
+    }
+    // Held open on purpose. Without the deadline this would never publish.
+    h.session.pump_transfers();
+    assert!(h.session.take_selection().is_none(), "not yet: nothing has expired");
+    std::thread::sleep(COPY_DEADLINE + std::time::Duration::from_millis(50));
+    h.session.pump_transfers();
+    let pulled = h.session.take_selection().expect("the deadline published what arrived");
+    assert_eq!(pulled.payloads[0].1, b"half a sentence");
+    assert_eq!(h.session.stats.copy_timeouts, 1);
+    drop(held);
+}
+
+/// A paste from a **drag** asks Windows for the drag, not for the clipboard.
+///
+/// The two are separate selections on Windows and the offer's own identity is
+/// the only thing that distinguishes them: an offer announced by
+/// `wl_data_device.enter` belongs to a drag over one of our surfaces, one
+/// announced by `.selection` belongs to the clipboard. Deciding it any other
+/// way returns the last thing dragged to somebody who pressed Ctrl-V.
+#[test]
+fn an_offer_from_a_drag_is_fetched_from_the_drag_and_not_the_clipboard() {
+    let (mut h, _m, device) = clipboard_harness();
+    let dragged = 0xff00_0010u32;
+    let copied = 0xff00_0011u32;
+
+    // The compositor announces a drag: data_offer, then enter(serial, surface,
+    // x, y, id).
+    for id in [dragged, copied] {
+        h.session
+            .server_message(
+                Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+                &id.to_ne_bytes(),
+            )
+            .unwrap();
+    }
+    let mut body = Vec::new();
+    for w in [1u32, 0, 0, 0] {
+        body.extend_from_slice(&w.to_ne_bytes());
+    }
+    body.extend_from_slice(&dragged.to_ne_bytes());
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "enter"), size: 8 + body.len() },
+            &body,
+        )
+        .unwrap();
+
+    let receive = rq("wl_data_offer", "receive");
+    let mime = string_body("text/uri-list");
+    for offer in [dragged, copied] {
+        let (_r, w) = pipe().unwrap();
+        h.session
+            .client_message(
+                Header { object: offer, opcode: receive, size: 8 + mime.len() },
+                &mime,
+                &mut VecDeque::from([w]),
+            )
+            .unwrap();
+    }
+    let fetches = h.session.take_fetches();
+    assert_eq!(fetches.len(), 2);
+    assert_eq!(fetches[0].1, Source::Drag, "the offer that came with an enter");
+    assert_eq!(fetches[1].1, Source::Clipboard, "the one that did not");
+
+    // A `leave` ends it: the same offer id would now be the clipboard's, which
+    // is wrong in a way nothing else would notice, so it is asserted.
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "leave"), size: 8 },
+            &[],
+        )
+        .unwrap();
+    let (_r, w) = pipe().unwrap();
+    h.session
+        .client_message(
+            Header { object: dragged, opcode: receive, size: 8 + mime.len() },
+            &mime,
+            &mut VecDeque::from([w]),
+        )
+        .unwrap();
+    assert_eq!(h.session.take_fetches()[0].1, Source::Clipboard);
 }

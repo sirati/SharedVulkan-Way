@@ -452,7 +452,7 @@ block_titlebar() {
 # say about it
 # ---------------------------------------------------------------------------
 #
-# STAGE 29. The arrangement itself is `WM_NCCALCSIZE` and cannot be tested here
+# TABS IN THE TITLE BAR. The arrangement itself is `WM_NCCALCSIZE` and cannot be tested here
 # at all: there is no Win32 under this compositor and no window manager under
 # the headless platform. What *can* be tested here is the half of it that is a
 # fact about the client, and it is the half §22.5 got a free pass on.
@@ -465,7 +465,7 @@ block_titlebar() {
 # window has to be the rectangle rather than the buffer or the tab strip lands
 # 23 px below the top of the caption it is supposed to be inside. That is what
 # this block asserts, and it is a check rather than an assumption because the
-# brief for stage 29 said in as many words not to assume it.
+# brief for the tabs-in-title-bar stage said in as many words not to assume it.
 block_tabs() {
   echo "== tabs: the client half of --decorations tabs, on Linux"
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
@@ -519,8 +519,8 @@ block_tabs() {
     bad "the window is ${mapped:-nothing}, and the geometry rectangle is ${geom:-nothing}"
   fi
 
-  # The client area is the surface in this mode too, which is what stage 29
-  # replaced three conversions with (§29.2). The headless platform prints both.
+  # The client area is the surface in this mode too, which is what the tabs-in-title-bar stage
+  # replaced three conversions with (§30.2). The headless platform prints both.
   grep -q "window 1 mapped surface $mapped client $mapped" "$dir/srv.log" \
     && ok "the client area is the surface: no conversion left between them" \
     || bad "the platform reports a client area that is not the surface"

@@ -16,7 +16,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use wc_proxy::pool::{Arena, CopyScope, Policy, PoolTransport, SharedFile};
+use wc_proxy::pool::{
+    Arena, CopyScope, FileGrowth, PlanGrowth, Policy, PoolTransport, RegionSource, SharedFile,
+};
 use wc_proxy::proxy::{self, Listener};
 use wc_proxy::session::Session;
 use wc_proxy::spec::Spec;
@@ -53,6 +55,29 @@ struct Args {
     /// one this stage measured; `first-fit` is stage 12's, kept so that a live
     /// run can be compared against a synthetic one without a rebuild.
     arena_policy: Policy,
+    /// DYNAMIC ARENA. May the arena obtain more memory when a pool does not
+    /// fit, and give it back when a region empties?
+    ///
+    /// **Off by default, and that is a decision rather than caution.** An arena
+    /// that grew whenever it was tight would make [`Policy`] untestable — every
+    /// measurement of how well runs are chosen would be contaminated by memory
+    /// that was added instead of used — and `docs/design.md` §20.4's matrix
+    /// compares policies at a fixed size. Growth is what happens after the
+    /// allocator has already failed, and a run has to say it wants it.
+    arena_grow: bool,
+    /// The base of the geometric growth series. Zero keeps
+    /// [`wc_proxy::pool::GROW_STEP`] — 16 MiB, argued from the pool sizes
+    /// clients actually ask for.
+    ///
+    /// It used to default to `--arena-size`, which meant a session started at
+    /// 768 MiB grew in 768 MiB jumps. That was two unrelated quantities sharing
+    /// a default rather than a number anybody chose.
+    arena_grow_step: u64,
+    /// How many frames a region must be empty before it is returned. Not a
+    /// timer: what makes a region cold is that nothing drew in it, and a clock
+    /// cannot tell a cold region from a paused video. Zero returns it as soon
+    /// as it is empty, which thrashes; the default is a guard against that.
+    arena_grow_idle: u64,
     scope: CopyScope,
     headroom: u64,
     trace: bool,
@@ -77,6 +102,11 @@ struct Args {
     /// is how this proxy runs on the VM host, gets systemd's environment and
     /// not a login shell's.
     icon_dirs: Vec<std::path::PathBuf>,
+    /// THE CLIPBOARD. Carry the clipboard across on a third connection
+    /// (`crate::clip`). Off, a client that copies or pastes gets nothing —
+    /// which is what the compositor did before this stage, minus the part
+    /// where the connection died.
+    clipboard: bool,
 }
 
 fn usage() -> &'static str {
@@ -103,6 +133,22 @@ usage: wc-proxy --upstream <path> [options]
                          first -- out of them. Must match the compositor's
                          --arena-outbound. With --arena-plan the plan carries it
                          and this is refused rather than believed.
+  --arena-grow           arena: when a pool does not fit, obtain another region
+                         rather than refusing, and give a region back once it
+                         has been empty for --arena-grow-idle frames. Off by
+                         default so that --arena-policy stays measurable: an
+                         arena that grew when tight would hide how well it
+                         places what it already has.
+  --arena-grow-step N    arena: base of the geometric growth series, doubling
+                         to a 64 MiB cap (default 16 MiB, from the pool sizes
+                         clients ask for). Growing costs a locate -- ~0.4 s on
+                         the deployment -- so the number of growths is what
+                         wants bounding, and the cap bounds the overshoot in
+                         exchange. A pool larger than the step gets a region big
+                         enough for it; a pool never straddles two.
+  --arena-grow-idle N    arena: frames a region must be empty before it is
+                         returned (default 120). Frames, not seconds — a clock
+                         cannot tell a cold region from a paused video.
   --arena-policy KIND    arena: first-fit | best-fit    (default best-fit)
                          which run of free bytes a pool takes. best-fit is
                          stage 16's, measured in docs/design.md 20.4; first-fit
@@ -119,6 +165,8 @@ usage: wc-proxy --upstream <path> [options]
 
   --icon-theme NAME      the icon theme to search before hicolor
                          (default $WC_ICON_THEME, else hicolor)
+  --no-clipboard         do not carry the clipboard: no third connection to the
+                         compositor, and copy and paste do nothing
   --no-icons             do not resolve app ids to icons at all: no second
                          connection to the compositor, no directory walk
   --icon-data-dir DIR    an extra XDG data directory to search first; may be
@@ -145,6 +193,9 @@ fn parse_args() -> Result<Args, String> {
         arena_plan: PathBuf::new(),
         arena_outbound: 0,
         arena_policy: Policy::default(),
+        arena_grow: false,
+        arena_grow_step: 0,
+        arena_grow_idle: 120,
         scope: CopyScope::Damage,
         headroom: 1,
         trace: false,
@@ -154,6 +205,7 @@ fn parse_args() -> Result<Args, String> {
         icons: true,
         icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
         icon_dirs: Vec::new(),
+        clipboard: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -172,6 +224,15 @@ fn parse_args() -> Result<Args, String> {
                 a.arena_outbound =
                     next()?.parse().map_err(|e| format!("--arena-outbound: {e}"))?
             }
+            "--arena-grow" => a.arena_grow = true,
+            "--arena-grow-step" => {
+                a.arena_grow_step =
+                    next()?.parse().map_err(|e| format!("--arena-grow-step: {e}"))?
+            }
+            "--arena-grow-idle" => {
+                a.arena_grow_idle =
+                    next()?.parse().map_err(|e| format!("--arena-grow-idle: {e}"))?
+            }
             "--arena-policy" => {
                 let v = next()?;
                 a.arena_policy = Policy::parse(&v)
@@ -187,6 +248,7 @@ fn parse_args() -> Result<Args, String> {
             "--trace" => a.trace = true,
             "--verify-damage" => a.verify = true,
             "--no-icons" => a.icons = false,
+            "--no-clipboard" => a.clipboard = false,
             "--icon-theme" => a.icon_theme = next()?,
             "--icon-data-dir" => a.icon_dirs.push(next()?.into()),
             "--pool-headroom" => {
@@ -303,12 +365,25 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut t = Arena::from_plan(args.arena_id, &args.arena_plan)?;
             t.set_policy(args.arena_policy)?;
             println!(
-                "[proxy] transport arena {}: {} bytes of {} \
+                "[proxy] transport arena {}: {} bytes of {} in {} region(s) \
                  (nothing is opened per pool, and the compositor opened nothing at all)",
                 t.id(),
                 t.size(),
                 t.origin(),
+                t.regions(),
             );
+            // DYNAMIC ARENA. Growth over guest RAM is the original handshake run
+            // again — the guest commits and stamps another region and the
+            // locator appends it to this same plan — so the source is the plan
+            // itself, and it already knows which regions have been taken up.
+            if args.arena_grow {
+                let ids = t.region_ids();
+                let src = PlanGrowth::new(&args.arena_plan, &ids);
+                println!("[proxy] arena {} may grow: {}", t.id(), src.describe());
+                t.set_source(Box::new(src))?;
+                t.set_grow_step(args.arena_grow_step)?;
+                t.set_reclaim_idle(args.arena_grow_idle)?;
+            }
             announce_outbound(&t);
             Some(t)
         }
@@ -327,6 +402,22 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.arena_id,
                 t.size(),
             );
+            // The fixture's growth, and it says so. `ProvidedRegion::file`'s
+            // note applies: this is the Wine and same-machine path, and a
+            // deployment reaching it would be a same-machine path wearing the
+            // design's clothes (design.md §1a).
+            if args.arena_grow {
+                let dir = args
+                    .arena_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf();
+                let src = FileGrowth::new(&dir, 0);
+                println!("[proxy] arena {} may grow: {}", t.id(), src.describe());
+                t.set_source(Box::new(src))?;
+                t.set_grow_step(args.arena_grow_step)?;
+                t.set_reclaim_idle(args.arena_grow_idle)?;
+            }
             announce_outbound(&t);
             Some(t)
         }
@@ -468,6 +559,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .map(wc_proxy::icons::dirs_for_pid)
             .unwrap_or_default();
         let extra_dirs = args.icon_dirs.clone();
+        let want_clipboard = args.clipboard;
         threads.push(std::thread::spawn(move || {
             // The `+ Send` is only needed to cross this boundary; `Session`
             // itself has no opinion, and widening its signature would push the
@@ -510,17 +602,53 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            // THE CLIPBOARD. The byte path's byte path, one per served connection
+            // and for the same reasons the icon feed is per connection: the
+            // state is per client, a feed that fails takes only its own
+            // client's clipboard with it, and a socket is cheap.
+            //
+            // **A separate connection from the icon feed on purpose.**
+            // `--no-icons` exists, and an icon resolver that cannot reach the
+            // theme must not be the reason copy and paste stop working.
+            let mut clip = if want_clipboard {
+                match wc_proxy::clip::ClipLink::connect(&upstream_path, &spec) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!(
+                            "[proxy] client {n}: no clipboard feed ({e}); copy and paste will \
+                             do nothing rather than failing"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
             session.set_verify(verify);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
-            match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
+            match proxy::pump(
+                &mut session,
+                client,
+                upstream,
+                icons.as_mut(),
+                clip.as_mut(),
+                idle,
+                &mut log,
+            ) {
                 Ok(why) => println!("[proxy] client {n} stopped: {why}"),
                 Err(e) => println!("[proxy] client {n} failed: {e}"),
             }
             println!("[proxy] client {n} transport {}", session.transport_name());
             println!("[proxy] client {n} {}", session.stats.summary());
+            if let Some(m) = session.transport_memory() {
+                println!("[proxy] client {n} {m}");
+            }
             if let Some(link) = &icons {
+                println!("[proxy] client {n} {}", link.summary());
+            }
+            if let Some(link) = &clip {
                 println!("[proxy] client {n} {}", link.summary());
             }
         }));
@@ -528,6 +656,41 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     for t in threads {
         let _ = t.join();
+    }
+    // DYNAMIC ARENA. The memory figure, printed once for the process because
+    // the arena is one region set shared by every connection and a per-client
+    // number would be four readings of the same bytes.
+    //
+    // **Peak resident, not bytes copied.** Every other number this proxy prints
+    // is throughput — MiB copied, per-copy microseconds — and a throughput
+    // figure standing next to a memory question gets read as an answer to it.
+    // A run that copied 1158 MiB held nothing like 1158 MiB; the two differ by
+    // the number of frames. So the memory line says what it is, says the floor
+    // release cannot go below, and says how many regions were up at the peak,
+    // because "1.2 GiB in one region" and "1.2 GiB in nineteen" are different
+    // facts about whether release can help at all.
+    if let Some(a) = &shared_arena {
+        let (peak, peak_regions) = a.peak();
+        let (grown, grow_nanos, refused, released, released_bytes) = a.growth();
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        println!(
+            "[proxy] arena {} memory: peak resident {:.1} MiB in {} region(s); \
+             now {:.1} MiB in {} region(s); floor {:.1} MiB (the startup region, \
+             which is never returned)",
+            a.id(),
+            mib(peak),
+            peak_regions,
+            mib(a.size()),
+            a.regions(),
+            mib(a.floor()),
+        );
+        println!(
+            "[proxy] arena {} churn: grew {grown} time(s) in {:.1} ms total, \
+             {refused} refused; released {released} region(s), {:.1} MiB",
+            a.id(),
+            grow_nanos as f64 / 1e6,
+            mib(released_bytes),
+        );
     }
     println!("[proxy] stopped: {served} client(s) served");
     Ok(())

@@ -78,11 +78,24 @@ impl Granularity {
     }
 }
 
-/// One run of physically contiguous frames, as the AWE path would report them.
+/// One run of physically contiguous frames, as the guest reports them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PfnRun {
     pub first_frame: u64,
     pub frames: u64,
+}
+
+impl PfnRun {
+    /// The frame numbers this run stands for, in page order.
+    ///
+    /// The expansion exists because the *encoding* is run-length while the
+    /// *meaning* is one frame per page of the extent, and the translating side
+    /// needs the second form. Keeping the two spellings one function apart
+    /// rather than re-deriving the arithmetic at each call site is what stops a
+    /// frame list meaning two different things on the two sides of the wire.
+    pub fn frame_numbers(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.frames).map(move |i| self.first_frame + i)
+    }
 }
 
 /// How the attaching side is to find the extent. design.md §5.1's table.
@@ -96,9 +109,70 @@ pub enum Locator {
     /// One record every 2 MiB. Sound only on the large-page path. Recorded in
     /// the design, not implemented in v1.
     Probe,
-    /// A reported frame list, run-length encoded. AWE only, and AWE is not the
-    /// path: 5863–16339 runs per 64 MiB against large pages' 22.
+    /// A reported frame list, run-length encoded.
+    ///
+    /// **No longer AWE-only** (design.md §0.14, 2026-08-13). Windows reports the
+    /// frame behind every page of any ordinary mapped window through
+    /// `NtQuerySystemInformation(SystemSuperfetchInformation)` /
+    /// `SuperfetchPfnQuery`, in ~330 ms whatever the window is, and — unlike
+    /// [`Locator::Scan`] — *without the pages still containing the stamp*.
+    /// Measured against the scan on the same 64 MiB window: byte-identical
+    /// offset tables, 16384/16384 pages.
+    ///
+    /// It is the locator that **trusts** rather than verifies, which is why
+    /// `security-model.md` R28 has the scan check it once, at attach, on the one
+    /// occasion when the stamps still exist to check it against.
     Pfns(Vec<PfnRun>),
+}
+
+impl Locator {
+    /// Run-length encode a frame list into the wire form.
+    ///
+    /// A run continues only when consecutive *pages of the extent* sit on
+    /// consecutive *frames*. That is stricter than "this frame is one more than
+    /// the last", and the difference is not academic: frames handed out in
+    /// reverse page order are contiguous by that looser test, would encode as
+    /// one run, and would have the far side map the extent backwards — §1's
+    /// invariant broken by a locator that looked like it worked.
+    ///
+    /// This is the same rule `awe_probe::superfetch::Located::runs` counts
+    /// attach cost with, and a test in that crate holds the two to it.
+    pub fn from_frames(frames: &[u64]) -> Locator {
+        let mut runs: Vec<PfnRun> = Vec::new();
+        for f in frames {
+            match runs.last_mut() {
+                Some(r) if r.first_frame + r.frames == *f => r.frames += 1,
+                _ => runs.push(PfnRun { first_frame: *f, frames: 1 }),
+            }
+        }
+        Locator::Pfns(runs)
+    }
+
+    /// The runs, if this is a frame-list locator.
+    pub fn pfn_runs(&self) -> Option<&[PfnRun]> {
+        match self {
+            Locator::Pfns(runs) => Some(runs),
+            _ => None,
+        }
+    }
+
+    /// How many pages the carried frame list describes — zero on the locating
+    /// paths, which carry no addresses at all.
+    ///
+    /// Saturating rather than wrapping, because this number exists to be
+    /// compared against an extent's page count before a descriptor is believed,
+    /// and a wrapped sum is precisely how a corrupt list would arrange to agree.
+    pub fn frame_count(&self) -> u64 {
+        match self {
+            Locator::Pfns(runs) => runs.iter().fold(0u64, |a, r| a.saturating_add(r.frames)),
+            _ => 0,
+        }
+    }
+
+    /// The frame numbers in page order. Empty on the locating paths.
+    pub fn frame_numbers(&self) -> impl Iterator<Item = u64> + '_ {
+        self.pfn_runs().unwrap_or(&[]).iter().flat_map(|r| r.frame_numbers())
+    }
 }
 
 /// What crosses about an extent. design.md §4.3:
@@ -175,7 +249,20 @@ impl ExtentDesc {
                 let n = d.array_size(16)?;
                 let mut runs = Vec::with_capacity(n);
                 for _ in 0..n {
-                    runs.push(PfnRun { first_frame: d.u64()?, frames: d.u64()? });
+                    let run = PfnRun { first_frame: d.u64()?, frames: d.u64()? };
+                    // A run of no frames names no page, so a list of them claims
+                    // a run count while describing nothing — and "the frame
+                    // count agrees with the page count" is exactly the check the
+                    // attaching side makes before believing a descriptor. The
+                    // encoder cannot produce one; refusing it here is what makes
+                    // that a property of the wire rather than of us.
+                    if run.frames == 0 {
+                        return Err(Error::BadColdMessage("a zero-length frame run"));
+                    }
+                    if run.first_frame.checked_add(run.frames).is_none() {
+                        return Err(Error::BadColdMessage("a frame run past the end of memory"));
+                    }
+                    runs.push(run);
                 }
                 Locator::Pfns(runs)
             }
@@ -669,6 +756,117 @@ mod tests {
             ..small.clone()
         };
         assert!(awe.size() > 90_000);
+    }
+
+    /// The encoding is runs and the meaning is one frame per page, so the two
+    /// spellings must be each other's inverse. Anything else is a locator that
+    /// is right about how many pages it found and wrong about which.
+    #[test]
+    fn a_frame_list_run_length_encodes_and_expands_back_to_itself() {
+        let frames: Vec<u64> = vec![10, 11, 12, 40, 100, 101];
+        let l = Locator::from_frames(&frames);
+        assert_eq!(
+            l.pfn_runs().unwrap(),
+            &[
+                PfnRun { first_frame: 10, frames: 3 },
+                PfnRun { first_frame: 40, frames: 1 },
+                PfnRun { first_frame: 100, frames: 2 },
+            ]
+        );
+        assert_eq!(l.frame_count(), 6);
+        assert_eq!(l.frame_numbers().collect::<Vec<_>>(), frames);
+
+        // The measured shapes as arithmetic: a 64 MiB window whose frames are
+        // one block is one run, and the worst case — 16384 pages, no two frames
+        // adjacent — is one run per page, which is the number §5.7 prices
+        // attaching in.
+        let contiguous: Vec<u64> = (0..16384).collect();
+        assert_eq!(Locator::from_frames(&contiguous).pfn_runs().unwrap().len(), 1);
+        let scattered: Vec<u64> = (0..16384).map(|i| i * 2).collect();
+        assert_eq!(Locator::from_frames(&scattered).pfn_runs().unwrap().len(), 16384);
+
+        // And the locating paths carry nothing, which is what makes asking them
+        // for frames safe rather than a panic waiting to happen.
+        assert_eq!(Locator::from_frames(&[]).frame_count(), 0);
+        assert_eq!(Locator::Scan.frame_count(), 0);
+        assert_eq!(Locator::Scan.pfn_runs(), None);
+        assert_eq!(Locator::Scan.frame_numbers().count(), 0);
+    }
+
+    /// Frames that are contiguous in the wrong direction are **not** one run. A
+    /// coalescer that only asked "is this frame one more than the last" would
+    /// say they were, and the far side would stitch the extent backwards with
+    /// every page present and every offset wrong.
+    #[test]
+    fn frames_contiguous_in_the_wrong_direction_are_one_run_per_page() {
+        let l = Locator::from_frames(&[12, 11, 10]);
+        assert_eq!(l.pfn_runs().unwrap().len(), 3);
+        assert_eq!(l.frame_numbers().collect::<Vec<_>>(), vec![12, 11, 10]);
+    }
+
+    /// The frame list survives the wire unchanged, which is what lets the host
+    /// translate what the guest measured instead of what it inferred.
+    #[test]
+    fn a_frame_list_round_trips_through_the_hello() {
+        let frames: Vec<u64> = vec![0x4_2000, 0x4_2001, 0x4_2002, 0x9_9999];
+        let ColdMessage::Hello(mut h) = hello() else { unreachable!() };
+        h.extent.control_pages = 1;
+        h.extent.arena_pages = 3;
+        h.extent.locator = Locator::from_frames(&frames);
+        let msg = ColdMessage::Hello(h);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let back = ColdMessage::decode(&buf).unwrap();
+        assert_eq!(back, msg);
+        let ColdMessage::Hello(h) = back else { unreachable!() };
+        assert_eq!(h.extent.locator.frame_numbers().collect::<Vec<_>>(), frames);
+        assert_eq!(h.extent.locator.frame_count(), h.extent.control_pages + h.extent.arena_pages);
+    }
+
+    /// A run of no frames names no memory, so a list of them would satisfy a
+    /// run-count check while describing nothing. The encoder cannot produce
+    /// one, so the decoder is the only place this can be refused.
+    #[test]
+    fn a_zero_length_frame_run_is_refused_on_the_wire() {
+        // run_id, granularity, two page counts, the tag, the run count, and one
+        // 16-byte run: 56 bytes, and `finish` insists the buffer is filled
+        // exactly rather than merely fitting.
+        let build = |first_frame: u64, frames: u64| {
+            let mut buf = vec![0u8; 56];
+            let mut e = Encoder::new(&mut buf);
+            e.u64(1).unwrap(); // run_id
+            e.u32(0).unwrap(); // Small4K
+            e.u64(1).unwrap(); // control_pages
+            e.u64(0).unwrap(); // arena_pages
+            e.u32(2).unwrap(); // Locator::Pfns
+            e.array_size(1).unwrap();
+            e.u64(first_frame).unwrap();
+            e.u64(frames).unwrap();
+            assert_eq!(e.finish().unwrap(), 56);
+            buf
+        };
+
+        let zero = build(7, 0);
+        assert!(matches!(
+            ExtentDesc::decode(&mut Decoder::new(&zero)),
+            Err(Error::BadColdMessage(_))
+        ));
+
+        // …and a run that runs off the end of the address space, which would
+        // wrap round into low memory when expanded.
+        let wrap = build(u64::MAX, 2);
+        assert!(matches!(
+            ExtentDesc::decode(&mut Decoder::new(&wrap)),
+            Err(Error::BadColdMessage(_))
+        ));
+
+        // The same shape with one real frame decodes, so the two refusals above
+        // are about the run and not about the message.
+        let good = build(7, 1);
+        assert_eq!(
+            ExtentDesc::decode(&mut Decoder::new(&good)).unwrap().locator,
+            Locator::Pfns(vec![PfnRun { first_frame: 7, frames: 1 }])
+        );
     }
 
     #[test]

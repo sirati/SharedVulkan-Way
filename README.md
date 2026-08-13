@@ -153,7 +153,7 @@ minimise, maximise and close buttons. It takes two levers and neither works
 alone: the compositor sends `default_mode(2)` on the KDE decoration manager, and
 the client is started with `MOZ_GTK_TITLEBAR_DECORATION=none`. The second is in
 the *client's* environment and no protocol carries it, so the launcher sets it —
-`docs/design.md` §22.3 is the assumption written down. This script photographs
+`docs/waycompose-design.md` §22.3 is the assumption written down. This script photographs
 the result on the guest's interactive desktop with the pixels in guest RAM, which
 is the run §17.11 item 4 asked for; `docs/stage17/stage17-server.png` is the
 picture and `scripts/wc-firefox.sh titlebar` is the same claim as protocol
@@ -165,7 +165,7 @@ WC_HOST=you@vm-host WC_HOST_FIREFOX=/path/to/firefox scripts/wc-titlebar.sh tabs
 
 **The other arrangement: Firefox's tabs *inside* Windows' caption.** Stage 17's
 answer is server-side — Windows draws the caption and Firefox draws below it.
-Stage 29 is the client-side one, which is how Firefox on Windows actually looks:
+Tabs in the title bar is the client-side one, which is how Firefox on Windows actually looks:
 `WM_NCCALCSIZE` moves the client rectangle's top edge to the top of the window,
 so the client's tab strip *is* the title bar, and the frame stays the system's —
 real border, real shadow, real resize edges. The corner is the interesting part.
@@ -173,10 +173,28 @@ The compositor draws no caption buttons of its own: it leaves the rectangle
 `DWMWA_CAPTION_BUTTON_BOUNDS` reports at zero alpha, which uncovers the ones DWM
 already drew, and forwards the frame's mouse messages to `DwmDefWindowProc` — so
 the buttons are Windows' own, and Windows 11's snap layouts work for the same
-reason they work anywhere else. `docs/stage29/pair-topstrip.png` is the two
-arrangements stacked and `docs/waycompose-design.md` §29 is the argument,
+reason they work anywhere else. `docs/tabs-in-titlebar/pair-topstrip.png` is the
+two arrangements stacked and `docs/waycompose-design.md` §30 is the argument,
 including the thing that is still not solved: no Wayland protocol can tell
 Firefox that the corner is occupied.
+
+```
+scripts/wc-launch.sh deploy && scripts/wc-launch.sh install
+```
+
+**The product.** It puts an icon on the guest's Windows desktop called "Firefox
+(Linux)", wearing Firefox's own pixels, and double-clicking it puts Firefox on
+the screen. Nothing above this line is in that path: `wc-launch.exe` runs in the
+guest, starts the compositor on the interactive desktop over an arena of the
+guest's own pinned RAM, opens its own ssh to the VM host on the host-only
+virtio-net link, and asks that host to run the application. The workstation
+builds it, installs it, and is not needed again.
+
+`cold`, `warm`, `native`, `bench`, `verify` and `shot` are the measurements —
+click-to-window against Windows' own Firefox on the same machine, and what
+actually carried the pixels — and `docs/waycompose-design.md` §28 is the argument. The
+number the design is arranged around is the host's 2.4 s sweep for the arena's
+stamps: a warm session pays it once instead of once per click.
 
 ## Layout
 
@@ -202,6 +220,11 @@ crates/
                  `PrintWindow` captures that work through a lock screen. Also
                  what `Sleep` costs against a high-resolution waitable timer
   wc-xkb-probe   proves the xkbcommon crate links and runs as a Windows binary
+  wc-launch      stage 14, **Windows only**: the launcher a desktop shortcut
+                 points at. A named mutex is the session, one owner starts the
+                 compositor and the tunnel, every later click is one ssh exec.
+                 Its portable half — the ini, the command lines, the .ico
+                 wrapper — is tested on the machine that compiles it
 vendor/
   wayland-backend    forked 0.3.16      | ours; workspace members, linted
   wayland-server     forked 0.31.13     |
@@ -229,7 +252,7 @@ scripts/
                      than off a wiki; `window` counts the browser's own pixels;
                      `titlebar` is stage 17's — the two levers that leave the
                      window one title bar, with the control leg that shows
-                     neither works alone; `tabs` is stage 29's client half —
+                     neither works alone; `tabs` is the tabs-in-title-bar stage's client half —
                      that under client-side decorations the shadow inset is real
                      and the window is the geometry rectangle; `menu`
                      right-clicks and gets an xdg_popup; `wine` puts the whole
@@ -242,7 +265,7 @@ scripts/
                      folded into the client area, and `noglass` and `nobuttons`
                      are its two controls — the same window with
                      DwmExtendFrameIntoClientArea off, and with the caption
-                     buttons left covered. docs/stage17/, docs/stage29/
+                     buttons left covered. docs/stage17/, docs/tabs-in-titlebar/
   probe-input.c      SendInput/PostMessage into the compositor's window, so the
                      keystrokes in that test are Win32's rather than ours
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux
@@ -269,6 +292,17 @@ scripts/
                      **interactive desktop** rather than in an ssh session, and
                      photographs of what it puts on screen; `fps` is the
                      poll-cadence A/B. Everything it produces is in docs/stage8/
+  wc-launch.sh       the stage-14 harness — it builds and installs the product
+                     and then measures it. `cold`/`warm`/`bench` time a click to
+                     a window from *inside* the guest, `native` times Windows'
+                     own Firefox on the same desktop for comparison, `verify`
+                     asserts from both machines' logs that the pixels crossed as
+                     arena slices, and `shot` photographs the result. What it
+                     tests needs none of it. Everything it produces is in
+                     docs/stage14/
+  wc-session         the VM host's half of stage 14, and the **forced command**
+                     of the guest's ssh key there: the guest can open a session
+                     and start applications and cannot get a shell
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)

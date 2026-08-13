@@ -50,14 +50,26 @@ SESSIONS=${1:-4}
 SECS=${2:-75}
 MODE=${3:-zink}
 
-DIR=/tmp/svff-int
-SHARE=/srv/winshare/svff
-SHARE_WIN='Z:\svff'
+# Every identity below is a knob, and not for taste. This machine runs a dozen
+# experiments at once and each of the four is something one run can destroy for
+# another: the host directory holds the binaries, the guest directory is what
+# the cleanup step kills processes *by prefix* of, the share is where the
+# compositor's log and frames land, and the ports are bound. A second experiment
+# that wants to run beside this one overrides the four and collides with
+# nothing.
+DIR=${SVFF_DIR:-/tmp/svff-int}
+GDIR=${SVFF_GDIR:-svffint}
+SHARE=${SVFF_SHARE:-/srv/winshare/svff}
+SHARE_WIN=${SVFF_SHARE_WIN:-'Z:\svff'}
 G=${SVFF_GUEST:-<guest-user>@<guest-nat-ip>}
 GK=(-i "$HOME/.ssh/wc_guest" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 ROOTC=${SVFF_ROOTC:-$HOME/rootc}
 BASH_BIN=$(command -v bash)
-GDIR=svffint
+# The systemd unit names, the run directory and the compositor's socket name.
+# Globbed in the cleanup steps, which is the reason it is a knob rather than a
+# literal: a `systemctl stop 'svff-run-*'` from one experiment stops another
+# experiment's run, and the symptom lands in theirs rather than in this one.
+UNITPFX=${SVFF_UNIT_PREFIX:-svff}
 BASE=${SVFF_BASE_PORT:-57360}
 WLPORT=${SVFF_WL_PORT:-57359}
 ARENA_PAGES=${SVFF_ARENA_PAGES:-196608}   # the compositor's arena, 768 MiB by default:
@@ -78,6 +90,10 @@ VKLOADER=${SVFF_VKLOADER:-/nix/store/i5p83jmafxzw98q980k8qwhdby5yf0i4-vulkan-loa
 # store path, and a `firefox` that resolved to something else would be a
 # different measurement. waycompose made the same choice for the same reason.
 FIREFOX=${SVFF_FIREFOX:-/nix/store/qxgg26945r3f9yzdqg0gfbnjvg6wm7x5-firefox-151.0.2/bin/firefox}
+# Only the `x11` mode uses these. The display number is this experiment's own,
+# for the same reason every other identity here is: the machine is shared.
+XWAYLAND=${SVFF_XWAYLAND:-/nix/store/8ynkvnr05j3pbaq4czb76yxnk940cmhm-xwayland-24.1.13/bin/Xwayland}
+XDISPLAY=${SVFF_XDISPLAY:-:77}
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 KIDS=()
@@ -85,14 +101,14 @@ cleanup() {
   kill "${KIDS[@]}" 2>/dev/null
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 pkill -f '$DIR/sv-hostd' 2>/dev/null
-systemctl stop 'svff-run-*' 2>/dev/null; systemctl reset-failed 'svff-*' 2>/dev/null
+systemctl stop '$UNITPFX-run-*' 2>/dev/null; systemctl reset-failed '$UNITPFX-*' 2>/dev/null
 true" | "$ROOTC" >/dev/null 2>&1
 }
 trap cleanup EXIT INT TERM
 
-RUN=$(mktemp -d /tmp/svff-run-XXXXXX); chmod 755 "$RUN"
+RUN=$(mktemp -d /tmp/$UNITPFX-run-XXXXXX); chmod 755 "$RUN"
 mkdir -p "$RUN/profile" "$RUN/home" "$RUN/xdg"
-SOCK="svff-$$"
+SOCK="$UNITPFX-$$"
 
 # Firefox's own prefs. Hardware WebRender, and the software fallback switched
 # off: the brief for this work is that a CPU GL implementation is not an
@@ -111,18 +127,26 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("toolkit.telemetry.enabled", false);
 PREFS
 
+# `about:support`'s answer is a long way down the page and nothing here can
+# scroll: there is no window manager and no route for a keystroke. Shrinking the
+# CSS pixel is the one knob that brings the Graphics table onto the first screen
+# without touching the graphics stack at all — it changes how many CSS pixels
+# fit, not which renderer draws them. Off by default so the ordinary run is the
+# ordinary run.
+[ -n "${SVFF_DPPX:-}" ] && echo "user_pref(\"layout.css.devPixelsPerPx\", \"$SVFF_DPPX\");" >>"$RUN/profile/user.js"
+
 # ------------------------------------------------------------------ clean ---
 say "clearing what this experiment left behind (by path, never by image name)"
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 pkill -f '$DIR/sv-hostd' 2>/dev/null
-systemctl stop 'svff-run-*' 'svff-hostd-*' 'svff-app-*' 2>/dev/null
-systemctl reset-failed 'svff-*' 2>/dev/null
+systemctl stop '$UNITPFX-run-*' '$UNITPFX-hostd-*' '$UNITPFX-app-*' 2>/dev/null
+systemctl reset-failed '$UNITPFX-*' 2>/dev/null
 rm -rf $SHARE; mkdir -p $SHARE/frames; chmod -R 777 $SHARE
 rm -f $DIR/icd.sock
 true" | "$ROOTC" >/dev/null 2>&1
 rm -f "$DIR"/cold*.sock "$DIR"/*.log
 # Only sockets this experiment made. §17's rule: identity is a path, not a name.
-ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/svff-* 2>/dev/null; true" >/dev/null 2>&1
+ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/$UNITPFX-* 2>/dev/null; true" >/dev/null 2>&1
 
 # **Kill this experiment's own leftovers in the guest, by executable path.**
 #
@@ -220,7 +244,7 @@ say "$SESSIONS cold path(s) and the Wayland path are up"
 
 # ------------------------------------- sv-hostd, then the proxy and Firefox --
 # Ordered after `wc-arena-host` because both want QMP and QMP serves one client.
-UNIT="svff-run-$$"
+UNIT="$UNITPFX-run-$$"
 
 # The one line that is the whole experiment, and its control. Chosen *before*
 # the script that uses it is written, so that the two modes are one command line
@@ -241,6 +265,46 @@ EXTRA=${SVFF_EXTRA_ENV:-}
 if [ "$MODE" = probe ]; then
   CLIENTCMD="${SVFF_PROBE_CMD:-$MESA_DEMOS/bin/eglinfo -B}"
   GLENV="MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink VK_DRIVER_FILES=$DIR/sv_icd.json SV_SOCKET=$DIR/icd.sock EGL_PLATFORM=wayland"
+elif [ "$MODE" = x11 ]; then
+  # **The cheap path**, and the reason it is in the same file as the expensive
+  # one: X11 in the middle of a Wayland stack is a step sideways, but the ICD
+  # already has `VK_KHR_xlib_surface` and `VK_KHR_xcb_surface`, so Firefox on
+  # X11 needs no driver change at all. A *rootful* Xwayland — one `wl_surface`
+  # carrying the whole X screen — is what makes this one window on the guest's
+  # desktop rather than a rootless server with no window manager to map
+  # anything. Its own presentation to the compositor is `wl_shm`, which is what
+  # `wc-proxy` offers and all it can offer.
+  cat >"$RUN/x11.sh" <<X11
+#!/usr/bin/env bash
+export XAUTHORITY="\$XDG_RUNTIME_DIR/Xauth"; : >"\$XAUTHORITY"
+# **Xwayland must not inherit the client's GL environment**, and getting that
+# wrong costs a whole run. The X server is itself a GL program — glamor is how
+# it has a GLX extension at all — so \`GALLIUM_DRIVER=zink\` and
+# \`VK_DRIVER_FILES\` reach it too, and an X server that cannot initialise its
+# own GL offers no fbconfig to anybody. The client's environment is set on the
+# client's line below; the server gets the software one.
+env -u GALLIUM_DRIVER -u MESA_LOADER_DRIVER_OVERRIDE -u VK_DRIVER_FILES -u SV_SOCKET \\
+  -u EGL_PLATFORM LIBGL_ALWAYS_SOFTWARE=1 \\
+  "$XWAYLAND" $XDISPLAY -geometry $OUTPUT -noreset >"$RUN/xwayland.log" 2>&1 &
+XW=\$!
+for _ in \$(seq 1 60); do [ -S /tmp/.X11-unix/X${XDISPLAY#:} ] && break; sleep 0.5; done
+if [ ! -S /tmp/.X11-unix/X${XDISPLAY#:} ]; then echo "Xwayland never listened"; exit 1; fi
+# **LIBGL_KOPPER_DRI2=1 is not a tuning knob, it is the whole mode.**
+# Mesa's platform_x11.c refuses Zink outright when the X server has no DRI3
+# multibuffer support — which an Xwayland with no DRM device never has —
+# unless this is set, in which case it skips the render-device checks and goes
+# straight to dri2_initialize_x11_kopper. Without it the run reports "DRI3 not
+# available" and "couldn't find RGB GLX visual or fbconfig" and never reaches
+# the ICD at all, which is what the first three attempts at this mode measured.
+DISPLAY=$XDISPLAY EGL_PLATFORM=x11 MOZ_ENABLE_WAYLAND=0 GDK_BACKEND=x11 \\
+  LIBGL_KOPPER_DRI2=${SVFF_KOPPER_DRI2:-1} \\
+  ${SVFF_X11_CMD:-"$FIREFOX" --no-remote --profile "$RUN/profile" $URL}
+rc=\$?
+kill \$XW 2>/dev/null
+exit \$rc
+X11
+  chmod 755 "$RUN/x11.sh"
+  CLIENTCMD="$RUN/x11.sh"
 else
   CLIENTCMD="$FIREFOX --no-remote --profile $RUN/profile $URL"
 fi
