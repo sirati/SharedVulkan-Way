@@ -7817,3 +7817,435 @@ Beyond those, the guest has to answer the questions no API call can:
    carries pixels and no name, so this needs the client's cursor **surface** to
    be matched against a known theme by hash, which is a guess wearing a
    measurement's clothes. Not done, and noted so it is not done accidentally.
+
+## 19. Stage 16: an arena that runs out, and a client that lives through it
+
+### 19.1 Status in one paragraph
+
+A user played a YouTube video and Firefox died instantly. The proxy log said
+`could not publish 2340864 bytes: arena 0 has no run of 2342912 bytes (3932160
+free, largest 1744896)`, then `client 2 stopped: the compositor closed the
+connection`, and Firefox said `Exiting due to channel error`. Three defects were
+in that, and only the first had a name. **Running out of arena was fatal, and
+§17.8 said it was not** — that is §19.2 and it is a correction rather than a
+feature. **The allocator could not use free space it had** — 1.7 times the
+request, in pieces — which is §19.4, and where the obvious fix turned out to be
+wrong under measurement. **Nothing frees a pool and it is now guest RAM** — §17.10
+item 1, the stage's largest inherited problem, answered in §19.5 by a policy that
+does not wait to be asked. All three are built, all three are tested, and one of
+them ran in anger against a real Firefox on a deliberately starved arena and
+handed back 18,837,504 bytes the client never offered. What is *not* here is a
+photograph: the pressure harness runs under Wine in an ssh session, where this
+compositor cannot create a window at all, so no run of it has ever painted
+anything. That is §19.7 and it is the honest limit of the evidence.
+
+### 19.2 The failure was not the allocation, it was the message after it
+
+§17.8 describes what happens when the arena has no room:
+
+> The failure mode is now known and is not a crash: `create` refuses with the
+> numbers, `flush_deferred` leaves the pool unannounced and notes it, and the
+> client's window stops updating. That is a compositor that looks frozen.
+
+**Every clause of that is true and the conclusion is false.** `create` does
+refuse with the numbers, `flush_deferred` does leave the pool unannounced, and it
+does note it. What the paragraph does not follow through is what the *client*
+does next, which is not to stop — it is to carry on using a pool it has every
+right to believe in:
+
+```
+wl_shm.create_pool(new_id 31, fd, 2340864)   -> deferred, refused, unannounced
+wl_shm_pool@31.create_buffer(new_id 44, ...) -> forwarded. To what?
+```
+
+The compositor has no object 31. A request on an unknown object is a protocol
+error in every Wayland server there is, and wayland-server answers it by posting
+`wl_display.error` and dropping the connection. So the proxy's own log line about
+the compositor closing the connection was not a second, unrelated event: it was
+the direct consequence of the first, two messages later.
+
+**The allocation failure was survivable. Forwarding past it was not.** That
+distinction is the whole of this item, and it generalises past the arena: any
+time this proxy decides not to emit a message, it has taken on the obligation to
+decide about every later message that depends on it. Deferral was invented in
+stage 4 for `wl_shm_pool.resize` (§9.6) and it was safe there because a resize
+that is absorbed changes nothing the client can observe. A `create_pool` that is
+absorbed creates an object the client can *address*, and nothing was watching for
+that.
+
+The rule the code now states, and the one thing to keep if all of this is
+rewritten: **`Pool::upstream()` — "does the compositor have a `wl_shm_pool` with
+this id right now" — is the question every message naming a pool must ask.** It
+is not the same question as "do we have bytes for it", and stage 12 could get
+away with conflating them only because a region, once published, was never taken
+away. §19.5 takes them away.
+
+### 19.3 What was built, in the order a message meets it
+
+Three answers, in order, and only the third is visible to a user.
+
+1. **Ask for the memory back.** An allocation failure runs the reclaimer
+   (§19.5), which destroys the upstream objects of pools nothing is using. It is
+   demand-driven: nothing is reclaimed while there is room.
+2. **Try again.** Reclamation cannot complete synchronously — the compositor has
+   to acknowledge the teardown before the bytes are safe to reuse, which is
+   §2.5's rule and not caution — so the retry that matters is the next message's,
+   and for a live client there is always a next message.
+3. **Say nothing about a pool that has no upstream object.** Every request
+   naming one is *absorbed*: `create_buffer` is recorded and replayed later from
+   the client's own bytes, `resize` updates the recorded size, `destroy` is
+   answered with an invented acknowledgement. The one request that cannot be
+   absorbed is `wl_surface.attach`, because a client may attach once and commit
+   for ever; it is held on the surface and retried at every commit.
+
+The result is a surface that freezes and a connection that does not. That is a
+real cost and it is counted: `attaches deferred` in the stats line is the number
+of frames the client drew that the compositor never saw.
+
+**Three things this deliberately does not do**, each rejected for a reason:
+
+* **Grow the arena.** §12 makes this much worse than a `realloc`: the region is
+  guest RAM located by a content sweep, so a second region means a second
+  `attach_guest_ram` in the guest, a second 13 GiB sweep on the host (2.4 s,
+  §12.5) and a second plan. Worse, `wc-arena-host` has exited by the time a
+  client is running, and §12.10 records that a region cannot be re-located
+  afterwards because the first pool overwrites the stamps the sweep looks for.
+  Growth is a deployment-time change, not a runtime one.
+* **Fall back to the file transport.** `--transport shared-file` is a Wine-only
+  fixture; §10.3 measured that two live mappings of one file on a virtio-fs
+  export do not see each other's stores. A fallback would be a silent
+  correctness failure on the only deployment that matters, and the guest-RAM
+  rule is standing.
+* **Block until room appears.** The session thread is the client's whole
+  connection. Blocking it stops the `wl_buffer.destroy` and `wl_shm_pool.destroy`
+  that are the only things that could free the arena, so it deadlocks exactly
+  when it is needed.
+
+### 19.4 Fragmentation: six policies, and the obvious answer was wrong
+
+The numbers in the log line are the reason this is a separate item: **3,932,160
+bytes free, largest run 1,744,896, request 2,342,912.** Two-thirds more space
+than the request, in pieces none of which was big enough. Stage 12's allocator is
+address-ordered first fit at 4096-byte granularity, and §17.8 had already shown
+that the machinery under it works — a pool at offset 28672 was reused and
+coalesced — so this is a policy problem and not a plumbing one.
+
+**The reproduction is synthetic and that is the point.** A YouTube video
+fragments the arena in about ten seconds, but it does so through Firefox, a
+compositor, a hypervisor and a guest, and a run of it can only say "it broke
+again". `pool::tests::video_churn` replays a deterministic 4000-round sequence
+with the two ingredients the live failure had and nothing else: large pools whose
+sizes wander in the band the log showed, and a few small pools that are never
+released — cursors and tooltips, which Firefox holds for the life of the process
+and which sit in the middle of the region stopping the large holes on either side
+from coalescing.
+
+One thing had to be fixed in the harness before it measured anything, and it is
+worth recording because it inverted the result. The first version retired a pool
+only when a *new* one had been allocated, so a single refusal froze the live set
+and every later round refused too. That made a bad allocator look catastrophic
+and a good one look bad. **A pool's life is the client's business, not the
+allocator's**: Firefox does not stop destroying pools because this proxy could
+not find room for one. With the schedule fixed — the slot from round `r - live`
+retires at round `r`, whatever happened — the numbers became stable and
+comparable.
+
+Then the matrix, at 64 MiB, 4000 rounds, refusals (and largest free run) by
+policy and by how many pools are live at once:
+
+| live | first-fit | best-fit + classes | first-fit + classes | best-fit, paged | best-fit + far-end + classes | **best-fit + far-end** |
+|---|---|---|---|---|---|---|
+| 16 | 0 | 0 | 0 | 0 | 0 | **0** |
+| 22 | 0 | 0 | 3 | 0 | 0 | **0** |
+| 24 | 62 | 41 | 81 | 19 | 0 | **0** |
+| 25 | 39 | 26 | 155 | 9 | 9 | **0** |
+| 26 | 121 | 46 | 219 | 23 | 27 | **3** |
+| 27 | 165 | 133 | 327 | 31 | 55 | **11** |
+| 28 | 275 | 203 | 393 | 115 | 141 | **53** |
+| 29 | 261 | 311 | 410 | 197 | 213 | **117** |
+| 30 | 267 | 337 | 421 | 191 | 303 | **160** |
+| 31 | 633 | 405 | 740 | 293 | 404 | **262** |
+
+**The design this stage set out to build is the third column, and it is worse
+than doing nothing at several occupancies.** The plan was best fit plus
+TLSF-style size classes: round every request up to one eighth of the power of two
+it sits in, so that the hole a freed pool leaves is exactly the shape the next
+request of its class wants, at a bounded 12.5% of internal fragmentation. The
+argument is sound, it is what TLSF and jemalloc do, and a doc comment explaining
+it was already written. The matrix says it is wrong here: **`first-fit +
+classes` is the worst column at every single occupancy**, and adding classes to
+best fit makes best fit worse at every occupancy too. The classes buy exact reuse
+and pay for it by making every request bigger, and in an arena this close to full
+the second dominates.
+
+What actually does the work is **choosing the run rather than reshaping the
+request**, in two independent halves:
+
+* **Best fit.** The smallest adequate run rather than the lowest. "Lowest" and
+  "smallest" are unrelated, and first fit shaves the low end of whatever large
+  run it meets first — so a region's big runs are eaten by requests a smaller
+  hole would have held perfectly well, and there is nowhere left to put a large
+  pool. This is most of the improvement.
+* **Small pools from the far end.** A pool of at most 64 KiB is cut from the
+  *highest* run, at that run's tail. This is the direct answer to ingredient 2 of
+  the reproduction: a permanent 8 KiB extent in the middle of the region is what
+  stops megabyte holes from coalescing, and sending it to the far end costs
+  nothing. 64 KiB is chosen from what clients create rather than from a round
+  number — a 32x32 cursor is 4096 bytes, a 128x128 icon is 65536, and every
+  content pool Firefox opens is at least fifteen times that, so the line falls in
+  a genuine gap in the distribution.
+
+Shipped: **best fit, small pools from the far end, page granularity, no
+classes.** Zero refusals where first fit refuses 62, a fifth of the refusals
+where first fit refuses 633, and never worse at any occupancy tested. Stage 12's
+policy stays, reachable as `--arena-policy first-fit`, so the comparison can be
+re-run against a live client without a rebuild — and because a claim that one
+allocator beats another should be re-runnable by whoever doubts it.
+
+**What the table also says, and it is the load-bearing caveat**: past about 24
+live pools every policy refuses something, because the working set is genuinely
+larger than the arena. A better allocator moves the cliff; it does not remove it.
+The live failure was at 94% occupancy — 62,128,128 bytes out of a 63 MiB usable
+region — which is past the cliff for anything. **So §19.2 is the fix and §19.4 is
+an improvement**, and it would be a misreading of this section to present them
+the other way round.
+
+### 19.5 Reclamation: a pool's arena bytes are a cache, not the client's memory
+
+§15.11 proposed releasing a pool's region when its last buffer dies, and called
+it "the fix with the best evidence behind it". §17.8 then measured the client it
+was designed for:
+
+| in one 25-second `about:blank` run | count |
+|---|---|
+| `wl_shm.create_pool` | 4 |
+| `wl_shm_pool.destroy` | **0** |
+| `wl_shm_pool.create_buffer` | 3 |
+| `wl_buffer.destroy` | **1** |
+
+Firefox destroys one buffer in three and no pools at all, so a policy that waits
+to be asked frees one pool of four here and none of the 88 in §15.10's startup
+run. **The plan was standing on a quarter of what it looked like.**
+
+The way out is to stop treating the compositor's `wl_shm_pool` as a resource the
+client owns. **A pool's arena bytes are a copy.** The original is the client's own
+`memfd`, which this proxy still holds mapped for the life of the pool
+(`Pool::client`) — it has to, because that is where every commit copies *from*.
+Nothing is lost by throwing the copy away. So the upstream pool is not the
+client's memory at all; it is **a cache this proxy chose to populate, and a cache
+may be evicted.** What the protocol lacks is a way to re-point an existing pool at
+new bytes, and that is worked around rather than defeated: destroy the objects,
+and rebuild them from the client's own requests the moment it touches the pool
+again. The proxy has everything it needs — it kept the `create_buffer` body
+verbatim, precisely so it never has to hold a second opinion about somebody
+else's XML.
+
+The policy, and each condition rules out a specific wrong answer:
+
+* **Under pressure only.** Nothing is reclaimed while there is room. There is no
+  timer and no background sweep: holding 400 MB of a 768 MiB arena is free as
+  long as it can be got back when it is needed, and a timer would churn for
+  nothing.
+* **Coldest first.** LRU by last commit that copied out of the pool.
+* **Never `zombie`.** The client must still own the pool's id, or a rebuilt
+  `create_pool` could collide with whatever the client has since put there. This
+  is also why `weston-presentation-shm` is untouched by any of this: it destroys
+  its pool immediately and then draws 784 frames from the buffers, so its pool is
+  a zombie from the first frame and never a candidate. §9.7's lesson survives
+  intact.
+* **No buffer attached, and none unreleased.** A buffer that is a surface's
+  current or pending contents is being displayed; one the compositor has not
+  `release`d may be being read this instant. `wl_buffer.release` is the
+  compositor's own word for "I am finished with these bytes", and this is the
+  first thing in the project to use it for anything.
+* **Colder than 250 ms.** Against thrash, not against error: a pool in active
+  rotation would be destroyed and rebuilt on alternate frames. Fifteen frames at
+  60 Hz is long enough that nothing in a video's rotation is ever a candidate and
+  short enough that the stale pools a resize leaves behind — which is what
+  actually accumulates — become candidates almost at once.
+
+The cost is stated where it can be watched: `republished` in the stats line. If
+it approaches `reclaimed`, the floor is too low or the arena is too small, and
+both are visible without a debugger.
+
+**And it works on a real client.** Against Firefox on a 24 MiB arena:
+
+```
+pool 3: reclaiming 18837504 bytes, idle 874 ms -- the client never asked for
+        them back and the arena needs 4608000
+... 252 commits, 244 copies, 1077.14 MiB in 47.7 ms; 5 pools (0 released,
+    1 reclaimed, 0 republished, 4 refusals, 1 attaches deferred)
+```
+
+**Zero released, one reclaimed.** That is §17.8's measurement and this stage's
+answer in the same line: the client returned nothing, and 18 MB of guest RAM came
+back anyway.
+
+### 19.6 Two bugs the tests found in the fix, both worth their note
+
+Neither was found by review and both were found by writing the test that was
+supposed to pass trivially.
+
+**Publication had to become demand-driven.** `flush_deferred` publishes every
+pool that has no region, which was right when the only way to have no region was
+never to have been published. After §19.5 a pool can *lose* its region, and the
+very next message the client sent — whatever it was about — rebuilt it. The memory
+came back and left again before anything could use it, and the reclaimer was, in
+effect, a no-op with a log line. `Pool::wanted` is the fix: set when the pool is
+created and when a request names it or one of its buffers, cleared when the
+reclaimer takes it apart. The subtlety is that `wl_shm_pool.destroy` must *not*
+set it — rebuilding a pool in order to forward its destructor is not merely
+wasteful, and it was doing exactly that until the test caught it.
+
+**A stale `BufferInfo` under a recycled id made the rebuild emit a duplicate
+`new_id`.** Wayland ids are recycled: a client destroys `wl_buffer@44`, the server
+acknowledges, and the next `create_region` is `wl_region@44`. `self.buffers` was
+never purged on that transition and it had never mattered, because nothing
+replayed what was in it. The rebuild replays it — so a stale entry left under an
+id that is now a live `wl_region` made the proxy emit
+`wl_shm_pool.create_buffer(new_id = 44)` for an id the compositor already had.
+**That is a protocol error and a dead client: the exact failure this stage exists
+to remove, reintroduced by its own fix.** It was caught on a real Firefox, not in
+a test — `Invalid new_id: 44`, with the upstream dump showing 44 created as a
+region four messages earlier — and the purge now happens at the moment an id is
+declared to be something else, which is the moment it provably stops meaning what
+this file thought.
+
+A third, smaller one: the "nothing could be reclaimed" line was written once per
+message, which for Firefox is thousands a second, and the first pressure run
+produced a log that was 90% that line with the three lines that mattered buried
+in it. Rate-limited, for the same reason `Pool::warned` exists.
+
+### 19.7 The evidence, and what the pressure harness cannot decide
+
+| leg | what it is worth |
+|---|---|
+| `pool::tests::a_video_sized_churn_fragments_first_fit_and_not_the_default` | The fragmentation claim, both directions: first fit still refuses pools it has room for, the default refuses none where the arena genuinely has room, and it is never worse at any occupancy tested — including past the cliff, which is the half that could have been hidden. |
+| `pool::tests::small_pools_are_cut_from_the_far_end_and_large_ones_from_the_near` | The half of the policy that is not best fit, asserted on offsets rather than on outcomes. |
+| `session::tests::a_full_arena_degrades_one_surface_and_never_the_connection` | **§19.2, asserted as a property**: not one message naming an unbacked pool, or a buffer cut from it, reaches the compositor — and the healthy surface next to it keeps working, and the starved one recovers when there is room. |
+| `session::tests::a_cold_pool_is_reclaimed_under_pressure_and_rebuilt_when_the_client_returns` | §19.5 end to end, including the case §17.10 warned about: a client re-attaching a buffer it never destroyed. |
+| `session::tests::an_acknowledgement_goes_to_whoever_asked_for_the_destruction` | The two `delete_id` directions, which are the part of this most likely to be got wrong by a later change. |
+| `scripts/wc-arena-pressure.sh` (new) | A real Firefox against a deliberately starved arena, which is the only place the *compositor's own verdict* on these messages can be had. It asserts three things: the arena really ran out, pools were reclaimed without the client asking, and the compositor reported no request on an object it does not have. |
+
+**What the pressure harness deliberately does not assert, and why.** It does not
+assert that the connection survives to the end of the run, and it does not assert
+that anything is painted — because under Wine in an ssh session this compositor
+cannot create a window at all. Every run of it, on this branch and on master
+alike, logs `could not create a window for surface 1: Invalid window handle. (os
+error 1400)` and dumps zero frames. That is §13.3's window station problem, it is
+nothing to do with the arena, and a pass/fail on it would be measuring the window
+station. What the harness *can* decide is what the compositor says about the
+messages it receives, and that is what it asserts.
+
+The comparison against master's proxy is worth recording even though it is not a
+gate. On the same starved arena, master reaches **2 commits and 0 copies** before
+the connection is dropped; this branch reaches **252 commits, 244 copies and 1077
+MiB copied** with the connection intact and no protocol error. In two further
+runs it reached 13 and 2 commits — the run-to-run spread is large, because how far
+Firefox gets before the windowless compositor upsets it is not controlled — but
+the three assertions held in all of them.
+
+**One thing seen and not explained.** In two early runs, before the stale-id purge
+of §19.6, the compositor reported `Invalid new_id`. After the purge it has not
+recurred in any run. That is consistent with the purge being the whole cause, and
+it is *not* proof: the same runs were also the ones with `--trace` on, which
+changes the timing substantially. Instrumenting the two paths that could produce
+it — invented acknowledgements and rebuilt buffers — showed **zero of each** in the
+run that failed, so whatever it was did not come from the new machinery. It is on
+§19.9's list rather than claimed as fixed.
+
+### 19.8 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **171 tests**, 0 failures |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --target x86_64-pc-windows-gnu` | 8 executables — real binaries, not metadata |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
+| `scripts/wc-input.sh all` (stage 6 + 10, Wine) | 82 passed, 0 failed — unchanged |
+| `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed |
+| `scripts/wc-firefox.sh wine-arena` (stage 12, Wine) | 10 passed, 0 failed — unchanged |
+| **`scripts/wc-arena-pressure.sh` (new)** | **3 passed, 0 failed** |
+| `scripts/wc-guest.sh firefox` (the guest) | **not run — see §19.9 item 1** |
+| `scripts/wc-desktop.sh`, `scripts/wc-icon.sh` | **not run — they need the interactive desktop** |
+
+All of these are from the checkout after the merge with master, which is §12.12's
+arrangement.
+
+**One gate failed on the way and it is worth its line, because it is the mistake
+the brief for this stage warned about in advance.** `wc-firefox.sh enumerate`
+reported `0 passed, 1 failed` — "the compositor never bound its socket" — and the
+compositor's own log said `unknown argument --decorations`. The merge with master
+brought stage 17's harness, which passes that flag, and the Linux binaries in
+`target/debug` were from before the merge: `cargo clippy` and
+`cargo build --target x86_64-pc-windows-gnu` had both been run, and neither
+builds a Linux executable. **A stale binary, exactly as predicted, and it
+presented as a protocol failure rather than as a missing flag.** `cargo build
+--workspace` and it passes 13 of 13. The rule generalises past this stage: the
+thing that must be rebuilt is whatever the *harness* runs, and this repository's
+harnesses run three different binaries on two targets.
+
+**On the `3 fds in, 1 out` invariant (§14.7): unchanged, and the reasoning is
+short.** Everything this stage added moves *messages*, not descriptors.
+`wl_buffer.destroy`, `wl_shm_pool.destroy`, `wl_shm_pool.create_buffer` and
+`wl_display.delete_id` carry no `h` argument in either direction, and the
+invented events go out on the client socket, which is the side where `SCM_RIGHTS`
+was always legal (§9.4). The Wine gates re-measure the count and it is the same
+number it was.
+
+### 19.9 What is not proven
+
+1. **Nothing here has run on the guest.** Every leg is local or Wine. The guest
+   is contended by three other agents and §16.8's rule about identity applies;
+   what needs a guest re-check is specifically the reclamation path, because a
+   `wl_shm_pool.destroy` this proxy sends unprompted crosses the hypervisor and
+   the compositor's response to it has only ever been seen under Wine.
+2. **The residual `Invalid new_id`** of §19.7. Not reproduced since the stale-id
+   purge, not proven to be caused by it.
+3. **The 250 ms floor is a judgement, not a measurement.** It is short enough
+   for the stale pools a resize leaves and long enough for a 60 Hz rotation, and
+   nothing has measured a client whose working set cycles more slowly than that
+   and is larger than the arena. Such a client would thrash, and `republished`
+   is the number that would say so.
+4. **Reclamation has never been observed rebuilding a pool on a real client.**
+   The test covers it and the live runs never needed it — `0 republished` in
+   every one — because the pools that got reclaimed were ones Firefox had
+   genuinely finished with. That is the good case; the interesting case is
+   untested outside `cargo test`.
+5. **A pool larger than the whole arena can never be published**, and the
+   surface that wants it freezes for ever. This is reachable — the 12 MiB run has
+   Firefox asking for 18,837,504 bytes — and the response is correct but
+   permanent. Nothing warns the operator that the arena is *structurally* too
+   small rather than temporarily full, and it should.
+6. **The best-fit scan is linear in the free list**, where first fit could stop
+   early. Nothing has measured it, the free list is short in every observed run,
+   and if it ever matters the answer is a segregated list rather than a different
+   policy.
+7. **§17.10 items 3 to 8 are unchanged**, and §12.13 items 3, 4 and 9 with them.
+
+### 19.10 What to do next
+
+1. **Run the pressure harness on the guest**, which is the only place the
+   reclamation teardown crosses a real hypervisor, and the only place the arena
+   is really guest RAM. It is §19.9 item 1 and it is one run.
+2. **Say when the arena is structurally too small.** §19.9 item 5: a pool bigger
+   than the region is a configuration error the operator can fix and the current
+   message does not distinguish it from ordinary pressure.
+3. **Carry the measurement into the unification.** The two repositories are
+   being merged into one workspace with one arena and one allocator, and this
+   stage's allocator is one of three being reconciled. The free-list code and the
+   granularity constant should certainly be shared; **the policy should be
+   carried with its matrix**, because the shortest of the three implementations
+   is first fit and first fit is the one that refused a pool it had room for and
+   killed the user's browser. The one thing that must not be unified is the
+   *ranges*: the outbound window and the pool allocator must stay disjoint, or a
+   client's pixels land on a live keymap silently (§14.5).
+
+   **Verified while this stage was being written**: the unified tree
+   (`shared-vulkan-base` at `020022d`) already carries `crates/wc-proxy/src/pool.rs`,
+   and it carries **none** of this — `git show master:crates/wc-proxy/src/pool.rs
+   | grep -c 'Policy\|best_fit'` is `0` there. So the port is a real piece of
+   work rather than a formality, and until it happens the unified tree has the
+   allocator that killed the browser.
