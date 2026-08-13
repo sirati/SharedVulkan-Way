@@ -249,7 +249,6 @@ pub mod x11 {
             *mut c_uint,
             *mut c_uint,
         ) -> c_int,
-        sync: unsafe extern "C" fn(*mut Display, c_int) -> c_int,
         set_error_handler: unsafe extern "C" fn(ErrorHandler) -> ErrorHandler,
         init_threads: unsafe extern "C" fn() -> c_int,
     }
@@ -266,31 +265,66 @@ pub mod x11 {
     /// code killed it with `BadDrawable` from `XCreateGC`. A driver that aborts
     /// the application because a frame could not be shown is worse than one that
     /// drops the frame.
-    unsafe extern "C" fn ignore_error(_dpy: *mut Display, _event: *mut c_void) -> c_int {
-        0
+    /// **Ours only.** An error on the application's own connection is passed to
+    /// whatever handler the application had, unchanged.
+    ///
+    /// Xlib's error handler is process-global rather than per-`Display`, which
+    /// is the one genuinely awkward thing about talking X from inside a driver.
+    /// The handler is nonetheless the only place the *display* is knowable, and
+    /// that is enough: `XErrorEvent`'s first member is the `Display*` the error
+    /// arrived on, and Xlib passes the same pointer as the first argument. So
+    /// "swallow errors this module caused" is expressible exactly, without ever
+    /// hiding one of the application's.
+    unsafe extern "C" fn ignore_error(dpy: *mut Display, event: *mut c_void) -> c_int {
+        if let Some(c) = CONN.get().and_then(|c| c.as_ref())
+            && c.lock().map(|g| g.display).unwrap_or(0) == dpy as usize
+        {
+            return 0;
+        }
+        match PREVIOUS.get().copied().flatten() {
+            // SAFETY: a plain function pointer `XSetErrorHandler` returned,
+            // called with the two arguments Xlib passed us and on the error's
+            // own display — which is exactly the call Xlib would have made had
+            // this module never installed a handler.
+            Some(prev) => unsafe { prev(dpy, event) },
+            None => 0,
+        }
     }
 
-    /// Run `f` with X errors swallowed, and make sure ours have arrived before
-    /// the application's handler goes back.
+    /// The handler that was installed when this module first needed one.
     ///
-    /// `XSetErrorHandler` is process-global rather than per-`Display`, which is
-    /// the one genuinely awkward thing about talking X from inside a driver. The
-    /// `XSync` is what makes the window narrow enough to accept: an X error is
-    /// delivered while its *own* connection is being read, so syncing our
-    /// connection before restoring the previous handler means every error we
-    /// caused has already been swallowed by ours. An error on the application's
-    /// connection can only be delivered while the application is inside Xlib,
-    /// which for a single-threaded GL program is never during this call.
+    /// A `OnceLock` and not a save/restore pair, which is the change this
+    /// carries and the reason for it: the previous version set the handler,
+    /// ran the request, **`XSync`ed**, and restored — because an error is
+    /// delivered while its own connection is being read, so the sync was what
+    /// made the swap narrow enough to be safe. That sync is a full round trip
+    /// to the X server **on every presented frame**, on top of the round trip
+    /// to the GPU side that the frame has already cost, and under an Xwayland
+    /// that is itself a Wayland client the round trip is not cheap.
+    ///
+    /// Installing once and dispatching on the display removes the swap, and so
+    /// removes the reason for the sync, and is strictly safer than what it
+    /// replaces: the old code hid *every* X error in the process for the
+    /// duration of each call, including the application's.
+    static PREVIOUS: OnceLock<ErrorHandler> = OnceLock::new();
+
+    /// Run `f` with this module's X errors swallowed.
+    ///
+    /// **This is not optional and it is not defensive coding.** Xlib's default
+    /// error handler calls `exit(1)`, and every request this module makes names
+    /// a window the *application* owns and may already have destroyed — which is
+    /// not a rare race but the ordinary shape of a GL program: `glxinfo` creates
+    /// and destroys a window per config it probes, and the first run of this
+    /// code killed it with `BadDrawable` from `XCreateGC`. A driver that aborts
+    /// the application because a frame could not be shown is worse than one that
+    /// drops the frame.
     fn quietly<T>(l: &Lib, dpy: *mut Display, f: impl FnOnce() -> T) -> T {
-        // SAFETY: `XSetErrorHandler` takes and returns a plain function pointer,
-        // and `XSync` on a live display.
-        unsafe {
-            let prev = (l.set_error_handler)(Some(ignore_error));
-            let out = f();
-            (l.sync)(dpy, 0);
-            (l.set_error_handler)(prev);
-            out
-        }
+        let _ = dpy;
+        // SAFETY: `XSetErrorHandler` takes and returns a plain function pointer.
+        // It runs at most once for the process, before any request this module
+        // makes, which is what leaves nothing to restore afterwards.
+        PREVIOUS.get_or_init(|| unsafe { (l.set_error_handler)(Some(ignore_error)) });
+        f()
     }
 
     // SAFETY: every field is a function pointer into a library that is loaded
@@ -339,7 +373,6 @@ pub mod x11 {
                     put_image: sym!("XPutImage"),
                     flush: sym!("XFlush"),
                     get_geometry: sym!("XGetGeometry"),
-                    sync: sym!("XSync"),
                     set_error_handler: sym!("XSetErrorHandler"),
                     init_threads: sym!("XInitThreads"),
                 })
@@ -358,8 +391,13 @@ pub mod x11 {
         screen: c_int,
     }
 
+    /// Module-level rather than a local of [`connection`], because
+    /// [`ignore_error`] has to read it: the whole point of that handler is to
+    /// tell an error on *our* display from one on the application's, and the
+    /// only thing that distinguishes them is this pointer.
+    static CONN: OnceLock<Option<Mutex<Connection>>> = OnceLock::new();
+
     fn connection() -> Option<&'static Mutex<Connection>> {
-        static CONN: OnceLock<Option<Mutex<Connection>>> = OnceLock::new();
         CONN.get_or_init(|| {
             let l = lib()?;
             // SAFETY: `XInitThreads` before the first `XOpenDisplay` is the
@@ -508,10 +546,14 @@ pub mod x11 {
                     core::ptr::copy_nonoverlapping(src.as_ptr(), self.pixels, self.len);
                 }
             }
-            // `quietly` ends in an `XSync`, which is a round trip to the X
-            // server per frame. That is the price of not being able to let an
-            // error escape into the application's handler, and it is paid where
-            // the frame has already cost a GPU copy and 8 MB of memory traffic.
+            // `XFlush` and **not** `XSync`: the frame is pushed to the server
+            // and this side does not wait to hear that it arrived. `quietly`
+            // used to end in an `XSync` — a full round trip per frame, on top
+            // of the round trip to the GPU side the frame has already cost —
+            // because it swapped the process-global error handler around each
+            // call and had to know its own errors had landed before swapping
+            // back. Installing the handler once removed the swap and with it
+            // the reason to wait. See [`PREVIOUS`].
             // SAFETY: handles this object created, on a live display.
             quietly(l, dpy, || unsafe {
                 (l.put_image)(

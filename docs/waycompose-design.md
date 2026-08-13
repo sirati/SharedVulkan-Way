@@ -5643,11 +5643,39 @@ more ways for that to be true and two ways to photograph the wrong instant.
 >    side reads `close requested`, which is what a user clicking the X looks
 >    like. Kills-by-name are not made safe by being gentle.
 >
-> The three instances so far: §12.8's image-name kill, which stage 8 narrowed to
-> an image *path* (§13.9); this stage's `WM_CLOSE` (below); and stage 12's
+> The four instances so far: §12.8's image-name kill, which stage 8 narrowed to
+> an image *path* (§13.9); this stage's `WM_CLOSE` (below); stage 12's
 > `clean` step running an unscoped `rm -f …/wg-*` over eight live sockets
-> belonging to this stage's runs. Each was diagnosed as flakiness first, and
-> each cost more than the fix.
+> belonging to this stage's runs; and the WSI stage's, which is the first to be
+> found by reading rather than by losing a run and is written out below. Each of
+> the first three was diagnosed as flakiness first, and each cost more than the
+> fix.
+>
+> **The fourth: `scripts/sv-firefox-guest.sh`, and it is rule 1 twice over.**
+> Its `clean` step runs
+>
+> ```
+> systemctl stop 'svff-run-*' 'svff-hostd-*' 'svff-app-*'
+> systemctl reset-failed 'svff-*'
+> ```
+>
+> and kills guest processes by the prefix `C:\Users\<guest-user>\svffint\` — while the
+> unit name it later starts is `svff-run-$$`, so the glob matches **every
+> concurrent run of this harness, not this one**. Two runs of it destroy each
+> other, and the symptom lands in the *other* run: a host-side unit that
+> vanishes mid-Firefox, which reads as a crash. The same is true of the guest
+> kill, of `/srv/winshare/svff`, of `/tmp/svff-int` where the binaries live, and
+> of the fixed TCP ports 57359–57363 — five shared identities, none of them
+> derived from the run.
+>
+> **The fix is not "use your own prefix", it is that the prefix is a
+> parameter.** `SVFF_DIR`, `SVFF_GDIR`, `SVFF_SHARE`, `SVFF_UNIT_PREFIX` and
+> `SVFF_BASE_PORT` now default to what they were, so an existing invocation is
+> unchanged, and a second experiment overrides the five and collides with
+> nothing. The globs remain — a `clean` step exists precisely to reap leftovers
+> whose pids nobody recorded — but they are now scoped to one experiment's own
+> namespace, which is the narrowest a glob can honestly be. Working around this
+> by hand, as this stage nearly did, is how it survives to a fifth instance.
 
 * **`taskkill /IM wc-compositor.exe` without `/F` sends `WM_CLOSE`.** Another
   worktree running an older `wc-guest.sh` reaps nothing of ours — our process
