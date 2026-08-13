@@ -1311,7 +1311,18 @@ echo rc=\\\$?\" | $ROOTC" >"$hl" 2>&1
 # ------------------------------------------------------------------ clean ----
 do_clean() {
   echo "== clean =="
-  g "rm -rf $GUESTDIR; rm -f /c/Users/<guest-user>/AppData/Local/waycompose/*.lock /c/Users/<guest-user>/AppData/Local/waycompose/wg-* 2>/dev/null; rmdir /c/Users/<guest-user>/AppData/Local/waycompose 2>/dev/null; echo cleaned" 2>&1 | tail -1
+  # STAGE 12: the socket nodes are only swept when this experiment owns the
+  # whole guest, and that is §12.8 again in the one place stage 7 did not look.
+  # `rm -f .../wg-*` is not scoped to anything: every experiment derived from
+  # this script names its sockets `wg-…`, so a clean here deleted another run's
+  # live socket node — which presents in *their* log as a compositor that
+  # cannot bind, exactly as the image-name `taskkill` did. The directory this
+  # deploy owns is scoped by `WC_GUESTNAME`; the AppData directory is not
+  # scoped by anything, so it is left alone unless nobody else can be using it.
+  local sockets=""
+  [ "$GUESTNAME" = wctest ] && sockets="rm -f /c/Users/<guest-user>/AppData/Local/waycompose/*.lock /c/Users/<guest-user>/AppData/Local/waycompose/wg-* 2>/dev/null; rmdir /c/Users/<guest-user>/AppData/Local/waycompose 2>/dev/null;"
+  kill_in_dir "$GUESTDIR_WIN"
+  g "rm -rf $GUESTDIR; $sockets echo cleaned" 2>&1 | tail -1
   [ -n "$HOST" ] || return 0
   # The export is somebody's real folder, so only what this script made goes.
   # `keymaps` is stage 6's and was not added here when it landed, so `clean` left

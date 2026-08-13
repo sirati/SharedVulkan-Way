@@ -5638,7 +5638,7 @@ multi-connection code before any of them cost a guest run. **What it could not
 find is §16.4**, because a file arena has no stamps, which is §14.12's boxed item
 being exactly right about what a file substrate cannot tell you.
 
-### 16.7 Three things that cost real time
+### 16.7 Four things worth writing down, three of which cost real time
 
 **Firefox will not run as root while somebody else owns its directories.** The
 host-side half runs in a root transient unit, because `/proc/<qemu-pid>/fd` is
@@ -5662,8 +5662,21 @@ stale one.
 
 **The frames go on the virtio-fs export.** A Firefox frame is a 2.3 MB PPM and a
 long run makes hundreds of them, on the mount §10.3 measured at 330× slower to
-touch. 46 of them is 100 MB and fine; a stage that raises the run length should
+touch. 48 of them is 110 MB and fine; a stage that raises the run length should
 look at that number before it does.
+
+**And one that cost nobody anything yet: `wc-guest.sh clean` was §12.8 all over
+again.** It ran `rm -f …/AppData/Local/waycompose/wg-*`, which is not scoped to
+anything — every experiment derived from this script names its sockets `wg-…`,
+so a clean would have deleted another run's **live** socket node and the symptom
+would have landed in their log as a compositor that cannot bind. It was found
+by reading the function before running it, and the evidence that it was real is
+in the directory: at the moment of this stage's clean, that directory held eight
+`wg-s11-*` nodes belonging to stage 11. It is now scoped exactly as stage 7
+scoped the kill — the sockets are only swept when `WC_GUESTNAME` is the default,
+i.e. when this deploy owns the whole guest — and the `wctest12` directory, which
+*is* scoped, is killed and removed as before. Stage 7 narrowed the kill and did
+not look at the clean five lines below it.
 
 ### 16.8 The gates
 
