@@ -322,6 +322,198 @@ fn every_copy_scope_produces_the_same_image() {
     }
 }
 
+/// A client that cycles buffers, the way every real toolkit does.
+///
+/// The distinction this exercises is the one that broke scrolling — see
+/// docs/design.md §27. `wl_surface.damage` is "what changed on the **surface**
+/// since the last commit", not "what I wrote into this **buffer**". A client
+/// that double-buffers repaints the whole back buffer (or copies the front
+/// buffer into it and then repaints the delta) and still reports only the
+/// frame's delta, because that is all that changed on screen. A compositor
+/// reading the buffer directly is fine. A proxy keeping a *per-buffer* shadow
+/// is not: the back buffer's shadow is stale everywhere the surface changed
+/// while some *other* buffer was on screen.
+///
+/// `canvas` is what the client believes the surface looks like. Every frame it
+/// changes one band, writes the **whole** canvas into the next buffer in the
+/// cycle, and damages only the band. So the attached buffer is always exactly
+/// right, and any disagreement in the region is the proxy's alone.
+struct Cycler {
+    frame: Frame,
+    buffers: Vec<u32>,
+    canvas: Vec<u8>,
+}
+
+impl Cycler {
+    /// The colour of band `tick`, chosen so that a band from the wrong frame is
+    /// a different colour rather than a plausible one.
+    fn band_colour(tick: u8) -> [u8; 4] {
+        [tick.wrapping_mul(37), tick.wrapping_mul(91), tick.wrapping_mul(13), 0xff]
+    }
+
+    /// The band frame `tick` repaints: full width, four rows, walking down.
+    fn band(&self, tick: u8) -> (i32, i32) {
+        let y = (i32::from(tick) * 4) % (self.frame.h - 4);
+        (y, 4)
+    }
+
+    fn tick(&mut self, h: &mut Harness, surface: u32, pixels: &mut [u8], tick: u8) {
+        let (y0, bh) = self.band(tick);
+        let c = Self::band_colour(tick);
+        for y in y0..y0 + bh {
+            for x in 0..self.frame.w {
+                let at = (y * self.frame.stride + x * 4) as usize;
+                self.canvas[at..at + 4].copy_from_slice(&c);
+            }
+        }
+        // Write the whole canvas into the buffer about to be attached. Legal,
+        // and what a front-to-back copy amounts to.
+        let buffer = self.buffers[usize::from(tick) % self.buffers.len()];
+        let base = (usize::from(tick) % self.buffers.len()) * self.canvas.len();
+        pixels[base..base + self.canvas.len()].copy_from_slice(&self.canvas);
+
+        h.send_words(surface, 1, &[buffer, 0, 0]); // attach
+        h.send_words(surface, 9, &[0, y0 as u32, self.frame.w as u32, bh as u32]); // damage_buffer
+        h.send_words(surface, 6, &[]); // commit
+    }
+}
+
+/// Run a buffer-cycling client and hand back the harness, the cycler and the
+/// byte offset of the buffer that was attached last.
+fn run_cycling_client(
+    transport: Box<dyn PoolTransport>,
+    scope: CopyScope,
+    nbuf: usize,
+    frames: u8,
+) -> (Harness, Cycler, usize) {
+    let frame = Frame { w: 200, h: 120, stride: 200 * 4, offset: 0 };
+    let one = (frame.stride * frame.h) as usize;
+    let pool_size = one * nbuf;
+
+    let mut h = Harness::new(transport, scope, 1);
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let compositor = h.bind(registry, 1, "wl_compositor", 6);
+    let shm = h.bind(registry, 2, "wl_shm", 2);
+
+    let surface = h.id();
+    h.send_words(compositor, 0, &[surface]);
+
+    let (fd, ptr) = client_pool(pool_size);
+    // SAFETY: `ptr`/`pool_size` are what `mmap` returned in `client_pool`, and
+    // this slice is the only reference to them for the rest of the test.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(ptr, pool_size) };
+
+    let pool = h.id();
+    let mut fds = VecDeque::from([fd]);
+    let mut body = Vec::new();
+    body.extend_from_slice(&pool.to_ne_bytes());
+    body.extend_from_slice(&(pool_size as u32).to_ne_bytes());
+    h.send(shm, 0, &body, &mut fds);
+
+    let mut buffers = Vec::new();
+    for i in 0..nbuf {
+        let buffer = h.id();
+        h.send_words(
+            pool,
+            0,
+            &[
+                buffer,
+                (i * one) as u32,
+                frame.w as u32,
+                frame.h as u32,
+                frame.stride as u32,
+                1,
+            ],
+        );
+        buffers.push(buffer);
+    }
+
+    let mut c = Cycler { frame, buffers, canvas: vec![0x20; one] };
+    for tick in 0..frames {
+        c.tick(&mut h, surface, pixels, tick);
+    }
+    let last = (usize::from(frames - 1) % nbuf) * one;
+    (h, c, last)
+}
+
+/// **The bug this stage exists for.** A buffer-cycling client's last frame must
+/// be readable in full from the region, and it was not: everything the surface
+/// changed while a *different* buffer was on screen was missing from this
+/// buffer's shadow. On a scrolling page that is a band of two-frames-ago
+/// content per frame, which is what "blank slides in about:support" was.
+///
+/// `Pool` and `Buffer` scope copy the whole extent every commit, so they cannot
+/// have the bug. That makes them the control: if `Damage` disagrees with them,
+/// the disagreement is damage tracking's and nothing else's.
+#[test]
+fn a_buffer_cycling_client_is_not_left_with_a_stale_shadow() {
+    for nbuf in [2usize, 3] {
+        let mut images = Vec::new();
+        for scope in [CopyScope::Pool, CopyScope::Buffer, CopyScope::Damage] {
+            let d = tmpdir(&format!("cycle-{nbuf}-{}", scope.as_str()));
+            let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
+            let (h, c, last) = run_cycling_client(Box::new(t), scope, nbuf, 12);
+            let peer = wc_handle::Handle::from_descriptor(h.pool_descriptor());
+            let map = peer.map().unwrap();
+            let seen = map.as_slice()[last..last + c.canvas.len()].to_vec();
+            images.push((scope, seen, c.canvas.clone()));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        for (scope, seen, canvas) in &images {
+            // Count and locate the disagreeing rows rather than dumping 96000
+            // bytes. The count is the measurement docs/design.md §27 quotes.
+            let stride = 200 * 4usize;
+            let rows: Vec<usize> = (0..120)
+                .filter(|y| seen[y * stride..(y + 1) * stride] != canvas[y * stride..(y + 1) * stride])
+                .collect();
+            assert!(
+                rows.is_empty(),
+                "{nbuf} buffers, {} scope: {} of 120 rows in the region are not what the client \
+                 drew (rows {:?})",
+                scope.as_str(),
+                rows.len(),
+                &rows[..rows.len().min(12)]
+            );
+        }
+    }
+}
+
+/// Paying off the arrears must not degenerate into copying the extent.
+///
+/// There is a trivially correct fix for the staleness above — copy the whole
+/// buffer every commit — and it is `CopyScope::Buffer`, which already exists.
+/// This is the test that says the damage scope is still the cheap one after the
+/// fix: the arrears of a two-buffer cycle are one extra frame's damage, not a
+/// whole buffer. Without it, a later "just to be safe" would quietly make the
+/// three scopes the same code again.
+#[test]
+fn paying_off_the_arrears_still_costs_less_than_the_extent() {
+    let mut bytes = Vec::new();
+    for scope in [CopyScope::Buffer, CopyScope::Damage] {
+        let d = tmpdir(&format!("arrears-{}", scope.as_str()));
+        let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
+        let (h, _, _) = run_cycling_client(Box::new(t), scope, 2, 24);
+        bytes.push((scope, h.session.stats.bytes_copied));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let get = |s: CopyScope| bytes.iter().find(|(k, _)| *k == s).unwrap().1;
+    // The arithmetic, because a ratio with no derivation is a number nobody can
+    // check. The client damages 4 rows of 120 a frame and cycles two buffers,
+    // so a steady-state frame owes 8 rows — 15x cheaper than the extent. The
+    // run also pays two unavoidable full extents, one per buffer's first
+    // commit, which nothing can avoid because the region has never held those
+    // bytes: 2 x 96000 + 22 x 8 x 800 = 332800 against 24 x 96000 = 2304000,
+    // which is 6.9x. The bound is 4x, loose enough to survive a change in the
+    // frame count and tight enough that "copy the extent to be safe" fails it.
+    assert!(
+        get(CopyScope::Damage) * 4 < get(CopyScope::Buffer),
+        "damage {} vs buffer {} -- the arrears fix has eaten the saving",
+        get(CopyScope::Damage),
+        get(CopyScope::Buffer)
+    );
+}
+
 /// Damage-scoped copying really does copy less. Without this the scope is a
 /// setting that changes nothing, and the measurement it exists for would be
 /// measuring the same code three times.
