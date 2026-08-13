@@ -97,6 +97,9 @@ struct Args {
     /// compositor starts; here it is a flag, which is the same fact supplied
     /// the same way — out of band.
     arenas: Vec<(u32, u64, String)>,
+    /// DYNAMIC ARENA, fixture only: where to find regions the peer grew into.
+    /// See `wc_handle::arena::set_grow_dir` for why the deployment needs none.
+    arena_grow_dir: Option<String>,
     /// Arenas to **provide** rather than open, as `id:size`.
     ///
     /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §12).
@@ -177,6 +180,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
+        arena_grow_dir: None,
         guest_arenas: Vec::new(),
         provide_arenas: Vec::new(),
         outbound: None,
@@ -221,6 +225,13 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             }
             // `id:size`. No path, because there is nothing to name: the region
             // is this process's own guest RAM and the host finds it by content.
+            "--arena-grow-dir" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-grow-dir needs a directory");
+                    return Err(2);
+                };
+                args.arena_grow_dir = Some(v.to_owned());
+            }
             "--arena-guest-ram" => {
                 let Some(v) = it.next() else {
                     eprintln!("wc-compositor: --arena-guest-ram needs id:size");
@@ -471,6 +482,20 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             Ok(()) => println!("wc-compositor: arena {id} attached: {size} bytes at {path}"),
             Err(e) => {
                 eprintln!("wc-compositor: could not attach arena {id} at {path}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+    // DYNAMIC ARENA. On the file fixture the peer can grow into regions this
+    // process was never told about, because `--arena` names one and there is no
+    // request in the protocol for a second. This says where to find them. On
+    // the guest-RAM deployment it is never needed: the regions are this
+    // process's own memory and are attached before the host can locate them.
+    if let Some(dir) = &args.arena_grow_dir {
+        match wc_handle::arena::set_grow_dir(std::path::Path::new(dir)) {
+            Ok(()) => println!("wc-compositor: regions the peer grows will be read from {dir}"),
+            Err(e) => {
+                eprintln!("wc-compositor: could not set the arena growth directory {dir}: {e}");
                 return std::process::ExitCode::from(2);
             }
         }

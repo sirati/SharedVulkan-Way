@@ -64,6 +64,7 @@ run_one() {
     --dump-frames "$(winp "$dir/frames")" \
     --arena-provide "0:$arena_size:$(winp "$dir/arena")" \
     --arena-outbound "0:$arena_out" \
+    --arena-grow-dir "$(winp "$dir")" \
     --log "$(winp "$dir/srv.log")" >"$dir/loader.log" 2>&1 &
   local srv=$!
 
