@@ -58,12 +58,12 @@ use crate::surface::{Rect, Shadow};
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
-pub use win32::{current_layout, start};
+pub use win32::{current_layout, keyboard_repeat, start};
 
 #[cfg(not(windows))]
 mod headless;
 #[cfg(not(windows))]
-pub use headless::{current_layout, start, Click};
+pub use headless::{current_layout, keyboard_repeat, start, Click};
 
 /// Identifies one toplevel, and therefore one window.
 ///
@@ -129,6 +129,29 @@ impl FrameStyle {
     }
 }
 
+/// Which edge an interactive resize is being driven from.
+///
+/// ADDED FOR STAGE 17. Spelled out here rather than passing Wayland's
+/// `xdg_toplevel::ResizeEdge` through, for the reason the whole file exists: the
+/// Wayland thread must not have to know what an `HWND` is and the platform must
+/// not have to link a protocol crate. The two encodings are the same idea with
+/// different numbers — Wayland's is a bitmask, Win32's `WMSZ_*` is an ordinal —
+/// and the translation happens once at each end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    /// The client named no edge, which the protocol allows and which means the
+    /// resize is not being driven by a pointer on a border.
+    None,
+    Top,
+    Bottom,
+    Left,
+    TopLeft,
+    BottomLeft,
+    Right,
+    TopRight,
+    BottomRight,
+}
+
 /// An icon, as pixels.
 ///
 /// **Deliberately not a path or a resource id.** In the topology the project is
@@ -148,6 +171,47 @@ pub struct IconImage {
     pub height: i32,
     /// BGRA, tightly packed, same layout as [`Shadow`].
     pub pixels: Vec<u8>,
+}
+
+/// What the pointer should look like.
+///
+/// ADDED FOR STAGE 12 (docs/design.md §23). One message for both halves of the
+/// protocol, because Win32 has one mechanism: `wl_pointer.set_cursor` sends a
+/// surface and `wp_cursor_shape_v1.set_shape` sends a name, and both end as a
+/// single `SetCursor` with a single `HCURSOR`.
+///
+/// **The cursor is a property of the seat, not of a window**, which is why
+/// there is no [`WindowId`] here. Wayland scopes the cursor to the pointer's
+/// current focus and the compositor is the one that decides what the pointer
+/// looks like at any moment; Win32 agrees, in the sense that `SetCursor` sets
+/// the cursor for the calling thread and every window it owns. Attaching this
+/// to a window would need a policy for what happens when the pointer is over a
+/// window whose client last spoke about a different one, and there is no such
+/// moment: only one surface has pointer focus at a time.
+#[derive(Clone, Debug)]
+pub enum CursorSpec {
+    /// `wl_pointer.set_cursor` with a null surface. The pointer is invisible
+    /// over this client's windows and reappears everywhere else, which is what
+    /// a text editor hiding the pointer while typing means.
+    Hidden,
+    /// A named shape. Resolved to a stock `IDC_*` by [`crate::cursor`]; the
+    /// name is carried rather than the ordinal so the log says what the client
+    /// asked for and not only what it got.
+    Named(smithay::input::pointer::CursorIcon),
+    /// The client's own pixels, from `wl_pointer.set_cursor` with a surface.
+    ///
+    /// The hotspot is in surface coordinates, which after
+    /// `CursorImageAttributes` has divided out the client scale is the same as
+    /// buffer coordinates for every buffer this compositor accepts (scale 1,
+    /// no transform — see `state.rs`'s commit handler).
+    Image {
+        /// BGRA, tightly packed, alpha **premultiplied** — the same layout and
+        /// the same convention as [`IconImage`], which is what a 32-bit
+        /// `CreateIconIndirect` needs.
+        image: IconImage,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
 }
 
 /// What sort of window to make.
@@ -196,6 +260,20 @@ pub enum ToUi {
         id: WindowId,
         icons: Vec<IconImage>,
     },
+    /// `xdg_popup.reposition`: an already-mapped popup moves.
+    ///
+    /// ADDED FOR STAGE 13. Separate from [`ToUi::Map`] because a popup that is
+    /// already on screen must not be re-shown — `ShowWindow` again would take
+    /// it through a hide/show and flicker — and separate from a resize because
+    /// the position is in the parent's coordinates and has to be converted
+    /// against the owner window, which only the platform can do.
+    MovePopup {
+        id: WindowId,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },
     /// The surface has committed its first buffer and may now be shown, at
@@ -207,8 +285,59 @@ pub enum ToUi {
         maximized: Option<bool>,
         minimized: Option<bool>,
     },
+
+    /// The pointer should look like this from now on.
+    ///
+    /// ADDED FOR STAGE 12. Sent on every `wl_pointer.set_cursor`, every
+    /// `wp_cursor_shape_device_v1.set_shape`, every commit of the surface a
+    /// client is using as its cursor, and — from smithay, without any client
+    /// asking — on every pointer leave, which is what puts the arrow back.
+    Cursor { spec: CursorSpec },
+
+    /// `xdg_toplevel.move`: a drag has begun somewhere the client considers a
+    /// title bar, and it wants the window manager to take over.
+    ///
+    /// ADDED FOR STAGE 17, and it is the **only** way a client-decorated window
+    /// can be moved here. Wayland has no protocol by which a client publishes
+    /// its draggable region: Firefox's `mDraggableRegion` is internal and is
+    /// observable only *after* a click, as this request. So `WM_NCHITTEST` can
+    /// never answer `HTCAPTION` over the tab strip, the whole surface stays
+    /// `HTCLIENT`, and every drag arrives here instead. §22.8 records what that
+    /// costs, which is Windows 11's snap-layout flyout.
+    BeginMove { id: WindowId },
+    /// `xdg_toplevel.resize`, with the edge the client named.
+    BeginResize { id: WindowId, edge: Edge },
+    /// `xdg_toplevel.show_window_menu`, at a point in **surface** coordinates.
+    ///
+    /// The menu belongs to the compositor, which here means it belongs to
+    /// Windows: `GetSystemMenu` is the same menu the caption's right-click and
+    /// Alt+Space produce, so a client that asks for one gets the system's
+    /// rather than an imitation of it.
+    WindowMenu { id: WindowId, x: i32, y: i32 },
+
     /// The toplevel is gone.
     Destroy { id: WindowId },
+
+    // --- stage 21 ----------------------------------------------------------
+    /// Keep the display awake, or stop keeping it awake.
+    ///
+    /// **Not per window, deliberately.** `zwp_idle_inhibit_manager_v1` hands
+    /// out an inhibitor per surface and Win32's counterpart —
+    /// `SetThreadExecutionState` — has no window argument at all: it is a
+    /// property of the calling *thread*, and there is one UI thread. So the
+    /// Wayland side does the "any surface still holds one?" arithmetic, where
+    /// it can see which surfaces are alive and mapped, and what crosses is the
+    /// answer. Sent only on a change, so a client that creates and destroys
+    /// inhibitors around every video frame does not produce a Win32 call per
+    /// frame.
+    IdleInhibit { on: bool },
+    /// Bring this window to the foreground: `xdg_activation_v1.activate`.
+    ///
+    /// A request rather than a command, and it is Windows that decides — see
+    /// `win32::activate_window` for exactly when it is allowed to succeed and
+    /// what happens when it is not.
+    Activate { id: WindowId },
+
     /// End the pump.
     Quit,
 }
@@ -254,7 +383,15 @@ pub enum FromUi {
     /// They usually move together and they are not the same thing: a window can
     /// be the active one while a child control holds the focus, and only the
     /// focus decides where a key goes.
-    KeyboardFocus { id: WindowId, on: bool },
+    /// Keyboard focus followed the foreground window.
+    ///
+    /// `caps` and `num` are STAGE 13's and travel with the focus rather
+    /// than being polled: they are *locked* modifiers, owned by the machine
+    /// and changeable while this process is not looking, so the only correct
+    /// time to read them is the moment focus is gained. Carrying them here
+    /// rather than calling `GetKeyState` from the Wayland thread is what keeps
+    /// the headless platform able to state them too.
+    KeyboardFocus { id: WindowId, on: bool, caps: bool, num: bool },
     /// A key went down or came up, in evdev numbering.
     Key {
         id: WindowId,

@@ -1370,10 +1370,25 @@ impl Session {
                         self.forget_stale_buffer(id, &iface);
                         if self.spec.interface(&iface).is_none() {
                             self.objects.note_unknown();
+                            // **This is fatal on the next message, not on some
+                            // later one.** The wording here used to say the
+                            // connection would fail "if it ever carries an h",
+                            // which is wrong and was corrected in stage 21
+                            // after it nearly cost somebody an afternoon:
+                            // `client_message` looks the opcode up in the spec
+                            // *before* it walks anything (see the top of that
+                            // function), so the very first request on an
+                            // unknown interface is `Error::UnknownOpcode` and
+                            // the connection ends. An interface with no fds
+                            // anywhere in it is no safer than one full of them.
+                            //
+                            // So this note is a warning about the *next*
+                            // message, and the fix is always the same: copy the
+                            // XML into `protocols/` and add a line to
+                            // `Spec::builtin`.
                             self.note(format!(
                                 "client bound {iface}, which is not in the vendored protocols; \
-                                 messages on it cannot be walked and the connection will fail \
-                                 if it ever carries an h"
+                                 its first request cannot be walked and will end the connection"
                             ));
                         }
                         self.objects.record(id, &iface);

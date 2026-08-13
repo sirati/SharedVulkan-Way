@@ -62,10 +62,24 @@ use windows_sys::Win32::Graphics::Gdi::{
     // ADDED FOR STAGE 9. `ClientToScreen` is filed under GDI rather than under
     // WindowsAndMessaging, which is where one would look for it.
     ClientToScreen,
+    // ADDED FOR STAGE 13, for per-pixel alpha on popups. `BLENDFUNCTION` and
+    // its two constants are filed under GDI even though the call that takes
+    // them, `UpdateLayeredWindow`, is filed under WindowsAndMessaging.
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    // ADDED FOR STAGE 13, for the locked modifiers. See `lock_on`.
+    GetKeyState, VK_CAPITAL, VK_NUMLOCK,
     GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
+// ADDED FOR STAGE 12, for the cursor (docs/design.md §23). `SetCursor` and
+// `DestroyCursor` are the whole of the Win32 half; `HTCLIENT` is the hit-test
+// code that decides whether the client's cursor applies or the system's frame
+// keeps its own.
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyCursor, SetCursor, SystemParametersInfoW, HTCLIENT, SPI_GETKEYBOARDDELAY,
+    SPI_GETKEYBOARDSPEED, WM_SETCURSOR,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -74,8 +88,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, ICONINFO, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MSG, SM_CXICON, SM_CXSCREEN, SM_CXSMICON, SM_CYICON, SM_CYSCREEN, SM_CYSMICON,
+    // ADDED FOR STAGE 13, for per-pixel alpha on popups. See `update_layered`.
+    UpdateLayeredWindow, ULW_ALPHA, WS_EX_LAYERED,
     SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
+    // ADDED FOR STAGE 17: the three toplevel requests a client-decorated
+    // window makes, handed to Windows' own modal loops.
+    GetSystemMenu, TrackPopupMenu, SC_MOVE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
@@ -85,19 +104,36 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
+    // ADDED FOR STAGE 21: `xdg_activation_v1` (raise a window) and the
+    // screensaver half of `zwp_idle_inhibit_manager_v1`.
+    FlashWindowEx, GetForegroundWindow, IsIconic, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG,
+    FLASHW_TRAY, SC_MONITORPOWER, WM_SYSCOMMAND,
 };
-use windows_sys::Win32::Foundation::POINT;
+// ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
+// rather than anywhere near the window APIs, because it is not about a window:
+// it is a property of the calling thread. See `set_idle_inhibit`.
+use windows_sys::Win32::System::Power::{
+    SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
+};
+use windows_sys::Win32::Foundation::{POINT, SIZE};
 
 use crate::input::{evdev, evdev_keycode};
 
 use super::{
-    assemble, Commands, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
-    WindowKind,
+    assemble, Commands, CursorSpec, Edge, FrameStyle, FromUi, IconImage, PlatformConfig, Started,
+    ToUi, WindowId, WindowKind,
 };
 use crate::surface::{Rect, Shadow};
 
 /// "Drain the command queue." The only message this module posts.
 const WM_WC_COMMAND: u32 = WM_APP + 1;
+/// "Put up the system menu", with the screen position packed into the `LPARAM`
+/// the way `WM_CONTEXTMENU` packs one.
+///
+/// ADDED FOR STAGE 17. A message of its own rather than a call from `drain`,
+/// for the reason the `ToUi::WindowMenu` arm gives: `TrackPopupMenu` does not
+/// return until the menu closes.
+const WM_WC_SYSMENU: u32 = WM_APP + 2;
 
 /// `WM_MOUSELEAVE`, 0x02A3.
 ///
@@ -108,6 +144,22 @@ const WM_WC_COMMAND: u32 = WM_APP + 1;
 /// `WM_MOUSEHOVER` and `TrackMouseEvent`; the metadata's placement is a fact
 /// about the Windows SDK's headers rather than about the message.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// `SC_SCREENSAVE`, 0xF140 — the `WM_SYSCOMMAND` the system sends to the
+/// foreground window when the screen saver is about to start.
+///
+/// Written out for the same reason as `WM_MOUSELEAVE`: `windows-sys` has
+/// `SC_MONITORPOWER` and does not have this one, which is a fact about which
+/// constants the Windows metadata chose to export rather than about the message.
+/// `winuser.h` declares the two on consecutive lines.
+const SC_SCREENSAVE: u32 = 0xF140;
+
+/// The mask `WM_SYSCOMMAND` requires before comparing `wParam`.
+///
+/// The low four bits are used internally by the system, so the documented way
+/// to test a system command is `(wParam & 0xFFF0) == SC_...`. Comparing the raw
+/// `wParam` works most of the time, which is worse than never working.
+const SC_MASK: usize = 0xFFF0;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -416,6 +468,15 @@ impl WindowState {
         let (sx, sy) = self.to_surface(x, y);
         self.last_pos.set((sx, sy));
 
+        // The pointer is over a client area of ours, so a cursor change may be
+        // applied immediately rather than waiting for the next mouse message.
+        // Set on every move, not only on entry: cheap, and it means a window
+        // that never saw its own `WM_MOUSELEAVE` — because it was destroyed
+        // under the pointer — cannot leave the flag stuck on for long.
+        if let Some(ui) = ui() {
+            ui.pointer_inside.set(true);
+        }
+
         if !self.tracking.replace(true) {
             // Arm the leave notification, and only now: `TrackMouseEvent` is a
             // one-shot and re-arming it on every mouse-move would be a syscall
@@ -440,6 +501,9 @@ impl WindowState {
 
     fn on_mouse_leave(&self, time: u32) {
         self.tracking.set(false);
+        if let Some(ui) = ui() {
+            ui.pointer_inside.set(false);
+        }
         self.send(FromUi::PointerLeave { id: self.id, time });
     }
 
@@ -600,6 +664,13 @@ struct Ui {
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
     controller: Cell<isize>,
+    /// Whether a client currently holds an idle inhibitor.
+    ///
+    /// ADDED FOR STAGE 21. Kept here as well as inside Windows' own execution
+    /// state because `SetThreadExecutionState` is write-only — it returns the
+    /// *previous* state, and there is no "what is it now" query — and because
+    /// `toplevel_proc` has to read it to answer `WM_SYSCOMMAND`.
+    idle_inhibited: Cell<bool>,
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
@@ -608,6 +679,37 @@ struct Ui {
     /// nobody outside the process ever measured. A frame dumped here is read
     /// back by `identify` and `compare`, which are not ours.
     dump_frames: Option<std::path::PathBuf>,
+
+    // --- the cursor, stage 12 ---------------------------------------------
+    //
+    // Three cells rather than one, because the `HCURSOR` a window shows, the
+    // `HCURSOR` this process must destroy, and whether the pointer is
+    // anywhere it matters are three independent facts (docs/design.md §23).
+    /// What `WM_SETCURSOR` should install over the client area. `0` means
+    /// "hidden", which is a value `SetCursor` accepts and is what
+    /// `wl_pointer.set_cursor` with a null surface asks for; it is therefore
+    /// **not** a "nothing set yet" sentinel — that state is the arrow, put
+    /// there at startup.
+    cursor: Cell<isize>,
+    /// The `HCURSOR` we built with `CreateIconIndirect`, if the current cursor
+    /// is one. Stock cursors from `LoadCursorW` are shared, must not be
+    /// destroyed, and are therefore never recorded here.
+    ///
+    /// A client that animates its cursor sends a new buffer several times a
+    /// second, so leaking these is not a slow leak: `weston-terminal`'s
+    /// watch cursor would burn a GDI object every 100 ms and hit the 10,000
+    /// handle quota in a quarter of an hour.
+    owned_cursor: Cell<isize>,
+    /// Whether the pointer is inside the client area of one of our windows.
+    ///
+    /// **Why this is needed at all.** `WM_SETCURSOR` arrives only when a mouse
+    /// message does, so a client that changes its cursor while the pointer is
+    /// still — a spinner starting, a `wl_pointer.leave` putting the arrow back
+    /// — would not be seen until the user moved. So the command handler calls
+    /// `SetCursor` itself. But `SetCursor` is thread-global: doing it while
+    /// the pointer is over somebody else's window would repaint *their*
+    /// cursor until their next mouse message. This is the guard.
+    pointer_inside: Cell<bool>,
 }
 
 thread_local! {
@@ -691,6 +793,80 @@ unsafe extern "system" fn toplevel_proc(
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
             0
         }
+        // ADDED FOR STAGE 17. `xdg_toplevel.show_window_menu`, arriving as a
+        // posted message so that the modal `TrackPopupMenu` is entered from the
+        // pump rather than from inside `drain`.
+        //
+        // **The system menu, not an imitation of it.** `GetSystemMenu` returns
+        // the very menu the caption's right-click and Alt+Space put up, with
+        // Windows' own strings, its own accelerators and its own greying — a
+        // maximised window's *Maximize* is disabled and a fixed-size window has
+        // no *Size*, and none of that has to be reimplemented. `TPM_RETURNCMD`
+        // asks for the chosen item back instead of a `WM_COMMAND`, and it is
+        // then posted as the `WM_SYSCOMMAND` the caption would have produced,
+        // so *Close* on this menu is the same code path as the close button.
+        WM_WC_SYSMENU => {
+            let x = (lparam & 0xffff) as i16 as i32;
+            let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+            // SAFETY: live window handle on its own thread. `GetSystemMenu`
+            // with `revert = 0` returns a handle owned by the window, which
+            // must not be destroyed here. `TrackPopupMenu` runs a modal loop
+            // and returns the command id because of `TPM_RETURNCMD`.
+            let chosen = unsafe {
+                let menu = GetSystemMenu(hwnd, 0);
+                if menu.is_null() {
+                    0
+                } else {
+                    TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        x,
+                        y,
+                        0,
+                        hwnd,
+                        std::ptr::null(),
+                    )
+                }
+            };
+            if chosen != 0 {
+                // SAFETY: live handle; posted rather than sent for the same
+                // reason the gesture is — `SC_MOVE` and `SC_SIZE` are among the
+                // things this menu can choose.
+                unsafe {
+                    PostMessageW(hwnd, WM_SYSCOMMAND, chosen as usize, 0);
+                }
+            }
+            println!(
+                "wc-compositor: window {} system menu at {x},{y} chose 0x{chosen:04x}",
+                state.id
+            );
+            0
+        }
+
+        // ADDED FOR STAGE 21: the second half of `zwp_idle_inhibit`.
+        //
+        // `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` resets the display
+        // idle timer and does not touch the screen saver, which runs on the
+        // *input* idle timer — and a client holding an idle inhibitor is
+        // usually playing a video, which is exactly the situation with no
+        // input. So the execution state alone leaves the screen saver free to
+        // start. Refusing the `WM_SYSCOMMAND` is the documented way for the
+        // foreground application to veto it, and `DefWindowProc` is what would
+        // otherwise let it through.
+        //
+        // Only while something actually holds an inhibitor: a compositor that
+        // permanently blocked the screen saver would be making a policy
+        // decision on the user's behalf that no client asked for.
+        WM_SYSCOMMAND
+            if matches!(wparam & SC_MASK, x if x == SC_SCREENSAVE as usize
+                || x == SC_MONITORPOWER as usize)
+                && ui().is_some_and(|ui| ui.idle_inhibited.get()) =>
+        {
+            println!(
+                "wc-compositor: refused a screen-blank request; a client holds an idle inhibitor"
+            );
+            0
+        }
 
         // --- input, stage 6 ------------------------------------------------
         //
@@ -702,11 +878,11 @@ unsafe extern "system" fn toplevel_proc(
         // the user's window manager is Windows and a compositor that decided
         // its own keyboard focus would be fighting it.
         WM_SETFOCUS => {
-            state.send(FromUi::KeyboardFocus { id: state.id, on: true });
+            state.send(FromUi::KeyboardFocus { id: state.id, on: true, caps: lock_on(VK_CAPITAL), num: lock_on(VK_NUMLOCK) });
             0
         }
         WM_KILLFOCUS => {
-            state.send(FromUi::KeyboardFocus { id: state.id, on: false });
+            state.send(FromUi::KeyboardFocus { id: state.id, on: false, caps: false, num: false });
             0
         }
 
@@ -737,6 +913,7 @@ unsafe extern "system" fn toplevel_proc(
             state.send(FromUi::Layout { name });
             0
         }
+
 
         WM_MOUSEMOVE => {
             state.on_mouse_move(lparam, message_time());
@@ -779,6 +956,38 @@ unsafe extern "system" fn toplevel_proc(
             // Documented as requiring TRUE rather than 0, unlike every other
             // button message.
             1
+        }
+        // ADDED FOR STAGE 12 (docs/design.md §23). **The only place a client's
+        // cursor is installed on a mouse message**, and the reason it has to be
+        // handled rather than left to `DefWindowProc` is that `DefWindowProc`
+        // sets the *class* cursor — the `IDC_ARROW` in `register_classes` —
+        // over the client area, on every mouse move. Anything the compositor
+        // set would be overwritten a few milliseconds later, which presents as
+        // a cursor that flickers to the right shape and back.
+        //
+        // **The hit-test guard is not a nicety.** `wParam` is the window and
+        // `LOWORD(lParam)` is the hit-test code, and only `HTCLIENT` is the
+        // client's business: `HTLEFT`, `HTBOTTOMRIGHT`, `HTCAPTION` and the
+        // rest are the system frame, where Windows draws the resize arrows and
+        // the arrow over the title bar. Claiming those would replace the resize
+        // cursors on the window border with whatever the client last asked for
+        // — the opposite of the goal, which wants a resize arrow on the edge.
+        //
+        // Returning `TRUE` means "the cursor is set, stop here"; falling
+        // through to `DefWindowProc` lets the frame keep its own.
+        WM_SETCURSOR => {
+            if (lparam as u32) & 0xffff == HTCLIENT
+                && let Some(ui) = ui()
+            {
+                // SAFETY: either 0 — which `SetCursor` documents as "remove
+                // the cursor from the screen" — or a live `HCURSOR` this
+                // thread owns or borrowed from the system.
+                unsafe {
+                    SetCursor(ui.cursor.get() as _);
+                }
+                return 1;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEWHEEL => {
             state.on_wheel(wparam, false, message_time());
@@ -902,12 +1111,42 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 map_window(&w, width, height);
             }
         }
+        // ADDED FOR STAGE 13. `SWP_NOACTIVATE` and no `ShowWindow`: the window
+        // is already up, and re-showing it would flicker.
+        ToUi::MovePopup { id, x, y, width, height } => {
+            if let Some(w) = window(ui, id) {
+                let mut origin = POINT { x, y };
+                // SAFETY: live handles; `ClientToScreen` converts in place and
+                // the owner is the one set at creation.
+                unsafe {
+                    let owner = GetWindow(w.hwnd(), GW_OWNER);
+                    if !owner.is_null() {
+                        ClientToScreen(owner, &mut origin);
+                    }
+                    SetWindowPos(
+                        w.hwnd(),
+                        HWND_TOPMOST,
+                        origin.x,
+                        origin.y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE,
+                    );
+                }
+                update_layered(&w);
+                println!(
+                    "wc-compositor: window {id} repositioned to {},{} {width}x{height}",
+                    origin.x, origin.y
+                );
+            }
+        }
         ToUi::Present { id, damage } => {
             if let Some(w) = window(ui, id) {
                 present(&w, &damage);
                 dump_frame(ui, &w);
             }
         }
+        ToUi::Cursor { spec } => set_cursor(ui, spec),
         ToUi::SetWindowState {
             id,
             maximized,
@@ -915,6 +1154,76 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         } => {
             if let Some(w) = window(ui, id) {
                 set_window_state(&w, maximized, minimized);
+            }
+        }
+        // ADDED FOR STAGE 17. All three **post** rather than send, and that is
+        // the only interesting thing about them.
+        //
+        // `SC_MOVE`, `SC_SIZE` and `TrackPopupMenu` each enter a modal loop
+        // that does not return until the user lets go. This code runs inside
+        // `drain`, which sets `ui.draining` for its duration and re-posts
+        // `WM_WC_COMMAND` whenever another arrives while it is set — so a
+        // `SendMessageW` here would hold `draining` for the whole gesture and
+        // spin the pump re-posting a wake it cannot service. Posting lets the
+        // drain finish; the loop is then entered from the pump, where §8.2's
+        // finding applies and a posted wake still reaches the window.
+        ToUi::BeginMove { id } => {
+            if let Some(w) = window(ui, id) {
+                begin_sysmenu_gesture(&w, SC_MOVE, "move");
+            }
+        }
+        ToUi::BeginResize { id, edge } => {
+            if let Some(w) = window(ui, id) {
+                // Win32 encodes the edge in the low four bits of the
+                // `WM_SYSCOMMAND` argument, as `WMSZ_*` + 1. Wayland encodes it
+                // as a bitmask. Neither is derivable from the other, so this is
+                // a table.
+                let wmsz = match edge {
+                    Edge::Left => 1,
+                    Edge::Right => 2,
+                    Edge::Top => 3,
+                    Edge::TopLeft => 4,
+                    Edge::TopRight => 5,
+                    Edge::Bottom => 6,
+                    Edge::BottomLeft => 7,
+                    Edge::BottomRight => 8,
+                    // No edge: `SC_SIZE` on its own is the keyboard-driven
+                    // resize, which is what the protocol's `none` means.
+                    Edge::None => 0,
+                };
+                begin_sysmenu_gesture(&w, SC_SIZE | wmsz, "resize");
+            }
+        }
+        ToUi::WindowMenu { id, x, y } => {
+            if let Some(w) = window(ui, id) {
+                // Surface coordinates to screen coordinates, through the same
+                // origin the input path uses in reverse.
+                let (ox, oy) = w.frame.content_origin();
+                let mut p = POINT {
+                    x: x + ox,
+                    y: y + oy,
+                };
+                // SAFETY: a live window handle; `ClientToScreen` converts in
+                // place. The result is packed into an `LPARAM` the way
+                // `WM_CONTEXTMENU` packs one, because that is what the handler
+                // in `toplevel_proc` unpacks.
+                unsafe {
+                    ClientToScreen(w.hwnd(), &mut p);
+                    PostMessageW(
+                        w.hwnd(),
+                        WM_WC_SYSMENU,
+                        0,
+                        ((p.x as u32 as isize) & 0xffff) | (((p.y as u32 as isize) & 0xffff) << 16),
+                    );
+                }
+                println!("wc-compositor: window {id} window menu at {},{} on screen", p.x, p.y);
+            }
+        }
+        // ADDED FOR STAGE 21.
+        ToUi::IdleInhibit { on } => set_idle_inhibit(ui, on),
+        ToUi::Activate { id } => {
+            if let Some(w) = window(ui, id) {
+                activate_window(&w);
             }
         }
         ToUi::Destroy { id } => {
@@ -940,6 +1249,165 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             }
         }
         ToUi::Quit => unreachable!("handled in drain"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle inhibition and activation — stage 21
+// ---------------------------------------------------------------------------
+
+/// Keep the display awake while a client holds an idle inhibitor.
+///
+/// # `SetThreadExecutionState` is per *thread*, and this is the thread
+///
+/// The state is a property of the calling thread and the system takes the union
+/// over every thread that has one. It is released when that thread exits, which
+/// is exactly the cleanup this feature wants and exactly the trap it would be if
+/// it were called from anywhere else: the Wayland thread is where the protocol
+/// lives, and had the call been made there, a compositor whose Wayland thread
+/// wound up first would drop the inhibition a moment before the process ended —
+/// harmless — while a compositor that later moved that work to a worker thread
+/// would silently stop inhibiting anything. So it is made from the UI thread,
+/// which is `main`'s thread and outlives everything. `handle` runs on it, and
+/// it is the only caller.
+///
+/// # `ES_CONTINUOUS` is what makes it a state rather than a nudge
+///
+/// Without it the call is a one-shot "the display is in use right now" that
+/// resets the idle timer once. With it, the flags stay set until they are
+/// cleared, which is what `zwp_idle_inhibitor_v1` means — the inhibitor lasts
+/// until the client destroys it. Clearing is `ES_CONTINUOUS` **alone**: passing
+/// zero is documented as an error, and passing `ES_CONTINUOUS` with no other
+/// flag is how the state is reset.
+///
+/// # What is deliberately not asked for
+///
+/// `ES_SYSTEM_REQUIRED`, which would also stop the machine suspending. The
+/// protocol asks the compositor not to blank, lock or screensave — display
+/// idleness — and says nothing about whether the computer may sleep. Asking for
+/// both would be this compositor deciding a power policy the client did not ask
+/// for, on a machine that is a guest VM whose host can suspend it regardless.
+///
+/// # Why `WM_SYSCOMMAND` is handled too
+///
+/// `ES_DISPLAY_REQUIRED` resets the *display* idle timer. The screen saver has
+/// its own timer, driven by input idleness, and a video playing is precisely the
+/// case with no input — so on a machine with a screen saver configured, the
+/// execution state alone leaves the hole open. `toplevel_proc` refuses
+/// `SC_SCREENSAVE` and `SC_MONITORPOWER` while this is set, which is the
+/// documented way for a foreground application to say no.
+fn set_idle_inhibit(ui: &Rc<Ui>, on: bool) {
+    if ui.idle_inhibited.replace(on) == on {
+        return;
+    }
+    let flags = if on {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    // SAFETY: a scalar in, a scalar out, no handles and no memory. The only
+    // requirement is the thread one, which is discharged above.
+    let previous = unsafe { SetThreadExecutionState(flags) };
+    if previous == 0 {
+        // The one documented failure. Said rather than swallowed, because the
+        // symptom otherwise is "the screen blanked during a video" with nothing
+        // anywhere to say the compositor tried.
+        eprintln!(
+            "wc-compositor: SetThreadExecutionState({flags:#x}) failed; the display will \
+             blank on its own timer"
+        );
+        return;
+    }
+    println!(
+        "wc-compositor: idle inhibit {} (SetThreadExecutionState {flags:#x}, was {previous:#x})",
+        if on { "on" } else { "off" }
+    );
+}
+
+/// `xdg_activation_v1.activate`: bring a window to the foreground.
+///
+/// # Windows decides, and here is when it says yes
+///
+/// `SetForegroundWindow` is not a command. Windows refuses it from a process
+/// that is not entitled to steal the foreground, and the entitlement rules are
+/// roughly: the calling process already owns the foreground window, or it
+/// received the last input event, or there is no foreground window at all, or
+/// the foreground lock timeout has expired.
+///
+/// **The common case is the permitted one, and that is a property of this
+/// design rather than luck.** Every toplevel in this compositor is an `HWND`
+/// owned by one process — wc-compositor — no matter how many Wayland clients
+/// are behind them. So "the user clicks a link in one client's window and
+/// another client's window raises" is a foreground request made by the process
+/// that already owns the foreground window, which Windows allows. Two clients
+/// on two machines, one Win32 process, one set of foreground rights.
+///
+/// The case that is refused is a client that asks unprompted while the user is
+/// in some other application — Notepad, a browser outside the compositor. There
+/// Windows says no, and it is right to: that is the behaviour the rule exists to
+/// stop, and a Wayland compositor on Linux would apply a policy of its own for
+/// the same reason. What the user gets instead is the flashing taskbar button,
+/// which is the platform's own idiom for "this window wants you" — requested
+/// explicitly here rather than relying on the system's implicit flash, so the
+/// outcome does not depend on an undocumented courtesy.
+///
+/// `FLASHW_TIMERNOFG` means "flash until the window comes to the foreground",
+/// so the notification clears itself when the user acts on it and there is
+/// nothing to cancel.
+///
+/// # Why `AllowSetForegroundWindow` is not called
+///
+/// It grants foreground rights to a *different process*, by pid. There is no
+/// different process: the request comes from a Wayland client over a socket and
+/// the window is ours. Calling it would be handing a right to somebody who does
+/// not need it. It becomes relevant the day the compositor launches a Windows
+/// application on a client's behalf, and not before.
+///
+/// # The client cannot be told
+///
+/// `xdg_activation_v1` version 1 has no failure event: `activate` is a request
+/// with no reply, and a client that asks has no way to learn that Windows said
+/// no. So the log line below is the only place the answer exists, and it says
+/// which of the two happened rather than just that something was attempted.
+fn activate_window(w: &Rc<WindowState>) {
+    let hwnd = w.hwnd();
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: a live window handle created on this thread, and this is that
+    // thread. Every call below is a plain query or a window-manager request.
+    unsafe {
+        // A minimised window cannot be the foreground one. Restoring first is
+        // what the user means by "raise it", and doing it before the foreground
+        // request means the request is not spent on a window that is still an
+        // icon.
+        if IsIconic(hwnd) != 0 {
+            w.self_driven.set(true);
+            ShowWindow(hwnd, SW_RESTORE);
+            w.self_driven.set(false);
+        }
+        if SetForegroundWindow(hwnd) != 0 {
+            println!("wc-compositor: window {} activated (SetForegroundWindow)", w.id);
+            return;
+        }
+        // Refused. `GetForegroundWindow` is read only to say *why* in the log:
+        // a null result is "nobody has it", anything else is another
+        // application's window and the answer is the foreground lock.
+        let owner = GetForegroundWindow();
+        println!(
+            "wc-compositor: window {} asked to be activated and Windows refused (the \
+             foreground belongs to {}); flashing its taskbar button instead",
+            w.id,
+            if owner.is_null() { "nothing" } else { "another application" }
+        );
+        let info = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        FlashWindowEx(&info);
     }
 }
 
@@ -993,9 +1461,12 @@ fn create_window(
             // window was deactivated, and a GTK menu responds to that by
             // closing itself. `WS_EX_TOOLWINDOW` keeps it out of the taskbar
             // and out of alt-tab. ADDED FOR STAGE 9.
+            // `WS_EX_LAYERED` on a popup is STAGE 13's, and it is the one
+            // thing that gives a menu its shadow and its rounded corners
+            // instead of a black rectangle. See `update_layered`.
             match kind {
                 WindowKind::Toplevel => 0,
-                WindowKind::Popup { .. } => WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                WindowKind::Popup { .. } => WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             },
             class.as_ptr(),
             title_w.as_ptr(),
@@ -1045,6 +1516,26 @@ fn create_window(
     Ok(())
 }
 
+/// Hand a gesture the client started over to Windows' own modal loop.
+///
+/// ADDED FOR STAGE 17, and it is the whole of `xdg_toplevel.move` and
+/// `xdg_toplevel.resize` on this platform.
+///
+/// `ReleaseCapture` first, and it is not optional: the client's drag began with
+/// a `WM_LBUTTONDOWN` that `toplevel_proc` answered with `SetCapture`, and
+/// `DefWindowProc` refuses to start a sizing or moving loop for a window that
+/// holds the capture. The symptom is a window that simply does not move, with
+/// nothing in any log.
+fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
+    // SAFETY: a live window handle, on the thread that created it.
+    // `ReleaseCapture` is a no-op when this thread holds no capture.
+    unsafe {
+        ReleaseCapture();
+        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, 0);
+    }
+    println!("wc-compositor: window {} handed a {what} to Windows", w.id);
+}
+
 /// Show the window for the first time, at the size the client chose.
 fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // ADDED FOR STAGE 9. A popup is a different act of window management from a
@@ -1069,7 +1560,15 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
                 height,
                 SWP_NOACTIVATE,
             );
-            if !w.mapped.replace(true) {
+            // STAGE 13: the bitmap **before** the window is shown. A layered
+            // window that has never been given one is not merely blank, it is
+            // undefined — and `ShowWindow` on it is a flash of whatever DWM had
+            // in that memory. `update_layered` is also what makes the window
+            // visible at all in the layered model, so a popup whose shadow is
+            // still empty is deliberately left hidden until it has pixels,
+            // which is the same rule the toplevel path already follows.
+            let painted = update_layered(w);
+            if painted && !w.mapped.replace(true) {
                 ShowWindow(w.hwnd(), SW_SHOWNOACTIVATE);
             }
         }
@@ -1234,8 +1733,189 @@ fn dump_frame(ui: &Rc<Ui>, w: &Rc<WindowState>) {
     }
 }
 
+/// Put the shadow on a layered window, alpha and all.
+///
+/// ADDED FOR STAGE 13, and it is the fix for a menu with a black border.
+///
+/// # What was wrong
+///
+/// `SetDIBitsToDevice` on a 32-bit `BI_RGB` DIB ignores the fourth byte —
+/// `map_window` has said so in every log since stage 3 (*"argb: alpha ignored
+/// by GDI, drawn opaque"*). For an opaque toplevel that costs nothing. For a
+/// GTK menu it is the whole appearance: the surface is `ARGB8888` and its
+/// outer margin is the client's drop shadow, fully transparent, so `A=0` pixels
+/// are drawn with whatever `R`, `G` and `B` happen to be — which for a cleared
+/// buffer is **black**. The rounded corners are the same pixels and the same
+/// black. It reads as a rendering bug in the client and it is our blit.
+///
+/// # Why a layered window rather than `AlphaBlend`
+///
+/// `AlphaBlend` composites the source against *what is already in the target
+/// DC*, and what is in a window's DC is that window's own background. It cannot
+/// show the desktop behind the window because the window is opaque to the
+/// system. Per-pixel transparency of a **window** is a window-manager property
+/// on Win32, and `WS_EX_LAYERED` plus `UpdateLayeredWindow` is the only
+/// mechanism for it: the bitmap becomes the window's shape and DWM composites
+/// it against whatever is behind.
+///
+/// # What it costs, and why only popups get it
+///
+/// `UpdateLayeredWindow` replaces `WM_PAINT` entirely and takes the **whole**
+/// window every time — damage cannot be used, so a layered window redraws
+/// everything on every commit. A menu is small and changes rarely. A toplevel
+/// is neither, and a layered toplevel would also lose its native frame, since
+/// the bitmap becomes the entire window and there is no non-client area left
+/// for Windows to draw a caption in. That is the opposite of what
+/// `docs/goal-firefox.md` asks for, so toplevels keep `SetDIBitsToDevice` and
+/// keep Windows' frame.
+///
+/// The toplevel's own transparent margin — GTK's shadow inset — is dealt with
+/// at the other end instead: `default_mode(Server)` (see `state.rs`) makes
+/// Firefox stop drawing one at all, which removes the pixels rather than
+/// compositing them.
+///
+/// # The alpha convention
+///
+/// `AC_SRC_ALPHA` is defined on **premultiplied** alpha, which is what
+/// `wl_shm`'s `ARGB8888` already is, so the bytes go across untouched. An
+/// `XRGB8888` surface has no alpha at all and its fourth byte is undefined;
+/// those are forced to 255, because a shaped window built from undefined bytes
+/// is a window with holes in it that move.
+fn update_layered(w: &Rc<WindowState>) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, SelectObject,
+    };
+
+    let (pixels, width, height, opaque) = {
+        let shadow = w.shadow.lock().unwrap_or_else(|e| e.into_inner());
+        if shadow.is_empty() || shadow.width() <= 0 || shadow.height() <= 0 {
+            return false;
+        }
+        (
+            shadow.pixels().to_vec(),
+            shadow.width(),
+            shadow.height(),
+            !shadow.format().has_alpha(),
+        )
+    };
+    let need = (width as usize) * (height as usize) * 4;
+    if pixels.len() < need {
+        return false;
+    }
+
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        biSizeImage: (width as u32) * (height as u32) * 4,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    };
+
+    // SAFETY: every handle below is checked before use and every one that is
+    // created is released on all paths.
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return false;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(
+            screen,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if mem.is_null() || dib.is_null() || bits.is_null() {
+            if !dib.is_null() {
+                DeleteObject(dib as _);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return false;
+        }
+        let dst = std::slice::from_raw_parts_mut(bits.cast::<u8>(), need);
+        dst.copy_from_slice(&pixels[..need]);
+        if opaque {
+            for px in dst.chunks_exact_mut(4) {
+                px[3] = 0xff;
+            }
+        }
+        let old = SelectObject(mem, dib as _);
+
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        // A null destination point keeps the window where it is, which is what
+        // `map_window` and `SetWindowPos` already decided; passing one here
+        // would make this a second authority on the window's position.
+        let ok = UpdateLayeredWindow(
+            w.hwnd(),
+            screen,
+            std::ptr::null(),
+            &size,
+            mem,
+            &src,
+            0,
+            &blend,
+            ULW_ALPHA,
+        ) != 0;
+
+        SelectObject(mem, old);
+        DeleteObject(dib as _);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        ok
+    }
+}
+
+/// Whether this window's pixels go through [`update_layered`].
+/// Whether a *locked* modifier is currently on.
+///
+/// ADDED FOR STAGE 13. **The low bit, not the high bit.** `GetKeyState`
+/// returns the physical up/down of the key in bit 15 and the toggle state in
+/// bit 0, and for Caps Lock it is the toggle that matters: the key is up
+/// almost all the time and the lock is on regardless. Reading the sign of the
+/// return value — the reflex, because that is how every other key is tested —
+/// reports the lock as off unless the user is holding the key down at the
+/// instant of the call.
+fn lock_on(vk: u16) -> bool {
+    // SAFETY: a virtual-key constant; the call has no pointer arguments.
+    unsafe { GetKeyState(vk as i32) & 1 != 0 }
+}
+
+fn is_layered(w: &Rc<WindowState>) -> bool {
+    matches!(w.kind, WindowKind::Popup { .. })
+}
+
 fn present(w: &Rc<WindowState>, damage: &[Rect]) {
     if !w.mapped.get() {
+        return;
+    }
+    // STAGE 13. A layered window has no `WM_PAINT`: its content is whatever
+    // was last handed to `UpdateLayeredWindow`, so invalidating a rectangle
+    // would do nothing at all and the menu would keep its first frame forever.
+    if is_layered(w) {
+        update_layered(w);
         return;
     }
     let (ox, oy) = w.frame.content_origin();
@@ -1409,8 +2089,25 @@ fn release_icons(w: &Rc<WindowState>) {
 /// `AlphaBlend`, which is defined on premultiplied colour. A straight-alpha
 /// source would show as a pale halo, not as a failure.
 fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
+    make_hicon(icon, tw, th, None)
+}
+
+/// The body of [`make_icon`], and of [`make_cursor`].
+///
+/// SPLIT OUT FOR STAGE 12. An icon and a cursor are the same `ICONINFO` with
+/// `fIcon` flipped and a hotspot filled in — Win32 models them as one object
+/// and `HICON` and `HCURSOR` are the same handle type — so writing the DIB
+/// twice would have been two places for the premultiplied-alpha convention to
+/// drift apart.
+///
+/// `hotspot` is `None` for an icon and `Some((x, y))` for a cursor, in pixels
+/// from the top-left of the *target* bitmap.
+fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -> Option<isize> {
     use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, CreateDIBSection};
 
+    if tw <= 0 || th <= 0 {
+        return None;
+    }
     if icon.width <= 0 || icon.height <= 0 {
         return None;
     }
@@ -1465,14 +2162,39 @@ fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
     // A 32-bit colour bitmap with an alpha channel still needs a mask bitmap
     // present; an all-zero mask means "take the alpha from the colour bitmap",
     // which is what every modern icon does.
-    // SAFETY: a 1bpp monochrome bitmap of the right size, zero-initialised by
-    // passing a null bit pointer.
-    let mask = unsafe { CreateBitmap(tw, th, 1, 1, std::ptr::null()) };
+    //
+    // **The zeroes are supplied rather than assumed.** `CreateBitmap`'s
+    // documentation says that with a null bit pointer "the contents of the new
+    // bitmap is undefined" — the zero-fill every Windows to date has actually
+    // done is not contractual, and this is the kind of thing Wine has already
+    // lied about four times (docs/design.md §13.6). For an icon a stray mask
+    // bit is one wrong pixel in a taskbar button; for a *cursor* the AND mask
+    // is what selects between "transparent" and "invert the screen", so a
+    // garbage mask is a cursor with inverted holes punched through it. Cheap
+    // to be sure: a 32x32 mask is 128 bytes.
+    //
+    // Scan lines of a `CreateBitmap` bitmap are **word**-aligned, not
+    // dword-aligned as they would be in a DIB.
+    let mask_stride = ((tw as usize).div_ceil(16)) * 2;
+    let mask_bits = vec![0u8; mask_stride.checked_mul(th as usize)?];
+    // SAFETY: a 1bpp monochrome bitmap whose bit buffer is exactly the size
+    // Win32 computes for these dimensions, and which outlives the call.
+    let mask = unsafe { CreateBitmap(tw, th, 1, 1, mask_bits.as_ptr().cast()) };
+
+    let (f_icon, (hx, hy)) = match hotspot {
+        None => (1, (0, 0)),
+        // Clamped into the bitmap. A hotspot outside the image is not a Win32
+        // error and not a Wayland one either — the protocol says only that it
+        // is "in surface-local coordinates" — but it makes the pointer act at
+        // a place that is not on the pointer, so a client that sends nonsense
+        // gets the nearest sensible thing rather than an unusable cursor.
+        Some((x, y)) => (0, (x.clamp(0, tw - 1) as u32, y.clamp(0, th - 1) as u32)),
+    };
 
     let info = ICONINFO {
-        fIcon: 1,
-        xHotspot: 0,
-        yHotspot: 0,
+        fIcon: f_icon,
+        xHotspot: hx,
+        yHotspot: hy,
         hbmMask: mask,
         hbmColor: colour,
     };
@@ -1488,6 +2210,313 @@ fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
     } else {
         Some(hicon as isize)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The cursor
+// ---------------------------------------------------------------------------
+
+/// Install what the client asked the pointer to look like.
+///
+/// ADDED FOR STAGE 12 (docs/design.md §23).
+///
+/// # The invariant this exists to keep
+///
+/// **Exactly one visible cursor, and it is a real Win32 cursor.** Nothing here
+/// draws anything: a client's cursor surface is turned into an `HCURSOR` and
+/// handed to Windows, which composites it above every window on the desktop
+/// with the right hotspot, the right refresh behaviour and no tearing, for
+/// free. The alternative — blitting the cursor image into the window as
+/// content — is what produced the two-cursor bug the user reported, and it is
+/// wrong for a reason no amount of care fixes: the client's cursor would be
+/// clipped to the window, lag the real pointer by a frame, and still leave the
+/// system arrow on top of it.
+///
+/// # Why the cursor is installed twice
+///
+/// Once here, and once from `WM_SETCURSOR`, and both are needed:
+///
+/// * `WM_SETCURSOR` is the only way to *keep* it. Windows re-asks on every
+///   mouse message and `DefWindowProc` answers with the class cursor, so a
+///   cursor set only here survives until the pointer moves one pixel.
+/// * This call is the only way to *apply* it now. `WM_SETCURSOR` needs a mouse
+///   message, and the interesting changes happen while the pointer is still —
+///   a page finishing loading, a client hiding the pointer as the user starts
+///   typing, a `wl_pointer.leave` restoring the arrow.
+fn set_cursor(ui: &Rc<Ui>, spec: CursorSpec) {
+    // Build the new one **before** destroying the old, so a failed build
+    // leaves the previous cursor up rather than leaving the pointer invisible.
+    let (handle, owned, what) = match &spec {
+        CursorSpec::Hidden => (0isize, false, "hidden".to_string()),
+        CursorSpec::Named(icon) => {
+            let stock = crate::cursor::stock_for(*icon);
+            let h = stock_cursor(stock.idc);
+            if h == 0 {
+                // `LoadCursorW` of a stock cursor failing is not something that
+                // happens on Windows; it is exactly the kind of thing that
+                // happens on Wine. Keep whatever is up and say so.
+                eprintln!(
+                    "wc-compositor: LoadCursorW({}) failed for shape {:?}; cursor unchanged",
+                    stock.name,
+                    icon.name()
+                );
+                return;
+            }
+            (h, false, format!("{} ({})", icon.name(), stock.name))
+        }
+        CursorSpec::Image { image, hotspot_x, hotspot_y } => {
+            match make_cursor(image, *hotspot_x, *hotspot_y) {
+                Some(h) => (
+                    h,
+                    true,
+                    format!(
+                        "{}x{} pixels, hotspot {hotspot_x},{hotspot_y}",
+                        image.width, image.height
+                    ),
+                ),
+                None => {
+                    eprintln!(
+                        "wc-compositor: could not build an HCURSOR from {}x{} pixels; \
+                         cursor unchanged",
+                        image.width, image.height
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    let previous = ui.cursor.replace(handle);
+    let previously_owned = ui.owned_cursor.replace(if owned { handle } else { 0 });
+
+    if ui.pointer_inside.get() {
+        // SAFETY: 0 is documented as "hide the cursor"; anything else is a
+        // handle produced immediately above and stored in `ui.cursor`, so it
+        // outlives the call.
+        unsafe {
+            SetCursor(handle as _);
+        }
+    }
+
+    // **After** `SetCursor`, and only if it is not the one still showing.
+    // Destroying a cursor that is on screen is legal but leaves the pointer
+    // drawn from freed memory until the next `SetCursor`, which is the classic
+    // way to get a corrupted pointer that survives the process.
+    if previously_owned != 0 && previously_owned != handle {
+        // SAFETY: came from `CreateIconIndirect`, is no longer installed, and
+        // the cell that held it has already been overwritten so this runs once.
+        unsafe {
+            DestroyCursor(previously_owned as _);
+        }
+    }
+
+    if previous != handle {
+        println!("wc-compositor: cursor -> {what}");
+    }
+}
+
+/// One of Win32's built-in cursors, by `IDC_*` ordinal.
+///
+/// **Not destroyed, ever.** Stock cursors are shared process-wide and owned by
+/// the system; `DestroyCursor` on one is documented as an error and in practice
+/// takes the arrow away from every window in the process.
+///
+/// The ordinal is cast to a pointer rather than named as a `windows-sys`
+/// constant because the table that chose it lives in `crate::cursor`, which
+/// compiles on Linux and must not mention `windows-sys` (see that file). This
+/// is `MAKEINTRESOURCE`, which has always been "the integer, in the pointer".
+fn stock_cursor(idc: u16) -> isize {
+    // SAFETY: a null instance means "the system's own resources", which is
+    // where the `IDC_*` cursors live, and the resource id is an integer
+    // ordinal rather than a string pointer.
+    unsafe { LoadCursorW(std::ptr::null_mut(), idc as usize as *const u16) as isize }
+}
+
+/// Build an `HCURSOR` from a client's cursor surface.
+///
+/// # Why the image is not scaled
+///
+/// [`make_icon`] resamples, because Windows asks for two specific icon sizes
+/// and a client's icon is whatever size the theme had. A cursor has no such
+/// requirement: `CreateIconIndirect` accepts any dimensions, and the sizes
+/// clients actually send — 24x24 and 32x32 from the XCursor themes, 48x48 and
+/// 64x64 at scale 2 — are all displayed as sent. Not scaling means the hotspot
+/// arrives as an exact pixel rather than as a rounded one, which matters:
+/// the hotspot *is* the pointer, and half a pixel of drift on a 1-pixel-wide
+/// I-beam is the difference between clicking before and after a character.
+///
+/// # The alpha
+///
+/// `wl_shm`'s `Argb8888` is **premultiplied**, and a 32-bit `CreateIconIndirect`
+/// wants premultiplied, so there is nothing to convert — but there is
+/// something not to do, which is to discard it. A cursor is mostly transparent
+/// and almost entirely antialiased edge; dropping the alpha channel gives a
+/// black rectangle with a cursor somewhere in it, and forcing it opaque gives
+/// a cursor with a hard jagged outline. Both are worse than the arrow this
+/// replaces, so the ARGB path is the only one implemented.
+fn make_cursor(image: &IconImage, hotspot_x: i32, hotspot_y: i32) -> Option<isize> {
+    let h = make_hicon(
+        image,
+        image.width,
+        image.height,
+        Some((hotspot_x, hotspot_y)),
+    )?;
+    verify_cursor_once(h);
+    Some(h)
+}
+
+/// Read the first cursor back out of Win32 and say what it became.
+///
+/// ADDED FOR STAGE 12, and it is a harness affordance rather than a check the
+/// compositor needs — but it has to live here, because **an `HCURSOR` from
+/// `CreateIconIndirect` belongs to the process that made it**. Measured:
+/// `GetIconInfo` on this handle from `scripts/probe-cursor.c`, a different
+/// process on the same desktop, fails with 1402 `ERROR_INVALID_CURSOR_HANDLE`.
+/// So the probe can say "the cursor Win32 is showing is not one of the sixteen
+/// stock ones", which is real evidence and is all it can get, and this says
+/// what the thing it is showing is made of.
+///
+/// Three facts, and each is a different way for the cursor to be wrong in a way
+/// nobody would see as a failure:
+///
+/// * `fIcon == 0`. An `HICON` and an `HCURSOR` are the same handle type, and
+///   `SetCursor` accepts an icon — it just draws it with the hotspot at 0,0.
+/// * The hotspot. Off by a few pixels means the pointer clicks somewhere other
+///   than where it is drawn, which reads as a badly calibrated screen.
+/// * 32 bits per pixel in the colour bitmap. Anything else means the alpha
+///   channel was dropped somewhere, and a cursor without alpha is a black
+///   rectangle with a shape in it.
+///
+/// Once per process: this is a hot-ish path — an animated cursor rebuilds
+/// several times a second — and the interesting question is whether the
+/// conversion works at all, which the first one answers.
+fn verify_cursor_once(hcursor: isize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Graphics::Gdi::{GetObjectW, BITMAP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetIconInfo;
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let mut info: ICONINFO = unsafe { std::mem::zeroed() };
+    // SAFETY: a handle this process created, and `info` is written by the call.
+    if unsafe { GetIconInfo(hcursor as _, &mut info) } == 0 {
+        eprintln!(
+            "wc-compositor: GetIconInfo on our own HCURSOR failed ({})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let mut bm: BITMAP = unsafe { std::mem::zeroed() };
+    // SAFETY: `GetIconInfo` hands over two bitmaps this process now owns, and
+    // `bm` is written by the call.
+    let bits = if info.hbmColor.is_null() {
+        0
+    } else if unsafe {
+        GetObjectW(
+            info.hbmColor as _,
+            std::mem::size_of::<BITMAP>() as i32,
+            (&mut bm as *mut BITMAP).cast(),
+        )
+    } != 0
+    {
+        bm.bmBitsPixel
+    } else {
+        0
+    };
+
+    println!(
+        "wc-compositor: cursor round-trip: fIcon={} hotspot={},{} colour={}x{} at {} bpp",
+        info.fIcon, info.xHotspot, info.yHotspot, bm.bmWidth, bm.bmHeight, bits
+    );
+
+    // `GetIconInfo` **creates** the two bitmaps it returns and the caller owns
+    // them. Not deleting them here would leak two GDI objects, which is the
+    // documented behaviour that is easiest to miss because nothing ever
+    // complains about it.
+    // SAFETY: both handles came from the call above and are deleted once.
+    unsafe {
+        if !info.hbmColor.is_null() {
+            DeleteObject(info.hbmColor as _);
+        }
+        if !info.hbmMask.is_null() {
+            DeleteObject(info.hbmMask as _);
+        }
+    }
+}
+
+/// How fast Windows itself repeats a held key, as `wl_keyboard.repeat_info`
+/// wants it: a delay in milliseconds and a rate in keys per second.
+///
+/// ADDED FOR STAGE 12. Until now these were the constants 500 and 30 — Windows'
+/// *defaults*, written out — which meant a user who had turned the repeat rate
+/// up in the Control Panel got the default in every Wayland client and the
+/// system rate in every native one. The compositor does not repeat anything
+/// itself (see `state.rs`), so this number is not a knob the compositor honours
+/// but a fact about the machine that it forwards; inventing it was the one
+/// thing that could not be right.
+///
+/// # The two scales, neither of which is in the units Wayland wants
+///
+/// `SPI_GETKEYBOARDDELAY` returns **0 to 3**, meaning 250 ms to 1000 ms in
+/// 250 ms steps. That is the documented mapping and it is exact.
+///
+/// `SPI_GETKEYBOARDSPEED` returns **0 to 31**, and Microsoft documents only the
+/// endpoints: 0 is "approximately 2.5 repetitions per second" and 31 is
+/// "approximately 30". The scale between them is linear in the *rate*, which is
+/// how `keybd.cpl`'s slider has always behaved. So this interpolates, and says
+/// so, rather than presenting a table of thirty-two numbers it would have made
+/// up. The endpoints are exact; the middle is an estimate, and the error at
+/// worst is a fraction of a repeat per second — well inside what a user could
+/// perceive as anything but "about right".
+///
+/// A failed call keeps the old constants. `SystemParametersInfo` failing is not
+/// something Windows does, and is something Wine might (docs/design.md §13.6).
+pub fn keyboard_repeat() -> (i32, i32) {
+    let mut delay: u32 = 1;
+    let mut speed: u32 = 31;
+
+    // SAFETY: both actions are documented as writing a `u32` through `pvParam`;
+    // `uiParam` is unused and `fWinIni` of 0 means "do not broadcast".
+    let ok_delay = unsafe {
+        SystemParametersInfoW(
+            SPI_GETKEYBOARDDELAY,
+            0,
+            (&mut delay as *mut u32).cast(),
+            0,
+        ) != 0
+    };
+    // SAFETY: as above.
+    let ok_speed = unsafe {
+        SystemParametersInfoW(
+            SPI_GETKEYBOARDSPEED,
+            0,
+            (&mut speed as *mut u32).cast(),
+            0,
+        ) != 0
+    };
+
+    if !ok_delay || !ok_speed {
+        eprintln!(
+            "wc-compositor: SystemParametersInfo could not read the keyboard repeat settings; \
+             advertising Windows' defaults"
+        );
+        return (500, 30);
+    }
+
+    let delay_ms = 250 * (delay.min(3) as i32 + 1);
+    // 2.5/s at 0, 30/s at 31, linear in between, rounded to the nearest whole
+    // repeat because `repeat_info` counts in whole ones.
+    let rate_hz = ((25 + (speed.min(31) as i32) * 275 / 31) + 5) / 10;
+
+    println!(
+        "wc-compositor: keyboard repeat: SPI delay {delay} -> {delay_ms} ms, \
+         SPI speed {speed} -> {rate_hz}/s"
+    );
+    (delay_ms, rate_hz)
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,7 +2577,15 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         frame: config.frame,
         draining: Cell::new(false),
         controller: Cell::new(controller as isize),
+        idle_inhibited: Cell::new(false),
         dump_frames: config.dump_frames.clone(),
+        // The arrow, so that the very first `WM_SETCURSOR` — which arrives
+        // before any client has said anything about a cursor — installs the
+        // same shape the window class would have. Starting at 0 would mean a
+        // window with no pointer at all until the first client spoke.
+        cursor: Cell::new(stock_cursor(crate::cursor::IDC_ARROW.idc)),
+        owned_cursor: Cell::new(0),
+        pointer_inside: Cell::new(false),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
@@ -1586,6 +2623,20 @@ impl PumpInner {
         for id in ids {
             handle(&self.ui, ToUi::Destroy { id });
         }
+        // The cursor we built, if the last thing a client asked for was its own
+        // pixels. Nothing is showing it any more — every window is gone — and
+        // the process may outlive the pump by however long the Wayland thread
+        // takes to wind up.
+        let owned = self.ui.owned_cursor.replace(0);
+        if owned != 0 {
+            // SAFETY: came from `CreateIconIndirect` in `make_cursor`, is
+            // destroyed once because the cell is cleared in the same breath,
+            // and is not installed anywhere: no window remains.
+            unsafe {
+                DestroyCursor(owned as _);
+            }
+        }
+
         let controller = self.ui.controller.replace(0);
         if controller != 0 {
             // SAFETY: created on this thread, destroyed once, and no `Ui`
