@@ -10699,10 +10699,18 @@ would be worse than the TCP path it replaces, so:
    needs root on the machine QEMU lives on.
 3. **No bring-up wiring.** `install_cross_wake` on both sides and a `Doorman`
    per process.
-4. **`wc-proxy` and `wc-compositor` still speak to the socket.** The
-   `ByteChannel` exists and is tested; the proxy's `pump` and the compositor's
-   Wayland thread have not been switched over to it.
-5. **No guest measurement.** The 480-frame present has not been re-run.
+4. **The host half is done; the guest half is not.** `wc-proxy --upstream-ring
+   <control-region>` claims a ring per client and pumps it, with the
+   0/1/5/20 ms poll ladder described above. `wc-compositor`'s Wayland thread
+   still only `accept()`s on `ListeningSocket` — it does not yet poll the ring
+   directory, which is the `accept()` half of §35.2's table and is the one
+   remaining piece of the data path.
+5. **No icon feed on the ring.** The icon link is a second connection to the
+   compositor (§16.7), so on the ring it is a second ring claim. The proxy says
+   so on the client's log line rather than skipping it silently, because a
+   generic icon looks like a bug in the icon code.
+6. **No guest measurement.** The 480-frame present has not been re-run, and no
+   Wayland client has yet driven a guest window through a ring.
 
 **`scripts/probe-relay.c` therefore stays, and is still the only thing that
 works end to end.** It is retired when a Wayland client drives a guest window
