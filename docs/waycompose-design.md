@@ -13062,9 +13062,14 @@ would be worse than the TCP path it replaces, so:
    machinery. `PortWake` and `serve_port` are written against `Read`/`Write`
    precisely so filling this gap changes nothing in `vdoorbell`.
 2. **No QMP hot-add.** Nobody has written `chardev-add`/`device_add`, and it
-   needs root on the machine QEMU lives on.
+   needs root on the machine QEMU lives on. The development guest did not need
+   it — its ports are declared in `nix/guest.nix` and it can be rebooted freely
+   — so the hot-add remains the untested half of §36.7's finding. What is now
+   known is that a second port on the existing controller *works*, which is the
+   part the hot-add was going to establish.
 3. **No bring-up wiring.** `install_cross_wake` on both sides and a `Doorman`
-   per process.
+   per process. Everything under it is measured; nothing above it calls it yet,
+   so no running session is faster than it was.
 4. **The host half is done; the guest half is not.** `wc-proxy --upstream-ring
    <control-region>` claims a ring per client and pumps it, with the
    0/1/5/20 ms poll ladder described above. `wc-compositor`'s Wayland thread
@@ -13075,8 +13080,16 @@ would be worse than the TCP path it replaces, so:
    compositor (§16.7), so on the ring it is a second ring claim. The proxy says
    so on the client's log line rather than skipping it silently, because a
    generic icon looks like a bug in the icon code.
-6. **No guest measurement.** The 480-frame present has not been re-run, and no
-   Wayland client has yet driven a guest window through a ring.
+6. **The doorbell is measured across a real boundary; the present is not.**
+   §36.6.3's ~9 µs is a real hypervisor on the development guest, and it settles
+   the quantity that was in doubt. It is not a present: the 480-frame
+   `vkQueuePresentKHR` figure still wants re-running on the Windows guest, where
+   the 1 ms `WaitOnAddress` floor and the rest of a present's cost both live.
+   That measurement is on `testhost`, which is somebody's working machine, and
+   it waits for a window when nobody is using it rather than for a gap in the
+   schedule.
+7. **No Wayland client has driven a guest window through a ring.** Which is the
+   milestone the whole section is for, and item 4 is what stands in the way.
 
 **`scripts/probe-relay.c` therefore stays, and is still the only thing that
 works end to end.** It is retired when a Wayland client drives a guest window
