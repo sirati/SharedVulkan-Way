@@ -260,6 +260,11 @@ int main(int argc, char **argv)
 	const char *text = "hello";
 	wchar_t cls[128] = L"WaycomposeToplevel";
 	int wait = 20, do_mouse = 1, do_keys = 1, leave = 1;
+	/* ADDED FOR §37. Where to click, in *client-area* coordinates, or -1 for
+	 * the centre. The centre is the wrong point for a decoration question: a
+	 * client that draws its own title bar draws it at the top, and the whole
+	 * of §37 is about a click near the top landing in the wrong row. */
+	int at_x = -1, at_y = -1;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--log") && i + 1 < argc) {
@@ -284,6 +289,11 @@ int main(int argc, char **argv)
 			leave = 0;
 		} else if (!strcmp(argv[i], "--type") && i + 1 < argc) {
 			text = argv[++i];
+		} else if (!strcmp(argv[i], "--at") && i + 1 < argc) {
+			if (sscanf(argv[++i], "%d,%d", &at_x, &at_y) != 2) {
+				printf("probe-input: --at wants X,Y in client-area pixels\n");
+				return 2;
+			}
 		} else if (!strcmp(argv[i], "--class") && i + 1 < argc) {
 			MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, cls, 128);
 		} else if (!strcmp(argv[i], "--wait") && i + 1 < argc) {
@@ -382,14 +392,38 @@ int main(int argc, char **argv)
 	}
 	fflush(stdout);
 
-	/* Client-area centre, in screen coordinates. */
-	POINT centre = { rc.right / 2, rc.bottom / 2 };
+	/* The point to click, in client-area coordinates and then in screen
+	 * coordinates. `--at` overrides the centre; the second move is 12,8 away
+	 * from the first either way, because a toolkit decides what is under the
+	 * pointer from a *motion* and not from the enter (see `deliver_click` in
+	 * `platform/headless.rs` for the same finding from the other side). */
+	int px = at_x >= 0 ? at_x : rc.right / 2;
+	int py = at_y >= 0 ? at_y : rc.bottom / 2;
+	POINT centre = { px, py };
 	ClientToScreen(target, &centre);
 
 	if (do_mouse) {
 		move_to(centre.x, centre.y);
 		move_to(centre.x + 12, centre.y + 8);
-		printf("probe-input: moved to the client-area centre\n");
+		/* ADDED FOR §37. The *client-area* coordinates of the two points the
+		 * pointer visited, printed rather than left implicit, because they are
+		 * the only numbers the harness can compare the client's report
+		 * against. `GetClientRect` is origin-relative, so `rc.right`/
+		 * `rc.bottom` are the width and height.
+		 *
+		 * Without this the wine leg could say a motion arrived and not where,
+		 * which is exactly the gap that let a 32-pixel offset ship.
+		 *
+		 * **Both, and not only the last one.** Measured under Wine: the two
+		 * `SendInput` moves reach the window proc out of order — the client's
+		 * log shows the second point, then the first, and the first is where
+		 * the click is reported from. That is Wine's input queue and not
+		 * anything the compositor did, so the harness is told which points
+		 * were visited and checks that the click is at one of them rather
+		 * than insisting on an order the platform does not guarantee. */
+		printf("probe-input: moved to the client-area centre, "
+		       "client points %ld,%ld and %ld,%ld\n",
+		       (long)px, (long)py, (long)(px + 12), (long)(py + 8));
 		click();
 		printf("probe-input: clicked\n");
 		wheel(1);

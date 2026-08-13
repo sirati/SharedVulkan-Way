@@ -5651,7 +5651,7 @@ guess is wrong and the harness was written against the guess: it is
 §13.9 said an image name is not an identity on this guest. Stage 11 found two
 more ways for that to be true and two ways to photograph the wrong instant.
 
-> **The rule, because this is the seventh time and it will not be the last.**
+> **The rule, because this is the eighth time and it will not be the last.**
 >
 > There is one Windows guest, one `/srv/winshare`, one taskbar, and as many
 > experiments as there are worktrees. Everything below is a special case of two
@@ -5716,6 +5716,43 @@ more ways for that to be true and two ways to photograph the wrong instant.
 > symptom it was built to detect has to be assumed to have done so until it
 > proves otherwise, which is why the probe now refuses to inject and the script
 > takes no photograph rather than an unattributable one.
+>
+> **The eighth is the last member of the family, and it was found by tidying
+> up.** `runint.ps1` registers its scheduled task as whatever `int`/`int_bg` was
+> called with, and those names are constants: `wccomp`, `wcshot`, `wcwin`. So
+> every worktree registered `wccomp`, and `Register-ScheduledTask -Force` means
+> the last run to start silently redefines the others'. §33 had made the socket
+> unique and the window selectable by pid, and §16.8 had separated the binaries
+> since stage 11 — the *task* name was the one identifier nobody had looked at,
+> because nothing had ever failed because of it. What found it was §37's author
+> removing a stale `Ready` task that pointed at their own deploy directory, from
+> a run started with `int_bg` — which, unlike `int -Wait`, never unregisters.
+>
+> Two things follow, and the second is the reusable one.
+>
+> The names are now `wc-<DESKNAME>-<pid>-<what>`: `DESKNAME` separates
+> worktrees, and the pid separates two runs of the same worktree, which is the
+> case that actually bites — `Unregister-ScheduledTask` on a name another run is
+> about to `Start-ScheduledTask` loses that run's step with no error at either
+> end.
+>
+> And **removing a task by name needs two checks**, which is the rule §37's
+> author applied by hand and the script did not apply to itself:
+>
+> * its `Actions` must run something under *this* run's `DESKDIR` — the name can
+>   have been redefined between registering it and reaping it, and rule 1 says a
+>   name is not an identity; what it will actually execute is. `Execute` alone
+>   does not answer it, because half of these tasks are
+>   `cmd.exe /c <DESKDIR>\wc-desk.exe …` (a task's stdout goes nowhere, so the
+>   redirect has to be a shell's) and the identity is then in the arguments;
+> * and its `State` must not be `Running`, because unregistering a running task
+>   is the very interference this is cleaning up after.
+>
+> That rule is not about scheduled tasks. It is rule 1 applied to *deletion*
+> rather than to selection, and it is the generalisation the first seven
+> instances were each a special case of: **check what a thing is, not what it is
+> called, at the moment you act on it** — not at the moment you named it, which
+> for a shared namespace is a different moment with a different answer.
 >
 > **The fourth: `scripts/sv-firefox-guest.sh`, and it is rule 1 twice over.**
 > Its `clean` step runs
@@ -13798,7 +13835,7 @@ visible bar is delivered inside it, and a press there is `xdg_toplevel.move`.
 Two title bars and a 32-pixel pointer offset are the same measurement read
 twice, which is the only reason this section mentions the second one.
 
-### 33.10 The harness, and three things it was doing to other people's runs (§16.8, instances five to seven)
+### 33.10 The harness, and four things it was doing to other people's runs (§16.8, instances five to eight)
 
 `scripts/wc-desktop.sh window` could not run at all on this branch, and the
 other three are contention bugs the guest has enough of already. **They are
@@ -13846,7 +13883,379 @@ the second exists for `weston-eventdemo`, whose every log is off by default and
 which is silent without `--log-key` in a way that looks exactly like a client
 receiving nothing.
 
+#### The eighth, which arrived after this section was written
+
+§37.8 item 5 found the member none of the above closed: **the scheduled task's
+name**. `runint.ps1` registers whatever `int`/`int_bg` was called with, and
+those are constants — `wccomp`, `wcshot`, `wcwin` — so every worktree registered
+`wccomp` and `Register-ScheduledTask -Force` let the last run to start redefine
+the others'. Three identifiers had been made unique by then (the deploy
+directory in §16.8, the socket and the window selector in §33) and this one had
+never been looked at, because nothing had failed because of it. It was found by
+somebody cleaning up a `Ready` task from a run that had finished.
+
+Names are now `wc-<DESKNAME>-<pid>-<what>`, and `reaptasks.ps1` clears this
+worktree's leftovers after the deploy and after the run — `int_bg` cannot
+unregister its own task, because the task has to outlive the ssh call that
+starts it, which is why the leftovers existed at all.
+
+The part worth carrying elsewhere is the **removal** rule, which both that
+script and `runint.ps1` now apply: a task is only unregistered if its `Actions`
+run something under this run's `DESKDIR` *and* its `State` is not `Running`.
+`Execute` alone does not answer the first, because half of these tasks are
+`cmd.exe /c <DESKDIR>\wc-desk.exe …` — a task's stdout goes nowhere, so the
+redirect has to be a shell's — and the identity is then in the arguments.
+§16.8's block states the generalisation: this is rule 1 applied to deletion
+rather than to selection, and *"check what a thing is, not what it is called, at
+the moment you act on it"* is what the other seven instances were each a special
+case of.
+
+**It was routed here rather than patched where it was found**, by an author who
+had the fix in their hand and wrote it down instead. That is why there is one
+implementation of it and not two, and it is worth naming as the thing that went
+right in a section otherwise full of things that did not.
+
+##### `wc-desktop.sh psgate`, because the fix was written during an embargo
+
+Three of the four files this script deploys are PowerShell written inside quoted
+heredocs, and until now the only way to find out whether any of it parsed was to
+run it on the guest — a contended machine, regularly unavailable, which answers
+a syntax error and a logic error with the same silence, because a scheduled
+task's stdout goes nowhere. `reaptasks.ps1` was written while the guest was
+embargoed, so it needed a way to be checked that was not the guest.
+
+`psgate` generates the files and runs two things over them with `pwsh` on the
+workstation: the PowerShell **parser** on each, and a **unit test** of the
+ownership rule against the seven cases it exists to separate. It skips with a
+note when `pwsh` is absent, which is the §26 convention.
+
+The second level is the one that earned its keep, twice.
+
+* Writing the test found a defect in the code under test immediately — but only
+  after the test's own `function T($exe, $args)` reported a *false* failure,
+  because `$args` is an automatic variable and a parameter named after one binds
+  nothing. That is the same hazard as the `-Home` parameter this section's fix
+  had already avoided, arriving from the other side within ten minutes. Both are
+  now commented where somebody would repeat them.
+* And the gate can fail, which §35 is the argument for. Deleting the trailing
+  separator from the path comparison — the one line in `Ours` whose reason is
+  not obvious — makes it report, precisely:
+
+  ```
+  FAIL  the ownership rule is wrong
+        FAIL the prefix collision, wcterm2 -> True, want False
+  ```
+
+  A `Contains` without it says a sibling worktree deployed to `…\wcterm2` is
+  ours, and reaping its tasks is the interference the whole function exists to
+  stop causing.
+
+## 37. The pointer and the pixels disagreed by the client's own inset
+
+A user reported it before any harness did:
+
+> "there is something wrong with mouse offset in the compositor... it happens
+> that mouse clicks and actions go to an offset location. i noticed that earlier
+> in firefox already, but in wayland terminal its very obvious that clicking
+> under the second titlebar instead starts moving the window as if the titlebar
+> were clicked, and in fact it snaps the mouse there"
+
+That is one defect with three visible faces: clicks land above where they were
+aimed, a click *below* a client-drawn title bar drags the window, and the
+pointer jumps to the caption. It had been in the tree since stage 9 and 1284
+tests did not see it.
+
+### 37.1 The bug, in two lines that were written a thousand lines apart
+
+`compose_tree` (stage 9) draws the window from the **window-geometry
+rectangle**, not from the buffer — a GTK client commits a buffer larger than its
+window on every side and says so with `xdg_surface.set_window_geometry`:
+
+```rust
+shadow.compose(src, (x - gx, y - gy));
+```
+
+So the window's top-left pixel *is* the surface's point `(gx, gy)`.
+
+`State::pointer_motion` said the opposite, and said it in a comment that was
+right when it was written and never revisited:
+
+```rust
+// Every window here is its own `HWND` with its own coordinate system and the
+// platform has already subtracted the frame, so the surface origin *is* the
+// compositor origin and this is `(0, 0)`.
+focus.map(|(_, s)| (s, (0.0, 0.0).into())),
+```
+
+Both halves of that sentence are true. The conclusion does not follow, because
+the frame Win32 subtracts is not the only offset in the path: the *client*
+declares one too, and it is per-surface rather than a property of the window
+system. `touch_down` and `touch_motion` carried the same zero, copied with the
+comment "`(0, 0)` for the same reason it is in `pointer_motion`" — §24's promise
+that touch reuses the pointer's conversion, kept faithfully, including the
+error.
+
+### 37.2 The measurement
+
+`weston-eventdemo` prints the coordinate it received, so the offset is a number
+rather than an impression. `--click 200,150` against it, on the headless
+platform:
+
+| | declared origin | clicked at (window px) | client received | should have been |
+|---|---|---|---|---|
+| `weston-eventdemo` | `(32, 32)` | `200,150` | **`200,150`** | `232,182` |
+| `weston-terminal` | `(32, 32)` | `200,40` | **`200,40`** | `232,72` |
+| `weston-flower` | `(0, 0)` | `100,60` | `100,60` | `100,60` |
+| Firefox, CSD (§22) | `(26, 23)` | — | — | — |
+| Firefox, SSD (§22) | `(0, 0)` | — | — | — |
+
+**32 pixels, up and to the left, for every Weston toytoolkit client.** The last
+two rows are why the user saw it "earlier in firefox" and only found it obvious
+in the terminal: under server-side decorations Firefox declares no inset at all
+and the bug does not exist, under client-side decorations it declares `(26, 23)`
+and the bug is a few pixels of misaimed clicking in a browser that mostly has
+large targets. `weston-terminal`'s title bar is about 30 px tall and its inset
+is 32, so the offset is larger than the bar — which turns a subtle aiming error
+into a window that drags when you click below its title bar.
+
+### 37.3 The symptom, reproduced and then removed
+
+`weston-terminal` draws its own frame, so it is the instrument for the reported
+behaviour rather than for the number. A click at window pixel `(200, 40)` —
+eight pixels below the bar it drew:
+
+```
+before   -> xdg_toplevel#17.move(wl_seat#4, 6)
+after    wl_pointer#12.enter(4, wl_surface#15, 232.00, 72.00)   [no move]
+```
+
+And the control in the other direction, a click at `(200, 12)`, *on* the drawn
+bar:
+
+```
+before   (nothing; surface y=12 is above the geometry rectangle entirely)
+after    -> xdg_toplevel#17.move(wl_seat#4, 6)
+```
+
+The two clicks swapped meanings. That is the whole bug seen from the user's
+chair, and it is why "it snaps the mouse there": the compositor hands
+`xdg_toplevel.move` to Windows as `SC_MOVE` with no mouse point, which is the
+**keyboard** move mode — Windows warps the cursor to the caption to start it.
+
+### 37.4 The fix, and why the number is stored rather than looked up again
+
+`Window::content_offset` is written by `compose_tree`, from the same `(gx, gy)`
+the blit used, and `surface_origin` negates it into the surface origin smithay
+subtracts (`event.location - loc`, `input/pointer/mod.rs:795`):
+
+```rust
+pub(crate) fn surface_origin(content_offset: (i32, i32)) -> (f64, f64) {
+    (-f64::from(content_offset.0), -f64::from(content_offset.1))
+}
+```
+
+Passing it as the **origin** rather than adding it to the location is deliberate:
+`location` stays in the coordinate space the platform sent and `pointer_at`
+stores, the geometry goes where smithay's model wants it, and there is one
+subtraction rather than two additions to keep in step.
+
+Storing it, rather than re-reading the cached state at input time, is the point
+of the field. The geometry is double-buffered like everything else; two
+independent reads can disagree by one commit, which is a click that lands in the
+wrong place for exactly one frame — the least debuggable version of this bug.
+One number, written where the pixels are decided, read where the pointer is
+delivered.
+
+`State::surface_and_origin` returns the surface and the origin together, so
+there is no call site that can take one and forget the other. That is what the
+three call sites did.
+
+### 37.5 What was suspected and was innocent
+
+The first hypothesis was `FrameStyle::extend_top` and `win32.rs`'s
+`to_surface`. In the tree this work started from, `extend_top` was an `i32`,
+`content_origin()` returned `(0, -extend_top)`, and `to_surface` computed
+`y - (-extend_top)` — which looks like a sign error and is one, in a model that
+had already been abandoned.
+
+**It was refuted structurally, before any of that was checked, and the argument
+is the reusable part.** `extend_top` is a constant of the *window system*: one
+number, decided once per compositor from a command-line flag, the same for every
+window on the desktop. The offset being hunted was 32 in one client, 26 by 23 in
+another, and 0 in a third, in the same run of the same compositor. **No frame
+constant can produce a per-client offset.** That eliminated the entire family of
+`FrameStyle` hypotheses from the second measurement onward, and pointed at the
+only per-surface quantity in the path — `xdg_surface.set_window_geometry`. The
+empirical check (`extend_top` was 0 everywhere, the compositor prints `content
+origin 0,0` at every map, the three conversions were identities) agreed, and was
+the cheaper confirmation rather than the reasoning.
+
+§31 has since landed and makes the point stronger than this section could on its
+own. It rewrote `FrameStyle` around what `WM_NCCALCSIZE` actually does — the
+caption is folded in by moving the *client rectangle's own top edge*, so the
+client origin stays at `(0, 0)` and the surface fills the client area — and
+`to_surface` is now the identity **by construction, in both decoration
+arrangements**, with the conversions deleted rather than kept as identities.
+So the Win32 half of the coordinate path contributes nothing in either
+arrangement, and the original brief's worry that the bug might exist in only one
+of them is answered from that side as well as from this one.
+
+### 37.6 The negative tests, which are the deliverable
+
+Three instruments, none of which existed before, each failing on the tree
+without the fix and passing with it.
+
+**`scripts/wc-input.sh pointer`** — the measurement. Drives `--click` at a known
+window pixel and compares what the client says it received against that pixel
+plus the inset the client itself declared on the wire. The expected number is
+never written down in the harness: hard-coding 32 would pass against a toolkit
+that changed its shadow margin and would say nothing about any other client.
+
+```
+without the fix                                   with it
+FAIL  reached the client at [200 150],            PASS  reached the client at
+      expected 232 182 -- off by the inset              surface 232 182
+FAIL  clicking the drawn title bar did nothing    PASS  clicking the title bar
+FAIL  clicking 40 px down started a move          PASS  40 px down: no move
+PASS  a client whose origin is 0,0 is untouched   PASS  (unchanged)
+```
+
+The fourth line is `weston-flower`, and it is the reason the set is worth
+having rather than decoration. Its declared origin is `(0, 0)`, so it passes
+*with the bug present* and must keep passing: a fix that added a constant, or
+added the inset twice, or applied a parent's inset to a popup would satisfy the
+first three lines and break this one.
+
+**`scripts/wc-input.sh wine`** — the same conversion with real Win32 messages
+under it. `SendInput` moves a real cursor, `WM_LBUTTONDOWN` arrives at the real
+window procedure, `to_surface` runs, and the click must reach the client at the
+injected client-area point plus the inset. `probe-input.exe` now prints the
+points it visited; it prints **both**, because measured under Wine the two
+`SendInput` moves reach the window procedure out of order and the click is
+reported from the first. Asserting an order the platform does not guarantee
+would be a flaky test about Wine's input queue rather than a test of the
+arithmetic.
+
+**`scripts/wc-input.sh term`** — the user's sequence. This leg used to pass
+`--no-mouse`: it typed into a window nobody had clicked in, which is not what a
+user does, and is a large part of why the defect survived a harness that
+photographs a terminal being typed into. It now clicks at `(200, 40)` first —
+the click that used to drag the window — and asserts on the compositor's own log
+that no move was started.
+
+**Five unit tests** in `state.rs` pin the conversion itself, including the
+asymmetric case (`(26, 23)`, so a fix carrying one number for both axes fails),
+the negative case (`set_window_geometry` takes a signed origin), and the
+identity. 1284 → 1289.
+
+### 37.7 Typing: one cause, and the second symptom is *not* settled
+
+The user also reported that the terminal could not be typed into, and the
+obvious story is that it follows from this: `SC_MOVE`'s keyboard move mode
+swallows every key until Escape, so a window that spuriously entered one would
+be dead to the keyboard.
+
+**Wine does not reproduce it, and that has to be said plainly rather than
+smoothed over.** With the bug present, the click starts the move — the new
+assertion fails, correctly — and the keystrokes still arrive: 21 new frames,
+every scan code translated. So on this instrument typing works before and after
+the fix, and the instrument cannot decide the question.
+
+One number from that run is worth keeping. The picture check "typing changed N
+pixels" reported **463** with the fix and **95034** without it. 463 pixels is
+one line of an 8×17 monospace font. 95034 is a window that moved. The check was
+passing in both runs and was measuring two different events — which is why the
+move is now asserted separately and by name, above the picture checks, so that
+everything below it is known to be a statement about a compositor that is not in
+a modal loop.
+
+What this leaves: the spurious move-drag is gone, which removes the most likely
+cause of the dead keyboard; whether the keyboard comes back is a claim only the
+guest can settle, and Wine's modal loops are exactly the class of thing Wine has
+been wrong about on this project before. §37.8 item 1.
+
+### 37.8 What is not done
+
+1. **No guest run.** Everything above is the headless platform and Wine. The
+   specific things worth checking on the guest, in order:
+   * that a click below `weston-terminal`'s bar no longer drags the window with
+     a real mouse — `scripts/wc-desktop.sh window` grew step **5c** for exactly
+     this, and it reads the compositor's own "handed a move to Windows" line;
+   * that typing into it works *after* that click, which is §37.7's open
+     question and the only one no instrument here can answer;
+   * and Firefox under both decoration arrangements. There are two independent
+     switches and they are worth naming separately, because §31 landing changed
+     what "both arrangements" means. `--decorations client|server` changes what
+     the **client** declares — Firefox's inset is `(26, 23)` under CSD and
+     `(0, 0)` under SSD — and that is the switch this bug lives on.
+     `FrameStyle::extend_top` changes what **Windows** does with the caption,
+     and §31 established that `to_surface` is the identity in both of *those*,
+     so it should be irrelevant here. "Should be" is the reason to run it: a
+     cheap cross-check of one section's conclusion by another section's harness
+     is worth more than either alone.
+
+   The one attempt failed in the arena locate (16377 of 16384 pages, a contended
+   sweep) before the client started, and the machine was then embargoed by its
+   owner. A deploy directory `C:\Users\<guest-user>\wcptr` is left on the guest; the
+   compositor that run started carried `--timeout 330` and has long since
+   exited.
+2. **Subsurfaces still route to the root.** `surface_and_origin` gives the
+   root surface's origin, and every pointer event goes to the toplevel's surface
+   with no hit test — `control.rs`'s header says so and it is unchanged. For a
+   client whose subsurfaces are children of one window that is correct, because
+   the client does its own routing; it is wrong the moment a subsurface has its
+   own geometry, and nothing here would notice.
+3. **Popups are trusted rather than measured.** A popup's position comes from
+   the positioner in the parent's window-geometry coordinates, which is the same
+   space the parent's pixels occupy, so the popup path was already right and is
+   untouched. Its *own* inset now goes through `content_offset` like any other
+   window's. Neither statement has a click behind it; `weston-terminal` opens no
+   menus and the WLCS popup tests do not declare insets.
+4. **No `wl_touch` measurement.** `touch_down` and `touch_motion` carried the
+   same wrong zero and now take the same origin from the same function, so the
+   fix is one call site rather than three expressions — which is §24's promise
+   that touch reuses the pointer's conversion, finally implemented as *reuse*.
+   But no touch event has been driven through a client that declares an inset
+   and reports what it received. The headless `--simulate-wm` gesture drives
+   `weston-eventdemo`, which binds `wl_touch` and prints nothing about it
+   (§24.6 says so), and there is no `--click` equivalent for a contact.
+5. **The scheduled-task *name* is still shared between worktrees.**
+   *(**Fixed** in `wc-desktop.sh` after this was written, by §33's author, whose
+   file it is: names are `wc-<DESKNAME>-<pid>-<what>`, `reaptasks.ps1` clears
+   this worktree's leftovers at both ends of a run, and both it and
+   `runint.ps1` apply the two checks below before removing anything. §16.8's
+   rule block has it as the eighth instance and states the general form. The
+   diagnosis below is unchanged and is the reason the fix has the shape it has —
+   it is left standing because routing a finding to the file's owner rather than
+   patching it in passing is what made one fix instead of two.)*
+   §33 made the
+   socket unique per run and the window selectable by pid, and `WC_DESKNAME`
+   has separated the binaries since §16.8 — but `runint.ps1` registers its task
+   as whatever `int`/`int_bg` was called with, and those names (`wccomp`,
+   `wcshot`, `wcwin`) are constants in the script. Every worktree therefore
+   registers `wccomp`, and `Register-ScheduledTask -Force` means the last run to
+   start silently redefines the others'. It is the same family as `wg-s8` and
+   `WaycomposeToplevel` and it is the one member still open.
+
+   Found by cleaning up rather than by failing: a `wccomp` was left `Ready` on
+   the guest pointing at this branch's deploy, from a run that started the
+   compositor with `int_bg` — which, unlike `int -Wait`, never unregisters.
+   Nothing broke, because a stale definition is inert and the next run
+   overwrites it. What it would cost is the case where two runs overlap and one
+   `Unregister-ScheduledTask`s a name the other is about to start. Removing a
+   task must therefore check that its `Actions.Execute` is under this run's
+   `DESKDIR` and that its `State` is not `Running`, which is what was done here
+   and is what the script does not yet do for itself.
+6. **A hazard found the hard way, and it is not about this bug.** `git stash` is
+   shared across every worktree of this repository. A plain `git stash pop` in
+   one worktree popped *another agent's* stash — 115 files from a branch this
+   one has never seen — and left the tree in conflict. Nothing was lost, because
+   a conflicted pop does not drop the stash, but the recovery was manual. Stash
+   by explicit ref (`git stash pop stash@{N}`) after reading `git stash list`,
+   or do not stash at all in a shared checkout.
+
 ---
+
 ## 38. Stage 38: the compositor learns where the screen is
 
 A user reported this:
