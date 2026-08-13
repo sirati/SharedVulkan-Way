@@ -9794,9 +9794,10 @@ passed 37/0 twice on identical trees, which is worse than failing because it
 teaches everyone to re-run until green; and 113 comments named the wrong design
 document, which had already landed three agents' sections in the wrong file
 during rebases. All four are fixed. `cargo test --workspace` on a tree that has
-never been built now reports **1211** — master's 1207 plus this section's four; `wc-proxy.sh` reports **50 passed, 0
-failed** where it reported 39, and **7 passed, 4 failed** against the 51x
-regression re-injected, naming it as 55.1x; every fixed `sleep` that guarded a
+never been built now reports **1211** — master's 1207 plus this section's four;
+`wc-proxy.sh` reports **54 passed, 0 failed** where it reported 39, and **7
+passed, 4 failed** against the 51x regression re-injected, naming it as 55.1x;
+every fixed `sleep` that guarded a
 *state* is a bounded wait that prints when it had to wait; and the sweep the
 second item asked for found eleven more numbers nobody was watching across seven
 other harnesses, including one script whose primary metric — the list of tests
@@ -9867,7 +9868,7 @@ here is why**.
 | rows in the table | `ok "six configurations measured"` whenever the file was non-empty | `== 6`, because a message stating a number the check does not verify is the same defect one level up |
 | microseconds per copy | printed | **informational, and labelled.** It is a rate on a machine running Xvfb, Wine, a compositor and a client at once; the same tree measured 37 us and 103 us for the same 244 KiB copy in one run |
 
-`wc-proxy.sh all` goes from **39 passed, 0 failed** to **50 passed, 0 failed**.
+`wc-proxy.sh all` goes from **39 passed, 0 failed** to **54 passed, 0 failed**.
 
 ### 31.4 The negative test: the 51x regression, re-injected
 
@@ -9892,6 +9893,31 @@ the defect exactly, and the finished gate says so:
 13.4 MiB per copy of a 244 KiB buffer, and 55.1x — the incident's own figures,
 arrived at independently by the gate rather than quoted from the report. The
 same tree at the same commit reported *37 passed, 0 failed* before this section.
+
+**And then the negative test found a fifth gate.** Putting the source back and
+running `cargo test --workspace` does *not* relink `target/debug/wc-proxy` —
+cargo builds test binaries — so the confirmation run afterwards reported the
+regression against a clean tree: twelve failures, every one of them a fact about
+a stale executable. That is this section's own defect one level down. The
+harness had an opinion about the numbers and none about **what produced them**;
+`[ -x "$LINUX_BIN/wc-proxy" ]` is a check that a file exists, which is not the
+same claim at all, and §18.8 says the neighbouring thing about clippy building
+metadata rather than an executable.
+
+`fresh()` now refuses to measure either binary if any `.rs`, `Cargo.toml` or
+`Cargo.lock` under `crates/` or `vendor/` is newer than it, in both the window
+leg and the cost leg — the cost table being the number this harness is trusted
+for. It fires on the exact condition that produced the false twelve:
+
+```
+== what a commit costs, per copy scope and per transport ==
+  FAIL  wc-proxy is older than crates/wc-compositor/src/platform/headless.rs
+        -- cargo build --workspace, or this run measures the previous tree
+== 0 passed, 1 failed ==
+```
+
+It is the only check here that was written because it had already caught
+something, which is the best reason a check can have.
 
 ### 31.5 Waiting for a state instead of sleeping past it
 
@@ -10049,7 +10075,7 @@ touched, because widening the blast radius was not what the change was for.
 | `cargo clippy --workspace --all-targets` (Linux) | clean but for the two pre-existing warnings |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean but for the pre-existing redundant redefinition in `sv-transport` |
 | `cargo build --workspace`, both targets | both, before the harness runs (§18.8) |
-| `scripts/wc-proxy.sh all` | **50 passed, 0 failed** (was 39) |
+| `scripts/wc-proxy.sh all` | **54 passed, 0 failed** (was 39) |
 | `scripts/wc-proxy.sh cost`, **51x regression re-injected** | **7 passed, 4 failed**, naming it as 55.1x |
 | `scripts/wc-input.sh linux` | 29 passed, 0 failed, unchanged, with the keymap sizes now asserted |
 | `scripts/wc-inhibit.sh` | PASS, and it finishes sooner: the 2 s sleep is now a wait that returns as soon as the sweep has run |
@@ -10077,3 +10103,7 @@ touched, because widening the blast radius was not what the change was for.
    the target-directory lock while tests execute. That was measured here and is
    not documented by cargo.
 5. **`scripts/*.sh` still say `docs/design.md`** — §31.7.
+6. **Only `wc-proxy.sh` refuses to measure a stale binary.** Every other harness
+   in `scripts/` checks that its binaries *exist* and not that they are newer
+   than the tree, and §31.4 is the demonstration that the difference is not
+   theoretical. `fresh()` is eleven lines and belongs in all of them.

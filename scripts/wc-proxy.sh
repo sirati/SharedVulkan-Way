@@ -132,6 +132,38 @@ start_x() {
   return 1
 }
 
+# fresh <binary> <what-to-run>
+#
+# **Refuse to measure a binary older than the tree it is supposed to be built
+# from.** This check exists because writing this file walked straight into what
+# it is guarding: the §27 fix was reverted to reproduce the 51x regression, the
+# source was put back, `cargo test --workspace` was run — which builds test
+# binaries and does *not* relink `target/debug/wc-proxy` — and the next harness
+# run reported the regression against a clean tree. Twelve failures, and every
+# one of them a fact about a stale executable.
+#
+# That is the same defect this whole section is about, one level down: the
+# harness had an opinion about the numbers and no opinion about *what produced
+# them*. `[ -x "$LINUX_BIN/wc-proxy" ]` is a check that the file exists, which
+# is not the same claim at all. §18.8 says the neighbouring thing about clippy
+# — it builds metadata, not an executable — and this is its other half.
+fresh() {
+  local bin=$1 how=$2 newer
+  if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
+    bad "no $bin -- $how"
+    return 1
+  fi
+  newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
+            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+            -newer "$bin" -print -quit 2>/dev/null)
+  if [ -n "$newer" ]; then
+    bad "$(basename "$bin") is older than ${newer#$ROOT/} -- $how, or this run measures the previous tree"
+    return 1
+  fi
+  ok "$(basename "$bin") is newer than every source file in the tree"
+  return 0
+}
+
 # wait_for <file> <extended-regex> <seconds> <what>
 #
 # Wait for a state to be *reported* rather than sleeping long enough that it
@@ -181,7 +213,7 @@ find_socket() {
 # one frame on a loaded machine, and that is a property of the load rather than
 # of the code.
 run_one() {
-  local tag=$1 client=$2 transport=$3 scope=$4 secs=$5 mindiff=${6:-0}
+  local tag=$1 client=$2 transport=$3 scope=$4 secs=$5 mindiff=${6:-0} shots=${7:-1}
   local dir="$RUNDIR/$tag"
   mkdir -p "$dir/rt" "$dir/frames"
   chmod 700 "$dir/rt"
@@ -268,7 +300,14 @@ run_one() {
   # before that and the screenshot assertions then measured the load. Bounded by
   # the client's own run length, so a client that never makes a window costs
   # nothing extra and fails in `check_common` where the diagnosis lives.
-  wait_for "$dir/srv.log" 'window .* created \(HWND' "$secs" "$tag: the window to be created" || true
+  #
+  # Only for the legs that photograph. The cost legs never look at a screenshot
+  # — `check_common` is not called for them — so waiting for a window there
+  # bought nothing and cost 16 s six times over, with a "gave up" line each
+  # time that trains a reader to ignore the notes. A wait nobody needs is
+  # noise, and noise is how a real one gets missed.
+  if [ "$shots" = 1 ]; then
+  wait_for "$dir/srv.log" 'window .* created \(HWND' $((secs + 10)) "$tag: the window to be created" || true
   # A beat for the client to paint into the window that now exists. This one
   # stays a `sleep` on purpose and it is a different kind of thing from the five
   # seconds it replaced: startup was the load-dependent part and is now waited
@@ -297,6 +336,7 @@ run_one() {
   done
   echo "$differ" >"$dir/differ"
   echo "$mindiff" >"$dir/mindiff"
+  fi
 
   wait "$cli" 2>/dev/null
   echo $? >"$dir/cli.rc"
@@ -479,10 +519,8 @@ check_common() {
 
 run_window() {
   echo "== the milestone: an unmodified third-party client, in a Windows window =="
-  for exe in wc-compositor.exe; do
-    [ -f "$WIN_BIN/$exe" ] || { bad "no $WIN_BIN/$exe -- cargo build --target x86_64-pc-windows-gnu first"; return; }
-  done
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy -- cargo build first"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build --workspace --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH -- required, see the header"; return; }
   command -v magick >/dev/null || { bad "imagemagick not on PATH -- required"; return; }
@@ -691,7 +729,10 @@ run_window() {
 
 run_cost() {
   echo "== what a commit costs, per copy scope and per transport =="
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  # The cost table is the number this harness is trusted for, so it is the last
+  # place that may be computed from a binary older than the tree. See `fresh`.
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || return
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build --workspace --target x86_64-pc-windows-gnu" || return
   command -v weston-presentation-shm >/dev/null \
     || { note "SKIP (weston-presentation-shm not installed)"; return; }
   start_x 94 || { bad "could not start Xvfb"; return; }
@@ -713,7 +754,7 @@ run_cost() {
   for transport in shared-file arena; do
     for scope in pool buffer damage; do
       local tag="cost-$transport-$scope"
-      run_one "$tag" weston-presentation-shm "$transport" "$scope" 6 || continue
+      run_one "$tag" weston-presentation-shm "$transport" "$scope" 6 0 0 || continue
       local line
       line=$(grep -o "[0-9]* commits, [0-9]* copies, [0-9.]* MiB in [0-9.]* ms" "$RUNDIR/$tag/proxy.log" | tail -1)
       local us kib
