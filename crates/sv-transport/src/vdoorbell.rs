@@ -204,8 +204,32 @@ pub fn serve_port<R: Read>(
             // stray byte take the doorbell down for the whole session.
             let Ok(ctrl) = RingCtrl::open(control, slot) else { continue };
             let Ok(bell) = ctrl.bell(lane) else { continue };
-            bell.ring_local();
+            // COUNT BEFORE RINGING, and the order is the whole of it.
+            //
+            // `ring_local` is what makes the wake observable: the waiter it
+            // releases can be scheduled, return from `park`, and read
+            // `Doorman::woken()` before this thread executes the next
+            // statement. With the increment *after* the ring, the counter is
+            // therefore allowed to read 0 in a waiter that has already been
+            // woken by it — which is not a doorbell defect but is
+            // indistinguishable from one at the assertion.
+            //
+            // Measured rather than reasoned about:
+            // `a_byte_on_the_port_wakes_a_waiter_that_no_futex_could_reach`
+            // passed 5 times out of 5 run alone and failed on both full
+            // `cargo test --workspace` runs, on `the doorman delivered no wakes
+            // at all` — while the two assertions *before* it, that the outcome
+            // was `Woken` and that it took under 500 ms, both passed. The wake
+            // plainly happened; only the count had not landed yet. Parallel
+            // load widens the window between these two lines, which is why the
+            // whole-workspace run is where it shows.
+            //
+            // Incrementing first is accurate: this thread has committed to
+            // delivering the wake and nothing between the two statements can
+            // fail. §35's shape — the failure mode of the *check*, not of the
+            // thing checked, and it made a shared gate red for everyone.
             woken.fetch_add(1, Ordering::Relaxed);
+            bell.ring_local();
         }
     }
 }

@@ -56,26 +56,50 @@ target/debug/sv-codegen gap        # from the registry: what the profile omits
 scripts/sv-cts.sh                  # from the suite: what a test actually asked for
 ```
 
-The first, measured 2026-08-13 against the zink profile:
+The first, measured 2026-08-13 against both profiles:
 
-| | count |
-|---|---|
-| commands defined for `vulkan` | 740 |
-| carried by the profile | 239 |
-| not carried | 501 |
-| …of those, unreachable by *any* profile | 23 |
+| | zink | full |
+|---|---|---|
+| commands defined for `vulkan` | 740 | 740 |
+| carried by the profile | 239 | **509** |
+| not carried | 501 | 231 |
+| …of those, unreachable by *any* profile | 23 | 23 |
 
 "Unreachable" means defined but required by nothing the registry supports for
 `vulkan` — a Vulkan SC command, or one behind a `disabled` extension. No profile
 can reach them, so they are counted and not listed.
 
-The 478 that remain are grouped by **the extension or core version that
-introduces each**, because that is the unit a profile is edited in: nobody adds
-`vkCmdTraceRaysKHR`, they add `VK_KHR_ray_tracing_pipeline`. The largest entries
-are `VK_EXT_extended_dynamic_state3` (31), `VK_KHR_device_address_commands` (22),
-`VK_KHR_acceleration_structure` (16), `VK_EXT_opacity_micromap` (14) and
-`VK_KHR_video_queue` (12); `VK_BASE_VERSION_1_4` contributes 6, which is the
-whole of what "core 1.0–1.3" costs.
+`zink` is still the default and is the Zink requirement set (design.md §11).
+`full` is core 1.0–1.4 plus **every extension the registry supports for `vulkan`
+with no `platform=`**, less a fourteen-entry exclusion list with a reason per
+line — a rule rather than a 304-name list, because a list that long is not
+reviewable and goes stale the day the registry moves. `SV_PROTO_PROFILE=full`
+builds the whole stack against it. design.md §0.19.
+
+The remainder is grouped by **the extension or core version that introduces
+each**, because that is the unit a profile is edited in: nobody adds
+`vkCmdTraceRaysKHR`, they add `VK_KHR_ray_tracing_pipeline`. Under `full` the
+largest entries are `VK_KHR_acceleration_structure` (16), `VK_EXT_opacity_micromap`
+(14), `VK_ARM_data_graph` (11), `VK_EXT_descriptor_buffer` (11) and
+`VK_EXT_descriptor_heap` (10). Core 1.4 is carried in full; `VK_KHR_swapchain`'s
+nine are implemented app-side and never cross (§10).
+
+**Two of those entries are one generator gap each, not a scope decision**, and
+they are what the remaining count mostly is: a `void*` whose extent is a device
+property rather than a `len=` (the capture-replay class), and a union with a
+handle in an arm whose live arm a sibling decides (the `noautovalidity` gap that
+`sv_codegen::exceptions::SIBLING_SELECTED` already closes one level in). Closing
+the second is worth 43 commands on its own. design.md §0.19 item 4.
+
+A third command answers "what does an *uncarried* command do?", which is not the
+same question and had a surprising answer — 501 are **absent**, which is what a
+conforming implementation should do, and six were **silently** wrong, which is
+the bug that was actually there:
+
+```
+target/debug/sv-codegen --icd-entry   # the C surface, and what it refused
+target/debug/sv-codegen --audit       # per extension: can the generator carry it?
+```
 
 **A count of missing commands is not a list of missing capability**, which is
 why the second command exists. `scripts/sv-cts.sh` runs the conformance suite

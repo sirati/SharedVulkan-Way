@@ -447,14 +447,20 @@ is inert for a profile that does not reach it.
 ## 5. Firefox, and the gap that is not where it was
 
 > **This whole section reads mozilla-central's tip, and the Firefox this project
-> deploys is 151.0.2, which predates every line of it.** Checked against the
-> binary in `design.md` §0.17: `libxul.so` contains no `FFmpegVulkanVideoDecoder`,
-> no `media.hardware-video-decoding-vulkan.enabled` and no
-> `AV_HWDEVICE_TYPE_VULKAN`. So §5a and §5b below are correct and are about a
-> browser that is not installed here — 151's only hardware decode paths are
-> VA-API and V4L2, both of which want a DRM node the host does not have. Keep
-> the section: it is the analysis that becomes load-bearing the day this
-> deployment moves to 153. Do not quote it as a fact about what is running.
+> *deploys* is 151.0.2, which predates every line of it.** Checked against the
+> binary in `design.md` §0.17: 151's `libxul.so` contains no
+> `FFmpegVulkanVideoDecoder` and no `media.hardware-video-decoding-vulkan.enabled`,
+> so its only hardware decode paths are VA-API and V4L2. Do not quote §5a as a
+> fact about what is currently running.
+>
+> **Do quote it as a fact about what is one flake bump away.** §0.17 also
+> measures `firefox-bin` **153.0.4** out of current `nixpkgs-unstable` — prebuilt,
+> no compile — which has all four symbols, grows an
+> `about:support` row `HARDWARE_VIDEO_DECODING_VULKAN available`, and logs
+> `VulkanDeviceHolder: created shared VkDevice`. So §5a and §5b are the right
+> analysis of the browser we would get, and the reason they are not yet the
+> binding constraint is §6 below: a forwarded device offers no `VIDEO_DECODE`
+> queue family, so decode is refused before any of §5a's two output paths runs.
 
 **The phase-2 research's answer here is out of date, and the correction goes in
 Firefox's favour.** It recorded that Firefox uses VA-API on Linux, that its

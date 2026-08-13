@@ -423,6 +423,51 @@ impl SharedVulkan {
         // (`vk_registry::profile::zink`). If the driver over there lacks it
         // entirely, that is a driver we cannot present through, and it will say
         // so at the first barrier rather than here.
+        // The third term of the intersection, and the one that was missing.
+        //
+        // The GPU side answers "the profile, intersected with what my driver
+        // has". Both halves of that can be true of an extension whose entry
+        // points this build never generated — the generator refuses a command
+        // whose reply it cannot shape, and the refusal lands in
+        // `sv_icd_entry::NOT_IMPLEMENTED` rather than in the profile. So the
+        // answer arriving over the wire is "the device supports it", not "it
+        // works", and design.md §9.2 asks for the second.
+        //
+        // Concretely: this is what stops `VK_KHR_buffer_device_address` being
+        // advertised while `vkGetBufferDeviceAddress` returns a silent zero.
+        // Nothing here decides *whether* to implement it — `sv-worktrees/cts2`
+        // owns that — it decides not to promise it until something does.
+        out.retain(|(n, _)| sv_icd_entry::INCOMPLETE_EXTENSIONS.binary_search(n).is_err());
+
+        // **`VK_KHR_swapchain` is added here rather than intersected**, and that
+        // is a correction to design.md §0.4 item 8 rather than an exception to
+        // it. §0.4's rule — the list is "the profile's extensions intersected
+        // with what the driver actually has, and only the side holding the
+        // driver knows the second half" — is right for every extension whose
+        // commands are *forwarded*. This one's commands are not: the whole of
+        // `VK_KHR_swapchain` is implemented in [`crate::wsi`], out of ordinary
+        // Vulkan the GPU side never learns is a swapchain. §9.2 says an
+        // extension in this list is a promise its entry points work, and the
+        // side that keeps that promise here is this one.
+        //
+        // The GPU-side driver still has to *enable* it — an application
+        // transitions a swapchain image to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`,
+        // and that layout does not exist on a device that did not — which is
+        // why it is in the profile the GPU side enables from
+        // (`vk_registry::profile::zink`). If the driver over there lacks it
+        // entirely, that is a driver we cannot present through, and it will say
+        // so at the first barrier rather than here.
+        //
+        // **It goes after the filter, not before, and that ordering is the whole
+        // of a regression this section caused and caught.** `VK_KHR_swapchain`
+        // is in `INCOMPLETE_EXTENSIONS` — `vkAcquireNextImage2KHR` and the three
+        // device-group present queries are stubs, and have always been — so
+        // adding it first and filtering second removed presentation from the
+        // advertised set. `vulkaninfo` through the forwarder went from 218
+        // device extensions to 217 and the missing one was the extension every
+        // windowed application requires. The filter answers "did the *generator*
+        // keep the promise"; this line answers "did `crate::wsi`", and those are
+        // different questions about different code.
         if !out.iter().any(|(n, _)| *n == "VK_KHR_swapchain") {
             out.push(("VK_KHR_swapchain", 70));
         }

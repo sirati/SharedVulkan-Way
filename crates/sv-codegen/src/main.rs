@@ -15,6 +15,7 @@ fn main() -> Result<()> {
     let mut icd_entry = false;
     let mut gpu_entry = false;
     let mut gap = false;
+    let mut audit = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -28,6 +29,7 @@ fn main() -> Result<()> {
             "--icd-entry" => icd_entry = true,
             "--gpu-entry" => gpu_entry = true,
             "--gap" | "gap" => gap = true,
+            "--audit" | "audit" => audit = true,
             "--check-determinism" => check_determinism = true,
             "--stats" => stats_only = true,
             "--list-profiles" => {
@@ -66,6 +68,70 @@ fn main() -> Result<()> {
     // missing command, because that is the unit a profile is edited in: nobody
     // adds `vkCmdTraceRaysKHR`, they add `VK_KHR_ray_tracing_pipeline`. A flat
     // list of 500 names would be true and useless.
+    // Which extensions the generator can actually carry, asked one at a time.
+    //
+    // Widening a profile is cheap when it works and opaque when it does not:
+    // adding thirty extensions at once and getting one error tells you about
+    // one of them. This asks the question per extension — resolve, plan the
+    // wire, plan the C ABI — and prints a verdict per line, so the profile can
+    // be edited from a list of facts rather than by bisecting a build failure.
+    //
+    // Emission is deliberately skipped. Every failure this project has hit came
+    // from `plan::build` (a type whose layout the registry does not state) or
+    // from `abi::build` (an `Opaque` used by value); nothing has ever failed for
+    // the first time inside `prettyplease`, and skipping it turns a ten-minute
+    // audit into a twenty-second one.
+    if audit {
+        let registry = vk_registry::Registry::load()?;
+        let model = registry.model()?;
+        let already: std::collections::BTreeSet<&str> =
+            profile.extensions.iter().map(String::as_str).collect();
+
+        let mut ok = Vec::new();
+        let mut bad: Vec<(String, String)> = Vec::new();
+        for ext in &model.extensions {
+            if !ext.supported_for_vulkan || already.contains(ext.name.as_str()) {
+                continue;
+            }
+            let mut p = profile.clone();
+            p.name = format!("{}+{}", profile.name, ext.name);
+            p.extensions.push(ext.name.clone());
+            let verdict = (|| -> Result<()> {
+                let resolved = p.resolve(&model)?;
+                let wire = sv_codegen::plan::build(&model, &resolved)?;
+                let _ = wire;
+                let forwarded: std::collections::BTreeSet<String> =
+                    resolved.commands.iter().cloned().collect();
+                let surface = sv_codegen::abi::surface_profile(&p);
+                sv_codegen::abi::build(&model, &surface, &forwarded)?;
+                Ok(())
+            })();
+            let platform = ext.platform.clone().unwrap_or_default();
+            match verdict {
+                Ok(()) => ok.push((ext.name.clone(), platform)),
+                Err(e) => {
+                    // One line. The chain's root is the fact; the context above
+                    // it is just "resolving profile zink+X", which the name
+                    // already says.
+                    let root = e.chain().last().map(|c| c.to_string()).unwrap_or_default();
+                    bad.push((ext.name.clone(), root.replace('\n', " ")));
+                }
+            }
+        }
+        println!("base profile          {}", profile.name);
+        println!("carryable             {}", ok.len());
+        println!("not carryable         {}", bad.len());
+        println!();
+        for (name, platform) in &ok {
+            let p = if platform.is_empty() { String::new() } else { format!(" [{platform}]") };
+            println!("ok    {name}{p}");
+        }
+        for (name, why) in &bad {
+            println!("FAIL  {name}: {why}");
+        }
+        return Ok(());
+    }
+
     if gap {
         let registry = vk_registry::Registry::load()?;
         let model = registry.model()?;
