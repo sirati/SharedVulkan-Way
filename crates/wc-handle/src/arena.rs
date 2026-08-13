@@ -883,6 +883,86 @@ pub fn attached() -> Vec<(u32, usize, String)> {
     out
 }
 
+/// Give a guest-RAM region back to the operating system.
+///
+/// DYNAMIC ARENA, and this is the half of release that actually returns
+/// memory. The host side unmapping its view of a region frees nothing: the
+/// pages are the *guest's*, committed and pinned by this process, and they stop
+/// being charged to anybody only when this process releases them.
+///
+/// # What actually happens
+///
+/// Dropping the registry entry drops the last `Arc` on the region's
+/// `LockedRegion`, whose `Drop` is `VirtualFree(base, 0, MEM_RELEASE)` —
+/// already written, already the thing that runs at process exit. All this does
+/// is make it run earlier, on purpose. `VirtualLock`'s working-set charge goes
+/// with it, which is why [`committed_bytes`] moves and not merely some counter
+/// of ours.
+///
+/// # Three refusals
+///
+/// * **Not provided.** An arena this process merely *opened* is somebody
+///   else's memory; releasing it would unmap a view and free nothing, while
+///   looking like it worked.
+/// * **The outbound window's arena.** Those bytes are keymaps and clipboard
+///   offers already handed to clients, live in their hands
+///   (`one-binary.md` §3.1a). This is the same exemption the host side makes by
+///   never reclaiming the startup region, made again on the side that owns the
+///   pages, because an invariant enforced on one side only is enforced nowhere.
+/// * **Unknown id.** Loud, because the alternative is a caller that believes it
+///   released something.
+///
+/// Returns the bytes released.
+pub fn release_guest_ram(arena: u32) -> io::Result<u64> {
+    let mut guard = registry()
+        .write()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?;
+    let Some(a) = guard.get(&arena) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("arena {arena} is not attached, so it cannot be released"),
+        ));
+    };
+    if !a.provided {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "arena {arena} was opened, not provided: these are not this process's \
+                 pages and releasing them would free nothing while looking like it worked"
+            ),
+        ));
+    }
+    if outbound().is_some_and(|w| w.arena == arena) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "arena {arena} carries the outbound window: those bytes are objects \
+                 already handed to clients and are live in their hands"
+            ),
+        ));
+    }
+    let len = a.len as u64;
+    // The `Arc` in the map is the last one for a provided region — nothing
+    // hands these out — so removing it runs `LockedRegion::drop`, which is the
+    // `VirtualFree(MEM_RELEASE)`.
+    guard.remove(&arena);
+    Ok(len)
+}
+
+/// This process's working set, in bytes, as the operating system accounts it.
+///
+/// The evidence that release worked, and it is deliberately **the platform's
+/// own number rather than one of ours**. A log line saying "released 16 MiB" is
+/// this code agreeing with itself; a working set that falls by 16 MiB is
+/// Windows agreeing.
+///
+/// The working set specifically, because that is what a `VirtualLock`ed arena
+/// is charged against (§10.10's quota) and what "Firefox is using 1.2 GB" is
+/// read off. `None` where the platform has no answer worth giving.
+pub fn committed_bytes() -> Option<u64> {
+    platform::working_set_bytes()
+}
+
 /// Where a region the peer grew into can be found, on the file fixture.
 ///
 /// DYNAMIC ARENA, and the narrowness is the point. A growing arena means the
@@ -1320,5 +1400,69 @@ mod tests {
             len: 16,
         });
         assert_eq!(h.map().unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    /// DYNAMIC ARENA. Committing a guest-RAM region raises this process's
+    /// working set, and releasing it brings it back down — measured by the
+    /// operating system, not by our own counter.
+    ///
+    /// This is the claim the user actually cares about: "using 1.2 GB for
+    /// Firefox is a lot". A log line saying we released is this code agreeing
+    /// with itself. A working set that falls is the platform agreeing.
+    ///
+    /// 64 MiB, because the noise floor of a process's working set under a
+    /// contended machine is a few MiB and the signal has to clear it. The
+    /// assertion is deliberately loose — at least half the region comes back —
+    /// because the allocator, the test harness and the page cache all move this
+    /// number a little and a tight bound would be a flake rather than a check.
+    #[test]
+    fn releasing_a_region_returns_the_pages_to_the_operating_system() {
+        const LEN: u64 = 64 << 20;
+        let Some(before) = committed_bytes() else {
+            eprintln!("no working-set accounting on this platform; nothing to assert");
+            return;
+        };
+        // An id nothing else in this process uses; the registry is global.
+        let id = 9_412;
+        let region = match attach_guest_ram(id, LEN) {
+            Ok(r) => r,
+            // Pinning needs a working-set quota and the machine may refuse it.
+            // A test that cannot commit has measured nothing and says so rather
+            // than failing, exactly as the guest-RAM path itself does.
+            Err(e) => {
+                eprintln!("could not commit {LEN} bytes of guest RAM here: {e}");
+                return;
+            }
+        };
+        let held = committed_bytes().expect("accounting worked a moment ago");
+        assert!(
+            held > before + LEN / 2,
+            "committing {LEN} bytes should show up: {before} -> {held}"
+        );
+        // `GuestRegion` is a `Copy` descriptor, not the mapping — the pages are
+        // held by the registry, and `release_guest_ram` below is what frees them.
+        let _ = region;
+
+        let freed = release_guest_ram(id).expect("a provided region can be released");
+        assert_eq!(freed, LEN);
+        let after = committed_bytes().expect("accounting worked a moment ago");
+        assert!(
+            after + LEN / 2 < held,
+            "releasing {LEN} bytes should give them back: {held} -> {after}"
+        );
+    }
+
+    /// An arena this process merely opened is somebody else's memory, and
+    /// releasing it would unmap a view and free nothing while looking like it
+    /// worked.
+    #[test]
+    fn only_a_region_this_process_provided_may_be_released() {
+        let e = release_guest_ram(9_413).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
     }
 }

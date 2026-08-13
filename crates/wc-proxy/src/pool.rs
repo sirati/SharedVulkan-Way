@@ -1900,7 +1900,7 @@ impl Arena {
             // bounding, and the cap is what bounds the overshoot in exchange.
             let step = a
                 .grow_step
-                .saturating_mul(1u64 << u32::from(a.grown).min(2))
+                .saturating_mul(1u64 << a.grown.min(2))
                 .min(GROW_STEP_CAP.max(a.grow_step));
             (a.next_id, want.max(step))
         };
@@ -2771,7 +2771,7 @@ mod tests {
         let mut total = 0u64;
         let mut n = 0u32;
         while total < need {
-            total += (GROW_STEP << u32::from(n).min(2)).min(GROW_STEP_CAP);
+            total += (GROW_STEP << n.min(2)).min(GROW_STEP_CAP);
             n += 1;
         }
         assert_eq!(n, 14, "fourteen locates to reach 768 MiB, not forty-eight");
