@@ -2,7 +2,7 @@
 //!
 //! # The measurement this exists because of
 //!
-//! docs/design.md §13.8. On the guest, with 40 samples each:
+//! docs/waycompose-design.md §13.8. On the guest, with 40 samples each:
 //!
 //! ```text
 //!   Sleep(0)    0.000 ms      Sleep(1)   15.813 ms

@@ -103,7 +103,7 @@ pub fn run(config: Config) -> ExitCode {
     //
     // One section holding two buffers back to back. On Windows this is a named
     // kernel object, and what crosses the socket is its *name*, in band
-    // (docs/design.md §2.3).
+    // (docs/waycompose-design.md §2.3).
     //
     // The handle is held for the whole run, and that is not tidiness. A Windows
     // section with no open handles is destroyed and its name freed, so dropping

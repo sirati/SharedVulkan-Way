@@ -26,7 +26,7 @@
 //! itself allocating from. Taking one means the client's next `new_id` is a
 //! duplicate and the compositor kills the connection. The alternative —
 //! renumbering every object id in both directions — would put a rewrite in
-//! front of every message in the protocol to save a socket, and docs/design.md
+//! front of every message in the protocol to save a socket, and docs/waycompose-design.md
 //! §9.3 is explicit that not understanding most messages is what makes this
 //! program small enough to trust.
 //!
@@ -38,7 +38,7 @@
 //! # This speaks the compositor's dialect, and carries no descriptors
 //!
 //! The far end is the Windows compositor, so the wire is the in-band-`h`
-//! dialect of docs/design.md §2.3. Nothing here sends an `h` in either
+//! dialect of docs/waycompose-design.md §2.3. Nothing here sends an `h` in either
 //! encoding: an icon is a few kilobytes of array argument, so the question of
 //! how a descriptor would cross does not arise. That is the point of the
 //! protocol having been designed as bytes rather than as `wl_buffer`s.

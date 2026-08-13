@@ -433,7 +433,7 @@ pub struct Layout {
 /// `xkb_keymap_new_from_names` resolves RMLVO names against the
 /// xkeyboard-config data tree — ~2,000 files of X11 configuration that does not
 /// exist on Windows and that this project deliberately does not ship
-/// (docs/design.md §7.2). Only `xkb_keymap_new_from_string` works there, so the
+/// (docs/waycompose-design.md §7.2). Only `xkb_keymap_new_from_string` works there, so the
 /// names have to be resolved on a machine that has the tree, which is the build
 /// machine. Weston's RDP backend does the same thing for the same reason.
 ///

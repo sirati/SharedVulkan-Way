@@ -6,7 +6,7 @@
 //! created it, and the pump is a blocking `GetMessage` loop. The Wayland side
 //! is a `poll`-shaped dispatch loop that on Windows cannot be nested inside
 //! `calloop`, because `Backend::poll_fd()` returns a wepoll handle and a wepoll
-//! handle is not a socket (docs/design.md §3.3). Two blocking loops, neither of
+//! handle is not a socket (docs/waycompose-design.md §3.3). Two blocking loops, neither of
 //! which can host the other, is two threads; that was settled in stage 1 and
 //! this stage is where it has to be built.
 //!
@@ -170,7 +170,7 @@ pub enum Edge {
 ///
 /// Stage 11 is where something started sending it: `xdg-toplevel-icon-v1` from
 /// a client that implements it, or `wc_icon_manager_v1` from a resolver on the
-/// Linux side for one that does not (docs/design.md §15).
+/// Linux side for one that does not (docs/waycompose-design.md §15).
 #[derive(Clone, Debug)]
 pub struct IconImage {
     pub width: i32,
@@ -181,7 +181,7 @@ pub struct IconImage {
 
 /// What the pointer should look like.
 ///
-/// ADDED FOR STAGE 12 (docs/design.md §23). One message for both halves of the
+/// ADDED FOR STAGE 12 (docs/waycompose-design.md §23). One message for both halves of the
 /// protocol, because Win32 has one mechanism: `wl_pointer.set_cursor` sends a
 /// surface and `wp_cursor_shape_v1.set_shape` sends a name, and both end as a
 /// single `SetCursor` with a single `HCURSOR`.

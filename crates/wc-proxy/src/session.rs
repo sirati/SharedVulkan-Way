@@ -4,7 +4,7 @@
 //! bytes and descriptors out", which is what lets the whole translation —
 //! including the pool path that is the point of the stage — be driven by tests
 //! rather than only by a running compositor. `wc-shmclient` was split the same
-//! way in stage 3 and for the same reason (docs/design.md §8.9): the encoding
+//! way in stage 3 and for the same reason (docs/waycompose-design.md §8.9): the encoding
 //! is the part most likely to be quietly wrong and it is testable without a
 //! socket, so it lives where the tests can reach it.
 //!
@@ -112,7 +112,7 @@ impl ClientMap {
         // the object's real size on every resize, which closes the case a
         // cooperative client can produce; a hostile one can still do it and
         // this proxy would die where libwayland-server would recover. Recorded
-        // in docs/design.md §9 as an unclosed gap rather than hidden here.
+        // in docs/waycompose-design.md §9 as an unclosed gap rather than hidden here.
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 
@@ -183,7 +183,7 @@ struct Pool {
     /// client's behalf and is waiting for the compositor's `delete_id` before
     /// it dares hand the bytes to anybody else. See [`Session::reclaim_for`].
     ///
-    /// The wait is docs/design.md §2.5's rule and not caution: the compositor
+    /// The wait is docs/waycompose-design.md §2.5's rule and not caution: the compositor
     /// may be mid-render out of the region, and the acknowledgement is the only
     /// moment at which it provably is not.
     teardown: bool,
@@ -422,7 +422,7 @@ pub struct Stats {
     /// A number worth having on its own rather than folded into
     /// `pools_released`, because the two answer different questions: released
     /// is what the client returned, reclaimed is what it did not, and
-    /// docs/design.md §17.8 measured that the second is where nearly all the
+    /// docs/waycompose-design.md §17.8 measured that the second is where nearly all the
     /// guest's memory is.
     pub pools_reclaimed: u64,
     /// STAGE 16. Pools rebuilt upstream after being reclaimed, because the
@@ -530,7 +530,7 @@ pub enum Error {
     /// The object's interface is unknown, so the message cannot be walked.
     /// **Fatal**, and deliberately so: forwarding a message whose shape is
     /// unknown is how a stream desynchronises silently, which is the one
-    /// failure docs/design.md §2.4 says must never be allowed to happen
+    /// failure docs/waycompose-design.md §2.4 says must never be allowed to happen
     /// quietly.
     UnknownObject { id: u32, opcode: u16 },
     /// The opcode is outside the interface's table.
@@ -670,7 +670,7 @@ pub struct Session {
     /// Off by default and never on in a real run: it reads the whole extent
     /// every commit, which is the cost `CopyScope::Damage` exists to avoid.
     /// That makes it an instrument for correctness and not for cadence, and
-    /// docs/design.md §13.8's retraction is the reason to write that down: an
+    /// docs/waycompose-design.md §13.8's retraction is the reason to write that down: an
     /// instrument inside the loop being timed produced a 2x that was really
     /// 1.03x. Nothing here may be used to time anything.
     verify: bool,
@@ -880,7 +880,7 @@ impl Session {
                     return Ok(out);
                 }
             }
-            // **Do not free the region here**, and this is docs/design.md
+            // **Do not free the region here**, and this is docs/waycompose-design.md
             // §2.5's lifetime rule arriving from the direction it warns about:
             //
             // > "Sending a descriptor transfers nothing… a sender that drops
@@ -1032,7 +1032,7 @@ impl Session {
     /// because the obvious design is wrong.
     ///
     /// A shared region cannot grow once the peer has mapped it. A Windows
-    /// section's size is fixed at `CreateFileMappingW` time (docs/design.md
+    /// section's size is fixed at `CreateFileMappingW` time (docs/waycompose-design.md
     /// §2.5) and an arena slice's neighbours are already allocated, so the only
     /// ways to honour `wl_shm_pool.resize` are to over-allocate up front, or to
     /// re-key the pool onto a new object — which the protocol gives no way to
@@ -1057,7 +1057,7 @@ impl Session {
     /// # STAGE 16: what happens when there is no room, which used to be death
     ///
     /// The old version of this function noted the failure and moved on, and
-    /// docs/design.md §17.8 described the consequence as "the client's window
+    /// docs/waycompose-design.md §17.8 described the consequence as "the client's window
     /// stops updating". **That was wrong, and §20.2 is the correction.** An
     /// unannounced pool is an object the compositor does not have; the very
     /// next `wl_shm_pool.create_buffer` was forwarded to it anyway, and a
@@ -1183,7 +1183,7 @@ impl Session {
     /// Take back the guest's memory from pools nothing is using, until `needed`
     /// bytes have been promised.
     ///
-    /// # STAGE 16, and it is the answer to docs/design.md §17.10 item 1
+    /// # STAGE 16, and it is the answer to docs/waycompose-design.md §17.10 item 1
     ///
     /// §15.11 proposed releasing a pool when its last buffer dies. §17.8 then
     /// measured what that would be worth against the client it was designed
@@ -2054,7 +2054,7 @@ fn materialise(
         // Detected by the prefix rather than by a flag, because the prefix is
         // what `wc_handle::platform::random_section_name` puts there on Windows
         // and it is the only thing in the descriptor that distinguishes the two
-        // cases. See docs/design.md §11.2.
+        // cases. See docs/waycompose-design.md §11.2.
         Descriptor::Section { name, .. } if name.starts_with("Local\\") || name.starts_with("Global\\") => {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

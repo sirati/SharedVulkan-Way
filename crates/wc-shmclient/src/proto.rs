@@ -2,7 +2,7 @@
 //!
 //! Compiled on both platforms even though only the Windows build can use it,
 //! for one reason: **`cargo test` cannot run for the Windows target**
-//! (docs/design.md §4.1), so anything that lives only behind `cfg(windows)` is
+//! (docs/waycompose-design.md §4.1), so anything that lives only behind `cfg(windows)` is
 //! checked by the compiler and by nothing else. The encoding is the part of
 //! this client most likely to be quietly wrong — a byte of padding, a size
 //! field counted from the wrong place — and it is testable without a socket,
@@ -111,7 +111,7 @@ pub fn message(object: u32, opcode: u16, args: &[u32]) -> Vec<u8> {
 /// 4-byte boundary.
 ///
 /// **This is also exactly how an `h` argument is encoded on Windows.** The
-/// entire deviation of docs/design.md §2.3 is that one sentence, and this is
+/// entire deviation of docs/waycompose-design.md §2.3 is that one sentence, and this is
 /// the function that implements it on the client side.
 pub fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn an_h_argument_is_encoded_exactly_like_an_array() {
-        // The claim of docs/design.md §2.3, as a test. A 20-byte descriptor
+        // The claim of docs/waycompose-design.md §2.3, as a test. A 20-byte descriptor
         // occupies 4 bytes of length plus 20 of payload; 20 is already a
         // multiple of 4, so nothing is padded.
         let descriptor = [0xABu8; 20];

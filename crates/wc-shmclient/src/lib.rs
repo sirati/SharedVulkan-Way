@@ -4,7 +4,7 @@
 //! # Why this has to exist, and why that is a cost rather than a choice
 //!
 //! Stage 2 established the most expensive fact in this project
-//! (docs/design.md §7.5): **no third-party Wayland client can send a buffer to
+//! (docs/waycompose-design.md §7.5): **no third-party Wayland client can send a buffer to
 //! the Windows build.** An `h` argument travels out-of-band by `SCM_RIGHTS` on
 //! Unix and in-band as a length-prefixed descriptor on Windows (§2.3); Wine's
 //! AF_UNIX carries no ancillary data; so the first `wl_shm.create_pool` from a
@@ -52,7 +52,7 @@
 //!
 //! # Why this is a library and not only a binary
 //!
-//! Because `cargo test` cannot run for the Windows target (docs/design.md
+//! Because `cargo test` cannot run for the Windows target (docs/waycompose-design.md
 //! §4.1). Everything about *what bytes* go on the wire lives in [`proto`],
 //! which builds on both platforms and is unit-tested on the one where tests
 //! run; only the socket and the loop are behind `cfg(windows)`. Without that

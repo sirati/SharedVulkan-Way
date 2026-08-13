@@ -9,7 +9,7 @@
 //! is an **unmodified** third-party client.
 //!
 //! To the compositor this is an ordinary client of ours: the same byte stream
-//! `wc-shmclient` speaks, with `h` arguments in band (docs/design.md §2.3).
+//! `wc-shmclient` speaks, with `h` arguments in band (docs/waycompose-design.md §2.3).
 //!
 //! # Why `SCM_RIGHTS` on one side is not a violation of the rule
 //!
@@ -97,7 +97,7 @@ impl Listener {
     /// ADDED FOR STAGE 13, for one purpose: finding where the client's own
     /// application is installed, so its icon can be resolved from its own
     /// package prefix rather than from whatever happens to be in
-    /// `XDG_DATA_DIRS` (`icons::dirs_for_pid`, and docs/design.md §18.5).
+    /// `XDG_DATA_DIRS` (`icons::dirs_for_pid`, and docs/waycompose-design.md §18.5).
     ///
     /// `SO_PEERCRED` is a property of the socket the kernel filled in at
     /// `connect` time; it cannot be forged by the client and it costs one
