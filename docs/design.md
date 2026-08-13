@@ -6719,3 +6719,319 @@ rates.
    adjustments can be honoured (§18.10 item 2). This is the same missing fact as
    §15.15 item 3 — nothing asks Windows how big anything is — and the two should
    be answered together.
+
+## 27. Stage 14: the damage a client reports is not the damage a *copy* needs
+
+### 27.1 Status in one paragraph
+
+**The user's clause is three symptoms and they are not one bug.** "Screen must
+not tear or stop rendering of scrolling no blank slides (e.g. in about:support)"
+— the tearing was §18's incoherent virtio-fs export and is fixed; the stopping
+did not reproduce and there is a number saying so; the blank regions were a
+real, separate defect in `wc-proxy`, present in every guest run since stage 4,
+and invisible to every harness this project has. `wl_surface.damage` is defined
+against the **surface** — what changed on screen since the last commit — and
+`wc-proxy` was spending it against a **buffer**, of which a scrolling Firefox
+has three. Everything the surface changed while some other buffer was on screen
+was never copied into the region, and a buffer the client had just allocated was
+copied only where the client happened to damage it, so the rest of it was
+whatever the region held before, which for a fresh arena is zeroes. Measured on
+a real Firefox scrolling `about:support` through Wine: **3 commits in 1509 left
+the region stale, the worst of them by 900 rows of a 900-row window** — the
+whole client area, showing nothing. After the fix, 1628 of 1628 commits match,
+and the run copies **2.05x fewer bytes** than it did before.
+
+### 27.2 What the reported damage means, and what a copying proxy needs instead
+
+The protocol sentence is short and the consequence is not. `wl_surface.damage`
+is "the region where the client has updated the contents **relative to the
+previous content of the surface**". Not relative to the previous content of the
+buffer being attached — relative to what was on screen.
+
+For a compositor that reads the client's buffer directly the two are
+interchangeable, and that is why the definition is written the way it is: the
+attached buffer is required to hold the whole current surface content, so
+"what changed on the surface" is exactly the set of pixels the compositor has to
+re-read. Nothing else in the buffer can have changed, because nothing else in
+the surface did.
+
+`wc-proxy` does not read the client's buffer. It keeps a **copy** of it, in a
+region the compositor across the boundary can map, and the copy is per buffer
+because the pool it copies is per buffer. So the question it has to answer is a
+different one: *which bytes of this buffer differ from my copy of this buffer* —
+and the client never answers that question, because no compositor has ever
+needed to ask it.
+
+The gap is one buffer cycle wide. Take a double-buffered client:
+
+| frame | attaches | client wrote into it | proxy copied |
+|-------|----------|----------------------|--------------|
+| n-1   | A        | the whole surface    | D(n-1)       |
+| n     | B        | the whole surface    | D(n)         |
+| n+1   | A        | the whole surface    | D(n+1)       |
+
+At frame n, the proxy's copy of B is correct everywhere except D(n-1) minus
+D(n) — the region that changed while A was on screen. The client has that region
+right in B; it wrote it there, because it had to. It simply never mentions it,
+because on screen it changed a frame ago. And it never will mention it: damage
+is not re-sent.
+
+That is a stale band per frame, growing with the buffer count, on exactly the
+content that is changing — which is why scrolling is where it shows and a static
+page is where it does not.
+
+### 27.3 The other half, which is the one Firefox actually hit
+
+There is a second case in the same shape and it is the one that produced the
+900-row measurement. A buffer the client has just created has *no* copy in the
+region. Its bytes there are whatever was there before — for the file transport,
+the previous pool's; for a freshly truncated arena, zeroes. If the client
+attaches it and damages only part of it, the proxy copies only that part and the
+rest of the window is that stale nothing.
+
+The old code believed it handled this. Its comment said so:
+
+> But the *first* commit of a buffer has nothing in the region yet, so a buffer
+> whose extent has never been copied is copied whole regardless of what the
+> client said.
+
+The code under the comment only did that when the damage list was **empty**:
+
+```rust
+if damage.is_empty() {
+    copy_extent(src, dst, &info, usable)   // "first commit" -- but only if silent
+} else {
+    copy_damage(src, dst, &info, &damage, usable)
+}
+```
+
+A first commit *with* damage — which is what a client does when it allocates a
+buffer to draw a partial update into — took the other branch. §14.9's pattern,
+"'implemented' has meant 'compiled' twice now", has a sibling here: a comment
+can describe an invariant the code beside it does not have, and it reads as
+evidence that the case was considered.
+
+All three of the stale commits in the pre-fix Firefox run are this case, and
+none of them is the cycling case of §27.2. The reason is worth recording because
+it is a fact about the client rather than about the bug: Firefox scrolling
+`about:support` damages **4292 KiB of a 4500 KiB buffer per commit** — 95% of
+the window — so the arrears from one intervening frame are almost entirely
+covered by the next frame's own damage. The cycling defect is real, it is what
+the unit test measures at 96 stale rows of 120, and on this client it is mostly
+masked by a client that repaints nearly everything anyway. Both are the same
+missing fact and both are fixed by the same three lines.
+
+### 27.4 The fix: arrears, per buffer, per surface
+
+Each surface keeps, for every buffer it has attached, what that buffer's copy
+owes: either a list of rectangles or "everything".
+
+```rust
+enum Stale { Everything, Rects(Vec<Rect>) }
+```
+
+On commit, this frame's damage is filed against every *other* buffer of the
+surface, and the buffer being attached pays off its whole arrears — this frame's
+damage plus every frame's since it was last on screen. A buffer this surface has
+never seen owes `Everything`, which is the §27.3 case and needs no special code
+once the question is asked in these terms.
+
+Three properties are worth stating because each one is a way the fix could have
+been wrong:
+
+* **It is still the cheap scope.** There is a trivially correct fix — copy the
+  extent every commit — and it already exists, as `--copy buffer`. The arrears
+  of a two-buffer cycle are one extra frame's damage, not a buffer, and
+  `paying_off_the_arrears_still_costs_less_than_the_extent` asserts a 4x margin
+  on a client whose real ratio is 6.9x. Without that test the fix could
+  degenerate into the safe thing and nothing would notice.
+* **It is keyed on the pair.** A buffer attached to a different surface starts
+  at `Everything` there and is copied whole. The arrears are a property of
+  (surface, buffer), not of the buffer.
+* **It survives id reuse.** This proxy implements `wl_display.delete_id`
+  deliberately, so buffer id 12 can be a *different* buffer a frame after the
+  old one was destroyed. A leftover "owes nothing" against a fresh buffer would
+  skip the one copy that must happen, and only on clients that recycle ids.
+  `forget_buffer_arrears` is called from both ends of a buffer's life and the
+  creation end is the load-bearing one.
+
+The rectangle list is capped at 64, past which it collapses to `Everything`:
+the union of 64 rectangles is close enough to the extent that tracking it costs
+more than copying it, and the cap bounds the pathology of a buffer that is
+allocated, damaged around for a thousand frames and attached once.
+
+### 27.5 The instrument, and why the established technique could not find this
+
+§10.7 and §18 both turned "it looks wrong" into a number by dumping frames and
+counting the distinct ones, and that technique cannot find this bug **at all**.
+A stale band is a *plausible picture*: real content, correctly blitted, from two
+frames ago. It is a distinct frame, so a distinct-frame count counts it; it has
+a normal colour histogram; it is what the page looked like a moment earlier. No
+screenshot distinguishes it from a page that had not finished scrolling.
+
+So the oracle is the client's own memory. `wc-proxy --verify-damage` compares,
+after every copy, the region's bytes for the attached buffer against the
+client's bytes for the same buffer, and counts the rows that differ. The
+comparison is exact and race-free **by protocol**: between `commit` and
+`wl_buffer.release` the client may not touch the buffer it attached, and that
+buffer must hold the whole current surface content. A disagreement at that
+instant has exactly one possible author.
+
+Two things about it are load-bearing:
+
+* **Only commits that attach can be checked.** A state-only commit — an
+  `ack_configure`, an opaque region, a subsurface move — does not re-take
+  ownership of the current buffer, which the compositor released frames ago and
+  which the client is very likely drawing the next frame into right now.
+  Measured before it was believed rather than reasoned into existence: with the
+  check applied to every commit, a fixed build still reported 91 stale of 936,
+  and every one of the twenty logged in full carried no damage at all and no
+  arrears — the signature of a commit that attached nothing. Gating on attach
+  took the same build to 0 of 1360, and the *pre-fix* build still failed under
+  the gate, at 3 of 1509, which is what says the gate removed noise rather than
+  the finding. Firefox's
+  traffic is **half** such commits — 1708 of 3343 — so the number is reported
+  rather than dropped, because a check whose coverage is unstated is a check
+  nobody can size.
+* **It is an instrument and not a clock.** It reads the whole buffer every
+  commit, which is precisely the cost `--copy damage` exists to avoid. §13.8
+  retracted a 2x throughput claim that was really 1.03x because the instrument
+  was inside the loop being timed. Nothing measured with `--verify-damage` on
+  may be quoted about cadence, and `scripts/wc-damage.sh` says so twice.
+
+### 27.6 The other two symptoms, and what the numbers say about them
+
+**Tearing did not reproduce, and §18 covers it.** Its cause was the export, its
+signature was page-granular bands, and the arbiter was that the compositor's own
+frame dump was torn identically to the screen. Nothing in this stage's runs
+tears, and the verifier is a stronger statement than that sounds: a torn copy is
+a row-level disagreement between the region and the client, which is exactly
+what `stale_rows` counts, and 1628 consecutive commits at zero says the copy
+path is not tearing. That says nothing about the coherency of a guest-RAM arena
+across the real VM boundary, which is §18's subject and is fixed there.
+
+**Rendering did not stop.** The compositor presented 1626 of the 1628
+buffer-carrying commits it received, and the ratio holds across every run of
+this stage: 1355/1360, 1506/1509, 1033/1035, 18/20. That is §13.8's 1464/1465
+again, in a harness that is actively scrolling rather than idling, and it means
+frames are not being dropped between the client and the window. If a user still
+sees a scroll stutter, the cause is not in the commit-to-present path and this
+number is the reason to look elsewhere.
+
+**The blank regions were real**, are the subject of §27.2 and §27.3, and are
+fixed.
+
+### 27.7 Why no harness could have caught it
+
+`wc-guest.sh` and `wc-desktop.sh` — the two harnesses that run on the real guest
+and the only ones a person watches — pass `--copy damage`. Every harness that
+exercises the copy scopes does not:
+
+* `scripts/wc-firefox.sh`'s wine leg runs `--copy pool`, which copies the whole
+  pool every commit.
+* `scripts/wc-proxy.sh cost` runs all three scopes, with
+  `weston-presentation-shm` — which damages its entire buffer every frame, so
+  all three scopes copy identical bytes, which is precisely what
+  `every_copy_scope_produces_the_same_image` was written to assert.
+* The unit tests drove a **single-buffered** client. With one buffer there are
+  no arrears, because there is no other buffer for the surface to have changed
+  behind.
+
+So the scope that ships was tested only by clients that cannot expose it. That
+is a sharper version of §18.2's finding — a fix that the only harness anybody
+watched had never used — and the general rule is the same: a configuration that
+no test uses is a configuration that is not tested, however many tests exist.
+
+### 27.8 The evidence
+
+Deterministic, no Wine, `cargo test -p wc-proxy`:
+
+* `a_buffer_cycling_client_is_not_left_with_a_stale_shadow` — a client that
+  cycles 2 and 3 buffers, writes the whole canvas into each, and damages only
+  the band it changed. Pre-fix: **96 of 120 rows** wrong in the region, in the
+  alternating pattern (`rows [0,1,2,3, 8,9,10,11, 16,17,18,19 …]`) that is the
+  double-buffer signature. `Pool` and `Buffer` scope pass in the same run and are
+  the control: the disagreement is damage tracking's alone.
+* `paying_off_the_arrears_still_costs_less_than_the_extent` — 332800 bytes
+  against 2304000, 6.9x, derived in the test rather than asserted as a ratio.
+
+Real client, `scripts/wc-damage.sh`, Firefox scrolling `about:support` with 60
+wheel notches injected by `probe-scroll.exe` from inside the Wine desktop:
+
+| build | commits checked | stale | worst | bytes/commit |
+|-------|-----------------|-------|-------|--------------|
+| pre-fix, `--copy damage` | 1509 | **3** | **900 rows of 900** | 4.19 MiB |
+| fixed, `--copy damage`   | 1628 | 0 | 0 | 2.04 MiB |
+| fixed, `--copy buffer` (control) | 1035 | 0 | 0 | — |
+
+The byte column is exact — it is a count, not a time — and it is the second
+result: the fix copies **2.05x less** than the code it replaces, because the old
+"an empty damage list means copy the extent" fired on all 1708 of Firefox's
+state-only commits and copied a 4.4 MiB buffer for a commit that changed
+nothing.
+
+### 27.9 Three things that cost real time
+
+1. **`set -o pipefail` plus a `--help` that exits non-zero.** The harness's
+   guard against a stale binary — `wc-proxy --help | grep -q -- --verify-damage`
+   — reported "no such flag" for a proxy that had it, because the pipeline's
+   status is the failing `--help`, not the succeeding `grep`. Every other
+   harness here uses the piped spelling on programs that happen to exit zero.
+2. **`wine explorer /desktop=NAME` returns immediately when the desktop already
+   exists.** `wc-input.sh` waits for it and never noticed, because its probe
+   takes about a second. This one scrolls for twenty, so the harness tore the
+   run down two seconds in — and the symptom was *a low commit count*, which is
+   the exact symptom this stage is investigating. A harness that measures a
+   stall it caused itself is worse than no harness. It now waits for the probe's
+   own last line.
+3. **A single run is not a rate.** The first draft of the comment on the
+   control's commit floor explained a 51-commit `--copy buffer` run by the cost
+   of its larger copy. The next `--copy buffer` run was 1035. The counts across
+   this stage's runs span 20 to 4106 on a machine ten agents are sharing, and
+   the honest statement is variance. §13.8's retraction is the precedent; this
+   is the same mistake caught one run earlier.
+
+### 27.10 What is not proven
+
+1. **Surface coordinates are still assumed to be buffer coordinates.**
+   `wl_surface.damage` (opcode 2) is in surface coordinates and
+   `damage_buffer` (opcode 9) is in buffer coordinates, and both `wc-proxy` and
+   `wc-compositor` merge them — the compositor says so in a comment at
+   `state.rs:1530`. They coincide at scale 1, transform `Normal` and attach
+   offset (0,0), which is every run this project has made. **Scale and
+   fractional scaling are unowned**, and this is one more reason for somebody to
+   own them; it is not started here.
+2. **The attach offset is ignored.** `wl_surface.attach`'s `x`/`y` are parsed
+   and dropped. A non-zero offset shifts surface coordinates relative to buffer
+   coordinates and would make item 1 bite at scale 1. Not observed in Firefox,
+   not checked either.
+3. **`--verify-damage` has nothing to say about half of Firefox's commits.**
+   1708 of 3343 attach no buffer. They cannot change what is on screen, so the
+   coverage gap is believed harmless, but it is a gap and it is stated rather
+   than netted out of the denominator.
+4. **This ran under Wine, against the shared-file transport.** Wine is not
+   Windows and has been wrong four times (§13.6). The insulation is unusually
+   good here — `--verify-damage` compares two mappings inside a Linux process
+   and Wine is only an upstream that consumes the stream — but the guest-RAM
+   arena leg has not been run with the verifier on.
+5. **The reproduction rate on Firefox is low.** 3 in 1509. The defect is
+   certain, the unit test is deterministic, and the worst case is the entire
+   client area; but a run of `scripts/wc-damage.sh scroll` against broken code
+   could plausibly come up zero, so the unit test is the regression gate and the
+   script is the reproduction.
+6. **`set_opaque_region` and `set_input_region` are still parsed and ignored.**
+   Neither can produce a stale region — the compositor draws every window opaque
+   because GDI ignores alpha — so neither is part of this stage's symptom.
+   Recorded so that the audit's finding is not read as closed.
+
+### 27.11 What to do next
+
+1. **Run `scripts/wc-damage.sh` against the guest-RAM arena** (§27.10 item 4).
+   The verifier is transport-agnostic and the leg is two flags.
+2. **Own the scale question** (§27.10 items 1 and 2). Two places merge two
+   coordinate spaces on an assumption that is currently true, and the code in
+   both says so; that is a good state to change deliberately and a bad one to
+   discover.
+3. **Ask why half of Firefox's commits carry no buffer.** 1708 of 3343 is a lot
+   of round trips through a proxy, and the answer is either "that is what
+   `ack_configure` and subsurfaces cost" or something worth fixing.

@@ -52,6 +52,10 @@ struct Args {
     scope: CopyScope,
     headroom: u64,
     trace: bool,
+    /// STAGE 14. After every copy, compare the region against the client's own
+    /// bytes and count the rows that differ. An instrument rather than a mode:
+    /// it reads the whole extent every commit. See `Session::verify`.
+    verify: bool,
     accept_timeout: Duration,
     idle_timeout: Duration,
     /// STAGE 11. Resolve `xdg_toplevel.set_app_id` to icon pixels here, where
@@ -97,7 +101,11 @@ usage: wc-proxy --upstream <path> [options]
                          and this is refused rather than believed.
 
   --copy pool|buffer|damage   how much to copy per commit (default damage)
-  --trace                log every message in both directions\n  --pool-headroom N      over-allocate each region N-fold so resize fits
+  --trace                log every message in both directions
+  --verify-damage        after every copy, compare the region against the
+                         client's own bytes and report the rows that differ.
+                         Reads the whole buffer per commit, so it is for finding
+                         a damage bug and never for timing one\n  --pool-headroom N      over-allocate each region N-fold so resize fits
                          (default 1)
 
   --icon-theme NAME      the icon theme to search before hicolor
@@ -130,6 +138,7 @@ fn parse_args() -> Result<Args, String> {
         scope: CopyScope::Damage,
         headroom: 1,
         trace: false,
+        verify: false,
         accept_timeout: Duration::from_secs(20),
         idle_timeout: Duration::from_secs(20),
         icons: true,
@@ -161,6 +170,7 @@ fn parse_args() -> Result<Args, String> {
                 a.scope = CopyScope::parse(&v).ok_or_else(|| format!("--copy {v}?"))?;
             }
             "--trace" => a.trace = true,
+            "--verify-damage" => a.verify = true,
             "--no-icons" => a.icons = false,
             "--icon-theme" => a.icon_theme = next()?,
             "--icon-data-dir" => a.icon_dirs.push(next()?.into()),
@@ -415,6 +425,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let (spec, scope, headroom, trace, idle) =
             (spec.clone(), args.scope, args.headroom, args.trace, args.idle_timeout);
+        let verify = args.verify;
         // STAGE 11. The icon feed, one per served connection.
         //
         // **Per connection rather than per process**, which is a decision and
@@ -479,6 +490,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
+            session.set_verify(verify);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
             match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
                 Ok(why) => println!("[proxy] client {n} stopped: {why}"),
