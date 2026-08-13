@@ -2913,7 +2913,7 @@ impl XdgShellHandler for State {
         let parent = surface.get_parent_surface().map(|s| root_of(&s));
         let parent_window = parent.as_ref().and_then(|p| self.windows.get(p));
         let parent_id = parent_window.map(|w| w.id);
-        let bounds = parent_window.and_then(|w| popup_bounds_of(w));
+        let bounds = parent_window.and_then(popup_bounds_of);
 
         // Where the popup goes, in the parent's window-geometry coordinates.
         // See [`Self::constrain`]: the rectangle is the positioner's own

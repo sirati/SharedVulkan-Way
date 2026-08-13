@@ -172,6 +172,11 @@ const DEFAULT_EXTENSIONS: &[(&str, u32)] = &[
     ("zwp_idle_inhibit_manager_v1", 1),
     ("xdg_activation_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
+    // The clipboard manager, which the compositor advertises and this table
+    // did not list. Found by `scripts/wc-wlcs.sh globals`, which exists to
+    // catch exactly this: a hand-run of the suite against the drifted table
+    // would be testing a *different* claim from the one the harness makes.
+    ("wc_clipboard_manager_v1", 1),
 ];
 
 /// Parse the `name version` file `WC_WLCS_EXTENSIONS` points at.

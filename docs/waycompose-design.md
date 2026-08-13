@@ -14042,13 +14042,20 @@ about the stand-in rather than about the compositor.
 
 | | before | after |
 |---|---:|---:|
-| passed | 230 | **277** |
-| failed | 236 | **189** |
+| passed | 231 | **278** |
+| failed | 235 | **188** |
 | skipped | 759 | 759 |
 
 1,225 verdicts joined by test name: **47 moved, every one of them FAIL to
-PASS, and nothing regressed.** The before column is exactly §26.6's recorded
-baseline, which is the check that the two runs are comparable.
+PASS, and nothing regressed.** The before column is `4a5dfb4`'s, measured by
+checking master's `crates/wc-compositor` out over this branch's and building
+again, so the two runs differ in nothing but this change; it is one verdict off
+§26.6's recorded baseline of 230/236, which four merges have moved by exactly
+one test since.
+
+The same measurement was taken twice more, at `7da9a58` (230 -> 277) and at
+`e3409ba` (231 -> 278), with the same 47 tests moving each time. Three trees,
+one number: this is not sensitive to what else has landed.
 
 | suite | failures before | after |
 |---|---:|---:|
@@ -14088,6 +14095,16 @@ Seven popup failures remain and none of them is placement:
 
 ### 38.9 The desktop, which is where the report came from
 
+**And Wine is not it.** The Win32 half of this section is two system calls, and
+under Wine both of them answer about Wine's own virtual desktop rather than
+about a Windows machine with a taskbar on it: `GetMonitorInfo`'s `rcWork` there
+is the X window `wine explorer` was given. So a green Wine run says the code
+path executes and computes *something* — which is worth having, and the Windows
+build's own unit tests are run that way (`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine
+cargo test --target x86_64-pc-windows-gnu`, 84 passing, the placement arithmetic
+among them) — and says nothing at all about whether the rectangle is the right
+one. Every claim below needed the guest.
+
 WLCS runs against the Linux build and a synthetic Win32. The bug was reported
 against a real screen with a real taskbar, so it is checked there too, with
 `scripts/wc-popup.sh` — the compositor on the guest's interactive desktop
@@ -14103,6 +14120,13 @@ taskbar.
 |---|---|---|
 | before | 214x236 at 1213, 688 | **no** — 147 px past the right edge, 172 px below the work area |
 | after | 214x236 at 1047, 454 | **yes** |
+
+Both were taken while the guest's desktop was unlocked and unattended, and
+`docs/stage38/README.md` records the rule that goes with that: this mode moves
+a window and clicks on a desktop somebody may be using, so a screen capture
+before and after — compared, not glanced at — is what says whether the machine
+was free. The window measurements in §38.10 were taken later against a *locked*
+screen, which is possible precisely because they need no input.
 
 `docs/stage38/stage38-screen-before.png` is the user's report, photographed:
 Firefox's context menu with only the first few pixels of "Save Page As…" and
@@ -14136,7 +14160,34 @@ without it the answer needs a Wayland trace.
 Once a window can be asked which monitor it is on, two things that were nobody's
 job become one line each, and both were visible in the "before" photograph: our
 Firefox window is 1296x820 at (-16, -68) on a 1280x800 screen — wider than the
-display, with its title bar above the top of it.
+display, with its title bar above the top of it. `CreateWindowExW` passes
+`CW_USEDEFAULT` for all four of x, y, width and height, so until this stage
+*nothing in this project had an opinion about either*: the position was
+Windows' cascade and the size was whatever the client asked for.
+
+Measured on the guest with `scripts/wc-popup.sh spawn`, which needs no input at
+all and therefore runs against a locked screen:
+
+| | Firefox's window | inside the work area |
+|---|---|---|
+| before | 1296x820 at 26, 26 | **no** — 42 px past the right edge, 94 px below the work area |
+| after | 960x543 at 104, 104 | **yes**, caption and all |
+
+`docs/stage38/stage38-window-before.png` and `-after.png` are those two
+windows, captured with `PrintWindow` on their own `HWND`s; `spawn-before.txt`
+and `spawn-after.txt` are the numbers. The 1296x820 is the same window in every
+run — it is what Firefox asks for when it is told the output is 1920x1080 —
+but *where* it lands is `CW_USEDEFAULT`'s cascade and moves from run to run: at
+26, 26 here, and at -16, -68 in the run
+`docs/stage38/stage38-screen-before.png` was taken during, with its title bar
+above the top of the screen. Either way it does not fit.
+
+**The "after" size is the interesting number, because nothing clamped it.**
+960x543 is Firefox's *own* choice against a `wl_output` that is now
+1280x752 — the real work area — rather than the fictitious 1920x1080 it used to
+be told. The clamp never fired. That is the right way round: a window that is
+resized after it has laid itself out reflows visibly, and a window that was
+told the truth first does not have to be.
 
 **The `wl_output` is now the work area.** Until this stage the one output was
 `--output WxH` and nothing else, with a default of 1920x1080 that was true of
@@ -14235,12 +14286,27 @@ a second monitor changes what is written into it and nothing that reads it.
    rectangle `state.rs` computed, whatever carried the buffer. It also needs no
    QMP, no root and no locate step, which is three fewer things between a
    placement question and its answer.
-5. **Two harness lessons, both of which produced a wrong green or a wrong
-   picture before they were understood.** A capture that fails writes nothing,
-   so the previous run's file gets fetched and reported as this run's — the
-   only tell was a four-minute-old clock in the corner of a screenshot, and the
-   fix is to delete the old file before the run rather than to trust the new
-   one. And **a menu is a grab**: it is gone the moment anything else takes the
-   focus, so the photograph has to be taken by the same process that clicked,
-   polling for the popup, rather than by a second scheduled task two seconds
-   later.
+5. **Three harness lessons, each of which produced a wrong green or a wrong
+   picture before it was understood.**
+   * A capture that fails writes nothing, so the previous run's file gets
+     fetched and reported as this run's — the only tell was a four-minute-old
+     clock in the corner of a screenshot. Delete the old file before the run
+     rather than trusting the new one.
+   * **A menu is a grab**: it is gone the moment anything else takes the focus,
+     so the photograph has to be taken by the same process that clicked,
+     polling for the popup, rather than by a second scheduled task two seconds
+     later.
+   * **A locked guest can still be measured, but not clicked.** With the lock
+     screen up, `mouse_event` goes to Winlogon's secure desktop and a screen
+     grab returns the lock screen — but scheduled tasks still run on
+     `WinSta0\Default`, `GetWindowRect` still answers, and `PrintWindow` still
+     reads DWM's redirection surface (§13). That is why `spawn` is a mode of
+     its own: the toplevel half of this section is measurable at any hour, and
+     the popup half needs an unlocked screen and a user who is not at it.
+6. **A stash is shared by every worktree of a repository.** `git stash push`
+   here is visible to `git stash pop` there, and one worktree popping "its"
+   stash can land a hundred files of somebody else's work in a tree that never
+   asked for them. It also silently drops `MERGE_HEAD`, so a merge in progress
+   commits as an ordinary commit with one parent. Neither is recoverable by
+   noticing later. Use `git checkout <ref> -- <path>` to swap a subtree for a
+   measurement, which is what §38.8's before-and-after runs do.

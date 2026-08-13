@@ -183,6 +183,10 @@ pub struct FrameStyle {
 ///
 /// `work` is `(left, top, right, bottom)` in screen coordinates, and the far
 /// edges are exclusive, which is Win32's convention for a `RECT`.
+/// Called from `win32.rs` and from this module's own tests, so off Windows a
+/// non-test build is right that nothing uses it. Saying so beats giving the
+/// headless platform a call it has no monitor to make.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn fit_to_work_area(
     (x, y, w, h): (i32, i32, i32, i32),
     work: (i32, i32, i32, i32),
