@@ -84,6 +84,13 @@ impl IcdLocal for SharedVulkan {
         self.state().mint()
     }
 
+    /// design.md §5.3's rewrite, app-side half. The generated forwarders call
+    /// this for every `(memory, offset)` pair that crosses; the arena allocator
+    /// that answers it lives here.
+    fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
+        SharedVulkan::rewrite_memory(self, memory, offset)
+    }
+
     fn instance_extensions(&self) -> &[(&'static str, u32)] {
         advertise::INSTANCE_EXTENSIONS
     }
@@ -876,14 +883,17 @@ impl Icd for SharedVulkan {
         Ok(())
     }
 
-    /// design.md §5.3's rewrite, app-side half.
+    /// Bind, or say nothing was bound.
     ///
-    /// The memory id becomes [`sv_gpu_server::ARENA_MEMORY_ID`]'s value and the
-    /// offset becomes the allocation's arena offset plus the application's. §5.3
-    /// says the id becomes "the slab's GPU-side handle"; it cannot — the app
-    /// side knows no driver handle and §6.4 depends on it not knowing one — so
-    /// what crosses is a well-known id and a number this side already owns, and
-    /// the GPU side finishes the translation. See `sv_gpu_server::table`.
+    /// **The `(memory, offset)` rewrite is no longer here.** It used to be, and
+    /// being here was the bug: §5.3's app-side half was one hand-written line in
+    /// this one command, so the six other commands that carry a memory id across
+    /// — `vkBindImageMemory` first among them — sent the app-side id raw and the
+    /// GPU side took a ring fatal on it (design.md §0.17). It is now generated
+    /// for every forwarded command, in `sv_icd_entry::forward`, and this
+    /// override is left only for the property the generated default does not
+    /// have: with no GPU side there is nothing to bind to, and saying so is
+    /// better than refusing by name.
     fn bind_buffer_memory(
         &self,
         args: p::VkBindBufferMemoryArgs,
@@ -892,16 +902,7 @@ impl Icd for SharedVulkan {
             // NO GPU: nothing to bind to.
             return Ok(p::VkBindBufferMemoryReply { result: p::VkResult(0) });
         };
-        let (memory, offset) = self.rewrite_memory(args.memory.0, args.memory_offset)?;
-        forward::bind_buffer_memory(
-            t,
-            p::VkBindBufferMemoryArgs {
-                device: args.device,
-                buffer: args.buffer,
-                memory: p::VkDeviceMemory(memory),
-                memory_offset: offset,
-            },
-        )
+        forward::bind_buffer_memory(t, args)
     }
 
     // -- descriptor update templates ----------------------------------------

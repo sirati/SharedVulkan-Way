@@ -242,13 +242,34 @@ fn emit_command(_plan: &Plan, c: &CommandPlan) -> TokenStream {
 
     // -- the reply type ------------------------------------------------------
     let reply_block = if c.generates_reply {
+        // **The `ret` field, and why it is a `u64` rather than the C type.**
+        // design.md §0.3 item 5's hole: a command returning a `VkDeviceAddress`
+        // has no output parameter to carry it, so the reply grows a field of its
+        // own. It is 64 bits wide and unsigned for all three commands in the
+        // profile, and the wire has no reason to know which of the three
+        // spellings the header uses — the ICD's stub casts it back to the C
+        // return type on arrival, which is where the C ABI lives.
+        //
+        // **The value is opaque and is never dereferenced on this side.** §11's
+        // caveat is what makes it workable: "if we return the GPU side's true
+        // device address and never relocate, an address the application writes
+        // into arena memory is dereferenceable by a GPU-side shader". Nothing
+        // here reads it, and R3 is intact because a device address is not a
+        // host pointer — it is a number the *GPU's* page tables interpret.
         let result_field = if c.returns_result {
             quote!(pub result: VkResult,)
+        } else if c.returns_value {
+            quote!(
+                /// The command's return value, as the driver produced it.
+                pub ret: u64,
+            )
         } else {
             quote!()
         };
         let result_default = if c.returns_result {
             quote!(result: VkResult(0),)
+        } else if c.returns_value {
+            quote!(ret: 0u64,)
         } else {
             quote!()
         };
@@ -263,10 +284,27 @@ fn emit_command(_plan: &Plan, c: &CommandPlan) -> TokenStream {
             let d = super::default_expr(&f.shape);
             quote!(#id: #d,)
         });
-        let result_size = if c.returns_result { quote!(n += 4usize;) } else { quote!() };
-        let result_encode = if c.returns_result { quote!(enc.i32(r.result.0)?;) } else { quote!() };
-        let result_decode =
-            if c.returns_result { quote!(out.result = VkResult(dec.i32()?);) } else { quote!() };
+        let result_size = if c.returns_result {
+            quote!(n += 4usize;)
+        } else if c.returns_value {
+            quote!(n += 8usize;)
+        } else {
+            quote!()
+        };
+        let result_encode = if c.returns_result {
+            quote!(enc.i32(r.result.0)?;)
+        } else if c.returns_value {
+            quote!(enc.u64(r.ret)?;)
+        } else {
+            quote!()
+        };
+        let result_decode = if c.returns_result {
+            quote!(out.result = VkResult(dec.i32()?);)
+        } else if c.returns_value {
+            quote!(out.ret = dec.u64()?;)
+        } else {
+            quote!()
+        };
 
         let rsize = c.outputs.iter().map(|f| {
             let id = naming::ident(&f.rust_name);
@@ -283,7 +321,11 @@ fn emit_command(_plan: &Plan, c: &CommandPlan) -> TokenStream {
             quote!(out.#id = #e;)
         });
 
-        let mut_r = if c.returns_result || !c.outputs.is_empty() { quote!(mut) } else { quote!() };
+        let mut_r = if c.returns_result || c.returns_value || !c.outputs.is_empty() {
+            quote!(mut)
+        } else {
+            quote!()
+        };
         let size_reply = format_ident!("size_reply_{}", naming::snake_case(&c.name));
         let encode_reply = format_ident!("encode_reply_{}", naming::snake_case(&c.name));
         let decode_reply = format_ident!("decode_reply_{}", naming::snake_case(&c.name));

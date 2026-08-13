@@ -136,6 +136,16 @@ pub enum WireError {
     /// registry's metadata is only ever used to *verify*, and a disagreement is
     /// reported instead of obeyed.
     LengthDisagreement { field: &'static str, declared: u64, actual: u64 },
+    /// A `VkDeviceMemory` id the app side's allocator has never handed out, met
+    /// while rewriting a `(memory, offset)` pair into arena coordinates
+    /// (design.md §5.3, §7.2 pass 6).
+    ///
+    /// It is a *wire* error because the pass that raises it is the generated
+    /// `MemoryTransform` walk, which speaks `sv_wire::Result` on both sides of
+    /// the boundary. Caught here it costs the application one failed call;
+    /// missed, the unrewritten id crosses and the GPU side takes a ring fatal
+    /// on a command it cannot resolve — which is how this was found.
+    NoSuchMemory { id: u64 },
 }
 
 impl fmt::Display for WireError {
@@ -169,6 +179,9 @@ impl fmt::Display for WireError {
                 f,
                 "{field} says {declared} but the array it describes has {actual} elements"
             ),
+            WireError::NoSuchMemory { id } => {
+                write!(f, "no VkDeviceMemory with app-side id {id} to rewrite")
+            }
         }
     }
 }
