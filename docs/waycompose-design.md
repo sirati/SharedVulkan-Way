@@ -14250,3 +14250,498 @@ been wrong about on this project before. §37.8 item 1.
    a conflicted pop does not drop the stash, but the recovery was manual. Stash
    by explicit ref (`git stash pop stash@{N}`) after reading `git stash list`,
    or do not stash at all in a shared checkout.
+## 36. The Wayland connection moves onto shared_vulkan's channel — and the doorbell that was costing 216.9 ms a frame
+
+This section records a correction, and then a much larger thing the correction
+walked into.
+
+### 36.1 What was wrong
+
+The Wayland byte stream crossed the VM boundary like this:
+
+```
+Firefox (Linux host) --AF_UNIX--> wc-proxy --AF_UNIX--> ssh -L tunnel
+    --TCP--> probe-relay.exe (guest) --afunix.sys--> sv-guest compositor
+```
+
+Every Wayland message went out over TCP, through an `ssh` forward, over a
+network the guest reaches by proxy-ARP over WiFi, into a C shim, and back out
+through `afunix.sys`. In a project whose entire premise is shared memory across
+that boundary.
+
+`scripts/probe-relay.c`'s header states the reasoning that made it acceptable:
+the Wayland wire protocol over the socket is a byte stream, and on Windows an
+`h` argument is encoded in band (§2.3), so a TCP hop has no ancillary data to
+lose. **That argument is still true and is exactly why the substitution below is
+safe.** It was never an argument that TCP was right.
+
+### 36.2 The correction, which is sharper than "use shared memory"
+
+The obvious reading is "give Wayland a shared-memory transport". That is wrong,
+and getting it wrong would have produced a second control region, a second
+locator on the cold path and a second doorbell convention, in a tree that
+already had one working copy of each.
+
+**Wayland is an addon to shared_vulkan.** It must therefore ride the channel
+shared_vulkan already has — the same control region, the same ring directory,
+the same lanes, the same doorbells, the same cold-path handshake that has
+carried a `deqp-vk` run and Firefox's GL. A parallel transport that happens to
+also be shared memory is the same mistake wearing better clothes.
+
+Once that is the frame, almost all of the design turns out to be a table rather
+than code:
+
+| Wayland | is | shared_vulkan |
+|---|---|---|
+| a connection | is | a ring slot of `RingKind::Wayland` |
+| `connect()` | is | `Control::claim_ring` — a CAS from `Free` to `Claimed` |
+| `accept()` | is | polling the ring directory for a `Live` ring of that kind |
+| client→server bytes | are | the **command** lane |
+| server→client bytes | are | the **reply** lane |
+| `close()` | is | a zero-length `PacketKind::Bytes` packet |
+| the socket buffer | is | the ring, and its backpressure is `RingFull` |
+
+**Nothing on the right-hand side is new.** A ring slot was already a
+bidirectional byte stream: `Layout` gives every slot two data buffers, two
+head/tail pairs and two doorbells, which is §4.4's command lane and reply lane.
+
+The bootstrap in particular needs no code at all. `cold.rs`'s constraint is that
+the locator must ride the cold path *because the control region is the thing
+being located* — and once it has been located, the ring directory is **inside
+it**. So a claim needs nothing further, and **Wayland adds no cold-path
+message.**
+
+### 36.3 One ring per connection, which is §0.12 one level down
+
+Firefox opens four Wayland connections. They get four ring slots.
+
+The temptation is one ring with a connection id in each packet. It is the same
+temptation `--clients N` gave in to: §0.11's bug was N clients sharing one
+session and §0.12's fix was N sessions. One ring carrying four connections would
+put four streams behind one head/tail pair, so a connection that stopped reading
+would stall the other three — head-of-line blocking between clients that have
+nothing to do with each other, which is precisely the failure `--clients N`
+produced a level up. It would also need the id-rewriting layer `wc-proxy`
+deliberately does not have (§9.3).
+
+Sixteen slots, one permanently `Reverse`, three claimed by Vulkan, four for
+Firefox. There is room, and `four_wayland_connections_coexist_with_the_vulkan_
+rings` asserts that all eight live in one directory and that filling one does
+not stall the next.
+
+### 36.4 Two changes to the ring, and one of them was nearly a silent corruption
+
+**`PacketKind::Bytes`.** `RingConsumer::next` cross-checks the ring's framing
+length against `sv_wire::CommandHeader.cmd_size` (offset 8) or
+`ReplyHeader.reply_size` (offset 4) for any payload at or above those header
+sizes. A Wayland chunk has an object id and an opcode there, and would be
+rejected as a `FramingDisagreement` on nearly every packet.
+
+`Bytes` turns off that one check and nothing else. It is worth being pedantic
+that this is **not a weakened check but a check whose second input does not
+exist**: it compares two independent encodings of one length, and opaque bytes
+have only one. §6.2 calls desynchronisation "the worst failure mode this project
+has", and a `Bytes` ring is not more exposed to it — the ring's own `len` still
+frames every packet exactly, and a byte stream has no commands to desynchronise
+*between*. What is lost is the ability to skip a single undecodable packet, and
+a byte stream has no such thing.
+
+**`FLAG_PAD`, four bits of the header's `flags` word.** This is the bug that
+would otherwise have shipped, and it is the kind that does not announce itself.
+Every packet length rounds up to 16, so a 37-byte payload is framed in 64 and
+the consumer reads 48: **37 bytes of stream and 11 bytes of injected NUL.** A
+command lane is immune because its header declares the true length and the
+framing check tolerates exactly one alignment unit of slack. A byte lane has no
+such header. Roughly fourteen packets in fifteen would have been silently
+corrupted. `an_unaligned_write_does_not_gain_trailing_zeroes` sweeps every
+length from 1 to 64 to pin it.
+
+Zero length is legal on `Bytes` and nowhere else, and means end of stream.
+Spelling EOF as a real packet rather than a directory state change is what keeps
+it **ordered against the bytes before it**: a client's last request and its
+disconnect arrive in the order it made them, which a `kill_ring` racing the
+reader would not guarantee.
+
+### 36.5 The descriptor count, argued where the number appears (§14.7)
+
+§14.7 argues the fd count at the boundary is *unrepresentable* rather than zero,
+because the crossing hop was `write_some(upstream.as_raw_fd(), &to_server)` — a
+plain `write`, with no argument through which a descriptor could be named.
+
+**That argument survives and strengthens.** The crossing hop is now
+`ByteChannel::write`, whose only parameter is `&[u8]`, reaching the peer through
+`SharedRegion::write_bytes`, which takes an offset and a slice. A descriptor is
+a per-process integer index into a kernel table; there is no encoding of one
+that survives being memcpy'd into a page the other kernel maps.
+
+The distinction is not rhetorical. The old `write` had a `sendmsg` sibling one
+refactor away — the discipline was that nobody would reach for it. This has no
+sibling. **The type system is what enforces the rule now, not review.**
+
+`wl_shm.create_pool`'s `h` is unaffected because it never reached this layer:
+`wc-proxy`'s session translates it into an arena handle of integers before the
+bytes are handed over.
+
+### 36.6 The doorbell, which turned out to be the whole cross-VM present
+
+Moving the Wayland stream onto shared_vulkan's channel means inheriting
+shared_vulkan's wakeup. That is where this section stops being about Wayland.
+
+**The measurement.** `vkQueuePresentKHR` costs 1.7–2.1 ms locally and **216.9 ms
+cross-VM** — median of 480 frames, min 213.9, max 228.7, load ~1. Two candidates
+were eliminated by control rather than by argument: the per-frame `XSync`
+(2.00/1.80/1.70 ms with, 2.10/1.80/1.60 ms without) and a contended guest (a 7%
+spread over 480 frames is not queueing).
+
+**The cause was already written down, in `park.rs`, in a doc comment that had
+been correct and complacent for months:**
+
+> Across a hypervisor they do not: the guest's kernel and the host's kernel each
+> have their own futex hash, and a wake on one side reaches nobody on the other.
+> **What saves it is that `slice` is finite.**
+
+`slice` being finite saves *correctness*. It does not save latency, and the
+sentence stopped one line too early. With one fixed 20 ms slice, **every** wait
+across the boundary costs the whole 20 ms, because the wake that would have
+ended it early reaches nobody and readiness is only re-examined when the slice
+expires. It is a poll with a 20 ms period wearing a doorbell's clothes. One
+present makes about eleven waits — `vkResetFences`, `vkQueueSubmit`,
+`vkWaitForFences`, the acquire, kopper's per-frame surface query — and
+216.9 / 20 is 10.8. **The number was not approximately the slice. It was the
+slice, once per wait.**
+
+#### 36.6.1 The mitigation, and why it is not the fix
+
+`Futex` grew a `first_slice` of 25 µs that doubles to the existing 20 ms
+ceiling, reset per park. Its virtue is that it needs to know nothing about the
+topology: same-kernel the doorbell fires and the first wait returns at once, so
+the ladder is never climbed and the same-machine round trip is unchanged;
+cross-VM the ladder bounds the damage to O(T) with O(log T) wakeups. Detecting
+the topology and switching parkers was the alternative and was refused, because
+the detection would have to be *right* and a ladder is correct when it guesses
+wrong in either direction.
+
+**It is still a poll at a better duty cycle**, and it must not be mistaken for a
+fix. On the guest its first rung is 1 ms, not 25 µs, because `WaitOnAddress`
+takes whole milliseconds. The honest ceiling of this mechanism on the guest is
+~11 ms a present — a factor of twenty, and no further.
+
+#### 36.6.2 The fix: a wake the hypervisor carries
+
+A virtio-serial port is a byte pipe between guest and host, and a write on one
+side is a virtqueue notification: a vmexit, an interrupt injected into the other
+side, and a blocked read returning. That is a wake the hypervisor carries,
+because carrying it is what a hypervisor is for.
+
+The mechanism is one thread and **no new way to wait**, which is the part worth
+reading twice. `FUTEX_WAIT` already blocks correctly; the only thing missing
+across the boundary is something to *end* it early. So `Doorman` blocks on the
+port and converts each arriving byte into an ordinary same-kernel
+`Bell::ring_local`. Every existing waiter is then woken by the mechanism it
+already uses, and **not one call site changes** — the drain threads, the ICD's
+`Transport::call` and §36's own Wayland rings all benefit without knowing the
+module exists. `Bell::ring` gains one line, behind the `parked` check that was
+already there, so an unparked lane still costs nothing and a busy ring never
+pays a vmexit per packet.
+
+Measured, the same eleven-wait present with the futex wake unavailable:
+
+| | 11 waits |
+|---|---|
+| fixed 20 ms slice — what shipped | **185 ms** idle, 137.8 ms contended |
+| slice ladder | ~11 ms idle, 34.8 ms contended |
+| **virtio-serial doorbell** | **9.26 ms**, 11 wakes delivered, on the *contended* run |
+
+The 185 ms is the figure worth staring at: it reproduces the 216.9 ms cross-VM
+present on one machine, with no VM, no GPU and no Vulkan anywhere near it, out
+of nothing but eleven waits and a slice. What is left in the last row is the
+work itself, 180 µs × 11 — which is what a present costs locally.
+
+**That table is a reproduction, not a boundary measurement.** A socketpair
+stands in for the port, and it stands in correctly for the *mechanism* and not
+at all for the *cost*: a socketpair write is a function call into the same
+kernel, and a virtio-serial write is a vmexit. The entire argument rests on the
+second being small compared to a 20 ms slice, and a socketpair cannot show that.
+
+#### 36.6.3 So it was measured across a real boundary
+
+`scripts/sv-bell-probe.sh`, on the development guest — `nix build .#svGuest`,
+whose RAM is a `memory-backend-memfd` and whose virtio-serial ports are the same
+mechanism `testhost` carries. The guest half echoes every byte; the host half
+sends one and times the round trip. Two ports on one controller, because the
+cold path is framed and the doorbell deliberately is not (§36.6.4).
+
+Round trip, 2,000 samples, µs:
+
+| | min | median | p99 | max |
+|---|---|---|---|---|
+| same kernel (the socketpair reproduction) | 1.5 | 1.9 | 3.3 | 27.9 |
+| **across the VM (virtio-serial)** | **13.5** | **17.6** | **32.6** | **603.0** |
+
+A doorbell is one way, and a round trip is what can be measured without two
+synchronised clocks — which across a VM boundary there is no cheap way to have.
+So the figure to carry is half the median:
+
+> **A doorbell crosses the hypervisor in ~9 µs.**
+
+Against the alternatives, per wait: the fixed 20 ms slice is **2,266×** that,
+and the ladder's 1 ms floor on the guest is **113×** it. Eleven waits — one
+present — is **0.10 ms of doorbell latency against 220 ms of slice**.
+
+A second run at 10,000 samples agreed on everything that matters (min 12.2,
+median 18.8 → 9.4 µs one way) and disagreed on the tail: p99 980 µs, max 6.5 ms.
+**That tail is the machine, not the transport**, and the control says so — the
+*same-kernel* baseline's max moved from 27.9 µs to 2,064 µs between the same two
+runs, on a workstation several agents share. A socketpair does not acquire a
+2 ms tail because of virtio.
+
+What this does not measure is a present. It measures the quantity a present was
+losing eleven times, which is the quantity that was in doubt; the 480-frame
+figure still wants re-running on the Windows guest, and `vkQueuePresentKHR` has
+other costs than waiting.
+
+#### 36.6.4 No framing on the doorbell, deliberately
+
+One byte, one wake; slot and lane packed into seven bits. Every other byte pipe
+in `sv-transport` carries a magic and a length (`stream.rs`) because a misparsed
+`ColdMessage` is a corrupt session. A doorbell has the opposite property — **a
+lost byte costs one slice and a spurious byte costs one syscall** — so there is
+nothing to resynchronise, and a reader cannot lose its place in a stream of
+independent single bytes. A magic here would turn a self-resynchronising stream
+into one that can desynchronise.
+
+### 36.7 Two deployment findings, and the first contradicts this tree
+
+**The VM does not need restarting.** `scripts/sv-guest-host.sh` says adding a
+port "means editing this machine's NixOS configuration and restarting a VM other
+people are using". That is out of date. The `virtio-serial-pci,id=vioserial`
+controller already exists, so a port can be **hot-added to the running guest over
+QMP** at `/run/windows-vm/qmp.sock` — which testhost's own `windows-vm.nix`
+says next to the controller, and which `docs/hardware-constraints.md` repeats.
+Nothing in either repository issues `chardev-add`/`device_add` yet. The trap
+already recorded in the harnesses applies: **the QMP chardev serves exactly one
+client**, so a leftover `sv-hostd` holding it makes the next opener hang
+silently.
+
+The "exactly two ports" is also three: `org.qemu.guest_agent.0` (live),
+`org.sirati.wifi.0` (live), and `org.sirati.display.0` — configured but with no
+guest-side opener ever installed, so free.
+
+**A virtio-serial port permits exactly one opener**, and this is the constraint
+that decides the shape. One port serves one guest *process*. `sv-guest`
+dispatches on `argv[1]` and runs the GPU server and the compositor as separate
+processes; N Vulkan sessions are N processes. So a doorbell for all of them is
+either N ports, or one port and a guest-side daemon that cannot reach the
+others' private `VirtualAlloc` windows. **The clean resolution is the one
+`docs/one-binary.md` already wants for other reasons: both halves in one
+process, one control region, one port.** This is now a second, independent
+argument for that work.
+
+### 36.8 What is not done, precisely
+
+This section is mechanism, tested, and not yet deployed. Leaving that vague
+would be worse than the TCP path it replaces, so:
+
+1. ~~No Windows `open_virtio_port`.~~ **Done** — `winpipe::open_virtio_port`
+   opens `\\.\Global\<name>` with the same `CreateFileW(OPEN_EXISTING)` as
+   `Pipe::connect`, minus the `WaitNamedPipeW` retry, which on a port that is
+   not a named pipe fails with `ERROR_INVALID_NAME` rather than waiting. It is
+   compiled but **not exercised**: no Windows guest has opened one, because that
+   needs the QMP hot-add on testhost. `PortWake` and `serve_port` are written
+   against `Read`/`Write`, which is why filling this gap changed nothing in
+   `vdoorbell` — the port type was the only platform-specific thing in it.
+2. **No QMP hot-add.** Nobody has written `chardev-add`/`device_add`, and it
+   needs root on the machine QEMU lives on. The development guest did not need
+   it — its ports are declared in `nix/guest.nix` and it can be rebooted freely
+   — so the hot-add remains the untested half of §36.7's finding. What is now
+   known is that a second port on the existing controller *works*, which is the
+   part the hot-add was going to establish.
+3. ~~No bring-up wiring.~~ **Done for the Vulkan half** — `sv-gpu-server guest
+   --bell <port>` and the ICD's `SV_BELL`, both optional, both degrading to a
+   warning. A real application's commands now cross a real hypervisor with a
+   doorbell under them. What is *not* done is showing that it made anything
+   faster in an application: see §36.10, where the instrument turned out to be
+   inadequate and the numbers say so.
+4. ~~The host half is done; the guest half is not.~~ **Both halves are done and
+   a client has run through them** — `wc-proxy --upstream-ring` claims, and
+   `wc-compositor --wayland-ring` accepts by polling the directory. See §36.11.
+   What remains on this item is the socketpair between `RingLink` and smithay,
+   which is guest-local and is described there.
+5. **No icon feed on the ring.** The icon link is a second connection to the
+   compositor (§16.7), so on the ring it is a second ring claim. The proxy says
+   so on the client's log line rather than skipping it silently, because a
+   generic icon looks like a bug in the icon code.
+6. **The doorbell is measured across a real boundary; the present is not.**
+   §36.6.3's ~9 µs is a real hypervisor on the development guest, and it settles
+   the quantity that was in doubt. It is not a present: the 480-frame
+   `vkQueuePresentKHR` figure still wants re-running on the Windows guest, where
+   the 1 ms `WaitOnAddress` floor and the rest of a present's cost both live.
+   That measurement is on `testhost`, which is somebody's working machine, and
+   it waits for a window when nobody is using it rather than for a gap in the
+   schedule.
+7. **No Wayland client has driven a *guest* window through a ring.** One has
+   driven a compositor through a ring (§36.11), on one machine. What is left
+   between the two is deployment rather than design: the compositor's control
+   region has to be the guest's pinned RAM published over the cold path rather
+   than a file it creates, which is `win_guest`'s existing `Hello`/`Accept` with
+   a different owner — and the compositor is a second guest *process*, which
+   §1.6 of `one-binary.md` argues is the thing to fix rather than to work
+   around.
+
+**`scripts/probe-relay.c` therefore stays, and is still the only thing that
+works end to end.** It is retired when a Wayland client drives a guest window
+through a ring and the latency is measured against it — not before, because two
+paths with no statement of which is real is worse than one path that is wrong.
+
+### 36.9 A process-global in a parallel test suite is a flake generator, and this tree now has two
+
+`cargo test` runs a binary's tests as **threads of one process**. Anything
+process-global is therefore shared between tests that were written as though
+they were alone, and the failure it produces has three properties that make it
+expensive out of all proportion to the bug: it is intermittent, it appears in a
+test that has nothing to do with the cause, and a failing binary stops
+`cargo test --workspace` where it stands so the run reports a *truncated total*
+rather than a failure.
+
+Two instances, found within hours of each other by different people:
+
+| | the global | how it presented |
+|---|---|---|
+| §32.2 | `/dev/shm/sv.arena.{run_id:016x}`, `O_CREAT\|O_EXCL`, two tests passing `run_id = 1` | `errno 17`, and the workspace run reporting **169 tests of 1253** |
+| §36.6 | `park::CROSS_WAKE`, the process's cross-VM doorbell | `a_rung_doorbell_wakes_the_consumer` failing about **one run in four**, in a test that does not use the doorbell |
+
+The second is the more instructive, because the sharing is not a name collision
+but a *behaviour* one. While any test had a doorbell installed, `Bell::ring`
+**everywhere in the suite** wrote a byte into that test's pipe — so an unrelated
+test's timing changed, and the test that failed was not the test that was wrong.
+The fix is an `Installed` guard holding a `static Mutex` for the duration and
+uninstalling on `Drop`, including on a panic; a leaked install would break tests
+that have nothing to do with the module.
+
+**And the truncated total is the part to learn.** Before the merge, one
+`cargo test --workspace` in this branch reported `TOTAL: 138` where the next two
+reported 1255. It was written off as a mid-compile artefact. It was not: that
+branch predated §32.2's fix, so it was carrying the `/dev/shm` collision, and
+138 is precisely that bug's signature — a binary dying early and taking the rest
+of the run's terms with it.
+
+A test count that drops by an order of magnitude and then recovers is never
+noise. It looks like noise only because the number is a **sum**, and nothing
+draws attention to a missing term. The cheap fix is to count the terms:
+
+```
+$ cargo test 2>&1 | grep -cE '^test result: ok\.'      # binaries that finished
+$ cargo test 2>&1 | grep -cE '^test result: FAILED'    # binaries that did not
+```
+
+On this branch, post-merge, five consecutive runs: **82 binaries, 1302 tests, 0
+failed binaries**, every time. The binary count is the thing that would have
+made the earlier 138 unmistakable in the moment rather than a week later —
+anything reporting a total should report how many binaries contributed to it.
+
+### 36.10 The doorbell is wired, and `vulkaninfo` cannot measure it
+
+§36.8 item 3 said "everything under the doorbell is measured; nothing above it
+calls it yet". That is now false, and the part of it that is now true is worth
+separating carefully from the part that is not.
+
+**Wired.** `sv-gpu-server guest --bell <port>` attaches a [`Doorman`] on the
+guest's second virtio-serial port after the control region is stamped; the ICD
+attaches to the host end of the same chardev when `SV_BELL` names it. Both are
+optional and both degrade to a warning, because a session without a doorbell is
+exactly the session that shipped and refusing to start because an *optimisation*
+is unavailable would be worse than not having built it. `scripts/sv-guest-e2e.sh
+--bell` runs the whole cross-VM topology with it, and both halves say so:
+
+```
+[gpu] doorbell attached on /dev/virtio-ports/org.sirati.svbell.0
+[icd] doorbell attached on /tmp/sv-guest/bell.sock
+cross-VM: PASS — the application read a driver that lives in another kernel
+```
+
+So a real Vulkan application's commands now cross a real hypervisor with a
+doorbell under them. That is the data path finished for the Vulkan half.
+
+**And it cannot be measured this way.** Six runs each, app-side wall clock, ms:
+
+| | samples | median | min | max |
+|---|---|---|---|---|
+| no doorbell | 167 146 93 398 264 148 | 157.5 | 93 | 398 |
+| doorbell | 111 115 111 346 267 770 | 191 | 111 | 770 |
+
+The median is *worse* with the doorbell and the ranges overlap almost entirely.
+**That is not a regression; it is an inadequate instrument**, and saying so is
+the only honest reading of those numbers. Three reasons, all identifiable
+without a better experiment:
+
+1. **`vulkaninfo --summary` is setup, not round trips.** It enumerates and
+   exits. The waits the doorbell shortens are a small part of what the timer
+   spans, and process startup, loader enumeration and arena import are most of
+   the rest. For scale, the *locate* in the same run took 166.72 ms — larger
+   than the whole quantity being measured, and outside the timer.
+2. **The baseline already has the ladder.** §36.6.1 shortened the first slice
+   from 20 ms to 25 µs, so "no doorbell" is not the 20 ms behaviour that cost
+   216.9 ms a present; it is the already-16×-better behaviour. The delta being
+   looked for here is ladder→doorbell, which is much smaller than
+   slice→doorbell.
+3. **Each sample includes a VM boot**, on a workstation several agents share.
+   A 4× spread within one condition is the machine.
+
+**What the latency evidence still is**: §36.6.3's ~9 µs against a 20 ms slice,
+measured directly and with a same-kernel control. Nothing here weakens that, and
+nothing here confirms it in an application either.
+
+**What a real measurement needs**, so that the next person does not repeat this:
+a command-heavy workload with a *fixed, known* number of round trips; timing
+taken in-process around the calls rather than around the process; the parker's
+`first_slice` settable at run time so that fixed-slice, ladder and doorbell are
+three conditions of one experiment rather than three builds; and enough
+repetitions to state a median with a spread. `frame-200` is the right shape of
+workload and is the obvious candidate.
+
+This is recorded as a section rather than deleted because a measurement that
+failed to resolve its effect is a result, and an unrecorded one gets taken
+again.
+
+### 36.11 The milestone: a Wayland client, through a ring
+
+`scripts/wc-ring.sh`:
+
+```
+wc-compositor: accepting Wayland rings in /tmp/wc-ring-4RGQVu/ctl
+wc-compositor: client 1 accepted on ring slot 1 (no socket crossed the VM boundary)
+[proxy] upstream is the shared_vulkan session at ...ctl (16 ring slots, generation 1)
+[proxy] client 1 connected, upstream ring slot 1 (no socket, no TCP, no ssh)
+[proxy] client 1 ... 0 fds in, 0 out; 8 client msgs, 31 server msgs
+ring: PASS — an unmodified Wayland client drove a compositor with no socket upstream
+```
+
+`wayland-info`, which knows nothing about any of this, enumerated **16
+interfaces** — `wl_seat` with pointer, keyboard and touch among them — over a
+connection whose upstream hop is a memcpy into a mapped region. 8 client
+messages and 31 server messages, so it is real bidirectional protocol traffic
+and not a handshake that happened to complete.
+
+Everything in §36.2's table ran: the claim was the `connect()`, the directory
+poll was the `accept()`, the command lane carried the requests and the reply
+lane the events, and the chunking and reassembly of §36.4 held for a stream
+whose messages are 4-byte aligned and never 16.
+
+**What this is not, stated because the difference is the whole point of the
+project.** Both halves are Linux processes on one machine, so the ring is
+shared memory between two processes rather than across a hypervisor. The ring
+code does not know the difference — `SharedRegion` is a mapping either way, and
+that is exactly why this is worth running — but a guest window is not yet
+proven, and §36.8 tracks what separates them.
+
+**And the socket that remains, precisely.** smithay's `insert_client` takes a
+`wc_transport::Stream`, a concrete socket type that a ring cannot become (and
+`wepoll` needs a real socket handle, so even an enum would not do). So each
+accepted ring is bridged to smithay through a `Stream::pair()` inside the
+compositor. That socketpair is between two threads of one process **inside the
+guest**; what crosses the VM boundary is the ring and only the ring. The
+remaining hop is a memcpy through a loopback buffer where there used to be a
+WiFi round trip. Removing it means teaching the vendored `wayland-backend` to
+take a `Read + Write` client rather than a socket, which is a change to vendored
+code and a `wepoll` problem, and is not worth doing before a client has driven a
+*guest* window through a ring.

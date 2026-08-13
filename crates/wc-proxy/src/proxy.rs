@@ -176,6 +176,114 @@ impl Drop for Listener {
 /// is genuinely absent into a hang.
 const UPSTREAM_REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Where the compositor is, and how its bytes get there.
+///
+/// waycompose-design.md §36. There are two, and only one of them is the design:
+///
+/// - [`Upstream::Ring`] — a `ByteChannel` on a ring slot of the shared_vulkan
+///   session's control region. **This is the real one.** No socket, no TCP, no
+///   ssh; the bytes are memcpy'd into a page the guest maps.
+/// - [`Upstream::Socket`] — the `AF_UNIX` node, which under Wine is the
+///   compositor itself and on the guest deployment is the far end of
+///   `ssh -L` → `probe-relay.exe`. Retained because it is what the Wine fixture
+///   and every same-machine harness use, and because a second path with no
+///   statement of which is real is worse than either.
+///
+/// # The fd rule, restated where the choice is made (§14.7)
+///
+/// Both arms are write-only-bytes by construction. `Socket` writes with
+/// [`write_some`], a plain `write(2)` with no fd argument; `Ring` writes with
+/// `ByteChannel::write`, whose only parameter is `&[u8]`. Neither has a
+/// `sendmsg` in reach. The count crossing here is unrepresentable in both, which
+/// is why this enum can exist at all without weakening the invariant.
+pub enum Upstream {
+    Socket(UnixStream),
+    Ring(Box<sv_transport::wlbytes::ByteChannel>),
+}
+
+impl Upstream {
+    /// The descriptor `poll` should watch, or `-1` for an upstream that has
+    /// none. A negative fd in a `pollfd` is ignored, which is how the ring case
+    /// needs no second loop — the same trick the icon and clipboard feeds use.
+    fn poll_fd(&self) -> RawFd {
+        match self {
+            Upstream::Socket(s) => s.as_raw_fd(),
+            Upstream::Ring(_) => -1,
+        }
+    }
+
+    fn set_nonblocking(&self) -> io::Result<()> {
+        match self {
+            Upstream::Socket(s) => s.set_nonblocking(true),
+            // A ring is never anything else.
+            Upstream::Ring(_) => Ok(()),
+        }
+    }
+
+    /// Read what is there. `Ok(None)` is end of stream; `Ok(Some(0))` is
+    /// "nothing yet".
+    fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        match self {
+            Upstream::Socket(s) => {
+                // SAFETY: a live buffer whose length is passed truthfully.
+                let n = unsafe { libc::read(s.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n == 0 {
+                    return Ok(None);
+                }
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        return Ok(Some(0));
+                    }
+                    return Err(e);
+                }
+                Ok(Some(n as usize))
+            }
+            Upstream::Ring(ch) => match ch.read(buf).map_err(ring_err)? {
+                sv_transport::wlbytes::ReadOutcome::Bytes(n) => Ok(Some(n)),
+                sv_transport::wlbytes::ReadOutcome::Empty => Ok(Some(0)),
+                sv_transport::wlbytes::ReadOutcome::Eof => Ok(None),
+            },
+        }
+    }
+
+    /// Push what fits. A short write is normal and the caller retries; on the
+    /// ring a zero return is `RingFull`, which is the compositor applying
+    /// backpressure and not an error.
+    fn write_chunk(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Upstream::Socket(s) => write_some(s.as_raw_fd(), buf),
+            Upstream::Ring(ch) => ch.write(buf).map_err(ring_err),
+        }
+    }
+
+    fn is_ring(&self) -> bool {
+        matches!(self, Upstream::Ring(_))
+    }
+}
+
+fn ring_err(e: sv_transport::Error) -> io::Error {
+    io::Error::other(format!("{e}"))
+}
+
+/// How long `poll` may sleep when the upstream is a ring.
+///
+/// A ring has no descriptor, so `poll` cannot wait on it and the loop must come
+/// back and look. This is the ladder it climbs while nothing is happening, and
+/// it is the whole of this module's answer to "a doorbell without spinning a
+/// core": busy, the loop never sleeps at all and the latency is the memcpy;
+/// idle, it settles at the same 20 ms the socket path always used, which is
+/// fifty wakeups a second on a thread that would otherwise be blocked.
+///
+/// The failure being avoided by name: the WiFi tray utility on this machine once
+/// span a core at 92-99% doing exactly this with no ladder and no ceiling.
+const RING_POLL_LADDER_MS: [i32; 4] = [0, 1, 5, 20];
+
+/// Turns without traffic before the ladder advances a rung. Two, so that a
+/// request/reply pair — which is the shape of nearly everything Wayland does —
+/// never pays the step down.
+const RING_POLL_PATIENCE: u32 = 2;
+
 /// Connect to the compositor, treating `ECONNREFUSED` as "not listening *yet*".
 ///
 /// # Why this is a race and not defensiveness
@@ -237,14 +345,21 @@ pub fn connect_upstream(
 pub fn pump(
     session: &mut Session,
     client: UnixStream,
-    upstream: UnixStream,
+    upstream: Upstream,
     icons: Option<&mut crate::iconlink::IconLink>,
     clip: Option<&mut crate::clip::ClipLink>,
     idle_timeout: std::time::Duration,
     log: &mut dyn FnMut(&str),
 ) -> io::Result<&'static str> {
-    upstream.set_nonblocking(true)?;
+    let mut upstream = upstream;
+    upstream.set_nonblocking()?;
     client.set_nonblocking(true)?;
+    // §36. A ring has no descriptor for `poll` to wait on, so the loop must come
+    // back and look. A socket keeps the wait it always had and never advances a
+    // rung.
+    let ring_upstream = upstream.is_ring();
+    let mut rung = 0usize;
+    let mut quiet_turns = 0u32;
 
     let mut from_client = Vec::<u8>::new();
     let mut from_server = Vec::<u8>::new();
@@ -262,7 +377,7 @@ pub fn pump(
         // see `iconlink` and `clip` for why neither feed can ride the first one.
         let mut pollfds = [
             libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: upstream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: upstream.poll_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd {
                 fd: icons.as_ref().map_or(-1, |l| l.fd()),
                 events: libc::POLLIN,
@@ -292,7 +407,16 @@ pub fn pump(
         // list back to a variable-length transfer list is not worth its cost —
         // so the wait is what bounds a transfer's latency. A copy or a paste is
         // a few turns of this loop and a human pressed a key to start it.
-        let wait = if session.clip_busy() { 1 } else { 20 };
+        //
+        // §36 adds a second claim on the same number: a ring upstream has no
+        // descriptor for `poll` to wait on, so this wait is also what bounds the
+        // *compositor's* latency, not just a transfer's. The two are combined by
+        // taking the smaller — each is an upper bound on how long this loop may
+        // sleep, and honouring both means honouring the tighter one. A socket
+        // upstream contributes 20 and changes nothing.
+        let clip_wait = if session.clip_busy() { 1 } else { 20 };
+        let ring_wait = if ring_upstream { RING_POLL_LADDER_MS[rung] } else { 20 };
+        let wait = clip_wait.min(ring_wait);
         // A negative fd in a `pollfd` is ignored by `poll`, which is how the
         // no-icons case costs nothing and needs no second loop.
         // SAFETY: a live array of four `pollfd`s whose length is passed
@@ -351,23 +475,31 @@ pub fn pump(
         }
 
         // --- compositor -> client -------------------------------------------
-        if pollfds[1].revents & libc::POLLIN != 0 {
+        // A ring is never "readable" to `poll`, so it is asked unconditionally.
+        // A socket is asked only when `poll` said so, exactly as before.
+        if ring_upstream || pollfds[1].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; READ_CHUNK];
-            // SAFETY: a live buffer whose length is passed truthfully.
-            let n = unsafe {
-                libc::read(upstream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-            };
-            if n == 0 {
-                return Ok("the compositor closed the connection");
-            }
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    return Err(e);
+            let mut got = 0usize;
+            // Drain what is there rather than one packet a turn: a ring hands
+            // back at most `max_chunk` per call, and a turn that took one packet
+            // and then slept would make a large frame's worth of protocol crawl
+            // up the ladder one rung at a time.
+            loop {
+                match upstream.read_chunk(&mut buf[got..])? {
+                    None if got == 0 => return Ok("the compositor closed the connection"),
+                    None => break,
+                    Some(0) => break,
+                    Some(n) => {
+                        got += n;
+                        if got == buf.len() {
+                            break;
+                        }
+                    }
                 }
-            } else {
+            }
+            if got > 0 {
                 last_traffic = std::time::Instant::now();
-                from_server.extend_from_slice(&buf[..n as usize]);
+                from_server.extend_from_slice(&buf[..got]);
             }
             drain(&mut from_server, |h, body| match session.server_message(h, body) {
                 Ok((bytes, mut new_fds)) => {
@@ -442,7 +574,7 @@ pub fn pump(
             // Never with a control message. There is no code path here that
             // could send a descriptor upstream, which is the rule enforced by
             // construction rather than by review.
-            match write_some(upstream.as_raw_fd(), &to_server) {
+            match upstream.write_chunk(&to_server) {
                 Ok(n) => drop(to_server.drain(..n)),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
@@ -503,6 +635,23 @@ pub fn pump(
         if session.clip_busy() {
             last_traffic = std::time::Instant::now();
         }
+        // §36. The ladder. Any traffic at all this turn drops straight back to
+        // rung zero — a request/reply pair is the shape of nearly everything
+        // Wayland does, and making the reply pay a step down would put the
+        // ladder on the latency path it exists to keep off it.
+        if ring_upstream {
+            if last_traffic.elapsed() < std::time::Duration::from_millis(1) {
+                rung = 0;
+                quiet_turns = 0;
+            } else {
+                quiet_turns += 1;
+                if quiet_turns >= RING_POLL_PATIENCE {
+                    quiet_turns = 0;
+                    rung = (rung + 1).min(RING_POLL_LADDER_MS.len() - 1);
+                }
+            }
+        }
+
         if last_traffic.elapsed() > idle_timeout {
             return Ok("idle timeout");
         }

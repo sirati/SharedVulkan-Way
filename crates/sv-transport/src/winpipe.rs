@@ -111,6 +111,67 @@ pub struct Pipe {
 #[cfg(windows)]
 unsafe impl Send for Pipe {}
 
+/// Open the guest end of a **virtio-serial port** on Windows.
+///
+/// waycompose-design.md §36.6. This is the Windows twin of
+/// [`crate::stream::open_virtio_port`], and it lives in this module rather than
+/// beside it because the mechanism is this module's: `vioser.sys` exposes a port
+/// as a **named-pipe-shaped device object** at `\\.\Global\<name>`, and opening
+/// it is the same `CreateFileW(OPEN_EXISTING)` that [`Pipe::connect`] does. The
+/// returned [`Pipe`] is `Read + Write` and is a byte channel with no framing,
+/// which is exactly what the doorbell wants.
+///
+/// # Not `Pipe::connect`, and the difference is one call
+///
+/// `Pipe::connect` retries around `WaitNamedPipeW`, which is meaningful for a
+/// real named pipe whose instances can all be busy. A virtio-serial port is not
+/// a named pipe and has no instances: `WaitNamedPipeW` on it fails with
+/// `ERROR_INVALID_NAME` rather than waiting, so the retry would be a busy loop
+/// dressed as patience. What *is* worth retrying is the port not existing yet —
+/// the device object appears when the guest's `vioser.sys` binds the port, which
+/// on a hot-added port is some milliseconds after the QMP `device_add` returns —
+/// so this sleeps between attempts instead.
+///
+/// # One opener, and it is a platform rule rather than a convention
+///
+/// A virtio-serial port permits exactly one opener. That is why `docs/one-binary.md`
+/// §1.6 says the doorbell cannot be shared between the GPU half and the
+/// compositor half while they are separate processes, and it is the same
+/// constraint [`crate::stream::open_virtio_port`] records for Linux ("two
+/// descriptors on the same port is a way to deadlock"). Read and write both go
+/// through the one handle this returns.
+#[cfg(windows)]
+pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
+    // `\\.\Global\` rather than `\\.\`: the port has to be reachable from a
+    // service and from a session-0 process, and the session-local namespace is
+    // not. The guest half of this project has run as both.
+    let path = format!("\\\\.\\Global\\{name}");
+    let wpath = wide(&path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        // SAFETY: `wpath` outlives the call.
+        let handle = unsafe {
+            sys::CreateFileW(
+                wpath.as_ptr(),
+                sys::GENERIC_READ | sys::GENERIC_WRITE,
+                0,
+                core::ptr::null_mut(),
+                sys::OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if handle != sys::INVALID_HANDLE_VALUE {
+            return Ok(Pipe { handle, server: false });
+        }
+        let errno = unsafe { sys::GetLastError() } as i32;
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Os { call: "CreateFileW (virtio-serial port)", errno });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[cfg(windows)]
 impl Pipe {
     /// Create the pipe and block until a client connects.

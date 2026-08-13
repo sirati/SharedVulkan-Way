@@ -53,6 +53,9 @@ pub mod grow;
 mod icon;
 mod input;
 mod platform;
+/// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
+#[cfg(unix)]
+mod ringlink;
 mod state;
 mod surface;
 /// Which taskbar button a window belongs to. See its header, and
@@ -82,6 +85,10 @@ use state::{ClientState, Decorations, State};
 struct Args {
     once: bool,
     socket: Option<String>,
+    /// §36. When set, the compositor also accepts Wayland connections as ring
+    /// slots in the control region it creates at this path — the `accept()` half
+    /// of §36.2's table. The socket listener stays up alongside it.
+    wayland_ring: Option<String>,
     idle_timeout: Duration,
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
@@ -251,6 +258,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     let mut args = Args {
         once: false,
         socket: None,
+        wayland_ring: None,
         idle_timeout: Duration::from_secs(30),
         dump_frames: None,
         debug_icon: false,
@@ -283,6 +291,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--socket" => args.socket = it.next(),
+            "--wayland-ring" => args.wayland_ring = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -804,7 +813,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let wayland = std::thread::Builder::new()
         .name("wayland".into())
         .spawn(move || {
-            let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
+            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
@@ -832,6 +841,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
 fn wayland_thread(
     once: bool,
     socket: Option<String>,
+    wayland_ring: Option<String>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -899,7 +909,50 @@ fn wayland_thread(
     println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
     let _ = std::io::stdout().flush();
 
+    // §36. `accept()` on the ring directory, beside `accept()` on the socket.
+    // Both produce a `wc_transport::Stream` for `insert_client`; only one of
+    // them involves anything crossing the VM boundary.
+    #[cfg(unix)]
+    let mut ring_link = match wayland_ring.as_deref() {
+        None => None,
+        Some(path) => match ringlink::RingLink::create(path) {
+            Ok(rl) => {
+                println!("wc-compositor: accepting Wayland rings in {path}");
+                let _ = std::io::stdout().flush();
+                Some(rl)
+            }
+            Err(e) => {
+                eprintln!("wc-compositor: could not create the ring region {path}: {e}");
+                state.quit();
+                return 2;
+            }
+        },
+    };
+
     loop {
+        // The ring's accept, first, so a connection that arrived between turns
+        // is dispatched in the same turn as one that arrived on the socket.
+        #[cfg(unix)]
+        if let Some(rl) = ring_link.as_mut() {
+            for (slot, stream) in rl.accept() {
+                let index = (state.clients_seen + 1) as u32;
+                match display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::new(index)))
+                {
+                    Ok(_) => {
+                        state.clients_seen += 1;
+                        println!(
+                            "wc-compositor: client {index} accepted on ring slot {slot} \
+                             (no socket crossed the VM boundary)"
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                    Err(e) => eprintln!("wc-compositor: ring slot {slot} not inserted: {e}"),
+                }
+            }
+        }
+
         match listener.accept() {
             Ok(Some(stream)) => {
                 // The ordinal is assigned *before* the insert, so it counts
@@ -959,6 +1012,15 @@ fn wayland_thread(
             println!("wc-compositor: the platform stopped; winding up");
             code = 0;
             break;
+        }
+
+        // §36. Before dispatch: bytes that arrived from the ring have to be in
+        // the local socket *before* smithay reads it, or they wait a whole 5 ms
+        // tick. `pump` also drains what smithay wrote last turn, which is why it
+        // is one call and not two.
+        #[cfg(unix)]
+        if let Some(rl) = ring_link.as_mut() {
+            rl.pump();
         }
 
         if let Err(e) = display.dispatch_clients(&mut state) {
