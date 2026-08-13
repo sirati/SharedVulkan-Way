@@ -906,6 +906,40 @@ fn emit_forward_command(
         quote!(let __r = unsafe { __f(#(#args),*) };)
     };
 
+    // # External synchronisation of the one `VkQueue` (design.md §0.12 item 4)
+    //
+    // Vulkan makes `vkQueueSubmit`, `vkQueueWaitIdle`, `vkQueueBindSparse` and
+    // `vkDeviceWaitIdle` externally synchronised on the queue, which means *the
+    // caller* must not make two of them concurrently. Across this boundary the
+    // caller is not one application:
+    //
+    // - a GPU side opens **one** queue, and since §0.12 every session shares it,
+    //   so two well-behaved clients still reach one driver `VkQueue` at once;
+    // - within one session there are three ring threads (instance, device,
+    //   queue), and `vkDeviceWaitIdle` rides the device ring while
+    //   `vkQueueSubmit` rides the queue one — so the race predates multi-session
+    //   and §0.12 recorded it as such.
+    //
+    // The lock is per *device* and lives on the hand-written half, because what
+    // it protects is the driver's queue rather than the session's table. It is
+    // taken as narrowly as the call itself: raising the parameters above it
+    // touches nothing shared, and widening the lock to cover marshalling would
+    // serialise every submit's memcpy for no benefit.
+    //
+    // `drop` is explicit rather than left to the end of the block because
+    // `__b = __h` reborrows the host mutably immediately afterwards, and a guard
+    // holding a shared borrow across that line does not compile. That is the
+    // borrow checker enforcing the narrowness this comment claims.
+    let call = if c.externsync_queue {
+        quote! {
+            let __qg = __h.lock_queue();
+            #call
+            drop(__qg);
+        }
+    } else {
+        call
+    };
+
     // -- 5. bind created objects, and lower the outputs back ----------------
     let mut post = Vec::new();
     let mut reply_fields = Vec::new();
@@ -1228,6 +1262,16 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// Record that the driver has no such entry point, for one clear
             /// diagnosis rather than a silent refusal.
             fn note_missing(&mut self, command: &'static str);
+            /// Hold the device's queue lock for the duration of one driver call
+            /// the specification marks externally synchronised on a `VkQueue`.
+            ///
+            /// The generated dispatch takes this around — and only around — the
+            /// call itself, for the commands
+            /// `vk_registry::model::Command::externally_synchronizes_a_queue`
+            /// selects. A GPU side has one queue and every session shares it, so
+            /// the obligation cannot be discharged by any one client behaving
+            /// (design.md §0.12 item 4).
+            fn lock_queue(&self) -> crate::QueueGuard<'_>;
 
             #(#methods)*
         }

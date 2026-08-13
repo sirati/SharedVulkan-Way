@@ -414,6 +414,37 @@ impl Command {
     pub fn dispatch_param(&self) -> Option<&Member> {
         self.params.first()
     }
+
+    /// Whether the specification requires the caller to externally synchronise
+    /// a `VkQueue` for this command.
+    ///
+    /// Two spellings in the registry mean the same obligation and both have to
+    /// be read, which is why this is a method rather than a grep:
+    ///
+    /// - an explicit `externsync=` on a parameter whose type is `VkQueue` —
+    ///   `vkQueueSubmit`, `vkQueueSubmit2`, `vkQueueWaitIdle`,
+    ///   `vkQueueBindSparse`, the debug-utils label family;
+    /// - an `<implicitexternsyncparams>` entry naming "all sname:VkQueue objects
+    ///   created from pname:device" — `vkDeviceWaitIdle` and `vkDestroyDevice`,
+    ///   which have no queue parameter at all and are therefore invisible to the
+    ///   first rule.
+    ///
+    /// This is what pass 12 consults to decide which generated dispatches take
+    /// the device's queue lock. A GPU side opens **one** queue and every session
+    /// shares it (design.md §0.12 item 4), so the application's own
+    /// synchronisation cannot discharge the obligation: two clients that each
+    /// use their queue correctly still reach one driver `VkQueue` at once.
+    pub fn externally_synchronizes_a_queue(&self) -> bool {
+        let explicit = self
+            .params
+            .iter()
+            .any(|p| p.externsync.is_some() && p.ty.base_name() == Some("VkQueue"));
+        // The implicit list is prose, and prose is what the registry gives — the
+        // entries are asciidoc, `ifdef::` blocks and all. Matching on the type
+        // name is the only stable thing in them.
+        let implicit = self.implicit_externsync.iter().any(|p| p.contains("VkQueue"));
+        explicit || implicit
+    }
 }
 
 // ---------------------------------------------------------------------------

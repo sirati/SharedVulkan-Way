@@ -6,8 +6,9 @@
  * was written for is "does a notch arrive, and with the right sign" — a
  * question one notch answers completely. This probe asks a different one: what
  * a *scrolling page* does to the damage path over sixty frames' worth of
- * changing rectangles, which is the shape of the bug in docs/design.md §27 and
- * which one notch cannot show. Separate file rather than a flag on
+ * changing rectangles, which is the shape of the bug in §27 of
+ * docs/waycompose-design.md and which one notch cannot show. Separate file
+ * rather than a flag on
  * `probe-input.c` for the reason §16.8 gives about shared guests: ten agents
  * are editing this tree, and a probe with its own name cannot collide with
  * somebody else's edit to a probe with theirs.

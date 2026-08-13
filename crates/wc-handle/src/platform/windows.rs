@@ -715,3 +715,23 @@ impl Drop for WritableView {
         }
     }
 }
+
+/// This process's working set, in bytes.
+///
+/// `GetProcessMemoryInfo`, which is where a `VirtualLock`ed arena's charge
+/// shows up and where Task Manager's number comes from. See
+/// [`crate::arena::committed_bytes`] for why the platform's own accounting is
+/// the only evidence worth offering that release worked.
+pub fn working_set_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    // SAFETY: a zeroed POD the API fills in, sized by its own `cb` field, with
+    // the current process pseudo-handle. Nothing here outlives the call.
+    unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) == 0 {
+            return None;
+        }
+        Some(c.WorkingSetSize as u64)
+    }
+}

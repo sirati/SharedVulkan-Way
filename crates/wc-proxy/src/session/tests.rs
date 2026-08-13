@@ -325,9 +325,9 @@ fn every_copy_scope_produces_the_same_image() {
 /// A client that cycles buffers, the way every real toolkit does.
 ///
 /// The distinction this exercises is the one that broke scrolling — see
-/// docs/design.md §27. `wl_surface.damage` is "what changed on the **surface**
-/// since the last commit", not "what I wrote into this **buffer**". A client
-/// that double-buffers repaints the whole back buffer (or copies the front
+/// docs/waycompose-design.md §27. `wl_surface.damage` is "what changed on the
+/// **surface** since the last commit", not "what I wrote into this **buffer**".
+/// A client that double-buffers repaints the whole back buffer (or copies the front
 /// buffer into it and then repaints the delta) and still reports only the
 /// frame's delta, because that is all that changed on screen. A compositor
 /// reading the buffer directly is fine. A proxy keeping a *per-buffer* shadow
@@ -339,6 +339,10 @@ fn every_copy_scope_produces_the_same_image() {
 /// cycle, and damages only the band. So the attached buffer is always exactly
 /// right, and any disagreement in the region is the proxy's alone.
 struct Cycler {
+    /// Damage the whole buffer every frame, the way `weston-presentation-shm`
+    /// does. The arrears of such a client are N copies of the extent, which is
+    /// the case that has to collapse to one.
+    damage_all: bool,
     frame: Frame,
     buffers: Vec<u32>,
     canvas: Vec<u8>,
@@ -373,7 +377,9 @@ impl Cycler {
         pixels[base..base + self.canvas.len()].copy_from_slice(&self.canvas);
 
         h.send_words(surface, 1, &[buffer, 0, 0]); // attach
-        h.send_words(surface, 9, &[0, y0 as u32, self.frame.w as u32, bh as u32]); // damage_buffer
+        let (dy, dh) =
+            if self.damage_all { (0, self.frame.h) } else { (y0, bh) };
+        h.send_words(surface, 9, &[0, dy as u32, self.frame.w as u32, dh as u32]); // damage_buffer
         h.send_words(surface, 6, &[]); // commit
     }
 }
@@ -385,6 +391,7 @@ fn run_cycling_client(
     scope: CopyScope,
     nbuf: usize,
     frames: u8,
+    damage_all: bool,
 ) -> (Harness, Cycler, usize) {
     let frame = Frame { w: 200, h: 120, stride: 200 * 4, offset: 0 };
     let one = (frame.stride * frame.h) as usize;
@@ -429,7 +436,7 @@ fn run_cycling_client(
         buffers.push(buffer);
     }
 
-    let mut c = Cycler { frame, buffers, canvas: vec![0x20; one] };
+    let mut c = Cycler { damage_all, frame, buffers, canvas: vec![0x20; one] };
     for tick in 0..frames {
         c.tick(&mut h, surface, pixels, tick);
     }
@@ -453,7 +460,7 @@ fn a_buffer_cycling_client_is_not_left_with_a_stale_shadow() {
         for scope in [CopyScope::Pool, CopyScope::Buffer, CopyScope::Damage] {
             let d = tmpdir(&format!("cycle-{nbuf}-{}", scope.as_str()));
             let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
-            let (h, c, last) = run_cycling_client(Box::new(t), scope, nbuf, 12);
+            let (h, c, last) = run_cycling_client(Box::new(t), scope, nbuf, 12, false);
             let peer = wc_handle::Handle::from_descriptor(h.pool_descriptor());
             let map = peer.map().unwrap();
             let seen = map.as_slice()[last..last + c.canvas.len()].to_vec();
@@ -462,7 +469,7 @@ fn a_buffer_cycling_client_is_not_left_with_a_stale_shadow() {
         }
         for (scope, seen, canvas) in &images {
             // Count and locate the disagreeing rows rather than dumping 96000
-            // bytes. The count is the measurement docs/design.md §27 quotes.
+            // bytes. The count is the measurement docs/waycompose-design.md §27 quotes.
             let stride = 200 * 4usize;
             let rows: Vec<usize> = (0..120)
                 .filter(|y| seen[y * stride..(y + 1) * stride] != canvas[y * stride..(y + 1) * stride])
@@ -493,7 +500,7 @@ fn paying_off_the_arrears_still_costs_less_than_the_extent() {
     for scope in [CopyScope::Buffer, CopyScope::Damage] {
         let d = tmpdir(&format!("arrears-{}", scope.as_str()));
         let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
-        let (h, _, _) = run_cycling_client(Box::new(t), scope, 2, 24);
+        let (h, _, _) = run_cycling_client(Box::new(t), scope, 2, 24, false);
         bytes.push((scope, h.session.stats.bytes_copied));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -512,6 +519,44 @@ fn paying_off_the_arrears_still_costs_less_than_the_extent() {
         get(CopyScope::Damage),
         get(CopyScope::Buffer)
     );
+}
+
+/// **A client that damages everything must never cost more than `Buffer`.**
+///
+/// This is the test the arrears fix shipped without, and the regression it let
+/// through is the reason it exists. `weston-presentation-shm` damages its whole
+/// 250x250 buffer every frame and cycles buffers, so a buffer coming back round
+/// owes one *full-buffer* rectangle per intervening frame — and `copy_damage`
+/// copies overlapping rectangles as many times as it is given them, on purpose,
+/// because unioning two of them costs more than copying twice. Sixty is not
+/// two. `scripts/wc-proxy.sh cost` went from 168 MiB to 8583 MiB for the same
+/// 700 commits, 13 MiB per copy of a 244 KiB buffer, and the harness still
+/// reported 37 passed 0 failed because it prints that table and does not check
+/// it.
+///
+/// `<=` rather than `<`: with whole-buffer damage the two scopes are copying
+/// the same pixels, and the honest assertion is that damage never costs *more*.
+/// The strict inequality belongs to the partial-damage test above.
+#[test]
+fn whole_buffer_damage_never_costs_more_than_the_extent() {
+    for nbuf in [2usize, 4] {
+        let mut bytes = Vec::new();
+        for scope in [CopyScope::Buffer, CopyScope::Damage] {
+            let d = tmpdir(&format!("whole-{nbuf}-{}", scope.as_str()));
+            let t = SharedFile::new(&d, &format!("{}/", d.display())).unwrap();
+            let (h, _, _) = run_cycling_client(Box::new(t), scope, nbuf, 40, true);
+            bytes.push((scope, h.session.stats.bytes_copied));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        let get = |s: CopyScope| bytes.iter().find(|(k, _)| *k == s).unwrap().1;
+        assert!(
+            get(CopyScope::Damage) <= get(CopyScope::Buffer),
+            "{nbuf} buffers: damage copied {} bytes against buffer's {} -- arrears are \
+             being copied once per rectangle instead of collapsing to the extent",
+            get(CopyScope::Damage),
+            get(CopyScope::Buffer)
+        );
+    }
 }
 
 /// Damage-scoped copying really does copy less. Without this the scope is a

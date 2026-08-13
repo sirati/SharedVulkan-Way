@@ -665,11 +665,47 @@ pub fn queue_present(
     // (design.md §5.3). The GPU side's write to it is ordered before this read
     // by the fence just waited on.
     let bytes = unsafe { core::slice::from_raw_parts(pixels as *const u8, len) };
+    frame_note(swapchain, bytes, width, height);
     let mut chains = icd.swapchains();
     if let Some(sc) = chains.get_mut(&swapchain) {
         sc.target.present(bytes, width, height, swap_rb);
     }
     Ok(())
+}
+
+/// Say, occasionally and only under `SV_DEBUG`, whether the frame about to be
+/// displayed has anything in it.
+///
+/// **This exists because "presented" and "visible" are different claims and
+/// this project has now confused them twice.** A swapchain whose every entry
+/// point returns `VK_SUCCESS`, whose fence signals and whose blit runs, still
+/// shows a black window if the application rendered nothing into the image —
+/// and from the outside that is indistinguishable from a broken display target.
+/// One number tells the two apart, and it is the *only* number that does
+/// without a screenshot.
+///
+/// Sampled rather than summed: a 4K frame is 33 MB and this runs sixty times a
+/// second, so it reads one pixel per 4 KiB — enough to tell "all zero" from
+/// "an image" and cheap enough to leave in.
+fn frame_note(swapchain: u64, bytes: &[u8], width: u32, height: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n % 60 != 0 {
+        return;
+    }
+    let mut nonzero = 0usize;
+    let mut sampled = 0usize;
+    for px in bytes.chunks_exact(4).step_by(1024) {
+        sampled += 1;
+        if px[0] | px[1] | px[2] != 0 {
+            nonzero += 1;
+        }
+    }
+    trace!(
+        "vkQueuePresentKHR: swapchain {swapchain:#x} frame {n} {width}x{height} — \
+         {nonzero}/{sampled} sampled pixels are not black"
+    );
 }
 
 /// `vkDestroySwapchainKHR`.

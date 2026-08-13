@@ -336,6 +336,16 @@ pub struct OutboundWindow {
     pub offset: u64,
     /// Its length. Always a whole number of [`REGION_PAGE`]s.
     pub len: u64,
+    /// DYNAMIC ARENA. The run id of the region this window is the whole of,
+    /// when `reserve_outbound` had to commit one. `None` when the window is a
+    /// tail of a region somebody else already committed and reported.
+    ///
+    /// It is here because the host cannot locate a region it has not been told
+    /// the run id of, and a dedicated outbound region is committed *inside*
+    /// `reserve_outbound` where the caller would otherwise never see it. A
+    /// region nobody can locate is a region the compositor writes keymaps into
+    /// and no client ever reads.
+    pub run_id: Option<u64>,
 }
 
 /// The window, plus the free list that is the whole of the allocator's state.
@@ -423,6 +433,44 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         ));
     }
     let len = len.div_ceil(GIFT_GRANULARITY) * GIFT_GRANULARITY;
+    // DYNAMIC ARENA. An id this process has not committed means "commit a
+    // region for the window", and the window is then the whole of it.
+    //
+    // This is the split the floor depends on. While the window was a tail of
+    // the data region, the region carrying live keymaps was also the region the
+    // data allocator started in, so pinning the one pinned the other and
+    // whatever the session started at became permanent — an `sv-guest` holding
+    // 817 MB with no client connected. Giving the window its own region makes
+    // the floor the size of the thing that actually has to stay.
+    //
+    // The id carries the meaning rather than a new flag, because the two cases
+    // want to be told apart by *which region*, which is exactly what an id is
+    // for. `--arena-outbound 0:M` against a committed arena 0 is the pre-split
+    // spelling and still does what it always did.
+    if !registry()
+        .read()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?
+        .contains_key(&arena)
+    {
+        // Its own commit, its own stamps, its own run id: the host locates it
+        // exactly as it locates a data region, and `defer_gifts` still covers
+        // the ordering (see that function for what a dedicated region did and
+        // did not change about the stamp race).
+        let region = attach_guest_ram(arena, len)?;
+        let mut guard = outbound_slot()
+            .lock()
+            .map_err(|_| io::Error::other("outbound window poisoned"))?;
+        if let Some(w) = guard.as_ref() {
+            return Err(io::Error::other(format!(
+                "this process already has an outbound window, in arena {}: a second \
+                 would be a second allocator over objects clients already hold",
+                w.arena
+            )));
+        }
+        let w = Window { arena, base: 0, len, free: vec![(0, len)], given: 0, pending: None };
+        *guard = Some(w);
+        return Ok(OutboundWindow { arena, offset: 0, len, run_id: Some(region.run_id) });
+    }
     let arena_len = {
         let guard = registry()
             .read()
@@ -462,7 +510,7 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
     }
     let base = arena_len - len;
     *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None });
-    Ok(OutboundWindow { arena, offset: base, len })
+    Ok(OutboundWindow { arena, offset: base, len, run_id: None })
 }
 
 /// Hold every gift's bytes in memory until [`release_gifts`] is called.
@@ -484,6 +532,29 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
 /// so the keymap is minted before the socket is bound, let alone bound to.
 /// 73017 bytes of `de` layout is ten pages of stamps, and ten is exactly what
 /// the sweep was short.
+///
+/// # What a dedicated outbound region changed, and what it did not
+///
+/// DYNAMIC ARENA. The window now lives in a region of its own rather than on
+/// the tail of the data region, and that **scopes this race without removing
+/// it**. Gifts can only ever overwrite the *outbound* region's stamps, so every
+/// data region is safe by construction — a class of race gone, not merely made
+/// less likely. What is left is one 256 KiB region whose stamps a keymap will
+/// eat, and it still has to be located before that happens.
+///
+/// The deferral is not cheaper for being scoped, because the sweep's cost is a
+/// function of the *host's* RAM and not the region's: §12.5 measured 2.37-2.42 s
+/// against a 13312 MiB backing object whatever was being looked for. A 256 KiB
+/// region takes just as long to find by content as a 768 MiB one.
+///
+/// **What removes the deferral outright is the PFN locator**, which re-locates a
+/// region whose contents have already been overwritten — §0.14 item 4 measured
+/// it returning the same 16384 frames where the content sweep found 0 pages.
+/// With `Locator::Pfns` in use there is no ordering constraint left to defer
+/// against: a gift may land before the locate, because the locate no longer
+/// reads the bytes the gift overwrote. This code stays because the scan is
+/// still the R28 cross-check at attach and still the only locator on a guest
+/// that cannot run the query; it is dead weight on a guest that can.
 ///
 /// # Why deferring is the fix rather than re-ordering something
 ///
@@ -566,7 +637,7 @@ pub fn outbound() -> Option<OutboundWindow> {
     let guard = outbound_slot().lock().ok()?;
     guard
         .as_ref()
-        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len })
+        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len, run_id: None })
 }
 
 /// Bytes given out and bytes still free in the outbound window, for the one log
@@ -881,6 +952,86 @@ pub fn attached() -> Vec<(u32, usize, String)> {
         .collect();
     out.sort_by_key(|(id, _, _)| *id);
     out
+}
+
+/// Give a guest-RAM region back to the operating system.
+///
+/// DYNAMIC ARENA, and this is the half of release that actually returns
+/// memory. The host side unmapping its view of a region frees nothing: the
+/// pages are the *guest's*, committed and pinned by this process, and they stop
+/// being charged to anybody only when this process releases them.
+///
+/// # What actually happens
+///
+/// Dropping the registry entry drops the last `Arc` on the region's
+/// `LockedRegion`, whose `Drop` is `VirtualFree(base, 0, MEM_RELEASE)` —
+/// already written, already the thing that runs at process exit. All this does
+/// is make it run earlier, on purpose. `VirtualLock`'s working-set charge goes
+/// with it, which is why [`committed_bytes`] moves and not merely some counter
+/// of ours.
+///
+/// # Three refusals
+///
+/// * **Not provided.** An arena this process merely *opened* is somebody
+///   else's memory; releasing it would unmap a view and free nothing, while
+///   looking like it worked.
+/// * **The outbound window's arena.** Those bytes are keymaps and clipboard
+///   offers already handed to clients, live in their hands
+///   (`one-binary.md` §3.1a). This is the same exemption the host side makes by
+///   never reclaiming the startup region, made again on the side that owns the
+///   pages, because an invariant enforced on one side only is enforced nowhere.
+/// * **Unknown id.** Loud, because the alternative is a caller that believes it
+///   released something.
+///
+/// Returns the bytes released.
+pub fn release_guest_ram(arena: u32) -> io::Result<u64> {
+    let mut guard = registry()
+        .write()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?;
+    let Some(a) = guard.get(&arena) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("arena {arena} is not attached, so it cannot be released"),
+        ));
+    };
+    if !a.provided {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "arena {arena} was opened, not provided: these are not this process's \
+                 pages and releasing them would free nothing while looking like it worked"
+            ),
+        ));
+    }
+    if outbound().is_some_and(|w| w.arena == arena) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "arena {arena} carries the outbound window: those bytes are objects \
+                 already handed to clients and are live in their hands"
+            ),
+        ));
+    }
+    let len = a.len as u64;
+    // The `Arc` in the map is the last one for a provided region — nothing
+    // hands these out — so removing it runs `LockedRegion::drop`, which is the
+    // `VirtualFree(MEM_RELEASE)`.
+    guard.remove(&arena);
+    Ok(len)
+}
+
+/// This process's working set, in bytes, as the operating system accounts it.
+///
+/// The evidence that release worked, and it is deliberately **the platform's
+/// own number rather than one of ours**. A log line saying "released 16 MiB" is
+/// this code agreeing with itself; a working set that falls by 16 MiB is
+/// Windows agreeing.
+///
+/// The working set specifically, because that is what a `VirtualLock`ed arena
+/// is charged against (§10.10's quota) and what "Firefox is using 1.2 GB" is
+/// read off. `None` where the platform has no answer worth giving.
+pub fn committed_bytes() -> Option<u64> {
+    platform::working_set_bytes()
 }
 
 /// Where a region the peer grew into can be found, on the file fixture.
@@ -1320,5 +1471,69 @@ mod tests {
             len: 16,
         });
         assert_eq!(h.map().unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    /// DYNAMIC ARENA. Committing a guest-RAM region raises this process's
+    /// working set, and releasing it brings it back down — measured by the
+    /// operating system, not by our own counter.
+    ///
+    /// This is the claim the user actually cares about: "using 1.2 GB for
+    /// Firefox is a lot". A log line saying we released is this code agreeing
+    /// with itself. A working set that falls is the platform agreeing.
+    ///
+    /// 64 MiB, because the noise floor of a process's working set under a
+    /// contended machine is a few MiB and the signal has to clear it. The
+    /// assertion is deliberately loose — at least half the region comes back —
+    /// because the allocator, the test harness and the page cache all move this
+    /// number a little and a tight bound would be a flake rather than a check.
+    #[test]
+    fn releasing_a_region_returns_the_pages_to_the_operating_system() {
+        const LEN: u64 = 64 << 20;
+        let Some(before) = committed_bytes() else {
+            eprintln!("no working-set accounting on this platform; nothing to assert");
+            return;
+        };
+        // An id nothing else in this process uses; the registry is global.
+        let id = 9_412;
+        let region = match attach_guest_ram(id, LEN) {
+            Ok(r) => r,
+            // Pinning needs a working-set quota and the machine may refuse it.
+            // A test that cannot commit has measured nothing and says so rather
+            // than failing, exactly as the guest-RAM path itself does.
+            Err(e) => {
+                eprintln!("could not commit {LEN} bytes of guest RAM here: {e}");
+                return;
+            }
+        };
+        let held = committed_bytes().expect("accounting worked a moment ago");
+        assert!(
+            held > before + LEN / 2,
+            "committing {LEN} bytes should show up: {before} -> {held}"
+        );
+        // `GuestRegion` is a `Copy` descriptor, not the mapping — the pages are
+        // held by the registry, and `release_guest_ram` below is what frees them.
+        let _ = region;
+
+        let freed = release_guest_ram(id).expect("a provided region can be released");
+        assert_eq!(freed, LEN);
+        let after = committed_bytes().expect("accounting worked a moment ago");
+        assert!(
+            after + LEN / 2 < held,
+            "releasing {LEN} bytes should give them back: {held} -> {after}"
+        );
+    }
+
+    /// An arena this process merely opened is somebody else's memory, and
+    /// releasing it would unmap a view and free nothing while looking like it
+    /// worked.
+    #[test]
+    fn only_a_region_this_process_provided_may_be_released() {
+        let e = release_guest_ram(9_413).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
     }
 }
