@@ -336,6 +336,16 @@ pub struct OutboundWindow {
     pub offset: u64,
     /// Its length. Always a whole number of [`REGION_PAGE`]s.
     pub len: u64,
+    /// DYNAMIC ARENA. The run id of the region this window is the whole of,
+    /// when `reserve_outbound` had to commit one. `None` when the window is a
+    /// tail of a region somebody else already committed and reported.
+    ///
+    /// It is here because the host cannot locate a region it has not been told
+    /// the run id of, and a dedicated outbound region is committed *inside*
+    /// `reserve_outbound` where the caller would otherwise never see it. A
+    /// region nobody can locate is a region the compositor writes keymaps into
+    /// and no client ever reads.
+    pub run_id: Option<u64>,
 }
 
 /// The window, plus the free list that is the whole of the allocator's state.
@@ -423,6 +433,44 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         ));
     }
     let len = len.div_ceil(GIFT_GRANULARITY) * GIFT_GRANULARITY;
+    // DYNAMIC ARENA. An id this process has not committed means "commit a
+    // region for the window", and the window is then the whole of it.
+    //
+    // This is the split the floor depends on. While the window was a tail of
+    // the data region, the region carrying live keymaps was also the region the
+    // data allocator started in, so pinning the one pinned the other and
+    // whatever the session started at became permanent — an `sv-guest` holding
+    // 817 MB with no client connected. Giving the window its own region makes
+    // the floor the size of the thing that actually has to stay.
+    //
+    // The id carries the meaning rather than a new flag, because the two cases
+    // want to be told apart by *which region*, which is exactly what an id is
+    // for. `--arena-outbound 0:M` against a committed arena 0 is the pre-split
+    // spelling and still does what it always did.
+    if !registry()
+        .read()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?
+        .contains_key(&arena)
+    {
+        // Its own commit, its own stamps, its own run id: the host locates it
+        // exactly as it locates a data region, and `defer_gifts` still covers
+        // the ordering (see that function for what a dedicated region did and
+        // did not change about the stamp race).
+        let region = attach_guest_ram(arena, len)?;
+        let mut guard = outbound_slot()
+            .lock()
+            .map_err(|_| io::Error::other("outbound window poisoned"))?;
+        if let Some(w) = guard.as_ref() {
+            return Err(io::Error::other(format!(
+                "this process already has an outbound window, in arena {}: a second \
+                 would be a second allocator over objects clients already hold",
+                w.arena
+            )));
+        }
+        let w = Window { arena, base: 0, len, free: vec![(0, len)], given: 0, pending: None };
+        *guard = Some(w);
+        return Ok(OutboundWindow { arena, offset: 0, len, run_id: Some(region.run_id) });
+    }
     let arena_len = {
         let guard = registry()
             .read()
@@ -462,7 +510,7 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
     }
     let base = arena_len - len;
     *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None });
-    Ok(OutboundWindow { arena, offset: base, len })
+    Ok(OutboundWindow { arena, offset: base, len, run_id: None })
 }
 
 /// Hold every gift's bytes in memory until [`release_gifts`] is called.
@@ -589,7 +637,7 @@ pub fn outbound() -> Option<OutboundWindow> {
     let guard = outbound_slot().lock().ok()?;
     guard
         .as_ref()
-        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len })
+        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len, run_id: None })
 }
 
 /// Bytes given out and bytes still free in the outbound window, for the one log
