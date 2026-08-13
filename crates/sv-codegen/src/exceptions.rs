@@ -224,6 +224,68 @@ pub fn platform_scalar(type_name: &str) -> Option<&'static str> {
     PLATFORM_SCALARS.iter().find(|(n, _)| *n == type_name).map(|(_, t)| *t)
 }
 
+/// Array members that are only *valid to read* when a sibling holds one of a
+/// set of values — a union in everything but the registry's spelling.
+///
+/// # The one that cost a device loss
+///
+/// `VkWriteDescriptorSet` carries `pImageInfo`, `pBufferInfo` and
+/// `pTexelBufferView`. Exactly one of the three is used and `descriptorType`
+/// says which; **the other two are ignored and the specification permits them to
+/// hold anything at all** — an uninitialised stack slot, a stale pointer, a
+/// pointer to an array of a different element type or a shorter length. The
+/// registry marks all three `noautovalidity="true"`, which is its way of saying
+/// "a sibling decides this and I cannot express how".
+///
+/// A lowering that reads whichever pointers happen to be non-null is therefore
+/// making an out-of-bounds read of the *application's* memory — design.md §0.3
+/// item 2's hazard exactly, met for the second time and this time live. What it
+/// produced was a `VkBuffer` id of `0xFFFFFFFF00000001` on the wire and
+/// `no VkBuffer with id …` on the GPU side; and that is the **lucky** outcome,
+/// because an id that fails to map takes the ring fatal and says so. An id that
+/// happens to collide with a live object maps successfully, the driver is given
+/// a descriptor pointing at the wrong resource, and the GPU hangs with no
+/// diagnostic anywhere — which is what the CTS device losses were.
+///
+/// # Why no harness had caught it
+///
+/// Zink uses descriptor update *templates* unconditionally in its default mode
+/// (design.md §0.4 item 10), and this project expands those app-side into wire
+/// structs directly, never touching this lowering. DXVK leans on templates too.
+/// So the direct `vkUpdateDescriptorSets` path — the one every ordinary Vulkan
+/// application uses — had never been exercised by anything in this tree until
+/// the conformance suite ran. §0.15's whole argument for owning a CTS harness,
+/// in one struct.
+///
+/// # Why a table and not a rule
+///
+/// There is nothing in `vk.xml` to derive this from: `noautovalidity` says only
+/// *that* a sibling decides, never *which* sibling or *which* values. The
+/// mapping below is the specification's, transcribed, and the table is closed —
+/// `VkWriteDescriptorSet` is the only struct on this surface with the shape.
+/// A member listed here reads as an empty array when the selector does not
+/// choose it, which is what the wire should carry: the callee must not look at
+/// it either.
+///
+/// Values are `VkDescriptorType` enumerants, quoted from `vulkan_core.h`:
+/// SAMPLER 0, COMBINED_IMAGE_SAMPLER 1, SAMPLED_IMAGE 2, STORAGE_IMAGE 3,
+/// UNIFORM_TEXEL_BUFFER 4, STORAGE_TEXEL_BUFFER 5, UNIFORM_BUFFER 6,
+/// STORAGE_BUFFER 7, UNIFORM_BUFFER_DYNAMIC 8, STORAGE_BUFFER_DYNAMIC 9,
+/// INPUT_ATTACHMENT 10.
+pub const SIBLING_SELECTED: &[(&str, &str, &str, &[i64])] = &[
+    ("VkWriteDescriptorSet", "pImageInfo", "descriptorType", &[0, 1, 2, 3, 10]),
+    ("VkWriteDescriptorSet", "pBufferInfo", "descriptorType", &[6, 7, 8, 9]),
+    ("VkWriteDescriptorSet", "pTexelBufferView", "descriptorType", &[4, 5]),
+];
+
+/// The selector and the values that make `struct.member` valid to read.
+pub fn sibling_selected(owner: &str, member: &str) -> Option<(&'static str, &'static [i64])> {
+    SIBLING_SELECTED
+        .iter()
+        .find(|(s, m, _, _)| *s == owner && *m == member)
+        .map(|(_, _, sel, vals)| (*sel, *vals))
+}
+
 /// Members whose value is a `(memory, offset)` pair the `transform` pass must
 /// rewrite (design.md §5.3).
 ///

@@ -36,10 +36,12 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::time::Instant;
+use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::time::{Duration, Instant};
 
 use wc_handle::Descriptor;
 
+use crate::clip::{Answer, Source};
 use crate::objects::Objects;
 use crate::pool::{CopyScope, PoolTransport, Region};
 use crate::spec::{ArgKind, Spec};
@@ -444,6 +446,10 @@ pub struct Stats {
     pub resize_overflows: u64,
     pub fds_received: u64,
     pub fds_materialised: u64,
+    /// Descriptors taken off the queue and closed because the message carrying
+    /// them had no transport. Zero for every protocol in the tree; see the note
+    /// at the bottom of `client_message`.
+    pub fds_dropped: u64,
     /// Of those, the ones the compositor described as a **slice of the arena**
     /// rather than as a file both sides can name.
     ///
@@ -456,6 +462,23 @@ pub struct Stats {
     pub fds_from_arena: u64,
     pub messages_client: u64,
     pub messages_server: u64,
+
+    // --- the clipboard, §29 -------------------------------------------
+    //
+    // Counted separately from `fds_received` / `fds_materialised` even though
+    // both of those move too, because §14.7's line is an assertion about the
+    // *boundary* and these are an assertion about a feature. See §29.4 for
+    // what the fd line reads now and why it is still the same claim.
+    /// Selections pulled out of a client and shipped to the system clipboard.
+    pub selections_copied: u64,
+    /// `wl_data_offer.receive` requests terminated here rather than forwarded.
+    pub pastes_served: u64,
+    pub clip_bytes_out: u64,
+    pub clip_bytes_in: u64,
+    /// Copies that hit [`COPY_DEADLINE`] with a client still holding its pipe
+    /// open. Should be zero; if it is not, something offered a mime type it
+    /// could not produce.
+    pub copy_timeouts: u64,
     /// §27, and only with `--verify-damage`. Commits whose copy was
     /// checked against the client's own bytes.
     pub verified: u64,
@@ -485,6 +508,22 @@ impl Stats {
         } else {
             "no copies".to_owned()
         };
+        let clip = if self.selections_copied > 0 || self.pastes_served > 0 {
+            format!(
+                "; clipboard: {} copied ({} bytes), {} pasted ({} bytes){}",
+                self.selections_copied,
+                self.clip_bytes_out,
+                self.pastes_served,
+                self.clip_bytes_in,
+                if self.copy_timeouts > 0 {
+                    format!(", {} timed out", self.copy_timeouts)
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            String::new()
+        };
         // One grep-able line, with the number a harness can assert on spelled
         // out even when it is zero — a check that only prints when it fails is
         // indistinguishable from a check that never ran.
@@ -500,7 +539,7 @@ impl Stats {
             "{} commits, {} copies, {mb:.2} MiB in {ms:.1} ms ({per}); \
              {} pools ({} released, {} reclaimed, {} republished, {} resizes, {} overflows, \
              {} refusals, {} attaches deferred); {} fds in, {} out{}; \
-             {} client msgs, {} server msgs{verify}",
+             {} client msgs, {} server msgs{verify}{clip}",
             self.commits,
             self.copies,
             self.pools_created,
@@ -538,9 +577,6 @@ pub enum Error {
     Walk(String),
     /// A message needed a descriptor and the queue was empty.
     MissingFd { interface: String, message: String },
-    /// The message carries an `h` this proxy has no transport for. Clipboard
-    /// and drag-and-drop pipes, which are stage 5.
-    UnsupportedFd { interface: String, message: String },
     /// The compositor named an object this side cannot open. ADDED FOR
     /// STAGE 6; see the note in `server_message` for why it is fatal.
     Materialise {
@@ -565,11 +601,6 @@ impl std::fmt::Display for Error {
             Error::MissingFd { interface, message } => {
                 write!(f, "{interface}.{message} needs a descriptor and none arrived")
             }
-            Error::UnsupportedFd { interface, message } => write!(
-                f,
-                "{interface}.{message} carries a descriptor this proxy cannot yet republish \
-                 (clipboard and drag-and-drop pipes are stage 5)"
-            ),
             Error::Materialise { interface, message, descriptor, source } => write!(
                 f,
                 "{interface}.{message} names {descriptor}, which this side cannot open: {source}"
@@ -607,6 +638,176 @@ mod op {
     pub const DISPLAY_DELETE_ID: u16 = 1;
 }
 
+/// How long a copy waits for the client to finish writing into the pipe.
+///
+/// A client that answers `wl_data_source.send` is expected to write and close
+/// immediately, and every one measured does. The deadline is here because the
+/// alternative to a deadline is a selection that never publishes: a client that
+/// offers a mime type it cannot actually produce may write nothing and never
+/// close, and there is no message that says so. Two seconds is far longer than
+/// any real transfer and far shorter than a user will wait before pressing
+/// Ctrl-C again.
+const COPY_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The mime types worth pulling out of a client's selection, richest first.
+///
+/// **At most one text flavour plus HTML**, which is a policy and not a
+/// limitation of the wire. GTK offers the same string under five names
+/// (docs/design.md §22.3); pulling all five would open five pipes, wake the
+/// client five times and hand the compositor five copies of one paragraph to
+/// pick one from. The compositor picks by exactly this order anyway
+/// (`wc-compositor`'s `clipboard::TEXT_MIMES`), so the choice is made once,
+/// here, where the pipes are.
+const WANTED_TEXT: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+const WANTED_HTML: &str = "text/html";
+
+/// One selection's worth of bytes: a payload per mime type.
+pub type Payloads = Vec<(String, Vec<u8>)>;
+
+/// A selection read out of the client and ready to go across.
+pub struct Pulled {
+    pub payloads: Payloads,
+    /// A drag rather than a copy. The two carry the same bytes through the
+    /// same code and differ only in what the far side does with them, which is
+    /// the property the side interface was shaped to preserve.
+    pub for_drag: bool,
+}
+
+/// A pull from the client: the proxy asked for one mime type and is reading it.
+struct Outgoing {
+    mime: String,
+    /// The **read** end of a pipe this process made. The write end went to the
+    /// client in a `wl_data_source.send` and this process no longer holds one,
+    /// which is what makes the EOF below meaningful.
+    fd: OwnedFd,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+/// A push into the client: the client asked to paste and is reading.
+struct Incoming {
+    token: u32,
+    /// The **write** end of a pipe the *client* made, which arrived by
+    /// `SCM_RIGHTS` on `wl_data_offer.receive` and stops here. This is the
+    /// descriptor that used to end the connection (docs/design.md §22.1).
+    fd: OwnedFd,
+    /// `None` until the compositor answers. `Some` — including `Some(empty)` —
+    /// means write it and close.
+    data: Option<Vec<u8>>,
+    at: usize,
+}
+
+/// Which event opcodes the proxy has to *synthesise* toward its client.
+///
+/// Read from the same XML everything else is, because these are events this
+/// program sends as though it were the compositor, and a wrong opcode here is
+/// a message the client mis-parses — §2.4's failure with the proxy as its
+/// author rather than its victim.
+struct DataOps {
+    source_send: u16,
+    source_cancelled: u16,
+    source_dnd_drop_performed: u16,
+    source_dnd_finished: u16,
+    source_action: u16,
+}
+
+impl DataOps {
+    fn from(spec: &Spec) -> DataOps {
+        let ev = |name: &str| -> u16 {
+            spec.interface("wl_data_source")
+                .and_then(|i| i.events.iter().position(|m| m.name == name))
+                .map(|p| p as u16)
+                // Only reachable if `wayland.xml` lost a message, which the
+                // spec tests would catch first. Zero is `target`, which is
+                // harmless to send and impossible to mistake in a trace.
+                .unwrap_or(0)
+        };
+        DataOps {
+            source_send: ev("send"),
+            source_cancelled: ev("cancelled"),
+            source_dnd_drop_performed: ev("dnd_drop_performed"),
+            source_dnd_finished: ev("dnd_finished"),
+            source_action: ev("action"),
+        }
+    }
+}
+
+/// Everything about this connection's clipboard.
+///
+/// # Why the proxy owns the whole `wl_data_*` family rather than forwarding it
+///
+/// Because two of its messages carry an `h` and the boundary carries none.
+/// `wl_data_offer.receive` is the client handing the compositor a pipe to write
+/// into; `wl_data_source.send` is the compositor handing the client a pipe to
+/// write into. Neither can be turned into a name, because the bytes do not
+/// exist yet at the moment the descriptor changes hands — which is the property
+/// that separates them from `wl_keyboard.keymap` (§14.7).
+///
+/// So the proxy answers those two itself, and **exactly those two plus the two
+/// requests that would cause them**:
+///
+/// * `wl_data_offer.receive` is answered here, so the compositor is never asked
+///   to write into a descriptor.
+/// * `wl_data_device.set_selection` and `.start_drag` are not forwarded, so the
+///   compositor never holds a client source and can never be asked to send one
+///   — which is what makes `wl_data_source.send` unreachable rather than merely
+///   unimplemented.
+///
+/// Everything else in the family is forwarded unchanged, including the requests
+/// that *create* objects. That is not a softening of the rule, it is what makes
+/// it survivable: a client's ids are a sequence and a swallowed `new_id` breaks
+/// the next one (see `create_data_source` in [`Session::clip_request`], where
+/// the measurement is). And every announcement — `wl_data_device.data_offer`,
+/// `wl_data_offer.offer`, `wl_data_device.selection` — is plain bytes, with the
+/// compositor much better placed than a proxy to decide who may see the
+/// selection.
+#[derive(Default)]
+struct Clip {
+    /// Client-created `wl_data_source`s and the mime types each has offered.
+    sources: HashMap<u32, Vec<String>>,
+    /// The source that owns the selection on this connection, if any.
+    selection: Option<u32>,
+    /// A source in the middle of a drag, if any.
+    dragging: Option<u32>,
+    /// `wl_data_offer`s the compositor announced as belonging to a **drag over
+    /// one of our surfaces** rather than to the clipboard, learned by watching
+    /// `wl_data_device.enter` go past. See [`Session::begin_paste`].
+    ///
+    /// A set rather than one id because the protocol permits a new offer per
+    /// `enter` and nothing says the old one is destroyed first; the ids are
+    /// retired by `wl_display.delete_id` like every other object.
+    drag_offers: std::collections::HashSet<u32>,
+    outgoing: Vec<Outgoing>,
+    /// When the current pull started, for [`COPY_DEADLINE`].
+    started: Option<Instant>,
+    /// What the pull is for once it completes.
+    for_drag: bool,
+    /// What the dragging source permits, in `wl_data_device_manager.dnd_action`
+    /// bits.
+    drag_actions: u32,
+    incoming: Vec<Incoming>,
+    /// Fetches to issue on the side connection.
+    fetches: Vec<(u32, Source, String)>,
+    /// A completed pull, waiting for the pump to hand it to the compositor.
+    ready: Option<Pulled>,
+    next_token: u32,
+    /// The descriptors that ride beside the events this proxy invents.
+    ///
+    /// **The bytes go in `Session::to_client`, which stage 16 already built for
+    /// its fabricated `wl_display.delete_id`.** Two queues of "events this
+    /// proxy invents for its own client" would be two orders in which they
+    /// could reach the socket, and the one that matters here is that a
+    /// `wl_data_source.send` must not overtake a `delete_id` for an id it
+    /// reuses. One queue, one order.
+    to_client_fds: Vec<OwnedFd>,
+}
+
 pub struct Session {
     spec: Spec,
     objects: Objects,
@@ -637,6 +838,8 @@ pub struct Session {
     /// bytes-in / bytes-out and has no business opening an icon theme or
     /// writing to a second socket. What it can do is notice.
     app_ids: Vec<String>,
+    clip: Clip,
+    data_ops: DataOps,
     /// STAGE 16. Events this proxy invents for its own client, drained by the
     /// pump. Today there is exactly one kind: `wl_display.delete_id`.
     /// # Why a proxy invents an event at all
@@ -697,6 +900,7 @@ impl Session {
         scope: CopyScope,
         headroom: u64,
     ) -> Session {
+        let data_ops = DataOps::from(&spec);
         Session {
             spec,
             objects: Objects::new(),
@@ -711,6 +915,8 @@ impl Session {
             trace: false,
             notes: Vec::new(),
             app_ids: Vec::new(),
+            clip: Clip { next_token: 1, ..Clip::default() },
+            data_ops,
             to_client: Vec::new(),
             proxy_destroyed: std::collections::HashSet::new(),
             pressure_noted: false,
@@ -748,6 +954,12 @@ impl Session {
 
     pub fn transport_name(&self) -> &'static str {
         self.transport.name()
+    }
+
+    /// What the arena is holding. See `PoolTransport::memory` for why this is
+    /// reported per connection.
+    pub fn transport_memory(&self) -> Option<crate::pool::MemoryReport> {
+        self.transport.memory()
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -823,6 +1035,17 @@ impl Session {
             && let Some(app_id) = spans.first().and_then(|s| wire::string_at(body, s)) {
                 self.app_ids.push(app_id);
             }
+
+        // STAGE 13. The one *family* this program answers itself rather than
+        // forwarding. See [`Clip`] for why, and note that this is matched on
+        // the interface and the message's **name**: an opcode is a position in
+        // somebody else's XML, and this is the only place that would notice if
+        // one moved.
+        if interface.starts_with("wl_data_")
+            && self.clip_request(&interface, &msg.name, header.object, body, &spans, fds)
+        {
+            return Ok(out);
+        }
 
         // The semantic half: everything the proxy has to understand rather than
         // merely carry.
@@ -1004,16 +1227,40 @@ impl Session {
             // form: a well-formed message the compositor parses happily and
             // then cannot map, or worse, a length the parser walks past.
             //
-            // Reachable today only for `wl_data_offer.receive`, which is
-            // clipboard transfer and out of scope for this stage. It is an
-            // error with the message's name in it rather than a silent
-            // truncation, so the first client that tries gets a diagnosis
-            // rather than a mystery.
+            // **CHANGED IN STAGE 13, and this is the defect the stage exists to
+            // remove.** This used to return `Error::UnsupportedFd`, which
+            // `proxy.rs` turns into a failed drain, which **ends the client's
+            // connection** — so a client that pasted did not fail to paste, it
+            // died. The only message that could reach here was
+            // `wl_data_offer.receive`, and it no longer can, because the
+            // clipboard family is answered above.
+            //
+            // What is left is the case somebody else's protocol brings: an `h`
+            // in an XML added later, in a message this file has no transport
+            // for. Dropping the message is the honest answer. The descriptors
+            // are consumed, so the fd queue stays in step and nothing after it
+            // desynchronises; the client is left waiting for whatever it asked
+            // for, which is recoverable, where a closed connection is not. It
+            // is loud in the log because a silent drop would be the mystery
+            // the old error was trying to avoid.
             if descriptors.len() != msg.fd_count() {
-                return Err(Error::UnsupportedFd {
-                    interface: interface.clone(),
-                    message: msg.name.clone(),
-                });
+                for _ in 0..msg.fd_count() {
+                    if fds.pop_front().is_some() {
+                        self.stats.fds_received += 1;
+                    }
+                }
+                self.stats.fds_dropped += 1;
+                self.note(format!(
+                    "{interface}.{} carries {} descriptor(s) this proxy has no transport for; \
+                     the message was dropped and its descriptors closed. The client will wait \
+                     for an answer that is not coming, which is better than the connection \
+                     being closed under it — but nothing here can carry that fd across the \
+                     boundary, so the protocol needs a by-bytes route the way the clipboard \
+                     got one (docs/design.md §22.2).",
+                    msg.name,
+                    msg.fd_count()
+                ));
+                return Ok(out);
             }
             wire::splice_fds(body, &spans, FdEncoding::OutOfBand, &descriptors)
         } else {
@@ -1021,6 +1268,417 @@ impl Session {
         };
         out.extend_from_slice(&wire::message(header.object, header.opcode, &out_body));
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
+    // The clipboard
+    // -----------------------------------------------------------------------
+
+    /// Answer one `wl_data_*` request here, or say it should be forwarded.
+    ///
+    /// Returns `true` if the message was **consumed** — not forwarded, and any
+    /// descriptors it carried taken off the queue.
+    fn clip_request(
+        &mut self,
+        interface: &str,
+        name: &str,
+        object: u32,
+        body: &[u8],
+        spans: &[Span],
+        fds: &mut std::collections::VecDeque<OwnedFd>,
+    ) -> bool {
+        match (interface, name) {
+            // **Watched and forwarded, not swallowed**, and the difference was
+            // measured rather than reasoned about.
+            //
+            // The first design swallowed `create_data_source`, on the argument
+            // that a compositor which never learns the source's id can never
+            // send `wl_data_source.send` on it. That is true and it is fatal:
+            // a client's object ids are a *sequence*, and `wayland-backend`'s
+            // server-side map accepts a new id only when it is the next free
+            // one (`rs/map.rs`, the same check `iconlink`'s header quotes).
+            // Skipping id 10 means the client's next request, for 11, is
+            // refused — and the failure is not subtle. `wl-copy` died with
+            //
+            //     wl_display#1: error 0: Invalid new_id: 10.
+            //
+            // on the request *after* the one that was swallowed.
+            //
+            // So the object is created upstream and simply never used: the
+            // compositor holds a `wl_data_source` with mime types on it that is
+            // never made a selection and never starts a drag, because
+            // `set_selection` and `start_drag` are the requests that do not get
+            // forwarded. smithay sends `send` only for a source it has been
+            // given as the selection or as a drag's, so the event that cannot
+            // cross is unreachable by construction — which is the same property
+            // the first design wanted, obtained one message later.
+            ("wl_data_device_manager", "create_data_source") => {
+                if let Some(id) = wire::word_at(body, &spans[0]) {
+                    self.clip.sources.insert(id, Vec::new());
+                }
+                false
+            }
+            ("wl_data_source", "offer") => {
+                if let Some(mime) = wire::string_at(body, &spans[0])
+                    && let Some(list) = self.clip.sources.get_mut(&object)
+                    && !list.contains(&mime)
+                {
+                    list.push(mime);
+                }
+                false
+            }
+            ("wl_data_source", "set_actions") => {
+                if let Some(actions) = wire::word_at(body, &spans[0]) {
+                    self.clip.drag_actions = actions;
+                }
+                false
+            }
+            ("wl_data_source", "destroy") => {
+                self.clip.sources.remove(&object);
+                if self.clip.selection == Some(object) {
+                    self.clip.selection = None;
+                }
+                if self.clip.dragging == Some(object) {
+                    self.clip.dragging = None;
+                }
+                // Forwarded like the rest, so the `wl_display.delete_id` that
+                // retires the number comes from the compositor as it does for
+                // every other object. Synthesising one here would race the real
+                // one and retire the id twice.
+                false
+            }
+            ("wl_data_device", "set_selection") => {
+                let source = wire::word_at(body, &spans[0]).unwrap_or(0);
+                self.set_selection(source);
+                true
+            }
+            ("wl_data_device", "start_drag") => {
+                let source = wire::word_at(body, &spans[0]).unwrap_or(0);
+                self.start_drag(source);
+                true
+            }
+            // The message this whole stage is about. The descriptor is the
+            // client's own pipe, on the client's own machine, and it stops
+            // here.
+            ("wl_data_offer", "receive") => {
+                let mime = wire::string_at(body, &spans[0]).unwrap_or_default();
+                match fds.pop_front() {
+                    Some(fd) => {
+                        self.stats.fds_received += 1;
+                        self.begin_paste(object, mime, fd);
+                    }
+                    None => self.note(format!(
+                        "wl_data_offer.receive for {mime:?} arrived with no descriptor; \
+                         nothing to write into"
+                    )),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// One event on a client-owned `wl_data_source`, sent as though this were
+    /// the compositor.
+    fn source_event(&mut self, source: u32, opcode: u16, body: &[u8]) {
+        self.to_client
+            .extend_from_slice(&wire::message(source, opcode, body));
+    }
+
+    /// `wl_data_device.set_selection`: the client has copied something.
+    fn set_selection(&mut self, source: u32) {
+        if source == 0 {
+            // A null source clears the selection. Publishing an empty set
+            // empties the system clipboard, which is what the client asked for.
+            self.clip.selection = None;
+            self.clip.ready = Some(Pulled { payloads: Vec::new(), for_drag: false });
+            self.note("the client cleared its selection".into());
+            return;
+        }
+        self.clip.selection = Some(source);
+        self.begin_pull(source, false);
+    }
+
+    /// `wl_data_device.start_drag`.
+    fn start_drag(&mut self, source: u32) {
+        if source == 0 {
+            return;
+        }
+        self.clip.dragging = Some(source);
+        self.begin_pull(source, true);
+    }
+
+    /// Ask the client for the bytes behind a source, over pipes this process
+    /// makes.
+    ///
+    /// **Eager, and that is forced rather than chosen.** Windows' clipboard
+    /// takes the data at `SetClipboardData` time and OLE asks for a drag's data
+    /// with a synchronous call from inside a modal loop; neither can round-trip
+    /// to a Wayland client on another machine at the moment it is asked. Delayed
+    /// rendering (`SetClipboardData(fmt, NULL)` and answer `WM_RENDERFORMAT`)
+    /// would be the Win32 way to avoid the copy, and it would put a hypervisor
+    /// crossing inside a synchronous message handler with a client that may be
+    /// busy. So a copy costs one read of the selection at the moment of
+    /// copying, which is what every clipboard bridge does.
+    fn begin_pull(&mut self, source: u32, for_drag: bool) {
+        let mimes = self.clip.sources.get(&source).cloned().unwrap_or_default();
+        let wanted = wanted_mimes(&mimes);
+        if wanted.is_empty() {
+            self.note(format!(
+                "the client offered [{}], none of which this clipboard carries; \
+                 the system clipboard is left alone",
+                mimes.join(", ")
+            ));
+            // Deliberately **not** an empty publish: clearing the system
+            // clipboard because a client copied an image would destroy
+            // something the user put there on purpose.
+            if !for_drag {
+                self.clip.selection = None;
+            }
+            return;
+        }
+        // A pull already running is abandoned rather than interleaved: two
+        // selections in flight would publish in whichever order the pipes
+        // drained, and the client's later copy is the one the user meant.
+        self.clip.outgoing.clear();
+        self.clip.for_drag = for_drag;
+        self.clip.started = Some(Instant::now());
+        for mime in wanted {
+            let (read, write) = match pipe() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.note(format!("could not make a pipe for {mime:?}: {e}"));
+                    continue;
+                }
+            };
+            let mut body = Vec::new();
+            wire::push_bytes(&mut body, &nul(&mime));
+            self.source_event(source, self.data_ops.source_send, &body);
+            // The write end goes to the client and this process keeps none of
+            // it — which is what makes the EOF in `pump_transfers` mean "the
+            // client has finished writing" rather than "nobody has written
+            // yet". `proxy.rs` drops these once they are sent.
+            self.clip.to_client_fds.push(write);
+            self.stats.fds_materialised += 1;
+            let _ = set_nonblocking(&read);
+            self.clip.outgoing.push(Outgoing { mime, fd: read, buf: Vec::new(), done: false });
+        }
+    }
+
+    /// `wl_data_offer.receive`: the client wants to paste.
+    ///
+    /// `offer` decides **which system selection is asked for**, and it has to be
+    /// the offer's own identity rather than anything about this connection's
+    /// state. An offer the compositor announced with `wl_data_device.enter` is a
+    /// drag's; one announced with `.selection` is the clipboard's. Deciding from
+    /// "is this client dragging" instead would be asking about the wrong drag
+    /// entirely — the client is the *source* of its own drag and never receives
+    /// from it — and Windows keeps the two selections apart, so a paste that
+    /// asked the wrong one would quietly return the last thing dragged.
+    fn begin_paste(&mut self, offer: u32, mime: String, fd: OwnedFd) {
+        let token = self.clip.next_token;
+        self.clip.next_token = self.clip.next_token.wrapping_add(1).max(1);
+        // Non-blocking on **the write end this process now holds**. A pipe's
+        // two ends are separate open file descriptions, so this cannot make the
+        // client's own reads non-blocking; without it a payload larger than the
+        // pipe buffer would block the pump on a client that is not reading yet.
+        let _ = set_nonblocking(&fd);
+        self.stats.pastes_served += 1;
+        let source = if self.clip.drag_offers.contains(&offer) {
+            Source::Drag
+        } else {
+            Source::Clipboard
+        };
+        self.clip.fetches.push((token, source, mime));
+        self.clip.incoming.push(Incoming { token, fd, data: None, at: 0 });
+    }
+
+    /// Fetches the pump should issue on the side connection.
+    pub fn take_fetches(&mut self) -> Vec<(u32, Source, String)> {
+        std::mem::take(&mut self.clip.fetches)
+    }
+
+    /// A completed pull, and whether it is for a drag rather than a copy.
+    pub fn take_selection(&mut self) -> Option<Pulled> {
+        self.clip.ready.take()
+    }
+
+    /// What the source permits, for a drag.
+    pub fn drag_actions(&self) -> u32 {
+        self.clip.drag_actions
+    }
+
+    /// The compositor answered a fetch. Write it into the client's pipe.
+    pub fn deliver(&mut self, token: u32, answer: Answer) {
+        let bytes = match answer {
+            Answer::Bytes(b) => {
+                self.stats.clip_bytes_in += b.len() as u64;
+                b
+            }
+            Answer::Failed(why) => {
+                self.note(format!("paste {token} refused: {why}"));
+                // An empty payload rather than a dangling pipe. The client
+                // reads EOF at once and pastes nothing, which is the outcome a
+                // user understands; leaving the descriptor open would hang
+                // whatever is reading it.
+                Vec::new()
+            }
+        };
+        if let Some(inc) = self.clip.incoming.iter_mut().find(|i| i.token == token) {
+            inc.data = Some(bytes);
+        }
+    }
+
+    /// A drag has ended: tell the source what happened.
+    pub fn drag_finished(&mut self, action: u32) {
+        let Some(source) = self.clip.dragging.take() else {
+            return;
+        };
+        if action != 0 {
+            self.source_event(source, self.data_ops.source_action, &action.to_ne_bytes());
+            self.source_event(source, self.data_ops.source_dnd_drop_performed, &[]);
+            self.source_event(source, self.data_ops.source_dnd_finished, &[]);
+        } else {
+            self.source_event(source, self.data_ops.source_cancelled, &[]);
+        }
+    }
+
+    /// Whether a transfer is in flight, so the pump can poll more eagerly.
+    pub fn clip_busy(&self) -> bool {
+        !self.clip.outgoing.is_empty() || !self.clip.incoming.is_empty()
+    }
+
+    /// Move whatever bytes will move, in both directions. Called once per turn
+    /// of the pump.
+    ///
+    /// **Not `poll`ed on**, and that is a decision rather than an oversight.
+    /// Adding the pipes to the pump's `pollfd` array would mean matching a
+    /// variable-length array back to a variable-length list of transfers on
+    /// every turn, for a gain of a few milliseconds on an operation that
+    /// happens when a human presses a key. Instead the pump polls at 1 ms
+    /// while `clip_busy`, and this drains everything available each turn — so
+    /// a transfer costs a millisecond of latency and a spin that lasts as long
+    /// as the transfer does.
+    pub fn pump_transfers(&mut self) {
+        for out in &mut self.clip.outgoing {
+            if out.done {
+                continue;
+            }
+            loop {
+                let mut buf = [0u8; 16 * 1024];
+                // SAFETY: a live fd owned by `out` and a buffer whose length is
+                // passed truthfully.
+                let n = unsafe {
+                    libc::read(out.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                };
+                if n > 0 {
+                    out.buf.extend_from_slice(&buf[..n as usize]);
+                    continue;
+                }
+                if n == 0 {
+                    // The client closed its end: the payload is complete.
+                    out.done = true;
+                } else {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::WouldBlock
+                        && e.kind() != io::ErrorKind::Interrupted
+                    {
+                        out.done = true;
+                    }
+                }
+                break;
+            }
+        }
+
+        let expired = self
+            .clip
+            .started
+            .is_some_and(|t| t.elapsed() > COPY_DEADLINE);
+        if !self.clip.outgoing.is_empty()
+            && (self.clip.outgoing.iter().all(|o| o.done) || expired)
+        {
+            if expired {
+                self.stats.copy_timeouts += 1;
+                self.note(format!(
+                    "a client held its clipboard pipe open for more than {:?}; \
+                     publishing the {} bytes it did write",
+                    COPY_DEADLINE,
+                    self.clip.outgoing.iter().map(|o| o.buf.len()).sum::<usize>()
+                ));
+            }
+            let for_drag = self.clip.for_drag;
+            let payloads: Payloads = self
+                .clip
+                .outgoing
+                .drain(..)
+                .map(|o| {
+                    self.stats.clip_bytes_out += o.buf.len() as u64;
+                    (o.mime, o.buf)
+                })
+                .collect();
+            self.clip.started = None;
+            self.stats.selections_copied += 1;
+            self.note(format!(
+                "the client's selection is {} byte(s) across {} mime type(s): {}",
+                payloads.iter().map(|(_, b)| b.len()).sum::<usize>(),
+                payloads.len(),
+                payloads.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+            self.clip.ready = Some(Pulled { payloads, for_drag });
+            // The client no longer owns the selection — the system does, and it
+            // holds a copy. Telling it so is what lets a clipboard tool exit
+            // rather than sit forever waiting to serve a `send` that will never
+            // come, and it is what the protocol means by `cancelled`.
+            //
+            // A drag is **not** cancelled here: its source is still live and is
+            // owed a `dnd_finished` when the drop happens.
+            if !for_drag && let Some(source) = self.clip.selection.take() {
+                self.source_event(source, self.data_ops.source_cancelled, &[]);
+            }
+        }
+
+        let mut finished = Vec::new();
+        for inc in &mut self.clip.incoming {
+            let Some(data) = &inc.data else { continue };
+            while inc.at < data.len() {
+                // SAFETY: a live fd owned by `inc`, writing inside `data`.
+                let n = unsafe {
+                    libc::write(
+                        inc.fd.as_raw_fd(),
+                        data[inc.at..].as_ptr().cast(),
+                        data.len() - inc.at,
+                    )
+                };
+                if n > 0 {
+                    inc.at += n as usize;
+                    continue;
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
+                    break;
+                }
+                // The client closed its read end mid-paste, which is legal —
+                // a text field that only wanted the first line. Nothing to
+                // report.
+                inc.at = data.len();
+            }
+            if inc.at >= data.len() {
+                finished.push(inc.token);
+            }
+        }
+        // Dropping the `Incoming` closes the write end, which is the EOF the
+        // client is waiting for. A paste that never closed would hang the
+        // client just as surely as the connection error this stage removed.
+        self.clip.incoming.retain(|i| !finished.contains(&i.token));
+    }
+
+    /// Bytes and descriptors this program is sending its client on its own
+    /// account, drained by the pump.
+    pub fn take_client_messages(&mut self) -> (Vec<u8>, Vec<OwnedFd>) {
+        (
+            std::mem::take(&mut self.to_client),
+            std::mem::take(&mut self.clip.to_client_fds),
+        )
     }
 
     /// Announce every pool that has finished being sized, and return the
@@ -1353,6 +2011,31 @@ impl Session {
 
         self.record_new_ids(body, &spans, &msg.args);
 
+        // STAGE 13. The compositor's own announcements are forwarded untouched,
+        // and two of them are *watched* on the way past for the same reason
+        // `xdg_toplevel.set_app_id` is: this side has to know something the
+        // message is not addressed to it about. `wl_data_device.enter` marks an
+        // offer as a drag's rather than the clipboard's, which decides what a
+        // later `receive` on it asks Windows for.
+        if interface == "wl_data_device" {
+            match msg.name.as_str() {
+                // enter(serial, surface, x, y, id)
+                "enter" => {
+                    if let Some(span) = spans.get(4)
+                        && let Some(id) = wire::word_at(body, span)
+                        && id != 0
+                    {
+                        self.clip.drag_offers.insert(id);
+                    }
+                }
+                // The drag is over one way or the other. The ids stay valid
+                // until the client destroys them, but nothing more will be
+                // received from them.
+                "leave" => self.clip.drag_offers.clear(),
+                _ => {}
+            }
+        }
+
         // STAGE 16. The compositor has released a buffer, which is its own word
         // for "I am no longer reading those bytes" and is the reclaimer's
         // interlock. Forwarded unchanged — the client needs it far more than
@@ -1394,6 +2077,7 @@ impl Session {
                 return Ok((Vec::new(), Vec::new()));
             }
             self.objects.forget(id);
+            self.clip.drag_offers.remove(&id);
             // The compositor has finished with this object. For a pool that
             // means it has certainly opened the region by now, so one of the
             // three conditions on releasing it is met. See the note on
@@ -1899,6 +2583,54 @@ impl Session {
             self.stats.bytes_copied += copied as u64;
         }
     }
+}
+
+/// Which of a client's offered mime types to actually pull. See
+/// [`WANTED_TEXT`].
+fn wanted_mimes(offered: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(text) = WANTED_TEXT
+        .iter()
+        .find(|want| offered.iter().any(|m| m == *want))
+    {
+        out.push((*text).to_owned());
+    }
+    if offered.iter().any(|m| m == WANTED_HTML) {
+        out.push(WANTED_HTML.to_owned());
+    }
+    out
+}
+
+/// A Wayland string is NUL-terminated inside its length.
+fn nul(s: &str) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.push(0);
+    v
+}
+
+/// `pipe2(O_CLOEXEC)`, as `(read, write)`.
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: a two-element array, and a flag `pipe2` accepts.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: both were just returned by `pipe2` and are owned here.
+    unsafe { Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
+}
+
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: a live fd; `F_GETFL` and `F_SETFL` take no pointer arguments.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// How many of the attached buffer's rows the region disagrees with the client

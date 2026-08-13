@@ -1,0 +1,45 @@
+# wc-arena-host — locate the guest compositor's arena in QEMU's memory backend
+# and write the plan `wc-proxy --arena-plan` maps.
+#
+# RESTORED IN STAGE 14, AND AS AN ORDINARY MEMBER THIS TIME.
+#
+# `unify: delete wc-arena-host` removed this crate on the grounds that it existed
+# only to hold an absolute path dependency on a sibling repository, and that the
+# sibling is now this tree. **The first half of that is right and the second half
+# deleted a program nothing replaced.** `crates/arena-host` is a different tool
+# with a different argument set — `scan`, `translate`, `write1` — and it panics
+# with `--fd is required` when handed this one's arguments, which is what a
+# desktop shortcut got instead of a window. Nothing else in the tree turns a
+# compositor's run id into a plan, and `scripts/wc-guest.sh` still called for it
+# by name.
+#
+# It comes back with its paths made **relative**, which is what the merge made
+# possible and was the whole of the original objection, and as a **member**
+# rather than an exclusion, which is what the merge's own comment in the root
+# manifest says is now correct.
+#
+# THE DEPENDENCY IS STILL THE WHOLE POINT. Guest-physical-address translation
+# exists exactly once across what used to be two projects, and it is
+# `sv_hostd::qemu` (find QEMU, read `info mtree -f` over QMP, build a region
+# table) plus `sv_hostd::locate` (sweep the backing object for the guest's stamps
+# and coalesce what is found). Nothing on the waycompose side re-implements any
+# of it, and this dependency is what makes that statement checkable rather than
+# aspirational.
+[package]
+name = "wc-arena-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+description = "Locate the guest compositor's arena in QEMU's memory backend and write the plan wc-proxy maps"
+
+[dependencies]
+sv-hostd = { path = "../sv-hostd" }
+# `ExtentDesc`, which is how the arena is described to the locator.
+sv-transport = { path = "../sv-transport" }
+# `RunList`, the coalesced result.
+sv-arena = { path = "../sv-arena" }
+# The definitive stamp layout.
+arena-record = { path = "../arena-record" }
+# And our own side of the same twenty bytes.
+wc-handle = { path = "../wc-handle" }

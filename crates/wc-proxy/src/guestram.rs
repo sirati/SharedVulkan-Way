@@ -263,10 +263,21 @@ impl Plan {
                          of a {len}-byte arena"
                     )));
                 }
-                if wlen >= len {
+                // A window covering the **whole** region is now the good case,
+                // not the refused one: it is a region dedicated to the
+                // compositor's outbound objects, which is what lets every data
+                // region be reclaimed and drops the floor from the startup size
+                // to the outbound size.
+                //
+                // It used to be refused because "leaves nothing of the arena"
+                // was true when there was one region and the arena *was* that
+                // region. With several regions it leaves the other regions,
+                // which is the entire point. A region that is neither the whole
+                // window nor a tail is still refused above.
+                if wlen > len {
                     return Err(bad(format!(
-                        "{where_}: an outbound window of {wlen} bytes leaves nothing \
-                         of a {len}-byte arena"
+                        "{where_}: an outbound window of {wlen} bytes does not fit \
+                         in a {len}-byte region"
                     )));
                 }
             }
@@ -513,7 +524,14 @@ mod tests {
         let (_d3, p3) = write_plan(
             "object /proc/1/fd/9\nlen 8192\nrun 0x1\noutbound 0 8192\nr 0 0x0 8192\n",
         );
-        assert!(Plan::read(&p3).is_err(), "a window of the whole arena must be refused");
+        // A window covering the whole region is a **dedicated outbound
+        // region**, which is the shape that lets every data region be
+        // reclaimed. It used to be refused, because with one region "the whole
+        // window" and "the whole arena" were the same sentence; with several
+        // they are not, and this is now the good case.
+        let whole = Plan::read(&p3).expect("a region that is all window is an outbound region");
+        assert_eq!(whole.outbound, Some((0, 8192)));
+        assert_eq!(whole.len, 8192);
 
         // And a plan without one is the pre-stage-10 plan, still read.
         let (_d4, p4) = write_plan("object /proc/1/fd/9\nlen 8192\nrun 0x1\nr 0 0x0 8192\n");

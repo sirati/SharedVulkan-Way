@@ -7,7 +7,7 @@
 //! that knows what a window is. [`crate::wsi`] produces a rectangle of BGRA
 //! bytes in the arena and hands it here.
 //!
-//! # Two targets, and why there is no third
+//! # Three targets
 //!
 //! - [`Target::Headless`] displays nothing. That is not a stub: it is what
 //!   `VK_EXT_headless_surface` means, it is what Wine maps `VK_KHR_win32_surface`
@@ -16,12 +16,13 @@
 //!   so that a harness can judge presentation on pixels rather than on
 //!   `vkQueuePresentKHR` returning `VK_SUCCESS`.
 //! - [`Target::X11`] puts the pixels in a window with `XPutImage`.
+//! - [`Target::Wayland`] attaches a `wl_shm` buffer to the application's own
+//!   `wl_surface`, on the application's own connection. It is the newest and
+//!   the one with a measured reason to exist; see [`wayland`].
 //!
-//! Wayland is not here and is not an oversight: it needs a `wl_display` this
-//! side would have to speak a protocol to, and a real compositor integration is
-//! phase 2 (`docs/phase2`). The rule this module follows instead is the smallest
-//! one that is honest — **make something an application can present to and a
-//! human can see**, and do not build a compositor.
+//! This module's rule is the smallest one that is honest — **make something an
+//! application can present to and a human can see**, and do not build a
+//! compositor.
 //!
 //! # Why Xlib is `dlopen`ed rather than linked
 //!
@@ -52,6 +53,8 @@ pub enum Target {
     Headless(Dump),
     #[cfg(unix)]
     X11(x11::Window),
+    #[cfg(target_os = "linux")]
+    Wayland(Box<wayland::Surface>),
 }
 
 impl Target {
@@ -83,6 +86,21 @@ impl Target {
             },
             #[cfg(not(unix))]
             PresentTarget::X11 { .. } => Target::Headless(Dump::from_env()),
+            #[cfg(target_os = "linux")]
+            PresentTarget::Wayland { display, surface } => {
+                match wayland::Surface::open(display, surface, width, height) {
+                    Some(s) => Target::Wayland(Box::new(s)),
+                    None => {
+                        sv_icd_entry::report_transport_failure(&format_args!(
+                            "presentation: cannot set up wl_shm on display {display:#x} for \
+                             surface {surface:#x}; frames will be dropped"
+                        ));
+                        Target::Headless(Dump::from_env())
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            PresentTarget::Wayland { .. } => Target::Headless(Dump::from_env()),
         }
     }
 
@@ -94,10 +112,18 @@ impl Target {
             Target::Headless(d) => d.write(pixels, width, height, swap_rb),
             #[cfg(unix)]
             Target::X11(w) => w.put(pixels, width, height, swap_rb),
+            #[cfg(target_os = "linux")]
+            Target::Wayland(w) => w.put(pixels, width, height, swap_rb),
         }
     }
 
     /// The size the surface currently is, or `None` for "no size of its own".
+    ///
+    /// `None` for Wayland is not a shortcut: a `wl_surface` genuinely has no
+    /// size until a buffer is attached to it, which is why the `VK_KHR_surface`
+    /// specification requires `currentExtent` to be `(0xFFFFFFFF, 0xFFFFFFFF)`
+    /// there and lets the swapchain choose. It is the X11 answer that is the
+    /// odd one, and it is the window system that makes it so.
     pub fn extent(target: PresentTarget) -> Option<(u32, u32)> {
         match target {
             PresentTarget::Headless => None,
@@ -105,6 +131,7 @@ impl Target {
             PresentTarget::X11 { window } => x11::geometry(window),
             #[cfg(not(unix))]
             PresentTarget::X11 { .. } => None,
+            PresentTarget::Wayland { .. } => None,
         }
     }
 }
@@ -519,4 +546,731 @@ pub mod x11 {
         }
     }
 
+}
+
+#[cfg(target_os = "linux")]
+pub mod wayland {
+    //! `VK_KHR_wayland_surface`, as a `wl_shm` buffer on the application's own
+    //! connection.
+    //!
+    //! # Why this is not the usual Vulkan Wayland WSI, and cannot be
+    //!
+    //! A Wayland WSI normally means the driver creates dmabufs and attaches
+    //! them, so that the compositor imports the GPU's own pages and nothing is
+    //! copied. **This driver may not do that and it is not a limitation to be
+    //! removed.** design.md §1a forbids any file descriptor crossing the VM
+    //! boundary, and a dmabuf is both a kernel object and a descriptor; on the
+    //! topology this exists for the GPU is in a Windows guest and the host has
+    //! no DRM device at all, so there is nothing to make one from either.
+    //!
+    //! What is left is the path `wc-proxy` already offers and Firefox already
+    //! uses in software: `wl_shm`. The frame's route is unchanged from
+    //! [`super::x11`]'s in shape — the GPU side's `vkCmdCopyImageToBuffer` puts
+    //! it in the arena, and this side copies it into a buffer the compositor
+    //! reads — and the *point* of the extension is not the copy count at all.
+    //! It is that Mesa's `zink_kopper` cannot make a `VkSurfaceKHR` on the
+    //! Wayland platform without it, so Mesa loads swrast with Zink merely
+    //! behind it, and Firefox's hardware WebRender rejects the EGL configs that
+    //! produces (`docs/firefox-accel.md`).
+    //!
+    //! **No descriptor crosses the boundary here.** The `memfd` below is
+    //! created by this process, sent over the *host's* Wayland socket to
+    //! `wc-proxy`, which is another process on the same host, and consumed
+    //! there: `wc_proxy::pool` copies its bytes into the arena and passes a
+    //! `(slab, offset, len)` triple onward. The rule is about the boundary, not
+    //! about descriptors as such (`wc_proxy::pool`'s own header says the same
+    //! in the other direction).
+    //!
+    //! # Why the application's connection, and not one of our own
+    //!
+    //! [`super::x11`] opens its own connection precisely so that it is not
+    //! inside somebody else's locking discipline, and that is possible because
+    //! **an X window id is global to the display**. A `wl_surface` is not: it is
+    //! a proxy, private to one connection, with no name a second connection
+    //! could resolve. So there is no choice — the only way to put a frame on the
+    //! application's surface is to speak on the application's `wl_display`.
+    //!
+    //! Two things make that safe, and they are the same two libwayland gives
+    //! every library that has to do it:
+    //!
+    //! - **an event queue of our own** ([`wl_display_create_queue`]), so that
+    //!   dispatching our `wl_buffer.release` events cannot consume an event the
+    //!   application was waiting for. Every object created here is created
+    //!   through a proxy wrapper assigned to that queue, so it inherits it.
+    //! - **libwayland's own thread safety**, which covers `wl_proxy_marshal_*`
+    //!   and the display, unlike Xlib's, which is conditional on the
+    //!   application having called `XInitThreads`.
+    //!
+    //! # Why the protocol is written out by hand
+    //!
+    //! The request opcodes below are spelled as constants and the messages are
+    //! sent with [`wl_proxy_marshal_array_flags`], rather than by linking
+    //! `libwayland-client` and calling `wl_surface_attach`. Three reasons, the
+    //! same three [`super::x11`] gives for `dlopen`ing Xlib and one more: the
+    //! ICD is a `cdylib` the loader opens into arbitrary processes and must not
+    //! carry a `DT_NEEDED` on a library a Windows or headless host has no
+    //! reason to own; the functions that would be linked are `static inline` in
+    //! `wayland-client-protocol.h`, so linking would not even provide them —
+    //! only `wl_proxy_marshal_array_flags` is an exported symbol; and the ICD
+    //! is loaded *into* a process that already has libwayland open whenever the
+    //! surface is a Wayland surface, so `dlopen` finds the copy already there,
+    //! which is the copy whose proxies these are.
+    //!
+    //! The array form is used rather than the variadic `wl_proxy_marshal_flags`
+    //! because a `union wl_argument[]` is a thing Rust can build exactly, and a
+    //! C variadic call is a thing it can only build by convention.
+
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Request opcodes, from `wayland.xml`. These are protocol constants and
+    /// cannot change: a Wayland interface may only ever *append* requests.
+    const WL_DISPLAY_GET_REGISTRY: u32 = 1;
+    const WL_REGISTRY_BIND: u32 = 0;
+    const WL_SHM_CREATE_POOL: u32 = 0;
+    const WL_SHM_POOL_CREATE_BUFFER: u32 = 0;
+    const WL_SHM_POOL_DESTROY: u32 = 1;
+    const WL_BUFFER_DESTROY: u32 = 0;
+    const WL_SURFACE_ATTACH: u32 = 1;
+    const WL_SURFACE_DAMAGE: u32 = 2;
+    const WL_SURFACE_COMMIT: u32 = 6;
+    const WL_SURFACE_DAMAGE_BUFFER: u32 = 9;
+    /// `wl_surface.damage_buffer` arrived in `wl_surface` version 4.
+    const DAMAGE_BUFFER_SINCE: u32 = 4;
+    /// `WL_MARSHAL_FLAG_DESTROY`.
+    const MARSHAL_FLAG_DESTROY: u32 = 1;
+    /// `WL_SHM_FORMAT_XRGB8888`: little-endian `0xXXRRGGBB`, which is B, G, R,
+    /// X in memory order — the byte order `VK_FORMAT_B8G8R8A8_UNORM` already
+    /// has, so the copy below is a `memcpy`.
+    ///
+    /// Opaque rather than `ARGB8888` because a swapchain image's alpha channel
+    /// is whatever the application's last draw left there, and a compositor
+    /// that honours it turns an unrelated bug into a see-through window. Both
+    /// formats are mandatory for every `wl_shm`, so neither has to be
+    /// negotiated.
+    const WL_SHM_FORMAT_XRGB8888: u32 = 1;
+
+    /// How many `wl_shm` buffers a swapchain cycles through.
+    ///
+    /// Three, and the number is about the *compositor* rather than about this
+    /// driver: `vkQueuePresentKHR` here is synchronous, so one buffer would be
+    /// correct were it not that a committed buffer stays the compositor's until
+    /// it sends `wl_buffer.release`, and writing into it before then is a
+    /// visible tear. Three is one being shown, one in flight and one to write.
+    const BUFFERS: usize = 3;
+
+    /// `union wl_argument`, one 64-bit slot per argument.
+    ///
+    /// Constructed through the helpers below rather than directly, so that
+    /// every one of the eight bytes is written even when the argument is a
+    /// 32-bit integer: libwayland reads only the member the message signature
+    /// names, but a partially initialised value passed across FFI is a thing to
+    /// avoid on principle rather than on evidence.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union Arg {
+        i: i32,
+        u: u32,
+        s: *const c_char,
+        o: *mut c_void,
+        h: i32,
+    }
+
+    fn zeroed() -> Arg {
+        Arg { o: core::ptr::null_mut() }
+    }
+    fn arg_i(v: i32) -> Arg {
+        let mut a = zeroed();
+        a.i = v;
+        a
+    }
+    fn arg_u(v: u32) -> Arg {
+        let mut a = zeroed();
+        a.u = v;
+        a
+    }
+    fn arg_h(v: c_int) -> Arg {
+        let mut a = zeroed();
+        a.h = v;
+        a
+    }
+    fn arg_o(v: *mut c_void) -> Arg {
+        Arg { o: v }
+    }
+    fn arg_s(v: *const c_char) -> Arg {
+        Arg { s: v }
+    }
+    /// The placeholder slot a `new_id` argument occupies. libwayland fills in
+    /// the id it allocates; the value here is never read.
+    fn arg_new() -> Arg {
+        zeroed()
+    }
+
+    /// `struct wl_interface`. Only `name` is read, by `wl_registry.bind`, whose
+    /// message signature is `usun` — the interface name goes on the wire as a
+    /// string because the compositor has no other way to know what is being
+    /// bound.
+    #[repr(C)]
+    struct WlInterface {
+        name: *const c_char,
+        version: c_int,
+        method_count: c_int,
+        methods: *const c_void,
+        event_count: c_int,
+        events: *const c_void,
+    }
+
+    #[repr(C)]
+    struct RegistryListener {
+        global: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *const c_char, u32),
+        global_remove: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
+    }
+
+    #[repr(C)]
+    struct BufferListener {
+        release: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    }
+
+    struct Lib {
+        display_create_queue: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        event_queue_destroy: unsafe extern "C" fn(*mut c_void),
+        proxy_create_wrapper: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        proxy_wrapper_destroy: unsafe extern "C" fn(*mut c_void),
+        proxy_set_queue: unsafe extern "C" fn(*mut c_void, *mut c_void),
+        #[allow(clippy::type_complexity)]
+        proxy_marshal_array_flags: unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            *const WlInterface,
+            u32,
+            u32,
+            *mut Arg,
+        ) -> *mut c_void,
+        proxy_add_listener:
+            unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int,
+        proxy_destroy: unsafe extern "C" fn(*mut c_void),
+        proxy_get_version: unsafe extern "C" fn(*mut c_void) -> u32,
+        proxy_get_display: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        display_roundtrip_queue: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+        display_dispatch_queue_pending: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+        display_flush: unsafe extern "C" fn(*mut c_void) -> c_int,
+        registry_interface: *const WlInterface,
+        shm_interface: *const WlInterface,
+        shm_pool_interface: *const WlInterface,
+        buffer_interface: *const WlInterface,
+    }
+
+    // SAFETY: every field is a function pointer or a `const` data symbol in a
+    // library that is loaded for the life of the process — `dlclose` is never
+    // called. libwayland's own thread safety is documented and covers every
+    // entry point used here; the four interfaces are immutable.
+    unsafe impl Send for Lib {}
+    unsafe impl Sync for Lib {}
+
+    // The same exemption `sv-icd-entry` and [`super::x11`] take, for the same
+    // reason: `dlsym` returns `*mut c_void` and the only route to a function
+    // pointer is a transmute, whose target type is already written once on the
+    // field being assigned. A second copy in the annotation is the one that
+    // could be wrong.
+    #[allow(clippy::missing_transmute_annotations)]
+    fn lib() -> Option<&'static Lib> {
+        static LIB: OnceLock<Option<Lib>> = OnceLock::new();
+        LIB.get_or_init(|| {
+            // SAFETY: `dlopen`/`dlsym` with literal NUL-terminated names. The
+            // handle is never closed, which is what makes the `'static` true.
+            // `RTLD_NOLOAD` is deliberately *not* used: the ICD may be the
+            // first thing in the process to need libwayland only in the
+            // pathological case, and an ordinary `dlopen` finds the copy the
+            // application already has open when there is one.
+            unsafe {
+                let h = libc::dlopen(
+                    c"libwayland-client.so.0".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if h.is_null() {
+                    return None;
+                }
+                macro_rules! sym {
+                    ($name:literal) => {{
+                        let p = libc::dlsym(h, concat!($name, "\0").as_ptr() as *const c_char);
+                        if p.is_null() {
+                            return None;
+                        }
+                        core::mem::transmute(p)
+                    }};
+                }
+                macro_rules! iface {
+                    ($name:literal) => {{
+                        let p = libc::dlsym(h, concat!($name, "\0").as_ptr() as *const c_char);
+                        if p.is_null() {
+                            return None;
+                        }
+                        p as *const WlInterface
+                    }};
+                }
+                Some(Lib {
+                    display_create_queue: sym!("wl_display_create_queue"),
+                    event_queue_destroy: sym!("wl_event_queue_destroy"),
+                    proxy_create_wrapper: sym!("wl_proxy_create_wrapper"),
+                    proxy_wrapper_destroy: sym!("wl_proxy_wrapper_destroy"),
+                    proxy_set_queue: sym!("wl_proxy_set_queue"),
+                    proxy_marshal_array_flags: sym!("wl_proxy_marshal_array_flags"),
+                    proxy_add_listener: sym!("wl_proxy_add_listener"),
+                    proxy_destroy: sym!("wl_proxy_destroy"),
+                    proxy_get_version: sym!("wl_proxy_get_version"),
+                    proxy_get_display: sym!("wl_proxy_get_display"),
+                    display_roundtrip_queue: sym!("wl_display_roundtrip_queue"),
+                    display_dispatch_queue_pending: sym!("wl_display_dispatch_queue_pending"),
+                    display_flush: sym!("wl_display_flush"),
+                    registry_interface: iface!("wl_registry_interface"),
+                    shm_interface: iface!("wl_shm_interface"),
+                    shm_pool_interface: iface!("wl_shm_pool_interface"),
+                    buffer_interface: iface!("wl_buffer_interface"),
+                })
+            }
+        })
+        .as_ref()
+    }
+
+    /// What the registry sweep is looking for, and where the listener puts it.
+    struct Found {
+        shm_name: u32,
+        shm_version: u32,
+    }
+
+    unsafe extern "C" fn on_global(
+        data: *mut c_void,
+        _registry: *mut c_void,
+        name: u32,
+        interface: *const c_char,
+        version: u32,
+    ) {
+        if data.is_null() || interface.is_null() {
+            return;
+        }
+        // SAFETY: `interface` is a NUL-terminated string libwayland owns for
+        // the duration of the callback, and `data` is the `Found` the caller
+        // passed to `wl_proxy_add_listener`, alive until the registry proxy is
+        // destroyed at the end of `open`.
+        unsafe {
+            if core::ffi::CStr::from_ptr(interface).to_bytes() == b"wl_shm" {
+                let found = &mut *(data as *mut Found);
+                found.shm_name = name;
+                found.shm_version = version;
+            }
+        }
+    }
+
+    unsafe extern "C" fn on_global_remove(_data: *mut c_void, _registry: *mut c_void, _name: u32) {}
+
+    /// `wl_buffer.release`: the compositor is finished with this buffer.
+    unsafe extern "C" fn on_release(data: *mut c_void, _buffer: *mut c_void) {
+        if data.is_null() {
+            return;
+        }
+        // SAFETY: `data` is the `AtomicBool` this buffer's slot owns, boxed so
+        // that its address does not move, and dropped only after the buffer
+        // proxy is destroyed.
+        unsafe { (*(data as *const AtomicBool)).store(false, Ordering::Release) };
+    }
+
+    static REGISTRY_LISTENER: RegistryListener =
+        RegistryListener { global: on_global, global_remove: on_global_remove };
+    static BUFFER_LISTENER: BufferListener = BufferListener { release: on_release };
+
+    /// One `wl_shm` buffer of the ring, and whether the compositor still has it.
+    struct Buf {
+        proxy: *mut c_void,
+        offset: usize,
+        /// Boxed for address stability: the pointer is handed to libwayland as
+        /// the listener's `data` and must outlive every event.
+        busy: Box<AtomicBool>,
+    }
+
+    /// Everything one swapchain needs to put frames on one `wl_surface`.
+    pub struct Surface {
+        display: *mut c_void,
+        surface: *mut c_void,
+        surface_version: u32,
+        queue: *mut c_void,
+        shm: *mut c_void,
+        pool: *mut c_void,
+        map: *mut u8,
+        map_len: usize,
+        buffers: Vec<Buf>,
+        width: u32,
+        height: u32,
+        next: usize,
+    }
+
+    // SAFETY: every pointer is a libwayland object, and libwayland is
+    // thread-safe for all of them. The one thing that is *not* safe to do from
+    // two threads at once is dispatch the same event queue, and this queue is
+    // reachable only through `&mut self` — `crate::wsi::queue_present` holds
+    // the swapchain map's lock across the whole of `present`.
+    unsafe impl Send for Surface {}
+
+    impl Surface {
+        /// Bind `wl_shm` on a queue of our own and build the buffer ring.
+        ///
+        /// Every step that can fail returns `None`, and the caller falls back
+        /// to the headless target rather than failing swapchain creation — the
+        /// same choice, for the same reason, that [`super::Target::open`] makes
+        /// for X11.
+        pub fn open(display: usize, surface: usize, width: u32, height: u32) -> Option<Surface> {
+            let l = lib()?;
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let app_display = display as *mut c_void;
+            let surface = surface as *mut c_void;
+
+            // SAFETY: from here to the end of the function, every call is a
+            // libwayland entry point on a proxy this block owns or on the
+            // application's display, which the loader guarantees is live for
+            // the lifetime of the `VkSurfaceKHR`. The argument arrays match the
+            // signatures in `wayland.xml` for the opcodes named above.
+            unsafe {
+                // Mesa hands `vkCreateWaylandSurfaceKHR` whichever `wl_display`
+                // its EGL display holds, and that may be a proxy *wrapper*
+                // rather than the display itself. `wl_display_create_queue` and
+                // `wl_display_roundtrip_queue` want the real one, and
+                // `wl_proxy_get_display` is the only thing that reliably says
+                // which that is — for a real display it returns itself.
+                let display = (l.proxy_get_display)(app_display);
+                if display.is_null() {
+                    return None;
+                }
+
+                let queue = (l.display_create_queue)(display);
+                if queue.is_null() {
+                    return None;
+                }
+
+                // The wrapper exists for exactly one request: it makes the
+                // registry — and so everything bound from it — belong to our
+                // queue rather than to the application's default one.
+                let wrapper = (l.proxy_create_wrapper)(display);
+                if wrapper.is_null() {
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+                (l.proxy_set_queue)(wrapper, queue);
+                let mut args = [arg_new()];
+                let registry = (l.proxy_marshal_array_flags)(
+                    wrapper,
+                    WL_DISPLAY_GET_REGISTRY,
+                    l.registry_interface,
+                    (l.proxy_get_version)(wrapper),
+                    0,
+                    args.as_mut_ptr(),
+                );
+                (l.proxy_wrapper_destroy)(wrapper);
+                if registry.is_null() {
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+
+                let mut found = Found { shm_name: 0, shm_version: 0 };
+                (l.proxy_add_listener)(
+                    registry,
+                    &REGISTRY_LISTENER as *const RegistryListener as *const c_void,
+                    &mut found as *mut Found as *mut c_void,
+                );
+                // One round trip is enough and is the whole cost of setting
+                // this up: the compositor sends every `global` before it
+                // answers the sync.
+                if (l.display_roundtrip_queue)(display, queue) < 0 || found.shm_version == 0 {
+                    (l.proxy_destroy)(registry);
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+
+                // Version 1 is all this needs — `create_pool` and the two
+                // mandatory formats have been there since the beginning — so
+                // asking for more would only be a way to fail against an older
+                // compositor.
+                let shm_name = (*l.shm_interface).name;
+                let mut args = [
+                    arg_u(found.shm_name),
+                    arg_s(shm_name),
+                    arg_u(1),
+                    arg_new(),
+                ];
+                let shm = (l.proxy_marshal_array_flags)(
+                    registry,
+                    WL_REGISTRY_BIND,
+                    l.shm_interface,
+                    1,
+                    0,
+                    args.as_mut_ptr(),
+                );
+                // The listener's `data` is a stack local, so the registry must
+                // not outlive this function.
+                (l.proxy_destroy)(registry);
+                if shm.is_null() {
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+
+                let stride = width as usize * 4;
+                let frame = stride * height as usize;
+                let map_len = frame * BUFFERS;
+
+                // **The descriptor that does not cross.** It is created here,
+                // sent to `wc-proxy` on this host, and closed here; what
+                // reaches the guest is `(slab, offset, len)`. See this module's
+                // header.
+                let fd = libc::memfd_create(c"sv-icd-swapchain".as_ptr(), libc::MFD_CLOEXEC);
+                if fd < 0 {
+                    (l.proxy_destroy)(shm);
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+                if libc::ftruncate(fd, map_len as libc::off_t) != 0 {
+                    libc::close(fd);
+                    (l.proxy_destroy)(shm);
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+                let map = libc::mmap(
+                    core::ptr::null_mut(),
+                    map_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                if map == libc::MAP_FAILED {
+                    libc::close(fd);
+                    (l.proxy_destroy)(shm);
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+
+                let mut args = [arg_new(), arg_h(fd), arg_i(map_len as i32)];
+                let pool = (l.proxy_marshal_array_flags)(
+                    shm,
+                    WL_SHM_CREATE_POOL,
+                    l.shm_pool_interface,
+                    (l.proxy_get_version)(shm),
+                    0,
+                    args.as_mut_ptr(),
+                );
+                // libwayland `dup`s the descriptor into its own outgoing queue,
+                // so this one is ours to close and closing it is not optional:
+                // a swapchain rebuilt on every window resize would otherwise
+                // leak a descriptor per rebuild.
+                libc::close(fd);
+                if pool.is_null() {
+                    libc::munmap(map, map_len);
+                    (l.proxy_destroy)(shm);
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+
+                let mut buffers = Vec::with_capacity(BUFFERS);
+                for i in 0..BUFFERS {
+                    let offset = i * frame;
+                    let mut args = [
+                        arg_new(),
+                        arg_i(offset as i32),
+                        arg_i(width as i32),
+                        arg_i(height as i32),
+                        arg_i(stride as i32),
+                        arg_u(WL_SHM_FORMAT_XRGB8888),
+                    ];
+                    let b = (l.proxy_marshal_array_flags)(
+                        pool,
+                        WL_SHM_POOL_CREATE_BUFFER,
+                        l.buffer_interface,
+                        (l.proxy_get_version)(pool),
+                        0,
+                        args.as_mut_ptr(),
+                    );
+                    if b.is_null() {
+                        break;
+                    }
+                    let busy = Box::new(AtomicBool::new(false));
+                    (l.proxy_add_listener)(
+                        b,
+                        &BUFFER_LISTENER as *const BufferListener as *const c_void,
+                        &*busy as *const AtomicBool as *mut c_void,
+                    );
+                    buffers.push(Buf { proxy: b, offset, busy });
+                }
+                if buffers.is_empty() {
+                    libc::munmap(map, map_len);
+                    let mut none: [Arg; 0] = [];
+                    (l.proxy_marshal_array_flags)(
+                        pool,
+                        WL_SHM_POOL_DESTROY,
+                        core::ptr::null(),
+                        (l.proxy_get_version)(pool),
+                        MARSHAL_FLAG_DESTROY,
+                        none.as_mut_ptr(),
+                    );
+                    (l.proxy_destroy)(shm);
+                    (l.event_queue_destroy)(queue);
+                    return None;
+                }
+
+                sv_icd_entry::report_transport_failure(&format_args!(
+                    "presentation: wl_shm ready on the application's display — \
+                     {width}x{height}, {} buffer(s), {map_len} bytes",
+                    buffers.len()
+                ));
+
+                Some(Surface {
+                    display,
+                    surface,
+                    surface_version: (l.proxy_get_version)(surface),
+                    queue,
+                    shm,
+                    pool,
+                    map: map as *mut u8,
+                    map_len,
+                    buffers,
+                    width,
+                    height,
+                    next: 0,
+                })
+            }
+        }
+
+        /// One frame: copy the arena bytes into a free buffer, attach, damage,
+        /// commit.
+        pub fn put(&mut self, src: &[u8], width: u32, height: u32, swap_rb: bool) {
+            // A resize between swapchain creation and this frame is the
+            // application's to notice, and Mesa does — it rebuilds. Dropping
+            // the frame is the only thing that is safe here, because the
+            // buffers are the old size.
+            let frame = self.width as usize * self.height as usize * 4;
+            if width != self.width || height != self.height || src.len() < frame {
+                return;
+            }
+            let Some(l) = lib() else { return };
+
+            // SAFETY: libwayland entry points on this object's own proxies and
+            // its own queue, and a write into this object's own mapping at an
+            // offset the constructor established is `frame` bytes long.
+            unsafe {
+                // Free, without blocking: whatever releases the compositor has
+                // already sent are sitting in our queue.
+                (l.display_dispatch_queue_pending)(self.display, self.queue);
+                let mut idx = self.pick();
+                if idx.is_none() {
+                    // Every buffer is still the compositor's. One round trip is
+                    // the backpressure — it returns as soon as the compositor
+                    // answers a `wl_display.sync`, so it cannot wait on a frame
+                    // that will never come, which is what makes this safe where
+                    // waiting on `wl_surface.frame` would not be.
+                    (l.display_flush)(self.display);
+                    (l.display_roundtrip_queue)(self.display, self.queue);
+                    idx = self.pick();
+                }
+                // Still nothing: rather than drop the frame, take the next in
+                // the ring. The worst case is one torn frame; a swapchain that
+                // silently stops presenting is much harder to diagnose.
+                let i = idx.unwrap_or(self.next % self.buffers.len());
+                self.next = (i + 1) % self.buffers.len();
+
+                let dst = self.map.add(self.buffers[i].offset);
+                if swap_rb {
+                    for p in (0..frame).step_by(4) {
+                        *dst.add(p) = src[p + 2];
+                        *dst.add(p + 1) = src[p + 1];
+                        *dst.add(p + 2) = src[p];
+                        *dst.add(p + 3) = src[p + 3];
+                    }
+                } else {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, frame);
+                }
+                self.buffers[i].busy.store(true, Ordering::Release);
+
+                let mut args = [arg_o(self.buffers[i].proxy), arg_i(0), arg_i(0)];
+                (l.proxy_marshal_array_flags)(
+                    self.surface,
+                    WL_SURFACE_ATTACH,
+                    core::ptr::null(),
+                    self.surface_version,
+                    0,
+                    args.as_mut_ptr(),
+                );
+
+                // `damage_buffer` is in buffer coordinates and `damage` in
+                // surface coordinates. They differ the moment the surface has a
+                // scale, and the whole buffer is what changed either way, so
+                // the newer one is used where it exists.
+                let (op, w, h) = if self.surface_version >= DAMAGE_BUFFER_SINCE {
+                    (WL_SURFACE_DAMAGE_BUFFER, self.width as i32, self.height as i32)
+                } else {
+                    (WL_SURFACE_DAMAGE, i32::MAX, i32::MAX)
+                };
+                let mut args = [arg_i(0), arg_i(0), arg_i(w), arg_i(h)];
+                (l.proxy_marshal_array_flags)(
+                    self.surface,
+                    op,
+                    core::ptr::null(),
+                    self.surface_version,
+                    0,
+                    args.as_mut_ptr(),
+                );
+
+                let mut none: [Arg; 0] = [];
+                (l.proxy_marshal_array_flags)(
+                    self.surface,
+                    WL_SURFACE_COMMIT,
+                    core::ptr::null(),
+                    self.surface_version,
+                    0,
+                    none.as_mut_ptr(),
+                );
+                (l.display_flush)(self.display);
+            }
+        }
+
+        /// The first buffer the compositor is not holding.
+        fn pick(&self) -> Option<usize> {
+            (0..self.buffers.len())
+                .map(|k| (self.next + k) % self.buffers.len())
+                .find(|&i| !self.buffers[i].busy.load(Ordering::Acquire))
+        }
+    }
+
+    impl Drop for Surface {
+        fn drop(&mut self) {
+            let Some(l) = lib() else { return };
+            // SAFETY: proxies this object created and has not yet destroyed,
+            // and its own mapping. Nothing here can fail in a way the
+            // application sees: `vkDestroySwapchainKHR` returns void.
+            unsafe {
+                for b in &self.buffers {
+                    let mut none: [Arg; 0] = [];
+                    (l.proxy_marshal_array_flags)(
+                        b.proxy,
+                        WL_BUFFER_DESTROY,
+                        core::ptr::null(),
+                        (l.proxy_get_version)(b.proxy),
+                        MARSHAL_FLAG_DESTROY,
+                        none.as_mut_ptr(),
+                    );
+                }
+                let mut none: [Arg; 0] = [];
+                (l.proxy_marshal_array_flags)(
+                    self.pool,
+                    WL_SHM_POOL_DESTROY,
+                    core::ptr::null(),
+                    (l.proxy_get_version)(self.pool),
+                    MARSHAL_FLAG_DESTROY,
+                    none.as_mut_ptr(),
+                );
+                (l.proxy_destroy)(self.shm);
+                (l.display_flush)(self.display);
+                (l.event_queue_destroy)(self.queue);
+                libc::munmap(self.map as *mut c_void, self.map_len);
+            }
+        }
+    }
 }
