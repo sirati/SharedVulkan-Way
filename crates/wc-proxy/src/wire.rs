@@ -516,10 +516,15 @@ mod tests {
                 }
             }
         }
-        // 177 messages across the two vendored protocols, walked in both
+        // 188 messages across the four vendored protocols, walked in both
         // dialects. An exact figure rather than a floor: adding a protocol
         // should be a visible change to this line, because the set of messages
         // the proxy can walk is exactly the set of clients it can carry.
-        assert_eq!(checked, 354, "the vendored protocols changed shape");
+        //
+        // It moved from 354 to 376 in stage 9, when the two decoration
+        // protocols were added — eleven messages between them, and the reason
+        // is docs/design.md §13.7: the compositor advertises both to find out
+        // which one Firefox uses, and a global that is advertised can be bound.
+        assert_eq!(checked, 376, "the vendored protocols changed shape");
     }
 }

@@ -333,8 +333,17 @@ run_window() {
       grep -q 'app_id -> "org.freedesktop.weston.wayland-terminal"' "$srv" \
         && ok "term: set_app_id arrived, which is what the taskbar icon will key off" \
         || bad "term: no app_id"
-      grep -q "mapped 806x491" "$srv" \
-        && ok "term: the window is 806x491, the size the client asked for" \
+      # **CHANGED IN STAGE 9, and the change is the point.** This used to expect
+      # 806x491, which is the size of the client's *buffer*. `weston-terminal`
+      # draws a 32-pixel drop shadow and resize margin around its frame and
+      # tells the compositor which part of that is the window with
+      # `xdg_surface.set_window_geometry` — 742x427 at +32,+32. Until stage 9
+      # nothing honoured it, so the window was the buffer: offset by 32 px on
+      # two sides, showing the client's own title bar under Windows' caption,
+      # with the opposite edges clipped away. Stage 8 measured that; §13.6 has
+      # both halves. The old number passing was the bug.
+      grep -q "mapped 742x427" "$srv" \
+        && ok "term: the window is 742x427, the client's window-geometry rectangle" \
         || bad "term: unexpected geometry: $(grep -o 'mapped [0-9]*x[0-9]*' "$srv" | head -1)"
 
       # The pixels, read back by tools that are not ours. The dump is the
@@ -349,16 +358,15 @@ run_window() {
         geom=$(magick identify -format "%wx%h" "$frame" 2>/dev/null)
         fw=${geom%x*}; fh=${geom#*x}
         colours=$(magick identify -format "%k" "$frame" 2>/dev/null)
-        # The buffer is *larger* than the window and that is correct, not a
-        # bug: toytoolkit draws a drop shadow around its frame and tells the
-        # compositor the visible part with `xdg_surface.set_window_geometry`.
-        # Measured at 869x555 for an 806x491 window. Asserting equality here
-        # would be asserting that the client does not do something it is
-        # entitled to do.
-        if [ "${fw:-0}" -ge 806 ] && [ "${fh:-0}" -ge 491 ]; then
+        # **CHANGED IN STAGE 9 for the same reason as the line above.** The dump
+        # is the window's shadow, and the window's shadow is now the composited
+        # scene cropped to the geometry rectangle rather than a copy of the
+        # client's buffer. So it is exactly the window size, and asserting
+        # equality is now the right thing where before it would have been wrong.
+        if [ "$geom" = "742x427" ]; then
           ok "term: the dumped frame decodes as $geom with $colours distinct colours"
         else
-          bad "term: the dumped frame is $geom, smaller than the 806x491 window"
+          bad "term: the dumped frame is $geom, not the 742x427 window"
         fi
         [ "${colours:-0}" -ge 16 ] \
           && ok "term: the frame has structure -- a terminal with text in it, not a flat field" \

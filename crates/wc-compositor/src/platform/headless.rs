@@ -180,6 +180,34 @@ pub(crate) struct PumpInner {
     dump_frames: Option<PathBuf>,
     frame: FrameStyle,
     simulate: Simulation,
+    /// ADDED FOR STAGE 9: one scripted click, into the first window that maps.
+    ///
+    /// # Why a harness needs this and `--simulate-wm` was not enough
+    ///
+    /// The thing stage 9 has to show is a **menu**, and a menu is opened by
+    /// clicking a particular pixel. `--simulate-wm` clicks the centre of the
+    /// window, which in a browser is the middle of a web page and opens
+    /// nothing. There is no window manager on this platform and no `SendInput`,
+    /// so without a way to say *where*, the popup path can only be exercised
+    /// under Wine — and Wine is a hypothesis (docs/design.md §4.4).
+    ///
+    /// Deliberately a single click rather than a scripting language: the
+    /// question is whether one press at a known point produces an `xdg_popup`
+    /// and a second window, and anything more would be building a test
+    /// framework instead of answering it.
+    click: Option<Click>,
+}
+
+/// `--click X,Y[,BUTTON][,MS]`.
+#[derive(Clone, Copy, Debug)]
+pub struct Click {
+    pub x: f64,
+    pub y: f64,
+    /// An evdev button code: `BTN_LEFT` 0x110, `BTN_RIGHT` 0x111.
+    pub button: u32,
+    /// How long after the window maps, which has to be long enough for the
+    /// client to have drawn the thing being clicked on.
+    pub after: Duration,
 }
 
 /// A window with no window in it.
@@ -198,6 +226,10 @@ struct Headless {
     input: bool,
     resized: bool,
     closed: bool,
+    /// ADDED FOR STAGE 9. The scripted click is delivered once, into the first
+    /// window only: a popup is itself a window, and clicking into the menu that
+    /// the first click opened would dismiss it.
+    clicked: bool,
 }
 
 /// Which layout the keyboard compiles when nobody says.
@@ -228,6 +260,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             } else {
                 Simulation::OFF
             },
+            click: config.click,
         },
     ))
 }
@@ -266,8 +299,20 @@ impl PumpInner {
                 title,
                 app_id,
                 shadow,
+                kind,
             } => {
-                println!("wc-compositor: window {id} created (headless) title={title:?}");
+                // The kind is logged rather than acted on: there is no window
+                // manager here to place a popup against, and the harness reads
+                // this line to know one was made.
+                match kind {
+                    crate::platform::WindowKind::Toplevel => println!(
+                        "wc-compositor: window {id} created (headless) title={title:?}"
+                    ),
+                    crate::platform::WindowKind::Popup { parent, x, y } => println!(
+                        "wc-compositor: window {id} created (headless popup) \
+                         parent={parent} at {x},{y}"
+                    ),
+                }
                 windows.insert(
                     id,
                     Headless {
@@ -282,6 +327,7 @@ impl PumpInner {
                         input: false,
                         resized: false,
                         closed: false,
+                        clicked: false,
                     },
                 );
             }
@@ -394,6 +440,18 @@ impl PumpInner {
     /// pump's idle tick (for the deadline), so a client that stops drawing is
     /// still closed.
     fn simulate(&self, id: WindowId, w: &mut Headless) {
+        // ADDED FOR STAGE 9, and outside the `--simulate-wm` gate on purpose:
+        // the two are independent, and a run that wants a menu opened does not
+        // want the window resized and closed underneath it four seconds later.
+        if let Some(click) = self.click
+            && w.mapped
+            && !w.clicked
+            && id == 1
+            && w.mapped_at.is_some_and(|t| t.elapsed() >= click.after)
+        {
+            w.clicked = true;
+            self.deliver_click(id, w, click);
+        }
         if !self.simulate.enabled || !w.mapped {
             return;
         }
@@ -431,6 +489,36 @@ impl PumpInner {
             );
             let _ = self.events.send(FromUi::CloseRequested { id });
         }
+    }
+
+    /// One click, at a named point, in the order a real pointer produces.
+    ///
+    /// ADDED FOR STAGE 9. The focus event comes first because a GTK client that
+    /// has never been focused treats a button press as a click-to-focus and
+    /// swallows it, which looks exactly like a compositor that failed to
+    /// deliver the button.
+    fn deliver_click(&self, id: WindowId, w: &Headless, click: Click) {
+        let t = || {
+            w.mapped_at
+                .map(|m| m.elapsed().as_millis() as u32)
+                .unwrap_or(0)
+        };
+        let send = |e: FromUi| {
+            let _ = self.events.send(e);
+        };
+        println!(
+            "wc-compositor: [click] window {id} button {:#x} at {},{}",
+            click.button, click.x, click.y
+        );
+        send(FromUi::Activated { id, on: true });
+        send(FromUi::KeyboardFocus { id, on: true });
+        send(FromUi::PointerEnter { id, x: click.x, y: click.y, time: t() });
+        // A motion after the enter: GTK decides what is under the pointer from
+        // the motion, and a press whose only position came from the enter
+        // event lands on whatever the widget last thought was hovered.
+        send(FromUi::PointerMotion { id, x: click.x, y: click.y, time: t() });
+        send(FromUi::PointerButton { id, button: click.button, pressed: true, time: t() });
+        send(FromUi::PointerButton { id, button: click.button, pressed: false, time: t() });
     }
 
     /// Drive the seat, in the units and the order a real one produces.

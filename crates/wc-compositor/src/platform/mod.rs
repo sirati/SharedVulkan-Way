@@ -63,7 +63,7 @@ pub use win32::{current_layout, start};
 #[cfg(not(windows))]
 mod headless;
 #[cfg(not(windows))]
-pub use headless::{current_layout, start};
+pub use headless::{current_layout, start, Click};
 
 /// Identifies one toplevel, and therefore one window.
 ///
@@ -149,17 +149,33 @@ pub struct IconImage {
     pub pixels: Vec<u8>,
 }
 
+/// What sort of window to make.
+///
+/// ADDED FOR STAGE 9. The distinction is not cosmetic: a popup must not take
+/// activation (a menu that stole focus would close itself), must not appear in
+/// the taskbar, must have no caption, and must be allowed to extend past its
+/// parent's edges. On Win32 that is `WS_POPUP` with an owner, which is exactly
+/// what the system's own menus are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowKind {
+    Toplevel,
+    /// `xdg_popup`. `x` and `y` are in the parent's window-geometry
+    /// coordinates, which is where `xdg_positioner` puts them.
+    Popup { parent: WindowId, x: i32, y: i32 },
+}
+
 /// Wayland thread -> UI thread.
 #[derive(Debug)]
 pub enum ToUi {
-    /// Make a window for this toplevel. It starts hidden: Wayland says a
-    /// surface is not mapped until it has committed a buffer, and showing an
-    /// empty window first is a visible white flash.
+    /// Make a window for this toplevel or popup. It starts hidden: Wayland
+    /// says a surface is not mapped until it has committed a buffer, and
+    /// showing an empty window first is a visible white flash.
     Create {
         id: WindowId,
         title: String,
         app_id: String,
         shadow: Arc<Mutex<Shadow>>,
+        kind: WindowKind,
     },
     /// `xdg_toplevel.set_title`.
     Title { id: WindowId, title: String },
@@ -357,6 +373,14 @@ pub struct PlatformConfig {
     /// all, so without it the entire platform-to-client direction — the resize
     /// negotiation and the close handshake — is never driven by anything.
     pub simulate_wm: bool,
+    /// One scripted click, honoured by the headless platform only.
+    ///
+    /// ADDED FOR STAGE 9. On Win32 a click comes from `SendInput` in a separate
+    /// process (`scripts/probe-input.c`), which is a better test because it is
+    /// the real message path; there is no equivalent here and a menu cannot be
+    /// opened without one. See [`headless::Click`].
+    #[cfg(not(windows))]
+    pub click: Option<headless::Click>,
 }
 
 /// Shared by both platforms: the receiving end of the command queue.
