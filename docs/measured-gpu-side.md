@@ -1591,3 +1591,318 @@ echo stamp=<hex> > /srv/winshare/svvkalloc/host-vkalloc-fill.txt
 
 The guest half releases as soon as the fill file appears, so it holds somebody's
 laptop memory for seconds rather than minutes.
+
+---
+
+# Asking Windows where the pages are: the PFN database, measured
+
+Measured 2026-08-13 on **testhost**, against the live guest while somebody was
+using it. Instruments: `awe-probe`'s new `sf-probe` binary and `gpu-probe
+--vk-alloc --superfetch` in the guest, `arena-host translate` / `arena-host
+scan` on the host.
+
+The question is the one the user asked: *"scanning for the physical pages isn't
+so great, it would be better if we can directly query where the pages are"*,
+with the constraint that whatever replaces the scan must leave the memory able
+to be the GPU's own allocation, with no copy between the two.
+
+`design.md` §5.1 says the query does not exist — **"Windows does not report
+frame numbers to user mode outside AWE at all"** — and cites §0.1 item 5, which
+measured `QueryWorkingSetEx` over 262144 entries and found no physical address
+in any field. That measurement is correct and this section does not contradict
+it. What it contradicts is the generalisation from it. `QueryWorkingSetEx` is
+the *documented* API. It is not the only one.
+
+## The route the user named first, and the reason it is closed
+
+**virtio-fs with DAX does not exist on any part of this stack.** Three
+independent negatives, each read off the machine or off source rather than
+inferred:
+
+- **QEMU 10.2.2 has no DAX window to offer.** `-device vhost-user-fs-pci,help`
+  on the exact binary this guest runs lists no `cache-size` property, and
+  neither does `vhost-user-fs-device`. Upstream `hw/virtio/vhost-user-fs.c` at
+  v10.2.0 has four properties — `chardev`, `tag`, `num-request-queues`,
+  `queue-size` — and no occurrence of `cache`, `shm` or `dax`. The DAX code
+  exists only in the `virtio-fs/qemu` fork's `virtio-fs-dev` branch, whose last
+  commit is 2022-04-20; it was never merged.
+- **virtiofsd 1.13.3 has no DAX to serve.** `--help` on the running binary has
+  no `--dax`, no `--cache-size` and no shared-memory option; `--cache` is the
+  `auto|always|never` policy and nothing else. In the Rust daemon's `src/server.rs`
+  both `setupmapping` and `removemapping` are `ENOSYS` stubs. There is one open,
+  unmerged MR (virtiofsd!318, opened 2026-06-03) that implements them against a
+  *modified Cloud Hypervisor*, not QEMU.
+- **The Windows driver could not consume one if both existed.** In
+  `virtio-win/kvm-guest-drivers-windows`, `viofs/` mentions `FUSE_SETUPMAPPING`
+  in exactly one place: a verbatim copy of Linux's `fuse.h`. Nothing outside
+  that header refers to it. `FUSE_INIT` negotiates `FUSE_DO_READDIRPLUS |
+  FUSE_MAX_PAGES` and not `FUSE_MAP_ALIGNMENT`. Decisively, the shared VirtIO
+  library cannot even *see* a shared-memory capability: `VirtIOPCIModern.c`
+  declares `int capabilities[VIRTIO_PCI_CAP_PCI_CFG]` — five entries — and
+  `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` is type 8. A cap of type 8 is structurally
+  undiscoverable by this driver stack.
+
+And if all three were fixed, the result would be the wrong shape anyway. Per the
+virtio spec §5.11.6.4 the DAX window is **shared memory region 0, a PCI BAR
+aperture**, into which host file pages are mapped sparsely and revocably by
+`FUSE_SETUPMAPPING`; Linux only gets away with treating it as page-backed by
+manufacturing `MEMORY_DEVICE_FS_DAX` `struct page`s over the BAR range. That is
+the same object §5.1 already rejected under the name ivshmem, for the same
+mechanism reason: a BAR is not ordinary RAM, and the arena has to be memory the
+guest's own `vkAllocateMemory` can hand back. **DAX would have solved the
+locating problem by making the memory unable to be the GPU's.**
+
+## The interface that does answer: `SuperfetchPfnQuery`
+
+`NtQuerySystemInformation(SystemSuperfetchInformation)` with
+`SUPERFETCH_INFORMATION{Version: 45, Magic: 'kuhC', InfoClass:
+SuperfetchPfnQuery}` takes a `PF_PFN_PRIO_REQUEST` whose tail is an array of
+`MMPFN_IDENTITY`. The caller fills in `PageFrameIndex` per entry; the kernel
+fills in the rest — what the page is for, who owns it, and **the virtual address
+it is mapped at**. It is where Sysinternals' RAMMap gets its "Physical Pages"
+table.
+
+The direction is inverted relative to what the design wanted. One cannot ask
+"what frame is page P of my window on"; one asks "what is at frame N" for every
+frame in the machine and keeps the answers whose virtual address lands in the
+window. That is O(guest RAM) exactly as the host's scan is — and it is a
+kernel-side walk of a table rather than a 13 GiB read through a memfd.
+
+Structures declared by hand from `phnt` (`ntpfapi.h`, `ntmmapi.h`) in
+`crates/awe-probe/src/superfetch.rs`, bitfield decoding unit-tested.
+
+## What it costs: nothing that is not already held
+
+`whoami /priv` in the guest's ssh session, before any change was made:
+
+```
+SeProfileSingleProcessPrivilege   Erstellen eines Profils für einen Einzelprozess   Aktiviert
+SeDebugPrivilege                  Debuggen von Programmen                           Aktiviert
+```
+
+Both are default rights of `BUILTIN\Administrators`, and the account this
+project already uses is a local administrator. **No security-policy change, no
+`LsaAddAccountRights`, no new SID, no reboot, no code-integrity setting.** This
+is strictly less than R25's `SeLockMemoryPrivilege`, which had to be granted.
+
+The real cost is that the interface is **undocumented**. `SUPERFETCH_INFORMATION`
+is not in the SDK, its version constant is 45 by reverse engineering, and
+`MMPFN_IDENTITY`'s unions are `phnt`'s reading of a kernel structure. Microsoft
+owes nobody its stability. That is a maintenance risk and it is the honest
+argument against this route; it is not a correctness risk, because every answer
+it gives is checkable against the memfd (below).
+
+## The numbers
+
+Guest: Windows 11 build 26200, 13312 MiB, up ~2 days, in interactive use.
+`SuperfetchMemoryRangesQuery` reports **6 ranges, 3391496 frames (13248 MiB)** —
+which is guest RAM minus the holes, and matches R21's region table.
+
+| Window | Locate (guest, whole machine) | Pages found | Runs |
+|---|---:|---:|---:|
+| 1 MiB, 4 KiB `VirtualLock` | 330 ms | 256/256 | 46 |
+| 2 MiB, 4 KiB `VirtualLock` | 347 ms | 512/512 | 61 |
+| 64 MiB, 4 KiB `VirtualLock` | 331–349 ms | 16384/16384 | 757–1472 |
+| 32 MiB, `MEM_LARGE_PAGES` | 330 ms | 8192/8192 | 14 |
+| 64 MiB, `MEM_LARGE_PAGES` | 346–349 ms | 16384/16384 | 26 |
+| 1 GiB, `MEM_LARGE_PAGES` | 351 ms | 262144/262144 | 399 |
+| 64 MiB, driver `vkAllocateMemory` type 1 | 329 ms | 16384/16384 | 416 |
+| 64 MiB, driver `vkAllocateMemory` type 2 | 324 ms | 16384/16384 | 884 |
+
+**The dump costs ~330 ms and does not vary with the window**, for the same
+reason the scan does not: both are linear in guest RAM. So the comparison is
+330 ms against 1.8–2.32 s, on the *guest's* CPU rather than the host's, and
+without root, and without `/proc/<qemu-pid>/fd/35`.
+
+**Re-checking a frame list already held is a different order of cost
+altogether**, because it asks only about the frames it names: 512 frames in
+**0 ms**, 16384 in **1 ms**, 262144 in **22 ms**. That is a re-validation cheap
+enough to run at every handshake, which is what R26's canary was invented to
+approximate.
+
+## It agrees with the scan, page for page
+
+The decisive check, because a frame list that is confidently wrong is exactly
+R21's failure mode. A 64 MiB `VirtualLock`ed window was located both ways at
+once — stamped as usual so `arena-host scan` could work, and reported through
+`SuperfetchPfnQuery` so `arena-host translate` could:
+
+```
+--- translate ---   translated 16384 guest frames to memfd offsets
+                    translation verified for 16384/16384 pages
+                    contiguous runs in the memfd: 1472        real 0m0.064s
+--- scan ---        located 16384 pages
+                    contiguous runs in the memfd: 1472        real 0m2.308s
+--- compare ---     IDENTICAL
+```
+
+16384 of 16384 pages, byte-identical offset tables, and the host's own side of
+the work drops from **2.308 s to 0.064 s** because it is arithmetic over a run
+list instead of a sweep.
+
+## The thing the scan structurally cannot do
+
+`design.md` §5.1: *"An extent must be located before it is used, and cannot be
+re-located afterwards … the stamps are gone."* Measured, on a 64 MiB large-page
+window, by overwriting every byte of it and asking both locators again:
+
+```
+first locate:    16384 of 16384 pages, 26 runs, first pfn 0x1ce600     349 ms
+overwriting every byte of the window — the stamps are now gone
+after overwrite: 16384 of 16384 pages, 26 runs, first pfn 0x1ce600     346 ms
+SAME frame list after the window was overwritten
+```
+
+and, from the host, against the frame list obtained *after* the overwrite:
+
+```
+arena-host scan       -> located 0 pages
+arena-host translate  -> translated 16384 guest frames to memfd offsets
+                         translation verified for 0/16384 pages     (the stamps are gone)
+arena-host write1     -> wrote stamp 0x5f5f5f5f0badf00d into 16384 pages
+```
+
+The guest then read its own window back:
+
+```
+host wrote through the superfetch frame list: 16384/16384 pages carry its
+record at the right index (0 at a wrong one)
+```
+
+**The scan finds nothing; the query finds everything, and the everything is
+right.** That is the whole of §5.1's "cannot be re-located afterwards", removed.
+Note what carried the proof: with the stamps destroyed, `translate`'s own
+content check *must* fail — 0/16384 — so correctness had to be shown in the
+other direction, by the host writing into the offsets the frame list named and
+the guest finding them at the right page indices through its own mapping.
+
+## The constraint that had to survive: the driver's own memory
+
+§0.10 measured that `vkAllocateMemory`'s memory is ordinary guest RAM the host
+can find, at 26–55 runs per 64 MiB, with no privilege — and that is the
+direction in which *the arena is the GPU's own allocation and no copy exists
+between the two*. A locator that only worked on memory the guest was told to
+allocate would be a regression however fast it was.
+
+`gpu-probe --vk-alloc --superfetch`, both host-visible types, 64 MiB each:
+
+```
+type 1: superfetch located 16384/16384 pages of the DRIVER's allocation in 329 ms, 416 runs
+type 2: superfetch located 16384/16384 pages of the DRIVER's allocation in 324 ms, 884 runs
+```
+
+and against the host, for each type, `translate` versus `scan`:
+
+```
+translated 16384 guest frames to memfd offsets
+translation verified for 16384/16384 pages
+located 16384 pages
+IDENTICAL to the scan
+```
+
+Then the host wrote through the superfetch-derived offsets and the guest read it
+back through the *driver's* `vkMapMemory` pointer:
+
+```
+type 1: 16384 carry the host's write, 16384 of those at the page index the host believed
+type 2: 16384 carry the host's write, 16384 of those at the page index the host believed
+```
+
+**The query does not care who allocated.** It asks by virtual address, and the
+driver's mapping is a virtual address like any other. The property §0.10
+established is preserved exactly.
+
+## Where it does not work, and one number that is worse than the design's
+
+**AWE is not locatable this way.** An AWE window's pages came back with no
+virtual address in the window's range at all — `16384 of 16384 pages missing`.
+AWE frames are mapped through `MapUserPhysicalPages` and the PFN identity does
+not report the window's VA for them. This costs nothing: AWE is the one
+allocator that already reports its own frames, and §5.1 does not use it.
+
+**Large pages report an undocumented use code.** Every page of a
+`MEM_LARGE_PAGES` window comes back with `UseDescription = 13`, which `phnt`'s
+`MMPFNUSE_*` list (0–11) does not name. The owner and the virtual address are
+filled in exactly as for an ordinary private page, so nothing downstream cares —
+but a reader who checks against the header should know why the name is missing.
+
+**The owner field is a process id, not a page directory base.** `phnt` offers
+both readings of the same 48 bits (`PAGEDIR_INFORMATION.PageDirectoryBase` and
+`UNIQUE_PROCESS_INFORMATION.UniqueProcessKey`). Measured: a run whose
+`GetCurrentProcessId` was 17380 saw every page of its window reported with
+payload `0x43e4`. It is the pid. So this route does **not** hand the design a
+CR3 for free, and the host-side page-table walk stays a separate question.
+
+**Contiguity has decayed badly with guest uptime, and that is a finding about
+§0.1 rather than about this locator.** §0.1 measured a 1 GiB large-page window
+as **1 run**, on a guest with 1.3 hours of uptime and 8973 MiB free. The same
+allocation today, on the same guest after ~2 days of ordinary use, is **399
+runs**; 64 MiB is 26 rather than 22, and the 4 KiB path drifted from 1471 to
+757–1472 between two allocations minutes apart. §5.1's "contiguity gets better
+with size" is a statement about a freshly booted guest. The design's
+`vm.max_map_count` headroom absorbs it — 399 VMAs for a gigabyte is nothing —
+but "the large-page path is one or two `mmap` calls for the whole arena" is not
+true on a guest that has been up for two days, and §5.7 should not be read as
+though it were.
+
+## What this does not settle
+
+- **Nothing about frame *stability* is improved by measuring it more cheaply.**
+  What changes is that R26's question now has a 1 ms instrument instead of a
+  2 s one, so it can be asked continuously rather than argued about. One data
+  point was taken with it: a 64 MiB `VirtualLock`ed window, located, **held for
+  300 s while somebody used the machine**, and located again —
+  `after hold: 16384 of 16384 pages, 757 runs, first pfn 0x23f34e`,
+  `frame list unchanged after 300s`, and the 1 ms re-check agreed. That is
+  R26's 3m14s result reproduced with an instrument that could have run every
+  second instead of twice. Whether frames move under *memory pressure* was again
+  not provoked: it is somebody's daily machine.
+- **The interface is undocumented and could change in a Windows update.** The
+  mitigation is that it is checkable: the frame list can be verified against the
+  stamps on the one occasion the stamps still exist, which is the first locate.
+  A design that cross-checks the query against a scan once, at attach, and then
+  trusts the query for re-location, pays 2 s once and never again — and detects
+  a broken interface loudly rather than silently.
+- **This was measured on one build.** 26200. Nothing here says what 26100 or
+  27xxx does.
+
+## The four routes, priced
+
+Asked in the order the requirement named them. Every "closed" below is a read of
+the machine or of source, not a judgement.
+
+| Route | Possible here? | Cost | Evidence |
+|---|---|---|---|
+| **virtio-fs with DAX** | **No, on four counts** | — | QEMU 10.2.2 `-device vhost-user-fs-pci,help` has no `cache-size`; upstream `vhost-user-fs.c` has four properties and no DAX; virtiofsd 1.13.3 `setupmapping` is an `ENOSYS` stub and its DAX MR is open and aimed at Cloud Hypervisor; `viofs` mentions `FUSE_SETUPMAPPING` only inside a copied Linux header and its VirtIO library cannot discover a type-8 capability. And the window would be a **PCI BAR**, which is the object §5.1 already rejects. |
+| **A BAR by another name** (ivshmem, reserved e820, a new shm device) | Technically yes, but it is the wrong memory | A QEMU flag change on a guest in production use, a guest driver, and — fatally — memory that `vkAllocateMemory` cannot hand back | §5.1's existing mechanism argument: host-pointer import is kernel userptr, userptr pins pages, BAR mappings are `VM_IO|VM_PFNMAP` and the pinning path rejects them by construction. The user's own stated preference is direct VM↔host mapping over a device. Not measured, because the DAX finding is the same mechanism and settles it. |
+| **A guest kernel driver** (`MmProbeAndLockPages` + `MmGetMdlPfnArray`) | Technically yes — and note **Secure Boot is not enabled in this VM**: `Confirm-SecureBootUEFI` fails with `0xC0000100`, "variable not defined", and `bcdedit /enum {current}` shows no `testsigning`, `hypervisorlaunchtype Off`, DeviceGuard `SecurityServicesRunning` `0`. So test-signing *would* load a driver here. | Forbidden by R6 — no permanent test-signing on this machine — or an EV certificate and attestation-signing paperwork, which is exactly why §5.1 dropped the pinning driver. It now buys strictly less than it did then. | Guest state read directly, 2026-08-13. |
+| **Walking the guest page tables from the host** | Reachable, and not cheap | QMP gives only the *current* vCPU's CR3 (`hmp_gva2gpa` → `mon_get_cpu`; `query-cpus-fast` carries no registers at all; `x-query-registers` does not exist), so choosing a process means Windows introspection — kernel base, `_EPROCESS`, `_KPROCESS.DirectoryTableBase` — with build-specific offsets. MemProcFS/LeechCore does exactly this against a live file-backed physical source and would need only a memory map, which `RegionTable` already produces; `memflow-win32` has no offsets newer than 10.0.22000. | Not measured. Recorded because the PFN query's owner field turned out to be a **process id, not a page directory base**, so this route does not come free with it. |
+
+**The route that was not on the list is the one that works**, and it is not a
+mechanism at all — it is a question. Windows will say where the pages are if
+asked through the interface RAMMap uses.
+
+## Re-running it
+
+```
+# guest half, from the dev shell
+cargo build --release -p awe-probe -p gpu-probe --target x86_64-pc-windows-gnu
+scripts/pl.sh push target/x86_64-pc-windows-gnu/release/sf-probe.exe
+scripts/pl.sh root 'install -m0755 /tmp/sf-probe.exe /srv/winshare/probe/'
+
+# the cheap questions, no host involved
+scripts/pl.sh guest 'cd /c/Users/<guest-user>/sv && ./sf-probe.exe --mode large --pages 16384 --recheck'
+scripts/pl.sh guest 'cd /c/Users/<guest-user>/sv && ./sf-probe.exe --mode locked --pages 16384 --overwrite'
+
+# the cross-check, guest holding and host reading
+scripts/pl.sh guest 'cd /c/Users/<guest-user>/sv && ./sf-probe.exe --mode locked --pages 16384 --keep 300'
+QP=$(pgrep -f 'qemu-system-x86_64 -name windows-vm'); FD=35; P=/srv/winshare/probe
+RUN=$(grep ^run_id= $P/guest-status.txt | cut -d= -f2)
+arena-host translate --fd /proc/$QP/fd/$FD --run $RUN --gpas $P/guest-status.txt --out t.txt
+arena-host scan      --fd /proc/$QP/fd/$FD --run $RUN --out s.txt
+sort t.txt > a; sort s.txt > b; diff a b && echo IDENTICAL
+```
+
+`--overwrite` plus `--await-host` is the version that proves re-location: the
+guest destroys its own stamps, republishes the frame list it obtained
+afterwards, and counts the host's writes when they arrive.

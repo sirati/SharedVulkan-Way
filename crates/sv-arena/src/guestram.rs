@@ -157,6 +157,21 @@ impl ArenaProvider for GuestRamProvider {
         Ok(())
     }
 
+    /// `None` — this provider does not know its frames.
+    ///
+    /// It is no longer true that it *could* not. design.md §0.14: on Windows,
+    /// `NtQuerySystemInformation(SystemSuperfetchInformation)` with
+    /// `SuperfetchPfnQuery` reports the frame behind every page of an ordinary
+    /// mapped window in ~330 ms, measured against the live guest and agreeing
+    /// with the host's scan on 16384 of 16384 pages, with no privilege the
+    /// account does not already hold. `awe_probe::superfetch` is the measured
+    /// implementation; this is where it would be called, and `desc.locator`
+    /// would become [`Locator::Pfns`] — which the wire already carries.
+    ///
+    /// Not done here yet, deliberately: the query is undocumented (R28) and the
+    /// arrangement §5.1 settles on runs the scan *once* as its cross-check, so
+    /// wiring it up is a change to both sides of the handshake rather than to
+    /// this function alone.
     fn frames(&self, _extent: &Extent) -> Option<RunList> {
         None
     }
@@ -230,9 +245,11 @@ mod tests {
         assert!(p.commit(0, 0).is_err());
     }
 
-    /// The guest cannot enumerate its own frames without privilege, on Linux as
-    /// on Windows. `None` is the honest encoding and the reason `ScanLocator` is
-    /// the locator on every path (D21).
+    /// This provider does not enumerate its own frames. That was once "cannot"
+    /// and is now "does not": design.md §0.14 measured that Windows will report
+    /// them through `SuperfetchPfnQuery`, and this provider has not been taught
+    /// to ask. `None` stays the honest encoding of what it currently knows, and
+    /// `ScanLocator` stays the locator (D21).
     #[test]
     fn the_guest_does_not_claim_to_know_its_frames() {
         let mut p = provider();

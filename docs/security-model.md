@@ -649,6 +649,17 @@ Treat "the privilege is still granted" as something to re-justify whenever the
 memory plan changes, and revoke it if the plan ever stops needing large pages.
 
 ### R26 — `VirtualLock` promises residency, not frame stability
+*Update 2026-08-13: this risk now has a direct instrument rather than a proxy.
+The guest can re-read the identity of exactly the frames it already holds in
+**0–22 ms** (512 frames 0 ms, 16384 frames 1 ms, 262144 frames 22 ms) and see
+whether each is still mapped at the virtual address it was — R28,
+`measured-gpu-side.md`. That is cheap enough to run at every handshake and it
+answers the question the canary below only approximates. A second data point was
+taken with it: a 64 MiB locked window held 300 s on a machine in use came back
+`frame list unchanged after 300s`, all 757 runs identical. Relocation under
+memory pressure is still not provoked. The canary stays until the direct check is
+wired into `sv-gpu-server`.*
+
 The 4 KiB path pins arena pages with `VirtualLock`, and the app side then holds
 a table of memfd offsets derived from where those pages were when it attached.
 `VirtualLock`'s contract is that the pages stay *resident* — it says nothing
@@ -731,3 +742,48 @@ server accounts to the same user, and a frame is `XPutImage`d unencrypted over
 whatever transport `$DISPLAY` names. Both are properties of X rather than of
 this design, and both are reasons the phase-2 answer is a compositor rather than
 more of this.
+
+### R28 — The frame-list locator rests on an undocumented Windows interface
+Added 2026-08-13 (`measured-gpu-side.md`, "Asking Windows where the pages are";
+design.md §0.14, §5.1). The guest can be asked where its own pages are, rather
+than the host searching 13 GiB for them, via
+`NtQuerySystemInformation(SystemSuperfetchInformation)` with
+`SuperfetchPfnQuery`. That is the interface RAMMap uses and it is not in the SDK.
+
+**What it costs in rights: nothing new.** It needs
+`SeProfileSingleProcessPrivilege` and `SeDebugPrivilege`. Both are default rights
+of `BUILTIN\Administrators`, both were already enabled on the account this
+project uses, and both were verified present *before* any change was made. No
+`LsaAddAccountRights`, no new SID, no reboot, no code-integrity setting — this is
+strictly less than R25, which had to be granted, and unlike R25 it is not
+reversible-with-a-cost because there is nothing to revoke.
+
+**What it reads.** The whole machine's PFN database: for every physical frame,
+what the frame is used for, the process id that owns it, and the virtual address
+it is mapped at. That is a *system-wide* read — the same information RAMMap
+displays — and it is available to any process on the machine holding those two
+privileges, which on a single-administrator laptop is any elevated process. It
+tells an attacker who already has administrator rights nothing they could not get
+from `SeDebugPrivilege` alone, which the account also holds. The exposure is
+therefore not new; the dependency is.
+
+**The actual risk is availability, not confidentiality.** The interface is
+undocumented, its version constant (`SUPERFETCH_INFORMATION_VERSION = 45`) is
+reverse-engineered, and `MMPFN_IDENTITY`'s union layout is `phnt`'s reading of a
+kernel structure. Build 26200 already returns an undocumented `UseDescription`
+of 13 for large pages that no published list names. A Windows update may change
+any of it, and the failure mode of a *silently shifted field* is exactly R21's:
+a confident, wrong frame list that translates to valid, unrelated memory.
+
+*Mitigation, and it is the reason §5.1 does not delete the scan:* the frame list
+is cross-checked against the content scan **once, at attach**, on the single
+occasion when the stamps still exist and the two locators can be compared page
+for page. A mismatch is fatal to the session and loud. After that the query is
+trusted, because after that there is nothing left to check it against — and the
+1 ms re-check it makes possible (R26) is a stronger continuous guarantee than
+the design previously had at any price.
+
+*What this does not mitigate:* a Windows update that breaks the interface
+outright makes the query fail rather than lie, which degrades the design to
+`ScanLocator` — measured working, and the reason the scan stays in the codebase
+rather than being replaced.

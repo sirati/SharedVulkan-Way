@@ -6,6 +6,25 @@
 //! extent with `{magic, run_id, page_index}` before publishing it, and this
 //! module sweeps the backing object for the magic.
 //!
+//! **That premise was narrowed on 2026-08-13 and this module's role with it**
+//! (design.md §0.14, §5.1; `measured-gpu-side.md`, "Asking Windows where the
+//! pages are"). Windows reports no frames through `QueryWorkingSetEx`, which is
+//! what was measured — but it does through
+//! `NtQuerySystemInformation(SystemSuperfetchInformation)` /
+//! `SuperfetchPfnQuery`, for any allocator that produces ordinary mapped pages,
+//! including the guest driver's own `vkAllocateMemory` memory, in ~330 ms
+//! whatever the window is, and *without needing the pages to still contain the
+//! stamp*. The scan agreed with it on 16384 of 16384 pages.
+//!
+//! The scan is therefore no longer the only locator — but it stays, and stays
+//! on every path, because it is the only one that **verifies**: it is the
+//! cross-check that the undocumented interface is telling the truth, run once at
+//! attach while the stamps still exist (R28). What the query removes is the
+//! *re-location* limitation below, not this module. The host half of the frame
+//! path — `PfnLocator`, translating a run list through
+//! [`crate::qemu::RegionTable::gpa_to_offset`] — is implemented in `arena-host`
+//! and is not yet in this daemon.
+//!
 //! # Why the scan is the locator on every path, including large pages
 //!
 //! > The scan's cost is linear in *guest RAM*, not in arena size — the sweep
