@@ -27,8 +27,13 @@
 # WHAT IS DELIBERATELY NOT CLAIMED
 #
 # Nothing here runs on the real guest, and the `wine` block is Wine. Wine has
-# been wrong seven times on this project; a pass says the code paths are
-# self-consistent and a negative is not a result. Everything in `enumerate`,
+# been wrong four times on this project — the number is design.md §13.6's, which
+# withdrew the SetProcessDpiAwarenessContext entry with the measurement attached,
+# and §14.12 item 6 records why three different counts were in circulation. A
+# pass says the code paths are self-consistent; a negative is not a result, and
+# §13.6's lesson is the sharper one — a negative from Wine, or from the guest,
+# is only evidence if the question was asked where the code will really run.
+# Everything in `enumerate`,
 # `window` and `menu` runs against the **Linux** build of the compositor, where
 # Firefox is a stock libwayland client talking to a stock `wayland-server` —
 # which is exactly the right place to ask what a client needs, and says nothing

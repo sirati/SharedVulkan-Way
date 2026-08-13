@@ -410,7 +410,30 @@ impl Descriptor {
 #[derive(Clone)]
 pub struct Handle {
     descriptor: Descriptor,
-    keepalive: Option<Arc<platform::OwnedObject>>,
+    keepalive: Option<Arc<Owned>>,
+}
+
+/// What a `Handle` holds when this process is the one that made the object.
+///
+/// STAGE 10 SPLIT THIS IN TWO, and the split is the crate's write rule stated
+/// as a type. Before, "owns something" and "is an OS object" were the same
+/// thing, because the only way to create something for a peer was to create an
+/// OS object. A compositor cutting a keymap out of an arena creates no object
+/// at all — it takes bytes out of a region that already exists — so the
+/// keepalive is now either the object or the allocation.
+///
+/// Both arms mean exactly the same thing to every caller: **this process made
+/// these bytes and must hold them for as long as the protocol object they back**
+/// (docs/design.md §2.5). What differs is what release means — closing a
+/// section and unlinking a file for one, returning a range to the outbound
+/// window's free list for the other.
+enum Owned {
+    Object(platform::OwnedObject),
+    /// An allocation out of this process's outbound arena window. The only
+    /// value in this crate that carries a write path into an arena, and not
+    /// constructible from anything that arrived on the wire — see
+    /// [`arena::Gift`].
+    Gift(arena::Gift),
 }
 
 impl fmt::Debug for Handle {
@@ -460,7 +483,28 @@ impl Handle {
         let object = platform::create_section(&name, size)?;
         Ok(Self {
             descriptor: Descriptor::Section { name, size },
-            keepalive: Some(Arc::new(object)),
+            keepalive: Some(Arc::new(Owned::Object(object))),
+        })
+    }
+
+    /// Cut `size` bytes out of this process's outbound arena window
+    /// ([`arena::reserve_outbound`]) and return a handle that owns them.
+    ///
+    /// ADDED FOR STAGE 10. The descriptor is a [`Descriptor::ArenaSlice`], which
+    /// is three integers and names nothing: no path, no kernel object, nothing
+    /// the peer has to open and therefore nothing a filesystem has to be able to
+    /// carry. That is the whole point — it is the only kind of object a
+    /// compositor can create for a client across a hypervisor without a shared
+    /// filesystem existing at all.
+    ///
+    /// Fails, rather than falling back, when there is no window or the window is
+    /// full. See [`create_shared`](Handle::create_shared) for why the choice is
+    /// made once rather than per call.
+    pub fn create_arena_gift(size: u64) -> io::Result<Self> {
+        let gift = arena::give(size)?;
+        Ok(Self {
+            descriptor: gift.descriptor(),
+            keepalive: Some(Arc::new(Owned::Gift(gift))),
         })
     }
 
@@ -488,8 +532,32 @@ impl Handle {
     /// it backs. For a file-backed object it is stronger than a courtesy —
     /// dropping the handle deletes the file.
     ///
+    /// # STAGE 10 puts a third answer in front of the other two
+    ///
+    /// If this process has an **outbound arena window**, the object is a slice
+    /// of it and nothing is created at all. That is preferred over a published
+    /// directory, and the order is the argument:
+    ///
+    /// * An arena slice needs no filesystem both sides can reach. A published
+    ///   directory needs one, and docs/design.md §10.4 measured what such a
+    ///   filesystem costs on the deployment that matters — 330× slower to touch
+    ///   — and §10.3 measured that it is not even coherent for a live mapping.
+    ///   The keymap survived it because a keymap is a closed write (§12.11);
+    ///   that is luck the next server-created object should not have to have.
+    /// * The arena is already there. The compositor mapped it before the socket
+    ///   existed; every other transport here is a per-object `CreateFileW` or
+    ///   `CreateFileMappingW` on a path.
+    ///
+    /// So the full order is: **arena window, then published directory, then a
+    /// session-local section** — most specific to least, each one available only
+    /// when the deployment set it up. A caller still says nothing and gets the
+    /// answer the deployment chose, which is unchanged and is the point.
+    ///
     /// [`create_section`]: Handle::create_section
     pub fn create_shared(size: u64) -> io::Result<Self> {
+        if arena::outbound().is_some() {
+            return Self::create_arena_gift(size);
+        }
         match publish::mint() {
             Some((local, peer)) => Self::create_shared_file(&local, &peer, size),
             None => Self::create_section(size),
@@ -514,7 +582,7 @@ impl Handle {
         let object = platform::create_file_object(local_path, size)?;
         Ok(Self {
             descriptor: Descriptor::SharedFile { path: peer_path.to_owned(), size },
-            keepalive: Some(Arc::new(object)),
+            keepalive: Some(Arc::new(Owned::Object(object))),
         })
     }
 
@@ -543,7 +611,7 @@ impl Handle {
         let object = platform::open_file_object(local_path, size)?;
         Ok(Self {
             descriptor: Descriptor::SharedFile { path: peer_path.to_owned(), size },
-            keepalive: Some(Arc::new(object)),
+            keepalive: Some(Arc::new(Owned::Object(object))),
         })
     }
 
@@ -597,11 +665,31 @@ impl Handle {
     /// (docs/design.md §7.4). This is the *producer's* side of the same
     /// section: a client drawing frames needs one persistent view, because
     /// mapping and unmapping per damaged row would cost more than the drawing.
+    ///
+    /// # Not available for a gift, and that is deliberate — STAGE 10
+    ///
+    /// An arena gift has no `map_mut`, and refusing it is not an omission. A
+    /// `MappingMut` is a writable view that outlives the call and hands out
+    /// `&mut [u8]`; over arena memory that is a lasting, aliasable write
+    /// capability into a region the peer is copying pixels through, held by the
+    /// side of the boundary that is supposed to be reading. The one thing a
+    /// server-created object actually needs is to be filled in once, and
+    /// [`write_at`](Handle::write_at) does that with a bounded copy and no
+    /// lasting reference. A caller that genuinely needs a persistent writable
+    /// view of shared memory is a *producer* of frames, which on this side of
+    /// the boundary nothing is.
     pub fn map_mut(&self) -> io::Result<MappingMut> {
-        let Some(object) = self.keepalive.as_ref() else {
+        let Some(owned) = self.keepalive.as_ref() else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "not the owner of this object",
+            ));
+        };
+        let Owned::Object(object) = &**owned else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "an arena gift has no writable mapping: use write_at, which is bounded by the \
+                 gift and leaves no reference into the region behind it",
             ));
         };
         let size = self.owned_object_size()?;
@@ -615,9 +703,11 @@ impl Handle {
     ///
     /// `Section` and `SharedFile` differ in how the peer names the object and
     /// not at all in what the creator holds, so both are writable by their
-    /// creator. `ArenaSlice` is not: the creator of an arena slice did not
-    /// create an OS object, it was given a window into one, and the arena's own
-    /// allocator decides who may write where.
+    /// creator. `ArenaSlice` is not, and is not reached here: an arena slice has
+    /// no OS object behind it, and how much of it may be written is the *gift's*
+    /// business rather than the descriptor's — `write_at` takes the `Owned::Gift`
+    /// arm before it ever asks this. A slice that arrived from the wire has no
+    /// gift and therefore still lands here, and is still refused.
     fn owned_object_size(&self) -> io::Result<u64> {
         match &self.descriptor {
             Descriptor::Section { size, .. } | Descriptor::SharedFile { size, .. } => Ok(*size),
@@ -634,20 +724,33 @@ impl Handle {
     /// write path, which is the right default for a compositor reading client
     /// buffers.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        let Some(object) = self.keepalive.as_ref() else {
+        let Some(owned) = self.keepalive.as_ref() else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "not the owner of this object",
             ));
         };
-        let size = &self.owned_object_size()?;
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write overflows"))?;
-        if end > *size {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "write past end of section"));
+        match &**owned {
+            Owned::Object(object) => {
+                let size = &self.owned_object_size()?;
+                let end = offset
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "write overflows")
+                    })?;
+                if end > *size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "write past end of section",
+                    ));
+                }
+                platform::write_section(object, offset as usize, bytes)
+            }
+            // The bound is the gift's own extent, chosen by the allocator, so
+            // no argument to this function reaches another gift or a client's
+            // pool. See `arena::Gift::write_at`.
+            Owned::Gift(gift) => gift.write_at(offset, bytes),
         }
-        platform::write_section(object, offset as usize, bytes)
     }
 }
 
@@ -673,6 +776,21 @@ impl MappingMut {
         // exists to arbitrate: a well-behaved client writes only into a buffer
         // the compositor has released.
         unsafe { std::slice::from_raw_parts_mut(self.inner.ptr_mut(), self.len) }
+    }
+
+    /// The same bytes, for reading, without giving up the writable mapping.
+    ///
+    /// ADDED FOR STAGE 10: the proxy holds one writable view of an arena and
+    /// now has to *read* a range of it that the compositor wrote — the outbound
+    /// window. Taking `&self` rather than `&mut self` is the whole of the
+    /// difference and it is what lets the read happen while the write path is
+    /// borrowed elsewhere.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `inner` holds a live mapping of `len` bytes for as long as
+        // `self` lives; `&self` rules out a `&mut [u8]` from `as_mut_slice`
+        // existing at the same time. The peer may still write these bytes,
+        // which is the shared-memory hazard `Mapping::as_slice` documents.
+        unsafe { std::slice::from_raw_parts(self.inner.ptr(), self.len) }
     }
 
     pub fn len(&self) -> usize {

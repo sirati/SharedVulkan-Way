@@ -70,10 +70,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyWindow, DispatchMessageW, GetClientRect, GetMessageTime, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage,
+    GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, ICONINFO, ICON_BIG, ICON_SMALL,
-    IDC_ARROW, MSG, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SIZE_MAXIMIZED,
+    IDC_ARROW, MSG, SM_CXICON, SM_CXSCREEN, SM_CXSMICON, SM_CYICON, SM_CYSCREEN, SM_CYSMICON,
+    SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
@@ -1132,6 +1133,64 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
             " (xrgb)"
         }
     );
+
+    // What the window turned out to be, in the units the window manager uses.
+    // docs/design.md §8.11 item 5 asks what happens on a scaled display, and the
+    // answer is three numbers rather than a yes: the DPI Windows assigned this
+    // window, the outer rectangle it gave us for the client size we asked for,
+    // and the client rectangle it ended up with. On a 150% desktop a virtualised
+    // window reports 96 here and a frame whose non-client thickness is the
+    // 100%-scale one; an aware window reports 144 and a frame 1.5x as thick.
+    // Printed once per window, at map, because that is when the frame exists and
+    // the size is the client's own rather than a drag's.
+    let (dpi, wr, cr) = window_geometry(w.hwnd());
+    println!(
+        "wc-compositor: window {} dpi {dpi} ({}%) window {}x{} client {}x{} nonclient {}x{}",
+        w.id,
+        dpi * 100 / 96,
+        wr.0,
+        wr.1,
+        cr.0,
+        cr.1,
+        wr.0 - cr.0,
+        wr.1 - cr.1
+    );
+}
+
+/// `(dpi, (window w, h), (client w, h))` for a live window.
+///
+/// `GetDpiForWindow` is a Windows 10 1607 entry point and is resolved rather
+/// than linked, for the reason in `announce_dpi_awareness`. A 0 means the symbol
+/// was not there, which is a different thing from 96 and is printed as such.
+fn window_geometry(hwnd: HWND) -> (u32, (i32, i32), (i32, i32)) {
+    let lib = wide("user32.dll");
+    // SAFETY: a live NUL-terminated name for an already-loaded module.
+    let user32 = unsafe { LoadLibraryW(lib.as_ptr()) };
+    let dpi = if user32.is_null() {
+        0
+    } else {
+        // SAFETY: an ASCII, NUL-terminated symbol name; the transmute is to
+        // `GetDpiForWindow(HWND) -> UINT`.
+        match unsafe { GetProcAddress(user32, c"GetDpiForWindow".as_ptr().cast()) } {
+            Some(f) => unsafe {
+                let f: unsafe extern "system" fn(HWND) -> u32 = std::mem::transmute(f);
+                f(hwnd)
+            },
+            None => 0,
+        }
+    };
+    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: live window handle; both rectangles are written in place.
+    unsafe {
+        GetWindowRect(hwnd, &mut wr);
+        GetClientRect(hwnd, &mut cr);
+    }
+    (
+        dpi,
+        (wr.right - wr.left, wr.bottom - wr.top),
+        (cr.right - cr.left, cr.bottom - cr.top),
+    )
 }
 
 /// Write this frame out as a PPM, if `--dump-frames` asked for it.
@@ -1523,7 +1582,7 @@ fn register_classes() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ask for per-monitor DPI awareness, and say what happened.
+/// Ask for per-monitor DPI awareness, and say **why** it did or did not happen.
 ///
 /// # Why this is here and why it is a `GetProcAddress`
 ///
@@ -1537,14 +1596,33 @@ fn register_classes() -> std::io::Result<()> {
 /// `SetProcessDpiAwarenessContext` is resolved at runtime rather than linked,
 /// because it is a Windows 10 1703 entry point and a link-time reference would
 /// mean the binary does not load at all on anything older — trading a
-/// degradation for a failure.
+/// degradation for a failure. Everything else read here is resolved the same
+/// way and for the same reason.
 ///
-/// **This is one of the items that Wine cannot settle** (docs/design.md §8.8):
-/// Wine's DPI handling is not `ntdll`'s, and a success here says only that the
-/// call was made.
+/// # Why "refused" was not enough (docs/design.md §10.13 item 3)
+///
+/// §10.8 recorded that Wine reports `ok` and the guest reports failure, and
+/// that the compositor could not tell an **already-aware** process from an
+/// **unavailable context**. Those are one fine case and one bug, and they are
+/// distinguished by exactly two things the old code threw away: `GetLastError`,
+/// and the awareness the process actually ended up with.
+///
+/// * `ERROR_ACCESS_DENIED` (5) is documented as "the default API awareness mode
+///   for the process has already been set", so the awareness printed *before*
+///   the call is the one that will be used, and the question becomes whether
+///   that one is good enough rather than whether the call worked.
+/// * `ERROR_INVALID_PARAMETER` (87) is the context itself not being available,
+///   which on a scaled display is the bug.
+///
+/// So this prints the awareness before, the call, the error, and the awareness
+/// after — and then the display metrics that the choice actually decides,
+/// because a per-monitor-aware process and a virtualised one disagree about
+/// `SM_CXSCREEN` and that disagreement is the whole observable effect.
 fn announce_dpi_awareness() {
-    // Per-monitor v2, the value of DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.
+    // The documented `DPI_AWARENESS_CONTEXT` pseudo-handles. They are opaque
+    // negative values rather than pointers, which is why they can be constants.
     const PER_MONITOR_AWARE_V2: isize = -4;
+
     let lib = wide("user32.dll");
     // SAFETY: a live NUL-terminated name; user32 is already loaded, so this is
     // a reference-count bump on a module that cannot go away.
@@ -1552,19 +1630,66 @@ fn announce_dpi_awareness() {
     if user32.is_null() {
         return;
     }
-    // SAFETY: an ASCII, NUL-terminated symbol name.
-    let sym = unsafe { GetProcAddress(user32, c"SetProcessDpiAwarenessContext".as_ptr().cast()) };
-    match sym {
+    // SAFETY (all four): ASCII, NUL-terminated symbol names, and each
+    // `transmute` below is to that entry point's documented signature. A
+    // missing symbol comes back as `None` and is handled.
+    let set = unsafe { GetProcAddress(user32, c"SetProcessDpiAwarenessContext".as_ptr().cast()) };
+    let get_thread =
+        unsafe { GetProcAddress(user32, c"GetThreadDpiAwarenessContext".as_ptr().cast()) };
+    let get_awareness =
+        unsafe { GetProcAddress(user32, c"GetAwarenessFromDpiAwarenessContext".as_ptr().cast()) };
+    let dpi_for_system = unsafe { GetProcAddress(user32, c"GetDpiForSystem".as_ptr().cast()) };
+
+    // `DPI_AWARENESS`: 0 unaware, 1 system-aware, 2 per-monitor-aware. -1 is
+    // the documented "invalid" return and is what a missing symbol reads as.
+    let awareness = || -> i32 {
+        let (Some(t), Some(a)) = (get_thread, get_awareness) else {
+            return -1;
+        };
+        // `GetProcAddress` already hands back an `unsafe extern "system" fn() -> isize`,
+        // which is `GetThreadDpiAwarenessContext`'s signature exactly, so only the
+        // second entry point needs a transmute.
+        // SAFETY: `GetAwarenessFromDpiAwarenessContext(ctx) -> DPI_AWARENESS`.
+        unsafe {
+            let a: unsafe extern "system" fn(isize) -> i32 = std::mem::transmute(a);
+            a(t())
+        }
+    };
+    let name = |a: i32| match a {
+        0 => "unaware",
+        1 => "system-aware",
+        2 => "per-monitor-aware",
+        _ => "unknown",
+    };
+
+    let before = awareness();
+    match set {
         Some(f) => {
             // SAFETY: the documented signature of
             // `SetProcessDpiAwarenessContext`: one `DPI_AWARENESS_CONTEXT`
             // (an opaque `isize`), returning `BOOL`.
-            let f: unsafe extern "system" fn(isize) -> i32 =
-                unsafe { std::mem::transmute(f) };
+            let f: unsafe extern "system" fn(isize) -> i32 = unsafe { std::mem::transmute(f) };
             let ok = unsafe { f(PER_MONITOR_AWARE_V2) };
+            // Read immediately: anything in between, including the `println!`,
+            // is entitled to clobber the thread's last error.
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            let after = awareness();
+            let verdict = if ok != 0 {
+                "ok"
+            } else {
+                match err {
+                    // ERROR_ACCESS_DENIED: already set, and `after` says to what.
+                    5 => "refused: awareness was already set",
+                    // ERROR_INVALID_PARAMETER: this context is not available.
+                    87 => "refused: PER_MONITOR_AWARE_V2 is not an available context",
+                    _ => "refused",
+                }
+            };
             println!(
-                "wc-compositor: SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) -> {}",
-                if ok != 0 { "ok" } else { "refused" }
+                "wc-compositor: SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) -> {verdict} \
+                 (err {err}); awareness {} -> {}",
+                name(before),
+                name(after)
             );
         }
         None => {
@@ -1573,4 +1698,23 @@ fn announce_dpi_awareness() {
             );
         }
     }
+
+    // The observable consequence, printed whichever way the call went. On a
+    // 150%-scaled 1920x1200 panel an unaware process is told 1280x800 and a
+    // per-monitor-aware one is told 1920x1200, so this line is what says which
+    // of the two the compositor is about to size windows in.
+    let sysdpi = match dpi_for_system {
+        // SAFETY: `GetDpiForSystem() -> UINT`, no arguments.
+        Some(f) => unsafe {
+            let f: unsafe extern "system" fn() -> u32 = std::mem::transmute(f);
+            f()
+        },
+        None => 0,
+    };
+    // SAFETY: two documented system-metric indices; the call cannot fail.
+    let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    println!(
+        "wc-compositor: primary screen {cx}x{cy}, system dpi {sysdpi} ({}%)",
+        if sysdpi == 0 { 0 } else { sysdpi * 100 / 96 }
+    );
 }

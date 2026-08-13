@@ -38,6 +38,17 @@ struct Args {
     /// of it that are the guest's arena. Set, `--transport arena` maps guest
     /// RAM; unset, it opens `--arena-path` as a file.
     arena_plan: PathBuf,
+    /// STAGE 10. How many bytes at the **end** of the arena belong to the
+    /// compositor rather than to this process's pool allocator — the window it
+    /// cuts the objects it creates for clients out of. Zero means it has none.
+    ///
+    /// Only for `--arena-path`, the same-machine file case. With `--arena-plan`
+    /// the number comes from the plan, because it was decided in the guest and
+    /// the plan is already the description of the region that crossed from
+    /// there: a number typed into two command lines is a number that can differ
+    /// between them, and two allocators over the same bytes is the one failure
+    /// this flag exists to prevent.
+    arena_outbound: u64,
     scope: CopyScope,
     headroom: u64,
     trace: bool,
@@ -64,6 +75,11 @@ usage: wc-proxy --upstream <path> [options]
   --arena-id N           arena: the number both sides call it (default 0)
   --arena-size BYTES     arena: how big (default 64 MiB; with --arena-plan the
                          guest's allocation decides and this is ignored)
+  --arena-outbound N     arena: the last N bytes belong to the compositor, which
+                         cuts the objects it creates for clients -- a keymap
+                         first -- out of them. Must match the compositor's
+                         --arena-outbound. With --arena-plan the plan carries it
+                         and this is refused rather than believed.
 
   --copy pool|buffer|damage   how much to copy per commit (default damage)
   --trace                log every message in both directions\n  --pool-headroom N      over-allocate each region N-fold so resize fits
@@ -87,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
         arena_size: 64 << 20,
         arena_path: PathBuf::new(),
         arena_plan: PathBuf::new(),
+        arena_outbound: 0,
         scope: CopyScope::Damage,
         headroom: 1,
         trace: false,
@@ -106,6 +123,10 @@ fn parse_args() -> Result<Args, String> {
             "--arena-path" => a.arena_path = next()?.into(),
             "--arena-plan" => a.arena_plan = next()?.into(),
             "--arena-id" => a.arena_id = next()?.parse().map_err(|e| format!("--arena-id: {e}"))?,
+            "--arena-outbound" => {
+                a.arena_outbound =
+                    next()?.parse().map_err(|e| format!("--arena-outbound: {e}"))?
+            }
             "--arena-size" => {
                 a.arena_size = next()?.parse().map_err(|e| format!("--arena-size: {e}"))?
             }
@@ -163,6 +184,26 @@ pub fn main() -> std::process::ExitCode {
     }
 }
 
+/// Say, in the log, that this side knows about the compositor's window.
+///
+/// STAGE 10. It is one line and it is worth one line: the number is the only
+/// thing standing between two allocators over one region, and a run where the
+/// compositor reserved a window and this side did not hear about it would work
+/// perfectly until the arena filled up.
+fn announce_outbound(t: &Arena) {
+    match t.outbound() {
+        Some((off, len)) => println!(
+            "[proxy] arena {}: the last {len} bytes (offset {off}) are the compositor's to \
+             hand to clients; this allocator will not touch them",
+            t.id()
+        ),
+        None => println!(
+            "[proxy] arena {}: no outbound window; the compositor creates nothing here",
+            t.id()
+        ),
+    }
+}
+
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let spec = Spec::builtin()?;
     println!("[proxy] {} interfaces from the vendored protocols", spec.len());
@@ -210,6 +251,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         "arena" if !args.arena_plan.as_os_str().is_empty() => {
             arena_taken = true;
+            if args.arena_outbound != 0 {
+                return Err(
+                    "--arena-outbound and --arena-plan are mutually exclusive: the window \
+                     was decided in the guest and travels in the plan, so a second spelling \
+                     of it on this command line could only ever disagree"
+                        .into(),
+                );
+            }
             let t = Arena::from_plan(args.arena_id, &args.arena_plan)?;
             println!(
                 "[proxy] transport arena {}: {} bytes of {} \
@@ -218,11 +267,15 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 t.size(),
                 t.origin(),
             );
+            announce_outbound(&t);
             Box::new(t)
         }
         "arena" => {
             arena_taken = true;
-            let t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
+            let mut t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
+            if args.arena_outbound != 0 {
+                t.reserve_outbound(args.arena_outbound)?;
+            }
             println!(
                 "[proxy] transport arena {}: {} bytes at {} \
                  (the compositor must be started with --arena {}:<its path>:{})",
@@ -232,6 +285,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.arena_id,
                 t.size(),
             );
+            announce_outbound(&t);
             Box::new(t)
         }
         other => return Err(format!("--transport {other}? try shared-file or arena").into()),

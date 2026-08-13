@@ -139,6 +139,29 @@ pub trait PoolTransport {
 
     /// Bytes currently published, for the log.
     fn published(&self) -> u64;
+
+    /// Read `(arena, offset, len)` of a region this transport holds, if it holds
+    /// one.
+    ///
+    /// STAGE 10, and it is the *server*-to-client direction: the compositor now
+    /// cuts the objects it creates — a `wl_keyboard` keymap first — out of its
+    /// own window of the same arena, and this is how they are read back here to
+    /// be turned into a descriptor for a Linux client
+    /// (`crate::session::materialise`).
+    ///
+    /// It is on the transport rather than on `wc_handle::arena` because this
+    /// process reaches the region through `guestram::StitchedRegion` — 1500
+    /// `mmap(MAP_FIXED)` calls into one reservation — and registering that with
+    /// `wc_handle` would mean a second way to hold the same pages, whose two
+    /// halves could disagree. There is one mapping and one owner of it.
+    ///
+    /// `None` for a transport with no arena, which is a real answer rather than
+    /// a failure: `--transport shared-file` never sees an arena slice unless the
+    /// compositor was configured against a region this proxy does not have, and
+    /// that misconfiguration should say so in those words.
+    fn peer_slice(&self, _arena: u32, _offset: u64, _len: u64) -> Option<&[u8]> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +321,15 @@ impl Backing {
             Backing::GuestRam(r) => r.as_mut_slice(),
         }
     }
+
+    /// The same bytes, for reading. Needed because the compositor's outbound
+    /// window is read from here and the pool path is the only writer.
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Backing::File { view, .. } => view.as_slice(),
+            Backing::GuestRam(r) => r.as_slice(),
+        }
+    }
 }
 
 pub struct Arena {
@@ -310,6 +342,9 @@ pub struct Arena {
     next: u64,
     published: u64,
     size: u64,
+    /// The peer's outbound window, `(offset, len)`, which this allocator has
+    /// been told to stay out of. See [`Arena::reserve_outbound`].
+    outbound: Option<(u64, u64)>,
 }
 
 /// The allocator's granularity, and the alignment of every offset it returns.
@@ -381,7 +416,58 @@ impl Arena {
             region.runs(),
             region.origin()
         );
-        Ok(Arena::over(id, Backing::GuestRam(region), &origin, size))
+        let mut arena = Arena::over(id, Backing::GuestRam(region), &origin, size);
+        if let Some((_, len)) = plan.outbound {
+            arena.reserve_outbound(len)?;
+        }
+        Ok(arena)
+    }
+
+    /// Take the last `len` bytes of this arena out of the free list, because the
+    /// peer declared them **its** to hand to clients.
+    ///
+    /// STAGE 10 and docs/design.md §12.11 item 3. The allocator above owns the
+    /// whole region by default, which was true while the only things in an arena
+    /// were `wl_shm` pools this process published. A compositor that can create
+    /// objects for its clients is a second allocator over the same bytes, and two
+    /// allocators handing out the same offsets is the failure this exists to make
+    /// impossible: it would put a client's pixels on top of another client's
+    /// keymap, and it would do it silently.
+    ///
+    /// The tail rather than an arbitrary hole, because the free list is a sorted
+    /// run list and shortening it is exact; a hole would be a special case in the
+    /// one piece of code that must not have one.
+    ///
+    /// **This must be called before the first pool**, and it is: both callers do
+    /// it during construction, from the plan or from a flag, before any client
+    /// exists. It refuses rather than assumes, so a later call with anything
+    /// allocated is an error and not a quietly moved boundary.
+    pub fn reserve_outbound(&mut self, len: u64) -> io::Result<()> {
+        if self.published > 0 || self.free != vec![(0, self.size)] {
+            return Err(io::Error::other(
+                "the peer's outbound window must be reserved before anything is allocated",
+            ));
+        }
+        if len == 0 || len >= self.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "an outbound window of {len} bytes leaves nothing of a {}-byte arena",
+                    self.size
+                ),
+            ));
+        }
+        let len = len.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
+        self.outbound = Some((self.size - len, len));
+        self.free = vec![(0, self.size - len)];
+        Ok(())
+    }
+
+    /// The peer's window, `(offset, len)`, for the log line that says this proxy
+    /// knows about it. `None` is the answer for every deployment before stage 10
+    /// and for every one whose compositor creates nothing.
+    pub fn outbound(&self) -> Option<(u64, u64)> {
+        self.outbound
     }
 
     fn over(id: u32, backing: Backing, origin: &str, size: u64) -> Arena {
@@ -394,6 +480,7 @@ impl Arena {
             next: 0,
             published: 0,
             size,
+            outbound: None,
         }
     }
 
@@ -496,6 +583,19 @@ impl PoolTransport for Arena {
 
     fn published(&self) -> u64 {
         self.published
+    }
+
+    /// The whole region is readable, not only the part this side allocated —
+    /// the compositor's outbound window is in it and is precisely the range this
+    /// side never hands out. Bounds-checked rather than trusted: the offsets
+    /// arrive in a descriptor from the other side of the boundary.
+    fn peer_slice(&self, arena: u32, offset: u64, len: u64) -> Option<&[u8]> {
+        if arena != self.id {
+            return None;
+        }
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.backing.as_slice().get(start..end)
     }
 }
 

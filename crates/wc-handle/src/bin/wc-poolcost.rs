@@ -83,6 +83,20 @@ mod imp {
         reply: Option<(u64, String)>,
         sections: bool,
         prepare: Option<String>,
+        /// STAGE 10. Measure the **sending** side instead of the receiving one:
+        /// what it costs this process to make an object of `--size` *for a peer*
+        /// and fill it, which is what a `wl_keyboard.keymap` is.
+        ///
+        /// `Handle::create_shared` picks the transport from what the process was
+        /// set up with, so this runs it three times over three setups rather
+        /// than taking a mode argument — a section, a published directory, and
+        /// an outbound arena window. The directory is `--files`, reused, because
+        /// where objects go is the same question in both directions.
+        mint: bool,
+        /// `PATH:BYTES` — a file to provide as a writable arena for `--mint`.
+        /// Under Wine there is no hypervisor and therefore no guest RAM; a file
+        /// both sides open is the substrate that leg has.
+        mint_arena: Option<(String, u64)>,
     }
 
     fn usage() -> &'static str {
@@ -103,6 +117,13 @@ usage: wc-poolcost [options]
   --reply OFF:TEXT       and answer at OFF once it does (the other direction)
   --sections             also measure a named section, as the control
   --prepare DIR          create the pool files in DIR and exit
+
+  --mint                 measure the *sending* side instead: what it costs to
+                         make an object of --size for a peer and fill it, which
+                         is what a wl_keyboard.keymap is. Uses --files as the
+                         published directory and --mint-arena as the region.
+  --mint-arena PATH:BYTES  provide PATH as a writable arena for --mint, and cut
+                         the objects out of a window at the end of it
 "
     }
 
@@ -117,6 +138,8 @@ usage: wc-poolcost [options]
             reply: None,
             sections: false,
             prepare: None,
+            mint: false,
+            mint_arena: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -127,6 +150,17 @@ usage: wc-poolcost [options]
                 "--files" => a.files = Some(next()?),
                 "--sections" => a.sections = true,
                 "--prepare" => a.prepare = Some(next()?),
+                "--mint" => a.mint = true,
+                "--mint-arena" => {
+                    let v = next()?;
+                    let (path, size) = v
+                        .rsplit_once(':')
+                        .ok_or_else(|| "--mint-arena wants PATH:BYTES".to_string())?;
+                    a.mint_arena = Some((
+                        path.to_owned(),
+                        size.parse().map_err(|e| format!("--mint-arena size: {e}"))?,
+                    ));
+                }
                 "--arena" => {
                     let v = next()?;
                     // Split at the *last* colon: a Windows path starts with one.
@@ -185,14 +219,33 @@ usage: wc-poolcost [options]
         (mean, median)
     }
 
+    /// The receiving side's three phases, which is what this program was for
+    /// until stage 10.
     fn report(label: &str, map: Vec<Duration>, touch: Vec<Duration>, drop_: Vec<Duration>) {
-        let (mm, md) = stats(map);
-        let (tm, _) = stats(touch);
-        let (dm, _) = stats(drop_);
+        report_as(label, ["map", "touch", "drop"], "pool", map, touch, drop_);
+    }
+
+    /// The same table with the phases named, because the sending side's three
+    /// are not `map`/`touch`/`drop` and a table that said they were would be
+    /// wrong in the one way a reader could not check.
+    fn report_as(
+        label: &str,
+        phases: [&str; 3],
+        unit: &str,
+        a: Vec<Duration>,
+        b: Vec<Duration>,
+        c: Vec<Duration>,
+    ) {
+        let (am, ad) = stats(a);
+        let (bm, _) = stats(b);
+        let (cm, _) = stats(c);
         println!(
-            "  {label:<14} map {mm:9.1} us (median {md:8.1})  touch {tm:9.1} us  \
-             drop {dm:7.1} us  total {:9.1} us/pool",
-            mm + tm + dm
+            "  {label:<18} {:<8}{am:9.1} us (median {ad:8.1})  {:<6}{bm:9.1} us  \
+             {:<8}{cm:7.1} us  total {:9.1} us/{unit}",
+            phases[0],
+            phases[1],
+            phases[2],
+            am + bm + cm
         );
     }
 
@@ -239,6 +292,98 @@ usage: wc-poolcost [options]
                 args.iters, args.size
             );
             return std::process::ExitCode::SUCCESS;
+        }
+
+        // ------------------------------------------------------------ 10 ---
+        // The sending side. Everything below this block measures what a
+        // *receiver* pays to reach a pool a peer made; this measures what a
+        // **sender** pays to make an object a peer will open, which is the
+        // direction stage 6 opened and stage 10 gave an arena to.
+        //
+        // Three phases, chosen to mirror the receiver's three so the two tables
+        // read the same way:
+        //
+        //  * **create** — `Handle::create_shared`, whatever it decides that is.
+        //  * **fill** — `write_at` of the whole object, once. A keymap is
+        //    written exactly once and never touched again.
+        //  * **release** — dropping the handle. For a published file that is an
+        //    unlink; for a gift it is a free-list insert.
+        //
+        // Deliberately *not* included: the receiver's cost, which is the rest
+        // of this program, and the descriptor's 30-odd bytes on the wire, which
+        // are the same for both.
+        if args.mint {
+            println!(
+                "wc-poolcost: minting {} objects of {} bytes each, for a peer",
+                args.iters, args.size
+            );
+            let mut bad = 0;
+
+            let run = |label: &str| -> usize {
+                let mut bad = 0usize;
+                let (mut c, mut f, mut r) = (Vec::new(), Vec::new(), Vec::new());
+                let filler = vec![0x5au8; args.size as usize];
+                for _ in 0..args.iters {
+                    let t0 = Instant::now();
+                    let h = match Handle::create_shared(args.size) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            eprintln!("  {label}: create failed: {e}");
+                            bad += 1;
+                            break;
+                        }
+                    };
+                    c.push(t0.elapsed());
+                    let t1 = Instant::now();
+                    if let Err(e) = h.write_at(0, &filler) {
+                        eprintln!("  {label}: fill failed: {e}");
+                        bad += 1;
+                        break;
+                    }
+                    f.push(t1.elapsed());
+                    let t2 = Instant::now();
+                    std::mem::drop(h);
+                    r.push(t2.elapsed());
+                }
+                report_as(label, ["create", "fill", "release"], "object", c, f, r);
+                bad
+            };
+
+            // A section, first, because it is the answer with no filesystem and
+            // no arena and is therefore the floor for the other two.
+            bad += run("mint section");
+            if let Some(dir) = &args.files {
+                let sep = if dir.ends_with('\\') || dir.ends_with('/') { "" } else { "\\" };
+                if let Err(e) = wc_handle::publish::set(dir, &format!("{dir}{sep}")) {
+                    eprintln!("  mint shared-file: --files {dir}: {e}");
+                    bad += 1;
+                } else {
+                    bad += run("mint shared-file");
+                }
+            }
+            // Last, because an outbound window wins over a published directory
+            // in `create_shared` and there is no way to give it back.
+            if let Some((path, size)) = &args.mint_arena {
+                match arena::provide_file(9, path, *size)
+                    .and_then(|()| arena::reserve_outbound(9, *size / 2))
+                {
+                    Ok(w) => {
+                        println!("  arena 9 outbound window: {}+{}", w.offset, w.len);
+                        bad += run("mint arena-slice");
+                    }
+                    Err(e) => {
+                        eprintln!("  mint arena-slice: {path}: {e}");
+                        bad += 1;
+                    }
+                }
+            }
+            return if bad == 0 {
+                println!("RESULT: minted");
+                std::process::ExitCode::SUCCESS
+            } else {
+                println!("RESULT: {bad} measurement(s) failed");
+                std::process::ExitCode::FAILURE
+            };
         }
 
         println!(

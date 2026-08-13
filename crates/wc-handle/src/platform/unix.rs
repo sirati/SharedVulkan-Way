@@ -251,6 +251,52 @@ pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
     map_section(path, len)
 }
 
+/// Open an object by filesystem path and map it **writable**, as a region.
+///
+/// STAGE 10, and it is the local twin of [`alloc_locked_region`] rather than a
+/// second `map_file`. The type it returns is the same [`MappedView`] the arena
+/// registry holds, and the reason a *writable* mapping can come back through a
+/// type documented as read-only is the same one `alloc_locked_region` already
+/// relies on: the view is not what decides who may write. The registry does —
+/// only a `provided` arena has a write path at all, and only its declared
+/// outbound window can be reached through it (`crate::arena`).
+///
+/// This exists so that the compositor side of an arena can be a *file* on a
+/// machine with no hypervisor. Under Wine the region cannot be guest RAM,
+/// because nothing outside the VM can locate pages when there is no VM; a file
+/// both sides open is the substrate that leg has, and everything above
+/// `attach` is identical for the two.
+pub fn map_file_mut(path: &str, len: usize) -> io::Result<MappedView> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let have = file.metadata()?.len();
+    if have < len as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path} is {have} bytes, not the {len} it was said to be"),
+        ));
+    }
+    if len == 0 {
+        return Ok(MappedView { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+    }
+    // SAFETY: as `map_section`, with write access added. `MAP_SHARED` because
+    // the entire point is that the peer sees these stores; `MAP_PRIVATE` would
+    // compile, run, and show the peer nothing forever.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len })
+}
+
 /// Write into an object this process owns.
 ///
 /// `pwrite` rather than a writable mapping: it needs no `unsafe`, and the
@@ -305,6 +351,11 @@ pub struct WritableView {
 unsafe impl Send for WritableView {}
 
 impl WritableView {
+    /// The same mapping, for reading. See `crate::MappingMut::as_slice`.
+    pub fn ptr(&self) -> *const u8 {
+        self.ptr.cast_const()
+    }
+
     pub fn ptr_mut(&mut self) -> *mut u8 {
         self.ptr
     }
