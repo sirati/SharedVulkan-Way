@@ -2440,6 +2440,68 @@ mod tests {
         assert_eq!(&a.bytes_mut(&second).unwrap()[0..4], b"TWO.");
     }
 
+    /// What growth costs, measured rather than asserted.
+    ///
+    /// Ignored by default because it is an instrument and not a gate — it
+    /// prints numbers and asserts almost nothing, and docs/design.md §13.8's
+    /// retraction is the reason that distinction is kept sharp. Run it with
+    ///
+    /// ```text
+    /// cargo test -p wc-proxy -- --ignored --nocapture growth_costs
+    /// ```
+    ///
+    /// It measures the *host* half only: `mmap` and bookkeeping, with no guest
+    /// and no locate. That is the honest scope of a local measurement, and the
+    /// locate is the term that dominates the real one — §12.5 measured the
+    /// content sweep at 2.37–2.42 s and §0.14 measured the PFN query at 0.064 s
+    /// on the host plus ~330 ms of guest CPU. This number is what is left when
+    /// that term is removed, and it is what growth would cost if locating were
+    /// free.
+    #[test]
+    #[ignore = "an instrument: prints what growth costs, gates nothing"]
+    fn growth_costs_what_it_costs() {
+        let d = tmpdir("cost");
+        std::fs::create_dir_all(&d).unwrap();
+        const REGION: u64 = 64 << 20;
+        const POOL: u64 = 2_340_864; // the pool that killed Firefox
+
+        let mut a = Arena::open_or_create(7300, &d.join("arena"), REGION).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, REGION))).unwrap();
+
+        // Fill the startup region with video-sized pools, as the real client
+        // does, and time the ones that do not grow.
+        let mut held = Vec::new();
+        let mut in_region = Vec::new();
+        loop {
+            let t = std::time::Instant::now();
+            let before = a.regions();
+            let Ok(r) = a.create(POOL) else { break };
+            let dt = t.elapsed().as_nanos() as u64;
+            if a.regions() == before {
+                in_region.push(dt);
+            }
+            held.push(r);
+            if a.regions() > 3 {
+                break;
+            }
+        }
+        let (grown, nanos, refused, _, _) = a.growth();
+        let plain: u64 = in_region.iter().sum::<u64>() / in_region.len().max(1) as u64;
+        println!("\n--- growth cost, host half only (no guest, no locate) ---");
+        println!("  region size            {REGION} bytes");
+        println!("  pool size              {POOL} bytes (the one that killed Firefox)");
+        println!("  pools placed           {}", held.len());
+        println!("  allocations, no growth {} ns mean over {}", plain, in_region.len());
+        println!("  growths                {grown}  ({refused} refused)");
+        println!("  growth total           {nanos} ns");
+        println!("  growth mean            {} ns", nanos / u64::from(grown.max(1)));
+        println!("  arena now              {} bytes in {} region(s)", a.size(), a.regions());
+        println!("\n  the term this cannot measure is the locate:");
+        println!("    content sweep   2.37-2.42 s   (design.md 12.5, and it cannot re-locate)");
+        println!("    PFN query       0.064 s host + ~330 ms guest   (design.md 0.14)");
+        assert!(grown >= 1, "the point of the measurement is that growth happened");
+    }
+
     /// A plan naming several regions maps all of them, and the first is the one
     /// the compositor was told about.
     #[test]
