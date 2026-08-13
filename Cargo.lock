@@ -1280,6 +1280,9 @@ dependencies = [
  "awe-probe",
  "libc",
  "smithay",
+ "sv-arena",
+ "sv-proto",
+ "sv-transport",
  "wayland-backend",
  "wayland-scanner",
  "wayland-server",
@@ -1328,6 +1331,8 @@ dependencies = [
  "png",
  "quick-xml",
  "sv-arena",
+ "sv-proto",
+ "sv-transport",
  "wc-handle",
 ]
 

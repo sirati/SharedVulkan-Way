@@ -83,7 +83,62 @@ pub const PACKET_ALIGN: u64 = 16;
 
 const KIND_COMMAND: u16 = 1;
 const KIND_PAD: u16 = 2;
+const KIND_BYTES: u16 = 3;
 const FLAG_HAS_BARRIER: u16 = 1 << 0;
+
+/// Bits 8..12 of `flags`: how many of the packet's trailing bytes are alignment
+/// padding rather than payload.
+///
+/// **Only meaningful on [`PacketKind::Bytes`], and load-bearing there.** Every
+/// packet length is rounded up to [`PACKET_ALIGN`], so a payload of 37 bytes is
+/// framed in 64 and the consumer would otherwise read 48 — 37 of stream and 11
+/// of zeroes. On a command lane that is harmless because the `sv-wire` header
+/// declares the true length and the framing check tolerates exactly one
+/// alignment unit of slack; on a byte lane there is no such header, and 11
+/// injected NUL bytes is a corrupted wayland message stream, silently, on
+/// roughly fourteen packets in fifteen.
+///
+/// Four bits suffice: the padding is `total - (header + payload)` where `total`
+/// is the next multiple of 16, so it is always in `0..16`.
+const FLAG_PAD_SHIFT: u16 = 8;
+const FLAG_PAD_MASK: u16 = 0x0F00;
+
+/// What a packet's payload is, which decides which framing checks apply to it.
+///
+/// # Why a third kind exists, and why it is not a second ring
+///
+/// waycompose-design.md §36 moves the Wayland connection off TCP and onto this
+/// ring. A Wayland connection is an **opaque byte stream**: the bytes are a
+/// wayland-protocol message stream, and nothing in this crate parses them or is
+/// allowed to. That collides with exactly one thing above — the deviation-1
+/// cross-check in [`RingConsumer::next`], which reads a `u32` at offset 8 of
+/// every command-lane payload of at least [`sv_wire::COMMAND_HEADER_SIZE`] (12)
+/// bytes and requires it to agree with the ring's own framing length. A Wayland
+/// chunk has a `wl_display` object id and an opcode there, and would be rejected
+/// as a [`crate::Error::FramingDisagreement`] on almost every packet.
+///
+/// [`PacketKind::Bytes`] turns off **that one check and nothing else**. The
+/// length, the alignment, the wrap/`PAD` rule, the `pos + len` bound, the
+/// zero-length guard, the seqno, the barrier field and the doorbell are all
+/// still there. The check being skipped is a cross-check *between two encodings
+/// of the same length*, and on this kind there is only one encoding, so there is
+/// nothing to cross-check — it is not a check being weakened, it is a check
+/// whose second input does not exist.
+///
+/// That distinction is worth being pedantic about because §6.2 calls
+/// desynchronisation "the worst failure mode this project has". A `Bytes` ring
+/// is not more exposed to it: the ring's own `len` still frames every packet
+/// exactly, and a byte stream has no commands to desynchronise *between* — the
+/// consumer hands the bytes to a wayland parser that does its own framing and
+/// that will itself fail loudly on a short read. What is lost is the ability to
+/// skip a single undecodable packet, and a byte stream has no such thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketKind {
+    /// An `sv-wire` command or reply. Cross-checked against its own header.
+    Command,
+    /// Opaque bytes. Framed, never parsed.
+    Bytes,
+}
 
 /// A ring, named the only way a handle is allowed to be named: by its index in
 /// the directory (R3). There is no pointer here and there never will be.
@@ -267,6 +322,7 @@ impl RingCtrl {
         Ok(crate::park::Bell {
             wake: self.region.atomic_u32(self.base + wake_off)?,
             parked: self.region.atomic_u32(self.base + parked_off)?,
+            token: crate::park::lane_token(self.id.0, lane),
         })
     }
 }
@@ -362,10 +418,33 @@ impl RingProducer {
     /// every seqno-based diagnostic lie, and `fatal_seqno` naming a command that
     /// was never sent is a bad hour for whoever is reading it.
     pub fn push(&mut self, payload: &[u8], barrier: Option<RingBarrier>) -> Result<u64> {
-        let total = self.frame_len(payload, barrier)?;
+        let total = self.frame_len(PacketKind::Command, payload, barrier)?;
         let (tail, pos) = self.place(total)?;
         let seqno = self.next_seqno()?;
-        self.write_packet(tail, pos, total, seqno, payload, barrier)?;
+        self.write_packet(tail, pos, total, seqno, PacketKind::Command, payload, barrier)?;
+        Ok(seqno)
+    }
+
+    /// Send `payload` as opaque bytes ([`PacketKind::Bytes`]).
+    ///
+    /// **An empty payload is legal here and nowhere else, and it means end of
+    /// stream on this lane.** `push` rejects an empty payload because a
+    /// zero-length command is not a command; but a byte stream is precisely the
+    /// thing that *has* an end, and the peer closing its half is the ordinary
+    /// termination of a Wayland connection rather than an error. Spelling EOF as
+    /// a real packet rather than as a directory state change is what keeps it
+    /// *ordered against the bytes before it*: a client's last request and its
+    /// disconnect arrive in the order it made them, which a `kill_ring` racing
+    /// the reader would not guarantee.
+    ///
+    /// Returns the seqno, as `push` does. Byte streams do not use barriers, so
+    /// there is no barrier argument: a barrier orders one ring against another,
+    /// and a Wayland connection is ordered only against itself.
+    pub fn push_bytes(&mut self, payload: &[u8]) -> Result<u64> {
+        let total = self.frame_len(PacketKind::Bytes, payload, None)?;
+        let (tail, pos) = self.place(total)?;
+        let seqno = self.next_seqno()?;
+        self.write_packet(tail, pos, total, seqno, PacketKind::Bytes, payload, None)?;
         Ok(seqno)
     }
 
@@ -377,18 +456,24 @@ impl RingProducer {
         payload: &[u8],
         barrier: Option<RingBarrier>,
     ) -> Result<()> {
-        let total = self.frame_len(payload, barrier)?;
+        let total = self.frame_len(PacketKind::Command, payload, barrier)?;
         let (tail, pos) = self.place(total)?;
-        self.write_packet(tail, pos, total, seqno, payload, barrier)
+        self.write_packet(tail, pos, total, seqno, PacketKind::Command, payload, barrier)
     }
 
     /// Validate the request and return the framed length.
-    fn frame_len(&self, payload: &[u8], barrier: Option<RingBarrier>) -> Result<u64> {
+    fn frame_len(
+        &self,
+        kind: PacketKind,
+        payload: &[u8],
+        barrier: Option<RingBarrier>,
+    ) -> Result<u64> {
         self.check_generation()?;
-        if payload.is_empty() {
+        if payload.is_empty() && kind == PacketKind::Command {
             // A zero-length command is not a command. Rejecting it here rather
             // than framing it is what stops the consumer from being handed a
-            // record it can neither decode nor skip.
+            // record it can neither decode nor skip. On a `Bytes` lane the same
+            // record is decodable and means EOF — see `push_bytes`.
             return Err(Error::BadPacketLength { ring: self.ctrl.id.0, len: 0 });
         }
         let barrier_len = if barrier.is_some() { BARRIER_SIZE } else { 0 };
@@ -438,12 +523,19 @@ impl RingProducer {
         Ok((tail, pos))
     }
 
+    // Eight arguments, and grouping them would be worse: `tail`/`pos`/`total`
+    // come from `place`, `seqno` from `next_seqno`, and `kind`/`payload`/
+    // `barrier` from the caller. A struct would name that split without making
+    // it any harder to pass the wrong `pos`, which is the only mistake here that
+    // matters.
+    #[allow(clippy::too_many_arguments)]
     fn write_packet(
         &self,
         tail: u64,
         pos: u64,
         total: u64,
         seqno: u64,
+        kind: PacketKind,
         payload: &[u8],
         barrier: Option<RingBarrier>,
     ) -> Result<()> {
@@ -453,8 +545,18 @@ impl RingProducer {
         // fine because nobody looks" this crate declines to rely on.
         let mut rec = vec![0u8; total as usize];
         rec[0..4].copy_from_slice(&(total as u32).to_le_bytes());
-        rec[4..6].copy_from_slice(&KIND_COMMAND.to_le_bytes());
-        let flags = if barrier.is_some() { FLAG_HAS_BARRIER } else { 0 };
+        let tag = match kind {
+            PacketKind::Command => KIND_COMMAND,
+            PacketKind::Bytes => KIND_BYTES,
+        };
+        rec[4..6].copy_from_slice(&tag.to_le_bytes());
+        let mut flags = if barrier.is_some() { FLAG_HAS_BARRIER } else { 0 };
+        if kind == PacketKind::Bytes {
+            let barrier_len = if barrier.is_some() { BARRIER_SIZE } else { 0 };
+            let pad = total - PACKET_HEADER_SIZE - barrier_len - payload.len() as u64;
+            debug_assert!(pad < PACKET_ALIGN);
+            flags |= (pad as u16) << FLAG_PAD_SHIFT;
+        }
         rec[6..8].copy_from_slice(&flags.to_le_bytes());
         rec[8..16].copy_from_slice(&seqno.to_le_bytes());
         let mut at = PACKET_HEADER_SIZE as usize;
@@ -504,6 +606,10 @@ pub struct PacketView<'a> {
     pub seqno: u64,
     pub barrier: Option<RingBarrier>,
     pub payload: &'a [u8],
+    /// Which framing contract this packet was written under. A `Bytes` packet
+    /// with an empty `payload` is end of stream; a `Command` packet can never be
+    /// empty, so the two cases cannot be confused.
+    pub kind: PacketKind,
 }
 
 /// The consuming end of one lane of one ring.
@@ -634,9 +740,11 @@ impl RingConsumer {
                     .store(head + len64, Ordering::Release);
                 continue;
             }
-            if kind != KIND_COMMAND {
-                return Err(Error::BadPacketLength { ring: self.ctrl.id.0, len });
-            }
+            let packet_kind = match kind {
+                KIND_COMMAND => PacketKind::Command,
+                KIND_BYTES => PacketKind::Bytes,
+                _ => return Err(Error::BadPacketLength { ring: self.ctrl.id.0, len }),
+            };
 
             let mut at = PACKET_HEADER_SIZE;
             let barrier = if flags & FLAG_HAS_BARRIER != 0 {
@@ -654,8 +762,20 @@ impl RingConsumer {
                 None
             };
 
-            let payload_len = len64 - at;
-            if payload_len == 0 {
+            let mut payload_len = len64 - at;
+            if packet_kind == PacketKind::Bytes {
+                // Strip the alignment padding the producer declared. Checked
+                // rather than trusted: a `pad` larger than the packet's own
+                // payload would underflow into a huge length, which is the one
+                // way a four-bit field could hurt.
+                let pad = u64::from((flags & FLAG_PAD_MASK) >> FLAG_PAD_SHIFT);
+                if pad >= PACKET_ALIGN || pad > payload_len {
+                    return Err(Error::BadPacketLength { ring: self.ctrl.id.0, len });
+                }
+                payload_len -= pad;
+            } else if payload_len == 0 {
+                // Zero length is fatal for a command and ordinary for a byte
+                // stream, where it is end of stream. See `push_bytes`.
                 return Err(Error::BadPacketLength { ring: self.ctrl.id.0, len });
             }
             self.buf.clear();
@@ -696,7 +816,12 @@ impl RingConsumer {
                 Lane::Command => sv_wire::COMMAND_HEADER_SIZE,
                 Lane::Reply => sv_wire::REPLY_HEADER_SIZE,
             };
-            if self.buf.len() >= header_len {
+            //
+            // Skipped entirely on a `Bytes` lane: see [`PacketKind`]. There is
+            // no second encoding of the length there to cross-check against, and
+            // reading a wayland object id as a `cmd_size` would reject the
+            // stream rather than validate it.
+            if packet_kind == PacketKind::Command && self.buf.len() >= header_len {
                 let declared =
                     u32::from_le_bytes(self.buf[size_at..size_at + 4].try_into().unwrap());
                 // The payload is zero-padded up to the packet alignment, so the
@@ -715,7 +840,7 @@ impl RingConsumer {
             }
 
             self.pending = Some(Pending { head, len: len64, seqno });
-            return Ok(Some(PacketView { seqno, barrier, payload: &self.buf }));
+            return Ok(Some(PacketView { seqno, barrier, payload: &self.buf, kind: packet_kind }));
         }
     }
 

@@ -279,6 +279,9 @@ pub struct RingTransport {
     pub arena: Arc<SharedRegion>,
     /// Clearing this stops the heartbeat thread.
     beating: Arc<std::sync::atomic::AtomicBool>,
+    /// The cross-VM doorbell reader thread (§36.6). Held so it lives as long as
+    /// the transport that depends on it; dropping it stops answering the door.
+    _doorman: Option<sv_transport::vdoorbell::Doorman>,
 }
 
 impl Drop for RingTransport {
@@ -631,6 +634,51 @@ impl RingTransport {
         };
 
         let control = Arc::new(control);
+
+        // THE DOORBELL (waycompose-design.md §36.6), the application side.
+        //
+        // This is the half that *waits*: `Transport::call` parks on the reply
+        // lane for every command, and across a hypervisor the GPU side's
+        // `FUTEX_WAKE` reaches nobody, so each of those parks ran out its slice.
+        // One `vkQueuePresentKHR` makes about eleven of them, which is the whole
+        // of 216.9 ms cross-VM against 1.7-2.1 ms local. A byte on a
+        // virtio-serial port crosses in ~9 µs (§36.6.3).
+        //
+        // Named by environment rather than by argument because this side is a
+        // `cdylib` inside somebody else's process — the same reason `SV_SOCKET`
+        // is an environment variable and not a flag. Absent, everything behaves
+        // exactly as it did.
+        //
+        // A failure to attach is a warning, never an error: a session without a
+        // doorbell is the session that shipped, and refusing to run because an
+        // optimisation is unavailable would be worse than not having it.
+        // Unix only: the host end of the chardev is a Unix socket, which is what
+        // the cross-VM topology has. A Windows *app* side is the same-machine
+        // topology, where the peer is on this kernel and the ordinary futex wake
+        // already reaches it — there is no hypervisor to carry anything across.
+        #[cfg(unix)]
+        let doorman = match std::env::var(crate::BELL_ENV) {
+            Err(_) => None,
+            Ok(path) => match sv_transport::vdoorbell::PortHandle::host_socket(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|p| {
+                    sv_transport::vdoorbell::attach(p, Arc::clone(&control))
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(d) => {
+                    eprintln!("[icd] doorbell attached on {path}");
+                    Some(d)
+                }
+                Err(e) => {
+                    eprintln!("[icd] no doorbell on {path} ({e}); waits will run out their slice");
+                    None
+                }
+            },
+        };
+
+        #[cfg(not(unix))]
+        let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
+
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
             let control = Arc::clone(&control);
@@ -666,6 +714,7 @@ impl RingTransport {
                 blobs: Mutex::new(Blobs::new(arena_len, reserve)),
                 arena,
                 beating,
+                _doorman: doorman,
             },
             arena_len,
             slab_size,

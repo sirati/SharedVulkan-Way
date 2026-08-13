@@ -70,6 +70,14 @@ pub const WIRE_VERSION: u32 = 1;
 /// everything locally without saying so.
 pub const SOCKET_ENV: &str = "SV_SOCKET";
 
+/// Where the host end of the cross-VM doorbell chardev is (§36.6).
+///
+/// An environment variable for the same reason `SV_SOCKET` is one: this side is
+/// a `cdylib` inside somebody else's process and has no command line of its own.
+/// Unset is the ordinary case and behaves exactly as it did before the doorbell
+/// existed — every wait runs out its slice, which across a hypervisor is 20 ms.
+pub const BELL_ENV: &str = "SV_BELL";
+
 use core::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 use sv_icd_entry::{PFN_vkVoidFunction, VkInstance, VkResult};

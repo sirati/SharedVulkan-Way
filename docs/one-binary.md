@@ -275,7 +275,50 @@ Both fixes converged on the same shape (`Arc` the shared thing, per-consumer the
 rest), which is the strongest possible argument that it should have been one
 piece of code. §3 is that piece.
 
----
+### 1.6 The doorbell cannot be shared, because a virtio-serial port has one opener
+
+Every argument above is about cost: a copy that need not happen, an allocator
+written three times, a bug paid for twice. This one is different in kind. It is
+a **hard platform constraint**, discovered while building the cross-VM doorbell
+of `waycompose-design.md` §36.6, and it says the split is not merely expensive
+but blocking.
+
+The doorbell is the fix for §36.6's headline defect: a futex wake does not cross
+a hypervisor, so every cross-VM wait ran out its 20 ms slice, and one present
+makes about eleven waits — which is the whole of the 216.9 ms cross-VM present
+against 1.7–2.1 ms local. The wake that *does* cross is a byte on a
+virtio-serial port, measured at **~9 µs one way** across a real boundary
+(`scripts/sv-bell-probe.sh`, median round trip 17.6 µs over 2,000 samples).
+
+**A virtio-serial port permits exactly one opener.** The driver allows a single
+process to hold the port, and the design already relies on that elsewhere — it
+is why `sv-transport::stream::open_virtio_port`'s own doc warns that two
+descriptors on one port deadlock.
+
+Now count the processes. `sv-guest` dispatches on `argv[1]`: `gpu` runs the GPU
+server and `wayland` runs the compositor, one half per process. N Vulkan
+sessions are N processes. So a doorbell for everything the guest is doing needs
+**one port per process**, and the alternatives are all worse:
+
+- *One port and a guest-side doorbell daemon* — it would have to ring the bells
+  in each session's control region, and those regions are private
+  `VirtualAlloc` windows in other processes' address spaces. There is nothing
+  for it to write to.
+- *One port, shared by framing it* — the doorbell has no framing on purpose
+  (§36.6.4): a lost byte costs one slice and a spurious byte costs one syscall,
+  so there is nothing to resynchronise. Giving it a frame purely to coexist with
+  another user is the one property it must not have.
+- *N ports* — on `testhost` the ports are enumerated in that machine's NixOS
+  configuration, and while a port can be hot-added over QMP without restarting
+  the guest, "how many Wayland connections and Vulkan sessions might exist" is
+  not a question a machine's configuration should have to answer in advance.
+
+**One process wants one port, and gets one.** That is the shape the constraint
+is pushing towards, and it is the same shape §3 and §5 already want for
+unrelated reasons — which is worth noticing: the copy count said the split was
+expensive, and this says it is in the way. `default = ["gpu", "wayland"]` puts
+both halves in one address space; one address space is one control region, one
+doorbell thread, and one port.
 
 ## 2. The shape: two binaries, one workspace, features for composition
 

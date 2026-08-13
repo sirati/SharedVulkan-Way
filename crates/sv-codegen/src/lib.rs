@@ -238,7 +238,11 @@ pub fn generate_gpu_entry(model: &Model, wire_profile: &Profile) -> Result<Gener
     let cx = emit::icd_entry::Ctx::new(model, &abi, &wire);
     let hand = exceptions::gpu_hand_written();
     let (sections, refusals) =
-        emit::gpu_entry::emit_all(&cx, &hand, &wire_profile.extensions);
+        // `resolved.extensions`, not `wire_profile.extensions`. A profile that
+        // states a *rule* rather than a list — `include_portable_extensions` —
+        // declares thirty names and enables nearer three hundred, and the GPU
+        // side must advertise what it forwards rather than what was typed.
+        emit::gpu_entry::emit_all(&cx, &hand, &resolved.extensions);
 
     let mut tokens = proc_macro2::TokenStream::new();
     for (_, t) in &sections {
@@ -324,8 +328,11 @@ pub fn profile_by_name(name: &str) -> Option<Profile> {
         // `docs/video-decode.md`; `SV_PROTO_PROFILE=video` builds the whole
         // stack against it.
         "video" => Some(vk_registry::profiles::video()),
+        // Core 1.0–1.4 and every portable extension: the answer to "740 defined,
+        // 239 carried". See `vk_registry::profiles::full`.
+        "full" => Some(vk_registry::profiles::full()),
         _ => None,
     }
 }
 
-pub const PROFILE_NAMES: &[&str] = &["zink", "step3-minimal", "video"];
+pub const PROFILE_NAMES: &[&str] = &["zink", "step3-minimal", "video", "full"];

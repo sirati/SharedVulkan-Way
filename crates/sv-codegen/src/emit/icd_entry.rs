@@ -2041,6 +2041,49 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     }
 
     let not_implemented: Vec<&str> = refused.iter().map(String::as_str).collect();
+
+    // Extensions this build must not advertise, worked out here rather than
+    // guessed at runtime.
+    //
+    // design.md §9.2 says an extension in the advertised list is a promise its
+    // entry points work. Until now that promise was kept by *intersecting* the
+    // profile with what the GPU side's driver reports, which answers "does the
+    // hardware have it" and leaves "did we generate a working stub for it"
+    // unasked — which is how `bufferDeviceAddress` came to be advertised with
+    // three of its entry points in `NOT_IMPLEMENTED`, and how an application
+    // could call one and get a silent zero back.
+    //
+    // An extension appears here when **any** command it introduces is refused.
+    // Not "all": an extension is one promise, and half of it working is a driver
+    // that fails where the specification says it must not.
+    //
+    // Core versions are deliberately absent. A refused core command cannot be
+    // un-advertised — the version number is what advertises it — so it stays a
+    // `NOT_IMPLEMENTED` entry and nothing else. That is the honest split, and
+    // the API version is `sv-worktrees/vers`'s question, not this table's.
+    let mut incomplete: BTreeSet<&str> = BTreeSet::new();
+    for e in &cx.model.extensions {
+        if !e.supported_for_vulkan {
+            continue;
+        }
+        // Through the alias, not just the name. `VK_KHR_buffer_device_address`
+        // requires `vkGetBufferDeviceAddressKHR`, which is an *alias* of the
+        // core `vkGetBufferDeviceAddress` — one entry point under two names, and
+        // it is the core name the generator refuses. Comparing names alone let
+        // the extension through, which is the exact bug this table exists to
+        // stop, one indirection down.
+        let breaks = e.requires.iter().flat_map(|b| b.items.iter()).any(|it| match it {
+            vk_registry::InterfaceRef::Command(c) => {
+                refused.contains(c) || refused.contains(&cx.model.canonical_command(c))
+            }
+            _ => false,
+        });
+        if breaks {
+            incomplete.insert(e.name.as_str());
+        }
+    }
+    let incomplete: Vec<&str> = incomplete.into_iter().collect();
+
     let n_impl = cx.abi.commands.len() - refused.len();
     let total = cx.abi.commands.len();
     let hand_written = HAND_WRITTEN;
@@ -2065,6 +2108,17 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// read off a partial implementation, and a list that drifts from the
         /// code is worse than no list.
         pub static NOT_IMPLEMENTED: &[&str] = &[#(#not_implemented,)*];
+
+        /// Extensions at least one of whose entry points is in
+        /// [`NOT_IMPLEMENTED`], and which must therefore **not** be advertised.
+        ///
+        /// `sv_icd` subtracts this from whatever the GPU side reports, so that
+        /// the advertised set is the intersection of three things and not two:
+        /// what the profile carries, what the device supports, and what this
+        /// build actually generated a working stub for.
+        ///
+        /// Sorted, so `binary_search` is the lookup.
+        pub static INCOMPLETE_EXTENSIONS: &[&str] = &[#(#incomplete,)*];
 
         /// Entry points `sv-icd-entry` writes by hand — see the generator's
         /// `HAND_WRITTEN` for why each one cannot be a fold over a wire reply.

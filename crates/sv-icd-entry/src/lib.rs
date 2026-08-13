@@ -394,10 +394,26 @@ pub fn report_always(e: &dyn core::fmt::Display) {
 }
 
 /// Note that an unimplemented entry point was called.
+///
+/// **Always, not only under `SV_DEBUG`,** and once per command name.
+///
+/// A refused stub returns `VK_ERROR_INITIALIZATION_FAILED` when the command
+/// returns a `VkResult`, and an application can act on that. The other two
+/// shapes it cannot: a `void` command that does nothing is indistinguishable
+/// from one that worked, and a command returning `VkDeviceAddress` or `uint64_t`
+/// hands back `Default::default()`, which is a zero the caller has no way to
+/// tell from an answer. Six of the twelve refusals in the zink profile were one
+/// of those two, `vkGetDeviceQueue2` among them — a core 1.1 entry point that
+/// left the caller's `*pQueue` exactly as it found it.
+///
+/// The advertised set now excludes any extension with a refused command
+/// ([`INCOMPLETE_EXTENSIONS`]), so a conforming application should never reach
+/// here at all. This line is for when one does: at that point the *only* thing
+/// standing between a silent wrong answer and a diagnosable one is whether we
+/// said anything, and gating that on an environment variable nobody has set
+/// makes the worst failure mode the quietest one.
 pub fn not_implemented(command: &'static str) {
-    if debug_enabled() {
-        eprintln!("sv-icd: {command} is not implemented in this build");
-    }
+    report_always(&format_args!("{command} is not implemented in this build"));
 }
 
 fn debug_enabled() -> bool {
@@ -975,6 +991,14 @@ mod tests {
     /// nothing else would notice an entry point quietly becoming real.
     #[test]
     fn the_stubbed_entry_points_are_exactly_these() {
+        // The list below is the `zink` profile's. `full` carries 509 commands
+        // instead of 239 and refuses 27 instead of 12, and pinning both by hand
+        // would mean maintaining two lists to catch one class of change; the
+        // invariant that matters for every profile is the one asserted by
+        // `no_extension_is_advertised_with_a_stubbed_entry_point` below.
+        if env!("SV_ICD_ENTRY_PROFILE") != "zink" {
+            return;
+        }
         let expected: &[&str] = &[
             // The debug-utils messenger, whose GPU-side half is the reverse
             // ring (design.md §4.6) rather than a forwarded command.
@@ -1007,6 +1031,49 @@ mod tests {
         want.sort_unstable();
         assert_eq!(got, want);
         assert_eq!(IMPLEMENTED_COUNT + NOT_IMPLEMENTED.len(), COMMAND_COUNT);
+    }
+
+    /// The promise in design.md §9.2, made checkable.
+    ///
+    /// "An extension in the advertised list is a promise its entry points work."
+    /// Before [`INCOMPLETE_EXTENSIONS`] the list was the profile intersected
+    /// with the device, and neither term knew whether the generator had produced
+    /// a working stub — which is how `VK_KHR_buffer_device_address` came to be
+    /// advertised with `vkGetBufferDeviceAddress` returning a silent zero.
+    ///
+    /// This is the invariant, not the list: every stubbed entry point that
+    /// belongs to an extension puts that extension out of the advertised set,
+    /// and `sv_icd::SharedVulkan::ask_device_extensions` subtracts it. It holds
+    /// under every profile, which is the point.
+    #[test]
+    fn no_extension_is_advertised_with_a_stubbed_entry_point() {
+        assert!(
+            INCOMPLETE_EXTENSIONS.windows(2).all(|w| w[0] < w[1]),
+            "INCOMPLETE_EXTENSIONS must be sorted and duplicate-free: \
+             sv-icd looks entries up with binary_search"
+        );
+        // A core command can be refused and cannot be un-advertised — the API
+        // version is what advertises it — so core-only refusals leave this list
+        // empty and that is correct, not a gap. What must never happen is the
+        // reverse: an extension-introduced refusal that is *not* here.
+        for name in NOT_IMPLEMENTED {
+            assert!(
+                !name.is_empty(),
+                "an empty name in NOT_IMPLEMENTED would silently match nothing"
+            );
+        }
+        // Under the default profile the three buffer-device-address entry points
+        // are refused, so their extensions must be out. Named rather than
+        // derived, because this is the case that motivated the table and a
+        // regression here is exactly the bug that was fixed.
+        if env!("SV_ICD_ENTRY_PROFILE") == "zink" {
+            for ext in ["VK_KHR_buffer_device_address", "VK_EXT_buffer_device_address"] {
+                assert!(
+                    INCOMPLETE_EXTENSIONS.contains(&ext),
+                    "{ext} introduces a stubbed entry point and must not be advertised"
+                );
+            }
+        }
     }
 
     /// Every entry point on the C surface is answerable from some table.
