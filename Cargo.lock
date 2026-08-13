@@ -131,6 +131,7 @@ version = "0.1.0"
 dependencies = [
  "arena-record",
  "sv-transport",
+ "sv-wire",
 ]
 
 [[package]]

@@ -11,6 +11,11 @@ description = "The passthrough arena: extents, slabs, the 4096-granularity alloc
 # is carved from. The allocator itself touches neither: design.md §5.2 keeps it
 # entirely in the app side's private memory.
 sv-transport = { workspace = true }
+# The shared handle (`handle`) is carried on two transports — the ring, and a
+# Wayland request built from `uint` arguments — and both must carry identical
+# bytes. Encoding it with the project's own primitives rather than by hand is
+# what makes a round-trip test through one a proof about the other.
+sv-wire = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The stamped page record, for the Linux guest-side provider. Shared with

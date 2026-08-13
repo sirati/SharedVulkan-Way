@@ -10,6 +10,8 @@
 //! | [`extent`] | §5.1 provider/locator/attacher, §5.7 runs and what attaching costs |
 //! | [`alloc`] | §5.2 the 4096-granularity allocator, §5.3 what a `VkDeviceMemory` is, §5.5 deferred free |
 //! | [`canary`] | §5.2's canary, `security-model.md` R26 |
+//! | [`handle`] | `firefox-accel.md` §7's shared handle, `one-binary.md` §4 |
+//! | [`shared`] | `one-binary.md` §3: one allocator, several consumers, disjoint windows |
 //!
 //! # Three facts this crate is built on, all measured
 //!
@@ -37,6 +39,8 @@
 pub mod alloc;
 pub mod canary;
 pub mod extent;
+pub mod handle;
+pub mod shared;
 /// The Linux guest-side provider. Gated because it is `mlock` and `smaps`, and
 /// because the *other* guest-side provider is `awe-probe`'s Win32 one.
 #[cfg(target_os = "linux")]
