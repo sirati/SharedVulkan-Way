@@ -306,6 +306,20 @@ pub mod x11 {
     /// removes the reason for the sync, and is strictly safer than what it
     /// replaces: the old code hid *every* X error in the process for the
     /// duration of each call, including the application's.
+    ///
+    /// **The one thing it gives up, said plainly**: an application that installs
+    /// its own handler *after* this module has installed its own gets its
+    /// handler on top of ours, and ours then delegates to whatever was there
+    /// before — not to the new one. The old code had the same hole and a
+    /// narrower window for it. It is not closable from inside a driver: Xlib
+    /// offers no way to observe a handler being replaced, and there is exactly
+    /// one global slot. The consequence is bounded — one of *our* errors could
+    /// reach an application handler installed after us, which is the behaviour
+    /// an application would have had if this module did nothing at all.
+    ///
+    /// Removing the `XSync` was measured and is **not** why this is here: on
+    /// devhost it is worth nothing at all (`docs/firefox-accel.md`, "The
+    /// stall, decomposed"). The safety argument above is the whole reason.
     static PREVIOUS: OnceLock<ErrorHandler> = OnceLock::new();
 
     /// Run `f` with this module's X errors swallowed.
