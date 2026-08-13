@@ -84,6 +84,27 @@ struct Args {
     /// backend and write into them. The compositor prints the run id, which is
     /// the only thing the host needs and the only thing that crosses.
     guest_arenas: Vec<(u32, u64)>,
+    /// Arenas to provide as a **file both sides open**, as `id:size:path`.
+    ///
+    /// ADDED FOR STAGE 10. `--arena` opens the region read-only, which is all a
+    /// compositor reading a client's pixels needs and is why it cannot give any
+    /// of the region away. This opens the same file read-write and marks it
+    /// provided, which is what `--arena-outbound` requires. It is the local twin
+    /// of `--arena-guest-ram`: on a machine with no hypervisor there is nothing
+    /// to locate pages from outside, so the substrate is a file and everything
+    /// above `wc_handle::arena` is identical.
+    provide_arenas: Vec<(u32, u64, String)>,
+    /// How many bytes of which arena are **this process's to hand to clients**,
+    /// as `id:bytes`.
+    ///
+    /// ADDED FOR STAGE 10, and it is docs/design.md §12.11 item 3. A `wl_shm`
+    /// pool is created by the client and read here; a `wl_keyboard` keymap is
+    /// created here and read by the client. The second direction had a wire
+    /// format from stage 1 and no statement of *which bytes* were the
+    /// compositor's, so it had no allocator either. This is that statement: the
+    /// last `bytes` bytes of arena `id`, which the peer's allocator is told to
+    /// leave alone.
+    outbound: Option<(u32, u64)>,
     /// Where objects this process creates **for a client to open** are put, and
     /// how the client spells that directory.
     ///
@@ -116,6 +137,8 @@ fn parse_args() -> Result<Args, u8> {
         expect_presents: 0,
         arenas: Vec::new(),
         guest_arenas: Vec::new(),
+        provide_arenas: Vec::new(),
+        outbound: None,
         shared_dir: None,
         shared_peer_prefix: String::new(),
         layout: None,
@@ -167,6 +190,42 @@ fn parse_args() -> Result<Args, u8> {
                     return Err(2);
                 };
                 args.guest_arenas.push((id, size));
+            }
+            // `id:size:path`, split from the left twice for the same reason
+            // `--arena` is: a Windows path has a colon two characters in.
+            "--arena-provide" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-provide needs id:size:path");
+                    return Err(2);
+                };
+                let mut parts = v.splitn(3, ':');
+                let (Some(id), Some(size), Some(path)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    eprintln!("wc-compositor: --arena-provide wants id:size:path, got {v:?}");
+                    return Err(2);
+                };
+                let (Ok(id), Ok(size)) = (id.parse::<u32>(), size.parse::<u64>()) else {
+                    eprintln!("wc-compositor: --arena-provide {v:?}: id and size must be numbers");
+                    return Err(2);
+                };
+                args.provide_arenas.push((id, size, path.to_owned()));
+            }
+            "--arena-outbound" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-outbound needs id:bytes");
+                    return Err(2);
+                };
+                let mut p = v.splitn(2, ':');
+                let (Some(id), Some(bytes)) = (p.next(), p.next()) else {
+                    eprintln!("wc-compositor: --arena-outbound wants id:bytes, got {v:?}");
+                    return Err(2);
+                };
+                let (Ok(id), Ok(bytes)) = (id.parse::<u32>(), bytes.parse::<u64>()) else {
+                    eprintln!("wc-compositor: --arena-outbound {v:?}: id and bytes must be numbers");
+                    return Err(2);
+                };
+                args.outbound = Some((id, bytes));
             }
             "--shared-dir" => args.shared_dir = it.next(),
             "--shared-peer-prefix" => args.shared_peer_prefix = it.next().unwrap_or_default(),
@@ -305,10 +364,56 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // And the ones this process provides as a file. See `--arena-provide`: this
+    // is `--arena` opened read-write, which is what makes an outbound window
+    // possible on a machine with no hypervisor in it.
+    for (id, size, path) in &args.provide_arenas {
+        match wc_handle::arena::provide_file(*id, path, *size) {
+            Ok(()) => println!(
+                "wc-compositor: arena {id} provided from a file: {size} bytes at {path}"
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not provide arena {id} from {path}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
+    // The window this process may hand to clients, out of an arena it provided.
+    // After the arenas and before the socket, because it is a fact about the
+    // region rather than about any client, and because the *number* on this
+    // line is what the peer's allocator has to be told to stay out of.
+    if let Some((id, bytes)) = args.outbound {
+        match wc_handle::arena::reserve_outbound(id, bytes) {
+            Ok(w) => println!(
+                "wc-compositor: arena {id} outbound window: offset {}, {} bytes \
+                 (objects made for clients are arena slices; wc-proxy needs \
+                 --arena-outbound {} to leave them alone)",
+                w.offset, w.len, w.len
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not reserve an outbound window in arena {id}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     // Where objects made for a client go. Before the socket exists, for the
     // same reason the arenas are: a wrong path must be a startup failure with
     // the path in it, not a client that connects and then dies on its first
     // keymap.
+    //
+    // STAGE 10: with an outbound window this is dead weight and says so, rather
+    // than being silently ignored. `Handle::create_shared` prefers the arena,
+    // so a run with both flags puts nothing at all in the directory — and a
+    // reader of the log who did not know that would spend the afternoon looking
+    // for a keymap file that was never going to exist.
+    if args.outbound.is_some() && args.shared_dir.is_some() {
+        println!(
+            "wc-compositor: --shared-dir is unused: with an outbound arena window, objects \
+             made for clients are arena slices and no directory is opened"
+        );
+    }
     if let Some(dir) = &args.shared_dir {
         if args.shared_peer_prefix.is_empty() {
             eprintln!(

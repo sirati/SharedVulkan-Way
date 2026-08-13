@@ -4,7 +4,9 @@
 #
 #   scripts/wc-input.sh linux    the seat and the keymap, against Weston clients
 #   scripts/wc-input.sh wine     real WM_KEYDOWN, through the proxy, into a client
-#   scripts/wc-input.sh all      both
+#   scripts/wc-input.sh arena    the same, with the keymap cut from the arena
+#                                and no shared directory at all (stage 10)
+#   scripts/wc-input.sh all      all of them
 #
 # Run from inside `nix develop`.
 #
@@ -332,8 +334,24 @@ start_x() {
   return 1
 }
 
+# STAGE 10 gave this leg a parameter, and it is the only difference between the
+# two runs of it: **what carried the keymap**.
+#
+#   run_wine shared-file   the stage-6 answer. `--shared-dir` puts the keymap in
+#                          a directory both sides can name, and the client opens
+#                          a path.
+#   run_wine arena         the stage-10 answer. The compositor cuts the keymap
+#                          out of its own window of the arena and sends three
+#                          integers; **there is no shared directory at all**.
+#
+# Everything else is held identical on purpose — the same client, the same
+# injected keystrokes, the same `check_client_events` — because the claim being
+# made is that the transport changed and nothing else did. A weaker check on the
+# new leg would prove nothing, and a stronger one would be measuring the check
+# rather than the transport.
 run_wine() {
-  echo "== real WM_KEYDOWN, across the boundary, into an unmodified client =="
+  local mode=${1:-shared-file}
+  echo "== real WM_KEYDOWN, across the boundary, into an unmodified client (keymap by $mode) =="
   [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe"; return; }
   [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
@@ -341,7 +359,7 @@ run_wine() {
   command -v weston-eventdemo >/dev/null || { note "SKIP (weston-eventdemo not installed)"; return; }
   command -v x86_64-w64-mingw32-gcc >/dev/null || { bad "no mingw gcc -- run inside nix develop"; return; }
 
-  local dir="$RUNDIR/wine"
+  local dir="$RUNDIR/wine-$mode"
   mkdir -p "$dir/rt" "$dir/pools" "$dir/keymaps"
   chmod 700 "$dir/rt"
 
@@ -364,23 +382,56 @@ run_wine() {
   start_x 95 || { bad "could not start Xvfb"; return; }
   ok "Xvfb up on $DISPLAY"
 
-  local sock="wl-in6-wine"
+  local sock="wl-in6-$mode"
+  local desktop="wc-in-$mode"
   rm -f "$WINEPREFIX/drive_c"/users/*/AppData/Local/waycompose/"$sock"* 2>/dev/null
 
-  # `--shared-dir` is the stage-6 flag and the whole reason this leg can work:
-  # it is where the compositor puts objects a *client* has to open, and its
-  # peer spelling is how the client names the same bytes. Without it the keymap
-  # is a `Local\wc-…` section and `wc-proxy` refuses the connection with a
-  # diagnosis — which is itself checked below.
-  local keymaps_win
-  keymaps_win=$(winepath -w "$dir/keymaps" 2>/dev/null || echo "$dir/keymaps")
+  # The two answers to "where does an object the compositor made for a client
+  # go", as flags.
+  #
+  #   shared-file: `--shared-dir` is the stage-6 flag — a directory both sides
+  #     can name, with its peer spelling. Without it the keymap is a
+  #     `Local\wc-…` section and `wc-proxy` refuses the connection with a
+  #     diagnosis, which is itself checked by a unit test.
+  #
+  #   arena: `--arena-provide` opens the region read-write on the compositor's
+  #     side (under Wine there is no hypervisor, so the substrate is a file —
+  #     see `wc_handle::arena::provide_file`) and `--arena-outbound` says how
+  #     many of its bytes are the compositor's to hand out. **No `--shared-dir`
+  #     at all**, which is the point of the leg: nothing the client opens has a
+  #     name on any filesystem.
+  local comp_flags=() proxy_flags=()
+  # 32 MiB, and the number was measured rather than chosen. `weston-eventdemo`
+  # asks for a **4190208-byte** pool for its cursor theme, on top of its own
+  # 800 KiB surface, and resizes it repeatedly; a 4 MiB arena ran out, the
+  # proxy reported `no run of 4190208 bytes`, and the client exited before a
+  # single keystroke was injected. That is docs/design.md §12.13 item 5 —
+  # "64 MiB is a guess" — arriving in the smallest possible client, and it is
+  # worth knowing that the guess has to be generous.
+  local arena_bytes=$((32 * 1024 * 1024)) out_bytes=$((1024 * 1024))
+  if [ "$mode" = arena ]; then
+    # The proxy creates the region if it is not there, and it must exist before
+    # the compositor opens it read-write — so it is made here, once, by the side
+    # that owns its size.
+    head -c "$arena_bytes" /dev/zero >"$dir/arena"
+    comp_flags=(--arena-provide "0:$arena_bytes:$(winepath -w "$dir/arena" 2>/dev/null || echo "$dir/arena")"
+                --arena-outbound "0:$out_bytes")
+    proxy_flags=(--transport arena --arena-path "$dir/arena" --arena-id 0
+                 --arena-size "$arena_bytes" --arena-outbound "$out_bytes")
+  else
+    local keymaps_win
+    keymaps_win=$(winepath -w "$dir/keymaps" 2>/dev/null || echo "$dir/keymaps")
+    comp_flags=(--shared-dir "$keymaps_win" --shared-peer-prefix "$dir/keymaps/")
+    proxy_flags=(--transport shared-file --pool-dir "$dir/pools"
+                 --peer-prefix "$(winepath -w "$dir/pools" 2>/dev/null || echo "$dir/pools")\\")
+  fi
 
   # See wc-proxy.sh: a distinct desktop name and a gap, both measured rather
   # than chosen.
   sleep 3
-  wine explorer "/desktop=wc-input,1280x1024" \
+  wine explorer "/desktop=$desktop,1280x1024" \
     "$WIN_BIN/wc-compositor.exe" --socket "$sock" --timeout 70 --layout us \
-    --shared-dir "$keymaps_win" --shared-peer-prefix "$dir/keymaps/" \
+    "${comp_flags[@]}" \
     --log "$(winepath -w "$dir/srv.log" 2>/dev/null || echo "$dir/srv.log")" \
     >"$dir/loader.log" 2>&1 &
   local srv=$!
@@ -396,8 +447,7 @@ run_wine() {
 
   XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-proxy" \
     --upstream "$node" --socket wl-proxy --runtime-dir "$dir/rt" \
-    --transport shared-file --pool-dir "$dir/pools" \
-    --peer-prefix "$(winepath -w "$dir/pools" 2>/dev/null || echo "$dir/pools")\\" \
+    "${proxy_flags[@]}" \
     --trace --accept-timeout 25 --timeout 30 >"$dir/proxy.log" 2>&1 &
   local proxy=$!
   sleep 0.8
@@ -435,7 +485,7 @@ run_wine() {
   local probe_log_win probe_mode=()
   [ -n "${WC_PROBE_POST:-}" ] && probe_mode=(--post)
   probe_log_win=$(winepath -w "$dir/probe.log" 2>/dev/null || echo "$dir/probe.log")
-  wine explorer "/desktop=wc-input,1280x1024" \
+  wine explorer "/desktop=$desktop,1280x1024" \
     "$dir/probe-input.exe" --class WaycomposeToplevel --wait 25 --type helloZ \
     "${probe_mode[@]}" --log "$probe_log_win" >"$dir/probe-loader.log" 2>&1
   local probe_rc=$?
@@ -496,12 +546,47 @@ run_wine() {
   # the proxy's own count, because a run that got the keymap across by passing
   # something would look identical from the client's side.
   local fds
-  fds=$(grep -o "[0-9]* fds in, [0-9]* out" "$dir/proxy.log" | tail -1)
+  fds=$(grep -o "[0-9]* fds in, [0-9]* out[^;]*" "$dir/proxy.log" | tail -1)
   case "$fds" in
-    *", "[1-9]*" out") ok "wine: the proxy manufactured the client's keymap fd locally ($fds)" ;;
-    "")                bad "wine: the proxy reported no descriptor counts" ;;
-    *)                 bad "wine: the proxy materialised nothing: $fds" ;;
+    *", "[1-9]*" out"*) ok "wine: the proxy manufactured the client's keymap fd locally ($fds)" ;;
+    "")                 bad "wine: the proxy reported no descriptor counts" ;;
+    *)                  bad "wine: the proxy materialised nothing: $fds" ;;
   esac
+
+  # STAGE 10: **which** mechanism carried it, which is the whole difference
+  # between the two runs of this leg and is invisible from the client's side —
+  # the characters are identical either way. The proxy counts the descriptors it
+  # made from an arena slice separately from the ones it opened by name, for the
+  # reason docs/design.md §8.4 gives: a stage that added a second provider with
+  # no way to tell which one ran would not really have added it.
+  if [ "$mode" = arena ]; then
+    case "$fds" in
+      *"from the arena"*) ok "wine: the keymap crossed as an arena slice ($fds)" ;;
+      *) bad "wine: the compositor had an outbound window and nothing came from the arena: $fds" ;;
+    esac
+    grep -q "are the compositor's to hand to clients" "$dir/proxy.log" \
+      && ok "wine: $(grep -o "arena 0: the last .*" "$dir/proxy.log" | head -1)" \
+      || bad "wine: the proxy did not reserve the compositor's window"
+    grep -q "outbound window: offset" "$dir/srv.log" \
+      && ok "wine: $(grep -o 'arena 0 outbound window: offset [0-9]*, [0-9]* bytes' "$dir/srv.log" | head -1)" \
+      || bad "wine: the compositor reserved no outbound window"
+    # And the claim the stage exists for: nothing the client opened has a name
+    # on any filesystem. There is no `--shared-dir` on this leg's command line
+    # and the directory the other leg uses stays empty.
+    if [ -z "$(ls -A "$dir/keymaps" 2>/dev/null)" ]; then
+      ok "wine: no keymap file was created anywhere — the object has no name at all"
+    else
+      bad "wine: something landed in $dir/keymaps: $(ls -A "$dir/keymaps" | tr '\n' ' ')"
+    fi
+  else
+    case "$fds" in
+      *"from the arena"*) bad "wine: this leg has no arena and something came from one: $fds" ;;
+      *) ok "wine: the keymap crossed as a file both sides could name ($fds)" ;;
+    esac
+    [ -n "$(ls -A "$dir/keymaps" 2>/dev/null)" ] \
+      && ok "wine: the keymap is a file in the shared directory ($(ls -A "$dir/keymaps" | head -1))" \
+      || bad "wine: --shared-dir was given and nothing was published into it"
+  fi
   if grep -q "wl_keyboard@[0-9]*\.keymap" "$dir/proxy.log"; then
     ok "wine: the proxy walked wl_keyboard.keymap in the server direction"
   else
@@ -676,12 +761,13 @@ run_term() {
 
 case "${1:-all}" in
   linux) run_linux ;;
-  wine)  run_wine ;;
+  wine)  run_wine shared-file ;;
+  arena) run_wine arena ;;
   term)  run_term ;;
-  all)   run_linux; echo; run_wine; echo
+  all)   run_linux; echo; run_wine shared-file; echo; run_wine arena; echo
          kill "${XPID:-0}" 2>/dev/null; unset XPID; unset DISPLAY
          run_term ;;
-  *) echo "usage: $0 [linux|wine|term|all]"; exit 2 ;;
+  *) echo "usage: $0 [linux|wine|arena|term|all]"; exit 2 ;;
 esac
 
 echo

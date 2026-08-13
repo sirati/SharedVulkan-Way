@@ -545,6 +545,79 @@ pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
     Ok(MappedView { address, len, backing: Backing::View })
 }
 
+/// Open a shared-memory object by **filesystem path** and map it **writable**,
+/// as a region.
+///
+/// STAGE 10, and it is the local twin of [`alloc_locked_region`] rather than a
+/// second [`map_file`]. The type it returns is the same [`MappedView`] the
+/// arena registry holds, and the reason a *writable* mapping can come back
+/// through a type documented as read-only is the one `alloc_locked_region`
+/// already relies on: the view is not what decides who may write. The registry
+/// does — only a `provided` arena has a write path at all, and only its
+/// declared outbound window can be reached through it (`crate::arena`).
+///
+/// This exists so that the compositor side of an arena can be a *file* on a
+/// machine with no hypervisor. Under Wine the region cannot be guest RAM,
+/// because nothing outside the VM can locate pages when there is no VM; a file
+/// both sides open is the substrate that leg has, and everything above `attach`
+/// is identical for the two.
+pub fn map_file_mut(path: &str, len: usize) -> io::Result<MappedView> {
+    let path_w = wide(path);
+    // SAFETY: a live NUL-terminated UTF-16 path for the duration of the call.
+    let file = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    if len == 0 {
+        // SAFETY: closing the handle we just opened.
+        unsafe {
+            CloseHandle(file);
+        }
+        return Ok(MappedView {
+            address: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            },
+            len: 0,
+            backing: Backing::View,
+        });
+    }
+    // SAFETY: a live file handle and a null name. Size 0 means "the whole
+    // file", so a file shorter than advertised fails at `MapViewOfFile` below
+    // rather than handing back a short view.
+    let section = unsafe {
+        CreateFileMappingW(file, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null())
+    };
+    // SAFETY: closing the file handle once, after the section holds its own
+    // reference to it.
+    unsafe {
+        CloseHandle(file);
+    }
+    if section.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: mapping `len` bytes of the section we just made, read-write.
+    let address = unsafe { MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, len) };
+    // SAFETY: closing the section handle once; the view keeps its own
+    // reference, exactly as in `map_section`.
+    unsafe {
+        CloseHandle(section);
+    }
+    if address.Value.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(MappedView { address, len, backing: Backing::View })
+}
+
 /// Write into a section this process created.
 pub fn write_section(object: &OwnedObject, offset: usize, bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
@@ -622,6 +695,11 @@ impl std::fmt::Debug for WritableView {
 unsafe impl Send for WritableView {}
 
 impl WritableView {
+    /// The same mapping, for reading. See `crate::MappingMut::as_slice`.
+    pub fn ptr(&self) -> *const u8 {
+        self.address.Value.cast::<u8>().cast_const()
+    }
+
     pub fn ptr_mut(&mut self) -> *mut u8 {
         self.address.Value.cast::<u8>()
     }

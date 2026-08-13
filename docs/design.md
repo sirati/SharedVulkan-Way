@@ -3468,3 +3468,324 @@ lifetime and the refusals — where the ordinary bugs live. The claim itself is
    It reported `refused` again on every run of this stage.
 5. **Decide what to do about a 15 ms tick** (§10.8). Unchanged and still
    unaddressed; `Sleep(1)` measured 15.464 ms on this stage's runs.
+
+---
+
+## 13. Stage 10: the compositor can put something *into* the arena
+
+### 13.1 Status in one paragraph
+
+Written 2026-08-13, after stage 7. **§12.13 item 7 is closed.** A
+`wl_keyboard.keymap` now crosses as `Descriptor::ArenaSlice` — three integers,
+naming nothing — and `weston-eventdemo`, which has never heard of this project,
+decoded `helloZ` from it with its own libxkbcommon on a run where the compositor
+was started with **no `--shared-dir` and no shared directory in existence**. The
+whole of `scripts/wc-input.sh` is **82 passed, 0 failed** (52 before), 28 of
+those from a new leg that is the old one with the transport swapped and nothing
+else changed. Minting a 71249-byte object for a peer costs **1.5–1.9 µs** as an
+arena slice against **77.8–82.5 µs** as a file in a *local* directory and
+32.0–35.4 µs as a session-local section. The cost was two new concepts and one
+new type: an **outbound window**, which is the statement §12.11 item 3 said did
+not exist anywhere, and a **`Gift`**, which is the only value in `wc_handle` that
+carries a write path into an arena and is not constructible from anything that
+arrived on the wire.
+
+What has **not** happened is a guest run. Everything here is Wine and unit
+tests, the arena under Wine is a *file* rather than guest RAM, and §13.10 item 1
+is the whole of what that leaves open.
+
+### 13.2 What was built, in the order the bytes move
+
+| piece | where | what it does |
+|---|---|---|
+| `arena::provide_file` | `wc-handle`, both platforms | opens a file arena **read-write** and marks it provided — the local twin of `attach_guest_ram` for a machine with no hypervisor |
+| `arena::reserve_outbound(id, len)` | `wc-handle` | declares the last `len` bytes of a provided arena to be this process's to give away |
+| `arena::Gift` / `arena::give` | `wc-handle` | first fit over that window, 4096-byte granularity, coalescing on drop |
+| `Handle::create_shared` | `wc-handle` | **arena window, then published directory, then section** — most specific first |
+| `--arena-provide`, `--arena-outbound` | `wc-compositor` | the two flags, applied before the socket exists |
+| `PoolTransport::peer_slice` | `wc-proxy` | reads the compositor's window out of the region this side already had mapped |
+| `Arena::reserve_outbound` | `wc-proxy` | shortens the pool allocator's free list by the same number |
+| `outbound <off> <len>` | `wc-arena-host`'s plan | carries that number from where it was decided to where it is needed |
+
+Everything above `Handle::create_shared` is untouched, which is the same claim
+§12.2 made about `Arena::open_or_create` and is the reason both claims are worth
+making. `vendor/smithay`'s `SealedFile::with_data` — the one call site, and the
+thing that actually makes a keymap — is **byte for byte what stage 6 left**. It
+calls `create_shared` and `write_at`, and both of those now mean something else.
+
+### 13.3 The safety property, and why it is a type rather than a comment
+
+§12.11 item 2 named the obstacle exactly: *"A compositor-side arena is read-only
+by contract. `Handle::map` gives a `Mapping`, never a `MappingMut`, and that is
+what stops a compositor writing into a client's pixels."* That is a property
+worth more than the feature, so the feature was built without spending it.
+
+**The rule that already existed does all the work.** A `Handle` decoded from the
+wire owns nothing, and a `Handle` that owns nothing has no write path — that is
+stage 1's rule and it is why a compositor cannot write a client's buffer today.
+Stage 10 did not widen it. It split what "owns something" can *be*:
+
+```rust
+enum Owned {
+    Object(platform::OwnedObject),   // a section, or a file
+    Gift(arena::Gift),               // bytes out of the outbound window
+}
+```
+
+A client's `wl_shm` pool arrives as a `Descriptor::ArenaSlice`, becomes a
+`Handle::from_descriptor`, has `keepalive: None`, and is refused by `write_at`
+and by `map_mut` exactly as before. A keymap is a `Gift`, and **there is no
+function that turns a `Descriptor` into a `Gift`** — `give` is the only
+constructor and it allocates only inside the declared window. So the question
+"could a client's buffer write become a compositor write to arbitrary arena
+memory?" is answered by the type checker rather than by review.
+
+Three smaller decisions follow from the same argument and are worth naming
+because each of them is a place the easy version would have been wrong:
+
+* **`Gift::write_at`'s offset is relative to the gift**, and its bound is the
+  gift's own length, which the allocator chose. There is no argument to it that
+  reaches another gift, a client's pool, or the stamps. A wider
+  `arena_write(arena, offset, bytes)` would have been four lines shorter and
+  would have made the rule a matter of caller discipline.
+* **A gift has no `map_mut`.** A `MappingMut` is a writable view that outlives
+  the call and hands out `&mut [u8]`; over arena memory that is a lasting write
+  capability into a region the peer is copying pixels through. A server-created
+  object needs to be filled in once, and a bounded copy does that.
+* **`guest_write` got narrower.** The coherency probe (§12.6) is still the only
+  other write path into a provided arena, and it now refuses any range that
+  overlaps the outbound window. Partly for the safety argument, and partly for
+  ordinary correctness: the window holds live keymaps that clients have been
+  told about, and a probe write into one would present as a client dying inside
+  libxkbcommon, a long way from a coherency probe.
+
+One thing that fell out and is better than it was designed to be:
+`arena::guest_write` has exactly one caller in the whole tree and it is
+`crates/wc-handle/src/bin/wc-poolcost.rs`. **The compositor binary contains no
+path that writes an arbitrary arena offset at all.**
+
+### 13.4 What it costs to mint an object for a client
+
+`wc-poolcost` measured the *receiving* side per pool (§12.4). This is the
+sending side, per object, through the same production path — `create_shared`,
+`write_at`, drop — for a 71249-byte object, 64 iterations, three runs, under
+Wine on this workstation:
+
+| minting an object for a peer | create | fill | release | total |
+|---|---|---|---|---|
+| `Local\wc-…` section | 6.7–7.7 µs | 19.9–22.1 µs | 5.4–5.7 µs | 32.0–35.4 µs |
+| a file in a published directory (**local** fs) | 28.0–30.2 µs | 31.7–33.3 µs | 17.9–19.0 µs | **77.8–82.5 µs** |
+| **an arena slice** | **0.2–0.3 µs** | **1.1–1.4 µs** | **0.2 µs** | **1.5–1.9 µs** |
+
+**The middle row is a floor and must be read as one.** That directory is on this
+workstation's own filesystem, not on the guest's virtio-fs export, and §12.4
+measured a *single open* of a file on that export at 539–546 µs — two orders of
+magnitude above the 28 µs here. The real ratio on the deployment that matters is
+therefore larger than the 45× this table shows, and by how much is not known
+because it has not been measured there.
+
+The honest counterweight: **a keymap is minted once per keyboard, not once per
+frame.** 80 µs a client is not a number anybody would notice, and if this were
+the whole argument it would not be worth the code. The argument is §13.7.
+
+### 13.5 Which arena, and which bytes: the tail, and how the number travels
+
+§12.11 item 3 asked for a statement of ownership rather than an encoding, and
+the statement is `(arena, offset, len)` with two constraints on it.
+
+**It is the tail.** Both allocators that can share an arena with this one —
+`wc-proxy`'s pool allocator and `sv_arena::alloc` — are first fit from offset 0
+upward, so the tail is what they reach last. The peer then has one number to
+subtract from its own length rather than a hole to route a free list around, and
+the free list stays a sorted run list with no special case in the one piece of
+code that must not have one.
+
+**The number has one origin.** It is decided inside the guest by
+`reserve_outbound`, printed on the compositor's report line, and carried to the
+proxy *in `wc-arena-host`'s plan* — not typed onto two command lines. Two
+spellings of one number can differ; the symptom of their differing is two
+allocators over the same bytes, which is a client's pixels written on top of a
+live keymap, silently. `wc-proxy` refuses `--arena-outbound` together with
+`--arena-plan` for that reason. The file-arena case has no plan, so there it
+*is* a flag on both, and that is a real weakness of the file-arena case rather
+than an inconsistency.
+
+The unit test that matters here is not the allocator's. It is the one that fills
+the arena: `a_keymap_cut_from_the_arena_reaches_the_client_with_no_shared_filesystem`
+asks the pool allocator for everything it will give — 7936 pages of an 8192-page
+arena — and asserts that not one of them is inside the window and that the
+keymap still reads back afterwards.
+
+### 13.6 The keymap, measured with an unmodified client
+
+`scripts/wc-input.sh` grew a leg. It is the stage-6 Wine leg with two flags
+changed and **nothing else** — the same `weston-eventdemo`, the same
+`SendInput` of `helloZ`, the same `check_client_events` — because the claim is
+that the transport changed and nothing else did, and a weaker check on the new
+leg would prove nothing.
+
+| | shared-file (stage 6) | arena (stage 10) |
+|---|---|---|
+| compositor flags | `--shared-dir`, `--shared-peer-prefix` | `--arena-provide`, `--arena-outbound` |
+| proxy summary | `3 fds in, 1 out` | `3 fds in, 1 out (1 from the arena)` |
+| keymap on the wire | `wl_keyboard@10.keymap(1, fd 8, 35572)` | the same |
+| what the client typed | `helloZ` | `helloZ` |
+| files in the keymap directory | 1 | **0** |
+| checks | 26 passed, 0 failed | **28 passed, 0 failed** |
+
+The `1 from the arena` is a new counter in the proxy's summary and it exists for
+§8.4's reason: *a stage that added a second provider with no way to tell which
+one ran would not really have added it.* The two runs produce byte-identical
+characters in the client, so the count is the only thing that distinguishes
+them.
+
+Two numbers in that table are worth an explicit note. The compositor's own log
+says `layout us (71249 bytes of keymap)` and the client is handed **35572**;
+both are right and they are different things — smithay recompiles the embedded
+source through xkbcommon and serialises the result, so the source length and the
+wire length were never going to agree. And `weston-eventdemo` asks for a
+**4190208-byte** pool for its cursor theme on top of its own 800 KiB surface: a
+4 MiB arena ran out, the proxy reported `no run of 4190208 bytes`, and the client
+exited before a keystroke was injected. That is §12.13 item 5 — "64 MiB is a
+guess" — arriving in the smallest client available, and the guess has to be
+generous.
+
+### 13.7 Can `--shared-dir` go away? Yes, where there is an arena — and that is the point
+
+Stated plainly, because it was asked plainly.
+
+**`wc_handle::publish` has exactly one customer in the tree**, and it is
+`SealedFile::with_data`, and that is the keymap. There is nothing else. So the
+question "can the shared directory go away" is exactly the question "can the
+keymap come out of the arena", and the answer is yes:
+
+* **With an arena — `--transport arena` or `--transport guest-ram` — it can go
+  entirely.** `scripts/wc-guest.sh`'s guest-RAM path now passes no
+  `--shared-dir` at all and asserts that nothing lands in the export's `keymaps`
+  directory. Every protocol object in both directions is then either a client's
+  pool copied *into* the arena or a compositor's object cut *out* of it.
+* **Without one it cannot, and should not.** `--transport shared-file` has no
+  region to cut from, and two Windows processes on one machine want a
+  `Local\wc-…` section rather than either. `create_shared`'s three-way choice is
+  exactly this fact, and `--shared-dir` remains the right answer for the
+  deployment that has no arena.
+
+**What this is actually worth is not the 80 µs.** It is that stage 5 measured
+the guest's virtio-fs export as *incoherent for live mappings* (§10.3:
+MISMATCH on 65280 of 65536 bytes, both directions) and 330× slower to touch,
+and stage 7 found that the keymap survived it anyway because a keymap happens to
+be a closed write rather than a live mapping (§12.11). That was luck, and it was
+luck the *next* server-created object — a clipboard offer being drained while the
+client reads it, a cursor surface, an icon — would not have. Removing the last
+protocol use of that filesystem means the next one inherits an arena instead of
+inheriting the caveat.
+
+What the guest still uses the share for is the harness's own artefacts: frames,
+logs, pool files for the other two transports. Those are `--dump-frames` and
+`--log`, they are ours, and none of them is a protocol object.
+
+### 13.8 Three things that were not expected
+
+**The proxy already resolved an arena slice, and it did not work.** §12.11 said
+"the client side of `wc-proxy` already resolves one", and the code was there —
+`materialise` had an `ArenaSlice` arm since stage 4. It could never have run:
+it resolved the slice through `wc_handle::arena`, and `wc-proxy` never registers
+its region there. The region belongs to `pool::Arena`, which holds a
+`StitchedRegion` of ~1500 `mmap(MAP_FIXED)` calls, and registering that a second
+time with `wc_handle` would be two owners of one mapping who could disagree. So
+the read moved onto the transport (`PoolTransport::peer_slice`) instead. **An
+arm that has never been reached is not an implementation**, and this one was
+counted as one in the previous stage's write-up.
+
+**The client's descriptor had its file offset at the end.** The same arm wrote
+the bytes into its fresh `memfd` with `write`, leaving the offset at EOF, and
+handed *that* descriptor to the client. libwayland's keymap path `mmap`s and
+does not care — which is why no test caught it — but the next customer of this
+direction is a clipboard transfer, which reads, and would have got zero bytes
+and no error. It is `pwrite` now. This was found by a unit test that did
+`read_exact` on the fd, which was written because reading it back seemed like
+the obvious thing to assert.
+
+**The startup log had to learn about the new case.** The compositor printed *"no
+`--shared-dir`, so the keymap will be a Windows section"* on every arena run —
+a true sentence about a code path that did not run, printed at exactly the moment
+somebody is looking for the reason a client died. It now names whichever of the
+three actually applies. This is the second time in this project that a
+diagnostic surviving a stage unchanged was worse than no diagnostic.
+
+### 13.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **136 tests**, 0 failures (133 on master) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
+| `scripts/wc-input.sh all` (stage 6 + this, Wine) | **82 passed, 0 failed** (52 before) |
+| `scripts/wc-guest.sh` (the guest) | **not run — see §13.10 item 1** |
+
+The three new tests are one each side of the boundary plus the plan's parser,
+and two of them are deliberately
+*one* test rather than several: `wc_handle`'s outbound window and `publish`'s
+directory are process-global by design, and `cargo test` runs threads at once, so
+a second test that reserved a window would race the first and the loser would
+report a perfectly true `AlreadyExists` about somebody else's arena.
+
+### 13.10 What is not proven, updated
+
+§12.13's list, with this stage's changes:
+
+1. **NEW, AND THE LARGEST: none of this has run over guest RAM.** The arena in
+   the Wine leg is a *file* — `provide_file`, the local twin — because under Wine
+   there is no hypervisor and nothing can locate pages when there is no VM. What
+   is unexercised is specifically: a gift written into `VirtualAlloc`ed, pinned,
+   stamped guest memory and read back by the host through the stitched view.
+   §12.6 measured that region coherent in both directions for a live mapping, so
+   there is a reason to expect it to work, and that is not the same as having
+   seen it. `scripts/wc-guest.sh` is wired for it — `--arena-outbound` on the
+   compositor, `--outbound` on the locator, no `--shared-dir`, and three
+   assertions in the checker — and needs a guest that stage 8 and stage 9 are
+   currently using.
+2. **NEW: the gift overwrites stamps, and the ordering is argued rather than
+   measured.** A gift written before the host's locate would take pages of
+   stamps with it and the sweep would report `located 16366 of 16384`. The order
+   holds in every topology that exists — the host cannot proxy a client it has
+   not connected for, and the compositor cannot mint a keymap before a client
+   binds a seat — but "holds by construction" is what §12.10 said about a second
+   locate before measuring it, and this deserves the same treatment on the guest.
+3. **NEW: releasing a gift is only unit-tested.** A keymap is dropped when the
+   layout changes, and the layout change is exercised on the Linux leg, where
+   `create_shared` is not the arena path. So the free list's coalescing has never
+   run in anger. It is thirty lines and it is tested; it has simply never been a
+   real compositor's free list.
+4. **NEW: one outbound window, one client, one object at a time.** The window is
+   process-global, which is right — it is a property of the deployment, exactly
+   as the arena registry and `publish` are — but nothing has yet asked for two
+   objects to be live at once outside a unit test, and §12.13 item 6's "one
+   client at a time" is unchanged and now has a second reason to matter.
+5. ~~The compositor cannot put anything *into* an arena.~~ **Closed.** §12.13
+   item 7, and §12.11 items 1, 2 and 3 with it.
+6. **The window has still never been seen** (§12.13 item 2), pinning is still
+   asserted rather than proven over time (item 4), 64 MiB is still a guess and
+   this stage produced a client that would have exhausted 4 MiB (item 5), and
+   §11.10's whole list is unchanged.
+7. **Wine has now lied nine times if it lies here.** The arena leg is a Wine
+   pass and therefore a hypothesis. What it can say is that the wire format, the
+   allocator, the ownership split and the client's own libxkbcommon all agree;
+   what it cannot say is anything about guest RAM, which is item 1.
+
+### 13.11 What to do next, in the order the evidence puts it
+
+1. **Run `scripts/wc-guest.sh stage4` on the guest** when stage 8 and stage 9 are
+   done with it. Items 1 and 2 above are one errand and the harness is already
+   wired for it; `WC_GUESTNAME` and `WC_HOST_SHARE` keep it out of anybody's way
+   (§12.8).
+2. **§12.14's list is otherwise unchanged** and its item 1 — log in and look at a
+   window — is still the largest single gap in the project.
+3. **Give the file-arena case one origin for its number too.** The plan carries
+   it for guest RAM and a flag carries it on both sides for a file, which is the
+   disagreement this design otherwise avoids. The fix is probably a header in the
+   arena file itself, and nothing yet needs it because the file arena is a test
+   substrate.

@@ -647,6 +647,99 @@ fn an_event_carrying_a_descriptor_becomes_a_real_fd_for_the_client() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The same event, over the arena, with **no filesystem the two sides share**.
+///
+/// STAGE 10, and it is the whole stage in one test. The compositor's half is
+/// real rather than simulated: `wc_handle::arena::provide_file` and
+/// `reserve_outbound` are exactly what `wc-compositor.exe` calls at startup, and
+/// `Handle::create_shared` is exactly what smithay's `SealedFile` calls to make
+/// a keymap. What crosses is three integers. This side reads them out of the
+/// region it already had mapped and manufactures the client's descriptor
+/// locally, which is the same rule as ever: **a name — or here, an offset — is
+/// what crosses, never a descriptor.**
+///
+/// One test rather than several, because `wc_handle`'s outbound window is
+/// process-global by design and `cargo test` runs these threads at once. It
+/// therefore also carries the assertion that the two allocators over the one
+/// region do not overlap, which is the property the window exists for.
+#[test]
+fn a_keymap_cut_from_the_arena_reaches_the_client_with_no_shared_filesystem() {
+    let d = tmpdir("arenakeymap");
+    let path = d.join("arena");
+    let id = 7260;
+    let size = 64 * 4096u64;
+    let outbound = 8 * 4096u64;
+
+    // This side: the proxy's allocator over the region, told to leave the last
+    // eight pages alone.
+    let mut t = Arena::open_or_create(id, &path, size).unwrap();
+    t.reserve_outbound(outbound).unwrap();
+    assert_eq!(t.outbound(), Some((size - outbound, outbound)));
+
+    // The other side: the compositor's, in this process because the region is a
+    // file and a file has no side.
+    let p = path.to_string_lossy().into_owned();
+    wc_handle::arena::provide_file(id, &p, size).unwrap();
+    let w = wc_handle::arena::reserve_outbound(id, outbound).unwrap();
+    assert_eq!((w.arena, w.offset, w.len), (id, size - outbound, outbound));
+
+    let keymap = b"xkb_keymap { /* compiled by the compositor */ };\0";
+    let owner = wc_handle::Handle::create_shared(keymap.len() as u64).unwrap();
+    owner.write_at(0, keymap).unwrap();
+    // Nothing was created. This is the assertion that distinguishes this
+    // transport from every other one in the crate.
+    assert!(
+        matches!(owner.descriptor(), wc_handle::Descriptor::ArenaSlice { .. }),
+        "create_shared did not cut from the arena: {:?}",
+        owner.descriptor()
+    );
+
+    let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let seat = h.bind(registry, 3, "wl_seat", 7);
+    let kbd = h.id();
+    h.send_words(seat, 1, &[kbd]);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u32.to_ne_bytes());
+    wire::push_bytes(&mut body, &owner.descriptor().encode());
+    body.extend_from_slice(&(keymap.len() as u32).to_ne_bytes());
+    let (out, fds) = h
+        .session
+        .server_message(Header { object: kbd, opcode: 0, size: 8 + body.len() }, &body)
+        .unwrap();
+
+    assert_eq!(fds.len(), 1, "the client must get exactly one descriptor");
+    assert_eq!(out.len(), 8 + 8, "the in-band descriptor was not removed");
+    assert_eq!(h.session.stats.fds_from_arena, 1, "the run must be able to say which kind ran");
+
+    use std::io::Read as _;
+    let mut f = std::fs::File::from(fds.into_iter().next().unwrap());
+    let mut got = vec![0u8; keymap.len()];
+    f.read_exact(&mut got).unwrap();
+    assert_eq!(got, keymap, "the client's fd is not the compositor's keymap");
+
+    // And the two allocators cannot meet. The pool allocator is asked for
+    // everything it will give and none of it is inside the compositor's window
+    // — which is the failure the reservation exists to prevent, and it would be
+    // a client's pixels on top of a live keymap.
+    let mut pools = Vec::new();
+    while let Ok(r) = h.session.transport.create(4096) {
+        let wc_handle::Descriptor::ArenaSlice { offset, .. } = r.descriptor else {
+            panic!("wrong kind")
+        };
+        assert!(offset + 4096 <= w.offset, "pool at {offset} is inside the keymap window {w:?}");
+        pools.push(r);
+    }
+    assert_eq!(pools.len() as u64, (size - outbound) / 4096, "the arena short-changed the peer");
+    // The keymap is still what it was after the arena filled up.
+    let again = wc_handle::Handle::from_descriptor(owner.descriptor().clone()).map().unwrap();
+    assert_eq!(&again.as_slice()[..keymap.len()], keymap);
+
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A keymap in a **Windows section** is refused, loudly, and the connection
 /// ends.
 ///

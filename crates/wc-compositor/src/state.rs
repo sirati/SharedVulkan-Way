@@ -214,12 +214,27 @@ impl State {
         // knows about it is when it has to end a connection. One line here
         // turns "the client died on connect" into "we were told this at
         // startup".
-        if cfg!(windows) && keyboard.is_some() && wc_handle::publish::get().is_none() {
-            println!(
-                "wc-compositor: no --shared-dir, so the keymap will be a Windows section. \
-                 That is correct for a client on this machine and unopenable by one across \
-                 the boundary."
-            );
+        //
+        // STAGE 10 added a third possibility and the line has to know about it,
+        // because saying "the keymap will be a Windows section" on a run where
+        // it is an arena slice is worse than saying nothing: it is a true
+        // sentence about a code path that did not run, printed at exactly the
+        // moment somebody is looking for the reason a client died.
+        if cfg!(windows) && keyboard.is_some() {
+            match (wc_handle::arena::outbound(), wc_handle::publish::get()) {
+                (Some(w), _) => println!(
+                    "wc-compositor: the keymap will be a slice of arena {} \
+                     (its outbound window is {}+{}), so nothing is opened and no filesystem \
+                     is involved.",
+                    w.arena, w.offset, w.len
+                ),
+                (None, Some(_)) => {}
+                (None, None) => println!(
+                    "wc-compositor: no --shared-dir and no --arena-outbound, so the keymap \
+                     will be a Windows section. That is correct for a client on this machine \
+                     and unopenable by one across the boundary."
+                ),
+            }
         }
 
         State {

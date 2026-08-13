@@ -29,22 +29,51 @@
 //! reason this is the right kind for the real deployment and not merely the
 //! available one.
 //!
-//! # What is *not* here
+//! # What is *not* here, and what stage 10 added
 //!
-//! No allocator. Who owns which bytes of an arena is the sender's problem —
+//! Until stage 10 this module had **no allocator at all**, and the header said
+//! why: who owns which bytes of an arena is the sender's problem —
 //! `sv_arena::alloc` on the shared_vulkan side, `wc-proxy`'s pool allocator on
-//! this one. This module resolves `(arena, offset, len)` to memory and refuses
-//! anything out of range. Refusing is the whole of its safety contribution and
-//! it is worth being clear that it is not much: a peer that can name any offset
-//! in the arena can read any of it, exactly as a peer that can name a section
-//! can read all of that section. The boundary is between the two sides, not
-//! within one arena.
+//! this one. That is still true of the *pool* direction and it is still where
+//! almost all the bytes go. What it left out is that the sender is not always
+//! the peer. `wl_keyboard.keymap` is created by the compositor and opened by
+//! the client, and so are a clipboard offer, an icon and a cursor theme; for
+//! those the compositor is the sender and had nothing to ask for bytes.
+//!
+//! So there is now exactly one allocator here, and it is deliberately the
+//! smallest one that can exist:
+//!
+//! * It allocates from **one declared sub-range** of one arena — the *outbound
+//!   window*, [`reserve_outbound`] — and not from the arena at large. The rest
+//!   of the region still belongs entirely to the peer's allocator, which never
+//!   hears about this one; the two cannot hand out the same offset because
+//!   they are not handing out from the same bytes.
+//! * The only thing it produces is a [`Gift`], and a `Gift` is the *only* value
+//!   in this crate that carries a write path into an arena. There is no
+//!   function anywhere that takes an arbitrary `(arena, offset)` from a caller
+//!   and writes it: [`Gift::write_at`] is bounded by the gift's own extent,
+//!   which the allocator chose, and [`guest_write`] — the coherency probe, and
+//!   the only other write path — now refuses the outbound window outright.
+//!
+//! That is the shape the safety argument needs. A client's buffer arrives as a
+//! `Descriptor::ArenaSlice` decoded from the wire, becomes a
+//! [`Handle`](crate::Handle) that owns nothing, and therefore has no write path
+//! at all — the same rule that has kept a compositor's view of a client's
+//! pixels read-only since stage 1. A compositor's keymap arrives as a `Gift`,
+//! which is not constructible from the wire. Widening `Handle::map` would have
+//! broken that; adding a token that only the allocator can mint does not.
+//!
+//! Refusing out-of-range windows is still the whole of this module's safety
+//! contribution on the *reading* side, and it is still worth being clear that
+//! it is not much: a peer that can name any offset in the arena can read any of
+//! it, exactly as a peer that can name a section can read all of that section.
+//! The boundary is between the two sides, not within one arena.
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use crate::{Mapping, MappingInner, platform};
+use crate::{Descriptor, Mapping, MappingInner, platform};
 
 /// One attached region.
 struct Attached {
@@ -52,13 +81,19 @@ struct Attached {
     len: usize,
     /// How the region was named, for logs. Never used to reach it again.
     origin: String,
-    /// True only for a region **this process committed** ([`attach_guest_ram`]),
-    /// as opposed to one it opened because somebody else provided it.
+    /// True only for a region **this process provided** — committed itself with
+    /// [`attach_guest_ram`], or opened read-write because the deployment said it
+    /// owns it ([`provide_file`]) — as opposed to one it opened because somebody
+    /// else provided it.
     ///
-    /// It exists to gate [`guest_write`], and gating it is the point: a
-    /// compositor writing into a client's buffer is a bug in every case, and
-    /// writing into a region the peer owns is the one case where it is also
-    /// unsound. This process's own memory is neither.
+    /// It gates [`guest_write`] and [`reserve_outbound`], and gating them is the
+    /// point: a compositor writing into a client's buffer is a bug in every
+    /// case, and writing into a region the peer owns is the one case where it is
+    /// also unsound. Bytes this process owns are neither.
+    ///
+    /// Note that this says nothing about *which* bytes may be written. That is
+    /// the outbound window's job, and the two are separate on purpose: `provided`
+    /// is a fact about the region, and the window is a decision about part of it.
     provided: bool,
 }
 
@@ -84,6 +119,7 @@ fn registry() -> &'static Registry {
 pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
     let len = usize::try_from(size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
+    refuse_if_outbound(id)?;
     let view = platform::map_file(path, len)?;
     let mut guard = registry()
         .write()
@@ -93,6 +129,70 @@ pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
         Attached { view: Arc::new(view), len, origin: path.to_owned(), provided: false },
     );
     Ok(())
+}
+
+/// Attach arena `id` as a **file this process may write**: the local twin of
+/// [`attach_guest_ram`], for a machine with no hypervisor in it.
+///
+/// STAGE 10. [`attach`] opens the region read-only, which is right for the side
+/// that only ever reads a peer's pixels, and it is the reason a compositor over
+/// a file arena has no outbound window: there is nothing to write into. This
+/// opens the same file read-write and marks the arena `provided`, so
+/// [`reserve_outbound`] will take a window out of it.
+///
+/// # Why this is not "attach with a flag"
+///
+/// Because of what `provided` means, which is not "writable" but "these bytes
+/// are this process's to give away". A guest-RAM region is provided because the
+/// process committed it; this file is provided because the deployment said so,
+/// out of band, in the same breath as the arena id. Both are statements about
+/// ownership that no amount of inspection of the region could establish, which
+/// is why both are supplied rather than detected.
+///
+/// The peer opens the same file read-write through its own allocator. On the
+/// deployment this is for — Wine, or two processes on one Linux box — that is a
+/// coherent shared mapping and was measured to be one (docs/design.md §9.4,
+/// `scripts/probe-filemap.c`). On a virtio-fs export it is **not**, which is
+/// §10.3, and is exactly why the deployment that matters uses guest RAM.
+pub fn provide_file(id: u32, path: &str, size: u64) -> io::Result<()> {
+    let len = usize::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
+    refuse_if_outbound(id)?;
+    let view = platform::map_file_mut(path, len)?;
+    let mut guard = registry()
+        .write()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?;
+    guard.insert(
+        id,
+        Attached {
+            view: Arc::new(view),
+            len,
+            origin: format!("provided file {path}"),
+            provided: true,
+        },
+    );
+    Ok(())
+}
+
+/// Refuse to replace an arena that an outbound window has been cut out of.
+///
+/// The registry replaces on re-attach and says so, and until stage 10 the worst
+/// that could do was show a client the wrong pixels. A live [`Gift`] holds an
+/// `(arena, offset)` and nothing else, so replacing the region under one would
+/// silently re-point a keymap at somebody else's memory — a wrong answer of
+/// exactly the kind this project keeps refusing to produce quietly.
+fn refuse_if_outbound(id: u32) -> io::Result<()> {
+    let guard = outbound_slot().lock().map_err(|_| io::Error::other("outbound window poisoned"))?;
+    match guard.as_ref() {
+        Some(w) if w.arena == id => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "arena {id} has an outbound window at {}+{} and cannot be re-attached",
+                w.base, w.len
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +291,7 @@ pub struct GuestRegion {
 pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
     let len = usize::try_from(size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
+    refuse_if_outbound(id)?;
     let run_id = random_run_id();
     let (view, locked) = platform::alloc_locked_region(len, &|index, page| {
         page.fill(STAMP_FILL);
@@ -215,30 +316,309 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
     )
 }
 
-/// Write `bytes` at `offset` of an arena **this process provided**.
+// ---------------------------------------------------------------------------
+// STAGE 10: the compositor's side of the arena, and the one allocator here
+// ---------------------------------------------------------------------------
+
+/// The sub-range of one arena that this process may hand *out*.
 ///
-/// Refused for an arena that was [`attach`]ed, and that refusal is the whole of
-/// the function's design. A compositor writing into a region its peer owns is
-/// unsound as well as wrong; writing into memory this process committed itself
-/// is neither. Encoding the distinction in the registry means the wrong one
-/// cannot be reached by passing a different id.
+/// docs/design.md §12.11 item 3: "which arena, and which sub-range, is the
+/// compositor's to give away is not expressed anywhere". This is that
+/// expression, and it is three integers because that is all it ever was — the
+/// wire has carried `Descriptor::ArenaSlice` in this direction since stage 1
+/// and the client half of `wc-proxy` already resolves one. What was missing was
+/// a statement of ownership, not an encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundWindow {
+    /// Which arena, in the numbering both sides agreed on out of band.
+    pub arena: u32,
+    /// Byte offset of the window within it.
+    pub offset: u64,
+    /// Its length. Always a whole number of [`REGION_PAGE`]s.
+    pub len: u64,
+}
+
+/// The window, plus the free list that is the whole of the allocator's state.
+struct Window {
+    arena: u32,
+    base: u64,
+    len: u64,
+    /// Sorted, coalesced, absolute arena offsets. Identical in shape to
+    /// `wc_proxy::pool::Arena`'s, and deliberately: two free lists that behave
+    /// the same way are two things a reader has to learn once.
+    free: Vec<(u64, u64)>,
+    given: u64,
+}
+
+fn outbound_slot() -> &'static Mutex<Option<Window>> {
+    static WINDOW: OnceLock<Mutex<Option<Window>>> = OnceLock::new();
+    WINDOW.get_or_init(|| Mutex::new(None))
+}
+
+/// The granularity every gift is aligned and rounded to.
 ///
-/// # What this is for, which is one thing
+/// `wc_proxy::pool::ARENA_GRANULARITY` and `sv_arena::GRANULARITY` are the same
+/// number for the same reason (docs/design.md §12.4): it is the page the host
+/// sweeps in and the alignment the peer's mapping wants. Nothing here needs the
+/// alignment — the peer copies a keymap out byte by byte — but an allocator in
+/// this region that used a different unit from the one next door would be a
+/// difference with no reason behind it.
+pub const GIFT_GRANULARITY: u64 = REGION_PAGE as u64;
+
+/// Declare the **last `len` bytes** of arena `arena` to be this process's to
+/// give away, and take them out of nobody's hands but its own.
 ///
-/// The live-coherency probe: the host writes into the guest's arena while the
-/// guest holds a live mapping, and the guest answers at another offset so the
-/// host can measure the other direction. On a virtio-fs export neither
-/// direction worked (docs/design.md §10.3) and every check above the pixels
-/// passed anyway (§10.7), which is why this is measured directly rather than
-/// inferred from a window looking right.
+/// # The tail, and why the two sides can agree on one number
 ///
-/// Nothing on the frame path calls it and nothing should.
-pub fn guest_write(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
+/// Both allocators that share an arena with this one — `wc-proxy`'s pool
+/// allocator and `sv_arena::alloc` — are first-fit from offset 0 upward, so the
+/// tail is the part of the region they reach last. Reserving it means the peer
+/// has one number to subtract from its own length rather than a hole to route
+/// its free list around, and a peer that was never told still works until the
+/// arena is nearly full — at which point it overlaps, which is why the peer is
+/// told rather than trusted to be lucky. `wc-arena-host` writes the window into
+/// the plan for exactly that reason: the number originates here, where it is
+/// decided, and travels with the description of the region.
+///
+/// # What this refuses, and why each refusal is worth its line
+///
+/// * **An arena nobody provided.** A region opened with [`attach`] is somebody
+///   else's memory and mapped read-only; giving pieces of it away would be
+///   giving away bytes the peer is about to allocate for itself.
+/// * **A second window.** One process, one outbound window: a second would
+///   reintroduce the question of which one a `create_shared` meant, and there
+///   is no caller that wants to choose.
+/// * **The whole arena.** A window that left the peer nothing is a
+///   configuration error that would present as the first `wl_shm` pool failing
+///   to allocate, a long way from the flag that caused it.
+///
+/// # The ordering that has to hold, which is the guest-RAM one
+///
+/// On guest RAM the compositor's pages carry the stamps the host locates by,
+/// and a gift overwrites them (§12.10). The host's locate must therefore finish
+/// before the first object is handed out — which it does in every topology that
+/// exists, because the host cannot proxy a client it has not connected for and
+/// the compositor cannot mint a keymap before a client binds a seat. It is
+/// stated here because the symptom of getting it wrong is `located 16366 of
+/// 16384 pages`, which reads as a broken arena rather than as a race.
+pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an outbound window of zero bytes is not a window",
+        ));
+    }
+    let len = len.div_ceil(GIFT_GRANULARITY) * GIFT_GRANULARITY;
+    let arena_len = {
+        let guard = registry()
+            .read()
+            .map_err(|_| io::Error::other("arena registry poisoned"))?;
+        let Some(a) = guard.get(&arena) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("arena {arena} is not attached"),
+            ));
+        };
+        if !a.provided {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "arena {arena} was opened, not provided: this process does not own its bytes \
+                     and cannot give any of them away"
+                ),
+            ));
+        }
+        a.len as u64
+    };
+    if len >= arena_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "an outbound window of {len} bytes leaves nothing of a {arena_len}-byte arena \
+                 for the peer's pools"
+            ),
+        ));
+    }
+    let mut guard = outbound_slot().lock().map_err(|_| io::Error::other("outbound window poisoned"))?;
+    if let Some(w) = guard.as_ref() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("arena {} already has the outbound window ({}+{})", w.arena, w.base, w.len),
+        ));
+    }
+    let base = arena_len - len;
+    *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0 });
+    Ok(OutboundWindow { arena, offset: base, len })
+}
+
+/// The outbound window, if one was declared.
+pub fn outbound() -> Option<OutboundWindow> {
+    let guard = outbound_slot().lock().ok()?;
+    guard
+        .as_ref()
+        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len })
+}
+
+/// Bytes given out and bytes still free in the outbound window, for the one log
+/// line that says whether the compositor is running out of room to answer a
+/// client.
+pub fn outbound_usage() -> Option<(u64, u64)> {
+    let guard = outbound_slot().lock().ok()?;
+    guard
+        .as_ref()
+        .map(|w| (w.given, w.free.iter().map(|(_, l)| *l).sum()))
+}
+
+/// A range of the outbound window that this process has allocated, may write,
+/// and may describe to a peer.
+///
+/// **This is the capability.** Not a flag, not a convention, not a comment
+/// asking people to be careful: a `Gift` cannot be decoded from the wire, has no
+/// public constructor, and is produced by exactly one function
+/// ([`give`](give)), which allocates only inside [`reserve_outbound`]'s range.
+/// So the question "could a client's buffer write turn into a compositor write
+/// to arbitrary arena memory?" has a type-level answer — a client's buffer is a
+/// `Descriptor` and a `Descriptor` never becomes a `Gift`.
+///
+/// Dropping it returns the bytes. That is the lifetime rule of docs/design.md
+/// §2.5 arriving from the other end: a section has to be *held* because its name
+/// dies with the last handle, and a gift has to be held because its bytes are
+/// reused by the next one. `crate::Handle` keeps it in an `Arc` for exactly as
+/// long as it keeps a section open, so both rules are one rule at the call site.
+#[derive(Debug)]
+pub struct Gift {
+    arena: u32,
+    offset: u64,
+    /// What the caller asked for, which is what the descriptor says.
+    len: u64,
+    /// What the allocator took, rounded to [`GIFT_GRANULARITY`], which is what
+    /// is returned on drop.
+    span: u64,
+}
+
+impl Gift {
+    /// Exactly the bytes that cross to describe these bytes.
+    pub fn descriptor(&self) -> Descriptor {
+        Descriptor::ArenaSlice { arena: self.arena, offset: self.offset, len: self.len }
+    }
+
+    /// Where this is, for a log line.
+    pub fn extent(&self) -> (u32, u64, u64) {
+        (self.arena, self.offset, self.len)
+    }
+
+    /// Write into **this gift**, at an offset relative to its own start.
+    ///
+    /// The offset is relative and the bound is the gift's own length, so there
+    /// is no spelling of this call that reaches another gift, a client's pool,
+    /// or the stamps. That is the property, and it is why this exists rather
+    /// than a wider `arena_write(arena, offset, bytes)` — which would have been
+    /// four lines shorter and would have made the rule a matter of caller
+    /// discipline.
+    pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "gift write overflows"))?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("write {offset}..{end} runs past the end of a {}-byte gift", self.len),
+            ));
+        }
+        write_provided(self.arena, self.offset + offset, bytes)
+    }
+}
+
+impl Drop for Gift {
+    fn drop(&mut self) {
+        let Ok(mut guard) = outbound_slot().lock() else {
+            return;
+        };
+        let Some(w) = guard.as_mut() else {
+            return;
+        };
+        if w.arena != self.arena {
+            return;
+        }
+        w.given = w.given.saturating_sub(self.span);
+        let at = w.free.partition_point(|(o, _)| *o < self.offset);
+        w.free.insert(at, (self.offset, self.span));
+        // Coalesce, so a long-lived compositor that has minted a keymap per
+        // client for a week can still answer the next one. Same loop as
+        // `wc_proxy::pool::Arena::release` and for the same reason.
+        let mut i = 0;
+        while i + 1 < w.free.len() {
+            let (o, l) = w.free[i];
+            let (o2, l2) = w.free[i + 1];
+            if o + l == o2 {
+                w.free[i] = (o, l + l2);
+                w.free.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Allocate `len` bytes of the outbound window.
+///
+/// First fit, as next door. A compositor holds one keymap per layout and a
+/// handful of transient offers; anything cleverer would be a guess about a load
+/// nobody has measured.
+///
+/// Fails rather than falling back to another transport, and that is the same
+/// rule `wc_proxy::pool::PoolTransport::create` states: a transport that quietly
+/// degraded to another would defeat the point of being able to say which one
+/// ran.
+pub fn give(len: u64) -> io::Result<Gift> {
+    if len == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a gift cannot be empty"));
+    }
+    let mut guard = outbound_slot().lock().map_err(|_| io::Error::other("outbound window poisoned"))?;
+    let Some(w) = guard.as_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no outbound window: this process has no arena bytes of its own to give away",
+        ));
+    };
+    let want = len.div_ceil(GIFT_GRANULARITY) * GIFT_GRANULARITY;
+    let idx = w.free.iter().position(|(_, l)| *l >= want).ok_or_else(|| {
+        let total: u64 = w.free.iter().map(|(_, l)| *l).sum();
+        let largest = w.free.iter().map(|(_, l)| *l).max().unwrap_or(0);
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "the outbound window of arena {} has no run of {want} bytes \
+                 ({total} free, largest {largest}); raise --arena-outbound",
+                w.arena
+            ),
+        )
+    })?;
+    let (offset, have) = w.free[idx];
+    if have == want {
+        w.free.remove(idx);
+    } else {
+        w.free[idx] = (offset + want, have - want);
+    }
+    w.given += want;
+    Ok(Gift { arena: w.arena, offset, len, span: want })
+}
+
+/// The one unsafe write, shared by [`Gift::write_at`] and [`guest_write`].
+///
+/// Both callers have already established that `offset..offset+len` is theirs to
+/// write; this checks it is inside the region as well, because a bounds check
+/// that is only made by the caller is a bounds check that a future caller will
+/// forget.
+fn write_provided(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
     let guard = registry()
         .read()
         .map_err(|_| io::Error::other("arena registry poisoned"))?;
     let Some(a) = guard.get(&arena) else {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("arena {arena} is not attached")));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("arena {arena} is not attached"),
+        ));
     };
     if !a.provided {
         return Err(io::Error::new(
@@ -257,15 +637,81 @@ pub fn guest_write(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
             format!("write {offset}..{end} runs past the end of arena {arena} ({})", a.len),
         ));
     }
-    // SAFETY: the region is `PAGE_READWRITE` memory this process committed in
-    // `attach_guest_ram` and holds for its whole life, and `offset..end` was
-    // just checked against its length. Concurrent reads of these bytes by the
-    // host are the point of the function; they are shared memory, which is a
-    // `wl_shm` hazard rather than a Rust one — see `Mapping::as_slice`.
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: the region is memory this process provided — committed by
+    // `attach_guest_ram` or opened read-write by `provide_file` — and holds for
+    // its whole life, and `offset..end` was just checked against its length.
+    // Concurrent reads of these bytes by the peer are the point; they are
+    // shared memory, which is a `wl_shm` hazard rather than a Rust one — see
+    // `Mapping::as_slice`.
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), a.view.ptr().cast_mut().add(offset), bytes.len());
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            a.view.ptr().cast_mut().add(offset),
+            bytes.len(),
+        );
     }
     Ok(())
+}
+
+/// Write `bytes` at `offset` of an arena **this process provided**.
+///
+/// Refused for an arena that was [`attach`]ed, and that refusal is the whole of
+/// the function's design. A compositor writing into a region its peer owns is
+/// unsound as well as wrong; writing into memory this process committed itself
+/// is neither. Encoding the distinction in the registry means the wrong one
+/// cannot be reached by passing a different id.
+///
+/// # What this is for, which is one thing
+///
+/// The live-coherency probe: the host writes into the guest's arena while the
+/// guest holds a live mapping, and the guest answers at another offset so the
+/// host can measure the other direction. On a virtio-fs export neither
+/// direction worked (docs/design.md §10.3) and every check above the pixels
+/// passed anyway (§10.7), which is why this is measured directly rather than
+/// inferred from a window looking right.
+///
+/// Nothing on the frame path calls it and nothing should.
+///
+/// # STAGE 10 narrowed it rather than widening it
+///
+/// Stage 10 gave the compositor a way to put objects *into* an arena, and the
+/// obvious way to do that would have been to let this function be called from
+/// the keymap path. It is not, and this function got **smaller** instead: it now
+/// refuses any range that overlaps the outbound window. There are two separate
+/// reasons and both are worth having.
+///
+/// The first is the safety property this whole stage is about. A probe that can
+/// write anywhere in a provided arena plus a caller that can choose the offset
+/// is a general-purpose write primitive with a comment on it; a [`Gift`] is not.
+/// Keeping the two apart is what makes "the compositor cannot write into a
+/// client's buffer" a fact about the types rather than about the call sites.
+///
+/// The second is ordinary correctness: the window holds live keymaps that
+/// clients have already been told about, and a probe write into one would
+/// corrupt a keymap another process is mid-`mmap` on. That failure would present
+/// as a client dying inside libxkbcommon, which is a long way from a coherency
+/// probe.
+pub fn guest_write(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    if let Some(w) = outbound()
+        && w.arena == arena
+    {
+        let end = offset.saturating_add(bytes.len() as u64);
+        if offset < w.offset + w.len && end > w.offset {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "write {offset}..{end} overlaps arena {arena}'s outbound window \
+                     ({}+{}), whose bytes belong to the objects this process has already \
+                     handed to clients",
+                    w.offset, w.len
+                ),
+            ));
+        }
+    }
+    write_provided(arena, offset, bytes)
 }
 
 /// 64 unguessable bits, from the same source the section names use.
@@ -504,6 +950,127 @@ mod tests {
     fn a_partial_page_is_refused() {
         assert!(attach_guest_ram(9007, 4095).is_err());
         assert!(attach_guest_ram(9007, 0).is_err());
+    }
+
+    // ---------------------------------------------------------------- 10 ---
+    // The outbound window, its allocator, and the refusals that make the
+    // allocator safe to have at all.
+    //
+    // **One test, several assertions, for the same reason `publish`'s test is
+    // one test**: there is exactly one outbound window per process and
+    // `cargo test` runs these threads concurrently, so a second test that
+    // reserved a window would race this one and the loser would report a
+    // perfectly true `AlreadyExists` about somebody else's arena. It also means
+    // this test is the only place `create_shared` may be called in this crate —
+    // once the window exists, every call to it in this process returns a gift.
+
+    const OUT: u32 = 9100;
+
+    #[test]
+    fn the_outbound_window_is_the_compositors_and_nothing_else_can_write_it() {
+        let pages = 16u64;
+        let region = attach_guest_ram(OUT, pages * REGION_PAGE as u64).unwrap();
+        assert!(outbound().is_none(), "nothing may be outbound before it is reserved");
+
+        // Not provided: refused. An arena somebody else owns has no bytes this
+        // process may give away, and this is the check that says so.
+        let borrowed = 9101;
+        let path = format!("{}/wc-arena-test-{borrowed}", std::env::temp_dir().display());
+        let _keep = make_arena(borrowed, 8192, |_| {});
+        assert_eq!(
+            reserve_outbound(borrowed, 4096).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // A window that leaves the peer nothing is a configuration error, not a
+        // very small arena.
+        assert_eq!(
+            reserve_outbound(OUT, region.len as u64).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // The tail, and exactly the tail.
+        let w = reserve_outbound(OUT, 4 * REGION_PAGE as u64).unwrap();
+        assert_eq!(w.arena, OUT);
+        assert_eq!(w.len, 4 * REGION_PAGE as u64);
+        assert_eq!(w.offset, region.len as u64 - w.len);
+        assert_eq!(outbound(), Some(w));
+        // One per process.
+        assert_eq!(
+            reserve_outbound(OUT, 4096).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        // And the region it was cut from cannot be swapped underneath it.
+        assert_eq!(
+            attach_guest_ram(OUT, 4096).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // A gift is inside the window, is writable by its owner, and the bytes
+        // are readable from the descriptor alone — which is the whole claim.
+        let h = Handle::create_shared(1000).unwrap();
+        let Descriptor::ArenaSlice { arena, offset, len } = h.descriptor().clone() else {
+            panic!("create_shared did not cut from the arena: {:?}", h.descriptor())
+        };
+        assert_eq!(arena, OUT);
+        assert_eq!(len, 1000, "the descriptor carries what the caller asked for");
+        assert!(offset >= w.offset && offset + len <= w.offset + w.len, "{offset} is outside {w:?}");
+        h.write_at(0, b"xkb_keymap {").unwrap();
+        h.write_at(988, b"};\0").unwrap();
+        let wire = h.descriptor().encode();
+        let peer = Handle::from_descriptor(Descriptor::decode(&wire).unwrap());
+        let m = peer.map().unwrap();
+        assert_eq!(&m.as_slice()[..12], b"xkb_keymap {");
+        assert_eq!(&m.as_slice()[988..991], b"};\0");
+
+        // The peer's copy of the same descriptor owns nothing and cannot write.
+        // This is the rule the whole stage rests on: a slice off the wire is
+        // never a gift.
+        assert_eq!(
+            peer.write_at(0, b"x").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Nor may the owner take a lasting writable view of arena memory.
+        assert_eq!(h.map_mut().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        // Nor may it write past its own extent, however the offset is spelled.
+        assert!(h.write_at(1000, b"x").is_err());
+        assert!(h.write_at(u64::MAX, b"x").is_err());
+
+        // Two live gifts never overlap, and dropping one returns its bytes.
+        let a = Handle::create_shared(4096).unwrap();
+        let b = Handle::create_shared(4096).unwrap();
+        let span = |x: &Handle| match x.descriptor() {
+            Descriptor::ArenaSlice { offset, len, .. } => (*offset, *len),
+            other => panic!("{other:?}"),
+        };
+        let (ao, al) = span(&a);
+        let (bo, _) = span(&b);
+        assert!(ao + al <= bo || bo + 4096 <= ao, "gifts {ao} and {bo} overlap");
+        let (given, free) = outbound_usage().unwrap();
+        assert_eq!(given + free, w.len);
+        drop(b);
+        let (given2, _) = outbound_usage().unwrap();
+        assert_eq!(given2, given - 4096, "a dropped gift did not return its bytes");
+
+        // The window is finite and says so with a number rather than panicking.
+        assert_eq!(
+            Handle::create_shared(w.len).unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
+
+        // And the coherency probe — the only other write path into a provided
+        // arena — cannot touch the window. Outside it, it still works.
+        assert_eq!(
+            guest_write(OUT, w.offset, b"probe").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            guest_write(OUT, w.offset - 2, b"probe").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "a write that only overlaps the window's first byte must still be refused"
+        );
+        guest_write(OUT, 0, b"probe").unwrap();
     }
 
     #[test]

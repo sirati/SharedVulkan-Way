@@ -71,6 +71,20 @@ pub struct Plan {
     pub len: u64,
     /// The run id the guest stamped, carried only so a log line can say it.
     pub run_id: u64,
+    /// The guest compositor's **outbound window**, `(offset, len)`, if it
+    /// declared one.
+    ///
+    /// STAGE 10. These bytes are the guest's to hand to clients — a keymap, a
+    /// clipboard offer — and this side's pool allocator must not hand them out
+    /// as well. It travels in the plan rather than in a flag on both programs
+    /// because the number is *decided* in the guest, by
+    /// `wc_handle::arena::reserve_outbound`, and the plan is already the
+    /// description of the region that crossed from there to here. A number
+    /// typed into two command lines is a number that can differ between them,
+    /// and the symptom of its differing is two allocators writing the same
+    /// bytes — pixels in a keymap, which presents as a client dying inside
+    /// libxkbcommon a long way from the flag.
+    pub outbound: Option<(u64, u64)>,
     pub runs: Vec<Run>,
 }
 
@@ -85,6 +99,7 @@ impl Plan {
         let mut object = PathBuf::new();
         let mut len = 0u64;
         let mut run_id = 0u64;
+        let mut outbound = None;
         let mut runs = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -106,6 +121,7 @@ impl Plan {
                 ["object", v] => object = PathBuf::from(v),
                 ["len", v] => len = num(v)?,
                 ["run", v] => run_id = num(v)?,
+                ["outbound", o, l] => outbound = Some((num(o)?, num(l)?)),
                 ["r", a, o, l] => runs.push(Run {
                     arena_offset: num(a)?,
                     file_offset: num(o)?,
@@ -128,7 +144,26 @@ impl Plan {
                 path.display()
             )));
         }
-        Ok(Plan { object, len, run_id, runs })
+        // The window has to be inside the arena, and it has to be the tail —
+        // which is what `reserve_outbound` produces and what this side's
+        // allocator can express by simply being shorter. A window in the middle
+        // would need a hole in the free list, and refusing here is better than
+        // silently allocating around only part of one.
+        if let Some((off, wlen)) = outbound {
+            if off.checked_add(wlen) != Some(len) {
+                return Err(bad(format!(
+                    "{}: an outbound window at {off}+{wlen} is not the tail of a {len}-byte arena",
+                    path.display()
+                )));
+            }
+            if wlen >= len {
+                return Err(bad(format!(
+                    "{}: an outbound window of {wlen} bytes leaves nothing of a {len}-byte arena",
+                    path.display()
+                )));
+            }
+        }
+        Ok(Plan { object, len, run_id, outbound, runs })
     }
 }
 
@@ -242,6 +277,15 @@ impl StitchedRegion {
         &self.origin
     }
 
+    /// The same bytes, for reading. STAGE 10: the guest's outbound window is
+    /// read from here while the pool path holds the writable half.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: as `as_mut_slice`, with `&self`, which rules out a `&mut`
+        // through this struct existing at the same time. The guest writes these
+        // bytes concurrently, which is the point of the region.
+        unsafe { std::slice::from_raw_parts(self.base.cast_const(), self.len) }
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: the whole reservation is mapped read-write by `attach`, which
         // refuses a plan that does not cover it, and `&mut self` is the only
@@ -325,6 +369,35 @@ mod tests {
         assert!(e.to_string().contains("4096 bytes of a 8192-byte arena"), "{e}");
     }
 
+    /// STAGE 10. The guest compositor's window, carried in the plan so that it
+    /// has one origin. The two refusals matter more than the parse: a window
+    /// that is not the tail cannot be expressed by shortening a free list, and a
+    /// window that is the whole arena leaves the pool allocator nothing — and
+    /// both would otherwise be discovered as a pool allocated on top of a live
+    /// keymap.
+    #[test]
+    fn an_outbound_window_is_read_and_must_be_the_tail() {
+        let (_d, p) = write_plan(
+            "object /proc/1/fd/9\nlen 8192\nrun 0x1\noutbound 4096 4096\nr 0 0x0 8192\n",
+        );
+        assert_eq!(Plan::read(&p).unwrap().outbound, Some((4096, 4096)));
+
+        let (_d2, p2) = write_plan(
+            "object /proc/1/fd/9\nlen 8192\nrun 0x1\noutbound 0 4096\nr 0 0x0 8192\n",
+        );
+        let e = Plan::read(&p2).unwrap_err();
+        assert!(e.to_string().contains("is not the tail"), "{e}");
+
+        let (_d3, p3) = write_plan(
+            "object /proc/1/fd/9\nlen 8192\nrun 0x1\noutbound 0 8192\nr 0 0x0 8192\n",
+        );
+        assert!(Plan::read(&p3).is_err(), "a window of the whole arena must be refused");
+
+        // And a plan without one is the pre-stage-10 plan, still read.
+        let (_d4, p4) = write_plan("object /proc/1/fd/9\nlen 8192\nrun 0x1\nr 0 0x0 8192\n");
+        assert_eq!(Plan::read(&p4).unwrap().outbound, None);
+    }
+
     #[test]
     fn an_empty_plan_is_refused() {
         let (_d, p) = write_plan("# nothing here\n");
@@ -351,6 +424,7 @@ mod tests {
             object: backing,
             len: 8192,
             run_id: 1,
+            outbound: None,
             runs: vec![
                 Run { arena_offset: 0, file_offset: 4096, len: 4096 },
                 Run { arena_offset: 4096, file_offset: 0, len: 4096 },

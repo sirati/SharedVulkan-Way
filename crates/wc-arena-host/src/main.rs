@@ -86,6 +86,19 @@ struct Args {
     verify: bool,
     poke: Option<(u64, String)>,
     watch: Option<(u64, u64)>,
+    /// STAGE 10. How many bytes at the end of the arena the guest compositor
+    /// reserved for the objects **it** creates for clients — a `wl_keyboard`
+    /// keymap first. Copied into the plan so that `wc-proxy`'s pool allocator
+    /// leaves them alone.
+    ///
+    /// This program does not decide the number and does not check it against
+    /// anything: it was decided by `wc_handle::arena::reserve_outbound` inside
+    /// the guest and printed on the compositor's own report line, exactly as the
+    /// run id and the page count were. Carrying it here rather than putting it
+    /// on `wc-proxy`'s command line as well keeps it a single value with a
+    /// single origin — two spellings of it could differ, and the symptom of
+    /// their differing is a pool allocated on top of a live keymap.
+    outbound: u64,
 }
 
 fn usage() -> &'static str {
@@ -97,6 +110,10 @@ usage: wc-arena-host --qmp <sock> --run <hex> --pages <n> --plan <path> [options
   --run 0xHEX       the run id the guest compositor printed
   --pages N         how many 4096-byte pages the arena is
   --plan PATH       where to write the plan wc-proxy reads
+
+  --outbound BYTES  the guest compositor reserved the last BYTES of the arena
+                    for objects it creates for clients; record it in the plan
+                    so wc-proxy's pool allocator leaves them alone
 
   --no-verify       skip the per-page index check (do not)
   --poke OFF:TEXT   write TEXT at arena offset OFF once the arena is mapped
@@ -114,6 +131,7 @@ fn parse() -> Result<Args, String> {
         verify: true,
         poke: None,
         watch: None,
+        outbound: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -129,6 +147,9 @@ fn parse() -> Result<Args, String> {
                     .map_err(|e| format!("--run {v}: {e}"))?;
             }
             "--pages" => a.pages = next()?.parse().map_err(|e| format!("--pages: {e}"))?,
+            "--outbound" => {
+                a.outbound = next()?.parse().map_err(|e| format!("--outbound: {e}"))?
+            }
             "--poke" => {
                 let v = next()?;
                 let (off, text) = v.split_once(':').ok_or("--poke wants OFFSET:TEXT")?;
@@ -252,8 +273,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    write_plan(&args.plan, &hostd.object, len, args.run_id, &hostd.runs)?;
+    if args.outbound >= len {
+        return Err(format!(
+            "--outbound {} leaves nothing of a {len}-byte arena for the proxy's pools",
+            args.outbound
+        )
+        .into());
+    }
+    write_plan(&args.plan, &hostd.object, len, args.run_id, args.outbound, &hostd.runs)?;
     println!("plan: {} ({} run(s), object {})", args.plan.display(), hostd.runs.len(), hostd.object);
+    if args.outbound > 0 {
+        println!(
+            "outbound: the last {} bytes (offset {}) are the guest compositor's",
+            args.outbound,
+            len - args.outbound
+        );
+    }
 
     // ------------------------------------------------------------------ live
     // The measurement docs/design.md §10.3 could not make about a file. Both
@@ -295,6 +330,7 @@ fn write_plan(
     object: &str,
     len: u64,
     run_id: u64,
+    outbound: u64,
     runs: &RunList,
 ) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
@@ -303,6 +339,12 @@ fn write_plan(
     writeln!(f, "object {object}")?;
     writeln!(f, "len {len}")?;
     writeln!(f, "run 0x{run_id:016x}")?;
+    if outbound > 0 {
+        // The guest compositor's own window, as `offset len`. Always the tail,
+        // which is what `wc_handle::arena::reserve_outbound` produces and what
+        // `wc_proxy::guestram::Plan::read` refuses anything else than.
+        writeln!(f, "outbound {} {outbound}", len - outbound)?;
+    }
     for r in runs.runs() {
         writeln!(f, "r {} 0x{:x} {}", r.extent_offset, r.file_offset, r.len)?;
     }

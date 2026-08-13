@@ -253,6 +253,16 @@ pub struct Stats {
     pub resize_overflows: u64,
     pub fds_received: u64,
     pub fds_materialised: u64,
+    /// Of those, the ones the compositor described as a **slice of the arena**
+    /// rather than as a file both sides can name.
+    ///
+    /// STAGE 10, and it is the §8.4 rule applied to the direction stage 6
+    /// opened: "a stage that added a second provider with no way to tell which
+    /// one ran would not really have added it". A keymap that crossed by arena
+    /// and a keymap that crossed by shared file produce byte-identical
+    /// characters in the client, so the only way to state which mechanism
+    /// carried it is to count them here, in the one function that opens them.
+    pub fds_from_arena: u64,
     pub messages_client: u64,
     pub messages_server: u64,
 }
@@ -272,7 +282,7 @@ impl Stats {
         };
         format!(
             "{} commits, {} copies, {mb:.2} MiB in {ms:.1} ms ({per}); \
-             {} pools ({} released, {} resizes, {} overflows); {} fds in, {} out; \
+             {} pools ({} released, {} resizes, {} overflows); {} fds in, {} out{}; \
              {} client msgs, {} server msgs",
             self.commits,
             self.copies,
@@ -282,6 +292,11 @@ impl Stats {
             self.resize_overflows,
             self.fds_received,
             self.fds_materialised,
+            if self.fds_from_arena > 0 {
+                format!(" ({} from the arena)", self.fds_from_arena)
+            } else {
+                String::new()
+            },
             self.messages_client,
             self.messages_server,
         )
@@ -741,13 +756,16 @@ impl Session {
                 })?;
                 let d = Descriptor::decode(bytes)
                     .map_err(|e| Error::Walk(format!("{interface}.{}: {e}", msg.name)))?;
-                let fd = materialise(&d).map_err(|e| Error::Materialise {
+                let fd = materialise(&d, &*self.transport).map_err(|e| Error::Materialise {
                     interface: interface.clone(),
                     message: msg.name.clone(),
                     descriptor: format!("{d:?}"),
                     source: e,
                 })?;
                 self.stats.fds_materialised += 1;
+                if matches!(d, Descriptor::ArenaSlice { .. }) {
+                    self.stats.fds_from_arena += 1;
+                }
                 fds.push(fd);
             }
         }
@@ -991,7 +1009,16 @@ fn copy_damage(
 /// **This opens a name; it does not receive a handle.** The compositor sent a
 /// path or an arena window; this side opens or slices it and produces an fd out
 /// of memory it already reaches. Nothing was passed.
-fn materialise(d: &Descriptor) -> io::Result<std::os::fd::OwnedFd> {
+///
+/// STAGE 10 gave it a second argument. An arena slice is not reachable by name
+/// from anywhere — that is what makes it the kind a compositor can create
+/// across a hypervisor with no shared filesystem — so the only way to read one
+/// is through the mapping this process already holds, which belongs to the
+/// transport (`crate::pool::PoolTransport::peer_slice`).
+fn materialise(
+    d: &Descriptor,
+    transport: &dyn crate::pool::PoolTransport,
+) -> io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
     match d {
         Descriptor::SharedFile { path, .. } => {
@@ -1023,13 +1050,29 @@ fn materialise(d: &Descriptor) -> io::Result<std::os::fd::OwnedFd> {
             let f = std::fs::File::open(name)?;
             Ok(OwnedFd::from(f))
         }
-        Descriptor::ArenaSlice { .. } => {
+        Descriptor::ArenaSlice { arena, offset, len } => {
             // A window into the arena has no fd of its own, so one is made:
             // a fresh anonymous object with the bytes copied into it. A copy
             // rather than a mapping because the client will be given this fd
             // and must not be able to write into the arena.
-            let mapping = wc_handle::Handle::from_descriptor(d.clone()).map()?;
-            let bytes = mapping.as_slice();
+            //
+            // **This is a keymap, or a clipboard offer, or an icon — not a
+            // frame.** It runs once per object the compositor creates, which is
+            // a handful per client, and the copy is what makes the client's fd
+            // a genuinely separate object it may do as it likes with. A frame
+            // goes the other way and never comes near this function.
+            let bytes = transport.peer_slice(*arena, *offset, *len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "the compositor described an object as arena {arena} \
+                         {offset}+{len}, which this proxy has no region for. Either it was \
+                         started with --transport shared-file while the compositor has an \
+                         --arena-outbound window, or the two disagree about the arena's \
+                         number or its length."
+                    ),
+                )
+            })?;
             // SAFETY: a NUL-terminated literal name and a valid flag.
             let fd = unsafe {
                 libc::memfd_create(c"wc-proxy-event".as_ptr(), libc::MFD_CLOEXEC)
@@ -1039,14 +1082,24 @@ fn materialise(d: &Descriptor) -> io::Result<std::os::fd::OwnedFd> {
             }
             // SAFETY: `fd` was just returned by `memfd_create` and is owned here.
             let owned = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            // `pwrite` rather than `write`, and it is not a style choice. A
+            // sequential write leaves the descriptor's file offset at the end,
+            // and the client is handed *that* descriptor: libwayland's keymap
+            // path `mmap`s and does not care, but anything that reads — a
+            // clipboard transfer, which is the next customer of this
+            // direction — would get zero bytes and no error. Writing at
+            // explicit offsets leaves the offset where a fresh descriptor's
+            // should be, which is 0.
             let mut written = 0usize;
             while written < bytes.len() {
-                // SAFETY: writing `bytes` through a live fd this function owns.
+                // SAFETY: writing `bytes` through a live fd this function owns,
+                // at an offset inside the range being written.
                 let n = unsafe {
-                    libc::write(
+                    libc::pwrite(
                         owned.as_raw_fd(),
                         bytes[written..].as_ptr().cast(),
                         bytes.len() - written,
+                        written as libc::off_t,
                     )
                 };
                 if n <= 0 {
