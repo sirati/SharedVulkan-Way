@@ -9777,3 +9777,400 @@ share, to re-learn a fact that does not depend on the platform).
    control-socket verb and a `FromUi` variant, and it should be done at the
    same time as `wl_touch` itself so that neither is scored against the other's
    absence.
+
+---
+
+## 38. Stage 38: the compositor learns where the screen is
+
+A user reported this:
+
+> "when opening a window close to a screen boundary the menu opens so that part
+> of it is outside of the display. ik that there is a wayland protocol for this
+> because on my native linux machine it knows how to place the menu, tooltips
+> and popups so that they stay on screen"
+
+They are right about the protocol. `xdg_positioner.set_constraint_adjustment`
+is how a client says which ways it is willing to have a popup moved —
+`slide_x`, `slide_y`, `flip_x`, `flip_y`, `resize_x`, `resize_y`, in that
+precedence, per axis — and **the compositor does the moving.** This compositor
+was not doing it, and the reason it was not doing it was written down.
+
+### 33.1 The comment was wrong, and the report is the disproof
+
+`state.rs`'s `new_popup` said:
+
+> What is deliberately **not** used here is `get_unconstrained_geometry`:
+> constraining a menu to the monitor is the compositor's job, and on Windows
+> the compositor that owns the monitor is Windows. Letting `SetWindowPos` place
+> it and reporting no constraint back is honest; recomputing it here would be a
+> second, disagreeing, opinion.
+
+The first sentence is right and the second does not follow. **`SetWindowPos`
+does not constrain anything.** It puts a window exactly where it is told, off
+the edge of the desktop if that is what the numbers say. Windows keeps a menu
+on screen only for menus *it* owns — the ones put up through `TrackPopupMenu`,
+which is a different API with a modal loop and a constraining placement policy
+of its own. An arbitrary `WS_POPUP`, which is what an `xdg_popup` is here
+(§15.6), gets no such treatment.
+
+So "the compositor that owns the monitor is Windows" is a true statement about
+*ownership* and a false statement about *behaviour*, and the code depended on
+the second. Nothing constrained the popup, and the user watched a menu hang off
+the side of their screen. `reposition_request` carried the same reasoning in
+its own words — *"this compositor does not know where the parent window is on
+the Windows desktop, so it cannot tell whether the result would be
+off-screen"* — and that sentence was the actually true one. It was a statement
+about a missing input, not about whose job it was. This stage supplies the
+input.
+
+### 33.2 The naming trap, stated before anything else
+
+smithay's two functions read backwards, and getting them the wrong way round
+produces a compositor that looks like it is trying:
+
+* **`PositionerState::get_geometry()`** is the *unconstrained* rectangle — the
+  positioner's raw arithmetic, anchor rectangle and anchor edge and gravity and
+  offset, with the constraint adjustment ignored.
+* **`PositionerState::get_unconstrained_geometry(target)`** is the
+  *constrained* one. "Unconstrained" means "adjusted until it no longer
+  violates the constraint", i.e. the popup is no longer constrained *by* the
+  target. It is the one that applies `slide`, `flip` and `resize`.
+
+`constrain()` in `state.rs` is now the only caller of either, and its doc
+comment says this again, because the next person to read the two names will
+have the same problem.
+
+### 33.3 Where the constraint is applied, and why it cannot be anywhere else
+
+In `state.rs`, on the Wayland thread, before the first `configure`.
+
+Not in `win32.rs` at `SetWindowPos` time, which is where the monitor is known
+and where it would be one line. The protocol has the compositor *tell the
+client* where the popup ended up: the `xdg_popup.configure` carries the
+rectangle, and the client draws its menu, positions its submenus and does its
+keyboard navigation against that rectangle. A compositor that moved the `HWND`
+and reported the unmoved rectangle would have the pixels in one place and the
+client's idea of them in another, which is a worse bug than the one being
+fixed, because it is invisible until a submenu opens in the wrong place.
+
+And the precedence is **not reimplemented**. `get_unconstrained_geometry`
+implements the order the XML fixes — flip, then slide, then resize, per axis,
+with a flip that fails to help reverted — and the one implementation of that
+rule in this tree should be the one generated from the same XML the client
+read. A client that declared only `slide_x` must never be flipped, and that
+rule is the whole of the protocol's contract here.
+
+### 33.4 So the monitor has to reach the Wayland thread
+
+`MonitorFromWindow` needs an `HWND`, and an `HWND` belongs to the thread that
+created it (§8's header). The Wayland thread may not call it. A
+request-and-wait across the boundary would deadlock the first time the UI
+thread was inside a modal loop — a window drag, a system menu, `TrackPopupMenu`
+itself.
+
+So it is a **cache**, `platform::PopupBounds`, which is an
+`Arc<Mutex<Option<Rect>>>` per window: the same shape as the `Shadow` that
+already crosses (§8), created by `state.rs` at `ToUi::Create`, written by the
+UI thread, read by the Wayland thread when a popup is parented to that window.
+It holds **the rectangle that window's popups must stay inside, in that
+window's own window-geometry coordinates** — already converted, so the Wayland
+side does no geometry at all.
+
+The UI thread refreshes it at four moments, and each is a way the answer can
+change:
+
+| when | what changed |
+|---|---|
+| `create_window` | there is now a window to ask about |
+| `WM_WINDOWPOSCHANGED` | it moved, possibly onto another monitor |
+| `WM_DISPLAYCHANGE` | the resolution or the monitor layout changed |
+| `WM_SETTINGCHANGE` | the taskbar moved, resized, or became auto-hiding |
+
+The last two are the ones a "refresh it when the window moves" design would
+miss: `rcWork` changes without any window moving. All three messages fall
+through to `DefWindowProc` rather than returning 0 — `WM_WINDOWPOSCHANGED`'s
+default handler is what generates `WM_SIZE` and `WM_MOVE`, and swallowing it
+would take the whole resize negotiation with it.
+
+**What the cache costs is stated rather than hidden**: a menu opened in the
+same millisecond that its window is dragged onto a second monitor can be
+constrained against the monitor it just left. Windows sends
+`WM_WINDOWPOSCHANGED` for every step of a drag, so the cache is at most one
+message stale. `None` — nothing has said yet — means *do not constrain*, which
+is the pre-stage-38 behaviour and is a known-wrong answer rather than a guess.
+
+### 33.5 Three ways to get the rectangle wrong, all silent
+
+**`MonitorFromWindow(parent)`, not the primary monitor.** `GetSystemMetrics`
+with `SM_CXSCREEN` is shorter, and it describes the *primary* display: on a
+two-monitor desktop every menu on the second screen would be shoved back
+towards the first. That is invisible on a single-monitor test machine, which is
+every test machine this project has. `MONITOR_DEFAULTTONEAREST` also answers
+for a window dragged mostly off the desktop, where `MONITOR_DEFAULTTONULL`
+would answer nothing.
+
+**`rcWork`, not `rcMonitor`.** The work area is the monitor minus the taskbar
+and any other appbar. A menu slid until its last row is behind the taskbar is
+exactly as unusable as one off the screen, and it looks deliberate. `rcWork` is
+also what Windows' own menus respect, so this is the choice that makes our
+menus behave like the ones next to them.
+
+**The coordinates are converted, not assumed.** `rcWork` is in screen
+coordinates; `xdg_positioner` works in the parent's window-geometry
+coordinates. Both corners go through `ScreenToClient` and then through
+`WindowState::to_surface` — *the same* conversion the pointer and the touch
+paths use (§6, §20), not a second one. This is the part that would fail
+plausibly: with the conversion wrong, a menu is constrained against a rectangle
+that is the right size and in the wrong place, so it looks right in the common
+case where the window is near the top left of the screen and is wrong
+everywhere else. Sharing the conversion with the input paths means a menu
+cannot be constrained against a rectangle that disagrees with where the clicks
+are.
+
+### 33.6 `reposition_request` needed the same treatment, for a reason worth naming
+
+`xdg_popup.reposition` (§18.6) had the same raw call, and fixing only
+`new_popup` would have produced a compositor that was right once. GTK opens a
+submenu wherever the positioner first says and *then* repositions it with a
+second positioner carrying the constraint adjustment; a compositor that
+constrains at creation and not at reposition moves the menu on screen and then
+puts it back off again on the next keystroke.
+
+The bounds used there belong to the **parent**, not to the popup being moved:
+the positioner's rectangle is in the parent's coordinates and so is the answer.
+A popup cannot be reparented, but its parent can certainly have been dragged to
+another monitor since it was mapped.
+
+### 33.7 The synthetic Win32 could not see a popup at all
+
+`crate::control` (§26.4) is the stand-in for Windows that the conformance suite
+drives. It knew where every window was **except** the ones whose position this
+compositor chooses: WLCS positions the windows *it* creates, and it never
+positions a popup, because in Wayland a popup's position is not the suite's to
+choose. So every popup sat at (0, 0) in the stand-in's hit test.
+
+That is why the whole `XdgPopupPositionerTest` family failed even for cases
+with no constraint in them at all: the suite's `surface_actually_at_location`
+moves the pointer to where it expects the menu and asks the client what is
+under the cursor, and it was being told about whatever was at the top left of
+the screen. Two facts had to reach `control.rs` for the family to mean
+anything:
+
+1. **where a popup is** — `Rect::popup_at` now carries `(parent, x, y)`, and
+   `origin()` walks up the chain, so a submenu three levels deep resolves
+   through its menu and its window;
+2. **where the screen is** — `publish_bounds` writes the same
+   `PopupBounds` cell the real platform writes, from the one advertised output
+   minus the window's position. A window at (5, 5) on a 1920x1080 output is
+   told `(-5, -5, 1920, 1080)`, and a popup of that window at (-60, -40) is
+   then visibly 55 pixels off the left edge and can be slid back on.
+
+This is the shape the harness is supposed to have (§26.4): the stand-in does
+what Windows does, at the same seam, and when it does not, it is a statement
+about the stand-in rather than about the compositor.
+
+### 33.8 The measurement: 47 verdicts moved, all of them the right way
+
+`scripts/wc-wlcs.sh headless`, the same command before and after, on this tree:
+
+| | before | after |
+|---|---:|---:|
+| passed | 230 | **277** |
+| failed | 236 | **189** |
+| skipped | 759 | 759 |
+
+1,225 verdicts joined by test name: **47 moved, every one of them FAIL to
+PASS, and nothing regressed.** The before column is exactly §26.6's recorded
+baseline, which is the check that the two runs are comparable.
+
+| suite | failures before | after |
+|---|---:|---:|
+| `Gravity/XdgPopupPositionerTest` | 9 | 0 |
+| `Anchor/XdgPopupPositionerTest` | 8 | 0 |
+| `AnchorRect/XdgPopupPositionerTest` | 6 | 0 |
+| `ConstraintAdjustmentSlide/XdgPopupPositionerTest` | 5 | 0 |
+| `ConstraintAdjustmentFlip/XdgPopupPositionerTest` | 5 | 0 |
+| `ConstraintAdjustmentResize/XdgPopupPositionerTest` | 5 | 0 |
+| `ConstraintAdjustmentNone/XdgPopupPositionerTest` | 5 | 0 |
+| `Default/XdgPopupPositionerTest` | 1 | 0 |
+| `XdgPopupStable/XdgPopupTest` | 6 | 4 |
+| `XdgPopupTest` | 4 | 3 |
+
+**The 44-failure `xdg_positioner` cluster — the second largest on the
+scoreboard, and §26.12 item 2 — is gone entirely.** Three more went with it.
+
+The `ConstraintAdjustmentSlide` cases are the ones that show the fix rather
+than the bookkeeping: before, the compositor answered `(-60, -40)` where the
+suite wanted `(-5, -5)`; the popup was off the top left of the output and the
+client had declared `slide_x | slide_y`. That is the user's bug, in a
+conformance suite, and it had been failing since stage 9.
+
+Seven popup failures remain and none of them is placement:
+
+* `zero_size_anchor_rect_stable` — a **protocol error** test: the positioner is
+  invalid and the compositor must raise `invalid_input`. §26.12 item 3.
+* `when_parent_surface_is_moved_a_reactive_popup_is_moved` and
+  `..._a_nonreactive_popup_is_not_moved` — both drive
+  `xdg_toplevel.move` and expect the *parent* to move. On the headless leg
+  nothing implements an interactive move, so the parent never moves and the
+  test cannot pass for a reason that has nothing to do with popups. `reactive`
+  is also unimplemented: this compositor does not re-run a positioner when the
+  parent moves, and after this stage it finally *could* — see 33.12.
+* four `grabbed_popup*` cases — popup grab semantics: dismissal order,
+  keyboard focus, and the one-click-per-level behaviour §18.6 already records.
+
+### 33.9 The desktop, which is where the report came from
+
+WLCS runs against the Linux build and a synthetic Win32. The bug was reported
+against a real screen with a real taskbar, so it is checked there too, with
+`scripts/wc-popup.sh` — the compositor on the guest's interactive desktop
+(§13), Firefox on the other side of the hypervisor, the parent window moved to
+the bottom right corner of the work area, and a **real** right-click from
+`SetCursorPos` plus `mouse_event`, so the press is routed by Windows exactly as
+a hand's would be.
+
+The work area on that guest is 1280x752: a 1280x800 screen with a 48-pixel
+taskbar.
+
+| | menu rectangle, in screen coordinates | inside the work area |
+|---|---|---|
+| before | 214x236 at 1213, 688 | **no** — 147 px past the right edge, 172 px below the work area |
+| after | 214x236 at 1047, 454 | **yes** |
+
+`docs/stage38/stage38-screen-before.png` is the user's report, photographed:
+Firefox's context menu with only the first few pixels of "Save Page As…" and
+"Select All" visible at the edge of the screen and the rest of the menu
+nowhere. `docs/stage38/stage38-screen-after.png` is the same click on the same
+machine with this stage's binary: the whole menu, flipped up and to the left,
+sitting above the taskbar.
+
+**And the negative check, which is the same bug wearing different clothes.** A
+constraint that fires when it should not is not better than one that never
+fires — it moves a menu the client placed deliberately. Two things check it:
+
+* `weston-terminal` sets anchor, size and gravity and **no constraint
+  adjustment at all** (measured with `WAYLAND_DEBUG=1`; Firefox sets 63, which
+  is all six bits). Its menu is therefore entitled to hang off the screen, and
+  on the guest it does, at exactly the rectangle the positioner asked for and
+  not one pixel from it. The script knows the difference and scores it as the
+  control rather than as a failure.
+* `a_menu_that_fits_is_placed_exactly_where_the_positioner_asked` in
+  `state.rs`'s tests asserts equality with `get_geometry()` for a menu in the
+  middle of the screen, so the "does not fire" case is in the ordinary gate and
+  not only on a guest.
+
+The compositor now logs what the client declared on every popup —
+`adjust ConstraintAdjustment(SlideX | ... )` — because that is the first
+question to ask of any future report that a menu is in the wrong place, and
+without it the answer needs a Wayland trace.
+
+### 33.10 The same knowledge fixes the window, not only the menu
+
+Once a window can be asked which monitor it is on, two things that were nobody's
+job become one line each, and both were visible in the "before" photograph: our
+Firefox window is 1296x820 at (-16, -68) on a 1280x800 screen — wider than the
+display, with its title bar above the top of it.
+
+**The `wl_output` is now the work area.** Until this stage the one output was
+`--output WxH` and nothing else, with a default of 1920x1080 that was true of
+no particular machine — and the comment on that argument named the debt: *"the
+Win32 platform ought to override it with the real monitor and does not yet"*.
+It does now, from `SPI_GETWORKAREA` at startup, and `--output` still wins so a
+conformance run gets the desktop it asked for. This is the fix that arrives
+*first*: a client sizes itself against the output, so telling it the truth
+prevents the bad size instead of correcting it, and a browser reflowing after a
+correction is visible.
+
+**And the window is fitted to the work area at map time**, because a client may
+ask for any size regardless of what the output says. `fit_to_work_area` caps
+the size and then *bounds* — never chooses — the position. A window that
+already fits is not moved at all: `CW_USEDEFAULT`'s cascade is not wrong, it is
+merely unbounded, and a few windows into it the next one is off the bottom
+right corner.
+
+Fitting the whole outer rectangle is deliberately stronger than "keep the title
+bar on screen", and cheaper: there is no arrangement in which the frame fits
+inside the work area and the caption does not, so it needs no knowledge of
+where the caption is or how tall it is at this DPI and this theme. The
+arithmetic is in `platform/mod.rs` rather than in `win32.rs` so that it is
+tested by the ordinary gate on a machine with no monitor; the Win32 side is
+then only the two system calls that say where the work area is.
+
+Two details in that path cost more thought than the clamp:
+
+* **`AdjustWindowRectEx` is given the window's live style**, read with
+  `GetWindowLongPtrW(GWL_STYLE)`, not the constant `create_window` used. They
+  are the same today and would silently stop being the same the moment a window
+  is given a different frame — §22's title-bar work is exactly that — and the
+  failure would be a non-client inset wrong by a caption's height.
+* **A window that was made smaller must be told.** `map_window` sets
+  `self_driven` around its `SetWindowPos` so that the `WM_SIZE` it provokes is
+  not echoed back to the client as a configure — which is right when the size
+  is the one the client asked for and *wrong* when it is not. It is now
+  suppressed only when nothing changed, and `last_configured` records what the
+  window actually got, so the next real resize is compared against a size this
+  window has had.
+
+### 33.11 What was learned about monitor geometry, since two other sections asked
+
+`EnumDisplayMonitors` and `GetDpiForWindow` appeared nowhere in this tree
+before this stage; `GetSystemMetrics(SM_CXSCREEN)` was printed once at startup
+and used for nothing. §15.15 item 3, §18.11 item 5 and §26.12 item 2 all ask
+for somebody to go and ask Windows where things are. This is the first section
+that did, so what it found is worth writing down plainly:
+
+1. **A window's monitor is a question with a cheap answer.**
+   `MonitorFromWindow` + `GetMonitorInfoW` is two calls, no allocation, no
+   registration, and it is safe to make on every `WM_WINDOWPOSCHANGED`. There
+   is no reason for anything in this tree to reason about "the screen" from
+   `SM_CXSCREEN` again.
+2. **The work area is a different rectangle from the monitor, and it is
+   usually the one you want.** Everything user-visible — where a window opens,
+   how large a maximised window is, where a menu may go — is `rcWork`.
+   `rcMonitor` is for full-screen.
+3. **The compositor still advertises exactly one `wl_output`, and now it is a
+   truthful one.** That is not multi-monitor support. A second monitor needs a
+   second `wl_output` with its own position in a global compositor coordinate
+   space, `wl_surface.enter`/`leave` as a window is dragged between them, and a
+   scale factor per output; this stage adds none of it and does not pretend to.
+   What it does add is the first place where the answer is measured rather than
+   assumed, which is where that work would start.
+4. **Scale is still hard-coded to 1** and this stage does not touch it. It is
+   now visibly the *next* untrue number: `GetDpiForWindow` exists, the
+   compositor already prints the per-window DPI at map (§13), and
+   `wp_fractional_scale_manager_v1` is a recorded gap on the scoreboard. A
+   150% desktop would want all of it at once, and half of it would be worse
+   than none.
+
+Both are deliberately out of scope and both are unowned. The one thing this
+stage does for them is that `PopupBounds` is per-window rather than global, so
+a second monitor changes what is written into it and nothing that reads it.
+
+### 33.12 What is left
+
+1. **`reactive` popups.** `xdg_positioner.set_reactive` asks the compositor to
+   re-run the positioner when the parent moves. Before this stage there was
+   nothing to re-run it *against*; now there is, and the input is already
+   refreshed on `WM_WINDOWPOSCHANGED` — the same message that would trigger it.
+   It is two WLCS tests and one real behaviour: a menu that stays on screen
+   when its window is dragged towards an edge.
+2. **The protocol errors** — `invalid_input` for a zero-sized anchor rectangle
+   and the rest. §26.12 item 3, and still the cheapest thing on that list.
+3. **A popup stack rather than one grabbing popup** (§18.6), which is what the
+   four remaining `grabbed_popup*` failures are about.
+4. **`scripts/wc-desktop.sh window` does not run in this tree.** It builds
+   `crates/wc-arena-host`, which the unified merge deleted — the workspace
+   `Cargo.toml` records the deletion, and `wc-guest.sh` and
+   `sv-firefox-guest.sh` reference it too. `scripts/wc-popup.sh` therefore uses
+   the shared-file transport, which needs no QMP, no root and no locate step;
+   it is what §32's runs against this same guest are using. Whoever owns the
+   arena harnesses should either restore the crate or move those scripts over.
+5. **Two harness lessons, both of which produced a wrong green or a wrong
+   picture before they were understood.** A capture that fails writes nothing,
+   so the previous run's file gets fetched and reported as this run's — the
+   only tell was a four-minute-old clock in the corner of a screenshot, and the
+   fix is to delete the old file before the run rather than to trust the new
+   one. And **a menu is a grab**: it is gone the moment anything else takes the
+   focus, so the photograph has to be taken by the same process that clicked,
+   polling for the popup, rather than by a second scheduled task two seconds
+   later.

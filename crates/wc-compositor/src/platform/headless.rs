@@ -295,6 +295,9 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             },
             click: config.click,
         },
+        // STAGE 38: no monitor here, so no work area. `--output` stays the
+        // whole answer, which is what the conformance leg needs.
+        None,
     ))
 }
 
@@ -333,6 +336,13 @@ impl PumpInner {
                 app_id,
                 shadow,
                 kind,
+                // STAGE 38: deliberately dropped. There is no monitor here, so
+                // there is no work area to answer with, and a headless run with
+                // no `--control` must leave popups unconstrained rather than
+                // invent a screen. Where something *is* standing in for Windows
+                // — the conformance leg — `crate::control` fills the same cell
+                // from the advertised output.
+                bounds: _,
             } => {
                 // The kind is logged rather than acted on: there is no window
                 // manager here to place a popup against, and the harness reads
