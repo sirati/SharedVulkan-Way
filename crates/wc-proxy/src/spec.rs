@@ -163,6 +163,24 @@ impl Spec {
         // says so instead of desynchronising.
         spec.load(include_str!("../protocols/xdg-decoration-unstable-v1.xml"))?;
         spec.load(include_str!("../protocols/server-decoration.xml"))?;
+        // ADDED FOR STAGE 12 (docs/design.md §23). `wp_cursor_shape_v1`, so a
+        // client can say "I-beam" instead of shipping cursor pixels.
+        //
+        // It is a **staging** protocol and the copy is taken from the same
+        // `wayland-protocols 0.32.12` the compositor's smithay generates its
+        // server half from, for the reason at the top of this function: a
+        // proxy whose table came from a different revision of the XML than the
+        // compositor's dispatch is a proxy that desynchronises on an argument
+        // nobody changed on purpose.
+        //
+        // Two interfaces, no `h` argument in either, and one loose end worth
+        // naming: `wp_cursor_shape_manager_v1.get_tablet_tool_v2` takes a
+        // `zwp_tablet_tool_v2` that no file here defines. That is fine and is
+        // not an oversight — an `object` argument is four bytes whatever it
+        // points at, and the proxy only needs a definition for an interface
+        // whose *own* messages it has to walk. No tablet global is advertised,
+        // so no client can obtain one to send.
+        spec.load(include_str!("../protocols/cursor-shape-v1.xml"))?;
         Ok(spec)
     }
 
@@ -302,10 +320,10 @@ mod tests {
     fn the_builtin_protocols_parse() {
         let s = spec();
         // 23 in wayland.xml, 5 in xdg-shell.xml, 2 in each of the two
-        // decoration protocols, counted with grep. A number rather than "not
-        // empty", so that a parser that silently dropped a trailing interface
-        // would be caught.
-        assert_eq!(s.len(), 32, "interfaces: {:?}", s.names());
+        // decoration protocols, and 2 in cursor-shape-v1.xml, counted with
+        // grep. A number rather than "not empty", so that a parser that
+        // silently dropped a trailing interface would be caught.
+        assert_eq!(s.len(), 34, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,
@@ -393,6 +411,43 @@ mod tests {
         assert_eq!(s.request("xdg_wm_base", 2).unwrap().name, "get_xdg_surface");
         assert_eq!(s.request("xdg_surface", 1).unwrap().name, "get_toplevel");
         assert_eq!(s.event("xdg_toplevel", 1).unwrap().name, "close");
+    }
+
+    /// The protocol stage 12 added, and the two messages the proxy will
+    /// actually see on the wire.
+    ///
+    /// Both opcodes are 1 because `destroy` is opcode 0 in each interface,
+    /// which is the sort of thing that is obvious until it is not: getting
+    /// either wrong makes the proxy walk a `destroy` — no arguments — as a
+    /// message that has two, and §8.9's silent desynchronisation follows.
+    #[test]
+    fn cursor_shape_is_walkable() {
+        let s = spec();
+
+        let m = s.request("wp_cursor_shape_manager_v1", 1).unwrap();
+        assert_eq!(m.name, "get_pointer");
+        assert_eq!(
+            m.args.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [ArgKind::NewId, ArgKind::Object]
+        );
+        assert_eq!(
+            m.args[0].interface.as_deref(),
+            Some("wp_cursor_shape_device_v1")
+        );
+
+        let m = s.request("wp_cursor_shape_device_v1", 1).unwrap();
+        assert_eq!(m.name, "set_shape");
+        // A serial and an enum: eight bytes of body and nothing else. This is
+        // the whole reason the named half is the cheap half.
+        assert_eq!(
+            m.args.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [ArgKind::Word, ArgKind::Word]
+        );
+        assert!(!m.has_fd());
+
+        // Neither interface has an event at all, so the reverse direction has
+        // nothing to walk.
+        assert!(s.event("wp_cursor_shape_device_v1", 0).is_none());
     }
 
     #[test]

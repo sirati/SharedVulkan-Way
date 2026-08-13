@@ -78,12 +78,28 @@ use smithay::reexports::wayland_protocols_misc::server_decoration::server
 use smithay::reexports::wayland_server::WEnum;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+// ADDED FOR STAGE 12 (docs/design.md §23), the cursor.
+//
+// `CursorShapeManagerState` is `wp_cursor_shape_v1`: a client names a shape
+// instead of shipping pixels, which is what GTK4 binds and is the half of the
+// problem that maps onto `LoadCursorW` with nothing in between.
+//
+// `TabletSeatHandler` is here for a reason that is not about tablets.
+// `wp_cursor_shape_manager_v1` has a `get_tablet_tool_v2` request beside its
+// `get_pointer`, so smithay's dispatch for the manager is bounded on both
+// handlers and the protocol cannot be delegated without implementing it. The
+// trait's one method has a default body and this compositor keeps it: there is
+// no `zwp_tablet_manager_v2` global, so no client can ever obtain a tablet tool
+// to set an image on.
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::seat::CURSOR_IMAGE_ROLE;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_kde_decoration, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_kde_decoration,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
-use crate::platform::{FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
+use crate::platform::{CursorSpec, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
 use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource};
 
 /// What kind of shell surface a window is.
@@ -192,8 +208,32 @@ pub struct State {
     /// they happen wherever the last motion was — so the compositor has to
     /// remember.
     pointer_at: (f64, f64),
-    /// Said once, the first time a client sets a cursor. See [`SeatHandler`].
-    cursor_noted: bool,
+    /// `wp_cursor_shape_v1`, held only so the global outlives the display.
+    ///
+    /// ADDED FOR STAGE 12. Named with a leading underscore for the same reason
+    /// as `_data_device`: nothing calls a method on it, and dropping it would
+    /// destroy the global.
+    _cursor_shape: CursorShapeManagerState,
+    /// The surface a client last handed to `wl_pointer.set_cursor`, if the
+    /// last thing it asked for was pixels rather than a name.
+    ///
+    /// ADDED FOR STAGE 12. Kept so that a *later* commit on that surface —
+    /// which is how an animated cursor advances, and how a client that
+    /// changes shape without a new `set_cursor` works — is recognised as a
+    /// cursor frame rather than as content nobody wants.
+    cursor_surface: Option<WlSurface>,
+    /// The pixels of the last cursor-role surface to commit, and which surface
+    /// they came from.
+    ///
+    /// **This is a cache, and it exists because the two requests arrive in
+    /// either order.** A client may `set_cursor(surface)` and *then* attach and
+    /// commit the buffer (GTK does), or attach and commit and *then*
+    /// `set_cursor` (Qt does). In the first order the commit is what has the
+    /// pixels; in the second the `set_cursor` is, and by then smithay has
+    /// already taken the buffer out of the surface's pending state and it
+    /// cannot be read again. One slot covers both, because a client has one
+    /// cursor at a time.
+    cursor_pixels: Option<(WlSurface, IconImage)>,
 
     ui: Ui,
     events: Receiver<FromUi>,
@@ -257,23 +297,33 @@ impl ClientData for ClientState {
     }
 }
 
-/// How fast a held key repeats, and how long before it starts.
-///
-/// **The compositor does not repeat anything.** `wl_keyboard.repeat_info` is
-/// advertised and the *client* runs the timer, which is how the protocol is
-/// specified and is why a Wayland client's key repeat keeps working while the
-/// compositor is busy. Windows repeats too — a held key produces a stream of
-/// `WM_KEYDOWN` with the "previous state" bit set — and forwarding those as
-/// well would give a client two repeat streams at different rates. So they are
-/// dropped, in `win32.rs`, and this is the only rate anyone sees.
-///
-/// The numbers are Windows' own defaults expressed the way Wayland wants them:
-/// `SPI_GETKEYBOARDDELAY` 1 is 500 ms, `SPI_GETKEYBOARDSPEED` is around 30/s at
-/// its default. Reading the real values is a `SystemParametersInfo` call and is
-/// noted in the design as not done, rather than guessed at silently.
-const REPEAT_DELAY_MS: i32 = 500;
-const REPEAT_RATE_HZ: i32 = 30;
-
+// How fast a held key repeats, and how long before it starts.
+//
+// **The compositor does not repeat anything.** `wl_keyboard.repeat_info` is
+// advertised and the *client* runs the timer, which is how the protocol is
+// specified and is why a Wayland client's key repeat keeps working while the
+// compositor is busy. Windows repeats too — a held key produces a stream of
+// `WM_KEYDOWN` with the "previous state" bit set — and forwarding those as
+// well would give a client two repeat streams at different rates. So they are
+// dropped, in `win32.rs`, and this is the only rate anyone sees.
+//
+// > **[SUPERSEDED — 2026-08-13, see docs/design.md §23.5]** The numbers are
+// > Windows' own defaults expressed the way Wayland wants them:
+// > `SPI_GETKEYBOARDDELAY` 1 is 500 ms, `SPI_GETKEYBOARDSPEED` is around 30/s
+// > at its default. Reading the real values is a `SystemParametersInfo` call
+// > and is noted in the design as not done, rather than guessed at silently.
+// >
+// >     const REPEAT_DELAY_MS: i32 = 500;
+// >     const REPEAT_RATE_HZ: i32 = 30;
+//
+// The call is now made: `crate::platform::keyboard_repeat` reads both settings
+// and converts them, and the two constants are gone. They were the same
+// mistake as the cursor in miniature — a number this compositor invented and
+// advertised as if it had been asked for — and a user who had moved the
+// Control Panel slider got the default in every Wayland client and their own
+// rate in every native one. The headless platform still returns 500 and 30,
+// because there is no Windows there to ask and the harness must not depend on
+// the build host's desktop settings.
 impl State {
     pub fn new(
         dh: &DisplayHandle,
@@ -310,16 +360,19 @@ impl State {
             );
             crate::input::layout(crate::input::FALLBACK)
         });
+        // ADDED FOR STAGE 12: asked for, not assumed. See the block comment
+        // above, and `platform::keyboard_repeat`.
+        let (repeat_delay_ms, repeat_rate_hz) = crate::platform::keyboard_repeat();
         let keyboard = chosen.and_then(|l| {
             match seat.add_keyboard(
                 XkbConfig { keymap: Some(l.keymap), ..XkbConfig::default() },
-                REPEAT_DELAY_MS,
-                REPEAT_RATE_HZ,
+                repeat_delay_ms,
+                repeat_rate_hz,
             ) {
                 Ok(k) => {
                     println!(
                         "wc-compositor: seat0 keyboard: layout {} ({} bytes of keymap), \
-                         repeat {REPEAT_RATE_HZ}/s after {REPEAT_DELAY_MS} ms",
+                         repeat {repeat_rate_hz}/s after {repeat_delay_ms} ms",
                         l.name,
                         l.keymap.len()
                     );
@@ -444,7 +497,12 @@ impl State {
             keyboard_focus: None,
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
-            cursor_noted: false,
+            // ADDED FOR STAGE 12. Version 2 of the protocol, which is what
+            // smithay's global advertises and what adds `dnd_ask` and
+            // `all_resize` to the shape enum.
+            _cursor_shape: CursorShapeManagerState::new::<State>(dh),
+            cursor_surface: None,
+            cursor_pixels: None,
             ui,
             events,
             sources: vec![Box::new(ShmSource)],
@@ -1118,6 +1176,94 @@ impl State {
         );
         self.ui.send(ToUi::Icon { id, icons });
     }
+
+    /// Is this surface a client's cursor image?
+    ///
+    /// ADDED FOR STAGE 12. `wl_pointer.set_cursor` gives the surface the
+    /// `"cursor_image"` role and smithay refuses to give it any other, so the
+    /// role is the authority on the question — better than comparing against
+    /// [`Self::cursor_surface`], which is only set once the compositor has been
+    /// *told* about the surface and is therefore empty for the first commit of
+    /// a client that attaches before it calls `set_cursor`.
+    fn is_cursor_surface(surface: &WlSurface) -> bool {
+        compositor::get_role(surface) == Some(CURSOR_IMAGE_ROLE)
+    }
+
+    /// A cursor-role surface committed a buffer: keep its pixels, and if it is
+    /// the cursor the pointer is wearing, show them.
+    ///
+    /// ADDED FOR STAGE 12. Called from `commit` **before** the ordinary path,
+    /// and it does not divert it: whether a cursor surface is also composited
+    /// as content is a scene-graph question and is answered in `present` /
+    /// `compose_tree`, not here. This function only reads.
+    ///
+    /// The buffer is read through the same [`PixelSource`] list a window's
+    /// buffer goes through, so a cursor whose pixels live in the arena rather
+    /// than in a `wl_shm` pool costs nothing extra here.
+    fn cursor_committed(&mut self, surface: &WlSurface, buffer: &wl_buffer::WlBuffer) {
+        let mut got = None;
+        for source in &self.sources {
+            let mut taken = None;
+            match source.with_pixels(buffer, &mut |bytes, spec| {
+                taken = crate::icon::image_from_bytes(bytes, spec);
+            }) {
+                Ok(()) => {
+                    got = taken;
+                    break;
+                }
+                Err(PixelError::UnknownSource) => continue,
+                Err(e) => {
+                    eprintln!("wc-compositor: cursor buffer: {e}");
+                    break;
+                }
+            }
+        }
+        let Some(image) = got else {
+            eprintln!("wc-compositor: a cursor surface committed a buffer that could not be read");
+            return;
+        };
+
+        self.cursor_pixels = Some((surface.clone(), image));
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.send_cursor_surface(&surface.clone());
+        }
+    }
+
+    /// Send the cached pixels of `surface` to the platform, if they are the
+    /// ones it holds.
+    ///
+    /// The hotspot is read here rather than cached with the pixels, because it
+    /// is a property of the `set_cursor` request and not of the buffer: a
+    /// client may move the hotspot without redrawing. smithay has already
+    /// divided out the client's buffer scale by the time it is in the data map.
+    fn send_cursor_surface(&mut self, surface: &WlSurface) {
+        let Some((cached, image)) = self.cursor_pixels.as_ref() else {
+            return;
+        };
+        if cached != surface {
+            return;
+        }
+        let image = image.clone();
+
+        let (hotspot_x, hotspot_y) = compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .get::<smithay::input::pointer::CursorImageSurfaceData>()
+                .map(|d| {
+                    let a = d.lock().unwrap();
+                    (a.hotspot.x, a.hotspot.y)
+                })
+                // A cursor surface that has never been through `set_cursor` has
+                // no hotspot recorded. Zero is the protocol's own default and
+                // is what `set_cursor` would have written.
+                .unwrap_or((0, 0))
+        });
+
+        self.ui.send(ToUi::Cursor {
+            spec: CursorSpec::Image { image, hotspot_x, hotspot_y },
+        });
+    }
+
     /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
     /// what that changed and how big the result is.
     ///
@@ -1370,7 +1516,18 @@ impl CompositorHandler for State {
             .unwrap_or(false);
 
         match buffer {
-            Some(BufferAssignment::NewBuffer(buffer)) => self.present(surface, &buffer, rects),
+            Some(BufferAssignment::NewBuffer(buffer)) => {
+                // ADDED FOR STAGE 12 (docs/design.md §23). A cursor surface's
+                // buffer is read for the `HCURSOR` and then handed on
+                // unchanged — this reads and does not divert, so what the
+                // scene graph does with a cursor surface stays the scene
+                // graph's decision. `present` releases the buffer, which is
+                // why this runs first.
+                if Self::is_cursor_surface(surface) {
+                    self.cursor_committed(surface, &buffer);
+                }
+                self.present(surface, &buffer, rects)
+            }
             Some(BufferAssignment::Removed) => {
                 if let Some(window) = self.windows.get_mut(surface) {
                     // A null buffer unmaps the surface. The toplevel still
@@ -1427,32 +1584,62 @@ impl SeatHandler for State {
         );
     }
 
-    /// The client wants to draw the cursor itself.
+    /// What the pointer should look like.
     ///
-    /// **Not implemented, and the reason is worth stating rather than leaving
-    /// as an empty body.** `wl_pointer.set_cursor` hands over a surface whose
-    /// buffer is the cursor image, and turning that into something Win32 shows
-    /// means `CreateIconIndirect` per frame plus a `SetCursor` from the window
-    /// procedure's `WM_SETCURSOR` — the same shape as `set_icon` in
-    /// `win32.rs`, which already exists. What is missing is not the conversion
-    /// but the *policy*: hiding the system arrow while the client's cursor is
-    /// up, and putting it back on leave, is state that belongs to the window
-    /// and there is nothing to test it against until a client that sets one is
-    /// in the harness.
+    /// IMPLEMENTED IN STAGE 12 (docs/design.md §23); before it, this logged
+    /// once and the user saw the Win32 arrow over everything — no I-beam over
+    /// text, no hand over a link.
     ///
-    /// The visible consequence is that the arrow the user sees is Windows',
-    /// which for a terminal is the same arrow the client would have drawn, and
-    /// for a text field is the wrong shape. Said once so it is in the log of
-    /// any run where it matters.
+    /// # One callback, three sources
+    ///
+    /// smithay funnels everything here, which is why this is one function and
+    /// not three:
+    ///
+    /// * `wp_cursor_shape_device_v1.set_shape` arrives as `Named`. This is the
+    ///   modern half and the one GTK4 binds.
+    /// * `wl_pointer.set_cursor` with a surface arrives as `Surface`, and with
+    ///   a null surface as `Hidden`. This is what GTK3 — and therefore Firefox
+    ///   — still sends.
+    /// * **A pointer leave arrives as `Named(Default)`, with no client having
+    ///   asked for anything.** smithay sends it from `PointerHandle::leave`,
+    ///   and it is what puts the arrow back when the pointer moves off a text
+    ///   field. Without it a compositor would show the last client's I-beam
+    ///   over its own desktop.
+    ///
+    /// # What this deliberately does not do
+    ///
+    /// It does not draw. The cursor surface's pixels become an `HCURSOR` and
+    /// Windows composites it; the surface itself must never reach the scene
+    /// graph, or the user sees two cursors — the client's, blitted into the
+    /// window a frame late and clipped to it, under the system's own. That was
+    /// a live bug when this was written.
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        if !self.cursor_noted {
-            self.cursor_noted = true;
-            println!(
-                "wc-compositor: a client set a cursor ({image:?}); \
-                 client cursors are not drawn yet, the system arrow is shown instead"
-            );
+        match image {
+            CursorImageStatus::Hidden => {
+                self.cursor_surface = None;
+                self.ui.send(ToUi::Cursor { spec: CursorSpec::Hidden });
+            }
+            CursorImageStatus::Named(icon) => {
+                self.cursor_surface = None;
+                self.ui.send(ToUi::Cursor { spec: CursorSpec::Named(icon) });
+            }
+            CursorImageStatus::Surface(surface) => {
+                self.cursor_surface = Some(surface.clone());
+                // If this surface has already committed its buffer — the
+                // attach-then-set_cursor order — the pixels are in the cache
+                // and the cursor can change now. If it has not, the commit
+                // that follows will do it, and until then the previous cursor
+                // stays up rather than blinking to an arrow and back.
+                self.send_cursor_surface(&surface);
+            }
         }
     }
+}
+
+impl TabletSeatHandler for State {
+    // The default `tablet_tool_image` is kept. See the import: this is a bound
+    // on `wp_cursor_shape_v1`'s dispatch, not a feature — there is no
+    // `zwp_tablet_manager_v2` global, so nothing can reach it.
 }
 
 /// Read the title and app id a client has set, if any.
@@ -1928,3 +2115,5 @@ delegate_output!(State);
 delegate_data_device!(State);
 delegate_xdg_decoration!(State);
 delegate_kde_decoration!(State);
+// ADDED FOR STAGE 12. `wp_cursor_shape_manager_v1` and its per-pointer device.
+delegate_cursor_shape!(State);
