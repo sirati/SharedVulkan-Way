@@ -80,6 +80,9 @@ fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 RUNDIR=$(mktemp -d /tmp/wc-xdg-XXXXXX)
 chmod 700 "$RUNDIR"
 trap 'rm -rf "$RUNDIR"' EXIT
@@ -123,7 +126,7 @@ check_log() {
 
 run_linux() {
   echo "== linux: compositor as a Linux binary =="
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "cargo build -p wc-compositor" || return
   [ -n "$CLIENT" ] || { echo "  SKIP  weston-flower not on PATH"; return; }
 
   XDG_RUNTIME_DIR="$RUNDIR" "$LINUX_BIN/wc-compositor" \
@@ -165,7 +168,7 @@ run_linux() {
 
 run_wine() {
   echo "== wine: compositor as a Windows binary =="
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe -- cargo build --target x86_64-pc-windows-gnu first"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   [ -n "$CLIENT" ] || { echo "  SKIP  weston-flower not on PATH"; return; }
 

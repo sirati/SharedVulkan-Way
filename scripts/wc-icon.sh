@@ -199,6 +199,9 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # uses all five and defining them twice is how two harnesses end up counting
 # different things.
 . "$(dirname "$0")/wc-substrate.sh"
+# STAGE 42. `fresh` and `deployed_is`: is the binary newer than the tree, and is
+# the copy on the guest the one this tree built.
+. "$(dirname "$0")/wc-binaries.sh"
 
 # Run a command line on the interactive desktop and wait for it.
 int() {
@@ -278,13 +281,28 @@ PS1
 }
 
 # Pull a BMP off the guest and convert it.
+# STAGE 42. **This gate could not fail, and it guards stage 11's evidence.**
+# What was here converted the capture and then printed its geometry *into the
+# success message*, comparing it with nothing:
+#
+#   ok "$caption -> docs/stage11/$png ($(identify -format '%wx%h' "$png"))"
+#
+# A 1x1 capture, or an all-black one, converts fine and read as a PASS — so
+# every photograph in docs/stage11/ was gated on ImageMagick being able to open
+# the file. §41.8 found and fixed the same helper in `wc-taskbar.sh`; the audit
+# that followed found the unfixed original still here and in three more
+# harnesses.
+#
+# `kind` is required rather than defaulted, which is §41.8's other half: the
+# tray shots here are **1280x48**, so one bound for every caller would be the
+# impossible-threshold bug rather than a fix for the vacuous one.
 fetch() {
-  local remote="$1" local_png="$2" caption="$3"
+  local remote="$1" local_png="$2" caption="$3" kind="${4:-window}"
   scp "${SSHOPT[@]}" "$GUEST:$GUESTNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
     mkdir -p "$OUT"
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      ok "$caption -> docs/stage11/$local_png ($(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null))"
+      picture_is "$OUT/$local_png" "$kind" "$caption -> docs/stage11/$local_png"
     else
       bad "could not convert $remote"
     fi
@@ -296,12 +314,16 @@ fetch() {
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
-  for e in wc-desk.exe wc-compositor.exe; do
-    [ -f "$WIN_BIN/$e" ] || {
-      echo "  missing $WIN_BIN/$e"
-      echo "error: cargo build --workspace --target x86_64-pc-windows-gnu first"; exit 1; }
-  done
-  [ -x "$LINUX_BIN/wc-proxy" ] || { echo "error: cargo build -p wc-proxy first"; exit 1; }
+  # STAGE 42. **Existence is not freshness.** What was here checked that each
+  # binary was a file, which a binary built before the change under test also
+  # is: §35.4 measured a harness reporting the *previous* tree's behaviour after
+  # `cargo test` declined to relink, and §35.6 item 6 named this harness as one
+  # of seventeen with no guard at all. `fresh` compares the binary's mtime
+  # against every source in the tree and names the first file that is newer.
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
+  fresh "$WIN_BIN/wc-desk.exe"       "$how_win" || exit 1
+  fresh "$WIN_BIN/wc-compositor.exe" "$how_win" || exit 1
+  fresh "$LINUX_BIN/wc-proxy"        "cargo build -p wc-proxy" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-icon-stage-XXXXXX)
   cp "$WIN_BIN/wc-desk.exe" "$stage/"
@@ -322,6 +344,25 @@ do_deploy() {
   g "mkdir -p $DESKDIR" || exit 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$GUESTNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
+
+  # STAGE 42. **And the copy is checked, because copying is the step that can
+  # silently not happen.** `scp` returning 0 says the transfer ran, not that the
+  # bytes on the guest are this tree's -- a running `.exe` cannot be overwritten
+  # on Windows, so a compositor somebody else left running makes `scp` succeed
+  # and leaves the old file in place. That is the single most expensive failure
+  # here because its symptom is a *behaviour change*, and on the GPU path it
+  # presents as a transport fault: `finish_attach` refuses a wire-version skew
+  # and says "This is a version skew between two builds, not a transport fault."
+  # `WIRE_VERSION` went 1 -> 2 while this stage was being written, so the
+  # scenario is current rather than hypothetical.
+  #
+  # Byte identity rather than a version comparison, and that is not a compromise
+  # -- `WIRE_VERSION` is a `pub const u32` the compiler inlines, no binary
+  # carries it as data, and nothing prints it, so there is nothing to read. The
+  # hash is strictly stronger: it catches a version skew, a protocol-hash skew,
+  # and every other difference, without needing any of them to be observable.
+  deployed_all "$stage" "$DESKDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-desk.exe" "$COMP_EXE" || exit 1
   if [ ! -f "$stage/probe-relay.exe" ]; then
     g "test -f $DESKDIR/probe-relay.exe" >/dev/null 2>&1 \
       && echo "  probe-relay.exe: kept the one already there" \
@@ -444,7 +485,7 @@ EOD" >/dev/null
   int wciconshot "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe shot --class Shell_TrayWnd --out $DESKDIR_WIN\\tray0.bmp > $DESKDIR_WIN\\shot.txt 2>&1" \
     >/dev/null 2>&1
-  fetch tray0.bmp "stage11-taskbar-before-$mode$SUFFIX.png" "the taskbar before the window ($mode)"
+  fetch tray0.bmp "stage11-taskbar-before-$mode$SUFFIX.png" "the taskbar before the window ($mode)" tray
 
   local port=$PORT
   [ "$mode" = generic ] && port=$((PORT + 1))
@@ -575,8 +616,8 @@ $DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DES
 
   WINDOW_OK=""
   grep -q WaycomposeToplevel "$RUNDIR/windows-$mode.txt" && WINDOW_OK=yes
-  fetch win.bmp  "stage11-window-$mode$SUFFIX.png"  "the window, whose caption carries ICON_SMALL ($mode)"
-  fetch tray.bmp "stage11-taskbar-$mode$SUFFIX.png" "the taskbar with the window's button ($mode)"
+  fetch win.bmp  "stage11-window-$mode$SUFFIX.png"  "the window, whose caption carries ICON_SMALL ($mode)" window
+  fetch tray.bmp "stage11-taskbar-$mode$SUFFIX.png" "the taskbar with the window's button ($mode)" tray
 
   wait $drv 2>/dev/null
   kill $relay 2>/dev/null; wait $relay 2>/dev/null
@@ -694,11 +735,28 @@ do_compare() {
       *generic*) generic_rmse="$rmse" ;;
     esac
   done
+  # STAGE 42. **This block prints "is the host's icon in the guest's picture?"
+  # and could not answer no.** The failing arm was a `note`, so the one check
+  # that the resolved icon actually reached the guest's screen — the claim §16.9
+  # calls "measured, not looked at" — reported nothing whenever it failed. Both
+  # arms are verdicts now.
+  #
+  # The `-z` guard around them was the second half of the same problem: if
+  # either search produced no number the whole comparison was skipped in
+  # silence, which is the state a missing or unreadable photograph produces.
+  # That is now a `bad` too, because "I could not measure it" and "it passed"
+  # must not be the same output.
   if [ -n "${icons_rmse:-}" ] && [ -n "${generic_rmse:-}" ]; then
-    awk -v a="${icons_rmse:-1e30}" -v b="${generic_rmse:-0}" 'BEGIN { exit !(a + 0 < b / 2) }' \
-      && ok "the icon run's caption contains the host's icon and the control run's does not \
-($icons_rmse against $generic_rmse)" \
-      || note "the two captions are not distinguishable by this search ($icons_rmse vs $generic_rmse)"
+    if awk -v a="$icons_rmse" -v b="$generic_rmse" 'BEGIN { exit !(a + 0 < b / 2) }'; then
+      ok "the icon run's caption contains the host's icon and the control run's does not \
+($icons_rmse against $generic_rmse)"
+    else
+      bad "the two captions are not distinguishable by this search ($icons_rmse vs $generic_rmse): \
+the icon run's caption should match the reference at least twice as well as the control's"
+    fi
+  else
+    bad "the icon comparison produced no numbers (icons=${icons_rmse:-none} generic=${generic_rmse:-none}) \
+-- with no measurement there is no result, and this is the check that the pixels reached the screen"
   fi
 }
 

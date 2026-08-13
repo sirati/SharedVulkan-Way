@@ -107,6 +107,9 @@ miss() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 
+# STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
+. "$(dirname "$0")/wc-binaries.sh"
+
 int_bg() {
   g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
        -File '$DESKDIR_WIN\\runint.ps1' -Exe '$2' -Arguments '$3' -Name '$1'" 2>&1
@@ -361,13 +364,22 @@ $out
 PS3
 }
 
+# STAGE 42. The geometry was printed into the success message and compared with
+# nothing, so a 1x1 or all-black capture read as a PASS — the same vacuous gate
+# §41.8 fixed in `wc-taskbar.sh`, found here by the audit that followed. `kind`
+# is required rather than defaulted for §41.8's other reason: `screen-*.bmp` is
+# a whole desktop and `win-*.bmp` is a window, and one bound for both would be
+# an impossible threshold for one of them.
 fetch() {
+  local kind="${4:-window}"
   scp "${SSHOPT[@]}" "$GUEST:$DESKNAME/$1" "$RUNDIR/$1" >/dev/null 2>&1
   if [ -s "$RUNDIR/$1" ]; then
     mkdir -p "$OUT"
-    magick "$RUNDIR/$1" "$OUT/$2" 2>/dev/null \
-      && ok "$3 -> docs/stage38/$2 ($(identify -format '%wx%h' "$OUT/$2" 2>/dev/null))" \
-      || bad "could not convert $1"
+    if magick "$RUNDIR/$1" "$OUT/$2" 2>/dev/null; then
+      picture_is "$OUT/$2" "$kind" "$3 -> docs/stage38/$2"
+    else
+      bad "could not convert $1"
+    fi
   else
     bad "$3: nothing came back"
   fi
@@ -381,9 +393,15 @@ start_side() {
   local sock="$1" exe="$2" client_cmd="$3"
   h "mkdir -p $HOST_DIR $SHARE/pools $SHARE/keymaps; chmod 777 $SHARE/pools $SHARE/keymaps" >/dev/null
   h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true" >/dev/null 2>&1
+  # STAGE 42. Fresh here, and identical there. This harness never checked either:
+  # it copied whatever was at `$LINUX_BIN/wc-proxy` and trusted `scp`'s exit
+  # status, which reports that the transfer ran rather than that the bytes
+  # landed. §35.4 and §35.6 item 6.
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || return 1
   scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$HOST:$HOST_DIR/" >/dev/null || {
     bad "could not copy wc-proxy to $HOST"; return; }
   h "chmod +x $HOST_DIR/wc-proxy" >/dev/null
+  deployed_is "$LINUX_BIN/wc-proxy" "$HOST_DIR/wc-proxy" h "re-run this with no wc-proxy of ours live on $HOST" || return 1
 
   write_menu_ps1 "$RUNDIR/menu.ps1"
   write_ours_ps1 "$RUNDIR/ours38.ps1"
@@ -566,7 +584,7 @@ $HOST_FIREFOX --no-remote --profile \$RUN/profile about:blank"
   # previous run's screen — which is exactly what happened once here: an
   # `after` picture that was really the `before` one, with a four-minute-old
   # clock in the corner as the only tell.
-  fetch "screen-$tag.bmp" "stage38-screen-$tag.png" "the screen with the menu on it"
+  fetch "screen-$tag.bmp" "stage38-screen-$tag.png" "the screen with the menu on it" screen
 
   # The verdict, from the numbers rather than from the picture — and it depends
   # on what the client declared, which is why the log line carries it.
@@ -593,10 +611,30 @@ $HOST_FIREFOX --no-remote --profile \$RUN/profile about:blank"
       bad "$tag: the menu asked to be moved and hangs off the work area  ($popup)"
     fi
   else
+    # STAGE 42. **This arm awarded an unconditional PASS**, so for any client
+    # that is not Firefox — which is what `WC_HOST_WESTON` alone gives, i.e. the
+    # default — stage 38's negative control could not fail. And it is the arm
+    # that most needs to: a compositor that "helpfully" moves a menu the client
+    # never asked to have moved is the *other* half of the bug this stage fixed,
+    # and §38's whole argument is that `set_constraint_adjustment` is a
+    # declaration the compositor may not exceed.
+    #
+    # The claim is checkable from the same line the other arm uses. A client
+    # that declared nothing gets its menu exactly where the positioner asked,
+    # and here that position is deliberately off the work area — the parent is
+    # put in the bottom-right corner precisely so the menu would not fit. So
+    # `inside-work-area=True` for a client that declared nothing means the
+    # compositor moved it anyway, which is a failure and used to read as a pass.
     note "$tag: the client declared no adjustment, so the only right answer is"
     note "      wherever the positioner put it — this is the negative control"
-    note "      ($popup)"
-    ok "$tag: a menu that declared nothing was placed and not second-guessed"
+    if echo "$popup" | grep -q "inside-work-area=False"; then
+      ok "$tag: a menu that declared nothing was placed where it asked and not second-guessed ($popup)"
+    elif echo "$popup" | grep -q "inside-work-area=True"; then
+      bad "$tag: the menu was moved on-screen for a client that declared no adjustment -- \
+the compositor exceeded the declaration ($popup)"
+    else
+      bad "$tag: the report says nothing about the work area, so the control proves nothing ($popup)"
+    fi
   fi
 
   stop_side "$sock" "$tag"

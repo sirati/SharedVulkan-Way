@@ -16529,3 +16529,204 @@ upstream in the same hours**, which is worth recording as a finding about the
    commits as an ordinary commit with one parent. Neither is recoverable by
    noticing later. Use `git checkout <ref> -- <path>` to swap a subtree for a
    measurement, which is what §38.8's before-and-after runs do.
+
+## 42. Two ways for a gate to be useless, and the seventeen harnesses that could measure the wrong tree
+
+### 42.1 Status in one paragraph
+
+§35 spent a section on checks that cannot fail. §41.8 found the mirror image —
+a check that cannot *pass* — in the photograph gate of the stage whose evidence
+is a photograph. This section takes both defects as one class and does two
+things: it gives every harness that runs a binary the freshness guard §35.6 item
+6 listed seventeen of them as lacking, plus a check that the copy on the far
+side of the VM boundary is the binary this tree built; and it audits all 53
+harnesses for gates of either kind. Twelve were found and all twelve are fixed.
+**One of them was in code this stage's own author had written four hours
+earlier**, which is the most useful thing in the section.
+
+### 42.2 The rule, since this is now the third section circling it
+
+> **A gate must be run against a real value on both sides of its own boundary.**
+> A threshold nobody has fed a passing value is as broken as one nobody has fed
+> a failing value, and the two defects have one root: a bound written against an
+> assumption instead of against a measurement.
+>
+> Where a gate is currently vacuous, **bound it properly or delete it and say
+> so**. A check nobody can fail is worse than no check, because it is counted as
+> coverage.
+
+§35 is the "cannot fail" half; §41.8 is the "cannot pass" half; §35.10 is the
+same defect in prose. The candidate set is mechanical: every gate whose
+threshold was never exercised in both directions.
+
+### 42.3 Existence is not freshness, and `scp` returning 0 is not a deployment
+
+`scripts/wc-binaries.sh` is the shared file. §35.6 item 6 said `fresh()` was
+"copied rather than shared because these scripts have no common file"; that
+stopped being true when `wc-substrate.sh` landed in §41, so `fresh` moved there
+and `wc-proxy.sh`'s and `wc-clip.sh`'s private copies are deleted rather than
+kept in sync — two copies of a check are two checks that can disagree, which is
+§41.4's argument for not implementing the file-arena refusal twice.
+
+Three functions, and the third is new:
+
+* **`fresh`** — is this binary newer than every source in the tree? §35.4's
+  measurement: `cargo test` does not relink `target/debug/wc-proxy`, so a run
+  after a source change can measure the previous tree.
+* **`fresh_or_skip`** — three answers where the harnesses had two. Several
+  blocks skip when a binary is absent, which is right; they then ran whatever
+  *was* there, however old. **A stale binary is strictly worse than a missing
+  one, because a missing one stops the block and a stale one produces a
+  number.** Absence keeps its skip; staleness becomes a failure.
+* **`deployed_is` / `deployed_all`** — is the copy on the far side the bytes we
+  just built?
+
+The last is the one that has cost this project the most, because its symptom is
+a lie. `finish_attach` says so in its own refusal:
+
+> "This is a version skew between two builds, not a transport fault. The usual
+> cause is a stale binary: on the cross-VM topology the GPU side is *copied* to
+> the guest, so rebuilding here changes only this side."
+
+`WIRE_VERSION` went 1 → 2 while this section was being written, so the scenario
+is current rather than hypothetical.
+
+**Why identity and not a version comparison.** The obvious check — assert both
+sides' `WIRE_VERSION` agree — cannot be written. It is a `pub const u32` the
+compiler inlines into the comparison, no binary carries it as data, and nothing
+prints it at startup; grepping a `.exe` for it finds nothing because there is
+nothing to find. Byte identity is strictly stronger: it catches a wire-version
+skew, a protocol-hash skew, and every other difference at once, without needing
+any of them to be observable from outside.
+
+**And `scp` returning 0 is the gap it closes.** It reports that the transfer
+ran, not that the bytes over there are this tree's. On Windows a running `.exe`
+cannot be overwritten — usually that makes `scp` *fail* loudly, which several
+harnesses have comments about; the case nobody was watching is the one where it
+appears to succeed and the old file stays.
+
+Verified on the real guest, both arms and the round trip:
+
+```
+PASS  wc-desk.exe on the far side is byte-identical to this tree's build
+   … append one byte to the guest's copy …
+FAIL  wc-desk.exe on the far side is NOT the binary this tree built
+      here  55f52765012b0b84…   there 83e7495620fd4c99…
+   … re-copy …
+PASS  wc-desk.exe on the far side is byte-identical to this tree's build
+```
+
+Wired into all seven harnesses that deploy across a boundary — `wc-desktop.sh`,
+`wc-guest.sh`, `wc-icon.sh`, `wc-launch.sh`, `wc-popup.sh`, `wc-taskbar.sh`,
+`wc-titlebar.sh` — and `fresh`/`fresh_or_skip` into eleven more.
+`wc-titlebar.sh` and `wc-launch.sh` check *both* boundaries, guest and VM host,
+which is what the `runner` argument is for.
+
+**A sharper instance than the one being fixed**, found while wiring it:
+`wc-launch.sh` builds immediately before checking, and the build is
+
+```sh
+cargo build --target x86_64-pc-windows-gnu -p wc-launch -p wc-desk 2>&1 | grep -E "^error" | head -5
+```
+
+The pipeline's exit status is `head`'s, so cargo's is discarded: **a build that
+fails leaves the previous binary in place and `[ -f ]` is perfectly happy with
+it.** That harness had §35.4's failure mode *and* a build step that hides it.
+
+### 42.4 The audit: twelve gates, and the first one was mine
+
+All 53 harnesses, every `grep` literal cross-referenced against `crates/`.
+
+**The vacuous photograph gate, in four harnesses at once.** §41.8 fixed this in
+`wc-taskbar.sh`; the audit found the unfixed original still in `wc-icon.sh`,
+`wc-desktop.sh`, `wc-popup.sh` and `wc-titlebar.sh`, gating **twelve** checked-in
+photographs between them. In every one the geometry was interpolated into the
+success message and compared with nothing:
+
+```sh
+ok "$caption -> docs/stage11/$png ($(identify -format '%wx%h' "$png"))"
+```
+
+A 1x1 capture, or an all-black one, converts fine and reads as a PASS. These are
+the stages' headline evidence, which is the worst possible place for it.
+
+`picture_is <png> <kind> <caption>` is now in the shared file, and **`kind` is
+required rather than defaulted** — that is §41.8's lesson carried forward. The
+tray shots in `wc-icon.sh` and `wc-desktop.sh` are the same **1280x48** strip
+that made §41.8's bound impossible, and a single `w<200||h<200` for all callers
+would have reintroduced exactly the bug being removed. `tray` is also bounded
+*above* in height, which turns "is it big enough" into "is it the right window":
+a full-desktop capture arriving there means the class selector missed
+`Shell_TrayWnd`. Verified against the real checked-in images, all five arms.
+
+**The one that was mine, four hours old.** `wc-substrate.sh`'s frame-list
+coverage guard, added in §41:
+
+```sh
+n=$(grep -c '^pfn ' "$scratch/arena.frames" 2>/dev/null || echo 0)
+if [ "${n:-0}" -ne "$pages" ]; then …
+```
+
+`grep -c` prints `0` **and exits 1** when it matches nothing, so `|| echo 0`
+appends a second line and `n` becomes `"0\n0"`. Every arithmetic test on that
+fails with `integer expected` and returns 2 — so the guard was not merely wrong,
+it was **skipped**: the `elif` ran, an empty frame list went to `wc-arena-host
+--frames`, and the run announced *"the guest named its own 0 page frames"* as a
+PASS. A coverage guard that cannot fire, inside the check whose entire job is to
+refuse a frame list that does not cover the region.
+
+`wc-arena-pressure.sh` documents this exact trap at its own line 115, in this
+same tree, and the fix is its idiom — `grep -a … | wc -l | tr -d ' '`, since
+`wc -l` on an empty stream is a plain `0` with a zero exit. A sweep confirmed
+this was the **only** instance: a bare `n=$(grep -c …)` is safe, because command
+substitution captures the `0` and discards the exit status.
+
+**A grep that could never match, wrapped in an arm that could never fail.**
+`wc-window.sh` tested for `icon set from`; the compositor prints `icon set: {} of
+2 slots from {} image(s)`, so that substring does not occur in this tree and
+never has. Its failing arm was a `note`, so it reported nothing in either
+direction from the day it was written — both defects in three lines. It was the
+only genuine never-matcher in 53 files.
+
+The rest, each now a verdict rather than a `note` or an unconditional `ok`:
+
+| where | was | now |
+|---|---|---|
+| `wc-icon.sh` `do_compare` | printed "is the host's icon in the guest's picture?" and could not answer no | both arms are verdicts; "no numbers" is also a failure |
+| `wc-guest.sh` descriptor rule | 20 lines arguing which number would break §14.7, then asserting only that a number exists | `out` must equal `from the arena`; a relayed descriptor now fails |
+| `wc-popup.sh` negative control | unconditional `ok` for any non-Firefox client | a menu moved on-screen for a client that declared nothing now fails |
+| `wc-input.sh` discrete axis | `note` on the failing arm, beside a sibling with two `bad`s | a smooth scroll where a detent was sent now fails |
+| `wc-window.sh` frame geometry | comment promised "the size the protocol said"; nothing compared it | comment corrected — third-party clients pick their own size — and a shape bound added |
+| `wc-launch.sh` desktop shot | `note` both ways on a checked-in photograph | asserted as `screen`; absence stays a note, because a locked guest genuinely cannot be photographed |
+
+The `wc-window.sh` row is §35.10 again: the comment was older than the code and
+the code never caught up. It is **corrected rather than implemented**, because
+on that leg the claim cannot be made — `run_linux` drives third-party clients
+that choose their own surface size, so there is no protocol-declared number to
+compare against. Saying so is the honest fix; inventing a threshold would have
+been a third way to get this wrong.
+
+### 42.5 What is not done
+
+1. **Nothing here was re-run on the guest except `wc-icon.sh deploy`.** That
+   run exercised `fresh` and `deployed_is` end to end and is quoted above. The
+   twelve repaired gates are verified against real inputs — the checked-in
+   images for `picture_is`, doctored inputs for the rest — but a full guest pass
+   of `wc-desktop.sh`, `wc-popup.sh` and `wc-titlebar.sh` has not been made, and
+   the `picture_is` `kind` chosen for each of their callers is an argument from
+   what the capture is *of* rather than from having seen every one.
+2. **`wc-popup.sh`'s negative control now asserts something no run has
+   produced.** The claim — that a menu from a client declaring no adjustment
+   stays where the positioner put it, off the work area — follows from §38's
+   argument and from the parent being placed in the corner on purpose. If the
+   first run says `inside-work-area=True`, the number to question is the
+   assertion, not the compositor, and this note is here so that is a decision
+   rather than a surprise.
+3. **The `fresh` walk is over `crates/`, `vendor/` and `Cargo.lock`.** A change
+   to `build.rs` output, to `vk.xml`, or to the nix shell's toolchain does not
+   move a source file's mtime and will not be caught. `vk.xml` is the one that
+   matters, since the protocol crate is generated from it.
+4. **`sv-*.sh` were audited but not wired.** `sv-cts.sh`, `sv-bench.sh` and
+   `sv-present.sh` are on §35.6 item 6's list and run built binaries; their
+   gates came back clean, so they have no vacuous checks, but they still have no
+   freshness guard. That is the remaining half of item 6.
