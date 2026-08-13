@@ -15110,6 +15110,136 @@ and is a change to a running VM rather than a read.
 hypervisor is the latency evidence and stands; §36.12's cross-VM Wayland client
 is the milestone and stands. The Windows guest's port is what would let the
 *deployment* guest use the doorbell, and it is a nice-to-have behind both.
+
+### 36.14 The flags were accepted and ignored on the only platform that matters
+
+`cargo build --workspace --target x86_64-pc-windows-gnu` was clean, and emitted
+exactly two warnings:
+
+```
+warning: unused variable: `wayland_ring`
+warning: unused variable: `wayland_cold`
+```
+
+The whole `ring_link` block was `#[cfg(unix)]`. So on Windows both flags were
+**parsed, accepted, and silently dropped**, and the compositor fell through to
+the socket listener. "The Wayland connection rides shared_vulkan's channel" was
+therefore true on the machine the tests run on and false on the machine the
+thing ships to — and the only artefact that said so was an unused-variable
+warning nobody reads.
+
+That is §35's failure mode in its purest form: a gate reporting success while
+something is wrong. It is also, precisely, the thing this section was started to
+fix — the guest was still on TCP over `ssh -L`, which is what "these channels
+should also be over RAM, not over ssh" was about.
+
+Three changes.
+
+**`RingLink` is no longer `#[cfg(unix)]`.** The only platform difference was the
+region: a file on Unix, a **named section** on Windows. `winshm::Section` is
+already the Windows half of exactly this — §1a made the arena a *named* object on
+both sides so that nothing but text has to cross — so it is reused rather than
+written again. A second mapper would be a second place for the geometry to be
+wrong.
+
+**A flag that cannot be honoured fails at parse.** `check_platform_flags` runs
+where the user typed the flag, not where the binary was built:
+
+```
+wc-compositor: --wayland-cold publishes a control region out of guest RAM, which
+needs the Linux guest-RAM provider (sv_arena::guestram). The Windows guest
+commits its window through awe_probe's VirtualAlloc path instead — that is what
+sv-gpu-server's win_guest does — and no compositor has been taught to do it yet.
+Use --wayland-ring with a section name, or run the Linux guest fixture.
+```
+
+The message names the **asymmetry**, not the platform, because "not supported on
+Windows" invites the next person to add a `cfg` and move on. A compile warning is
+addressed to whoever built the binary; the person who needs to know is whoever
+ran it.
+
+**And it is verified on the target, not inferred from it.** The three
+`ringlink` tests were run against the *Windows* binary under Wine —
+`a_ring_region_can_be_created_and_starts_empty` exercises
+`winshm::Section::create`, `map_section`, `Control::create` and the directory
+poll on the real Windows code path:
+
+```
+running 3 tests
+test ringlink::tests::a_flag_this_platform_cannot_honour_is_refused_at_parse ... ok
+test ringlink::tests::a_ring_region_can_be_created_and_starts_empty ... ok
+test ringlink::tests::the_ring_flag_is_accepted_on_every_platform ... ok
+```
+
+and the refusal was confirmed by running `wc-compositor.exe --wayland-cold` and
+reading the message it printed.
+
+**The lesson for what gets gated on.** `cargo clippy --target` builds *metadata*
+and will not catch a `#[cfg(unix)]` call from non-`cfg`'d code; `cargo test`
+stops at the first failing binary and under-reports the total. What catches this
+class is `cargo build --workspace --target …` with the warnings read, plus
+`cargo test --workspace --no-fail-fast` with the **binary** count checked
+alongside the test count (§36.9).
+
+### 36.15 The number moves: 18.96 ms → 1.06 ms per wait, across a real hypervisor
+
+§36.10 failed to measure the doorbell and said exactly what a real measurement
+would need: *"a command-heavy workload with a fixed, known number of round trips;
+timing taken in-process around the calls rather than around the process; the
+parker's `first_slice` settable at run time so that fixed-slice, ladder and
+doorbell are three conditions of one experiment rather than three builds."*
+
+All three were built, and the measurement now resolves.
+
+**The instrument.** `park::park_stats` counts every wait and accumulates the time
+spent in it, in `wait_until` — the one place every ring wait goes through — via a
+`Drop` accountant so that waits ending in a timeout or an error are counted too.
+The app side reports it at exit. Wall clock was the wrong instrument and §36.10
+is the record of why; **time spent parked** is precisely the quantity a doorbell
+changes.
+
+`SV_PARK_FIRST_SLICE_US` makes the old fixed-slice behaviour reachable from the
+shipping binary, so the comparison does not require checking out an older
+revision — which would change more than the variable under test.
+
+**The result**, `scripts/sv-guest-e2e.sh` on the development guest, two rounds:
+
+| condition | ring waits | parked | **mean per wait** |
+|---|---|---|---|
+| fixed 20 ms slice (what shipped) | 95 | 1801.5 / 1697.5 ms | **18.96 / 17.87 ms** |
+| slice ladder | 95 | 416.2 / 440.5 ms | **4.38 / 4.64 ms** |
+| **ladder + virtio-serial doorbell** | 95 | 100.8 / 113.7 ms | **1.06 / 1.20 ms** |
+
+App-side wall clock moved with it — 1933 → 506 → 159 ms — but the wall clock is
+the weaker number and is only quoted second.
+
+**Read the control first: 95 ring waits in every condition, both rounds.** The
+workload is identical and only the cost of waiting changed. That is what §36.10's
+experiment could not establish and is why this one can.
+
+Three things follow.
+
+1. **The diagnosis was right, exactly.** 18.96 ms per wait against a 20 ms
+   slice. §36.6 claimed the number "was not approximately the slice, it *was* the
+   slice, once per wait", from arithmetic on 216.9/20 = 10.8. This measures it
+   directly and it is the slice, less the fraction of waits satisfied during the
+   spin phase.
+2. **The ladder is a real mitigation and really is not the fix.** 4.3× better and
+   still 4 ms a wait, because it is a poll and the ladder's own ceiling bounds it.
+3. **The doorbell is the fix: 17.9× against the fixed slice**, and what is left —
+   about 1 ms — is the residue of the waits that the ladder is still climbing
+   before the byte arrives, plus scheduling. The doorbell itself crosses in ~9 µs
+   (§36.6.3), so there is more available here; the ladder and the doorbell are
+   currently additive rather than the doorbell simply winning.
+
+**Caveats, in the order they matter.** The guest is Linux, so the Windows
+`WaitOnAddress` floor of 1 ms is not in this measurement and the deployment guest
+will not do as well until §36.13's port question is answered. `vulkaninfo` is
+still a setup-heavy workload — but that no longer matters, because the instrument
+measures the waits rather than the process. And 95 waits is `vulkaninfo`'s
+enumeration, not a frame: a present is ~11 waits and the per-wait figure is what
+transfers, not the total.
+
 ## 41. Five guest harnesses could still reach a file, and three of them only ever had one
 
 ### 41.1 Status in one paragraph

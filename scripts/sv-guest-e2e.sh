@@ -139,7 +139,7 @@ say "vulkaninfo through the real loader, our ICD, and a GPU side in the VM${BELL
 # those waits plus the work — which is exactly the quantity the doorbell changes.
 APP_T0=$(date +%s.%N)
 env VK_DRIVER_FILES="$ROOT/target/debug/sv_icd.json" SV_SOCKET="$RUNDIR/icd.sock" \
-  ${BELL:+SV_BELL="$RUNDIR/bell.sock"} \
+  ${BELL:+SV_BELL="$RUNDIR/bell.sock"} ${SV_PARK_FIRST_SLICE_US:+SV_PARK_FIRST_SLICE_US="$SV_PARK_FIRST_SLICE_US"} \
   vulkaninfo --summary > "$RUNDIR/app.log" 2>&1
 APP_RC=$?
 APP_MS=$(awk "BEGIN{printf \"%.0f\", ($(date +%s.%N) - $APP_T0) * 1000}")
@@ -153,6 +153,7 @@ sed 's/^/  /' "$RUNDIR/hostd.log"
 
 REPORTED=$(grep -m1 "deviceName" "$RUNDIR/app.log" | sed 's/.*= //')
 say "----- app side -----"
+grep -h "ring waits" "$RUNDIR/app.log" 2>/dev/null | sed "s/^/  /"
 echo "  app side sees: ${REPORTED:-<nothing>}"
 
 echo
