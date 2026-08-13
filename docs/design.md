@@ -3480,6 +3480,13 @@ lifetime and the refusals — where the ordinary bugs live. The claim itself is
    arena. Two proxies against one compositor would need two arena ids and there
    is no protocol for allocating them; `shared_vulkan`'s cold-path handshake is
    where that belongs.
+
+   > **[CLOSED BY STAGE 12 — §16.2, for the case that matters, and the
+   > reasoning here is where the confusion started.]** Several *connections* of
+   > one proxy now share one arena and one allocator, which is what Firefox
+   > needs and what §15.14's box was about. Two **proxies** would still need two
+   > ids and that is still unbuilt — but it is a different statement, and this
+   > item's wording let the two be read as one for two stages.
 7. **New: the compositor cannot put anything *into* an arena.** §12.11 item 1
    and item 2. There is no allocator on the compositor's side and its view is
    read-only by contract, so a server-created object — a keymap, a clipboard
@@ -4629,6 +4636,19 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
 > it and stage 9 has not. The harness being wired and the assertions being
 > written is the right stopping point — taking the guest from a stage that is
 > mid-run would not be, and §12.8 exists because somebody already did.
+>
+> > **[CLOSED BY STAGE 12 — §16, and the harness did not pass the first time.]**
+> > A `Gift` has now been written into `VirtualAlloc`ed, pinned, stamped guest
+> > memory and read back by the host through the stitched view: `wl_keyboard.keymap`
+> > crossed as three integers on the real guest, twice in one run, with the
+> > export's `keymaps` directory empty and `--shared-dir` not passed
+> > (§16.5). Both "independent reasons to expect it to work" held. **What the
+> > file substrate could not tell you is that it would not work at all**: the
+> > first run of this harness reported `located 16374 of 16384 pages` and wrote
+> > no plan, because the gift destroys the very stamps the host locates by and
+> > §14.12 item 1's ordering argument is false (§16.4). A file arena has no
+> > stamps, so no amount of the Wine leg could have found it — which is this
+> > box's own claim, arriving in a form it did not predict.
 
 §12.13's list, with the rest of this stage's changes:
 
@@ -4640,6 +4660,20 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
    binds a seat — but "holds by construction" is what §12.10 said about a second
    locate before measuring it, and it deserves the same treatment. It is part of
    the same guest run as the item above.
+
+   > **[MEASURED BY STAGE 12 — §16.4 — AND THE ARGUMENT WAS WRONG.]** The
+   > second clause is false. smithay seals the keymap in `Seat::add_keyboard`,
+   > which this compositor calls **during start-up**, before the socket is
+   > bound — so the first guest run of an outbound window reported
+   > `located 16374 of 16384 pages` and wrote no plan, with no client anywhere
+   > near it. Ten pages is a 37532-byte `de` keymap rounded up, and the
+   > prediction of `16366` was right about everything except that it needs
+   > nobody's help. The fix is `arena::defer_gifts`: gifts are held in the
+   > compositor's heap until the first client connects, which is a moment that
+   > provably follows the locate because the client arrives through a proxy that
+   > was started from the plan. This paragraph's own caution — "holds by
+   > construction is what §12.10 said before measuring it" — is the only reason
+   > the run was made at all.
 2. **Releasing a gift is only unit-tested.** A keymap is dropped when the layout
    changes, and the layout change is exercised on the Linux leg, where
    `create_shared` is not the arena path. So the free list's coalescing has never
@@ -4650,6 +4684,15 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
    as the arena registry and `publish` are — but nothing has yet asked for two
    objects to be live at once outside a unit test, and §12.13 item 6's "one
    client at a time" is unchanged and now has a second reason to matter.
+
+   > **[CLOSED BY STAGE 12 — §16.2 and §16.5.]** Both halves. Firefox binds
+   > `wl_seat` twice and gets a keymap for each, so two gifts were live in one
+   > window at once on the guest; and "one client at a time" is gone — an arena
+   > is a handle on one region and one free list, three connections shared it on
+   > the guest and four on the Wine leg. The free list also ran in anger for the
+   > first time on the *pool* side: offset 28672 was reused by a later pool
+   > after an earlier one was released and coalesced, which is item 2's other
+   > half.
 4. ~~The compositor cannot put anything *into* an arena.~~ **Closed.** §12.13
    item 7, and §12.11 items 1, 2 and 3 with it.
 5. **The window has still never been seen** (§12.13 item 2), pinning is still
@@ -4689,6 +4732,14 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
    project exists for does not have one. Stage 8 has finished with the guest;
    stage 9 has not, and `WC_GUESTNAME` and `WC_HOST_SHARE` keep this out of its
    way (§12.8). The run also settles §14.12 item 1.
+
+   > **[CLOSED BY STAGE 12 — §16.]** Done, and with Firefox on the far end
+   > rather than `weston-terminal`, which is why it closes §15.14's box in the
+   > same run — §15.15 item 2 said one run would and it did.
+   > `scripts/wc-guest.sh firefox` is 16 passed, 0 failed, the transport line is
+   > `mapped: 0 section, 0 shared-file, 3 arena-slice`, and the compositor was
+   > started with no `--shared-dir`. It settled §14.12 item 1 by refuting it
+   > (§16.4).
 
    Stage 8 makes one part of it easier and one part harder. Easier: §13.2
    established that the interactive desktop is reachable and that a run in an
@@ -5236,6 +5287,18 @@ not a coincidence — they are the same gap seen from the two ends of the arena.
 > cold-path handshake question. Nothing here should be read as evidence that
 > the deployment's transport works with the deployment's client, because
 > nothing here tested that pair.
+>
+> > **[CLOSED BY STAGE 12 — §16 — and the last sentence of the guess was
+> > wrong.]** That pair is tested: Firefox, on the real guest, over an arena
+> > that is the guest's own pinned RAM, `mapped: 0 section, 0 shared-file, 3
+> > arena-slice`, 46 frames of which 25 distinct, a last frame of 456 colours,
+> > and nothing on any filesystem (§16.5). "Not a compositor change" was right.
+> > **"One arena id per client" was not**: the id names a *region*, and one per
+> > client would have meant a second `attach_guest_ram`, a second 13 GiB sweep
+> > and a second plan per connection. What was actually needed is one allocator
+> > shared by every session — 60 lines and an `Arc` — because the invariant is
+> > one allocator per region, not one client per region, and the refusal this
+> > box quotes had confused the two for two stages (§16.2).
 
 §12.13's list, with the rest of this stage's changes:
 
@@ -5301,6 +5364,11 @@ not a coincidence — they are the same gap seen from the two ends of the arena.
    guest is not free**: §12.8 exists because an experiment took another agent's,
    and `WC_GUESTNAME` / `WC_HOST_SHARE` are how this is done without repeating
    it.
+
+   > **[CLOSED BY STAGE 12 — §16.]** Both, in one run, exactly as predicted.
+   > `scripts/wc-guest.sh firefox` is block 11; it ran as `wctest12` against
+   > `/srv/winshare/wc12` while stage 11 had the interactive desktop, and killed
+   > nothing of anybody's.
 3. **Ask Windows how big the desktop is.** `--output` is a flag with a plausible
    default, which is exactly the shape of the bug §15.3 describes.
 4. **Find out whether Firefox's pool cache ever releases.** §15.10. Zero
@@ -5311,3 +5379,380 @@ not a coincidence — they are the same gap seen from the two ends of the arena.
    resolves it to pixels. `xdg-toplevel-icon-v1` is **not** in either binary's
    strings, so the goal document's "check rather than assume" is answered: it
    will not be handed to us and the app-id route is the only one.
+
+---
+
+## 16. Stage 12: Firefox, over the guest's own RAM
+
+### 16.1 Status in one paragraph
+
+Written 2026-08-13, branched from master after stage 9's merge, so master's last
+section is §15 and this is §16 — **stage 11 is in flight against an older base
+and will want a number too; whoever merges second renumbers, as §14.1 and §15.1
+both did.** `docs/stage12/stage12-firefox-guest.png` is the stage: Firefox,
+unmodified, drawing its tab strip and URL bar into an `HWND` made by
+`wc-compositor.exe` **on the real guest**, from pixels that crossed as
+`(arena, offset, len)` into the guest's own pinned RAM. The transport line is
+`mapped: 0 section, 0 shared-file, 3 arena-slice`, the compositor was started
+with **no `--shared-dir`**, and `scripts/wc-guest.sh firefox` is **16 passed, 0
+failed** on real Windows. Both boxed items are closed: §14.12's, because the
+compositor-side allocator has now run over guest RAM rather than over a file,
+and §15.14's, because Firefox has now run over an arena rather than over a
+shared file. They were the same gap and one run closed it, exactly as §15.15
+item 2 predicted.
+
+Getting there cost two things and only one of them was the advertised work.
+The advertised one is 60 lines: an arena is now a **handle on one region and one
+free list**, and every connection gets one. The other was a claim in this
+document being wrong. §14.12 item 1 said the ordering between a gift and the
+host's locate "holds by construction"; the first guest run of an outbound window
+reported **`located 16374 of 16384 pages`** and wrote no plan, because smithay
+seals the keymap inside `Seat::add_keyboard`, during start-up, a minute before
+any client exists. Ten pages of stamps, which is exactly a 37532-byte `de`
+keymap rounded up.
+
+### 16.2 What the second connection actually needed, and why it is not a second arena
+
+§15.14 named the next stage and guessed its shape: *"Multi-connection arena
+support is the next stage, and it is not a compositor change: it is one arena id
+per client, which is a `shared_vulkan` cold-path handshake question."* **The
+first half is right and the second half is wrong**, and the difference is worth
+stating because the wrong version is three orders of magnitude more work.
+
+The refusal it replaces was this, in `run.rs`:
+
+> the arena is already serving a client, and there is one arena (§12.13 item 6).
+> Use `--transport shared-file` for a client that opens more than one connection.
+
+with a comment saying a silent share "would give two clients overlapping offsets
+into the same guest pages". **The premise is right and the conclusion does not
+follow.** What must not be duplicated is the *allocator*. Two allocators over one
+region hand out the same offsets; one allocator serving four connections is the
+same operation as one allocator serving one connection's four pools, which it
+has done since stage 4. The one-client rule was never a property of the region —
+it was a property of `Box<dyn PoolTransport>` being moved into a session's
+thread, and it had been read as a protocol limitation for two stages.
+
+So an `Arena` is now `Arc<ArenaInner>`: the region, the origin string, the
+outbound window, and one `Mutex<Alloc>` holding the free list, the live map and
+the counters. `Arena::share()` clones the `Arc`; the accept loop calls it once
+per client. Three consequences worth naming:
+
+* **The arena id names a region, not a client.** One id per client would have
+  meant one *region* per client: a second `attach_guest_ram` inside the guest, a
+  second 13 GiB sweep on the host at 2.4 s each (§12.5), a second plan and a
+  second stitch — four times over, for one Firefox, to avoid a mutex. And the
+  four regions could not share a byte, so Firefox's 14 MB would have had to be
+  four separate arenas sized for the peak of each.
+* **The lock is not on the frame path.** `bytes_mut` takes it for a `HashMap`
+  lookup and drops it before the copy. A commit is 414 µs of `memcpy` on the
+  guest run below; four connections holding one mutex across that would
+  serialise every client's frames against every other's, which would be a real
+  cost of sharing and there is no reason to pay it.
+* **The transport is built once, before the accept loop**, so a plan that cannot
+  be read is now a startup failure with the message on stderr rather than the
+  first client being told "no transport for it" twenty seconds later.
+
+`reserve_outbound` gained a third refusal and the type does the work: it takes
+`&mut self` and reaches the region through `Arc::get_mut`, so **the refcount is
+"before the first client"**. A window cannot be moved under a session that
+already holds the arena, and that is checked at the only moment it could go
+wrong rather than asserted in a doc comment.
+
+### 16.3 Two connections writing one region, and the check that replaces an argument
+
+The region is a `MappingMut` or a `StitchedRegion`, and `wc_handle` says of the
+first: *"a read-only view can be shared freely, a writable one is exclusive to
+whoever holds the `&mut`"*. That rule is right for one owner and it is the wrong
+shape for four connections, so it is **replaced by a narrower one in
+`wc_proxy::pool` rather than widened in `wc_handle`**, where a `MappingMut` still
+means what it always meant.
+
+The narrower rule is that the only writable references handed out are extents
+the allocator has handed out, and the allocator never overlaps two of them — so
+the `&mut [u8]`s alive at any moment are disjoint sub-slices of one allocation,
+which is what `split_at_mut` produces and is sound for the same reason. That is
+one `unsafe` block with the allocator's invariant as its precondition, and
+`four_connections_share_one_arena_without_overlapping` is the test: four threads,
+32 slices, each filled with its own letter, asserted disjoint *and* asserted to
+still hold one letter each afterwards. The second assertion is the one that
+matters — **overlapping offsets that nobody writes look exactly like working
+code**.
+
+The read side got narrower rather than argued. `PoolTransport::peer_slice` used
+to return any range of the region and a comment explained why that was all
+right; it now **refuses anything outside the compositor's outbound window**. With
+one session the difference was invisible. With four it is the difference between
+reading a keymap and reading another client's buffer while it is being copied
+into, so the disjointness of the reads and the writes is now a bounds check
+against the range `reserve_outbound` removed from the free list, not a sentence.
+Anything else a compositor describes is either a misconfiguration or one client's
+pixels being handed to another, and both are refused with the numbers in the
+message.
+
+### 16.4 §14.12 item 1 was wrong, and the first guest run of it said so
+
+This is the finding of the stage, and it is a finding about this document.
+
+§14.12 item 1, on the ordering between a gift and the host's locate:
+
+> The order holds in every topology that exists — the host cannot proxy a client
+> it has not connected for, and the compositor cannot mint a keymap before a
+> client binds a seat — but "holds by construction" is what §12.10 said about a
+> second locate before measuring it, and it deserves the same treatment.
+
+It deserved the same treatment and it got it, one stage later, and it failed:
+
+```
+S4-GUESTARENA: arena 0 provided from guest RAM: run 0x1b44…, 67108864 bytes, 16384 pages, locked=true
+wc-arena-host: io: located 16374 of 16384 pages after sweeping 13312 MiB
+S4-FAIL: wc-arena-host did not locate the arena
+```
+
+**The second clause is false.** smithay compiles and *seals* the keymap in
+`Seat::add_keyboard`, which this compositor calls while it is starting up — the
+log line `seat0 keyboard: layout de (73017 bytes of keymap)` is printed before
+`listening on …`. So the keymap is minted before the socket is bound, let alone
+bound to. Serialised it is 37532 bytes, which the gift allocator rounds to ten
+pages, and ten is exactly what the sweep was short. §14.12 predicted the number
+would look like `located 16366 of 16384`; it looked like `16374`, and everything
+about the shape was right except that it happens with no client at all.
+
+**Why deferring is the fix and not re-ordering something.** Every page of a
+guest-RAM arena has to carry its stamp when the host sweeps, because the sweep is
+a *content* search: a page whose stamp is gone has no known guest-physical
+address, and the stitched view would have a `PROT_NONE` hole exactly where the
+compositor's objects live. Nothing may write into the region until the sweep is
+done, and no ordering of the compositor's own start-up achieves that — **the
+compositor cannot know when a host it never talks to has finished.**
+
+What it can know is that a client has connected, and that is sufficient and
+provably so: the client arrived through a proxy, the proxy was started from a
+plan, and the plan exists only if the locate succeeded. It is also the earliest
+moment anything could want the bytes, because nothing inside the guest ever reads
+a gift. So `arena::defer_gifts` holds every gift's bytes in memory, keyed by its
+arena offset, and `arena::release_gifts` — called from the accept loop — writes
+them in and says so:
+
+```
+wc-compositor: arena 0 objects made for clients are held in memory until the first
+               client connects, so that the host can still find every page's stamp
+wc-compositor: client 1 released 1 held object(s), 37532 bytes, into the arena
+```
+
+Three details that are not decoration. It is asked for rather than automatic,
+because a file arena has no stamps and nothing looking for it, so
+`--arena-provide` writes its keymap straight through and the Wine leg is
+unchanged. `Gift::write_at`'s deferred path takes **only** the outbound lock:
+`write_provided` takes the arena registry's read lock and `reserve_outbound`
+takes them in the other order, and two locks in two orders is a deadlock that
+would present as a compositor that accepted a client and then stopped. And a
+`Gift` dropped while deferred takes its buffer with it, or the next gift at the
+same offset would inherit somebody else's bytes.
+
+The client that released the keymap on the guest run is **client 1 — Firefox's
+throwaway probe connection**, the one §15.8 spent two runs diagnosing. It opens
+a connection, binds nothing, and closes it. It is now the thing that tells the
+compositor the host has finished looking.
+
+### 16.5 What Firefox did on the guest
+
+`scripts/wc-guest.sh firefox` is block 11 and it is `s4_run` with the client
+swapped, plus four assertions that are only interesting because the client is
+this one. 60 seconds, `--copy damage`, a 64 MiB arena with a 1 MiB outbound
+window, `--output 1600x1000` so the window size is comparable with §15.6's.
+
+Three runs, and the ranges are across all three rather than one run's numbers
+dressed as a constant — §12.5's discipline, and the run count of the stitch is
+the same property of the guest's free-page state it was there.
+
+| | |
+|---|---|
+| locate | **16384/16384 pages**, every run; 2.40 s sweep of 13312 MiB, 4 other-run stamps, **0 outside guest RAM** |
+| stitch | 1107–1469 runs, 3.15–4.07 ms |
+| connections | **3**, all three on one region and one allocator, every run |
+| transport | **`mapped: 0 section, 0 shared-file, 3 arena-slice`**, every run |
+| descriptors | `6–7 fds in, 2 out (2 from the arena)` |
+| the export's `keymaps` directory | **empty**; `--shared-dir` was not passed |
+| pools | 6–7 (2 released, 3 resizes, **0 overflows**), largest 5,072,256 |
+| copies | 269 commits, 262 copies, **739.20 MiB in 108.4 ms** — 2889.1 KiB and **414 µs** per copy |
+| frames | **46–48 presented, all dumped, 25 distinct, the commonest 11–13** |
+| the last frame | 1028x749, **456 distinct colours**, chrome `srgb(235,235,237)` against content `srgb(255,255,255)` |
+
+`docs/stage12/` is the last of those runs, whole: the checker's output, the
+compositor's own log from inside the VM, and the frame.
+
+Four things in that table are worth more than the row they are on.
+
+**The window is the geometry rectangle and then the guest argues with it.** The
+compositor mapped `1280x900` — §15.6's number, on real Windows for the first
+time — and then reported `window 1044x788 client 1028x749` and sent
+`configure 1028x749`, because the guest's primary screen is 1024x768 and a
+1280x900 client area does not fit on it. Firefox took the configure and redrew,
+which is why the dumped frame is 1028x749 rather than 1280x900. That is the
+resize round trip working on the deployment, and it is also §15.15 item 3
+arriving as a fact: `--output` is a flag with a plausible default and the desktop
+under it is a different size.
+
+**Two keymaps were live in one window at once**, which is §14.12 item 3 — "one
+outbound window, one client, one object at a time … nothing has yet asked for two
+objects to be live at once outside a unit test". Firefox binds `wl_seat` twice,
+GTK's at v5 and Gecko's at v8 (§15.2), and each bind gets a keymap. Measured, both
+binds are on **one** connection rather than one each, which is not what §15.2's
+"Firefox opens two Wayland connections that matter … GTK's `GdkDisplay` is one
+client and Gecko's `nsWaylandDisplay` is another" reads like: the connection that
+carries every pixel is a single one, `client 2`, with 269 commits and both seats
+on it. The other two connections bind nothing and close.
+
+**The free list ran in anger**, which is §14.12 item 2's other half. `pool 43`
+was published at `arena 0 slice 28672+3460320` — offset 28672 is where `pool 37`
+had been, and it was reused after that pool was released and its extent
+coalesced. That path had been unit-tested and never run.
+
+**Three connections, not four.** §15.8 counted four on this workstation and the
+Wine leg below counted four again; this run counted three. Both numbers are
+Firefox's, taken 25 minutes apart on two machines, and the stage does not claim to
+know why they differ — what it claims is that the arena served every one of them,
+which is the thing that could not happen before.
+
+### 16.6 The Wine leg, which is the same run with two flags changed
+
+`scripts/wc-firefox.sh wine-arena` is `wine` with `--transport arena` and
+`--arena-provide` instead of `--shared-dir`, **and nothing else** — the same
+Firefox, the same Xvfb, the same assertions — because the claim is that the
+transport changed and nothing did, and §14.6 set that discipline for
+`weston-eventdemo`.
+
+| | shared-file (§15.8) | arena (this stage) |
+|---|---|---|
+| connections served | 4 | 4, all on one region |
+| transport line | `0 section, 4 shared-file, 0 arena-slice` | **`0 section, 0 shared-file, 3–4 arena-slice`** |
+| descriptors from the arena | 0 | **2** |
+| files on any filesystem | 4 pools + 1 keymap | **0** |
+| frames | 26 | 26–30 |
+| copies | 4503.3 KiB / 131 µs | 4503.3 KiB / 131 µs |
+| checks | 7 passed | **10 passed, 0 failed** |
+
+It is a hypothesis and it is here for one reason: it found every bug in the
+multi-connection code before any of them cost a guest run. **What it could not
+find is §16.4**, because a file arena has no stamps, which is §14.12's boxed item
+being exactly right about what a file substrate cannot tell you.
+
+### 16.7 Three things that cost real time
+
+**Firefox will not run as root while somebody else owns its directories.** The
+host-side half runs in a root transient unit, because `/proc/<qemu-pid>/fd` is
+root-only (§12.9), and Firefox refuses with
+`Running Firefox as root in a regular user's session is not supported` — first
+about `$HOME`, and then, once that was fixed, about `$XDG_RUNTIME_DIR`. It is a
+real check against a real mistake and the answer is to give the run its own
+directories rather than to argue with it: a root-owned home, a root-owned
+`$RUN/xdg`, and the proxy's socket reached by **absolute path** in
+`WAYLAND_DISPLAY`, which libwayland accepts and which is the whole reason the
+runtime directory and the socket can be separated. Dropping to the invoking user
+for the client alone was the alternative and it is worse: it would put the
+socket and its client on two sides of a permission boundary for no gain.
+
+**`located 16374 of 16384` is not a hardware problem and reads like one.** It is
+§16.4, and the reason it took a run to find rather than a reading is that the
+harness had been *written* for the outbound window since stage 10 and had never
+been *run* — §14.12's box says so in as many words. The failure is loud, which is
+§12.10's design working: no plan is written, so nothing downstream can use a
+stale one.
+
+**The frames go on the virtio-fs export.** A Firefox frame is a 2.3 MB PPM and a
+long run makes hundreds of them, on the mount §10.3 measured at 330× slower to
+touch. 46 of them is 100 MB and fine; a stage that raises the run length should
+look at that number before it does.
+
+### 16.8 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **141 tests**, 0 failures (138 on master; three new, all in `wc-proxy`) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
+| `scripts/wc-input.sh all` (stage 6 + 10, Wine) | 82 passed, 0 failed — unchanged |
+| `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed |
+| `scripts/wc-firefox.sh wine-arena` (new) | **10 passed, 0 failed** |
+| **`scripts/wc-guest.sh firefox` (new, the guest)** | **16 passed, 0 failed** |
+| `scripts/wc-desktop.sh` (stage 8, the interactive desktop) | **not run — needs the interactive session, and stage 11 has it** |
+
+The three new tests are all in `crates/wc-proxy/src/pool.rs`: four connections
+over one arena from four threads, a `peer_slice` outside the outbound window
+being refused, and a window that cannot be reserved once a session holds the
+arena. The deferral of §16.4 is tested inside `wc_handle`'s existing
+single outbound-window test, for the reason §14.11 gives — there is one window
+per process and `cargo test` runs these threads at once, so a second test that
+reserved one would race the first.
+
+**On the count of times Wine has been wrong: four.** §13.6 is the authority, it
+is the only number in circulation that comes with the measurement attached, and
+§14.12 item 6 explains why three different counts were once in circulation at
+all. This stage adds nothing to it: the Wine leg agreed with the guest about
+everything it could see, and the one thing it could not see — a stamp — is not a
+Wine question, it is a substrate question.
+
+### 16.9 What is not proven
+
+**Nothing on this list is boxed, and that is the first time.** §14.12's box and
+§15.14's box are both closed, and the largest remaining gaps are ordinary items.
+
+1. **Nothing frees a pool, and now it is guest RAM** (§15.11). Measured further
+   this stage and the answer is not encouraging: in a 25-second trace Firefox
+   sent `1` `wl_buffer.destroy` against 3 `create_buffer` and **0**
+   `wl_shm_pool.destroy`, so §15.11 item 1's "release on `wl_buffer.destroy`" is
+   a fix with much less behind it than it looked. What the guest run adds is that
+   the *proxy's* own release path does work — 6 pools, 2 released, and an offset
+   reused — so the leak is the client's habit rather than the transport's. 64 MiB
+   held a 60-second Firefox with `0 overflows`; a 40-second startup measured at
+   401 MB in §15.10 would not have fit, and nothing here has measured a long
+   session.
+2. **Three connections is not a bound.** The allocator serves any number and the
+   test uses four, but nothing has run two *different applications* against one
+   arena, which is the case where one client's overflow becomes another's. The
+   error names the connection count now, which is the least that can be done for
+   it.
+3. **The deferral is trusted to be brief.** Gifts are held in the compositor's
+   own heap until the first client connects; a compositor that never gets one
+   holds them forever, which is a keymap and harmless, and a compositor whose
+   client connects *before* the locate would write them too early — the ordering
+   is now enforced against the wrong end. That cannot happen in this topology,
+   because the proxy is what connects and the plan is what starts it. It is the
+   same shape of argument §14.12 item 1 made and lost, which is why it is on this
+   list rather than in a comment.
+4. **The window is 1028x749 because the guest's screen is 1024x768**, and nothing
+   asks Windows how big the desktop is (§15.15 item 3). The resize round trip
+   worked, so this is a default that is wrong rather than a path that is broken.
+5. **Nothing has been typed into Firefox** (§15.14 item 3), no menu has been
+   dismissed (item 4), alpha is still thrown away (item 5), and **nobody has
+   looked at this window** — the run is in an ssh session's window station, which
+   is §13.6's lesson and §15.14 item 1 unchanged. `docs/stage12/` is the
+   compositor's own `--dump-frames` output, which is what it believes it
+   composited, not what a display server holds.
+6. **§12.13 items 3, 4 and 9 are unchanged.** In particular pinning is still
+   asserted rather than proven over time, and this run is 60 seconds.
+7. **The `de` keymap is the guest's, and it is not the one anything else uses.**
+   The workstation's runs are `us` at 35572 bytes on the wire; the guest's
+   keyboard layout is `0x0407` and its keymap is 37532. Nothing depends on it and
+   both are gifts, but a number that differs between two runs of "the same" test
+   is worth writing down once.
+
+### 16.10 What to do next
+
+1. **`DwmExtendFrameIntoClientArea`.** §15.15 item 1 is untouched and is now the
+   largest single item in the project: `docs/stage12/stage12-firefox-guest.png`
+   is Firefox's own tab strip with Windows' caption above it, on the guest, which
+   is the same bug report §15.7 filed with a stronger photograph.
+2. **Decide what a pool that is never destroyed costs a long session.** Item 1
+   above. The measurement to make is a Firefox that browses rather than one that
+   opens `about:blank`, and the number to watch is `overflows`.
+3. **Ask Windows how big the desktop is** (§15.15 item 3), which this stage
+   turned from a plausible-default bug into a measured one.
+4. **Look at the guest's Firefox window on the interactive desktop.** §13 has the
+   instrument (`scripts/wc-desktop.sh`, `PrintWindow`) and stage 11 has the
+   desktop; this stage has the client. §15.14 item 1 is still open and it is one
+   run.

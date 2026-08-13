@@ -489,6 +489,28 @@ fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(2);
             }
         }
+
+        // STAGE 12, and it is a correction rather than a feature. The window's
+        // pages carry the stamps the *host* locates this arena by, and a gift
+        // written into them before the host has swept takes them with it — the
+        // first guest run of an outbound window reported
+        // `located 16374 of 16384 pages` and wrote no plan, because smithay
+        // seals the keymap in `Seat::add_keyboard`, ten lines below and a full
+        // minute before any client exists. docs/design.md §14.12 item 1 said
+        // that ordering held by construction; it does not, and this is what
+        // makes it hold. Only for guest RAM: a file arena has no stamps and
+        // nothing is looking for it.
+        if args.guest_arenas.iter().any(|(gid, _)| *gid == id)
+            && let Err(e) = wc_handle::arena::defer_gifts(id)
+        {
+            eprintln!("wc-compositor: could not defer gifts into arena {id}: {e}");
+            return std::process::ExitCode::from(2);
+        } else if args.guest_arenas.iter().any(|(gid, _)| *gid == id) {
+            println!(
+                "wc-compositor: arena {id} objects made for clients are held in memory until the \
+                 first client connects, so that the host can still find every page's stamp"
+            );
+        }
     }
 
     // Where objects made for a client go. Before the socket exists, for the
@@ -662,7 +684,27 @@ fn wayland_thread(
                     .handle()
                     .insert_client(stream, Arc::new(ClientState::default()))
                 {
-                    Ok(_) => state.clients_seen += 1,
+                    Ok(_) => {
+                        state.clients_seen += 1;
+                        // STAGE 12. The first client is the earliest moment at
+                        // which anything could want an object this compositor
+                        // made, and — over guest RAM — the earliest moment at
+                        // which it is safe to write one: the client arrived
+                        // through a proxy that was started from a plan, and the
+                        // plan only exists if the host's sweep of the region
+                        // succeeded. See `wc_handle::arena::defer_gifts`.
+                        match wc_handle::arena::release_gifts() {
+                            Ok((0, _)) => {}
+                            Ok((n, bytes)) => println!(
+                                "wc-compositor: client {} released {n} held object(s), \
+                                 {bytes} bytes, into the arena",
+                                state.clients_seen
+                            ),
+                            Err(e) => {
+                                eprintln!("wc-compositor: could not release held objects: {e}")
+                            }
+                        }
+                    }
                     Err(e) => eprintln!("wc-compositor: could not insert client: {e}"),
                 }
             }

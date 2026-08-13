@@ -212,45 +212,22 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // one transport for the process. See the accept loop below for why there is
     // more than one client now.
     //
-    // `arena` refuses the second call, and refusing loudly is the point: one
-    // region, one allocator, and no protocol for handing out a second arena id
-    // (docs/design.md §12.13 item 6). A silent share would give two clients
-    // overlapping offsets into the same guest pages, which presents as one
-    // window showing another's pixels.
-    let mut arena_taken = false;
-    let mut make_transport =
-        || -> Result<Box<dyn PoolTransport + Send>, Box<dyn std::error::Error>> {
-        Ok(match args.transport.as_str() {
-        "shared-file" => {
-            if args.peer_prefix.is_empty() {
-                return Err(
-                    "--peer-prefix is required for --transport shared-file: the proxy \
-                     cannot guess how the compositor spells the pool directory, and a \
-                     guess would be wrong on the deployment that matters"
-                        .into(),
-                );
-            }
-            let t = SharedFile::new(&args.pool_dir, &args.peer_prefix)?;
-            println!(
-                "[proxy] transport shared-file: {} here, {:?} there",
-                args.pool_dir.display(),
-                args.peer_prefix
-            );
-            Box::new(t)
-        }
-        // STAGE 7. The region is the guest's RAM, and the compositor is the side
-        // that *provided* it — so there is no path to tell it about and nothing
-        // for it to open. What it was started with is
-        // `--arena-guest-ram <id>:<size>`, and what it printed is the run id
-        // this plan was made from.
-        "arena" if arena_taken => {
-            return Err("the arena is already serving a client, and there is one arena \
-                        (docs/design.md §12.13 item 6). Use --transport shared-file for a \
-                        client that opens more than one connection."
-                .into());
-        }
+    // CHANGED AGAIN IN STAGE 12: the arena is built **once, here**, before any
+    // client exists, and each session gets a handle on the same region and the
+    // same allocator (`Arena::share`). Stage 9 refused the second call by name —
+    // one region, one allocator, no protocol for a second arena id
+    // (docs/design.md §12.13 item 6) — and that refusal was the reason Firefox,
+    // which opens four connections, had never touched an arena (§15.14). The
+    // premise was right and the conclusion was not: what must not be duplicated
+    // is the *allocator*, and one allocator serves four connections for exactly
+    // the reason it serves four pools of one connection. See §16.2.
+    //
+    // Building it before the accept loop is a second, smaller improvement: a
+    // plan that cannot be read or a window that cannot be reserved is now a
+    // startup failure with the message on stderr, rather than the first client
+    // being told "no transport for it" twenty seconds later.
+    let shared_arena = match args.transport.as_str() {
         "arena" if !args.arena_plan.as_os_str().is_empty() => {
-            arena_taken = true;
             if args.arena_outbound != 0 {
                 return Err(
                     "--arena-outbound and --arena-plan are mutually exclusive: the window \
@@ -259,6 +236,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             }
+            // STAGE 7. The region is the guest's RAM, and the compositor is the
+            // side that *provided* it — so there is no path to tell it about and
+            // nothing for it to open. What it was started with is
+            // `--arena-guest-ram <id>:<size>`, and what it printed is the run id
+            // this plan was made from.
             let t = Arena::from_plan(args.arena_id, &args.arena_plan)?;
             println!(
                 "[proxy] transport arena {}: {} bytes of {} \
@@ -268,10 +250,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 t.origin(),
             );
             announce_outbound(&t);
-            Box::new(t)
+            Some(t)
         }
         "arena" => {
-            arena_taken = true;
             let mut t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
             if args.arena_outbound != 0 {
                 t.reserve_outbound(args.arena_outbound)?;
@@ -286,9 +267,48 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 t.size(),
             );
             announce_outbound(&t);
-            Box::new(t)
+            Some(t)
+        }
+        "shared-file" => {
+            if args.peer_prefix.is_empty() {
+                return Err(
+                    "--peer-prefix is required for --transport shared-file: the proxy \
+                     cannot guess how the compositor spells the pool directory, and a \
+                     guess would be wrong on the deployment that matters"
+                        .into(),
+                );
+            }
+            println!(
+                "[proxy] transport shared-file: {} here, {:?} there",
+                args.pool_dir.display(),
+                args.peer_prefix
+            );
+            None
         }
         other => return Err(format!("--transport {other}? try shared-file or arena").into()),
+    };
+
+    let make_transport = |n: usize| -> Result<Box<dyn PoolTransport + Send>, Box<dyn std::error::Error>> {
+        Ok(match &shared_arena {
+            // A handle on the region, not a copy of it. `sharers()` is the count
+            // §8.4's rule wants: a stage that made a second client possible with
+            // no way to see that it happened would not really have made it
+            // possible.
+            Some(a) => {
+                let t = a.share();
+                println!(
+                    "[proxy] client {n}: joins arena {} ({} connection(s) on it now, {} of {} bytes out)",
+                    t.id(),
+                    t.sharers() - 1,
+                    t.published(),
+                    t.size(),
+                );
+                Box::new(t)
+            }
+            // A transport per session, and here that really is a separate one:
+            // the names `SharedFile` gives pool files carry 128 bits of
+            // randomness, so two of them over one directory cannot collide.
+            None => Box::new(SharedFile::new(&args.pool_dir, &args.peer_prefix)?),
         })
     };
 
@@ -354,12 +374,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("[proxy] client {n} connected, upstream {} connected", args.upstream.display());
 
-        // A transport per session. The names `SharedFile` gives pool files
-        // carry 128 bits of randomness, so two of them over one directory
-        // cannot collide; an `Arena` is a single region with one allocator and
-        // **cannot** be shared, which is docs/design.md §12.13 item 6 arriving
-        // as a real limitation rather than a note.
-        let transport = match make_transport() {
+        // A transport per session: a fresh `SharedFile`, or a handle on the one
+        // arena. docs/design.md §16.2.
+        let transport = match make_transport(n) {
             Ok(t) => t,
             Err(e) => {
                 println!("[proxy] client {n}: no transport for it: {e}");

@@ -49,6 +49,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use wc_handle::{Descriptor, Handle, MappingMut};
 
@@ -292,6 +293,20 @@ impl PoolTransport for SharedFile {
 /// First fit rather than anything cleverer because a `wl_shm` client holds two
 /// or three pools at a time. If that changes the allocator is 60 lines and it
 /// is tested; replacing it does not touch the wire.
+///
+/// # One allocator, several connections
+///
+/// STAGE 12. An `Arena` is a handle on a region and on **one** free list;
+/// [`Arena::share`] makes another handle on the same two things, and every
+/// Wayland connection the proxy serves gets one. Firefox opens four
+/// (docs/design.md §15.8), which is why this exists.
+///
+/// The invariant this preserves is the one that was always the point: **two
+/// allocators over one region would hand out the same offsets**, which is a
+/// client's pixels written on top of another client's — or on top of a live
+/// keymap — with nothing in any log. Sharing the *allocator* is the opposite of
+/// that: four connections asking one free list for space is the same operation
+/// as one connection asking it four times.
 /// Where an [`Arena`]'s bytes actually are.
 ///
 /// STAGE 7 SPLIT THIS IN TWO, and docs/design.md §12 is why. Everything above
@@ -321,30 +336,105 @@ impl Backing {
             Backing::GuestRam(r) => r.as_mut_slice(),
         }
     }
+}
 
-    /// The same bytes, for reading. Needed because the compositor's outbound
-    /// window is read from here and the pool path is the only writer.
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Backing::File { view, .. } => view.as_slice(),
-            Backing::GuestRam(r) => r.as_slice(),
+/// The region, reachable from several session threads at once.
+///
+/// STAGE 12, and this type is where the whole multi-connection question lands.
+/// The `Backing` above is *one* mapping — a `MappingMut` or a
+/// `StitchedRegion` — and neither is `Sync`, deliberately: `wc_handle` says
+/// "a read-only view can be shared freely, a writable one is exclusive to
+/// whoever holds the `&mut`". That rule is right for one owner and it is the
+/// wrong shape for four Wayland connections into one arena, so it is replaced
+/// here by a narrower one rather than widened over there.
+///
+/// # The rule that replaces it
+///
+/// **The only writable references handed out are the extents one allocator has
+/// handed out, and that allocator never overlaps two of them.** So the `&mut`s
+/// that exist at any moment are disjoint sub-slices of one allocation, which is
+/// what `slice::split_at_mut` produces and is sound for the same reason. The
+/// allocator is [`Alloc`], it is behind a single [`Mutex`], its extents are
+/// asserted disjoint by `arena_slices_never_overlap`, and a `Region`'s key is
+/// only ever known to the one session that asked for it.
+///
+/// The read side is narrower still: [`Arena::peer_slice`] refuses anything
+/// outside the compositor's outbound window, and the outbound window is exactly
+/// the range [`Arena::reserve_outbound`] removed from the free list. So a
+/// shared `&[u8]` and any `&mut [u8]` are disjoint **by a check**, not by an
+/// argument.
+struct SharedBacking {
+    /// Held for its lifetime and its `Drop`; never dereferenced again, because
+    /// both of its accessors want a whole-region slice and this type must never
+    /// form one while sub-slices are out.
+    _backing: Backing,
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `base` is the one mapping `_backing` owns and outlives every
+// reference this type hands out. Sharing it between threads is sound because of
+// the rule in the doc comment above: the writable references are disjoint
+// allocator extents and the readable ones are inside the outbound window, which
+// the allocator does not hand out. It is shared memory — the compositor and,
+// over guest RAM, the guest itself write it too — which is a `wl_shm` hazard
+// rather than a Rust one, and is the hazard `wc_handle::Mapping` documents.
+unsafe impl Send for SharedBacking {}
+unsafe impl Sync for SharedBacking {}
+
+impl SharedBacking {
+    fn new(mut backing: Backing) -> SharedBacking {
+        let whole = backing.as_mut_slice();
+        let (base, len) = (whole.as_mut_ptr(), whole.len());
+        SharedBacking { _backing: backing, base, len }
+    }
+
+    /// The address of `offset..offset + len`, or `None` if that is not inside
+    /// the region.
+    ///
+    /// A pointer rather than a slice, so that the two places a *reference* is
+    /// made out of it are the two places the argument for making one has to be
+    /// written down. Handing back a `&mut [u8]` from `&self` would put the whole
+    /// claim in one function and its callers would inherit it silently — which
+    /// is also what `clippy::mut_from_ref` is about.
+    fn range(&self, offset: usize, len: usize) -> Option<*mut u8> {
+        if offset.checked_add(len)? > self.len {
+            return None;
         }
+        // SAFETY: `offset + len <= self.len`, so this stays inside the mapping.
+        Some(unsafe { self.base.add(offset) })
     }
 }
 
-pub struct Arena {
-    id: u32,
-    backing: Backing,
-    /// How the region was obtained, for the one log line that says it.
-    origin: String,
+/// The whole of the allocator's mutable state, behind one lock.
+///
+/// It is one struct rather than four fields so that "the free list, the live
+/// map and the counters move together" is a property of the type instead of a
+/// thing every method has to remember.
+#[derive(Default)]
+struct Alloc {
     free: Vec<(u64, u64)>,
     live: HashMap<u64, (u64, u64)>,
     next: u64,
     published: u64,
+}
+
+/// The region, the one allocator over it, and everything that does not change
+/// once a client exists.
+struct ArenaInner {
+    id: u32,
+    region: SharedBacking,
+    /// How the region was obtained, for the one log line that says it.
+    origin: String,
     size: u64,
     /// The peer's outbound window, `(offset, len)`, which this allocator has
     /// been told to stay out of. See [`Arena::reserve_outbound`].
     outbound: Option<(u64, u64)>,
+    alloc: Mutex<Alloc>,
+}
+
+pub struct Arena {
+    inner: Arc<ArenaInner>,
 }
 
 /// The allocator's granularity, and the alignment of every offset it returns.
@@ -383,6 +473,46 @@ impl Arena {
         };
         let view = handle.map_mut()?;
         Ok(Arena::over(id, Backing::File { _handle: handle, view }, &path, size))
+    }
+
+    /// A second handle on **the same region and the same allocator**, for
+    /// another Wayland connection.
+    ///
+    /// STAGE 12, and it is the whole of docs/design.md §16.2. Until this stage
+    /// `--transport arena` refused the second connection by name, on the grounds
+    /// that there is one region and one allocator (§12.13 item 6) — and the
+    /// premise was right while the conclusion was not. **One allocator is the
+    /// invariant; one client was an artefact of `Box<dyn PoolTransport>` being
+    /// moved into one session's thread.** Four connections through one allocator
+    /// cannot overlap, for exactly the reason two pools of one connection
+    /// cannot: the free list is the only thing that decides an offset, and there
+    /// is still only one of it.
+    ///
+    /// What this is *not* is a second arena id. §15.14 guessed that
+    /// multi-connection support would be "one arena id per client, a
+    /// `shared_vulkan` cold-path handshake question", and that would have been a
+    /// second **region** — a second `attach_guest_ram` in the guest, a second
+    /// 13 GiB sweep on the host (2.4 s, §12.5) and a second plan, per
+    /// connection, four times over for one Firefox. The id names the region, not
+    /// the client, and nothing about a region wants to be per-client.
+    pub fn share(&self) -> Arena {
+        Arena { inner: Arc::clone(&self.inner) }
+    }
+
+    /// How many sessions hold this arena, for the log line that says so.
+    pub fn sharers(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    /// The allocator, with poisoning treated as recoverable.
+    ///
+    /// Nothing under this lock does anything but arithmetic on a `Vec` and a
+    /// `HashMap`, so a panic elsewhere in a session thread cannot have left the
+    /// free list half-updated. Refusing to serve the other three connections
+    /// because a fourth panicked would be turning a contained failure into a
+    /// total one, which is the opposite of what the accept loop is for.
+    fn alloc(&self) -> MutexGuard<'_, Alloc> {
+        self.inner.alloc.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Take the region `wc-arena-host` located in the guest as arena `id`.
@@ -442,24 +572,36 @@ impl Arena {
     /// it during construction, from the plan or from a flag, before any client
     /// exists. It refuses rather than assumes, so a later call with anything
     /// allocated is an error and not a quietly moved boundary.
+    /// **STAGE 12 gave it a third refusal, and the type does the work.** It
+    /// takes `&mut self` and reaches the region through `Arc::get_mut`, so an
+    /// arena that any session already holds cannot have its window moved: the
+    /// refcount *is* "before the first client", which is stronger than the free
+    /// list being untouched and is checked at the only moment it could go wrong.
     pub fn reserve_outbound(&mut self, len: u64) -> io::Result<()> {
-        if self.published > 0 || self.free != vec![(0, self.size)] {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
             return Err(io::Error::other(
-                "the peer's outbound window must be reserved before anything is allocated",
+                "the peer's outbound window must be reserved before any client is served: \
+                 this arena is already shared with a session",
             ));
+        };
+        let size = inner.size;
+        {
+            let alloc = inner.alloc.get_mut().unwrap_or_else(|e| e.into_inner());
+            if alloc.published > 0 || alloc.free != vec![(0, size)] {
+                return Err(io::Error::other(
+                    "the peer's outbound window must be reserved before anything is allocated",
+                ));
+            }
         }
-        if len == 0 || len >= self.size {
+        if len == 0 || len >= size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "an outbound window of {len} bytes leaves nothing of a {}-byte arena",
-                    self.size
-                ),
+                format!("an outbound window of {len} bytes leaves nothing of a {size}-byte arena"),
             ));
         }
         let len = len.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
-        self.outbound = Some((self.size - len, len));
-        self.free = vec![(0, self.size - len)];
+        inner.outbound = Some((size - len, len));
+        inner.alloc.get_mut().unwrap_or_else(|e| e.into_inner()).free = vec![(0, size - len)];
         Ok(())
     }
 
@@ -467,35 +609,37 @@ impl Arena {
     /// knows about it. `None` is the answer for every deployment before stage 10
     /// and for every one whose compositor creates nothing.
     pub fn outbound(&self) -> Option<(u64, u64)> {
-        self.outbound
+        self.inner.outbound
     }
 
     fn over(id: u32, backing: Backing, origin: &str, size: u64) -> Arena {
         Arena {
-            id,
-            backing,
-            origin: origin.to_owned(),
-            free: vec![(0, size)],
-            live: HashMap::new(),
-            next: 0,
-            published: 0,
-            size,
-            outbound: None,
+            inner: Arc::new(ArenaInner {
+                id,
+                region: SharedBacking::new(backing),
+                origin: origin.to_owned(),
+                size,
+                outbound: None,
+                alloc: Mutex::new(Alloc {
+                    free: vec![(0, size)],
+                    ..Alloc::default()
+                }),
+            }),
         }
     }
 
     pub fn id(&self) -> u32 {
-        self.id
+        self.inner.id
     }
 
     /// Where the region came from, for the log line that is the only difference
     /// a reader of the output can see between the two substrates.
     pub fn origin(&self) -> &str {
-        &self.origin
+        &self.inner.origin
     }
 
     pub fn size(&self) -> u64 {
-        self.size
+        self.inner.size
     }
 
     /// Free bytes, and the largest contiguous run of them. The second number is
@@ -503,12 +647,15 @@ impl Arena {
     /// it is the fragmentation failure shared_vulkan's design.md §5.7 is about,
     /// and reporting only the total would hide it.
     pub fn free_bytes(&self) -> (u64, u64) {
+        let alloc = self.alloc();
         (
-            self.free.iter().map(|(_, l)| *l).sum(),
-            self.free.iter().map(|(_, l)| *l).max().unwrap_or(0),
+            alloc.free.iter().map(|(_, l)| *l).sum(),
+            alloc.free.iter().map(|(_, l)| *l).max().unwrap_or(0),
         )
     }
+}
 
+impl Alloc {
     fn release(&mut self, offset: u64, len: u64) {
         let at = self.free.partition_point(|(o, _)| *o < offset);
         self.free.insert(at, (offset, len));
@@ -539,63 +686,103 @@ impl PoolTransport for Arena {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a pool cannot be empty"));
         }
         let want = size.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
-        let idx = self.free.iter().position(|(_, l)| *l >= want).ok_or_else(|| {
-            let (total, largest) = self.free_bytes();
+        let mut alloc = self.alloc();
+        let idx = alloc.free.iter().position(|(_, l)| *l >= want).ok_or_else(|| {
+            let total: u64 = alloc.free.iter().map(|(_, l)| *l).sum();
+            let largest = alloc.free.iter().map(|(_, l)| *l).max().unwrap_or(0);
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 format!(
-                    "arena {} has no run of {want} bytes ({total} free, largest {largest}); \
-                     raise --arena-size",
-                    self.id
+                    "arena {} has no run of {want} bytes ({total} free, largest {largest}, \
+                     {} bytes out to {} connection(s)); raise --arena-size",
+                    self.inner.id,
+                    alloc.published,
+                    Arc::strong_count(&self.inner)
                 ),
             )
         })?;
-        let (offset, len) = self.free[idx];
+        let (offset, len) = alloc.free[idx];
         if len == want {
-            self.free.remove(idx);
+            alloc.free.remove(idx);
         } else {
-            self.free[idx] = (offset + want, len - want);
+            alloc.free[idx] = (offset + want, len - want);
         }
-        let key = self.next;
-        self.next += 1;
-        self.live.insert(key, (offset, want));
-        self.published += want;
+        let key = alloc.next;
+        alloc.next += 1;
+        alloc.live.insert(key, (offset, want));
+        alloc.published += want;
         Ok(Region {
-            descriptor: Descriptor::ArenaSlice { arena: self.id, offset, len: size },
+            descriptor: Descriptor::ArenaSlice { arena: self.inner.id, offset, len: size },
             size,
             key,
         })
     }
 
     fn destroy(&mut self, region: &Region) {
-        if let Some((offset, len)) = self.live.remove(&region.key) {
-            self.published -= len;
-            self.release(offset, len);
+        let mut alloc = self.alloc();
+        if let Some((offset, len)) = alloc.live.remove(&region.key) {
+            alloc.published -= len;
+            alloc.release(offset, len);
         }
     }
 
     fn bytes_mut(&mut self, region: &Region) -> Option<&mut [u8]> {
-        let (offset, _) = *self.live.get(&region.key)?;
+        // The lock is held only for the lookup, not for the copy. A commit is
+        // 126 us of `memcpy` for Firefox (docs/design.md §15.10) and four
+        // connections holding one mutex across it would serialise every client's
+        // frame path against every other's — which would be a real cost of
+        // sharing the arena, and there is no reason to pay it: the extent this
+        // returns cannot be handed to anybody else while it is live.
+        let (offset, _) = *self.alloc().live.get(&region.key)?;
         let start = usize::try_from(offset).ok()?;
         let len = usize::try_from(region.size).ok()?;
-        self.backing.as_mut_slice().get_mut(start..start + len)
+        let p = self.inner.region.range(start, len)?;
+        // SAFETY: `region.key` is live in the allocator, so `start..start + len`
+        // is an extent no other `Region` overlaps — the allocator hands out
+        // disjoint runs and a key belongs to exactly one session — and `&mut
+        // self` rules out a second reference to it from this handle. The
+        // compositor may be reading these bytes at the same time, which is the
+        // `wl_shm` race `wl_buffer.release` arbitrates and not a Rust one.
+        Some(unsafe { std::slice::from_raw_parts_mut(p, len) })
     }
 
     fn published(&self) -> u64 {
-        self.published
+        self.alloc().published
     }
 
-    /// The whole region is readable, not only the part this side allocated —
-    /// the compositor's outbound window is in it and is precisely the range this
-    /// side never hands out. Bounds-checked rather than trusted: the offsets
-    /// arrive in a descriptor from the other side of the boundary.
+    /// **Only the compositor's outbound window**, and the narrowness is the
+    /// point.
+    ///
+    /// The bytes this returns are read while other threads are copying pixels
+    /// into the same region, so the range has to be one that no pool can ever
+    /// occupy. That range exists and has a name: it is the window
+    /// [`Arena::reserve_outbound`] took out of the free list, which is exactly
+    /// the set of bytes the compositor may describe to a client. Anything
+    /// outside it is either a misconfiguration or a compositor describing a
+    /// client's pool back to another client, and both should be refused with the
+    /// numbers in the message rather than served.
+    ///
+    /// STAGE 12 narrowed this from "the whole region". Before it there was one
+    /// session and the widest possible read was harmless; with four sessions the
+    /// widest possible read overlaps another session's pixels while it is being
+    /// written, and the check is what makes [`SharedBacking`]'s two accessors
+    /// provably disjoint instead of merely conventionally so.
     fn peer_slice(&self, arena: u32, offset: u64, len: u64) -> Option<&[u8]> {
-        if arena != self.id {
+        if arena != self.inner.id {
+            return None;
+        }
+        let (base, wlen) = self.inner.outbound?;
+        if offset < base || offset.checked_add(len)? > base + wlen {
             return None;
         }
         let start = usize::try_from(offset).ok()?;
-        let end = start.checked_add(usize::try_from(len).ok()?)?;
-        self.backing.as_slice().get(start..end)
+        let len = usize::try_from(len).ok()?;
+        let p = self.inner.region.range(start, len)?;
+        // SAFETY: the range is inside the mapping and inside the outbound
+        // window, which the allocator never hands out — so no `bytes_mut` on any
+        // thread can be holding a `&mut` that overlaps it. The compositor writes
+        // it, once, before it names it in a message this proxy has yet to read.
+        Some(unsafe { std::slice::from_raw_parts(p.cast_const(), len) })
     }
 }
 
@@ -739,6 +926,121 @@ mod tests {
         let a = t.create(4096).unwrap();
         let b = t.create(4096).unwrap();
         assert_ne!(a.descriptor, b.descriptor);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// STAGE 12, and the test the stage exists for.
+    ///
+    /// Four handles on one arena — Firefox's count — each allocating and each
+    /// **writing its own name into its own slice**, from four threads at once.
+    /// The assertions are the two failures that sharing an allocator could
+    /// produce and that nothing else in this file would catch: two connections
+    /// handed overlapping offsets, and a connection's bytes turning up in
+    /// another's slice. The second is the one that matters, because overlapping
+    /// offsets with nobody writing them look exactly like working code.
+    #[test]
+    fn four_connections_share_one_arena_without_overlapping() {
+        let d = tmpdir("share");
+        std::fs::create_dir_all(&d).unwrap();
+        let a = Arena::open_or_create(7105, &d.join("arena"), 4 << 20).unwrap();
+        assert_eq!(a.sharers(), 1);
+
+        let handles: Vec<_> = (0..4u8)
+            .map(|n| {
+                let mut t = a.share();
+                std::thread::spawn(move || {
+                    let mut mine = Vec::new();
+                    for i in 0..8u64 {
+                        let r = t.create(4096 * (i + 1)).unwrap();
+                        let Descriptor::ArenaSlice { offset, len, .. } = r.descriptor else {
+                            panic!("wrong kind")
+                        };
+                        let bytes = t.bytes_mut(&r).unwrap();
+                        bytes.fill(b'A' + n);
+                        mine.push((offset, len));
+                    }
+                    // Read them back through this session's own handle after
+                    // every other session has finished writing, which is what
+                    // makes this a test of the region rather than of the loop.
+                    mine
+                })
+            })
+            .collect();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for h in handles {
+            spans.extend(h.join().unwrap());
+        }
+        assert_eq!(a.sharers(), 1, "every session's handle must have been dropped");
+        assert_eq!(spans.len(), 32);
+        spans.sort();
+        for w in spans.windows(2) {
+            assert!(
+                w[0].0 + w[0].1.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY <= w[1].0,
+                "{:?} overlaps {:?} — two connections were given the same bytes",
+                w[0],
+                w[1]
+            );
+        }
+        // Each slice still holds one letter, so nothing wrote through anybody
+        // else's extent.
+        let map = Handle::open_shared_file(
+            &d.join("arena").to_string_lossy(),
+            &d.join("arena").to_string_lossy(),
+            4 << 20,
+        )
+        .unwrap()
+        .map()
+        .unwrap();
+        for (offset, len) in spans {
+            let s = &map.as_slice()[offset as usize..(offset + len) as usize];
+            assert!(
+                s.iter().all(|b| *b == s[0]) && (b'A'..=b'D').contains(&s[0]),
+                "slice {offset}+{len} is not one connection's bytes: {:?}",
+                &s[..8.min(s.len())]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The window a compositor may describe, and nothing else.
+    ///
+    /// STAGE 12 narrowed `peer_slice` from the whole region to the outbound
+    /// window. With one connection the difference was invisible; with four it is
+    /// the difference between reading a keymap and reading another client's
+    /// buffer while it is being copied into.
+    #[test]
+    fn a_peer_slice_outside_the_outbound_window_is_refused() {
+        let d = tmpdir("peerwin");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7106, &d.join("arena"), 64 * 4096).unwrap();
+        a.reserve_outbound(8 * 4096).unwrap();
+        let (base, len) = a.outbound().unwrap();
+        assert!(a.peer_slice(7106, base, len).is_some(), "the window itself must be readable");
+        assert!(a.peer_slice(7106, base, len + 1).is_none(), "past the end of the arena");
+        assert!(a.peer_slice(7106, base - 4096, 4096).is_none(), "below the window");
+        // And the range a pool would occupy, which is the one that matters.
+        let r = a.create(4096).unwrap();
+        let Descriptor::ArenaSlice { offset, len, .. } = r.descriptor else { panic!() };
+        assert!(
+            a.peer_slice(7106, offset, len).is_none(),
+            "a pool's own bytes must not be readable as a compositor's object"
+        );
+        assert!(a.peer_slice(7107, base, 4096).is_none(), "another arena's id");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The window is a property of the deployment and is fixed before any client
+    /// exists. Once one does, the refcount says so.
+    #[test]
+    fn an_outbound_window_cannot_be_reserved_once_a_connection_holds_the_arena() {
+        let d = tmpdir("late");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7107, &d.join("arena"), 64 * 4096).unwrap();
+        let held = a.share();
+        let e = a.reserve_outbound(4096).unwrap_err();
+        assert!(e.to_string().contains("already shared with a session"), "{e}");
+        drop(held);
+        a.reserve_outbound(4096).expect("and it is allowed again once nothing holds it");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -348,6 +348,12 @@ struct Window {
     /// the same way are two things a reader has to learn once.
     free: Vec<(u64, u64)>,
     given: u64,
+    /// STAGE 12. While this is `Some`, a gift's bytes are held **here** instead
+    /// of going into the region, keyed by the gift's arena offset. See
+    /// [`defer_gifts`] for the whole argument; the short version is that on
+    /// guest RAM the window's pages carry the stamps the host locates the arena
+    /// by, and a gift written before the sweep takes them with it.
+    pending: Option<HashMap<u64, Vec<u8>>>,
 }
 
 fn outbound_slot() -> &'static Mutex<Option<Window>> {
@@ -447,8 +453,104 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         ));
     }
     let base = arena_len - len;
-    *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0 });
+    *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None });
     Ok(OutboundWindow { arena, offset: base, len })
+}
+
+/// Hold every gift's bytes in memory until [`release_gifts`] is called.
+///
+/// # STAGE 12, and it is a correction to a claim rather than a feature
+///
+/// docs/design.md §14.12 item 1 said the ordering held by construction:
+///
+/// > A gift written before the host's locate would take pages of stamps with it
+/// > and the sweep would report `located 16366 of 16384`. The order holds in
+/// > every topology that exists — the host cannot proxy a client it has not
+/// > connected for, and the compositor cannot mint a keymap before a client
+/// > binds a seat.
+///
+/// **The second clause is false, and the first guest run of an outbound window
+/// measured it**: `located 16374 of 16384 pages`, no plan written, the run over
+/// before a client existed. smithay compiles and *seals* the keymap in
+/// `Seat::add_keyboard`, which the compositor calls while it is starting up —
+/// so the keymap is minted before the socket is bound, let alone bound to.
+/// 73017 bytes of `de` layout is ten pages of stamps, and ten is exactly what
+/// the sweep was short.
+///
+/// # Why deferring is the fix rather than re-ordering something
+///
+/// Every page of a guest-RAM arena has to carry its stamp when the host sweeps,
+/// because the sweep is a *content* search: a page whose stamp is gone is a page
+/// with no known guest-physical address, and the stitched view would have a hole
+/// exactly where the compositor's objects live. So nothing may write into the
+/// region until the sweep is done, and no ordering of the compositor's own
+/// start-up achieves that — the compositor cannot know when a host it never
+/// talks to has finished.
+///
+/// What it *can* know is that a client has connected, and that is sufficient:
+/// the proxy is what connects, the proxy is started from the plan, and the plan
+/// only exists if the locate succeeded. So "the first client" is a moment that
+/// provably follows the sweep, and it is also the earliest moment anything could
+/// want a gift's bytes — nothing inside the guest ever reads them.
+///
+/// Deferral is asked for rather than automatic because it is only right where
+/// there are stamps to protect. A file arena has none and nothing to locate, so
+/// `--arena-provide` does not defer and its keymap is in the region the moment
+/// it is written.
+pub fn defer_gifts(arena: u32) -> io::Result<()> {
+    let mut guard =
+        outbound_slot().lock().map_err(|_| io::Error::other("outbound window poisoned"))?;
+    let Some(w) = guard.as_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no outbound window to defer writes into",
+        ));
+    };
+    if w.arena != arena {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("the outbound window is arena {}'s, not arena {arena}'s", w.arena),
+        ));
+    }
+    if w.given > 0 {
+        return Err(io::Error::other(
+            "gifts have already been handed out: deferring now would leave the ones already \
+             written in the region and the rest out of it, which is worse than either",
+        ));
+    }
+    w.pending = Some(HashMap::new());
+    Ok(())
+}
+
+/// Write every deferred gift into the region and stop deferring.
+///
+/// Returns `(gifts, bytes)` for the log line that says it happened, because a
+/// stage that changed *when* the bytes land with no way to see it had done so
+/// would not really have changed it (§8.4). Calling it when nothing is deferred
+/// is a no-op returning `(0, 0)`, which is what lets the caller be an accept
+/// loop rather than a first-time flag.
+pub fn release_gifts() -> io::Result<(usize, u64)> {
+    let (arena, taken) = {
+        let mut guard =
+            outbound_slot().lock().map_err(|_| io::Error::other("outbound window poisoned"))?;
+        let Some(w) = guard.as_mut() else {
+            return Ok((0, 0));
+        };
+        match w.pending.take() {
+            Some(p) => (w.arena, p),
+            None => return Ok((0, 0)),
+        }
+    };
+    // The lock is dropped first, on purpose: `write_provided` takes the arena
+    // registry's read lock, and `reserve_outbound` takes them in the other
+    // order. Two locks taken in two orders is a deadlock that would present as
+    // a compositor that accepted a client and then stopped.
+    let mut bytes = 0u64;
+    for (offset, buf) in &taken {
+        write_provided(arena, *offset, buf)?;
+        bytes += buf.len() as u64;
+    }
+    Ok((taken.len(), bytes))
 }
 
 /// The outbound window, if one was declared.
@@ -525,6 +627,26 @@ impl Gift {
                 format!("write {offset}..{end} runs past the end of a {}-byte gift", self.len),
             ));
         }
+        // STAGE 12. While the window is deferred the bytes stay here, because
+        // the region still has to look to the host exactly as the guest stamped
+        // it. Only the outbound lock is taken on this path — `write_provided`
+        // takes the registry's, and taking both here in that order would invert
+        // `reserve_outbound`'s.
+        {
+            let mut guard =
+                outbound_slot().lock().map_err(|_| io::Error::other("outbound window poisoned"))?;
+            if let Some(w) = guard.as_mut()
+                && w.arena == self.arena
+                && let Some(pending) = w.pending.as_mut()
+            {
+                let len = usize::try_from(self.len)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "gift too large"))?;
+                let buf = pending.entry(self.offset).or_insert_with(|| vec![0u8; len]);
+                let (o, e) = (offset as usize, end as usize);
+                buf[o..e].copy_from_slice(bytes);
+                return Ok(());
+            }
+        }
         write_provided(self.arena, self.offset + offset, bytes)
     }
 }
@@ -541,6 +663,12 @@ impl Drop for Gift {
             return;
         }
         w.given = w.given.saturating_sub(self.span);
+        // STAGE 12: and its bytes, if they never reached the region. A gift
+        // dropped while the window is deferred has to take its buffer with it,
+        // or a later gift at the same offset would inherit it.
+        if let Some(pending) = w.pending.as_mut() {
+            pending.remove(&self.offset);
+        }
         let at = w.free.partition_point(|(o, _)| *o < self.offset);
         w.free.insert(at, (self.offset, self.span));
         // Coalesce, so a long-lived compositor that has minted a keymap per
@@ -1006,6 +1134,40 @@ mod tests {
             attach_guest_ram(OUT, 4096).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
+
+        // STAGE 12: deferral, and the property it exists for.
+        //
+        // **The region must still read as the guest stamped it** until somebody
+        // says the host has finished looking. The first guest run of an outbound
+        // window failed exactly here — `located 16374 of 16384 pages` — because
+        // smithay seals the keymap during start-up and ten pages of stamps went
+        // with it. So: defer, mint an object, and assert that the page under it
+        // still carries the magic.
+        defer_gifts(OUT).unwrap();
+        let held = Handle::create_shared(64).unwrap();
+        held.write_at(0, b"KEYMAP").unwrap();
+        let held_at = match held.descriptor() {
+            Descriptor::ArenaSlice { offset, .. } => *offset,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(held_at, w.offset, "the first gift is the start of the window, which is a page");
+        let look = |off: u64, len: u64| {
+            Handle::from_descriptor(Descriptor::ArenaSlice { arena: OUT, offset: off, len })
+                .map()
+                .unwrap()
+        };
+        assert_eq!(
+            &look(held_at, 8).as_slice()[..8],
+            &STAMP_MAGIC,
+            "a deferred gift reached the region, and the host's sweep would be short by a page"
+        );
+        // And then it lands, once, and saying so twice is a no-op.
+        assert_eq!(release_gifts().unwrap(), (1, 64));
+        assert_eq!(&look(held_at, 6).as_slice()[..6], b"KEYMAP");
+        assert_eq!(release_gifts().unwrap(), (0, 0), "a second release must do nothing");
+        // Deferring after the fact is refused rather than half-applied.
+        assert!(defer_gifts(OUT).is_err());
+        drop(held);
 
         // A gift is inside the window, is writable by its owner, and the bytes
         // are readable from the descriptor alone — which is the whole claim.

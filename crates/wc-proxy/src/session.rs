@@ -1066,10 +1066,13 @@ fn materialise(
                     io::ErrorKind::NotFound,
                     format!(
                         "the compositor described an object as arena {arena} \
-                         {offset}+{len}, which this proxy has no region for. Either it was \
-                         started with --transport shared-file while the compositor has an \
-                         --arena-outbound window, or the two disagree about the arena's \
-                         number or its length."
+                         {offset}+{len}, which is not a range this proxy will read. Either \
+                         it was started with --transport shared-file while the compositor \
+                         has an --arena-outbound window, or the two disagree about the \
+                         arena's number or its length, or — STAGE 12 — the range is outside \
+                         the compositor's outbound window, which is the only part of a \
+                         shared arena a compositor may describe to a client: everything \
+                         else in it is some connection's pixels, being written now."
                     ),
                 )
             })?;

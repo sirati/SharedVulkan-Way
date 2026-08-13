@@ -5,7 +5,8 @@
 #   scripts/wc-firefox.sh window      the browser's own pixels, measured from outside
 #   scripts/wc-firefox.sh menu        a click, an xdg_popup, and a second window
 #   scripts/wc-firefox.sh wine        the same client into a real HWND, through the proxy
-#   scripts/wc-firefox.sh all         all four
+#   scripts/wc-firefox.sh wine-arena  the same run with the pixels in an arena
+#   scripts/wc-firefox.sh all         all five
 #
 # Run from inside `nix develop`.
 #
@@ -340,13 +341,19 @@ block_menu() {
 # ---------------------------------------------------------------------------
 
 block_wine() {
-  echo "== wine: Firefox -> wc-proxy -> wc-compositor.exe -> an HWND"
+  # STAGE 12 gave this block a transport argument, and the second leg is the
+  # first one **with two flags changed and nothing else** — the same Firefox,
+  # the same Xvfb, the same assertions — because the claim is that the transport
+  # changed and nothing did. §14.6 set that discipline for `weston-eventdemo`
+  # and a weaker check on the new leg would prove nothing.
+  local transport=${1:-shared-file}
+  echo "== wine/$transport: Firefox -> wc-proxy -> wc-compositor.exe -> an HWND"
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
   have wine || { non "no wine"; return; }
   have Xvfb || { non "no Xvfb"; return; }
   [ -x "$WIN_BIN/wc-compositor.exe" ] || { non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return; }
 
-  local dir="$RUNDIR/wine"
+  local dir="$RUNDIR/wine-$transport"
   mkdir -p "$dir/rt" "$dir/frames" "$dir/pools" "$dir/keymaps" "$dir/profile"
   chmod 700 "$dir/rt"
 
@@ -382,10 +389,38 @@ block_wine() {
   # A previous run's node, which `afunix` will not bind over: the error is
   # `OS Error 433`, which says nothing about a stale file.
   rm -f "$WINEPREFIX/drive_c"/users/*/AppData/Local/waycompose/"$sock"* 2>/dev/null
+
+  # STAGE 12. The two configurations, and the only difference between the runs.
+  #
+  # `arena`: the region is one file both sides map, provided out of band before
+  # either starts, and the compositor keeps the last MiB of it for the objects
+  # *it* creates — which for Firefox is two keymaps, one per seat-binding
+  # connection (§15.2's table has `wl_seat` twice). So **no `--shared-dir` at
+  # all**: if the run passes, no protocol object touched a filesystem.
+  #
+  # 64 MiB against the 14,325,120 bytes of pools a settled Firefox holds
+  # (§15.10). The arena is truncated fresh every run for §12.7's reason: a
+  # region still full of the previous run's pixels is a way for a frozen frame
+  # to look like a live one.
+  local arena_size=$((64 * 1024 * 1024)) arena_out=$((1024 * 1024))
+  local comp_extra=() proxy_extra=()
+  case "$transport" in
+    shared-file)
+      comp_extra=(--shared-dir "$(winp "$dir/keymaps")" --shared-peer-prefix "$dir/keymaps/")
+      proxy_extra=(--transport shared-file --pool-dir "$dir/pools"
+                   --peer-prefix "$(winp "$dir/pools")\\") ;;
+    arena)
+      : >"$dir/arena"; truncate -s $arena_size "$dir/arena"
+      comp_extra=(--arena-provide "0:$arena_size:$(winp "$dir/arena")"
+                  --arena-outbound "0:$arena_out")
+      proxy_extra=(--transport arena --arena-path "$dir/arena" --arena-id 0
+                   --arena-size $arena_size --arena-outbound $arena_out) ;;
+    *) bad "unknown transport $transport"; return ;;
+  esac
+
   wine explorer "/desktop=$desk,1600x1050" \
     "$WIN_BIN/wc-compositor.exe" --socket "$sock" --timeout 150 --output "$OUTPUT" \
-    --dump-frames "$(winp "$dir/frames")" \
-    --shared-dir "$(winp "$dir/keymaps")" --shared-peer-prefix "$dir/keymaps/" \
+    --dump-frames "$(winp "$dir/frames")" "${comp_extra[@]}" \
     --log "$(winp "$dir/srv.log")" >"$dir/loader.log" 2>&1 &
   local srv=$!
 
@@ -405,8 +440,7 @@ block_wine() {
 
   XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-proxy" \
     --upstream "$node" --socket wl-proxy --runtime-dir "$dir/rt" \
-    --copy pool --transport shared-file --pool-dir "$dir/pools" \
-    --peer-prefix "$(winp "$dir/pools")\\" \
+    --copy pool "${proxy_extra[@]}" \
     --accept-timeout 40 --timeout 120 >"$dir/proxy.log" 2>&1 &
   local proxy=$!
   sleep 1
@@ -462,12 +496,48 @@ block_wine() {
   # produce an identical picture and fail this.
   local counts
   counts=$(grep -o 'mapped: [0-9]* section, [0-9]* shared-file, [0-9]* arena-slice' "$dir/srv.log" | tail -1)
-  case "$counts" in
-    "mapped: 0 section, "[1-9]*" shared-file, 0 arena-slice")
+  case "$transport:$counts" in
+    "shared-file:mapped: 0 section, "[1-9]*" shared-file, 0 arena-slice")
       ok "the compositor opened only shared files by name ($counts)" ;;
+    "arena:mapped: 0 section, 0 shared-file, "[1-9]*" arena-slice")
+      ok "the compositor resolved only arena offsets, opening nothing ($counts)" ;;
     *)
       bad "wrong transport served the pixels: ${counts:-nothing recorded}" ;;
   esac
+
+  # STAGE 12, and this is the leg's reason to exist. Firefox opens four
+  # connections (§15.8) and `--transport arena` refused the second of them until
+  # this stage (§15.14), so the number below is the whole claim: four sessions,
+  # one region, one allocator.
+  if [ "$transport" = arena ]; then
+    local served joined
+    served=$(grep -c '^\[proxy\] client [0-9]* connected' "$dir/proxy.log")
+    joined=$(grep -c 'joins arena 0' "$dir/proxy.log")
+    if [ "${served:-0}" -ge 2 ] && [ "$served" = "$joined" ]; then
+      ok "$served connections were served and all $joined of them share one arena and one allocator"
+    else
+      bad "$served connection(s) served, $joined joined the arena"
+      grep 'no transport for it' "$dir/proxy.log" | sed 's/^/        /' | head -3
+    fi
+
+    # Two keymaps, from Firefox's two `wl_seat` binds (§15.2), cut from one
+    # outbound window and live at the same time. §14.12 item 3 said nothing had
+    # asked for two objects at once outside a unit test. Both binds turn out to
+    # be on **one** connection, which §16.5 records.
+    local arenafds
+    arenafds=$(grep -o '[0-9]* fds in, [0-9]* out ([0-9]* from the arena)' "$dir/proxy.log" \
+               | grep -o '([0-9]* from the arena)' | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+    [ "${arenafds:-0}" -ge 2 ] \
+      && ok "$arenafds objects the compositor created were live at once in its outbound window" \
+      || bad "only ${arenafds:-0} descriptor(s) came from the arena; two keymaps were expected"
+
+    # And nothing at all on a filesystem: this leg passes no --shared-dir.
+    if [ -z "$(ls -A "$dir/keymaps" 2>/dev/null)" ] && [ -z "$(ls -A "$dir/pools" 2>/dev/null)" ]; then
+      ok "no protocol object was written to any filesystem: the keymap directory and the pool directory are both empty"
+    else
+      bad "something landed on a filesystem: $(ls -A "$dir/keymaps" "$dir/pools" 2>/dev/null | tr '\n' ' ')"
+    fi
+  fi
 
   if have magick && [ -f "$dir/s2.png" ]; then
     local colours
@@ -482,12 +552,14 @@ block_wine() {
 WC_X_DISPLAY=${WC_X_DISPLAY:-77}
 
 case "${1:-all}" in
-  enumerate) block_enumerate ;;
-  window)    block_window ;;
-  menu)      block_menu ;;
-  wine)      block_wine ;;
-  all)       block_enumerate; block_window; block_menu; block_wine ;;
-  *) echo "usage: $0 [enumerate|window|menu|wine|all]"; exit 2 ;;
+  enumerate)  block_enumerate ;;
+  window)     block_window ;;
+  menu)       block_menu ;;
+  wine)       block_wine shared-file ;;
+  wine-arena) block_wine arena ;;
+  all)        block_enumerate; block_window; block_menu
+              block_wine shared-file; block_wine arena ;;
+  *) echo "usage: $0 [enumerate|window|menu|wine|wine-arena|all]"; exit 2 ;;
 esac
 
 echo
