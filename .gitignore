@@ -15,3 +15,6 @@ result-*
 .wine/
 *.exe.so
 shadercache.bin
+
+# stray Firefox MOZ_LOG output from a probe run
+.child-*.moz_log
