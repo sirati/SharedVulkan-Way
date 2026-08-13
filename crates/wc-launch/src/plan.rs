@@ -34,7 +34,16 @@ pub fn remote_upstream(id: &str) -> String {
 /// a socket and a log — and nothing else. In particular **no `--dump-frames`**:
 /// a Firefox frame is a 2.3 MB PPM and a session is not a 60-second run
 /// (§17.7).
-pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
+///
+/// `frames` is where the compositor writes the page frame list of the region it
+/// commits. It is the difference between a locate that takes 0.064 s and always
+/// works and one that takes 2.3 s and sometimes reports `page index claimed
+/// twice` — the sweep reads 13 GiB of guest memory whose contents are allowed
+/// to change while it reads them, and five consecutive runs of the test harness
+/// failed that way. The file stays on the guest; the launcher pipes it to the
+/// VM host over the ssh channel it already has, because a 64 MiB arena's list
+/// is 256 KiB and that is not a command-line argument.
+pub fn compositor_argv(cfg: &Config, socket: &str, log: &str, frames: &str) -> Vec<String> {
     vec![
         // `sv-guest` is one binary with two halves and the first argument picks
         // one; `sv-guest wayland …` takes exactly the arguments the old
@@ -51,6 +60,8 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
         socket.into(),
         "--log".into(),
         log.into(),
+        "--arena-frames".into(),
+        frames.into(),
         "--output".into(),
         cfg.output.clone(),
         "--timeout".into(),
@@ -239,10 +250,19 @@ mod tests {
     #[test]
     fn guest_ram_is_the_only_transport() {
         let cfg = cfg();
-        let argv = compositor_argv(&cfg, "wl-x", "log");
+        let argv = compositor_argv(&cfg, "wl-x", "log", "frames.txt");
         assert_eq!(argv[0], "wayland", "the one binary needs its half named first");
         assert!(argv.iter().any(|a| a == "--arena-guest-ram"), "{argv:?}");
         assert!(argv.contains(&format!("0:{}", 64u64 * 1024 * 1024)));
+        // The frame list is asked for on every session, because the locate it
+        // replaces is not merely slower but *unreliable*: the sweep searches
+        // 13 GiB of guest memory for stamps while the guest is free to move
+        // pages under it, and five consecutive harness runs failed that way.
+        // Its absence would be a session that still works and sometimes takes
+        // three seconds to start and sometimes does not start at all, which is
+        // exactly the kind of degrade this test exists to make loud.
+        assert!(argv.iter().any(|a| a == "--arena-frames"), "{argv:?}");
+        assert!(argv.contains(&"frames.txt".to_string()), "{argv:?}");
         for forbidden in ["--arena", "--arena-provide", "--shared-dir", "--shared-peer-prefix"] {
             assert!(
                 !argv.iter().any(|a| a == forbidden),
@@ -270,7 +290,7 @@ mod tests {
     fn the_compositor_gets_a_session_length_and_not_a_test_length() {
         let mut c = cfg();
         c.session_secs = 43200;
-        let argv = compositor_argv(&c, "s", "l");
+        let argv = compositor_argv(&c, "s", "l", "f");
         let i = argv.iter().position(|a| a == "--timeout").unwrap();
         assert_eq!(argv[i + 1], "43200");
     }

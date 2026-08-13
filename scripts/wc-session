@@ -13,7 +13,11 @@
 # starts applications, and it is not a shell.
 #
 #   wc-session ping
-#   wc-session up   ID RUNID PAGES OUTBOUND   locate the guest-RAM arena, write the plan
+#   wc-session up   ID RUNID PAGES OUTBOUND [frames]
+#                                             locate the guest-RAM arena, write the
+#                                             plan. With `frames`, the arena's page
+#                                             frame list arrives on stdin and is
+#                                             translated instead of swept for.
 #   wc-session proxy ID                       start wc-proxy on the plan, as root
 #   wc-session run  ID BASE64CMD              run a Wayland client against that proxy
 #   wc-session icon APPID                     the app's icon from this machine's theme
@@ -130,8 +134,37 @@ up)
   D=$(dir_of "$ID")
   rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
   [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host"
-  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
-    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
+  # THE FRAME LIST, WHICH ARRIVES ON STDIN AND ONLY IF ASKED FOR
+  #
+  # A fifth word `frames` means the guest is piping the arena's page frame list
+  # down this same ssh channel. It is opt-in rather than "read stdin if there is
+  # any", because a `cat` here would block for ever on the older launcher that
+  # sends nothing, and a session that hangs at the locate is worse than one that
+  # sweeps.
+  #
+  # Why it is worth a transfer: the sweep is not merely slow (2.3 s against
+  # 0.064 s), it is a coin flip on a loaded guest. Five consecutive runs of the
+  # test harness gave `16377 of 16384 pages` and `28 page index(es) claimed
+  # twice` -- it searches 13 GiB of guest memory for stamps while the guest is
+  # free to move pages under it. Translating a frame list reads no stamps at
+  # all, so that whole class of failure stops being expressible.
+  #
+  # 16 bytes a page, so a 64 MiB arena is 256 KiB. That is why it is a pipe and
+  # not an argument. What crosses is *where the guest's pages are*, never what
+  # is in them: the arena is still guest RAM found in QEMU's backing object.
+  FRAMES_ARG=""
+  if [ "${5:-}" = frames ]; then
+    cat >"$D/arena.frames"
+    if [ -s "$D/arena.frames" ]; then
+      FRAMES_ARG="--frames $D/arena.frames"
+      echo "frames $(wc -l <"$D/arena.frames")"
+    else
+      echo "frames 0 (empty; sweeping instead)" >&2
+    fi
+  fi
+  # shellcheck disable=SC2086
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
+    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" "$FRAMES_ARG" \
     "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
     "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
     | "$ROOTC" >/dev/null 2>&1
