@@ -92,9 +92,24 @@ pub struct Config {
     /// * **64 MiB** — also the cap of the growth series, so it is where growth
     ///   would converge anyway.
     ///
-    /// It has to hold it alone because **growth is armed and inert** on this
-    /// deployment (`scripts/wc-session`): over guest RAM the proxy takes a new
-    /// region by re-reading the plan, and nothing appends to the plan yet.
+    /// It has to hold it alone because **growth is armed and inert**, and that
+    /// is a fact about the tree rather than about this file. Over guest RAM the
+    /// proxy takes a new region by re-reading the plan
+    /// (`wc_proxy::pool::PlanGrowth`), and **two things that would put a region
+    /// in that plan do not exist**:
+    ///
+    /// * nothing makes the guest commit one. `wc_handle::arena::attach_guest_ram`
+    ///   is called once per `--arena-guest-ram` at start-up and from nowhere
+    ///   else; the compositor's only growth flag is `--arena-grow-dir`, which is
+    ///   the *file* fixture.
+    /// * nothing appends to the plan. `wc-arena-host` writes one for a run and a
+    ///   page count and has no append mode.
+    ///
+    /// **The target is 16 MiB** — one `GROW_STEP`, so the first region is the
+    /// first step and there is no separate startup constant — and it is one line
+    /// here (or `WC_LAUNCH_ARENA_MIB=16`) the day those two exist. It is not that
+    /// today because it was measured: 32 MiB already refuses, so 16 would refuse
+    /// harder, and a window that stops updating is worse than 48 MiB of RAM.
     ///
     /// 64 MiB, then — twelve times smaller than the 768 that reached the user,
     /// and large enough that nothing measured here refuses. The asymmetry that

@@ -10262,13 +10262,16 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    855 ms of the 855 ms gap to a browser starting on the smaller half of a laptop.
    That is a claim about a deployment rather than about this project, and it is
    one `-smp` away from being tested.
-6. **Write the appender, and growth stops being a flag.** `--arena-grow` is armed
+6. **Write the appender, and the arena drops to 16 MiB.** `--arena-grow` is armed
    and there is nothing to grow into (§28.12): over guest RAM the proxy takes a
    new region by re-reading the plan, and the plan only ever gets the one the
    session started with. It is one `wc-session` verb — ask the guest to commit and
    stamp another region, run the locator with an append, and the running proxy
-   picks it up on its next pool — and it is the difference between a 64 MiB
-   startup region being *small* and being a *ceiling*.
+   picks it up on its next pool. It is the difference between a 64 MiB startup
+   region being *small* and being a *ceiling*, and it is what lets the startup
+   size fall to one `GROW_STEP`, which is where it belongs. Note that the guest
+   half needs a compositor that can `attach_guest_ram` after start-up, which it
+   cannot today.
 7. **Grep the tree for 805306368.** A second harness on the same guest copied the
    768 MiB hardcode and is holding 778 MB of non-pageable memory while this is
    being written. One launcher is not the guest's memory.
@@ -10390,6 +10393,28 @@ other direction and it is now measured in both. A locator that asks where the
 pages are instead of searching for them would be the thing that moves it, and
 that is §28.9 item 3. The cold click is 6573 ms at 64 MiB, inside the range it was
 already in.
+
+
+**Why 16 MiB, which is the size this should be, is not the size it is.** The
+target is one `GROW_STEP` — 16 MiB — so that the startup region *is* the first
+step of the growth series and there is no separate startup constant to reason
+about. Everything about that is right except that it does not work here, and the
+reason is two absences rather than an opinion:
+
+* **Nothing makes the guest commit a second region.**
+  `wc_handle::arena::attach_guest_ram` is called once per `--arena-guest-ram` in
+  the compositor's start-up loop and from nowhere else. The compositor's only
+  growth flag is `--arena-grow-dir`, which is the *file* fixture's.
+* **Nothing appends to the plan.** `wc-arena-host` writes a plan for one run id
+  and one page count; it has no append mode. `PlanGrowth` re-reads that file and
+  finds the same one region it found before.
+
+The proxy's own refusal says both out loud — *"the guest has not committed one,
+or the locator has not appended it yet"* — and the only harness in the tree that
+exercises growth exercises it over files. So on this deployment the startup
+region is not a starting point, it is the whole arena, and it was sized as one.
+**16 MiB is one line here — or `WC_LAUNCH_ARENA_MIB=16` — the day those two
+exist**, and until then it would be 32 MiB's ten refusals made worse.
 
 *Growth is armed and inert.* `--arena-grow` is passed and the proxy says
 `arena 0 may grow: guest RAM, as the locator appends it to …/arena.plan` — but
