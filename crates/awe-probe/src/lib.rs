@@ -45,6 +45,11 @@ pub fn new_run_id() -> u64 {
 }
 
 pub mod rendezvous;
+/// Asking Windows where the pages are. The structure decoding builds and is
+/// tested everywhere; the `NtQuerySystemInformation` half is Windows-only and
+/// gated inside the module, so the Linux build still type-checks the part that
+/// decides what an answer means.
+pub mod superfetch;
 
 #[cfg(windows)]
 pub mod alloc;

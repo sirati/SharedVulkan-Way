@@ -1420,6 +1420,106 @@ is no forwarded-versus-llvmpipe number on the machine where that comparison is
 the only one there is**, and §0.12's "how much acceleration is worth here is not
 yet measured" stands.
 
+### 0.14 Where the pages are, asked instead of searched for
+
+Measured 2026-08-13 on **testhost** against the live guest,
+`docs/measured-gpu-side.md`, "Asking Windows where the pages are: the PFN
+database, measured". Asked because §5.1's locator is a **content scan** — the
+guest stamps every page, the host sweeps 13312 MiB for the stamp — which costs
+~2 s per attach, needs root and the memfd, and cannot re-locate an extent once
+the arena's own data has overwritten the stamps.
+
+**The claim this section overturns is one sentence of §5.1**: *"Windows does not
+report frame numbers to user mode outside AWE at all."* It was measured, and
+what was measured was `QueryWorkingSetEx`, which is the documented API and does
+not. It is not the only one.
+
+**`NtQuerySystemInformation(SystemSuperfetchInformation)` with
+`SuperfetchPfnQuery` reports the PFN database to user mode**, one
+`MMPFN_IDENTITY` per physical frame carrying the frame number, the owning
+process id and **the virtual address it is mapped at**. It is what RAMMap draws
+its "Physical Pages" tab from. Six results:
+
+1. **It works on build 26200, and it agrees with the scan page for page.** A
+   64 MiB `VirtualLock`ed window located both ways at once gave **byte-identical
+   offset tables, 16384/16384 pages, 1472 runs both times**. The host's own work
+   drops from **2.308 s to 0.064 s**, because translating a frame list is
+   arithmetic and sweeping a memfd is not.
+2. **The guest-side dump costs ~330 ms and does not vary with the window** —
+   3391496 frames examined whatever the arena is, exactly as the scan reads all
+   13312 MiB whatever the arena is. So the honest comparison is 330 ms of *guest*
+   CPU against 1.8–2.32 s of host CPU, with no root and no `/proc/<qemu>/fd/35`.
+3. **Re-checking a frame list already held costs 0–22 ms**: 512 frames in 0 ms,
+   16384 in 1 ms, 262144 in 22 ms, because that query names only the frames it
+   cares about. R26's canary was invented to approximate this and can now be
+   replaced by the thing itself.
+4. **It re-locates a window whose contents are gone**, which is the property
+   §5.1 gives up. Every byte of a 64 MiB large-page window was overwritten and
+   both locators asked again: the scan **located 0 pages**; the query returned
+   the **same 16384 frames, same 26 runs**. The host then wrote through the
+   post-overwrite frame list and the guest found **16384/16384 pages carrying
+   the host's record at the right page index**.
+5. **It does not care who allocated, which is the constraint that had to
+   survive.** The driver's own `vkAllocateMemory` memory — §0.10's direction,
+   the one in which the arena *is* the GPU's allocation with no copy between
+   them — located **16384/16384 on both host-visible types, identical to the
+   scan**, and the host's writes arrived at every page index through the
+   driver's own `vkMapMemory` pointer. The query asks by virtual address; a
+   driver's mapping is a virtual address.
+6. **It needs no privilege this guest does not already hold.**
+   `SeProfileSingleProcessPrivilege` and `SeDebugPrivilege` are default rights of
+   `BUILTIN\Administrators` and were already enabled on the account. No policy
+   change, no new SID, no reboot, no code-integrity setting — strictly less than
+   R25, which had to be granted. **The cost is that the interface is
+   undocumented**, and that is the real argument against it (§5.1, R28).
+
+**The route the requirement named is closed, and closed on four counts.**
+virtio-fs DAX: QEMU 10.2.2's `vhost-user-fs-pci` has no `cache-size` property
+and upstream never merged the fork's DAX patches; virtiofsd 1.13.3's
+`setupmapping`/`removemapping` are `ENOSYS` stubs and its only DAX MR is open and
+written against Cloud Hypervisor; and the Windows `viofs` driver mentions
+`FUSE_SETUPMAPPING` only inside a copied Linux header — its VirtIO library
+declares `capabilities[VIRTIO_PCI_CAP_PCI_CFG]`, five entries, so a shared-memory
+capability of type 8 is structurally undiscoverable by it. The fourth count is
+the one that would matter even if the other three were fixed: **the DAX window is
+a PCI BAR aperture** (virtio spec §5.11.6.4, shared memory region 0), populated
+sparsely and revocably by `FUSE_SETUPMAPPING`. That is the same object §5.1
+rejects under the name ivshmem, for the same reason — a BAR is not ordinary RAM
+and cannot be what `vkAllocateMemory` hands back. DAX would have solved locating
+by making the memory unable to be the GPU's.
+
+**Two other routes were priced and neither is taken.** A guest kernel driver
+(`MmProbeAndLockPages` + `MmGetMdlPfnArray`) gives exact frames with no dump at
+all, and Secure Boot is *not* enabled in this VM so test-signing would in fact
+load — but R6 forbids permanent test-signing on this machine and attestation
+signing costs an EV certificate, which is exactly why §5.1 dropped the pinning
+driver. It now buys strictly less than it did then: the PFN query already
+delivers the frames. And walking the guest's page tables from the host is
+reachable — MemProcFS/LeechCore attaches to a live file-backed physical memory
+source, and `RegionTable::gpa_to_offset` is already the remap it needs — but
+QMP gives only the *current* vCPU's CR3, so choosing a process means Windows
+introspection (kernel base, `_EPROCESS`, `_KPROCESS.DirectoryTableBase`) with
+build-specific offsets. The PFN query's owner field is a **process id, not a page
+directory base** (measured), so it does not shortcut that. It stays a recorded
+alternative, not a plan.
+
+**One number in §0.1 does not survive contact with a guest that has been up for
+two days.** §0.1 item 4 measured a 1 GiB large-page window as **1 run**, on a
+guest with 1.3 hours of uptime. The same allocation today is **399 runs**, and
+64 MiB is 26 rather than 22. The conclusion — large pages beat the alternatives
+by two orders of magnitude — is untouched; the claim that the whole arena
+arrives as one or two `mmap` calls is not true on a guest in ordinary use, and
+§5.7 is corrected.
+
+**What changes in the design.** §5.1 gains a fourth locator and `Locator::Pfns`
+stops being an AWE-only path; the wire type already exists
+(`sv_transport::cold::Locator::Pfns`). The recommendation is stated there and is
+deliberately not "delete the scan": the query is undocumented, so the scan runs
+**once**, at attach, as the cross-check that the query is telling the truth, and
+the query is what re-locates and re-validates afterwards — 2 s paid once,
+1 ms per re-check thereafter, and a broken interface caught loudly on the one
+occasion the stamps still exist.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
@@ -2098,13 +2198,31 @@ nobody implements. We keep it in the risk table and not in the design.
 
 **How the two sides agree on which pages: locate, do not compute.**
 
+> **[SUPERSEDED in part — 2026-08-13, `measured-gpu-side.md` "Asking Windows
+> where the pages are: the PFN database, measured", §0.14]**
+>
+> *The original design had one answer — the guest reports frame numbers, the host
+> translates them — and that answer is available on the AWE path and nowhere
+> else. It is not a matter of privilege: **Windows does not report frame numbers
+> to user mode outside AWE at all.***
+>
+> The second sentence is false as stated and the first is true only of
+> *documented* interfaces. What was measured was `QueryWorkingSetEx`, and that
+> measurement stands: it carries no physical address in any field.
+> `NtQuerySystemInformation(SystemSuperfetchInformation)` with
+> `SuperfetchPfnQuery` does — one `MMPFN_IDENTITY` per physical frame, carrying
+> the frame number, the owning process id and the virtual address it is mapped
+> at, for **any** allocator that produces ordinary mapped pages. It is measured
+> working on build 26200, agreeing with the scan on 16384 of 16384 pages, and it
+> needs no privilege this guest does not already hold. `SuperfetchPfnLocator`
+> below.
+>
+> `\Device\PhysicalMemory` needs a privilege of its own and is still not a
+> supported route to one's own frames.
+
 The original design had one answer — the guest reports frame numbers, the host
-translates them — and that answer is available on the AWE path and nowhere else.
-It is not a matter of privilege: **Windows does not report frame numbers to user
-mode outside AWE at all.** `QueryWorkingSetEx` was measured, with the privilege
-held, and carries no physical address in any field (below);
-`\Device\PhysicalMemory` needs a privilege of its own and is not a supported
-route to one's own frames either. Step 0 therefore
+translates them — and until 2026-08-13 that answer was available on the AWE path
+and nowhere else. Step 0 therefore
 had to solve the problem the other way round, and did: **the app side finds the
 pages by content.** The guest stamps every page of the extent with
 `{magic, run_id, region_tag, page_index}` before publishing it; `sv-hostd`
@@ -2112,24 +2230,42 @@ sweeps the memfd for the magic and builds a page map from what it finds. All
 16384 pages of the 64 MiB window were located this way, with zero wrong indices
 (`measured-gpu-side.md`).
 
-Three locators, one trait, chosen by the `ExtentDesc` granularity:
+Four locators, one trait:
 
 | Locator | Mechanism | Cost | Status |
 |---|---|---|---|
-| `ScanLocator` | Sweep the whole memfd for the magic. Works for any granularity | **1.8 s at 64 MiB, 2.02 s at 1 GiB, 2.32 s at 2 GiB, measured** | **v1, on every path** |
-| `PfnLocator` | Translate the reported frame list. AWE only | O(pages) arithmetic, no I/O | Implemented and tested; **16384/16384 frames verified**, unused here |
-| `ProbeLocator` | Read one record every 2 MiB. Large pages only, because only they are guaranteed 2 MiB-aligned in GPA | ~6656 probes for 13 GiB, ~1/512 of a scan | Not implemented in v1 |
+| `ScanLocator` | Sweep the whole memfd for the magic. Works for any granularity | **1.8 s at 64 MiB, 2.02 s at 1 GiB, 2.32 s at 2 GiB, measured** | **v1, and the cross-check on every path** |
+| `SuperfetchPfnLocator` | The guest asks the PFN database where its own pages are and reports the frames; the host translates them | **~330 ms in the guest for any window; 0.064 s on the host; 0–22 ms to re-check a list already held. Measured** | **Measured working, agrees with the scan 16384/16384. Not yet wired into `sv-gpu-server`** |
+| `PfnLocator` | Translate the reported frame list. AWE only | O(pages) arithmetic, no I/O | Implemented and tested in `arena-host`; **16384/16384 frames verified**, unused here |
+| `ProbeLocator` | Read one record every 2 MiB. Large pages only, because only they are guaranteed 2 MiB-aligned in GPA | ~6656 probes for 13 GiB, ~1/512 of a scan | Not implemented, and now pointless |
 
-**Decision: `ScanLocator` is the locator, on the large-page path as well as the
-4 KiB one.** The scan's cost is linear in *guest RAM*, not in arena size — the
-sweep reads all 13312 MiB whatever the window is, and 32× the arena cost 0.5 s
-more — so there is no arena this machine can hold for which locating is not
-about two seconds, paid once, at attach (`measured-gpu-side.md`, "So how does the
-host find large-page memory? Ranked"). It is also the only locator that
-**verifies rather than trusts**: it finds pages by their contents, so it cannot
-produce R21's silent wrong answer the way a translated frame list or a computed
-formula can. Optimising two one-off seconds is not worth a second stamping
-convention in v1.
+**Decision, revised 2026-08-13: the scan locates an extent once, and the query
+re-locates it thereafter.** Neither alone is right, and the reason is that they
+fail in opposite directions.
+
+- **The scan verifies rather than trusts.** It finds pages by their contents, so
+  it cannot produce R21's silent wrong answer. What it cannot do is run twice:
+  the stamps are arena data by the time anyone would want to ask again, and a
+  scan of an overwritten window **locates 0 pages**, measured.
+- **The query trusts rather than verifies, and it does not care what is in the
+  memory.** It answers from the kernel's own PFN database, so an overwritten
+  window locates exactly as well as a fresh one — **same 16384 frames, same 26
+  runs, before and after every byte was overwritten**, measured. What it cannot
+  do is prove itself: it is an undocumented interface, and an undocumented
+  interface that quietly starts returning a shifted field is precisely the
+  failure this project refuses to accept.
+
+Running the scan **once**, at attach, against the frame list the query produced
+for the same extent, is the arrangement in which each covers the other's
+weakness: the one occasion on which the stamps exist is the one occasion on
+which the query can be checked, and after that the query is the only locator
+that still works. The cost is the scan's 2 s, paid once, exactly as before —
+plus ~330 ms of guest CPU — and it buys re-location, a 1 ms re-validation that
+replaces R26's canary, and a loud failure if the interface ever moves.
+
+`ProbeLocator` is now pointless and should be deleted from this table when
+somebody is next in here: it was a cheaper scan, and the query is cheaper still
+and does not need a second stamping convention.
 
 `ProbeLocator` is `ScanLocator` with the search space divided by 512, and it is
 sound for exactly one reason: on the large-page path the *only* place a stamped
@@ -2191,11 +2327,22 @@ left to compare against. Two consequences worth stating because both are easy to
 trip over later.
 
 - **An extent must be located before it is used, and cannot be re-located
-  afterwards.** If `sv-hostd` restarts, it does not re-scan and re-attach — it
-  cannot, the stamps are gone. It bumps the generation, which every ring
-  operation already carries, and every app-side client takes
+  afterwards *by the scan*.** If `sv-hostd` restarts, it does not re-scan and
+  re-attach — it cannot, the stamps are gone. It bumps the generation, which
+  every ring operation already carries, and every app-side client takes
   `VK_ERROR_DEVICE_LOST` (§4.3). That is the same path a guest reboot takes and
   it needs no new machinery.
+
+  **This is now a property of `ScanLocator` rather than of the arena** (§0.14).
+  The guest can be asked again for the frame list at any moment, at ~330 ms, and
+  the answer for an overwritten window is the same one — measured, against a
+  window every byte of which had been overwritten, cross-checked by the host
+  writing into the re-obtained offsets and the guest finding all 16384 of them
+  at the right page indices. So a `sv-hostd` restart *could* re-attach without a
+  generation bump. It is not proposed for v1, because the generation bump is
+  already built and correct and a restart is not a hot path; it is recorded so
+  that "the arena cannot be re-located" stops being repeated as a fact about the
+  design.
 - **A permanent per-page stamp is rejected.** Reserving sixteen bytes at the
   head of every arena page would make the map re-derivable at any time, and it
   would put a hole in every page and destroy the flat offset invariant of §1 —
@@ -2618,6 +2765,17 @@ blocks merged — and it keeps improving with size, a gigabyte arriving as a sin
 extent. AWE is the *worst* row, not a better one. And `NONPAGED_LARGE`, which
 this document twice named as the fix, returned scattered 4 KiB frames and short
 by 12392 of them.
+
+**Every row of that table is a *freshly booted guest*, and that is a property of
+the measurement rather than of the allocator** (§0.14, 2026-08-13). Repeated on
+the same guest after ~2 days of ordinary use: 64 MiB of large pages is **26**
+runs rather than 22, and **1 GiB is 399 runs rather than 1**. The ranking is
+unchanged and the conclusion — large pages beat every alternative by two orders
+of magnitude — is untouched. What does not survive is the sentence below about
+"one or two `mmap` calls for the whole arena": on a guest that has been up for
+days it is a few hundred, which the `vm.max_map_count` budget absorbs without
+noticing but which is not the same claim. Read the table as the best case and
+the paragraph after it as the one that binds.
 
 Roughly 23 runs per MiB on the 4 KiB path is not a rounding error, it is a
 factor of 1471, and it lands entirely on the attaching side. Working through it
@@ -3885,7 +4043,12 @@ has not moved at all, and it is the one that matters.
    from a 60 ms, 64 MiB write pass — a hypothesis about linearity, of the same
    kind the locate-time extrapolation turned out to survive.
 5. **Whether large-page allocation succeeds on a guest that has been up for
-   weeks.** 13 attempts at 64 MiB, 256 MiB and 1 GiB all succeeded, slowest
+   weeks.** *Partly answered 2026-08-13 and not in the direction hoped: at ~2
+   days of uptime allocation still **succeeds** at 64 MiB and at 1 GiB, but the
+   contiguity it returns has collapsed — 1 GiB is 399 runs against the 1 run
+   measured at 1.3 hours (§0.14, §5.7). So the risk is not that the allocator
+   fails; it is that the number §5.7's best case rests on is a cold-boot number.*
+   13 attempts at 64 MiB, 256 MiB and 1 GiB all succeeded, slowest
    90 ms, on a guest with 8973 MiB free and 1.3 hours of uptime — the favourable
    case, deliberately, because manufacturing memory pressure on somebody's daily
    machine was out of scope. The failure mode (`ERROR_NO_SYSTEM_RESOURCES`)
@@ -3898,6 +4061,12 @@ has not moved at all, and it is the one that matters.
    the question by construction, and the 4 KiB fallback carries a canary that
    turns a silent divergence into a loud one (§5.1, §5.2). The residual is that
    the canary has not been seen to fire, because nothing has yet made it.
+   *2026-08-13: the question is unchanged and the instrument is not. Re-reading
+   the identity of frames already held costs 1 ms for 16384 of them and 22 ms for
+   262144 (§0.14), so this can be asked continuously rather than twice — and a
+   second data point taken that way, a 64 MiB locked window held 300 s on a
+   machine in use, again came back byte-identical. Pressure is still not
+   provoked.*
 7. **Whether balloon inflation can take arena pages.** `info balloon` reports
    `actual=13312`, so nothing is inflated today, and a locked user allocation
    should not be reachable by the balloon driver's non-paged pool — but that is

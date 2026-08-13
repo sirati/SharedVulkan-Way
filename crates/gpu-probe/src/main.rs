@@ -78,6 +78,10 @@ struct Opts {
     /// allocates, maps, writes and waits, so it disturbs a machine somebody is
     /// using as little as any Vulkan program can.
     vk_alloc: bool,
+    /// In the `--vk-alloc` path, also ask the PFN database where the
+    /// driver put the pages (`awe_probe::superfetch`). Windows-only, and the
+    /// point of it is that the answer must not depend on who allocated.
+    superfetch: bool,
     /// Non-Windows only: back the window with a shared mapping of this file
     /// instead of anonymous memory, so `arena-host` can play the host half
     /// against it. That makes the entire three-party protocol — fill, dispatch,
@@ -98,6 +102,7 @@ fn parse_args() -> Opts {
         concurrent: false,
         no_perf: false,
         vk_alloc: false,
+        superfetch: false,
         file: None,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -143,6 +148,10 @@ fn parse_args() -> Opts {
             }
             "--vk-alloc" => {
                 o.vk_alloc = true;
+                i += 1;
+            }
+            "--superfetch" => {
+                o.superfetch = true;
                 i += 1;
             }
             other => panic!("unknown argument {other}"),
@@ -737,6 +746,61 @@ fn run_vk_alloc(opts: &Opts) -> Result<(), Fail> {
             "no host-visible memory type could be allocated and mapped — nothing to look for"
                 .into(),
         ));
+    }
+
+    // **Does the new locator work on the memory the *driver* allocated?**
+    //
+    // design.md §0.10 measured that this memory is ordinary guest RAM and that
+    // the host can find it by sweeping for the stamp. The constraint on any
+    // replacement for that sweep is that it keep working here, because this is
+    // the direction in which the arena *is* the GPU's own allocation and no
+    // copy exists between the two. Superfetch asks by virtual address and does
+    // not care who allocated, so it should — and "should" is not a measurement.
+    #[cfg(windows)]
+    if opts.superfetch {
+        use awe_probe::superfetch as sf;
+        match sf::available() {
+            Err(e) => log!("superfetch is not available: {e}"),
+            Ok(_) => {
+                for (t, _, run_id) in &allocated {
+                    let base = ptrs[*t as usize] as usize;
+                    match sf::locate_timed(base, opts.pages, 1 << 16) {
+                        Err(e) => log!("type {t}: superfetch locate failed: {e}"),
+                        Ok((loc, ms)) => match loc.frames(opts.pages) {
+                            Err(e) => log!("type {t}: superfetch locate incomplete: {e}"),
+                            Ok(frames) => {
+                                let runs = sf::Located::runs(&frames);
+                                log!(
+                                    "type {t}: superfetch located {}/{} pages of the DRIVER's \
+                                     allocation in {ms} ms, {} runs, owners {:?}",
+                                    frames.len(),
+                                    opts.pages,
+                                    runs.len(),
+                                    loc.owners.iter().take(2).collect::<Vec<_>>()
+                                );
+                                let mut s = format!(
+                                    "run_id={run_id:016x}\npages={}\npage_size={PAGE}\n\
+                                     base_va={base:016x}\nlocator=superfetch\ntype={t}\n",
+                                    opts.pages
+                                );
+                                for (i, f) in frames.iter().enumerate() {
+                                    s.push_str(&format!(
+                                        "pfn {i} {:x} gpa {:x}\n",
+                                        f,
+                                        (*f as u64) << 12
+                                    ));
+                                }
+                                write_file(
+                                    &opts.workdir.join(format!("guest-vkalloc-pfn-{t}.txt")),
+                                    &s,
+                                );
+                                log!("type {t}: wrote guest-vkalloc-pfn-{t}.txt");
+                            }
+                        },
+                    }
+                }
+            }
+        }
     }
 
     write_file(&opts.workdir.join("guest-vkalloc.txt"), &status);
