@@ -26,7 +26,7 @@ use wc_proxy::spec::Spec;
 struct Args {
     /// The compositor's `AF_UNIX` node. Under Wine this is a real host socket
     /// inside the prefix, which is what lets a Linux process reach a `.exe`
-    /// (docs/design.md §4.2); on the guest it is the far end of a relay.
+    /// (docs/waycompose-design.md §4.2); on the guest it is the far end of a relay.
     upstream: PathBuf,
     runtime_dir: PathBuf,
     socket: String,
@@ -61,7 +61,7 @@ struct Args {
     /// **Off by default, and that is a decision rather than caution.** An arena
     /// that grew whenever it was tight would make [`Policy`] untestable — every
     /// measurement of how well runs are chosen would be contaminated by memory
-    /// that was added instead of used — and `docs/design.md` §20.4's matrix
+    /// that was added instead of used — and `docs/waycompose-design.md` §20.4's matrix
     /// compares policies at a fixed size. Growth is what happens after the
     /// allocator has already failed, and a run has to say it wants it.
     arena_grow: bool,
@@ -102,6 +102,11 @@ struct Args {
     /// is how this proxy runs on the VM host, gets systemd's environment and
     /// not a login shell's.
     icon_dirs: Vec<std::path::PathBuf>,
+    /// THE CLIPBOARD. Carry the clipboard across on a third connection
+    /// (`crate::clip`). Off, a client that copies or pastes gets nothing —
+    /// which is what the compositor did before this stage, minus the part
+    /// where the connection died.
+    clipboard: bool,
 }
 
 fn usage() -> &'static str {
@@ -146,7 +151,7 @@ usage: wc-proxy --upstream <path> [options]
                          cannot tell a cold region from a paused video.
   --arena-policy KIND    arena: first-fit | best-fit    (default best-fit)
                          which run of free bytes a pool takes. best-fit is
-                         stage 16's, measured in docs/design.md 20.4; first-fit
+                         stage 16's, measured in docs/waycompose-design.md 20.4; first-fit
                          is stage 12's, kept so a live run can be compared
                          against the synthetic one without a rebuild.
 
@@ -160,6 +165,8 @@ usage: wc-proxy --upstream <path> [options]
 
   --icon-theme NAME      the icon theme to search before hicolor
                          (default $WC_ICON_THEME, else hicolor)
+  --no-clipboard         do not carry the clipboard: no third connection to the
+                         compositor, and copy and paste do nothing
   --no-icons             do not resolve app ids to icons at all: no second
                          connection to the compositor, no directory walk
   --icon-data-dir DIR    an extra XDG data directory to search first; may be
@@ -198,6 +205,7 @@ fn parse_args() -> Result<Args, String> {
         icons: true,
         icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
         icon_dirs: Vec::new(),
+        clipboard: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -240,6 +248,7 @@ fn parse_args() -> Result<Args, String> {
             "--trace" => a.trace = true,
             "--verify-damage" => a.verify = true,
             "--no-icons" => a.icons = false,
+            "--no-clipboard" => a.clipboard = false,
             "--icon-theme" => a.icon_theme = next()?,
             "--icon-data-dir" => a.icon_dirs.push(next()?.into()),
             "--pool-headroom" => {
@@ -328,7 +337,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // client exists, and each session gets a handle on the same region and the
     // same allocator (`Arena::share`). Stage 9 refused the second call by name —
     // one region, one allocator, no protocol for a second arena id
-    // (docs/design.md §12.13 item 6) — and that refusal was the reason Firefox,
+    // (docs/waycompose-design.md §12.13 item 6) — and that refusal was the reason Firefox,
     // which opens four connections, had never touched an arena (§15.14). The
     // premise was right and the conclusion was not: what must not be duplicated
     // is the *allocator*, and one allocator serves four connections for exactly
@@ -474,7 +483,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // real. Against a one-shot proxy the throwaway is the only connection that
     // is ever served; the real one finds a closed socket, and Firefox reports
     // `Wayland protocol error: Compositor () crashed` and dumps core. Measured,
-    // and it is docs/design.md §13.8.
+    // and it is docs/waycompose-design.md §13.8.
     //
     // Each client gets its **own upstream connection**, which is what a
     // compositor expects: object ids are per-connection, and multiplexing two
@@ -505,7 +514,25 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // being accepted into a proxy with nowhere to forward to; that is still
         // true and is now handled by failing the connection immediately, which
         // is a closed socket at the same moment either way.
-        let upstream = match std::os::unix::net::UnixStream::connect(&args.upstream) {
+        //
+        // **Retried on `ECONNREFUSED`, for the reason `wc-wlcs` retries.** `bind`
+        // creates the filesystem node and `listen` makes it accept; between the
+        // two, `connect` is refused. Every harness that starts a compositor and
+        // then a proxy waits for the *node*, which does not close that window,
+        // and the symptom is one leg of a run failing with "cannot reach the
+        // compositor" while an identical tree passes — a red that is not a
+        // regression, which teaches everyone to re-run until green.
+        //
+        // Bounded and reported: the retry is printed, so a run that needed it
+        // says so rather than hiding a slow compositor behind a pass. A refusal
+        // that outlives the deadline is still a failure, because a compositor
+        // that is not listening after five seconds is not a race.
+        let upstream = match proxy::connect_upstream(&args.upstream, |refusals, ms| {
+            println!(
+                "[proxy] client {n}: the compositor refused {refusals} connect(s) over {ms:.0} ms \
+                 before it was listening"
+            );
+        }) {
             Ok(u) => u,
             Err(e) => {
                 println!(
@@ -518,7 +545,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("[proxy] client {n} connected, upstream {} connected", args.upstream.display());
 
         // A transport per session: a fresh `SharedFile`, or a handle on the one
-        // arena. docs/design.md §16.2.
+        // arena. docs/waycompose-design.md §16.2.
         let transport = match make_transport(n) {
             Ok(t) => t,
             Err(e) => {
@@ -550,6 +577,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .map(wc_proxy::icons::dirs_for_pid)
             .unwrap_or_default();
         let extra_dirs = args.icon_dirs.clone();
+        let want_clipboard = args.clipboard;
         threads.push(std::thread::spawn(move || {
             // The `+ Send` is only needed to cross this boundary; `Session`
             // itself has no opinion, and widening its signature would push the
@@ -592,11 +620,41 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            // THE CLIPBOARD. The byte path's byte path, one per served connection
+            // and for the same reasons the icon feed is per connection: the
+            // state is per client, a feed that fails takes only its own
+            // client's clipboard with it, and a socket is cheap.
+            //
+            // **A separate connection from the icon feed on purpose.**
+            // `--no-icons` exists, and an icon resolver that cannot reach the
+            // theme must not be the reason copy and paste stop working.
+            let mut clip = if want_clipboard {
+                match wc_proxy::clip::ClipLink::connect(&upstream_path, &spec) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!(
+                            "[proxy] client {n}: no clipboard feed ({e}); copy and paste will \
+                             do nothing rather than failing"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
             session.set_verify(verify);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
-            match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
+            match proxy::pump(
+                &mut session,
+                client,
+                upstream,
+                icons.as_mut(),
+                clip.as_mut(),
+                idle,
+                &mut log,
+            ) {
                 Ok(why) => println!("[proxy] client {n} stopped: {why}"),
                 Err(e) => println!("[proxy] client {n} failed: {e}"),
             }
@@ -606,6 +664,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 println!("[proxy] client {n} {m}");
             }
             if let Some(link) = &icons {
+                println!("[proxy] client {n} {}", link.summary());
+            }
+            if let Some(link) = &clip {
                 println!("[proxy] client {n} {}", link.summary());
             }
         }));

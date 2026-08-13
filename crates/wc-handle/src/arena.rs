@@ -16,13 +16,13 @@
 //! upstream calls with nothing but an fd, and giving it a context parameter
 //! would mean carrying a diff through smithay's `ShmState`, its `Client` data
 //! and its `wl_shm` dispatch — precisely the "spread through the commit path"
-//! cost docs/design.md §8.4 says the seam exists to avoid. An arena is
+//! cost docs/waycompose-design.md §8.4 says the seam exists to avoid. An arena is
 //! genuinely process-wide state; modelling it as such is honest, and it keeps
 //! the fork's diff at zero lines.
 //!
 //! # The lifetime rule, which is the opposite of a section's
 //!
-//! docs/design.md §2.5 says the *creator* of a section must hold it open until
+//! docs/waycompose-design.md §2.5 says the *creator* of a section must hold it open until
 //! the receiver has opened it. An arena inverts that: the receiver holds the
 //! region open for the life of the process, and the sender's slices are pure
 //! arithmetic that cannot dangle. Nothing has to be raced. That is the second
@@ -108,7 +108,7 @@ fn registry() -> &'static Registry {
 ///
 /// Read-only, because the receiving side of an arena slice is a compositor
 /// reading a client's pixels — the same default `Handle::map` has for a
-/// section, and for the same reason (docs/design.md §7.4).
+/// section, and for the same reason (docs/waycompose-design.md §7.4).
 ///
 /// Idempotent per id only in the sense that re-attaching replaces: an arena is
 /// identified by its number on the wire, and if the two sides ever disagree
@@ -151,7 +151,7 @@ pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
 ///
 /// The peer opens the same file read-write through its own allocator. On the
 /// deployment this is for — Wine, or two processes on one Linux box — that is a
-/// coherent shared mapping and was measured to be one (docs/design.md §9.4,
+/// coherent shared mapping and was measured to be one (docs/waycompose-design.md §9.4,
 /// `scripts/probe-filemap.c`). On a virtio-fs export it is **not**, which is
 /// §10.3, and is exactly why the deployment that matters uses guest RAM.
 pub fn provide_file(id: u32, path: &str, size: u64) -> io::Result<()> {
@@ -259,7 +259,7 @@ pub struct GuestRegion {
 /// process outside the virtual machine can find those pages in the hypervisor's
 /// backing object.
 ///
-/// This is docs/design.md §9.10 item 3 and §10.13 item 1: the region stops being
+/// This is docs/waycompose-design.md §9.10 item 3 and §10.13 item 1: the region stops being
 /// a file. Everything above `Handle::map` is unchanged — a `Descriptor` is still
 /// three integers, `window()` is still checked arithmetic — and what changes is
 /// only who provided the pages.
@@ -322,7 +322,7 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
 
 /// The sub-range of one arena that this process may hand *out*.
 ///
-/// docs/design.md §12.11 item 3: "which arena, and which sub-range, is the
+/// docs/waycompose-design.md §12.11 item 3: "which arena, and which sub-range, is the
 /// compositor's to give away is not expressed anywhere". This is that
 /// expression, and it is three integers because that is all it ever was — the
 /// wire has carried `Descriptor::ArenaSlice` in this direction since stage 1
@@ -336,6 +336,16 @@ pub struct OutboundWindow {
     pub offset: u64,
     /// Its length. Always a whole number of [`REGION_PAGE`]s.
     pub len: u64,
+    /// DYNAMIC ARENA. The run id of the region this window is the whole of,
+    /// when `reserve_outbound` had to commit one. `None` when the window is a
+    /// tail of a region somebody else already committed and reported.
+    ///
+    /// It is here because the host cannot locate a region it has not been told
+    /// the run id of, and a dedicated outbound region is committed *inside*
+    /// `reserve_outbound` where the caller would otherwise never see it. A
+    /// region nobody can locate is a region the compositor writes keymaps into
+    /// and no client ever reads.
+    pub run_id: Option<u64>,
 }
 
 /// The window, plus the free list that is the whole of the allocator's state.
@@ -423,6 +433,44 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         ));
     }
     let len = len.div_ceil(GIFT_GRANULARITY) * GIFT_GRANULARITY;
+    // DYNAMIC ARENA. An id this process has not committed means "commit a
+    // region for the window", and the window is then the whole of it.
+    //
+    // This is the split the floor depends on. While the window was a tail of
+    // the data region, the region carrying live keymaps was also the region the
+    // data allocator started in, so pinning the one pinned the other and
+    // whatever the session started at became permanent — an `sv-guest` holding
+    // 817 MB with no client connected. Giving the window its own region makes
+    // the floor the size of the thing that actually has to stay.
+    //
+    // The id carries the meaning rather than a new flag, because the two cases
+    // want to be told apart by *which region*, which is exactly what an id is
+    // for. `--arena-outbound 0:M` against a committed arena 0 is the pre-split
+    // spelling and still does what it always did.
+    if !registry()
+        .read()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?
+        .contains_key(&arena)
+    {
+        // Its own commit, its own stamps, its own run id: the host locates it
+        // exactly as it locates a data region, and `defer_gifts` still covers
+        // the ordering (see that function for what a dedicated region did and
+        // did not change about the stamp race).
+        let region = attach_guest_ram(arena, len)?;
+        let mut guard = outbound_slot()
+            .lock()
+            .map_err(|_| io::Error::other("outbound window poisoned"))?;
+        if let Some(w) = guard.as_ref() {
+            return Err(io::Error::other(format!(
+                "this process already has an outbound window, in arena {}: a second \
+                 would be a second allocator over objects clients already hold",
+                w.arena
+            )));
+        }
+        let w = Window { arena, base: 0, len, free: vec![(0, len)], given: 0, pending: None };
+        *guard = Some(w);
+        return Ok(OutboundWindow { arena, offset: 0, len, run_id: Some(region.run_id) });
+    }
     let arena_len = {
         let guard = registry()
             .read()
@@ -462,14 +510,14 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
     }
     let base = arena_len - len;
     *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None });
-    Ok(OutboundWindow { arena, offset: base, len })
+    Ok(OutboundWindow { arena, offset: base, len, run_id: None })
 }
 
 /// Hold every gift's bytes in memory until [`release_gifts`] is called.
 ///
 /// # STAGE 12, and it is a correction to a claim rather than a feature
 ///
-/// docs/design.md §14.12 item 1 said the ordering held by construction:
+/// docs/waycompose-design.md §14.12 item 1 said the ordering held by construction:
 ///
 /// > A gift written before the host's locate would take pages of stamps with it
 /// > and the sweep would report `located 16366 of 16384`. The order holds in
@@ -589,7 +637,7 @@ pub fn outbound() -> Option<OutboundWindow> {
     let guard = outbound_slot().lock().ok()?;
     guard
         .as_ref()
-        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len })
+        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len, run_id: None })
 }
 
 /// Bytes given out and bytes still free in the outbound window, for the one log
@@ -613,7 +661,7 @@ pub fn outbound_usage() -> Option<(u64, u64)> {
 /// to arbitrary arena memory?" has a type-level answer — a client's buffer is a
 /// `Descriptor` and a `Descriptor` never becomes a `Gift`.
 ///
-/// Dropping it returns the bytes. That is the lifetime rule of docs/design.md
+/// Dropping it returns the bytes. That is the lifetime rule of docs/waycompose-design.md
 /// §2.5 arriving from the other end: a section has to be *held* because its name
 /// dies with the last handle, and a gift has to be held because its bytes are
 /// reused by the next one. `crate::Handle` keeps it in an `Arc` for exactly as
@@ -828,7 +876,7 @@ fn write_provided(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
 /// The live-coherency probe: the host writes into the guest's arena while the
 /// guest holds a live mapping, and the guest answers at another offset so the
 /// host can measure the other direction. On a virtio-fs export neither
-/// direction worked (docs/design.md §10.3) and every check above the pixels
+/// direction worked (docs/waycompose-design.md §10.3) and every check above the pixels
 /// passed anyway (§10.7), which is why this is measured directly rather than
 /// inferred from a window looking right.
 ///
@@ -904,6 +952,44 @@ pub fn attached() -> Vec<(u32, usize, String)> {
         .collect();
     out.sort_by_key(|(id, _, _)| *id);
     out
+}
+
+/// Where a region this process **provided** starts in this process's address
+/// space, for the one caller that needs an address rather than bytes.
+///
+/// # Why a raw address is exported at all, when nothing else here is
+///
+/// Every other accessor in this module hands out bytes, because the whole point
+/// of an arena id is that neither side has to know where the other put
+/// anything. This one exists for `SuperfetchPfnQuery`, which is a *reverse*
+/// lookup: it enumerates the machine's page frames and keeps the ones whose
+/// recorded virtual address falls inside a window (`awe_probe::superfetch`).
+/// The window has to be named by its address because that is the only name the
+/// PFN database knows it by — there is no id to give it.
+///
+/// It is `provided` only, and that is the same rule [`guest_write`] and
+/// [`release_guest_ram`] are under: a region this process merely *opened* is
+/// somebody else's memory, its frames belong to whoever committed them, and
+/// asking Windows which frames back a foreign mapping would produce an answer
+/// about a different process's pages.
+///
+/// # What this makes possible, and it is the whole of §0.14 item 4
+///
+/// The content sweep can only find a region whose pages still carry their
+/// stamps, and the first pool allocated into a region overwrites them
+/// ([`attach_guest_ram`]'s own note says so: "this region cannot be re-found
+/// later"). The frame list does not care what is in the pages — measured, on a
+/// window whose every byte had been overwritten, as the *same* frame list where
+/// the sweep found zero pages. So this is not an optimisation of locating; it
+/// is what makes locating a region twice possible, and growth is the first
+/// thing that needs it.
+pub fn region_base(arena: u32) -> Option<usize> {
+    let guard = registry().read().ok()?;
+    let a = guard.get(&arena)?;
+    if !a.provided {
+        return None;
+    }
+    Some(a.view.ptr() as usize)
 }
 
 /// Give a guest-RAM region back to the operating system.

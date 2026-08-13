@@ -8,7 +8,7 @@
 //! the `Keysym`/`Keycode` newtypes have to agree with the C ABI.
 //!
 //! It is a separate crate from `wc-server` on purpose. Stage 1 established that
-//! `cargo check` proves nothing about linking (docs/design.md §5.4 item 2); a
+//! `cargo check` proves nothing about linking (docs/waycompose-design.md §5.4 item 2); a
 //! probe that produces its own `.exe` keeps that lesson enforced by the build
 //! graph instead of by memory.
 //!

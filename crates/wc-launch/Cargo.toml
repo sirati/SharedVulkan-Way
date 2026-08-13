@@ -1,0 +1,28 @@
+[package]
+name = "wc-launch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Double-click a Windows shortcut and a Linux application appears, over the guest's own RAM"
+
+# NO DEPENDENCIES ON LINUX, AND TWO WIN32 FEATURES ON WINDOWS.
+#
+# The parts worth testing -- the configuration, the command lines that come out
+# of it, and the .ico wrapper -- are portable and are tested by `cargo test` on
+# the machine that builds this, which is not the machine that runs it. What is
+# left for Windows is a named mutex and `CreateProcess`, and std does the second
+# one.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  # CloseHandle, GetLastError, ERROR_ALREADY_EXISTS.
+  "Win32_Foundation",
+  # `CreateMutexW` takes a pointer to SECURITY_ATTRIBUTES, so its binding is
+  # behind this feature even though the pointer passed is always null.
+  "Win32_Security",
+  # CreateMutexW / OpenMutexW: the liveness test. docs/waycompose-design.md §19.4 --
+  # a process that holds a named mutex is alive by construction, which an image
+  # name is not (§16.8) and which a probe of the compositor's own socket must
+  # not be (§17.4: the first client releases the held keymap).
+  "Win32_System_Threading",
+] }

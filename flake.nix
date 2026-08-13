@@ -290,6 +290,22 @@
           # toplevel.
           weston
 
+          # ADDED FOR STAGE 13. `wl-copy` and `wl-paste` are the clipboard's
+          # equivalent of what `weston-flower` was for surfaces and
+          # `weston-eventdemo` was for input: **libwayland clients written by
+          # somebody else that drive the exact protocol under test**. `wl-copy`
+          # creates a `wl_data_source`, offers mime types and calls
+          # `set_selection`; `wl-paste` receives a `wl_data_offer` and calls
+          # `receive` — which is the request that, before this stage, killed
+          # the connection.
+          #
+          # `wl-paste` needs the selection, and a compositor only offers the
+          # selection to the client with data-device focus, so it opens an
+          # `xdg_toplevel` of its own to acquire focus and closes it again. That
+          # is a real window through the real proxy, which makes the test
+          # stronger rather than weaker.
+          wl-clipboard
+
           # `xkbcli compile-keymap` — the Linux-side half of the keymap story.
           # There is no xkeyboard-config data tree on Windows and there is not
           # going to be one, so keymap *strings* are generated here, on Linux,

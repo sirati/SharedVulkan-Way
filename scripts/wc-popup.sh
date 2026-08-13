@@ -84,10 +84,10 @@ HOST_FIREFOX="${WC_HOST_FIREFOX:-}"
 # there, and the two are independent: the popup's `HWND` is placed by
 # `SetWindowPos` from a rectangle `state.rs` computed, whatever carried the
 # buffer. The arena needs QMP, `/proc/<qemu-pid>/fd` and therefore root on the
-# host, and — in this tree — `crates/wc-arena-host`, which the unified merge
-# deleted (see the note in the workspace `Cargo.toml`), so `wc-desktop.sh
-# window` cannot run here as written. The shared-file transport needs none of
-# that and is what §32's runs are using against this same guest today.
+# host — three things between a placement question and its answer, each of
+# which can fail for reasons that say nothing about placement. The shared-file
+# transport needs none of them and is what §32's runs are using against this
+# same guest today.
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc38}"
 SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc38}"
 COMP_SHARE_ARGS="--shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/"

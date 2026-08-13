@@ -34,7 +34,7 @@
 //! # The event loop is still a poll loop, and still deliberately
 //!
 //! No `calloop`. `Backend::poll_fd()` returns a wepoll handle on Windows and a
-//! wepoll handle is not a socket (docs/design.md §3.3), so the backend cannot
+//! wepoll handle is not a socket (docs/waycompose-design.md §3.3), so the backend cannot
 //! nest inside it. The Wayland thread therefore polls on a 5 ms wait, exactly
 //! as stages 1 and 2 did — though on Windows it took until stage 8 for that to
 //! be 5 ms rather than `Sleep`'s 15.9 ms quantum (`tick.rs`). It is a latency
@@ -42,23 +42,28 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+mod clipboard;
 /// The socket a conformance suite drives this compositor through, standing
 /// where Windows stands. Linux only, because WLCS is. See its header, and
 /// docs/waycompose-design.md §26.
 #[cfg(unix)]
 mod control;
 mod cursor;
+pub mod grow;
 mod icon;
 mod input;
 mod platform;
 mod state;
 mod surface;
+/// Which taskbar button a window belongs to. See its header, and
+/// docs/waycompose-design.md §32.
+mod taskbar;
 mod tick;
 
 /// How long the Wayland thread waits between turns.
 ///
 /// 5 ms since stage 1, and unchanged — what changed in stage 8 is that it is
-/// now *actually* 5 ms. See `tick.rs` and docs/design.md §13.8: on Windows this
+/// now *actually* 5 ms. See `tick.rs` and docs/waycompose-design.md §13.8: on Windows this
 /// number went through `Sleep`, whose quantum is 15.6 ms, so the loop had always
 /// been turning at 15.9 ms. That is a latency floor on every UI event; §13.8 is
 /// also the record of this comment once claiming it was a throughput floor, and
@@ -83,7 +88,7 @@ struct Args {
     simulate_wm: bool,
     /// Force the poll loop back onto `Sleep`, with its 15.6 ms quantum.
     ///
-    /// The control for the cadence question (docs/design.md §13.8). One binary,
+    /// The control for the cadence question (docs/waycompose-design.md §13.8). One binary,
     /// one flag, everything else identical -- which is the only way to attribute
     /// a frame rate to the wait rather than to the tree, the transport or the
     /// instrument, and §13.8 is a record of getting that wrong first.
@@ -107,7 +112,7 @@ struct Args {
     arena_grow_dir: Option<String>,
     /// Arenas to **provide** rather than open, as `id:size`.
     ///
-    /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §12).
+    /// ADDED FOR STAGE 7, and it is the substrate change (docs/waycompose-design.md §12).
     /// A `--arena` is a file both sides open; a `--arena-guest-ram` is memory
     /// this process commits and pins inside the virtual machine, stamped so
     /// that a process on the *host* can find those pages in QEMU's memory
@@ -127,7 +132,7 @@ struct Args {
     /// How many bytes of which arena are **this process's to hand to clients**,
     /// as `id:bytes`.
     ///
-    /// ADDED FOR STAGE 10, and it is docs/design.md §12.11 item 3. A `wl_shm`
+    /// ADDED FOR STAGE 10, and it is docs/waycompose-design.md §12.11 item 3. A `wl_shm`
     /// pool is created by the client and read here; a `wl_keyboard` keymap is
     /// created here and read by the client. The second direction had a wire
     /// format from stage 1 and no statement of *which bytes* were the
@@ -144,7 +149,7 @@ struct Args {
     /// compositor and opened by the client. The second direction has no
     /// transport at all without this: a keymap in a `Local\wc-…` section is
     /// perfectly well-formed and cannot be opened by a Linux process
-    /// (docs/design.md §9.10 item 5).
+    /// (docs/waycompose-design.md §9.10 item 5).
     ///
     /// Two flags rather than one `local:peer` argument, because both values are
     /// paths and one of them has a drive letter in it.
@@ -614,12 +619,38 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // line is what the peer's allocator has to be told to stay out of.
     if let Some((id, bytes)) = args.outbound {
         match wc_handle::arena::reserve_outbound(id, bytes) {
-            Ok(w) => println!(
-                "wc-compositor: arena {id} outbound window: offset {}, {} bytes \
-                 (objects made for clients are arena slices; wc-proxy needs \
-                 --arena-outbound {} to leave them alone)",
-                w.offset, w.len, w.len
-            ),
+            Ok(w) => {
+                // DYNAMIC ARENA. A run id here means `reserve_outbound` had to
+                // commit a region of its own for the window, because `id` named
+                // an arena this process had not provided. The run id goes out on
+                // its own line and in the same shape as the data regions',
+                // because the host's locator cannot find a region it has not
+                // been told the run id of — and a region nobody can locate is
+                // one the compositor writes keymaps into that no client ever
+                // reads.
+                if let Some(run) = w.run_id {
+                    println!(
+                        "wc-compositor: arena {id} provided from guest RAM: \
+                         run 0x{run:016x}, {} bytes, {} pages, locked=true \
+                         (the outbound window's own region)",
+                        w.len,
+                        w.len / wc_handle::arena::GIFT_GRANULARITY,
+                    );
+                }
+                println!(
+                    "wc-compositor: arena {id} outbound window: offset {}, {} bytes{} \
+                     (objects made for clients are arena slices; wc-proxy needs \
+                     --arena-outbound {} to leave them alone)",
+                    w.offset,
+                    w.len,
+                    if w.run_id.is_some() {
+                        ", the whole of its own region, so every data region can be reclaimed"
+                    } else {
+                        ", a tail of the data region, which therefore cannot be reclaimed"
+                    },
+                    w.len
+                );
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not reserve an outbound window in arena {id}: {e}");
                 return std::process::ExitCode::from(2);
@@ -632,7 +663,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         // first guest run of an outbound window reported
         // `located 16374 of 16384 pages` and wrote no plan, because smithay
         // seals the keymap in `Seat::add_keyboard`, ten lines below and a full
-        // minute before any client exists. docs/design.md §14.12 item 1 said
+        // minute before any client exists. docs/waycompose-design.md §14.12 item 1 said
         // that ordering held by construction; it does not, and this is what
         // makes it hold. Only for guest RAM: a file arena has no stamps and
         // nothing is looking for it.

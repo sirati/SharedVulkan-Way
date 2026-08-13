@@ -2,7 +2,7 @@
 //!
 //! Compiled on both platforms even though only the Windows build can use it,
 //! for one reason: **`cargo test` cannot run for the Windows target**
-//! (docs/design.md §4.1), so anything that lives only behind `cfg(windows)` is
+//! (docs/waycompose-design.md §4.1), so anything that lives only behind `cfg(windows)` is
 //! checked by the compiler and by nothing else. The encoding is the part of
 //! this client most likely to be quietly wrong — a byte of padding, a size
 //! field counted from the wrong place — and it is testable without a socket,
@@ -111,7 +111,7 @@ pub fn message(object: u32, opcode: u16, args: &[u32]) -> Vec<u8> {
 /// 4-byte boundary.
 ///
 /// **This is also exactly how an `h` argument is encoded on Windows.** The
-/// entire deviation of docs/design.md §2.3 is that one sentence, and this is
+/// entire deviation of docs/waycompose-design.md §2.3 is that one sentence, and this is
 /// the function that implements it on the client side.
 pub fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
@@ -214,6 +214,20 @@ pub fn create_window(
     out.extend_from_slice(&finish(ID_TOPLEVEL, REQ_TOPLEVEL_SET_APP_ID, body));
     out.extend_from_slice(&message(ID_SURFACE, REQ_SURFACE_COMMIT, &[]));
     out
+}
+
+/// `xdg_toplevel.set_app_id` on its own, after the window is up.
+///
+/// ADDED FOR STAGE 32. `set_app_id` is not a one-off: the protocol allows a
+/// client to send it whenever it likes, including long after its first buffer,
+/// and the compositor's answer to "which taskbar button is this window on" has
+/// to move with it. No client this project can install does that on demand —
+/// the toolkits all set it before they draw — so the only way to *measure* the
+/// late path is a client that can be told to take it, and this is that request.
+pub fn set_app_id(app_id: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    push_string(&mut body, app_id);
+    finish(ID_TOPLEVEL, REQ_TOPLEVEL_SET_APP_ID, body)
 }
 
 /// `wl_shm.create_pool` carrying the descriptor as an `h`, then the two
@@ -549,7 +563,7 @@ mod tests {
 
     #[test]
     fn an_h_argument_is_encoded_exactly_like_an_array() {
-        // The claim of docs/design.md §2.3, as a test. A 20-byte descriptor
+        // The claim of docs/waycompose-design.md §2.3, as a test. A 20-byte descriptor
         // occupies 4 bytes of length plus 20 of payload; 20 is already a
         // multiple of 4, so nothing is padded.
         let descriptor = [0xABu8; 20];
@@ -586,6 +600,28 @@ mod tests {
         }
         assert_eq!(at, buf.len(), "trailing bytes that are not a message");
         out
+    }
+
+    /// STAGE 32. A late `set_app_id` is one message on the toplevel, framed
+    /// like any other, whatever the padding of the name comes to.
+    #[test]
+    fn a_late_app_id_is_one_well_framed_message() {
+        for id in ["", "a", "firefox", "org.freedesktop.weston.wayland-terminal"] {
+            let bytes = set_app_id(id);
+            let f = frames(&bytes);
+            assert_eq!(f.len(), 1, "app id {id:?}");
+            assert_eq!(f[0].0, ID_TOPLEVEL);
+            assert_eq!(f[0].1, REQ_TOPLEVEL_SET_APP_ID);
+        }
+        // And it is the same bytes `create_window` sends, so the late path
+        // cannot drift from the early one.
+        let early = create_window((1, 6), (2, 2), (3, 6), "t", "org.example.App");
+        assert!(
+            early
+                .windows(set_app_id("org.example.App").len())
+                .any(|w| w == set_app_id("org.example.App")),
+            "the opening burst does not contain the same set_app_id message"
+        );
     }
 
     #[test]

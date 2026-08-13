@@ -92,7 +92,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus,
     GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-// ADDED FOR STAGE 12, for the cursor (docs/design.md §23). `SetCursor` and
+// ADDED FOR STAGE 12, for the cursor (docs/waycompose-design.md §23). `SetCursor` and
 // `DestroyCursor` are the whole of the Win32 half; `HTCLIENT` is the hit-test
 // code that decides whether the client's cursor applies or the system's frame
 // keeps its own.
@@ -149,7 +149,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
-use windows_sys::Win32::Foundation::{POINT, SIZE};
+// ADDED FOR STAGE 32: the taskbar identity. `SHGetPropertyStoreForWindow` is
+// the only entry point in this file that hands back a **COM interface**, and
+// the workspace manifest's "no COM" note stops being true here — see
+// `set_taskbar_identity` for what that costs and why nothing else will do.
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreForWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA};
+use windows_sys::Win32::Foundation::{GlobalFree, POINT, PROPERTYKEY, SIZE};
+use windows_sys::core::{GUID, HRESULT};
+// ADDED FOR THE CLIPBOARD. The clipboard lives in `DataExchange` rather than with
+// the window messages, and its payloads are moveable global handles rather than
+// pointers, which is why `Memory` comes with it. See `set_clipboard`.
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+    GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+
+use crate::clipboard::SystemFormat;
 
 use crate::input::{evdev, evdev_keycode};
 
@@ -194,6 +213,23 @@ const SC_SCREENSAVE: u32 = 0xF140;
 /// to test a system command is `(wParam & 0xFFF0) == SC_...`. Comparing the raw
 /// `wParam` works most of the time, which is worse than never working.
 const SC_MASK: usize = 0xFFF0;
+/// `WM_CLIPBOARDUPDATE`, 0x031D: the system clipboard's contents changed.
+///
+/// Delivered to every window registered with `AddClipboardFormatListener`,
+/// which is how a clipboard is watched now — the old route was a
+/// `SetClipboardViewer` chain, where one badly behaved application that forgot
+/// to forward broke the notification for everything after it. There is nothing
+/// to unhook here except our own registration.
+const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+
+/// `CF_UNICODETEXT` and `CF_HDROP`.
+///
+/// Written out for the reason [`WM_MOUSELEAVE`] is: `windows-sys` files the
+/// clipboard format constants under `Win32::System::Ole`, which is a large
+/// module to compile into every build in order to say `13`. The numbers are in
+/// `winuser.h` and have not moved since Windows 3.1.
+const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -277,6 +313,14 @@ struct WindowState {
     /// How many frames this window has presented, for the dump filenames.
     frames: Cell<u32>,
     icon_small: Cell<isize>,
+    /// The taskbar identity currently on this window's property store.
+    ///
+    /// ADDED FOR STAGE 32. Held so that a repeated `set_app_id` with the same
+    /// string — which is a thing clients do — does not rebuild a taskbar button
+    /// that is already right. A `RefCell` rather than a `Cell` because it has
+    /// to be *read* to answer that; it is borrowed only for the comparison and
+    /// never across a Win32 call, which is this module's rule.
+    aumid: RefCell<String>,
 
     // --- input, stage 6 ---------------------------------------------------
     /// Whether `TrackMouseEvent` is currently armed for this window.
@@ -753,7 +797,7 @@ pub fn current_layout() -> &'static str {
 // The thread-local registry
 // ---------------------------------------------------------------------------
 
-struct Ui {
+pub(crate) struct Ui {
     windows: RefCell<HashMap<WindowId, Rc<WindowState>>>,
     commands: Commands,
     events: Sender<FromUi>,
@@ -763,7 +807,7 @@ struct Ui {
     /// messages rather than pumping them — but "should not be possible" is not
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
-    controller: Cell<isize>,
+    pub(crate) controller: Cell<isize>,
     /// Whether a client currently holds an idle inhibitor.
     ///
     /// ADDED FOR STAGE 21. Kept here as well as inside Windows' own execution
@@ -771,10 +815,19 @@ struct Ui {
     /// *previous* state, and there is no "what is it now" query — and because
     /// `toplevel_proc` has to read it to answer `WM_SYSCOMMAND`.
     idle_inhibited: Cell<bool>,
+    /// `RegisterClipboardFormatW("HTML Format")`, resolved once.
+    ///
+    /// A **registered** format has no compile-time number: the id is minted per
+    /// session and two processes get the same one only because they registered
+    /// the same string. 0 means "not resolved yet"; the registration cannot
+    /// fail in any way worth a second code path — if it does, `html_format`
+    /// returns 0 and no HTML crosses, which is the same outcome as a clipboard
+    /// with no HTML on it.
+    html_format: Cell<u32>,
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
-    /// is exactly what docs/design.md §8.5 had to apologise for: the half of
+    /// is exactly what docs/waycompose-design.md §8.5 had to apologise for: the half of
     /// the evidence that produced an `HWND` was also the half whose pixels
     /// nobody outside the process ever measured. A frame dumped here is read
     /// back by `identify` and `compare`, which are not ours.
@@ -784,7 +837,7 @@ struct Ui {
     //
     // Three cells rather than one, because the `HCURSOR` a window shows, the
     // `HCURSOR` this process must destroy, and whether the pointer is
-    // anywhere it matters are three independent facts (docs/design.md §23).
+    // anywhere it matters are three independent facts (docs/waycompose-design.md §23).
     /// What `WM_SETCURSOR` should install over the client area. `0` means
     /// "hidden", which is a value `SetCursor` accepts and is what
     /// `wl_pointer.set_cursor` with a null surface asks for; it is therefore
@@ -1098,7 +1151,7 @@ unsafe extern "system" fn toplevel_proc(
             // button message.
             1
         }
-        // ADDED FOR STAGE 12 (docs/design.md §23). **The only place a client's
+        // ADDED FOR STAGE 12 (docs/waycompose-design.md §23). **The only place a client's
         // cursor is installed on a mouse message**, and the reason it has to be
         // handled rather than left to `DefWindowProc` is that `DefWindowProc`
         // sets the *class* cursor — the `IDC_ARROW` in `register_classes` —
@@ -1492,7 +1545,307 @@ unsafe extern "system" fn controller_proc(
         }
         return 0;
     }
+    if msg == WM_CLIPBOARDUPDATE {
+        if let Some(ui) = ui() {
+            on_clipboard_update(&ui);
+        }
+        return 0;
+    }
+    // The OLE drag loop, entered **here** rather than from `drain`. See
+    // `super::drag`'s header and stage 17's identical treatment of `SC_MOVE`:
+    // `drain` holds `ui.draining`, and a modal loop under it spins the pump
+    // re-posting a wake it cannot service. By the time this arrives the drain
+    // has returned.
+    if msg == super::drag::WM_WC_DRAG {
+        if let Some(ui) = ui()
+            && let Some(action) = super::drag::enter_modal_loop()
+        {
+            let _ = ui.events.send(FromUi::DragFinished { action });
+        }
+        return 0;
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+// ---------------------------------------------------------------------------
+// The clipboard
+// ---------------------------------------------------------------------------
+
+/// The clipboard changed. Tell the Wayland side what is on it now.
+///
+/// # This fires for our own writes too, and that is kept deliberately
+///
+/// `SetClipboard` below posts a `WM_CLIPBOARDUPDATE` straight back at us, so a
+/// Wayland client that copies immediately gets a selection offer describing its
+/// own bytes. The obvious tidy-up is to remember `GetClipboardSequenceNumber`
+/// after our own write and swallow the echo.
+///
+/// **That would break copying and pasting inside one client.** wc-proxy does
+/// not forward `wl_data_device.set_selection` — it cannot, because the
+/// compositor would then have to answer `wl_data_source.send` with a
+/// descriptor — so a client that copies has told the compositor nothing about
+/// having a selection. The echo is the *only* thing that gives that client a
+/// `wl_data_offer` for what it just copied. Swallow it and Ctrl-C followed by
+/// Ctrl-V in the same window pastes nothing, which is the first thing anybody
+/// tries.
+///
+/// The cost of keeping it is one extra round trip per copy. That is the right
+/// side of the trade, and it is also what makes client-to-client copying work
+/// transitively through Windows' own clipboard.
+fn on_clipboard_update(ui: &Rc<Ui>) {
+    let formats = available_formats(ui);
+    let mimes = crate::clipboard::mimes_for(&formats);
+    println!(
+        "wc-compositor: WM_CLIPBOARDUPDATE: [{}] -> {} mime type(s)",
+        formats.iter().map(|f| f.name()).collect::<Vec<_>>().join(", "),
+        mimes.len()
+    );
+    let _ = ui.events.send(FromUi::ClipboardChanged { mimes });
+}
+
+/// `RegisterClipboardFormatW("HTML Format")`, once per process.
+fn html_format(ui: &Rc<Ui>) -> u32 {
+    if ui.html_format.get() != 0 {
+        return ui.html_format.get();
+    }
+    let name = wide("HTML Format");
+    // SAFETY: a NUL-terminated UTF-16 buffer that outlives the call.
+    let id = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
+    ui.html_format.set(id);
+    id
+}
+
+fn format_id(ui: &Rc<Ui>, format: SystemFormat) -> u32 {
+    match format {
+        SystemFormat::UnicodeText => CF_UNICODETEXT,
+        SystemFormat::Html => html_format(ui),
+        SystemFormat::HDrop => CF_HDROP,
+    }
+}
+
+/// Which of the three formats this compositor carries are on the clipboard.
+///
+/// `IsClipboardFormatAvailable` rather than `EnumClipboardFormats`, because it
+/// does **not** require the clipboard to be open — which matters more than the
+/// three calls it saves. Opening the clipboard inside a `WM_CLIPBOARDUPDATE`
+/// handler is a fight with whichever application has just finished writing to
+/// it and has not yet closed it, and losing that fight would mean announcing an
+/// empty clipboard to Wayland at precisely the moment something was copied.
+fn available_formats(ui: &Rc<Ui>) -> Vec<SystemFormat> {
+    [SystemFormat::UnicodeText, SystemFormat::Html, SystemFormat::HDrop]
+        .into_iter()
+        .filter(|f| {
+            let id = format_id(ui, *f);
+            // SAFETY: a pure query taking a format number.
+            id != 0 && unsafe { IsClipboardFormatAvailable(id) } != 0
+        })
+        .collect()
+}
+
+/// Run `f` with the clipboard open, or return `None`.
+///
+/// **The retry is not defensive coding.** The clipboard is a single global
+/// lock held by whichever process is reading or writing it, `OpenClipboard`
+/// fails outright rather than waiting, and the documented remedy is to try
+/// again. Losing the race silently would mean a copy that did nothing, so the
+/// failure is logged with the reason and the window that holds it.
+fn with_clipboard<T>(ui: &Rc<Ui>, what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    let hwnd = ui.controller.get() as HWND;
+    for attempt in 0..8 {
+        // SAFETY: a live window handle owned by this thread.
+        if unsafe { OpenClipboard(hwnd) } != 0 {
+            let out = f();
+            // SAFETY: the clipboard was opened by this thread just above.
+            unsafe { CloseClipboard() };
+            return Some(out);
+        }
+        if attempt < 7 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    eprintln!(
+        "wc-compositor: could not open the clipboard to {what}: {}",
+        std::io::Error::last_os_error()
+    );
+    None
+}
+
+/// One format's bytes, copied out of the clipboard's global handle.
+///
+/// The handle belongs to the clipboard and is **not** freed here; only the lock
+/// is released. Freeing it is how an application takes the clipboard down with
+/// it, and it is the classic Win32 clipboard bug.
+fn read_format(id: u32) -> Option<Vec<u8>> {
+    // SAFETY: the clipboard is open (the caller is inside `with_clipboard`).
+    let handle = unsafe { GetClipboardData(id) };
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: a handle the clipboard just gave us.
+    let ptr = unsafe { GlobalLock(handle) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the same handle, still locked.
+    let len = unsafe { GlobalSize(handle) };
+    // SAFETY: `ptr` addresses `len` bytes for as long as the lock is held.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec();
+    // SAFETY: balancing the lock taken above.
+    unsafe { GlobalUnlock(handle) };
+    Some(bytes)
+}
+
+/// Put one format on the clipboard. The clipboard must already be open and
+/// emptied.
+fn write_format(id: u32, bytes: &[u8]) -> bool {
+    // SAFETY: an allocation request; the handle is checked below.
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: a handle just allocated here.
+    let ptr = unsafe { GlobalLock(handle) };
+    if ptr.is_null() {
+        // SAFETY: ours, never handed to the clipboard.
+        unsafe { GlobalFree(handle) };
+        return false;
+    }
+    // SAFETY: `ptr` addresses at least `bytes.len()` bytes and the source is a
+    // live slice; the two cannot overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        GlobalUnlock(handle);
+    }
+    // SAFETY: the clipboard is open and owned by this thread. **On success the
+    // system owns `handle`** — which is why there is no `GlobalFree` on this
+    // path and why there must be one on the other.
+    if unsafe { SetClipboardData(id, handle) }.is_null() {
+        // SAFETY: the call failed, so ownership never transferred.
+        unsafe { GlobalFree(handle) };
+        return false;
+    }
+    true
+}
+
+/// A Wayland selection as the numbered Windows formats it becomes.
+///
+/// The one place the conversion (`crate::clipboard`, which is arithmetic and is
+/// tested on Linux) meets the numbering (which is Win32's and half of it is
+/// minted at runtime). **Shared by the clipboard and the drag source on
+/// purpose**: a drag's data and a selection's data are the same bytes in the
+/// same formats, and building them twice would be two ways for one client's
+/// selection to arrive differently.
+pub(crate) fn system_formats(ui: &Rc<Ui>, payloads: &[(String, Vec<u8>)]) -> Vec<(u32, Vec<u8>)> {
+    crate::clipboard::to_system(payloads)
+        .into_iter()
+        .filter_map(|(format, bytes)| {
+            let id = format_id(ui, format);
+            (id != 0).then_some((id, bytes))
+        })
+        .collect()
+}
+
+fn set_clipboard(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>) {
+    let system = crate::clipboard::to_system(&payloads);
+    with_clipboard(ui, "publish a selection", || {
+        // SAFETY: the clipboard is open. `EmptyClipboard` also makes this
+        // process the owner, which is required before `SetClipboardData`.
+        unsafe { EmptyClipboard() };
+        for (format, bytes) in &system {
+            let id = format_id(ui, *format);
+            let ok = id != 0 && write_format(id, bytes);
+            println!(
+                "wc-compositor: clipboard set {} ({} bytes): {}",
+                format.name(),
+                bytes.len(),
+                if ok { "ok" } else { "failed" }
+            );
+        }
+        if system.is_empty() {
+            println!("wc-compositor: clipboard cleared");
+        }
+    });
+}
+
+/// Hand the staged payloads to OLE as a drag source.
+///
+/// See [`super::drag`] for the `IDataObject`/`IDropSource` pair and for why
+/// `DoDragDrop` is entered from a posted message rather than from here.
+///
+/// `run` answers immediately only when the drag could not be started at all;
+/// otherwise the answer comes from [`WM_WC_DRAG`](super::drag::WM_WC_DRAG),
+/// after the loop. Either way exactly one `DragFinished` is sent, which is what
+/// stops a client's `wl_data_source` waiting forever.
+fn start_drag(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>, actions: u32) {
+    if let Some(action) = super::drag::run(ui, &payloads, actions) {
+        let _ = ui.events.send(FromUi::DragFinished { action });
+    }
+}
+
+fn cancel_drag(ui: &Rc<Ui>) {
+    super::drag::cancel(ui);
+}
+
+fn fetch_clipboard(ui: &Rc<Ui>, token: u64, from_drag: bool, mime: &str) {
+    if from_drag {
+        let data = super::drag::payload(ui, mime);
+        println!(
+            "wc-compositor: drag fetch token={token} mime={mime:?} -> {}",
+            match &data {
+                Some(b) => format!("{} bytes", b.len()),
+                None => "nothing".to_owned(),
+            }
+        );
+        let _ = ui.events.send(FromUi::ClipboardData { token, data });
+        return;
+    }
+    let formats = available_formats(ui);
+    let data = with_clipboard(ui, "answer a paste", || {
+        formats.iter().find_map(|f| {
+            let bytes = read_format(format_id(ui, *f))?;
+            crate::clipboard::from_system(mime, *f, &bytes)
+        })
+    })
+    .flatten();
+    match &data {
+        Some(b) => println!(
+            "wc-compositor: clipboard fetch token={token} mime={mime:?} -> {} bytes",
+            b.len()
+        ),
+        // The one case worth the extra open: the answer was nothing, and the
+        // difference between "the clipboard is empty" and "it holds a bitmap"
+        // is otherwise invisible.
+        None => println!(
+            "wc-compositor: clipboard fetch token={token} mime={mime:?} -> nothing; \
+             the clipboard holds formats [{}]",
+            describe_clipboard(ui)
+        ),
+    }
+    let _ = ui.events.send(FromUi::ClipboardData { token, data });
+}
+
+/// Every clipboard format on the clipboard right now, by number, for the log.
+///
+/// Only called when `--trace`-ish curiosity is warranted — a paste that found
+/// nothing — because it needs the clipboard open and the answer is a list of
+/// integers that mean nothing without a registry lookup. It is here because
+/// "the client asked for text/plain and got nothing" and "the clipboard held
+/// only CF_BITMAP" are the same log line otherwise.
+fn describe_clipboard(ui: &Rc<Ui>) -> String {
+    with_clipboard(ui, "list its formats", || {
+        let mut out = Vec::new();
+        let mut id = 0u32;
+        loop {
+            // SAFETY: the clipboard is open; 0 starts the enumeration.
+            id = unsafe { EnumClipboardFormats(id) };
+            if id == 0 {
+                break;
+            }
+            out.push(id.to_string());
+        }
+        out.join(", ")
+    })
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,11 +1885,12 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             id,
             title,
             app_id,
+            aumid,
             shadow,
             kind,
             bounds,
         } => {
-            if let Err(e) = create_window(ui, id, &title, &app_id, shadow, kind, bounds) {
+            if let Err(e) = create_window(ui, id, &title, &app_id, &aumid, shadow, kind, bounds) {
                 eprintln!("wc-compositor: could not create a window for surface {id}: {e}");
             }
         }
@@ -1552,12 +1906,15 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 println!("wc-compositor: window {id} title -> {title:?}");
             }
         }
-        ToUi::AppId { id, app_id } => {
-            // Nothing to do on Win32. `set_app_id` names a desktop entry, and
-            // turning that into pixels happens on the machine the client is on
-            // (docs/design.md §16.4); by the time an icon reaches this thread
-            // it is a `ToUi::Icon`. Logged so the harness can see it arrive.
+        ToUi::AppId { id, app_id, aumid } => {
+            // The *pixels* for an app id are still somebody else's problem —
+            // they are resolved on the machine the client is on and arrive as a
+            // `ToUi::Icon` (§16.4). What arrives here is the identity, and
+            // until stage 32 this arm did nothing at all.
             println!("wc-compositor: window {id} app_id -> {app_id:?}");
+            if let Some(w) = window(ui, id) {
+                apply_identity(&w, &aumid);
+            }
         }
         ToUi::Icon { id, icons } => {
             if let Some(w) = window(ui, id) {
@@ -1684,6 +2041,12 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 activate_window(&w);
             }
         }
+        ToUi::SetClipboard { payloads } => set_clipboard(ui, payloads),
+        ToUi::FetchClipboard { token, from_drag, mime } => {
+            fetch_clipboard(ui, token, from_drag, &mime)
+        }
+        ToUi::StartDrag { payloads, actions } => start_drag(ui, payloads, actions),
+        ToUi::CancelDrag => cancel_drag(ui),
         ToUi::Destroy { id } => {
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
@@ -1874,6 +2237,7 @@ fn create_window(
     id: WindowId,
     title: &str,
     app_id: &str,
+    aumid: &str,
     shadow: Arc<Mutex<Shadow>>,
     kind: WindowKind,
     bounds: PopupBounds,
@@ -1894,6 +2258,7 @@ fn create_window(
         icon_big: Cell::new(0),
         frames: Cell::new(0),
         icon_small: Cell::new(0),
+        aumid: RefCell::new(String::new()),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
@@ -1975,9 +2340,16 @@ fn create_window(
     // put the window somewhere already, so `MonitorFromWindow` has an answer,
     // and it is refreshed on every move from here on.
     state.publish_popup_bounds();
-    ui.windows.borrow_mut().insert(id, state);
+    ui.windows.borrow_mut().insert(id, state.clone());
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
+    // ADDED FOR STAGE 32, and *here* rather than at map for one reason: the
+    // window is still hidden. The shell has not seen it, so it has no taskbar
+    // button for it yet, so the identity it eventually reads is whatever is on
+    // the property store at `ShowWindow`. Doing it now costs nothing and makes
+    // the map-time call an idempotent no-op for every client that named itself
+    // before its first buffer.
+    apply_identity(&state, aumid);
     Ok(())
 }
 
@@ -2174,7 +2546,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     );
 
     // What the window turned out to be, in the units the window manager uses.
-    // docs/design.md §8.11 item 5 asks what happens on a scaled display, and the
+    // docs/waycompose-design.md §8.11 item 5 asks what happens on a scaled display, and the
     // answer is three numbers rather than a yes: the DPI Windows assigned this
     // window, the outer rectangle it gave us for the client size we asked for,
     // and the client rectangle it ended up with. On a 150% desktop a virtualised
@@ -2558,6 +2930,322 @@ fn set_window_state(w: &Rc<WindowState>, maximized: Option<bool>, minimized: Opt
     w.self_driven.set(false);
 }
 
+// ---------------------------------------------------------------------------
+// Taskbar identity, stage 32
+// ---------------------------------------------------------------------------
+//
+// WHY THERE IS COM IN A FILE WHOSE MANIFEST SAYS THERE IS NONE
+//
+// Every window this process makes is made by *this process*, and the shell
+// groups taskbar buttons by process unless a window says otherwise. Saying
+// otherwise is one property on one window — `PKEY_AppUserModel_ID` — and the
+// only way to set a property on an `HWND` is `SHGetPropertyStoreForWindow`,
+// which returns an `IPropertyStore`. There is no flat entry point for it.
+//
+// The process-wide alternative, `SetCurrentProcessExplicitAppUserModelID`, *is*
+// a flat entry point and is exactly the wrong shape: it gives the whole process
+// one identity, which is the state we are already in and the defect being
+// fixed.
+//
+// windows-sys 0.61 generates no COM interfaces at all — only functions,
+// structs and constants — so the vtable below is declared by hand from
+// `propsys.h`. That is eight function pointers in a fixed order and two GUIDs;
+// getting the order wrong is a call through the wrong slot, which is why the
+// declaration is a transcription with the header's own comments kept.
+
+/// `IID_IPropertyStore`, from `propsys.h`.
+const IID_PROPERTY_STORE: GUID = GUID::from_u128(0x886d8eeb_8cf2_4446_8d02_cdba1dbdcf99);
+
+/// The `fmtid` every `PKEY_AppUserModel_*` shares, from `propkey.h`.
+const FMTID_APP_USER_MODEL: GUID = GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3);
+
+/// `PKEY_AppUserModel_ID`: the string the shell groups taskbar buttons by.
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 5,
+};
+
+/// `PKEY_AppUserModel_PreventPinning`: no "Pin to taskbar" on this button.
+///
+/// **Set, deliberately, and this is a decision rather than caution.** Pinning
+/// writes a shortcut whose target is what the shell can work out about the
+/// window, and relaunching it would start `wc-compositor.exe` — not the Wayland
+/// client the button appears to be. The three properties that would make
+/// pinning honest (`PKEY_AppUserModel_RelaunchCommand`, `…IconResource`,
+/// `…DisplayNameResource`) cannot be filled in truthfully from here either: the
+/// application is a process on **another machine**, started by a person or a
+/// script that this compositor knows nothing about, and there is no command
+/// line on this side that would bring it back. A pinned button that silently
+/// does the wrong thing is worse than an absent affordance, so the affordance
+/// is removed and the reason is written down.
+const PKEY_PREVENT_PINNING: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 9,
+};
+
+/// `VT_LPWSTR`.
+const VT_LPWSTR: u16 = 31;
+/// `VT_BOOL`.
+const VT_BOOL: u16 = 11;
+/// `VARIANT_TRUE`, which is `-1` and not `1`.
+const VARIANT_TRUE: i16 = -1;
+
+/// `PROPVARIANT`, as much of it as two property types need.
+///
+/// The real union is sixteen bytes after an eight-byte header. Only the first
+/// eight of those are ever written here — a `LPWSTR` or a `VARIANT_BOOL` — and
+/// the rest is zero, which is what an unset `PROPVARIANT` looks like anyway.
+/// The size assertion is the check that this agrees with the ABI; it is written
+/// for a 64-bit target on purpose, because a 32-bit build would need a
+/// different one and should fail loudly rather than pass a mis-shaped struct to
+/// the shell.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PropVariant {
+    vt: u16,
+    reserved: [u16; 3],
+    value: [u64; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<PropVariant>() == 24);
+
+impl PropVariant {
+    const fn empty() -> Self {
+        PropVariant { vt: 0, reserved: [0; 3], value: [0; 2] }
+    }
+
+    /// A `VT_LPWSTR` **borrowing** `s`.
+    ///
+    /// Borrowing is sound because `IPropertyStore::SetValue` copies the value
+    /// it is given (it is a store, not a sink) and because this variant is
+    /// never handed to `PropVariantClear`. So the `Vec<u16>` behind `s` owns
+    /// the memory, frees it on drop, and no allocator crosses the boundary in
+    /// either direction.
+    fn lpwstr(s: *const u16) -> Self {
+        PropVariant { vt: VT_LPWSTR, reserved: [0; 3], value: [s as u64, 0] }
+    }
+
+    fn boolean(v: bool) -> Self {
+        let raw = if v { VARIANT_TRUE } else { 0 } as u16;
+        PropVariant { vt: VT_BOOL, reserved: [0; 3], value: [u64::from(raw), 0] }
+    }
+
+    /// The string out of a variant a `GetValue` filled in, and the shell's
+    /// allocation with it.
+    ///
+    /// Consuming, because the pointer is freed here: `PROPVARIANT` strings come
+    /// from `CoTaskMemAlloc`, which is exactly what `PropVariantClear` would
+    /// free, and taking the one case this file can produce is cheaper than
+    /// pulling in the whole of `Win32_System_Com_StructuredStorage` for it.
+    fn take_string(self) -> Option<String> {
+        if self.vt != VT_LPWSTR || self.value[0] == 0 {
+            return None;
+        }
+        let p = self.value[0] as *mut u16;
+        let mut n = 0usize;
+        // SAFETY: a NUL-terminated UTF-16 string from the property store.
+        unsafe {
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            CoTaskMemFree(p.cast());
+            Some(s)
+        }
+    }
+}
+
+#[repr(C)]
+struct PropertyStore {
+    vtbl: *const PropertyStoreVtbl,
+}
+
+/// `IPropertyStoreVtbl`, transcribed from `propsys.h` in its own order.
+#[repr(C)]
+struct PropertyStoreVtbl {
+    // IUnknown
+    query_interface:
+        unsafe extern "system" fn(*mut PropertyStore, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+    release: unsafe extern "system" fn(*mut PropertyStore) -> u32,
+    // IPropertyStore
+    get_count: unsafe extern "system" fn(*mut PropertyStore, *mut u32) -> HRESULT,
+    get_at: unsafe extern "system" fn(*mut PropertyStore, u32, *mut PROPERTYKEY) -> HRESULT,
+    get_value:
+        unsafe extern "system" fn(*mut PropertyStore, *const PROPERTYKEY, *mut PropVariant)
+            -> HRESULT,
+    set_value:
+        unsafe extern "system" fn(*mut PropertyStore, *const PROPERTYKEY, *const PropVariant)
+            -> HRESULT,
+    commit: unsafe extern "system" fn(*mut PropertyStore) -> HRESULT,
+}
+
+thread_local! {
+    /// Whether this thread has called `CoInitializeEx`.
+    static COM_READY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Put this thread in a single-threaded apartment, once.
+///
+/// Lazy rather than at startup so that a compositor which never makes a window
+/// — the headless and the `--probe` paths — never initialises COM at all, and
+/// so that the HRESULT is logged next to the first thing that needed it.
+/// Apartment-threaded because this is a thread with a message loop, which is
+/// what an STA is; `RPC_E_CHANGED_MODE` (0x80010106) would mean somebody had
+/// already made it multi-threaded, and is reported rather than treated as
+/// fatal because the property store works either way.
+///
+/// There is no `CoUninitialize`. This thread runs until the process exits.
+fn com_init() {
+    COM_READY.with(|ready| {
+        if ready.replace(true) {
+            return;
+        }
+        // SAFETY: a plain call with a null reserved argument, on the thread
+        // that will use the apartment.
+        // `COINIT_*` is generated as a signed `COINIT`; the entry point takes
+        // an unsigned flag word. The cast is the whole of the difference.
+        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        println!("wc-compositor: COM apartment on the UI thread: hr 0x{:08x}", hr as u32);
+    });
+}
+
+/// Which taskbar button this window belongs on.
+///
+/// Returns the identity the property store reads back, which is a stronger
+/// claim than "`SetValue` returned `S_OK`" and costs one more call.
+///
+/// # Ordering, which is the part that is easy to get wrong
+///
+/// The shell creates a taskbar button when the window is **shown** and reads
+/// this property then. Setting it afterwards leaves the button where it was.
+/// So every call site here is before a `ShowWindow` — at creation, and at map
+/// just before `map_window` — and the one path that cannot be, a `set_app_id`
+/// that arrives after the window is up, rebuilds the button by hiding and
+/// re-showing it (see the `ToUi::AppId` arm).
+fn set_taskbar_identity(w: &Rc<WindowState>, aumid: &str) -> Result<String, (&'static str, HRESULT)> {
+    com_init();
+    let mut store: *mut PropertyStore = std::ptr::null_mut();
+    // SAFETY: a live window handle; the out pointer is written only on success
+    // and is checked below.
+    let hr = unsafe {
+        SHGetPropertyStoreForWindow(
+            w.hwnd(),
+            &IID_PROPERTY_STORE,
+            (&mut store as *mut *mut PropertyStore).cast(),
+        )
+    };
+    if hr < 0 || store.is_null() {
+        return Err(("SHGetPropertyStoreForWindow", hr));
+    }
+    let id = wide(aumid);
+    // SAFETY: `store` is a live `IPropertyStore` from the call above and is
+    // released on every path out. `id` outlives every use of the borrowed
+    // pointer inside it, because `SetValue` copies before returning.
+    unsafe {
+        let vtbl = &*(*store).vtbl;
+        let mut result = Ok(String::new());
+        let hr = (vtbl.set_value)(store, &PKEY_APP_USER_MODEL_ID, &PropVariant::lpwstr(id.as_ptr()));
+        if hr < 0 {
+            result = Err(("SetValue(PKEY_AppUserModel_ID)", hr));
+        }
+        if result.is_ok() {
+            let hr =
+                (vtbl.set_value)(store, &PKEY_PREVENT_PINNING, &PropVariant::boolean(true));
+            if hr < 0 {
+                result = Err(("SetValue(PKEY_AppUserModel_PreventPinning)", hr));
+            }
+        }
+        if result.is_ok() {
+            let hr = (vtbl.commit)(store);
+            if hr < 0 {
+                result = Err(("Commit", hr));
+            }
+        }
+        // The read-back. What the store answers is what the shell will read,
+        // and it is the difference between "the call succeeded" and "the
+        // property is there" — a distinction §16 paid for once already, where
+        // both `WM_SETICON`s succeeded and the taskbar showed neither.
+        if result.is_ok() {
+            let mut pv = PropVariant::empty();
+            let hr = (vtbl.get_value)(store, &PKEY_APP_USER_MODEL_ID, &mut pv);
+            result = if hr < 0 {
+                Err(("GetValue(PKEY_AppUserModel_ID)", hr))
+            } else {
+                Ok(pv.take_string().unwrap_or_default())
+            };
+        }
+        (vtbl.release)(store);
+        result
+    }
+}
+
+/// Stamp an identity on a window, and say what happened.
+///
+/// `rebuild` is for the late case: the window is already on screen, so the
+/// button exists and the property alone will not move it. Hiding and re-showing
+/// is what makes the shell drop the button and make a new one; it is done only
+/// when the identity actually changed, because it costs a flicker and — since
+/// hiding the foreground window gives the focus away — a deactivation the
+/// client can see.
+fn apply_identity(w: &Rc<WindowState>, aumid: &str) {
+    if aumid.is_empty() {
+        // A popup. `WS_EX_TOOLWINDOW` with an owner has no taskbar button at
+        // all, so there is nothing to group and nothing to say.
+        return;
+    }
+    if *w.aumid.borrow() == aumid {
+        return;
+    }
+    let rebuild = w.mapped.get();
+    match set_taskbar_identity(w, aumid) {
+        Ok(read_back) => {
+            w.aumid.replace(aumid.to_string());
+            if read_back == aumid {
+                println!("wc-compositor: window {} taskbar identity <- {aumid:?}", w.id);
+            } else {
+                // The store took something other than what it was given. Not
+                // seen, and said out loud if it ever is, because a truncated or
+                // rejected identity is a window quietly back on the shared
+                // button.
+                println!(
+                    "wc-compositor: window {} taskbar identity <- {aumid:?} but the store \
+                     reads back {read_back:?}",
+                    w.id
+                );
+            }
+        }
+        Err((call, hr)) => {
+            eprintln!(
+                "wc-compositor: window {} could not take the taskbar identity {aumid:?}: \
+                 {call} returned 0x{:08x}",
+                w.id, hr as u32
+            );
+            return;
+        }
+    }
+    if rebuild {
+        // SAFETY: a live window handle on its own thread. Both calls reenter
+        // `toplevel_proc` before returning, which is what `self_driven` is for:
+        // the `WM_SIZE` this provokes is ours and is not a user action.
+        //
+        // `SW_SHOWNA` rather than `SW_SHOWNORMAL`: hiding the window has
+        // already cost it the focus, and taking the foreground back would be a
+        // window stealing activation for a reason the user cannot see.
+        w.self_driven.set(true);
+        unsafe {
+            ShowWindow(w.hwnd(), SW_HIDE);
+            ShowWindow(w.hwnd(), SW_SHOWNA);
+        }
+        w.self_driven.set(false);
+        println!(
+            "wc-compositor: window {} was already on screen, so its taskbar button was \
+             rebuilt under the new identity",
+            w.id
+        );
+    }
+}
+
 /// Set the window and taskbar icon from pixels.
 ///
 /// # Pixels, and never a path
@@ -2753,7 +3441,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
     // documentation says that with a null bit pointer "the contents of the new
     // bitmap is undefined" — the zero-fill every Windows to date has actually
     // done is not contractual, and this is the kind of thing Wine has already
-    // lied about four times (docs/design.md §13.6). For an icon a stray mask
+    // lied about four times (docs/waycompose-design.md §13.6). For an icon a stray mask
     // bit is one wrong pixel in a taskbar button; for a *cursor* the AND mask
     // is what selects between "transparent" and "invert the screen", so a
     // garbage mask is a cursor with inverted holes punched through it. Cheap
@@ -2804,7 +3492,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
 
 /// Install what the client asked the pointer to look like.
 ///
-/// ADDED FOR STAGE 12 (docs/design.md §23).
+/// ADDED FOR STAGE 12 (docs/waycompose-design.md §23).
 ///
 /// # The invariant this exists to keep
 ///
@@ -3060,7 +3748,7 @@ fn verify_cursor_once(hcursor: isize) {
 /// perceive as anything but "about right".
 ///
 /// A failed call keeps the old constants. `SystemParametersInfo` failing is not
-/// something Windows does, and is something Wine might (docs/design.md §13.6).
+/// something Windows does, and is something Wine might (docs/waycompose-design.md §13.6).
 pub fn keyboard_repeat() -> (i32, i32) {
     let mut delay: u32 = 1;
     let mut speed: u32 = 31;
@@ -3164,6 +3852,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         draining: Cell::new(false),
         controller: Cell::new(controller as isize),
         idle_inhibited: Cell::new(false),
+        html_format: Cell::new(0),
         dump_frames: config.dump_frames.clone(),
         // The arrow, so that the very first `WM_SETCURSOR` — which arrives
         // before any client has said anything about a cursor — installs the
@@ -3175,6 +3864,25 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         slots: RefCell::new(crate::input::touch::Slots::new()),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
+
+    // Watch the clipboard from here on. A message-only window is a perfectly
+    // good listener — the notification is posted to the handle rather than
+    // broadcast to visible windows — and it is the right one, because the
+    // clipboard belongs to the compositor and not to any client's window.
+    //
+    // A failure is logged and shrugged off: without it the Windows-to-Wayland
+    // direction stops being automatic and nothing else changes, which is worth
+    // a degraded run rather than a refusal to start.
+    // SAFETY: a live window handle owned by this thread.
+    if unsafe { AddClipboardFormatListener(controller) } == 0 {
+        eprintln!(
+            "wc-compositor: AddClipboardFormatListener failed ({}); \
+             Windows-to-Wayland clipboard changes will not be announced",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        println!("wc-compositor: watching the system clipboard (WM_CLIPBOARDUPDATE)");
+    }
 
     Ok(assemble(
         tx,
@@ -3268,8 +3976,13 @@ impl PumpInner {
         let controller = self.ui.controller.replace(0);
         if controller != 0 {
             // SAFETY: created on this thread, destroyed once, and no `Ui`
-            // handle can post to it after `Stopped` is observed.
+            // handle can post to it after `Stopped` is observed. The clipboard
+            // registration is removed first: `DestroyWindow` would take it with
+            // the window, and unhooking explicitly is what makes a run that
+            // ends cleanly leave nothing behind in the window station — which
+            // matters on a guest several worktrees share (§16.8).
             unsafe {
+                RemoveClipboardFormatListener(controller as HWND);
                 DestroyWindow(controller as HWND);
             }
         }
@@ -3340,7 +4053,7 @@ fn register_classes() -> std::io::Result<()> {
 /// degradation for a failure. Everything else read here is resolved the same
 /// way and for the same reason.
 ///
-/// # Why "refused" was not enough (docs/design.md §10.13 item 3)
+/// # Why "refused" was not enough (docs/waycompose-design.md §10.13 item 3)
 ///
 /// §10.8 recorded that Wine reports `ok` and the guest reports failure, and
 /// that the compositor could not tell an **already-aware** process from an
@@ -3376,7 +4089,7 @@ fn register_classes() -> std::io::Result<()> {
 ///
 /// So this is not tidiness. It is the difference between the taskbar showing
 /// the client's icon and showing the generic one, and it was invisible to every
-/// check that looked at the compositor's own logs (docs/design.md §16.6).
+/// check that looked at the compositor's own logs (docs/waycompose-design.md §16.6).
 ///
 /// **`GetConsoleProcessList` is what makes this safe.** A console shared with
 /// anything else — a `cmd.exe` or an ssh session that started us — belongs to

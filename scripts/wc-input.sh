@@ -176,10 +176,31 @@ run_linux() {
   else
     bad "eventdemo: keycode 21 gave [$probes], expected 121 then 122"
   fi
-  local sizes
+  # **§31: the sizes are checked, not recited.** This was `ok "keymaps
+  # delivered, in bytes: $sizes"`, fired unconditionally — it passed on two
+  # keymaps, on one, and on none, because the only thing it did with the numbers
+  # was print them.
+  #
+  # Two things they can say. There must be **two** of them, because the test
+  # above changes the layout and a second keymap is the whole subject; and each
+  # must be a plausible keymap rather than a truncated one. Measured at 35,572
+  # and 37,532 bytes for `us` and `de` on this machine, so 1 KiB is a floor with
+  # thirty-five times the margin, and a zero-length or header-only file — which
+  # is what a failed `mmap` or a short write on the server side produces, and
+  # which the client would then fail to compile with no size in the message —
+  # is what it excludes.
+  local sizes count small
   sizes=$(grep -o "wl_keyboard@[0-9]*\.keymap(1, fd [0-9]*, [0-9]*)" "$dir/cli.log.clean" \
           | grep -o "[0-9]*)" | tr -d ')' | tr '\n' ' ')
-  ok "eventdemo: keymaps delivered, in bytes: $sizes"
+  count=$(echo "$sizes" | wc -w)
+  small=$(echo "$sizes" | tr ' ' '\n' | awk '$1 != "" && $1 < 1024' | wc -l)
+  if [ "$count" -ne 2 ]; then
+    bad "eventdemo: $count keymap(s) delivered, expected 2 (one per layout): [$sizes]"
+  elif [ "$small" -ne 0 ]; then
+    bad "eventdemo: $small of the keymaps is under 1 KiB and cannot be a real one: [$sizes]"
+  else
+    ok "eventdemo: two keymaps delivered, both a plausible size, in bytes: $sizes"
+  fi
 }
 
 # STAGE 20. What a `wl_touch` stream must look like on the wire.

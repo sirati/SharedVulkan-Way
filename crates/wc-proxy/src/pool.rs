@@ -56,7 +56,7 @@ use wc_handle::{Descriptor, Handle, MappingMut};
 /// How much of a pool is copied when a surface commits.
 ///
 /// All three are correct; they differ in how much they copy and in how much
-/// they have to understand to do it. Measured in `docs/design.md` §9.
+/// they have to understand to do it. Measured in `docs/waycompose-design.md` §9.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyScope {
     /// The whole pool, every commit. Understands nothing beyond "this surface's
@@ -203,7 +203,7 @@ pub trait PoolTransport {
 /// `CreateFileMappingW` plus `MapViewOfFile` there — which is cheap on a local
 /// filesystem and is exactly what is *not* cheap across a hypervisor, where the
 /// peer's open is a round trip through a filesystem daemon. That is the
-/// measurement that decides between the two, and it is in `docs/design.md` §9.
+/// measurement that decides between the two, and it is in `docs/waycompose-design.md` §9.
 pub struct SharedFile {
     dir: PathBuf,
     /// How the peer spells `dir`. `Z:\tmp\wc-pools` for Wine; a drive letter on
@@ -217,7 +217,7 @@ pub struct SharedFile {
 }
 
 struct Live {
-    /// Holds the object open. docs/design.md §2.5's lifetime rule: the creator
+    /// Holds the object open. docs/waycompose-design.md §2.5's lifetime rule: the creator
     /// must outlive the peer's use of the name, and for a file that is also
     /// what keeps it off the filesystem afterwards, since the `Handle`'s drop
     /// unlinks it.
@@ -295,7 +295,7 @@ impl PoolTransport for SharedFile {
 /// Wayland traffic.
 ///
 /// This is `Descriptor::ArenaSlice`, reserved in the type since stage 1
-/// (docs/design.md §2.2 (c)) and constructed here for the first time. In the
+/// (docs/waycompose-design.md §2.2 (c)) and constructed here for the first time. In the
 /// real deployment the region is shared_vulkan's passthrough arena — guest RAM
 /// the host found by walking QEMU's flat view (its design.md §5.1) — and this
 /// process is handed a range of it. In the same-machine test the region is one
@@ -325,7 +325,7 @@ impl PoolTransport for SharedFile {
 /// STAGE 12. An `Arena` is a handle on a region and on **one** free list;
 /// [`Arena::share`] makes another handle on the same two things, and every
 /// Wayland connection the proxy serves gets one. Firefox opens four
-/// (docs/design.md §15.8), which is why this exists.
+/// (docs/waycompose-design.md §15.8), which is why this exists.
 ///
 /// The invariant this preserves is the one that was always the point: **two
 /// allocators over one region would hand out the same offsets**, which is a
@@ -335,7 +335,7 @@ impl PoolTransport for SharedFile {
 /// as one connection asking it four times.
 /// Where an [`Arena`]'s bytes actually are.
 ///
-/// STAGE 7 SPLIT THIS IN TWO, and docs/design.md §12 is why. Everything above
+/// STAGE 7 SPLIT THIS IN TWO, and docs/waycompose-design.md §12 is why. Everything above
 /// this enum — the allocator, the free list, the descriptor, the compositor's
 /// side of it — is identical for both, which is exactly the claim §9.10 item 3
 /// made and this stage had to cash: "substituting the real provider changes
@@ -437,7 +437,7 @@ impl SharedBacking {
 /// # STAGE 16, and it is a choice so that the choice could be measured
 ///
 /// Stage 12's allocator is [`Policy::FirstFit`] and it fragmented under a video
-/// (docs/design.md §20.3): `arena 0 has no run of 2342912 bytes (3932160 free,
+/// (docs/waycompose-design.md §20.3): `arena 0 has no run of 2342912 bytes (3932160 free,
 /// largest 1744896)`. Two-thirds more free space than the request, in pieces
 /// none of which was big enough.
 ///
@@ -1028,7 +1028,7 @@ impl Arena {
     /// A second handle on **the same region and the same allocator**, for
     /// another Wayland connection.
     ///
-    /// STAGE 12, and it is the whole of docs/design.md §16.2. Until this stage
+    /// STAGE 12, and it is the whole of docs/waycompose-design.md §16.2. Until this stage
     /// `--transport arena` refused the second connection by name, on the grounds
     /// that there is one region and one allocator (§12.13 item 6) — and the
     /// premise was right while the conclusion was not. **One allocator is the
@@ -1152,7 +1152,7 @@ impl Arena {
     /// Take the last `len` bytes of this arena out of the free list, because the
     /// peer declared them **its** to hand to clients.
     ///
-    /// STAGE 10 and docs/design.md §12.11 item 3. The allocator above owns the
+    /// STAGE 10 and docs/waycompose-design.md §12.11 item 3. The allocator above owns the
     /// whole region by default, which was true while the only things in an arena
     /// were `wl_shm` pools this process published. A compositor that can create
     /// objects for its clients is a second allocator over the same bytes, and two
@@ -1832,7 +1832,7 @@ impl PoolTransport for Arena {
 
     fn bytes_mut(&mut self, region: &Region) -> Option<&mut [u8]> {
         // The lock is held only for the lookup, not for the copy. A commit is
-        // 126 us of `memcpy` for Firefox (docs/design.md §15.10) and four
+        // 126 us of `memcpy` for Firefox (docs/waycompose-design.md §15.10) and four
         // connections holding one mutex across it would serialise every client's
         // frame path against every other's — which would be a real cost of
         // sharing the arena, and there is no reason to pay it: the extent this
@@ -2943,7 +2943,7 @@ mod tests {
     /// What growth costs, measured rather than asserted.
     ///
     /// Ignored by default because it is an instrument and not a gate — it
-    /// prints numbers and asserts almost nothing, and docs/design.md §13.8's
+    /// prints numbers and asserts almost nothing, and docs/waycompose-design.md §13.8's
     /// retraction is the reason that distinction is kept sharp. Run it with
     ///
     /// ```text

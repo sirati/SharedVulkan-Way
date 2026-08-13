@@ -248,6 +248,7 @@ pub fn surface_profile(wire: &Profile) -> Profile {
         "VkAccelerationStructureInstanceKHR".to_string(),
         "VkXcbSurfaceCreateInfoKHR".to_string(),
         "VkXlibSurfaceCreateInfoKHR".to_string(),
+        "VkWaylandSurfaceCreateInfoKHR".to_string(),
     ];
     p
 }
@@ -261,9 +262,10 @@ pub fn surface_profile(wire: &Profile) -> Profile {
 /// here rather than left to the emitter, so that a generated `extern "system"`
 /// signature naming `xcb_connection_t` cannot come back by accident.
 ///
-/// Note what is **not** in this list: the two
+/// Note what is **not** in this list: the three
 /// `vkGetPhysicalDevice…PresentationSupportKHR` queries take the same
-/// `xcb_connection_t*`/`Display*` and are on the surface anyway, because the
+/// `xcb_connection_t*`/`Display*`/`struct wl_display*` and are on the surface
+/// anyway, because the
 /// loader's terminator calls `abort()` for an ICD that does not export them.
 /// They ignore the argument, so a `*mut c_void` in the signature is enough.
 /// `vkCreateHeadlessSurfaceEXT` is in the list for a second reason, and it is
@@ -275,8 +277,12 @@ pub fn surface_profile(wire: &Profile) -> Profile {
 /// `VkIcdSurfaceBase`", which is a thing that can be read; exporting some makes
 /// it "either that or one of my ids", which is a thing that can only be
 /// guessed at.
-pub const SURFACE_CREATORS: &[&str] =
-    &["vkCreateXlibSurfaceKHR", "vkCreateXcbSurfaceKHR", "vkCreateHeadlessSurfaceEXT"];
+pub const SURFACE_CREATORS: &[&str] = &[
+    "vkCreateXlibSurfaceKHR",
+    "vkCreateXcbSurfaceKHR",
+    "vkCreateWaylandSurfaceKHR",
+    "vkCreateHeadlessSurfaceEXT",
+];
 
 /// Build the ABI plan.
 ///

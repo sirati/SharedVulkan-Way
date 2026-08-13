@@ -20,6 +20,9 @@ pub fn run(config: Config) -> ExitCode {
         partial,
         title,
         app_id,
+        late_app_id,
+        late_after,
+        seconds,
         path_arg,
     } = config;
 
@@ -103,7 +106,7 @@ pub fn run(config: Config) -> ExitCode {
     //
     // One section holding two buffers back to back. On Windows this is a named
     // kernel object, and what crosses the socket is its *name*, in band
-    // (docs/design.md §2.3).
+    // (docs/waycompose-design.md §2.3).
     //
     // The handle is held for the whole run, and that is not tidiness. A Windows
     // section with no open handles is destroyed and its name freed, so dropping
@@ -144,7 +147,7 @@ pub fn run(config: Config) -> ExitCode {
     // --- the loop ---------------------------------------------------------
     let mut committed = 0u32;
     let mut slot = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
 
     while committed < frames && !c.closed && Instant::now() < deadline {
         // Both conditions are the compositor's to satisfy: a buffer may not be
@@ -187,6 +190,19 @@ pub fn run(config: Config) -> ExitCode {
         c.frame_done = false;
         if c.send(proto::present(slot, damage)).is_err() {
             return ExitCode::from(2);
+        }
+
+        // STAGE 32. After the window is unmistakably up — `late_after` frames
+        // have been drawn and acknowledged — rename the application. Sent once,
+        // and said out loud, because what it is for is to be compared against
+        // what the taskbar does next.
+        if let Some(late) = &late_app_id
+            && committed == late_after
+        {
+            println!("wc-shmclient: frame {committed}: set_app_id -> {late:?} (late, on purpose)");
+            if c.send(proto::set_app_id(late)).is_err() {
+                return ExitCode::from(2);
+            }
         }
 
         if committed < 3 || committed.is_multiple_of(20) {

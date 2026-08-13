@@ -164,7 +164,23 @@ rc=$?
 cat "$tmp/probe.log"
 
 # The compositor's per-turn sweep needs a turn after the client has gone.
-sleep 2
+#
+# **§31: waited for, not slept through.** Two seconds was enough on an idle
+# machine and is a guess on a loaded one, and what it guards is not decorative:
+# the sweep is what produces "idle inhibitor(s) went away with their surface"
+# and the second "idle inhibit -> off", both of which are asserted below. A
+# short sleep therefore reports a *compositor defect* when what happened was
+# load, which is the failure mode that teaches people to re-run until green.
+#
+# Bounded at ten seconds and reported when it took more than a moment, so a
+# machine drifting towards the old cliff is visible before it goes over. The
+# assertions still fail if the sweep genuinely never runs — the wait gives up
+# and the greps below find nothing.
+for i in $(seq 1 200); do
+	grep -q "idle inhibitor(s) went away with their surface" "$log" 2>/dev/null && break
+	sleep 0.05
+done
+[ "$i" -gt 20 ] && say "  ....  waited $(awk -v i="$i" 'BEGIN{printf "%.1f", i/20}')s for the compositor's sweep"
 # Guarded: an unset `proxy` expanded to 0 would signal the whole process
 # group, which includes this script.
 [ -n "${proxy:-}" ] && kill "$proxy" 2>/dev/null

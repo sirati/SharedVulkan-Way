@@ -310,10 +310,25 @@ $HOST_DIR/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $runid --pages $pages
 echo rc=\\\$? >>'$HOST_DIR/locate-$mode.log'
 chmod a+r '$HOST_DIR/locate-$mode.log' '$HOST_DIR/arena-$mode.plan' 2>/dev/null; true\" | $ROOTC" \
     >/dev/null 2>&1
-  local verify
+  local verify vok vtot
   verify=$(h "grep -o 'verify: [0-9]*/[0-9]* pages of the stitched view carry their own arena index' $HOST_DIR/locate-$mode.log 2>/dev/null" | tr -d '\r')
+  # **§31: the ratio inside `$verify` is now compared, not merely quoted.** The
+  # check was `rc=0`, and `$verify` — "N/M pages of the stitched view carry
+  # their own arena index" — was interpolated into the pass message. A view
+  # stitched from the wrong physical pages verifies 3 of 4096 and still exits 0,
+  # and this line printed that as a pass with the evidence against it in the
+  # same sentence. Every page must carry its own index or the view is not the
+  # arena.
+  vok=${verify#verify: }; vok=${vok%%/*}
+  vtot=${verify#*/}; vtot=${vtot%% *}
   if h "grep -q '^rc=0$' $HOST_DIR/locate-$mode.log" 2>/dev/null; then
-    ok "$mode: the guest's arena was located in QEMU's backend — $verify"
+    if [ -z "$vok" ] || [ -z "$vtot" ] || [ "$vtot" = "$verify" ]; then
+      bad "$mode: wc-arena-host exited 0 but reported no page verification at all"
+    elif [ "$vok" -eq "$vtot" ]; then
+      ok "$mode: the guest's arena was located in QEMU's backend — $verify"
+    else
+      bad "$mode: only $vok of $vtot stitched pages carry their own arena index; the view is not the arena"
+    fi
   else
     bad "$mode: wc-arena-host did not locate the arena"
     h "tail -12 $HOST_DIR/locate-$mode.log 2>/dev/null" | sed 's/^/        /'
@@ -430,11 +445,21 @@ systemd-run --unit=$TBNAME-$mode --collect /run/current-system/sw/bin/bash \
     *) bad "$mode: wrong transport served the pixels: ${counts:-nothing recorded}" ;;
   esac
 
+  # **§31: the failing arm was a `note`, so this could not fail.** A run in which
+  # Firefox presented nothing at all — the exact outcome this block exists to
+  # detect — printed an informational line and left the scoreboard green. The
+  # count is only emitted when the toplevel goes away, which is the reason the
+  # soft arm was written, and it is a reason to assert that the toplevel *did*
+  # go away rather than a reason to have no opinion about the frames.
   local presents
   presents=$(grep -o '([0-9]* frames presented)' "$RUNDIR/comp-$mode.log" | grep -o '[0-9]*' | tail -1)
-  [ "${presents:-0}" -ge 2 ] \
-    && ok "$mode: $presents frames of Firefox's pixels were blitted into it" \
-    || note "$mode: ${presents:-0} frames presented (the count is printed when the toplevel goes away)"
+  if [ -z "$presents" ]; then
+    bad "$mode: the compositor never reported a frame count; no toplevel was destroyed, so nothing here was measured"
+  elif [ "$presents" -ge 2 ]; then
+    ok "$mode: $presents frames of Firefox's pixels were blitted into it"
+  else
+    bad "$mode: only $presents frame(s) presented; the window was made and never painted"
+  fi
 
   ours "$sock" >/dev/null 2>&1
   kill "$relay" 2>/dev/null; wait "$relay" 2>/dev/null

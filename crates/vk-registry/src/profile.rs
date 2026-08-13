@@ -505,15 +505,26 @@ pub mod profiles {
                 // for — it marks `VK_KHR_swapchain` *required* even for a device
                 // that will never present (§0.5).
                 "VK_KHR_swapchain".into(),
-                // The two X11 surface extensions Mesa's `zink_kopper` asks for
-                // by name. Neither carries a window-system dependency into this
-                // crate: the loader's `VkIcdSurfaceXlib`/`VkIcdSurfaceXcb` are
-                // what an ICD actually receives, and the ICD reads a window id
-                // out of one rather than linking Xlib. `VK_KHR_wayland_surface`
-                // is deliberately not here — it needs a `wl_display` this side
-                // would have to speak to, which is phase 2.
+                // The three surface extensions Mesa's `zink_kopper` asks for by
+                // name. None carries a window-system dependency into this
+                // crate: the loader's `VkIcdSurfaceXlib`/`VkIcdSurfaceXcb`/
+                // `VkIcdSurfaceWayland` are what an ICD actually receives, and
+                // what the ICD does with the pointers inside them is
+                // `sv_icd::present`'s business — Xlib and `libwayland-client`
+                // are both reached through `dlopen`.
+                //
+                // **`VK_KHR_wayland_surface` used to say "deliberately not
+                // here — phase 2", and that sentence is what stopped Firefox.**
+                // Without it `zink_kopper` cannot make a `VkSurfaceKHR` on the
+                // Wayland platform, so Mesa loads the *swrast* DRI driver with
+                // Zink merely behind it as the gallium driver, and Firefox's
+                // hardware WebRender rejects the resulting EGL configs
+                // (`docs/firefox-accel.md`, "testhost, reached"). The control
+                // that pins it is RADV on a `wl_shm`-only weston, where the one
+                // difference is that RADV has this extension.
                 "VK_KHR_xlib_surface".into(),
                 "VK_KHR_xcb_surface".into(),
+                "VK_KHR_wayland_surface".into(),
             ],
             extra_commands: vec![],
             excluded_commands: excluded_commands(),
@@ -615,12 +626,23 @@ pub mod profiles {
             // documented fallback and carries the same two fields.
             "vkCreateXlibSurfaceKHR",
             "vkCreateXcbSurfaceKHR",
-            // These two, by contrast, **must** be exported once the extension is
-            // advertised: the loader's terminator calls `abort()` when the
+            "vkCreateWaylandSurfaceKHR",
+            // These three, by contrast, **must** be exported once the extension
+            // is advertised: the loader's terminator calls `abort()` when the
             // selected ICD does not have them, rather than answering VK_FALSE.
             // They are hand-written and ignore their connection argument.
+            //
+            // Excluded from the *wire* rather than from the C surface, and the
+            // distinction is the whole reason they are in this list twice over:
+            // `Display*`, `xcb_connection_t*` and `struct wl_display*` are
+            // platform types the wire planner refuses to serialise — correctly,
+            // since a pointer into another process's libwayland means nothing
+            // in the guest — while a generated C signature can name them
+            // perfectly well as an opaque pointer, which is what
+            // `sv_codegen::abi::AbiType::Opaque` is for.
             "vkGetPhysicalDeviceXlibPresentationSupportKHR",
             "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+            "vkGetPhysicalDeviceWaylandPresentationSupportKHR",
             // The debug-utils messenger lives on the app side; its GPU-side
             // half is the reverse ring, which is hand-written (design.md §4.6,
             // §6.3), not a forwarded command.
@@ -664,6 +686,16 @@ pub mod profiles {
             // same two fields and no registry entry at all.
             "VkXcbSurfaceCreateInfoKHR",
             "VkXlibSurfaceCreateInfoKHR",
+            // And the Wayland one, for the same reason and one more. `struct
+            // wl_display*` and `struct wl_surface*` are pointers into
+            // `libwayland-client`, which this project also does not link — and
+            // unlike the X11 pair, these two pointers are **used**: `sv_icd`'s
+            // Wayland target attaches a `wl_shm` buffer to that very surface on
+            // that very connection (design.md §10, `sv_icd::present::wayland`).
+            // Used through `dlopen`, though, so the crate still links nothing;
+            // what the struct has to be here is the loader's
+            // `VkIcdSurfaceWayland`, which has the same two fields.
+            "VkWaylandSurfaceCreateInfoKHR",
         ]
         .iter()
         .map(|s| s.to_string())

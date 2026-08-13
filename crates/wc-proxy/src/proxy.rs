@@ -9,7 +9,7 @@
 //! is an **unmodified** third-party client.
 //!
 //! To the compositor this is an ordinary client of ours: the same byte stream
-//! `wc-shmclient` speaks, with `h` arguments in band (docs/design.md §2.3).
+//! `wc-shmclient` speaks, with `h` arguments in band (docs/waycompose-design.md §2.3).
 //!
 //! # Why `SCM_RIGHTS` on one side is not a violation of the rule
 //!
@@ -97,7 +97,7 @@ impl Listener {
     /// ADDED FOR STAGE 13, for one purpose: finding where the client's own
     /// application is installed, so its icon can be resolved from its own
     /// package prefix rather than from whatever happens to be in
-    /// `XDG_DATA_DIRS` (`icons::dirs_for_pid`, and docs/design.md §18.5).
+    /// `XDG_DATA_DIRS` (`icons::dirs_for_pid`, and docs/waycompose-design.md §18.5).
     ///
     /// `SO_PEERCRED` is a property of the socket the kernel filled in at
     /// `connect` time; it cannot be forged by the client and it costs one
@@ -167,6 +167,67 @@ impl Drop for Listener {
     }
 }
 
+/// How long a refused upstream `connect` is treated as a race rather than an
+/// answer.
+///
+/// Five seconds, the same figure `wc-wlcs`'s `connect_client` uses, and for the
+/// same reason: far longer than the gap between `bind` and `listen`, far
+/// shorter than any harness's own timeout, so it cannot turn a compositor that
+/// is genuinely absent into a hang.
+const UPSTREAM_REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Connect to the compositor, treating `ECONNREFUSED` as "not listening *yet*".
+///
+/// # Why this is a race and not defensiveness
+///
+/// `bind` creates the filesystem node; `listen` is what makes that node accept.
+/// Between the two, `connect` is refused. Every harness that starts a
+/// compositor and then a proxy waits for the *node* to appear — `find_socket`
+/// in `scripts/wc-proxy.sh` does exactly that — and waiting for the node does
+/// not close the window. The symptom is one leg of a run reporting "cannot
+/// reach the compositor" while an identical tree passes, which is worse than a
+/// failure: it teaches everyone to re-run until green, and a scoreboard whose
+/// noise floor is one test cannot report a one-test regression.
+///
+/// The same shape was measured and fixed in `wc-wlcs::connect_client`, where
+/// one test in 1,225 failed this way on a loaded machine and read as a
+/// compositor change because it moved a SKIP to a FAIL across a merge.
+///
+/// `ECONNREFUSED` is the **only** error retried. A missing node (`ENOENT`), a
+/// permission failure, or a wrong address are answers rather than races, and
+/// retrying them would turn a clear failure into a five-second one.
+///
+/// `report` is called once, and only if the connection was refused at least
+/// once, with the number of refusals and the milliseconds they spanned: a retry
+/// that leaves no trace in the log is a slow compositor showing up as a fast
+/// one, and the point of a bounded retry is that it is *visible*.
+pub fn connect_upstream(
+    upstream: &Path,
+    report: impl FnOnce(u32, f64),
+) -> io::Result<UnixStream> {
+    let start = std::time::Instant::now();
+    let deadline = start + UPSTREAM_REFUSAL_GRACE;
+    let mut refusals = 0u32;
+    loop {
+        match UnixStream::connect(upstream) {
+            Ok(u) => {
+                if refusals > 0 {
+                    report(refusals, start.elapsed().as_secs_f64() * 1e3);
+                }
+                return Ok(u);
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::ConnectionRefused
+                    && std::time::Instant::now() < deadline =>
+            {
+                refusals += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Run the pump until either side closes or `idle_timeout` passes with no
 /// traffic.
 ///
@@ -178,6 +239,7 @@ pub fn pump(
     client: UnixStream,
     upstream: UnixStream,
     icons: Option<&mut crate::iconlink::IconLink>,
+    clip: Option<&mut crate::clip::ClipLink>,
     idle_timeout: std::time::Duration,
     log: &mut dyn FnMut(&str),
 ) -> io::Result<&'static str> {
@@ -192,16 +254,22 @@ pub fn pump(
     let mut to_client_fds = Vec::<OwnedFd>::new();
     let mut last_traffic = std::time::Instant::now();
     let mut icons = icons;
+    let mut clip = clip;
 
     loop {
-        // Three descriptors at most, and the third is this program's *own*
-        // connection to the compositor rather than anything a client gave it —
-        // see `iconlink` for why the icon feed cannot ride the first one.
+        // Four descriptors at most, and the last two are this program's *own*
+        // connections to the compositor rather than anything a client gave it —
+        // see `iconlink` and `clip` for why neither feed can ride the first one.
         let mut pollfds = [
             libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: upstream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd {
                 fd: icons.as_ref().map_or(-1, |l| l.fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: clip.as_ref().map_or(-1, |l| l.fd()),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -215,11 +283,21 @@ pub fn pump(
         if icons.as_ref().is_some_and(|l| l.wants_write()) {
             pollfds[2].events |= libc::POLLOUT;
         }
+        if clip.as_ref().is_some_and(|l| l.wants_write()) {
+            pollfds[3].events |= libc::POLLOUT;
+        }
+        // **1 ms while a clipboard transfer is running, 20 otherwise.** The
+        // clipboard's pipes are deliberately not in this array — see
+        // `Session::pump_transfers` for why matching a variable-length pollfd
+        // list back to a variable-length transfer list is not worth its cost —
+        // so the wait is what bounds a transfer's latency. A copy or a paste is
+        // a few turns of this loop and a human pressed a key to start it.
+        let wait = if session.clip_busy() { 1 } else { 20 };
         // A negative fd in a `pollfd` is ignored by `poll`, which is how the
         // no-icons case costs nothing and needs no second loop.
-        // SAFETY: a live array of three `pollfd`s whose length is passed
+        // SAFETY: a live array of four `pollfd`s whose length is passed
         // truthfully.
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 3, 20) };
+        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 4, wait) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -230,7 +308,16 @@ pub fn pump(
 
         // --- client -> compositor -------------------------------------------
         if pollfds[0].revents & libc::POLLIN != 0 {
-            match recv_with_fds(client.as_raw_fd(), &mut from_client, &mut fds)? {
+            let read = match recv_with_fds(client.as_raw_fd(), &mut from_client, &mut fds) {
+                Ok(n) => n,
+                // The same ending seen from the reading side. See the note on
+                // the write.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    return Ok("the client closed the connection abruptly");
+                }
+                Err(e) => return Err(e),
+            };
+            match read {
                 0 => return Ok("the client closed the connection"),
                 _ => last_traffic = std::time::Instant::now(),
             }
@@ -297,6 +384,59 @@ pub fn pump(
             }
         }
 
+        // --- the clipboard ---------------------------------------------------
+        //
+        // Between the reads and the writes on purpose: a `wl_data_source.send`
+        // this turn produced has to reach the client in the same turn, or the
+        // client cannot write into the pipe this loop is about to read from.
+        // The two halves are one deadlock away from each other and the order
+        // is what keeps them apart.
+        session.pump_transfers();
+        if let Some(link) = clip.as_deref_mut() {
+            for (token, source, mime) in session.take_fetches() {
+                if !link.fetch(token, source, &mime) {
+                    session.deliver(
+                        token,
+                        crate::clip::Answer::Failed("no clipboard feed".into()),
+                    );
+                }
+            }
+            if let Some(pulled) = session.take_selection() {
+                if pulled.for_drag {
+                    if !link.start_drag(pulled.payloads, session.drag_actions()) {
+                        // Answered rather than dropped, so the client's source
+                        // is not left waiting for a `dnd_finished`.
+                        session.drag_finished(0);
+                    }
+                } else {
+                    link.publish(pulled.payloads);
+                }
+            }
+            for (token, answer) in link.take_answers() {
+                session.deliver(token, answer);
+            }
+            if let Some(action) = link.take_drag_result() {
+                session.drag_finished(action);
+            }
+        } else {
+            // No feed at all: every request is answered negatively rather than
+            // ignored, which is the difference between a clipboard that does
+            // nothing and a client that hangs.
+            for (token, _, _) in session.take_fetches() {
+                session.deliver(token, crate::clip::Answer::Failed("no clipboard feed".into()));
+            }
+            if let Some(pulled) = session.take_selection()
+                && pulled.for_drag
+            {
+                session.drag_finished(0);
+            }
+        }
+        {
+            let (bytes, mut new_fds) = session.take_client_messages();
+            to_client.extend_from_slice(&bytes);
+            to_client_fds.append(&mut new_fds);
+        }
+
         // --- writes ---------------------------------------------------------
         if !to_server.is_empty() {
             // Never with a control message. There is no code path here that
@@ -318,7 +458,17 @@ pub fn pump(
                     to_client_fds.clear();
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                // **`ConnectionReset` is an ordinary ending, not a failure**,
+                // and the clipboard is where that became worth saying. A client that
+                // calls `exit()` with data still queued for it — which
+                // `wl-paste` does the moment it has the bytes, and which is
+                // entirely legal — resets the socket rather than closing it,
+                // and reporting that as `client N failed:` makes a successful
+                // paste look like the connection error this stage removed.
+                Err(e)
+                    if e.kind() == io::ErrorKind::BrokenPipe
+                        || e.kind() == io::ErrorKind::ConnectionReset =>
+                {
                     return Ok("the client stopped reading");
                 }
                 Err(e) => return Err(e),
@@ -338,7 +488,21 @@ pub fn pump(
                 link.on_writable()?;
             }
         }
+        if let Some(link) = clip.as_deref_mut() {
+            if pollfds[3].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                link.on_readable(log)?;
+            }
+            if link.wants_write() {
+                link.on_writable()?;
+            }
+        }
 
+        // A transfer in flight keeps the connection alive. Without this a copy
+        // of a large selection from a client that is otherwise idle would time
+        // the whole session out halfway through.
+        if session.clip_busy() {
+            last_traffic = std::time::Instant::now();
+        }
         if last_traffic.elapsed() > idle_timeout {
             return Ok("idle timeout");
         }
@@ -562,5 +726,136 @@ mod tests {
         let second = Listener::bind(&dir, "wl-test");
         assert_eq!(second.unwrap_err().kind(), io::ErrorKind::AddrInUse);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // the window between `bind` and `listen`
+    // -----------------------------------------------------------------------
+
+    /// A socket that has been `bind`-ed and **not** `listen`-ed.
+    ///
+    /// `UnixListener::bind` does both in one call, so std cannot express this
+    /// state — which is precisely why it is easy to forget that it exists. A
+    /// compositor written in any language reaches it, and every harness that
+    /// waits for the socket *node* to appear is waiting for the first half of
+    /// it.
+    struct HalfBound {
+        fd: RawFd,
+        path: PathBuf,
+    }
+
+    impl HalfBound {
+        fn new(name: &str) -> HalfBound {
+            let path =
+                std::env::temp_dir().join(format!("wc-proxy-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            // SAFETY: a plain AF_UNIX stream socket.
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+
+            // SAFETY: zeroed is a valid `sockaddr_un`; the path is copied in
+            // below with room kept for the terminating NUL.
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = path.as_os_str().as_encoded_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "temp path too long for sun_path");
+            for (slot, b) in addr.sun_path.iter_mut().zip(bytes) {
+                *slot = *b as libc::c_char;
+            }
+
+            // SAFETY: a live fd and a correctly formed address of the size
+            // given.
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+            HalfBound { fd, path }
+        }
+
+        fn listen(&self) {
+            // SAFETY: a live, bound fd.
+            assert_eq!(unsafe { libc::listen(self.fd, 16) }, 0);
+        }
+    }
+
+    impl Drop for HalfBound {
+        fn drop(&mut self) {
+            // SAFETY: a live fd this type owns.
+            unsafe { libc::close(self.fd) };
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// **The defect, demonstrated.** The node exists — every "wait for the
+    /// socket" check in every harness is satisfied — and `connect` is refused
+    /// anyway.
+    ///
+    /// Without this test the retry below is a change nobody can show the need
+    /// for, and a fix you cannot show failing is the same class of thing it is
+    /// fixing.
+    #[test]
+    fn a_bound_socket_that_is_not_listening_exists_and_refuses() {
+        let sock = HalfBound::new("halfbound");
+        assert!(sock.path.exists(), "bind creates the node a harness waits for");
+        assert_eq!(
+            UnixStream::connect(&sock.path).unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused,
+            "and the node accepting nothing is what a plain connect walks into"
+        );
+    }
+
+    /// The retry rides out that window, and says so.
+    #[test]
+    fn connect_upstream_rides_out_the_gap_and_reports_it() {
+        let sock = HalfBound::new("gap");
+        let fd = sock.fd;
+        let listener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            // SAFETY: the fd outlives this thread — `sock` is joined below.
+            assert_eq!(unsafe { libc::listen(fd, 16) }, 0);
+        });
+
+        let seen = std::cell::Cell::new(None);
+        let stream = connect_upstream(&sock.path, |refusals, ms| seen.set(Some((refusals, ms))));
+        listener.join().unwrap();
+        assert!(stream.is_ok(), "the compositor started listening well inside the grace");
+
+        let (refusals, ms) = seen.get().expect("a run that had to retry must say so");
+        assert!(refusals >= 1, "the gap was real, so at least one connect was refused");
+        assert!(ms >= 100.0, "and the report covers the whole wait, not the last attempt");
+    }
+
+    /// A socket that is already listening costs nothing and reports nothing —
+    /// so the log line above is a signal rather than noise on every run.
+    #[test]
+    fn connect_upstream_is_silent_when_there_was_no_race() {
+        let sock = HalfBound::new("nogap");
+        sock.listen();
+        let mut called = false;
+        let stream = connect_upstream(&sock.path, |_, _| called = true);
+        assert!(stream.is_ok());
+        assert!(!called, "nothing was refused, so nothing should be reported");
+    }
+
+    /// A compositor that is not there at all is an answer, not a race: the
+    /// error comes back at once rather than after the grace period.
+    ///
+    /// This is the half that keeps the retry from turning every genuine
+    /// misconfiguration into a five-second stall.
+    #[test]
+    fn a_missing_compositor_fails_immediately_rather_than_waiting_out_the_grace() {
+        let path = std::env::temp_dir().join(format!("wc-proxy-absent-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let start = std::time::Instant::now();
+        let e = connect_upstream(&path, |_, _| unreachable!("nothing was refused")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            start.elapsed() < UPSTREAM_REFUSAL_GRACE / 2,
+            "ENOENT is not ECONNREFUSED and must not be retried"
+        );
     }
 }
