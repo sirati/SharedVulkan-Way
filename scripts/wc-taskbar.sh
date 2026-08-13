@@ -238,7 +238,7 @@ PS1
 
 # Pull a BMP off the guest and convert it.
 fetch() {
-  local remote="$1" local_png="$2" caption="$3"
+  local remote="$1" local_png="$2" caption="$3" kind="${4:-window}"
   rm -f "$RUNDIR/$remote"
   scp "${SSHOPT[@]}" "$GUEST:$GUESTNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
@@ -251,20 +251,50 @@ fetch() {
     #
     # The bounds are deliberately weak and absolute rather than exact: this is a
     # screenshot of a Windows desktop whose size the harness does not fix, so
-    # what is excluded is a capture that cannot be of a desktop at all. 200x200
-    # against a 1280x1024 screen, and 16 colours against the 1 a blank surface
-    # gives -- the same floor and the same reasoning as §35.3's screenshot check.
+    # what is excluded is a capture that cannot be of the thing at all, and
+    # 16 colours against the 1 a blank surface gives -- the same floor and the
+    # same reasoning as §35.3's screenshot check.
+    #
+    # **BUT THE BOUND HAS TO MATCH THE SHAPE, AND FOR ONE CALLER IT NEVER DID.**
+    # §41.8. This check was `w < 200 || h < 200` -- "too small to be a desktop"
+    # -- for *both* callers, and one of them photographs `Shell_TrayWnd`, which
+    # on this guest's 1280x1024 screen is **1280x48**. Forty-eight is less than
+    # two hundred, so the taskbar photograph -- the one picture stage 32 exists
+    # to produce -- has been failing since §35 added the gate, on its geometry
+    # rather than on anything about the taskbar. Measured on the first guest-RAM
+    # run: `FAIL the taskbar, two applications: the capture is 1280x48, too
+    # small to be a desktop`, with the image itself correct and 1280x48 being
+    # exactly what `wc-icon.sh` photographs and calls a taskbar.
+    #
+    # That is §35's own shape turned around: a check that **cannot pass** is as
+    # useless as one that cannot fail, and it is worse than useless when it
+    # fails the stage's headline evidence for a reason unrelated to it. The
+    # right bound is per shape, so `kind` is now an argument:
+    #
+    #   tray    a strip across the screen: wide, short, and *bounded above* in
+    #           height, because a full-desktop capture arriving here would mean
+    #           `--class Shell_TrayWnd` selected the wrong window.
+    #   window  a client's window, which has no fixed size but is not a sliver.
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      local geo w hgt colours
+      local geo w hgt colours why=""
       geo=$(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null)
       colours=$(identify -format '%k' "$OUT/$local_png" 2>/dev/null)
       w=${geo%x*}; hgt=${geo#*x}
-      if [ "${w:-0}" -lt 200 ] || [ "${hgt:-0}" -lt 200 ]; then
-        bad "$caption: the capture is ${geo:-nothing}, too small to be a desktop"
+      case "$kind" in
+        tray)
+          [ "${w:-0}" -lt 400 ] && why="${geo:-nothing} is too narrow to be a taskbar spanning the screen"
+          [ -z "$why" ] && [ "${hgt:-0}" -lt 16 ] && why="${geo:-nothing} is too short to hold a button"
+          [ -z "$why" ] && [ "${hgt:-0}" -gt 200 ] && why="${geo:-nothing} is too tall to be Shell_TrayWnd -- the capture selected the wrong window" ;;
+        *)
+          [ "${w:-0}" -lt 100 ] || [ "${hgt:-0}" -lt 100 ] \
+            && why="${geo:-nothing} is too small to be a client's window" ;;
+      esac
+      if [ -n "$why" ]; then
+        bad "$caption: $why"
       elif [ "${colours:-0}" -lt 16 ]; then
         bad "$caption: the capture is $geo with only ${colours:-0} distinct colours -- a blank surface"
       else
-        ok "$caption -> docs/stage32/$local_png ($geo, $colours distinct colours)"
+        ok "$caption -> docs/stage32/$local_png ($geo, $colours distinct colours, checked as $kind)"
       fi
     else
       bad "could not convert $remote"
@@ -395,7 +425,7 @@ local_run() {
   sleep 12
 
   photograph "$tag" "$CPID"
-  fetch "tray-$tag.bmp" "stage32-taskbar-$tag.png" "the taskbar ($tag)"
+  fetch "tray-$tag.bmp" "stage32-taskbar-$tag.png" "the taskbar ($tag)" tray
   fetch "win-$tag.bmp"  "stage32-window-$tag.png"  "one of the windows ($tag)"
 
   g "cat $DESKDIR/cli-a-$tag.log" >"$RUNDIR/cli-a-$tag.log" 2>&1
@@ -654,7 +684,7 @@ chmod +x $HOST_DIR/s32.sh" >/dev/null
     [ "$(ours apps | wc -l)" -ge 2 ] && break
     note "attempt $attempt: fewer than two of our windows on the desktop yet"
   done
-  fetch "tray-$tag.bmp" "stage32-taskbar-two-applications.png" "the taskbar, two applications"
+  fetch "tray-$tag.bmp" "stage32-taskbar-two-applications.png" "the taskbar, two applications" tray
   fetch "win-$tag.bmp"  "stage32-window-apps.png"              "one of the two windows"
 
   wait $drv 2>/dev/null

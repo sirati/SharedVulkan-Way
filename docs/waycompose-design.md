@@ -5951,6 +5951,16 @@ set correctly on a window whose button the shell was not drawing.
    make on purpose. `wc-icon.sh` now runs on guest RAM by default, cannot reach
    a file at all, and asserts on the substrate it used, so the next run of it
    will say `SUBSTRATE guest-ram` in its own output or fail.
+
+   **RE-TAKEN, §41.9.** That run has now happened: 21 passed, 0 failed, on the
+   real guest over guest RAM, with `SUBSTRATE guest-ram: … 0 sections, 0 shared
+   files` on both passes. **The result reproduces** — the subimage search that
+   read RMSE 595 against 26741 on the fixture reads **590.611 against 46691.5**
+   on guest RAM, the icon figure the same to within 0.8%. The images in
+   `docs/stage11/` are now the guest-RAM ones. This paragraph stays because the
+   fixture-era numbers are what makes that comparison possible, and because the
+   next person to find a harness measuring the wrong substrate should be able to
+   see what it cost to establish that it had not mattered.
    The right test is a GTK 4.20 application, which needs `wl_output`,
    `wl_subcompositor` and a data device — all of which stage 9 added — and one
    was not run here.
@@ -12441,6 +12451,16 @@ not something this compositor can assert.
    the guest itself with no proxy and no arena, so it has no substrate to
    declare.
 
+   **RE-TAKEN, §41.9.** 9 passed, 0 failed, on the real guest over guest RAM:
+   two distinct taskbar identities over two windows, both icons resolved on the
+   host, `SUBSTRATE guest-ram: 4 arena slice(s) … 0 sections, 0 shared files`,
+   and the claim the shared-file version could not make — **both clients on one
+   region and one allocator**, `client 2: joins arena 0 (2 connection(s) on it
+   now)`, with the buttons coming apart while both clients' pixels sit in that
+   one 64 MiB of guest RAM. The images in `docs/stage32/` are now the guest-RAM
+   ones. Re-running it also found §41.8: the taskbar photograph had been failing
+   a geometry gate that could never pass for a 1280x48 strip.
+
 ## 35. Gates that reported success while something was wrong
 
 ### 35.1 Status in one paragraph
@@ -15345,17 +15365,14 @@ Three, and the test for each is the same: can a run reach it *silently*.
 
 ### 41.7 What is not done
 
-1. **Nothing here was run against the guest.** This stage is a change to what
-   five harnesses *can* do, verified by unit tests, by shell syntax, by
-   exercising `wc-substrate.sh`'s decision table directly, and by running the
-   built `wc-proxy` against a file arena with and without the permission to
-   confirm both arms. The two converted harnesses have not been driven end to
-   end on the guest, and the first agent to do so should expect the locate to be
-   the interesting part — see item 3.
-2. **The recorded results are still the fixture's.** Deliberately: §16.11 item 6
-   and §32.9 item 5 say so, and a silent re-run would replace evidence somebody
-   might want to compare against. Re-taking them is a measurement, and it is
-   somebody's to make on purpose.
+1. ~~**Nothing here was run against the guest.**~~ **CLOSED — §41.9.** Both
+   converted harnesses have now been driven end to end on the real guest, on
+   guest RAM, and both are green: `wc-icon.sh taskbar` 21 passed / 0 failed,
+   `wc-taskbar.sh apps` 9 passed / 0 failed.
+2. ~~**The recorded results are still the fixture's.**~~ **CLOSED — §41.9.**
+   Re-taken on purpose rather than silently, which is why §16.11 item 6 and
+   §32.9 item 5 were written first: the fixture-era numbers were on the record
+   before the guest-RAM ones replaced the images, so the two can be compared.
 3. **The `--frames` arm is used when the guest manages to publish a list, and
    the sweep is still reachable.** That asymmetry is deliberate and is not a
    substrate fallback — both arms locate guest RAM and differ only in how its
@@ -15434,3 +15451,152 @@ Three, and the test for each is the same: can a run reach it *silently*.
    runs two of our own clients on the guest itself with no proxy and no arena,
    so it has no substrate to declare. Worth stating because "every block of
    every harness" is the kind of claim that is easy to make and wrong.
+
+### 41.8 A §35 check that could never pass, in the picture the stage exists to produce
+
+Found by running `wc-taskbar.sh apps` on the guest for the first time, and it
+failed:
+
+```
+FAIL  the taskbar, two applications: the capture is 1280x48, too small to be a desktop
+```
+
+The image was correct. `fetch`'s gate was `w < 200 || h < 200`, with the comment
+"this is a screenshot of a Windows desktop" — and `fetch` has **two** callers.
+One photographs a client's window; the other photographs `Shell_TrayWnd`, which
+on this guest's 1280x1024 screen is **1280x48**. Forty-eight is less than two
+hundred, so the taskbar photograph — the single picture stage 32 exists to
+produce — has been failing on its geometry since §35 added the gate, for a
+reason with nothing to do with taskbars. The same 1280x48 strip is what
+`wc-icon.sh` photographs and calls a taskbar, in the same run of the same guest.
+
+**This is §35's own shape turned around.** §35 is about checks that cannot fail;
+this is a check that cannot *pass*, and it is worse than useless because it puts
+a red line against the stage's headline evidence. Both failure modes come from
+the same root — the bound was never run against the thing it bounds.
+
+The fix is a bound per shape, so `fetch` takes a `kind`:
+
+* `tray` — wide, short, and **bounded above** in height: a full-desktop capture
+  arriving here would mean `--class Shell_TrayWnd` selected the wrong window,
+  which is a real failure this now catches and the old bound could not express.
+* `window` — no fixed size, but not a sliver.
+
+And the reverse gap, in the other harness: **`wc-icon.sh`'s `fetch` asserts
+nothing at all.** It gates on `magick` converting the file and *prints* the
+geometry, which is exactly the §35.6 shape — a 1x1 or all-black capture converts
+fine and reads as a pass. It is left as it is here only because it is a second
+change to a second harness in a run whose purpose was the substrate, and it is
+written down rather than done: §41.10 item 3.
+
+### 41.9 The two annotated results, re-taken on guest RAM
+
+§16's icon work and §32's taskbar photographs were both measured on the file
+arena by harnesses that never said so (§16.11 item 6, §32.9 item 5). Both are
+now re-run on the real guest over guest RAM. **The annotations stay**: the point
+was never that the results were wrong, it was that nobody could tell what they
+were measured on, and the fixture-era numbers are worth keeping next to these.
+
+**The locate, which was the part five agents could not get past.** `--frames`
+and `--arena-frames` had landed by the time this ran, and the difference is not
+marginal:
+
+```
+arena 0 provided from guest RAM: run 0xbd58a8246c44db7b, 67108864 bytes,
+  16384 pages, locked=true, frames=C:\Users\<guest-user>\wcicon\arena-icons.frames (16384 in 559 ms)
+guest RAM in the flat view: 13311 MiB in 4 alias(es)
+located 16384 of 16384 pages in 8.99ms by frame list (swept 0 MiB; 1487 frame
+  run(s) became 1487 file run(s), first frame 0x31e4f8)
+stitched 64 MiB into one view with 1487 mmap(MAP_FIXED) call(s) in 3.70ms
+verify: 16384/16384 pages of the stitched view carry their own arena index
+```
+
+**`swept 0 MiB`** is the whole of it: no stamp was read, so `page index claimed
+twice` is not expressible. Four locates across the three runs, every one
+16384/16384 — **8.99 ms, 7.85 ms** and the rest, against the sweep's 2.308 s.
+That is ~260x, and more importantly it is deterministic where the sweep was a
+coin flip. The guest's own side of it costs 559–579 ms to enumerate the frames,
+which is real and is paid once per run rather than per locate.
+
+**§16, `wc-icon.sh taskbar` — 21 passed, 0 failed:**
+
+```
+PASS  icons:   SUBSTRATE guest-ram: 2 arena slice(s) over 16384 pages located by frames, 0 sections, 0 shared files
+PASS  generic: SUBSTRATE guest-ram: 2 arena slice(s) over 16384 pages located by frames, 0 sections, 0 shared files
+PASS  WM_SETICON was sent for both ICON_BIG and ICON_SMALL
+PASS  the icon run's caption contains the host's icon and the control run's does not (590.611 against 46691.5)
+```
+
+and the proxy's line, which is the substrate stated by the process that opened
+the memory:
+
+```
+[proxy] transport arena 0: 67108864 bytes of guest RAM, run 0xbd58a8246c44db7b,
+  1487 run(s) of /proc/1709630/fd/35 in 1 region(s)
+  (nothing is opened per pool, and the compositor opened nothing at all)
+```
+
+**The icon result reproduces.** §16.9's fixture-era subimage search was RMSE
+**595** for the icon run against **26741** for the control; on guest RAM it is
+**590.611** against **46691.5**. The figure that matters — how well the host's
+`qemu` icon is found in the guest's window caption — is the same to within 0.8%,
+which is the answer §16.11 item 6 was honest about not knowing. The control's
+number moved a long way and that is expected and harmless: it measures the
+*absence* of the icon, so a larger number is a stronger negative, and it is the
+best match of a 16x16 icon against a caption that does not contain it.
+
+**§32, `wc-taskbar.sh apps` — 9 passed, 0 failed:**
+
+```
+PASS  apps: SUBSTRATE guest-ram: 4 arena slice(s) over 16384 pages located by frames, 0 sections, 0 shared files
+PASS  apps: both clients share one guest-RAM arena and one allocator (2 joined)
+PASS  two real applications -> 2 distinct taskbar identities over 2 windows
+        Waycompose.app.org.freedesktop.weston.flower
+        Waycompose.app.org.freedesktop.weston.wayland-terminal
+PASS  and both windows carry an icon resolved on the host (icon set: 2 of 2 slots)
+```
+
+**The claim the shared-file version could not make, made:**
+
+```
+[proxy] client 1: joins arena 0 (1 connection(s) on it now, 0 of 67108864 bytes out)
+[proxy] client 1: pool 3:  38272 bytes from the client -> arena 0 slice 66019328+38272
+[proxy] client 1: pool 19: 1740104 bytes from the client -> arena 0 slice 0+1740104
+[proxy] client 2: joins arena 0 (2 connection(s) on it now, 1781760 of 67108864 bytes out)
+```
+
+Two unmodified Linux applications, two connections, **one region of guest RAM
+and one allocator**, and the two taskbar buttons come apart while both clients'
+pixels are in that one region. §12.13 item 6's one-connection limit — the stale
+sentence that put this experiment on a file for four stages (§41.3) — is now
+disproved by the very experiment it misdirected.
+
+Nothing was opened by name on either run: `0 sections, 0 shared files`, no
+`--shared-dir`, and the keymap cut from the compositor's outbound window. The
+only file that crossed is the frame list, 267300 bytes of `pfn <index> <frame>`
+— 16 bytes a page, as §41.5 said — and it carries where the pages are, not the
+pages.
+
+### 41.10 What is still not done
+
+1. **`local` in `wc-taskbar.sh` and the Wine legs were not re-run.** `local` has
+   no arena and needed none; the Wine harnesses are fixtures by construction and
+   their behaviour is unchanged by any of this.
+2. **The guest's leftover sweep found one thing the harnesses miss.** After the
+   runs, a `probe-relay.exe` of this run's own was still up — `wctb32`'s, with
+   its `--timeout 360` still to expire — and `wc-taskbar.sh`'s closing "nothing
+   of wctb32's is still running" had already passed, because that check looks
+   for the *compositor* and the relay is a different executable. Killed by pid.
+   The check should cover every process the harness starts on the guest, not the
+   one it starts last; it is one `-match` away and is not done here.
+3. **`wc-icon.sh`'s `fetch` still asserts nothing about its images** — §41.8's
+   second half. It prints the geometry it should be checking, which is the
+   §35.6 shape, and it is the reason `wc-icon.sh` did not catch the bound bug
+   that `wc-taskbar.sh` did.
+4. **Four stale scheduled tasks under `wcicon` were left alone, deliberately.**
+   They point at `C:\Users\<guest-user>\wcicon\wc-compositor.exe` — the *pre-rename*
+   executable, from a session before §16.8's rename — so they are not this
+   run's, and §16.8's own rule is that unregistering a name another run may be
+   about to start loses that run's step with no error on either side. This run's
+   own two, `wciconcomp-icons` and `wciconcomp-generic`, were verified by their
+   `Actions.Execute` path and removed.
