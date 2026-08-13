@@ -3734,13 +3734,14 @@ The violated states are:
   client's pool fd is `mmap`ed and dropped here; the count of descriptors the
   proxy passes on unchanged is zero and there is no code path that would make it
   anything else;
-* `1 out` appearing on a run where the **compositor** and the client are the same
-  side of the boundary in the other direction — i.e. a descriptor originating in
-  the guest. It cannot: an `h` from the compositor arrives as
-  `Descriptor` **bytes in the message body** (§2.3), which is a name or three
-  integers, and `Descriptor::NtHandle` — the one variant that would be a handle
-  crossing — is asserted against by name in
-  `nothing_but_a_name_or_an_offset_reaches_the_compositor`.
+* the descriptor the proxy hands its client having **originated in the guest** —
+  the same violation seen from the other end, and the one somebody would
+  actually build if they wanted to save the copy. It cannot happen by accident:
+  an `h` from the compositor arrives as `Descriptor` **bytes in the message
+  body** (§2.3), which is a name, a path or three integers, and the one variant
+  that would be a handle crossing — `Descriptor::NtHandle` — is asserted against
+  by name in `nothing_but_a_name_or_an_offset_reaches_the_compositor`. Nothing
+  constructs one, and §2.7 says nothing on the critical path ever needs to.
 
 So `3 fds in, 1 out` reads: three descriptors arrived from a local client and
 were consumed here; one was manufactured here and given to a local client; none
