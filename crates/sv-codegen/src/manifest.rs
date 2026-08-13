@@ -50,6 +50,9 @@ pub fn render(plan: &Plan) -> String {
     for b in &plan.bitmasks {
         render_bitmask(&mut s, b);
     }
+    for f in &plan.flag_words {
+        render_flag_word(&mut s, f);
+    }
     for st in &plan.structs {
         render_struct(&mut s, st);
     }
@@ -82,6 +85,20 @@ fn render_bitmask(s: &mut String, b: &BitmaskPlan) {
     let _ = writeln!(s, "bitmask {} width={}", b.name, b.bit_width);
     for (n, v) in &b.values {
         let _ = writeln!(s, "  {n} = {v}");
+    }
+}
+
+/// A flag word's bit layout is part of the protocol, so it is in the manifest.
+///
+/// The *wire* does not depend on the layout — the word is copied — but the two
+/// sides' accessors do, and a build whose generator laid the bits out
+/// differently would produce a struct the peer's driver reads wrongly with no
+/// symptom at the transport. Putting the offsets in the manifest makes that a
+/// handshake refusal instead (design.md §4.3).
+fn render_flag_word(s: &mut String, f: &crate::plan::FlagWordPlan) {
+    let _ = writeln!(s, "flag-word {} width={}", f.name, f.bit_width);
+    for b in &f.fields {
+        let _ = writeln!(s, "  {} @{} :{}", b.name, b.offset, b.bits);
     }
 }
 

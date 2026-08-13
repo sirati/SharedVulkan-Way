@@ -320,8 +320,9 @@ pub fn profile_by_name(name: &str) -> Option<Profile> {
     match name {
         "zink" => Some(vk_registry::profiles::zink()),
         "step3-minimal" | "step3" => Some(vk_registry::profiles::step3_minimal()),
-        // Does not resolve, on purpose. See `vk_registry::profiles::video` and
-        // `docs/video-decode.md`.
+        // Zink plus H.264 decode. See `vk_registry::profiles::video` and
+        // `docs/video-decode.md`; `SV_PROTO_PROFILE=video` builds the whole
+        // stack against it.
         "video" => Some(vk_registry::profiles::video()),
         _ => None,
     }

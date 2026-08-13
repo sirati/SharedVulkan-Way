@@ -8,7 +8,7 @@
 //! without ever claiming it is one of the variants. R7 in one design decision.
 
 use crate::naming;
-use crate::plan::{Plan, Scalar, Shape, StructPlan};
+use crate::plan::{FlagWordPlan, Plan, Scalar, Shape, StructPlan};
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -20,13 +20,83 @@ pub fn emit(plan: &Plan) -> TokenStream {
     let bitmasks = plan.bitmasks.iter().map(|b| {
         emit_newtype(&b.name, b.bit_width, &b.values, /* bitflags */ true)
     });
+    let flag_words = plan.flag_words.iter().map(emit_flag_word);
     let structs = plan.structs.iter().map(|s| emit_struct(plan, s));
 
     quote! {
         #(#handles)*
         #(#enums)*
         #(#bitmasks)*
+        #(#flag_words)*
         #(#structs)*
+    }
+}
+
+/// A C bitfield struct: one `u32`, with a getter and a setter per field.
+///
+/// Rust has no `#[repr(C)]` bitfield, so the storage unit is the type and the
+/// fields are methods. That is not a compromise here — it is closer to what the
+/// wire wants than a struct would be, because the word is copied end to end and
+/// never taken apart in transit (see `plan::FlagWordPlan`).
+///
+/// The accessors shift and mask from the least significant bit upwards, in
+/// declaration order, which is what the x86-64 System V ABI and MSVC x64 both do
+/// for consecutive same-type bitfields. The generated `bit_layout` doc comment
+/// states the offsets so a reader can check them against the header without
+/// reading this generator.
+fn emit_flag_word(f: &FlagWordPlan) -> TokenStream {
+    let ty = naming::type_ident(&f.name);
+
+    let accessors = f.fields.iter().map(|b| {
+        let get = naming::ident(&b.rust_name);
+        let set = naming::ident(&format!("set_{}", b.rust_name));
+        let with = naming::ident(&format!("with_{}", b.rust_name));
+        let offset = b.offset;
+        let mask: u32 = if b.bits >= 32 { u32::MAX } else { (1u32 << b.bits) - 1 };
+        let doc = format!(
+            "`{}`: {} bit{} at offset {}.",
+            b.name,
+            b.bits,
+            if b.bits == 1 { "" } else { "s" },
+            b.offset
+        );
+        quote! {
+            #[doc = #doc]
+            pub fn #get(self) -> u32 { (self.0 >> #offset) & #mask }
+            #[doc = #doc]
+            pub fn #set(&mut self, value: u32) {
+                self.0 = (self.0 & !(#mask << #offset)) | ((value & #mask) << #offset);
+            }
+            #[doc = #doc]
+            pub fn #with(mut self, value: u32) -> Self { self.#set(value); self }
+        }
+    });
+
+    let layout = f
+        .fields
+        .iter()
+        .map(|b| format!("`{}` [{}..{})", b.name, b.offset, b.offset + b.bits))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let doc = format!(
+        "`{}`, a C struct of `uint32_t` bitfields.\n\n\
+         Carried as the one 32-bit storage unit it occupies, and copied without \
+         being taken apart: the wire form does not depend on the bit order, only \
+         on the two sides' C compilers agreeing about it — which they must \
+         anyway, because each side's compiler has to agree with its own driver.\n\n\
+         Bit layout, least significant bit first: {layout}.",
+        f.name
+    );
+
+    quote! {
+        #[doc = #doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        #[repr(transparent)]
+        pub struct #ty(pub u32);
+
+        impl #ty {
+            #(#accessors)*
+        }
     }
 }
 

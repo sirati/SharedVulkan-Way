@@ -133,6 +133,65 @@ pub fn header_paths() -> Result<Vec<PathBuf>> {
             out.push(p);
         }
     }
+    out.extend(video_header_paths()?);
+    Ok(out)
+}
+
+/// The `vk_video/*.h` headers of the same package.
+///
+/// # Why these are read at all
+///
+/// `vk_registry::video_registry_path` explains why the generator's *input* for
+/// the `StdVideo*` types is `video.xml` rather than these headers: it is the
+/// machine-readable source they are generated from, it is in the same schema as
+/// `vk.xml`, and using it puts no second reader of C into the build.
+///
+/// That decision is only safe if the two are checked against each other, and
+/// this is the file that can do it. The relationship is exactly the one this
+/// module already has to `vulkan_core.h`: **the header is the published
+/// artefact, and disagreeing with it means one of the two readings is wrong.**
+/// Our model says `StdVideoH264SequenceParameterSet.level_idc` is a
+/// `StdVideoH264LevelIdc` at member index 2 and that
+/// `StdVideoH264SpsFlags.frame_mbs_only_flag` is one bit at offset 8; the header
+/// says so independently, in C, and the comparison is what makes the merge
+/// something other than a claim.
+///
+/// Every header the package ships is read, not only H.264 — including the encode
+/// and AV1/VP9/H.265 ones nothing generates for yet — because the model carries
+/// all of them the moment `video.xml` is merged, and a type that is *carried and
+/// not compared* is the quiet case this whole exercise exists to prevent.
+pub fn video_header_paths() -> Result<Vec<PathBuf>> {
+    let xml = vk_registry::registry_path()?;
+    // …/share/vulkan/registry/vk.xml → …/include/vk_video/
+    let prefix = xml
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .with_context(|| format!("VK_XML {} is not inside a package prefix", xml.display()))?;
+    let dir = prefix.join("include/vk_video");
+    if !dir.is_dir() {
+        bail!(
+            "no vk_video headers next to the pinned registry: expected {} beside {}. \
+             video.xml defines the StdVideo* types and these headers are the only \
+             independent check that our reading of it is right.",
+            dir.display(),
+            xml.display()
+        );
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let p = entry?.path();
+        if p.extension().is_some_and(|e| e == "h") {
+            out.push(p);
+        }
+    }
+    // `read_dir` order is the filesystem's, and a comparison whose output depends
+    // on it cannot be diffed.
+    out.sort();
+    if out.is_empty() {
+        bail!("{} contains no headers", dir.display());
+    }
     Ok(out)
 }
 
@@ -516,8 +575,10 @@ fn section_marker(line: &str) -> Option<String> {
 fn object_define(line: &str) -> Option<(String, String)> {
     let rest = line.strip_prefix("#define ")?;
     let (name, body) = rest.split_once(char::is_whitespace)?;
-    // Function-like macros are not constants.
-    if name.contains('(') || !name.starts_with("VK_") {
+    // Function-like macros are not constants. `STD_VIDEO_` is the video std
+    // headers' prefix for the same thing `VK_` is in `vulkan_core.h`: every one
+    // of them is an array extent of a `StdVideo*` struct.
+    if name.contains('(') || !(name.starts_with("VK_") || name.starts_with("STD_VIDEO_")) {
         return None;
     }
     let body = body.split("//").next().unwrap_or(body).trim();

@@ -74,6 +74,11 @@ pub enum Mode {
 pub fn size_expr(shape: &Shape, access: &TokenStream, mode: Mode) -> TokenStream {
     match shape {
         Shape::Scalar(s) => scalar_size(s, access, mode),
+        // The `let _ = &item` in the two aggregate arms below is the same
+        // measure as the `Optional` arm's, for the same reason: an element whose
+        // size is a constant — `StdVideoH264ScalingLists::ScalingList4x4` is
+        // `uint8_t[6][16]`, so each row is 16 packed bytes — produces an
+        // expression that never mentions the binding.
         Shape::FixedArray { elem, count, .. } => {
             let n = *count as usize;
             let body = match packed_kind(elem) {
@@ -82,7 +87,7 @@ pub fn size_expr(shape: &Shape, access: &TokenStream, mode: Mode) -> TokenStream
                 Some(PackedKind::Wide(w)) => quote!(#n * #w),
                 None => {
                     let e = size_expr(elem, &quote!(item), mode);
-                    quote!(#access.iter().map(|item| #e).sum::<usize>())
+                    quote!(#access.iter().map(|item| { let _ = &item; #e }).sum::<usize>())
                 }
             };
             quote!(8usize + #body)
@@ -102,7 +107,7 @@ pub fn size_expr(shape: &Shape, access: &TokenStream, mode: Mode) -> TokenStream
                 Some(PackedKind::Wide(w)) => quote!(#access.len() * #w),
                 None => {
                     let e = size_expr(elem, &quote!(item), mode);
-                    quote!(#access.iter().map(|item| #e).sum::<usize>())
+                    quote!(#access.iter().map(|item| { let _ = &item; #e }).sum::<usize>())
                 }
             };
             quote!(8usize + #body)

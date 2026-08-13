@@ -42,6 +42,8 @@ Recorded here because `design.md` §6.6 commits to crediting them.
 | Venus (`VK_EXT_command_serialization`, `vn_cs`) | MIT | The wire format **rules** — primitive widths, array framing, the presence flag, the three-state output validity and the `_partial` encodings — reimplemented in Rust in `sv-wire` and `sv-codegen`. |
 | gfxstream | Apache-2.0 (output), MIT (generators) | **Design only:** the pass taxonomy of `design.md` §7.2, length-prefixed `pNext` links, the boxed-handle table, the `(memory, offset)` transform. No code was read into ours. |
 | Khronos `vk.xml` | Apache-2.0 OR MIT | The registry itself, pinned by nix and never vendored. |
+| Khronos `video.xml` | Apache-2.0 OR MIT | The video std registry — the `StdVideo*` types of `VK_KHR_video_decode_h264` and its siblings. Read from the same pinned `vulkan-headers` path as `vk.xml`, beside it, and never vendored. `crates/vk-registry/src/lib.rs` says why it is read instead of the `vk_video/*.h` headers it generates. |
+| Khronos `vulkan_core.h`, `vk_video/*.h` | Apache-2.0 | Read as **data at test time only**, by `sv-testkit`, out of the same store path, as the independent cross-check that our reading of the two registries is right. Nothing from them is compiled or vendored. |
 
 ## Deviations from Venus that are ours
 

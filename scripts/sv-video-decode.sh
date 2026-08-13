@@ -3,9 +3,15 @@
 #
 #   scripts/sv-video-decode.sh [icd-manifest-basename]   default: radeon_icd.x86_64.json
 #
-# Five checks. The first four are about the drivers and pass; the fifth is about
-# the forwarder and it fails on purpose, because that is where the project
-# actually stands and a harness that hid it would be worth nothing.
+# Six checks. The first four are about the drivers. The last two are about the
+# forwarder, and they are the half that moved: the wire profile that used to
+# refuse to plan now plans, and the forwarded device answers the video
+# capability queries with the driver's own numbers — but the decode itself still
+# does not run, and check 6 says so rather than skipping it.
+#
+# The forwarded half needs binaries built for the video profile:
+#
+#   SV_PROTO_PROFILE=video cargo build -p sv-icd -p sv-gpu-server -p video-probe
 #
 #  1. **The survey.** `video-probe caps` asks every physical device the loader
 #     offers what it can decode — per codec, per profile, with the capabilities
@@ -134,9 +140,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-say "5. the same questions, asked of the forwarder"
+say "5. the wire profile plans"
 # ---------------------------------------------------------------------------
-if [ -f "$MANIFEST" ] && [ -x "$BIN/sv-gpu-server" ]; then
+# It did not, until the generator was given `video.xml` — Khronos's own
+# machine-readable definition of the `StdVideo*` types, which ships beside
+# `vk.xml` and is what the `vk_video/*.h` headers are generated from. See
+# `vk_registry::video_registry_path`.
+if (cd "$ROOT" && cargo run -q -p sv-codegen -- --profile video --stats) \
+     > "$RUNDIR/plan.txt" 2>&1; then
+  grep -E '^(profile|protocol_hash|commands|structs)' "$RUNDIR/plan.txt" | sed 's/^/  /'
+  ok "the wire profile carries the video decode extensions"
+else
+  grep -A3 '^Error' "$RUNDIR/plan.txt" | sed 's/^/  /'
+  bad "the video profile no longer plans"
+fi
+
+# ---------------------------------------------------------------------------
+say "6. the same questions, asked of the forwarder"
+# ---------------------------------------------------------------------------
+# The binaries have to have been built with `SV_PROTO_PROFILE=video`, because the
+# profile is a build input: an ICD built for `zink` has no video opcodes and
+# reports no video extensions, correctly.
+#
+# What is compared is not "did it answer" but "did it answer the same thing".
+# The capability numbers are the ones `docs/video-decode.md` §1 says no driver
+# reports believably, so a forwarder that quietly rounded one would be
+# indistinguishable from a driver that meant it — unless the two are put side by
+# side, which is what this does.
+# One GPU side per client, because `sv-gpu-server --clients N` waits for all N
+# to attach before it serves any of them: a second run against a `--clients 1`
+# server gets a closed socket and the ICD refuses to load, which looks exactly
+# like the failure this script is about to claim and is not.
+forwarded() {
+  local out="$1"; shift
+  rm -f "$SOCK"
   VK_DRIVER_FILES="$ICDDIR/$ICD" "$BIN/sv-gpu-server" serve \
     --socket "$SOCK" --arena $((256 << 20)) --clients 1 \
     > "$RUNDIR/gpu.log" 2>&1 &
@@ -146,32 +183,69 @@ if [ -f "$MANIFEST" ] && [ -x "$BIN/sv-gpu-server" ]; then
     kill -0 $GPUPID 2>/dev/null || break
     sleep 0.05
   done
+  local rc=1
   if [ -S "$SOCK" ]; then
-    env VK_DRIVER_FILES="$MANIFEST" SV_SOCKET="$SOCK" \
-      "$PROBE" caps > "$RUNDIR/fwd.txt" 2>&1
-    grep -E '^device |^  video extensions' "$RUNDIR/fwd.txt" | sed 's/^/  /'
-    if grep -q '^  video extensions: none' "$RUNDIR/fwd.txt"; then
-      ok "the forwarded device reports no video extensions — as designed, today"
-    else
-      echo "  the forwarded device now reports video extensions; this script is out of date"
-    fi
+    env VK_DRIVER_FILES="$MANIFEST" SV_SOCKET="$SOCK" "$@" > "$out" 2>&1
+    rc=$?
   else
-    echo "  (the GPU side did not start; skipping)"
+    echo "the GPU side did not start" > "$out"
   fi
   kill "$GPUPID" 2>/dev/null; wait "$GPUPID" 2>/dev/null; GPUPID=""
+  return $rc
+}
+
+if [ -f "$MANIFEST" ] && [ -x "$BIN/sv-gpu-server" ]; then
+  # Direct, against the *same* ICD the GPU side will load, so the comparison is
+  # transport against no transport rather than one driver against another. The
+  # dev shell carries two RADVs and they answer differently (§1).
+  VK_DRIVER_FILES="$ICDDIR/$ICD" "$PROBE" caps > "$RUNDIR/direct.txt" 2>&1
+
+  forwarded "$RUNDIR/fwd.txt" "$PROBE" caps
+  grep -E '^device |^  video extensions' "$RUNDIR/fwd.txt" | sed 's/^/  /'
+  if ! grep -q '^  video extensions: VK_KHR_video' "$RUNDIR/fwd.txt"; then
+    sed 's/^/  /' "$RUNDIR/fwd.txt" | head -8
+    bad "the forwarded device reports no video extensions — rebuild with SV_PROTO_PROFILE=video"
+  else
+    ok "the forwarded device advertises the profile's video extensions"
+
+    # The H.264 block of each report: four profiles, their coded extents, DPB
+    # slot counts, bitstream alignments, decode flags, `maxLevelIdc` — which is
+    # a `StdVideoH264LevelIdc`, the type that used to stop the planner — and
+    # every `vkGetPhysicalDeviceVideoFormatPropertiesKHR` row.
+    #
+    # H.265 and AV1 are in the direct report and not in the forwarded one, on
+    # purpose: the wire profile carries `VK_KHR_video_decode_h264` and neither of
+    # the others, and §0.4 item 8 intersects the advertised list with the
+    # driver's. So the comparison is over the H.264 block, which both have.
+    sed -n '/^  h264/,/^  h265/p' "$RUNDIR/direct.txt" | grep -v '^  h265' > "$RUNDIR/direct.h264"
+    sed -n '/^  h264/,/^  h265/p' "$RUNDIR/fwd.txt"    | grep -v '^  h265' > "$RUNDIR/fwd.h264"
+    LINES=$(wc -l < "$RUNDIR/direct.h264")
+    if [ "$LINES" -gt 20 ] && cmp -s "$RUNDIR/direct.h264" "$RUNDIR/fwd.h264"; then
+      ok "$LINES lines of H.264 capabilities crossed the boundary byte-identically"
+      echo "     sha256 $(sha256sum < "$RUNDIR/direct.h264" | cut -c1-16)…"
+    else
+      diff "$RUNDIR/direct.h264" "$RUNDIR/fwd.h264" | head -20 | sed 's/^/  /'
+      bad "the forwarded capabilities are not the driver's capabilities"
+    fi
+
+    # And the decode, which does not run. The wall is no longer a type; it is
+    # the one synthesised queue family of §0.4 item 7, and it is named here
+    # rather than skipped, because "the decode has not been forwarded" is the
+    # finding.
+    if forwarded "$RUNDIR/fwddec.txt" "$PROBE" decode "$RUNDIR/idr.264" "$RUNDIR/fwd.nv12"; then
+      echo "  the forwarded decode SUCCEEDED — docs/video-decode.md §6 needs rewriting"
+      fail=1
+    else
+      sed 's/^/  /' "$RUNDIR/fwddec.txt"
+      if grep -q 'no queue family with VIDEO_DECODE' "$RUNDIR/fwddec.txt"; then
+        ok "the forwarded decode stops where the design says it does: no VIDEO_DECODE family"
+      else
+        bad "the forwarded decode failed somewhere other than the queue family"
+      fi
+    fi
+  fi
 else
   echo "  (sv-icd / sv-gpu-server not built; skipping the forwarded half)"
-fi
-
-echo
-echo "  and the reason it reports none:"
-if (cd "$ROOT" && cargo run -q -p sv-codegen -- --profile video --stats) \
-     > "$RUNDIR/plan.txt" 2>&1; then
-  echo "  the video profile now PLANS — docs/video-decode.md needs rewriting"
-  fail=1
-else
-  grep -A3 '^Error' "$RUNDIR/plan.txt" | sed 's/^/  /'
-  ok "the wire profile still refuses the video decode extensions, and says why"
 fi
 
 echo

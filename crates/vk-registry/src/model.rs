@@ -32,7 +32,7 @@
 //! subset are we generating for — and it lives in [`crate::profile`], because
 //! the answer differs per build while the model does not.
 
-use crate::ctype::{ArrayExtent, CType, Declarator, parse_proto};
+use crate::ctype::{ArrayExtent, CType, CTypeKind, Declarator, parse_proto};
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
@@ -487,6 +487,138 @@ impl Model {
         m.build_extended_by();
         m.resolve_constant_aliases();
         Ok(m)
+    }
+
+    /// Merge Khronos's *video std* registry — `video.xml` — into this model.
+    ///
+    /// `vk.xml` names the `StdVideo*` types and does not define them (see
+    /// [`crate::video_registry_path`] for the whole argument). `video.xml` is
+    /// the machine-readable definition the `vk_video/*.h` headers are generated
+    /// from, in the same schema, so this is the same three passes the main
+    /// registry gets and not a second reader.
+    ///
+    /// Three things it deliberately does **not** do.
+    ///
+    /// - **It does not add `video.xml`'s `<extension>` blocks to
+    ///   [`Model::extensions`].** They are named `vulkan_video_codec_h264std`
+    ///   and so on: header guards, not Vulkan extensions. A profile must never
+    ///   be able to list one, and `VK_KHR_video_decode_h264` in `vk.xml` already
+    ///   pulls in every type it needs by name.
+    /// - **It does not touch `extended_by`.** No `StdVideo*` struct carries an
+    ///   `sType` or a `pNext`; they are plain C aggregates that Vulkan structs
+    ///   point at. That is also why nothing generic can walk them, and why the
+    ///   registry's `len=`/`optional=` on their pointer members is the only
+    ///   thing that says how deep a copy has to go.
+    /// - **It does not overwrite a primitive.** `video.xml` re-declares
+    ///   `uint32_t` and friends the way `vk.xml` does; `build_types` already
+    ///   refuses to replace a seeded primitive with an opaque placeholder.
+    ///
+    /// What it *does* overwrite, on purpose, is the `TypeDef::External`
+    /// placeholder `vk.xml` leaves for each `StdVideo*` name. After this call
+    /// `StdVideoH264LevelIdc` is an enum with nineteen values, and
+    /// `StdVideoH264SequenceParameterSet` is a struct with three pointer members
+    /// whose lengths and optionality the registry states.
+    pub fn merge_video(&mut self, raw: &vk_parse::Registry) -> Result<()> {
+        for child in &raw.0 {
+            match child {
+                vk_parse::RegistryChild::Types(types) => self.build_types(types)?,
+                vk_parse::RegistryChild::Enums(enums) => self.build_enums(enums)?,
+                // `video.xml` declares no commands, and if a future release does
+                // they are not Vulkan entry points and must not become opcodes.
+                vk_parse::RegistryChild::Extensions(exts) => {
+                    self.merge_video_constants(exts);
+                }
+                _ => {}
+            }
+        }
+
+        // The array extents of the video structs are named constants —
+        // `STD_VIDEO_H264_SCALING_LIST_4X4_NUM_LISTS` and eleven others — and an
+        // extent that does not resolve to a number is a generator error, not a
+        // zero-length array. Say so here, where the reason is legible, rather
+        // than three layers away in `shape_of`.
+        for def in self.types.values() {
+            let TypeDef::Struct(s) = def else { continue };
+            if !s.name.starts_with("StdVideo") {
+                continue;
+            }
+            for m in &s.members {
+                let mut ty = &m.ty;
+                while let CTypeKind::Array(inner, ext) = &ty.kind {
+                    if self.extent_value(ext).is_none() {
+                        bail!(
+                            "{}.{}: array extent {ext} is not a number video.xml \
+                             defines. Every StdVideo array extent is an <enum> in a \
+                             <require> block of video.xml's own <extensions>; a \
+                             missing one means `merge_video_constants` did not see \
+                             that block.",
+                            s.name,
+                            m.name
+                        );
+                    }
+                    ty = inner;
+                }
+            }
+        }
+
+        // Deterministic emission order, as `merge_extension_enum_values` does
+        // for the main registry.
+        for def in self.types.values_mut() {
+            if let TypeDef::Enum(et) = def {
+                et.values.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// `video.xml` states its API constants inside `<extension>/<require>`
+    /// rather than in an `<enums name="API Constants">` block:
+    ///
+    /// ```xml
+    /// <enum name="STD_VIDEO_H264_SCALING_LIST_4X4_NUM_LISTS" value="6" type="uint32_t"/>
+    /// ```
+    ///
+    /// They are still API constants — every one is an array extent of a struct
+    /// in the same file — so they go where `vk.xml`'s do. The string-valued ones
+    /// (`…_EXTENSION_NAME`) come through with `value: None`, exactly as
+    /// `VK_WHOLE_SIZE` does, rather than being guessed at.
+    fn merge_video_constants(&mut self, exts: &vk_parse::Extensions) {
+        for e in &exts.children {
+            for child in &e.children {
+                let vk_parse::ExtensionChild::Require { api, items, .. } = child else {
+                    continue;
+                };
+                if !api_matches(api.as_deref()) {
+                    continue;
+                }
+                for item in items {
+                    let vk_parse::InterfaceItem::Enum(en) = item else { continue };
+                    if !api_matches(en.api.as_deref()) {
+                        continue;
+                    }
+                    // Only free-standing values. An `extends=` here would be a
+                    // video enum extending a Vulkan enum, which does not occur
+                    // and which this path is not the place to handle.
+                    let (text, alias) = match &en.spec {
+                        vk_parse::EnumSpec::Value { value, extends: None, .. } => {
+                            (value.clone(), None)
+                        }
+                        vk_parse::EnumSpec::Alias { alias, extends: None, .. } => {
+                            (alias.clone(), Some(alias.clone()))
+                        }
+                        _ => continue,
+                    };
+                    let value = parse_c_integer(&text);
+                    self.constants.entry(en.name.clone()).or_insert(Constant {
+                        name: en.name.clone(),
+                        text,
+                        value,
+                        alias,
+                    });
+                }
+            }
+        }
+        self.resolve_constant_aliases();
     }
 
     fn build_types(&mut self, types: &vk_parse::Types) -> Result<()> {
@@ -1209,7 +1341,7 @@ mod tests {
             return;
         };
         let reg = crate::Registry::load_from(path).unwrap();
-        let m = Model::build(&reg.raw).unwrap();
+        let m = reg.model().unwrap();
 
         let value = |enum_name: &str, constant: &str| -> i64 {
             let Some(TypeDef::Enum(e)) = m.type_def(enum_name) else {
@@ -1284,7 +1416,7 @@ mod tests {
             return;
         };
         let reg = crate::Registry::load_from(path).unwrap();
-        let m = Model::build(&reg.raw).unwrap();
+        let m = reg.model().unwrap();
 
         let has = |enum_name: &str, constant: &str| -> bool {
             match m.type_def(enum_name) {

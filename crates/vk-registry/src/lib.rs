@@ -46,29 +46,122 @@ pub fn registry_path() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Where the *video std* registry lives: `video.xml`, beside `vk.xml`.
+///
+/// # Why a second XML file, and why this one
+///
+/// `vk.xml` does not define the `StdVideo*` types. It names them, and only
+/// names them:
+///
+/// ```xml
+/// <type requires="vk_video/vulkan_video_codec_h264std.h" name="StdVideoH264LevelIdc"/>
+/// ```
+///
+/// which the model has no choice but to read as [`TypeDef::External`] — a
+/// platform type like `HWND`, whose layout we cannot know. That is what stops
+/// the video profile in `sv-codegen`'s planner, and it is *not* a missing case
+/// in the planner: the file it reads genuinely does not say.
+///
+/// The definitions are in `vk_video/vulkan_video_codec_h264std.h`, and the top
+/// of that header says where *it* came from:
+///
+/// > This header is generated from the Khronos Vulkan XML API Registry.
+///
+/// That registry is `video.xml`, and it ships in the same `vulkan-headers`
+/// package, in the same directory as `vk.xml`. So the answer to "how should the
+/// generator learn about `vk_video`" is not "parse C" and not "hand-write a
+/// table of layouts". It is: **read the other XML file that Khronos already
+/// publishes for exactly this purpose**, in the same schema, with the same
+/// parser, from the same pinned store path.
+///
+/// Four properties, which are the same four `sv_testkit::cheader` gives for
+/// reading `vulkan_core.h`:
+///
+/// 1. It is the *authoritative* source — the headers are generated from it, not
+///    the other way round.
+/// 2. It cannot drift from `$VK_XML`: it is derived from that path, and a
+///    missing file is an error rather than a fallback.
+/// 3. It needs no new parser. `vk-parse` reads it; `Model::merge_video` reuses
+///    the same `build_types`/`build_enums` this crate already has.
+/// 4. It puts **no second source of truth about a C layout** into the project.
+///    design.md's video-decode note listed "teach the pipeline about
+///    `vk_video`" as an option with the objection that it would do exactly
+///    that; using Khronos's own machine-readable definition is the version of
+///    the option the objection does not apply to.
+///
+/// The headers are still read, by `sv-testkit`'s cross-check, and they are read
+/// as a *check* rather than as an input — the same relationship `vulkan_core.h`
+/// has to `vk.xml`. If the two disagree, that test fails.
+pub fn video_registry_path() -> Result<PathBuf> {
+    let xml = registry_path()?;
+    let path = xml.with_file_name("video.xml");
+    if !path.is_file() {
+        bail!(
+            "no video.xml beside the pinned registry: expected {} next to {}. \
+             The video std types (StdVideoH264*, StdVideoDecode*) are defined \
+             there and nowhere else in machine-readable form; vk.xml only names \
+             them. A vulkan-headers package without it cannot generate the video \
+             profile.",
+            path.display(),
+            xml.display()
+        );
+    }
+    Ok(path)
+}
+
 /// A parsed registry, kept in vk-parse's own representation for now.
 ///
 /// Wrapped rather than re-modelled because the shape the generator wants is not
 /// yet decided, and inventing an intermediate representation before knowing
 /// what it feeds would be guessing. What this type does buy is a single place
 /// that knows how the registry was loaded.
+///
+/// It holds *two* parsed files, because the API is described by two:
+/// `vk.xml` and, for the video std types, `video.xml`. See
+/// [`video_registry_path`].
 pub struct Registry {
     pub raw: vk_parse::Registry,
     pub path: PathBuf,
+    /// `video.xml`, when the package ships one. `None` only for a registry
+    /// loaded from an explicit path that has no sibling video registry, which
+    /// is a shape the tests use and the build never sees.
+    pub video: Option<vk_parse::Registry>,
+    pub video_path: Option<PathBuf>,
 }
 
 impl Registry {
-    /// Parse the registry named by `$VK_XML`.
+    /// Parse the registry named by `$VK_XML`, and the `video.xml` beside it.
     pub fn load() -> Result<Self> {
-        Self::load_from(registry_path()?)
+        let mut r = Self::load_from(registry_path()?)?;
+        let vpath = video_registry_path()?;
+        r.video = Some(Self::parse_one(&vpath)?);
+        r.video_path = Some(vpath);
+        Ok(r)
     }
 
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let raw = Self::parse_one(&path)?;
+        // The sibling video registry, when there is one. Loading it here rather
+        // than only in `load()` means every path that reads a registry from the
+        // store — including the tests, which call `load_from(registry_path())` —
+        // gets the same model, and a model that silently differs between the
+        // build and the tests is worse than one that fails.
+        let vpath = path.with_file_name("video.xml");
+        let (video, video_path) = if vpath.is_file() {
+            (Some(Self::parse_one(&vpath)?), Some(vpath))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self { raw, path, video, video_path })
+    }
+
+    fn parse_one(path: &Path) -> Result<vk_parse::Registry> {
         // `.context()` does not apply here: vk_parse::FatalError does not
         // implement std::error::Error, so anyhow cannot wrap it. Format it in
         // by hand rather than reaching for a wrapper type.
-        let (raw, errors) = vk_parse::parse_file(&path)
+        let (raw, errors) = vk_parse::parse_file(path)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e:?}", path.display()))?;
 
         // vk-parse reports recoverable oddities rather than failing. They are
@@ -86,13 +179,16 @@ impl Registry {
                 eprintln!("  {e:?}");
             }
         }
-
-        Ok(Self { raw, path })
+        Ok(raw)
     }
 
     /// Build the typed model the generator consumes.
     pub fn model(&self) -> Result<Model> {
-        Model::build(&self.raw)
+        let mut m = Model::build(&self.raw)?;
+        if let Some(v) = &self.video {
+            m.merge_video(v)?;
+        }
+        Ok(m)
     }
 
     /// Counts of the things the generator will have to emit code for.

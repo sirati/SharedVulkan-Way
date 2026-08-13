@@ -524,26 +524,35 @@ pub mod profiles {
 
     /// Zink's set plus Vulkan Video's H.264 decode path.
     ///
-    /// **This profile does not resolve, and that is what it is for.** It is the
-    /// one-line experiment `docs/video-decode.md` asks anyone to repeat:
-    ///
-    /// ```text
-    /// cargo run -p sv-codegen -- --profile video --stats
-    /// ```
-    ///
-    /// The failure is in `plan.rs`, on the first `StdVideo*` type it reaches,
-    /// and the reason is structural rather than a missing case. `vk.xml` does
-    /// not define the video std types — it names them, with
+    /// **This profile used not to resolve, and that was what it was for.** It
+    /// failed in `plan.rs` on the first `StdVideo*` type it reached, because
+    /// `vk.xml` does not define the video std types — it names them, with
     /// `requires="vk_video/vulkan_video_codec_h264std.h"` — so the registry
-    /// models them as `TypeDef::External` and the wire planner refuses an
-    /// external type because it cannot know its layout. Six of them are on the
-    /// H.264 decode surface, and one of those, `StdVideoH264ProfileIdc`, is
-    /// passed *by value*, so even the "external types only appear behind
-    /// pointers" assumption the C ABI pass makes does not hold.
+    /// modelled them as `TypeDef::External` and the wire planner refused a type
+    /// whose layout it could not know. Six were on the H.264 decode surface and
+    /// two were passed by value, which also broke the C ABI pass's assumption
+    /// that an external type is only ever seen behind a pointer.
     ///
-    /// Keeping the profile in the tree rather than deleting it makes the wall a
-    /// thing a person can walk into in ten seconds, and makes it a build error
-    /// on the day somebody teaches the planner about `vk_video`.
+    /// It resolves now, and nothing about the planner's rule changed: the
+    /// generator was given the other registry Khronos publishes.
+    /// `crate::video_registry_path` is the whole argument; the short version is
+    /// that `video.xml` ships beside `vk.xml` in the same package, is what the
+    /// `vk_video/*.h` headers are generated *from*, and is read by the same
+    /// parser. `sv-testkit`'s `the_video_std_types_match_the_vk_video_headers`
+    /// is what makes that something other than a claim.
+    ///
+    /// What it carries, and what it does not:
+    ///
+    /// - 252 commands against Zink's 239 — the thirteen of `VK_KHR_video_queue`
+    ///   and `VK_KHR_video_decode_queue`.
+    /// - The `StdVideo*` types by value and by pointer, including
+    ///   `StdVideoH264SequenceParameterSet`'s three pointer members, which the
+    ///   generator deep-copies because the registry states their `len=` and
+    ///   `optional=`. `docs/video-decode.md` §4 expected to have to hand-write
+    ///   that; it did not.
+    /// - **H.264 only.** H.265 and AV1 are surveyed by `video-probe` and are not
+    ///   in the profile; their per-frame structures have pointers where H.264's
+    ///   have none, and adding them is a measurement rather than a line.
     pub fn video() -> Profile {
         let mut p = zink();
         p.name = "video".into();
@@ -670,7 +679,7 @@ mod tests {
     fn model() -> Option<Model> {
         let path = crate::registry_path().ok()?;
         let reg = crate::Registry::load_from(path).ok()?;
-        Model::build(&reg.raw).ok()
+        reg.model().ok()
     }
 
     #[test]

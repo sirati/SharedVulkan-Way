@@ -930,6 +930,13 @@ afternoon. **Two of the six are used by value**, which also makes `abi.rs`'s
 zero-sized `AbiType::Opaque` wrong for them — latently, since nothing reaches it
 today.
 
+> **[CORRECTED — 2026-08-13, §0.9.]** The wall came down the next day and
+> §7.1's design survived intact: the generator still reads XML and nothing else,
+> it now reads *two* files. `video.xml` ships beside `vk.xml` in the same
+> `vulkan-headers` package and is the registry the `vk_video/*.h` headers are
+> generated from. The by-value problem was **not** latent — it was live in the
+> zink profile, on `xcb_visualid_t`. §0.9.
+
 **2. §0.6's rule has its first real second candidate, and it points at a smaller
 protocol rather than a larger one.** "A capability that is expressible in the
 forwarded API does not deserve a protocol extension" — decode is not expressible,
@@ -1010,6 +1017,96 @@ reachable at all. Four refinements, and the conclusion survived all of them:
 The gap is one output path in one Firefox file — a *third* one, since neither
 existing branch can be redirected: everything below `GetVideoFrameSurface` is
 typed on `AVDRMFrameDescriptor`. `docs/video-decode.md` §5 has the code.
+
+### 0.9 What the video wire stage settled
+
+Built 2026-08-13, `docs/video-decode.md` §4a, §4b and §6. **§0.8's wall is
+down: the generator carries the `StdVideo*` types, the video profile builds the
+whole stack, and the H.264 capability path crosses the boundary byte-identically
+to the driver's own answer.** The decode itself still does not run, and the
+reason is now the one §0.8 item 2 already named.
+
+**1. The answer to "how should the generator learn about `vk_video`" was to read
+the other registry.** §0.8 item 1 framed the choice as parsing C headers or
+hand-writing layouts, and said either would put a second source of truth about a
+C layout into the project. Neither was needed. Every `vk_video/*.h` header opens
+with *"This header is generated from the Khronos Vulkan XML API Registry"*, and
+that registry is `share/vulkan/registry/video.xml` — same package as `vk.xml`,
+same schema, same parser. `vk_registry::Model::merge_video` is the whole change;
+`§7.1`'s "one XML file and nothing else" becomes "two, from one pinned store
+path", which is the same property.
+
+The relationship to the headers is now the one `sv-testkit::cheader` already had
+to `vulkan_core.h`: **they are the check, not the input.** They are in
+`header_paths()`, so every `STD_VIDEO_*` extent and every `StdVideo*` enum value
+is compared alongside the rest of the API; `check_structs` compares each
+`StdVideo*` struct's members and array extents; `check_flag_words` compares each
+bitfield struct's field order, widths and offsets. Three negative controls plant
+the faults that matter.
+
+**2. The zero-sized `AbiType::Opaque` was a live bug, not a latent one.** §0.8
+item 1 said "latently, since nothing reaches it today". Refusing an external
+type used by value found `vkGetPhysicalDeviceXcbPresentationSupportKHR`'s
+`xcb_visualid_t visual_id` — in the **zink** profile, on the shipping C surface,
+declared as a zero-sized incomplete type in an `extern "system"` signature. It
+has never had a symptom because that entry point exists only so the loader's
+terminator does not `abort()` and it ignores the argument.
+`exceptions::PLATFORM_SCALARS` is now a closed two-entry table with the header
+line that gives each width. This is the third realised instance of R8's shape —
+a wrong answer with no symptom — and the second one found by adding an assertion
+rather than by hitting it.
+
+**3. Bitfields come back into scope, narrowly and by data.** §7.4 put them out
+because `vk.xml` has one bitfield struct and it is ray tracing. `video.xml` has
+**293 members of the form `uint32_t x : 1`**. `plan::FlagWordPlan` carries a
+struct whose members are *all* `uint32_t` bitfields fitting one word as that
+word — `#[repr(transparent)] struct StdVideoH264SpsFlags(pub u32)` — and refuses
+anything that mixes bitfields with ordinary members, so
+`VkAccelerationStructureInstanceKHR` stays excluded and its exclusion stays a
+tripwire. **The wire does not depend on the bit order**, because the word is
+copied and never taken apart; only the generated accessors do, and the layout
+they assume is compared against the headers field by field.
+
+**4. §0.8 item 1's "these have to be deep-copied by hand" was wrong.**
+`StdVideoH264SequenceParameterSet`'s three pointers are described by
+`video.xml`'s own `len=` and `optional=`, so the ordinary generator produces
+`Vec<i32>` and `Option<Box<…>>` and walks them like any other pointer graph. The
+thing that made them look unwalkable — no `sType`, no `pNext` — only defeats a
+*generic* walker, and this generator is not one.
+
+**5. Two-dimensional arrays existed and had never been reached.**
+`StdVideoH264ScalingLists::ScalingList4x4` is `uint8_t[6][16]`. The GPU side's
+`raise` asked the whole member for its element type at both levels and emitted a
+loop pushing a `u8` into a `Vec<[u8; 16]>`; the header cross-check compared the
+*product* of the extents, which calls `[6][16]` and `[96]` the same thing. Both
+were found by a profile reaching them and both are fixed. Neither is
+video-specific and neither was reachable from any earlier profile.
+
+**6. Merging a second registry is inert for a profile that does not reach it.**
+The zink `protocol_hash` is `0x44c19f913c79a5fa` before and after, and the ICD
+and GPU-side command counts are unchanged. Stated because "we added a registry
+and the wire did not move" is the claim that makes the change safe to land.
+
+**7. The capability path crosses, and the numbers are the driver's.** With
+`SV_PROTO_PROFILE=video`, the forwarded device advertises
+`VK_KHR_video_queue`, `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`
+and answers `vkGetPhysicalDeviceVideoCapabilitiesKHR` and
+`vkGetPhysicalDeviceVideoFormatPropertiesKHR`. The 44-line H.264 block of
+`video-probe caps` is **byte-identical** to the same probe run directly against
+the same RADV, `sha256 9c1dca7512d844d6…` — including `maxLevelIdc`, the
+`StdVideoH264LevelIdc` that stopped the planner, and a `pNext` chain carrying
+two codec-specific capability structures. §1 says these numbers are not
+believable, which is exactly why forwarding them had to be checked against the
+driver rather than against a range.
+
+**8. The remaining wall is the one queue family of §0.4 item 7, and it is not to
+be removed by adding a second one.** `video-probe decode` through the forwarder
+stops at "no queue family with `VIDEO_DECODE`". Advertising a decode family would
+mean a second ring (D8), a family the app side can see, and building the design
+§0.8 item 2 rejects — so this stage did not. What is measured is that everything
+below that decision works, and that what remains is a stage: the GPU side owning
+the session, the DPB and the decode queue privately, answering a protocol
+command the generator cannot write. §11's future work.
 
 One thing about the harness rather than the result. **A `pNext` that the
 specification requires and the driver does not check is a segfault with no
@@ -2592,6 +2689,19 @@ against ~20 (§7.4). Pure Rust stands, and the JSON model is not revisited.
 Registry sourcing is unchanged: `$VK_XML` from the pinned `vulkan-headers`, no
 fallback to a system path, exactly as `vk-registry` already enforces.
 
+**[AMENDED — 2026-08-13, §0.9 item 1.] There are two registries, from one
+package.** `vk.xml` does not define the `StdVideo*` types; it names them with
+`requires="vk_video/vulkan_video_codec_h264std.h"` and stops, which is what made
+`docs/video-decode.md` §4 call video decode unforwardable. The definitions have a
+registry of their own — `share/vulkan/registry/video.xml`, beside `vk.xml` in the
+same store path, and the file the `vk_video/*.h` headers are generated *from*. It
+is the same schema, read by the same parser, and merged in
+`vk_registry::Model::merge_video`. Its path is **derived** from `$VK_XML` and a
+missing file is an error, so the drift objection above does not reappear: the two
+are the same release by construction. Nothing else about this section changes —
+in particular the generator still reads no C, and the headers are read only by
+`sv-testkit` as the independent check.
+
 **A `<feature>` is not a leaf, and assuming it is produces a small protocol
 rather than an error.** As of `vulkan-headers 1.4.350` each core version is split
 into `apitype="internal"` sub-features chained by `depends=`:
@@ -2767,6 +2877,16 @@ an escape hatch. Budget for it now (fwd §1.3, §4.3):
   that is legal.
 - **`VkAccelerationStructureInstanceKHR`**: bitfields the registry cannot
   describe. Out of scope with ray tracing.
+
+  **[CORRECTED — 2026-08-13, §0.9 item 3.]** The registry *can* describe them —
+  `vk.xml` writes `<member><type>uint32_t</type><name>mask</name> : 8</member>`
+  and `vk-parse` carries the width — and `video.xml` has 293 of them, so the
+  video profile does not exist without them. `plan::FlagWordPlan` carries a
+  struct whose members are **all** `uint32_t` bitfields fitting one word, as
+  that word. `VkAccelerationStructureInstanceKHR` mixes bitfields with ordinary
+  members and is still refused, so this entry stands as written for the type it
+  names; what changed is that it is no longer a statement about bitfields in
+  general.
 
 Every exception is a data entry in one file, and an unlisted case is a build
 failure. That is the difference between a generator that is honest about its
@@ -3197,6 +3317,24 @@ change my mind:* Zink shipping and conformant, plus a decision to expose a
 second, non-suballocated, permanently-resident memory class for BDA-using
 applications. That is a different project and it comes after this one.
 
+**Video decode is in scope, and the shape it takes is a protocol extension.**
+The types cross today and the capability queries cross byte-identically to the
+driver's own answers (§0.9); what does not is a decode, because the ICD
+advertises one universal queue family and a decode queue is a second one. The
+answer is **not** to advertise a second family. §0.6's rule — a capability
+expressible in the forwarded API does not deserve a protocol extension — has its
+mirror here: decode's *state machine* is expressible, but the queue it runs on
+cannot be shown to the app side without a second ring (D8) and a family the
+application would have to be told not to use. So the GPU side owns the video
+session, the DPB and the decode queue **privately**, and what crosses is a
+compressed bitstream and an image id. That is 188× less data at 1080p30
+(`docs/video-decode.md` §2), it is the only candidate since
+`vkUpdateDescriptorSetWithTemplate` that passes §0.6's test, and it is a stage of
+its own: the GPU side has to allocate the DPB, keep a slot table per session and
+answer a command the generator cannot write. **H.264 only** until something is
+measured — AV1's per-frame structure has eight pointers where H.264's has none,
+so the marshalling argument does not transfer.
+
 **What this means for the DirectX goal, stated without hedging.** D3D9, D3D10
 and D3D11 through DXVK ≤ 2.6 are a realistic target once Zink works. **D3D12 is
 not, and will not be.** The honest answer for D3D12 on `testhost` is to run
@@ -3210,9 +3348,9 @@ framing holds for GL and for older D3D, and does not hold for D3D12.
 
 | Crate | Kind | Contents |
 |---|---|---|
-| `vk-registry` | lib | **Exists.** Typed model, the 375-line C declarator parser, `depends=` resolution and profiles (§7.1). The only thing that reads `vk.xml`. |
+| `vk-registry` | lib | **Exists.** Typed model, the 375-line C declarator parser, `depends=` resolution and profiles (§7.1). The only thing that reads `vk.xml` — and, since §0.9, the `video.xml` beside it. |
 | `sv-codegen` | bin + lib | **Exists.** The generator: ten emitted passes (`arena_bind` has nothing to do, §7.2), exception table, `quote`/`prettyplease` emission, protocol-hash computation |
-| `sv-proto` | lib, **generated**, `forbid(unsafe_code)` | **Exists.** Types, encode, decode, pnext, handle_map, transform, subdecode — 126,205 lines for the 239-command Zink profile |
+| `sv-proto` | lib, **generated**, `forbid(unsafe_code)` | **Exists.** Types, encode, decode, pnext, handle_map, transform, subdecode — 126,205 lines for the 239-command Zink profile, 140,238 for the 252-command video profile (`SV_PROTO_PROFILE=video`, §0.9) |
 | `sv-icd-entry` | lib, **generated** | `extern "system"` stubs and proc-address tables. The only generated crate that permits `unsafe`, in one mechanical shape |
 | `sv-wire` | lib | **Exists.** Bounds-checked cursor, packet headers, primitive encodings. Hand-written, Miri-tested |
 | `sv-transport` | lib | Region mapping, handshake, rings, reply rings, reverse ring, `Parker`/`Doorbell` traits and backends, cold-path socket |

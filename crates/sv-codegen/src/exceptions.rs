@@ -171,6 +171,59 @@ const UNSERIALISABLE: &[(&str, &str)] = &[
     ),
 ];
 
+/// Platform typedefs that appear **by value** on the ICD's C surface, and the
+/// integer each one actually is.
+///
+/// `vk.xml` names a platform type and stops: `<type requires="xcb/xcb.h"
+/// name="xcb_visualid_t"/>` says where the definition lives and nothing about
+/// it. `abi::AbiType::Opaque` renders that as a zero-sized incomplete type,
+/// which is the correct and complete ABI of a type only ever seen behind a
+/// pointer — and silently wrong for one used by value, where it gives the
+/// parameter no storage at all.
+///
+/// **Two parameters on the whole surface are in that position**, and both are
+/// found by `abi::build`'s refusal rather than by reading:
+///
+/// - `vkGetPhysicalDeviceXcbPresentationSupportKHR(…, xcb_visualid_t visual_id)`
+/// - `vkGetPhysicalDeviceXlibPresentationSupportKHR(…, VisualID visualID)`
+///
+/// Both are on the surface for the reason `abi::SURFACE_CREATORS` gives — the
+/// loader's terminator calls `abort()` for an ICD that does not export them —
+/// and both are answered locally without looking at the value. So a wrong width
+/// here has never had a symptom, which is exactly why it is written down rather
+/// than left to be right by accident.
+///
+/// The widths are the platform headers', quoted:
+///
+/// ```c
+/// /* xcb/xproto.h  */ typedef uint32_t xcb_visualid_t;
+/// /* X11/X.h       */ typedef unsigned long VisualID;
+/// ```
+///
+/// `VisualID` is `unsigned long`, so it is 64-bit on the LP64 targets this ICD
+/// is built for. It is written as `uint64_t` and the entry says why, because
+/// "long" is the one C width that is not a fact about the type alone. Xlib does
+/// not exist on the Windows side of this project, so there is no target where
+/// the other reading applies.
+///
+/// The second field is a **registry primitive name**, not a Rust one, so it goes
+/// through the same `c_type` mapping every other declaration does.
+///
+/// This is a hand-written table about a C layout, which is the thing
+/// `vk_registry::video_registry_path` argues against — and the difference is
+/// that there is no machine-readable source to prefer. For the `StdVideo*`
+/// types there is one, and it is used. Here there is not, so the table names its
+/// source, states its scope, and is closed: `abi::build` refuses any *other*
+/// external type used by value, so this list cannot silently grow.
+pub const PLATFORM_SCALARS: &[(&str, &str)] = &[
+    ("xcb_visualid_t", "uint32_t"),
+    ("VisualID", "uint64_t"),
+];
+
+pub fn platform_scalar(type_name: &str) -> Option<&'static str> {
+    PLATFORM_SCALARS.iter().find(|(n, _)| *n == type_name).map(|(_, t)| *t)
+}
+
 /// Members whose value is a `(memory, offset)` pair the `transform` pass must
 /// rewrite (design.md §5.3).
 ///

@@ -291,6 +291,67 @@ pub struct BitmaskPlan {
     pub values: Vec<(String, i64)>,
 }
 
+/// One member of a C bitfield struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitField {
+    pub name: String,
+    pub rust_name: String,
+    /// Bit position of the low bit, counting from the least significant bit of
+    /// the storage unit. See [`FlagWordPlan`] for why that direction is assumed
+    /// and what checks it.
+    pub offset: u32,
+    pub bits: u32,
+}
+
+/// A C struct whose members are *all* bitfields of one `uint32_t`.
+///
+/// # Why this shape exists at all
+///
+/// design.md §7.4 put bitfields out of scope and the planner refused them
+/// outright, because `vk.xml`'s only bitfield struct is
+/// `VkAccelerationStructureInstanceKHR`, which is ray tracing and out of scope
+/// anyway. `video.xml` is nothing like that: **293 of its members are
+/// `uint32_t x : 1`**, and every `StdVideo*Flags` type on the H.264 decode
+/// surface is one of these and nothing else. Refusing them refuses video decode.
+///
+/// So the exception is budgeted rather than discovered, in §7.4's sense, and it
+/// is deliberately the narrowest rule that admits the video types:
+///
+/// - every member is a bitfield, and
+/// - every member's declared type is `uint32_t`, and
+/// - the widths sum to at most 32.
+///
+/// A struct that mixes bitfields with ordinary members is still refused, so
+/// `VkAccelerationStructureInstanceKHR` — bitfields *and* a
+/// `VkTransformMatrixKHR` — stays out and its exclusion in
+/// `abi::surface_profile` stays a live tripwire.
+///
+/// # What crosses, and why the bit order is not a wire question
+///
+/// The wire form is **one `u32`, copied**. Neither side ever takes the word
+/// apart: the ICD reads the application's struct as a word and sends it; the GPU
+/// side writes that word into the struct it hands the driver. So the protocol
+/// does not depend on which end of the word `constraint_set0_flag` lives at —
+/// only on the two C compilers agreeing, which they must anyway for the
+/// application and the driver to agree on the same machine.
+///
+/// The generated *accessors* do depend on it. They assume the allocation order
+/// every C ABI this project targets uses — first member at bit 0, ascending —
+/// which is what the x86-64 System V ABI and MSVC on x64 both specify for
+/// consecutive same-type bitfields. That assumption is checked rather than
+/// asserted: `sv-testkit`'s video header cross-check reads the widths and order
+/// out of `vk_video/*.h` independently, and `docs/video-decode.md` records that
+/// the same layout, via bindgen, decoded byte-identically on RADV, NVIDIA and
+/// the guest Intel driver — three drivers across both ABIs.
+#[derive(Debug, Clone)]
+pub struct FlagWordPlan {
+    pub name: String,
+    /// Always 32 today; carried so a future 16-bit flag word is a planner change
+    /// rather than a silent widening.
+    pub bit_width: u32,
+    pub fields: Vec<BitField>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandlePlan {
     pub name: String,
@@ -306,6 +367,9 @@ pub struct Plan {
     pub structs: Vec<StructPlan>,
     pub enums: Vec<EnumPlan>,
     pub bitmasks: Vec<BitmaskPlan>,
+    /// C bitfield structs, which are `Scalar::Bitmask` on the wire and a
+    /// `#[repr(transparent)]` `u32` newtype in Rust. See [`FlagWordPlan`].
+    pub flag_words: Vec<FlagWordPlan>,
     pub handles: Vec<HandlePlan>,
     /// Type aliases in the profile: alias → target.
     pub type_aliases: BTreeMap<String, String>,
@@ -365,16 +429,24 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
                 parent: h.parent.clone(),
             }),
             TypeDef::Struct(s) => {
+                if let Some(fw) = flag_word_of(model, s)? {
+                    plan.flag_words.push(fw);
+                    continue;
+                }
                 let mut fields = Vec::new();
                 let member_names: Vec<String> =
                     s.members.iter().map(|m| m.name.clone()).collect();
                 let lengths = length_members(&s.members);
                 for m in &s.members {
-                    if m.bitfield_bits.is_some() {
+                    if let Some(bits) = m.bitfield_bits {
                         bail!(
-                            "{name}.{}: bitfields cannot be described by the registry and are \
-                             out of scope (design.md §7.4). Exclude the type in the profile if \
-                             this is intentional.",
+                            "{name}.{}: a {bits}-bit bitfield in a struct that is not a flag \
+                             word. The planner carries a struct whose members are *all* \
+                             `uint32_t` bitfields summing to at most 32 bits, as one `u32` \
+                             (see plan::FlagWordPlan); a struct that mixes bitfields with \
+                             ordinary members has no layout the registry states and none this \
+                             generator will invent (design.md §7.4). Exclude the type in the \
+                             profile if this is intentional.",
                             m.name
                         );
                     }
@@ -482,6 +554,54 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
     plan.handles.sort_by(|a, b| a.name.cmp(&b.name));
     plan.structs.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(plan)
+}
+
+/// Recognise a C bitfield struct, and lay its members out.
+///
+/// Returns `Ok(None)` for anything that is not one — the common case, and the
+/// answer for every struct in `vk.xml` except `VkAccelerationStructureInstanceKHR`.
+/// Returns an error only for the shapes that *look* like a flag word and are
+/// not, because those are the ones where guessing would produce a plausible
+/// wrong answer.
+///
+/// See [`FlagWordPlan`] for the rule and for what the bit order rests on.
+pub fn flag_word_of(model: &Model, s: &vk_registry::StructType) -> Result<Option<FlagWordPlan>> {
+    if s.is_union || s.members.is_empty() || !s.members.iter().all(|m| m.bitfield_bits.is_some()) {
+        return Ok(None);
+    }
+    let mut fields = Vec::new();
+    let mut offset = 0u32;
+    for m in &s.members {
+        let bits = m.bitfield_bits.unwrap_or(0);
+        let base = m.ty.base_name().unwrap_or("");
+        if model.canonical_type(base) != "uint32_t" || m.ty.indirection() != 0 {
+            bail!(
+                "{}.{}: a bitfield of {base}. The planner carries `uint32_t` bitfields \
+                 only, because that is the only spelling `video.xml` uses and because a \
+                 narrower storage unit changes both the wire width and the packing rule \
+                 (plan::FlagWordPlan).",
+                s.name,
+                m.name
+            );
+        }
+        if bits == 0 || offset + bits > 32 {
+            bail!(
+                "{}.{}: {bits} bits at offset {offset} does not fit one 32-bit storage \
+                 unit. A C compiler would start a second word here and this generator \
+                 would silently drop it.",
+                s.name,
+                m.name
+            );
+        }
+        fields.push(BitField {
+            name: m.name.clone(),
+            rust_name: crate::naming::snake_case(&m.name),
+            offset,
+            bits,
+        });
+        offset += bits;
+    }
+    Ok(Some(FlagWordPlan { name: s.name.clone(), bit_width: 32, fields }))
 }
 
 /// Which members are named by some other member's `len=`.
@@ -693,6 +813,13 @@ fn scalar_of(model: &Model, owner: &str, field: &str, name: &str) -> Result<Scal
         TypeDef::Struct(s) => {
             if s.is_union {
                 Scalar::Union(s.name.clone())
+            } else if flag_word_of(model, s)?.is_some() {
+                // A flag word is one `u32` on the wire, which is what
+                // `Scalar::Bitmask` already means. Reusing it rather than adding
+                // a variant keeps the encoders, decoders, samplers and the
+                // manifest renderer untouched — the wire really is identical,
+                // and the difference is only in how the *type* is declared.
+                Scalar::Bitmask(s.name.clone())
             } else {
                 Scalar::Struct(s.name.clone())
             }

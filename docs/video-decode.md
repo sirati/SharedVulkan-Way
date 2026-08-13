@@ -18,6 +18,9 @@ a *second* RADV whose answers differ from the system one. Three shells appear:
 The instrument is `crates/video-probe`, and `scripts/sv-video-decode.sh` runs
 the whole thing.
 
+§1–§3 are the drivers and were measured 2026-08-13. §4 was the forwarder and it
+did not work; **§4a and §6 are the day after**, when it partly did.
+
 ---
 
 ## 1. The survey
@@ -268,90 +271,176 @@ same field the two RADVs disagree about in §1, from the other side.
 
 ---
 
-## 4. What it would take to forward it, measured
+## 4. The wall was a type, and the type had a registry
 
-**It does not forward today, and the wall is not where the phase-2 research
-expected.** It is not the queue family and it is not `VkVideoSessionKHR`. It is
-that `vk.xml` does not define the types.
+> **[SUPERSEDED — 2026-08-13. The section below is kept because the reasoning
+> that turned out to be wrong is the useful part. §4a says what happened.]**
+>
+> **It does not forward today, and the wall is not where the phase-2 research
+> expected.** It is not the queue family and it is not `VkVideoSessionKHR`. It is
+> that `vk.xml` does not define the types.
+>
+> The experiment is one command and it is in the tree, as
+> `vk_registry::profiles::video` — the Zink profile plus `VK_KHR_video_queue`,
+> `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`:
+>
+> ```
+> $ cargo run -p sv-codegen -- --profile video --stats
+> Error: planning profile "video"
+>
+> Caused by:
+>     VkVideoDecodeH264CapabilitiesKHR.maxLevelIdc: StdVideoH264LevelIdc comes
+>     from a platform header and is not serialisable (design.md §6.1)
+> ```
+>
+> The profile resolves — every dependency is satisfied by a core 1.3 profile — and
+> then `plan.rs` refuses on the first `StdVideo*` type it reaches. The registry
+> carries these types as `TypeDef::External`, because that is all `vk.xml` says
+> about them:
+>
+> ```xml
+> <type requires="vk_video/vulkan_video_codec_h264std.h" name="StdVideoH264LevelIdc"/>
+> ```
+>
+> Six of them are on the H.264 decode surface: `StdVideoH264ProfileIdc`,
+> `StdVideoH264LevelIdc`, `StdVideoH264SequenceParameterSet`,
+> `StdVideoH264PictureParameterSet`, `StdVideoDecodeH264PictureInfo` and
+> `StdVideoDecodeH264ReferenceInfo`. The definitions live in
+> `vk_video/vulkan_video_codec_h264std.h`, a header this project has never
+> parsed — the generator reads one XML file and nothing else, which is §7.1's
+> whole design.
+>
+> Four consequences, in increasing order of how much work they are.
+>
+> 1. **The C ABI pass is already wrong about them, latently.** `abi.rs` maps
+>    `TypeDef::External` to `AbiType::Opaque`, emitted as a zero-sized incomplete
+>    type on the reasoning that an external type is only ever seen behind a
+>    pointer. `VkVideoDecodeH264ProfileInfoKHR::stdProfileIdc` is a
+>    `StdVideoH264ProfileIdc` **by value**, and so is the `maxLevelIdc` above. The
+>    assumption holds for `HWND` and `xcb_connection_t` and does not hold here.
+> 2. **The per-frame structures could cross as bytes; the per-stream ones cannot.**
+>    `StdVideoDecodeH264PictureInfo` and `StdVideoDecodeH264ReferenceInfo` are
+>    flat: bitfields, integers, a two-element array, no pointers.
+>    `StdVideoH264SequenceParameterSet` holds **three pointers**
+>    (`pOffsetForRefFrame`, `pScalingLists`, `pSequenceParameterSetVui`) and
+>    `StdVideoH264PictureParameterSet` holds one. They are not `pNext` chains and
+>    carry no `sType`, so nothing generic can walk them; §1a's rule that no
+>    descriptor crosses has an obvious sibling here, which is that no *pointer*
+>    crosses either, and these have to be deep-copied by hand. H.265 is worse —
+>    its sequence parameter set has seven pointers and nests four deep.
+> 3. **The decode queue needs a family that does not exist on either side.** …
+> 4. **The alternative is to teach the pipeline about `vk_video`**, either by
+>    parsing those headers or by a new exception category carrying a known layout.
+>    Both put a second source of truth about a C layout into a project whose whole
+>    argument is that there is one. Recorded as the option, not as the
+>    recommendation.
 
-The experiment is one command and it is in the tree, as
-`vk_registry::profiles::video` — the Zink profile plus `VK_KHR_video_queue`,
-`VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`:
+Item 3 is unchanged and is now the only one left; it is restated in §6. Items 1,
+2 and 4 did not survive contact.
 
-```
-$ cargo run -p sv-codegen -- --profile video --stats
-Error: planning profile "video"
+### 4a. `video.xml`
 
-Caused by:
-    VkVideoDecodeH264CapabilitiesKHR.maxLevelIdc: StdVideoH264LevelIdc comes
-    from a platform header and is not serialisable (design.md §6.1)
-```
+**The `vk_video` headers are generated from a registry, and that registry ships
+in the same package as `vk.xml`.** The first line of every one of them says so:
 
-The profile resolves — every dependency is satisfied by a core 1.3 profile — and
-then `plan.rs` refuses on the first `StdVideo*` type it reaches. The registry
-carries these types as `TypeDef::External`, because that is all `vk.xml` says
-about them:
-
-```xml
-<type requires="vk_video/vulkan_video_codec_h264std.h" name="StdVideoH264LevelIdc"/>
-```
-
-Six of them are on the H.264 decode surface: `StdVideoH264ProfileIdc`,
-`StdVideoH264LevelIdc`, `StdVideoH264SequenceParameterSet`,
-`StdVideoH264PictureParameterSet`, `StdVideoDecodeH264PictureInfo` and
-`StdVideoDecodeH264ReferenceInfo`. The definitions live in
-`vk_video/vulkan_video_codec_h264std.h`, a header this project has never
-parsed — the generator reads one XML file and nothing else, which is §7.1's
-whole design.
-
-Four consequences, in increasing order of how much work they are.
-
-1. **The C ABI pass is already wrong about them, latently.** `abi.rs` maps
-   `TypeDef::External` to `AbiType::Opaque`, emitted as a zero-sized incomplete
-   type on the reasoning that an external type is only ever seen behind a
-   pointer. `VkVideoDecodeH264ProfileInfoKHR::stdProfileIdc` is a
-   `StdVideoH264ProfileIdc` **by value**, and so is the `maxLevelIdc` above. The
-   assumption holds for `HWND` and `xcb_connection_t` and does not hold here.
-2. **The per-frame structures could cross as bytes; the per-stream ones cannot.**
-   `StdVideoDecodeH264PictureInfo` and `StdVideoDecodeH264ReferenceInfo` are
-   flat: bitfields, integers, a two-element array, no pointers.
-   `StdVideoH264SequenceParameterSet` holds **three pointers**
-   (`pOffsetForRefFrame`, `pScalingLists`, `pSequenceParameterSetVui`) and
-   `StdVideoH264PictureParameterSet` holds one. They are not `pNext` chains and
-   carry no `sType`, so nothing generic can walk them; §1a's rule that no
-   descriptor crosses has an obvious sibling here, which is that no *pointer*
-   crosses either, and these have to be deep-copied by hand. H.265 is worse —
-   its sequence parameter set has seven pointers and nests four deep.
-3. **The decode queue needs a family that does not exist on either side.** The
-   GPU side picks one compute-capable family at startup (`driver.rs`) and the
-   ICD advertises one universal family (`advertise.rs`), and D8 gives each queue
-   its own ring. A video decode queue is a second family and therefore a second
-   ring. But — and this is the interesting part — **it may not have to be
-   visible at all.** §0.6's rule is that a capability expressible in the
-   forwarded API does not deserve a protocol extension; the mirror of it applies
-   here. If the GPU side owns the video session, the DPB and the decode queue
-   privately, then what crosses is "decode these bytes into this image", the
-   second ring never exists, and the app side never sees a queue family it
-   cannot use. That is a protocol extension, and it is the first candidate since
-   `vkUpdateDescriptorSetWithTemplate` that passes §0.6's test — because the API
-   *cannot* be expressed by a generator that only reads `vk.xml`.
-4. **The alternative is to teach the pipeline about `vk_video`**, either by
-   parsing those headers or by a new exception category carrying a known layout.
-   Both put a second source of truth about a C layout into a project whose whole
-   argument is that there is one. Recorded as the option, not as the
-   recommendation.
-
-Meanwhile the forwarded device says so honestly. `video-probe caps` against our
-own ICD, with the GPU side on RADV:
-
-```
-device 0: AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO)
-  video extensions: none
+```c
+/*
+** This header is generated from the Khronos Vulkan XML API Registry.
+**
+*/
 ```
 
-which is §0.4 item 8 working exactly as designed: the device extension list is
-the profile's extensions intersected with the driver's, and the profile has
-none of these.
+and the file is `share/vulkan/registry/video.xml`, 196 KB, in the same nix store
+path `$VK_XML` points into. It is the same schema — `<types>`, `<enums>`,
+`<member len="…" optional="…">` — so `vk-parse` reads it and
+`vk_registry::Model::merge_video` merges it with the same `build_types` and
+`build_enums` the main registry gets. **No C parser, no hand-written table of
+layouts, and no second source of truth**, which was §4 item 4's whole objection.
+
+That was the decision, and the rest of this section is what it cost and what it
+found. Three things had to change in the generator and none of them is
+video-specific.
+
+**1. Bitfields, which §7.4 had put out of scope.** `vk.xml` has one bitfield
+struct and it is ray tracing. `video.xml` has **293 members of the form
+`uint32_t x : 1`**, and every `StdVideo*Flags` type is one of these and nothing
+else. So `plan::FlagWordPlan` carries a struct whose members are *all* `uint32_t`
+bitfields summing to at most 32 bits, as the one word it occupies:
+`#[repr(transparent)] struct StdVideoH264SpsFlags(pub u32)`, with a getter and a
+setter per field. A struct that *mixes* bitfields with ordinary members is still
+refused, so `VkAccelerationStructureInstanceKHR` stays out and its exclusion
+stays a live tripwire.
+
+The bit order is worth being precise about. **The wire does not depend on it**:
+the word is copied end to end and neither side takes it apart, so what has to
+agree is the two sides' C compilers — which they must anyway, because each
+side's compiler has to agree with its own driver. The generated *accessors* do
+depend on it, and they assume what the x86-64 System V ABI and MSVC x64 both
+specify: first member at bit 0, ascending. §3's byte-identical decodes are the
+evidence, since `video-probe` uses bindgen's reading of the same headers on both
+Linux and Windows.
+
+**2. `abi.rs`'s zero-sized `AbiType::Opaque`, which was live and not latent.**
+§4 item 1 said the by-value problem was latent because nothing reached it. It
+was not. `abi::build` now refuses any external type used by value, and the first
+thing it refused was not a video type at all:
+
+```
+Error: vkGetPhysicalDeviceXcbPresentationSupportKHR.visual_id: xcb_visualid_t is
+a platform type the registry only names, used *by value*.
+```
+
+`xcb_visualid_t` is a `uint32_t` and the ICD had been declaring it as a
+zero-sized incomplete type in an `extern "system"` signature — in the **zink**
+profile, shipping today. It has never had a symptom, because that entry point
+exists only to stop the loader's terminator calling `abort()` and it ignores the
+argument. `exceptions::PLATFORM_SCALARS` is now a two-entry table, closed, with
+the header line that gives each width; anything not in it is a build failure.
+
+**3. Two-dimensional arrays, which no profile had reached.**
+`StdVideoH264ScalingLists::ScalingList4x4` is `uint8_t[6][16]`. The GPU side's
+`raise` asked the *whole member* for its element type at every level of the
+recursion, so both levels got `[u8; 16]` and the inner loop pushed a `u8` into a
+`Vec<[u8; 16]>`. Caught by the compiler, but only once a profile reached it; the
+cross-check's extent comparison had the same fault in a quieter form, comparing
+the *product* of the extents, which calls `uint8_t[6][16]` and `uint8_t[96]` the
+same thing. Both fixed.
+
+And §4 item 2 was simply wrong. The per-stream structures do **not** have to be
+deep-copied by hand: `video.xml` states `len="num_ref_frames_in_pic_order_cnt_cycle"`
+on `pOffsetForRefFrame` and `optional="true"` on the other two, so the ordinary
+generator produces `Vec<i32>` and `Option<Box<…>>` and walks them like any other
+pointer graph. The thing that made them look unwalkable — no `sType`, no
+`pNext` — is only a problem for a *generic* walker, and this generator is not
+one.
+
+### 4b. What is checked, and by what
+
+The whole argument for reading `video.xml` instead of the headers is that it is
+the source the headers come from. That is only worth anything if the two are
+compared, so they are, by the same machinery `vulkan_core.h` already had
+(`sv-testkit/src/cheader.rs`, `xcheck.rs`):
+
+- the `vk_video/*.h` headers are now part of `cheader::header_paths()`, so every
+  `STD_VIDEO_*` array extent and every `StdVideo*` enum value is compared with
+  the constants and enum values of the rest of the API rather than in a special
+  case;
+- `xcheck::check_structs` compares every `StdVideo*` struct's member sequence,
+  each member's C type, and each fixed array's extents **level by level**;
+- `xcheck::check_flag_words` compares each bitfield struct's member sequence,
+  each field's width in bits, and the offset that follows — the check that makes
+  the flag-word layout a comparison rather than an assertion;
+- three negative controls plant the faults that matter: a one-bit flag widened
+  to two (which shifts every flag after it), two bitfields swapped, and a member
+  dropped from `StdVideoH264SequenceParameterSet`.
+
+What none of it can see is the *direction* a C compiler allocates bits in. The
+header does not say and no reading of it can. That is stated as an assumption
+where it is made, with §3 as the evidence.
+
+The Zink profile's `protocol_hash` is **unchanged** at `0x44c19f913c79a5fa`
+across the whole change, which is the statement that merging a second registry
+is inert for a profile that does not reach it.
 
 ---
 
@@ -600,11 +689,115 @@ No `vkCmdCopyImageToBuffer`, no `av_hwframe_transfer_data`, no `vkMapMemory`.
 
 ---
 
+## 6. What crosses the boundary now, and where it stops
+
+Measured 2026-08-13 in `nix develop`, with the GPU side pointed at the **system**
+RADV (Mesa 26.1.1) so that the comparison is transport against no transport
+rather than one driver against another — the dev shell carries two RADVs and §1
+records that they answer differently. `scripts/sv-video-decode.sh` checks 5 and 6
+run all of this; the binaries have to be built for the profile:
+
+```
+SV_PROTO_PROFILE=video cargo build -p sv-icd -p sv-gpu-server -p video-probe
+```
+
+**The profile plans, and the whole stack builds against it.**
+
+| | zink | video |
+|---|---|---|
+| wire commands | 239 (+35 aliases) | **252** (+35) |
+| wire structs / unions | 338 / 2 | **371** / 2 |
+| enums / bitmasks | 127 / 98 | **144** / 111 |
+| `protocol_hash` | `0x44c19f913c79a5fa` | `0xdd37c6aa3d072455` |
+| ICD C surface | 260 commands, 615 types | **273**, 685 |
+| GPU side forwarded generically | 217 | **230** |
+
+The thirteen new commands are `VK_KHR_video_queue`'s and
+`VK_KHR_video_decode_queue`'s, all of them forwarded by the generator with no
+hand-written line on either side. 636 generated round-trip tests pass for the
+video profile, including `roundtrip_std_video_h264_sequence_parameter_set`,
+`roundtrip_std_video_h264_scaling_lists`,
+`roundtrip_std_video_decode_h264_picture_info` and
+`roundtrip_cmd_vk_cmd_decode_video_khr`.
+
+**The forwarded device advertises the video extensions and answers the
+capability queries with the driver's own numbers.** `video-probe caps` against
+our ICD, GPU side on RADV:
+
+```
+device 0: AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO)
+  video extensions: VK_KHR_video_decode_h264(9) VK_KHR_video_decode_queue(8)
+                    VK_KHR_video_queue(8)
+```
+
+and the check that matters is not that it answered but that it answered the same
+thing. The H.264 block of the report — four profiles, their coded extents, DPB
+slot counts, bitstream buffer alignments, decode flags, every
+`vkGetPhysicalDeviceVideoFormatPropertiesKHR` row, and `maxLevelIdc`, which is
+the `StdVideoH264LevelIdc` that used to stop the planner — is **44 lines and
+byte-identical** between the direct run and the forwarded one, `sha256
+9c1dca7512d844d6…`. That is the same argument §3 makes with the frames, applied
+to the numbers: §1 says these numbers are not believable, so a forwarder that
+quietly rounded one would be indistinguishable from a driver that meant it,
+unless the two are put side by side.
+
+What crossed to produce it is worth naming, because it is exactly what §4 said
+could not: a `pNext` chain of `VkVideoDecodeCapabilitiesKHR` and
+`VkVideoDecodeH264CapabilitiesKHR` in, a `StdVideoH264LevelIdc` by value out,
+and a `VkVideoProfileInfoKHR` carrying a `VkVideoDecodeH264ProfileInfoKHR` whose
+`stdProfileIdc` is a `StdVideoH264ProfileIdc` by value.
+
+**The decode does not run, and the wall has moved to where §4 item 3 said it
+would.**
+
+```
+$ SV_SOCKET=… VK_DRIVER_FILES=…/sv_icd.json video-probe decode idr.264 out.nv12
+Error: no device can decode this profile:
+  AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO):
+    no queue family with VIDEO_DECODE
+```
+
+The ICD advertises one universal queue family (`advertise.rs`, design.md §0.4
+item 7) and the GPU side serves one compute-capable family (`driver.rs`). A
+video decode queue is a second family, and D8 gives every family its own ring.
+
+**That is not a thing to fix by adding a second family**, and this stage
+deliberately did not. design.md §0.8 item 2 names the shape the topology wants:
+if the GPU side owns the video session, the DPB and the decode queue *privately*,
+then what crosses is a compressed bitstream and an image id, the second ring
+never exists, and the app side never sees a queue family it cannot use. Adding a
+visible decode family would be building the alternative that section rejects,
+and it would then have to be unbuilt. The measurement here is that everything
+*below* that decision now works: the types cross, the queries cross, and the
+only thing left is whose queue submits.
+
+The honest cost of the remaining step, so it is not underestimated: a private
+video session means the GPU side allocating the DPB images, the decode target
+and the session parameters from its own device, keeping a slot table per
+session, and answering a protocol command that is not a Vulkan command. Every
+one of those is code that the generator cannot write, which is precisely §0.6's
+test being met — and it is a stage, not an afternoon.
+
+---
+
 ## What this does not tell us
 
-- **Nothing has been decoded through the forwarder.** §4 is a measurement of why
-  not, and it is precise, but it is not a decode. Every number in §3 is a driver
-  reached directly.
+- **Nothing has been decoded through the forwarder.** §6 moves the wall from a
+  type to a queue family and measures the capability path across it exactly, but
+  a capability query is not a decode. Every frame in §3 is a driver reached
+  directly.
+- **No video *object* has been created through the forwarder either.**
+  `vkCreateVideoSessionKHR` takes a `queueFamilyIndex` that must name a decode
+  family, so the session, its memory requirements and its parameters — which is
+  where `StdVideoH264SequenceParameterSet`'s three pointers would actually
+  cross a boundary rather than only round-trip in a test — are all downstream of
+  the same missing family. The round-trip tests exercise the marshalling; no
+  driver has yet been handed the result.
+- **The bit order of the flag words is assumed, not measured here.** §4a states
+  the assumption and §3 is the evidence for it, but the evidence is indirect:
+  three drivers agreed with *bindgen's* reading of the headers, not with this
+  generator's. A direct check would compare the two layouts in one process, and
+  it has not been written.
 - **Inter prediction has not been decoded at all**, on any device. Every frame
   in the fixture is an IDR. A real stream is 1 IDR in 250 frames and the other
   249 need reference list construction, which is where a decoder's real
@@ -638,9 +831,10 @@ No `vkCmdCopyImageToBuffer`, no `av_hwframe_transfer_data`, no `vkMapMemory`.
 ## Re-running it
 
 ```
-# everything, from the dev shell
+# everything, from the dev shell. The forwarded half of the script needs the
+# binaries built for the video profile, because the profile is a build input.
 nix develop
-cargo build -p video-probe -p sv-icd -p sv-gpu-server
+SV_PROTO_PROFILE=video cargo build -p video-probe -p sv-icd -p sv-gpu-server
 scripts/sv-video-decode.sh
 
 # NVIDIA — must be a clean shell, see flake.nix
@@ -655,8 +849,11 @@ scripts/pl.sh root 'install -m0755 /tmp/video-probe.exe /srv/winshare/probe/'
 scripts/pl.sh guest 'cd /z/probe && ./video-probe.exe caps'
 scripts/pl.sh guest 'cd /z/probe && ./video-probe.exe decode idr-320x180.264 Z:/probe/out.nv12'
 
-# the wall
+# the profile that used to be the wall
 cargo run -p sv-codegen -- --profile video --stats
+
+# the two checks that keep video.xml honest against the vk_video headers
+cargo test -p sv-testkit --test header_crosscheck
 ```
 
 `SV_VIDEO_DEVICE` matches a substring of the device name, case-insensitively,

@@ -134,7 +134,18 @@ fn raise_expr(
             // wire. Building through a `Vec` and converting keeps the `raise`
             // of each element in one place, and `try_from` cannot fail because
             // the loop runs exactly `n` times.
-            let inner = raise_expr(cx, elem, abi, &quote!((#access)[__i]), owner)?;
+            //
+            // The recursion peels one array level off the *member's own C type*
+            // as it descends, rather than asking the same member for its
+            // element type at every depth. That distinction only shows up with
+            // more than one dimension, and `StdVideoH264ScalingLists` —
+            // `uint8_t ScalingList4x4[6][16]` — is the first member in any
+            // profile that has two. Asking the whole member gave both levels
+            // `[u8; 16]`, so the inner loop pushed a `u8` into a
+            // `Vec<[u8; 16]>`: caught by the compiler, but only once a profile
+            // reached it.
+            let inner_abi = AbiMember { ty: peel_array(&abi.ty)?, ..abi.clone() };
+            let inner = raise_expr(cx, elem, &inner_abi, &quote!((#access)[__i]), owner)?;
             let cty = fixed_elem_c_type(cx, &abi.ty)?;
             quote!({
                 let mut __t: Vec<#cty> = Vec::with_capacity(#n);
@@ -258,6 +269,18 @@ fn pointee_c_type(cx: &Ctx<'_>, ty: &CType) -> Result<TokenStream, String> {
 }
 
 /// The C element type of a fixed array member.
+/// One array (or decayed-array pointer) level off a C type.
+///
+/// The type-level companion of [`fixed_elem_c_type`], which produces the
+/// *rendered* element type; this produces the `CType` the next level of the
+/// recursion should ask its questions of.
+fn peel_array(ty: &CType) -> Result<CType, String> {
+    match &ty.kind {
+        CTypeKind::Array(inner, _) | CTypeKind::Pointer(inner) => Ok((**inner).clone()),
+        _ => Err(format!("expected an array, got {ty:?}")),
+    }
+}
+
 fn fixed_elem_c_type(cx: &Ctx<'_>, ty: &CType) -> Result<TokenStream, String> {
     match &ty.kind {
         CTypeKind::Array(inner, _) => Ok(c_type(cx, inner)),

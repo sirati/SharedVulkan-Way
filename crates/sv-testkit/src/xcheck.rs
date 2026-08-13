@@ -80,6 +80,10 @@ pub struct Counts {
     pub structs: usize,
     pub members: usize,
     pub widths: usize,
+    /// C bitfield structs compared against their header declaration, and the
+    /// individual bitfields inside them. See [`check_flag_words`].
+    pub flag_words: usize,
+    pub flag_bits: usize,
     pub signatures: usize,
     pub params: usize,
     pub handles: usize,
@@ -572,6 +576,96 @@ fn our_declared_width(s: &Scalar) -> Option<usize> {
     })
 }
 
+/// Every C bitfield struct we carry as one word, against the header's own
+/// declaration of it.
+///
+/// This is the check that makes `plan::FlagWordPlan` something other than an
+/// assertion. The planner reads `video.xml` and lays the fields out in
+/// declaration order from bit 0; the header states the same struct in C, with
+/// its own `: N` widths, read by a parser that has never seen `video.xml`. What
+/// is compared is the member sequence, each member's width in bits, and the
+/// offset that follows from it — so a member dropped, reordered, or given the
+/// wrong number of bits is a failure here.
+///
+/// What it cannot see is the *direction* a C compiler allocates in, because the
+/// header does not say and no reading of it can. That is stated as an assumption
+/// in `plan::FlagWordPlan`, with the evidence for it: the same layout, via
+/// bindgen, decoded byte-identically on three drivers across both ABIs
+/// (`docs/video-decode.md`). It is also the one thing the wire does not depend
+/// on — the word is copied, never taken apart.
+pub fn check_flag_words(plan: &Plan, header: &HeaderModel, report: &mut XReport) {
+    for f in &plan.flag_words {
+        let Some(hs) = header.structs.get(&f.name) else {
+            report.note(
+                Category::Member,
+                &f.name,
+                "we carry it as a 32-bit flag word; no published header declares it".to_string(),
+            );
+            continue;
+        };
+        report.counts.flag_words += 1;
+
+        if hs.members.len() != f.fields.len() {
+            report.note(
+                Category::Member,
+                &f.name,
+                format!(
+                    "we lay out {} bitfield(s); the header declares {}",
+                    f.fields.len(),
+                    hs.members.len()
+                ),
+            );
+            continue;
+        }
+        let mut offset = 0u32;
+        for (ours, theirs) in f.fields.iter().zip(hs.members.iter()) {
+            report.counts.flag_bits += 1;
+            if ours.name != theirs.name {
+                report.note(
+                    Category::Member,
+                    format!("{}.{}", f.name, ours.name),
+                    format!(
+                        "we have {:?} at this position; the header has {:?}",
+                        ours.name, theirs.name
+                    ),
+                );
+                break;
+            }
+            let Some(bits) = theirs.bitfield else {
+                report.note(
+                    Category::Member,
+                    format!("{}.{}", f.name, ours.name),
+                    "we read it as a bitfield; the header declares it as an ordinary member"
+                        .to_string(),
+                );
+                break;
+            };
+            if !same_type(header, "uint32_t", &theirs.base_type) {
+                report.note(
+                    Category::Width,
+                    format!("{}.{}", f.name, ours.name),
+                    format!(
+                        "we assume a `uint32_t` storage unit; the header declares {}",
+                        theirs.base_type
+                    ),
+                );
+            }
+            if ours.bits != bits || ours.offset != offset {
+                report.note(
+                    Category::Width,
+                    format!("{}.{}", f.name, ours.name),
+                    format!(
+                        "we place {} bit(s) at offset {}; the header declares {bits} bit(s), \
+                         which in declaration order falls at offset {offset}",
+                        ours.bits, ours.offset
+                    ),
+                );
+            }
+            offset += bits;
+        }
+    }
+}
+
 /// Every struct we generate, against the header's declaration of it.
 pub fn check_structs(plan: &Plan, header: &HeaderModel, report: &mut XReport) {
     for s in &plan.structs {
@@ -653,18 +747,28 @@ fn compare_struct(
 
         // Array extents: this is where an API constant we resolved wrongly
         // shows up as a buffer of the wrong length.
-        if let (Shape::FixedArray { count, extent, .. }, false) =
-            (&f.shape, h.arrays.is_empty())
-        {
-            let theirs = resolve_extent(header, &h.arrays);
+        //
+        // Compared level by level rather than as a product, because a C array
+        // can have more than one dimension and a product would call
+        // `uint8_t[6][16]` and `uint8_t[96]` the same thing. They are not: the
+        // first is a `[[u8; 16]; 6]` and the second a `[u8; 96]`, and the wire
+        // writes a length prefix per level. `video.xml` has two of these —
+        // `StdVideoH264ScalingLists::ScalingList4x4` and `…8x8` — and they are
+        // the first multi-dimensional arrays any profile has reached.
+        if matches!(f.shape, Shape::FixedArray { .. }) && !h.arrays.is_empty() {
+            let ours = our_extents(&f.shape);
+            let theirs: Option<Vec<u64>> = h
+                .arrays
+                .iter()
+                .map(|a| crate::cheader::parse_c_number(a).or_else(|| header.define_value(a)))
+                .collect();
             match theirs {
-                Some(n) if n == *count => {}
-                Some(n) => report.note(
+                Some(t) if t == ours => {}
+                Some(t) => report.note(
                     Category::Member,
                     &subject,
                     format!(
-                        "array extent differs: ours {count} (from {extent}), vulkan_core.h {n} \
-                         (from [{}])",
+                        "array extent differs: ours {ours:?}, vulkan_core.h {t:?} (from [{}])",
                         h.arrays.join("][")
                     ),
                 ),
@@ -719,13 +823,15 @@ fn spell(d: &HeaderDecl) -> String {
     s
 }
 
-fn resolve_extent(header: &HeaderModel, arrays: &[String]) -> Option<u64> {
-    let mut total: u64 = 1;
-    for a in arrays {
-        let n = crate::cheader::parse_c_number(a).or_else(|| header.define_value(a))?;
-        total = total.checked_mul(n)?;
+/// Our array extents, outermost first, to compare against the header's list.
+fn our_extents(shape: &Shape) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut cur = shape;
+    while let Shape::FixedArray { elem, count, .. } = cur {
+        out.push(*count);
+        cur = elem;
     }
-    Some(total)
+    out
 }
 
 /// Every command's signature, against the header's `PFN_vk…` typedef.
@@ -979,6 +1085,7 @@ pub fn compare(
     check_struct_types(plan, header, report);
     check_command_set(profile, plan, header, report);
     check_structs(plan, header, report);
+    check_flag_words(plan, header, report);
     check_signatures(model, plan, header, report);
     check_handles(plan, header, report);
     check_aliases(plan, header, report);
@@ -990,6 +1097,7 @@ pub fn summary(report: &XReport) -> String {
     format!(
         "cross-check against vulkan_core.h: {} constants, {} enum values, {} sTypes, \
          {} commands in the profile's resolved set, {} structs / {} members / {} widths, \
+         {} flag words / {} bitfields, \
          {} signatures / {} parameters, {} handles, {} aliases; {} divergence(s)",
         c.constants,
         c.enum_values,
@@ -998,6 +1106,8 @@ pub fn summary(report: &XReport) -> String {
         c.structs,
         c.members,
         c.widths,
+        c.flag_words,
+        c.flag_bits,
         c.signatures,
         c.params,
         c.handles,

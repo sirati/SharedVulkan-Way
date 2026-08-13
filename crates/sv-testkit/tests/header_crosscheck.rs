@@ -43,6 +43,11 @@ struct Fixture {
     zink_profile: Profile,
     minimal: sv_testkit::Built,
     minimal_profile: Profile,
+    /// Zink plus the three video decode extensions. It is here because it is the
+    /// only profile that reaches the `StdVideo*` types, and those come from a
+    /// *second* registry — `video.xml` — whose reading nothing else checks.
+    video: sv_testkit::Built,
+    video_profile: Profile,
 }
 
 /// Built once: parsing `vk.xml`, resolving two profiles and reading a 26,000
@@ -58,12 +63,15 @@ fn fixture() -> Option<&'static Fixture> {
         let header = HeaderModel::load_all(&paths).expect("reading the generated headers");
         let zink_profile = profiles::zink();
         let minimal_profile = profiles::step3_minimal();
+        let video_profile = profiles::video();
         Some(Fixture {
             header,
             zink: sv_testkit::build_for(&zink_profile).expect("building the zink plan"),
             zink_profile,
             minimal: sv_testkit::build_for(&minimal_profile).expect("building the minimal plan"),
             minimal_profile,
+            video: sv_testkit::build_for(&video_profile).expect("building the video plan"),
+            video_profile,
         })
     })
     .as_ref()
@@ -261,6 +269,207 @@ fn every_handle_and_alias_matches_vulkan_core_h() {
 }
 
 // ---------------------------------------------------------------------------
+// the video std types: a second registry, checked against its own headers
+// ---------------------------------------------------------------------------
+
+/// `video.xml`, against `vk_video/*.h`.
+///
+/// The generator learns the `StdVideo*` types from `video.xml` rather than from
+/// the C headers, for the reasons in `vk_registry::video_registry_path`. That is
+/// only defensible if the two are compared, and this is the comparison: every
+/// `StdVideo*` struct the video profile carries, its member sequence, each
+/// member's C type and each fixed array's extent, against the header Khronos
+/// generates from the same file.
+///
+/// The `STD_VIDEO_*` array extents and every `StdVideo*` enum value are covered
+/// too, by the ordinary constant and enum-value checks — the video headers are
+/// part of `cheader::header_paths()`, so they are in the same comparison the
+/// rest of the API gets rather than in a special case.
+#[test]
+fn the_video_std_types_match_the_vk_video_headers() {
+    let Some(f) = fixture() else { return };
+    let mut r = XReport::default();
+    xcheck::compare(&f.video.model, &f.video.plan, &f.video_profile, &f.header, &mut r);
+    eprintln!("video profile: {}", xcheck::summary(&r));
+
+    // The counts that make this test non-vacuous, and they are about the video
+    // types specifically rather than about the profile as a whole.
+    let std_structs = f.video.plan.structs.iter().filter(|s| s.name.starts_with("StdVideo")).count();
+    assert!(
+        std_structs >= 5,
+        "only {std_structs} StdVideo* struct(s) in the video profile — the merge of \
+         video.xml did not happen, and every check below would then pass by comparing \
+         nothing"
+    );
+    assert!(
+        r.counts.flag_words >= 5,
+        "only {} flag word(s) compared against the vk_video headers",
+        r.counts.flag_words
+    );
+    assert!(
+        r.counts.flag_bits >= 40,
+        "only {} bitfield(s) compared against the vk_video headers",
+        r.counts.flag_bits
+    );
+    // The array extents come from video.xml's own `<require>` blocks and nowhere
+    // else; if `merge_video_constants` had missed them, every `StdVideo*` array
+    // would have failed to resolve and the plan would not have built at all.
+    assert_eq!(
+        f.video.model.constants.get("STD_VIDEO_H264_SCALING_LIST_4X4_NUM_LISTS").and_then(|c| c.value),
+        Some(6)
+    );
+    assert_eq!(
+        f.video.model.constants.get("STD_VIDEO_DECODE_H264_FIELD_ORDER_COUNT_LIST_SIZE").and_then(|c| c.value),
+        Some(2)
+    );
+
+    require_clean(
+        &r,
+        &[
+            Category::Constant,
+            Category::EnumValue,
+            Category::StructType,
+            Category::Member,
+            Category::Width,
+        ],
+        "the video std types",
+    );
+}
+
+/// The one number `docs/video-decode.md` §3 had to hand-build a table for.
+///
+/// `StdVideoH264LevelIdc` is an enum, not the bitstream's `level_idc` byte:
+/// level 1.2 is `level_idc = 12` in the stream and enum value **2** in the
+/// header. `video-probe`'s `decode::level_idc_enum` is that mapping, pinned by
+/// its own test against a hand-written table. Now the generator carries the enum
+/// itself, so the mapping's *target* is a published number rather than a
+/// transcription — and this is the assertion that it is.
+#[test]
+fn the_h264_level_enum_is_the_headers_and_not_the_bitstreams() {
+    let Some(f) = fixture() else { return };
+    let e = f
+        .video
+        .plan
+        .enums
+        .iter()
+        .find(|e| e.name == "StdVideoH264LevelIdc")
+        .expect("StdVideoH264LevelIdc is generated for the video profile");
+    let value = |n: &str| e.values.iter().find(|(k, _)| k == n).map(|(_, v)| *v);
+    assert_eq!(value("STD_VIDEO_H264_LEVEL_IDC_1_0"), Some(0));
+    assert_eq!(value("STD_VIDEO_H264_LEVEL_IDC_1_2"), Some(2), "the probe's fixture level");
+    assert_eq!(value("STD_VIDEO_H264_LEVEL_IDC_5_1"), Some(14), "what Mesa 26.1.1 reports");
+    assert_eq!(value("STD_VIDEO_H264_LEVEL_IDC_6_2"), Some(18), "the last one, so 52 is outside");
+
+    // And the profile idc, which is the other by-value external type that used
+    // to stop the planner.
+    let p = f
+        .video
+        .plan
+        .enums
+        .iter()
+        .find(|e| e.name == "StdVideoH264ProfileIdc")
+        .expect("StdVideoH264ProfileIdc is generated");
+    assert_eq!(
+        p.values.iter().find(|(k, _)| k == "STD_VIDEO_H264_PROFILE_IDC_HIGH").map(|(_, v)| *v),
+        Some(100),
+        "the H.264 profile_idc of High is 100 in the bitstream and in this enum alike"
+    );
+}
+
+/// All three passes generate valid Rust for the video profile.
+///
+/// The wire pass is checked by every build of `sv-proto`; the other two are only
+/// checked by a build with `SV_PROTO_PROFILE=video`, which is not the default,
+/// so nothing would notice a profile-specific emitter fault until somebody
+/// tried it. One did exist and this is the test that would have found it:
+/// `StdVideoH264ScalingLists::ScalingList4x4` is `uint8_t[6][16]`, the first
+/// two-dimensional array any profile has reached, and the GPU side's `raise`
+/// asked the whole member for its element type at both levels — emitting a loop
+/// that pushed a `u8` into a `Vec<[u8; 16]>`.
+///
+/// `generate_*` parse their own output with `syn` before printing it, so a
+/// token stream that is not valid Rust fails here rather than in a 34,000-line
+/// generated file. It does not typecheck it, which is why the fault above
+/// needed a compile — but it is the cheap half, and it runs every time.
+#[test]
+fn the_video_profile_generates_all_three_passes() {
+    let Some(f) = fixture() else { return };
+
+    let wire = sv_codegen::generate_from_model(&f.video.model, &f.video_profile)
+        .expect("the wire pass generates for the video profile");
+    let icd = sv_codegen::generate_icd_entry(&f.video.model, &f.video_profile)
+        .expect("the ICD C surface generates for the video profile");
+    let gpu = sv_codegen::generate_gpu_entry(&f.video.model, &f.video_profile)
+        .expect("the GPU side generates for the video profile");
+    eprintln!(
+        "video profile: wire {} commands / {} structs, icd {} commands / {} types, \
+         gpu {} forwarded",
+        wire.stats.commands, wire.stats.structs, icd.commands, icd.types, gpu.forwarded
+    );
+
+    // Zink resolves to 239 commands and video adds the thirteen of
+    // `VK_KHR_video_queue` and `VK_KHR_video_decode_queue`. Stated as a
+    // difference rather than as an absolute, so a registry bump moves both.
+    let zink_commands = f.zink.plan.commands.len();
+    assert_eq!(
+        wire.stats.commands - zink_commands,
+        13,
+        "the video profile should add exactly the video queue and decode-queue commands"
+    );
+    for name in [
+        "vkCreateVideoSessionKHR",
+        "vkCreateVideoSessionParametersKHR",
+        "vkCmdDecodeVideoKHR",
+        "vkGetPhysicalDeviceVideoCapabilitiesKHR",
+    ] {
+        assert!(
+            f.video.plan.commands.iter().any(|c| c.name == name),
+            "{name} is not in the generated video protocol"
+        );
+    }
+
+    // And the generated protocol really carries the std types, by value and
+    // through a pointer graph. `maxLevelIdc` is the by-value one that stopped
+    // the planner; `pStdSPSs` is the deep one.
+    let caps = f
+        .video
+        .plan
+        .struct_plan("VkVideoDecodeH264CapabilitiesKHR")
+        .expect("the H.264 decode capabilities struct is generated");
+    let level = caps.fields.iter().find(|f| f.name == "maxLevelIdc").expect("maxLevelIdc");
+    assert!(
+        matches!(
+            &level.shape,
+            sv_codegen::plan::Shape::Scalar(sv_codegen::plan::Scalar::Enum(n))
+                if n == "StdVideoH264LevelIdc"
+        ),
+        "maxLevelIdc should be a StdVideoH264LevelIdc enum on the wire, not {:?}",
+        level.shape
+    );
+    let sps = f
+        .video
+        .plan
+        .struct_plan("StdVideoH264SequenceParameterSet")
+        .expect("the H.264 SPS is generated");
+    // The three pointer members `docs/video-decode.md` §4 expected to have to
+    // deep-copy by hand. The registry states a `len=` for one and `optional=`
+    // for the other two, so the generator does it.
+    let shape_of = |n: &str| sps.fields.iter().find(|f| f.name == n).map(|f| f.shape.clone());
+    assert!(
+        matches!(shape_of("pOffsetForRefFrame"), Some(sv_codegen::plan::Shape::Array { .. })),
+        "pOffsetForRefFrame has len=num_ref_frames_in_pic_order_cnt_cycle and should be an array"
+    );
+    assert!(
+        matches!(shape_of("pScalingLists"), Some(sv_codegen::plan::Shape::Optional(_))),
+        "pScalingLists is optional=true and should be an optional value"
+    );
+    assert!(
+        matches!(shape_of("pSequenceParameterSetVui"), Some(sv_codegen::plan::Shape::Optional(_))),
+        "pSequenceParameterSetVui is optional=true and should be an optional value"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // negative controls
 // ---------------------------------------------------------------------------
 //
@@ -454,6 +663,79 @@ fn a_wrong_array_extent_is_caught() {
     assert!(
         r.in_category(Category::Member).iter().any(|d| d.subject == corrupted),
         "the cross-check did not notice a fixed array extent off by one in {corrupted}"
+    );
+}
+
+/// A bitfield given the wrong number of bits, which moves every bit after it.
+///
+/// The control for `check_flag_words`. `StdVideoH264SpsFlags` is sixteen
+/// one-bit fields; widening one to two silently shifts fifteen flags by a bit,
+/// and a driver handed that struct decodes a different picture with no error
+/// anywhere. Nothing in a round trip can see it — both sides would agree.
+#[test]
+fn a_bitfield_at_the_wrong_width_is_caught() {
+    let Some(f) = fixture() else { return };
+    let mut plan = f.video.plan.clone();
+    let fw = plan
+        .flag_words
+        .iter_mut()
+        .find(|f| f.name == "StdVideoH264SpsFlags")
+        .expect("StdVideoH264SpsFlags is a flag word of the video profile");
+    assert_eq!(fw.fields[0].bits, 1, "before corruption");
+    fw.fields[0].bits = 2;
+    for b in fw.fields.iter_mut().skip(1) {
+        b.offset += 1;
+    }
+
+    let mut r = XReport::default();
+    xcheck::check_flag_words(&plan, &f.header, &mut r);
+    assert!(
+        !r.in_category(Category::Width).is_empty(),
+        "the cross-check did not notice a one-bit flag widened to two, which shifts \
+         every flag after it"
+    );
+}
+
+/// Two bitfields swapped, which is the same corruption by another route.
+#[test]
+fn a_reordered_bitfield_is_caught() {
+    let Some(f) = fixture() else { return };
+    let mut plan = f.video.plan.clone();
+    let fw = plan
+        .flag_words
+        .iter_mut()
+        .find(|f| f.name == "StdVideoDecodeH264PictureInfoFlags")
+        .expect("the per-frame flags are a flag word of the video profile");
+    fw.fields.swap(0, 1);
+
+    let mut r = XReport::default();
+    xcheck::check_flag_words(&plan, &f.header, &mut r);
+    assert!(
+        !r.in_category(Category::Member).is_empty(),
+        "the cross-check did not notice two bitfields swapped"
+    );
+}
+
+/// A `StdVideo*` struct whose members no longer match `video.xml`'s reading.
+///
+/// The video types come from a registry nothing else in the project reads, so
+/// this is the control that the second reader is checked at all.
+#[test]
+fn a_dropped_std_video_member_is_caught() {
+    let Some(f) = fixture() else { return };
+    let mut plan = f.video.plan.clone();
+    let s = plan
+        .structs
+        .iter_mut()
+        .find(|s| s.name == "StdVideoH264SequenceParameterSet")
+        .expect("the H.264 SPS is generated for the video profile");
+    let dropped = s.fields.remove(3).name;
+
+    let mut r = XReport::default();
+    xcheck::check_structs(&plan, &f.header, &mut r);
+    assert!(
+        !r.in_category(Category::Member).is_empty(),
+        "the cross-check did not notice {dropped} dropped from StdVideoH264SequenceParameterSet"
     );
 }
 

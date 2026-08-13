@@ -126,11 +126,28 @@ pub enum AbiType {
     /// reason `crate::emit::types` gives: a value from a newer driver that is
     /// not one of the declared variants is undefined behaviour in a Rust `enum`
     /// and merely an integer in a newtype.
+    ///
+    /// A C bitfield struct is also one of these — see [`build`]'s handling of
+    /// `plan::flag_word_of`. `struct { uint32_t a:1; uint32_t b:1; }` and
+    /// `#[repr(transparent)] struct T(u32)` have the same size, alignment and
+    /// argument-passing class, and the ICD never takes the word apart.
     Newtype { name: String, bit_width: u32, bitflags: bool, values: Vec<(String, i64)> },
     Struct { name: String, is_union: bool, members: Vec<AbiMember> },
     FuncPointer { name: String, return_type: CType, params: Vec<(String, CType)> },
-    /// A type from a platform header. Only ever used behind a pointer, so an
-    /// opaque incomplete type is the whole ABI of it.
+    /// A type from a platform header, emitted as a zero-sized incomplete type.
+    ///
+    /// **Only legal behind a pointer.** `HWND` and `xcb_connection_t*` are the
+    /// cases this exists for and both are pointers; a zero-sized stand-in used
+    /// *by value* would silently give a struct member no storage and shift every
+    /// member after it.
+    ///
+    /// That was not a hypothetical. `VkVideoDecodeH264ProfileInfoKHR::stdProfileIdc`
+    /// is a `StdVideoH264ProfileIdc` by value, and `StdVideoH264ProfileIdc` was
+    /// an external type until `video.xml` was merged
+    /// (`vk_registry::video_registry_path`). Nothing reached it, so nothing
+    /// broke — which is exactly the shape of bug this project keeps finding.
+    /// [`build`] now refuses a by-value use rather than emitting one, so the
+    /// next such type is a generator error and not a wrong offset.
     Opaque { name: String },
 }
 
@@ -436,8 +453,28 @@ fn member(
 ) -> Result<AbiMember> {
     if let Some(bits) = m.bitfield_bits {
         bail!(
-            "{owner}.{}: a {bits}-bit bitfield. Rust has no `#[repr(C)]` bitfield, so \
-             this type cannot be given a C-compatible definition (design.md §7.4).",
+            "{owner}.{}: a {bits}-bit bitfield in a struct that is not a flag word. \
+             Rust has no `#[repr(C)]` bitfield; a struct whose members are *all* \
+             `uint32_t` bitfields is carried as the one word it occupies \
+             (plan::FlagWordPlan), and a struct that mixes the two has no \
+             C-compatible Rust definition at all (design.md §7.4).",
+            m.name
+        );
+    }
+    // A platform type with no definition has no size, so it cannot be a value.
+    // See `AbiType::Opaque` and `exceptions::PLATFORM_SCALARS`.
+    if m.ty.indirection() == 0
+        && let Some(base) = m.ty.base_name()
+        && matches!(model.type_def(base), Some(TypeDef::External { .. }))
+        && crate::exceptions::platform_scalar(base).is_none()
+    {
+        bail!(
+            "{owner}.{}: {base} is a platform type the registry only names, used *by \
+             value*. It is emitted as a zero-sized incomplete type, which is right \
+             behind a pointer and silently wrong here — every member after this one \
+             would be at the wrong offset. Either the type belongs in a registry the \
+             generator reads (as the StdVideo* types now do, via video.xml), or this \
+             surface should not reach it.",
             m.name
         );
     }
@@ -554,6 +591,25 @@ fn abi_type(
             }
         }
         TypeDef::Struct(s) => {
+            // A C bitfield struct is one `uint32_t` and is passed like one, so
+            // it gets the same `#[repr(transparent)]` newtype a `VkFlags` does.
+            // The single-bit members become named constants; a multi-bit one
+            // (`reserved : 30`, which H.265 and AV1 have and H.264 does not) is
+            // not a bit and gets none, rather than a constant that is a lie.
+            if let Some(fw) = crate::plan::flag_word_of(model, s)? {
+                let values = fw
+                    .fields
+                    .iter()
+                    .filter(|b| b.bits == 1)
+                    .map(|b| (b.name.clone(), 1i64 << b.offset))
+                    .collect();
+                return Ok(Some(AbiType::Newtype {
+                    name: s.name.clone(),
+                    bit_width: fw.bit_width,
+                    bitflags: true,
+                    values,
+                }));
+            }
             let lengths = length_members(&s.members);
             let mut members = Vec::new();
             for m in &s.members {
@@ -572,7 +628,17 @@ fn abi_type(
                 params: f.params.clone(),
             }
         }
-        TypeDef::External { name, .. } => AbiType::Opaque { name: name.clone() },
+        // A platform type used by value is an integer with a width, and the
+        // width is written down once, in `exceptions::PLATFORM_SCALARS`, with
+        // the header that states it. Everything else stays incomplete, which is
+        // the whole ABI of a type only seen behind a pointer.
+        TypeDef::External { name, .. } => match crate::exceptions::platform_scalar(name) {
+            Some(prim) => AbiType::Alias {
+                name: name.clone(),
+                underlying: CType::named(prim),
+            },
+            None => AbiType::Opaque { name: name.clone() },
+        },
     }))
 }
 
@@ -652,7 +718,7 @@ mod tests {
     fn model() -> Option<Model> {
         let path = vk_registry::registry_path().ok()?;
         let reg = vk_registry::Registry::load_from(path).ok()?;
-        Model::build(&reg.raw).ok()
+        reg.model().ok()
     }
 
     fn plan() -> Option<AbiPlan> {
