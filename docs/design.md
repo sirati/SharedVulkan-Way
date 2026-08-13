@@ -5311,3 +5311,449 @@ not a coincidence — they are the same gap seen from the two ends of the arena.
    resolves it to pixels. `xdg-toplevel-icon-v1` is **not** in either binary's
    strings, so the goal document's "check rather than assume" is answered: it
    will not be handed to us and the app-id route is the only one.
+
+---
+
+## 16. Stage 11: the taskbar shows the client's own icon
+
+### 16.1 Status in one paragraph
+
+**The Windows taskbar carries the client's real icon, and the pixels came from
+an icon theme on the other side of a hypervisor.** There is a photograph
+(`docs/stage11/stage11-taskbar-icons.png`), a control taken minutes later with
+one flag changed (`stage11-taskbar-generic.png`, which is stage 8's generic
+icon), and a measurement that does not need an eye: the host's own
+`16x16/apps/qemu.png` is found inside the guest's window caption by
+`compare -subimage-search` at +16,+7 with an RMSE of 595, against 26741 for the
+same search in the control. `docs/goal-firefox.md`'s first clause — *taskbar
+icon and title correct* — is closed.
+
+Three things are worth saying before the detail. First, the interesting half of
+this was never `WM_SETICON`: it was that `xdg_toplevel.set_app_id` names a
+desktop entry in an icon theme that exists only on the *client's* machine, so
+something on the Linux side has to resolve it and ship pixels. Second,
+`xdg-toplevel-icon-v1` — the protocol that would do this properly — is
+implemented here and **cannot** carry this case, for a reason that is a
+measurement rather than an opinion (§16.2). Third, the taskbar showed the
+generic icon for an entire run *after* both `HICON`s were set successfully, and
+the reason was a console window (§16.6).
+
+### 16.2 `xdg-toplevel-icon-v1`, measured in real clients, and why it cannot carry this anyway
+
+`docs/goal-firefox.md` says to *"check rather than assume"* whether Firefox
+implements it. Checked, on this machine's store, by looking for the interface
+name in the binaries that would contain it:
+
+| binary | `xdg_toplevel_icon_manager_v1` | control: `xdg_wm_base` |
+|---|---|---|
+| Firefox 151's `libxul.so` | **0** | 2 |
+| GTK 3.24.51 and 3.24.52 (`libgdk-3.so`) | **0** | 3 |
+| GTK 4.20.3 and 4.22.4 (`libgtk-4.so`) | **present**, both interfaces | 2 |
+| weston 15 and 16 (`weston-terminal`) | **0** | 2 |
+
+So the answer is no for everything this project has ever run, and yes for GTK 4
+— which matters, because it means the protocol is not theoretical and a
+compositor that ignored it would be wrong about a real toolkit. The XML is in
+`wayland-protocols` 1.48 and 1.49 under `staging/`, and the vendored smithay
+already has a `wayland::xdg_toplevel_icon` module, so implementing it cost about
+forty lines. Stage 9 reached the same conclusion from the other direction
+(§15.15 item 5) by grepping both of Firefox's binaries.
+
+**But even a client that implements it would not have helped here, and this is
+the part worth keeping.** The protocol attaches an icon to an `xdg_toplevel`
+*object*. A Wayland object belongs to exactly one client, so only the
+application can use it on its own behalf. The resolver in this topology is
+wc-proxy, which is a *different* client of the compositor — it cannot touch the
+application's objects, and the obvious workaround, injecting requests into the
+application's own connection with ids the proxy mints, does not work:
+
+```rust
+// wayland-backend/src/rs/map.rs
+match id.cmp(&store.len()) {
+    Ordering::Greater => Err(()),      // "not the next free id"
+```
+
+Client ids must be *the next free one*. There is no high reserved band to take
+from — an id above the end of the map is a protocol error — so the only ids a
+proxy could inject are exactly the ones the client is about to allocate, and the
+client's next `new_id` would then be a duplicate. The alternative is renumbering
+every object id in both directions, which puts a rewrite in front of every
+message in the protocol; §9.3's whole argument for this proxy being small enough
+to trust is that it does *not* understand most of what it carries.
+
+So the icon feed is keyed by **application id** rather than by object, on a
+second connection, and `xdg-toplevel-icon-v1` is implemented alongside it for
+the clients that do send it. The two are not alternatives: a client that sets
+its own icon wins, always, because it is the application saying what it looks
+like and the other is a guess made from a string.
+
+### 16.3 What was built, in the order the bytes move
+
+```
+weston-terminal / firefox        wc-proxy                    wc-compositor.exe
+   (unmodified, on Linux)      (has the icon theme)          (on the guest)
+        │ set_app_id ─────────────▶ crates/wc-proxy/icons.rs
+        │                            .desktop → Icon= → theme → PNG → BGRA
+        │                                │
+        │                                │ wc_icon_manager_v1, on a second
+        │                                │ connection: chunk* image* publish
+        │                                └──────────────────▶ icon::IconStore
+        │ commit ──────────────────▶ arena ─────────────────▶ window maps
+        │                                                     best_match(16,32)
+        │                                                     WM_SETICON ×2
+```
+
+Five pieces, and each is where it is because of the boundary:
+
+* **`crates/wc-proxy/src/icons.rs`** — app id to pixels. Desktop entry lookup,
+  `Icon=`, an icon-theme search, PNG decode, premultiply. On the host, because
+  that is the only machine with `$XDG_DATA_DIRS` on it.
+* **`crates/wc-compositor/protocols/wc-icon-v1.xml`** — `wc_icon_manager_v1`:
+  `chunk(array)`, `image(w,h)`, `publish(app_id)`, `forget(app_id)`.
+* **`crates/wc-proxy/src/iconlink.rs`** — a hand-written Wayland client for
+  exactly that interface, which reads its opcodes out of the compositor's own
+  copy of the XML with `include_str!`, so the two ends cannot drift.
+* **`crates/wc-compositor/src/icon.rs`** — the store, the staging arithmetic,
+  buffer-to-image conversion, and `best_match`, which is the choice of which
+  image fills which Win32 slot.
+* **`platform/win32.rs`** — `set_icon` was written in stage 3 and had never
+  run against anything but `--debug-icon`. It now takes a *set*.
+
+### 16.4 The resolver, and the three things it does not do
+
+The lookup is the XDG icon-theme specification's, implemented to the depth that
+finds what real themes actually contain:
+
+1. `$XDG_DATA_HOME`, then `$XDG_DATA_DIRS`, in order.
+2. `<app_id>.desktop`, then the lower-cased name, then — and this is the one a
+   panel actually relies on — any entry whose `StartupWMClass` is this app id.
+3. `Icon=` from the `[Desktop Entry]` group **only**. Firefox's own desktop file
+   has three further groups with their own `Icon=` keys, and a parser that took
+   the first match in the file would give a window the "New Private Window"
+   icon on some machines and the right one on others.
+4. Inside a theme: the directory tree is walked and the size is taken from
+   whichever path component looks like one, so `48x48/apps/firefox.png` and
+   `apps/48/firefox.png` are both found. `index.theme` is read only for
+   `Inherits`; `hicolor` is always last, as the specification requires.
+5. `pixmaps/` as a final resort, treated as unsized.
+
+Three sizes are shipped — 16, 32 and 48 — because Windows asks for two
+(`SM_CXSMICON`, `SM_CXICON`) and a theme has both *drawn* rather than resampled.
+Scaling one image at the far end would throw away information we were given for
+free.
+
+**Not implemented, and each is a real limit:**
+
+* **SVG.** A scalable icon needs a renderer. A theme with only SVG resolves to
+  nothing and degrades to the generic icon. Adwaita on this machine is largely
+  SVG, which is exactly the sort of thing that makes a feature look broken on
+  somebody else's machine, so it is recorded here rather than discovered there.
+* **The icon *name* half of `xdg-toplevel-icon-v1`.** A client may send a name
+  instead of buffers; the compositor has no theme to resolve it against. It is
+  looked up in the published store instead (an application's icon name is
+  usually its app id) and says so in the log when that misses.
+* **A cache across runs.** Each proxy process resolves each app id once.
+
+The cost, measured on the host: **3.4 to 6.3 ms** for an app id that resolves,
+and **112 ms** for one that does not — the miss is expensive because it scans
+every `.desktop` file in every data directory looking for a `StartupWMClass`.
+Once per app id per connection, off the frame path, several round trips before
+the window is ever shown.
+
+### 16.5 What crosses, and why it is an array rather than a `wl_buffer`
+
+Icon pixels are **data on the wire**: a `wl_array` argument, in chunks. Not a
+`wl_shm` buffer, which is what `xdg-toplevel-icon-v1` uses and what the pool
+machinery in this proxy already knows how to make.
+
+The rule (§9.4) is that no descriptor crosses, and a `wl_shm` pool would not
+have broken it — the proxy would have named a region the way it names every
+other one. It would have put an `h`-shaped argument on a wire for a few
+kilobytes sent once per application, to save a copy nobody can measure, and it
+would have made the icon path depend on the pool allocator. An array is a
+`memcpy` into a message.
+
+The chunk size is **3072 bytes**, and that number is a measurement of the far
+end rather than a preference: `wayland-backend`'s receive buffer is
+`DEFAULT_MAX_BUFFER_SIZE = 4096` (`rs/mod.rs`), a message that does not fit in
+it cannot be read at all, and a 48x48 BGRA image is 9216 bytes. So an icon is
+`chunk chunk chunk image`, repeated per size, then `publish`.
+
+Two conventions travel with the bytes and both are silent if wrong. The layout
+is BGRA, which is what `wl_shm`'s ARGB8888, this compositor's shadow buffers and
+a 32-bit `BI_RGB` DIB all already are (§8.4). The alpha is **premultiplied**,
+which is what `wl_shm` specifies and what `AlphaBlend` — which is how the shell
+composites a 32-bit icon — is defined on; PNG's is straight, so the resolver
+multiplies through at decode. Getting that wrong is a pale halo round the icon
+rather than an error, so it is asserted in a unit test rather than left to a
+photograph.
+
+### 16.6 Both `HICON`s were set, and the taskbar showed the generic icon anyway
+
+This is the finding of the stage, it cost a run, and no log on either side could
+have shown it.
+
+The compositor's own account was unambiguous — `icon big <- 32x32`,
+`icon small <- 16x16`, `icon set: 2 of 2 slots` — and the window's caption
+carried the icon in the photograph. The taskbar button did not: it had Windows'
+generic application icon on it, which is precisely the picture stage 8 took when
+nothing called `WM_SETICON` at all.
+
+The cause is that **the shell groups taskbar buttons by process, and a console
+window is a window.** The compositor is started by a scheduled task (§13.3),
+which gives it a console; the shell put the console window and the toplevel
+under one button; and the icon on a *grouped* button comes from the executable
+rather than from either window's `WM_SETICON`. `wc-compositor.exe` has no icon
+resource, so the group got `IDI_APPLICATION`.
+
+The fix is three lines and one guard: hide the console window, but only if
+`GetConsoleProcessList` says this process is the only one attached to it. A
+console shared with a `cmd.exe` or an ssh session belongs to that other process
+and hiding it would take away somebody's terminal; a console with exactly one
+process attached was created for this process and dies with it. It is not
+tidiness — it is the difference between the taskbar showing the client's icon
+and showing the generic one.
+
+**Windows had not lied. Nothing had.** Every call succeeded and every log line
+was true; the icon was on one of the process's two windows and the shell was
+showing the other one's group. This is the same shape as §13.7 — the mistake was
+not in the operation, it was in which of two things the answer was about — and
+the only instrument that shows it is a picture of the taskbar.
+
+### 16.7 What happens when the app id resolves to nothing
+
+Deliberately the same length of code path as success, because a missing icon is
+the *common* case and it must not degrade to a blank button, a crash or a
+silence.
+
+* A client with **no app id at all** — `weston-presentation-shm` sets none,
+  measured — gets an empty set and a log line saying nothing can be resolved for
+  it.
+* An app id with **no desktop entry and no theme file** — `weston-terminal`'s
+  own `org.freedesktop.weston.wayland-terminal` on a machine without a weston
+  desktop entry, which is every machine, because weston installs none — resolves
+  to zero images, and the proxy publishes *that*, which the compositor stores as
+  a negative answer so the next window with the same app id costs nothing.
+* An empty set reaching the platform destroys both `HICON`s and sets neither, so
+  the window falls back to its **class icon**, which is `IDI_APPLICATION` — the
+  generic one. That is what `stage11-taskbar-generic.png` is a photograph of.
+* A compositor with no `wc_icon_manager_v1` global — an older build — makes the
+  proxy's second connection bind nothing; it says so once and stops resolving.
+  The `wl_display.sync` that follows `get_registry` is what makes "the manager
+  has not arrived yet" distinguishable from "this compositor has no manager".
+* A publisher that miscounts its bytes gets a protocol error on the *icon*
+  connection, which is the one real advantage of the feed being a separate
+  client: it costs an icon rather than a window.
+
+`weston-terminal`'s app id is worth recording on its own, because the obvious
+guess is wrong and the harness was written against the guess: it is
+**`org.freedesktop.weston.wayland-terminal`**, not `weston-terminal`.
+
+### 16.8 Four things that cost a run each, all of them about sharing a guest
+
+§13.9 said an image name is not an identity on this guest. Stage 11 found two
+more ways for that to be true and two ways to photograph the wrong instant.
+
+> **The rule, because this is the third time and it will not be the last.**
+>
+> There is one Windows guest, one `/srv/winshare`, one taskbar, and as many
+> experiments as there are worktrees. Everything below is a special case of two
+> sentences, and the next person should meet them here rather than derive them
+> again:
+>
+> 1. **An identity is a process id or a full path. Never an image name, never a
+>    window class, never a glob.** Every experiment deploys its own copy into
+>    its own directory, so the path is unique and the image name is not;
+>    `WaycomposeToplevel` is registered by every compositor in the tree; and
+>    `rm -f …/wg-*` matches somebody else's live sockets as happily as your dead
+>    ones.
+> 2. **A "polite" close is still a kill.** `taskkill /IM foo.exe` without `/F`
+>    does not terminate anything — it sends `WM_CLOSE` to every window of every
+>    matching process, which for a compositor means `xdg_toplevel.close`, a
+>    client that exits correctly, and a window that is simply not there any
+>    more. Nothing in either log says "somebody killed me"; the compositor's
+>    side reads `close requested`, which is what a user clicking the X looks
+>    like. Kills-by-name are not made safe by being gentle.
+>
+> The three instances so far: §12.8's image-name kill, which stage 8 narrowed to
+> an image *path* (§13.9); this stage's `WM_CLOSE` (below); and stage 12's
+> `clean` step running an unscoped `rm -f …/wg-*` over eight live sockets
+> belonging to this stage's runs. Each was diagnosed as flakiness first, and
+> each cost more than the fix.
+
+* **`taskkill /IM wc-compositor.exe` without `/F` sends `WM_CLOSE`.** Another
+  worktree running an older `wc-guest.sh` reaps nothing of ours — our process
+  survives — but our *window* closes, the compositor correctly sends
+  `xdg_toplevel.close`, the client exits politely, and the photograph is of a
+  taskbar with no button on it. The compositor's own log says `window 1 close
+  requested` with nothing on this side having asked. This stage now deploys the
+  compositor under its own image name, `wc-s11-compositor.exe`, which no other
+  harness kills. It happened again afterwards, so the rename is not a complete
+  defence and the harness retries a pass whose window did not survive.
+* **A scheduled task costs about a minute, and the first version of the harness
+  did not know that.** It held the client for 60 seconds, photographed the
+  window inside that, and then took the taskbar's picture two tasks later — by
+  which time the window had been gone for a minute. The result was a taskbar
+  with the right number of buttons and none of them ours, which reads exactly
+  like "Windows refused the icon". The client is now held for 210 seconds and
+  every picture is taken by one task.
+* **A shot of a window that is not there leaves the previous shot's file.** The
+  harness fetched it and reported a photograph it had not taken; the two passes'
+  images were byte-identical and the comparison between them said the icon was
+  in both. The output files are deleted on the guest before every attempt now.
+* **Two runs on one TCP port**, which is §13.10's lesson arriving unchanged: the
+  second run's relay listener sits in `TIME_WAIT`, the client never connects, and
+  what the harness prints is the *client's* "Failed to process Wayland
+  connection: Broken pipe" — which reads as the compositor having gone away. The
+  port is derived from the run's pid now.
+
+A fifth, smaller: registering two scheduled tasks with the same name in one run
+leaves `Start-ScheduledTask` with nothing to start and no error, which printed
+as "the compositor did not start" for the second pass only — with the
+compositor's own log on the guest proving that it had.
+
+**And the other half of the rule, which is about what a run leaves behind.**
+While this stage was running, the guest was found to be holding **six abandoned
+`wc-compositor.exe` processes started between 06:55 and 07:28**, still alive
+seven hours later, each with a window on the desktop — after a stage had
+reported that nothing of its own was running. That is the second time a cleanup
+claim has turned out to be false rather than the first; §13.9's fourth lesson is
+the same shape, where a compositor left over from an interrupted run kept
+writing frames into a directory the next run had just emptied.
+
+The mechanism is not mysterious: a scheduled task's process does not die with
+the ssh session that started it (§13.3), so *every* path out of a harness that
+is not an explicit kill leaves one behind — an interrupted run, a timeout, a
+failed assertion that returns early, a `set -e` on a line before the teardown.
+
+So the check has to be **"count the processes"** rather than **"the script
+reached its cleanup block"**. The two are not the same statement, they differ in
+exactly the cases anybody cares about, and only one of them is a measurement.
+A harness that means to say the guest is clean should enumerate
+`Win32_Process` and say how many it found — which is one line of the PowerShell
+each of these scripts already ships — rather than infer it from having run some
+code.
+
+### 16.9 The evidence
+
+`docs/stage11/README.md` is the exhibit list. The two that carry the claim:
+
+| | |
+|---|---|
+| `stage11-taskbar-icons.png` | the guest's taskbar, our window's button, the host's QEMU icon on it |
+| `stage11-taskbar-generic.png` | the same run with `--no-icons`: the same button, the generic icon |
+
+The icon is QEMU's rather than Firefox's **on purpose**, and it is about the
+measurement rather than about taste: the guest's taskbar has Firefox pinned to
+it, so a search for the Firefox icon in a taskbar capture finds one whether or
+not any of this works. The QEMU icon is in the host's theme, is not in the
+guest's taskbar and is not in Windows at all, so finding it there is only
+possible if it crossed.
+
+The client is `weston-terminal`, unmodified, on the far side of a hypervisor —
+and because weston ships no desktop entry for it, the harness writes a
+three-line one naming an icon that the *host's own theme* holds. What is
+synthetic is that file; the theme search, the size choice, the decode, the
+premultiply, the chunking and `WM_SETICON` are all the real path.
+
+**And then the goal's own client, with nothing synthetic in it at all.**
+`stage11-taskbar-icons-firefox.png` is Firefox on the Linux host, through the
+proxy, in a window made by `wc-compositor.exe`, with **Firefox's icon on its
+taskbar button** — resolved from the `firefox.desktop` and the
+`hicolor/32x32/apps/firefox.png` that the Firefox package on the host installs,
+with no file written by this harness (`WC_ICON_NAME=` empty refuses to write
+one). Two things about that run are worth keeping:
+
+* It needs `--transport shared-file`, because Firefox opens two connections and
+  the arena serves one (§12.13 item 6, §15.14's boxed item). The icon path does
+  not care which transport carries the pixels — it does not use one — but the
+  window will not appear without it.
+* The window in the picture is Firefox's *"Profile Missing"* dialog, because the
+  harness named a profile directory that did not exist. That is a fault in a
+  command line and not in anything below it: the window, the caption, the button
+  and the icon are all real, and the app id Firefox set on the way to
+  complaining is the same `"firefox"` stage 9 measured.
+
+### 16.10 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **154 tests**, 0 failures (138 on master, +16 here) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-icon.sh deploy` | builds and copies |
+| `scripts/wc-icon.sh taskbar` (`weston-terminal`, the guest's desktop) | 12 passed, 0 failed |
+| `scripts/wc-icon.sh taskbar` (Firefox, `--transport shared-file`) | 7 passed, 0 failed, 1 skipped |
+| `scripts/wc-icon.sh` teardown check — `Win32_Process` count on the guest | 0 left behind |
+
+The skip is the caption comparison in the Firefox run, which wants a 16x16
+reference file to search for and is looking in the Firefox package's own theme;
+it is a harness gap rather than a result, and the taskbar picture from that run
+is the one that matters.
+
+The sixteen tests are the parts that are arithmetic rather than Win32 or
+filesystem: `best_match`'s preference for scaling down over scaling up, the
+staging arithmetic that splits one run of chunks into several images, the
+strided-buffer repack, the opaque-format alpha fix, the desktop-entry group
+parser, the size-from-path rule, the theme chain, a path-traversal refusal, and
+an end-to-end resolution against a theme built in a temporary directory — which
+asserts the premultiply on a two-pixel PNG written by hand, because that is the
+conversion whose failure is a halo rather than an error.
+
+What is *not* a unit test is the whole of §16.6, and could not be: the icon was
+set correctly on a window whose button the shell was not drawing.
+
+### 16.11 What is not proven
+
+1. **The taskbar claim rests on one photograph and its control.** The window
+   caption's copy of the same icon is measured — `subimage-search`, RMSE 595
+   against 26741 — and the taskbar's is not, because a taskbar button draws the
+   icon scaled to 24 px and the search finds nothing at that size. A crop
+   comparison against the button rectangle would close it and needs the button's
+   position, which nothing here knows.
+2. **`xdg-toplevel-icon-v1` is implemented and has never been exercised by a
+   client.** No client this project can run implements it (§16.2), and the only
+   thing that has driven the code path is the compositor's own `--debug-icon`.
+   The right test is a GTK 4.20 application, which needs `wl_output`,
+   `wl_subcompositor` and a data device — all of which stage 9 added — and one
+   was not run here.
+3. **Nothing has resolved an icon on the machine the goal describes.** The
+   resolver reads the *host's* theme, which is right; but on this rig the host
+   is the VM host rather than a general Linux desktop, and its theme has two
+   application icons in it. A machine with Adwaita and SVG-only icons will
+   resolve less than this one did, and §16.4 says so rather than finding out
+   later.
+4. **The icon is never updated after the window is mapped, except by a
+   publish.** A client that changes its app id gets a fresh lookup; a client
+   whose *theme* changes does not, and neither does a window whose DPI changes,
+   which is where `SM_CXICON` would move.
+5. **`forget` is implemented and unused.** Nothing in the proxy calls it.
+6. **The second connection is a second client to the compositor**, so a
+   compositor that counted clients or exited with `--once` when the last one
+   left now sees two. `--once` is a harness flag and the change is benign, but
+   it is a change.
+7. **Any client can bind `wc_icon_manager_v1` and publish an icon for any app
+   id.** There is no notion of who is entitled to say what an application looks
+   like. That is the same trust model as the rest of this compositor (§2.6) and
+   it is worth naming rather than assuming.
+
+### 16.12 What to do next
+
+1. **Give the compositor's window an `AppUserModelID`.** §16.6 is a symptom of
+   the shell deciding what our window belongs to by looking at the process. A
+   per-window `SetCurrentProcessExplicitAppUserModelID` — or the per-window
+   property — is how a Windows application controls grouping, and it is what a
+   compositor showing several clients' windows will need anyway: two toplevels
+   from two different applications should not share a taskbar button, and today
+   they would.
+2. **Run a GTK 4 client** and close §16.11 item 2. The compositor advertises
+   `xdg_toplevel_icon_manager_v1` with the sizes it wants; GTK 4.20 binds it; the
+   whole path is written and untested against anything but ourselves.
+3. **Resolve icon *names*, not just app ids.** A client that sends
+   `xdg_toplevel_icon_v1.set_name` is asking for a theme lookup on the
+   compositor's side, which is the one thing the compositor cannot do. The proxy
+   could answer it — it is the same resolver, keyed by the same string — if the
+   compositor could ask, which needs a request in the other direction.
+4. **Cache resolutions across proxy runs**, or don't, but measure the 112 ms
+   miss first: it is a full scan of every desktop file, and it happens once per
+   app id that has no icon, which on a busy desktop is most of them.

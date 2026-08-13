@@ -23,6 +23,14 @@ smithay = { path = "../../vendor/smithay", default-features = false, features = 
   "desktop",
 ] }
 wayland-server = { workspace = true }
+# STAGE 11. `protocols/wc-icon-v1.xml` is this project's own interface — icon
+# pixels keyed by application id, for a resolver that is not the toplevel's
+# client (see `src/icon.rs` for why that cannot be `xdg-toplevel-icon-v1`).
+# The scanner generates the server half from the XML at compile time, and
+# `wayland-backend` is named because the generated code refers to it; it is
+# already in the tree as the transport fork, so this adds nothing to build.
+wayland-scanner = { workspace = true }
+wayland-backend = { workspace = true }
 wc-transport = { workspace = true }
 # Unconditional as of stage 4, where it was `cfg(windows)` before. Two things
 # moved it: `--arena` attaches regions on both platforms, and `map_counts()` is

@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wc_icon_v1">
+
+  <copyright>
+    SPDX-License-Identifier: MIT OR Apache-2.0
+  </copyright>
+
+  <description summary="icon pixels for an application id, from a resolver that is not the toplevel's client">
+    Wayland has no way for a *third party* to say what an application's icon is.
+    xdg-toplevel-icon-v1 is the right protocol and the wrong shape for this
+    project: it attaches an icon to an xdg_toplevel object, and a Wayland object
+    belongs to exactly one client, so only the toplevel's own client can use it.
+
+    In the topology waycompose is built for (docs/goal-firefox.md) the client is
+    on Linux, the compositor is on Windows, and the thing that knows what
+    "firefox" looks like is neither of them: it is the XDG icon theme on the
+    Linux side, which only wc-proxy can read. wc-proxy is a different client of
+    this compositor from the application, and it cannot touch the application's
+    objects.
+
+    So this interface is keyed by application id rather than by object. The
+    resolver publishes pixels for an app id; the compositor applies them to
+    every toplevel that has set that app id, now or later. Nothing here refers
+    to a surface, and a publisher does not have to be running when the window
+    it decorates appears.
+
+    Three things are deliberate:
+
+    - **Pixels, never a path or a name.** The whole point is that the
+      filesystem holding the icon is on the other side of a hypervisor
+      (docs/design.md §2.1). A request carrying a file name would work on one
+      machine and be unimplementable on the one that matters.
+    - **No wl_buffer, so no file descriptor.** An icon is a few kilobytes sent
+      once per application. Routing it through a wl_shm pool would put an
+      fd-shaped argument on a wire that must never carry one, to save a copy
+      nobody can measure.
+    - **Chunked, because a Wayland message is bounded.** wayland-backend's
+      receive buffer is 4096 bytes (rs/mod.rs, DEFAULT_MAX_BUFFER_SIZE) and a
+      48x48 BGRA image is 9216, so the array has to arrive in pieces. That is a
+      measured limit rather than a defensive one.
+  </description>
+
+  <interface name="wc_icon_manager_v1" version="1">
+    <description summary="publishes icon pixels for application ids">
+      An icon is built up out of band and then named: chunk* image, repeated
+      once per size, and finally publish, which installs the whole set against
+      an app id and empties the staging area.
+
+      A publish replaces whatever was there before. There is no way to ask what
+      is installed: this is a one-directional feed from something that knows to
+      something that draws.
+    </description>
+
+    <enum name="error">
+      <entry name="too_big" value="0"
+             summary="more staged bytes than the compositor will hold"/>
+      <entry name="short_image" value="1"
+             summary="image named a size larger than the bytes that were staged"/>
+      <entry name="bad_size" value="2"
+             summary="a non-positive or implausible width or height"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop publishing">
+        Icons already published stay published. Destroying the manager does not
+        take back what it said, because a window that has an icon should not
+        lose it when the resolver exits.
+      </description>
+    </request>
+
+    <request name="chunk">
+      <description summary="append bytes to the staging area">
+        Bytes are BGRA with **premultiplied** alpha, tightly packed, top row
+        first — the layout the compositor's own shadow buffers use and the one
+        wl_shm's ARGB8888 already specifies, so nothing has to be swizzled or
+        multiplied between here and CreateIconIndirect. Windows agrees: a 32-bit
+        icon bitmap is composited with AlphaBlend, which is defined on
+        premultiplied colour.
+
+        A resolver decoding a PNG has to do the multiply itself, because PNG's
+        alpha is straight. Getting that wrong shows up as a light halo around
+        the icon rather than as an error.
+
+        Send as many chunks as the image needs. The split points carry no
+        meaning; a row may span two chunks.
+      </description>
+      <arg name="data" type="array" summary="a piece of the next image's pixels"/>
+    </request>
+
+    <request name="image">
+      <description summary="close off one image at this size">
+        Consumes exactly width * height * 4 bytes from the front of the staging
+        area and adds them to the set being built. Any remaining bytes stay
+        staged for the next image, so a caller may send every size in one run of
+        chunks if it likes.
+      </description>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+
+    <request name="publish">
+      <description summary="install the staged set for an application id">
+        The app id is the string an xdg_toplevel gives to set_app_id, matched
+        exactly. Publishing an empty set removes the entry, which is the
+        difference between "this application has no icon" and "nobody has
+        looked yet" — see forget.
+
+        Windows that already carry this app id are updated at once; windows that
+        appear later pick it up when they are mapped.
+      </description>
+      <arg name="app_id" type="string"/>
+    </request>
+
+    <request name="forget">
+      <description summary="drop what was published for an application id">
+        Existing windows keep the icon they were given. This only stops the
+        entry being applied to windows that have not appeared yet.
+      </description>
+      <arg name="app_id" type="string"/>
+    </request>
+  </interface>
+
+</protocol>

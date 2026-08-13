@@ -42,6 +42,8 @@
 //!
 //! | module | what it is | testable without |
 //! |---|---|---|
+//! | [`icons`] | an app id, a desktop entry and an icon theme become pixels | anything |
+//! | [`iconlink`] | a second connection, on which those pixels are published | a compositor |
 //! | [`spec`] | the protocol's argument signatures, read from the vendored XML | anything |
 //! | [`wire`] | walking and rebuilding a message body in either dialect | anything |
 //! | [`objects`] | which interface each object id has | anything |
@@ -66,6 +68,10 @@
 
 #[cfg(unix)]
 pub mod guestram;
+#[cfg(unix)]
+pub mod iconlink;
+#[cfg(unix)]
+pub mod icons;
 #[cfg(unix)]
 pub mod objects;
 #[cfg(unix)]
