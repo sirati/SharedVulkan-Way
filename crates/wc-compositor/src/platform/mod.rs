@@ -60,12 +60,18 @@ mod drag;
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
-pub use win32::{current_layout, start};
+pub use win32::{current_layout, has_touch, keyboard_repeat, start};
 
 #[cfg(not(windows))]
 mod headless;
 #[cfg(not(windows))]
-pub use headless::{current_layout, start, Click};
+pub use headless::{current_layout, has_touch, keyboard_repeat, start, Click};
+
+/// ADDED FOR STAGE 20. The ellipse a `wl_touch.shape`/`.orientation` pair
+/// describes, derived from Win32's contact rectangle by
+/// [`crate::input::touch::shape_from_contact`] — which is where the reasoning
+/// and the tests are, because none of it needs a window.
+pub use crate::input::touch::Shape as TouchShape;
 
 /// Identifies one toplevel, and therefore one window.
 ///
@@ -175,6 +181,47 @@ pub struct IconImage {
     pub pixels: Vec<u8>,
 }
 
+/// What the pointer should look like.
+///
+/// ADDED FOR STAGE 12 (docs/design.md §23). One message for both halves of the
+/// protocol, because Win32 has one mechanism: `wl_pointer.set_cursor` sends a
+/// surface and `wp_cursor_shape_v1.set_shape` sends a name, and both end as a
+/// single `SetCursor` with a single `HCURSOR`.
+///
+/// **The cursor is a property of the seat, not of a window**, which is why
+/// there is no [`WindowId`] here. Wayland scopes the cursor to the pointer's
+/// current focus and the compositor is the one that decides what the pointer
+/// looks like at any moment; Win32 agrees, in the sense that `SetCursor` sets
+/// the cursor for the calling thread and every window it owns. Attaching this
+/// to a window would need a policy for what happens when the pointer is over a
+/// window whose client last spoke about a different one, and there is no such
+/// moment: only one surface has pointer focus at a time.
+#[derive(Clone, Debug)]
+pub enum CursorSpec {
+    /// `wl_pointer.set_cursor` with a null surface. The pointer is invisible
+    /// over this client's windows and reappears everywhere else, which is what
+    /// a text editor hiding the pointer while typing means.
+    Hidden,
+    /// A named shape. Resolved to a stock `IDC_*` by [`crate::cursor`]; the
+    /// name is carried rather than the ordinal so the log says what the client
+    /// asked for and not only what it got.
+    Named(smithay::input::pointer::CursorIcon),
+    /// The client's own pixels, from `wl_pointer.set_cursor` with a surface.
+    ///
+    /// The hotspot is in surface coordinates, which after
+    /// `CursorImageAttributes` has divided out the client scale is the same as
+    /// buffer coordinates for every buffer this compositor accepts (scale 1,
+    /// no transform — see `state.rs`'s commit handler).
+    Image {
+        /// BGRA, tightly packed, alpha **premultiplied** — the same layout and
+        /// the same convention as [`IconImage`], which is what a 32-bit
+        /// `CreateIconIndirect` needs.
+        image: IconImage,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+}
+
 /// What sort of window to make.
 ///
 /// ADDED FOR STAGE 9. The distinction is not cosmetic: a popup must not take
@@ -246,6 +293,15 @@ pub enum ToUi {
         maximized: Option<bool>,
         minimized: Option<bool>,
     },
+
+    /// The pointer should look like this from now on.
+    ///
+    /// ADDED FOR STAGE 12. Sent on every `wl_pointer.set_cursor`, every
+    /// `wp_cursor_shape_device_v1.set_shape`, every commit of the surface a
+    /// client is using as its cursor, and — from smithay, without any client
+    /// asking — on every pointer leave, which is what puts the arrow back.
+    Cursor { spec: CursorSpec },
+
     /// `xdg_toplevel.move`: a drag has begun somewhere the client considers a
     /// title bar, and it wants the window manager to take over.
     ///
@@ -266,6 +322,7 @@ pub enum ToUi {
     /// Alt+Space produce, so a client that asks for one gets the system's
     /// rather than an imitation of it.
     WindowMenu { id: WindowId, x: i32, y: i32 },
+
     /// The toplevel is gone.
     Destroy { id: WindowId },
 
@@ -492,6 +549,61 @@ pub enum FromUi {
     /// a drag that never ends is the failure this whole feature exists not to
     /// build.
     DragFinished { action: u32 },
+    // --- touch, stage 20 ---------------------------------------------------
+    //
+    // Already in Wayland's units, like everything above: surface-local
+    // coordinates, a millisecond timestamp, and a **contact id that is not
+    // Windows' `pointerId`** — the mapping is `crate::input::touch::Slots` and
+    // lives on the platform side, seat-wide, for the reasons written there.
+    //
+    // There is no `TouchEnter`/`TouchLeave` pair and that is the protocol
+    // rather than an omission: `wl_touch` has no notion of a contact hovering
+    // over a surface, `down` names the surface it landed on, and every
+    // subsequent event for that contact belongs to that surface until it comes
+    // up. Win32 agrees by accident — a touch contact is implicitly captured to
+    // the window that received its `WM_POINTERDOWN` — so no `SetCapture` is
+    // needed here, unlike the mouse.
+    /// A contact landed on a window.
+    TouchDown {
+        id: WindowId,
+        /// Small and dense, 0 upwards, in the protocol's numbering.
+        slot: i32,
+        x: f64,
+        y: f64,
+        /// The contact patch, when the digitiser reports one. **`None` when it
+        /// does not, and then no `shape` or `orientation` event is sent at
+        /// all** — the protocol makes both conditional on the device
+        /// supporting shape reports, and a fabricated ellipse would be a
+        /// statement this compositor cannot make.
+        shape: Option<TouchShape>,
+        time: u32,
+    },
+    /// A contact moved. Carries the shape again because Windows re-reports it
+    /// on every update and it genuinely changes as a finger presses harder.
+    TouchMotion {
+        id: WindowId,
+        slot: i32,
+        x: f64,
+        y: f64,
+        shape: Option<TouchShape>,
+        time: u32,
+    },
+    /// A contact lifted. No coordinates: `wl_touch.up` carries none, and the
+    /// last position is whatever the last motion said.
+    TouchUp { id: WindowId, slot: i32, time: u32 },
+    /// End of a logically grouped set of the three above.
+    ///
+    /// **Not optional.** A client is entitled to accumulate everything in a
+    /// frame and act on none of it until the frame closes, so a compositor
+    /// that omits this leaves touches buffered indefinitely — the same class of
+    /// bug as a missing `wl_pointer.frame`, and with the same symptom: input
+    /// that appears to work in a debug log and does nothing on screen. Carries
+    /// no window id because the frame belongs to the seat, not to a window.
+    TouchFrame,
+    /// The system took the gesture away — an edge swipe, the touch keyboard,
+    /// a window losing its pointer capture. Every live contact is finished at
+    /// once and its id may be reused, which is exactly `wl_touch.cancel`.
+    TouchCancel,
 
     /// The pump has stopped. Nothing more is coming and no window will paint
     /// again.

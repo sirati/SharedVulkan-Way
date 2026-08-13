@@ -17,6 +17,7 @@
  *   probe-clip.exe set TEXT     put TEXT on the clipboard as CF_UNICODETEXT
  *   probe-clip.exe set-html HTML  put HTML on it, with the CF_HTML header
  *   probe-clip.exe list         the format numbers on it now
+ *   probe-clip.exe wait-for S N poll up to N s for text containing S, print it
  *
  * Exit code 0 on success, 1 if the format is not there, 2 on a usage or API
  * error, so a shell harness can assert without parsing.
@@ -126,6 +127,53 @@ static int get_format(const char *name) {
     return rc;
 }
 
+/* Wait, inside **one** process, for the clipboard to hold text containing
+ * `needle`, then print the whole of it.
+ *
+ * This exists because the shell doing the polling was worse than the thing it
+ * was polling. Each `probe-clip.exe get` is a Wine process, a poll ran twenty
+ * of them, and the compositor's log filled with pairs of WM_CLIPBOARDUPDATE
+ * saying the clipboard had gone empty and come back — the churn was the
+ * measurement disturbing the thing measured. One process that asks in a loop
+ * touches the window station once and leaves the clipboard alone between
+ * asks.
+ *
+ * Still a poll rather than an AddClipboardFormatListener, and deliberately: a
+ * listener needs a message loop, a message loop needs a window, and a window
+ * in this process is one more thing on the desktop that the compositor's own
+ * window has to not be confused with. A one-second `GetClipboardSequenceNumber`
+ * is enough to answer "has it changed" and needs nothing.
+ */
+static int wait_for(const char *needle, int seconds) {
+    int i;
+    for (i = 0; i < seconds; i++) {
+        HANDLE h;
+        if (open_clipboard()) {
+            h = GetClipboardData(CF_UNICODETEXT);
+            if (h) {
+                const wchar_t *w = (const wchar_t *)GlobalLock(h);
+                int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+                char *utf8 = (char *)malloc(n > 0 ? (size_t)n : 1);
+                WideCharToMultiByte(CP_UTF8, 0, w, -1, utf8, n, NULL, NULL);
+                GlobalUnlock(h);
+                CloseClipboard();
+                if (strstr(utf8, needle) != NULL) {
+                    int rc = emit(utf8, n > 0 ? (size_t)(n - 1) : 0);
+                    free(utf8);
+                    return rc;
+                }
+                free(utf8);
+            } else {
+                CloseClipboard();
+            }
+        }
+        Sleep(1000);
+    }
+    fprintf(stderr, "probe-clip: no CF_UNICODETEXT containing \"%s\" after %d s\n",
+            needle, seconds);
+    return 1;
+}
+
 static int list(void) {
     UINT fmt = 0;
     wchar_t name[128];
@@ -184,7 +232,8 @@ static int set_html(const char *fragment) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: probe-clip.exe get | get-html | set TEXT | set-html HTML | list\n");
+                "usage: probe-clip.exe get | get-html | set TEXT | set-html HTML | list"
+                " | wait-for SUBSTRING [SECONDS]\n");
         return 2;
     }
     if (!strcmp(argv[1], "get"))
@@ -193,6 +242,8 @@ int main(int argc, char **argv) {
         return get_format("HTML Format");
     if (!strcmp(argv[1], "list"))
         return list();
+    if (!strcmp(argv[1], "wait-for") && argc >= 3)
+        return wait_for(argv[2], argc >= 4 ? atoi(argv[3]) : 30);
     if (!strcmp(argv[1], "set") && argc >= 3) {
         int n = MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, NULL, 0);
         wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));

@@ -66,12 +66,34 @@ use windows_sys::Win32::Graphics::Gdi::{
     // its two constants are filed under GDI even though the call that takes
     // them, `UpdateLayeredWindow`, is filed under WindowsAndMessaging.
     AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
+    // ADDED FOR STAGE 20, filed in the same surprising place, and needed
+    // because `POINTER_INFO` reports in **screen** coordinates while every
+    // other input message this file handles reports in client ones.
+    ScreenToClient,
+};
+// ADDED FOR STAGE 20. See `on_pointer`: the `WM_POINTER*` family rather than
+// `RegisterTouchWindow`/`WM_TOUCH`, and this is the whole of the extra API.
+use windows_sys::Win32::UI::Input::Pointer::{
+    GetPointerTouchInfo, GetPointerType, POINTER_FLAG_CANCELED, POINTER_FLAG_INCONTACT,
+    POINTER_TOUCH_INFO,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     // ADDED FOR STAGE 13, for the locked modifiers. See `lock_on`.
     GetKeyState, VK_CAPITAL, VK_NUMLOCK,
+    // ADDED FOR STAGE 20: a touch that consumes `WM_POINTERDOWN` also consumes
+    // the `DefWindowProc` that would have moved the focus, so `on_pointer`
+    // moves it by hand.
+    GetFocus, SetFocus,
     GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
+// ADDED FOR STAGE 12, for the cursor (docs/design.md §23). `SetCursor` and
+// `DestroyCursor` are the whole of the Win32 half; `HTCLIENT` is the hit-test
+// code that decides whether the client's cursor applies or the system's frame
+// keeps its own.
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyCursor, SetCursor, SystemParametersInfoW, HTCLIENT, SPI_GETKEYBOARDDELAY,
+    SPI_GETKEYBOARDSPEED, WM_SETCURSOR,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -93,6 +115,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, XBUTTON1,
+    // ADDED FOR STAGE 20: touch. `SM_MAXIMUMTOUCHES` is how a machine says
+    // whether it has a digitiser at all, and the `PT_*` and `TOUCH_MASK_*`
+    // constants are filed here rather than beside the functions that produce
+    // them.
+    PT_TOUCH, POINTER_INPUT_TYPE, SM_MAXIMUMTOUCHES, TOUCH_MASK_CONTACTAREA,
+    TOUCH_MASK_ORIENTATION, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER,
+    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE,
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
@@ -123,8 +152,8 @@ use crate::clipboard::SystemFormat;
 use crate::input::{evdev, evdev_keycode};
 
 use super::{
-    assemble, Commands, Edge, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
-    WindowKind,
+    assemble, Commands, CursorSpec, Edge, FrameStyle, FromUi, IconImage, PlatformConfig, Started,
+    ToUi, WindowId, WindowKind,
 };
 use crate::surface::{Rect, Shadow};
 
@@ -488,6 +517,15 @@ impl WindowState {
         let (sx, sy) = self.to_surface(x, y);
         self.last_pos.set((sx, sy));
 
+        // The pointer is over a client area of ours, so a cursor change may be
+        // applied immediately rather than waiting for the next mouse message.
+        // Set on every move, not only on entry: cheap, and it means a window
+        // that never saw its own `WM_MOUSELEAVE` — because it was destroyed
+        // under the pointer — cannot leave the flag stuck on for long.
+        if let Some(ui) = ui() {
+            ui.pointer_inside.set(true);
+        }
+
         if !self.tracking.replace(true) {
             // Arm the leave notification, and only now: `TrackMouseEvent` is a
             // one-shot and re-arming it on every mouse-move would be a syscall
@@ -512,6 +550,9 @@ impl WindowState {
 
     fn on_mouse_leave(&self, time: u32) {
         self.tracking.set(false);
+        if let Some(ui) = ui() {
+            ui.pointer_inside.set(false);
+        }
         self.send(FromUi::PointerLeave { id: self.id, time });
     }
 
@@ -696,6 +737,57 @@ pub(crate) struct Ui {
     /// nobody outside the process ever measured. A frame dumped here is read
     /// back by `identify` and `compare`, which are not ours.
     dump_frames: Option<std::path::PathBuf>,
+
+    // --- the cursor, stage 12 ---------------------------------------------
+    //
+    // Three cells rather than one, because the `HCURSOR` a window shows, the
+    // `HCURSOR` this process must destroy, and whether the pointer is
+    // anywhere it matters are three independent facts (docs/design.md §23).
+    /// What `WM_SETCURSOR` should install over the client area. `0` means
+    /// "hidden", which is a value `SetCursor` accepts and is what
+    /// `wl_pointer.set_cursor` with a null surface asks for; it is therefore
+    /// **not** a "nothing set yet" sentinel — that state is the arrow, put
+    /// there at startup.
+    cursor: Cell<isize>,
+    /// The `HCURSOR` we built with `CreateIconIndirect`, if the current cursor
+    /// is one. Stock cursors from `LoadCursorW` are shared, must not be
+    /// destroyed, and are therefore never recorded here.
+    ///
+    /// A client that animates its cursor sends a new buffer several times a
+    /// second, so leaking these is not a slow leak: `weston-terminal`'s
+    /// watch cursor would burn a GDI object every 100 ms and hit the 10,000
+    /// handle quota in a quarter of an hour.
+    owned_cursor: Cell<isize>,
+    /// Whether the pointer is inside the client area of one of our windows.
+    ///
+    /// **Why this is needed at all.** `WM_SETCURSOR` arrives only when a mouse
+    /// message does, so a client that changes its cursor while the pointer is
+    /// still — a spinner starting, a `wl_pointer.leave` putting the arrow back
+    /// — would not be seen until the user moved. So the command handler calls
+    /// `SetCursor` itself. But `SetCursor` is thread-global: doing it while
+    /// the pointer is over somebody else's window would repaint *their*
+    /// cursor until their next mouse message. This is the guard.
+    ///
+    /// **Touch deliberately never sets it**, and that is the one place stages
+    /// 12 and 20 meet. This flag means "the mouse cursor is over our client
+    /// area", not "somebody is pointing at our window": a finger does not move
+    /// the cursor, and `on_pointer` suppresses the mouse messages Windows would
+    /// otherwise synthesise from a contact, so a tap leaves the real cursor
+    /// wherever it was. Setting this on a touch would let a client's cursor
+    /// change repaint the cursor while it is sitting over somebody else's
+    /// window — exactly the failure this guard exists to prevent, reached from
+    /// the one direction that has no cursor in it at all.
+    pointer_inside: Cell<bool>,
+
+    /// ADDED FOR STAGE 20. Windows pointer ids to `wl_touch` contact ids.
+    ///
+    /// **On the pump and not on the window**, which is the one structural
+    /// decision in the touch path. `wl_touch`'s ids namespace the *seat*, and
+    /// there is one seat; a per-window table would let two windows each hand
+    /// out contact 0 and the client would see one finger in two places. Win32
+    /// has no seat, so the nearest thing that exists — the thread that pumps
+    /// every window — owns it. See `crate::input::touch::Slots`.
+    slots: RefCell<crate::input::touch::Slots>,
 }
 
 thread_local! {
@@ -943,6 +1035,38 @@ unsafe extern "system" fn toplevel_proc(
             // button message.
             1
         }
+        // ADDED FOR STAGE 12 (docs/design.md §23). **The only place a client's
+        // cursor is installed on a mouse message**, and the reason it has to be
+        // handled rather than left to `DefWindowProc` is that `DefWindowProc`
+        // sets the *class* cursor — the `IDC_ARROW` in `register_classes` —
+        // over the client area, on every mouse move. Anything the compositor
+        // set would be overwritten a few milliseconds later, which presents as
+        // a cursor that flickers to the right shape and back.
+        //
+        // **The hit-test guard is not a nicety.** `wParam` is the window and
+        // `LOWORD(lParam)` is the hit-test code, and only `HTCLIENT` is the
+        // client's business: `HTLEFT`, `HTBOTTOMRIGHT`, `HTCAPTION` and the
+        // rest are the system frame, where Windows draws the resize arrows and
+        // the arrow over the title bar. Claiming those would replace the resize
+        // cursors on the window border with whatever the client last asked for
+        // — the opposite of the goal, which wants a resize arrow on the edge.
+        //
+        // Returning `TRUE` means "the cursor is set, stop here"; falling
+        // through to `DefWindowProc` lets the frame keep its own.
+        WM_SETCURSOR => {
+            if (lparam as u32) & 0xffff == HTCLIENT
+                && let Some(ui) = ui()
+            {
+                // SAFETY: either 0 — which `SetCursor` documents as "remove
+                // the cursor from the screen" — or a live `HCURSOR` this
+                // thread owns or borrowed from the system.
+                unsafe {
+                    SetCursor(ui.cursor.get() as _);
+                }
+                return 1;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_MOUSEWHEEL => {
             state.on_wheel(wparam, false, message_time());
             0
@@ -950,6 +1074,23 @@ unsafe extern "system" fn toplevel_proc(
         WM_MOUSEHWHEEL => {
             state.on_wheel(wparam, true, message_time());
             0
+        }
+
+        // --- touch, stage 20 -----------------------------------------------
+        //
+        // Deliberately falling through to `DefWindowProc` when `on_pointer`
+        // declines: that is what turns a pen — or a touch whose details have
+        // already been discarded — back into the mouse messages above, rather
+        // than into nothing. See `on_pointer` for why consuming the message is
+        // the whole of the opt-in, and why not consuming it would deliver every
+        // tap twice.
+        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERENTER | WM_POINTERLEAVE
+        | WM_POINTERCAPTURECHANGED => {
+            if on_pointer(state, msg, wparam) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_CLOSE => {
             // Deliberately **not** `DefWindowProc`, which would destroy the
@@ -964,6 +1105,20 @@ unsafe extern "system" fn toplevel_proc(
             0
         }
         WM_DESTROY => {
+            // ADDED FOR STAGE 20. A window that goes away holding contacts
+            // would leak their ids for the life of the process — Windows sends
+            // no `WM_POINTERUP` to a window that no longer exists — and would
+            // leave the client believing fingers are still down on a surface it
+            // has destroyed. Both are fixed by the event the protocol already
+            // has for "these did not finish".
+            //
+            // Seat-wide, so it also ends contacts on *other* windows, which is
+            // the same asymmetry `on_pointer` accepts for a cancelled contact
+            // and for the same reason: one finger is on one window in practice,
+            // and a lost gesture beats a stuck one.
+            if let Some(ui) = ui() {
+                cancel_all(state, &ui, "the window was destroyed");
+            }
             // SAFETY: clearing the slot before reclaiming the `Rc` means any
             // message still to be delivered to this window sees a null pointer
             // and takes the `DefWindowProc` path above.
@@ -975,6 +1130,291 @@ unsafe extern "system" fn toplevel_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Touch
+// ---------------------------------------------------------------------------
+
+/// Whether this machine has a touch digitiser.
+///
+/// **Read at startup so that `wl_seat` does not claim a capability the hardware
+/// cannot produce.** `SM_MAXIMUMTOUCHES` is the number of simultaneous contacts
+/// the installed digitisers support and is 0 when there is none — the same
+/// question `GetSystemMetrics(SM_DIGITIZER)` answers with flags, asked in the
+/// form that has a useful number in it. A laptop without a touchscreen
+/// therefore advertises pointer and keyboard and not touch, which is what the
+/// protocol means by a capability and is why this is not simply hard-coded
+/// true.
+///
+/// `WC_FORCE_TOUCH` overrides it, and exists for exactly one purpose: driving
+/// the path with `InjectSyntheticPointerInput` on a machine with no digitiser.
+/// It is an environment variable rather than a flag so that a run which used it
+/// is visible in the process environment of the thing under test, and the
+/// startup line says so — a synthetic run must not be mistakable for a hardware
+/// one (docs/waycompose-design.md §24.6).
+pub fn has_touch() -> bool {
+    if std::env::var_os("WC_FORCE_TOUCH").is_some() {
+        println!(
+            "wc-compositor: WC_FORCE_TOUCH is set, so wl_seat will advertise touch whatever the \
+             hardware says. Any touch event in this run is synthetic."
+        );
+        return true;
+    }
+    // SAFETY: a pure query taking a documented index.
+    let n = unsafe { GetSystemMetrics(SM_MAXIMUMTOUCHES) };
+    if n <= 0 {
+        println!(
+            "wc-compositor: SM_MAXIMUMTOUCHES is {n}, so this machine has no touch digitiser and \
+             wl_seat will not advertise touch."
+        );
+        return false;
+    }
+    println!("wc-compositor: touch digitiser reports {n} simultaneous contacts");
+    true
+}
+
+/// One `WM_POINTER*` message. Returns whether it was consumed.
+///
+/// # Why `WM_POINTER*` and not `RegisterTouchWindow`/`WM_TOUCH`
+///
+/// Both are real, both work, and a window must opt into one of them or Windows
+/// synthesises **mouse messages** from the primary contact instead — which is
+/// what this compositor was doing before this stage, and is worth stating
+/// because it means touch was never *absent* here, it was arriving as a mouse.
+/// A tap became `WM_LBUTTONDOWN`, Firefox saw `wl_pointer.button`, and it
+/// mostly worked; what it could not do was two fingers, or tell a client that
+/// the input was a finger at all.
+///
+/// The pointer family is chosen for one reason that decides it and two that
+/// support it:
+///
+/// * **`WM_TOUCH` cannot express `wl_touch.orientation` at all.** `TOUCHINPUT`
+///   carries `cxContact`/`cyContact` — a contact *size* — and no angle
+///   whatsoever. `wl_seat` is advertised at 9, so `shape` and `orientation`
+///   are both in scope, and choosing `WM_TOUCH` would mean one of the two
+///   events could never be sent by construction rather than for want of
+///   hardware. `POINTER_TOUCH_INFO` has `rcContact` *and* `orientation`, each
+///   with a bit in `touchMask` saying whether the digitiser filled it in,
+///   which is exactly the conditionality the protocol wants.
+/// * It is the supported family. `WM_TOUCH` is documented as legacy and
+///   `RegisterTouchWindow` switches the window *away* from pointer messages,
+///   so taking it would also forfeit pen and every later input type.
+/// * `InjectSyntheticPointerInput` drives it, which is the only way this path
+///   can be exercised at all on a machine with no digitiser.
+///
+/// The cost is Windows 8, and this compositor already requires far newer.
+///
+/// # Consuming the message is what suppresses the mouse
+///
+/// Returning 0 rather than falling through to `DefWindowProc` is not a
+/// formality: the default handling of `WM_POINTERDOWN`/`UPDATE`/`UP` is what
+/// *generates* the legacy `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`. Left
+/// in place, every single-finger tap would reach the client twice — once as
+/// `wl_touch` and once as `wl_pointer` — and a client that handles both, which
+/// Firefox does, would act on it twice.
+///
+/// So the suppression is deliberate and it is also *narrow*: anything that is
+/// not `PT_TOUCH` is handed straight to `DefWindowProc`. A pen still becomes
+/// mouse messages and still works exactly as it did, because a `wl_tablet_tool`
+/// this compositor does not implement is worse than a mouse it does.
+///
+/// # Focus
+///
+/// `SetFocus` is called explicitly on the first contact, because the
+/// `DefWindowProc` handling that would have done it is the same handling being
+/// suppressed. Without it, tapping a window would move no keyboard focus and
+/// the client could not be typed into after being touched — a failure that
+/// looks like a keyboard bug and is a touch one.
+fn on_pointer(state: &WindowState, msg: u32, wparam: WPARAM) -> bool {
+    // `GET_POINTERID_WPARAM` is the low word, on every message in the family.
+    let pointer_id = (wparam & 0xffff) as u32;
+
+    let mut kind: POINTER_INPUT_TYPE = 0;
+    // SAFETY: `kind` is written by the call; a failure leaves it alone, which
+    // is why it is initialised to a value that is not `PT_TOUCH`.
+    if unsafe { GetPointerType(pointer_id, &mut kind) } == 0 || kind != PT_TOUCH {
+        // A pen, or a pointer that has already gone away. Let Windows make
+        // mouse messages out of it; the existing path handles those.
+        return false;
+    }
+
+    let Some(ui) = ui() else { return false };
+
+    // Capture taken away by the system — an edge swipe, the touch keyboard,
+    // a shell gesture. Every live contact is finished at once, which is what
+    // `wl_touch.cancel` means, and no per-contact information is needed.
+    if msg == WM_POINTERCAPTURECHANGED {
+        cancel_all(state, &ui, "the system took the pointer capture");
+        return true;
+    }
+
+    // A touch contact has no hover, so these carry nothing this compositor
+    // wants. They are still consumed, and there are two reasons rather than
+    // one. Handed to `DefWindowProc` they would produce the synthesised mouse
+    // enter and leave that the rest of this function exists to prevent, so
+    // `wl_pointer` would report a pointer wandering in and out of the window
+    // every time somebody tapped it — and, since stage 12, that synthesised
+    // `WM_MOUSEMOVE` would also set `Ui::pointer_inside`, which is the guard on
+    // a **thread-global** `SetCursor`. A finger would then license the
+    // compositor to repaint the cursor while the real one is over somebody
+    // else's window. See the field's own note.
+    if msg == WM_POINTERENTER || msg == WM_POINTERLEAVE {
+        return true;
+    }
+
+    let mut ti: POINTER_TOUCH_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `ti` is fully owned here and written by the call.
+    if unsafe { GetPointerTouchInfo(pointer_id, &mut ti) } == 0 {
+        // The type said touch and the details are gone, which means the contact
+        // ended between the two calls. Not consumed: a mouse message is a
+        // better outcome than a dropped one.
+        return false;
+    }
+
+    // **Screen coordinates.** `ptPixelLocation` is on the desktop, unlike every
+    // other input message in this file, whose `lParam` is already client-local.
+    // Converting here and then through `to_surface` is what keeps a touch and a
+    // click landing on the same pixel of the same surface.
+    let mut pt = POINT {
+        x: ti.pointerInfo.ptPixelLocation.x,
+        y: ti.pointerInfo.ptPixelLocation.y,
+    };
+    // SAFETY: a live window handle and a stack point written by the call.
+    unsafe {
+        ScreenToClient(state.hwnd(), &mut pt);
+    }
+    let (sx, sy) = state.to_surface(pt.x, pt.y);
+
+    // `message_time()` and **not** `ti.pointerInfo.dwTime`, which is the
+    // digitiser's own stamp. Wayland says only that timestamps within a seat
+    // are comparable, and mixing two epochs on one seat would make a
+    // touch-then-click sequence appear to go backwards in time — which is
+    // precisely what a client's double-tap and gesture timing reads.
+    let time = message_time();
+
+    // The contact patch, only if the digitiser said it has one. Both halves are
+    // conditional and neither is invented; see `shape_from_contact`.
+    let shape = if ti.touchMask & TOUCH_MASK_CONTACTAREA != 0 {
+        let r = ti.rcContact;
+        let orientation = if ti.touchMask & TOUCH_MASK_ORIENTATION != 0 {
+            Some(f64::from(ti.orientation))
+        } else {
+            None
+        };
+        crate::input::touch::shape_from_contact(
+            f64::from(r.right - r.left),
+            f64::from(r.bottom - r.top),
+            orientation,
+        )
+    } else {
+        None
+    };
+
+    // A contact Windows has marked as not meant — palm rejection is the usual
+    // one. There is no per-contact cancel in the protocol: `wl_touch.cancel`
+    // ends the whole stream. Cancelling everything is the deliberate choice,
+    // because the two ways to be wrong are not symmetric — over-cancelling
+    // loses a gesture the user must repeat, while delivering it as a normal
+    // `up` completes a tap the user never made, on whatever control the palm
+    // was resting on.
+    if ti.pointerInfo.pointerFlags & POINTER_FLAG_CANCELED != 0 {
+        cancel_all(state, &ui, "Windows marked the contact cancelled");
+        return true;
+    }
+
+    match msg {
+        WM_POINTERDOWN => {
+            let slot = ui.slots.borrow_mut().down(pointer_id);
+            let Some(slot) = slot else {
+                eprintln!(
+                    "wc-compositor: window {} dropped touch contact {pointer_id}: more than {} \
+                     down at once",
+                    state.id,
+                    crate::input::touch::MAX_CONTACTS
+                );
+                return true;
+            };
+            // The two numberings, side by side, once per contact. Cheap — a
+            // contact is a few messages, not one per pixel — and it is the only
+            // place the mapping is observable from outside: Windows' id is the
+            // input stack's own and the client is told a small dense one, and
+            // on the guest they were 4 and 5 against 0 and 1 for the same two
+            // fingers. A reader who suspects the ids are wrong can
+            // check them here rather than infer it from a client behaving oddly.
+            println!(
+                "wc-compositor: window {} touch contact: Windows pointer {pointer_id} \
+                 -> wl_touch id {slot}",
+                state.id
+            );
+            // See this function's header: the `DefWindowProc` that would have
+            // moved the focus is the one being suppressed.
+            // SAFETY: both are pure queries on a live handle owned by this
+            // thread; `SetFocus` on the already-focused window is a no-op.
+            unsafe {
+                if GetFocus() != state.hwnd() {
+                    SetFocus(state.hwnd());
+                }
+            }
+            state.send(FromUi::TouchDown { id: state.id, slot, x: sx, y: sy, shape, time });
+        }
+        WM_POINTERUPDATE => {
+            // A contact that is in range but not touching. Touch digitisers
+            // rarely do this and pens always do; the flag is checked rather
+            // than assumed, because a hovering contact reported as motion is a
+            // finger that a client believes is dragging.
+            if ti.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT == 0 {
+                return true;
+            }
+            let Some(slot) = ui.slots.borrow().get(pointer_id) else {
+                // An update for a contact whose down went somewhere else. Not
+                // an error and not deliverable: `wl_touch.motion` may only name
+                // an id that a `down` has already introduced.
+                return true;
+            };
+            state.send(FromUi::TouchMotion { id: state.id, slot, x: sx, y: sy, shape, time });
+        }
+        WM_POINTERUP => {
+            let Some(slot) = ui.slots.borrow_mut().up(pointer_id) else {
+                return true;
+            };
+            state.send(FromUi::TouchUp { id: state.id, slot, time });
+        }
+        _ => return false,
+    }
+
+    // **One frame per message, and every message closes its own.**
+    //
+    // Win32 delivers one `WM_POINTER*` per contact; there is no message that
+    // carries two. Windows does offer `GetPointerFrameTouchInfo` plus
+    // `SkipPointerFrameMessages`, which would gather every contact sharing a
+    // `frameId` into one frame — and it is not used, because `Skip…` discards
+    // the queued messages for the whole frame including `WM_POINTERDOWN`s whose
+    // implicit capture and whose focus handling this function depends on, and
+    // there is no digitiser here to establish that doing so is safe.
+    //
+    // Nothing is lost by the simpler shape. The protocol says a frame
+    // "terminates at least one event but otherwise no guarantee is provided
+    // about the set of events within a frame", and a client "must assume that
+    // any state not updated in a frame is unchanged" — so a frame per changed
+    // contact is exactly what libinput and Weston produce for the same
+    // gesture, one evdev `SYN_REPORT` at a time. A pinch arrives as alternating
+    // single-contact frames with equal timestamps, which is a correct
+    // description of it.
+    state.send(FromUi::TouchFrame);
+    true
+}
+
+/// End every live contact at once, if there is one.
+///
+/// Guarded on there being something down, because `wl_touch.cancel` with no
+/// contact is a client being told to finalise touch points it does not have.
+fn cancel_all(state: &WindowState, ui: &Rc<Ui>, why: &str) {
+    if !ui.slots.borrow_mut().clear() {
+        return;
+    }
+    println!("wc-compositor: window {} touch cancelled: {why}", state.id);
+    state.send(FromUi::TouchCancel);
 }
 
 unsafe extern "system" fn controller_proc(
@@ -1400,6 +1840,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 dump_frame(ui, &w);
             }
         }
+        ToUi::Cursor { spec } => set_cursor(ui, spec),
         ToUi::SetWindowState {
             id,
             maximized,
@@ -2348,8 +2789,25 @@ fn release_icons(w: &Rc<WindowState>) {
 /// `AlphaBlend`, which is defined on premultiplied colour. A straight-alpha
 /// source would show as a pale halo, not as a failure.
 fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
+    make_hicon(icon, tw, th, None)
+}
+
+/// The body of [`make_icon`], and of [`make_cursor`].
+///
+/// SPLIT OUT FOR STAGE 12. An icon and a cursor are the same `ICONINFO` with
+/// `fIcon` flipped and a hotspot filled in — Win32 models them as one object
+/// and `HICON` and `HCURSOR` are the same handle type — so writing the DIB
+/// twice would have been two places for the premultiplied-alpha convention to
+/// drift apart.
+///
+/// `hotspot` is `None` for an icon and `Some((x, y))` for a cursor, in pixels
+/// from the top-left of the *target* bitmap.
+fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -> Option<isize> {
     use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, CreateDIBSection};
 
+    if tw <= 0 || th <= 0 {
+        return None;
+    }
     if icon.width <= 0 || icon.height <= 0 {
         return None;
     }
@@ -2404,14 +2862,39 @@ fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
     // A 32-bit colour bitmap with an alpha channel still needs a mask bitmap
     // present; an all-zero mask means "take the alpha from the colour bitmap",
     // which is what every modern icon does.
-    // SAFETY: a 1bpp monochrome bitmap of the right size, zero-initialised by
-    // passing a null bit pointer.
-    let mask = unsafe { CreateBitmap(tw, th, 1, 1, std::ptr::null()) };
+    //
+    // **The zeroes are supplied rather than assumed.** `CreateBitmap`'s
+    // documentation says that with a null bit pointer "the contents of the new
+    // bitmap is undefined" — the zero-fill every Windows to date has actually
+    // done is not contractual, and this is the kind of thing Wine has already
+    // lied about four times (docs/design.md §13.6). For an icon a stray mask
+    // bit is one wrong pixel in a taskbar button; for a *cursor* the AND mask
+    // is what selects between "transparent" and "invert the screen", so a
+    // garbage mask is a cursor with inverted holes punched through it. Cheap
+    // to be sure: a 32x32 mask is 128 bytes.
+    //
+    // Scan lines of a `CreateBitmap` bitmap are **word**-aligned, not
+    // dword-aligned as they would be in a DIB.
+    let mask_stride = ((tw as usize).div_ceil(16)) * 2;
+    let mask_bits = vec![0u8; mask_stride.checked_mul(th as usize)?];
+    // SAFETY: a 1bpp monochrome bitmap whose bit buffer is exactly the size
+    // Win32 computes for these dimensions, and which outlives the call.
+    let mask = unsafe { CreateBitmap(tw, th, 1, 1, mask_bits.as_ptr().cast()) };
+
+    let (f_icon, (hx, hy)) = match hotspot {
+        None => (1, (0, 0)),
+        // Clamped into the bitmap. A hotspot outside the image is not a Win32
+        // error and not a Wayland one either — the protocol says only that it
+        // is "in surface-local coordinates" — but it makes the pointer act at
+        // a place that is not on the pointer, so a client that sends nonsense
+        // gets the nearest sensible thing rather than an unusable cursor.
+        Some((x, y)) => (0, (x.clamp(0, tw - 1) as u32, y.clamp(0, th - 1) as u32)),
+    };
 
     let info = ICONINFO {
-        fIcon: 1,
-        xHotspot: 0,
-        yHotspot: 0,
+        fIcon: f_icon,
+        xHotspot: hx,
+        yHotspot: hy,
         hbmMask: mask,
         hbmColor: colour,
     };
@@ -2427,6 +2910,313 @@ fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
     } else {
         Some(hicon as isize)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The cursor
+// ---------------------------------------------------------------------------
+
+/// Install what the client asked the pointer to look like.
+///
+/// ADDED FOR STAGE 12 (docs/design.md §23).
+///
+/// # The invariant this exists to keep
+///
+/// **Exactly one visible cursor, and it is a real Win32 cursor.** Nothing here
+/// draws anything: a client's cursor surface is turned into an `HCURSOR` and
+/// handed to Windows, which composites it above every window on the desktop
+/// with the right hotspot, the right refresh behaviour and no tearing, for
+/// free. The alternative — blitting the cursor image into the window as
+/// content — is what produced the two-cursor bug the user reported, and it is
+/// wrong for a reason no amount of care fixes: the client's cursor would be
+/// clipped to the window, lag the real pointer by a frame, and still leave the
+/// system arrow on top of it.
+///
+/// # Why the cursor is installed twice
+///
+/// Once here, and once from `WM_SETCURSOR`, and both are needed:
+///
+/// * `WM_SETCURSOR` is the only way to *keep* it. Windows re-asks on every
+///   mouse message and `DefWindowProc` answers with the class cursor, so a
+///   cursor set only here survives until the pointer moves one pixel.
+/// * This call is the only way to *apply* it now. `WM_SETCURSOR` needs a mouse
+///   message, and the interesting changes happen while the pointer is still —
+///   a page finishing loading, a client hiding the pointer as the user starts
+///   typing, a `wl_pointer.leave` restoring the arrow.
+fn set_cursor(ui: &Rc<Ui>, spec: CursorSpec) {
+    // Build the new one **before** destroying the old, so a failed build
+    // leaves the previous cursor up rather than leaving the pointer invisible.
+    let (handle, owned, what) = match &spec {
+        CursorSpec::Hidden => (0isize, false, "hidden".to_string()),
+        CursorSpec::Named(icon) => {
+            let stock = crate::cursor::stock_for(*icon);
+            let h = stock_cursor(stock.idc);
+            if h == 0 {
+                // `LoadCursorW` of a stock cursor failing is not something that
+                // happens on Windows; it is exactly the kind of thing that
+                // happens on Wine. Keep whatever is up and say so.
+                eprintln!(
+                    "wc-compositor: LoadCursorW({}) failed for shape {:?}; cursor unchanged",
+                    stock.name,
+                    icon.name()
+                );
+                return;
+            }
+            (h, false, format!("{} ({})", icon.name(), stock.name))
+        }
+        CursorSpec::Image { image, hotspot_x, hotspot_y } => {
+            match make_cursor(image, *hotspot_x, *hotspot_y) {
+                Some(h) => (
+                    h,
+                    true,
+                    format!(
+                        "{}x{} pixels, hotspot {hotspot_x},{hotspot_y}",
+                        image.width, image.height
+                    ),
+                ),
+                None => {
+                    eprintln!(
+                        "wc-compositor: could not build an HCURSOR from {}x{} pixels; \
+                         cursor unchanged",
+                        image.width, image.height
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    let previous = ui.cursor.replace(handle);
+    let previously_owned = ui.owned_cursor.replace(if owned { handle } else { 0 });
+
+    if ui.pointer_inside.get() {
+        // SAFETY: 0 is documented as "hide the cursor"; anything else is a
+        // handle produced immediately above and stored in `ui.cursor`, so it
+        // outlives the call.
+        unsafe {
+            SetCursor(handle as _);
+        }
+    }
+
+    // **After** `SetCursor`, and only if it is not the one still showing.
+    // Destroying a cursor that is on screen is legal but leaves the pointer
+    // drawn from freed memory until the next `SetCursor`, which is the classic
+    // way to get a corrupted pointer that survives the process.
+    if previously_owned != 0 && previously_owned != handle {
+        // SAFETY: came from `CreateIconIndirect`, is no longer installed, and
+        // the cell that held it has already been overwritten so this runs once.
+        unsafe {
+            DestroyCursor(previously_owned as _);
+        }
+    }
+
+    if previous != handle {
+        println!("wc-compositor: cursor -> {what}");
+    }
+}
+
+/// One of Win32's built-in cursors, by `IDC_*` ordinal.
+///
+/// **Not destroyed, ever.** Stock cursors are shared process-wide and owned by
+/// the system; `DestroyCursor` on one is documented as an error and in practice
+/// takes the arrow away from every window in the process.
+///
+/// The ordinal is cast to a pointer rather than named as a `windows-sys`
+/// constant because the table that chose it lives in `crate::cursor`, which
+/// compiles on Linux and must not mention `windows-sys` (see that file). This
+/// is `MAKEINTRESOURCE`, which has always been "the integer, in the pointer".
+fn stock_cursor(idc: u16) -> isize {
+    // SAFETY: a null instance means "the system's own resources", which is
+    // where the `IDC_*` cursors live, and the resource id is an integer
+    // ordinal rather than a string pointer.
+    unsafe { LoadCursorW(std::ptr::null_mut(), idc as usize as *const u16) as isize }
+}
+
+/// Build an `HCURSOR` from a client's cursor surface.
+///
+/// # Why the image is not scaled
+///
+/// [`make_icon`] resamples, because Windows asks for two specific icon sizes
+/// and a client's icon is whatever size the theme had. A cursor has no such
+/// requirement: `CreateIconIndirect` accepts any dimensions, and the sizes
+/// clients actually send — 24x24 and 32x32 from the XCursor themes, 48x48 and
+/// 64x64 at scale 2 — are all displayed as sent. Not scaling means the hotspot
+/// arrives as an exact pixel rather than as a rounded one, which matters:
+/// the hotspot *is* the pointer, and half a pixel of drift on a 1-pixel-wide
+/// I-beam is the difference between clicking before and after a character.
+///
+/// # The alpha
+///
+/// `wl_shm`'s `Argb8888` is **premultiplied**, and a 32-bit `CreateIconIndirect`
+/// wants premultiplied, so there is nothing to convert — but there is
+/// something not to do, which is to discard it. A cursor is mostly transparent
+/// and almost entirely antialiased edge; dropping the alpha channel gives a
+/// black rectangle with a cursor somewhere in it, and forcing it opaque gives
+/// a cursor with a hard jagged outline. Both are worse than the arrow this
+/// replaces, so the ARGB path is the only one implemented.
+fn make_cursor(image: &IconImage, hotspot_x: i32, hotspot_y: i32) -> Option<isize> {
+    let h = make_hicon(
+        image,
+        image.width,
+        image.height,
+        Some((hotspot_x, hotspot_y)),
+    )?;
+    verify_cursor_once(h);
+    Some(h)
+}
+
+/// Read the first cursor back out of Win32 and say what it became.
+///
+/// ADDED FOR STAGE 12, and it is a harness affordance rather than a check the
+/// compositor needs — but it has to live here, because **an `HCURSOR` from
+/// `CreateIconIndirect` belongs to the process that made it**. Measured:
+/// `GetIconInfo` on this handle from `scripts/probe-cursor.c`, a different
+/// process on the same desktop, fails with 1402 `ERROR_INVALID_CURSOR_HANDLE`.
+/// So the probe can say "the cursor Win32 is showing is not one of the sixteen
+/// stock ones", which is real evidence and is all it can get, and this says
+/// what the thing it is showing is made of.
+///
+/// Three facts, and each is a different way for the cursor to be wrong in a way
+/// nobody would see as a failure:
+///
+/// * `fIcon == 0`. An `HICON` and an `HCURSOR` are the same handle type, and
+///   `SetCursor` accepts an icon — it just draws it with the hotspot at 0,0.
+/// * The hotspot. Off by a few pixels means the pointer clicks somewhere other
+///   than where it is drawn, which reads as a badly calibrated screen.
+/// * 32 bits per pixel in the colour bitmap. Anything else means the alpha
+///   channel was dropped somewhere, and a cursor without alpha is a black
+///   rectangle with a shape in it.
+///
+/// Once per process: this is a hot-ish path — an animated cursor rebuilds
+/// several times a second — and the interesting question is whether the
+/// conversion works at all, which the first one answers.
+fn verify_cursor_once(hcursor: isize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Graphics::Gdi::{GetObjectW, BITMAP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetIconInfo;
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let mut info: ICONINFO = unsafe { std::mem::zeroed() };
+    // SAFETY: a handle this process created, and `info` is written by the call.
+    if unsafe { GetIconInfo(hcursor as _, &mut info) } == 0 {
+        eprintln!(
+            "wc-compositor: GetIconInfo on our own HCURSOR failed ({})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let mut bm: BITMAP = unsafe { std::mem::zeroed() };
+    // SAFETY: `GetIconInfo` hands over two bitmaps this process now owns, and
+    // `bm` is written by the call.
+    let bits = if info.hbmColor.is_null() {
+        0
+    } else if unsafe {
+        GetObjectW(
+            info.hbmColor as _,
+            std::mem::size_of::<BITMAP>() as i32,
+            (&mut bm as *mut BITMAP).cast(),
+        )
+    } != 0
+    {
+        bm.bmBitsPixel
+    } else {
+        0
+    };
+
+    println!(
+        "wc-compositor: cursor round-trip: fIcon={} hotspot={},{} colour={}x{} at {} bpp",
+        info.fIcon, info.xHotspot, info.yHotspot, bm.bmWidth, bm.bmHeight, bits
+    );
+
+    // `GetIconInfo` **creates** the two bitmaps it returns and the caller owns
+    // them. Not deleting them here would leak two GDI objects, which is the
+    // documented behaviour that is easiest to miss because nothing ever
+    // complains about it.
+    // SAFETY: both handles came from the call above and are deleted once.
+    unsafe {
+        if !info.hbmColor.is_null() {
+            DeleteObject(info.hbmColor as _);
+        }
+        if !info.hbmMask.is_null() {
+            DeleteObject(info.hbmMask as _);
+        }
+    }
+}
+
+/// How fast Windows itself repeats a held key, as `wl_keyboard.repeat_info`
+/// wants it: a delay in milliseconds and a rate in keys per second.
+///
+/// ADDED FOR STAGE 12. Until now these were the constants 500 and 30 — Windows'
+/// *defaults*, written out — which meant a user who had turned the repeat rate
+/// up in the Control Panel got the default in every Wayland client and the
+/// system rate in every native one. The compositor does not repeat anything
+/// itself (see `state.rs`), so this number is not a knob the compositor honours
+/// but a fact about the machine that it forwards; inventing it was the one
+/// thing that could not be right.
+///
+/// # The two scales, neither of which is in the units Wayland wants
+///
+/// `SPI_GETKEYBOARDDELAY` returns **0 to 3**, meaning 250 ms to 1000 ms in
+/// 250 ms steps. That is the documented mapping and it is exact.
+///
+/// `SPI_GETKEYBOARDSPEED` returns **0 to 31**, and Microsoft documents only the
+/// endpoints: 0 is "approximately 2.5 repetitions per second" and 31 is
+/// "approximately 30". The scale between them is linear in the *rate*, which is
+/// how `keybd.cpl`'s slider has always behaved. So this interpolates, and says
+/// so, rather than presenting a table of thirty-two numbers it would have made
+/// up. The endpoints are exact; the middle is an estimate, and the error at
+/// worst is a fraction of a repeat per second — well inside what a user could
+/// perceive as anything but "about right".
+///
+/// A failed call keeps the old constants. `SystemParametersInfo` failing is not
+/// something Windows does, and is something Wine might (docs/design.md §13.6).
+pub fn keyboard_repeat() -> (i32, i32) {
+    let mut delay: u32 = 1;
+    let mut speed: u32 = 31;
+
+    // SAFETY: both actions are documented as writing a `u32` through `pvParam`;
+    // `uiParam` is unused and `fWinIni` of 0 means "do not broadcast".
+    let ok_delay = unsafe {
+        SystemParametersInfoW(
+            SPI_GETKEYBOARDDELAY,
+            0,
+            (&mut delay as *mut u32).cast(),
+            0,
+        ) != 0
+    };
+    // SAFETY: as above.
+    let ok_speed = unsafe {
+        SystemParametersInfoW(
+            SPI_GETKEYBOARDSPEED,
+            0,
+            (&mut speed as *mut u32).cast(),
+            0,
+        ) != 0
+    };
+
+    if !ok_delay || !ok_speed {
+        eprintln!(
+            "wc-compositor: SystemParametersInfo could not read the keyboard repeat settings; \
+             advertising Windows' defaults"
+        );
+        return (500, 30);
+    }
+
+    let delay_ms = 250 * (delay.min(3) as i32 + 1);
+    // 2.5/s at 0, 30/s at 31, linear in between, rounded to the nearest whole
+    // repeat because `repeat_info` counts in whole ones.
+    let rate_hz = ((25 + (speed.min(31) as i32) * 275 / 31) + 5) / 10;
+
+    println!(
+        "wc-compositor: keyboard repeat: SPI delay {delay} -> {delay_ms} ms, \
+         SPI speed {speed} -> {rate_hz}/s"
+    );
+    (delay_ms, rate_hz)
 }
 
 // ---------------------------------------------------------------------------
@@ -2490,6 +3280,14 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         idle_inhibited: Cell::new(false),
         html_format: Cell::new(0),
         dump_frames: config.dump_frames.clone(),
+        // The arrow, so that the very first `WM_SETCURSOR` — which arrives
+        // before any client has said anything about a cursor — installs the
+        // same shape the window class would have. Starting at 0 would mean a
+        // window with no pointer at all until the first client spoke.
+        cursor: Cell::new(stock_cursor(crate::cursor::IDC_ARROW.idc)),
+        owned_cursor: Cell::new(0),
+        pointer_inside: Cell::new(false),
+        slots: RefCell::new(crate::input::touch::Slots::new()),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
@@ -2546,6 +3344,20 @@ impl PumpInner {
         for id in ids {
             handle(&self.ui, ToUi::Destroy { id });
         }
+        // The cursor we built, if the last thing a client asked for was its own
+        // pixels. Nothing is showing it any more — every window is gone — and
+        // the process may outlive the pump by however long the Wayland thread
+        // takes to wind up.
+        let owned = self.ui.owned_cursor.replace(0);
+        if owned != 0 {
+            // SAFETY: came from `CreateIconIndirect` in `make_cursor`, is
+            // destroyed once because the cell is cleared in the same breath,
+            // and is not installed anywhere: no window remains.
+            unsafe {
+                DestroyCursor(owned as _);
+            }
+        }
+
         let controller = self.ui.controller.replace(0);
         if controller != 0 {
             // SAFETY: created on this thread, destroyed once, and no `Ui`

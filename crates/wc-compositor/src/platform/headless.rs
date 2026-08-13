@@ -50,7 +50,10 @@ use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{assemble, Commands, FrameStyle, FromUi, PlatformConfig, Started, ToUi, WindowId};
+use super::{
+    assemble, Commands, CursorSpec, FrameStyle, FromUi, PlatformConfig, Started, ToUi, TouchShape,
+    WindowId,
+};
 use crate::surface::{PixelFormat, Shadow};
 
 /// Nothing to wake: [`PumpInner::run`] blocks in `Receiver::recv_timeout`,
@@ -242,6 +245,36 @@ pub fn current_layout() -> &'static str {
     crate::input::FALLBACK
 }
 
+/// ADDED FOR STAGE 20. Whether `wl_seat` may advertise touch.
+///
+/// **True**, and the mirror of `win32::has_touch` rather than a copy of it. On
+/// Windows the question is whether a digitiser exists, because the events come
+/// from one; here they come from [`PumpInner::simulate_input`], which is a real
+/// source of `wl_touch` events even though it is not a finger — so the
+/// capability is honest on the same terms. A Linux run without `--simulate-wm`
+/// advertises a touch that never fires, which is exactly what a Windows machine
+/// with a digitiser nobody touches also does.
+///
+/// This leg is where a third-party client is the arbiter (docs/waycompose-design.md §24.6):
+/// on Windows there is no Weston client to connect directly, and here there is.
+pub fn has_touch() -> bool {
+    true
+}
+
+/// What `wl_keyboard.repeat_info` advertises when there is no Windows to ask.
+///
+/// ADDED FOR STAGE 12, as the mirror of `win32.rs`'s `SystemParametersInfo`
+/// call. **Windows' defaults, not Linux's**, and that is deliberate: this
+/// platform exists so the compositor's own logic can be exercised on the
+/// machine that builds it, and a headless run that advertised whatever
+/// `xset q` says on the build host would make the harness's output depend on
+/// the developer's desktop settings. The numbers are `SPI_GETKEYBOARDDELAY` 1
+/// and `SPI_GETKEYBOARDSPEED` 31 put through the same arithmetic, which is
+/// what a stock Windows install returns.
+pub fn keyboard_repeat() -> (i32, i32) {
+    (500, 30)
+}
+
 pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(dir) = &config.dump_frames {
@@ -392,6 +425,44 @@ impl PumpInner {
                     }
                 }
             }
+
+            // ADDED FOR STAGE 12. There is no pointer here to put a cursor on,
+            // so the command is reported — and reported in the terms the Win32
+            // side would act on, including the `IDC_*` a named shape resolves
+            // to. That table is arithmetic rather than Win32 (see
+            // `crate::cursor`), so running it here means the mapping every
+            // client actually depends on is exercised by `cargo test` on Linux
+            // rather than only on the guest.
+            ToUi::Cursor { spec } => match spec {
+                CursorSpec::Hidden => {
+                    println!("wc-compositor: cursor -> hidden");
+                }
+                CursorSpec::Named(icon) => {
+                    let stock = crate::cursor::stock_for(icon);
+                    println!(
+                        "wc-compositor: cursor -> {} ({})",
+                        icon.name(),
+                        stock.name
+                    );
+                }
+                CursorSpec::Image {
+                    image,
+                    hotspot_x,
+                    hotspot_y,
+                } => {
+                    // The hash for the same reason `ToUi::Icon` carries one: it
+                    // is how a test asserts that the pixels which arrived are
+                    // the client's, with no Windows in the loop.
+                    println!(
+                        "wc-compositor: cursor -> {}x{} pixels hotspot {hotspot_x},{hotspot_y} \
+                         hash={:016x}",
+                        image.width,
+                        image.height,
+                        fnv1a(&image.pixels)
+                    );
+                }
+            },
+
             // ADDED FOR STAGE 13. Printed rather than acted on: there is no
             // window manager here to move anything, and the thing worth
             // asserting is that `xdg_popup.reposition` produced a move at all,
@@ -399,6 +470,7 @@ impl PumpInner {
             ToUi::MovePopup { id, x, y, width, height } => println!(
                 "wc-compositor: window {id} repositioned to {x},{y} {width}x{height}"
             ),
+
             ToUi::Map { id, width, height } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;
@@ -784,6 +856,96 @@ impl PumpInner {
 
         println!("wc-compositor: [simulate-wm] window {id} pointer leave");
         send(FromUi::PointerLeave { id, time: t() });
+
+        self.simulate_touch(id, w, &send, &t);
+    }
+
+    /// STAGE 20. A two-finger pinch, then both fingers up.
+    ///
+    /// # Why a pinch and not a tap
+    ///
+    /// A tap would exercise `down`, `motion`, `up` and `frame` and would say
+    /// nothing about the part of `wl_touch` that is actually hard, which is
+    /// that **contacts are tracked by id and the ids must stay put**. Two
+    /// contacts moving in opposite directions is the smallest gesture where a
+    /// swapped or renumbered id is visible in a client rather than only in a
+    /// log: the two fingers converge instead of diverging.
+    ///
+    /// The order is a user's order and not a list of the event types, for the
+    /// same reason `simulate_input` above says so: a `motion` for an id that
+    /// has not been `down` is a protocol error a client may treat as fatal, and
+    /// a harness that emitted them in a tidy order would not be testing that
+    /// this one is right.
+    ///
+    /// # Both answers about shape, because there are two
+    ///
+    /// The pinch carries **no** `shape`, which is what a digitiser that does
+    /// not report a contact area produces and is by far the commoner case; a
+    /// client must see no `shape` and no `orientation` at all across it, not a
+    /// default ellipse. The last contact carries **one**, so that the
+    /// conditional half of `wl_touch` is executed by something rather than
+    /// merely compiled — including its ordering, which the protocol constrains:
+    /// `shape` and `orientation` must precede the `frame` that closes the
+    /// update they belong to.
+    ///
+    /// The distinction that matters, and it is not the same distinction: on
+    /// Windows a shape is sent **only** when `POINTER_TOUCH_INFO::touchMask`
+    /// says the digitiser measured one. Inventing an ellipse *there* would tell
+    /// a client something about hardware that was never asked. Writing one down
+    /// *here* is the same kind of statement as the scripted keystrokes above —
+    /// a harness saying what a device would send, so the code that handles it
+    /// runs.
+    fn simulate_touch(
+        &self,
+        id: WindowId,
+        w: &Headless,
+        send: &dyn Fn(FromUi),
+        t: &dyn Fn() -> u32,
+    ) {
+        let (cx, cy) = (f64::from(w.surface.0) / 2.0, f64::from(w.surface.1) / 2.0);
+        // Contact ids as the platform hands them out: dense, from zero.
+        let (a, b) = (0, 1);
+
+        println!("wc-compositor: [simulate-wm] window {id} two contacts down at {cx},{cy}");
+        send(FromUi::TouchDown { id, slot: a, x: cx - 20.0, y: cy, shape: None, time: t() });
+        send(FromUi::TouchDown { id, slot: b, x: cx + 20.0, y: cy, shape: None, time: t() });
+        // One frame for both, because they landed together. This is the case a
+        // client that buffers on `frame` gets wrong if the compositor forgets
+        // to close it — and the case Win32 cannot produce, since it delivers
+        // one message per contact (see `win32::on_pointer`).
+        send(FromUi::TouchFrame);
+
+        println!("wc-compositor: [simulate-wm] window {id} pinch out, four steps");
+        for step in 1..=4 {
+            let d = 20.0 + f64::from(step) * 15.0;
+            send(FromUi::TouchMotion { id, slot: a, x: cx - d, y: cy, shape: None, time: t() });
+            send(FromUi::TouchMotion { id, slot: b, x: cx + d, y: cy, shape: None, time: t() });
+            send(FromUi::TouchFrame);
+        }
+
+        // Lifted one at a time, which is what fingers do, and which is the
+        // ordering that catches an implementation that retires the wrong id.
+        println!("wc-compositor: [simulate-wm] window {id} contacts up, one at a time");
+        send(FromUi::TouchUp { id, slot: b, time: t() });
+        send(FromUi::TouchFrame);
+        send(FromUi::TouchUp { id, slot: a, time: t() });
+        send(FromUi::TouchFrame);
+
+        // And a tap the system takes away mid-gesture, which is the event a
+        // compositor is most likely never to send at all: `cancel` has no
+        // matching thing a user does, it comes from the platform deciding the
+        // stream was a shell gesture, and a client that never sees one will
+        // hold the contact for ever.
+        //
+        // It is also the one that carries a contact patch: 9 by 14 surface
+        // units at 30 degrees clockwise of the surface's y axis, which is a
+        // finger at a slight angle and is the shape `shape_from_contact` builds
+        // from a Windows rectangle whose `TOUCH_MASK_ORIENTATION` bit is set.
+        println!("wc-compositor: [simulate-wm] window {id} a contact the system then cancels");
+        let shape = Some(TouchShape { major: 14.0, minor: 9.0, orientation: 30.0 });
+        send(FromUi::TouchDown { id, slot: a, x: cx, y: cy, shape, time: t() });
+        send(FromUi::TouchFrame);
+        send(FromUi::TouchCancel);
     }
 }
 

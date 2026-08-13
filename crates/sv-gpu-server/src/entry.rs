@@ -58,6 +58,22 @@ pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
 
 #[cfg(windows)]
 fn win_run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match argv.get(1).map(String::as_str) {
+        Some("serve") => win_serve(argv),
+        Some("guest") => win_guest(argv),
+        _ => {
+            eprintln!(
+                "usage:\n  \
+                 sv-gpu-server serve --session <name> [--device N] [--arena BYTES]\n  \
+                 sv-gpu-server guest --port <tcp> [--device N] [--arena BYTES] [--idle SECS]"
+            );
+            Err("no subcommand".into())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use sv_gpu_server::driver::Driver;
     use sv_gpu_server::{arena, server::Shared, session, table::Objects};
@@ -71,12 +87,6 @@ fn win_run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
-    if args.get(1).map(String::as_str) != Some("serve") {
-        eprintln!(
-            "usage: sv-gpu-server serve --session <name> [--device N] [--arena BYTES]"
-        );
-        return Err("no subcommand".into());
-    }
     let session_name = arg("--session").ok_or("--session is required")?;
     let device: usize = arg("--device").map_or(Ok(0), |s| s.parse())?;
     let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
@@ -181,6 +191,241 @@ fn win_run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(30),
     )?;
     eprintln!("[gpu] {handled} commands dispatched");
+    Ok(())
+}
+
+/// The **Windows guest side** of the cross-VM topology.
+///
+/// ```text
+/// sv-gpu-server guest --port <tcp> [--device N] [--arena BYTES] [--idle SECS]
+/// ```
+///
+/// This is the mode `testhost` needs and the one that did not exist: the
+/// Windows path had only `serve`, which puts both halves inside the guest and
+/// hands the app side two **named sections** — objects with no meaning outside
+/// that kernel. An application on the Linux host cannot open a section name, so
+/// `serve` cannot reach it however it is started.
+///
+/// The Linux [`guest`] subcommand is the same shape and this is deliberately a
+/// mirror of it rather than a new design. What differs is only the spelling of
+/// the two OS-specific steps:
+///
+/// | step | Linux `guest` | here |
+/// |---|---|---|
+/// | commit + pin | `mmap(MAP_POPULATE)` + `mlock` ([`sv_arena::guestram`]) | `VirtualAlloc(MEM_LARGE_PAGES)`, else `VirtualAlloc`+`VirtualLock` ([`awe_probe::alloc`]) |
+/// | stamp | one `arena_record` per 4 KiB page | the same, from the same crate |
+/// | cold path | `/dev/virtio-ports/<name>` | a **TCP listener on loopback** |
+///
+/// # Why the cold path is TCP, and why that is not a hole
+///
+/// The Linux path rides a virtio-serial port. This guest has exactly two —
+/// `org.sirati.wifi.0` and `org.sirati.display.0`, both spoken for — and adding
+/// a third is a change to the machine's NixOS configuration and a reboot of a
+/// VM other people are using. So the channel is a loopback TCP listener the
+/// host reaches with `ssh -L <unix-socket>:127.0.0.1:<port>`, which puts a Unix
+/// socket on the host at the far end of it and lets `sv-hostd qemu-serve`
+/// connect to it with **no change at all** — [`sv_transport::stream`]'s
+/// `ColdChannel` is blanket-implemented for anything `Read + Write`, which is
+/// the claim that module exists to make.
+///
+/// This is waycompose's `probe-relay.c` argument and it holds for the same
+/// reason: **what crosses is framed text and page counts**, never a descriptor,
+/// because on this path there is no descriptor to cross — the guest cannot name
+/// its own frames and the host finds the pages by content (§5.1, D21). A
+/// transport that *could* carry a descriptor would not make this one carry one.
+/// The listener is bound to `127.0.0.1` so the only way to it is through an ssh
+/// channel the host already had.
+///
+/// # One session per process, on purpose
+///
+/// Unlike Linux `serve`, this takes no `--clients`. A cross-VM session is one
+/// pinned window, one extent for the host to locate, and one control region;
+/// serving several from one process would mean the host locating one extent and
+/// slicing it, which is a wire change for no isolation. Firefox needs several
+/// sessions (§0.11 — it forks `glxtest` before the browser exists), and the way
+/// to get them here is several of these processes on several ports, each with
+/// its own window. That is §0.12's "a separate allocation per session makes it
+/// a fact" arriving on the cross-VM path, and it costs the same `--arena` bytes
+/// per session that it costs there.
+#[cfg(windows)]
+fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use awe_probe::alloc::{Mode, Window};
+    use std::sync::Arc;
+    use sv_gpu_server::driver::Driver;
+    use sv_gpu_server::{arena, server::Shared, session, table::Objects};
+    use sv_transport::cold::{ColdMessage, ExtentDesc, Granularity, Hello, Locator};
+    use sv_transport::control::{Control, ENDIAN_MARKER};
+    use sv_transport::region::{PAGE, SharedRegion};
+    use sv_transport::stream::{read_message, write_message};
+
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let port: u16 = arg("--port").ok_or("--port is required")?.parse()?;
+    let device: usize = arg("--device").map_or(Ok(0), |s| s.parse())?;
+    let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
+    let idle: u64 = arg("--idle").map_or(Ok(30), |s| s.parse())?;
+
+    let geometry = geometry_for(arena_size);
+    let total = geometry.control_size + geometry.arena_size;
+    let extent_pages = (total / PAGE as u64) as usize;
+
+    // Large pages first. It is not a performance preference: 64 MiB of 4 KiB
+    // locked pages measured 1471 physical runs and the same window in 2 MiB
+    // pages measured 22 (`measured-gpu-side.md`), and every run is a separate
+    // `mmap` on the host and 24 bytes in the attach message. `LockedVa` is the
+    // fallback and works without `SeLockMemoryPrivilege`; it is not refused,
+    // because a fragmented arena that runs beats a tidy one that does not.
+    let order = [Mode::LargePages, Mode::LockedVa];
+    let window_pages = awe_probe::alloc::round_pages(&order, extent_pages);
+    let mut window = Window::acquire(&order, window_pages)
+        .map_err(|e| format!("no guest-RAM window: {e}"))?;
+    if window.pages < extent_pages {
+        return Err(format!(
+            "the allocator gave {} pages of the {extent_pages} the geometry needs",
+            window.pages
+        )
+        .into());
+    }
+    eprintln!(
+        "[gpu] {} window: {} MiB of guest RAM, {} pages",
+        window.mode.as_str(),
+        window.size() >> 20,
+        window.pages,
+    );
+
+    // Stamped here rather than through `Window::stamp`, which writes every page
+    // of the *window*. A large-page allocation is rounded up to the 2 MiB
+    // granularity, so the window can be larger than the extent, and pages
+    // stamped past its end carry indices the host is not expecting — a page
+    // that turns up where the extent does not reach is exactly what the
+    // stitched-view check refuses. So this stamps the extent and nothing more,
+    // which is what `sv_arena::guestram` does on the Linux path.
+    let run_id = awe_probe::new_run_id() | 1;
+    let mode_code = window.mode.code();
+    let gpas: Vec<u64> = (0..extent_pages)
+        .map(|p| window.pfns().map(|f| (f[p] as u64) << 12).unwrap_or(0))
+        .collect();
+    {
+        let bytes = window.as_mut_slice();
+        for i in 0..extent_pages {
+            let page = arena_record::make_guest_page(run_id, i as u32, mode_code, gpas[i]);
+            bytes[i * PAGE..(i + 1) * PAGE].copy_from_slice(&page);
+        }
+    }
+    let extent = ExtentDesc {
+        run_id,
+        // Understated, exactly as the Linux provider understates it, and for
+        // the same reason: claiming `Large2M` switches off the R26 canary, and
+        // this path has not earned that. `mode` above records what was actually
+        // obtained, in every page, where the host can read it.
+        granularity: Granularity::Small4K,
+        control_pages: geometry.control_size / PAGE as u64,
+        arena_pages: geometry.arena_size / PAGE as u64,
+        // The guest cannot enumerate its own frames on the two `VirtualAlloc`
+        // paths — that is the whole reason the host scans — so `Scan` it is,
+        // even when `pfns()` happened to be `Some`. D21.
+        locator: Locator::Scan,
+    };
+    eprintln!(
+        "[gpu] extent {} MiB of guest RAM, run 0x{run_id:016x}, stamped {extent_pages} pages",
+        total >> 20,
+    );
+
+    // The cold path. Bound before the driver is opened so that a host waiting
+    // on the port sees it come up promptly; opening a Vulkan device takes long
+    // enough that the other order reads as a connection that is refused.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+    eprintln!("[gpu] publishing the extent on 127.0.0.1:{port}");
+    let (mut port_stream, _) = listener.accept()?;
+    // Nagle would hold a 200-byte handshake frame waiting for more to send,
+    // against a peer that is waiting for exactly that frame. The Linux path
+    // never met this because a virtio-serial port has no Nagle.
+    port_stream.set_nodelay(true)?;
+
+    write_message(
+        &mut port_stream,
+        &ColdMessage::Hello(Box::new(Hello {
+            ids: sv_gpu_server::protocol_ids(),
+            generation: 1,
+            extent: extent.clone(),
+            geometry,
+            endianness: ENDIAN_MARKER,
+            pointer_width: 64,
+        })),
+    )?;
+    let mut scratch = Vec::new();
+    match read_message(&mut port_stream, &mut scratch)? {
+        ColdMessage::Accept { generation: 1 } => {
+            eprintln!("[gpu] the host located the extent and accepted generation 1");
+        }
+        ColdMessage::Refuse { code, reason } => {
+            return Err(format!("the host refused {code}: {reason}").into());
+        }
+        other => return Err(format!("unexpected cold-path reply {other:?}").into()),
+    }
+
+    // **After the Accept, never before.** `Control::create` zeroes the control
+    // region, which erases exactly the stamps the host sweeps for; publishing
+    // the header first cost the Linux path a run that reported "located 8192 of
+    // 12288 pages" with nothing to say why. The ordering is the same here and
+    // the reason is the same, so it is written down in both places rather than
+    // referred to from one.
+    let base = window.base as *mut u8;
+    let control_region =
+        Arc::new(unsafe { SharedRegion::from_raw(base, geometry.control_size as usize) });
+    let arena_region = Arc::new(unsafe {
+        SharedRegion::from_raw(
+            base.add(geometry.control_size as usize),
+            geometry.arena_size as usize,
+        )
+    });
+
+    let driver = Driver::open(device)?;
+    eprintln!(
+        "[gpu] {} ({}), queue family {}, provider GuestRam (VirtualAlloc, pinned)",
+        driver.name,
+        driver.driver_key(),
+        driver.queue_family
+    );
+    // Imported before the header is written, so that a driver which refuses the
+    // pointer fails while there is still nothing on the far side waiting.
+    let gpu_arena = arena::import_whole(&driver, Arc::clone(&arena_region))?;
+    eprintln!(
+        "[gpu] arena imported as a host pointer, memory type {}",
+        gpu_arena.memory_type
+    );
+
+    let control = Control::create(
+        Arc::clone(&control_region),
+        geometry,
+        sv_gpu_server::protocol_ids(),
+        1,
+    )?;
+    control.stamp_epoch()?;
+    eprintln!("[gpu] control region published, generation 1");
+
+    let fns = driver.load_fns();
+    report_missing(&fns);
+    let mut objects = Objects::new();
+    objects.set_arena(gpu_arena.memory, gpu_arena.len);
+    let shared = Arc::new(Shared {
+        driver: Arc::new(driver),
+        arena: gpu_arena,
+        objects: std::sync::Mutex::new(objects),
+        fns: Arc::new(fns),
+        queue_lock: Arc::new(std::sync::Mutex::new(())),
+    });
+    let handled = session::serve(
+        Arc::new(control),
+        shared,
+        geometry.ring_slot_count,
+        std::time::Duration::from_secs(idle),
+    )?;
+    eprintln!("[gpu] {handled} commands dispatched");
+    // The two `SharedRegion`s own these pages now; dropping the window here
+    // would unlock and free memory the host still has mapped.
+    std::mem::forget(window);
     Ok(())
 }
 

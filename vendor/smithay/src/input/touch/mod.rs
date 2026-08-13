@@ -619,12 +619,33 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         }
     }
 
+    // WAYCOMPOSE FORK. Upstream guarded this loop with the same
+    // `current >= pending` test that `frame` above uses, and skipped every slot
+    // that passed it. That test means "this slot has already had a frame sent
+    // for everything pending on it", which is the right thing for `frame` — a
+    // second frame with nothing new to terminate is a no-op — and is the wrong
+    // thing here, because it makes `cancel` a no-op for *exactly the slots that
+    // are in a settled state*, which is every contact in an ordinary gesture.
+    //
+    // A real touch stream is `down`, `frame`, `motion`, `frame`, ... and then
+    // the compositor decides the stream was a system gesture and cancels. At
+    // that moment every live slot has `current == pending`, so upstream sends
+    // nothing at all: the client never receives `wl_touch.cancel`, holds its
+    // contacts for ever, and the compositor's log says it cancelled them.
+    // Measured against `weston-eventdemo`, which received the `down` and the
+    // `frame` and then no cancel (docs/design.md §24.4).
+    //
+    // The guard is dropped. Slots that have already been released still send
+    // nothing, because `up` takes their focus and this only fires on a focus
+    // that is still there — which is the condition that was actually wanted.
+    // `current` is still stamped so that a `frame` arriving after a cancel
+    // remains a no-op, and `frame_pending` is cleared because the protocol says
+    // outright that "no frame event is required after the cancel event" and a
+    // frame for a contact that has just been told it did not happen is noise.
     fn cancel(&mut self, data: &mut D, seat: &Seat<D>, seq: Serial) {
         for state in self.focus.values_mut() {
-            if state.current.map(|c| c >= state.pending).unwrap_or(false) {
-                continue;
-            }
             state.current = Some(seq);
+            state.frame_pending = None;
             if let Some((focus, _)) = state.focus.take() {
                 focus.cancel(seat, data, seq);
             }

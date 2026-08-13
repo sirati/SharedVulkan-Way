@@ -7131,6 +7131,512 @@ lever stops being needed as well as if it stops working.
    now six figures. Whether a long-lived guest eventually becomes unusable for
    this transport is a real question and it is not this stage's.
 
+## 24. Stage 20: `wl_touch`, and a seat that grows a third capability
+
+### 24.1 Status in one paragraph
+
+Written 2026-08-13, branched from `waycompose-base` at `08f66b8`, merged there
+after stages 13, 17 and 21, and then **rebased onto the unified tree** when the
+two repositories became one — so this is a section of
+`docs/waycompose-design.md` rather than of `docs/design.md`, which is now the
+Vulkan side's. It is placed between §22 and §25, which is where its number puts
+it; the file as a whole is **not** in numeric order any more, because several
+stages are landing at once and each append goes to the end. Worth knowing before
+searching for a section by scrolling rather than by number. Every gate in §24.7
+was re-run from the merged tree rather than carried over, which is the
+arrangement §12.12, §14.11, §15.13
+and §17.1 all used. `wl_seat` advertised
+`pointer keyboard` and the touch capability was correctly absent — `add_touch`
+was never called and no touch event existed anywhere in the tree, so the absence
+was honest rather than partial. It is present now, on the same terms: the events
+behind it are real, and the capability is **conditional on the machine having a
+digitiser** rather than hard-coded, so the guest — which has none — still says
+`pointer keyboard` and is still telling the truth. The Linux leg drives a
+scripted two-finger pinch into `weston-eventdemo` and libwayland decodes
+`down`, `motion`, `frame`, `up`, `shape`, `orientation` and `cancel` off the
+wire; `scripts/wc-input.sh linux` is **29 passed, 0 failed**. On the guest,
+`scripts/probe-touch.c` injects two synthetic contacts through
+`InjectTouchInput` and the compositor reports them at the right surface
+coordinates with the right ids — real `WM_POINTER*` messages, no finger.
+
+Three things cost more than the advertised work. **`wl_touch.cancel` was never
+sent**, and it was smithay rather than this code (§24.4). **An ssh session on
+the guest cannot be used for this at all**, for two independent reasons that
+both had to be worked around (§24.6). And the choice between the two Win32
+touch APIs turned out to be forced rather than a preference (§24.2).
+
+### 24.2 `WM_POINTER*` and not `WM_TOUCH` — and what the window was doing before
+
+A window must opt into one of them. Do neither and **Windows synthesises mouse
+messages** from the primary contact, which is what this compositor was doing
+until this stage: a tap arrived as `WM_LBUTTONDOWN`, became `wl_pointer.button`,
+and mostly worked. Touch was therefore never *absent* here, it was arriving as a
+mouse — which is worth saying plainly, because "touch does nothing" and "touch
+is a mouse" are different bugs and the second one hides.
+
+The two ways in:
+
+* **`RegisterTouchWindow` + `WM_TOUCH`.** Simpler and universally available.
+  `TOUCHINPUT` carries `dwID`, a position, and — with
+  `TOUCHINPUTMASKF_CONTACTAREA` — a contact *size* in `cxContact`/`cyContact`.
+* **`WM_POINTERDOWN`/`UPDATE`/`UP` + `GetPointerTouchInfo`.** Windows 8 and
+  after. `POINTER_TOUCH_INFO` carries `rcContact`, `orientation` and `pressure`,
+  each announced by a bit in `touchMask`.
+
+The pointer family is taken, and one reason decides it: **`WM_TOUCH` cannot
+express `wl_touch.orientation` at all.** `TOUCHINPUT` has no angle field. Since
+`wl_seat` is advertised at 9, `shape` *and* `orientation` are both in scope, and
+choosing `WM_TOUCH` would mean one of the two could never be sent by
+construction rather than for want of hardware — which is a different kind of
+absence from the one this stage is trying to keep. `touchMask` is also exactly
+the conditionality the protocol asks for: `shape` "is only sent by the
+compositor if the touch device supports shape reports", and Windows says whether
+it does.
+
+Two supporting reasons. `RegisterTouchWindow` switches a window *away* from
+pointer messages, so taking it would forfeit pen and every later input type as
+well. And `InjectTouchInput` drives the pointer family, which is the only way
+this path can be exercised at all on a machine with no digitiser — which is
+every machine this project has.
+
+**Consuming the message is the whole of the opt-in, and it is what suppresses
+the mouse.** `DefWindowProc`'s handling of `WM_POINTERDOWN`/`UPDATE`/`UP` is
+what *generates* the legacy `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`, so
+returning 0 is not a formality: left in place, every single-finger tap would
+reach the client twice, once as `wl_touch` and once as `wl_pointer`, and a
+toolkit that handles both — Firefox does — would act on it twice. There is no
+message that announces the duplication. `State::pointer_button` now logs, so
+that a button appearing beside a contact is visible in a log rather than only in
+a client behaving oddly; the guest run in §24.6 has no such line.
+
+The suppression is deliberately *narrow*. Anything that is not `PT_TOUCH` goes
+straight to `DefWindowProc`, so a pen still becomes mouse messages and still
+works exactly as before — a `wl_tablet_tool` this compositor does not implement
+is worse than a mouse it does.
+
+Two consequences of consuming the message that had to be put back by hand:
+
+* **Focus.** The `DefWindowProc` that would have moved the keyboard focus on a
+  tap is the one being suppressed, so `WM_POINTERDOWN` calls `SetFocus`
+  explicitly. Without it, tapping a window moves no focus and the client cannot
+  be typed into afterwards — a failure that looks like a keyboard bug.
+* **`WM_POINTERENTER`/`LEAVE` are consumed too**, doing nothing. Handed to
+  `DefWindowProc` they produce the synthesised mouse enter and leave, and
+  `wl_pointer` would report a pointer wandering in and out of the window every
+  time somebody tapped it.
+
+**What is not needed, and this is the pleasant surprise:** no `SetCapture`. A
+touch contact is implicitly captured by Windows to the window that received its
+`WM_POINTERDOWN`, so `UPDATE` and `UP` arrive there even when the finger leaves
+the window — which is exactly `wl_touch`'s model, where `down` names the surface
+and every later event for that contact belongs to it. The mouse needed
+`SetCapture` and `TrackMouseEvent` (§11) to get the same property; touch has it
+for free, on both sides, and the two protocols agree by accident.
+
+### 24.3 Contact ids: two numberings, and the one the client is entitled to
+
+Wayland tracks contacts by id and requires them stable for the life of a
+contact. Windows' `pointerId` is not that number. It is a `u32` from the input
+stack: unique while the contact exists, recycled afterwards, and with a value
+that is whatever the session has got to. **Measured on the guest: two contacts
+injected as 0 and 1 arrived as `pointerId` 4 and 5.**
+
+Passing those through would be legal — the protocol only requires an `int` that
+is unique among the contacts currently down — and it would be the kind of legal
+that gets found later, because every client in existence was written against
+libinput's slot numbers, which are small and dense. So
+`crate::input::touch::Slots` allocates **the lowest free index**, which is
+exactly what an evdev multi-touch slot is: `down` claims one, `up` frees it,
+`clear` is a cancel.
+
+Two decisions in it that are not obvious:
+
+* **The table is on the pump, not on the window.** `wl_touch`'s ids namespace
+  the *seat*, and there is one seat. A per-window table would let two windows
+  each hand out contact 0 and the client would see one finger in two places.
+  Win32 has no seat, so the nearest thing that exists — the thread that pumps
+  every window — owns it.
+* **It is bounded, at 32.** The table is keyed on pointer ids and freed on
+  `WM_POINTERUP`; an up that never arrives would otherwise grow it for the life
+  of the process and hand out ever-larger ids. A contact past the bound is
+  dropped with a line, because silently reusing a live id puts two fingers on
+  one contact, which looks to a client like a finger teleporting and is much
+  harder to diagnose than a missing one.
+
+The whole of it is in `crate::input`, tested by `cargo test` on Linux, for the
+reason that file already exists: `platform/win32.rs` is `cfg(windows)`, so
+anything living there is compiled by the cross gate and **run by nothing**. Nine
+tests, and the one that would have caught the worst bug is
+`an_id_does_not_move_while_the_contact_is_down`.
+
+### 24.4 `frame`, `cancel`, and the smithay bug the cancel found
+
+**`frame` grouping is not optional.** A client is entitled to accumulate
+everything since the last frame and act on none of it until the frame closes, so
+a compositor that omits it leaves touches buffered indefinitely — the same class
+of bug as a missing `wl_pointer.frame`, with the same symptom: input that looks
+right in a debug log and does nothing on screen.
+
+**One frame per Win32 message**, and the simplification is deliberate. Win32
+delivers one `WM_POINTER*` per contact; there is no message carrying two.
+Windows does offer `GetPointerFrameTouchInfo` plus `SkipPointerFrameMessages`,
+which would gather every contact sharing a `frameId` into one frame, and it is
+not used: `Skip…` discards the queued messages for the whole frame *including*
+`WM_POINTERDOWN`s, whose implicit capture and whose `DefWindowProc` suppression
+this design depends on, and there is no digitiser here to establish that doing
+so is safe. Nothing is lost by the simpler shape — the protocol says a frame
+"terminates at least one event but otherwise no guarantee is provided about the
+set of events within a frame", and a frame per changed contact is what libinput
+and Weston produce for the same gesture, one evdev `SYN_REPORT` at a time. A
+pinch arrives as alternating single-contact frames with equal timestamps, which
+is a correct description of it.
+
+`cancel` is the event a compositor is likeliest never to send, because nothing a
+user does produces one: it comes from the platform deciding the stream was a
+system gesture. Three things produce it here — `WM_POINTERCAPTURECHANGED`, a
+contact Windows has flagged `POINTER_FLAG_CANCELED` (palm rejection), and a
+window destroyed while holding contacts.
+
+The second of those is a real trade and is taken deliberately. The protocol has
+**no per-contact cancel**: `wl_touch.cancel` ends the whole stream. So one
+rejected palm cancels every live contact. The two ways to be wrong are not
+symmetric — over-cancelling loses a gesture the user repeats, while delivering a
+rejected contact as a normal `up` completes a tap the user never made, on
+whatever control the palm was resting on.
+
+**And then it did not arrive.** The Linux leg drove a contact, closed its frame,
+cancelled it, and `weston-eventdemo` received the `down` and the `frame` and
+nothing else, while the compositor's log said it had cancelled. The cause is
+upstream smithay: `TouchInternal::cancel` opened with the same guard `frame`
+uses —
+
+```rust
+if state.current.map(|c| c >= state.pending).unwrap_or(false) { continue; }
+```
+
+— which for `frame` correctly means "this slot has already had a frame for
+everything pending on it" and for `cancel` means "this slot is in a settled
+state, so do not cancel it". That is *every live contact in an ordinary
+gesture*, because an ordinary gesture is `down`, `frame`, `motion`, `frame`, and
+only then a cancel. `wl_touch.cancel` was emitted only for a contact with an
+unframed event outstanding, and never in the case the event exists for.
+
+The guard is dropped; `state.focus.take()` already skips contacts that `up` has
+released, which is the condition that was wanted. Three lines, no Windows
+content, upstreamable as a strict bug fix — `vendor/PATCHES.md` has it under
+stage 20. Worth recording for how it was found: not by reading the code but by
+`scripts/wc-input.sh` asserting on a `cancel()` that had to be on the wire.
+
+### 24.5 Shape and orientation, and the one number nobody here can check
+
+`POINTER_TOUCH_INFO` carries `rcContact`, an **axis-aligned rectangle** bounding
+the contact patch, and `orientation` in whole degrees 0..359. Both are optional
+and both announce themselves in `touchMask`. A digitiser that reports neither
+leaves the fields zeroed.
+
+`crate::input::touch::shape_from_contact` returns an `Option`, and the `None` is
+the point: **no fallback ellipse is manufactured.** A compositor that answered
+every contact with a plausible 10x10 circle would be telling clients a fact it
+does not have, and the protocol explicitly allows for not knowing — a client
+"has to make reasonable assumptions about the shape if it did not receive this
+event". `None` means no `shape` and no `orientation`, and the Linux leg asserts
+that the pinch — which reports no geometry — produces neither.
+
+Two conversions are done, and both are read off the data rather than invented:
+
+* **Which side is major.** The protocol requires `major` to be the longer
+  diameter, so the rectangle's larger extent is it — and the orientation then
+  has to say which axis that was, or the client draws the ellipse the wrong way
+  round. When Windows reports no orientation the rectangle is still
+  axis-aligned, so the answer is implied by it: 0 if the tall side is the major
+  one (the protocol's zero is "major along +y"), 90 if the wide side is.
+* **The angle's range.** Windows says 0..359, Wayland says -180..=180. Anything
+  over 180 is that value minus 360.
+
+**The assumption that cannot be checked here**, stated rather than buried:
+Wayland defines orientation as the clockwise angle from the positive surface y
+axis, and Microsoft's documentation of `POINTER_TOUCH_INFO::orientation` says
+only "in a range of 0 to 359". The code takes them to be the same convention.
+Settling that needs a digitiser that reports orientation, which is a narrower
+class of hardware than a touchscreen — no injection API offers an orientation
+either, so `probe-touch.c` deliberately does not claim `TOUCH_MASK_ORIENTATION`
+rather than test that the compositor forwards the probe's fiction.
+
+One known imprecision, on a path only reachable on hardware that reports
+orientation at all: when Windows *does* report a non-zero angle, `rcContact` is
+the bounding box of an already-rotated ellipse, so its extents over-estimate the
+axes. Windows exposes no other description of the patch. An over-estimate from
+the real rectangle beats a number this code made up.
+
+### 24.6 What each leg proves, and the hole in the middle
+
+The §8.5 split again, with a sharper edge than usual because the arbiter is
+weaker on one side.
+
+**linux — a real client, a scripted gesture.** `--simulate-wm` drives a
+two-finger pinch, both contacts up one at a time, then a contact the system
+cancels; `weston-eventdemo` connects directly and `WAYLAND_DEBUG=1` prints what
+libwayland decoded. Every `wl_touch` event exists on the wire, the contacts keep
+their ids across the pinch (0: 183→138, 1: 253→298 — diverging, so nothing was
+renumbered), every event is inside a closed frame, and `shape`/`orientation`
+appear exactly once, for the one contact that has geometry.
+
+This leg is **one step weaker than the keyboard's**, and it is worth saying why:
+`weston-eventdemo` has no touch logging flag. The toytoolkit binds `wl_touch`
+and handles the events and says nothing about them, so the claim is "libwayland
+decoded these and the client did not disconnect in protocol error" rather than
+the keyboard leg's "the client told us which letter it made of it". What this
+leg cannot say anything about at all is the translation: there is no
+`WM_POINTERDOWN` here.
+
+**wine — nothing, and it says so twice.** `scripts/wc-input.sh wine` is 26
+passed, 0 failed, and its seat line reads `wl_seat.capabilities(3) =
+pointer|keyboard; no touch digitiser on this machine` — Wine's
+`SM_MAXIMUMTOUCHES` is 0, so the conditional capability is exercised on a
+Windows-ish platform and correctly withholds the bit. Then Wine 11.14 staging
+exports `InitializeTouchInjection` and **not** `InjectTouchInput`, so
+`probe-touch.exe` exits 4 with both addresses printed. That is a distinct exit
+code on purpose:
+"the platform has no touch injection" is a fact about the platform and must not
+be read as "the compositor mishandled a touch". Wine has lied four times on this
+project (§13.6) and has no touch hardware behind it; on this stage it is a
+compile check and not evidence.
+
+**guest — synthetic contacts, real `WM_POINTER*`.** The guest is Windows 11
+26200.9168 and **`SM_MAXIMUMTOUCHES` is 0 and `SM_DIGITIZER` is 0**: there is no
+digitiser, so nothing on it can be exercised by a finger, and `has_touch()`
+correctly refuses to advertise the capability there. `WC_FORCE_TOUCH=1` overrides
+that for a run whose events are all injected, and says so in its startup line so
+that a synthetic run cannot be mistaken for a hardware one.
+
+`InitializeTouchInjection` succeeds on that machine — injection does not need a
+digitiser — and with the compositor, `wc-shmclient` and `probe-touch` all on the
+interactive desktop, the compositor logged:
+
+```
+window 1 touch contact: Windows pointer 4 -> wl_touch id 0
+window 1 touch contact: Windows pointer 5 -> wl_touch id 1
+window 1 touch down contact 0 at 230,200 (12x12 at 0 deg)
+window 1 touch down contact 1 at 270,200 (12x12 at 0 deg)
+window 1 touch up contact 0
+window 1 touch up contact 1
+```
+
+Four things in six lines. The id mapping is not the identity and is measured
+saying so. The coordinates are right: the contacts were injected at screen
+`388±20, 361`, the window is 500x400, and its client centre is surface
+`250,200` — so `230,200` and `270,200` is the screen-to-client-to-surface chain
+end to end. The contact patch is the probe's twelve pixels, arriving through
+`TOUCH_MASK_CONTACTAREA`. And **there is no `pointer button` line anywhere in
+that log**, which is the measurement that the legacy mouse promotion was
+suppressed and the client was not told about the tap twice.
+
+**Two things about the guest that are about the deployment and not about
+touch**, both of which had to be solved before any of the above:
+
+1. **An ssh session is not on the desktop.** §10.12 item 3 already knew this —
+   sshd logs the user into session 0 with its own window station,
+   `Service-0x0-<luid>$` — and the consequence for injected input is total:
+   `FindWindow` from an ssh-launched process does not find the compositor's
+   toplevel, so `probe-touch.exe` had nothing to inject into. This is also why
+   `wc-guest.sh` has never run `probe-input.c`. The fix is stage 8's:
+   `runint.ps1`, a scheduled task with an `Interactive` principal, which is
+   already in `scripts/wc-desktop.sh` and was reused unchanged.
+2. **And then the client has to go with it.** With the compositor on the
+   interactive desktop and `wc-shmclient` still in the ssh session, the
+   compositor refused the client's buffer:
+   `protocol error on object 5, code 2: Failed to mmap fd … Section { name:
+   "Local\\wc-…" }`. `Local\` is the **per-session** NT object namespace, so a
+   section made in session 0 does not exist in session 1. That is the same fact
+   §11.2 records about a keymap crossing the VM boundary, met from a new
+   direction: two Windows processes on one machine are not necessarily in one
+   namespace either. Both ends run on the interactive desktop now.
+
+**The hole**: nothing here has been touched by a finger. No machine on this
+project has a digitiser. Contact geometry from real hardware, orientation from
+any hardware, palm rejection, `WM_POINTERCAPTURECHANGED` from a real shell
+gesture, and the behaviour of a client under a gesture that is actually
+continuous rather than four scripted steps are all unexercised and are all
+hardware nobody here has.
+
+### 24.7 The gates
+
+Run from the **unified** tree: rebased onto `one-binary`, then merged with
+master at `8fc1f41`, which is where the cursor stage arrived.
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | 1147 passed, 0 failed — master `8fc1f41` measured at **1138** in its own worktree, plus this stage's 9, which are also counted by name |
+| `cargo clippy --workspace --all-targets` | one warning, not this stage's — see below |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same one |
+| `cargo build --workspace` and the same `--target x86_64-pc-windows-gnu` | both link |
+| `sv-guest`, all three feature configurations, both targets | build (`default`, `--features gpu`, `--features wayland`) |
+| `scripts/wc-proxy.sh` | 37 passed, 0 failed |
+| `scripts/wc-input.sh linux` | 29 passed, 0 failed |
+| `scripts/wc-input.sh wine` | 26 passed, 0 failed; seat correctly `capabilities(3)` |
+| `probe-touch.exe` under Wine | exit 4, "this user32 has no touch injection" |
+| `probe-touch.exe` on the guest's interactive desktop | exit 0, contacts decoded (§24.6) |
+
+**The guest row is carried over and every other row is not**, which is worth
+stating rather than hiding: re-running the guest means putting a window on a
+desktop where somebody is working, and nothing between that run and this tree
+touched touch code — the conflicts across four merges and one rebase were an
+import block, two adjacent-but-unrelated statements in `pointer_button`, and
+section ordering in this file.
+
+`scripts/wc-proxy.sh` is in the table because a green `cargo test` does not
+imply it: it drives weston's own clients over both transports and three
+compositors and is the gate for anything touching `Spec::builtin`. **This stage
+touches no proxy file and adds no XML**, which is also why the three exact-count
+protocol tests below pass unchanged — so it is run to confirm the absence of an
+effect rather than to demonstrate one.
+
+**It did not pass first time, which is worth recording rather than quietly
+re-running until green.** The first run was **31 passed, 6 failed**. The second,
+on the *identical* tree with nothing changed between them, was 37/0; so was the
+third, after the merge with `8fc1f41`. The six were therefore not this stage's —
+the same code produced both numbers — and the conclusion is that this gate is
+timing-sensitive under load. That is a plausible thing for it to be: it starts an
+Xvfb, a compositor, a proxy and a real weston client per configuration, and
+several of its assertions are frame counts and screenshot comparisons taken 1.5
+seconds apart. This machine had five other agents and a user on it at the time.
+
+Two things follow, and the second is the one that matters. A green run here is
+weaker evidence than 37/0 suggests, because a red run is not reliably a
+regression. And **the failure detail was lost the first time** — that run's
+output had been truncated to its summary — so what actually failed is unknown.
+That is the part that should not happen twice; the later runs kept the whole
+log. Whoever owns the script should consider whether the frame-count and
+screenshot assertions want a retry or a load-independent formulation, because a
+gate that cries wolf under contention gets ignored exactly when it is right.
+
+**A second trap, found while measuring the baseline, and it is not about
+touch.** `cargo test --workspace` **is not self-contained on a clean checkout**.
+On a fresh worktree of master it fails:
+
+```
+sv-icd/tests/loader.rs:110  a_trivial_application_gets_through_the_real_loader
+  vkCreateInstance returned VkResult(-9)      # VK_ERROR_INCOMPATIBLE_DRIVER
+```
+
+The test drives the real Vulkan loader through the ICD manifest, and the
+library that manifest names is a build artefact `cargo test` does not produce
+in the right order. **A failing test binary stops `cargo test` from running the
+rest**, so the run reports **166** — a number that reads as a catastrophe and is
+an artefact of the ordering. `cargo build --workspace` first and the same tree
+reports **1138**, which is the real figure and the one this stage's 1147 is
+nine more than.
+
+Worth knowing for two reasons. Anyone establishing a baseline to compare against
+must build before testing, or they will compare against 166 and conclude
+something alarming. And the documented gate would be better as `cargo build
+--workspace && cargo test --workspace`, or the loader test better gated on its
+artefact existing, so that a clean CI checkout does not fail for a reason that
+has nothing to do with the change under test. Not fixed here — it is the Vulkan
+side's test and this stage has no business rewriting it — but it cost two
+measurements to find and should not cost anyone else the same.
+
+**The clippy warning, named rather than rounded to "clean".** It is
+`clippy::identity_op` on `crates/sv-hostd/src/qemu.rs:666`,
+`(0xcb000 - 0xcb000) + (0x100000 - 0xe8000)`, and it is present on the base
+commit `020022d` in a crate this stage never touches — the diff against
+`crates/sv-hostd/` is empty. It is left alone rather than fixed, because the
+zero-width term looks deliberate: it is a memory-hole calculation written so the
+holes line up with a table, and collapsing it would delete the documentation the
+arithmetic is carrying. Whoever owns that crate should decide. Recorded here so
+that "clippy is clean apart from one thing" does not become "clippy is clean"
+and then quietly acquire company.
+
+**Two other stages touch something this stage depends on**, and both are worth
+naming because in one case the answer is "nothing to do" and in the other it is
+"do nothing, deliberately".
+
+* **Stage 17 (§22) changed what the frame is**, and a touch position becomes a
+  surface position through `WindowState::to_surface`, which is
+  `FrameStyle::content_origin` — the *same* conversion the mouse uses,
+  deliberately, and the reason `on_pointer` converts screen to client first
+  rather than doing its own arithmetic. The title-bar change therefore reaches
+  touch for free, and the check that it did is the Linux leg's `the contacts
+  kept their ids across the pinch (0: 183->138, 1: 253->298)`, unchanged across
+  every merge.
+* **Stage 12's cursor (§23) added `Ui::pointer_inside`, and touch must never
+  set it.** The flag means "the mouse cursor is over our client area" and it
+  guards a **thread-global** `SetCursor`, which `set_cursor` calls immediately
+  so that a client changing its cursor while the pointer is still is seen
+  without waiting for a mouse move. A finger does not move the cursor, and
+  `on_pointer` suppresses the mouse messages Windows would otherwise synthesise
+  from a contact — so a tap leaves the real cursor wherever it was, possibly
+  over a different application's window. Had `WM_POINTERENTER` been left to
+  `DefWindowProc`, the synthesised `WM_MOUSEMOVE` would have set the flag and a
+  tap would have licensed this compositor to repaint somebody else's cursor:
+  the failure §23 built the guard for, reached from the one direction that has
+  no cursor in it at all. `on_pointer` consuming those two messages is what
+  prevents it, and that is now one of its two reasons rather than one.
+
+  Nothing is lost by staying out: `set_cursor` always stores into `ui.cursor`
+  and only the *immediate* `SetCursor` is guarded, so a cursor change made
+  during a touch is installed by the next real `WM_SETCURSOR`. The suppression
+  costs a cursor update that had no cursor to update.
+
+The three exact-count tests that the small-protocols work breaks —
+`wire::tests::every_message_in_every_protocol_round_trips`,
+`spec::tests::the_builtin_protocols_parse` and
+`spec::tests::the_reverse_direction_has_fds_too` — all pass unchanged here. This
+stage added no XML and touched no proxy file, so it has nothing to renumber;
+noted only because the next merge into this branch may.
+
+### 24.8 What is not proven
+
+1. **A finger.** §24.6's hole, and it is the whole of the hardware gap. Every
+   contact in this stage was manufactured by software.
+2. **Orientation, in either direction.** The convention is assumed to match
+   (§24.5) and nothing available can report one.
+3. **Firefox.** It has touch handling in `nsWindow` and it was never put in
+   front of this: the guest run used `wc-shmclient`, which binds no seat, so
+   what was measured is the `WM_POINTER*`-to-`FromUi` half on real Windows and
+   the `FromUi`-to-`wl_touch` half on Linux. Nothing has yet run both halves
+   with a real client in front of them.
+4. **A frame that genuinely contains two contacts, on Win32.** The Linux leg
+   sends one; Win32 cannot produce one because it delivers a message per
+   contact, and the API that would group them is not used (§24.4).
+5. **Long sessions.** `Slots` is bounded and reuses lowest-first, and no run has
+   been longer than a few gestures. A digitiser that stops sending an up would
+   leak a slot until the bound, and nothing has ever done that here.
+
+### 24.9 What to do next
+
+1. **Put Firefox in front of it.** Item 3 above is the cheapest remaining gain
+   by a distance: `scripts/wc-guest.sh firefox` already runs Firefox against the
+   compositor on the guest, and adding `WC_FORCE_TOUCH=1` plus a `probe-touch`
+   call to that leg would join the two halves with a client that has never heard
+   of this project. It needs the interactive desktop, which §24.6 shows how to
+   reach.
+2. **Ask for a digitiser.** One cheap USB touchscreen or one tablet passed
+   through to the guest closes items 1 and 2 and nothing else will. Until then
+   `shape` is exercised only by rectangles this project wrote.
+3. **Send the smithay patch upstream.** §24.4 is a plain bug in a released
+   crate, with no Windows content, and every compositor built on smithay that
+   cancels a settled touch stream has it. `vendor/PATCHES.md` carries it under
+   the `smithay` stage-20 entry, with the maintenance rule that matters: the
+   hunk should **disappear** when a release contains it rather than be carried,
+   and it is the one hunk a rebase must not drop silently, because a lost
+   feature gate fails to compile and a lost `cancel` fix compiles and quietly
+   stops sending an event. A fuller write-up as a submittable task exists in
+   `waycompose-base` (`7b30a26`, a standalone "Upstreamable" section) and should
+   be folded in when that commit reaches this tree; what is left either way is a
+   human deciding how to approach that project, not rediscovering the fix.
+4. **Reconsider `GetPointerFrameTouchInfo`** if a digitiser ever appears. The
+   reason for not using it is "no hardware to establish that
+   `SkipPointerFrameMessages` is safe", which is a reason that expires.
+5. **Nothing, for the two items that used to be here.** They were "carry the
+   cursor interaction across when the cursor stage arrives" and "reconcile the
+   `vendor/PATCHES.md` entry with the standalone Upstreamable section when that
+   arrives". Both arrived with the unified master and both are done: the
+   `Ui::pointer_inside` note is on the field and in §24.7, and the stage-20
+   entry now points at the Upstreamable section rather than restating it. Kept
+   as a numbered item rather than deleted because a "what to do next" list that
+   silently loses entries is one nobody can audit.
+
 ## 25. Stage 21: four protocols, one of which was a trap
 
 ### 25.1 Status in one paragraph
@@ -7528,6 +8034,1091 @@ considered during the stage and deliberately not built:
    sketched; what it needs is somebody to say whether a periodic
    `GetLastInputInfo` on the guest is acceptable, which is a question about the
    deployment and not about the code.
+---
+
+## 23. Stage 12: the mouse cursor
+
+### 23.1 Status in one paragraph
+
+Written 2026-08-13. `wl_pointer.set_cursor` was a stub — it logged once, did
+nothing, and the user saw the Win32 arrow over everything: no I-beam over text,
+no hand over a link, no resize arrow on a client's own edge. It is implemented,
+together with `wp_cursor_shape_v1`, which was absent altogether. Both arrive at
+the same smithay callback and leave through the same platform message, because
+from Win32's point of view they are one act: `SetCursor` with one `HCURSOR`.
+`scripts/wc-cursor.sh` is **5 passed, 0 failed** on the Linux leg and **8
+passed, 0 failed** on the Wine leg, and the sentence the Wine leg buys is:
+*a client's cursor theme — 32x32 pixels with a hotspot of 5,5, drawn by
+somebody else's XCursor theme — crossed the proxy, became a `CreateIconIndirect`
+handle inside `wc-compositor.exe`, and is what the compositor's input queue is
+holding.* `wl_keyboard.repeat_info` stopped being invented at the same time and
+is now `SystemParametersInfo`.
+
+The invariant this stage exists to keep, and the one the user stated: **exactly
+one visible cursor, and it is a real Win32 cursor.** Nothing here draws
+anything. A client's cursor surface becomes an `HCURSOR` and Windows
+composites it above every window on the desktop, with the right hotspot and no
+tearing, for free. Blitting a cursor surface into the window as content is the
+alternative and it is wrong three ways at once — clipped to the window, a frame
+late, and with the system arrow still on top of it, which is the two-cursor bug
+that was live while this was written.
+
+### 23.2 Two protocols, and why the named one first
+
+`wp_cursor_shape_v1` carries a **name** — `default`, `text`, `pointer`,
+`ns_resize` — and `wl_pointer.set_cursor` carries a **surface**. The named one
+was done first and it is not merely the tidier half:
+
+* It maps almost one-to-one onto `LoadCursorW(NULL, IDC_IBEAM)` and friends. No
+  pixels, no hotspot arithmetic, no surface lifetime, no buffer release.
+* The cursor a user gets is then the *system's*, at the system's size and DPI,
+  matching every native application on the machine. A themed Linux cursor is
+  the right shape drawn in the wrong house.
+* It is what GTK4 binds today.
+
+That last claim was checked rather than repeated. `libgtk-4.so.1` contains the
+string `wp_cursor_shape_manager_v1`; `libgtk-3.so.0` does not; and **Firefox
+151's `libxul.so` does not either**. So for the application this project is
+aimed at, the named path is not the one that matters — Firefox reaches the
+compositor entirely through `wl_pointer.set_cursor` with a buffer, which is
+why both halves were done in one stage rather than the easy one being shipped
+alone.
+
+**And that is the second time the same measurement has come back the same way,
+so it is worth stating as a rule rather than as a surprise.** §13.7 found that
+GTK 3 does not implement `xdg-decoration` and binds KDE's
+`org_kde_kwin_server_decoration` instead — checked the same way, by looking for
+the interface name in `libgdk-3.so`. The general form:
+
+> For a GTK3-era client, the modern protocol is frequently **advertised and
+> never bound**. Implementing it is therefore not evidence that anything
+> reaches it, and a compositor that shipped only the modern half would pass
+> every protocol-shaped test and change nothing a user could see.
+
+The cheap check is one `grep` against the client's own shared object, and it
+costs less than the run that would otherwise discover the same thing an hour
+later. It is also why §23.8 item 1 is written as an admission rather than a
+footnote: the *named* path here is currently in exactly the state this rule
+warns about — advertised, carried, unit-tested, and bound by nothing in the
+harness.
+
+### 23.3 The table, and where it lives
+
+`crates/wc-compositor/src/cursor.rs`. It is a new file for one reason: the
+mapping is **lossy** — thirty-six named shapes onto fourteen stock Win32
+cursors — and every lossy entry is a judgement someone should be able to read
+and disagree with. A table like that belongs somewhere it can be unit-tested on
+the machine that builds it, so it deals in the `IDC_*` **resource ordinals**
+(`IDC_IBEAM` is the integer 32513 and has been since Windows 3.0) and never
+mentions `windows-sys`. `platform/win32.rs` is the only file that turns one
+into a `PCWSTR`.
+
+Five tests, and the two that earn their keep are the ones about mistakes that
+are invisible at a glance: `the_diagonals_do_not_swap` (NE/SW is the `/` cursor
+and NW/SE is the `\` one, and both look like "a resize arrow" from a metre
+away) and `only_the_six_documented_shapes_fall_back_to_the_arrow` — because the
+failure mode of a lossy table is entries quietly rotting into the default.
+
+The six given up on are `context_menu`, `alias`, `copy`, `dnd_ask`, `zoom_in`
+and `zoom_out`. Windows draws these as an arrow with a badge, and the badges
+are not stock cursors: they live in the shell's drag-and-drop implementation
+and are reachable only through `IDropTarget`, a COM interface this compositor
+has no business implementing to decorate a pointer. An arrow is honest; a
+crosshair standing in for "copy" is not.
+
+### 23.4 The buffer path, and the four things it has to get right
+
+1. **When the pixels arrive.** A client may `set_cursor(surface)` and *then*
+   attach and commit the buffer (GTK does), or attach and commit and *then*
+   `set_cursor` (Qt does). In the second order, by the time `set_cursor`
+   arrives smithay has already taken the buffer out of the surface's pending
+   state and it cannot be read again. So `State` keeps one slot,
+   `cursor_pixels`, filled by any commit on a surface with the
+   `"cursor_image"` role, and both orders work. The role is the authority on
+   "is this a cursor", not a comparison against the surface the compositor was
+   told about — that field is empty for the first commit of the second order.
+
+2. **Not diverting the commit.** The hook in `commit` reads and returns.
+   Whether a cursor surface is *also* composited as window content is a
+   scene-graph question, answered in `present`/`compose_tree`, and is a
+   different agent's change; doing both here would have been two fixes for one
+   bug in two files.
+
+3. **The alpha.** `wl_shm`'s `Argb8888` is premultiplied and a 32-bit
+   `CreateIconIndirect` wants premultiplied, so there is nothing to convert —
+   but there is something not to *do*, which is discard it. A cursor is mostly
+   transparent and almost entirely antialiased edge; dropping the channel gives
+   a black rectangle with a cursor in it, and forcing it opaque gives a hard
+   jagged outline. Both are worse than the arrow this replaces.
+   `crate::icon::image_from_bytes` was reused unchanged, which also gets
+   `Xrgb8888` right: it forces the undefined fourth byte to 0xFF, and without
+   that an `Xrgb` cursor would be entirely invisible.
+
+4. **The mask.** `CreateBitmap` with a null bit pointer is documented as
+   leaving "the contents of the new bitmap undefined". Every Windows to date
+   zero-fills it and the icon path has relied on that since stage 11. For an
+   icon a stray mask bit is one wrong pixel in a taskbar button; for a cursor
+   the AND mask selects between "transparent" and "invert the screen", so
+   garbage is a cursor with inverted holes punched through it. A 32x32 mask is
+   128 bytes, so it is now supplied rather than assumed — and the scan lines
+   are **word**-aligned, not dword-aligned as they would be in a DIB.
+
+The image is **not** resampled. `make_icon` scales because Windows asks for two
+specific icon sizes; a cursor has no such requirement, and not scaling means
+the hotspot arrives as an exact pixel. Half a pixel of drift on a
+one-pixel-wide I-beam is the difference between clicking before and after a
+character.
+
+### 23.5 `WM_SETCURSOR`, and why the cursor is installed twice
+
+Once from the window procedure and once from the command handler, and both are
+needed:
+
+* **`WM_SETCURSOR` is the only way to keep it.** Windows re-asks on every mouse
+  message and `DefWindowProc` answers with the *class* cursor — the `IDC_ARROW`
+  in `register_classes`. A cursor set only from the command handler survives
+  until the pointer moves one pixel, and presents as a cursor that flickers to
+  the right shape and back.
+* **The command handler is the only way to apply it now.** `WM_SETCURSOR` needs
+  a mouse message, and the interesting changes happen while the pointer is
+  *still*: a page finishing loading, a client hiding the pointer as the user
+  starts typing, a `wl_pointer.leave` restoring the arrow.
+
+`SetCursor` is thread-global, so the immediate call is guarded by
+`Ui::pointer_inside` — set from `on_mouse_move` and cleared from
+`on_mouse_leave`. Without it, a client changing its cursor while the pointer is
+over somebody else's window would repaint *their* cursor until their next mouse
+message.
+
+**The hit-test guard is not a nicety.** `LOWORD(lParam)` is the hit-test code
+and only `HTCLIENT` is the client's business. `HTLEFT`, `HTBOTTOMRIGHT`,
+`HTCAPTION` and the rest are the system frame, where Windows draws the resize
+arrows. Claiming those would replace the resize cursors on the window border
+with whatever the client last asked for — the exact opposite of the goal, which
+wants a resize arrow on the edge.
+
+**How this reads after stage 17**, which landed while this branch was merging
+and which is the other half of the same window. §22 keeps the real system
+frame and does not handle `WM_NCHITTEST` at all — a client-decorated window is
+moved by `xdg_toplevel.move` arriving as `ToUi::BeginMove`, because Wayland has
+no protocol by which a client publishes its draggable region. So the hit-test
+codes here mean exactly what they meant before it: the caption and the resize
+borders are genuinely non-client and keep the system's cursors, and everything
+the client draws is `HTCLIENT` and gets the client's. That is the right answer
+for a client that paints its own title bar — over its tab strip the cursor
+should be whatever the client says — and it is the answer by construction
+rather than by agreement between two stages, which is the only reason the two
+did not have to be merged carefully.
+
+Lifetime: stock cursors from `LoadCursorW` are shared, owned by the system, and
+must never be destroyed. Ours must be, and promptly — a client animating its
+cursor rebuilds several times a second, so leaking these would burn a GDI
+object every 100 ms and hit the 10,000-handle quota in a quarter of an hour.
+The new one is built before the old is destroyed (a failed build leaves the
+previous cursor up rather than leaving the pointer invisible) and the old is
+destroyed *after* `SetCursor` (destroying a cursor that is on screen leaves the
+pointer drawn from freed memory).
+
+`wl_keyboard.repeat_info` was fixed in the same breath because it is the same
+shape of mistake: 500 ms and 30 Hz were Windows' *defaults*, written out as
+constants, so a user who had moved the Control Panel slider got the default in
+every Wayland client and their own rate in every native one.
+`SPI_GETKEYBOARDDELAY` returns 0..3 meaning 250..1000 ms, which is exact;
+`SPI_GETKEYBOARDSPEED` returns 0..31 and Microsoft documents only the endpoints
+(2.5/s and 30/s), so the middle is interpolated linearly in the rate and is
+labelled an estimate rather than presented as a table of thirty-two numbers
+somebody made up. The headless platform still returns 500 and 30, because there
+is no Windows there to ask and the harness must not depend on the build host's
+desktop settings.
+
+### 23.6 What was measured, and how
+
+`scripts/wc-cursor.sh`, two legs, for the reason every stage here splits its
+evidence — the two halves fail in different ways.
+
+**linux — 5 passed, 0 failed.** `wp_cursor_shape_v1` is a name on the wire and
+nothing else, so what can go wrong with it is protocol-shaped. `wayland-info`
+— libwayland's own client, which has never heard of this project — sees
+`wp_cursor_shape_manager_v1` at **version 2** in the registry, and sees it
+again through `wc-proxy`. The proxy needed the XML (`crates/wc-proxy/protocols/
+cursor-shape-v1.xml`, the byte copy from the same `wayland-protocols 0.32.12`
+smithay is generated from) and the three counted assertions moved with it:
+32 interfaces to 34, 376 walked messages to 386, and the fd list did not move
+because neither interface has an `h`.
+
+**wine — 8 passed, 0 failed.** `weston-eventdemo` is the client, and it is the
+right one for a reason that is not convenience: Weston's toytoolkit loads an
+**XCursor theme** and calls `wl_pointer.set_cursor` with a themed surface, so
+the pixels are a real theme's, at whatever size it ships, with a hotspot that
+is not 0,0, and nothing in this project chose any of it. The chain:
+
+```
+wc-compositor: cursor -> 32x32 pixels, hotspot 5,5
+wc-compositor: cursor round-trip: fIcon=0 hotspot=5,5 colour=32x32 at 32 bpp
+probe-cursor:  client-area-msg cursor=custom handle=00000000000b0040
+```
+
+Three different statements. The first is the Wayland thread: a cursor surface
+committed and its pixels were read. The second is Win32 read back through
+`GetIconInfo` — `CreateIconIndirect` accepted the ARGB bitmap, kept 32 bits per
+pixel, and did not move the hotspot. The third is `scripts/probe-cursor.c`, a
+separate process, reporting that the cursor on the compositor's input queue
+matches **none of the sixteen stock cursors** — so what `SetCursor` installed
+is ours.
+
+### 23.7 What Wine could not answer, and what has to be re-checked on the guest
+
+Wine has been wrong four times on this project (§13.6) and a cursor is exactly
+the kind of thing it emulates rather than implements. Two things were measured
+here as *Wine limitations*, not as compositor behaviour, and both are on the
+guest list:
+
+1. **`GetCursorInfo` kills the probe.** Under wine-11.14 on Xvfb, reading the
+   global cursor after injecting a mouse move dies with a fatal
+   `BadWindow (X_QueryPointer)` — Wine's X11 driver, not the compositor. The
+   harness therefore puts its sturdy readings first and treats the
+   `GetCursorInfo` reading as optional. On a real guest it is the reading that
+   says what the *user* sees, and it should be the primary assertion.
+
+2. **A cross-process `SendMessageW(WM_SETCURSOR)` is not delivered.** It
+   returns 0 for both `HTCLIENT` and `HTRIGHT`, and — the tell — the cursor on
+   the queue does not change for `HTRIGHT` either, where `DefWindowProc` would
+   have installed `IDC_SIZEWE` had the message arrived. So the hit-test guard
+   is currently defended by reading and not by measurement. On the guest this
+   is two sharp assertions: `1` for `HTCLIENT`, `0` for `HTRIGHT`.
+
+Beyond those, the guest has to answer the questions no API call can:
+
+3. **Does Windows draw a premultiplied ARGB cursor correctly?** The round-trip
+   says the bitmap went in intact. Whether the compositing on screen is right —
+   no black box, no hard outline, no halo — is a photograph.
+4. **Firefox.** A hand over a link, an I-beam over text, and a resize arrow on
+   the window edge, in one screenshot. §23.2 says this goes entirely through
+   the buffer path, so it is the same code the Wine leg exercised, with a
+   different and much larger client driving it.
+5. **`repeat_info` against a machine whose slider has been moved.** The
+   arithmetic is exercised nowhere but the guest: the headless platform returns
+   the constants and Wine's `SystemParametersInfo` is its own answer.
+6. **A client that hides the pointer.** `CursorSpec::Hidden` is implemented and
+   nothing in the harness reaches it, because neither `weston-eventdemo` nor
+   `wayland-info` ever sends `set_cursor(NULL)`. A terminal that hides the
+   pointer while typing would.
+
+### 23.8 What to do next
+
+1. **A client that actually sends `set_shape`.** Nothing in the harness binds
+   `wp_cursor_shape_v1` — the global is advertised, the proxy carries it, and
+   the table is unit-tested, but no run has taken a named shape end to end.
+   GTK4 is the client that would (§23.2) and none is installed here. This is
+   the one gap in this stage's evidence that is not Wine's fault.
+2. **Cursor scale.** A client on a 2x display sends a 64x64 cursor and expects
+   it drawn at 32 logical pixels. The compositor accepts scale-1 buffers only
+   (the commit handler says so out loud), so this is the same unimplemented
+   `buffer_scale` that everything else here is waiting on, and it will show up
+   as a cursor that is twice the size rather than as an error.
+3. **The named path could serve the buffer path.** A themed Linux cursor drawn
+   at Linux's size next to native Windows applications is the wrong size and
+   the wrong theme. A compositor that recognised the *standard* XCursor names
+   and substituted the stock Win32 cursor would look right — but `set_cursor`
+   carries pixels and no name, so this needs the client's cursor **surface** to
+   be matched against a known theme by hash, which is a guess wearing a
+   measurement's clothes. Not done, and noted so it is not done accidentally.
+
+## 20. Stage 16: an arena that runs out, and a client that lives through it
+
+### 20.1 Status in one paragraph
+
+A user played a YouTube video and Firefox died instantly. The proxy log said
+`could not publish 2340864 bytes: arena 0 has no run of 2342912 bytes (3932160
+free, largest 1744896)`, then `client 2 stopped: the compositor closed the
+connection`, and Firefox said `Exiting due to channel error`. Three defects were
+in that, and only the first had a name. **Running out of arena was fatal, and
+§17.8 said it was not** — that is §20.2 and it is a correction rather than a
+feature. **The allocator could not use free space it had** — 1.7 times the
+request, in pieces — which is §20.4, and where the obvious fix turned out to be
+wrong under measurement. **Nothing frees a pool and it is now guest RAM** — §17.10
+item 1, the stage's largest inherited problem, answered in §20.5 by a policy that
+does not wait to be asked. All three are built, all three are tested, and one of
+them ran in anger against a real Firefox on a deliberately starved arena and
+handed back 18,837,504 bytes the client never offered. What is *not* here is a
+photograph: the pressure harness runs under Wine in an ssh session, where this
+compositor cannot create a window at all, so no run of it has ever painted
+anything. That is §20.7 and it is the honest limit of the evidence.
+
+### 20.2 The failure was not the allocation, it was the message after it
+
+§17.8 describes what happens when the arena has no room:
+
+> The failure mode is now known and is not a crash: `create` refuses with the
+> numbers, `flush_deferred` leaves the pool unannounced and notes it, and the
+> client's window stops updating. That is a compositor that looks frozen.
+
+**Every clause of that is true and the conclusion is false.** `create` does
+refuse with the numbers, `flush_deferred` does leave the pool unannounced, and it
+does note it. What the paragraph does not follow through is what the *client*
+does next, which is not to stop — it is to carry on using a pool it has every
+right to believe in:
+
+```
+wl_shm.create_pool(new_id 31, fd, 2340864)   -> deferred, refused, unannounced
+wl_shm_pool@31.create_buffer(new_id 44, ...) -> forwarded. To what?
+```
+
+The compositor has no object 31. A request on an unknown object is a protocol
+error in every Wayland server there is, and wayland-server answers it by posting
+`wl_display.error` and dropping the connection. So the proxy's own log line about
+the compositor closing the connection was not a second, unrelated event: it was
+the direct consequence of the first, two messages later.
+
+**The allocation failure was survivable. Forwarding past it was not.** That
+distinction is the whole of this item, and it generalises past the arena: any
+time this proxy decides not to emit a message, it has taken on the obligation to
+decide about every later message that depends on it. Deferral was invented in
+stage 4 for `wl_shm_pool.resize` (§9.6) and it was safe there because a resize
+that is absorbed changes nothing the client can observe. A `create_pool` that is
+absorbed creates an object the client can *address*, and nothing was watching for
+that.
+
+The rule the code now states, and the one thing to keep if all of this is
+rewritten: **`Pool::upstream()` — "does the compositor have a `wl_shm_pool` with
+this id right now" — is the question every message naming a pool must ask.** It
+is not the same question as "do we have bytes for it", and stage 12 could get
+away with conflating them only because a region, once published, was never taken
+away. §20.5 takes them away.
+
+### 20.3 What was built, in the order a message meets it
+
+Three answers, in order, and only the third is visible to a user.
+
+1. **Ask for the memory back.** An allocation failure runs the reclaimer
+   (§20.5), which destroys the upstream objects of pools nothing is using. It is
+   demand-driven: nothing is reclaimed while there is room.
+2. **Try again.** Reclamation cannot complete synchronously — the compositor has
+   to acknowledge the teardown before the bytes are safe to reuse, which is
+   §2.5's rule and not caution — so the retry that matters is the next message's,
+   and for a live client there is always a next message.
+3. **Say nothing about a pool that has no upstream object.** Every request
+   naming one is *absorbed*: `create_buffer` is recorded and replayed later from
+   the client's own bytes, `resize` updates the recorded size, `destroy` is
+   answered with an invented acknowledgement. The one request that cannot be
+   absorbed is `wl_surface.attach`, because a client may attach once and commit
+   for ever; it is held on the surface and retried at every commit.
+
+The result is a surface that freezes and a connection that does not. That is a
+real cost and it is counted: `attaches deferred` in the stats line is the number
+of frames the client drew that the compositor never saw.
+
+**Three things this deliberately does not do**, each rejected for a reason:
+
+* **Grow the arena.** §12 makes this much worse than a `realloc`: the region is
+  guest RAM located by a content sweep, so a second region means a second
+  `attach_guest_ram` in the guest, a second 13 GiB sweep on the host (2.4 s,
+  §12.5) and a second plan. Worse, `wc-arena-host` has exited by the time a
+  client is running, and §12.10 records that a region cannot be re-located
+  afterwards because the first pool overwrites the stamps the sweep looks for.
+  Growth is a deployment-time change, not a runtime one.
+* **Fall back to the file transport.** `--transport shared-file` is a Wine-only
+  fixture; §10.3 measured that two live mappings of one file on a virtio-fs
+  export do not see each other's stores. A fallback would be a silent
+  correctness failure on the only deployment that matters, and the guest-RAM
+  rule is standing.
+* **Block until room appears.** The session thread is the client's whole
+  connection. Blocking it stops the `wl_buffer.destroy` and `wl_shm_pool.destroy`
+  that are the only things that could free the arena, so it deadlocks exactly
+  when it is needed.
+
+### 20.4 Fragmentation: six policies, and the obvious answer was wrong
+
+The numbers in the log line are the reason this is a separate item: **3,932,160
+bytes free, largest run 1,744,896, request 2,342,912.** Two-thirds more space
+than the request, in pieces none of which was big enough. Stage 12's allocator is
+address-ordered first fit at 4096-byte granularity, and §17.8 had already shown
+that the machinery under it works — a pool at offset 28672 was reused and
+coalesced — so this is a policy problem and not a plumbing one.
+
+**The reproduction is synthetic and that is the point.** A YouTube video
+fragments the arena in about ten seconds, but it does so through Firefox, a
+compositor, a hypervisor and a guest, and a run of it can only say "it broke
+again". `pool::tests::video_churn` replays a deterministic 4000-round sequence
+with the two ingredients the live failure had and nothing else: large pools whose
+sizes wander in the band the log showed, and a few small pools that are never
+released — cursors and tooltips, which Firefox holds for the life of the process
+and which sit in the middle of the region stopping the large holes on either side
+from coalescing.
+
+One thing had to be fixed in the harness before it measured anything, and it is
+worth recording because it inverted the result. The first version retired a pool
+only when a *new* one had been allocated, so a single refusal froze the live set
+and every later round refused too. That made a bad allocator look catastrophic
+and a good one look bad. **A pool's life is the client's business, not the
+allocator's**: Firefox does not stop destroying pools because this proxy could
+not find room for one. With the schedule fixed — the slot from round `r - live`
+retires at round `r`, whatever happened — the numbers became stable and
+comparable.
+
+Then the matrix, at 64 MiB, 4000 rounds, refusals (and largest free run) by
+policy and by how many pools are live at once:
+
+| live | first-fit | best-fit + classes | first-fit + classes | best-fit, paged | best-fit + far-end + classes | **best-fit + far-end** |
+|---|---|---|---|---|---|---|
+| 16 | 0 | 0 | 0 | 0 | 0 | **0** |
+| 22 | 0 | 0 | 3 | 0 | 0 | **0** |
+| 24 | 62 | 41 | 81 | 19 | 0 | **0** |
+| 25 | 39 | 26 | 155 | 9 | 9 | **0** |
+| 26 | 121 | 46 | 219 | 23 | 27 | **3** |
+| 27 | 165 | 133 | 327 | 31 | 55 | **11** |
+| 28 | 275 | 203 | 393 | 115 | 141 | **53** |
+| 29 | 261 | 311 | 410 | 197 | 213 | **117** |
+| 30 | 267 | 337 | 421 | 191 | 303 | **160** |
+| 31 | 633 | 405 | 740 | 293 | 404 | **262** |
+
+**The design this stage set out to build is the third column, and it is worse
+than doing nothing at several occupancies.** The plan was best fit plus
+TLSF-style size classes: round every request up to one eighth of the power of two
+it sits in, so that the hole a freed pool leaves is exactly the shape the next
+request of its class wants, at a bounded 12.5% of internal fragmentation. The
+argument is sound, it is what TLSF and jemalloc do, and a doc comment explaining
+it was already written. The matrix says it is wrong here: **`first-fit +
+classes` is the worst column at every single occupancy**, and adding classes to
+best fit makes best fit worse at every occupancy too. The classes buy exact reuse
+and pay for it by making every request bigger, and in an arena this close to full
+the second dominates.
+
+What actually does the work is **choosing the run rather than reshaping the
+request**, in two independent halves:
+
+* **Best fit.** The smallest adequate run rather than the lowest. "Lowest" and
+  "smallest" are unrelated, and first fit shaves the low end of whatever large
+  run it meets first — so a region's big runs are eaten by requests a smaller
+  hole would have held perfectly well, and there is nowhere left to put a large
+  pool. This is most of the improvement.
+* **Small pools from the far end.** A pool of at most 64 KiB is cut from the
+  *highest* run, at that run's tail. This is the direct answer to ingredient 2 of
+  the reproduction: a permanent 8 KiB extent in the middle of the region is what
+  stops megabyte holes from coalescing, and sending it to the far end costs
+  nothing. 64 KiB is chosen from what clients create rather than from a round
+  number — a 32x32 cursor is 4096 bytes, a 128x128 icon is 65536, and every
+  content pool Firefox opens is at least fifteen times that, so the line falls in
+  a genuine gap in the distribution.
+
+Shipped: **best fit, small pools from the far end, page granularity, no
+classes.** Zero refusals where first fit refuses 62, a fifth of the refusals
+where first fit refuses 633, and never worse at any occupancy tested. Stage 12's
+policy stays, reachable as `--arena-policy first-fit`, so the comparison can be
+re-run against a live client without a rebuild — and because a claim that one
+allocator beats another should be re-runnable by whoever doubts it.
+
+**What the table also says, and it is the load-bearing caveat**: past about 24
+live pools every policy refuses something, because the working set is genuinely
+larger than the arena. A better allocator moves the cliff; it does not remove it.
+The live failure was at 94% occupancy — 62,128,128 bytes out of a 63 MiB usable
+region — which is past the cliff for anything. **So §20.2 is the fix and §20.4 is
+an improvement**, and it would be a misreading of this section to present them
+the other way round.
+
+### 20.5 Reclamation: a pool's arena bytes are a cache, not the client's memory
+
+§15.11 proposed releasing a pool's region when its last buffer dies, and called
+it "the fix with the best evidence behind it". §17.8 then measured the client it
+was designed for:
+
+| in one 25-second `about:blank` run | count |
+|---|---|
+| `wl_shm.create_pool` | 4 |
+| `wl_shm_pool.destroy` | **0** |
+| `wl_shm_pool.create_buffer` | 3 |
+| `wl_buffer.destroy` | **1** |
+
+Firefox destroys one buffer in three and no pools at all, so a policy that waits
+to be asked frees one pool of four here and none of the 88 in §15.10's startup
+run. **The plan was standing on a quarter of what it looked like.**
+
+The way out is to stop treating the compositor's `wl_shm_pool` as a resource the
+client owns. **A pool's arena bytes are a copy.** The original is the client's own
+`memfd`, which this proxy still holds mapped for the life of the pool
+(`Pool::client`) — it has to, because that is where every commit copies *from*.
+Nothing is lost by throwing the copy away. So the upstream pool is not the
+client's memory at all; it is **a cache this proxy chose to populate, and a cache
+may be evicted.** What the protocol lacks is a way to re-point an existing pool at
+new bytes, and that is worked around rather than defeated: destroy the objects,
+and rebuild them from the client's own requests the moment it touches the pool
+again. The proxy has everything it needs — it kept the `create_buffer` body
+verbatim, precisely so it never has to hold a second opinion about somebody
+else's XML.
+
+The policy, and each condition rules out a specific wrong answer:
+
+* **Under pressure only.** Nothing is reclaimed while there is room. There is no
+  timer and no background sweep: holding 400 MB of a 768 MiB arena is free as
+  long as it can be got back when it is needed, and a timer would churn for
+  nothing.
+* **Coldest first.** LRU by last commit that copied out of the pool.
+* **Never `zombie`.** The client must still own the pool's id, or a rebuilt
+  `create_pool` could collide with whatever the client has since put there. This
+  is also why `weston-presentation-shm` is untouched by any of this: it destroys
+  its pool immediately and then draws 784 frames from the buffers, so its pool is
+  a zombie from the first frame and never a candidate. §9.7's lesson survives
+  intact.
+* **No buffer attached, and none unreleased.** A buffer that is a surface's
+  current or pending contents is being displayed; one the compositor has not
+  `release`d may be being read this instant. `wl_buffer.release` is the
+  compositor's own word for "I am finished with these bytes", and this is the
+  first thing in the project to use it for anything.
+* **Colder than 250 ms.** Against thrash, not against error: a pool in active
+  rotation would be destroyed and rebuilt on alternate frames. Fifteen frames at
+  60 Hz is long enough that nothing in a video's rotation is ever a candidate and
+  short enough that the stale pools a resize leaves behind — which is what
+  actually accumulates — become candidates almost at once.
+
+The cost is stated where it can be watched: `republished` in the stats line. If
+it approaches `reclaimed`, the floor is too low or the arena is too small, and
+both are visible without a debugger.
+
+**And it works on a real client.** Against Firefox on a 24 MiB arena:
+
+```
+pool 3: reclaiming 18837504 bytes, idle 874 ms -- the client never asked for
+        them back and the arena needs 4608000
+... 252 commits, 244 copies, 1077.14 MiB in 47.7 ms; 5 pools (0 released,
+    1 reclaimed, 0 republished, 4 refusals, 1 attaches deferred)
+```
+
+**Zero released, one reclaimed.** That is §17.8's measurement and this stage's
+answer in the same line: the client returned nothing, and 18 MB of guest RAM came
+back anyway.
+
+### 20.6 Two bugs the tests found in the fix, both worth their note
+
+Neither was found by review and both were found by writing the test that was
+supposed to pass trivially.
+
+**Publication had to become demand-driven.** `flush_deferred` publishes every
+pool that has no region, which was right when the only way to have no region was
+never to have been published. After §20.5 a pool can *lose* its region, and the
+very next message the client sent — whatever it was about — rebuilt it. The memory
+came back and left again before anything could use it, and the reclaimer was, in
+effect, a no-op with a log line. `Pool::wanted` is the fix: set when the pool is
+created and when a request names it or one of its buffers, cleared when the
+reclaimer takes it apart. The subtlety is that `wl_shm_pool.destroy` must *not*
+set it — rebuilding a pool in order to forward its destructor is not merely
+wasteful, and it was doing exactly that until the test caught it.
+
+**A stale `BufferInfo` under a recycled id made the rebuild emit a duplicate
+`new_id`.** Wayland ids are recycled: a client destroys `wl_buffer@44`, the server
+acknowledges, and the next `create_region` is `wl_region@44`. `self.buffers` was
+never purged on that transition and it had never mattered, because nothing
+replayed what was in it. The rebuild replays it — so a stale entry left under an
+id that is now a live `wl_region` made the proxy emit
+`wl_shm_pool.create_buffer(new_id = 44)` for an id the compositor already had.
+**That is a protocol error and a dead client: the exact failure this stage exists
+to remove, reintroduced by its own fix.** It was caught on a real Firefox, not in
+a test — `Invalid new_id: 44`, with the upstream dump showing 44 created as a
+region four messages earlier — and the purge now happens at the moment an id is
+declared to be something else, which is the moment it provably stops meaning what
+this file thought.
+
+A third, smaller one: the "nothing could be reclaimed" line was written once per
+message, which for Firefox is thousands a second, and the first pressure run
+produced a log that was 90% that line with the three lines that mattered buried
+in it. Rate-limited, for the same reason `Pool::warned` exists.
+
+### 20.7 The evidence, and what the pressure harness cannot decide
+
+| leg | what it is worth |
+|---|---|
+| `pool::tests::a_video_sized_churn_fragments_first_fit_and_not_the_default` | The fragmentation claim, both directions: first fit still refuses pools it has room for, the default refuses none where the arena genuinely has room, and it is never worse at any occupancy tested — including past the cliff, which is the half that could have been hidden. |
+| `pool::tests::small_pools_are_cut_from_the_far_end_and_large_ones_from_the_near` | The half of the policy that is not best fit, asserted on offsets rather than on outcomes. |
+| `session::tests::a_full_arena_degrades_one_surface_and_never_the_connection` | **§20.2, asserted as a property**: not one message naming an unbacked pool, or a buffer cut from it, reaches the compositor — and the healthy surface next to it keeps working, and the starved one recovers when there is room. |
+| `session::tests::a_cold_pool_is_reclaimed_under_pressure_and_rebuilt_when_the_client_returns` | §20.5 end to end, including the case §17.10 warned about: a client re-attaching a buffer it never destroyed. |
+| `session::tests::an_acknowledgement_goes_to_whoever_asked_for_the_destruction` | The two `delete_id` directions, which are the part of this most likely to be got wrong by a later change. |
+| `scripts/wc-arena-pressure.sh` (new) | A real Firefox against a deliberately starved arena, which is the only place the *compositor's own verdict* on these messages can be had. It asserts three things: the arena really ran out, pools were reclaimed without the client asking, and the compositor reported no request on an object it does not have. |
+
+**What the pressure harness deliberately does not assert, and why.** It does not
+assert that the connection survives to the end of the run, and it does not assert
+that anything is painted — because under Wine in an ssh session this compositor
+cannot create a window at all. Every run of it, on this branch and on master
+alike, logs `could not create a window for surface 1: Invalid window handle. (os
+error 1400)` and dumps zero frames. That is §13.3's window station problem, it is
+nothing to do with the arena, and a pass/fail on it would be measuring the window
+station. What the harness *can* decide is what the compositor says about the
+messages it receives, and that is what it asserts.
+
+The comparison against master's proxy is worth recording even though it is not a
+gate. On the same starved arena, master reaches **2 commits and 0 copies** before
+the connection is dropped; this branch reaches **252 commits, 244 copies and 1077
+MiB copied** with the connection intact and no protocol error. In two further
+runs it reached 13 and 2 commits — the run-to-run spread is large, because how far
+Firefox gets before the windowless compositor upsets it is not controlled — but
+the three assertions held in all of them.
+
+**One thing seen and not explained.** In two early runs, before the stale-id purge
+of §20.6, the compositor reported `Invalid new_id`. After the purge it has not
+recurred in any run. That is consistent with the purge being the whole cause, and
+it is *not* proof: the same runs were also the ones with `--trace` on, which
+changes the timing substantially. Instrumenting the two paths that could produce
+it — invented acknowledgements and rebuilt buffers — showed **zero of each** in the
+run that failed, so whatever it was did not come from the new machinery. It is on
+§20.9's list rather than claimed as fixed.
+
+### 20.8 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **173 tests**, 0 failures |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --target x86_64-pc-windows-gnu` | 8 executables — real binaries, not metadata |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
+| `scripts/wc-input.sh all` (stage 6 + 10, Wine) | 82 passed, 0 failed — unchanged |
+| `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed |
+| `scripts/wc-firefox.sh wine-arena` (stage 12, Wine) | 10 passed, 0 failed — unchanged |
+| **`scripts/wc-arena-pressure.sh` (new)** | **3 passed, 0 failed** |
+| `scripts/wc-guest.sh firefox` (the guest) | **not run — see §20.9 item 1** |
+| `scripts/wc-desktop.sh`, `scripts/wc-icon.sh` | **not run — they need the interactive desktop** |
+
+All of these are from the checkout after the merge with master — stages 13, 17
+and 21, and then §27's damage work, which landed while this section was being
+written — which is §12.12's
+arrangement.
+
+**One gate failed on the way and it is worth its line, because it is the mistake
+the brief for this stage warned about in advance.** `wc-firefox.sh enumerate`
+reported `0 passed, 1 failed` — "the compositor never bound its socket" — and the
+compositor's own log said `unknown argument --decorations`. The merge with master
+brought stage 17's harness, which passes that flag, and the Linux binaries in
+`target/debug` were from before the merge: `cargo clippy` and
+`cargo build --target x86_64-pc-windows-gnu` had both been run, and neither
+builds a Linux executable. **A stale binary, exactly as predicted, and it
+presented as a protocol failure rather than as a missing flag.** `cargo build
+--workspace` and it passes 13 of 13. The rule generalises past this stage: the
+thing that must be rebuilt is whatever the *harness* runs, and this repository's
+harnesses run three different binaries on two targets.
+
+**On the `3 fds in, 1 out` invariant (§14.7): unchanged, and the reasoning is
+short.** Everything this stage added moves *messages*, not descriptors.
+`wl_buffer.destroy`, `wl_shm_pool.destroy`, `wl_shm_pool.create_buffer` and
+`wl_display.delete_id` carry no `h` argument in either direction, and the
+invented events go out on the client socket, which is the side where `SCM_RIGHTS`
+was always legal (§9.4). The Wine gates re-measure the count and it is the same
+number it was.
+
+### 20.9 What is not proven
+
+1. **Nothing here has run on the guest.** Every leg is local or Wine. The guest
+   is contended by three other agents and §16.8's rule about identity applies;
+   what needs a guest re-check is specifically the reclamation path, because a
+   `wl_shm_pool.destroy` this proxy sends unprompted crosses the hypervisor and
+   the compositor's response to it has only ever been seen under Wine.
+2. **The residual `Invalid new_id`** of §20.7. Not reproduced since the stale-id
+   purge, not proven to be caused by it.
+3. **The 250 ms floor is a judgement, not a measurement.** It is short enough
+   for the stale pools a resize leaves and long enough for a 60 Hz rotation, and
+   nothing has measured a client whose working set cycles more slowly than that
+   and is larger than the arena. Such a client would thrash, and `republished`
+   is the number that would say so.
+4. **Reclamation has never been observed rebuilding a pool on a real client.**
+   The test covers it and the live runs never needed it — `0 republished` in
+   every one — because the pools that got reclaimed were ones Firefox had
+   genuinely finished with. That is the good case; the interesting case is
+   untested outside `cargo test`.
+5. **A pool larger than the whole arena can never be published**, and the
+   surface that wants it freezes for ever. This is reachable — the 12 MiB run has
+   Firefox asking for 18,837,504 bytes — and the response is correct but
+   permanent. Nothing warns the operator that the arena is *structurally* too
+   small rather than temporarily full, and it should.
+6. **The best-fit scan is linear in the free list**, where first fit could stop
+   early. Nothing has measured it, the free list is short in every observed run,
+   and if it ever matters the answer is a segregated list rather than a different
+   policy.
+7. **§17.10 items 3 to 8 are unchanged**, and §12.13 items 3, 4 and 9 with them.
+
+### 20.10 What to do next
+
+1. **Run the pressure harness on the guest**, which is the only place the
+   reclamation teardown crosses a real hypervisor, and the only place the arena
+   is really guest RAM. It is §20.9 item 1 and it is one run.
+2. **Say when the arena is structurally too small.** §20.9 item 5: a pool bigger
+   than the region is a configuration error the operator can fix and the current
+   message does not distinguish it from ordinary pressure.
+3. **Carry the measurement into the unification.** The two repositories are
+   being merged into one workspace with one arena and one allocator, and this
+   stage's allocator is one of three being reconciled. The free-list code and the
+   granularity constant should certainly be shared; **the policy should be
+   carried with its matrix**, because the shortest of the three implementations
+   is first fit and first fit is the one that refused a pool it had room for and
+   killed the user's browser. The one thing that must not be unified is the
+   *ranges*: the outbound window and the pool allocator must stay disjoint, or a
+   client's pixels land on a live keymap silently (§14.5).
+
+   **Verified while this stage was being written**: the unified tree
+   (`shared-vulkan-base` at `020022d`) already carries `crates/wc-proxy/src/pool.rs`,
+   and it carries **none** of this — `git show master:crates/wc-proxy/src/pool.rs
+   | grep -c 'Policy\|best_fit'` is `0` there. So the port is a real piece of
+   work rather than a formality, and until it happens the unified tree has the
+   allocator that killed the browser.
+## 27. The damage a client reports is not the damage a *copy* needs
+
+*(No stage number. This branch was assigned §27 and called itself "stage 14"
+until the merge, at which point stage 14 turned out to belong to §19 — the
+Windows desktop shortcut. Section numbers are handed out and stage numbers are
+taken, so this one has only the number it was given.)*
+
+### 27.1 Status in one paragraph
+
+**The user's clause is three symptoms and they are not one bug.** "Screen must
+not tear or stop rendering of scrolling no blank slides (e.g. in about:support)"
+— the tearing was §18's incoherent virtio-fs export and is fixed; the stopping
+did not reproduce and there is a number saying so; the blank regions were a
+real, separate defect in `wc-proxy`, present in every guest run since stage 4,
+and invisible to every harness this project has. `wl_surface.damage` is defined
+against the **surface** — what changed on screen since the last commit — and
+`wc-proxy` was spending it against a **buffer**, of which a scrolling Firefox
+has three. Everything the surface changed while some other buffer was on screen
+was never copied into the region, and a buffer the client had just allocated was
+copied only where the client happened to damage it, so the rest of it was
+whatever the region held before, which for a fresh arena is zeroes. Measured on
+a real Firefox scrolling `about:support` through Wine: **3 commits in 1509 left
+the region stale, the worst of them by 900 rows of a 900-row window** — the
+whole client area, showing nothing. After the fix, 1628 of 1628 commits match,
+and the run copies **2.05x fewer bytes** than it did before.
+
+### 27.2 What the reported damage means, and what a copying proxy needs instead
+
+The protocol sentence is short and the consequence is not. `wl_surface.damage`
+is "the region where the client has updated the contents **relative to the
+previous content of the surface**". Not relative to the previous content of the
+buffer being attached — relative to what was on screen.
+
+For a compositor that reads the client's buffer directly the two are
+interchangeable, and that is why the definition is written the way it is: the
+attached buffer is required to hold the whole current surface content, so
+"what changed on the surface" is exactly the set of pixels the compositor has to
+re-read. Nothing else in the buffer can have changed, because nothing else in
+the surface did.
+
+`wc-proxy` does not read the client's buffer. It keeps a **copy** of it, in a
+region the compositor across the boundary can map, and the copy is per buffer
+because the pool it copies is per buffer. So the question it has to answer is a
+different one: *which bytes of this buffer differ from my copy of this buffer* —
+and the client never answers that question, because no compositor has ever
+needed to ask it.
+
+The gap is one buffer cycle wide. Take a double-buffered client:
+
+| frame | attaches | client wrote into it | proxy copied |
+|-------|----------|----------------------|--------------|
+| n-1   | A        | the whole surface    | D(n-1)       |
+| n     | B        | the whole surface    | D(n)         |
+| n+1   | A        | the whole surface    | D(n+1)       |
+
+At frame n, the proxy's copy of B is correct everywhere except D(n-1) minus
+D(n) — the region that changed while A was on screen. The client has that region
+right in B; it wrote it there, because it had to. It simply never mentions it,
+because on screen it changed a frame ago. And it never will mention it: damage
+is not re-sent.
+
+That is a stale band per frame, growing with the buffer count, on exactly the
+content that is changing — which is why scrolling is where it shows and a static
+page is where it does not.
+
+### 27.3 The other half, which is the one Firefox actually hit
+
+There is a second case in the same shape and it is the one that produced the
+900-row measurement. A buffer the client has just created has *no* copy in the
+region. Its bytes there are whatever was there before — for the file transport,
+the previous pool's; for a freshly truncated arena, zeroes. If the client
+attaches it and damages only part of it, the proxy copies only that part and the
+rest of the window is that stale nothing.
+
+The old code believed it handled this. Its comment said so:
+
+> But the *first* commit of a buffer has nothing in the region yet, so a buffer
+> whose extent has never been copied is copied whole regardless of what the
+> client said.
+
+The code under the comment only did that when the damage list was **empty**:
+
+```rust
+if damage.is_empty() {
+    copy_extent(src, dst, &info, usable)   // "first commit" -- but only if silent
+} else {
+    copy_damage(src, dst, &info, &damage, usable)
+}
+```
+
+A first commit *with* damage — which is what a client does when it allocates a
+buffer to draw a partial update into — took the other branch. §14.9's pattern,
+"'implemented' has meant 'compiled' twice now", has a sibling here: a comment
+can describe an invariant the code beside it does not have, and it reads as
+evidence that the case was considered.
+
+All three of the stale commits in the pre-fix Firefox run are this case, and
+none of them is the cycling case of §27.2. The reason is worth recording because
+it is a fact about the client rather than about the bug: Firefox scrolling
+`about:support` damages **4292 KiB of a 4500 KiB buffer per commit** — 95% of
+the window — so the arrears from one intervening frame are almost entirely
+covered by the next frame's own damage. The cycling defect is real, it is what
+the unit test measures at 96 stale rows of 120, and on this client it is mostly
+masked by a client that repaints nearly everything anyway. Both are the same
+missing fact and both are fixed by the same three lines.
+
+### 27.4 The fix: arrears, per buffer, per surface
+
+Each surface keeps, for every buffer it has attached, what that buffer's copy
+owes: either a list of rectangles or "everything".
+
+```rust
+enum Stale { Everything, Rects(Vec<Rect>) }
+```
+
+On commit, this frame's damage is filed against every *other* buffer of the
+surface, and the buffer being attached pays off its whole arrears — this frame's
+damage plus every frame's since it was last on screen. A buffer this surface has
+never seen owes `Everything`, which is the §27.3 case and needs no special code
+once the question is asked in these terms.
+
+Three properties are worth stating because each one is a way the fix could have
+been wrong:
+
+* **It is still the cheap scope.** There is a trivially correct fix — copy the
+  extent every commit — and it already exists, as `--copy buffer`. The arrears
+  of a two-buffer cycle are one extra frame's damage, not a buffer, and
+  `paying_off_the_arrears_still_costs_less_than_the_extent` asserts a 4x margin
+  on a client whose real ratio is 6.9x. Without that test the fix could
+  degenerate into the safe thing and nothing would notice.
+* **It is keyed on the pair.** A buffer attached to a different surface starts
+  at `Everything` there and is copied whole. The arrears are a property of
+  (surface, buffer), not of the buffer.
+* **It survives id reuse.** This proxy implements `wl_display.delete_id`
+  deliberately, so buffer id 12 can be a *different* buffer a frame after the
+  old one was destroyed. A leftover "owes nothing" against a fresh buffer would
+  skip the one copy that must happen, and only on clients that recycle ids.
+  `forget_buffer_arrears` is called from both ends of a buffer's life and the
+  creation end is the load-bearing one.
+
+The rectangle list is capped at 64, past which it collapses to `Everything`:
+the union of 64 rectangles is close enough to the extent that tracking it costs
+more than copying it, and the cap bounds the pathology of a buffer that is
+allocated, damaged around for a thousand frames and attached once.
+
+### 27.5 The instrument, and why the established technique could not find this
+
+§10.7 and §18 both turned "it looks wrong" into a number by dumping frames and
+counting the distinct ones, and that technique cannot find this bug **at all**.
+A stale band is a *plausible picture*: real content, correctly blitted, from two
+frames ago. It is a distinct frame, so a distinct-frame count counts it; it has
+a normal colour histogram; it is what the page looked like a moment earlier. No
+screenshot distinguishes it from a page that had not finished scrolling.
+
+So the oracle is the client's own memory. `wc-proxy --verify-damage` compares,
+after every copy, the region's bytes for the attached buffer against the
+client's bytes for the same buffer, and counts the rows that differ. The
+comparison is exact and race-free **by protocol**: between `commit` and
+`wl_buffer.release` the client may not touch the buffer it attached, and that
+buffer must hold the whole current surface content. A disagreement at that
+instant has exactly one possible author.
+
+Two things about it are load-bearing:
+
+* **Only commits that attach can be checked.** A state-only commit — an
+  `ack_configure`, an opaque region, a subsurface move — does not re-take
+  ownership of the current buffer, which the compositor released frames ago and
+  which the client is very likely drawing the next frame into right now.
+  Measured before it was believed rather than reasoned into existence: with the
+  check applied to every commit, a fixed build still reported 91 stale of 936,
+  and every one of the twenty logged in full carried no damage at all and no
+  arrears — the signature of a commit that attached nothing. Gating on attach
+  took the same build to 0 of 1360, and the *pre-fix* build still failed under
+  the gate, at 3 of 1509, which is what says the gate removed noise rather than
+  the finding. Firefox's
+  traffic is **half** such commits — 1708 of 3343 — so the number is reported
+  rather than dropped, because a check whose coverage is unstated is a check
+  nobody can size.
+* **It is an instrument and not a clock.** It reads the whole buffer every
+  commit, which is precisely the cost `--copy damage` exists to avoid. §13.8
+  retracted a 2x throughput claim that was really 1.03x because the instrument
+  was inside the loop being timed. Nothing measured with `--verify-damage` on
+  may be quoted about cadence, and `scripts/wc-damage.sh` says so twice.
+
+### 27.6 The other two symptoms, and what the numbers say about them
+
+**Tearing did not reproduce, and §18 covers it.** Its cause was the export, its
+signature was page-granular bands, and the arbiter was that the compositor's own
+frame dump was torn identically to the screen. Nothing in this stage's runs
+tears, and the verifier is a stronger statement than that sounds: a torn copy is
+a row-level disagreement between the region and the client, which is exactly
+what `stale_rows` counts, and 1628 consecutive commits at zero says the copy
+path is not tearing. That says nothing about the coherency of a guest-RAM arena
+across the real VM boundary, which is §18's subject and is fixed there.
+
+**Rendering did not stop.** The compositor presented 1626 of the 1628
+buffer-carrying commits it received, and the ratio holds across every run of
+this stage: 1355/1360, 1506/1509, 1033/1035, 18/20. That is §13.8's 1464/1465
+again, in a harness that is actively scrolling rather than idling, and it means
+frames are not being dropped between the client and the window. If a user still
+sees a scroll stutter, the cause is not in the commit-to-present path and this
+number is the reason to look elsewhere.
+
+**The blank regions were real**, are the subject of §27.2 and §27.3, and are
+fixed.
+
+### 27.7 Why no harness could have caught it
+
+`wc-guest.sh` and `wc-desktop.sh` — the two harnesses that run on the real guest
+and the only ones a person watches — pass `--copy damage`. Every harness that
+exercises the copy scopes does not:
+
+* `scripts/wc-firefox.sh`'s wine leg runs `--copy pool`, which copies the whole
+  pool every commit.
+* `scripts/wc-proxy.sh cost` runs all three scopes, with
+  `weston-presentation-shm` — which damages its entire buffer every frame, so
+  all three scopes copy identical bytes, which is precisely what
+  `every_copy_scope_produces_the_same_image` was written to assert.
+* The unit tests drove a **single-buffered** client. With one buffer there are
+  no arrears, because there is no other buffer for the surface to have changed
+  behind.
+
+So the scope that ships was tested only by clients that cannot expose it. That
+is a sharper version of §18.2's finding — a fix that the only harness anybody
+watched had never used — and the general rule is the same: a configuration that
+no test uses is a configuration that is not tested, however many tests exist.
+
+### 27.8 The evidence
+
+Deterministic, no Wine, `cargo test -p wc-proxy`:
+
+* `a_buffer_cycling_client_is_not_left_with_a_stale_shadow` — a client that
+  cycles 2 and 3 buffers, writes the whole canvas into each, and damages only
+  the band it changed. Pre-fix: **96 of 120 rows** wrong in the region, in the
+  alternating pattern (`rows [0,1,2,3, 8,9,10,11, 16,17,18,19 …]`) that is the
+  double-buffer signature. `Pool` and `Buffer` scope pass in the same run and are
+  the control: the disagreement is damage tracking's alone.
+* `paying_off_the_arrears_still_costs_less_than_the_extent` — 332800 bytes
+  against 2304000, 6.9x, derived in the test rather than asserted as a ratio.
+
+Real client, `scripts/wc-damage.sh`, Firefox scrolling `about:support` with 60
+wheel notches injected by `probe-scroll.exe` from inside the Wine desktop:
+
+| build | commits checked | stale | worst | bytes/commit |
+|-------|-----------------|-------|-------|--------------|
+| pre-fix, `--copy damage` | 1509 | **3** | **900 rows of 900** | 4.19 MiB |
+| fixed, `--copy damage`   | 1628 | 0 | 0 | 2.04 MiB |
+| fixed, `--copy buffer` (control) | 1035 | 0 | 0 | — |
+
+The byte column is exact — it is a count, not a time — and it is the second
+result: the fix copies **2.05x less** than the code it replaces, because the old
+"an empty damage list means copy the extent" fired on all 1708 of Firefox's
+state-only commits and copied a 4.4 MiB buffer for a commit that changed
+nothing.
+
+### 27.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **168 tests**, 0 failures — master's 166 after the cursor merge, plus this stage's two |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --workspace`, both targets | both, and **before** every deploy (§18.8: clippy builds metadata, not an executable) |
+| `scripts/wc-damage.sh scroll` (new) | **5 passed, 0 failed** — 1616 commits checked, 0 stale |
+| `scripts/wc-damage.sh control` (new) | **5 passed, 0 failed** — 1035 commits checked at `--copy buffer`, 0 stale |
+| the same, re-run **after merging master** — twice, because master moved under the merge (§22 title bar, §25 protocols, then §23 cursors) | 162 then 168 tests, clippy clean both targets, `scroll` 5/5 at 432 and 964 commits |
+| `scripts/wc-damage.sh scroll` against the **pre-fix** copy path | **4 passed, 1 failed** — which is the point |
+| `wc-proxy.sh`, `wc-input.sh`, `wc-firefox.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended** |
+
+The six that were not re-run are named rather than omitted, and the argument
+that they are safe is narrower than usual because it can be made from the change
+itself. `--verify-damage` is off unless asked for, and the copy path changed in
+exactly one direction: **strictly more bytes are copied per attaching commit,
+and none at all on a commit that attaches nothing**. Nothing downstream can see
+the first, because it can only make the region *more* like the client's buffer;
+the second is the case where the client asserted nothing changed and the surface
+content is unchanged by definition. The three unit tests that pin the copy
+scopes against each other — `every_copy_scope_produces_the_same_image`,
+`damage_scope_copies_less_than_the_other_two` and the new arrears test — all run
+in `cargo test` and all three scopes still agree.
+
+The merge is worth one more line — two, because master moved *again* between the
+first merge and pushing it, and the second re-run is the reason to say so rather
+than to quietly redo the first. Stage 13 (§18), stage 17 (§22), stage 21 (§25)
+and then stage 12's cursors (§23) all landed under this branch, and in both
+merges only `docs/design.md` conflicted, at the append point, where both sides
+had added a section at the end.
+`session.rs` and `session/tests.rs` merged cleanly despite §25 adding four
+protocols to the same crate. The three exact-count tests that break on protocol
+additions (`spec.rs`'s two and
+`wire.rs::every_message_in_every_protocol_round_trips`) had already been fixed on
+master and needed nothing here. The one thing the merge *did* change is this
+section's name: this branch called itself "stage 14" until it discovered that
+stage 14 is §19, the Windows desktop shortcut.
+
+### 27.10 Three things that cost real time
+
+1. **`set -o pipefail` plus a `--help` that exits non-zero.** The harness's
+   guard against a stale binary — `wc-proxy --help | grep -q -- --verify-damage`
+   — reported "no such flag" for a proxy that had it, because the pipeline's
+   status is the failing `--help`, not the succeeding `grep`. Every other
+   harness here uses the piped spelling on programs that happen to exit zero.
+2. **`wine explorer /desktop=NAME` returns immediately when the desktop already
+   exists.** `wc-input.sh` waits for it and never noticed, because its probe
+   takes about a second. This one scrolls for twenty, so the harness tore the
+   run down two seconds in — and the symptom was *a low commit count*, which is
+   the exact symptom this stage is investigating. A harness that measures a
+   stall it caused itself is worse than no harness. It now waits for the probe's
+   own last line.
+3. **A single run is not a rate.** The first draft of the comment on the
+   control's commit floor explained a 51-commit `--copy buffer` run by the cost
+   of its larger copy. The next `--copy buffer` run was 1035. The counts across
+   this stage's runs span 20 to 4106 on a machine ten agents are sharing, and
+   the honest statement is variance. §13.8's retraction is the precedent; this
+   is the same mistake caught one run earlier.
+
+### 27.11 What is not proven
+
+1. **Surface coordinates are still assumed to be buffer coordinates.**
+   `wl_surface.damage` (opcode 2) is in surface coordinates and
+   `damage_buffer` (opcode 9) is in buffer coordinates, and both `wc-proxy` and
+   `wc-compositor` merge them — the compositor says so in a comment at
+   `state.rs:1530`. They coincide at scale 1, transform `Normal` and attach
+   offset (0,0), which is every run this project has made. **Scale and
+   fractional scaling are unowned**, and this is one more reason for somebody to
+   own them; it is not started here.
+2. **The attach offset is ignored.** `wl_surface.attach`'s `x`/`y` are parsed
+   and dropped. A non-zero offset shifts surface coordinates relative to buffer
+   coordinates and would make item 1 bite at scale 1. Not observed in Firefox,
+   not checked either.
+3. **`--verify-damage` has nothing to say about half of Firefox's commits.**
+   1708 of 3343 attach no buffer. They cannot change what is on screen, so the
+   coverage gap is believed harmless, but it is a gap and it is stated rather
+   than netted out of the denominator.
+4. **This ran under Wine, against the shared-file transport.** Wine is not
+   Windows and has been wrong four times (§13.6). The insulation is unusually
+   good here — `--verify-damage` compares two mappings inside a Linux process
+   and Wine is only an upstream that consumes the stream — but the guest-RAM
+   arena leg has not been run with the verifier on.
+5. **The reproduction rate on Firefox is low.** 3 in 1509. The defect is
+   certain, the unit test is deterministic, and the worst case is the entire
+   client area; but a run of `scripts/wc-damage.sh scroll` against broken code
+   could plausibly come up zero, so the unit test is the regression gate and the
+   script is the reproduction.
+6. **`set_opaque_region` and `set_input_region` are still parsed and ignored.**
+   Neither can produce a stale region — the compositor draws every window opaque
+   because GDI ignores alpha — so neither is part of this stage's symptom.
+   Recorded so that the audit's finding is not read as closed.
+
+### 27.12 What to do next
+
+1. **Run `scripts/wc-damage.sh` against the guest-RAM arena** (§27.11 item 4).
+   The verifier is transport-agnostic and the leg is two flags.
+2. **Own the scale question** (§27.11 items 1 and 2). Two places merge two
+   coordinate spaces on an assumption that is currently true, and the code in
+   both says so; that is a good state to change deliberately and a bad one to
+   discover.
+3. **Ask why half of Firefox's commits carry no buffer.** 1708 of 3343 is a lot
+   of round trips through a proxy, and the answer is either "that is what
+   `ack_configure` and subsurfaces cost" or something worth fixing.
+
+---
 
 ## 28. The clipboard, and the two `h`s that cannot cross
 
@@ -7544,8 +9135,17 @@ copy in a Windows application and paste in a Linux client, text and HTML, both
 demonstrated end to end by programs that are not ours
 (`scripts/wc-clip.sh`, 11 passed / 0 failed). Drag and drop shares the same
 mechanism by construction and is **not finished**: the Wayland half is built and
-answers every path, the two OLE halves are not written, and §28.8 says exactly
-what is missing. `zwp_primary_selection_v1` is out of scope and untouched.
+answers every path, the OLE **drag source** is written and its COM contracts are
+tested against a real `ole32`, **`DoDragDrop` has never been entered on any
+run**, and the drop target is not written at all. §28.8 has all four of those
+and what would change each.
+
+That third clause is stated here, in the status paragraph, rather than left for
+a reader to find. **This project has had "implemented" mean "compiled" four
+times** — §14.9 is the section that noticed it was a pattern rather than an
+accident — and the only difference between a gap and a landmine is whether the
+person who left it said so first. `zwp_primary_selection_v1` is out of scope and
+untouched.
 
 ### 28.2 Why these two `h`s are different from the keymap's
 
@@ -7810,10 +9410,30 @@ stack before it pastes anything.
 The compositor's log from that run is in `docs/clipboard/compositor.log`
 and the proxy's in `docs/clipboard/proxy.log`.
 
-**Wine is not Windows and has been wrong four times (§13.6.)** This leg
-establishes that the code paths are self-consistent against a real `user32`
-clipboard with a real second process reading it. §28.9 lists what needs a guest
-re-check.
+**The harness's own poll had to move inside a Windows process, and that is a
+finding rather than a tidy-up.** A copy is asynchronous through four processes
+and nothing tells a shell script when the clipboard has it, so the harness
+polls. Written in the shell, each attempt was a fresh `wine probe-clip.exe get`
+— and twenty of those filled the compositor's log with pairs of
+`WM_CLIPBOARDUPDATE` saying the clipboard had emptied and come back. The run
+then failed with the bytes provably on the clipboard: the compositor's own log
+said `clipboard set CF_UNICODETEXT (18 bytes): ok` while the poll saw nothing.
+**The measurement was disturbing the thing measured.** `probe-clip.exe wait-for`
+does the waiting in one long-lived process, which touches the window station
+once, and the run has been 11/0 three times since. Recorded because the failure
+mode — a harness whose observation costs enough to change the answer — looks
+exactly like a product bug, and this project has spent runs on that shape of
+thing before (§13.8's retraction is the same lesson about an instrument inside
+the loop being timed).
+
+**Wine is not Windows and has been wrong four times (§13.6) — and that caveat
+is not the largest one.** This leg establishes that the code paths are
+self-consistent against a real `user32` clipboard with a real second process
+reading it. What it does *not* establish, and what no Wine leg in this project
+has ever established, is anything about the **boundary**: every process here is
+on one kernel. See the end of §28.8 for why that is a correction to the
+methodology rather than a caveat on one run. §28.9 lists what needs re-checking
+on a real arrangement.
 
 ### 28.8 Drag and drop: one mechanism, and the half that is missing
 
@@ -7868,9 +9488,22 @@ So `drag::run` does not call `DoDragDrop`. It stages the payload and posts
 `WM_WC_DRAG` to the controller window; the drain returns, `draining` clears, and
 `controller_proc` enters the loop from the pump, where §8.2's finding — a
 *posted* wake still reaches a window from inside a modal loop — applies
-unchanged. Finding this already answered is the one clear argument for the
-repositories having been merged: it was six lines of somebody else's comment and
-it removed an entire investigation.
+unchanged.
+
+**This is the most concrete argument for the unification anyone has produced,
+and it is worth stating as an argument rather than as an anecdote.** The
+question — does OLE's modal loop starve the pump, and what does entering it
+from inside `drain` do — was written into this section as work that had to be
+*measured* before a line of the drag source could be written. It had already
+been measured, by somebody else, for a different feature, and the answer was
+six lines of comment on an unrelated `match` arm. Before the merge that comment
+was in a different repository and this section would have spent a run
+rediscovering it — or, worse, not rediscovering it, shipping a `SendMessageW`,
+and finding out from a user that the compositor stops painting whenever a
+window is dragged. The value was not in shared code; nothing here calls
+anything of stage 17's. It was in one project's hard-won operational knowledge
+being *readable* from the other, which is exactly the thing two repositories
+cannot give you and no amount of interface design substitutes for.
 
 Four things in the COM are worth naming because each is silently wrong when it
 is wrong, and each has a test that runs **under Wine, on the Windows target**
@@ -7927,13 +9560,31 @@ compositor is linked with the OLE code and `scripts/wc-clip.sh` still passes
 11/0 with it in, so nothing regressed — but "a Wayland client dragged a link
 into Explorer" is a sentence nobody has yet earned.
 
-The route to earning it is **`nix build .#svGuest`**, and that is a methodology
-correction rather than a convenience: every Wine run in this project so far has
-been one machine with **no VM boundary at all**, so "Wine is not Windows"
-(§13.6) has been understating the gap — the topology was wrong too. Wine on the
-workstation as the Windows side with a Linux VM guest as the client gives a real
-boundary *and* a real desktop with a real Explorer to drop onto, which is
-exactly what a drag needs and what Xvfb cannot provide.
+The route to earning it is **`nix build .#svGuest`**, and that is a correction
+to this project's whole Wine methodology rather than a convenience for one
+feature.
+
+**Every Wine run in this project, from stage 1 to this one, has been a single
+machine with no boundary in it at all.** The caveat that has ridden along with
+all of them — "Wine is not Windows; it is evidence that our own code paths are
+self-consistent, not evidence about `afunix.sys`" (§4.4, §13.6) — names the
+platform and stops there, and it has been understating the problem for thirteen
+stages. The platform was one thing that was wrong. **The topology was the
+other**, and it is the one this project is *about*: a compositor on one side of
+a hypervisor and its clients on the other, which is the premise every design
+decision in this document is downstream of. A leg in which the proxy, the
+compositor and the client are three processes on one kernel cannot exercise it,
+whatever `user32` is underneath. That is why §14.7's fd argument has always had
+to rest on *construction* — the upstream writer has no fd argument — rather than
+on any run: no run has ever had a boundary for a descriptor to fail to cross.
+
+`nix build .#svGuest` builds the honest arrangement: Wine on this workstation as
+the Windows side, and a **Linux VM guest as the client**. That is a real
+hypervisor between the two halves and a real desktop with a real Explorer on it,
+which is what a drag needs — a mouse button held down across two applications'
+windows — and exactly what Xvfb with everything on one kernel cannot provide. It
+is the venue for `DoDragDrop` and for the drop target, and every item in §28.9
+that says "on the guest" should be re-read as "on that arrangement".
 
 ### 28.9 What is not proven
 
@@ -7973,12 +9624,22 @@ Run from the **unified** tree, after the rebase described at the top of
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | **1150 tests**, 0 failures (1125 on the unified master; 25 new) |
+| `cargo build && cargo test --workspace` | **1172 tests**, 0 failures (1147 on master; 25 new) |
 | `wine target/x86_64-pc-windows-gnu/debug/deps/wc_compositor-*.exe drag::` | **5 tests**, 0 failures — the COM contracts, on the Windows target |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy -p wc-compositor -p wc-proxy -p wc-handle --all-targets --target x86_64-pc-windows-gnu` | clean |
 | **`bash scripts/wc-proxy.sh`** | **37 passed, 0 failed** |
-| `scripts/wc-clip.sh wine` (new) | **11 passed, 0 failed** |
+| `scripts/wc-clip.sh wine` (new) | **11 passed, 0 failed**, three times |
+
+**`cargo build` before `cargo test`, and it is not a habit.** On a clean
+checkout `cargo test` reports 166 rather than 1172, because `sv-icd`'s loader
+test runs before the artefact it loads has been built. A number that depends on
+what happened to be in `target/` is not a gate.
+
+**`wc-proxy.sh` is timing-sensitive under load.** It scored 33/4 immediately
+after two Wine harnesses had been running, and 37/0 on its own twenty seconds
+later, on the same tree — which matches what has been seen from it elsewhere. A
+red run is a reason to re-run it alone, not a regression until it is one.
 
 `wc-proxy.sh` is on that list because `docs/one-binary.md` is right that a green
 `cargo test` does not imply it: it drives weston's own clients over both

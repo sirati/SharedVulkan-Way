@@ -44,12 +44,15 @@
 # the way Notepad does. A compositor that convinced itself it had set the
 # clipboard cannot fake that.
 #
-# WINE IS NOT WINDOWS, AND HAS BEEN WRONG FOUR TIMES (§13.6)
+# WINE IS NOT WINDOWS -- AND THAT IS NOT THE LARGEST CAVEAT
 #
 # What this leg establishes is that the code paths are self-consistent against a
 # real `user32` clipboard implementation with a real second process reading it.
-# What it does not establish is the guest. The specific things worth re-checking
-# there are listed in docs/waycompose-design.md §28.9.
+# What it does NOT establish is anything about the **boundary**: every process
+# here is on one kernel, and that has been true of every Wine run in this
+# project since stage 1. See docs/waycompose-design.md §28.8 for why that is a
+# correction to the methodology rather than a caveat on one run, and §28.9 for
+# what needs re-checking on a real arrangement.
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -107,8 +110,6 @@ clip() {
   ( cd "$RUNDIR" && wine "$RUNDIR/probe-clip.exe" "$@" ) 2>>"$RUNDIR/probe.log"
 }
 
-# `clip get`, retried until it answers or the deadline passes.
-#
 # **A poll rather than a longer sleep, and it is not flakiness management.** A
 # copy is asynchronous through four processes: the client answers
 # `wl_data_source.send` on its own event loop, wc-proxy drains the pipe on its
@@ -118,15 +119,25 @@ clip() {
 # compositor and nothing forwards that to a shell script. A fixed sleep encodes
 # a guess about four schedulers; asking until the answer arrives encodes the
 # actual question, and the deadline is what turns "never" into a failure.
+#
+# `clip_get_until <substring> [seconds]` — wait for the clipboard to hold text
+# containing <substring>, and print it as `od -c` names its bytes.
+#
+# **The waiting happens inside one Windows process, not in this shell.** A poll
+# written here spawns a Wine process per attempt, and doing that twenty times
+# filled the compositor's log with pairs of WM_CLIPBOARDUPDATE saying the
+# clipboard had emptied and come back: the measurement was disturbing the thing
+# measured, and the run failed with the bytes provably on the clipboard. See
+# `probe-clip.exe wait-for`.
+#
+# **The output is `od -c` rather than the bytes**, because the assertion that
+# matters here is about a carriage return and a CR does not survive a shell
+# comparison in any way worth trusting: `$( )` strips trailing newlines and
+# `[ = ]` compares after the shell has had its way with the byte. `od -c` names
+# every byte — `\\r`, `\\n`, `o`, `n`, `e` — and matching on names is unambiguous.
 clip_get_until() {
-  local want=$1 deadline=$((SECONDS + ${2:-20})) got=""
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    got=$(clip get)
-    [ "$got" = "$want" ] && { printf '%s' "$got"; return 0; }
-    sleep 1
-  done
-  printf '%s' "$got"
-  return 1
+  clip wait-for "$1" "${2:-20}" | od -c | head -4
+  return "${PIPESTATUS[0]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -200,36 +211,37 @@ block_wine() {
     || note "no clipboard listener line (AddClipboardFormatListener may have failed under Wine)"
 
   # -- direction A: a Linux client copies, a Windows application pastes -------
-  local text="waycompose stage 13 -- copied on Linux"
+  #
+  # **Two lines in one copy, carrying both assertions.** The text has to arrive
+  # intact, and the `\n` a Unix client sends has to be `\r\n` on the Windows
+  # clipboard or Notepad renders one long line. Those were two copies until a
+  # run showed why that is the wrong shape: the second `wl-copy` has to create a
+  # window, take focus and publish while the first is still exiting, and every
+  # publish calls `EmptyClipboard` — which fires its own `WM_CLIPBOARDUPDATE`
+  # with an empty clipboard on the way past. A second copy is a second race for
+  # no extra claim, so there is one copy and one read, and the poll's predicate
+  # *is* the assertion: it accepts only an escaped form with `\r` before `\n`.
+  local text
+  text=$(printf 'waycompose -- copied on Linux\nsecond line')
   ( wl timeout 40 wl-copy -- "$text" >"$DIR/copy.log" 2>&1 ) &
   local copier=$!
   local got rc
-  got=$(clip_get_until "$text" 25)
+  got=$(clip_get_until 'copied on Linux' 30)
   rc=$?
   wait "$copier" 2>/dev/null
-  if [ "$rc" -eq 0 ] && [ "$got" = "$text" ]; then
+  if [ "$rc" -eq 0 ]; then
     ok "a Windows application pasted what a Linux client copied"
-    note "CF_UNICODETEXT: $(printf '%s' "$got" | head -c 60)"
+    note "CF_UNICODETEXT: $(printf '%s' "$got" | head -1 | cut -c1-64)"
   else
     bad "probe-clip.exe get -> rc=$rc, ${got:-<nothing>}"
     note "proxy: $(grep -c . "$DIR/proxy.log") lines; last clipboard line:"
     grep -i clipboard "$DIR/proxy.log" | tail -3
     grep -i clipboard "$DIR/srv.log" | tail -3
   fi
-
-  # The `\n` a Unix client sends must be `\r\n` on the Windows clipboard, or
-  # Notepad renders one long line. Checked on the bytes rather than trusted.
-  ( wl timeout 40 wl-copy -- "$(printf 'one\ntwo')" >/dev/null 2>&1 ) &
-  copier=$!
-  # **One read, not two.** The bytes are examined from the same `clip get` that
-  # the poll accepted; asking a second time would be a second race against
-  # whatever writes the clipboard next, and it failed exactly that way once.
-  got=$(clip_get_until "$(printf 'one\r\ntwo')" 25 | od -c | head -2)
-  wait "$copier" 2>/dev/null
-  if printf '%s' "$got" | grep -q '\\r'; then
+  if printf '%s' "$got" | grep -Eq '\\r +\\n'; then
     ok "line endings became CRLF on the way to the Windows clipboard"
   else
-    bad "no CR in the pasted bytes: $got"
+    bad "no CRLF in the bytes the Windows process read: ${got:-<nothing>}"
   fi
 
   # -- direction B: a Windows application copies, a Linux client pastes ------
@@ -267,15 +279,22 @@ block_wine() {
     || ok "nothing hit the descriptor-with-no-transport path"
 
   # -- html ------------------------------------------------------------------
-  if clip set-html "<b>rich</b> text"; then
+  #
+  # Always reported, pass or fail. A block that only counts when its setup
+  # succeeded makes the run's own total move between runs, and a total that
+  # moves is one nobody can assert on — which is the same argument the summary
+  # line in `session.rs` makes for printing a zero.
+  local html=""
+  if ! clip set-html "<b>rich</b> text"; then
+    bad "probe-clip.exe could not put HTML on the clipboard"
+  else
     sleep 2
-    local html
     html=$(wl timeout 25 wl-paste --type text/html --no-newline 2>>"$DIR/paste.log")
     if printf '%s' "$html" | grep -q "<b>rich</b> text"; then
       ok "text/html crossed with the CF_HTML header stripped"
       note "got: $(printf '%s' "$html" | head -c 60)"
     else
-      note "text/html did not come back (${html:0:60}); see docs/waycompose-design.md §28.9"
+      bad "text/html did not come back (${html:0:60}); see docs/waycompose-design.md §28.9"
     fi
   fi
 

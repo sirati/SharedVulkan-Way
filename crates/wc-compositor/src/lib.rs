@@ -43,6 +43,7 @@
 //! drains every pending message.
 
 mod clipboard;
+mod cursor;
 mod icon;
 mod input;
 mod platform;

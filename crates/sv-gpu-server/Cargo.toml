@@ -28,6 +28,15 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "debug
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# The Windows guest-RAM provider, for the cross-VM topology. `awe-probe` owns
+# the four Win32 allocators `docs/measured-gpu-side.md` measured and the
+# `SVARENA1` stamp `sv-hostd`'s locator sweeps for. Depending on it here rather
+# than re-typing `VirtualAlloc`/`VirtualLock` is the same argument that crate's
+# own header makes: a second implementation would put the measurement at risk
+# for no gain, and the two would drift.
+[target.'cfg(windows)'.dependencies]
+awe-probe = { path = "../awe-probe" }
+
 [dev-dependencies]
 # Only so the two sides' shared constants can be *compared* rather than each
 # asserted against a literal. Neither side may depend on the other at run time —

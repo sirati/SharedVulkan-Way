@@ -92,6 +92,12 @@ windows-sys = { workspace = true, features = [
   # drag off the window loses its release), and `GetKeyboardLayout` (which
   # chooses the keymap).
   "Win32_UI_Input_KeyboardAndMouse",
+  # ADDED FOR STAGE 20: `GetPointerType` and `GetPointerTouchInfo`, which are
+  # the whole of the `wl_touch` source. The `WM_POINTER*` message numbers and
+  # the `PT_*`/`TOUCH_MASK_*` constants are filed under WindowsAndMessaging
+  # below, so this feature is only the two entry points and
+  # `POINTER_TOUCH_INFO`.
+  "Win32_UI_Input_Pointer",
   "Win32_UI_WindowsAndMessaging",
   # ADDED FOR STAGE 21: `SetThreadExecutionState`, which is
   # `zwp_idle_inhibit_manager_v1`'s whole implementation. It is filed under
