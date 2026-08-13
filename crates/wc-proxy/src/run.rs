@@ -36,6 +36,9 @@ struct Args {
     /// is the region as `sv-hostd` or `sv-gpu-server` published it, and opening
     /// it by name is what `Attach` would have told us to do anyway. §36.8.
     upstream_ring: Option<PathBuf>,
+    /// §36, cross-VM. The `sv-hostd` socket to attach through, when the
+    /// compositor published its control region out of the guest's own RAM.
+    upstream_ring_attach: Option<PathBuf>,
     runtime_dir: PathBuf,
     socket: String,
     transport: String,
@@ -194,6 +197,7 @@ fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         upstream: PathBuf::new(),
         upstream_ring: None,
+        upstream_ring_attach: None,
         runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir),
@@ -227,6 +231,7 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--upstream" => a.upstream = next()?.into(),
             "--upstream-ring" => a.upstream_ring = Some(next()?.into()),
+            "--upstream-ring-attach" => a.upstream_ring_attach = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -282,8 +287,11 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if a.upstream.as_os_str().is_empty() && a.upstream_ring.is_none() {
-        return Err("--upstream or --upstream-ring is required".into());
+    if a.upstream.as_os_str().is_empty()
+        && a.upstream_ring.is_none()
+        && a.upstream_ring_attach.is_none()
+    {
+        return Err("--upstream, --upstream-ring or --upstream-ring-attach is required".into());
     }
     if a.pool_dir.as_os_str().is_empty() {
         a.pool_dir = a.runtime_dir.join("wc-pools");
@@ -403,6 +411,36 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Some(t)
         }
         "arena" => {
+            // THE FILE ARENA IS NOT A TARGET. Guest RAM is (design.md §1a). This
+            // branch exists so a Wine run on one Linux machine — which has no
+            // QEMU and therefore no guest RAM to locate — can exercise the arena
+            // path at all. It is **kept** rather than deleted, because deleting
+            // it would delete the only way to run this code without a
+            // hypervisor. It is **refused** rather than allowed, because a run
+            // that quietly lands here is measuring the wrong substrate: §10.3
+            // measured that substrate incoherent for live mappings — 65280 of
+            // 65536 bytes wrong, in both directions — and it reached a user's
+            // screen once as a torn window that had passed every other check.
+            //
+            // `SV_ALLOW_FILE_ARENA=1` is how a fixture run says it means it.
+            // Any change to arena behaviour must be implemented fully and
+            // correctly on guest RAM; making the fixture pass is never enough.
+            if std::env::var_os("SV_ALLOW_FILE_ARENA").is_none() {
+                return Err(format!(
+                    "the FILE arena is not a target. `--transport arena --arena-path {}` \
+                     opens a file, which is a Wine-only fixture for a machine with no \
+                     hypervisor. Guest RAM is the only real substrate: pass `--arena-plan` \
+                     here and `--arena-guest-ram` to the compositor. Set \
+                     SV_ALLOW_FILE_ARENA=1 for a fixture run — never to make a guest run \
+                     pass.",
+                    args.arena_path.display()
+                )
+                .into());
+            }
+            eprintln!(
+                "[proxy] WARNING: FILE arena in use (SV_ALLOW_FILE_ARENA is set). This is \
+                 a fixture, not a target; guest RAM is the only real substrate."
+            );
             let mut t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
             t.set_policy(args.arena_policy)?;
             if args.arena_outbound != 0 {
@@ -508,9 +546,75 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // shared_vulkan's rings. Attached once for the whole proxy and shared by
     // every client thread, because the *region* is one session — it is the
     // *rings* that are per connection, which is the distinction §36.3 is about.
-    let ring: Option<std::sync::Arc<sv_transport::control::Control>> = match &args.upstream_ring {
-        None => None,
-        Some(path) => {
+    let ring: Option<std::sync::Arc<sv_transport::control::Control>> = match (
+        &args.upstream_ring,
+        &args.upstream_ring_attach,
+    ) {
+        // §36. The cross-VM form: the compositor published its control region
+        // out of *guest RAM* and `sv-hostd` located it. This is the ICD's
+        // `AttachRequest`/`Attach`/`Runs` exchange, and it is deliberately the
+        // same three messages — the Wayland half and the Vulkan half attach to a
+        // guest region by exactly one mechanism, which is the whole of §36.
+        (_, Some(sock)) => {
+            use sv_transport::cold::ColdMessage;
+            let s = std::os::unix::net::UnixStream::connect(sock)?;
+            sv_transport::cold::send(&s, &ColdMessage::AttachRequest)
+                .map_err(|e| format!("{sock}: {e}", sock = sock.display()))?;
+            let at = match sv_transport::cold::recv(&s)? {
+                ColdMessage::Attach(a) => a,
+                ColdMessage::Refuse { code, reason } => {
+                    return Err(format!("the daemon refused {code}: {reason}").into());
+                }
+                other => return Err(format!("unexpected cold-path reply {other:?}").into()),
+            };
+            let runs = if at.run_count != 0 {
+                match sv_transport::cold::recv(&s)? {
+                    ColdMessage::Runs(r) => r,
+                    other => return Err(format!("expected Runs, got {other:?}").into()),
+                }
+            } else {
+                Vec::new()
+            };
+            // The object is QEMU's memory backend, named rather than passed —
+            // §1a. A scattered extent has no single offset whose `mmap`
+            // reproduces it, which is what the run list is for.
+            let f = sv_transport::region::open_named(&at.object)?;
+            let region = if runs.is_empty() {
+                sv_transport::region::SharedRegion::map_fd(
+                    std::os::fd::AsFd::as_fd(&f),
+                    at.control_offset,
+                    at.control_len as usize,
+                )?
+            } else {
+                let stitch: Vec<sv_transport::region::StitchRun> = runs
+                    .iter()
+                    .filter(|r| r.extent_offset < at.control_len)
+                    .map(|r| sv_transport::region::StitchRun {
+                        file_offset: r.file_offset,
+                        extent_offset: r.extent_offset,
+                        len: r.len.min(at.control_len - r.extent_offset),
+                    })
+                    .collect();
+                sv_transport::region::SharedRegion::stitch(std::os::fd::AsFd::as_fd(&f), &stitch)?
+            };
+            let ids = sv_transport::control::ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+            let control = sv_transport::control::Control::attach(std::sync::Arc::new(region), ids)?;
+            // The acknowledgement the daemon waits for before it stops holding
+            // the session open. Sent after the attach, so a failure to map is
+            // reported here where the daemon can print it.
+            sv_transport::cold::send(&s, &ColdMessage::Accept { generation: at.generation })?;
+            println!(
+                "[proxy] upstream is the guest's own RAM via {} ({} run(s), {} ring slots, \
+                 generation {})",
+                sock.display(),
+                at.run_count,
+                control.layout().geometry.ring_slot_count,
+                control.generation()
+            );
+            Some(std::sync::Arc::new(control))
+        }
+        (None, None) => None,
+        (Some(path), None) => {
             let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
             let len = f.metadata()?.len() as usize;
             let region = std::sync::Arc::new(sv_transport::region::SharedRegion::map_fd(

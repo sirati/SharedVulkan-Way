@@ -446,6 +446,16 @@ is inert for a profile that does not reach it.
 
 ## 5. Firefox, and the gap that is not where it was
 
+> **This whole section reads mozilla-central's tip, and the Firefox this project
+> deploys is 151.0.2, which predates every line of it.** Checked against the
+> binary in `design.md` §0.17: `libxul.so` contains no `FFmpegVulkanVideoDecoder`,
+> no `media.hardware-video-decoding-vulkan.enabled` and no
+> `AV_HWDEVICE_TYPE_VULKAN`. So §5a and §5b below are correct and are about a
+> browser that is not installed here — 151's only hardware decode paths are
+> VA-API and V4L2, both of which want a DRM node the host does not have. Keep
+> the section: it is the analysis that becomes load-bearing the day this
+> deployment moves to 153. Do not quote it as a fact about what is running.
+
 **The phase-2 research's answer here is out of date, and the correction goes in
 Firefox's favour.** It recorded that Firefox uses VA-API on Linux, that its
 Vulkan video decoder was Linux/GTK-only with both prefs defaulting to false, and

@@ -11637,13 +11637,12 @@ Requirements 1, 2 and 4 are the ones that need to exist in the interface; 3 and
   2334 and 949 witness changes across ~7130 commits, in the two `mozilla-ipc`
   rendering pools, with no crash. What remains unproven about it is narrower and
   is listed below.
-* **That object identity is safe against inode reuse.** `(st_dev, st_ino)` is a
-  far better key than a descriptor number, but it is not eternal either: once a
-  memfd is fully released its inode can be reissued, and a pool record outliving
-  its object would then match a stranger — §30.6d one level up. The pool record
-  must end at `wl_shm_pool.destroy`, which is the protocol's own statement that
-  the object is finished; the experiment leaks the record instead, which is fine
-  for four pools and not fine for a session.
+* ~~That object identity is safe against inode reuse.~~ **Closed** (§30.11).
+  `(st_dev, st_ino)` is not eternal — a released memfd's inode can be reissued —
+  so the record now ends at `wl_shm_pool.destroy`, the protocol's own statement
+  that the object is finished. Verified by `scripts/wc-pooltest.c`:
+  `create_pool=12 redirected=12 destroyed=12`, no record left behind, and the
+  freed slot reused each round rather than climbing.
 * **That it is faster.** No end-to-end timing was taken, because the arena path
   was not built. The claim "126 µs per copy becomes 0 µs" is arithmetic on a
   copy that no longer happens, not a measurement, and it ignores whatever the
@@ -11715,13 +11714,47 @@ fraction of a real budget and this becomes worth its hazards. Two independent
 arguments now converge on "not yet", which is a much better place to stand than
 one.
 
-One thing to do *before* any of it, and it is small: end the pool record at
-`wl_shm_pool.destroy`. The experiment leaks it, and §30.10 explains why that
-cannot ship — `(st_dev, st_ino)` is a much better identity than a descriptor
-number but a released memfd's inode can be reissued, so a leaked record
-eventually matches a stranger. That is §30.6d a third time, and the pattern by
-now is unmistakable: **every identity in this mechanism must end when the thing
-it names ends.** The protocol already says when that is.
+One thing that was to be done before any of it, and now is: **the pool record
+ends at `wl_shm_pool.destroy`.** The experiment used to leak it, which could not
+ship — `(st_dev, st_ino)` is a much better identity than a descriptor number but
+a released memfd's inode can be reissued, so a leaked record eventually matches
+a stranger. That was §30.6d a third time, and the pattern is now the section's
+one-line lesson: **every identity in this mechanism must end when the thing it
+names ends.** The protocol already says when that is, so the record is bound to
+the `wl_shm_pool` the constructor returns and dies with it, taking the witness
+mapping and our descriptor with it.
+
+Proving that needed a client of its own, and the reason is worth recording.
+Firefox holds its rendering pools for the life of the window: a 70-second
+session creates four pools, destroys none, and reports `destroyed=0`. The
+ending compiled, bound to all four proxies, and never ran — code that looks
+right because nothing reached it, which is the failure this section keeps
+finding. `scripts/wc-pooltest.c` exists to reach it: it creates and destroys
+pools in a loop and draws nothing, because `create_pool` and `destroy` are the
+whole experiment. Twelve rounds give `create_pool=12 redirected=12
+destroyed=12` with no record left behind, and the freed slot is reused every
+round rather than climbing, which is what says the record is gone rather than
+merely marked.
+
+That client also exposed something the Firefox runs could not have: **libwayland
+recycles proxy pointers within a session.** Across twelve rounds the
+`wl_shm_pool` alternates between just two addresses. So a proxy pointer is no
+more eternal than a descriptor number or an inode, and keying on one would be
+§30.6d a fourth time — *except* that this identity ends at the exact instant the
+protocol declares the object finished, before the address can be handed out
+again. That is the whole reason it is safe, and it is worth stating, because
+"use the proxy pointer" is otherwise advice that would fail the same way as
+everything else here.
+
+The same run found one more instrument fault, in the same family as §30.6's.
+Adding the signal handler that lets killed clients report had silently dropped
+the `destructor` attribute from the report itself, so every *cleanly exiting*
+client had been producing no summary at all. Firefox is always killed, so it
+never showed; `wc-pooltest` exits normally, so it showed immediately. Both
+endings are now wired. An instrument with one blind ending is how §30.6 went
+wrong the first time, and this is the third distinct instance of the same
+mistake in one section — which is the strongest argument it contains for
+§30.7's verifier existing before the copy is removed rather than after.
 
 And keep the ordering straight. The accelerated path — WebRender rendering
 through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all
@@ -14191,11 +14224,59 @@ been wrong about on this project before. §37.8 item 1.
      cheap cross-check of one section's conclusion by another section's harness
      is worth more than either alone.
 
-   The one attempt failed in the arena locate (16377 of 16384 pages, a contended
-   sweep) before the client started, and the machine was then embargoed by its
-   owner. A deploy directory `C:\Users\<guest-user>\wcptr` is left on the guest; the
-   compositor that run started carried `--timeout 330` and has long since
-   exited.
+   **Five attempts, and none of them reached step 5c.** The blocker is not in
+   the input path; it is `wc-arena-host`, and it failed a different way each
+   time:
+
+   | attempt | where it stopped |
+   |---|---|
+   | 1 | locate: `16377 of 16384 pages` after sweeping 13312 MiB, 140 pages carrying the magic with a different run id |
+   | 2 | locate: `1 page index claimed twice` |
+   | 3 | **located**, proxy attached, client died: `failed to create display: Broken pipe` |
+   | 4 | locate: `28 page index(es) claimed twice` |
+   | 5 | locate: `1 page index claimed twice` |
+
+   Attempt 3 is the one that taught something, and its lesson is now fixed in
+   the harness: `probe-relay.exe` was started with `--timeout 120` **before**
+   the arena locate, and the locate on a contended guest takes minutes rather
+   than the 2.4 s §12.5 measured on an idle one. So the relay exited part-way
+   through a healthy run. What the harness printed was the *client* — "Broken
+   pipe" — and what the proxy printed was "the compositor closed the
+   connection"; the compositor had closed nothing and its log ends at
+   "listening", never mentioning a client. **A relay that has exited looks to
+   the proxy like a dead compositor and to the harness like a dead client, and
+   both readings blame the wrong end.** It is now `--timeout 330`, the
+   compositor's own, since there is no run in which one should outlive the
+   other; and the relay's log — the only process in this topology that nothing
+   ever printed — is dumped when the client fails to get a display.
+
+   The remaining failure is the stamp sweep and it is **not** a stale-stamp
+   problem, which is the reading the error message invites. `new_run_id()` is a
+   hash of the millisecond mixed with the pid, so a previous run's stamps carry
+   a different id and are counted as `other_runs` — attempt 1 shows the tool
+   doing exactly that with 140 of them. A *duplicate* means two pages carry
+   **this** run's id and the same page index, at two offsets in the backing
+   object, with no compositor running and 6.8 GiB free. That is either the same
+   guest page reachable at two file offsets in the flat view, or pages moving
+   under a sweep that takes seconds — and it is `sv-hostd`'s subject, not this
+   section's.
+
+   **The unblock already exists and is unwired.** `wc-arena-host --frames` reads
+   a frame list and uses `PfnLocator`, which reads the kernel's PFN database
+   instead of the extent's contents: 0.064 s against the scan's 2.308 s, with
+   byte-identical offset tables, and no stamps involved at all — so duplicates
+   and stale stamps both stop being possible. The producer exists too:
+   `wc_compositor::grow::frame_list_text` writes exactly the format the locator
+   parses. It has **no caller outside the growth path**, so nothing emits a
+   frame list at arena-publish time and the harness has nothing to pass. Wiring
+   that up is §34's work and one call site, and it would make this harness
+   deterministic rather than a coin flip on a busy guest.
+
+   A deploy directory `C:\Users\<guest-user>\wcptr` is left on the guest. No process
+   and no scheduled task of this branch's survives; the five compositors all
+   exited on their own `--timeout 330` or were killed by the harness, and the
+   two `wc-wcptr-*-wccomp` task definitions left `Ready` by `int_bg` were
+   unregistered by hand after checking each was not `Running`.
 2. **Subsurfaces still route to the root.** `surface_and_origin` gives the
    root surface's origin, and every pointer event goes to the toplevel's surface
    with no hit test — `control.rs`'s header says so and it is unchanged. For a
@@ -14545,11 +14626,13 @@ would be worse than the TCP path it replaces, so:
 1. ~~No Windows `open_virtio_port`.~~ **Done** — `winpipe::open_virtio_port`
    opens `\\.\Global\<name>` with the same `CreateFileW(OPEN_EXISTING)` as
    `Pipe::connect`, minus the `WaitNamedPipeW` retry, which on a port that is
-   not a named pipe fails with `ERROR_INVALID_NAME` rather than waiting. It is
-   compiled but **not exercised**: no Windows guest has opened one, because that
-   needs the QMP hot-add on testhost. `PortWake` and `serve_port` are written
-   against `Read`/`Write`, which is why filling this gap changed nothing in
-   `vdoorbell` — the port type was the only platform-specific thing in it.
+   not a named pipe fails with `ERROR_INVALID_NAME` rather than waiting, and
+   falls back to `\\.\<name>`. **Written, run, and it does not work yet** —
+   `ERROR_ACCESS_DENIED` on the deployment guest from an Administrator session,
+   with the device present. §36.13 has the elimination and the next step.
+   `PortWake` and `serve_port` are written against `Read`/`Write`, which is why
+   this changed nothing in `vdoorbell` — the port type was the only
+   platform-specific thing in it.
 2. **No QMP hot-add.** Nobody has written `chardev-add`/`device_add`, and it
    needs root on the machine QEMU lives on. The development guest did not need
    it — its ports are declared in `nix/guest.nix` and it can be rebooted freely
@@ -14579,14 +14662,13 @@ would be worse than the TCP path it replaces, so:
    That measurement is on `testhost`, which is somebody's working machine, and
    it waits for a window when nobody is using it rather than for a gap in the
    schedule.
-7. **No Wayland client has driven a *guest* window through a ring.** One has
-   driven a compositor through a ring (§36.11), on one machine. What is left
-   between the two is deployment rather than design: the compositor's control
-   region has to be the guest's pinned RAM published over the cold path rather
-   than a file it creates, which is `win_guest`'s existing `Hello`/`Accept` with
-   a different owner — and the compositor is a second guest *process*, which
-   §1.6 of `one-binary.md` argues is the thing to fix rather than to work
-   around.
+7. ~~No Wayland client has driven a *guest* window through a ring.~~ **Done, on a
+   Linux guest** — §36.12, across a real hypervisor. What is left is the Windows
+   substrate: `RingLink` maps with `map_fd` and Windows wants `map_section`, and
+   the guest-RAM provider there is `awe_probe`. The compositor also remains a
+   second guest *process*, which `one-binary.md` §1.6 argues is the thing to fix
+   rather than to work around — and which is now a doorbell constraint as well
+   as a copy one.
 
 **`scripts/probe-relay.c` therefore stays, and is still the only thing that
 works end to end.** It is retired when a Wayland client drives a guest window
@@ -14745,3 +14827,163 @@ WiFi round trip. Removing it means teaching the vendored `wayland-backend` to
 take a `Read + Write` client rather than a socket, which is a change to vendored
 code and a `wepoll` problem, and is not worth doing before a client has driven a
 *guest* window through a ring.
+
+### 36.12 Across a real hypervisor: a client here, a compositor in another kernel
+
+§36.11 ran both halves on one machine, and said so. This is the same thing with
+a hypervisor in the middle — `scripts/wc-ring-vm.sh`, on the development guest:
+
+```
+wc-compositor: 80 MiB of guest RAM for the ring region, run 0x3b6c4736baf9a7d3, 20480 pages stamped
+wc-compositor: the host located the ring region, generation 1
+wc-compositor: client 1 accepted on ring slot 1 (no socket crossed the VM boundary)
+
+sv-hostd: the guest offers run 0x3b6c4736baf9a7d3, 4096 control pages + 16384 arena pages, locator Scan
+sv-hostd: located 20480/20480 pages in 193.29ms over 2047 MiB of guest RAM; 3408 run(s), 0 outside RAM
+sv-hostd: stitched 80 MiB with 3408 mmap call(s); all 20480 pages carry their own index
+
+[proxy] upstream is the guest's own RAM via .../wl.sock (3408 run(s), 16 ring slots, generation 1)
+[proxy] client 1 connected, upstream ring slot 1 (no socket, no TCP, no ssh)
+[proxy] client 1 ... 0 fds in, 0 out; 8 client msgs, 31 server msgs
+
+cross-VM ring: PASS — a Wayland client drove a compositor in another kernel, over memory
+```
+
+`wayland-info` on the host enumerated 16 interfaces from a compositor inside a
+VM. The bytes went into pages the guest committed out of its own RAM and the
+host found by sweeping QEMU's memory backend for a stamp — **3,408 runs**, which
+is what a guest's fragmentation actually looks like and is exactly why the run
+list exists rather than an offset.
+
+**This is the thing the section was written for.** The chain it replaces was
+`wc-proxy → ssh -L → TCP over WiFi → probe-relay.exe → afunix.sys`. What is
+there now is a `Control::claim_ring` and a memcpy.
+
+#### 36.12.1 What it took, and it was almost nothing
+
+The compositor gained `--wayland-cold <port>` and the proxy gained
+`--upstream-ring-attach <socket>`. Both are the *existing* handshake:
+
+- the compositor's publish is `win_guest`'s bring-up with the arena unused —
+  commit, stamp, `Hello`, wait for `Accept`, **then** `Control::create`, in that
+  order because `Control::create` zeroes the region and would erase the stamps
+  the host is about to sweep for (the comment in `sv-gpu-server` is the one to
+  read; it was found by measurement, "located 8192 of 12288 pages");
+- the proxy's attach is `AttachRequest` / `Attach` / `Runs` / stitch — the ICD's
+  three messages, unchanged, because the Wayland half and the Vulkan half attach
+  to a guest region by exactly one mechanism. That is §36's whole thesis, and it
+  is the reason this step was small.
+
+`sv-hostd qemu-serve` was not modified at all. It located a Wayland compositor's
+control region believing it was serving an ICD, because at that layer there is
+no difference and there was never supposed to be one.
+
+**One wart, recorded rather than hidden.** `commit_and_stamp(control_size, 0)`
+is refused — "an extent with no arena" — so the compositor commits the smallest
+legal arena, stamps it with everything else, and never touches it. 64 MiB of
+guest RAM the host maps and nobody writes to. The alternative is a second shape
+of extent meaning "control only", which puts a special case in the locator to
+save 64 MiB in a fixture; that trade is not worth making until something other
+than a fixture asks for it.
+
+#### 36.12.2 What is still not proven
+
+The guest here is **Linux**. The deployment guest is Windows, and two things
+differ there and are not yet exercised: `RingLink` is `#[cfg(unix)]` because it
+maps its region with `map_fd` and Windows wants `map_section`, and the guest-RAM
+provider is the Linux one rather than `awe_probe`'s `VirtualAlloc` window. The
+protocol path — claim, accept, chunk, reassemble, EOF, and the cold-path publish
+— is now proven across a real hypervisor; the Windows *substrate* under it is
+not.
+
+`scripts/probe-relay.c` therefore still stays. It is the only thing that carries
+Wayland to the **Windows** guest, and §36 retires it when a ring does.
+
+### 36.13 The Windows guest will not open the port yet, and the reason is not privilege
+
+`winpipe::open_virtio_port` was written in §36.7, compiled, and marked "not
+exercised". It has now been exercised, on `testhost`'s Windows guest, and it
+**fails** — recorded here because a compiled-and-plausible function that nobody
+has run is exactly the kind of thing that gets believed.
+
+`sv-bell-probe.exe guest --port org.sirati.display.0`:
+
+```
+[bell-probe] cannot open org.sirati.display.0: CreateFileW (virtio-serial port) failed: errno 5
+```
+
+Five is `ERROR_ACCESS_DENIED`, and the obvious explanations are all eliminated:
+
+- **Not privilege.** The ssh session reports
+  `[Security.Principal.WindowsPrincipal]::IsInRole(Administrator) = True`.
+- **Not a missing device.** `Get-PnpDevice` shows `VirtIO Serial Driver` OK and
+  **three ports, `vport0p1`, `vport0p2`, `vport0p3`, all `OK`** — which is
+  exactly the three the host configures (`org.qemu.guest_agent.0`,
+  `org.sirati.wifi.0`, `org.sirati.display.0`). The port is there.
+- **Not the namespace.** Both `\\.\Global\<name>` and `\\.\<name>` were tried;
+  both return 5. (The fallback was added because of this measurement and is
+  worth keeping regardless — the security descriptor on the `Global\` alias is
+  not the one on the device.)
+- **Not the one-opener rule.** A second opener is `ERROR_SHARING_VIOLATION` (32),
+  not 5.
+
+So the remaining candidate is that **`vioser.sys` on this guest does not publish
+a symbolic link under the `name=` string at all**, and the openable path is the
+`vport0pN` device rather than the port's name. That is a spelling question with
+a cheap answer and it was **not** guessed at, deliberately: `vport0p2` is
+almost certainly `org.sirati.wifi.0`, which the user's WiFi tray tool owns, and
+opening a virtio-serial port that something else is using is exactly the
+one-opener collision this section has been careful about. Guessing to save a
+diagnostic would risk taking out a live tool on somebody's working machine.
+
+**The right next step** is to read the port name from the registry — the
+`vioser` enumeration records each port's `name=` against its `vport0pN` instance
+— and open the instance that matches, rather than assuming the name is directly
+openable. Until that is done, the Windows guest half of the doorbell is
+**unproven**, and §36.6.3's ~9 µs remains a Linux-guest measurement.
+
+**What this does not change**: the doorbell mechanism, which is
+platform-independent above the port, and which is measured across a real
+hypervisor on the Linux guest. What it changes is the claim about *where* it
+runs. The Windows guest is where the 216.9 ms was measured, and the doorbell
+has not yet been shown to reach it.
+
+#### 36.13.1 And there is no read-only way to map a port name to its instance
+
+Before guessing, two read-only sources were checked from the guest. Neither
+carries the name:
+
+- **`HKLM\SYSTEM\CurrentControlSet\Enum\VIOSERIAL`** — does not exist on this
+  guest. There is no per-port enumeration key to read a `name=` out of.
+- **`HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses\{6fde7521-…}`** — has
+  exactly three interfaces, and they are distinguished only by an **ordinal**:
+
+  ```
+  ##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&01#{6fde7521-…}
+  ##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&02#{6fde7521-…}
+  ##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&03#{6fde7521-…}
+  ```
+
+  Three interfaces for three ports, which corroborates §36.13's device count and
+  adds nothing about *which is which*. `Get-PnpDevice`'s friendly names —
+  `vport0p1`, `vport0p2`, `vport0p3` — are the same ordinals in another dress.
+
+So the mapping is not available read-only, and **this is where it stops.** The
+ordinals almost certainly follow the order the ports appear on the QEMU command
+line, which would make `&0&02` the WiFi port — and "almost certainly" is exactly
+the standard that must not be applied here, because a virtio-serial port takes
+one opener and being wrong means taking the WiFi tray tool off the user's live
+desktop to save a diagnostic. A slower doorbell is a much better outcome than
+that.
+
+What would settle it, and needs a writer rather than a reader: `vioser.sys`
+answers `IOCTL_VIOSERIAL_GET_PORT_NAME` (or the guest agent's own port-name
+query) on an *opened* handle — which is circular here, since opening is the
+thing that fails. The non-circular route is to add a **fourth** port whose
+ordinal is then known by construction, which is the QMP `device_add` of §36.7
+and is a change to a running VM rather than a read.
+
+**None of this is on the critical path.** §36.6.3's ~9 µs across a real
+hypervisor is the latency evidence and stands; §36.12's cross-VM Wayland client
+is the milestone and stands. The Windows guest's port is what would let the
+*deployment* guest use the doorbell, and it is a nice-to-have behind both.

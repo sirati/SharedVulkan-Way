@@ -299,9 +299,14 @@ pub fn attach(port: PortHandle, control: Arc<Control>) -> std::io::Result<Doorma
 /// host (the chardev's socket end), and a `Pipe` on the Windows guest.
 pub enum PortHandle {
     /// `/dev/virtio-ports/<name>`, from [`crate::stream::open_virtio_port`].
+    #[cfg(unix)]
     File(std::fs::File),
     /// The host end of the QEMU `-chardev socket`.
+    #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    /// `\\.\Global\<name>`, from [`crate::winpipe::open_virtio_port`].
+    #[cfg(windows)]
+    Pipe(std::sync::Arc<crate::winpipe::Pipe>),
 }
 
 impl PortHandle {
@@ -311,22 +316,65 @@ impl PortHandle {
         crate::stream::open_virtio_port(name).map(PortHandle::File)
     }
 
+    /// Open the guest end by port name. Windows guest.
+    ///
+    /// Ten seconds, because on a *hot-added* port the device object appears when
+    /// `vioser.sys` binds it, which is some milliseconds after the QMP
+    /// `device_add` returns — and a guest started by a harness may well race it.
+    #[cfg(windows)]
+    pub fn guest_port(name: &str) -> std::io::Result<PortHandle> {
+        crate::winpipe::open_virtio_port(name, 10_000)
+            .map(|p| PortHandle::Pipe(std::sync::Arc::new(p)))
+            .map_err(|e| std::io::Error::other(format!("{e}")))
+    }
+
     /// Connect to the host end of the chardev.
+    #[cfg(unix)]
     pub fn host_socket(path: &str) -> std::io::Result<PortHandle> {
         std::os::unix::net::UnixStream::connect(path).map(PortHandle::Unix)
     }
 
     fn split(self) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         Ok(match self {
+            #[cfg(unix)]
             PortHandle::File(f) => {
                 let w = f.try_clone()?;
                 (Box::new(f), Box::new(w))
             }
+            #[cfg(unix)]
             PortHandle::Unix(s) => {
                 let w = s.try_clone()?;
                 (Box::new(s), Box::new(w))
             }
+            // One handle, shared, rather than a `DuplicateHandle`: a
+            // virtio-serial port permits one opener and the point of the `Arc`
+            // is that this is still *one* open, used by a reader thread and a
+            // writer thread. `ReadFile` and `WriteFile` on one handle from two
+            // threads are independent operations on a byte-mode device.
+            #[cfg(windows)]
+            PortHandle::Pipe(p) => (Box::new(SharedPipe(p.clone())), Box::new(SharedPipe(p))),
         })
+    }
+}
+
+/// A `Pipe` two threads may use at once, one reading and one writing.
+#[cfg(windows)]
+struct SharedPipe(std::sync::Arc<crate::winpipe::Pipe>);
+
+#[cfg(windows)]
+impl Read for SharedPipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+#[cfg(windows)]
+impl Write for SharedPipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
     }
 }
 
