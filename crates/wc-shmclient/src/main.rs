@@ -17,6 +17,11 @@ fn main() -> ExitCode {
             "--height" => config.height = next_num(&mut it).unwrap_or(config.height),
             "--title" => config.title = it.next().unwrap_or(config.title),
             "--app-id" => config.app_id = it.next().unwrap_or(config.app_id),
+            // STAGE 32: change the app id after the window is up, which is what
+            // makes the taskbar's late-identity path measurable at all.
+            "--late-app-id" => config.late_app_id = it.next(),
+            "--late-after" => config.late_after = next_num(&mut it).unwrap_or(config.late_after),
+            "--seconds" => config.seconds = next_num(&mut it).unwrap_or(config.seconds),
             other if other.starts_with("--") => {
                 eprintln!("wc-shmclient: unknown argument {other}");
                 return ExitCode::from(2);

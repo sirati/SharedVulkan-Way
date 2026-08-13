@@ -36,4 +36,10 @@ windows-sys = { workspace = true, features = [
   "Win32_System_Threading",
   "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",
+  # ADDED FOR STAGE 32: `SHGetPropertyStoreForWindow`, which is how a window's
+  # taskbar identity is read back, plus the COM apartment and `CoTaskMemFree`
+  # that come with an interface. See `aumid` in main.rs — this is the one place
+  # in this binary that is not a flat C entry point.
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_System_Com",
 ] }

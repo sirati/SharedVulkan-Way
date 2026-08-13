@@ -245,16 +245,36 @@ pub enum ToUi {
         id: WindowId,
         title: String,
         app_id: String,
+        /// Which taskbar button this window belongs on. ADDED FOR STAGE 32;
+        /// see [`ToUi::AppId`] and `crate::taskbar`.
+        aumid: String,
         shadow: Arc<Mutex<Shadow>>,
         kind: WindowKind,
     },
     /// `xdg_toplevel.set_title`.
     Title { id: WindowId, title: String },
-    /// `xdg_toplevel.set_app_id`. Not used for anything on the platform side;
-    /// recorded so the window knows what it is, and so the Wayland side can
-    /// match it against an icon somebody published for that app id
-    /// (`crate::icon`).
-    AppId { id: WindowId, app_id: String },
+    /// `xdg_toplevel.set_app_id`, and what the platform is to do about it.
+    ///
+    /// The app id itself is recorded so the window knows what it is; the
+    /// **`aumid`** is `crate::taskbar::identity` of it, and it is what the
+    /// Windows shell groups taskbar buttons by. ADDED FOR STAGE 32, which is
+    /// where this message stopped being informational: before it, every window
+    /// this process made shared one button, because a window with no identity
+    /// of its own inherits the *process*'s.
+    ///
+    /// The two are carried together rather than one being derived from the
+    /// other at this end, because the derivation needs something the platform
+    /// does not have — which connection a nameless client arrived on.
+    ///
+    /// **Ordering matters.** The shell reads the property when the button is
+    /// created, which is at `ShowWindow`, so this has to reach a window before
+    /// [`ToUi::Map`] does. `set_app_id` may arrive later than that anyway, and
+    /// then the button already exists; see `win32::set_taskbar_identity`.
+    AppId {
+        id: WindowId,
+        app_id: String,
+        aumid: String,
+    },
     /// Set the window and taskbar icon.
     ///
     /// **A set of sizes, not an image.** Windows asks for two — `ICON_SMALL`
