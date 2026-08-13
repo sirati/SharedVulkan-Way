@@ -525,6 +525,12 @@ mod tests {
         // protocols were added — eleven messages between them, and the reason
         // is docs/design.md §13.7: the compositor advertises both to find out
         // which one Firefox uses, and a global that is advertised can be bound.
-        assert_eq!(checked, 376, "the vendored protocols changed shape");
+        //
+        // 376 to 426 in stage 21, for four protocols and the same reason
+        // stated more sharply (§25.1): `xdg-toplevel-icon` had been advertised
+        // by the compositor for two stages while this table did not know it,
+        // and the price of that disagreement is a killed connection rather
+        // than a missing feature.
+        assert_eq!(checked, 426, "the vendored protocols changed shape");
     }
 }

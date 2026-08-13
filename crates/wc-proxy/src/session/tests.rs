@@ -1075,3 +1075,93 @@ fn the_opcodes_this_file_hard_codes_are_the_right_ones() {
     }
     assert_eq!(s.event("wl_display", op::DISPLAY_DELETE_ID).unwrap().name, "delete_id");
 }
+
+/// The four protocols stage 21 added, driven the way a client drives them.
+///
+/// # What this is a regression test for
+///
+/// `xdg-toplevel-icon-v1` was complete in the compositor and advertised at
+/// every bind for two stages while this crate had never heard of the interface.
+/// The result was not a missing icon: `Session::client_message` resolves the
+/// opcode against the spec *before* it walks anything, so the client's first
+/// request on the manager — any request, with or without an `h` — is
+/// `Error::UnknownOpcode` and the proxy ends the connection. A GTK 4.20 client
+/// would have met a wall where a client one version older met a working
+/// compositor.
+///
+/// So this drives each manager past that exact point: bind it, make its child
+/// object, and send a request on the child. Binding alone would not do — the
+/// bind is a `wl_registry` message and succeeds for any interface name at all.
+/// That is precisely why nothing noticed.
+#[test]
+fn every_protocol_stage_21_added_survives_its_first_request() {
+    let d = tmpdir("p21");
+    let t = SharedFile::new(&d, "Z:\\pools\\").unwrap();
+    let mut h = Harness::new(Box::new(t), CopyScope::Damage, 0);
+
+    // The objects a real client would already have. `record` rather than a
+    // scripted `get_registry`, because what is under test is the four managers
+    // and not the handshake, which every other test in this file covers.
+    let registry = h.id();
+    h.session.objects.record(registry, "wl_registry");
+    let surface = h.id();
+    h.session.objects.record(surface, "wl_surface");
+    let seat = h.id();
+    h.session.objects.record(seat, "wl_seat");
+    let toplevel = h.id();
+    h.session.objects.record(toplevel, "xdg_toplevel");
+
+    // xdg-toplevel-icon: create_icon, name it, and set it on a toplevel. The
+    // icon's buffer argument is an object id and not an `h`, which is why the
+    // whole protocol crosses the boundary without touching the fd shim.
+    let icons = h.bind(registry, 3, "xdg_toplevel_icon_manager_v1", 1);
+    let icon = h.id();
+    h.send_words(icons, 1, &[icon]);
+    let mut name = b"firefox".to_vec();
+    name.push(0);
+    let mut body = Vec::new();
+    wire::push_bytes(&mut body, &name);
+    h.send(icon, 1, &body, &mut VecDeque::new());
+    h.send_words(icons, 2, &[toplevel, icon]);
+
+    // idle-inhibit: an inhibitor on a surface, then destroyed.
+    let idle = h.bind(registry, 12, "zwp_idle_inhibit_manager_v1", 1);
+    let inhibitor = h.id();
+    h.send_words(idle, 1, &[inhibitor, surface]);
+    h.send_words(inhibitor, 0, &[]);
+
+    // xdg-activation: mint a token, commit it, and activate a surface with the
+    // string that comes back. The token is a `string` on the wire — the one
+    // argument shape in these four that is neither a word nor an object, and
+    // therefore the one that would desynchronise the stream if its length were
+    // walked wrongly.
+    let activation = h.bind(registry, 13, "xdg_activation_v1", 1);
+    let token = h.id();
+    h.send_words(activation, 1, &[token]);
+    h.send_words(token, 3, &[]);
+    let mut tok = b"a-token-from-the-compositor".to_vec();
+    tok.push(0);
+    let mut body = Vec::new();
+    wire::push_bytes(&mut body, &tok);
+    body.extend_from_slice(&surface.to_ne_bytes());
+    h.send(activation, 2, &body, &mut VecDeque::new());
+
+    // keyboard-shortcuts-inhibit: an inhibitor for one surface on one seat.
+    let shortcuts = h.bind(registry, 14, "zwp_keyboard_shortcuts_inhibit_manager_v1", 1);
+    let grab = h.id();
+    h.send_words(shortcuts, 1, &[grab, surface, seat]);
+    h.send_words(grab, 0, &[]);
+
+    // Every message reached the compositor, and the stream it formed re-frames
+    // — which is the property §2.4 says a mis-walked argument destroys, and the
+    // one an assertion about return values alone would not have.
+    let sent = h.upstream_messages();
+    // Four binds and ten requests, none of them absorbed: unlike a pool resize,
+    // nothing in these four protocols is something the proxy answers itself.
+    assert_eq!(sent.len(), 14, "messages forwarded: {}", sent.len());
+    assert!(
+        h.session.take_notes().is_empty(),
+        "a note means the proxy did not recognise an interface it was handed"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -2,7 +2,7 @@
  *
  *   probe-scroll.exe --class WaycomposeToplevel --wait 40 --notches 60 --gap 250
  *
- * STAGE 14. `probe-input.exe` injects one wheel notch, because the question it
+ * §27. `probe-input.exe` injects one wheel notch, because the question it
  * was written for is "does a notch arrive, and with the right sign" — a
  * question one notch answers completely. This probe asks a different one: what
  * a *scrolling page* does to the damage path over sixty frames' worth of

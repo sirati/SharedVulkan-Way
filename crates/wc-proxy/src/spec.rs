@@ -163,6 +163,26 @@ impl Spec {
         // says so instead of desynchronising.
         spec.load(include_str!("../protocols/xdg-decoration-unstable-v1.xml"))?;
         spec.load(include_str!("../protocols/server-decoration.xml"))?;
+        // ADDED FOR STAGE 21, and the first of the four is a bug fix rather than
+        // a feature: the compositor has advertised `xdg_toplevel_icon_v1` since
+        // stage 11 and this table did not know the interface, so a guest client
+        // that bound it — GTK 4.20 does — died on its **first request** with
+        // `xdg_toplevel_icon_manager_v1 has no message 0`. A global that is
+        // advertised must be walkable, and the two are in different crates, so
+        // nothing but a person notices when they disagree. §25.1.
+        //
+        // The other three are the globals stage 21 adds. They are listed here in
+        // the same commit that creates them, for exactly the reason above.
+        //
+        // Taken from `wayland-protocols` 0.32.12, which is the version
+        // `Cargo.lock` pins and therefore the one the compositor's own
+        // implementations were generated from. (0.32.13 changes these four files
+        // only in indentation and prose — no message, opcode or argument moves —
+        // so a lockfile bump does not silently change this table.)
+        spec.load(include_str!("../protocols/xdg-toplevel-icon-v1.xml"))?;
+        spec.load(include_str!("../protocols/idle-inhibit-unstable-v1.xml"))?;
+        spec.load(include_str!("../protocols/xdg-activation-v1.xml"))?;
+        spec.load(include_str!("../protocols/keyboard-shortcuts-inhibit-unstable-v1.xml"))?;
         Ok(spec)
     }
 
@@ -305,7 +325,11 @@ mod tests {
         // decoration protocols, counted with grep. A number rather than "not
         // empty", so that a parser that silently dropped a trailing interface
         // would be caught.
-        assert_eq!(s.len(), 32, "interfaces: {:?}", s.names());
+        //
+        // STAGE 21 adds four more protocols of two interfaces each — a manager
+        // and the object it hands out, which is the shape all four happen to
+        // have — taking 32 to 40.
+        assert_eq!(s.len(), 40, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,
@@ -346,6 +370,12 @@ mod tests {
         assert_eq!(m.fd_count(), 1);
         // And the whole set, so that adding a protocol with a new one is a
         // visible change to this list rather than a silent one.
+        //
+        // STAGE 21 added four protocols and this list did not move, which is
+        // the fact worth having asserted rather than believed: an icon crosses
+        // as a `wl_buffer` object id, an activation token as a string, and an
+        // inhibitor carries nothing at all. None of the four needs the fd shim,
+        // so none of them can be broken by it.
         let mut with_fds = Vec::new();
         for name in s.names() {
             let i = s.interface(name).unwrap();
@@ -393,6 +423,54 @@ mod tests {
         assert_eq!(s.request("xdg_wm_base", 2).unwrap().name, "get_xdg_surface");
         assert_eq!(s.request("xdg_surface", 1).unwrap().name, "get_toplevel");
         assert_eq!(s.event("xdg_toplevel", 1).unwrap().name, "close");
+    }
+
+    /// Every global `wc-compositor` advertises, named here by hand.
+    ///
+    /// The list is duplicated rather than imported because `wc-proxy` does not
+    /// and must not depend on the compositor crate — one is a Linux binary and
+    /// the other is a Windows one, and they are only ever in the same process
+    /// during a Wine smoke test. That makes this the one place the two halves
+    /// can be checked against each other at all, so it is worth the duplication.
+    ///
+    /// The failure this catches is stage 21's opening bug: `xdg-toplevel-icon`
+    /// was complete in the compositor, advertised at every bind, and absent
+    /// from this table for two stages. Nothing noticed, because the only
+    /// clients that bind it are newer than the ones being tested — and the
+    /// symptom when one finally did would have been a killed connection on the
+    /// client's *first* request, not a missing icon.
+    #[test]
+    fn every_global_the_compositor_advertises_can_be_walked() {
+        let s = spec();
+        for iface in [
+            "wl_compositor",
+            "wl_shm",
+            "wl_seat",
+            "wl_output",
+            "wl_data_device_manager",
+            "wl_subcompositor",
+            "xdg_wm_base",
+            "zxdg_decoration_manager_v1",
+            "org_kde_kwin_server_decoration_manager",
+            "xdg_toplevel_icon_manager_v1",
+            "zwp_idle_inhibit_manager_v1",
+            "xdg_activation_v1",
+            "zwp_keyboard_shortcuts_inhibit_manager_v1",
+        ] {
+            assert!(
+                s.interface(iface).is_some(),
+                "{iface} is advertised by wc-compositor and is not in the proxy's table; \
+                 a client that binds it dies on its first request"
+            );
+            // And the manager's first request specifically, because that is the
+            // lookup `Session::client_message` does and the one that failed.
+            assert!(s.request(iface, 0).is_some(), "{iface} has no request 0");
+        }
+        // `wc_icon_manager_v1` is deliberately not in the list. It is this
+        // project's own interface and its only client is the proxy itself,
+        // which speaks it from the far side of the boundary rather than
+        // through `Session` — see `crate::iconlink`.
+        assert!(s.interface("wc_icon_manager_v1").is_none());
     }
 
     #[test]

@@ -337,7 +337,7 @@ pub struct Stats {
     pub fds_from_arena: u64,
     pub messages_client: u64,
     pub messages_server: u64,
-    /// STAGE 14, and only with `--verify-damage`. Commits whose copy was
+    /// §27, and only with `--verify-damage`. Commits whose copy was
     /// checked against the client's own bytes.
     pub verified: u64,
     /// Of those, the ones where the region did **not** match — the number that
@@ -510,8 +510,8 @@ pub struct Session {
     /// bytes-in / bytes-out and has no business opening an icon theme or
     /// writing to a second socket. What it can do is notice.
     app_ids: Vec<String>,
-    /// STAGE 14. After every copy, compare the attached buffer's visible rows
-    /// in the region against the client's own, and count the ones that differ.
+    /// §27. After every copy, compare the attached buffer's visible rows in the
+    /// region against the client's own, and count the ones that differ.
     ///
     /// The oracle is exact and it is the protocol's: between `commit` and
     /// `wl_buffer.release` the client may not touch the buffer it attached, and
@@ -936,10 +936,25 @@ impl Session {
                     if let Some((iface, _version, id)) = wire::untyped_new_id(body, span) {
                         if self.spec.interface(&iface).is_none() {
                             self.objects.note_unknown();
+                            // **This is fatal on the next message, not on some
+                            // later one.** The wording here used to say the
+                            // connection would fail "if it ever carries an h",
+                            // which is wrong and was corrected in stage 21
+                            // after it nearly cost somebody an afternoon:
+                            // `client_message` looks the opcode up in the spec
+                            // *before* it walks anything (see the top of that
+                            // function), so the very first request on an
+                            // unknown interface is `Error::UnknownOpcode` and
+                            // the connection ends. An interface with no fds
+                            // anywhere in it is no safer than one full of them.
+                            //
+                            // So this note is a warning about the *next*
+                            // message, and the fix is always the same: copy the
+                            // XML into `protocols/` and add a line to
+                            // `Spec::builtin`.
                             self.note(format!(
                                 "client bound {iface}, which is not in the vendored protocols; \
-                                 messages on it cannot be walked and the connection will fail \
-                                 if it ever carries an h"
+                                 its first request cannot be walked and will end the connection"
                             ));
                         }
                         self.objects.record(id, &iface);

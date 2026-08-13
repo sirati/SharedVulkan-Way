@@ -132,6 +132,14 @@
           wayland-utils
           wayland
 
+          # ADDED FOR STAGE 21. `scripts/wc-inhibit.sh` builds a C client from
+          # the XML in `crates/wc-proxy/protocols`, so that the probe's idea of
+          # an opcode is the same file the compositor was generated from rather
+          # than whatever `wayland-protocols` this machine happens to have. That
+          # needs the code generator, which nixpkgs splits out of `wayland`
+          # itself. 23 KiB.
+          wayland-scanner
+
           # Stage 2's independent client. `wayland-info` enumerates globals and
           # stops there; reaching `xdg_toplevel` needs a client that actually
           # makes a window. Weston's demo clients are C, use libwayland and the

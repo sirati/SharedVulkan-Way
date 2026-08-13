@@ -52,7 +52,7 @@ struct Args {
     scope: CopyScope,
     headroom: u64,
     trace: bool,
-    /// STAGE 14. After every copy, compare the region against the client's own
+    /// §27. After every copy, compare the region against the client's own
     /// bytes and count the rows that differ. An instrument rather than a mode:
     /// it reads the whole extent every commit. See `Session::verify`.
     verify: bool,
