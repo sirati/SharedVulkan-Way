@@ -168,15 +168,11 @@ const DEFAULT_EXTENSIONS: &[(&str, u32)] = &[
     ("org_kde_kwin_server_decoration_manager", 1),
     ("xdg_toplevel_icon_manager_v1", 1),
     ("wc_icon_manager_v1", 1),
+    ("wc_clipboard_manager_v1", 1),
     ("wp_cursor_shape_manager_v1", 2),
     ("zwp_idle_inhibit_manager_v1", 1),
     ("xdg_activation_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
-    // The clipboard manager, which the compositor advertises and this table
-    // did not list. Found by `scripts/wc-wlcs.sh globals`, which exists to
-    // catch exactly this: a hand-run of the suite against the drifted table
-    // would be testing a *different* claim from the one the harness makes.
-    ("wc_clipboard_manager_v1", 1),
 ];
 
 /// Parse the `name version` file `WC_WLCS_EXTENSIONS` points at.
@@ -463,39 +459,102 @@ unsafe extern "C" fn pointer_destroy(raw: *mut WlcsPointer) {
     drop(unsafe { Box::from_raw(raw.cast::<Pointer>()) });
 }
 
-/// A touch device that does nothing, because there is no touch anywhere in
-/// this project.
+/// A single touch contact, driven down the control socket.
 ///
-/// **Not a stub standing in for work that is nearly done.** `wl_seat` here
-/// advertises no touch capability, `platform::FromUi` has no touch event, and
-/// `win32.rs` handles no `WM_POINTER*` message. WLCS dereferences whatever
-/// `create_touch` returns before it does anything else
-/// (`in_process_server.cpp`'s `Touch::Impl`, which reads `touch->version`), so
-/// returning null is a segfault rather than a skip — hence an object whose
-/// methods are empty. The 48 touch tests fail, which is the correct answer,
-/// and docs/waycompose-design.md §26.6 lists them as a gap rather than as an exclusion:
-/// touch is perfectly implementable on Windows and simply is not implemented.
+/// # What this used to be, and why the comment mattered more than the code
+///
+/// Until §40 the methods here were empty, and the comment above them said the
+/// device did nothing "because there is no touch anywhere in this project" —
+/// `wl_seat` advertised no touch capability, `FromUi` had no touch event, and
+/// `win32.rs` handled no `WM_POINTER*` message. Every one of those three
+/// statements was true when it was written and none of them was true by §24:
+/// `has_touch` gates a real `add_touch`, `FromUi` carries four touch variants,
+/// and `win32.rs` has a `WM_POINTER*` handler with a `pointerId`-to-slot map.
+///
+/// **A stub is only honest for as long as its reason is checked**, and this one
+/// outlived its reason by sixteen stages while continuing to explain, in
+/// confident detail, why roughly a hundred failing tests were somebody else's
+/// problem. It is worth naming as a failure mode rather than quietly deleting:
+/// the comment was what stopped anybody looking.
+///
+/// # One contact, and why that is not a shortcut
+///
+/// WLCS's device is single-contact — `touch_down`, `touch_move`, `touch_up`,
+/// with no slot argument — so this reports slot 0 and nothing else. The
+/// multi-contact bookkeeping (`crate::input::touch::Slots` in the compositor)
+/// maps Windows' sparse `pointerId`s onto the protocol's dense slots, and it is
+/// exercised by the Win32 path rather than by this one. Driving two synthetic
+/// contacts from here would be testing the harness against itself.
+///
+/// WLCS dereferences whatever `create_touch` returns before it does anything
+/// else (`in_process_server.cpp`'s `Touch::Impl`, which reads `touch->version`),
+/// so returning null is a segfault rather than a skip.
 #[repr(C)]
 struct Touch {
     vtable: WlcsTouch,
+    server: *mut Server,
 }
 
-unsafe extern "C" fn create_touch(_raw: *mut WlcsDisplayServer) -> *mut WlcsTouch {
+unsafe extern "C" fn create_touch(raw: *mut WlcsDisplayServer) -> *mut WlcsTouch {
     Box::into_raw(Box::new(Touch {
         vtable: WlcsTouch {
             version: 1,
-            touch_down: touch_nowhere,
-            touch_move: touch_nowhere,
-            touch_up: touch_nothing,
+            touch_down,
+            touch_move,
+            touch_up,
             destroy: touch_destroy,
         },
+        server: raw.cast(),
     }))
     .cast()
 }
 
-unsafe extern "C" fn touch_nowhere(_raw: *mut WlcsTouch, _x: i32, _y: i32) {}
-unsafe extern "C" fn touch_nothing(_raw: *mut WlcsTouch) {}
+unsafe fn touch<'a>(raw: *mut WlcsTouch) -> &'a mut Touch {
+    unsafe { &mut *raw.cast::<Touch>() }
+}
+
+/// **`touch_down` and `touch_move` take whole pixels, not `wl_fixed_t`, and the
+/// header says otherwise.**
+///
+/// `wlcs/touch.h` declares both as `void (*)(WlcsTouch*, wl_fixed_t x,
+/// wl_fixed_t y)`, and `wlcs::Pointer` really does send fixed-point — so the
+/// obvious thing, and the thing this shim did first, is to divide by 256 in
+/// both places. But `in_process_server.cpp`'s `Touch::Impl` is
+///
+/// ```c++
+/// void down_at(int x, int y) { touch->touch_down(touch.get(), x, y); }
+/// ```
+///
+/// with no `wl_fixed_from_int` anywhere on the path, while `Pointer::Impl`'s
+/// `move_to` does convert. The types disagree with the calls, and the calls are
+/// what runs.
+///
+/// It cost a measurement to find, and it is worth recording *how*: every touch
+/// test failed with the contact landing on no surface at all, which looks
+/// exactly like "touch is not wired up" — the conclusion the stub this replaced
+/// had already asserted. One `eprintln!` of the received coordinates showed
+/// `0.355, 0.059` where `91, 15` was expected, and 91/256 = 0.355 named the bug
+/// immediately. A wrong unit is invisible in a pass/fail scoreboard and obvious
+/// in one printed number.
+unsafe extern "C" fn touch_down(raw: *mut WlcsTouch, x: i32, y: i32) {
+    let t = unsafe { touch(raw) };
+    unsafe { &mut *t.server }.request_ok(&format!("touch-down {x} {y}"));
+}
+
+unsafe extern "C" fn touch_move(raw: *mut WlcsTouch, x: i32, y: i32) {
+    let t = unsafe { touch(raw) };
+    unsafe { &mut *t.server }.request_ok(&format!("touch-move {x} {y}"));
+}
+
+unsafe extern "C" fn touch_up(raw: *mut WlcsTouch) {
+    let t = unsafe { touch(raw) };
+    unsafe { &mut *t.server }.request_ok("touch-up");
+}
+
 unsafe extern "C" fn touch_destroy(raw: *mut WlcsTouch) {
+    // Deliberately not a `touch-up`, for the same reason `pointer_destroy` is
+    // not a `pointer-leave`: unplugging a digitiser is not a finger lifting,
+    // and the suite does not ask for the second.
     drop(unsafe { Box::from_raw(raw.cast::<Touch>()) });
 }
 

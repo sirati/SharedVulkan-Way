@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "The generated shared_vulkan protocol: types, encode, decode, pnext, handle_map, transform, dispatch"
+# Not a native library. `links` is the only mechanism Cargo has for a build
+# script to publish a value to a *dependent's* build script, and `sv-icd`'s needs
+# exactly one: the core Vulkan version of the profile this build generated for,
+# so the ICD manifest it writes cannot disagree with what the wire carries.
+# See `build.rs` and `sv-icd/build.rs` (design.md §0.18).
+links = "sv_proto"
 
 [dependencies]
 sv-wire.workspace = true

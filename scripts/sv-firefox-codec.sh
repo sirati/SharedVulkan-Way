@@ -8,6 +8,7 @@
 #   scripts/sv-firefox-codec.sh up            weston + firefox + marionette
 #   scripts/sv-firefox-codec.sh codecs        which preferences remove which codec
 #   scripts/sv-firefox-codec.sh compare [s]   AV1 vs H.264, interleaved, at 1080p60
+#   scripts/sv-firefox-codec.sh vulkan [s]    Vulkan Video decode on vs off (Firefox >= 153)
 #   scripts/sv-firefox-codec.sh overlay TAG ARM   the player's own stats panel, photographed
 #   scripts/sv-firefox-codec.sh support TAG   about:support, as JSON and as pixels
 #   scripts/sv-firefox-codec.sh down
@@ -332,6 +333,44 @@ elif MODE == "compare":
             r["frames_in_window"], r["cpu_secs"], r["cores"]))
     open(RUN + "/compare.json", "w").write(json.dumps(rows, indent=1))
 
+elif MODE == "vulkan":
+    # Firefox 153's Vulkan Video decoder, on and off, against the same binary on
+    # the same machine in the same minute. `about:support` saying `HWDEC` is a
+    # statement about a *capability*; the only thing that says a frame was
+    # decoded on the GPU is the CPU it did not cost.
+    #
+    # The pref is read when a decoder is constructed, so flipping it is not
+    # enough on its own -- each arm navigates afresh, which is what builds the
+    # new decoder.
+    secs = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+    quality = sys.argv[3] if len(sys.argv) > 3 else "hd1080"
+    VK = "media.hardware-video-decoding-vulkan.enabled"
+    rows = []
+    for arm in ["on", "off", "on", "off"]:
+        m.context("chrome")
+        m.script("Services.prefs.setBoolPref(arguments[0], arguments[1]); return 1;",
+                 [VK, arm == "on"])
+        m.context("content")
+        m.navigate("about:blank")
+        print(arm, play(m, EMBED, quality, frame=True))
+        time.sleep(25)
+        pids = our_pids()
+        j0, w0 = cpu_jiffies(pids), time.time()
+        mk = m.script(STATS)
+        time.sleep(secs)
+        j1, w1 = cpu_jiffies(our_pids()), time.time()
+        r = m.script(STATS)
+        r.update(arm="vulkan-" + arm, nproc=len(pids), cpu_secs=j1 - j0,
+                 wall_secs=w1 - w0,
+                 dropped_in_window=r["dropped"] - mk["dropped"],
+                 frames_in_window=r["total"] - mk["total"])
+        r["cores"] = r["cpu_secs"] / r["wall_secs"]
+        rows.append(r)
+        print("vulkan %-3s %-34s %-22s dropped %5d of %6d   %.1f cpu-s (%.2f cores)" % (
+            arm, r["codecs"], r["resolution"], r["dropped_in_window"],
+            r["frames_in_window"], r["cpu_secs"], r["cores"]))
+    open(RUN + "/vulkan.json", "w").write(json.dumps(rows, indent=1))
+
 elif MODE == "overlay":
     tag, arm = sys.argv[2], sys.argv[3]
     quality = sys.argv[4] if len(sys.argv) > 4 else "hd720"
@@ -458,7 +497,7 @@ HTML
   done
   echo "FAIL: marionette never listened"; tail -20 "$RUN/ff.log"; exit 1
   ;;
-codecs|compare|overlay|support)
+codecs|compare|vulkan|overlay|support)
   SVC_PORT=$PORT SVC_VIDEO=$VIDEO "$PY/bin/python3" -u "$RUN/drive.py" "$@" ;;
 down)
   # By the profile path, never by image name: the user's own Firefox is on this
@@ -469,5 +508,5 @@ down)
   for p in $(pgrep -f -- "--socket=svcodec"); do kill "$p" 2>/dev/null; done
   pkill -f "http.server 8931" 2>/dev/null
   echo "down" ;;
-*) echo "usage: up|codecs|compare|overlay|support|down"; exit 2 ;;
+*) echo "usage: up|codecs|compare|vulkan|overlay|support|down"; exit 2 ;;
 esac

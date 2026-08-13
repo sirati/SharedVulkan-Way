@@ -191,6 +191,57 @@ fn result_of(op: sv_proto::Opcode, reply: &[u8]) -> Option<i32> {
 /// actually buys is not the absence of a copy but the absence of *framing*: one
 /// packet, one wake-up and one contiguous `memcpy` for a whole command buffer,
 /// against one of each per `vkCmd*`.
+/// `SV_DRIVER_VERSION_MAX=1.1`: report the driver as *older* than it is.
+///
+/// design.md §0.18 has to work in both directions — "a GPU that only does 1.1
+/// must still work, and the path where the device is older than our ceiling
+/// needs a test, not just the path where it is newer" — and there is no such GPU
+/// on the development machine. Every driver here reports 1.4. Without a knob the
+/// graceful-fallback half of the feature can only ever be unit-tested, and the
+/// unit test does not exercise the wire, the ICD's constructor, or the loader.
+///
+/// **It can only lower.** A value above the driver's own is ignored rather than
+/// honoured, because the one thing this must never become is a way to make the
+/// app side advertise a version nothing implements — that is the defect §0.18
+/// exists to remove, and a debug knob that could reintroduce it would be worse
+/// than no knob. Lying downwards is always safe: it can only make the app side
+/// promise less.
+///
+/// Unset — the ordinary case — it is the identity function and costs one
+/// `env::var` per session.
+fn version_floor() -> impl Fn(u32) -> u32 {
+    let cap = std::env::var("SV_DRIVER_VERSION_MAX").ok().and_then(|s| parse_version(&s));
+    if let Some(cap) = cap {
+        eprintln!(
+            "[gpu] SV_DRIVER_VERSION_MAX: reporting the driver as at most {}.{}.{} — a test \
+             knob, and it can only lower",
+            (cap >> 22) & 0x7f,
+            (cap >> 12) & 0x3ff,
+            cap & 0xfff
+        );
+    }
+    move |v| match cap {
+        Some(cap) => v.min(cap),
+        None => v,
+    }
+}
+
+/// `"1.1"` or `"1.1.128"` as `VK_MAKE_API_VERSION`. `None` for anything else,
+/// because a typo in a test knob must not silently become 0.0.0.
+fn parse_version(s: &str) -> Option<u32> {
+    let mut it = s.trim().split('.');
+    let major: u32 = it.next()?.parse().ok()?;
+    let minor: u32 = it.next()?.parse().ok()?;
+    let patch: u32 = match it.next() {
+        None => 0,
+        Some(p) => p.parse().ok()?,
+    };
+    if it.next().is_some() || major > 0x7f || minor > 0x3ff || patch > 0xfff {
+        return None;
+    }
+    Some((major << 22) | (minor << 12) | patch)
+}
+
 fn protocol_command(
     payload: &[u8],
     srv: &mut sv_gpu_entry::Forward<GpuServer>,
@@ -285,6 +336,25 @@ fn protocol_command(
             sv_proto::sv::ImportArenaSlabReply { result, memory_type }
                 .encode(reply)
                 .map_err(err)?;
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_DRIVER_VERSIONS) => {
+            sv_proto::sv::DriverVersions::decode(payload).map_err(err)?;
+            let driver = &srv.host().shared.driver;
+            // **Reported, not clamped.** `Driver::open` capped the instance *it*
+            // created at what the profile carries, and reporting that cap here
+            // would make the app side's negotiation a tautology — it would learn
+            // its own ceiling back and could never notice that the driver is
+            // richer than the wire. What travels is the driver's own two
+            // numbers; design.md §0.18 decides what to do with them, once, on
+            // the app side.
+            let lower = version_floor();
+            sv_proto::sv::DriverVersionsReply {
+                instance_api_version: lower(driver.instance_api_version),
+                device_api_version: lower(driver.props.api_version),
+            }
+            .encode(reply)
+            .map_err(err)?;
             Ok(0)
         }
         Some(other) => Err(format!("unknown protocol command {other:#x}")),
@@ -460,4 +530,35 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
         cons.advance().map_err(err)?;
     }
     Ok(handled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_cap_parses_or_refuses_but_never_guesses() {
+        let mk = |ma: u32, mi: u32, pa: u32| (ma << 22) | (mi << 12) | pa;
+        assert_eq!(parse_version("1.1"), Some(mk(1, 1, 0)));
+        assert_eq!(parse_version("1.4.323"), Some(mk(1, 4, 323)));
+        assert_eq!(parse_version(" 1.3.0 "), Some(mk(1, 3, 0)));
+        // A typo must not become 0.0.0, which would demote the driver to a 1.0
+        // one and look like a real answer on the way past.
+        for bad in ["", "1", "1.", "x.y", "1.1.2.3", "1.-1", "1.1.99999", "1.2000.0"] {
+            assert_eq!(parse_version(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// The one property that makes the knob safe to have in the binary.
+    #[test]
+    fn the_cap_can_only_lower() {
+        // `version_floor` reads the environment, which a test must not do
+        // concurrently with its siblings; the invariant is in the `min` and is
+        // checked against it directly.
+        let cap = parse_version("1.1").unwrap();
+        let floor = |v: u32| v.min(cap);
+        assert_eq!(floor(parse_version("1.4.348").unwrap()), cap, "a newer driver is lowered");
+        let older = parse_version("1.0.0").unwrap();
+        assert_eq!(floor(older), older, "an already-older driver is left alone, never raised");
+    }
 }

@@ -8,12 +8,21 @@
 //! that window to this absolute position, and move/click a pointer at these
 //! compositor coordinates. The first hook is a `connect()`. The other two have
 //! no answer in this project's architecture, because **this compositor does not
-//! place windows and does not hit-test a pointer.** Windows does. A window is
-//! an `HWND`, `SetWindowPos` moves it, and the `WM_MOUSEMOVE` that arrives has
-//! already been routed to the window under the cursor by the system; `win32.rs`
-//! converts the coordinates and forwards them, and `state.rs` sends them to the
-//! toplevel's surface with no further routing (see `State::pointer_motion`,
-//! whose surface origin is a hard-coded `(0, 0)` for exactly this reason).
+//! place windows and does not hit-test a pointer *between* windows.** Windows
+//! does. A window is an `HWND`, `SetWindowPos` moves it, and the `WM_MOUSEMOVE`
+//! that arrives has already been routed to the window under the cursor by the
+//! system; `win32.rs` converts the coordinates and forwards them.
+//!
+//! **"Between windows" is load-bearing, and this comment claimed something
+//! stronger until §40.** Routing *within* a window is not Windows' to do and
+//! cannot be: a `wl_subsurface` has no `HWND` of its own, the whole surface
+//! tree is composed into one window's pixels by `State::compose_tree`, and
+//! `wl_surface.set_input_region` is a Wayland concept Win32 has never heard of.
+//! So `State::surface_under` hit-tests the surface tree on *both* legs — it is
+//! shipping code, not a harness stand-in — and what this file replaces is only
+//! the outer question of which window the pointer is over. The stronger claim
+//! is how the largest cluster of WLCS failures in the suite came to be read as
+//! "not our layer" for as long as it was.
 //!
 //! So the two hooks have to be answered by something that stands in for
 //! Windows. That is this file: **a synthetic Win32, at the same seam the real
@@ -54,6 +63,9 @@
 //!   pointer-move <x> <y>                 -> ok          (absolute, f64)
 //!   pointer-button <evdev-code> <0|1>    -> ok
 //!   pointer-leave                        -> ok
+//!   touch-down <x> <y>                   -> ok | ok no-window
+//!   touch-move <x> <y>                   -> ok | ok no-contact
+//!   touch-up                             -> ok | ok no-contact
 //! ```
 //!
 //! `<client>` is the connection's ordinal, counted from 1 in accept order, and
@@ -160,6 +172,23 @@ pub struct Control {
     /// it a drag that crosses a window edge loses its release
     /// (`platform/win32.rs` says the same thing from the other side).
     held: Vec<u32>,
+    /// The window the live touch contact landed on, and where it is, in
+    /// compositor coordinates.
+    ///
+    /// ADDED FOR §40. `None` between an up and the next down, which is the
+    /// state a `wl_touch` client cannot observe and this side must still get
+    /// right — a `touch-move` with no contact down is not a motion, it is a
+    /// harness bug, and it is answered as one.
+    ///
+    /// **The window is remembered rather than re-hit-tested on every move,
+    /// and that is the protocol rather than an optimisation.** `wl_touch` has
+    /// no enter/leave: `down` names the surface the contact landed on and
+    /// every later event for that contact belongs to that surface until it
+    /// comes up. Win32 agrees — a contact is implicitly captured to the window
+    /// that received its `WM_POINTERDOWN`, with no `SetCapture` — so the same
+    /// rule holds on both legs, and it is the same rule `held` implements for
+    /// the mouse by a different mechanism.
+    touching: Option<WindowId>,
     /// Which window Windows would call the foreground one.
     ///
     /// See [`Control::follow_focus`] for why this is here and not left to the
@@ -206,6 +235,7 @@ impl Control {
             at: None,
             over: None,
             held: Vec::new(),
+            touching: None,
             focus: None,
             started: std::time::Instant::now(),
             output,
@@ -428,6 +458,104 @@ impl Control {
                 });
                 "ok\n".to_owned()
             }
+            // -------------------------------------------------------------
+            // Touch. ADDED FOR §40.
+            // -------------------------------------------------------------
+            //
+            // **The compositor has had touch since §20; this seam had not.**
+            // `wl_seat` advertises the capability on this leg
+            // (`platform::headless::has_touch`), `FromUi` has carried
+            // `TouchDown`/`TouchMotion`/`TouchUp`/`TouchFrame` since §24, and
+            // `State::touch_down` routes a contact through the same scene
+            // lookup a click uses. The only thing missing was a way for the
+            // suite to say a finger had landed — so every touch test failed,
+            // and the shim's stub said "there is no touch anywhere in this
+            // compositor", which had stopped being true two stages earlier.
+            //
+            // WLCS's touch device is a **single contact**: `touch_down`,
+            // `touch_move`, `touch_up`, with no slot argument. So slot 0, and
+            // the multi-contact bookkeeping in `crate::input::touch::Slots`
+            // stays on the Win32 side where the `pointerId` mapping it exists
+            // for actually happens. This leg cannot exercise it, and inventing
+            // a second contact here would be testing the harness.
+            "touch-down" => {
+                let (Some(x), Some(y)) = (num(), num()) else {
+                    return "err touch-down wants <x> <y>\n".to_owned();
+                };
+                // The between-windows hit test, done once, here — a contact is
+                // captured to the window it lands on from this moment, so
+                // unlike the pointer there is no `refresh` to re-run later.
+                let hit = windows.mapped().into_iter().rev().find(|r| {
+                    let (wx, wy) = self.position_of(r.client, r.surface);
+                    x >= wx as f64
+                        && y >= wy as f64
+                        && x < (wx + r.w) as f64
+                        && y < (wy + r.h) as f64
+                });
+                let Some(r) = hit else {
+                    // A contact on the desktop. Not an error, and nothing to
+                    // send: `wl_touch` has no way to say "a finger landed on
+                    // nothing", so the down simply does not happen.
+                    self.touching = None;
+                    return "ok no-window\n".to_owned();
+                };
+                let (wx, wy) = self.position_of(r.client, r.surface);
+                self.touching = Some(r.id);
+                let time = self.now_ms();
+                let _ = self.events.send(FromUi::TouchDown {
+                    id: r.id,
+                    slot: 0,
+                    x: x - wx as f64,
+                    y: y - wy as f64,
+                    // No digitiser, so no contact patch. `None` rather than a
+                    // fabricated ellipse, for the reason `FromUi::TouchDown`
+                    // gives: a shape event here would be a statement about
+                    // hardware this leg does not have.
+                    shape: None,
+                    time,
+                });
+                let _ = self.events.send(FromUi::TouchFrame);
+                "ok\n".to_owned()
+            }
+            "touch-move" => {
+                let (Some(x), Some(y)) = (num(), num()) else {
+                    return "err touch-move wants <x> <y>\n".to_owned();
+                };
+                let Some(id) = self.touching else {
+                    return "ok no-contact\n".to_owned();
+                };
+                // Deliberately *not* re-hit-tested: the contact belongs to the
+                // window it landed on. A move that leaves that window sends
+                // coordinates outside it, which is what `wl_touch` says and
+                // what Win32 does for a captured contact.
+                let Some(r) = windows.mapped().into_iter().find(|r| r.id == id) else {
+                    // The window went away under the finger. `touch_up` will
+                    // find nothing either; the contact is simply over.
+                    self.touching = None;
+                    return "ok window-gone\n".to_owned();
+                };
+                let (wx, wy) = self.position_of(r.client, r.surface);
+                let time = self.now_ms();
+                let _ = self.events.send(FromUi::TouchMotion {
+                    id,
+                    slot: 0,
+                    x: x - wx as f64,
+                    y: y - wy as f64,
+                    shape: None,
+                    time,
+                });
+                let _ = self.events.send(FromUi::TouchFrame);
+                "ok\n".to_owned()
+            }
+            "touch-up" => {
+                let Some(id) = self.touching.take() else {
+                    return "ok no-contact\n".to_owned();
+                };
+                let time = self.now_ms();
+                let _ = self.events.send(FromUi::TouchUp { id, slot: 0, time });
+                let _ = self.events.send(FromUi::TouchFrame);
+                "ok\n".to_owned()
+            }
             "pointer-leave" => {
                 if let Some(id) = self.over.take() {
                     let _ = self
@@ -572,6 +700,7 @@ mod tests {
                 at: None,
                 over: None,
                 held: Vec::new(),
+                touching: None,
                 focus: None,
                 started: std::time::Instant::now(),
                 output: (800, 600),

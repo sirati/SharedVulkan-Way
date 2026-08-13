@@ -45,6 +45,7 @@ wc-transport = { workspace = true }
 # §36: the Wayland byte stream rides shared_vulkan's rings, so the compositor
 # accepts connections from the same control region the GPU half uses.
 sv-transport = { workspace = true }
+sv-arena = { workspace = true }
 sv-proto = { workspace = true }
 # Unconditional as of stage 4, where it was `cfg(windows)` before. Two things
 # moved it: `--arena` attaches regions on both platforms, and `map_counts()` is

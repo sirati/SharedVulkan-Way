@@ -405,6 +405,32 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     control.stamp_epoch()?;
     eprintln!("[gpu] control region published, generation 1");
 
+    // THE DOORBELL (waycompose-design.md §36.6), the guest half, on Windows.
+    //
+    // This is the side the 216.9 ms was measured on. Without it every wait here
+    // runs its slice, and `WaitOnAddress` takes whole milliseconds so even the
+    // ladder floors at 1 ms; a byte on a virtio-serial port crosses in ~9 µs.
+    //
+    // After `Control::create`, because the `Doorman` rings bells in this region.
+    // Optional and warning-only: a guest without the port is the guest that
+    // shipped, and this must never be the reason a session fails to start.
+    let control = Arc::new(control);
+    let _doorman = match arg("--bell") {
+        None => None,
+        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+            .and_then(|p| sv_transport::vdoorbell::attach(p, Arc::clone(&control)))
+        {
+            Ok(d) => {
+                eprintln!("[gpu] doorbell attached on \\\\.\\Global\\{name}");
+                Some(d)
+            }
+            Err(e) => {
+                eprintln!("[gpu] no doorbell on {name} ({e}); waits will run out their slice");
+                None
+            }
+        },
+    };
+
     let fns = driver.load_fns();
     report_missing(&fns);
     let mut objects = Objects::new();
@@ -417,7 +443,7 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         queue_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
-        Arc::new(control),
+        control,
         shared,
         geometry.ring_slot_count,
         std::time::Duration::from_secs(idle),

@@ -281,12 +281,6 @@ pub struct RingTransport {
     beating: Arc<std::sync::atomic::AtomicBool>,
     /// The cross-VM doorbell reader thread (§36.6). Held so it lives as long as
     /// the transport that depends on it; dropping it stops answering the door.
-    ///
-    /// **Unix only**, because the port under it is: `sv_transport::vdoorbell`
-    /// is `#[cfg(unix)]` and the guest half opens `/dev/virtio-ports/...`. The
-    /// ICD is built for Windows too — it is the guest's — so the doorbell has
-    /// to be conditional or the Windows cross build does not compile at all.
-    #[cfg(unix)]
     _doorman: Option<sv_transport::vdoorbell::Doorman>,
 }
 
@@ -607,6 +601,27 @@ impl RingTransport {
                          and diff it."
                     ));
                 }
+                // The coarse check in front of the hash, and the one that fires
+                // on a **stale deployed binary** rather than on a code change.
+                // This project has lost time to that twice, both times reading
+                // the symptom as a transport fault, so the next step is spelled
+                // out here rather than left to be inferred from two numbers.
+                //
+                // `WIRE_VERSION` went 1 → 2 for design.md §0.18's
+                // `svDriverVersions`, which is hand-written in `sv_proto::sv`
+                // and therefore outside the generated table the protocol hash
+                // covers. A GPU side copied to the guest before that commit
+                // cannot answer it, and the honest thing is to refuse here
+                // rather than to discover it on the first version query.
+                Err(e @ sv_transport::Error::WireVersionMismatch { .. }) => {
+                    return Err(format!(
+                        "{e}\nThis is a version skew between two builds, not a transport \
+                         fault. The usual cause is a stale binary: on the cross-VM \
+                         topology the GPU side is *copied* to the guest, so rebuilding \
+                         here changes only this side. Rebuild and re-deploy **both** \
+                         sides from the same tree."
+                    ));
+                }
                 Err(e) => return Err(e.to_string()),
             }
         };
@@ -658,6 +673,10 @@ impl RingTransport {
         // A failure to attach is a warning, never an error: a session without a
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
+        // Unix only: the host end of the chardev is a Unix socket, which is what
+        // the cross-VM topology has. A Windows *app* side is the same-machine
+        // topology, where the peer is on this kernel and the ordinary futex wake
+        // already reaches it — there is no hypervisor to carry anything across.
         #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
@@ -677,19 +696,9 @@ impl RingTransport {
                 }
             },
         };
-        // No `vdoorbell` on this platform, so there is nothing to attach and
-        // nothing to hold. The block above already treats an absent doorbell as
-        // ordinary — "a session without a doorbell is the session that shipped"
-        // — and this is that same state, decided at compile time instead of at
-        // `connect`.
+
         #[cfg(not(unix))]
-        if std::env::var(crate::BELL_ENV).is_ok() {
-            eprintln!(
-                "[icd] {} is set and this build has no doorbell (it needs a virtio-serial \
-                 port); waits will run out their slice",
-                crate::BELL_ENV
-            );
-        }
+        let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -726,7 +735,6 @@ impl RingTransport {
                 blobs: Mutex::new(Blobs::new(arena_len, reserve)),
                 arena,
                 beating,
-                #[cfg(unix)]
                 _doorman: doorman,
             },
             arena_len,
@@ -1206,6 +1214,26 @@ impl RingTransport {
         }
         self.control.complete_slab_import(slab, r.memory_type).map_err(lower)?;
         Ok(())
+    }
+
+    /// Ask the GPU side which Vulkan version its driver actually is (§0.18).
+    ///
+    /// On the **instance** ring, because it is asked before any device exists —
+    /// `vkEnumerateInstanceVersion` is a global command and the loader may call
+    /// it before `vkCreateInstance`.
+    ///
+    /// `None` for any failure, and that is deliberate rather than lazy: a GPU
+    /// side built before this command existed answers "unknown protocol command"
+    /// and its ring is then fatal, so the *only* correct handling of a failure
+    /// here is to fall back to the ceiling. `WIRE_VERSION` is what actually
+    /// keeps such a peer away; this is the belt to that pair of braces.
+    pub fn driver_versions(&self) -> Option<(u32, u32)> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::DriverVersions.encode(&mut cmd).ok()?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Instance, sv_proto::sv::SV_DRIVER_VERSIONS, &cmd, &mut reply).ok()?;
+        let r = sv_proto::sv::DriverVersionsReply::decode(&reply).ok()?;
+        Some((r.instance_api_version, r.device_api_version))
     }
 
     /// `vkFreeCommandBuffers`: give the block back to the reserve.

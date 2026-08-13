@@ -46,28 +46,9 @@
 //! frame purely so the two could coexist, which is the property it must not
 //! have.
 
-// **Unix only, and refused rather than half-built.** The host half opens an
-// `AF_UNIX` socket and the guest half opens `/dev/virtio-ports/...`; neither
-// exists on Windows, and without this the workspace's Windows cross gate —
-// `cargo build --workspace --target x86_64-pc-windows-gnu`, which every
-// compositor change has to pass before it can be deployed — fails on four
-// `std::os::unix` references in a probe that was never meant to run there.
-// Found by §38's Windows build, one merge after this file landed.
-#[cfg(not(unix))]
-fn main() {
-    eprintln!(
-        "sv-bell-probe measures a virtio-serial doorbell across a hypervisor and needs \
-         AF_UNIX on one side and /dev/virtio-ports on the other; there is neither here"
-    );
-    std::process::exit(2);
-}
-
-#[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 fn usage() -> ! {
     eprintln!(
         "usage:\n  \
@@ -77,19 +58,34 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-#[cfg(unix)]
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
 }
 
-#[cfg(unix)]
+/// Unix only, and the gate is honest rather than incidental: the host end of a
+/// QEMU `-chardev socket` is a Unix socket, and the guest half opens
+/// `/dev/virtio-ports/`. Both halves of this probe are the Linux shapes of a
+/// port. The Windows guest opens `\\\\.\\Global\\<name>` instead
+/// (`winpipe::open_virtio_port`), which `vdoorbell` already handles — what has
+/// no Windows form is this *measurement harness*, not the doorbell.
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let port = arg("--port").unwrap_or_else(|| usage());
     match mode.as_str() {
         "guest" => guest(&port),
-        "host" => host(&port),
+        "host" => {
+            #[cfg(unix)]
+            host(&port);
+            // The host end of a QEMU `-chardev socket` is a Unix socket, so the
+            // measuring half is Unix-only. The *guest* half is not, and that is
+            // the half that had never run on Windows.
+            #[cfg(not(unix))]
+            {
+                eprintln!("the host half measures a Unix chardev; run it on the VM host");
+                std::process::exit(2);
+            }
+        }
         _ => usage(),
     }
 }
@@ -99,12 +95,22 @@ fn main() {
 /// Reads and writes on **one** descriptor: `crate::stream::open_virtio_port`'s
 /// doc warns that two descriptors on one port deadlock, because the driver
 /// serialises them and a reader blocked in one stops the other making progress.
-#[cfg(unix)]
 fn guest(port: &str) {
     let seconds: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(120);
-    let mut f = match sv_transport::stream::open_virtio_port(
-        port.rsplit('/').next().unwrap_or(port),
-    ) {
+    let name = port.rsplit('/').next().unwrap_or(port);
+    // The port is a different object on each side and the same byte pipe to
+    // everything above: `/dev/virtio-ports/<name>` on Linux, `\\\\.\\Global\\<name>`
+    // on Windows. This is the call that had never been exercised on the guest.
+    #[cfg(target_os = "linux")]
+    let mut f = match sv_transport::stream::open_virtio_port(name) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[bell-probe] cannot open {port}: {e}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(windows)]
+    let mut f = match sv_transport::winpipe::open_virtio_port(name, 10_000) {
         Ok(f) => f,
         Err(e) => {
             println!("[bell-probe] cannot open {port}: {e}");

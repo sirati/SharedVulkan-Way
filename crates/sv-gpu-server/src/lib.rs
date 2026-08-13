@@ -46,7 +46,13 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 /// Bumped when the generated protocol's *shape* changes in a way the hash does
 /// not already catch. In practice `sv_proto::PROTOCOL_HASH` is the real check
 /// (§4.3, R13) and this is the coarse one in front of it.
-pub const WIRE_VERSION: u32 = 1;
+///
+/// **2** since design.md §0.18: `svDriverVersions` is a hand-written command in
+/// `sv_proto::sv`, so it is outside the generated table the hash is computed
+/// over and the hash cannot see it. An app side that asks a GPU side built
+/// before it gets "unknown protocol command", which is fatal to that ring — the
+/// coarse check in front is precisely what this counter is for.
+pub const WIRE_VERSION: u32 = 2;
 
 /// The identity the two sides must agree on before a single ring is claimed.
 ///
