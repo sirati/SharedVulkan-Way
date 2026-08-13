@@ -59,6 +59,8 @@ note(){ echo "  ....  $*"; }
 # `WC_GUEST_CONFIGURED` is deliberately *not* set here: setting it would be
 # claiming a guest this harness has never had.
 . "$(dirname "$0")/wc-substrate.sh"
+# STAGE 42. `fresh`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
 
 RUNDIR=$(mktemp -d /tmp/wc-firefox-XXXXXX)
 KEEP=${WC_KEEP:-}
@@ -606,7 +608,7 @@ block_wine() {
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
   have wine || { non "no wine"; return; }
   have Xvfb || { non "no Xvfb"; return; }
-  [ -x "$WIN_BIN/wc-compositor.exe" ] || { non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return; }
+  fresh_or_skip "$WIN_BIN/wc-compositor.exe" "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; case $? in 2) non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return ;; 1) return ;; esac
 
   local dir="$RUNDIR/wine-$transport"
   mkdir -p "$dir/rt" "$dir/frames" "$dir/pools" "$dir/keymaps" "$dir/profile"

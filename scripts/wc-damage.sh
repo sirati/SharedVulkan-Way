@@ -70,6 +70,9 @@ bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 non() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 RUNDIR=$(mktemp -d /tmp/wc-damage-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -305,8 +308,8 @@ block_scroll() {
   have wine || { non "no wine"; return; }
   have Xvfb || { non "no Xvfb"; return; }
   have x86_64-w64-mingw32-gcc || { non "no mingw cross compiler for probe-scroll.exe"; return; }
-  [ -x "$WIN_BIN/wc-compositor.exe" ] || { non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return; }
-  [ -x "$LINUX_BIN/wc-proxy" ] || { non "no wc-proxy; cargo build"; return; }
+  fresh_or_skip "$WIN_BIN/wc-compositor.exe" "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; case $? in 2) non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return ;; 1) return ;; esac
+  fresh_or_skip "$LINUX_BIN/wc-proxy" "no wc-proxy; cargo build"; case $? in 2) non "no wc-proxy; cargo build"; return ;; 1) return ;; esac
   # §18.8: `cargo clippy` builds metadata and not an executable, and a stale
   # binary cost a run. The proxy must at least *know* the flag this harness
   # depends on, or the run measures the previous build.

@@ -143,6 +143,9 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # STAGE 41. Sourced after `ok`/`bad`/`note`/`g`/`h` exist, because the library
 # uses all five.
 . "$(dirname "$0")/wc-substrate.sh"
+# STAGE 42. `fresh` and `deployed_is`: is the binary newer than the tree, and is
+# the copy on the guest the one this tree built.
+. "$(dirname "$0")/wc-binaries.sh"
 
 # Run a command line on the interactive desktop and wait for it.
 int() {
@@ -307,11 +310,16 @@ fetch() {
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
+  # STAGE 42. **Existence is not freshness.** What was here checked that each
+  # binary was a file, which a binary built before the change under test also
+  # is: §35.4 measured a harness reporting the *previous* tree's behaviour after
+  # `cargo test` declined to relink, and §35.6 item 6 named this harness as one
+  # of the seventeen with no guard at all.
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
   for e in wc-desk.exe wc-compositor.exe wc-shmclient.exe; do
-    [ -f "$WIN_BIN/$e" ] || {
-      echo "error: missing $WIN_BIN/$e — cargo build --workspace --target x86_64-pc-windows-gnu first"
-      exit 1; }
+    fresh "$WIN_BIN/$e" "$how_win" || exit 1
   done
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-tb-stage-XXXXXX)
   cp "$WIN_BIN/wc-desk.exe" "$stage/"
@@ -341,6 +349,28 @@ do_deploy() {
   sleep 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$GUESTNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
+
+  # STAGE 42. **And the copy is checked, because copying is the step that can
+  # silently not happen.** `scp` returning 0 says the transfer ran, not that the
+  # bytes on the guest are this tree's: a running `.exe` cannot be overwritten on
+  # Windows, so a compositor another agent left up makes `scp` succeed and leaves
+  # the old file in place. This harness already kills its own copies first for
+  # exactly that reason — which handles *its* leftovers and not anybody else's.
+  #
+  # The symptom of getting this wrong is a behaviour change, and on the GPU path
+  # a transport fault: `finish_attach` refuses a wire-version skew with "This is
+  # a version skew between two builds, not a transport fault." `WIRE_VERSION`
+  # went 1 -> 2 while this was being written, so it is current, not hypothetical.
+  #
+  # Byte identity rather than a version comparison, and that is not a compromise:
+  # `WIRE_VERSION` is a `pub const u32` the compiler inlines, no binary carries it
+  # as data and nothing prints it, so there is nothing to read. The hash catches
+  # a version skew, a protocol-hash skew and every other difference at once.
+  # The staging directory already holds the *renamed* copies (§13.9: an image
+  # name is not an identity on a guest a dozen agents share), so the local and
+  # remote basenames are the same here and no `local:remote` pair is needed.
+  deployed_all "$stage" "$DESKDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-desk.exe" "$COMP_EXE" "$CLIENT_EXE" || exit 1
   rm -rf "$stage"
   mkdir -p "$OUT"
 }

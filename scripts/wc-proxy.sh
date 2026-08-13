@@ -112,6 +112,8 @@ note(){ echo "  ....  $*"; }
 # `wc-compositor` now require, and it refuses to hand that out to any harness
 # that has a guest.
 . "$(dirname "$0")/wc-substrate.sh"
+# STAGE 42. `fresh` / `fresh_or_skip` / `deployed_is`, shared rather than copied.
+. "$(dirname "$0")/wc-binaries.sh"
 wc_substrate_declare wine-fixture \
   "no QEMU on this box: a Wine run has no guest RAM to locate" || exit 2
 
@@ -156,22 +158,16 @@ start_x() {
 # them*. `[ -x "$LINUX_BIN/wc-proxy" ]` is a check that the file exists, which
 # is not the same claim at all. §18.8 says the neighbouring thing about clippy
 # — it builds metadata, not an executable — and this is its other half.
-fresh() {
-  local bin=$1 how=$2 newer
-  if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
-    bad "no $bin -- $how"
-    return 1
-  fi
-  newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
-            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-            -newer "$bin" -print -quit 2>/dev/null)
-  if [ -n "$newer" ]; then
-    bad "$(basename "$bin") is older than ${newer#$ROOT/} -- $how, or this run measures the previous tree"
-    return 1
-  fi
-  ok "$(basename "$bin") is newer than every source file in the tree"
-  return 0
-}
+# STAGE 42. `fresh` now lives in `scripts/wc-binaries.sh`, sourced above, and
+# this copy is deleted rather than kept in sync. §35.6 item 6 said it was
+# "copied rather than shared because these scripts have no common file"; that
+# stopped being true when `wc-substrate.sh` landed, and two copies of a check
+# are two checks that can disagree — which is the same argument §41.4 makes for
+# not implementing the file-arena refusal twice.
+#
+# The shared file also carries `fresh_or_skip`, which this harness does not need
+# and the seventeen in §35.6 item 6's list mostly did: a block that skips when a
+# binary is absent must still fail when one is present and stale.
 
 # wait_for <file> <extended-regex> <seconds> <what>
 #

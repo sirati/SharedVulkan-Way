@@ -81,6 +81,9 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 RUNDIR=$(mktemp -d /tmp/wc-window-XXXXXX)
 chmod 700 "$RUNDIR"
 KEEP="${WC_KEEP:-}"
@@ -107,7 +110,7 @@ CLIENT_BIG=weston-terminal
 run_linux() {
   echo "== linux: the buffer path, driven by third-party clients =="
   if [ ! -x "$LINUX_BIN/wc-compositor" ]; then
-    bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return
+    bad "cargo build -p wc-compositor"; return
   fi
 
   for client in "$CLIENT_ANIM" "$CLIENT_BIG"; do
@@ -185,9 +188,23 @@ run_linux() {
       bad "$client: no close was sent"
     fi
 
-    # Read the pixels back with tools that are not ours. A PPM that decodes,
-    # has the size the protocol said, and is not one flat colour is a much
-    # stronger statement than any log line the compositor writes about itself.
+    # Read the pixels back with tools that are not ours. A PPM that decodes, is
+    # a plausible surface rather than a sliver, and is not one flat colour is a
+    # much stronger statement than any log line the compositor writes about
+    # itself.
+    #
+    # STAGE 42. **The sentence here used to say "has the size the protocol
+    # said", and nothing compared the size to anything** — the geometry was
+    # interpolated into the `ok` string and dropped. The comment was the older
+    # of the two and the code never caught up, which is §35.10: a claim in prose
+    # that nothing asserts outlives its truth.
+    #
+    # It is corrected rather than implemented, because on this leg the claim
+    # cannot be made: `run_linux` drives *third-party* clients — weston-terminal
+    # and friends — which choose their own surface size, so the harness has no
+    # protocol-declared number to compare against. (The Wine leg does: it passes
+    # `--width 420 --height 300` to `wc-shmclient.exe`.) What is checkable here
+    # is shape, so that is what is checked and what the comment now says.
     local frame
     frame=$(find "$dir/frames" -name '*.ppm' | sort | tail -1)
     if [ -z "$frame" ]; then
@@ -198,10 +215,14 @@ run_linux() {
       local geom colours
       geom=$(identify -format "%wx%h" "$frame" 2>/dev/null)
       colours=$(identify -format "%k" "$frame" 2>/dev/null)
-      if [ -n "$geom" ]; then
-        ok "$client: the dumped frame decodes as $geom with $colours distinct colours"
-      else
+      local fw fh
+      fw=${geom%x*}; fh=${geom#*x}
+      if [ -z "$geom" ]; then
         bad "$client: the dumped frame does not decode"
+      elif [ "${fw:-0}" -lt 32 ] || [ "${fh:-0}" -lt 32 ]; then
+        bad "$client: the dumped frame is $geom -- too small to be a client's surface"
+      else
+        ok "$client: the dumped frame decodes as $geom with $colours distinct colours"
       fi
       # One flat colour means the blit produced nothing, which a hash check
       # would happily call a pass if every frame were flat in the same way.
@@ -255,7 +276,7 @@ find_socket() {
 run_wine() {
   echo "== wine: one HWND per xdg_toplevel, with the client's pixels in it =="
   for exe in wc-compositor.exe wc-shmclient.exe; do
-    [ -f "$WIN_BIN/$exe" ] || { bad "no $WIN_BIN/$exe -- cargo build --target x86_64-pc-windows-gnu first"; return; }
+    fresh "$WIN_BIN/$exe" "cargo build --target x86_64-pc-windows-gnu" || return
   done
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH -- see the header; it is required"; return; }
@@ -357,9 +378,30 @@ run_wine() {
   grep -q "window 1 title -> " "$log" \
     && ok "wine: set_title reached SetWindowTextW" \
     || bad "wine: the title never reached the window"
-  grep -q "icon set from" "$log" \
-    && ok "wine: WM_SETICON accepted an icon built from pixels" \
-    || note "wine: no icon was set"
+  # STAGE 42. **This grep could never match, and its failing arm was a `note`,
+  # so it reported nothing either way from the day it was written.** Both §35
+  # defects in three lines: a check that cannot pass, wrapped in one that cannot
+  # fail. The compositor prints
+  #
+  #   wc-compositor: window 1 icon set: 2 of 2 slots from 3 image(s) [48x48 …]
+  #
+  # (`win32.rs`, `"… icon set: {} of 2 slots from {} image(s) [{}]"`), so the
+  # substring `icon set from` does not occur in this tree and never has —
+  # confirmed by grepping every literal in every harness against `crates/`,
+  # where this was the only genuine never-matcher. `wc-icon.sh` greps the real
+  # string, `icon set: 2 of 2 slots`, which is what this now does.
+  #
+  # The verdict is `bad` rather than `note` because the two lines above it —
+  # `window 1 mapped`, `window 1 title -> ` — are `bad`, and an icon that did
+  # not reach `WM_SETICON` is the same kind of fact as a title that did not
+  # reach `SetWindowTextW`. §16 spent a whole stage on it.
+  local icons
+  icons=$(grep -o "icon set: [0-9]* of 2 slots" "$log" | tail -1)
+  case "$icons" in
+    "icon set: 2 of 2 slots") ok "wine: WM_SETICON accepted an icon for both slots ($icons)" ;;
+    "") bad "wine: no icon reached WM_SETICON at all" ;;
+    *)  bad "wine: only part of the icon reached the window ($icons)" ;;
+  esac
 
   echo "  -- the screenshot, taken from outside the process --"
   check_screenshot "$shot" "$shot2"
@@ -435,7 +477,7 @@ check_screenshot() {
 run_wine_thirdparty() {
   echo "== wine: what a *third-party* client gets from the Windows build =="
   echo "  (docs/design.md §2.4 and §7.5, measured rather than asserted)"
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { note "SKIP: no wc-compositor.exe"; return; }
+  fresh_or_skip "$WIN_BIN/wc-compositor.exe" "SKIP: no wc-compositor.exe"; case $? in 2) note "SKIP: no wc-compositor.exe"; return ;; 1) return ;; esac
   command -v "$CLIENT_ANIM" >/dev/null || { note "SKIP: $CLIENT_ANIM not installed"; return; }
 
   local sock=wl-stage3-tp

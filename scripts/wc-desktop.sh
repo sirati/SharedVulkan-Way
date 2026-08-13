@@ -179,6 +179,11 @@ miss() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 
+# STAGE 42. `fresh` and `deployed_is`: is the binary newer than the tree, and is
+# the copy on the guest the one this tree built. Sourced after `ok`/`bad`/`note`
+# and `g`/`h`, which it uses.
+. "$(dirname "$0")/wc-binaries.sh"
+
 # ------------------------------------------------------------ the arena ------
 # STAGE 13. Everything the guest-RAM transport needs, in one place, because
 # `do_window` and `do_fps` both need it and a second spelling of it is a second
@@ -486,17 +491,16 @@ PS1
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
-  local missing=0
-  for e in wc-desk.exe wc-compositor.exe probe-relay.exe; do
-    if [ -f "$WIN_BIN/$e" ]; then :; else
-      case "$e" in
-        probe-relay.exe) ;;   # built below, it is a C probe
-        *) echo "  missing $WIN_BIN/$e"; missing=1 ;;
-      esac
-    fi
-  done
-  [ $missing -eq 0 ] || {
-    echo "error: cargo build --workspace --target x86_64-pc-windows-gnu first"; exit 1; }
+  # STAGE 42. **Existence is not freshness.** This checked that each binary was
+  # a file, which a binary built before the change under test also is: §35.4
+  # measured a harness reporting the *previous* tree's behaviour after `cargo
+  # test` declined to relink, and §35.6 item 6 named this harness among the
+  # seventeen with no guard. `probe-relay.exe` stays exempt for the reason it
+  # always was — it is a C probe built below rather than by cargo, so no cargo
+  # target exists for `fresh` to compare against.
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
+  fresh "$WIN_BIN/wc-desk.exe"       "$how_win" || exit 1
+  fresh "$WIN_BIN/wc-compositor.exe" "$how_win" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-desk-stage-XXXXXX)
   cp "$WIN_BIN/wc-desk.exe" "$WIN_BIN/wc-compositor.exe" "$stage/"
@@ -526,6 +530,17 @@ do_deploy() {
   g "mkdir -p $DESKDIR" || exit 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DESKNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
+
+  # STAGE 42. **And the copy is checked.** The comment above says a running
+  # `.exe` makes `scp` fail — it does when Windows holds the file open, and the
+  # `kill_ours` above is why that is usually avoided. What neither covers is the
+  # case where the transfer *appears* to succeed and the old bytes remain, and
+  # `scp` returning 0 cannot tell the two apart. The symptom is a behaviour
+  # change; on the GPU path it is a transport fault, which `finish_attach`
+  # refuses with "This is a version skew between two builds, not a transport
+  # fault" — `WIRE_VERSION` went 1 -> 2 while this was written.
+  deployed_all "$stage" "$DESKDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-desk.exe" "wc-compositor.exe" || exit 1
   rm -rf "$stage"
   mkdir -p "$OUT"
   # After the copy, because `reaptasks.ps1` has to be on the guest to run — and
@@ -614,19 +629,29 @@ do_probe() {
   int wcshot "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe shot --class Shell_TrayWnd --out $DESKDIR_WIN\\taskbar.bmp > $DESKDIR_WIN\\shot.txt 2>&1" \
     >/dev/null 2>&1
-  fetch taskbar.bmp stage8-taskbar-empty.png "the taskbar with no compositor window"
+  fetch taskbar.bmp stage8-taskbar-empty.png "the taskbar with no compositor window" tray
 }
 
 # Pull a BMP off the guest and convert it. `convert` is in the dev shell for
 # exactly this (see flake.nix); a PNG is what a repository should hold.
+# STAGE 42. **Seven photographs, and the gate on all of them was that
+# ImageMagick could open the file.** The geometry went into the success string
+# and was compared with nothing, so a 1x1 or an all-black capture read as a
+# PASS. §41.8 fixed this helper in `wc-taskbar.sh`; the audit after it found the
+# original still here, in `wc-icon.sh`, `wc-popup.sh` and `wc-titlebar.sh`.
+#
+# `kind` is required and not defaulted, which is §41.8's other half: `tray2.bmp`
+# is a `--class Shell_TrayWnd` strip at **1280x48** and `screen.bmp` is a whole
+# desktop, so one bound across all seven callers would be the
+# impossible-threshold defect rather than a fix for the vacuous one.
 fetch() {
-  local remote="$1" local_png="$2" caption="$3"
+  local remote="$1" local_png="$2" caption="$3" kind="${4:-window}"
   scp "${SSHOPT[@]}" "$GUEST:$DESKNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
     mkdir -p "$OUT"
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null \
        || convert "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      ok "$caption -> docs/stage8/$local_png ($(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null))"
+      picture_is "$OUT/$local_png" "$kind" "$caption -> docs/stage8/$local_png"
     else
       bad "could not convert $remote"
     fi
@@ -1027,8 +1052,8 @@ chmod +x s8.sh" >/dev/null
   sed 's/^/        /' "$RUNDIR/shot.txt"
 
   fetch win.bmp    "stage8-window$SUFFIX.png"  "the client's window, frame and all"
-  fetch tray2.bmp  "stage8-taskbar$SUFFIX.png" "the taskbar with the window's button in it"
-  fetch screen.bmp "stage8-screen$SUFFIX.png"  "the screen, which is the lock screen"
+  fetch tray2.bmp  "stage8-taskbar$SUFFIX.png" "the taskbar with the window's button in it" tray
+  fetch screen.bmp "stage8-screen$SUFFIX.png"  "the screen, which is the lock screen" screen
 
   # Is the blit the right way up (§8.11 item 3), and is it the right rectangle?
   #

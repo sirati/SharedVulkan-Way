@@ -59,6 +59,9 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 # STAGE 41. No QEMU on this box, so no guest RAM to locate: this harness is the
 # Wine fixture and its `arena` mode is a file. `wc_substrate_declare
 # wine-fixture` is what hands it the `SV_ALLOW_FILE_ARENA=1` that `wc-proxy` and
@@ -91,7 +94,7 @@ EVENTDEMO_FLAGS=(--log-key --log-button --log-motion --log-axis --log-focus)
 
 run_linux() {
   echo "== the seat, against unmodified Weston clients =="
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "cargo build -p wc-compositor" || return
 
   local dir="$RUNDIR/linux"
   mkdir -p "$dir/rt"; chmod 700 "$dir/rt"
@@ -445,9 +448,20 @@ check_client_events() {
     "")                   bad "$tag: no vertical axis event" ;;
     *)                    bad "$tag: wrong axis value: $axis" ;;
   esac
-  grep -q "^axis discrete axis: 0 value: -1" "$log" \
-    && ok "$tag: and it was one discrete detent, not a smooth scroll" \
-    || note "$tag: no discrete axis line ($(grep -m1 '^axis discrete' "$log"))"
+  # STAGE 42. The sign check immediately above is a proper `case` with two `bad`
+  # arms; this one had a `note` on its failing side and so could not fail. A
+  # smooth scroll where a discrete detent was sent is a real defect and this is
+  # the only thing watching for it.
+  local discrete
+  discrete=$(grep -m1 '^axis discrete' "$log")
+  case "$discrete" in
+    "axis discrete axis: 0 value: -1")
+      ok "$tag: and it was one discrete detent, not a smooth scroll" ;;
+    "")
+      bad "$tag: no discrete axis event at all -- the scroll arrived as a smooth axis" ;;
+    *)
+      bad "$tag: wrong discrete axis event: $discrete" ;;
+  esac
   return 0
 }
 
@@ -494,8 +508,8 @@ start_x() {
 run_wine() {
   local mode=${1:-shared-file}
   echo "== real WM_KEYDOWN, across the boundary, into an unmodified client (keymap by $mode) =="
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe"; return; }
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH"; return; }
   command -v weston-eventdemo >/dev/null || { note "SKIP (weston-eventdemo not installed)"; return; }
@@ -865,7 +879,7 @@ pointer_probe() {
 
 run_pointer() {
   echo "== where the click landed =="
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "cargo build -p wc-compositor" || return
 
   # --- eventdemo: the measurement ----------------------------------------
   if command -v weston-eventdemo >/dev/null; then
@@ -970,8 +984,8 @@ run_pointer() {
 
 run_term() {
   echo "== typing into weston-terminal, in a Windows window =="
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe"; return; }
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || return
   command -v weston-terminal >/dev/null || { note "SKIP (weston-terminal not installed)"; return; }
   command -v magick >/dev/null || { bad "imagemagick not on PATH"; return; }
   command -v x86_64-w64-mingw32-gcc >/dev/null || { bad "no mingw gcc"; return; }

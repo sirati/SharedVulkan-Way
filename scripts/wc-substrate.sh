@@ -236,7 +236,21 @@ wc_locate_arena() {
       note "the guest could not name its own frames: $(echo "$line" | grep -o 'frames=none.*')" ;;
     *", frames="*)
       g "cat '$guestframes'" >"$scratch/arena.frames" 2>/dev/null
-      n=$(grep -c '^pfn ' "$scratch/arena.frames" 2>/dev/null || echo 0)
+      # **`grep -c` with `|| echo 0` is a bug, and it was one here.** §42.
+      # `grep -c` prints `0` *and* exits 1 when it matches nothing, so the
+      # `|| echo 0` this line used to carry appended a *second* line and `n`
+      # became the two-character-plus-newline string "0\n0". Every arithmetic
+      # test on that then fails with `integer expected` and returns 2 — so the
+      # `-ne "$pages"` guard below did not merely mis-answer, it was **skipped**,
+      # the `elif` ran, an empty frame list was shipped to `wc-arena-host
+      # --frames`, and the run announced "the guest named its own 0 page frames"
+      # as a PASS. A coverage guard that cannot fire, in the check whose whole
+      # job is to refuse a frame list that does not cover the region.
+      #
+      # `wc | tr` rather than `grep -c`, which is `wc-arena-pressure.sh`'s idiom
+      # and documents this exact trap at its own line 115. `wc -l` on an empty
+      # stream is a plain `0` with a zero exit, so there is nothing to `||`.
+      n=$(grep -a '^pfn ' "$scratch/arena.frames" 2>/dev/null | wc -l | tr -d ' ')
       if [ "${n:-0}" -ne "$pages" ]; then
         note "the frame list has ${n:-0} frames against $pages pages; not translating a list that does not cover the region"
       elif scp -q ${SSHOPT[@]+"${SSHOPT[@]}"} "$scratch/arena.frames" "$HOST:$plan.frames" 2>/dev/null; then
