@@ -42,6 +42,11 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+/// The socket a conformance suite drives this compositor through, standing
+/// where Windows stands. Linux only, because WLCS is. See its header, and
+/// docs/waycompose-design.md §26.
+#[cfg(unix)]
+mod control;
 mod cursor;
 mod icon;
 mod input;
@@ -163,6 +168,59 @@ struct Args {
     /// ADDED FOR STAGE 17. See [`Decorations`] for why it defaults to `server`
     /// and what a run that asks for `client` is for.
     decorations: Decorations,
+    /// Where to bind the conformance-suite control socket.
+    ///
+    /// ADDED FOR STAGE 26. `--click` is one scripted event decided before the
+    /// process starts; this is the general case — a peer that positions
+    /// windows and moves a pointer while the run is happening, because a test
+    /// suite decides where to click based on what the client did. Linux only:
+    /// see `crate::control` for why the thing it stands in for is Windows.
+    control: Option<String>,
+}
+
+/// The control socket, where one can exist, and nothing at all where one
+/// cannot.
+///
+/// A unit *struct* on the platform that has none, rather than `()`, so that the
+/// plumbing which carries it is ordinary code on both: a `()` makes every
+/// binding of it a `clippy::let_unit_value`, and silencing that lint at four
+/// sites is worse than declaring a type. Not a *stub* of `crate::control`
+/// either — that module is `AF_UNIX` and `std::os::unix::net`, and compiling a
+/// do-nothing Windows version of it would be exactly the "implemented means
+/// compiled" pattern docs/waycompose-design.md §14.9 is about.
+#[cfg(unix)]
+type ControlHook = Option<control::Control>;
+#[cfg(not(unix))]
+pub struct ControlHook;
+
+#[cfg(unix)]
+fn open_control(
+    path: Option<&str>,
+    events: std::sync::mpsc::Sender<platform::FromUi>,
+) -> Result<ControlHook, u8> {
+    let Some(path) = path else { return Ok(None) };
+    match control::Control::bind(path, events) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) => {
+            eprintln!("wc-compositor: could not bind --control {path}: {e}");
+            Err(2)
+        }
+    }
+}
+
+/// Refuse rather than ignore. A harness that asked for a control socket and
+/// silently did not get one would sit waiting for a connection that is never
+/// answered, which is the least informative failure available.
+#[cfg(not(unix))]
+fn open_control(
+    path: Option<&str>,
+    _events: std::sync::mpsc::Sender<platform::FromUi>,
+) -> Result<ControlHook, u8> {
+    if path.is_some() {
+        eprintln!("wc-compositor: --control is a Linux-only hook; there is no AF_UNIX listener here");
+        return Err(2);
+    }
+    Ok(ControlHook)
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, u8> {
@@ -187,6 +245,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
+        control: None,
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
@@ -273,6 +332,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 args.outbound = Some((id, bytes));
             }
+            "--control" => args.control = it.next(),
             "--shared-dir" => args.shared_dir = it.next(),
             "--shared-peer-prefix" => args.shared_peer_prefix = it.next().unwrap_or_default(),
             "--layout" => args.layout = it.next(),
@@ -592,6 +652,14 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // the other direction is owned by `platform::start`.
     let (event_tx, event_rx) = std::sync::mpsc::channel();
 
+    // Before the platform, because it takes the same sender: the control
+    // socket is a *second* source of `FromUi`, sitting exactly where the
+    // platform sits, which is the whole of what makes it honest.
+    let control = match open_control(args.control.as_deref(), event_tx.clone()) {
+        Ok(c) => c,
+        Err(code) => return std::process::ExitCode::from(code),
+    };
+
     let started = match platform::start(PlatformConfig {
         events: event_tx,
         // Stage 3 gives Windows the whole frame. The field is what
@@ -632,7 +700,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
-                args.decorations, ui, event_rx);
+                args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -667,8 +735,16 @@ fn wayland_thread(
     decorations: Decorations,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
+    control: ControlHook,
 ) -> u8 {
     use std::io::Write as _;
+
+    // `mut` here rather than in the parameter list so the Windows build, where
+    // the hook is a unit struct, does not carry an unused-mut.
+    #[cfg(unix)]
+    let mut control = control;
+    #[cfg(not(unix))]
+    let _ = control;
 
     let display: Display<State> = match Display::new() {
         Ok(d) => d,
@@ -720,9 +796,13 @@ fn wayland_thread(
     loop {
         match listener.accept() {
             Ok(Some(stream)) => {
+                // The ordinal is assigned *before* the insert, so it counts
+                // connections in accept order and matches what a peer that
+                // connected in that order believes. See `ClientState::index`.
+                let index = (state.clients_seen + 1) as u32;
                 match display
                     .handle()
-                    .insert_client(stream, Arc::new(ClientState::default()))
+                    .insert_client(stream, Arc::new(ClientState::new(index)))
                 {
                     Ok(_) => {
                         state.clients_seen += 1;
@@ -760,6 +840,14 @@ fn wayland_thread(
         // commits land and where `present` runs; then frame callbacks, so a
         // client is invited to draw the next frame only after this one has
         // been handed to the platform; then flush.
+        // Before `pump_ui_events`, so an event the control socket produces is
+        // delivered to the client in the same turn the request arrived rather
+        // than one poll interval later. See `control::Control::service`.
+        #[cfg(unix)]
+        if let Some(c) = control.as_mut() {
+            c.service(&state);
+        }
+
         state.pump_ui_events();
         if state.stopped {
             println!("wc-compositor: the platform stopped; winding up");

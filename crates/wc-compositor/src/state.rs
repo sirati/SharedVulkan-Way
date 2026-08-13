@@ -415,11 +415,34 @@ pub struct State {
 #[derive(Default)]
 pub struct ClientState {
     compositor_state: CompositorClientState,
+    /// Which connection this is, counted from 1 in accept order.
+    ///
+    /// ADDED FOR STAGE 26 (docs/design.md §26). A conformance suite driving
+    /// this compositor from outside knows a client-side `wl_surface*` and
+    /// nothing about our window ids, so the only handle it can name a window
+    /// by is *which connection* plus *which object id on it*. The connection
+    /// has no such name in the protocol — `ClientId` is an opaque handle whose
+    /// `Debug` spelling is an implementation detail — so it is counted here.
+    /// Costs one `u32` per client and is otherwise inert.
+    pub index: u32,
+}
+
+impl ClientState {
+    pub fn new(index: u32) -> ClientState {
+        ClientState { index, ..Default::default() }
+    }
 }
 
 impl ClientData for ClientState {
     fn initialized(&self, client_id: ClientId) {
-        println!("wc-compositor: client {client_id:?} initialized");
+        // The ordinal is printed as well as the backend's handle, and on both
+        // platforms. It is what a peer outside this process counts (see
+        // `index`), and a log that names only the opaque `ClientId` cannot be
+        // lined up against anything.
+        println!(
+            "wc-compositor: client {} ({client_id:?}) initialized",
+            self.index
+        );
     }
 
     fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
@@ -896,6 +919,46 @@ impl State {
 
     fn surface_of(&self, id: WindowId) -> Option<WlSurface> {
         self.by_id(id).map(|w| w.role.surface().clone())
+    }
+
+    /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
+    /// bottom of the stack first.
+    ///
+    /// ADDED FOR STAGE 26, and used only by `crate::control` — the socket a
+    /// conformance suite drives this compositor through. Stacking order is
+    /// window-id order, which is creation order: on Win32 a new window is
+    /// created on top and a popup is created after the toplevel it belongs to,
+    /// so the two agree for every case that has one.
+    ///
+    /// The size is read from the shadow rather than from a stored field
+    /// because the shadow *is* the size — it is reset to the buffer's
+    /// dimensions on every commit (`surface::Shadow::reset`), so it cannot
+    /// disagree with what the client last drew.
+    #[cfg(unix)]
+    pub fn mapped_windows(&self) -> Vec<crate::control::Rect> {
+        use smithay::reexports::wayland_server::Resource as _;
+        let mut out: Vec<crate::control::Rect> = self
+            .windows
+            .values()
+            .filter(|w| w.mapped)
+            .filter_map(|w| {
+                let surface = w.role.surface();
+                let client = surface
+                    .client()
+                    .and_then(|c| c.get_data::<ClientState>().map(|d| d.index))?;
+                let shadow = w.shadow.lock().ok()?;
+                Some(crate::control::Rect {
+                    id: w.id,
+                    client,
+                    surface: surface.id().protocol_id(),
+                    w: shadow.width(),
+                    h: shadow.height(),
+                    toplevel: w.role.toplevel().is_some(),
+                })
+            })
+            .collect();
+        out.sort_by_key(|r| r.id);
+        out
     }
 
     // -----------------------------------------------------------------------

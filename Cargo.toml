@@ -11,7 +11,7 @@ resolver = "3"
 # programs cannot name the same memory. See one-binary.md's opening table.
 #
 # `crates/wc-*` and `vendor/*` arrived here at the paths they already had — of
-# 502 files, six collided, and only `docs/design.md` had to be renamed (to
+# 502 files, six collided, and only `docs/waycompose-design.md` had to be renamed (to
 # `docs/waycompose-design.md`). That is deliberate, and it is what makes the
 # rebase recipe at the top of one-binary.md three lines long.
 members = [
@@ -45,6 +45,11 @@ members = [
   "crates/wc-desk",
   "crates/wc-shmclient",
   "crates/wc-proxy",
+  # The WLCS integration module (docs/waycompose-design.md §26). A member so that the
+  # Windows cross gate and clippy see it; its body is `#[cfg(unix)]`, so on
+  # Windows it compiles to an empty library rather than to a linker error
+  # against a libwayland that does not exist there.
+  "crates/wc-wlcs",
   "vendor/wayland-backend",
   "vendor/wayland-scanner",
   "vendor/wayland-server",

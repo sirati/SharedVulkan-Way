@@ -1,0 +1,28 @@
+[package]
+name = "wc-wlcs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The WLCS integration module: lets the Wayland Conformance Suite drive wc-compositor from outside the process"
+
+# A `cdylib`, because WLCS is a C++ test runner that `dlopen`s its compositor
+# integration and looks up one symbol in it. The integration API is plain C
+# (`wlcs/display_server.h` — structs of function pointers, no classes, no
+# exceptions across the boundary), so there is no C++ in this crate and no
+# reason for one: writing it in Rust means the shim is built by the same
+# toolchain and linted by the same gate as everything else in the tree.
+#
+# `rlib` alongside it so the parts that are ordinary logic — the control-socket
+# client, the extension table parser — have unit tests. A `cdylib` alone cannot
+# be tested by `cargo test`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(unix)'.dependencies]
+# For `dlsym` only. See `wayland` in lib.rs: the two libwayland-client entry
+# points this needs are resolved out of the process that loaded us rather than
+# linked, so that the crate has no link-time dependency on libwayland at all
+# and the Windows cross gate compiles it to an empty library instead of failing
+# at the linker.
+libc = "0.2"
