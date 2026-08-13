@@ -8,7 +8,8 @@
 #     --jobs J         concurrent deqp-vk processes, each its own session (default 8)
 #     --include RE     restrict to tests whose name matches this ERE, repeatable
 #     --arena BYTES    per-session arena (default 256 MiB)
-#     --timeout SEC    per-chunk timeout (default 900)
+#     --timeout SEC    hard ceiling on one deqp-vk invocation (default 3600)
+#     --stall SEC      kill an invocation that has printed nothing for this long (default 120)
 #     --chunk N        tests per deqp-vk invocation (default 200)
 #     --keep           do not delete the run directory
 #
@@ -74,7 +75,8 @@ ICDDIR=/run/opengl-driver/share/vulkan/icd.d
 FRACTION=2000
 JOBS=8
 ARENA=$((256 << 20))
-TIMEOUT=900
+TIMEOUT=3600
+STALL=120
 CHUNK=200
 KEEP=0
 INCLUDE=""
@@ -87,6 +89,7 @@ while [ $# -gt 0 ]; do
     --include)  INCLUDE="${INCLUDE:+$INCLUDE|}$2"; shift 2 ;;
     --arena)    ARENA="$2";    shift 2 ;;
     --timeout)  TIMEOUT="$2";  shift 2 ;;
+    --stall)    STALL="$2";    shift 2 ;;
     --chunk)    CHUNK="$2";    shift 2 ;;
     --keep)     KEEP=1;        shift ;;
     -h|--help)  sed -n '2,15p' "$0"; exit 0 ;;
@@ -243,13 +246,45 @@ run_chunk() {
       fi
       extra=("SV_SOCKET=$sock")
     fi
-    timeout "$TIMEOUT" env "$@" "${extra[@]}" deqp-vk \
+    # # A stall watchdog, not a deadline
+    #
+    # The first version gave the whole invocation `--timeout` seconds and that
+    # is the wrong instrument for the thing it has to catch. A chunk of 200
+    # forwarded tests legitimately takes ten minutes, and a *hang* is one test
+    # that never returns — so a deadline generous enough for the chunk costs
+    # fifteen minutes per hang, and one tight enough to catch the hang kills
+    # honest work. Two hangs at fraction 1-in-2000
+    # (`dEQP-VK.memory.allocation.random.79` and a `timeline_semaphore.device_host`
+    # case) turned a 25-minute run into an open-ended one.
+    #
+    # What distinguishes the two is *progress*, and deqp announces every test on
+    # stdout before running it. So the watchdog is "no new output for `--stall`
+    # seconds", which is bounded by the slowest single test rather than by the
+    # chunk. `stdbuf -oL` is what makes it work at all: a redirected stdout is
+    # block-buffered, so without it the file grows in 4 KiB steps and a stall
+    # looks the same as ordinary buffering.
+    stdbuf -oL -eL env "$@" "${extra[@]}" deqp-vk \
       --deqp-caselist-file="$todo" \
       --deqp-log-filename=/dev/null \
       --deqp-surface-width=64 --deqp-surface-height=64 \
       --deqp-shadercache=disable \
-      > "$log" 2>&1
+      > "$log" 2>&1 &
+    local dp=$! last=-1 quiet=0 elapsed=0 stalled=0
+    while kill -0 "$dp" 2>/dev/null; do
+      sleep 5
+      elapsed=$((elapsed + 5))
+      local now
+      now=$(stat -c %s "$log" 2>/dev/null || echo 0)
+      if [ "$now" -eq "$last" ]; then quiet=$((quiet + 5)); else quiet=0; last=$now; fi
+      if [ "$quiet" -ge "$STALL" ] || [ "$elapsed" -ge "$TIMEOUT" ]; then
+        stalled=1
+        kill -9 "$dp" 2>/dev/null
+        break
+      fi
+    done
+    wait "$dp" 2>/dev/null
     local rc=$?
+    [ "$stalled" -eq 1 ] && rc=124
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null

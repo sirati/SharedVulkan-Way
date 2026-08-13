@@ -1520,6 +1520,166 @@ the query is what re-locates and re-validates afterwards — 2 s paid once,
 1 ms per re-check thereafter, and a broken interface caught loudly on the one
 occasion the stamps still exist.
 
+### 0.15 The conformance suite, and what the control did to its number
+
+Built and measured 2026-08-13 on **devhost** in `nix develop`,
+`scripts/sv-cts.sh` against `vulkan-cts-1.4.6.1` on RADV RAPHAEL_MENDOCINO.
+**`deqp-vk` runs against the forwarded ICD.** Every instrument in this project
+until now judged one workload; this one judges the API, which is the only thing
+that can answer a claim about *surface area*. `sv-zink-gl.sh` renders a correct
+frame through 239 forwarded commands without saying a word about the other 501.
+
+`dEQP-VK.api.smoke.*` — the traditional first target — is **6/6 through the
+forwarder**, identical to the same six on the same RADV with no forwarding, and
+the ICD's `sv-icd: connected to the GPU side` plus the GPU side's session log
+are what say which implementation ran.
+
+*(The numbers in this section are the 1-in-20000 sample. The wider run is
+`scripts/sv-cts.sh --fraction 2000`; its shape is the same and its numbers
+belong here when it is re-run on a quiet machine.)*
+
+| | control (RADV direct) | forwarded |
+|---|---|---|
+| Pass | **96** | **24** |
+| NotSupported | 68 | 126 |
+| Fail | 0 | 1 |
+| DeviceLost | 0 | 12 |
+| ResourceError | 0 | 1 |
+| total | 164 | 164 |
+| wall | 1 s | 52 s |
+
+**The join is the answer and the totals are not.** 72 tests pass on RADV and
+not through the forwarder; **0** go the other way. Of those 72: **59 are
+`NotSupported`** — the forwarded device declining something it does not
+advertise, which is the profile and not a defect — **12 are `DeviceLost`** and
+**1 is `Fail`**. So the honest sentence is *thirteen forwarding defects and
+fifty-nine gaps in the declared scope*, and no arrangement of the totals says
+that.
+
+Nine findings. The first four are about the instrument, and they are here
+because each was a wrong number first.
+
+**1. The standard runner reported zero passes for a driver that passes.**
+`deqp-runner` 0.18.0 is what Mesa CI uses and it does not know deqp's
+`DeviceLost` status: `Failure getting run results: unknown dEQP status
+'DeviceLost'` abandons the entire group, and every test in it is written out as
+`Missing`. On this machine that happened to four groups out of four in a
+**control** run against unforwarded RADV — 0 Pass, 0 Fail, 33 Missing, for a
+configuration that had just passed 6/6. A tool that turns a driver's honest
+answer into an absence of data is worse than no tool, and the chunking that
+replaced it is thirty lines.
+
+**2. The mustpass lists shipped beside the binary are not the binary's tests.**
+362 of a 1451-test sample of `vk-default/*.txt` name tests the `deqp-vk` in the
+same derivation does not have — all format combinations, e.g.
+`…astc_10x10_srgb_block.b8g8r8_srgb.linear_optimal_nearest` where only the
+`optimal_optimal_*` variants are generated. A quarter of the first scoreboard
+was that. The caselist is now `--deqp-runmode=stdout-caselist` — 3,279,369
+tests, the binary describing itself — and is cached under the store hash it came
+from so a flake bump invalidates it by name.
+
+**3. `DeviceLost` is contagious, and the first attempt to correct for it was a
+heuristic that was wrong.** deqp holds **one** `VkDevice` for a whole
+invocation, so the test that loses it takes every test after it in that process.
+The first forwarded run reported twelve `DeviceLost` verdicts including
+`dEQP-VK.ubo.3_level_array.std140.mat3x2.vertex_comp_access`, which passes on
+its own every time. The fix attempted was "keep the first `DeviceLost` of a
+round as the culprit, retry the rest", and the next run said plainly that it was
+wrong: sixteen of them, the same innocent test among them. **The culprit does
+not have to report `DeviceLost`; it can report `Pass` and leave the device
+wedged for whoever comes next**, so no ordering heuristic can find it. What
+works is exact and dull: every non-benign verdict is re-run **alone**, one
+process and one GPU side per test, and the isolated verdict is the one that
+counts. Eight verdicts of twenty changed under isolation.
+
+**4. A GPU side that outlives its client wedges the machine, and the symptom
+accuses the wrong thing.** An interrupted run left four `sv-gpu-server`
+processes behind. `amdgpu: ring gfx_0.0.0 timeout, signaled seq=875426, emitted
+seq=875428` then appeared on *every* subsequent invocation, and plain
+unforwarded `dEQP-VK.api.smoke.*` went from 6/6 to 2/4 and aborted — which reads
+as "CTS breaks RADV" and is not that. Killing the four restored 6/6 immediately.
+The harness now records every server's pid and kills them on exit. Two things
+follow: a leaked GPU side is not a leaked process, it is a leaked *driver
+context with work queued on it*; and the control is what made the accusation
+falsifiable in ten seconds.
+
+**5. Presented as a deadline, a timeout is the wrong instrument for a hang.**
+A chunk of 200 forwarded tests legitimately takes ten minutes and a hang is one
+test that never returns, so a deadline generous enough for the first costs
+fifteen minutes per instance of the second. Two tests hang the forwarder at this
+sample — `dEQP-VK.memory.allocation.random.79` and a
+`synchronization.timeline_semaphore.device_host…` case — and they turned a
+25-minute run into an open-ended one. What distinguishes work from a hang is
+*progress*, and deqp announces every test before running it, so the watchdog is
+"no new output for `--stall` seconds". `stdbuf -oL` is what makes that
+measurable at all: a redirected stdout is block-buffered, and without it a stall
+is indistinguishable from ordinary buffering.
+
+**6. The one synthesised queue family is the largest single non-extension gap
+CTS finds.** §0.4 item 7 chose it deliberately — a GPU side has one queue on one
+family, and passing RADV's five through had an application select family 3 and
+get family 0's queue in silence. The cost is now a number: of the 59 tests that
+skip forwarded and pass on RADV, **11 skip for the queue family alone** —
+8 `No matching queue found: findQueueFamilyIndexWithCaps(requiredCaps=0x2;
+excludedCaps=0x1)` and 3 `Exclusive compute queue not supported`. That is second
+only to `VK_EXT_shader_object` (12) and ahead of
+`VK_EXT_graphics_pipeline_library` (7) and the whole ray-tracing family (6).
+§0.8 item 3 predicted a workload that would break the one-family decision;
+this is it, and unlike video decode it is not one extension away.
+
+**7. The gap is data now, on both sides of the boundary.** `sv-codegen gap`
+reports it from the registry — **740 commands defined, 239 carried by the zink
+profile, 501 not, 23 of those unreachable by any profile** — grouped by the
+extension that introduces each, because nobody adds `vkCmdTraceRaysKHR`, they
+add `VK_KHR_ray_tracing_pipeline`. The suite reports the other half, in deqp's
+own words, restricted to tests the control passes. The intersection is the work
+list and it is short: `VK_EXT_shader_object`,
+`VK_EXT_graphics_pipeline_library`, `VK_KHR_maintenance6`,
+`VK_KHR_push_descriptor`, `VK_EXT_sample_locations`,
+`VK_EXT_depth_range_unrestricted` — and a second queue family, which is not an
+extension at all.
+
+**8. Two ring fatals, and both name the same suspicion.** The GPU side declined
+to continue three times across the run, with two shapes:
+`no VkDeviceMemory with id 129` and `no VkBuffer with id 140737343632080` —
+both annotated by the code that raised them as a possible missing `RingBarrier`
+(R22). The second id is `0x7FFF…`, a **host pointer**, not an app-side id, so at
+least one of the two is a handle reaching the GPU side unmapped rather than an
+ordering fault. Recorded rather than fixed; they are the first defects CTS has
+found that no other harness in this tree could reach.
+
+**9. The multi-session property survives the suite, which is what §0.12 item 4
+was waiting for.** Eight concurrent clients on **one** GPU side — one driver,
+one `VkDevice`, one `VkQueue`, three ring threads each — over
+`dEQP-VK.api.smoke.*` and `compute.basic`: **48/48 Pass**, no ring fatal. The
+generated dispatch takes the device queue lock as of this branch; the set of
+commands it takes it for is derived from the registry's `externsync=` *and* its
+`<implicitexternsyncparams>` prose, which is the only place `vkDeviceWaitIdle`
+is marked, and `vkDeviceWaitIdle` is precisely the one that rides a different
+ring from `vkQueueSubmit`.
+
+**What is not settled**, and is the honest state of this stage:
+
+- **This is a 1-in-20000 sample of 3.28 million tests, not a conformance run.**
+  164 tests is enough to find defects and to size the gap; it is not enough to
+  claim anything about the suite, and the word "conformant" does not apply to
+  any number in this section. The instrument scales — `--fraction` is the only
+  knob — and what it costs is wall time on a machine with a GPU other people are
+  using.
+- **The forwarded pass is 52× the control's wall time**, and that number is
+  worth almost nothing as a performance figure: it includes a GPU-side restart
+  per chunk, an isolation phase the control barely uses, and twelve device
+  losses at ten seconds of kernel ring reset each. §0.13's sweep is the
+  performance measurement; this is not one.
+- **Twelve device losses and one hang are undiagnosed.** Each is reproducible by
+  name, each is in `/tmp/sv-cts-regressions.txt`, and none has been reduced to a
+  command.
+- **Nothing has run on testhost.** The Intel iGPU in the guest is the device
+  the north-star goal needs and the cross-VM stack is what would have to be
+  stood up to reach it; every number here is same-machine RADV over a Unix
+  socket. §0.13 said the same thing about the resolution sweep and it is still
+  true.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
