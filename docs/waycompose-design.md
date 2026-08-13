@@ -9099,7 +9099,7 @@ finding about comments, arriving in the harness layer.
 | `scripts/wc-damage.sh control` (new) | **5 passed, 0 failed** — 1035 commits checked at `--copy buffer`, 0 stale |
 | the same, re-run **after merging master** — twice, because master moved under the merge (§22 title bar, §25 protocols, then §23 cursors) | 162 then 168 tests, clippy clean both targets, `scroll` 5/5 at 432 and 964 commits |
 | `scripts/wc-damage.sh scroll` against the **pre-fix** copy path | **4 passed, 1 failed** — which is the point |
-| **on the unified tree**, `cargo test --workspace` | **1171 tests**, 0 failures — the tree moved three times under this merge; the number is whatever it was at the last one |
+| **on the unified tree**, `cargo test --workspace` | **1206 tests**, 0 failures — the tree moved five times under this merge; the number is whatever it was at the last one |
 | **on the unified tree**, `scripts/wc-proxy.sh` | **39 passed, 0 failed** — its 37 plus the two §27.9 adds |
 | **on the unified tree**, `scripts/wc-damage.sh scroll` | 5 passed, 0 failed — 1402 commits checked, 0 stale |
 | `wc-input.sh`, `wc-firefox.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended** |

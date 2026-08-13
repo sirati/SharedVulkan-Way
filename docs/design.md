@@ -1797,7 +1797,20 @@ sequence:
    the AWE path the frame list is run-length encoded — though AWE frames were
    measured to sort into 5863–16339 runs per 64 MiB, so "run-length encoded" is
    not the saving it sounds like, which is one more reason that path is not
-   taken (§5.1). `locator` is `Scan` in v1 on every path.
+   taken (§5.1).
+
+   **`locator` was `Scan` on every path and is now chosen** (§0.14, 2026-08-13).
+   `Pfns` is no longer AWE-only: the guest asks the PFN database where its own
+   pages are (`awe_probe::superfetch::pfn_locator`) and publishes the run-length
+   encoded answer, and the attaching side translates it
+   (`sv_hostd::locate::PfnLocator`) instead of sweeping thirteen gigabytes. It
+   is opt-in — `sv-hostd qemu --locator scan|pfns|both`, `arena-host locate
+   --locator …`, defaulting to `scan` — because R28 makes the scan the
+   cross-check that the undocumented interface is telling the truth, and `both`
+   is that cross-check: the same extent located twice by two mechanisms with
+   nothing in common, and a disagreement about any page fatal to the session.
+   On the large-page path a 64 MiB window is 26 runs, so the descriptor is 416
+   bytes rather than a page list.
 
    **`granularity` is asserted, never assumed.** The GPU side calls
    `QueryWorkingSetEx` on the extent and publishes the `LargePage` bit it
@@ -2235,8 +2248,8 @@ Four locators, one trait:
 | Locator | Mechanism | Cost | Status |
 |---|---|---|---|
 | `ScanLocator` | Sweep the whole memfd for the magic. Works for any granularity | **1.8 s at 64 MiB, 2.02 s at 1 GiB, 2.32 s at 2 GiB, measured** | **v1, and the cross-check on every path** |
-| `SuperfetchPfnLocator` | The guest asks the PFN database where its own pages are and reports the frames; the host translates them | **~330 ms in the guest for any window; 0.064 s on the host; 0–22 ms to re-check a list already held. Measured** | **Measured working, agrees with the scan 16384/16384. Not yet wired into `sv-gpu-server`** |
-| `PfnLocator` | Translate the reported frame list. AWE only | O(pages) arithmetic, no I/O | Implemented and tested in `arena-host`; **16384/16384 frames verified**, unused here |
+| `SuperfetchPfnLocator` | The guest asks the PFN database where its own pages are and reports the frames; the host translates them | **~330 ms in the guest for any window; 0.064 s on the host; 0–22 ms to re-check a list already held. Measured** | **Measured working, agrees with the scan 16384/16384.** Wired: `awe_probe::superfetch::pfn_locator` → `Locator::Pfns` → `sv_hostd::locate::PfnLocator`, selected by `--locator scan\|pfns\|both`. Not yet published by `sv-gpu-server`, which has no Windows provider |
+| `PfnLocator` | Translate a reported frame list through the region table. **No longer AWE-only** — the mechanism above feeds it | O(pages) arithmetic, no I/O | Implemented in `sv_hostd::locate` and unit-tested; the `arena-host` seed remains as `arena-host locate`. **16384/16384 frames verified** against a live guest |
 | `ProbeLocator` | Read one record every 2 MiB. Large pages only, because only they are guaranteed 2 MiB-aligned in GPA | ~6656 probes for 13 GiB, ~1/512 of a scan | Not implemented, and now pointless |
 
 **Decision, revised 2026-08-13: the scan locates an extent once, and the query

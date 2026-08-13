@@ -409,6 +409,12 @@ pub struct Stats {
     /// Pools whose region was released after the compositor acknowledged the
     /// destructor. Should equal `pools_created` at the end of a clean run.
     pub pools_released: u64,
+    /// DYNAMIC ARENA. Regions handed back to the guest, and their bytes. The
+    /// second number is the one a run has to print for release to be a claim
+    /// rather than a hope — "the guest's committed memory went down by this
+    /// much", said by the side that gave it back.
+    pub regions_released: u64,
+    pub region_bytes_released: u64,
     /// STAGE 16. Pools whose region this proxy took back **without the client
     /// asking**, because the arena had no room and the pool was cold. See
     /// [`Session::reclaim_for`].
@@ -1694,6 +1700,15 @@ impl Session {
     /// The frame path: apply the pending state and move the pixels.
     fn commit(&mut self, surface_id: u32) {
         self.stats.commits += 1;
+        // DYNAMIC ARENA. One frame has gone by, which is the unit the region
+        // release policy is written in. A transport with no regions to return
+        // returns none and this costs a virtual call; the arena may hand back a
+        // region that has been empty long enough to be worth unmapping.
+        for (id, bytes, origin) in self.transport.frame() {
+            self.stats.regions_released += 1;
+            self.stats.region_bytes_released += bytes;
+            self.note(format!("arena region {id} returned: {bytes} bytes of {origin}"));
+        }
         let Some(surface) = self.surfaces.get_mut(&surface_id) else {
             return;
         };
