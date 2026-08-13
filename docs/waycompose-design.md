@@ -15002,16 +15002,16 @@ about the stand-in rather than about the compositor.
 | skipped | 759 | 759 |
 
 1,225 verdicts joined by test name: **47 moved, every one of them FAIL to
-PASS, and nothing regressed.** The before column is `a7210e8`'s, measured by
+PASS, and nothing regressed.** The before column is `8cb82b1`'s, measured by
 checking master's `crates/wc-compositor` out over this branch's and building
 again, so the two runs differ in nothing but this change; it is two verdicts off
-§26.6's recorded baseline of 230/236, which five merges have moved since.
+§26.6's recorded baseline of 230/236, which six merges have moved since.
 
-The same measurement was taken three times more, at `7da9a58` (230 -> 277), at
-`e3409ba` (231 -> 278) and at `4a5dfb4` (231 -> 278), with the same 47 tests
-moving each time. Four trees, one number: it is not sensitive to what else has
-landed — including §37, which changed how every pointer coordinate is computed
-and moved none of these.
+The same measurement was taken four times more, at `7da9a58` (230 -> 277),
+`e3409ba` (231 -> 278), `4a5dfb4` (231 -> 278) and `a7210e8` (232 -> 279), with
+the same 47 tests moving each time. Five trees, one number: it is not sensitive
+to what else has landed — including §37, which changed how every pointer
+coordinate is computed and moved none of these.
 
 | suite | failures before | after |
 |---|---:|---:|
