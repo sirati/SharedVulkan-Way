@@ -545,6 +545,15 @@ run_wine() {
   # it the descriptor is a Windows section and unopenable here. Asserted from
   # the proxy's own count, because a run that got the keymap across by passing
   # something would look identical from the client's side.
+  #
+  # **Why a non-zero `out` is not the stage-4 rule breaking**, since this is the
+  # assertion a reader will stop at: that descriptor exists between `wc-proxy`
+  # and `weston-eventdemo`, both Linux processes on this machine, over a socket
+  # that never leaves it. The hop that crosses the boundary is the *other*
+  # socket, and `proxy.rs` writes that one with a plain `write` that has no fd
+  # argument -- so its count is not zero, it is unrepresentable. docs/design.md
+  # §14.7 states it in full, including what the number would have to be for the
+  # rule to be violated.
   local fds
   fds=$(grep -o "[0-9]* fds in, [0-9]* out[^;]*" "$dir/proxy.log" | tail -1)
   case "$fds" in

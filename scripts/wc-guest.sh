@@ -131,7 +131,7 @@ VM_HINT="${WC_VM_HINT:-windows-vm}"                  # how to recognise its proc
 ROOTC="${WC_ROOTC:-\$HOME/rootc}"                    # how WC_HOST becomes root
 ARENA_PAGES="${WC_ARENA_PAGES:-16384}"               # 64 MiB, in 4096-byte pages
 # STAGE 10: how much of that the compositor keeps for the objects it creates for
-# clients. See the driver, and docs/design.md §13.
+# clients. See the driver, and docs/design.md §14.
 ARENA_OUTBOUND="${WC_ARENA_OUTBOUND:-1048576}"       # 1 MiB, the outbound window
 
 STAGE=$(mktemp -d /tmp/wc-guest-XXXXXX)
@@ -901,6 +901,9 @@ s4_run() {
   # was relayed. What enforces the rule is that the proxy's upstream writer has
   # no fd path at all -- construction, not a counter -- and what this asserts is
   # the part a counter can see: every descriptor going out was made here.
+  # docs/design.md §14.7 is the full argument: which two processes that
+  # descriptor exists between, why that pair is not the boundary, and what this
+  # number would have to be for the rule to be broken.
   local fds
   fds=$(grep -o "[0-9]* fds in, [0-9]* out[^;]*" "$log" | tail -1)
   case "$fds" in
@@ -917,7 +920,7 @@ s4_run() {
   if [ "$transport" = guest-ram ]; then
     case "$fds" in
       *"from the arena"*)
-        ok "$tag: the keymap crossed as a slice of the guest's own RAM ($fds)  <-- §13" ;;
+        ok "$tag: the keymap crossed as a slice of the guest's own RAM ($fds)  <-- §14" ;;
       *)
         note "$tag: no descriptor came from the arena ($fds) -- expected for a client that binds no seat" ;;
     esac
