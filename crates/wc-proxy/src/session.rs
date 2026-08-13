@@ -407,6 +407,12 @@ pub struct Session {
     /// Lines worth telling the operator about, drained by the caller so this
     /// stays free of I/O.
     notes: Vec<String>,
+    /// Every `xdg_toplevel.set_app_id` seen, in order, drained by the caller.
+    ///
+    /// The same shape as `notes` and for the same reason: this module is
+    /// bytes-in / bytes-out and has no business opening an icon theme or
+    /// writing to a second socket. What it can do is notice.
+    app_ids: Vec<String>,
 }
 
 impl Session {
@@ -429,6 +435,7 @@ impl Session {
             stats: Stats::default(),
             trace: false,
             notes: Vec::new(),
+            app_ids: Vec::new(),
         }
     }
 
@@ -447,6 +454,11 @@ impl Session {
 
     fn note(&mut self, s: String) {
         self.notes.push(s);
+    }
+
+    /// The app ids seen since the last call. See the field.
+    pub fn take_app_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.app_ids)
     }
 
     /// Translate one request from the local client.
@@ -494,6 +506,17 @@ impl Session {
             && header.opcode == op::POOL_RESIZE
             && self.pools.get(&header.object).is_some_and(|p| p.region.is_none()));
         let mut out = if deferrable { Vec::new() } else { self.flush_deferred() };
+
+        // STAGE 11. The one message this program *watches* rather than
+        // understands: it is forwarded unchanged, and a copy of the string goes
+        // to the icon resolver, which is on this side because the icon theme is
+        // (`crate::icons`). Matched on the message's **name** rather than on an
+        // opcode constant, because the opcode is a position in somebody else's
+        // XML and this is the only place that would notice if it moved.
+        if interface == "xdg_toplevel" && msg.name == "set_app_id"
+            && let Some(app_id) = spans.first().and_then(|s| wire::string_at(body, s)) {
+                self.app_ids.push(app_id);
+            }
 
         // The semantic half: everything the proxy has to understand rather than
         // merely carry.

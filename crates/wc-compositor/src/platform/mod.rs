@@ -139,8 +139,9 @@ impl FrameStyle {
 /// work perfectly on this machine and be unimplementable on the one that
 /// matters.
 ///
-/// Nothing sends this yet. It is in the enum so that the thing that eventually
-/// does has somewhere to send it that is not a redesign.
+/// Stage 11 is where something started sending it: `xdg-toplevel-icon-v1` from
+/// a client that implements it, or `wc_icon_manager_v1` from a resolver on the
+/// Linux side for one that does not (docs/design.md §15).
 #[derive(Clone, Debug)]
 pub struct IconImage {
     pub width: i32,
@@ -179,14 +180,21 @@ pub enum ToUi {
     },
     /// `xdg_toplevel.set_title`.
     Title { id: WindowId, title: String },
-    /// `xdg_toplevel.set_app_id`. Not used for anything yet; recorded so the
-    /// window knows what it is when something has to resolve an icon for it.
+    /// `xdg_toplevel.set_app_id`. Not used for anything on the platform side;
+    /// recorded so the window knows what it is, and so the Wayland side can
+    /// match it against an icon somebody published for that app id
+    /// (`crate::icon`).
     AppId { id: WindowId, app_id: String },
-    /// Set the window and taskbar icon. Nothing sends this yet — see
-    /// [`IconImage`].
+    /// Set the window and taskbar icon.
+    ///
+    /// **A set of sizes, not an image.** Windows asks for two — `ICON_SMALL`
+    /// at `SM_CXSMICON` and `ICON_BIG` at `SM_CXICON` — and an icon theme has
+    /// both drawn rather than resampled, so the choice belongs at the end that
+    /// knows what Windows asked for. `crate::icon::best_match` is that choice;
+    /// an empty list clears the icon back to the system's generic one.
     Icon {
         id: WindowId,
-        icon: Option<IconImage>,
+        icons: Vec<IconImage>,
     },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },

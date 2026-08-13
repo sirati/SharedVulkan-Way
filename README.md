@@ -129,6 +129,20 @@ picture shows and no check could: `xdg_surface.set_window_geometry` is not
 implemented, so every client with its own decorations is drawn offset by its
 shadow margin and clipped by it.
 
+```
+WC_HOST=you@vm-host WC_HOST_WESTON=/path/to/weston/bin scripts/wc-icon.sh all
+```
+
+The taskbar button, with the **client's own icon** on it. Wayland has no icon
+protocol worth the name — `xdg_toplevel.set_app_id` names a desktop entry in an
+icon theme that exists on the *client's* machine — so `wc-proxy` resolves it
+there and ships pixels, and the compositor builds two `HICON`s. Runs twice, the
+second time with `--no-icons`, and photographs both taskbars; `docs/stage11/`
+holds the pair and `docs/design.md` §16 is the argument. The most useful thing
+in it is again something no log could show: both icons were set correctly for a
+whole run in which the taskbar showed the generic one, because the shell had
+grouped the window with the compositor's console window.
+
 ## Layout
 
 ```
@@ -190,6 +204,12 @@ scripts/
                      coherency, what a pool costs per transport, and stage 4
                      across a real VM boundary; block 10 is stage 7's arena --
                      guest RAM, located from outside the VM
+  wc-icon.sh         the stage-11 acceptance test — the client's own icon on the
+                     Windows taskbar. `deploy` cross-compiles and copies under
+                     its own image name; `taskbar` runs the client twice, once
+                     with the resolver and once with `--no-icons`, and
+                     photographs the taskbar both times. `WC_CLIENT_CMD` drives
+                     Firefox instead. Everything it produces is in docs/stage11/
   wc-desktop.sh      the stage-8 acceptance test — the compositor on the guest's
                      **interactive desktop** rather than in an ssh session, and
                      photographs of what it puts on screen; `fps` is the

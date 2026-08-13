@@ -136,6 +136,22 @@ struct Window {
     /// and a machine that sounds broken.
     frame_callbacks: Vec<WlCallback>,
     presented: u64,
+    /// The client has set an icon of its own through `xdg-toplevel-icon-v1`.
+    ///
+    /// Once it has, a publish on `wc_icon_manager_v1` for the same app id must
+    /// not overwrite it: the client is the authority on its own icon, and the
+    /// resolver is a guess made from a name. The reverse is not true — a
+    /// client that sets an icon *after* the resolver's guess has been applied
+    /// replaces it.
+    icon_from_client: bool,
+    /// The client called `xdg_toplevel_icon_manager_v1.set_icon` and the state
+    /// it named becomes current at the next commit.
+    ///
+    /// A flag rather than reading the cached state on every commit: the icon is
+    /// double-buffered like everything else, so "has it changed" is not a
+    /// question the current value can answer, and an animating client commits
+    /// sixty times a second with the same icon attached.
+    icon_dirty: bool,
 }
 
 pub struct State {
@@ -199,6 +215,22 @@ pub struct State {
     /// Synthesise an icon at map time, so the platform's icon path is executed
     /// by something rather than merely compiled.
     debug_icon: bool,
+    /// Icons published by app id, by something that is not the window's client
+    /// — in practice wc-proxy, which is the only thing in the topology that can
+    /// read a Linux icon theme (`crate::icon`).
+    icons: crate::icon::IconStore,
+    /// Kept alive so the global stays advertised, and so `Display::global_id`
+    /// is not the only handle to it.
+    _icon_manager: smithay::reexports::wayland_server::backend::GlobalId,
+    /// The same, for the standard protocol; it also owns the size list that
+    /// every binding client is told about.
+    _toplevel_icon: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+    /// Icons this compositor has actually put on a window, and how many were
+    /// asked for and had nothing to answer with. Printed at shutdown, because
+    /// "the icon is generic" is otherwise indistinguishable from "the icon
+    /// never arrived".
+    pub icons_applied: usize,
+    pub icons_missing: usize,
 
     pub clients_seen: usize,
     pub toplevels: usize,
@@ -334,6 +366,28 @@ impl State {
             }
         }
 
+        // Two icon globals, and they are not alternatives.
+        //
+        // `xdg-toplevel-icon-v1` is the protocol; a client that implements it
+        // is the authority on its own icon and needs nothing else. Measured
+        // against real clients (docs/design.md §15.3) that is GTK 4.20 and not
+        // Firefox 151, weston 15 or GTK 3 — so the second global exists for the
+        // ones that do not, and is bound by the resolver rather than by them.
+        let icon_manager = dh
+            .create_global::<State, crate::icon::proto::wc_icon_manager_v1::WcIconManagerV1, _>(
+                1,
+                (),
+            );
+        let mut toplevel_icon =
+            smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<State>(dh);
+        // The sizes Windows will ask for, told to the client at bind time:
+        // `SM_CXSMICON` and `SM_CXICON` are 16 and 32 at 96 dpi, and 48 is what
+        // a scaled display's `ICON_BIG` becomes. A client that honours these
+        // sends exactly the images that will be used and none that will not.
+        for size in [16, 32, 48] {
+            toplevel_icon.add_icon_size(size);
+        }
+
         // ADDED FOR STAGE 9: one output, describing the desktop the windows
         // will live on.
         //
@@ -400,6 +454,11 @@ impl State {
             started: Instant::now(),
             last_frame: Instant::now(),
             debug_icon,
+            icons: crate::icon::IconStore::default(),
+            _icon_manager: icon_manager,
+            _toplevel_icon: toplevel_icon,
+            icons_applied: 0,
+            icons_missing: 0,
             clients_seen: 0,
             toplevels: 0,
             popups: 0,
@@ -859,14 +918,18 @@ impl State {
                 self.ui.send(ToUi::Title { id, title });
             }
             if !app_id.is_empty() {
-                self.ui.send(ToUi::AppId { id, app_id });
-            }
-            if self.debug_icon {
-                self.ui.send(ToUi::Icon {
+                self.ui.send(ToUi::AppId {
                     id,
-                    icon: Some(debug_icon(id)),
+                    app_id: app_id.clone(),
                 });
             }
+            // At map, and not before: a window that is not on screen has no
+            // taskbar button to put an icon on, and `WM_SETICON` to a hidden
+            // window is a message the shell never reads. The resolver may have
+            // published long before this — it sees `set_app_id` on the wire,
+            // which is several round trips ahead of the first buffer — which is
+            // exactly why the store is keyed by app id and not by window.
+            self.apply_stored_icon(id, &app_id);
         }
         self.ui.send(ToUi::Present {
             id,
@@ -874,6 +937,187 @@ impl State {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Icons, stage 11
+    // -----------------------------------------------------------------------
+
+    /// Put whatever has been published for `app_id` on window `id`.
+    ///
+    /// **Always sends something.** An app id nobody has published for sends an
+    /// *empty* set, which the platform turns into "leave the class icon
+    /// alone" — the generic Windows application icon, which is what stage 8
+    /// photographed. A missing icon has to degrade to that rather than to a
+    /// blank button or a silence, and making the empty case an ordinary message
+    /// rather than a `return` is what keeps the two paths the same length.
+    fn apply_stored_icon(&mut self, id: WindowId, app_id: &str) {
+        if self.debug_icon {
+            self.ui.send(ToUi::Icon {
+                id,
+                icons: vec![debug_icon(id)],
+            });
+            return;
+        }
+        let icons = self.icons.get(app_id).map(<[IconImage]>::to_vec);
+        match icons {
+            Some(icons) => {
+                self.icons_applied += 1;
+                println!(
+                    "wc-compositor: window {id} icon <- {} image(s) published for {app_id:?}",
+                    icons.len()
+                );
+                self.ui.send(ToUi::Icon { id, icons });
+            }
+            None => {
+                self.icons_missing += 1;
+                // Both halves of the sentence matter: an empty app id is a
+                // client that never called `set_app_id` and cannot be resolved
+                // by anybody, and a non-empty one is a resolver that has not
+                // answered — one is the client's doing and the other is ours.
+                if app_id.is_empty() {
+                    println!(
+                        "wc-compositor: window {id} has no app id and no icon; \
+                         nothing can be resolved for it"
+                    );
+                } else {
+                    println!(
+                        "wc-compositor: window {id} app id {app_id:?} has no published icon \
+                         (the store holds {})",
+                        self.icons.len()
+                    );
+                }
+                self.ui.send(ToUi::Icon {
+                    id,
+                    icons: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Has anything at all been published this run? The difference between a
+    /// resolver that answered "no icon" and a resolver that was never there.
+    pub fn icons_is_empty(&self) -> bool {
+        self.icons.is_empty()
+    }
+
+    /// A publisher has spoken: install the set and update every window that is
+    /// already showing that app id.
+    ///
+    /// Windows whose client has set an icon of its own are skipped —
+    /// `xdg-toplevel-icon-v1` beats a name lookup, always, because one is the
+    /// application saying what it looks like and the other is a guess made from
+    /// a string.
+    fn publish_icons(&mut self, app_id: String, icons: Vec<IconImage>) {
+        println!(
+            "wc-compositor: icon published for {app_id:?}: {} image(s) [{}]",
+            icons.len(),
+            icons
+                .iter()
+                .map(|i| format!("{}x{}", i.width, i.height))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        self.icons.publish(app_id.clone(), icons);
+        let targets: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.mapped && !w.icon_from_client && w.app_id == app_id)
+            .map(|w| w.id)
+            .collect();
+        for id in targets {
+            self.apply_stored_icon(id, &app_id);
+        }
+    }
+
+    /// The client set its own icon through `xdg-toplevel-icon-v1`, and this
+    /// commit is where the double-buffered state became current.
+    ///
+    /// The buffers are read through the same [`PixelSource`] list the window's
+    /// content goes through, which is not tidiness: an icon buffer from a
+    /// client on the other side of a hypervisor arrives in the arena like any
+    /// other, and a second reader that only understood `wl_shm` would work on
+    /// this machine and not on the one that matters.
+    fn take_client_icon(&mut self, surface: &WlSurface) {
+        use smithay::wayland::xdg_toplevel_icon::ToplevelIconCachedState;
+
+        let (name, buffers) = compositor::with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<ToplevelIconCachedState>();
+            let current = guard.current();
+            (
+                current.icon_name().map(str::to_owned),
+                current.buffers().to_vec(),
+            )
+        });
+        let Some(window) = self.windows.get(surface) else {
+            return;
+        };
+        let (id, app_id) = (window.id, window.app_id.clone());
+
+        let mut icons = Vec::new();
+        for (buffer, scale) in &buffers {
+            let mut got = None;
+            for source in &self.sources {
+                let mut taken = None;
+                match source.with_pixels(buffer, &mut |bytes, spec| {
+                    taken = crate::icon::image_from_bytes(bytes, spec);
+                }) {
+                    Ok(()) => {
+                        got = taken;
+                        break;
+                    }
+                    Err(PixelError::UnknownSource) => continue,
+                    Err(e) => {
+                        eprintln!("wc-compositor: window {id}: icon buffer: {e}");
+                        break;
+                    }
+                }
+            }
+            match got {
+                Some(image) => icons.push(image),
+                None => eprintln!(
+                    "wc-compositor: window {id}: an xdg_toplevel_icon buffer (scale {scale}) \
+                     could not be read; skipping it"
+                ),
+            }
+        }
+
+        if icons.is_empty() {
+            // A name and no buffers is the other half of the protocol, and it
+            // is the half this compositor cannot honour on its own: the icon
+            // theme is on the client's machine. The name is looked up in the
+            // store anyway, because the resolver publishes under names it took
+            // from desktop entries and an application's icon name is usually
+            // its app id — when it is not, this is a miss and says so.
+            if let Some(name) = name {
+                println!(
+                    "wc-compositor: window {id} set an icon *name*, {name:?}; \
+                     there is no icon theme on this machine, so it is looked up as an app id"
+                );
+                if let Some(window) = self.windows.get_mut(surface) {
+                    window.icon_from_client = false;
+                }
+                self.apply_stored_icon(id, &name);
+                return;
+            }
+            // `set_icon(null)` — the client took its icon back.
+            println!("wc-compositor: window {id} cleared its icon; falling back to {app_id:?}");
+            if let Some(window) = self.windows.get_mut(surface) {
+                window.icon_from_client = false;
+            }
+            self.apply_stored_icon(id, &app_id);
+            return;
+        }
+
+        if let Some(window) = self.windows.get_mut(surface) {
+            window.icon_from_client = true;
+        }
+        self.icons_applied += 1;
+        println!(
+            "wc-compositor: window {id} icon <- {} buffer(s) from the client's own \
+             xdg_toplevel_icon_v1",
+            icons.len()
+        );
+        self.ui.send(ToUi::Icon { id, icons });
+    }
     /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
     /// what that changed and how big the result is.
     ///
@@ -1114,6 +1358,17 @@ impl CompositorHandler for State {
             })
             .collect();
 
+        // After the buffer, deliberately. The first commit is what maps the
+        // window, and a window that is not mapped has no taskbar button for an
+        // icon to be on; doing this first would send a `WM_SETICON` for a
+        // window the platform has not shown yet, which is legal, invisible and
+        // impossible to tell from a broken icon.
+        let icon_dirty = self
+            .windows
+            .get_mut(surface)
+            .map(|w| std::mem::take(&mut w.icon_dirty))
+            .unwrap_or(false);
+
         match buffer {
             Some(BufferAssignment::NewBuffer(buffer)) => self.present(surface, &buffer, rects),
             Some(BufferAssignment::Removed) => {
@@ -1134,6 +1389,10 @@ impl CompositorHandler for State {
             // A commit with no new buffer: state-only, or an ack. Damage
             // without a buffer means nothing.
             None => {}
+        }
+
+        if icon_dirty {
+            self.take_client_icon(surface);
         }
     }
 }
@@ -1253,6 +1512,8 @@ impl XdgShellHandler for State {
                 app_id,
                 frame_callbacks: Vec::new(),
                 presented: 0,
+                icon_from_client: false,
+                icon_dirty: false,
             },
         );
     }
@@ -1275,9 +1536,18 @@ impl XdgShellHandler for State {
             return;
         };
         window.app_id = app_id.clone();
-        let (id, mapped) = (window.id, window.mapped);
+        let (id, mapped, own) = (window.id, window.mapped, window.icon_from_client);
         if mapped {
-            self.ui.send(ToUi::AppId { id, app_id });
+            self.ui.send(ToUi::AppId {
+                id,
+                app_id: app_id.clone(),
+            });
+            // A new app id is a new answer to "what is this application", so
+            // the icon is looked up again — unless the client has said what its
+            // icon is itself, in which case the name is not evidence about it.
+            if !own {
+                self.apply_stored_icon(id, &app_id);
+            }
         }
     }
 
@@ -1413,6 +1683,11 @@ impl XdgShellHandler for State {
                 app_id: String::new(),
                 frame_callbacks: Vec::new(),
                 presented: 0,
+                // A popup has no taskbar button and no caption, so neither of
+                // these can ever be true of one. They are here because `Window`
+                // is one type for both roles, which is stage 9's decision.
+                icon_from_client: false,
+                icon_dirty: false,
             },
         );
     }
@@ -1431,6 +1706,107 @@ impl XdgShellHandler for State {
         _positioner: PositionerState,
         _token: u32,
     ) {
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Icons: the client's own, and somebody else's
+// ---------------------------------------------------------------------------
+
+impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for State {
+    /// The icon is *pending* here, not current: `set_icon` is double-buffered
+    /// and takes effect at the surface's next commit, which is where
+    /// [`State::take_client_icon`] reads it. All this does is remember that
+    /// there is something to read.
+    fn set_icon(
+        &mut self,
+        _toplevel: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+        wl_surface: WlSurface,
+    ) {
+        if let Some(window) = self.windows.get_mut(&wl_surface) {
+            println!(
+                "wc-compositor: window {} set an icon through xdg_toplevel_icon_v1",
+                window.id
+            );
+            window.icon_dirty = true;
+        }
+    }
+}
+
+smithay::delegate_xdg_toplevel_icon!(State);
+
+use crate::icon::proto::wc_icon_manager_v1::{self, WcIconManagerV1};
+use smithay::reexports::wayland_server::{DataInit, Dispatch, GlobalDispatch, New, Resource};
+
+/// Per-publisher staging. One publisher builds one icon set at a time, and two
+/// of them cannot get in each other's way because the state is on the resource
+/// rather than on the compositor.
+#[derive(Debug, Default)]
+pub struct PublisherState(std::sync::Mutex<crate::icon::Staging>);
+
+impl GlobalDispatch<WcIconManagerV1, ()> for State {
+    fn bind(
+        _state: &mut State,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WcIconManagerV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        // Worth saying out loud once per publisher: this global is how a
+        // machine that is not this one decides what a window looks like, and a
+        // run where nobody binds it is a run where every icon will be generic.
+        println!("wc-compositor: a client bound wc_icon_manager_v1 (an icon resolver)");
+        data_init.init(resource, PublisherState::default());
+    }
+}
+
+impl Dispatch<WcIconManagerV1, PublisherState> for State {
+    fn request(
+        state: &mut State,
+        _client: &Client,
+        resource: &WcIconManagerV1,
+        request: wc_icon_manager_v1::Request,
+        data: &PublisherState,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State>,
+    ) {
+        use crate::icon::StageError;
+        use wc_icon_manager_v1::{Error, Request};
+
+        // Every arm that can fail ends the *publisher's* connection rather than
+        // the window's client's, which is the one real advantage of the icon
+        // feed being a separate client: a resolver that miscounts its bytes
+        // costs an icon, not a window.
+        let fail = |e: StageError| match e {
+            StageError::TooBig => (Error::TooBig, "more staged bytes than the compositor holds"),
+            StageError::Short => (Error::ShortImage, "image named more pixels than were staged"),
+            StageError::BadSize => (Error::BadSize, "implausible icon size"),
+        };
+
+        match request {
+            Request::Chunk { data: bytes } => {
+                if let Err(e) = data.0.lock().unwrap().chunk(&bytes) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Image { width, height } => {
+                if let Err(e) = data.0.lock().unwrap().image(width, height) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Publish { app_id } => {
+                let images = data.0.lock().unwrap().take();
+                state.publish_icons(app_id, images);
+            }
+            Request::Forget { app_id } => {
+                println!("wc-compositor: icon for {app_id:?} forgotten");
+                state.icons.forget(&app_id);
+            }
+            Request::Destroy => {}
+        }
     }
 }
 

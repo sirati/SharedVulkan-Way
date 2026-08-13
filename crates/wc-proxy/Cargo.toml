@@ -35,3 +35,4 @@ libc = "0.2"
 # The same parser `vendor/wayland-scanner` uses, reading the same XML files, so
 # the proxy's idea of the wire format and the compositor's cannot drift apart.
 quick-xml = "0.41"
+png = "0.18"

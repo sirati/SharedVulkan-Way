@@ -54,6 +54,12 @@ struct Args {
     trace: bool,
     accept_timeout: Duration,
     idle_timeout: Duration,
+    /// STAGE 11. Resolve `xdg_toplevel.set_app_id` to icon pixels here, where
+    /// the icon theme is, and publish them to the compositor on a second
+    /// connection (`crate::iconlink`).
+    icons: bool,
+    /// Which icon theme to try before `hicolor`.
+    icon_theme: String,
 }
 
 fn usage() -> &'static str {
@@ -84,6 +90,11 @@ usage: wc-proxy --upstream <path> [options]
   --copy pool|buffer|damage   how much to copy per commit (default damage)
   --trace                log every message in both directions\n  --pool-headroom N      over-allocate each region N-fold so resize fits
                          (default 1)
+
+  --icon-theme NAME      the icon theme to search before hicolor
+                         (default $WC_ICON_THEME, else hicolor)
+  --no-icons             do not resolve app ids to icons at all: no second
+                         connection to the compositor, no directory walk
   --accept-timeout SEC   how long to wait for a client (default 20)
   --timeout SEC          exit after this long with no traffic (default 20)
 "
@@ -109,6 +120,8 @@ fn parse_args() -> Result<Args, String> {
         trace: false,
         accept_timeout: Duration::from_secs(20),
         idle_timeout: Duration::from_secs(20),
+        icons: true,
+        icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -135,6 +148,8 @@ fn parse_args() -> Result<Args, String> {
                 a.scope = CopyScope::parse(&v).ok_or_else(|| format!("--copy {v}?"))?;
             }
             "--trace" => a.trace = true,
+            "--no-icons" => a.icons = false,
+            "--icon-theme" => a.icon_theme = next()?,
             "--pool-headroom" => {
                 a.headroom = next()?.parse().map_err(|e| format!("--pool-headroom: {e}"))?
             }
@@ -386,20 +401,54 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let (spec, scope, headroom, trace, idle) =
             (spec.clone(), args.scope, args.headroom, args.trace, args.idle_timeout);
+        // STAGE 11. The icon feed, one per served connection.
+        //
+        // **Per connection rather than per process**, which is a decision and
+        // not an accident of where the code sits. A shared feed would be one
+        // more thing behind a mutex for no gain: an icon is published once per
+        // distinct app id, `IconLink` already remembers which ones it has done,
+        // and Firefox's throwaway connection (§15.2) sets no app id at all, so
+        // the second connection costs a socket and nothing else. Keeping it
+        // inside the thread also means a resolver that fails takes its own
+        // client's icons with it and nobody else's.
+        let (want_icons, icon_theme, upstream_path) =
+            (args.icons, args.icon_theme.clone(), args.upstream.clone());
         threads.push(std::thread::spawn(move || {
             // The `+ Send` is only needed to cross this boundary; `Session`
             // itself has no opinion, and widening its signature would push the
             // bound into every test that builds one.
             let transport: Box<dyn PoolTransport> = transport;
+            let mut icons = if want_icons {
+                let search = wc_proxy::icons::Search {
+                    data_dirs: wc_proxy::icons::default_data_dirs(),
+                    theme: icon_theme,
+                };
+                // A failure here is logged and shrugged off. The whole feature
+                // is cosmetic: a compositor too old to have the global, or a
+                // socket that will not take a second connection, must cost a
+                // picture rather than a window.
+                match wc_proxy::iconlink::IconLink::connect(&upstream_path, &spec, search) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!("[proxy] client {n}: no icon feed ({e}); icons will be generic");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
-            match proxy::pump(&mut session, client, upstream, idle, &mut log) {
+            match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
                 Ok(why) => println!("[proxy] client {n} stopped: {why}"),
                 Err(e) => println!("[proxy] client {n} failed: {e}"),
             }
             println!("[proxy] client {n} transport {}", session.transport_name());
             println!("[proxy] client {n} {}", session.stats.summary());
+            if let Some(link) = &icons {
+                println!("[proxy] client {n} {}", link.summary());
+            }
         }));
     }
 

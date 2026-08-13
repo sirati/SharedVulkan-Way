@@ -886,15 +886,15 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             }
         }
         ToUi::AppId { id, app_id } => {
-            // Nothing to do on Win32 yet. `set_app_id` names a desktop entry,
-            // and turning that into a taskbar icon means resolving it on the
-            // machine the client is on and shipping pixels back
-            // (docs/goal-firefox.md). Logged so the harness can see it arrive.
+            // Nothing to do on Win32. `set_app_id` names a desktop entry, and
+            // turning that into pixels happens on the machine the client is on
+            // (docs/design.md §16.4); by the time an icon reaches this thread
+            // it is a `ToUi::Icon`. Logged so the harness can see it arrive.
             println!("wc-compositor: window {id} app_id -> {app_id:?}");
         }
-        ToUi::Icon { id, icon } => {
+        ToUi::Icon { id, icons } => {
             if let Some(w) = window(ui, id) {
-                set_icon(&w, icon.as_ref());
+                set_icon(&w, &icons);
             }
         }
         ToUi::Map { id, width, height } => {
@@ -920,7 +920,12 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         ToUi::Destroy { id } => {
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
-                set_icon(&w, None);
+                // The window is about to go and the `HICON`s belong to this
+                // process rather than to it. Not `set_icon(&w, &[])`: that is
+                // the *client* saying it has no icon, and it says so in the
+                // log, which on a teardown reads as a failure that has not
+                // happened.
+                release_icons(&w);
                 let hwnd = w.hwnd();
                 if !hwnd.is_null() {
                     // SAFETY: the window was created on this thread, which is
@@ -1299,26 +1304,34 @@ fn set_window_state(w: &Rc<WindowState>, maximized: Option<bool>, minimized: Opt
 /// resource id would work on this machine and be unimplementable on the one
 /// that matters.
 ///
-/// **Status: implemented, unexercised.** No client path produces an icon yet —
-/// `xdg-toplevel-icon-v1` is not bound and the app-id resolver does not exist —
-/// so this runs only when `--debug-icon` synthesises one. That flag exists
-/// precisely so this is not a code path that has never executed.
-fn set_icon(w: &Rc<WindowState>, icon: Option<&IconImage>) {
-    // Release whatever is there first: `WM_SETICON` does not take ownership,
-    // so the previous `HICON` leaks unless it is destroyed here.
-    for slot in [&w.icon_big, &w.icon_small] {
-        let old = slot.replace(0);
-        if old != 0 {
-            // SAFETY: `old` came from `CreateIconIndirect` below and is
-            // destroyed exactly once.
-            unsafe {
-                DestroyIcon(old as _);
-            }
-        }
-    }
-    let Some(icon) = icon else {
+/// # Two slots, two sizes, one set
+///
+/// `WM_SETICON` is sent twice because Windows keeps two icons per window and
+/// shows them in different places: `ICON_SMALL` is the caption and the Alt-Tab
+/// row (`SM_CXSMICON`, 16 px at 96 dpi), `ICON_BIG` is the taskbar button and
+/// the switcher (`SM_CXICON`, 32). Sending one and leaving the other unset
+/// leaves the taskbar on the generic icon while the caption looks right, which
+/// is a confusing half-success and was worth the second call from the start.
+///
+/// Which image fills which slot is [`crate::icon::best_match`], on the Wayland
+/// side, because it is arithmetic and this file is not testable on the machine
+/// that runs `cargo test`.
+///
+/// An empty set clears both slots. That is the path a client with no icon takes
+/// and it must reach the *generic* icon rather than a blank button, which is
+/// what destroying the `HICON`s and never setting a new one does.
+fn set_icon(w: &Rc<WindowState>, icons: &[IconImage]) {
+    release_icons(w);
+    if icons.is_empty() {
+        // Both slots are already back to 0, and a window with no icon of its
+        // own gets its class icon — which is `IDI_APPLICATION`, the generic
+        // one stage 8 photographed. Said out loud because "no icon" and "the
+        // icon failed to build" produce the same picture and should not
+        // produce the same log.
+        println!("wc-compositor: window {} has no icon; the taskbar keeps the generic one", w.id);
         return;
-    };
+    }
+    let mut set = 0;
     for (which, slot) in [(ICON_BIG, &w.icon_big), (ICON_SMALL, &w.icon_small)] {
         let (tw, th) = if which == ICON_BIG {
             // SAFETY: pure queries.
@@ -1326,7 +1339,15 @@ fn set_icon(w: &Rc<WindowState>, icon: Option<&IconImage>) {
         } else {
             unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) }
         };
-        let Some(hicon) = make_icon(icon, tw.max(1), th.max(1)) else {
+        let (tw, th) = (tw.max(1), th.max(1));
+        let Some(icon) = crate::icon::best_match(icons, tw.max(th)) else {
+            continue;
+        };
+        let Some(hicon) = make_icon(icon, tw, th) else {
+            eprintln!(
+                "wc-compositor: window {} could not build a {tw}x{th} HICON from {}x{} pixels",
+                w.id, icon.width, icon.height
+            );
             continue;
         };
         slot.set(hicon);
@@ -1335,18 +1356,58 @@ fn set_icon(w: &Rc<WindowState>, icon: Option<&IconImage>) {
         unsafe {
             SendMessageW(w.hwnd(), WM_SETICON, which as WPARAM, hicon);
         }
+        set += 1;
+        println!(
+            "wc-compositor: window {} icon {} <- {}x{} pixels scaled to {tw}x{th}",
+            w.id,
+            if which == ICON_BIG { "big" } else { "small" },
+            icon.width,
+            icon.height
+        );
     }
     println!(
-        "wc-compositor: window {} icon set from {}x{} pixels",
-        w.id, icon.width, icon.height
+        "wc-compositor: window {} icon set: {} of 2 slots from {} image(s) [{}]",
+        w.id,
+        set,
+        icons.len(),
+        icons
+            .iter()
+            .map(|i| format!("{}x{}", i.width, i.height))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
+}
+
+/// Destroy the `HICON`s this window is holding, if any.
+///
+/// `WM_SETICON` does not take ownership — the window borrows the handle and the
+/// process still owns it — so every icon this file creates has to be destroyed
+/// here exactly once, both when it is replaced and when the window goes.
+fn release_icons(w: &Rc<WindowState>) {
+    for slot in [&w.icon_big, &w.icon_small] {
+        let old = slot.replace(0);
+        if old != 0 {
+            // SAFETY: `old` came from `CreateIconIndirect` and is destroyed
+            // exactly once, because the slot is cleared in the same breath.
+            unsafe {
+                DestroyIcon(old as _);
+            }
+        }
+    }
 }
 
 /// Build an `HICON` from BGRA pixels, nearest-neighbour scaled to `tw` x `th`.
 ///
 /// Nearest-neighbour because this is a fallback path for an icon that arrived
 /// at the wrong size; the right answer is for whatever resolves the app-id to
-/// ship the sizes Windows asks for, which is what an icon theme has.
+/// ship the sizes Windows asks for, which is what an icon theme has, and
+/// `crate::icon::best_match` has already picked the closest of them.
+///
+/// **The alpha is premultiplied on arrival and is not touched here.** That is
+/// `wl_shm`'s ARGB8888 convention, `wc_icon_manager_v1` requires the same, and
+/// it is what a 32-bit `HICON` needs: the shell composites icons with
+/// `AlphaBlend`, which is defined on premultiplied colour. A straight-alpha
+/// source would show as a pale halo, not as a failure.
 fn make_icon(icon: &IconImage, tw: i32, th: i32) -> Option<isize> {
     use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, CreateDIBSection};
 
@@ -1449,6 +1510,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         eprintln!("wc-compositor: --simulate-wm is headless-only and is ignored on Windows");
     }
     announce_dpi_awareness();
+    hide_own_console();
     register_classes()?;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1618,6 +1680,60 @@ fn register_classes() -> std::io::Result<()> {
 /// after — and then the display metrics that the choice actually decides,
 /// because a per-monitor-aware process and a virtualised one disagree about
 /// `SM_CXSCREEN` and that disagreement is the whole observable effect.
+/// Hide the console window, but only if this process is the one it was created
+/// for.
+///
+/// # Why a compositor cares about a console window
+///
+/// Because the shell groups taskbar buttons **by process**, and a console
+/// window is a window. Stage 11 spent a run on this: the client's icon was
+/// built, `WM_SETICON` succeeded for both slots, the window's caption showed
+/// the icon — and the taskbar button showed Windows' generic application icon
+/// anyway. The reason is that the process also owned the console window the
+/// task scheduler gave it, the shell put both windows under one button, and the
+/// icon on a grouped button comes from the *executable* rather than from either
+/// window's `WM_SETICON`. `wc-compositor.exe` has no icon resource, so the
+/// group got `IDI_APPLICATION`.
+///
+/// So this is not tidiness. It is the difference between the taskbar showing
+/// the client's icon and showing the generic one, and it was invisible to every
+/// check that looked at the compositor's own logs (docs/design.md §16.6).
+///
+/// **`GetConsoleProcessList` is what makes this safe.** A console shared with
+/// anything else — a `cmd.exe` or an ssh session that started us — belongs to
+/// that other process, and hiding it would take away the user's terminal. A
+/// console with exactly one process attached was created for this process and
+/// dies with it.
+fn hide_own_console() {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    // SAFETY: no arguments, and a null return is the documented "no console".
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_null() {
+        return;
+    }
+    let mut pids = [0u32; 4];
+    // SAFETY: a live buffer whose length is passed truthfully. The return is
+    // the number of processes attached, which may exceed the buffer.
+    let n = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    if n != 1 {
+        println!(
+            "wc-compositor: the console has {n} processes attached, so it is somebody else's \
+             and is left alone"
+        );
+        return;
+    }
+    // SAFETY: a live window handle from `GetConsoleWindow`.
+    unsafe {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    println!(
+        "wc-compositor: hid this process's own console window, so the shell does not group \
+         the toplevel with it and give the group the executable's icon"
+    );
+}
+
 fn announce_dpi_awareness() {
     // The documented `DPI_AWARENESS_CONTEXT` pseudo-handles. They are opaque
     // negative values rather than pointers, which is why they can be constants.

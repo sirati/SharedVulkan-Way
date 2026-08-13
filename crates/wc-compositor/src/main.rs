@@ -42,6 +42,7 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+mod icon;
 mod input;
 mod platform;
 mod state;
@@ -772,6 +773,20 @@ fn wayland_thread(
         ticker.wait(POLL);
     }
 
+    // Said on the way out, always. "The taskbar icon is the generic one" has
+    // three causes that look identical on a photograph — nobody published, the
+    // publish did not match the app id, or the window was never asked — and
+    // these two numbers separate the last from the first two.
+    println!(
+        "wc-compositor: icons: {} window(s) got one, {} had none to get{}",
+        state.icons_applied,
+        state.icons_missing,
+        if state.icons_is_empty() {
+            "; no resolver published anything this run"
+        } else {
+            ""
+        }
+    );
     let _ = std::io::stdout().flush();
     state.quit();
     code
