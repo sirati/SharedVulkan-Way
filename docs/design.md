@@ -89,11 +89,17 @@ Listed here rather than left implicit, because the temptation to read §0 as
 1. **Nothing has run on Windows.** Everything executable was executed under
    Wine 11.14 staging. Wine is not `afunix.sys`, not wepoll, and not the Windows
    scheduler. §4.4 is the honest accounting of what that does and does not buy.
+   **[SUPERSEDED — 2026-08-13, see §7.8.** It has all run on the guest now, 18
+   checks and no failures. The accounting in §4.4 was right about the *kind* of
+   thing Wine cannot tell you and wrong about which way one of them would go.**]**
 2. **`SIO_AF_UNIX_GETPEERPID` is untested.** Wine implements no `IOC_VENDOR`
    ioctl in that range at all — a deliberately invented control code returns the
    identical `WSAEOPNOTSUPP` (10045) — so peer credentials on Windows are code
    that has compiled and never run. It is written to degrade to "pid 0" rather
    than fail, which is the right shape, but the value has never been observed.
+   **[SUPERSEDED — 2026-08-13, see §7.8 item 1.** Observed: it returns the peer's
+   real pid, cross-checked from both ends of a connection between two
+   processes.**]**
 3. **No compositor exists.** There are no surfaces, no `xdg-shell`, no HWNDs and
    no pixels. `wl_shm.create_pool` maps the client's memory and prints what is in
    it; it does not implement `wl_shm`.
@@ -105,6 +111,10 @@ Listed here rather than left implicit, because the temptation to read §0 as
    registration asks for `PollMode::Level` and `polling`'s IOCP backend reports
    `supports_level() == true` unconditionally, but no test has yet produced a
    partial read that would exercise re-readiness.
+   **[PARTLY SUPERSEDED — 2026-08-13, see §7.8 item 3.** A fragmented client
+   stream on the guest — three bytes every 15 ms — produces the partial read, and
+   the protocol exchange completes through it. Still one client, so still not
+   *under load*.**]**
 
 ---
 
@@ -544,9 +554,13 @@ Two measured examples of the gap, both of which cost real time:
 The second is the useful lesson: Wine finds a different class of bug than
 Windows would, and finding none of them is not the same as there being none.
 
-**The remaining verification needs the guest.** It is one command
-(`scripts/wc-handshake.sh` with the binaries copied over) and it is the first
-thing to do when the machine is reachable again.
+**The remaining verification needs the guest.** It has now been done —
+`scripts/wc-guest.sh` and **§7.8**, which answers every item above and finds a
+third divergence the two examples here did not predict: `Sleep(1)` is 1 ms under
+Wine and 15.8 ms on Windows. Note also that it was *not* one command with the
+binaries copied over: a native Linux client cannot open an `afunix.sys` node, so
+the third-party client has to reach the guest through a byte relay. Wine gave
+that evidence away for free and Windows charges for it.
 
 ---
 
@@ -983,18 +997,24 @@ patches to those two crates are not clippy-checked.
 
 §0.2's list, with stage 2's changes:
 
-1. **Nothing has still run on Windows.** Everything executable was executed
-   under Wine 11.14 staging. §4.4 stands unchanged and is the most important
-   section in this document. One narrowing: libxkbcommon is pure userspace
-   computation over a string — no syscalls beyond `fopen`, no sockets, no timers
-   — so §7.2 is the result here where Wine is closest to conclusive. "Closest to"
-   is not "is".
-2. **`SIO_AF_UNIX_GETPEERPID` is still untested.** Unchanged.
+1. ~~Nothing has still run on Windows.~~ **Superseded by §7.8.** Everything in
+   stages 1 and 2 has now run on the guest, 18 checks with no failures. §4.4's
+   framing stands — a Wine pass still proves only self-consistency — but the
+   list of things it could not reach is no longer hypothetical, and one of the
+   divergences it warned about turned out to be Wine's bug rather than
+   Windows'.
+2. ~~`SIO_AF_UNIX_GETPEERPID` is still untested.~~ **Superseded by §7.8 item 1:**
+   it works, it returns the peer's real pid, and it reports
+   `cbBytesReturned = 0` while doing so.
 3. ~~No compositor exists.~~ **Superseded.** One exists, it reaches
    `xdg_toplevel`, and it draws nothing.
-4. **Level-triggered wepoll is still asserted, not observed under load.**
-   Unchanged, and stage 2 did not exercise it any harder: the poll loop is still
-   the sleep-poll loop of stage 1.
+4. ~~Level-triggered wepoll is still asserted, not observed under load.~~
+   **Partly superseded by §7.8 item 3:** a deliberately fragmented client stream
+   on the guest forces partial reads and re-readiness, and the xdg-shell exchange
+   completes through it. Still not observed under *load* — one client dribbling
+   bytes is not many clients competing — and the poll loop is still stage 1's
+   sleep-poll loop, which §7.8 now shows sleeps ~15.6 ms per iteration on real
+   Windows rather than the 5 ms it asks for.
 5. **New: the `Monotonic` clock's epoch is process start, not boot.** Correct
    for every current caller (ordering, differences, input timestamps) and wrong
    for a client comparing against its own clock, which is what `wp_presentation`
@@ -1009,23 +1029,137 @@ patches to those two crates are not clippy-checked.
 8. **New: `KeyboardHandle::new` cannot succeed on Windows**, because
    `XkbConfig::compile_keymap` is `new_from_names`. §7.2.
 
-### 7.8 What to re-check on the guest, in priority order
+### 7.8 What the guest answered
 
-The list from §4.4 plus stage 2's additions. This is the afternoon's agenda when
-the machine is reachable.
+**Everything in stages 1 and 2 has now run on real Windows.** The standing
+caveat of both stages — "nothing has ever run on Windows" — is closed. The
+machine is the testhost guest, Windows 11 build 10.0.26200.9168; the harness is
+`scripts/wc-guest.sh`, which cross-compiles the C probes, deploys everything,
+runs it and cleans up after itself. The four `.exe`s it carries over are a
+`cargo build --target x86_64-pc-windows-gnu` of committed `master`.
+**18 checks, 0 failures.**
 
-1. **`SIO_AF_UNIX_GETPEERPID`** returns a real pid. Wine implements no
-   `IOC_VENDOR` ioctl at all, so this has compiled and never run.
-2. **`afunix.sys` accept/peer-address semantics.** Stage 1 found Wine reports
-   `sun_family = 0` where Windows documents `AF_UNIX`; the fix works on both, but
-   the divergence class is proven to exist.
-3. **wepoll under load, level-triggered.** A partial read that exercises
-   re-readiness. Nothing has produced one yet.
-4. **Named section create/open across a process boundary**, with the real
-   `Local\` namespace and the real `BCryptGenRandom` — now on the critical path
-   for keymaps as well as `wl_shm`.
-5. **`libxkbcommon.a` linked into a real `.exe`.** Lowest risk of the list —
-   §7.2's caveat — but it is 590 KB of somebody else's C and it costs one command.
-6. **The 56 MB debug binary itself.** Nothing has checked that a binary this
-   size loads sensibly on real Windows; Wine's loader is not `ntdll`'s.
-7. **`std::time::Instant`'s resolution**, if §7.7 item 5 is fixed with QPC.
+| Check | Wine 11.14 staging | Real Windows |
+|---|---|---|
+| `SIO_AF_UNIX_GETPEERPID` returns the peer's real pid | `WSAEOPNOTSUPP` (10045), always | **pass** — cross-checked in both directions |
+| `accept()` reports a usable peer address | `sun_family = 0`; stock `uds_windows` rejects | **pass** — `sun_family = AF_UNIX`; stock `uds_windows` would accept |
+| control: a bogus `IOC_VENDOR` ioctl still fails | fails | fails |
+| `wc-probe.exe` ↔ `wc-server.exe` handshake | pass | **pass** |
+| an `h` argument crosses, via a named section | pass | **pass** — real `Local\` namespace, real `BCryptGenRandom` name |
+| `wayland-info` (libwayland C) enumerates the globals | pass, directly | **pass, through a relay** (see below) |
+| `wc-compositor.exe` advertises smithay's five globals | pass | **pass** |
+| smithay's `ShmState` accepts `create_pool` with a section | not run | **pass** |
+| `weston-multi-resource` reaches `xdg_toplevel` + configure + commit | pass | **pass** |
+| the same over a deliberately fragmented stream | not run | **pass** — 3-byte writes, 15 ms apart |
+| `probe-xkb.exe` (C) — every check, incl. the deliberate failure | pass | **pass** |
+| `wc-xkb-probe.exe` (the Rust crate) | pass | **pass** |
+| `weston-flower` (known broken, §7.5) | fails at `create_pool` | **fails identically** |
+
+The priority list this section used to be, with its answers:
+
+1. **`SIO_AF_UNIX_GETPEERPID` works.** `scripts/probe-accept.c` runs a server
+   and a client as separate processes; the client sends its own pid as text, the
+   server asks the kernel, and the two agree — 7672 and 7904, each side seeing
+   the other. Stage 1's transport decision (§1.1) rested partly on this existing,
+   and it exists. Two details worth carrying: the ioctl fails with
+   `WSAEOPNOTSUPP` on an *unconnected* socket, so the error means "no peer"
+   rather than "not implemented"; and **`WSAIoctl` reports
+   `cbBytesReturned = 0` even on success**, with the pid written anyway. Code
+   that validates the returned length would reject a correct answer.
+   `wc_transport::peer_credentials` checks only the return code, which is right.
+2. **`accept()` fills the peer address in properly**, and this is where Wine was
+   actively misleading. Windows returns `len = 110, sun_family = AF_UNIX` with an
+   empty path for an unnamed peer, so the predicate that `uds_windows` 1.2.1
+   applies (`src/stdnet/mod.rs:148`) passes and the stock crate would have
+   accepted every connection. Wine returns `sun_family = 0` and the stock crate
+   rejects every connection. Our `accept` passes a null address and never asks
+   the question, which remains the right thing to do — but it is now known to be
+   a workaround for a Wine bug rather than for a Windows one.
+3. **wepoll survives a partial read.** The relay can fragment the client's
+   stream, and at three bytes every 15 ms a Wayland message header cannot arrive
+   in one read: the server must park a partial message and be woken again. All
+   four xdg-shell milestones still land. That is the first time re-readiness has
+   been exercised anywhere.
+4. **Named sections cross a process boundary on the real namespace.** The server
+   logs the descriptor it received — `Section { name:
+   "Local\\wc-52bec8b6…", size: 4096 }` — and then the two markers it read out of
+   the mapping. It can only have opened the object by name.
+5. **`libxkbcommon.a` runs in a real `.exe`**, both the C probe and the Rust
+   crate, keycode 38 → `a`, +Shift → `A`, `get_as_string` round-tripping, and
+   `xkb_keymap_new_from_names` failing exactly as designed because there is no
+   xkeyboard-config tree. §7.2 holds.
+6. **The 56 MB debug binary loads like any other.** `wc-compositor.exe` (56.8 MB)
+   and `wc-server.exe` (16.5 MB) both take ~62 ms beyond their one-second idle
+   timeout, and are indistinguishable from each other. Size costs nothing here.
+7. **QPC resolves to 100 ns** (10 MHz), and two back-to-back calls really do
+   observe a 1-tick difference, so §7.7 item 5's fix has the resolution it needs.
+   QPC is boot-based: it differs from `GetTickCount64` by 5.15 s over 4.3 hours
+   of uptime (0.03%), which is this guest being hibernated and resumed rather
+   than a different epoch.
+
+#### Where Wine was a poor proxy, specifically
+
+Two stages of decisions rest on Wine, so the divergences matter more than the
+agreements. There are three, and they are not the same kind of wrong.
+
+* **It reported a function as absent that is present.** Wine implements no
+  `IOC_VENDOR` ioctl, so `SIO_AF_UNIX_GETPEERPID` failed there in a way
+  indistinguishable from the OS not having it. Had that been read as the answer,
+  §1.1's comparison against a named pipe would have lost one of its arguments to
+  a Wine limitation. It did not, because the code kept the call and treated
+  failure as non-fatal — but the general lesson is that **a negative result under
+  Wine is not a result**.
+* **It reported a struct as malformed that is well-formed** — §4.4's second
+  example, now closed from the other side. Wine's `sun_family = 0` broke
+  `uds_windows` entirely and cost real time; Windows never had the problem.
+  Wine found a bug that does not exist.
+* **It flattered a timing primitive by 15×, and this one is still live.**
+  `Sleep(1)` takes **1.06 ms under Wine and 15.8 ms on real Windows** — the
+  default platform timer tick, unchanged since NT. The poll loop in
+  `wc-server` and `wc-compositor` sleeps 5 ms between iterations (§3.2's "honest
+  about doing nothing clever"), which on Windows is really ~15.6 ms, capping
+  dispatch at about 64 Hz. Nothing measured so far cared, because nothing has a
+  frame deadline. **The two-thread design owes a timer decision** —
+  `timeBeginPeriod`, a waitable timer, or the message pump's own wait — and it
+  cannot be validated under Wine, because under Wine the problem is not there.
+
+What Wine got right is the rest of the table, which is most of it: the wire
+format, the in-band descriptor encoding, the section shim, smithay's protocol
+paths and all of libxkbcommon. §4.4's framing survives intact — a pass under
+Wine says the code is self-consistent and structurally possible, and says nothing
+about the platform.
+
+#### What the guest cost, and what it did not prove
+
+There is no third-party Wayland client for Windows, and Wine's trick of backing a
+Windows AF_UNIX socket with a host socket node — which is what let a native Linux
+`wayland-info` talk to a mingw `.exe` for free — has no equivalent here.
+`afunix.sys` creates a node on NTFS that no Linux process can open. Rather than
+fall back to a matched pair of our own binaries, `scripts/probe-relay.c` forwards
+a TCP connection on the guest's loopback into the compositor's AF_UNIX socket,
+and `ssh -L` puts the Linux end of that pipe in an `XDG_RUNTIME_DIR`. A stock
+libwayland client then opens it without knowing it is not a compositor. The
+byte stream is unaltered; the compositor's socket, `afunix.sys`, the framing and
+wepoll are all on the real side of the pipe.
+
+Two things that topology does not carry, both stated so nobody reads more into
+the passes than is there:
+
+* **The peer of a relayed client is the relay.** `SIO_AF_UNIX_GETPEERPID` on
+  those connections reports the relay's pid, truthfully. The ioctl is measured
+  directly by `probe-accept.exe` instead, which is why that check is separate.
+* **Nothing out of band crosses a TCP hop.** On Windows nothing is out of band —
+  an `h` is a length-prefixed descriptor in the stream (§2.3) — so there is
+  nothing to lose. On a Linux client an `SCM_RIGHTS` fd would simply vanish,
+  which is the *same* failure `weston-flower` already has for a different reason
+  and is why it stays a Linux-only control.
+
+`weston-flower` was run against the real Windows compositor anyway, and fails
+there exactly as it fails under Wine: no milestones, the framing desynchronised
+by the `wl_shm.create_pool` that toytoolkit issues during `display_create()`.
+That is worth having, because it confirms §7.5's diagnosis is about the encoding
+and not about Wine.
+
+Still not proven, and not a guest question: rendering, an HWND, presentation
+timing, and §7.7 items 6 and 7 — the unsealed `SealedFile` in particular is a
+design gap, not a platform one.
