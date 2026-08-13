@@ -124,6 +124,40 @@
           # behaviour that a sloppy forwarder gets away with until it does
           # not.
           vulkan-validation-layers
+          # `deqp-vk`, the Vulkan Conformance Test Suite. It is the arbiter of
+          # "the functions are all implemented" — the only instrument in this
+          # project that produces a number about the *API surface* rather than
+          # about one workload, and the only one nobody has to take on trust.
+          #
+          # Pinned through the flake for the same reason `vk.xml` is: a
+          # conformance number is meaningless without the version it was taken
+          # against, and a CTS found on the machine is a version nobody
+          # recorded. `scripts/sv-cts.sh` prints it.
+          #
+          # NOTE: the `vk-default` mustpass lists shipped in this derivation do
+          # **not** match the binary — 362 of 1451 sampled names are absent from
+          # the binary's own test hierarchy, e.g.
+          # `…blit_image.all_formats.color.2d.astc_10x10_srgb_block.b8g8r8_srgb.linear_optimal_nearest`,
+          # where the binary has only the `optimal_optimal_*` variants. So the
+          # harness takes its caselist from `--deqp-runmode=stdout-caselist`,
+          # which is the binary describing itself, and never from the lists
+          # beside it. A caselist that names tests that do not exist reports
+          # them as "Missing", which is neither a pass nor a skip and would
+          # otherwise sit in the scoreboard as an unexplained third of it.
+          vulkan-cts
+          #
+          # `deqp-runner` is deliberately NOT here, and it was tried first.
+          # It is the standard wrapper — crash isolation, parallelism, a
+          # results.csv — and 0.18.0 does not know deqp's `DeviceLost` status:
+          # `Failure getting run results: unknown dEQP status 'DeviceLost'`
+          # abandons the *whole group*, and every test in it is reported
+          # `Missing`. On this machine that happened to four groups out of four
+          # in a control run against unforwarded RADV, so the scoreboard was
+          # zero passes for a driver that passes. A tool that turns a driver's
+          # honest answer into an absence of data is worse here than no tool;
+          # `scripts/sv-cts.sh` chunks the caselist itself, which is thirty
+          # lines and knows every status deqp can print because it does not have
+          # to enumerate them.
           # glslangValidator, so a compute shader can be written as GLSL and
           # compiled to SPIR-V by the build rather than checked in as an opaque
           # blob nobody can read or re-derive. `gpu-probe`'s build.rs needs it.
@@ -281,6 +315,23 @@
           # test convenience.
           libxkbcommon
 
+          # --- The conformance suite ----------------------------------------
+          # WLCS, the Wayland Conformance Suite (docs/design.md §26). It is
+          # C++ with a CMake build, and it is already in nixpkgs at 1.8.1 and
+          # already in the binary cache — so there is no CMake invocation
+          # anywhere in this tree and no vendored copy to keep in step. That is
+          # worth stating because it was the part of the job that looked
+          # expensive: the runner is a **binary**, `libexec/wlcs/wlcs`, which
+          # dlopens a compositor integration module and runs 1,228 gtest cases
+          # against whatever that module connects it to. Our module is
+          # `crates/wc-wlcs`, and it is Rust, because the integration API is
+          # plain C.
+          #
+          # It is put on PATH by the shellHook below rather than named here,
+          # because nixpkgs installs the runner under `libexec` — there is no
+          # `bin/wlcs` for `packages` to pick up.
+          wlcs
+
           gdb
         ];
 
@@ -338,10 +389,17 @@
           export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
           export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
 
+          # The WLCS runner and its headers. `libexec` rather than `bin` is
+          # nixpkgs' own layout for it, and the header path is what a future C
+          # or bindgen consumer would want; `scripts/wc-wlcs.sh` reads both.
+          export WC_WLCS_RUNNER="${pkgs.wlcs}/libexec/wlcs/wlcs"
+          export WC_WLCS_INCLUDE="${pkgs.wlcs}/include"
+
           echo "shared_vulkan + waycompose dev shell — one binary per side"
           echo "  rustc    $(rustc --version 2>/dev/null | cut -d' ' -f2)"
           echo "  targets  x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-unknown-linux-musl"
           echo "  vk.xml   $VK_XML"
+          echo "  wlcs     ${pkgs.wlcs.version}"
           echo "  wine     $(wine --version 2>/dev/null || echo 'unavailable')"
         '';
       };

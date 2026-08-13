@@ -183,6 +183,15 @@ pub struct AbiCommand {
     pub forwarded: bool,
     pub returns_result: bool,
     pub returns_void: bool,
+    /// Whether the specification requires external synchronisation of a
+    /// `VkQueue` for this command — carried across from
+    /// `vk_registry::model::Command::externally_synchronizes_a_queue`, because
+    /// the emitters see an [`AbiCommand`] and never the registry's own.
+    ///
+    /// Pass 12 turns it into a lock around the driver call (design.md §0.12
+    /// item 4). Nothing on the C ABI reads it: the app side's caller *is* the
+    /// application, which Vulkan already obliges to synchronise itself.
+    pub externsync_queue: bool,
 }
 
 impl AbiCommand {
@@ -239,6 +248,7 @@ pub fn surface_profile(wire: &Profile) -> Profile {
         "VkAccelerationStructureInstanceKHR".to_string(),
         "VkXcbSurfaceCreateInfoKHR".to_string(),
         "VkXlibSurfaceCreateInfoKHR".to_string(),
+        "VkWaylandSurfaceCreateInfoKHR".to_string(),
     ];
     p
 }
@@ -252,9 +262,10 @@ pub fn surface_profile(wire: &Profile) -> Profile {
 /// here rather than left to the emitter, so that a generated `extern "system"`
 /// signature naming `xcb_connection_t` cannot come back by accident.
 ///
-/// Note what is **not** in this list: the two
+/// Note what is **not** in this list: the three
 /// `vkGetPhysicalDevice…PresentationSupportKHR` queries take the same
-/// `xcb_connection_t*`/`Display*` and are on the surface anyway, because the
+/// `xcb_connection_t*`/`Display*`/`struct wl_display*` and are on the surface
+/// anyway, because the
 /// loader's terminator calls `abort()` for an ICD that does not export them.
 /// They ignore the argument, so a `*mut c_void` in the signature is enough.
 /// `vkCreateHeadlessSurfaceEXT` is in the list for a second reason, and it is
@@ -266,8 +277,12 @@ pub fn surface_profile(wire: &Profile) -> Profile {
 /// `VkIcdSurfaceBase`", which is a thing that can be read; exporting some makes
 /// it "either that or one of my ids", which is a thing that can only be
 /// guessed at.
-pub const SURFACE_CREATORS: &[&str] =
-    &["vkCreateXlibSurfaceKHR", "vkCreateXcbSurfaceKHR", "vkCreateHeadlessSurfaceEXT"];
+pub const SURFACE_CREATORS: &[&str] = &[
+    "vkCreateXlibSurfaceKHR",
+    "vkCreateXcbSurfaceKHR",
+    "vkCreateWaylandSurfaceKHR",
+    "vkCreateHeadlessSurfaceEXT",
+];
 
 /// Build the ABI plan.
 ///
@@ -316,6 +331,7 @@ pub fn build(model: &Model, profile: &Profile, forwarded: &BTreeSet<String>) -> 
             forwarded: forwarded.contains(name),
             returns_result,
             returns_void,
+            externsync_queue: cmd.externally_synchronizes_a_queue(),
         });
     }
 

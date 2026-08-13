@@ -443,11 +443,34 @@ pub struct State {
 #[derive(Default)]
 pub struct ClientState {
     compositor_state: CompositorClientState,
+    /// Which connection this is, counted from 1 in accept order.
+    ///
+    /// ADDED FOR STAGE 26 (docs/design.md §26). A conformance suite driving
+    /// this compositor from outside knows a client-side `wl_surface*` and
+    /// nothing about our window ids, so the only handle it can name a window
+    /// by is *which connection* plus *which object id on it*. The connection
+    /// has no such name in the protocol — `ClientId` is an opaque handle whose
+    /// `Debug` spelling is an implementation detail — so it is counted here.
+    /// Costs one `u32` per client and is otherwise inert.
+    pub index: u32,
+}
+
+impl ClientState {
+    pub fn new(index: u32) -> ClientState {
+        ClientState { index, ..Default::default() }
+    }
 }
 
 impl ClientData for ClientState {
     fn initialized(&self, client_id: ClientId) {
-        println!("wc-compositor: client {client_id:?} initialized");
+        // The ordinal is printed as well as the backend's handle, and on both
+        // platforms. It is what a peer outside this process counts (see
+        // `index`), and a log that names only the opaque `ClientId` cannot be
+        // lined up against anything.
+        println!(
+            "wc-compositor: client {} ({client_id:?}) initialized",
+            self.index
+        );
     }
 
     fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
@@ -610,7 +633,7 @@ impl State {
                 1,
                 (),
             );
-        // §28. The clipboard's side door, for the one thing
+        // §29. The clipboard's side door, for the one thing
         // `wl_data_device` cannot express across this boundary: the bytes
         // themselves. See `protocols/wc-clipboard-v1.xml` and `crate::clipboard`.
         let clipboard_manager = dh
@@ -1019,6 +1042,46 @@ impl State {
         self.by_id(id).map(|w| w.role.surface().clone())
     }
 
+    /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
+    /// bottom of the stack first.
+    ///
+    /// ADDED FOR STAGE 26, and used only by `crate::control` — the socket a
+    /// conformance suite drives this compositor through. Stacking order is
+    /// window-id order, which is creation order: on Win32 a new window is
+    /// created on top and a popup is created after the toplevel it belongs to,
+    /// so the two agree for every case that has one.
+    ///
+    /// The size is read from the shadow rather than from a stored field
+    /// because the shadow *is* the size — it is reset to the buffer's
+    /// dimensions on every commit (`surface::Shadow::reset`), so it cannot
+    /// disagree with what the client last drew.
+    #[cfg(unix)]
+    pub fn mapped_windows(&self) -> Vec<crate::control::Rect> {
+        use smithay::reexports::wayland_server::Resource as _;
+        let mut out: Vec<crate::control::Rect> = self
+            .windows
+            .values()
+            .filter(|w| w.mapped)
+            .filter_map(|w| {
+                let surface = w.role.surface();
+                let client = surface
+                    .client()
+                    .and_then(|c| c.get_data::<ClientState>().map(|d| d.index))?;
+                let shadow = w.shadow.lock().ok()?;
+                Some(crate::control::Rect {
+                    id: w.id,
+                    client,
+                    surface: surface.id().protocol_id(),
+                    w: shadow.width(),
+                    h: shadow.height(),
+                    toplevel: w.role.toplevel().is_some(),
+                })
+            })
+            .collect();
+        out.sort_by_key(|r| r.id);
+        out
+    }
+
     // -----------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------
@@ -1040,7 +1103,7 @@ impl State {
             let Some(surface) = self.surface_of(id) else { return };
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
-            // **The clipboard follows the keyboard, and until §28 nothing
+            // **The clipboard follows the keyboard, and until §29 nothing
             // said so.** `wl_data_device`'s selection is offered to the client
             // with *data device focus*, which smithay keeps separately and
             // which nothing here had ever set — so a compositor-provided
@@ -2967,7 +3030,7 @@ impl Dispatch<WcClipboardManagerV1, ClipboardState> for State {
                     mime: mime_type,
                 });
             }
-            // Drag and drop, from a Wayland client outward. §28 stages the
+            // Drag and drop, from a Wayland client outward. §29 stages the
             // payload through exactly the same `chunk`/`data` path a publish
             // uses (see the XML) and hands it to the platform; a platform with
             // no OLE drag source answers `none` at once.
@@ -3008,7 +3071,7 @@ impl OutputHandler for State {}
 
 /// The clipboard, from `wl_data_device`'s side.
 ///
-/// # What §28 changed, and what it deliberately did not
+/// # What §29 changed, and what it deliberately did not
 ///
 /// This used to be smithay's defaults with a paragraph saying a Windows
 /// clipboard could not be built on them, because `send_selection` hands the
@@ -3066,14 +3129,14 @@ impl DataDeviceHandler for State {
 // smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
 // is not started here.
 //
-// §28 left this alone on purpose. Drag and drop is the same interface
+// §29 left this alone on purpose. Drag and drop is the same interface
 // family as the clipboard and it is **not implemented**, which is a decision
 // and not an oversight: a half-built DnD is a drag that starts, offers a
 // format, and then hangs on the drop, and that failure — a client waiting
 // forever on a transfer nobody will finish — is precisely what this stage
 // exists to remove. wc-proxy answers `wl_data_device.start_drag` with an
 // immediate `wl_data_source.cancelled`, so a client that tries gets a drag that
-// does not begin instead of one that does not end. docs/waycompose-design.md §28.8.
+// does not begin instead of one that does not end. docs/waycompose-design.md §29.8.
 impl ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 

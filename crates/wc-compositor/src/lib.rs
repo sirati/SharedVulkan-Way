@@ -43,6 +43,11 @@
 //! drains every pending message.
 
 mod clipboard;
+/// The socket a conformance suite drives this compositor through, standing
+/// where Windows stands. Linux only, because WLCS is. See its header, and
+/// docs/waycompose-design.md §26.
+#[cfg(unix)]
+mod control;
 mod cursor;
 mod icon;
 mod input;
@@ -98,6 +103,9 @@ struct Args {
     /// compositor starts; here it is a flag, which is the same fact supplied
     /// the same way — out of band.
     arenas: Vec<(u32, u64, String)>,
+    /// DYNAMIC ARENA, fixture only: where to find regions the peer grew into.
+    /// See `wc_handle::arena::set_grow_dir` for why the deployment needs none.
+    arena_grow_dir: Option<String>,
     /// Arenas to **provide** rather than open, as `id:size`.
     ///
     /// ADDED FOR STAGE 7, and it is the substrate change (docs/design.md §12).
@@ -164,6 +172,59 @@ struct Args {
     /// ADDED FOR STAGE 17. See [`Decorations`] for why it defaults to `server`
     /// and what a run that asks for `client` is for.
     decorations: Decorations,
+    /// Where to bind the conformance-suite control socket.
+    ///
+    /// ADDED FOR STAGE 26. `--click` is one scripted event decided before the
+    /// process starts; this is the general case — a peer that positions
+    /// windows and moves a pointer while the run is happening, because a test
+    /// suite decides where to click based on what the client did. Linux only:
+    /// see `crate::control` for why the thing it stands in for is Windows.
+    control: Option<String>,
+}
+
+/// The control socket, where one can exist, and nothing at all where one
+/// cannot.
+///
+/// A unit *struct* on the platform that has none, rather than `()`, so that the
+/// plumbing which carries it is ordinary code on both: a `()` makes every
+/// binding of it a `clippy::let_unit_value`, and silencing that lint at four
+/// sites is worse than declaring a type. Not a *stub* of `crate::control`
+/// either — that module is `AF_UNIX` and `std::os::unix::net`, and compiling a
+/// do-nothing Windows version of it would be exactly the "implemented means
+/// compiled" pattern docs/waycompose-design.md §14.9 is about.
+#[cfg(unix)]
+type ControlHook = Option<control::Control>;
+#[cfg(not(unix))]
+pub struct ControlHook;
+
+#[cfg(unix)]
+fn open_control(
+    path: Option<&str>,
+    events: std::sync::mpsc::Sender<platform::FromUi>,
+) -> Result<ControlHook, u8> {
+    let Some(path) = path else { return Ok(None) };
+    match control::Control::bind(path, events) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) => {
+            eprintln!("wc-compositor: could not bind --control {path}: {e}");
+            Err(2)
+        }
+    }
+}
+
+/// Refuse rather than ignore. A harness that asked for a control socket and
+/// silently did not get one would sit waiting for a connection that is never
+/// answered, which is the least informative failure available.
+#[cfg(not(unix))]
+fn open_control(
+    path: Option<&str>,
+    _events: std::sync::mpsc::Sender<platform::FromUi>,
+) -> Result<ControlHook, u8> {
+    if path.is_some() {
+        eprintln!("wc-compositor: --control is a Linux-only hook; there is no AF_UNIX listener here");
+        return Err(2);
+    }
+    Ok(ControlHook)
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, u8> {
@@ -178,6 +239,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
+        arena_grow_dir: None,
         guest_arenas: Vec::new(),
         provide_arenas: Vec::new(),
         outbound: None,
@@ -188,6 +250,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
+        control: None,
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
@@ -222,6 +285,13 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             }
             // `id:size`. No path, because there is nothing to name: the region
             // is this process's own guest RAM and the host finds it by content.
+            "--arena-grow-dir" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-grow-dir needs a directory");
+                    return Err(2);
+                };
+                args.arena_grow_dir = Some(v.to_owned());
+            }
             "--arena-guest-ram" => {
                 let Some(v) = it.next() else {
                     eprintln!("wc-compositor: --arena-guest-ram needs id:size");
@@ -274,6 +344,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 args.outbound = Some((id, bytes));
             }
+            "--control" => args.control = it.next(),
             "--shared-dir" => args.shared_dir = it.next(),
             "--shared-peer-prefix" => args.shared_peer_prefix = it.next().unwrap_or_default(),
             "--layout" => args.layout = it.next(),
@@ -476,6 +547,20 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             }
         }
     }
+    // DYNAMIC ARENA. On the file fixture the peer can grow into regions this
+    // process was never told about, because `--arena` names one and there is no
+    // request in the protocol for a second. This says where to find them. On
+    // the guest-RAM deployment it is never needed: the regions are this
+    // process's own memory and are attached before the host can locate them.
+    if let Some(dir) = &args.arena_grow_dir {
+        match wc_handle::arena::set_grow_dir(std::path::Path::new(dir)) {
+            Ok(()) => println!("wc-compositor: regions the peer grows will be read from {dir}"),
+            Err(e) => {
+                eprintln!("wc-compositor: could not set the arena growth directory {dir}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
     // And the ones this process provides. The run id goes out on the *first*
     // line of the report because the host's locator cannot start without it and
     // a harness has to be able to grep for it; `locked=false` goes on the same
@@ -517,12 +602,38 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // line is what the peer's allocator has to be told to stay out of.
     if let Some((id, bytes)) = args.outbound {
         match wc_handle::arena::reserve_outbound(id, bytes) {
-            Ok(w) => println!(
-                "wc-compositor: arena {id} outbound window: offset {}, {} bytes \
-                 (objects made for clients are arena slices; wc-proxy needs \
-                 --arena-outbound {} to leave them alone)",
-                w.offset, w.len, w.len
-            ),
+            Ok(w) => {
+                // DYNAMIC ARENA. A run id here means `reserve_outbound` had to
+                // commit a region of its own for the window, because `id` named
+                // an arena this process had not provided. The run id goes out on
+                // its own line and in the same shape as the data regions',
+                // because the host's locator cannot find a region it has not
+                // been told the run id of — and a region nobody can locate is
+                // one the compositor writes keymaps into that no client ever
+                // reads.
+                if let Some(run) = w.run_id {
+                    println!(
+                        "wc-compositor: arena {id} provided from guest RAM: \
+                         run 0x{run:016x}, {} bytes, {} pages, locked=true \
+                         (the outbound window's own region)",
+                        w.len,
+                        w.len / wc_handle::arena::GIFT_GRANULARITY,
+                    );
+                }
+                println!(
+                    "wc-compositor: arena {id} outbound window: offset {}, {} bytes{} \
+                     (objects made for clients are arena slices; wc-proxy needs \
+                     --arena-outbound {} to leave them alone)",
+                    w.offset,
+                    w.len,
+                    if w.run_id.is_some() {
+                        ", the whole of its own region, so every data region can be reclaimed"
+                    } else {
+                        ", a tail of the data region, which therefore cannot be reclaimed"
+                    },
+                    w.len
+                );
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not reserve an outbound window in arena {id}: {e}");
                 return std::process::ExitCode::from(2);
@@ -593,6 +704,14 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // the other direction is owned by `platform::start`.
     let (event_tx, event_rx) = std::sync::mpsc::channel();
 
+    // Before the platform, because it takes the same sender: the control
+    // socket is a *second* source of `FromUi`, sitting exactly where the
+    // platform sits, which is the whole of what makes it honest.
+    let control = match open_control(args.control.as_deref(), event_tx.clone()) {
+        Ok(c) => c,
+        Err(code) => return std::process::ExitCode::from(code),
+    };
+
     let started = match platform::start(PlatformConfig {
         events: event_tx,
         // Stage 3 gives Windows the whole frame. The field is what
@@ -633,7 +752,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
-                args.decorations, ui, event_rx);
+                args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -668,8 +787,16 @@ fn wayland_thread(
     decorations: Decorations,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
+    control: ControlHook,
 ) -> u8 {
     use std::io::Write as _;
+
+    // `mut` here rather than in the parameter list so the Windows build, where
+    // the hook is a unit struct, does not carry an unused-mut.
+    #[cfg(unix)]
+    let mut control = control;
+    #[cfg(not(unix))]
+    let _ = control;
 
     let display: Display<State> = match Display::new() {
         Ok(d) => d,
@@ -721,9 +848,13 @@ fn wayland_thread(
     loop {
         match listener.accept() {
             Ok(Some(stream)) => {
+                // The ordinal is assigned *before* the insert, so it counts
+                // connections in accept order and matches what a peer that
+                // connected in that order believes. See `ClientState::index`.
+                let index = (state.clients_seen + 1) as u32;
                 match display
                     .handle()
-                    .insert_client(stream, Arc::new(ClientState::default()))
+                    .insert_client(stream, Arc::new(ClientState::new(index)))
                 {
                     Ok(_) => {
                         state.clients_seen += 1;
@@ -761,6 +892,14 @@ fn wayland_thread(
         // commits land and where `present` runs; then frame callbacks, so a
         // client is invited to draw the next frame only after this one has
         // been handed to the platform; then flush.
+        // Before `pump_ui_events`, so an event the control socket produces is
+        // delivered to the client in the same turn the request arrived rather
+        // than one poll interval later. See `control::Control::service`.
+        #[cfg(unix)]
+        if let Some(c) = control.as_mut() {
+            c.service(&state);
+        }
+
         state.pump_ui_events();
         if state.stopped {
             println!("wc-compositor: the platform stopped; winding up");

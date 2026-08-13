@@ -262,7 +262,7 @@ check_run() {
 # The floor differs between the two scopes, and the honest reason is variance
 # rather than cost. How much a Firefox draws in twenty seconds of scrolling
 # under Xvfb and Wine, on a machine ten agents are sharing, is not reproducible:
-# the checked-commit count across the runs behind docs/design.md §27 was 454,
+# the checked-commit count across the runs behind §27 was 454,
 # 936, 1360, 1509, 1628 and 4106 at `damage`, and 20 and 1035 at `buffer`. The
 # first draft of this comment blamed the `buffer` scope's larger copy for its
 # low count, on the strength of a single 51-commit run; the next `buffer` run

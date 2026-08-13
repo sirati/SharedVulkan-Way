@@ -348,7 +348,7 @@ struct Surface {
     /// damage-scoped copy would leave the rows nobody damaged holding whatever
     /// the previous tenant of those arena bytes wrote.
     needs_full_copy: bool,
-    /// Per-buffer arrears, and the fix for docs/design.md §27.
+    /// Per-buffer arrears, and the fix for docs/waycompose-design.md §27.
     ///
     /// `wl_surface.damage` is defined against the **surface**: it is what
     /// changed on screen since the last commit, not what the client wrote into
@@ -411,6 +411,12 @@ pub struct Stats {
     /// Pools whose region was released after the compositor acknowledged the
     /// destructor. Should equal `pools_created` at the end of a clean run.
     pub pools_released: u64,
+    /// DYNAMIC ARENA. Regions handed back to the guest, and their bytes. The
+    /// second number is the one a run has to print for release to be a claim
+    /// rather than a hope — "the guest's committed memory went down by this
+    /// much", said by the side that gave it back.
+    pub regions_released: u64,
+    pub region_bytes_released: u64,
     /// STAGE 16. Pools whose region this proxy took back **without the client
     /// asking**, because the arena had no room and the pool was cold. See
     /// [`Session::reclaim_for`].
@@ -457,11 +463,11 @@ pub struct Stats {
     pub messages_client: u64,
     pub messages_server: u64,
 
-    // --- the clipboard, §28 -------------------------------------------
+    // --- the clipboard, §29 -------------------------------------------
     //
     // Counted separately from `fds_received` / `fds_materialised` even though
     // both of those move too, because §14.7's line is an assertion about the
-    // *boundary* and these are an assertion about a feature. See §28.4 for
+    // *boundary* and these are an assertion about a feature. See §29.4 for
     // what the fd line reads now and why it is still the same claim.
     /// Selections pulled out of a client and shipped to the system clipboard.
     pub selections_copied: u64,
@@ -948,6 +954,12 @@ impl Session {
 
     pub fn transport_name(&self) -> &'static str {
         self.transport.name()
+    }
+
+    /// What the arena is holding. See `PoolTransport::memory` for why this is
+    /// reported per connection.
+    pub fn transport_memory(&self) -> Option<crate::pool::MemoryReport> {
+        self.transport.memory()
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -2372,6 +2384,15 @@ impl Session {
     /// The frame path: apply the pending state and move the pixels.
     fn commit(&mut self, surface_id: u32) {
         self.stats.commits += 1;
+        // DYNAMIC ARENA. One frame has gone by, which is the unit the region
+        // release policy is written in. A transport with no regions to return
+        // returns none and this costs a virtual call; the arena may hand back a
+        // region that has been empty long enough to be worth unmapping.
+        for (id, bytes, origin) in self.transport.frame() {
+            self.stats.regions_released += 1;
+            self.stats.region_bytes_released += bytes;
+            self.note(format!("arena region {id} returned: {bytes} bytes of {origin}"));
+        }
         let Some(surface) = self.surfaces.get_mut(&surface_id) else {
             return;
         };
@@ -2476,7 +2497,35 @@ impl Session {
                     _ if full => copy_extent(src, dst, &info, usable),
                     Stale::Everything => copy_extent(src, dst, &info, usable),
                     Stale::Rects(rects) if rects.is_empty() => 0,
-                    Stale::Rects(rects) => copy_damage(src, dst, &info, &rects, usable),
+                    // **Never pay more than the extent.** `copy_damage` copies
+                    // overlapping rectangles twice, deliberately, because
+                    // computing their union costs more than the duplicate copy
+                    // when there are two of them. Arrears can make there be
+                    // sixty, and sixty copies of the same rectangle is sixty
+                    // times the buffer.
+                    //
+                    // Measured, and it is the regression this branch shipped
+                    // for one commit: `weston-presentation-shm` damages its
+                    // whole 250x250 buffer every frame and cycles buffers, so a
+                    // buffer coming back round owed one full-buffer rectangle
+                    // per intervening frame. `scripts/wc-proxy.sh cost` went
+                    // from 168 MiB to 8583 MiB for the same 700 commits — 13
+                    // MiB per copy of a 244 KiB buffer — and every assertion in
+                    // that harness still passed, because the table is printed
+                    // and not checked.
+                    //
+                    // The bound is exact rather than a heuristic: the sum of
+                    // the rectangle areas is precisely what `copy_damage` will
+                    // move, so comparing it against the extent picks the
+                    // cheaper of the two every time and can never be wrong by
+                    // more than the padding between rows.
+                    Stale::Rects(rects) => {
+                        if damage_area(&rects, &info) >= extent_area(&info) {
+                            copy_extent(src, dst, &info, usable)
+                        } else {
+                            copy_damage(src, dst, &info, &rects, usable)
+                        }
+                    }
                 }
             }
         };
@@ -2628,6 +2677,22 @@ fn copy_extent(src: &[u8], dst: &mut [u8], info: &BufferInfo, usable: usize) -> 
     }
     dst[start..end].copy_from_slice(&src[start..end]);
     end - start
+}
+
+/// How many pixels `copy_damage` would move for `damage`, overlaps counted as
+/// many times as they would be copied — which is the point, because that is the
+/// number being compared against the extent.
+fn damage_area(damage: &[Rect], info: &BufferInfo) -> i64 {
+    damage
+        .iter()
+        .filter_map(|r| r.clip(info.width, info.height))
+        .map(|r| i64::from(r.w) * i64::from(r.h))
+        .sum()
+}
+
+/// The pixels in one buffer's extent.
+fn extent_area(info: &BufferInfo) -> i64 {
+    i64::from(info.width.max(0)) * i64::from(info.height.max(0))
 }
 
 /// Copy only the damaged rows of one buffer.

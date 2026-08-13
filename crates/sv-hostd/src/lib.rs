@@ -88,6 +88,62 @@ pub enum Mode {
     Qemu,
 }
 
+/// Which of §5.1's locators to run when attaching to a guest's extent.
+///
+/// The default is [`LocatorChoice::Scan`] and stays the default: it is the only
+/// locator that *verifies* rather than trusts, it needs nothing from the guest
+/// but a run id, and every measurement this project quotes was taken with it.
+/// The other two are opt-in because the frame list rests on an undocumented
+/// Windows interface (R28) and nothing should acquire that dependency by
+/// accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocatorChoice {
+    /// Sweep the backing object for the guest's stamps. 1.8 s at 64 MiB, 2.32 s
+    /// at 2 GiB, measured — the cost is linear in guest RAM, not in arena size.
+    #[default]
+    Scan,
+    /// Translate the frame list the descriptor carries, and do not sweep.
+    /// 0.064 s, measured, and the only locator that works once the stamps have
+    /// been overwritten by arena data (§0.14). Trusted, not verified.
+    Pfns,
+    /// Both, compared page for page. **This is R28's attach-time cross-check**,
+    /// and the arrangement §5.1 settles on: the one occasion on which the stamps
+    /// still exist is the one occasion on which the query can be checked.
+    Both,
+}
+
+impl LocatorChoice {
+    pub fn parse(s: &str) -> Option<LocatorChoice> {
+        match s {
+            "scan" => Some(LocatorChoice::Scan),
+            "pfns" => Some(LocatorChoice::Pfns),
+            "both" => Some(LocatorChoice::Both),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocatorChoice::Scan => "scan",
+            LocatorChoice::Pfns => "pfns",
+            LocatorChoice::Both => "both",
+        }
+    }
+}
+
+/// What each locator that ran had to say. `None` means it did not run, which is
+/// a different statement from "it found nothing" and is why these are options
+/// rather than zeroed reports.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default)]
+pub struct LocateOutcome {
+    pub scan: Option<locate::ScanReport>,
+    pub pfns: Option<locate::PfnReport>,
+    /// Present only on [`LocatorChoice::Both`]. Its absence is what a session
+    /// that took the frame list on trust looks like from the outside.
+    pub cross_check: Option<locate::CrossCheck>,
+}
+
 /// The daemon's view of the one extent it serves.
 #[cfg(target_os = "linux")]
 pub struct Hostd {
@@ -230,12 +286,81 @@ impl Hostd {
         desc: &sv_transport::cold::ExtentDesc,
         generation: u32,
     ) -> Result<(Hostd, qemu::RegionTable, locate::ScanReport)> {
+        let (hostd, regions, outcome) =
+            Hostd::qemu_located(qmp, hint, desc, generation, LocatorChoice::Scan)?;
+        // `LocatorChoice::Scan` always produces one, and saying so here keeps
+        // this signature — which every existing caller depends on — free of the
+        // option the general form has to carry.
+        let report = outcome
+            .scan
+            .ok_or_else(|| HostdError::Io(std::io::Error::other("the scan produced no report")))?;
+        Ok((hostd, regions, report))
+    }
+
+    /// [`Hostd::qemu`], with §5.1's locator chosen rather than assumed.
+    ///
+    /// The two locators fail in opposite directions and the choice is which
+    /// failure the session is exposed to (§0.14, R28):
+    ///
+    /// - [`LocatorChoice::Scan`] cannot produce a silently wrong answer, and
+    ///   cannot run at all once the stamps are gone.
+    /// - [`LocatorChoice::Pfns`] does not care what is in the memory, and cannot
+    ///   prove itself.
+    /// - [`LocatorChoice::Both`] runs each against the other's weakness, which
+    ///   is what R28 requires at attach and what makes the frame list usable
+    ///   afterwards. **A disagreement is an error and not a preference**: by the
+    ///   time the two locators differ, one of them is naming somebody else's
+    ///   memory and there is no way to tell from here which.
+    ///
+    /// On `Both` the frame list's map is the one that is kept. The two are equal
+    /// — that is what was just checked — so this is not a choice about *this*
+    /// attach; it is the honest statement that the frame list is what the
+    /// session will re-locate with from now on.
+    pub fn qemu_located(
+        qmp: &std::path::Path,
+        hint: &str,
+        desc: &sv_transport::cold::ExtentDesc,
+        generation: u32,
+        choice: LocatorChoice,
+    ) -> Result<(Hostd, qemu::RegionTable, LocateOutcome)> {
         let target = qemu::QemuTarget::discover(qmp, hint).map_err(HostdError::Io)?;
-        let (map, report) = locate::scan(&target.file, target.file_len, &target.regions, desc)
-            .map_err(|e| match e {
-                locate::LocateError::Io(e) => HostdError::Io(e),
-                other => HostdError::Io(std::io::Error::other(other.to_string())),
-            })?;
+        let locate_err = |e| match e {
+            locate::LocateError::Io(e) => HostdError::Io(e),
+            other => HostdError::Io(std::io::Error::other(
+                <locate::LocateError as std::string::ToString>::to_string(&other),
+            )),
+        };
+        let sweep = || {
+            locate::scan(&target.file, target.file_len, &target.regions, desc).map_err(locate_err)
+        };
+        let translate = || locate::PfnLocator { regions: &target.regions }.locate(desc).map_err(locate_err);
+
+        let mut outcome = LocateOutcome::default();
+        let map = match choice {
+            LocatorChoice::Scan => {
+                let (map, report) = sweep()?;
+                outcome.scan = Some(report);
+                map
+            }
+            LocatorChoice::Pfns => {
+                let (map, report) = translate()?;
+                outcome.pfns = Some(report);
+                map
+            }
+            LocatorChoice::Both => {
+                // The scan first, because it is the one that can fail for an
+                // ordinary reason — a run id that is not in this guest's memory
+                // — and paying 2 s to discover that after a successful
+                // translation would report the wrong problem.
+                let (scanned, scan_report) = sweep()?;
+                let (translated, pfn_report) = translate()?;
+                outcome.scan = Some(scan_report);
+                outcome.pfns = Some(pfn_report);
+                outcome.cross_check =
+                    Some(locate::cross_check(&scanned, &translated).map_err(locate_err)?);
+                translated
+            }
+        };
         let runs = map.coalesce();
         let total = (desc.control_pages + desc.arena_pages) * PAGE as u64;
         runs.validate(total)?;
@@ -266,7 +391,7 @@ impl Hostd {
                 generation,
             },
             target.regions,
-            report,
+            outcome,
         ))
     }
 

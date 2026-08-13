@@ -26,6 +26,10 @@ windows-sys = { workspace = true, features = [
   # a sibling crate enabling it, which is §10.10's lesson applied on the first
   # occasion it could have been repeated.
   "Win32_System_Threading",
+  # DYNAMIC ARENA. `K32GetProcessMemoryInfo` — the working set, which is the
+  # evidence that releasing a region actually returned the pages. See
+  # `arena::committed_bytes`.
+  "Win32_System_ProcessStatus",
 ] }
 
 [target.'cfg(unix)'.dependencies]

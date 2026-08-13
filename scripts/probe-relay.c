@@ -211,7 +211,13 @@ int main(int argc, char **argv)
                 if (t) CloseHandle(t);
             }
         }
-        if ((GetTickCount() - start) / 1000 >= (DWORD)timeout) {
+        /* STAGE 14. `--timeout 0` is "for as long as somebody wants it", which
+         * is what a warm session needs: every other caller of this program is a
+         * test with a deadline, and one of them being a product does not make
+         * the deadline wrong for the rest. Written as a guard rather than as a
+         * large default, because a large default is a relay that outlives the
+         * compositor it was pointed at and then accepts into nothing. */
+        if (timeout > 0 && (GetTickCount() - start) / 1000 >= (DWORD)timeout) {
             printf("[relay] timeout reached; exiting\n");
             break;
         }

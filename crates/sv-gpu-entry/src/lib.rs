@@ -226,6 +226,47 @@ impl<H: GpuHost + ?Sized> sv_proto::MemoryTransform for Mapping<'_, H> {
     }
 }
 
+/// What [`GpuHost::lock_queue`] hands back: exclusive use of the device's one
+/// `VkQueue` until it is dropped.
+///
+/// # Why the guard is a type here rather than a `MutexGuard` in the signature
+///
+/// The generated dispatch has to name the return type, and it is generated into
+/// *this* crate, which has no idea what a GPU side's lock is made of — the
+/// implementation in `sv-gpu-server` holds an `Arc<Mutex<()>>` shared by every
+/// session of one device, and a test double holds nothing at all. An `Option`
+/// lets both answer, and `None` means "this host has no queue to protect"
+/// rather than "this host forgot to lock", because a host that forgot would not
+/// compile.
+///
+/// # Why `()` and not the queue
+///
+/// The queue handle is the driver's and the generated code already holds it as a
+/// raised parameter. What is being serialised is *use* of it, which is what
+/// Vulkan's "externally synchronized" means, so there is nothing for the guard
+/// to carry.
+///
+/// The field is never read, and that is the point: what it does happens in
+/// `Drop`, at the generated `drop(__qg)`. `dead_code` is allowed rather than
+/// worked around, because every way of "using" it would be a lie about what the
+/// type is for.
+pub struct QueueGuard<'a>(#[allow(dead_code)] Option<std::sync::MutexGuard<'a, ()>>);
+
+impl<'a> QueueGuard<'a> {
+    /// Hold the given lock. A poisoned lock is still honoured, for the reason
+    /// `sv_gpu_server::Shared::objects` gives: what it protects is the right to
+    /// call the driver, and a panic elsewhere does not make concurrent submits
+    /// safe.
+    pub fn held(m: &'a std::sync::Mutex<()>) -> QueueGuard<'a> {
+        QueueGuard(Some(m.lock().unwrap_or_else(|e| e.into_inner())))
+    }
+
+    /// No queue to protect. For a host that never reaches a driver.
+    pub fn none() -> QueueGuard<'static> {
+        QueueGuard(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

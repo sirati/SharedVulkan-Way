@@ -50,8 +50,8 @@
 # real `user32` clipboard implementation with a real second process reading it.
 # What it does NOT establish is anything about the **boundary**: every process
 # here is on one kernel, and that has been true of every Wine run in this
-# project since stage 1. See docs/waycompose-design.md §28.8 for why that is a
-# correction to the methodology rather than a caveat on one run, and §28.9 for
+# project since stage 1. See docs/waycompose-design.md §29.8 for why that is a
+# correction to the methodology rather than a caveat on one run, and §29.9 for
 # what needs re-checking on a real arrangement.
 set -uo pipefail
 
@@ -294,13 +294,13 @@ block_wine() {
       ok "text/html crossed with the CF_HTML header stripped"
       note "got: $(printf '%s' "$html" | head -c 60)"
     else
-      bad "text/html did not come back (${html:0:60}); see docs/waycompose-design.md §28.9"
+      bad "text/html did not come back (${html:0:60}); see docs/waycompose-design.md §29.9"
     fi
   fi
 
   # -- the counters ----------------------------------------------------------
   # One line from a connection that copied and one from a connection that
-  # pasted, because the two have different fd counts and §28.4 is an argument
+  # pasted, because the two have different fd counts and §29.4 is an argument
   # about exactly those numbers.
   local line
   line=$(grep "clipboard: 1 copied" "$DIR/proxy.log" | head -1)

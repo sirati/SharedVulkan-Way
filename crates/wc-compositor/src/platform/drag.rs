@@ -15,7 +15,7 @@
 //! **Not the drop target.** `RegisterDragDrop` and `IDropTarget` are not
 //! written; nothing can be dragged *onto* one of these windows yet.
 //! [`payload`] therefore answers `None`, which closes the client's pipe rather
-//! than leaving it open — see §28.6 for why an answer beats a silence.
+//! than leaving it open — see §29.6 for why an answer beats a silence.
 //!
 //! # Three vtables, written out
 //!
@@ -250,7 +250,7 @@ unsafe extern "system" fn ds_query_continue_drag(
 /// icon surface — but the cursor the user is looking at during a drag onto the
 /// Windows desktop should be *Windows'*, so that the copy/move/no-entry glyph
 /// matches what every other drag on that desktop looks like. The Wayland icon
-/// surface is dropped, and that is recorded in §28.8 rather than here.
+/// surface is dropped, and that is recorded in §29.8 rather than here.
 unsafe extern "system" fn ds_give_feedback(_this: *mut DropSource, _effect: DROPEFFECT) -> HRESULT {
     DRAGDROP_S_USEDEFAULTCURSORS
 }
@@ -271,7 +271,7 @@ struct DataObject {
     /// The formats, already converted, in announcement order. **Eager**: OLE
     /// asks for the bytes with a synchronous `GetData` from inside the modal
     /// loop, and there is no round trip available to a Wayland client on
-    /// another machine at that moment. §28.5 argues the same point for the
+    /// another machine at that moment. §29.5 argues the same point for the
     /// clipboard; this is where it is forced rather than merely convenient.
     formats: Vec<(u32, Vec<u8>)>,
 }
@@ -810,7 +810,7 @@ pub(crate) fn cancel(_ui: &Rc<Ui>) {
 /// Always `None`: `RegisterDragDrop` is not called, so nothing can be dragged
 /// onto these windows and `wl_data_device.enter` is never sent. Answering
 /// rather than ignoring is what closes the client's pipe if one somehow asks
-/// (§28.6).
+/// (§29.6).
 pub(crate) fn payload(_ui: &Rc<Ui>, _mime: &str) -> Option<Vec<u8>> {
     None
 }

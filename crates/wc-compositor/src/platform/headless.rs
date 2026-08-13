@@ -310,7 +310,7 @@ impl PumpInner {
         // only part of it that Windows owns is the last hop. Wine runs that
         // hop against the real `SetClipboardData` with a second Win32 process
         // reading the result, which is where the claim "a Windows application
-        // can paste it" is made. See docs/waycompose-design.md §28.
+        // can paste it" is made. See docs/waycompose-design.md §29.
         let mut clipboard: Vec<(crate::clipboard::SystemFormat, Vec<u8>)> = Vec::new();
 
         loop {
