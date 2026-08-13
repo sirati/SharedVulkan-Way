@@ -498,6 +498,44 @@ impl Policy {
     }
 }
 
+/// A sensible size for a **dedicated outbound region**, from what it holds.
+///
+/// # Why the outbound window gets its own region now
+///
+/// `reserve_outbound` argued for putting the window at the tail of the data
+/// region like this: "the tail is the part of the region they reach last.
+/// Reserving it means the peer has one number to subtract from its own length
+/// rather than a hole to route its free list around."
+///
+/// **That argument's premise was one region, and multi-region removed it.** With
+/// a `Vec<Slot>` the peer subtracts nothing — it simply never allocates from
+/// that region — so the tail's only advantage is gone. Its disadvantage is not:
+/// a region carrying live keymaps can never be reclaimed, so whatever the
+/// session started at became a permanent floor. An `sv-guest` was found holding
+/// 817 MB with no client connected, and that floor is why.
+///
+/// Splitting them makes the floor the *outbound* size instead of the *startup*
+/// size, and every data region — including the first — fully reclaimable.
+///
+/// # The number, from evidence
+///
+/// The window's first and largest customer is a keymap: waycompose §15.11
+/// measured the `us` keymap the client receives at **35,572 bytes** and the
+/// `de` keymap after a layout change at **37,532 bytes**, which §18 rounds to
+/// exactly ten pages. A layout change mints a new one before the old is
+/// dropped, so one keymap is not enough and two is the real minimum.
+///
+/// 256 KiB is six keymaps. It is chosen with room rather than at the minimum
+/// because the other customers are known and coming — the clipboard offer and
+/// the icon feed both mint objects this way — and because being wrong upward
+/// here costs 256 KiB while being wrong downward costs a growth on the path
+/// that hands a client its keyboard. Against the 768 MiB floor it replaces it
+/// is 0.03%.
+///
+/// It is not a ceiling: an outbound region that fills grows like any other
+/// (see [`Arena::reclaim_regions`] for what stays pinned and why).
+pub const OUTBOUND_REGION_BYTES: u64 = 256 << 10;
+
 /// The size of the first region growth asks for, and the base of the geometric
 /// series after it.
 ///
@@ -1159,10 +1197,17 @@ impl Arena {
                 "the peer's outbound window must be reserved before anything is allocated",
             ));
         }
-        if len == 0 || len >= size {
+        // A window of the *whole* region is the dedicated-outbound-region case
+        // and is now the preferred shape: it is what lets every data region be
+        // reclaimed, because the thing that must never be unmapped lives in a
+        // region of its own rather than on the tail of one that would otherwise
+        // be free to go. "Leaves nothing of the arena" was the right refusal
+        // when there was one region and the arena was that region; with several
+        // it leaves the other regions, which is the point.
+        if len == 0 || len > size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("an outbound window of {len} bytes leaves nothing of a {size}-byte arena"),
+                format!("an outbound window of {len} bytes does not fit in a {size}-byte region"),
             ));
         }
         let len = len.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
@@ -1314,8 +1359,7 @@ impl Arena {
     /// nothing about it, which is the argument for starting small and growing
     /// rather than for sizing the startup region generously.
     pub fn floor(&self) -> u64 {
-        let a = self.alloc();
-        a.slots.iter().find(|s| s.map.id == self.inner.id).map(|s| s.map.len).unwrap_or(0)
+        self.alloc().floor()
     }
 
     /// Give this arena a way to obtain more memory.
@@ -1465,7 +1509,24 @@ impl Arena {
             let mut i = 0;
             while i < a.slots.len() {
                 let slot = &a.slots[i];
-                let cold = slot.map.id != base
+                // What is pinned is the region holding the compositor's
+                // outbound window, and **only** that region.
+                //
+                // It was "the startup region" until the window got a region of
+                // its own, and the difference is the whole of the user's
+                // objection: pinning the startup region made its size a
+                // permanent floor, so an `sv-guest` started at 768 MiB held
+                // 768 MiB with no client connected. Pinning the outbound region
+                // instead makes the floor the size of the thing that actually
+                // has to stay — the keymaps and clipboard offers already handed
+                // to clients, live in their hands (`one-binary.md` §3.1a).
+                //
+                // A data region is now reclaimable whether or not it is the one
+                // the session started with. `base` is still the id the
+                // compositor was told and still names the arena; it no longer
+                // confers immortality.
+                let _ = base;
+                let cold = !slot.is_outbound()
                     && slot.is_empty()
                     && slot.idle_since.is_some_and(|t| tick.saturating_sub(t) >= idle_frames);
                 if !cold {
@@ -1498,19 +1559,35 @@ impl Arena {
 
 impl Slot {
     fn new(map: Arc<RegionMap>, policy: Policy) -> Slot {
-        // A region's free list starts as the whole of it minus the outbound
-        // window, which is the tail. `reserve_outbound` shortens it in place
-        // for the startup region; a grown region has no window and so is free
-        // to its end.
+        // A region's free list is the whole of it minus the outbound window,
+        // which is always a tail. Three cases, and the first is the one this
+        // stage added:
+        //
+        // * the window is the **whole** region — a dedicated outbound region.
+        //   Nothing is allocatable, so the free list is empty rather than
+        //   `[(0, 0)]`, which would be a zero-length run for `pick` to trip on;
+        // * the window is a tail of a data region — the pre-split spelling,
+        //   still read, still correct, and still carrying a floor;
+        // * no window — an ordinary data region, free to its end.
         let usable = match map.outbound {
             Some((base, _)) => base,
             None => map.len,
         };
+        let free = if usable == 0 { Vec::new() } else { vec![(0, usable)] };
         Slot {
             map,
-            alloc: Alloc { free: vec![(0, usable)], policy, ..Alloc::default() },
+            alloc: Alloc { free, policy, ..Alloc::default() },
             idle_since: Some(0),
         }
+    }
+
+    /// Does this region exist to hold objects the compositor hands to clients?
+    ///
+    /// True for a dedicated outbound region and for a data region carrying a
+    /// tail window. Either way the region is pinned for the session — see
+    /// [`Arena::reclaim_regions`].
+    fn is_outbound(&self) -> bool {
+        self.map.outbound.is_some()
     }
 
     /// Nothing is out of this region and nothing ever will be until something
@@ -1547,6 +1624,16 @@ impl Arenas {
 
     fn published(&self) -> u64 {
         self.slots.iter().map(|s| s.alloc.published).sum()
+    }
+
+    /// The least this arena can shrink to: the region(s) holding the
+    /// compositor.s outbound window, which are the only ones never reclaimed.
+    ///
+    /// Was the startup region.s size, which made whatever a session started
+    /// with a permanent floor. Now it is the size of the thing that actually
+    /// has to stay.
+    fn floor(&self) -> u64 {
+        self.slots.iter().filter(|s| s.is_outbound()).map(|s| s.map.len).sum()
     }
 
     fn size(&self) -> u64 {
@@ -1784,12 +1871,7 @@ impl PoolTransport for Arena {
             peak_regions: a.peak_regions,
             now_bytes: a.size(),
             now_regions: a.slots.len(),
-            floor_bytes: a
-                .slots
-                .iter()
-                .find(|s| s.map.id == self.inner.id)
-                .map(|s| s.map.len)
-                .unwrap_or(0),
+            floor_bytes: a.floor(),
             grown: a.grown,
             released_regions: a.released_regions,
             released_bytes: a.released_bytes,
@@ -1826,15 +1908,18 @@ impl PoolTransport for Arena {
     /// written, and the check is what makes [`SharedBacking`]'s two accessors
     /// provably disjoint instead of merely conventionally so.
     fn peer_slice(&self, arena: u32, offset: u64, len: u64) -> Option<&[u8]> {
-        // Growth does not widen this. Only the startup region has an outbound
-        // window, so naming any other region here is a compositor describing
-        // something it did not mint.
-        if arena != self.inner.id {
-            return None;
-        }
+        // Growth does not widen this. The readable range is the outbound
+        // window and nothing else, so the region named here must be one that
+        // has a window — naming any other is a compositor describing something
+        // it did not mint, which is refused rather than served.
+        //
+        // The id is no longer required to be the startup region's: once the
+        // window has a region of its own, that region has its own id, and
+        // hard-coding `self.inner.id` here would refuse the only region this
+        // function exists to read.
         let map = {
             let a = self.alloc();
-            Arc::clone(&a.slots.iter().find(|s| s.map.id == arena)?.map)
+            Arc::clone(&a.slots.iter().find(|s| s.map.id == arena && s.is_outbound())?.map)
         };
         let (base, wlen) = map.outbound?;
         if offset < base || offset.checked_add(len)? > base + wlen {
@@ -2590,6 +2675,75 @@ mod tests {
         assert!(!region_file.exists(), "the bytes are gone, not merely unlisted");
     }
 
+    /// A dedicated outbound region makes the floor the size of the *window*,
+    /// not the size the session started at — and every data region, including
+    /// the first, becomes reclaimable.
+    ///
+    /// This is the user's objection answered. An `sv-guest` was found holding
+    /// 817 MB with no client connected, because the region carrying the
+    /// compositor's keymaps was also the region the data allocator started in,
+    /// and pinning the one pinned the other. Separating them costs
+    /// [`OUTBOUND_REGION_BYTES`] and removes the floor entirely from the data
+    /// side.
+    #[test]
+    fn a_separate_outbound_region_drops_the_floor_to_the_window_size() {
+        use crate::guestram::Plan;
+        let d = tmpdir("split-outbound");
+        std::fs::create_dir_all(&d).unwrap();
+        let backing = d.join("backing");
+        // A 256 KiB outbound region and an 8-page data region behind it.
+        let out_len = OUTBOUND_REGION_BYTES;
+        let data_len = 8 * 4096u64;
+        std::fs::write(&backing, vec![0u8; (out_len + data_len) as usize]).unwrap();
+        let plan_path = d.join("plan");
+        std::fs::write(
+            &plan_path,
+            format!(
+                "region 0\nobject {0}\nlen {out_len}\nrun 0x1\noutbound 0 {out_len}\n\
+                 r 0 0 {out_len}\n\
+                 region 1\nobject {0}\nlen {data_len}\nrun 0x2\nr 0 {out_len} {data_len}\n",
+                backing.display()
+            ),
+        )
+        .unwrap();
+        // The plan reads: a region that is entirely window is the good case now.
+        let plans = Plan::read_all(&plan_path).unwrap();
+        assert_eq!(plans[0].outbound, Some((0, out_len)));
+        assert_eq!(plans[1].outbound, None);
+
+        let mut a = Arena::from_plan(0, &plan_path).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 0))).unwrap();
+        a.set_grow_step(data_len).unwrap();
+        assert_eq!(a.regions(), 2);
+        assert_eq!(a.floor(), out_len, "the floor is the window, not the startup size");
+
+        // The outbound region hands out nothing: it is not in the free list at
+        // all, so a pool can never land on a live keymap.
+        assert_eq!(a.free_bytes(), (data_len, data_len));
+        let pool = a.create(data_len).unwrap();
+        let Descriptor::ArenaSlice { arena, .. } = pool.descriptor else {
+            panic!("expected an arena slice");
+        };
+        assert_eq!(arena, 1, "pools go in the data region, never the outbound one");
+
+        // The compositor can still read its own window, by that region's id.
+        assert!(a.peer_slice(0, 0, 4096).is_some());
+        assert!(a.peer_slice(1, 0, 4096).is_none(), "a data region has no window to read");
+
+        // And now the part that used to be impossible: the data region the
+        // session started with is reclaimed, and the arena falls to the window.
+        a.destroy(&pool);
+        for _ in 0..10 {
+            a.tick();
+        }
+        let released = a.reclaim_regions(2);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].0, 1);
+        assert_eq!(a.regions(), 1, "only the outbound region is left");
+        assert_eq!(a.size(), out_len);
+        assert_eq!(a.size(), a.floor(), "an idle arena settles at the window size");
+    }
+
     /// The startup region is never returned, however empty and however cold.
     ///
     /// It carries the compositor's outbound window — keymaps the compositor has
@@ -2685,7 +2839,9 @@ mod tests {
         a.set_source(Box::new(FileGrowth::new(&d, 8 * 4096))).unwrap();
         a.set_grow_step(8 * 4096).unwrap();
         assert_eq!(a.peak(), (8 * 4096, 1));
-        assert_eq!(a.floor(), 8 * 4096);
+        // No outbound region, so nothing is pinned and the floor is zero. The
+        // startup size is no longer a floor — that was the whole complaint.
+        assert_eq!(a.floor(), 0);
 
         // Churn the same bytes many times over. Traffic is enormous; the arena
         // never grows, so the peak does not move.
@@ -2713,13 +2869,20 @@ mod tests {
         assert_eq!(a.peak(), (16 * 4096, 2), "and the peak still remembers");
         a.destroy(&hold);
 
-        // The floor is the startup region and release cannot go below it.
+        // With no outbound region there is **no floor at all**, and that is the
+        // change the user asked for: the startup region is reclaimable like any
+        // other, so an arena nobody is using falls to nothing.
+        //
+        // It used to be pinned, which made whatever a session started with a
+        // permanent floor — the reason an `sv-guest` held 817 MB with no client
+        // connected.
         for _ in 0..10 {
             a.tick();
         }
         a.reclaim_regions(1);
-        assert_eq!(a.size(), a.floor(), "an idle arena falls to its floor");
-        assert_eq!(a.floor(), 8 * 4096, "which is the size it started at");
+        assert_eq!(a.floor(), 0, "nothing here holds objects handed to clients");
+        assert_eq!(a.size(), 0, "so an idle arena releases every byte");
+        assert_eq!(a.regions(), 0);
     }
 
     /// Growth is geometric from a small base and then flat, and the default
