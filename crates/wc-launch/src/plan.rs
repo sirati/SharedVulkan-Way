@@ -352,6 +352,44 @@ mod tests {
         assert!(user_js(&app.prefs).contains("user_pref(\"middlemouse.paste\", false);"));
     }
 
+    /// The codec the host CPU can afford, stated by the deployment.
+    ///
+    /// design.md §0.17: on a VM host with no GPU, YouTube's ABR offers AV1 and
+    /// Firefox decodes it in software on two cores, at **1.25× the CPU of
+    /// H.264 on the medians** of eight interleaved windows at 720p60 and
+    /// 1080p60 — and far less predictably. These two preferences are what
+    /// leaves `avc1` as the thing the site negotiates, measured from the
+    /// player's own codec line: `avc1.4d4020 (298)`, not `av01.0.08M.08 (398)`.
+    ///
+    /// **`media.webm.enabled` and not `media.mediasource.vp9.enabled`**, which
+    /// is the correction this test exists to carry. The obvious-looking pref
+    /// does nothing: with it false, `MediaSource.isTypeSupported` still answers
+    /// yes for VP9 in both containers and the site still serves AV1. Only
+    /// turning WebM off removes VP9 — and AV1, which YouTube also ships in
+    /// WebM — so `media.av1.enabled` is belt to its braces, for the content
+    /// where AV1 arrives in MP4 instead. The cost is stated rather than hidden:
+    /// this takes Opus-in-WebM with it and the site falls back to AAC.
+    ///
+    /// It is pinned as a test rather than shipped in `wc-launch.ini`, because
+    /// the *deployment* is where it belongs — a fact about the machine the
+    /// browser runs on, that no protocol carries — but §0.17 also measures that
+    /// it does not fix what prompted it: the dropped frames were the 216.9 ms
+    /// cross-VM present, not the decoder. Across eight windows the largest drop
+    /// count belongs to *H.264*, so the codec is not what that number tracks.
+    /// Turning it on is one line in the `prefs` key. Losing Opus to buy 2.5% of
+    /// two cores that are not the bottleneck is a choice for whoever writes
+    /// that line, so the test carries the pair and not the ini.
+    #[test]
+    fn the_deployment_can_state_the_codec_the_host_can_afford() {
+        let js = user_js("media.av1.enabled=false;media.webm.enabled=false");
+        assert_eq!(
+            js,
+            "// Written by wc-launch on every start. See docs/waycompose-design.md §28.5.\n\
+             user_pref(\"media.av1.enabled\", false);\n\
+             user_pref(\"media.webm.enabled\", false);\n"
+        );
+    }
+
     #[test]
     fn the_profile_directory_is_read_off_the_command_line_or_absent() {
         assert_eq!(

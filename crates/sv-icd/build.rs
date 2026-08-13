@@ -68,28 +68,43 @@
 //!   for a version we do not support — that check is the loader's — so the
 //!   1.1 device simply reports 1.1 and the application decides.
 //!
-//! The one coupling that survives is this constant and
-//! `sv_icd::state::PROTOCOL_API_VERSION`, which is derived from the wire profile
-//! (`sv_proto::CORE_API_VERSION`). `the_manifest_agrees_with_what_we_report`
-//! fails the build's tests if they part company. A build script cannot read the
-//! library's constants — it runs first, and depending on `sv-proto` from here
-//! would compile the ~100,000 generated lines a second time for the host — so
-//! the check is a test rather than an impossibility.
+//! And **no copy of the number is maintained by hand**. A build script cannot
+//! read the library's constants — it runs first, and a build-dependency on
+//! `sv-proto` would compile the ~100,000 generated lines a second time for the
+//! host — but it can read a value another build script published, which is what
+//! `links = "sv_proto"` and `DEP_SV_PROTO_CORE_VERSION` are for. The manifest
+//! this file writes is therefore the profile's own core version, whatever
+//! `SV_PROTO_PROFILE` selected, and `the_manifest_agrees_with_what_we_report`
+//! has become a check on the mechanism rather than on somebody's memory.
 
 use std::path::PathBuf;
 
-/// The **ceiling**, as a string: it must equal
-/// `sv_icd::state::PROTOCOL_API_VERSION`, which is `sv_proto::CORE_API_VERSION`,
-/// which the generator derived from the wire profile's core versions.
+/// The **ceiling**, as a string, taken from `sv-proto`'s build script.
 ///
-/// Move this line when the profile gains a core version, and not before. The
-/// module docs above say why the manifest states the ceiling rather than
-/// whatever the machine's GPU happens to be, and
-/// `the_manifest_agrees_with_what_we_report` is the test that notices.
-const MANIFEST_API_VERSION: &str = "1.3.0";
+/// `DEP_SV_PROTO_CORE_VERSION` is `vk_registry::profile::Profile::core_api_version`
+/// over the profile the generator actually ran on, delivered here by
+/// `links = "sv_proto"`. So `SV_PROTO_PROFILE=full` — core 1.0–1.4 — writes a
+/// 1.4.0 manifest and a 1.4.0 `vkEnumerateInstanceVersion` in the same build,
+/// with nothing to remember and nothing to move by hand.
+///
+/// This used to be the literal `"1.3.0"` with a test holding it in step. The
+/// test is still there, because it also checks the ≥ 1.1 rule that the module
+/// docs above explain — but it can no longer *fail* on the profile moving, which
+/// is the point: design.md §0.18 removed every hand-maintained copy of this
+/// number and this was the last one.
+fn manifest_api_version() -> String {
+    // Missing means the dependency's build script did not run, which cannot
+    // happen for a `links` dependency — but panicking with the reason beats a
+    // manifest that silently says 0.0.0 and gets the driver demoted to 1.0.
+    let raw = std::env::var("DEP_SV_PROTO_CORE_VERSION")
+        .expect("DEP_SV_PROTO_CORE_VERSION: sv-proto declares links = \"sv_proto\"");
+    let v: u32 = raw.parse().expect("DEP_SV_PROTO_CORE_VERSION is a packed u32");
+    format!("{}.{}.{}", (v >> 22) & 0x7f, (v >> 12) & 0x3ff, v & 0xfff)
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    let manifest_api_version = manifest_api_version();
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     // OUT_DIR is `<target>/<profile>/build/<pkg>-<hash>/out`.
@@ -121,7 +136,7 @@ fn main() {
 
     let manifest = format!(
         "{{\n  \"file_format_version\": \"1.0.1\",\n  \"ICD\": {{\n    \
-         \"library_path\": \"{library_path}\",\n    \"api_version\": \"{MANIFEST_API_VERSION}\",\n    \
+         \"library_path\": \"{library_path}\",\n    \"api_version\": \"{manifest_api_version}\",\n    \
          \"library_arch\": \"64\",\n    \"is_portability_driver\": false\n  }}\n}}\n",
     );
 
@@ -132,7 +147,7 @@ fn main() {
     }
     println!("cargo:warning=sv-icd: manifest at {}", manifest_path.display());
     println!("cargo:rustc-env=SV_ICD_MANIFEST={}", manifest_path.display());
-    println!("cargo:rustc-env=SV_ICD_MANIFEST_API_VERSION={MANIFEST_API_VERSION}");
+    println!("cargo:rustc-env=SV_ICD_MANIFEST_API_VERSION={manifest_api_version}");
 
     // The absolute path of the `cdylib` the manifest names, and the profile it
     // belongs to, so that `tests/loader.rs` can tell "the driver is broken"

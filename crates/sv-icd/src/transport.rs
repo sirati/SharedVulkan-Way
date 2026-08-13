@@ -601,6 +601,27 @@ impl RingTransport {
                          and diff it."
                     ));
                 }
+                // The coarse check in front of the hash, and the one that fires
+                // on a **stale deployed binary** rather than on a code change.
+                // This project has lost time to that twice, both times reading
+                // the symptom as a transport fault, so the next step is spelled
+                // out here rather than left to be inferred from two numbers.
+                //
+                // `WIRE_VERSION` went 1 → 2 for design.md §0.18's
+                // `svDriverVersions`, which is hand-written in `sv_proto::sv`
+                // and therefore outside the generated table the protocol hash
+                // covers. A GPU side copied to the guest before that commit
+                // cannot answer it, and the honest thing is to refuse here
+                // rather than to discover it on the first version query.
+                Err(e @ sv_transport::Error::WireVersionMismatch { .. }) => {
+                    return Err(format!(
+                        "{e}\nThis is a version skew between two builds, not a transport \
+                         fault. The usual cause is a stale binary: on the cross-VM \
+                         topology the GPU side is *copied* to the guest, so rebuilding \
+                         here changes only this side. Rebuild and re-deploy **both** \
+                         sides from the same tree."
+                    ));
+                }
                 Err(e) => return Err(e.to_string()),
             }
         };
@@ -652,6 +673,11 @@ impl RingTransport {
         // A failure to attach is a warning, never an error: a session without a
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
+        // Unix only: the host end of the chardev is a Unix socket, which is what
+        // the cross-VM topology has. A Windows *app* side is the same-machine
+        // topology, where the peer is on this kernel and the ordinary futex wake
+        // already reaches it — there is no hypervisor to carry anything across.
+        #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             Ok(path) => match sv_transport::vdoorbell::PortHandle::host_socket(&path)
@@ -670,6 +696,9 @@ impl RingTransport {
                 }
             },
         };
+
+        #[cfg(not(unix))]
+        let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {

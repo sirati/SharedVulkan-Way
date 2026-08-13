@@ -1949,6 +1949,229 @@ the one being chased.
 
 ---
 
+### 0.17 The codec the host can afford, and what the dropped frames were not
+
+**Numbered 0.17 and not 0.16 as briefed**, because master — checked at
+`4a5dfb4` and again at `a7210e8` — already has a §0.16, "Why the forwarder was
+hanging the GPU", and a §0.15 that appears twice. Renumbering somebody else's
+landed section from this branch would be worse than taking the next free
+number, so this takes the next free number.
+
+Measured 2026-08-13 on **testhost's Linux host** and, for the parts that are
+facts about a browser rather than about that machine, on **devhost**. Both
+ran the same binary — `/nix/store/qxgg26945r3f9yzdqg0gfbnjvg6wm7x5-firefox-151.0.2`,
+byte for byte the same store path — because otherwise the two machines are not
+comparable. `scripts/sv-firefox-codec.sh` runs all of it.
+
+The claim being checked was mine and it was too strong: *hardware video decode
+is blocked*. The user's correction was one sentence — "GPU video is not blocked,
+just test with a video in a format that the host iGPU can decode" — and testing
+it splits the claim into three, of which one is true, one is true for a reason I
+had not measured, and one was never about decode at all.
+
+#### The Firefox in use has no Vulkan Video decoder, so §5 of `video-decode.md` is about a different browser
+
+`docs/video-decode.md` §5a reads `FFmpegVulkanVideoDecoder.cpp` at
+mozilla-central tip and concludes that both output paths end in
+`vkGetMemoryFdKHR` with no host-memory fallback. That reading is sound and it
+does not apply here: the decoder it describes shipped in **Firefox 153**, and
+this deployment runs **151.0.2**. Asked of the binary rather than of the source
+tree, with `strings` on its own `libxul.so`:
+
+| symbol | occurrences in 151.0.2's `libxul.so` |
+|---|---|
+| `FFmpegVulkanVideoDecoder` | **0** |
+| `media.hardware-video-decoding-vulkan.enabled` | **0** |
+| `AV_HWDEVICE_TYPE_VULKAN` | **0** |
+| `VulkanVideo` | **0** |
+| `FFmpegVideoDecoder` | 362 |
+| `VA-API` | 20 |
+
+`lib/firefox/vaapitest` exists and there is no Vulkan equivalent beside it. So
+**this browser has exactly two hardware decode paths, VA-API and V4L2, and both
+want a DRM node.** There is no pref to turn on and no branch to patch, which
+also means the whole §5a question — *which* of the two Vulkan branches would end
+in a dma-buf — is not a question this deployment can ask yet. It becomes one at
+153, and §5a is the right analysis to have waiting.
+
+#### `/dev/dri` is empty, and that is only half of why
+
+On testhost's host `/dev/dri` contains an empty `by-path` and nothing else, so
+VA-API has no device. That was the fact I had. The other half was found by
+running the *same binary* on devhost, which has two working VA-API render
+nodes (`vainfo` lists H.264 VLD on the NVIDIA node and H.264 VLD plus encode on
+radeonsi), under two different compositors:
+
+| harness | `WEBRENDER` | `DMABUF` | `HARDWARE_VIDEO_DECODING` |
+|---|---|---|---|
+| devhost, weston **pixman** | blocklisted `SOFTWARE_GL` | failed **`NO_DRM_DEVICE`** | unavailable `VIDEO_DECODING_TEST_FAILED` |
+| devhost, weston **gl** (RTX 5090, "dmabuf support: modifiers") | available | **available** | unavailable `VIDEO_DECODING_TEST_FAILED` |
+| testhost host, weston pixman | blocklisted `GLXTEST_FAILED` | blocklisted `GLXTEST_FAILED` | blocklisted `GLXTEST_FAILED` |
+
+The first two rows differ **only** in the compositor. So `NO_DRM_DEVICE` is not
+a statement about `/dev/dri` at all — it is what Firefox says when the
+compositor offers no `zwp_linux_dmabuf`, on a machine whose `/dev/dri` is fully
+populated. **`wc-proxy` offers `wl_shm` and nothing else**, which is the same
+shape, so even a host that grew a GPU tomorrow would still read `NO_DRM_DEVICE`
+until the proxy advertises a dmabuf it cannot have. Two independent causes had
+been producing one row and I had been reading it as one cause.
+
+#### What `about:support` says, which is the arbiter
+
+Codec Support Information on testhost's host, photographed rather than quoted
+from a log:
+
+```
+Codec Name  Software Decoding  Hardware Decoding
+H264        Supported          Unsupported
+VP9         Supported          Unsupported
+AV1         Supported          Unsupported
+HEVC        Supported          Unsupported
+```
+
+![about:support's Media section on testhost's host: Hardware Decoding
+"Unsupported" for every codec](video-decode/h264-support-media.png)
+
+Every codec, hardware decoding **Unsupported**, and `media.hardware-video-decoding.force-enabled`
+does not move it. The one control this does not have is a positive one: the
+`HWDEC` token is present in `libxul.so`, so the field is capable of saying it,
+but `vaapitest` produced no output on either of devhost's render nodes
+either, so no run in this stage ever saw the field say `HWDEC`. That is stated
+as a gap rather than glossed.
+
+**So: no. Hardware decode does not engage, and the guest's Intel iGPU is not
+reachable from here by any path this binary has.** §1's capability tables are
+still correct — that iGPU decodes H.264 baseline, main and high, 8×8 to
+4096×4096 — and they are correct about a GPU on the *other side of the
+hypervisor* from the browser that would need it.
+
+#### The codec can be forced, and the obvious preference for it is the wrong one
+
+`media.av1.enabled=false` is not enough on its own: YouTube's ABR simply moves
+down its own list to VP9, which is also a software decode. The preference whose
+*name* says it fixes that does nothing at all. Measured per combination, by
+`MediaSource.isTypeSupported` and then by what the site actually served:
+
+| combination | av1-mp4 | vp9-webm | vp9-mp4 | h264-mp4 | opus-webm | aac-mp4 | what the site then served |
+|---|---|---|---|---|---|---|---|
+| default | yes | yes | yes | yes | yes | yes | `av01.0.09M.08 (399) / opus (251)` |
+| `av1` off | NO | yes | yes | yes | yes | yes | `vp09.00.51.08… (303) / opus (251)` |
+| `mediasource.vp9` off | yes | yes | yes | yes | yes | yes | `av01.0.09M.08 (399) / opus (251)` |
+| `webm` off | yes | NO | yes | yes | NO | yes | **`avc1.64002a (299) / mp4a.40.2 (140)`** |
+| `av1` off + `mediasource.vp9` off | NO | yes | yes | yes | yes | yes | `vp09.00.51.08… (303) / opus (251)` |
+| `av1` off + `webm` off | NO | NO | yes | yes | NO | yes | **`avc1.64002a (299) / mp4a.40.2 (140)`** |
+
+**`media.mediasource.vp9.enabled=false` changes not one cell.** It does not even
+change the answer for `video/mp4; codecs="vp09…"`, which is the one thing its
+name promises. An earlier version of this work had shipped that preference in a
+test, on the strength of the name; the row above is why the test now says
+`media.webm.enabled` instead.
+
+The pair that works is `media.av1.enabled=false;media.webm.enabled=false` —
+`webm` because it is what actually removes VP9 and, for this content, AV1 with
+it; `av1` as belt to its braces, for the content where AV1 arrives in MP4. The
+cost is real and is not hidden: **WebM goes entirely, Opus with it**, and the
+site falls back to AAC. That is a defensible trade on a two-core machine with no
+GPU and a poor one anywhere else, which is exactly why it belongs in `prefs` in
+`wc-launch.ini` rather than in a binary.
+
+**It is deliberately not in the shipped `wc-launch.ini`.** The pair is pinned by
+`plan::tests::the_deployment_can_state_the_codec_the_host_can_afford` so that
+the correction cannot be lost, and turning it on is one line — but the section
+below measures that it does not fix the thing that prompted it, and taking Opus
+off a machine the user browses with, to buy 6.5% of two cores that are not the
+bottleneck, is the user's call to make rather than a default to slip in.
+
+#### What it buys: 1.7× the decoder's CPU, and not one dropped frame
+
+Interleaved A-B-A-B at 720p60, 60-second windows, on testhost's host, because
+its two cores are shared with the VM and a straight before/after would measure
+the drift as well as the codec:
+
+| res | arm | codec line, from the player's own stats | dropped | of | cpu-s | cores |
+|---|---|---|---|---|---|---|
+| 720p60 | av1 | `av01.0.08M.08 (398) / opus (251)` | 0 | 3587 | 13.4 | 0.22 |
+| 720p60 | h264 | `avc1.4d4020 (298) / mp4a.40.2 (140)` | 0 | 3563 | 11.4 | 0.19 |
+| 720p60 | av1 | `av01.0.08M.08 (398) / opus (251)` | 7 | 3569 | 23.4 | 0.39 |
+| 720p60 | h264 | `avc1.4d4020 (298) / mp4a.40.2 (140)` | 0 | 3579 | 9.8 | 0.16 |
+| 1080p60 | av1 | `av01.0.09M.08 (399) / opus (251)` | 43 | 3588 | 13.8 | 0.23 |
+| 1080p60 | h264 | `avc1.64002a (299) / mp4a.40.2 (140)` | **165** | 3705 | 11.9 | 0.20 |
+| 1080p60 | av1 | `av01.0.09M.08 (399) / opus (251)` | 0 | 3583 | 15.3 | 0.26 |
+| 1080p60 | h264 | `avc1.64002a (299) / mp4a.40.2 (140)` | 0 | 3564 | 11.8 | 0.20 |
+
+The codec line is read off the player's own "Stats for nerds" panel rather than
+off the preference, because the preference is what was asked and the panel is
+what was answered:
+
+![YouTube's stats panel, AV1 arm: Codecs av01.0.08M.08 (398) / opus (251), 0
+dropped of 1412, optimal 1280x720@60](video-decode/h264-overlay-av1.png)
+
+![the same panel, H.264 arm: Codecs avc1.4d4020 (298) / mp4a.40.2 (140), 0
+dropped of 2007, optimal 1280x720@60](video-decode/h264-overlay-avc1.png)
+
+**AV1 costs more CPU, and the margin is smaller and noisier than one resolution
+made it look.** Pooling the four windows of each arm: AV1 13.4, 23.4, 13.8, 15.3
+cpu-seconds against H.264 11.4, 9.8, 11.9, 11.8 — a ratio of **1.25× on the
+medians and 1.47× on the means**, and the gap between those two numbers is one
+AV1 window at 23.4. H.264 is the strikingly *stable* one: every window inside
+9.8–11.9, against AV1's 13.4–23.4. An earlier draft of this section read 1.74×
+off the 720p rows alone; 1080p is why it does not say that. On a host with two
+cores the median difference is about 3 cpu-seconds a minute, 2.5% of the
+machine.
+
+**And the dropped-frame count does not move with the codec at all.** It is 0 in
+five of the eight windows, 7 and 43 for AV1, and **165 for H.264** — the largest
+number in the table belongs to the codec that is supposed to be cheaper, in the
+window right after an AV1 arm that dropped 43. These are not decoder numbers.
+They are what a shared host does to a 60 fps video element, and the correct
+reading of the whole table is that at these resolutions **this machine is not
+decode-bound in either codec.**
+
+#### So the 387 dropped frames were the present path, not the decoder
+
+The observation that started this was 387 dropped of 4352 at 1280×720@60 with
+YouTube's own overlay calling 480p30 optimal. The same host, the same two cores,
+the same Firefox and the same AV1 stream, with the *compositor* changed from the
+live `wc-proxy` session to a headless weston, drops **0 of 3587** and calls
+1280x720@60 optimal. Nothing about the decoder differs between those two runs.
+
+What differs is what §0.6's successor measures: a cross-VM present costs 216.9 ms
+because `sv_transport::park`'s futex doorbell cannot cross a hypervisor, against
+1.7–2.1 ms locally. A `<video>` element whose frame callbacks arrive at ~4.6 Hz
+will report enormous `droppedVideoFrames`, because that counter is frames
+decoded and never composited — and YouTube's ABR reads exactly that counter to
+decide what is optimal, which is how a machine that decodes 720p60 AV1 on 0.22
+of its two cores gets told it should be watching 480p30.
+
+**The codec change and the doorbell fix are not alternatives and should not be
+reported as one number.** The doorbell fix is what returns the frames — and at
+the time of writing a doorbell measuring ~9 µs across a real boundary is merged
+but **nothing calls it yet**, so anyone re-running this against the live session
+today will still see the 217 ms and should not read it as a decode result. The codec
+change is worth making anyway, on its own smaller merits: it is about 3
+cpu-seconds a minute on a machine that has 120, and it removes the arm whose
+cost varies by 70% window to window. It is not, on this evidence, worth losing
+Opus for on its own.
+
+#### What this does not tell us
+
+1. **No positive control for `HWDEC`.** Every run in this stage read
+   `Unsupported`, on both machines. `vaapitest` fails on devhost too, so the
+   harness has never been shown reading a machine where hardware decode works.
+2. **One video.** Big Buck Bunny is animation and is cheap to decode; the 1.74×
+   is a ratio taken on easy content and film-grain-heavy material would move
+   both arms and probably the ratio.
+3. **The audio changes with the video.** Turning WebM off takes Opus with it, so
+   the H.264 arm decodes AAC where the AV1 arm decoded Opus. Both are small
+   against a 60 fps video decode, but the 7.8 cpu-seconds is a codec *pair*
+   difference and not a video-codec difference, and nothing here separated them.
+4. **Neither number is the user's path.** The harness is headless weston with
+   `wl_shm`, which is the same *shape* `wc-proxy` offers but not the same code;
+   the decode and the one shm copy are shared with the live session and the
+   transport is not.
+
+---
+
 ### 0.18 The API version, negotiated instead of asserted
 
 Built and measured 2026-08-13 on **devhost**. The requirement, in the user's
@@ -2131,15 +2354,14 @@ part is where it matters — the first measurement of the fallback path produced
 ICD whose `vkEnumerateInstanceVersion` said 1.1 and whose physical device said
 1.3, a driver contradicting itself one call apart.
 
-#### 6. The honest statement: what "1.4" would actually cost
+#### 6. The honest statement: what "1.4" actually costs, and who has paid it
 
 Advertising 1.4 while the wire cannot carry a 1.4 command is the same defect
-wearing the other hat, so the number belongs next to the claim. `sv-codegen gap`:
-**740 commands in the registry, 239 carried by the zink profile**, 501 not (23 of
-those unreachable by any profile).
+wearing the other hat, so the number belongs next to the claim. `sv-codegen gap`
+on this branch: **740 commands in the registry, 239 carried by the zink
+profile**, 501 not (23 of those unreachable by any profile).
 
-Resolving the zink profile with `VK_VERSION_1_4` added, against
-vulkan-headers 1.4.350.0:
+Resolving zink with `VK_VERSION_1_4` added, against vulkan-headers 1.4.350.0:
 
 - **239 → 253 commands (+14)**: `vkCmdBindDescriptorSets2`, `vkCmdPushConstants2`,
   `vkCmdPushDescriptorSet`, `vkCmdPushDescriptorSet2`,
@@ -2150,25 +2372,94 @@ vulkan-headers 1.4.350.0:
   `vkTransitionImageLayout`, `vkUnmapMemory2`.
 - **618 → 662 types (+44)**, including `VkPhysicalDeviceVulkan14Features` and
   `VkPhysicalDeviceVulkan14Properties` — the two the Zink regression above turned
-  on — plus the host-image-copy family (`VkCopyMemoryToImageInfo`,
-  `VkHostImageLayoutTransitionInfo`, `VkMemoryToImageCopy`, …), the
-  maintenance-6 and push-descriptor structs, and eight promoted `…Features`
-  blocks.
+  on — plus the host-image-copy family, the maintenance-6 and push-descriptor
+  structs, and eight promoted `…Features` blocks.
 - Nothing is removed: the 1.4 `<remove>` block takes nothing this profile has.
 
-So the answer is: **this build can advertise 1.4 once those fourteen commands
-cross the wire and those forty-four types are generated** — and, separately, once
-`vkMapMemory2`/`vkUnmapMemory2` are reconciled with §5's arena, which owns
-`vkMapMemory` locally and would have to own its successor too. Until then 1.3 is
-not a limitation being hidden; it is the number, and the ICD now says so out loud
-on every run against a 1.4 device.
+**And it does not merely resolve — it refuses.** Adding `VK_VERSION_1_4` to zink
+here does not produce a bigger protocol; it produces a generator error:
 
-**Out of scope and named as such.** The ICD also *over*-promises in the other
-direction: features are mirrored wholesale from the driver, so
-`bufferDeviceAddress` is advertised while `vkGetBufferDeviceAddress` and two
-friends sit in `NOT_IMPLEMENTED`. That is the same "advertise a constant, not the
-truth" shape and it is a live bug, but it is owned elsewhere and nothing in this
-section touches the feature-mirroring path.
+```
+Error: planning profile "zink"
+  VkImageToMemoryCopy.pHostPointer: a `void*` with no `len=` and no policy
+  entry. design.md §7.4 requires every one of these to be a data entry in
+  crates/sv-codegen/src/exceptions.rs; add one, with the reason.
+```
+
+That is §7.4 working, and it is the real gate on 1.4 — not the count.
+
+**`full-api` (b516f1c) has paid it, and this section's numbers are superseded by
+its.** That branch carries **509 of 740** commands in a new `full` profile,
+core 1.4 complete, and it adds exactly the policy the refusal above asks for — a
+name-based `("pHostPointer", VoidPolicy::ArenaOffset)` whose comment names core
+1.4's host image copy as the case it exists for. So the honest updated answer is
+not "fourteen commands away" but:
+
+> **The ceiling moves for free the moment `full` is the profile.** Nothing in
+> this section changes. `Profile::core_api_version` returns 1.4.0 for a
+> `features` list containing `VK_VERSION_1_4`, `DEP_SV_PROTO_CORE_VERSION`
+> carries it into the manifest and `sv_proto::CORE_API_VERSION` into
+> `vkEnumerateInstanceVersion`, in one build, and `negotiate` then stops clamping
+> RADV's 1.4.348 and NVIDIA's 1.4.329. That is the whole reason the ceiling was
+> derived from the profile rather than written down.
+
+Verified, rather than asserted: `SV_PROTO_PROFILE=step3-minimal` — the §13 step 3
+profile, whose only core feature is `VK_VERSION_1_0` — writes
+`"api_version": "1.0.0"` into the manifest with no other edit. The chain tracks
+the profile downward, so it tracks it upward. (It also demonstrates why
+`the_manifest_agrees_with_what_we_report` asserts `minor >= 1`: that profile
+would ship an ICD the loader silently demotes, and the assertion is the thing
+that says so.)
+
+Two things that will *not* follow automatically, and belong to whoever lands
+`full` rather than here. `full-api` deliberately leaves `zink()` at 1.0–1.3 and
+puts 1.4 in a separate profile, so the **default** build still advertises 1.3
+until `SV_PROTO_PROFILE`'s default changes — a decision about what ships, not
+about what is possible. And `vkMapMemory2`/`vkUnmapMemory2` still have to be
+reconciled with §5's arena, which owns `vkMapMemory` locally and would have to
+own its successors too; `full-api` says the same about `hostImageCopy`, which it
+gates in `sv_icd::advertise` because the bounce copy is not written.
+
+Until then 1.3 is not a limitation being hidden; it is the number, and the ICD
+now says so out loud on every run against a 1.4 device.
+
+#### 7. The other direction, and where the two meet
+
+**Out of scope and named as such.** The ICD also *over*-promises: features are
+mirrored wholesale from the driver, so `bufferDeviceAddress` is advertised while
+`vkGetBufferDeviceAddress` and two friends sit in `NOT_IMPLEMENTED`. That is the
+same "advertise a constant, not the truth" shape and it is a live bug. Nothing in
+this section touches the feature-mirroring path — no edit to
+`get_physical_device_features`/`…2` or to `convert.rs`'s `features()`.
+
+The two directions are the same defect and they meet in one place.
+`full-api` filters the advertised device-extension list against
+`sv_icd_entry::INCOMPLETE_EXTENSIONS`, which is "stop advertising what we do not
+implement"; this section is "stop under-advertising what we do". Its finding
+sharpens the point: six commands were *silent* rather than absent —
+`vkGetDeviceQueue2` among them, core 1.1 with no extension to decline, returning
+without writing `*pQueue`, and three of the six were buffer-device-address
+queries returning address zero while the feature was advertised. A version number
+that is too low and a feature list that is too high are the same failure to
+compare a claim against an implementation, and the fix in both directions is the
+same: derive the claim, do not declare it.
+
+#### 8. One deployment consequence, stated loudly
+
+**`WIRE_VERSION` went 1 → 2.** `svDriverVersions` is hand-written in
+`sv_proto::sv`, so it is outside the generated table `protocol_hash` is computed
+over and the hash cannot see it; the coarse counter in front of it is exactly
+what §4.3 keeps that check for. A GPU side built before this commit is refused at
+handshake, correctly.
+
+That matters because on the cross-VM topology the GPU side is a binary *copied*
+into the guest, so rebuilding on the host changes only the host's half. This
+project has twice read a stale deployed binary as a transport fault. So the
+refusal now names the cause and the fix in `RingTransport::finish_attach`
+— beside the `ProtocolHashMismatch` message that already did — and the four
+harnesses that deploy into a guest (`sv-windows-e2e.sh`, `sv-guest-e2e.sh`,
+`sv-guest-host.sh`, `sv-firefox-guest.sh`) say it in their headers. Rebuild and
+re-deploy **both** sides from one tree.
 
 ---
 

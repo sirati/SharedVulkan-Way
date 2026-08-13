@@ -66,6 +66,15 @@ fn main() -> Result<()> {
     // protocol hash and does not need to be: a profile that changes its core
     // version changes its command table, and the hash is over that.
     println!("cargo:rustc-env=SV_PROTOCOL_CORE_VERSION={}", profile.core_api_version());
+    // The same number again, this time for `sv-icd`'s **build script**, which
+    // has to write it into the ICD manifest — a JSON file the Vulkan loader
+    // reads before a line of Rust runs, so it cannot be negotiated and cannot be
+    // read out of a constant either. `links = "sv_proto"` in Cargo.toml is what
+    // makes this reach a dependent build script, as `DEP_SV_PROTO_CORE_VERSION`.
+    // It is the only way Cargo offers, and the alternative — a literal in
+    // `sv-icd/build.rs` kept in step by a test — is the hand-maintained coupling
+    // design.md §0.18 exists to remove.
+    println!("cargo:core_version={}", profile.core_api_version());
     println!(
         "cargo:warning=sv-proto: profile {}, {} commands, {} structs, hash {:#018x}",
         profile.name,
