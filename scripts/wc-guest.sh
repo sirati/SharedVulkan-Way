@@ -1045,7 +1045,9 @@ do_clean() {
   g "rm -rf $GUESTDIR; rm -f /c/Users/<guest-user>/AppData/Local/waycompose/*.lock /c/Users/<guest-user>/AppData/Local/waycompose/wg-* 2>/dev/null; rmdir /c/Users/<guest-user>/AppData/Local/waycompose 2>/dev/null; echo cleaned" 2>&1 | tail -1
   [ -n "$HOST" ] || return 0
   # The export is somebody's real folder, so only what this script made goes.
-  h "rm -rf $HOST_DIR $SHARE/pools $SHARE/live $SHARE/frames; rm -f $SHARE/arena $SHARE/coh.bin $SHARE/flush.bin $SHARE/s4.log; rmdir $SHARE 2>/dev/null; echo cleaned $HOST" | tail -1
+  # `keymaps` is stage 6's and was not added here when it landed, so `clean` left
+  # the share behind and `rmdir` failed silently on a directory that looked empty.
+  h "rm -rf $HOST_DIR $SHARE/pools $SHARE/live $SHARE/frames $SHARE/keymaps; rm -f $SHARE/arena $SHARE/coh.bin $SHARE/flush.bin $SHARE/s4.log; rmdir $SHARE 2>/dev/null; echo cleaned $HOST" | tail -1
 }
 
 pin_key
