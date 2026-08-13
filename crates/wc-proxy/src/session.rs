@@ -1008,7 +1008,7 @@ fn materialise(d: &Descriptor) -> io::Result<std::os::fd::OwnedFd> {
         // Detected by the prefix rather than by a flag, because the prefix is
         // what `wc_handle::platform::random_section_name` puts there on Windows
         // and it is the only thing in the descriptor that distinguishes the two
-        // cases. See docs/design.md §10.
+        // cases. See docs/design.md §11.2.
         Descriptor::Section { name, .. } if name.starts_with("Local\\") || name.starts_with("Global\\") => {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

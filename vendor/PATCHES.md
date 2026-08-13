@@ -308,7 +308,7 @@ things this file already records rather than new positions.
   opens a keymap is on the far side of the boundary. `create_shared` asks
   `wc_handle::publish` where objects made for a peer go and falls back to a
   section when nobody said — which is right for two Windows processes and is
-  what this file already documented. See `docs/design.md` §10.
+  what this file already documented. See `docs/design.md` §11.2.
 
 Nothing else in smithay changed for stage 6. The seat, the capabilities, the
 pointer and the keyboard are upstream code driven from `wc-compositor`.

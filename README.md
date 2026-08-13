@@ -18,10 +18,22 @@ keycodes, and gets a keymap across the boundary — which is `wl_keyboard.keymap
 `h` argument going the *other* way from a `wl_shm` pool, and is the direction
 stage 4 implemented without ever exercising. `weston-terminal`, unmodified, in a
 window with Windows' own caption, with text typed into it by `SendInput`:
-[`docs/stage6-typing.png`](docs/stage6-typing.png).
+[`docs/stage6-typing.png`](docs/stage6-typing.png). Under Wine — stage 5 put the
+earlier stages on the real guest, and no input has run there yet.
+
+**Two known defects of the keyboard, stated here because both are silent**
+(`docs/design.md` §11.4):
+
+* **A layout outside `us`/`gb`/`de`/`fr` produces American letters.** The key
+  *positions* are right, so the keyboard feels like it works and the characters
+  are not the ones printed on the keys. Nothing errors. Adding a layout is three
+  lines.
+* **There is no IME, so CJK input is impossible** — not degraded, impossible.
+  `WM_IME_*` is not handled and `text-input-v3` is not implemented, so there is
+  nowhere for a composed string to go.
 
 Read [`docs/design.md`](docs/design.md) first. It decides things and says why —
-§7 is stage 2, §10 is stage 6. [`vendor/PATCHES.md`](vendor/PATCHES.md) is the
+§7 is stage 2, §11 is stage 6. [`vendor/PATCHES.md`](vendor/PATCHES.md) is the
 inventory of what was changed in the forked upstream crates.
 
 ## Getting a shell
@@ -86,11 +98,26 @@ Read the header of `wc-xdg.sh` for why the client is that one and not
 `weston-flower` — the answer is `docs/design.md` §2.4 arriving on schedule, and
 it is a real limit rather than a test convenience.
 
+```
+WC_HOST=you@vm-host WC_HOST_WESTON=/path/to/weston/bin scripts/wc-guest.sh all
+```
+
+The same thing on **real Windows**, in a VM. Blocks 1-6 run from here; blocks
+7-9 are stage 4 and run the proxy and the client on `WC_HOST`, the machine that
+shares a filesystem with the guest, because a pixel has to land in memory both
+sides can name and protocol bytes do not. Without `WC_HOST` those three blocks
+skip and say why.
+
+One check is expected to fail: the shared mount is not coherent while mapped, so
+a client that redraws every frame gets a frozen window and `wc-guest.sh` says
+so. `docs/design.md` §10.7 is the measurement and why it must keep failing.
+
 ## Layout
 
 ```
 crates/
   wc-handle      the `h`-argument shim — what an fd becomes with no SCM_RIGHTS
+                 (and `wc-poolcost`, which measures what reaching one costs)
   wc-transport   AF_UNIX on both platforms, peer credentials, accept
   wc-server      the stage-1 server
   wc-probe       a client that writes the wire format by hand
@@ -126,7 +153,11 @@ scripts/
   probe-input.c      SendInput/PostMessage into the compositor's window, so the
                      keystrokes in that test are Win32's rather than ours
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux
-  probe-filemap-peer.c   MAP_SHARED mmap? Measured before stage 4 depended on it
+  probe-filemap-peer.c   MAP_SHARED mmap? Measured before stage 4 depended on it,
+                     and measured again across the hypervisor in stage 5
+  wc-guest.sh        the same acceptance tests on the real guest, plus stage 5:
+                     coherency, what a pool costs per transport, and stage 4
+                     across a real VM boundary
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)

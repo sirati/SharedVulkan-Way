@@ -44,7 +44,7 @@
 # this project. Input injection is a *worse* case than most, because `SendInput`
 # reaches into the window manager and Wine's is not Windows'. A pass says the
 # chain is self-consistent and structurally possible; `scripts/wc-guest.sh` is
-# the arbiter, and §10 lists what has to be re-checked there.
+# the arbiter, and §11.11 lists what has to be re-checked there.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

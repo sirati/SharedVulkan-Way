@@ -3,6 +3,7 @@
 #
 #   scripts/wc-guest.sh deploy   cross-compile the C probes and copy everything over
 #   scripts/wc-guest.sh run      run every check and print the table
+#   scripts/wc-guest.sh stage4   only blocks 7-9, the stage-4 half (needs WC_HOST)
 #   scripts/wc-guest.sh clean    remove everything this script put on the guest
 #   scripts/wc-guest.sh all      deploy, run, clean
 #
@@ -42,6 +43,29 @@
 # no ancillary data for a TCP hop to lose. The compositor's socket, afunix.sys,
 # the framing, wepoll and the whole server are on the real side of the pipe.
 #
+# THE SECOND MACHINE, WHICH STAGE 4 NEEDS AND STAGES 1-3 DID NOT
+#
+# Everything above moves *protocol bytes*, and a TCP hop moves those. Stage 4
+# moves *pixels*, and a pixel has to arrive in memory both sides can name. The
+# only such memory on this deployment is virtiofsd's export -- `/srv/winshare`
+# on the VM host, `Z:` in the guest -- and that export exists between the guest
+# and its own host, not between the guest and whichever workstation is driving
+# the tests. So the stage-4 block runs the proxy and the unmodified client on
+# **`WC_HOST`**: an ssh target for a Linux machine that shares a filesystem with
+# the guest. Everything else still runs from here.
+#
+# This is not a weakening. The proxy's job is to be a Wayland server to a local
+# client and a client of the Windows compositor, and it does that on whichever
+# Linux box the shared region is reachable from. What it does mean is that a
+# run with `WC_HOST` unset cannot test stage 4 at all, and says so rather than
+# testing something adjacent.
+#
+# The rule is untouched by any of this: no descriptor crosses. The client's fd
+# is consumed by the proxy on `WC_HOST` and what reaches the guest is a path or
+# an `(arena, offset, len)` triple -- which the checks below verify from the
+# compositor's own count of what it opened, not from the fact that pixels
+# appeared.
+#
 # TWO OPERATIONAL LESSONS, BOTH PAID FOR
 #
 # * A Windows process backgrounded inside an ssh session keeps that session
@@ -54,11 +78,19 @@
 #   reconnect, and fail as `agent refused operation` -- which looks exactly like
 #   a locked vault and is not one. The guest's sshd also caps at six key
 #   attempts and the agent offers six keys, so one identity is pinned.
+#
+# A THIRD, PAID FOR IN STAGE 5. The guest's user is an administrator, and
+# Windows' stock `sshd_config` ends with `Match Group administrators` /
+# `AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys`. So
+# `~/.ssh/authorized_keys` is read by nobody, and a key appended there is
+# offered, refused, and looks exactly like a key problem. `WC_HOST`'s key goes
+# in the ProgramData file.
 set -uo pipefail
 
 MODE="${1:-all}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
+LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
 GUESTDIR='/c/Users/<guest-user>/wctest'
@@ -67,6 +99,15 @@ APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 KEY="${WC_GUEST_KEY:-/tmp/wc-guest-key.pub}"
 PORT_BASE="${WC_PORT_BASE:-57271}"
+
+# The stage-4 half. Unset WC_HOST and blocks 7-9 skip with their reason.
+HOST="${WC_HOST:-}"                                  # ssh target of the VM host
+HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage4}"            # where its binaries land
+SHARE="${WC_HOST_SHARE:-/srv/winshare/wc}"           # the export, as the host spells it
+SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc}"                # the export, as the guest spells it
+HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"       # how the host reaches the guest
+HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"      # and with which key (expanded there)
+HOST_WESTON="${WC_HOST_WESTON:-}"                    # dir holding weston-terminal, or ""
 
 STAGE=$(mktemp -d /tmp/wc-guest-XXXXXX)
 RUNDIR=$(mktemp -d /tmp/wc-guest-run-XXXXXX)
@@ -93,6 +134,134 @@ pin_key() {
 
 g()  { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 gq() { ssh "${SSHOPT[@]}" "$GUEST" "$@" 2>&1; }
+h()  { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
+
+# ------------------------------------------------- the stage-4 driver --------
+#
+# One experiment, run on WC_HOST: the Windows compositor on the guest, the relay
+# beside it, an `ssh -L` unix socket into that relay, `wc-proxy` on the far end
+# of it, and an unmodified libwayland client on the proxy. It prints its logs
+# with markers and the caller below asserts on them.
+#
+# Written out from here rather than kept as a second file in `scripts/`. It has
+# exactly one caller, it must agree with that caller about every marker it
+# prints, and a stale copy left on a host from a previous run that silently
+# disagrees is a failure mode with no symptom -- the run would pass while
+# testing the old thing.
+write_stage4_driver() { cat >"$1" <<'DRIVER'
+#!/usr/bin/env bash
+# wc-stage4 -- generated by scripts/wc-guest.sh; do not edit on the host.
+#   wc-stage4 <transport> <client> <port> <share> <share_win> <guest> <key> <weston> <secs>
+set -uo pipefail
+TRANSPORT=$1 CLIENT=$2 PORT=$3 SHARE=$4 SHARE_WIN=$5 G=$6 GKEY=$7 WESTON=$8 SECS=$9
+# Unique per invocation. Reusing a name across runs cost an hour: killing the
+# ssh session that started a compositor kills the compositor, but the socket
+# node it bound survives it, and the next `bind` then fails with "Could not
+# write to XDG_RUNTIME_DIR" -- which reads as a permissions problem and is a
+# leftover file.
+SOCK="wg-s4-$$"
+HERE=$(cd "$(dirname "$0")" && pwd)
+ARENA_SIZE=$((64 * 1024 * 1024))
+GK=(-i "$GKEY" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
+
+RUN=$(mktemp -d /tmp/wc-s4-XXXXXX); chmod 700 "$RUN"
+trap 'rm -rf "$RUN"' EXIT
+
+rm -rf "$SHARE/frames" "$SHARE/live" "$SHARE/keymaps"
+mkdir -p "$SHARE/frames" "$SHARE/live" "$SHARE/keymaps"
+chmod 777 "$SHARE/frames" "$SHARE/live" "$SHARE/keymaps"; rm -f "$SHARE/s4.log"
+
+# STAGE 6, and this block would fail without it. The compositor now has a
+# keyboard, so a client that binds `wl_seat` receives a `wl_keyboard.keymap` —
+# an `h` in the *server-to-client* direction. Published as a `Local\wc-…`
+# section it is unopenable by a Linux process and `wc-proxy` ends the connection
+# with a diagnosis, which is what happened to `wc-proxy.sh` the moment stage 6
+# landed: `weston-terminal` binds a seat and `weston-presentation-shm` does not,
+# so exactly one of the two clients here starts failing. See docs/design.md
+# §11.2.
+#
+# **This is also the measurement §11.11 item 3 asks for, and it is not free.**
+# §10.3 found the export incoherent for two *live* mappings and coherent for a
+# closed write — and a keymap is a closed write, because `write_section` unmaps
+# before returning. What §10.3 did not measure is this direction: its
+# closed-write row is host-writes/guest-reads, and a keymap is
+# guest-writes/host-reads. So a failure here is a *result* rather than a
+# regression, and the proxy's error message names the descriptor kind so it can
+# be told apart from anything else.
+KEYMAP_EXTRA=(--shared-dir "$SHARE_WIN\\keymaps" --shared-peer-prefix "$SHARE/keymaps/")
+
+case "$TRANSPORT" in
+  arena)
+    # Provided out of band, before either side starts, which is what an arena
+    # is. Truncated to zero first: a region left full of the previous run's
+    # pixels is a way for a frozen frame to look like a live one.
+    : >"$SHARE/arena"; truncate -s $ARENA_SIZE "$SHARE/arena"; chmod 666 "$SHARE/arena"
+    COMP_EXTRA=(--arena "0:$ARENA_SIZE:$SHARE_WIN\\arena")
+    PROXY_EXTRA=(--transport arena --arena-path "$SHARE/arena" --arena-id 0 --arena-size $ARENA_SIZE) ;;
+  shared-file)
+    COMP_EXTRA=()
+    PROXY_EXTRA=(--transport shared-file --pool-dir "$SHARE/live" --peer-prefix "$SHARE_WIN\\live\\") ;;
+  *) echo "S4-FAIL: unknown transport $TRANSPORT"; exit 2 ;;
+esac
+
+# And a compositor that outlived its session holds the guest's only window
+# station slot as well as its socket, so both go before anything starts.
+ssh "${GK[@]}" "$G" "taskkill //F //IM wc-compositor.exe >/dev/null 2>&1; rm -f /c/Users/<guest-user>/AppData/Local/waycompose/wg-s4-* 2>/dev/null; true" >/dev/null 2>&1
+
+ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd wctest && ./wc-compositor.exe \
+  --socket $SOCK --timeout $((SECS + 45)) --dump-frames '$SHARE_WIN\\frames' \
+  --log '$SHARE_WIN\\s4.log' ${COMP_EXTRA[*]@Q} ${KEYMAP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
+COMP=$!
+sleep 8
+
+ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd wctest && ./probe-relay.exe $PORT \
+  'C:\\Users\\<guest-user>\\AppData\\Local\\waycompose\\$SOCK' --timeout $((SECS + 30))" >"$RUN/relay.out" 2>&1 &
+RELAY=$!
+sleep 4
+
+ssh "${GK[@]}" -N -L "$RUN/up.sock:127.0.0.1:$PORT" "$G" >"$RUN/fwd.out" 2>&1 &
+FWD=$!
+sleep 4
+
+if [ -S "$RUN/up.sock" ]; then
+  XDG_RUNTIME_DIR="$RUN" "$HERE/wc-proxy" --upstream "$RUN/up.sock" --socket wl-proxy \
+    --runtime-dir "$RUN" "${PROXY_EXTRA[@]}" --copy damage \
+    --accept-timeout 20 --timeout $((SECS + 5)) >"$RUN/proxy.log" 2>&1 &
+  PROXY=$!
+  sleep 2
+  XDG_RUNTIME_DIR="$RUN" WAYLAND_DISPLAY=wl-proxy timeout "$SECS" "$WESTON/$CLIENT" \
+    >"$RUN/cli.log" 2>&1
+  echo "S4-CLIENT-RC: $?"
+else
+  echo "S4-FAIL: the ssh -L forward produced no socket"
+  PROXY=0
+fi
+
+sleep 3
+kill $PROXY $FWD $RELAY $COMP 2>/dev/null; wait 2>/dev/null
+sleep 1
+
+# What the compositor presented, counted from the files it dumped rather than
+# from anything it said. `distinct` against `total` is the whole of the
+# staleness measurement: a client that redraws every frame and a compositor
+# that sees every redraw make those two numbers close.
+tot=$(ls "$SHARE/frames"/*.ppm 2>/dev/null | wc -l)
+if [ "$tot" -gt 0 ]; then
+  md5sum "$SHARE/frames"/*.ppm | cut -d' ' -f1 | sort > "$RUN/h"
+  dis=$(uniq -c "$RUN/h" | wc -l)
+  top=$(uniq -c "$RUN/h" | sort -rn | head -1 | awk '{print $1}')
+  geo=$(head -2 "$(ls "$SHARE/frames"/*.ppm | head -1)" | tail -1)
+else
+  dis=0; top=0; geo=none
+fi
+echo "S4-FRAMES: total=$tot distinct=$dis top=$top first=$geo"
+
+echo "S4-PROXY-BEGIN";  cat "$RUN/proxy.log"; echo "S4-PROXY-END"
+echo "S4-COMP-BEGIN";   cat "$SHARE/s4.log" 2>/dev/null; echo "S4-COMP-END"
+echo "S4-RELAY-BEGIN";  cat "$RUN/relay.out"; echo "S4-RELAY-END"
+echo "S4-CLIENT-BEGIN"; head -20 "$RUN/cli.log"; echo "S4-CLIENT-END"
+DRIVER
+}
 
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
@@ -121,17 +290,64 @@ do_deploy() {
     echo "  FAILED to generate a keymap"; exit 1; }
   echo "  generated us.xkb ($(wc -c < "$STAGE/us.xkb") bytes)"
 
+  # probe-filemap.exe has no `-lws2_32` and is the coherency half of block 7.
+  if $cc -O1 -o "$STAGE/probe-filemap.exe" "$ROOT/scripts/probe-filemap.c" 2>"$STAGE/cc.log"; then
+    echo "  built probe-filemap.exe"
+  else
+    echo "  FAILED to build probe-filemap.exe"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
+  fi
+
   local missing=0
-  for e in wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe; do
+  for e in wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe; do
     if [ -f "$WIN_BIN/$e" ]; then cp "$WIN_BIN/$e" "$STAGE/"; else
       echo "  missing $WIN_BIN/$e"; missing=1
     fi
   done
   [ $missing -eq 0 ] || { echo "error: build first: cargo build --target x86_64-pc-windows-gnu"; exit 1; }
 
+  # A `.exe` still running holds its own file open, and `scp` over it fails as
+  # `dest open ...: Failure` -- which reads as a permissions or disk problem and
+  # is neither. A compositor left behind by a killed ssh session is the usual
+  # cause; so is one that survived a guest reboot, which has been seen.
+  g "taskkill //F //IM wc-compositor.exe //IM wc-server.exe //IM probe-relay.exe >/dev/null 2>&1; true" >/dev/null 2>&1
+
   g "mkdir -p $GUESTDIR" || exit 1
   scp "${SSHOPT[@]}" "$STAGE"/*.exe "$STAGE/us.xkb" "$GUEST:wctest/" >/dev/null || exit 1
   echo "  copied $(ls "$STAGE" | grep -c . ) files to $GUEST:$GUESTDIR"
+
+  [ -n "$HOST" ] || { echo "  WC_HOST unset -- nothing deployed for stage 4"; return; }
+
+  # The stage-4 half, onto the machine that shares a filesystem with the guest.
+  # `probe-filemap-peer` is built here and copied, which is fine on a NixOS pair
+  # that shares a store and is the first thing to suspect if it will not run
+  # there; the check below is what turns that into a message rather than a
+  # mystery.
+  if gcc -O1 -o "$STAGE/probe-filemap-peer" "$ROOT/scripts/probe-filemap-peer.c" 2>"$STAGE/cc.log"; then
+    echo "  built probe-filemap-peer (native)"
+  else
+    echo "  FAILED to build probe-filemap-peer"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
+  fi
+  [ -x "$LINUX_BIN/wc-proxy" ] || { echo "error: no $LINUX_BIN/wc-proxy -- cargo build first"; exit 1; }
+  write_stage4_driver "$STAGE/wc-stage4"
+
+  # `probe-filemap.c`'s pattern, generated here so that both the generator and
+  # the verifier are this project's, and shipped rather than reproduced on the
+  # host -- a second implementation of `(k * 7 + 3) & 0xff` is a second thing
+  # that can be wrong.
+  { for i in $(seq 0 4095); do printf '%o\n' $(( (i * 7 + 3) % 256 )); done; } \
+    | while read -r o; do printf "\\$o"; done > "$STAGE/flush.bin"
+  [ "$(wc -c < "$STAGE/flush.bin")" = 4096 ] || { echo "  FAILED to generate flush.bin"; exit 1; }
+
+  h "mkdir -p $HOST_DIR $SHARE" >/dev/null
+  scp "${SSHOPT[@]}" "$STAGE/probe-filemap-peer" "$STAGE/wc-stage4" "$STAGE/flush.bin" \
+      "$LINUX_BIN/wc-proxy" "$HOST:$HOST_DIR/" >/dev/null || exit 1
+  h "chmod +x $HOST_DIR/*" >/dev/null
+  echo "  copied wc-proxy, probe-filemap-peer and the driver to $HOST:$HOST_DIR"
+  local vers; vers=$(h "$HOST_DIR/probe-filemap-peer 2>&1 | head -1")
+  case "$vers" in
+    *usage*) echo "  probe-filemap-peer runs on $HOST" ;;
+    *) echo "  WARNING: probe-filemap-peer will not run on $HOST: $vers" ;;
+  esac
 }
 
 # ------------------------------------------------------------------- run -----
@@ -277,24 +493,265 @@ do_run() {
   gq "cd $GUESTDIR && for e in wc-server.exe wc-compositor.exe; do s=\$(date +%s%N); ./\$e --socket ld\$e --timeout 1 >/dev/null 2>&1; f=\$(date +%s%N); echo \"\$e: \$(( (f-s)/1000000 )) ms wall, of which 1000 ms is the idle timeout\"; done" >"$RUNDIR/load.log"
   sed 's/^/        /' "$RUNDIR/load.log"
   note "docs/design.md §7.8 item 6: the 56 MB debug binary costs nothing measurable to load."
+
+  do_coherency
+  do_poolcost
+  do_stage4
+}
+
+# =============================================================================
+# Stage 4 on the real boundary. docs/design.md §9.11, all five items.
+# =============================================================================
+
+# ------------------------------------------------------------------ 7 --------
+# §9.11 item 1. Is the shared filesystem coherent -- does a store one side makes
+# through its own mapping become visible to the other with no flush and no
+# reopen? That decides whether `SharedFile` exists on the real boundary, and
+# `probe-filemap.c`'s header says why a one-way check is not enough.
+do_coherency() {
+  echo
+  echo "== 7. the shared filesystem, and whether a mapping of it is coherent =="
+  if [ -z "$HOST" ]; then
+    nope "WC_HOST unset: no Linux machine here shares a filesystem with the guest"
+    note "Set WC_HOST, WC_HOST_SHARE and WC_GUEST_SHARE to the two spellings of the export."
+    return
+  fi
+
+  # THE CONTROL, AND IT IS THE POINT OF THE BLOCK. A probe that reports
+  # "not coherent" is worth nothing unless it can report "coherent", so the same
+  # binary runs first against a local NTFS path with two Windows processes: one
+  # holds a mapping and has not closed it, the other opens and verifies. If that
+  # says MISMATCH the measurement below is broken, not the mount.
+  gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && rm -f ctl.bin && (./probe-filemap.exe '$GUESTDIR_WIN\\ctl.bin' 65536 > ctl-w.log 2>&1 &) && sleep 2 && ./probe-filemap.exe --open '$GUESTDIR_WIN\\ctl.bin' 65536; sleep 5; echo '--writer--'; cat ctl-w.log" >"$RUNDIR/coh-ctl.log"
+  if grep -q "^\[fm\] MATCH" "$RUNDIR/coh-ctl.log"; then
+    ok "control: on local NTFS a second process sees the first's live stores, unflushed"
+  else
+    bad "control: NTFS was not coherent either -- the probe is broken, not the mount"
+    sed 's/^/        /' "$RUNDIR/coh-ctl.log" | head -8
+  fi
+
+  # The measurement. The Windows side creates and fills through its mapping and
+  # waits for 0xAB; the Linux side verifies, stores 0xAB and waits for 0xCD.
+  h "mkdir -p $SHARE; : >$SHARE/coh.bin; truncate -s 65536 $SHARE/coh.bin; chmod 666 $SHARE/coh.bin" >/dev/null
+  ( gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && ./probe-filemap.exe '$SHARE_WIN\\coh.bin' 65536" >"$RUNDIR/coh-win.log" ) &
+  local w=$!
+  sleep 2
+  h "$HOST_DIR/probe-filemap-peer $SHARE/coh.bin 65536" >"$RUNDIR/coh-lin.log"
+  wait $w 2>/dev/null
+
+  local w2l l2w
+  grep -q "SAW the peer's write" "$RUNDIR/coh-win.log" && l2w=yes || l2w=no
+  grep -q "peer\] pattern from the Windows side: MATCH" "$RUNDIR/coh-lin.log" && w2l=yes || w2l=no
+  if [ "$w2l" = yes ] && [ "$l2w" = yes ]; then
+    ok "the export is coherent in both directions: \`SharedFile\` is a live transport here"
+  else
+    ok "measured: the export is NOT coherent while mapped (guest->host $w2l, host->guest $l2w)"
+    note "This is a result, not a failure: virtio-fs without DAX gives each side its own"
+    note "pages, exactly as docs/design.md §9.10 item 2 predicted. Block 9 measures what"
+    note "it costs a real client."
+  fi
+  sed 's/^/        /' "$RUNDIR/coh-lin.log" | head -3
+  grep -E "SAW|NEVER" "$RUNDIR/coh-win.log" | sed 's/^/        /'
+
+  # The weaker property, which is a different question and has a different
+  # answer. `flush.bin` holds the same pattern, written and closed on the host
+  # before the guest ever looks; the guest then opens it for the first time. So
+  # this is host-writes-then-closes, guest-opens-fresh -- the direction the
+  # pixels travel, without either side holding a mapping across the other's
+  # write. That is the property a filesystem is obliged to have and the one
+  # above is not, and separating them is what stops "not coherent" being read
+  # as "the mount does not work".
+  h "cp $HOST_DIR/flush.bin $SHARE/flush.bin; chmod 666 $SHARE/flush.bin; wc -c < $SHARE/flush.bin" >"$RUNDIR/flush-mk.log"
+  gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && ./probe-filemap.exe --open '$SHARE_WIN\\flush.bin' 4096" >"$RUNDIR/flush.log"
+  if grep -q "^\[fm\] MATCH" "$RUNDIR/flush.log"; then
+    ok "a closed write does cross: on a fresh open the guest maps the host's bytes exactly"
+  else
+    bad "even a closed write did not cross"; sed 's/^/        /' "$RUNDIR/flush.log"
+  fi
+}
+
+# ------------------------------------------------------------------ 8 --------
+# §9.11 item 2, which the section calls "the measurement that turns a preference
+# into a decision": what a pool costs the receiver, per transport, across the
+# hypervisor. `wc-poolcost` measures the shipping path -- `Handle::map` -- and
+# not an imitation of it.
+do_poolcost() {
+  echo
+  echo "== 8. what a pool costs the compositor, per transport =="
+  if [ -z "$HOST" ]; then
+    nope "WC_HOST unset: no shared filesystem, so no pool to open across one"
+    return
+  fi
+
+  local n=32 size=1048576 arena=$((64 * 1024 * 1024))
+  # The pool files are created **by the peer**, on the far side of the mount,
+  # because that is who creates them in the real path and a file this process
+  # made would be warm in the wrong cache.
+  h "rm -rf $SHARE/pools; mkdir -p $SHARE/pools; for i in \$(seq 0 $((n - 1))); do truncate -s $size \$(printf $SHARE/pools/pc-%06d.bin \$i); done; : >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod -R a+rw $SHARE/pools $SHARE/arena" >/dev/null
+
+  gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && ./wc-poolcost.exe --iters $n --size $size --sections --files '$SHARE_WIN\\pools' --arena '$SHARE_WIN\\arena:$arena'" >"$RUNDIR/cost-share.log"
+  sed 's/^/        /' "$RUNDIR/cost-share.log"
+
+  # The control that separates the hypervisor from Windows: the identical loop
+  # over a local NTFS directory. Without it, a slow `CreateFileW` could be
+  # Windows being slow rather than the mount, and the decision would rest on an
+  # attribution nothing had checked.
+  gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && mkdir -p pools && ./wc-poolcost.exe --prepare '$GUESTDIR_WIN\\pools' --iters $n --size $size >/dev/null && ./wc-poolcost.exe --iters $n --size $size --files '$GUESTDIR_WIN\\pools'" >"$RUNDIR/cost-ntfs.log"
+  sed 's/^/        /' "$RUNDIR/cost-ntfs.log"
+
+  local sf ar ntfs
+  sf=$(awk '/shared-file/ {print int($3)}' "$RUNDIR/cost-share.log" | head -1)
+  ar=$(awk '/arena-slice/ {print int($3)}' "$RUNDIR/cost-share.log" | head -1)
+  ntfs=$(awk '/shared-file/ {print int($3)}' "$RUNDIR/cost-ntfs.log" | head -1)
+
+  if [ -n "$sf" ] && [ -n "$ntfs" ] && [ "$ntfs" -gt 0 ] && [ "$sf" -gt $((ntfs * 5)) ]; then
+    ok "the mount, not Windows: the same open costs ${sf} us over the export and ${ntfs} us on NTFS"
+  else
+    bad "the export's open (${sf:-?} us) is not distinguishable from NTFS's (${ntfs:-?} us)"
+  fi
+
+  # The decision, stated as a ratio so it can come out either way. On one
+  # machine §9.5 measured these the same; if they are the same here too, the
+  # arena has no cost argument and this must say so.
+  if [ -n "$sf" ] && [ -n "$ar" ]; then
+    if [ "$sf" -gt $((ar * 20 + 20)) ]; then
+      ok "the decision: a pool costs ${sf} us as a shared file and ${ar} us as an arena slice (~$((sf / (ar + 1)))x)"
+    else
+      ok "measured: the two transports cost the same here (${sf} us vs ${ar} us) -- no cost argument for either"
+    fi
+  else
+    bad "the cost measurement produced no numbers"
+  fi
+}
+
+# ------------------------------------------------------------------ 9 --------
+# §9.11 items 3, 4 and 5: the proxy reaching the guest through the relay, what a
+# real client's pools do when they get there, and whether the run still reports
+# the transport that actually served the pixels.
+do_stage4() {
+  echo
+  echo "== 9. stage 4 across the real boundary: proxy -> ssh -L -> relay -> afunix =="
+  if [ -z "$HOST" ]; then
+    nope "WC_HOST unset: the proxy and the client need the shared filesystem"
+    note "§9.11 item 3's shape is implemented and untested without one."
+    return
+  fi
+  if [ -z "$HOST_WESTON" ]; then
+    nope "WC_HOST_WESTON unset: no unmodified third-party client on $HOST"
+    note "Our own binaries on both ends would be a matched pair; see the header."
+    return
+  fi
+
+  s4_run term  arena       weston-terminal         $((PORT_BASE + 10)) 12
+  s4_run pres  arena       weston-presentation-shm $((PORT_BASE + 11)) 20
+  s4_run termf shared-file weston-terminal         $((PORT_BASE + 12)) 12
+}
+
+# s4_run <tag> <transport> <client> <port> <seconds>
+s4_run() {
+  local tag=$1 transport=$2 client=$3 port=$4 secs=$5
+  local log="$RUNDIR/s4-$tag.log"
+  echo "  -- $client / $transport --"
+  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" $HOST_WESTON $secs" >"$log"
+
+  if grep -q "S4-FAIL" "$log"; then
+    bad "$tag: $(grep S4-FAIL "$log")"
+    return
+  fi
+
+  grep -q "xdg_toplevel created" "$log" \
+    && ok "$tag: an unmodified libwayland client reached xdg_toplevel on the guest's compositor" \
+    || { bad "$tag: no xdg_toplevel"; sed -n '/S4-COMP-BEGIN/,/S4-COMP-END/p' "$log" | head -12; return; }
+
+  grep -q "window .* created (HWND" "$log" \
+    && ok "$tag: a real Windows HWND was created for it  <-- §8.11 item 1, on the guest" \
+    || bad "$tag: no HWND"
+
+  local presents
+  presents=$(grep -o "([0-9]* frames presented)" "$log" | grep -o "[0-9]*" | tail -1)
+  presents=${presents:-0}
+  [ "$presents" -ge 2 ] \
+    && ok "$tag: $presents frames of the client's pixels were blitted into it" \
+    || bad "$tag: only $presents frame(s) presented"
+
+  # §9.11 item 5. The compositor's own count of what it opened, which is the
+  # only thing between "the pixels arrived" and "the pixels arrived the way we
+  # think they did".
+  local counts
+  counts=$(grep -o "mapped: [0-9]* section, [0-9]* shared-file, [0-9]* arena-slice" "$log" | tail -1)
+  case "$transport:$counts" in
+    "shared-file:mapped: 0 section, "[1-9]*" shared-file, 0 arena-slice")
+      ok "$tag: the compositor opened only shared files by name ($counts)" ;;
+    "arena:mapped: 0 section, 0 shared-file, "[1-9]*" arena-slice")
+      ok "$tag: the compositor resolved only arena offsets, opening nothing ($counts)" ;;
+    *)
+      bad "$tag: wrong transport served the pixels: ${counts:-nothing recorded}" ;;
+  esac
+
+  local fds
+  fds=$(grep -o "[0-9]* fds in, [0-9]* out" "$log" | tail -1)
+  case "$fds" in
+    *" 0 out") ok "$tag: the client's descriptors stopped at the proxy ($fds)" ;;
+    *) bad "$tag: the proxy sent $fds" ;;
+  esac
+
+  # §9.11 item 4: the pool growth the deferral design rests on. What matters is
+  # not the count -- see below, it is not a constant -- but that every resize
+  # was absorbed before anything else was asked of the pool.
+  local pools
+  pools=$(grep -o "[0-9]* pools ([0-9]* released, [0-9]* resizes, [0-9]* overflows)" "$log" | tail -1)
+  case "$pools" in
+    *"0 overflows)") ok "$tag: $pools -- every resize arrived before the pool was used" ;;
+    *) bad "$tag: $pools" ;;
+  esac
+
+  # And what the frames themselves say. `distinct` well below `total` means the
+  # compositor presented the same image many times: for a client that redraws
+  # every frame that is a stale mapping, and it is invisible in every check
+  # above.
+  local fr tot dis top
+  fr=$(grep "^S4-FRAMES:" "$log")
+  tot=$(echo "$fr" | grep -o "total=[0-9]*" | cut -d= -f2)
+  dis=$(echo "$fr" | grep -o "distinct=[0-9]*" | cut -d= -f2)
+  top=$(echo "$fr" | grep -o "top=[0-9]*" | cut -d= -f2)
+  note "$tag: ${tot:-0} frames dumped, ${dis:-0} of them distinct, the commonest repeated ${top:-0} times"
+  if [ "$client" = weston-presentation-shm ] && [ "${tot:-0}" -gt 20 ]; then
+    # This client redraws every frame, so on a coherent region almost every
+    # dumped frame differs. `top` is the number that catches a frozen mapping.
+    if [ "${top:-0}" -lt $((tot / 4)) ]; then
+      ok "$tag: the window is live -- no single image accounts for more than a quarter of $tot frames"
+    else
+      bad "$tag: the mapping is stale -- one image is $top of $tot frames from a client that redraws every one"
+      note "Expected on this deployment and it is block 7's result arriving as pixels: the"
+      note "region is a file on a mount that is not coherent while mapped, so the compositor"
+      note "reads its own cached copy. Nothing above catches it -- the HWND, the frame count"
+      note "and the transport line are all correct. What makes it pass is a coherent region:"
+      note "virtio-fs with DAX, or the arena this is standing in for -- guest RAM located"
+      note "through QEMU's flat view (docs/design.md §9.10 item 3), which is not a file."
+    fi
+  fi
 }
 
 # ------------------------------------------------------------------ clean ----
 do_clean() {
   echo "== clean =="
   g "rm -rf $GUESTDIR; rm -f /c/Users/<guest-user>/AppData/Local/waycompose/*.lock /c/Users/<guest-user>/AppData/Local/waycompose/wg-* 2>/dev/null; rmdir /c/Users/<guest-user>/AppData/Local/waycompose 2>/dev/null; echo cleaned" 2>&1 | tail -1
+  [ -n "$HOST" ] || return 0
+  # The export is somebody's real folder, so only what this script made goes.
+  h "rm -rf $HOST_DIR $SHARE/pools $SHARE/live $SHARE/frames; rm -f $SHARE/arena $SHARE/coh.bin $SHARE/flush.bin $SHARE/s4.log; rmdir $SHARE 2>/dev/null; echo cleaned $HOST" | tail -1
 }
 
 pin_key
 case "$MODE" in
   deploy) do_deploy ;;
   run)    do_run ;;
+  stage4) do_coherency; do_poolcost; do_stage4 ;;
   clean)  do_clean ;;
   all)    do_deploy; echo; do_run; echo; do_clean ;;
-  *) echo "usage: $0 [deploy|run|clean|all]"; exit 2 ;;
+  *) echo "usage: $0 [deploy|run|stage4|clean|all]"; exit 2 ;;
 esac
 
-if [ "$MODE" = run ] || [ "$MODE" = all ]; then
+if [ "$MODE" = run ] || [ "$MODE" = all ] || [ "$MODE" = stage4 ]; then
   echo
   echo "== $pass passed, $fail failed, $skip skipped -- on real Windows =="
 fi
