@@ -7393,7 +7393,26 @@ that maps a window cannot reach a Windows compositor without the proxy, by
 construction.** Which makes the `wine` mode the better test anyway: it is the
 only local run that proves §25.1's first item end to end.
 
-Both modes pass, ten assertions each.
+Both modes pass: nine assertions in `linux` mode, ten in `wine` — the extra one
+is that `wc-proxy` met no interface it could not walk, which is only checkable
+where there is a proxy.
+
+The whole table, run from master's checkout after the stage 13 merge rather than
+from the branch, which is the arrangement §12.12, §14.11, §15.13 and §17.1 used:
+
+| gate | result |
+| --- | --- |
+| `cargo test` | 160 passed, 0 failed (master was 158) |
+| `cargo clippy`, both targets | clean |
+| `scripts/wc-inhibit.sh` | PASS, 9 assertions |
+| `scripts/wc-inhibit.sh wine` | PASS, 10 assertions |
+| `scripts/wc-xdg.sh all` | 10 passed, 0 failed |
+| `scripts/wc-proxy.sh` | 37 passed, 0 failed |
+
+The last one is the regression that mattered, because this stage edited
+`Spec::builtin` — the table every client's every message is walked against. It
+covers both transports and three compositors with weston's own clients, and none
+of them has heard of these four protocols, which is the point.
 
 ### 25.8 What Wine says, and what it cannot
 
