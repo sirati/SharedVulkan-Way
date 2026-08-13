@@ -624,9 +624,27 @@ run_window() {
       else
         bad "term: no frame was dumped"
       fi
-      [ "$(cat "$RUNDIR/term/cli.rc")" = 0 ] \
-        && ok "term: the client exited 0" \
-        || note "term: the client exited $(cat "$RUNDIR/term/cli.rc") (124 = killed by timeout)"
+      # **§32, and this one was found by the merge rather than by the audit.**
+      #
+      # This was `ok` on 0 and `note` on anything else, so it could not fail —
+      # and on the merged tree it took the `note` arm (124, the timeout) and the
+      # scoreboard went from 54 to 53 with nothing reported. A check whose
+      # failing arm is informational does not merely fail to catch things; it
+      # *moves the total silently*, which is worse, because the total is what a
+      # person compares between runs.
+      #
+      # 0 and 124 are both correct. `weston-terminal` runs until something stops
+      # it, so `timeout` killing it is the ordinary ending, and which of the two
+      # happens depends on whether the compositor's own `--timeout` closed the
+      # connection first. Anything else — a segfault at 139, a protocol error at
+      # 1 — is the client dying on us, which is exactly what this line was
+      # supposed to notice and could not.
+      local rc
+      rc=$(cat "$RUNDIR/term/cli.rc")
+      case "$rc" in
+        0|124) ok "term: the client exited $rc (0 = clean, 124 = outlived the harness's timeout)" ;;
+        *)     bad "term: the client exited $rc -- neither a clean exit nor the timeout; it died" ;;
+      esac
     fi
   else
     note "SKIP weston-terminal (not installed)"

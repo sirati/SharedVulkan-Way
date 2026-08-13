@@ -11022,31 +11022,36 @@ those numbers. In particular `the_reverse_direction_has_fds_too` still lists
 `wl_data_offer.receive` and `wl_data_source.send`, which is correct: they still
 carry an `h`, and the point of this work is that neither one is ever forwarded.
 
-## 32. Four gates that reported success while something was wrong
+## 32. Gates that reported success while something was wrong
 
 ### 32.1 Status in one paragraph
 
-**A check that cannot fail is not a check, and this section is four of them.**
-Each had already let a real defect through or produced a wrong number an agent
-nearly published: `cargo test --workspace` reported **166 tests instead of
-1207** on a clean checkout, because one test failed for want of an artefact
-nothing had built and a failing test binary stops the whole run;
-`scripts/wc-proxy.sh` printed six cost numbers and asserted on none, so a **51x
-copy-cost regression** — 167 MiB to 8583 MiB, a buffer copied 55 times instead
-of once — passed it at *37 passed, 0 failed*; the same harness failed 6 once and
-passed 37/0 twice on identical trees, which is worse than failing because it
-teaches everyone to re-run until green; and 113 comments named the wrong design
-document, which had already landed three agents' sections in the wrong file
-during rebases. All four are fixed. `cargo test --workspace` on a tree that has
-never been built now reports **1211** — master's 1207 plus this section's four;
-`wc-proxy.sh` reports **54 passed, 0 failed** where it reported 39, and **7
-passed, 4 failed** against the 51x regression re-injected, naming it as 55.1x;
-every fixed `sleep` that guarded a
-*state* is a bounded wait that prints when it had to wait; and the sweep the
-second item asked for found eleven more numbers nobody was watching across seven
-other harnesses, including one script whose primary metric — the list of tests
-the forwarder loses — was computed, printed, written to a file and never
-compared with anything.
+**A check that cannot fail is not a check, and this section started as four of
+them and finished as sixteen.** The four given: `cargo test --workspace`
+reported **166 tests instead of 1207** on a clean checkout, because one test
+failed for want of an artefact nothing had built and a failing test binary stops
+the whole run; `scripts/wc-proxy.sh` printed six cost numbers and asserted on
+none, so a **51x copy-cost regression** — 167 MiB to 8583 MiB, a buffer copied
+55 times instead of once — passed it at *37 passed, 0 failed*; the same harness
+failed 6 once and passed 37/0 twice on identical trees, which is worse than
+failing because it teaches everyone to re-run until green; and 113 comments
+named the wrong design document, which had already landed three agents' sections
+in the wrong file during rebases.
+
+All four are fixed, and looking for the shape found twelve more — §32.6, and
+they are the more valuable half. Two of them were found by this section's own
+work rather than by reading: a stale binary (§32.4) and a second test that
+truncates the workspace run (§32.2). Two more arrived with the merge that
+brought §29's clipboard, one of them in `wc-proxy.sh` itself.
+
+`cargo test --workspace` on a tree that has never been built reports **1266** —
+master's 1262 plus this section's four; `wc-proxy.sh` reports **54 passed, 0
+failed** where it reported 39, and **7 passed, 4 failed** against the 51x
+regression re-injected, naming it as 55.1x; `wc-clip.sh` reports 15 where it
+reported 11, with §29.4's descriptor counts asserted rather than recited; every
+fixed `sleep` that guarded a *state* is a bounded wait that prints when it had
+to wait; and one script's primary metric — the list of tests the forwarder loses
+— was computed, printed, written to a file and never compared with anything.
 
 ### 32.2 `cargo test` cannot run the loader test, and said so as a failure
 
@@ -11082,10 +11087,30 @@ failure, which is what a release gate should set.
 
 | | before | after |
 |---|---|---|
-| `cargo test --workspace`, artefact absent | `test result: FAILED`, run stops, **166 tests** | `2 passed`, run continues, **1211 tests** across 77 binaries |
+| `cargo test --workspace`, artefact absent | `test result: FAILED`, run stops, **166 tests** | `2 passed`, run continues, **1266 tests** across 81 test binaries |
 | the same test binary run directly with the artefact removed | fails, `VkResult(-9)` | builds the `cdylib` and passes in 0.29 s |
 | the same, with cargo made unrunnable | fails | `SKIP: the real-loader test cannot run: …` |
 | the same, `SV_ICD_REQUIRE_LOADER=1` | fails, with a misleading reason | fails, naming the reason |
+
+**And a second cause of the same truncation, found on master while merging.**
+`sv-hostd` names its `/dev/shm` object `sv.arena.{run_id:016x}` and creates it
+`O_CREAT|O_EXCL` — deliberately, so two daemons cannot collide and a leftover
+from a crash is identifiable. **Two of its tests passed the same `run_id` of
+1**, and libtest runs tests in parallel threads of one process, so whichever
+lost the race got `open(shm, O_CREAT|O_EXCL), errno: 17`.
+
+It fires intermittently, which is what made it expensive: two consecutive runs
+of master `c229a4b` reported **169 tests of 1266** and a third completed. A
+total that is either 169 or 1266 depending on thread scheduling is not a
+baseline — and it is very likely where the "1262" figure and the "1253" one both
+came from. Measured: **1 failure in 40** runs of the binary at
+`--test-threads=16` with the shared run id, **0 in 40** with unique ones. The
+run id now carries the process id as well as a per-test constant, so a run that
+panicked before `Drop` could unlink cannot poison every future run of the same
+test, which `O_EXCL` on a fixed name otherwise guarantees.
+
+That is the §26.9 standard read the other way round. A noise floor of one test
+is bad enough when one test is what it costs; here one test costs 1,097.
 
 ### 32.3 Every number `wc-proxy.sh` prints, and what it is now
 
@@ -11199,7 +11224,7 @@ rather than for a state: the gap before `wine explorer` (§8.9's wineserver
 shutdown, which nothing observable reports) and the 1.5 s between the two
 screenshots, which *is* the measurement.
 
-### 32.6 The sweep: eleven more numbers nobody was watching
+### 32.6 The sweep: fourteen more numbers nobody was watching
 
 The same audit across the other harnesses. Ordered by how badly it mattered.
 
@@ -11290,6 +11315,40 @@ The same audit across the other harnesses. Ordered by how badly it mattered.
     That is the third honest state, and it is listed here so the audit is
     complete rather than because anything is wrong with it.
 
+**Three more arrived with the merge that brought §29**, and two of them are the
+best evidence in this section that the shape is worth looking for rather than
+being told about.
+
+12. **`wc-clip.sh` recited the counts §29.4 is an argument about.** The comment
+    above the block says exactly that — "§29.4 is an argument about exactly
+    those numbers" — and the code under it was `[ -n "$line" ] && note "…"`. So
+    the numbers were never compared, *and* a run in which the proxy logged no
+    copy, or no paste, printed **nothing at all** and passed. The absence of the
+    evidence was silent, which is the worse half.
+
+    §29.4 states the values and derives them, so they are assertable: a copy is
+    `1 fds in, 2 out` (the client's `wl_shm` pool in; the keymap `memfd` plus
+    one `pipe2` write end per mime type out) and a paste is `2 fds in, 1 out`
+    (the second `in` is the client's own pipe, consumed here). A drift either
+    way is a change in what the proxy does with descriptors, which is the one
+    thing this project's rule is about. The byte counts are asserted non-zero
+    rather than by value: a transfer that was counted and moved nothing is the
+    case every other check in that file passes. Measured: exactly those, at 41
+    and 54 bytes. 11 passed → **15**, with `fresh()` (§32.4) as the other two.
+
+13. **`wc-proxy.sh`'s own client exit code**, which the audit missed because it
+    passed on every run before the merge. `ok` on 0 and **`note` on anything
+    else** — so a client that segfaulted could not fail it. On the merged tree
+    it took the `note` arm at 124 and the scoreboard went from 54 to 53 **with
+    nothing reported**. That is the defect in its purest form: a check whose
+    failing arm is informational does not merely fail to catch things, it moves
+    the total silently, and the total is what a person compares between runs. 0
+    and 124 are both correct endings for a client the harness kills; 139 and 1
+    are not, and now say so.
+
+14. **`sv-hostd`'s colliding `/dev/shm` name** — §32.2, and it is on master
+    rather than on this branch.
+
 ### 32.7 The rename, and why it was one commit on its own
 
 After the unification `docs/design.md` is the *Vulkan* side's document. 138
@@ -11314,13 +11373,21 @@ touched, because widening the blast radius was not what the change was for.
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace`, **on a tree with no `cdylib` built** | **1211 tests**, 0 failures, 3 ignored — master's 1207 plus this section's four, and the number this section exists to make true |
+All of these are **after** the merge of master `c229a4b` (§29's clipboard, §28's
+desktop shortcut), not before it.
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace`, **on a tree with no `cdylib` built** | **1266 tests**, 0 failures, 3 ignored, 81 test binaries of which 39 carry tests — master's 1262 plus this section's four, and the number this section exists to make true |
+| the same, repeated | 1266 again. Master `c229a4b` gave 169, 169 and 1266 on three attempts, which is §32.2's second half |
+| `sv_hostd` test binary, `--test-threads=16`, 40 runs | **0 failures**, against 1 in 40 with the shared run id |
 | `cargo test -p wc-proxy --lib proxy::` | 9 passed, of which 4 are new (the `bind`/`listen` window) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean but for the two pre-existing warnings |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean but for the pre-existing redundant redefinition in `sv-transport` |
-| `cargo build --workspace`, both targets | both, before the harness runs (§18.8) |
+| `cargo build --workspace`, both targets | both, before the harness runs (§18.8) — and now enforced by `fresh()` rather than remembered |
 | `scripts/wc-proxy.sh all` | **54 passed, 0 failed** (was 39) |
 | `scripts/wc-proxy.sh cost`, **51x regression re-injected** | **7 passed, 4 failed**, naming it as 55.1x |
+| `scripts/wc-clip.sh all` | **15 passed, 0 failed** (was 11), with §29.4's `1 fds in, 2 out` and `2 fds in, 1 out` asserted at 41 and 54 bytes |
 | `scripts/wc-input.sh linux` | 29 passed, 0 failed, unchanged, with the keymap sizes now asserted |
 | `scripts/wc-inhibit.sh` | PASS, and it finishes sooner: the 2 s sleep is now a wait that returns as soon as the sweep has run |
 
@@ -11347,7 +11414,23 @@ touched, because widening the blast radius was not what the change was for.
    the target-directory lock while tests execute. That was measured here and is
    not documented by cargo.
 5. **`scripts/*.sh` still say `docs/design.md`** — §32.7.
-6. **Only `wc-proxy.sh` refuses to measure a stale binary.** Every other harness
-   in `scripts/` checks that its binaries *exist* and not that they are newer
-   than the tree, and §32.4 is the demonstration that the difference is not
-   theoretical. `fresh()` is eleven lines and belongs in all of them.
+6. **Only `wc-proxy.sh` and `wc-clip.sh` refuse to measure a stale binary.**
+   Every other harness in `scripts/` checks that its binaries *exist* and not
+   that they are newer than the tree, and §32.4 is the demonstration that the
+   difference is not theoretical. `fresh()` is eleven lines, it is copied rather
+   than shared because these scripts have no common file, and it belongs in all
+   of them — `wc-guest.sh`, `wc-titlebar.sh`, `wc-damage.sh`, `wc-input.sh`,
+   `wc-cursor.sh`, `wc-inhibit.sh`, `wc-window.sh`, `wc-desktop.sh`,
+   `wc-firefox.sh`, `wc-icon.sh`, `wc-launch.sh`, `wc-wlcs.sh`, `sv-cts.sh`,
+   `sv-bench.sh`, `sv-present.sh`. That is the next piece of work rather than a
+   footnote.
+7. **`wc-launch.sh` and `sv-firefox-wayland.sh` arrived with the merge and were
+   not audited.** 685 and 153 lines. The sweep in §32.6 covers what existed when
+   it was written plus `wc-clip.sh`; these two are outstanding, and the shape to
+   look for is a number in an `ok` message that no comparison guards, or a
+   failing arm that is a `note`.
+8. **The audit found item 13 only because the merge made it fire.** The
+   `wc-proxy.sh` exit-code check had a `note` on its failing arm and was read
+   past twice, in a file being audited for exactly that. Reading finds these;
+   running the harness on a tree where the value has moved finds the ones
+   reading misses. Both are needed and neither is sufficient.
