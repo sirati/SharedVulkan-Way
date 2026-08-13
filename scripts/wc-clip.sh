@@ -107,6 +107,28 @@ clip() {
   ( cd "$RUNDIR" && wine "$RUNDIR/probe-clip.exe" "$@" ) 2>>"$RUNDIR/probe.log"
 }
 
+# `clip get`, retried until it answers or the deadline passes.
+#
+# **A poll rather than a longer sleep, and it is not flakiness management.** A
+# copy is asynchronous through four processes: the client answers
+# `wl_data_source.send` on its own event loop, wc-proxy drains the pipe on its
+# poll turn, the bytes cross to the compositor, and the compositor's UI thread
+# reaches its command queue and calls `SetClipboardData`. There is no message
+# that says "the clipboard now holds it" — `WM_CLIPBOARDUPDATE` says so to the
+# compositor and nothing forwards that to a shell script. A fixed sleep encodes
+# a guess about four schedulers; asking until the answer arrives encodes the
+# actual question, and the deadline is what turns "never" into a failure.
+clip_get_until() {
+  local want=$1 deadline=$((SECONDS + ${2:-20})) got=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    got=$(clip get)
+    [ "$got" = "$want" ] && { printf '%s' "$got"; return 0; }
+    sleep 1
+  done
+  printf '%s' "$got"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # the run
 # ---------------------------------------------------------------------------
@@ -179,12 +201,11 @@ block_wine() {
 
   # -- direction A: a Linux client copies, a Windows application pastes -------
   local text="waycompose stage 13 -- copied on Linux"
-  ( wl timeout 25 wl-copy -- "$text" >"$DIR/copy.log" 2>&1 ) &
+  ( wl timeout 40 wl-copy -- "$text" >"$DIR/copy.log" 2>&1 ) &
   local copier=$!
-  sleep 6
-  local got
-  got=$(clip get)
-  local rc=$?
+  local got rc
+  got=$(clip_get_until "$text" 25)
+  rc=$?
   wait "$copier" 2>/dev/null
   if [ "$rc" -eq 0 ] && [ "$got" = "$text" ]; then
     ok "a Windows application pasted what a Linux client copied"
@@ -198,9 +219,9 @@ block_wine() {
 
   # The `\n` a Unix client sends must be `\r\n` on the Windows clipboard, or
   # Notepad renders one long line. Checked on the bytes rather than trusted.
-  ( wl timeout 25 wl-copy -- "$(printf 'one\ntwo')" >/dev/null 2>&1 ) &
+  ( wl timeout 40 wl-copy -- "$(printf 'one\ntwo')" >/dev/null 2>&1 ) &
   copier=$!
-  sleep 5
+  clip_get_until "$(printf 'one\r\ntwo')" 25 >/dev/null
   got=$(clip get | od -c | head -2)
   wait "$copier" 2>/dev/null
   if printf '%s' "$got" | grep -q '\\r'; then

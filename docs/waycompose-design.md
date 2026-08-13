@@ -7933,12 +7933,29 @@ harness problem nobody has solved in this tree.
 
 ### 28.10 The gates
 
+Run from the **unified** tree, after the rebase described at the top of
+`docs/one-binary.md`.
+
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | see below |
+| `cargo test --workspace` | **1150 tests**, 0 failures (1125 on the unified master; 25 new) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
-| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo clippy -p wc-compositor -p wc-proxy -p wc-handle --all-targets --target x86_64-pc-windows-gnu` | clean |
+| **`bash scripts/wc-proxy.sh`** | **37 passed, 0 failed** |
 | `scripts/wc-clip.sh wine` (new) | **11 passed, 0 failed** |
+
+`wc-proxy.sh` is on that list because `docs/one-binary.md` is right that a green
+`cargo test` does not imply it: it drives weston's own clients over both
+transports and three compositors, and it is the gate for anything touching
+`Spec::builtin`. This work does not touch `Spec::builtin` (see below), and the
+line it asserts about descriptors — `2 fds in, 1 out` for `weston-terminal` over
+the arena — is unchanged, because a weston client never copies anything.
+
+**One unrelated flake, recorded rather than hidden.**
+`sv-transport`'s `a_rung_doorbell_wakes_the_consumer_rather_than_the_slice_expiring`
+failed once at 8.1 ms in a full-workspace run and passes on its own. It is a
+timing assertion in a crate this work does not touch, on a machine running
+several agents' builds at once.
 
 The 25 new tests are: 13 in `wc-compositor/src/clipboard.rs` (the conversions,
 which are silently wrong when they are wrong), 4 in `wc-proxy/src/clip.rs`
@@ -7947,9 +7964,14 @@ which are silently wrong when they are wrong), 4 in `wc-proxy/src/clip.rs`
 real pipes, because the whole design is that both ends of every pipe are local
 and so a test needs no compositor at all.
 
-`crates/wc-proxy/src/spec.rs`'s two counting tests are **unchanged**, and that is
-deliberate: `wc-clipboard-v1.xml` is loaded into a *clone* of the spec by
+**The three exact-count protocol tests are untouched**, and that is deliberate
+rather than lucky. `docs/one-binary.md` warns that
+`spec.rs::the_builtin_protocols_parse`, `spec.rs::the_reverse_direction_has_fds_too`
+and `wire.rs::every_message_in_every_protocol_round_trips` fail on any protocol
+addition. `wc-clipboard-v1.xml` is loaded into a *clone* of the spec by
 `clip.rs`, exactly as `wc-icon-v1.xml` is by `iconlink.rs`, so it never enters
-`Spec::builtin()`. Adding a protocol to the proxy's own vocabulary and adding one
-to a private side channel are different acts and only the first should move
-those numbers.
+`Spec::builtin()` — adding a protocol to the proxy's own vocabulary and adding
+one to a private side channel are different acts, and only the first should move
+those numbers. In particular `the_reverse_direction_has_fds_too` still lists
+`wl_data_offer.receive` and `wl_data_source.send`, which is correct: they still
+carry an `h`, and the point of this work is that neither one is ever forwarded.
