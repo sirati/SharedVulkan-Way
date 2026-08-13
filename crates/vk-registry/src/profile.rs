@@ -727,6 +727,53 @@ mod tests {
         assert!(!p.has_type("VkAllocationCallbacks"));
     }
 
+    /// The set pass 12 locks the device queue around, as data.
+    ///
+    /// Asserted as an **equality** rather than a containment, because both
+    /// mistakes matter and they fail differently: a command missing from this
+    /// list is a race the generator will not close, and one added spuriously is
+    /// a driver call needlessly serialised across every session. It also checks
+    /// that [`crate::model::Command::externally_synchronizes_a_queue`] reads
+    /// both spellings — the first two entries have no `VkQueue` parameter and
+    /// are reached only through `<implicitexternsyncparams>`.
+    #[test]
+    fn the_commands_that_externally_synchronize_a_queue_are_these_nine() {
+        let Some(m) = model() else { return };
+        let p = profiles::zink().resolve(&m).unwrap();
+        let mut got: Vec<&str> = p
+            .commands
+            .iter()
+            .filter(|n| {
+                m.commands.get(n.as_str()).is_some_and(|c| c.externally_synchronizes_a_queue())
+            })
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [
+                // `vkDestroyDevice` is the one entry pass 12 emits no lock for,
+                // because it is hand-written on the GPU side — the device
+                // outlives every client and the command is a no-op there
+                // (`sv_codegen::exceptions::GPU_HAND_WRITTEN`). So this list has
+                // nine names and the generated file has eight `lock_queue`
+                // sites, and the difference is not an omission.
+                "vkDestroyDevice",
+                "vkDeviceWaitIdle",
+                // The debug-utils label family is externally synchronised on the
+                // queue for the same reason submission is: the label stack is
+                // the queue's.
+                "vkQueueBeginDebugUtilsLabelEXT",
+                "vkQueueBindSparse",
+                "vkQueueEndDebugUtilsLabelEXT",
+                "vkQueueInsertDebugUtilsLabelEXT",
+                "vkQueueSubmit",
+                "vkQueueSubmit2",
+                "vkQueueWaitIdle",
+            ]
+        );
+    }
+
     #[test]
     fn aliases_are_kept_alongside_their_targets() {
         let Some(m) = model() else { return };
