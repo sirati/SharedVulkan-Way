@@ -4563,14 +4563,20 @@ in the smallest client available, and the guess has to be generous.
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | **136 tests**, 0 failures (133 on master) |
+| `cargo test --workspace` | **138 tests**, 0 failures (135 on master, which is 133 plus stage 8's two) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
 | `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
 | `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
 | `scripts/wc-input.sh all` (stage 6 + this, Wine) | **82 passed, 0 failed** (52 before) |
-| `scripts/wc-guest.sh` (the guest) | **not run — see §14.10 item 1** |
+| `scripts/wc-desktop.sh` (stage 8, the interactive desktop) | **not run — needs the guest, same as below** |
+| `scripts/wc-guest.sh` (the guest) | **not run — see the boxed item in §14.12** |
+
+All of these are from **master's checkout after the merge with stage 8**, not
+from the branch before it. Every one was re-run there rather than carried over,
+which is the arrangement §12.12 used and the reason the test count in the first
+row is not the one the branch reported.
 
 The three new tests are one each side of the boundary plus the plan's parser,
 and two of them are deliberately
