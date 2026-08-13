@@ -27,7 +27,7 @@ use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::reexports::wayland_server::protocol::{
     wl_buffer, wl_output, wl_seat, wl_surface::WlSurface,
 };
-use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -38,6 +38,8 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
+// ADDED FOR STAGE 13: the edge a client names when it asks to be resized.
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 // ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
 // than guessed at, and they are requirements for different reasons — see
@@ -83,8 +85,62 @@ use smithay::{
     delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
-use crate::platform::{FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
+use crate::platform::{Edge, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
 use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource};
+
+/// Which decoration mode the compositor advertises, and answers with.
+///
+/// ADDED FOR STAGE 13, and it is the whole of docs/design.md §18.2. Until this
+/// stage the answer was hard-coded to `Client`, on the reasoning that
+/// docs/goal-firefox.md wants Firefox painting its tabs into the title bar and
+/// only a client that draws a title bar can do that. The reasoning was right
+/// and the *default* was wrong: the compositor was promising a frame it had not
+/// built, so every window came up with Windows' caption **and** the client's,
+/// one directly above the other, which is the bug the user reported.
+///
+/// So the mode is a flag with `Server` as its default — Windows' caption is a
+/// real server-side decoration and claiming it is the honest answer — and
+/// `Client` is what the frame-extension work of §18.7 is developed against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Decorations {
+    /// Windows draws the caption; the client draws none. **The default.**
+    #[default]
+    Server,
+    /// The client draws its own title bar, and the Win32 side is expected to
+    /// extend the frame into it (`FrameStyle::extend_top`).
+    Client,
+}
+
+impl Decorations {
+    /// Parse the `--decorations` argument. `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "server" => Some(Self::Server),
+            "client" => Some(Self::Client),
+            _ => None,
+        }
+    }
+
+    /// The KDE protocol's spelling, which is the one that decides GTK's
+    /// behaviour: `gtk_window_should_use_csd()` consults nothing else on
+    /// Wayland, and it reads the **manager's** default rather than the answer
+    /// to any per-surface request.
+    fn kde(self) -> KdeDefaultMode {
+        match self {
+            Self::Server => KdeDefaultMode::Server,
+            Self::Client => KdeDefaultMode::Client,
+        }
+    }
+
+    /// The `xdg-decoration` spelling. Measured to be used by nothing this
+    /// project runs (§15.7), and answered consistently anyway.
+    fn xdg(self) -> DecorationMode {
+        match self {
+            Self::Server => DecorationMode::ServerSide,
+            Self::Client => DecorationMode::ClientSide,
+        }
+    }
+}
 
 /// What kind of shell surface a window is.
 ///
@@ -170,6 +226,9 @@ pub struct State {
     /// ADDED FOR STAGE 9. Both decoration protocols; see the import.
     _xdg_decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
+    /// ADDED FOR STAGE 13. Which mode is advertised as the manager default and
+    /// answered to anything that asks. See [`Decorations`].
+    decorations: Decorations,
     /// Owns the seat: `SeatState` keeps every `Seat` it makes, so there is no
     /// separate field for the one seat and dropping the local from `new` does
     /// not destroy the global.
@@ -275,6 +334,7 @@ const REPEAT_DELAY_MS: i32 = 500;
 const REPEAT_RATE_HZ: i32 = 30;
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dh: &DisplayHandle,
         ui: Ui,
@@ -282,6 +342,7 @@ impl State {
         debug_icon: bool,
         layout: &str,
         output_size: (i32, i32),
+        decorations: Decorations,
     ) -> Self {
         let mut seat_state = SeatState::new();
         // The local is dropped at the end of this function and that is safe:
@@ -420,6 +481,10 @@ impl State {
         output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
         output.set_preferred(mode);
         println!("wc-compositor: output WC-1 {ow}x{oh} at 60 Hz, scale 1");
+        // Greppable, because "how many title bars does this window have" is
+        // decided here and nowhere else, and a run that answers it wrongly
+        // looks like a rendering bug rather than a negotiation one.
+        println!("wc-compositor: decorations: manager default is {decorations:?}");
 
         State {
             compositor: CompositorState::new::<State>(dh),
@@ -428,16 +493,13 @@ impl State {
             output,
             _data_device: DataDeviceState::new::<State>(dh),
             _xdg_decoration: XdgDecorationState::new::<State>(dh),
-            // **`Client` is the default mode this compositor advertises, and
-            // that is the goal document's decision rather than a shrug.**
-            // docs/goal-firefox.md wants Firefox painting its tabs into the
-            // title bar, which is only possible if Firefox is drawing the title
-            // bar — a server-decorated window has a caption the client cannot
-            // touch. So the compositor asks for client-side decorations and the
-            // Win32 side's job becomes extending the frame into them
-            // (`FrameStyle::extend_top`), which is the shape
-            // `DwmExtendFrameIntoClientArea` wants.
-            kde_decoration: KdeDecorationState::new::<State>(dh, KdeDefaultMode::Client),
+            // **This one line decides how many title bars the window has**, and
+            // it is `default_mode` on the *manager*, sent once at bind, rather
+            // than the answer to any per-surface request: GTK 3 reads the
+            // manager's default in `gdk_wayland_display_prefers_ssd()` and
+            // ignores what it is told about its own surface. §18.2.
+            kde_decoration: KdeDecorationState::new::<State>(dh, decorations.kde()),
+            decorations,
             seat_state,
             keyboard,
             pointer,
@@ -1551,6 +1613,77 @@ impl XdgShellHandler for State {
         }
     }
 
+    // ADDED FOR STAGE 13. The three requests a client-decorated toplevel makes
+    // when the user grabs its own title bar, all of which had smithay's empty
+    // default until now — so a window drawn by Firefox could be closed and
+    // maximised but could not be *moved*, and there was no other way to move it
+    // (see [`ToUi::BeginMove`]).
+    //
+    // The seat and the serial are ignored in all three, and that is a decision
+    // rather than an omission. The protocol wants them checked against a recent
+    // input event so that a client cannot start a drag out of nothing; on this
+    // compositor there is one seat, the events came from Win32 in the first
+    // place, and Windows' own modal loop refuses to start unless a button is
+    // actually down — so the check the serial exists to make is made by the
+    // platform, one layer down, against the real hardware state.
+
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            println!("wc-compositor: window {} asked to be moved", window.id);
+            self.ui.send(ToUi::BeginMove { id: window.id });
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        edges: ResizeEdge,
+    ) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let edge = match edges {
+                ResizeEdge::Top => Edge::Top,
+                ResizeEdge::Bottom => Edge::Bottom,
+                ResizeEdge::Left => Edge::Left,
+                ResizeEdge::TopLeft => Edge::TopLeft,
+                ResizeEdge::BottomLeft => Edge::BottomLeft,
+                ResizeEdge::Right => Edge::Right,
+                ResizeEdge::TopRight => Edge::TopRight,
+                ResizeEdge::BottomRight => Edge::BottomRight,
+                // `None`, and anything a newer protocol version adds. The enum
+                // is `#[non_exhaustive]`, and treating an unknown edge as "no
+                // edge" starts a keyboard-driven resize rather than refusing.
+                _ => Edge::None,
+            };
+            println!("wc-compositor: window {} asked to be resized from {edge:?}", window.id);
+            self.ui.send(ToUi::BeginResize {
+                id: window.id,
+                edge,
+            });
+        }
+    }
+
+    fn show_window_menu(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        location: Point<i32, Logical>,
+    ) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            println!(
+                "wc-compositor: window {} asked for the window menu at {},{}",
+                window.id, location.x, location.y
+            );
+            self.ui.send(ToUi::WindowMenu {
+                id: window.id,
+                x: location.x,
+                y: location.y,
+            });
+        }
+    }
+
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         if let Some(window) = self.windows.get(surface.wl_surface()) {
             self.ui.send(ToUi::SetWindowState {
@@ -1854,32 +1987,36 @@ impl ServerDndGrabHandler for State {}
 /// `xdg-decoration`, which is the standard one and — measured — the one Firefox
 /// does not use.
 ///
-/// Implemented anyway, and answered honestly: a client that asks for
-/// `ServerSide` is told `ClientSide`, because this compositor has no frame of
-/// its own to draw and Windows' caption is not something the Wayland side can
-/// promise. Saying `ServerSide` and drawing nothing is how a client ends up
-/// with a window that has no way to be moved.
+/// Implemented anyway, and answered with whatever [`Decorations`] this run was
+/// started with, so that the two protocols cannot disagree. Note that
+/// `xdg-decoration` gives the compositor the last word — the client *requests*
+/// and the compositor *configures* — so this handler is entitled to overrule,
+/// and does. GTK 3 has no code for this protocol at all (§15.7), so nothing
+/// this project runs is affected either way.
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        println!("wc-compositor: xdg-decoration: client created a decoration object");
+        let mode = self.decorations.xdg();
+        println!("wc-compositor: xdg-decoration: client created a decoration object, telling it {mode:?}");
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ClientSide);
+            state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
     }
 
-    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
-        println!("wc-compositor: xdg-decoration: client asked for {mode:?}, answering ClientSide");
+    fn request_mode(&mut self, toplevel: ToplevelSurface, requested: DecorationMode) {
+        let mode = self.decorations.xdg();
+        println!("wc-compositor: xdg-decoration: client asked for {requested:?}, answering {mode:?}");
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ClientSide);
+            state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        println!("wc-compositor: xdg-decoration: client unset its mode, answering ClientSide");
+        let mode = self.decorations.xdg();
+        println!("wc-compositor: xdg-decoration: client unset its mode, answering {mode:?}");
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ClientSide);
+            state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
     }
@@ -1910,10 +2047,30 @@ impl KdeDecorationHandler for State {
         decoration: &OrgKdeKwinServerDecoration,
         mode: WEnum<KdeMode>,
     ) {
-        println!("wc-compositor: kde-decoration: client asked for {mode:?}");
-        // Echo, which is what smithay's default does: the client has told us
-        // how it intends to decorate itself and there is nothing to negotiate
-        // when the answer is always "you draw it".
+        println!(
+            "wc-compositor: kde-decoration: client asked for {mode:?} (default is {:?})",
+            self.decorations
+        );
+        // **Echoed, deliberately, even when it contradicts the default**, and
+        // that is this stage's answer to "what happens for a client that
+        // insists on Client".
+        //
+        // Three reasons, in order of weight. First, the per-surface answer is
+        // not the lever: GTK 3 decides whether to draw a title bar from the
+        // *manager's* `default_mode` and re-reads nothing afterwards, so
+        // refusing here changes no client's behaviour. Second, GDK's handler
+        // re-requests the mode it wants when it is contradicted, which was
+        // captured as a loop against real KWin — KWin eventually capitulates,
+        // and a compositor that does not is a compositor that spins. Third, a
+        // client that has decided to draw its own title bar and is told it may
+        // not still draws one; the only thing refusing buys is a client that
+        // draws none and cannot be moved.
+        //
+        // The cost is honest and small: under `--decorations server` a client
+        // that insists on `Client` gets two title bars, exactly as every client
+        // did before this stage. Its shadow inset is still reported as window
+        // geometry and `compose_tree` still honours it, so the *window* is
+        // right even when the picture inside it has a bar too many.
         if let WEnum::Value(mode) = mode {
             decoration.mode(mode);
         }

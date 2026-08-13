@@ -3,10 +3,11 @@
 #
 #   scripts/wc-firefox.sh enumerate   what Firefox binds, and what it does without
 #   scripts/wc-firefox.sh window      the browser's own pixels, measured from outside
+#   scripts/wc-firefox.sh titlebar    the two levers that leave exactly one title bar
 #   scripts/wc-firefox.sh menu        a click, an xdg_popup, and a second window
 #   scripts/wc-firefox.sh wine        the same client into a real HWND, through the proxy
 #   scripts/wc-firefox.sh wine-arena  the same run with the pixels in an arena
-#   scripts/wc-firefox.sh all         all five
+#   scripts/wc-firefox.sh all         all six
 #
 # Run from inside `nix develop`.
 #
@@ -74,6 +75,11 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # assertions below reproducible.
 OUTPUT=1600x1000
 
+# STAGE 13. See `run_firefox`. Declared here so that `set -u` cannot turn an
+# unset array into a run that dies three functions deep.
+FX_DECOR=client
+FX_ENV=()
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------------------
@@ -88,6 +94,18 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # `--no-remote` and a private profile, because a Firefox already running on the
 # user's desktop would otherwise take the request and open a tab there instead
 # — which looks exactly like a client that connected and drew nothing.
+#
+# STAGE 13. Two knobs, both empty by default so that every block written before
+# this stage passes exactly what it passed before:
+#
+#   FX_DECOR   the `--decorations` the compositor is started with. Every block
+#              names it explicitly now, because the compiled-in default changed
+#              in this stage (§18.2) and a block that relied on it would be
+#              measuring the flag rather than the client.
+#   FX_ENV     extra `VAR=value` words put in front of Firefox. This is where
+#              `MOZ_GTK_TITLEBAR_DECORATION` goes, and it is an *array* because
+#              the alternative — a string that the shell re-splits — puts a
+#              quoting bug between the harness and the only lever the client has.
 run_firefox() {
   local dir=$1 sock=$2 secs=$3; shift 3
   mkdir -p "$dir/rt" "$dir/profile" "$dir/frames"
@@ -95,6 +113,7 @@ run_firefox() {
 
   XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-compositor" \
     --socket "$sock" --timeout $((secs + 30)) --output "$OUTPUT" \
+    --decorations "${FX_DECOR:-client}" \
     --dump-frames "$dir/frames" "$@" >"$dir/srv.log" 2>&1 &
   local srv=$!
   for _ in $(seq 1 100); do
@@ -114,7 +133,7 @@ run_firefox() {
   env -u DISPLAY \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     XDG_RUNTIME_DIR="$dir/rt" WAYLAND_DISPLAY="$sock" \
-    ${WC_WAYLAND_DEBUG:+WAYLAND_DEBUG=1} \
+    ${WC_WAYLAND_DEBUG:+WAYLAND_DEBUG=1} "${FX_ENV[@]}" \
     timeout "$secs" "$FIREFOX" --no-remote --profile "$dir/profile" about:blank \
     >"$dir/fx.log" 2>&1
   echo $? >"$dir/fx.rc"
@@ -139,6 +158,12 @@ binds() {
 block_enumerate() {
   echo "== enumerate: what Firefox binds, and what it does when a thing is missing"
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
+
+  # Explicit since stage 13: this block's claims are all about the *client-side*
+  # arrangement — the shadow inset, the tab strip, the mode Firefox picks when
+  # nothing is done to it — so it names the mode it wants rather than inheriting
+  # a compiled-in default that has now changed. §18.2.
+  FX_DECOR=client; FX_ENV=()
 
   local dir="$RUNDIR/enum"
   WC_WAYLAND_DEBUG=1 run_firefox "$dir" wc-enum 25 || { bad "the compositor never bound its socket"; return; }
@@ -168,8 +193,12 @@ block_enumerate() {
   else
     ok "decorations: xdg-decoration was advertised and ignored, as §13.7 says"
   fi
+  # Offered `Client`, Firefox asks for `Client`. Stage 13 changed what that is
+  # evidence *for*: §15.7 read it as the goal document's clause arriving for
+  # free, and §18.3 shows it is the client agreeing with whatever the manager
+  # said. The other half of the pair is `block_titlebar`'s.
   grep -q 'kde-decoration: client asked for Value(Client)' "$dir/srv.log" \
-    && ok "decorations: Firefox asked for client-side, which is what the goal needs" \
+    && ok "decorations: offered Client, Firefox asked for Client" \
     || bad "decorations: Firefox did not ask for client-side decorations"
 
   # dmabuf. The strategically important one: no `zwp_linux_dmabuf_v1` is
@@ -218,6 +247,7 @@ block_window() {
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
   have magick   || { non "no imagemagick"; return; }
 
+  FX_DECOR=client; FX_ENV=()
   local dir="$RUNDIR/win"
   run_firefox "$dir" wc-win 30 || { bad "the compositor never bound its socket"; return; }
 
@@ -282,6 +312,141 @@ block_window() {
 }
 
 # ---------------------------------------------------------------------------
+# titlebar: one title bar, and it is the window manager's
+# ---------------------------------------------------------------------------
+#
+# ADDED FOR STAGE 13, and it is the stage. Every window this project has ever
+# made has had **two** title bars — the host window manager's caption, and
+# directly beneath it Firefox's tab strip with its own minimise, maximise and
+# close buttons. The user reported it, on the crash reporter's window as well as
+# the browser's, so it is every window rather than a browser quirk.
+#
+# TWO LEVERS, AND NEITHER WORKS ALONE. That is the finding, and this block is
+# built to say so rather than to assert the happy path:
+#
+#   * the compositor sending `default_mode(2)` on `org_kde_kwin_server_-`
+#     `decoration_manager` bind. GTK 3 reads the manager's default in
+#     `gdk_wayland_display_prefers_ssd()`, and `gtk_window_should_use_csd()`
+#     consults nothing else on Wayland — not `GTK_CSD`, which is checked after
+#     an unconditional Wayland branch and is therefore dead here.
+#   * `MOZ_GTK_TITLEBAR_DECORATION=none` in the *client's* environment, which is
+#     what makes Gecko stop drawing a title bar of its own. The compositor
+#     cannot set this and there is no protocol that carries it, which is why
+#     §18.4 records it as a deployment requirement rather than a fix.
+#
+# The control leg below is the one that earns the paragraph: with the compositor
+# sending `default_mode(2)` and the environment variable absent, Firefox still
+# asks for `Client` and still reports a shadow inset. Without the control this
+# block would be evidence for the wrong lever.
+block_titlebar() {
+  echo "== titlebar: default_mode(Server) plus MOZ_GTK_TITLEBAR_DECORATION=none"
+  have "$FIREFOX" || { non "no firefox on PATH"; return; }
+
+  # --- the arrangement the stage ships -------------------------------------
+  local dir="$RUNDIR/tb"
+  FX_DECOR=server; FX_ENV=(MOZ_GTK_TITLEBAR_DECORATION=none)
+  WC_WAYLAND_DEBUG=1 run_firefox "$dir" wc-tb 25 \
+    || { bad "the compositor never bound its socket"; return; }
+
+  grep -q 'decorations: manager default is Server' "$dir/srv.log" \
+    && ok "the compositor advertised Server as the manager default" \
+    || bad "the compositor did not advertise Server"
+
+  # From the client's own trace, not from ours: `default_mode` is an event the
+  # compositor sends and libwayland logs on receipt, so this is Firefox saying
+  # it heard it.
+  grep -q 'default_mode(2)' "$dir/fx.txt" \
+    && ok "Firefox's own trace shows it received default_mode(2)" \
+    || bad "Firefox never logged default_mode(2)"
+
+  local asked
+  asked=$(grep -o 'org_kde_kwin_server_decoration#[0-9]*\.request_mode([0-9]*)' "$dir/fx.txt" \
+          | grep -o '([0-9]*)' | tr -d '()' | sort -u | tr '\n' ' ')
+  case "$asked" in
+    "2 ") ok "Firefox asked for mode 2 (Server) and nothing else" ;;
+    "")   bad "Firefox made no decoration request at all" ;;
+    *)    bad "Firefox asked for mode(s) $asked; 2 (Server) was expected" ;;
+  esac
+
+  # **The number the Win32 side has to live with.** §15.6 made the window the
+  # `set_window_geometry` rectangle rather than the buffer, and under client-side
+  # decorations that rectangle is inset by GTK's invisible resize margin and drop
+  # shadow — (26, 23) for this theme. Under server-side decorations there is no
+  # shadow to subtract and the origin is (0, 0), so the window *is* the buffer
+  # again. Both are handled by the same code and this is the assertion that the
+  # inset really went away rather than being compensated for somewhere.
+  #
+  # Only the toplevel's rectangle is looked at. A popup sets its own geometry
+  # and its origin is its own business, so anything narrower than 640 px is
+  # skipped rather than folded into the claim.
+  local insets
+  insets=$(grep -o 'set_window_geometry([0-9-]*, [0-9-]*, [0-9-]*, [0-9-]*)' "$dir/fx.txt" \
+           | tr -d 'a-z_()' | tr -d ' ' | awk -F, '$3 >= 640 { print $1 "," $2 }' | sort -u | tr '\n' ' ')
+  case "$insets" in
+    "0,0 ") ok "the toplevel's window geometry has a zero origin: no shadow inset to subtract" ;;
+    "")     bad "Firefox set no toplevel window geometry" ;;
+    *)      bad "the toplevel's geometry origin is $insets, not 0,0 — the CSD shadow inset is still there" ;;
+  esac
+
+  local mapped
+  mapped=$(grep -o 'window 1 mapped surface [0-9]*x[0-9]*' "$dir/srv.log" | tail -1)
+  [ -n "$mapped" ] \
+    && ok "the window mapped, and its size is the geometry rectangle: $mapped" \
+    || bad "the window never mapped"
+
+  # A window with no title bar is also what a client that failed to start looks
+  # like, so the frame is checked for being a browser.
+  if have magick; then
+    local last colours
+    last=$(ls "$dir"/frames/window1-*.ppm 2>/dev/null | tail -1)
+    if [ -n "$last" ]; then
+      colours=$(magick "$last" -format %k info: 2>/dev/null)
+      [ "${colours:-0}" -ge 50 ] \
+        && ok "the frame has $colours colours, so it is the browser and not an empty bar" \
+        || bad "the frame has only ${colours:-0} colours — Firefox drew nothing"
+      note "the client's pixels, with no title bar of their own: $last"
+    else
+      bad "no frame was dumped"
+    fi
+  fi
+
+  # --- the control: the same compositor, without the environment variable ---
+  #
+  # Run second and asserted *positively* — it is expected to fail to fix
+  # anything, and a control that is only reported is a control nobody notices
+  # has stopped controlling.
+  local ctl="$RUNDIR/tb-control"
+  FX_DECOR=server; FX_ENV=()
+  WC_WAYLAND_DEBUG=1 run_firefox "$ctl" wc-tbc 25 \
+    || { bad "the control run's compositor never bound its socket"; return; }
+
+  local casked cinsets
+  casked=$(grep -o 'org_kde_kwin_server_decoration#[0-9]*\.request_mode([0-9]*)' "$ctl/fx.txt" \
+           | grep -o '([0-9]*)' | tr -d '()' | sort -u | tr '\n' ' ')
+  cinsets=$(grep -o 'set_window_geometry([0-9-]*, [0-9-]*, [0-9-]*, [0-9-]*)' "$ctl/fx.txt" \
+            | tr -d 'a-z_()' | tr -d ' ' | awk -F, '$3 >= 640 { print $1 "," $2 }' | sort -u | tr '\n' ' ')
+  if [ "$casked" = "1 " ] && [ "$cinsets" != "0,0 " ]; then
+    ok "control: with default_mode(2) alone Firefox still asks for Client and still insets by ${cinsets% }"
+  else
+    bad "control: default_mode(2) alone gave mode(s) ${casked:-none} and origin ${cinsets:-none}; the environment variable may no longer be needed, which would change §18.4"
+  fi
+
+  # And the compositor did not fight it. §18.2's decision: the per-surface
+  # request is echoed even when it contradicts the default, because refusing it
+  # changes no client's behaviour and makes GDK re-request in a loop.
+  grep -q 'kde-decoration: client asked for Value(Client) (default is Server)' "$ctl/srv.log" \
+    && ok "control: the compositor logged the contradiction and honoured it" \
+    || bad "control: the compositor did not record a client insisting on Client"
+  local loops
+  loops=$(grep -c 'request_mode' "$ctl/fx.txt")
+  [ "${loops:-0}" -le 2 ] \
+    && ok "control: $loops request_mode(s) in the whole trace — echoing does not make GDK loop" \
+    || bad "control: $loops request_mode calls — the client is re-requesting in a loop"
+
+  FX_DECOR=client; FX_ENV=()
+}
+
+# ---------------------------------------------------------------------------
 # menu: the thing stage 6 could not do
 # ---------------------------------------------------------------------------
 
@@ -293,6 +458,7 @@ block_menu() {
   # context menu, which is chosen over the hamburger button on purpose: it does
   # not depend on hitting a 24-pixel target, so it does not become a test of
   # this harness's arithmetic.
+  FX_DECOR=client; FX_ENV=()
   local dir="$RUNDIR/menu"
   run_firefox "$dir" wc-menu 32 --click 640,500,273,12000 \
     || { bad "the compositor never bound its socket"; return; }
@@ -418,8 +584,13 @@ block_wine() {
     *) bad "unknown transport $transport"; return ;;
   esac
 
+  # `--decorations client` since stage 13, and named rather than inherited: this
+  # leg's `1280x900` assertion below is the *client-side* geometry rectangle,
+  # which is what a client-decorated Firefox reports and is the number §15.6
+  # established. The stage's own arrangement is `block_titlebar`'s.
   wine explorer "/desktop=$desk,1600x1050" \
     "$WIN_BIN/wc-compositor.exe" --socket "$sock" --timeout 150 --output "$OUTPUT" \
+    --decorations client \
     --dump-frames "$(winp "$dir/frames")" "${comp_extra[@]}" \
     --log "$(winp "$dir/srv.log")" >"$dir/loader.log" 2>&1 &
   local srv=$!
@@ -554,12 +725,13 @@ WC_X_DISPLAY=${WC_X_DISPLAY:-77}
 case "${1:-all}" in
   enumerate)  block_enumerate ;;
   window)     block_window ;;
+  titlebar)   block_titlebar ;;
   menu)       block_menu ;;
   wine)       block_wine shared-file ;;
   wine-arena) block_wine arena ;;
-  all)        block_enumerate; block_window; block_menu
+  all)        block_enumerate; block_window; block_titlebar; block_menu
               block_wine shared-file; block_wine arena ;;
-  *) echo "usage: $0 [enumerate|window|menu|wine|wine-arena|all]"; exit 2 ;;
+  *) echo "usage: $0 [enumerate|window|titlebar|menu|wine|wine-arena|all]"; exit 2 ;;
 esac
 
 echo

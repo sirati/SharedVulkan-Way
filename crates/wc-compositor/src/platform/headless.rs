@@ -446,6 +446,20 @@ impl PumpInner {
                     let _ = self.events.send(FromUi::Minimized { id, on });
                 }
             }
+            // ADDED FOR STAGE 13. There is no window manager here to hand a
+            // gesture to, and inventing one would be testing this file. Logged
+            // in the same greppable shape as everything else, so that a harness
+            // can assert the request *arrived* — which is the half of the path
+            // that lives in `state.rs` and is the half a Linux run can check.
+            ToUi::BeginMove { id } => {
+                println!("wc-compositor: window {id} asked the platform to move it");
+            }
+            ToUi::BeginResize { id, edge } => {
+                println!("wc-compositor: window {id} asked the platform to resize it from {edge:?}");
+            }
+            ToUi::WindowMenu { id, x, y } => {
+                println!("wc-compositor: window {id} asked the platform for a window menu at {x},{y}");
+            }
             ToUi::Destroy { id } => {
                 println!("wc-compositor: window {id} destroyed");
                 windows.remove(&id);
