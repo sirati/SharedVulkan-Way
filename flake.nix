@@ -86,6 +86,20 @@
           vulkan-loader
           # vulkaninfo, for establishing what a real implementation reports
           # versus what ours claims.
+          #
+          # KNOWN, measured 2026-08-13: the RTX 5090 does NOT enumerate inside
+          # this shell, while `nix shell nixpkgs#vulkan-tools` on the same
+          # machine lists all three devices. The loader reports "Failed loading
+          # library associated with ICD JSON" for nvidia_icd.json — yet a plain
+          # dlopen of that same library FROM THIS SHELL succeeds, so it is not
+          # a search-path fault, and prepending /run/opengl-driver/lib does not
+          # fix it. Cause unknown.
+          #
+          # It matters more than a missing device: an NVIDIA measurement taken
+          # in here is taken on a machine where NVIDIA is absent, and the
+          # absence looks like a driver that enumerates nothing. Take
+          # NVIDIA-specific measurements in a clean `nix shell` until this is
+          # understood.
           vulkan-tools
           # The forwarded implementation has to survive validation, not just
           # run one triangle. Zink, DXVK and vkd3d-proton all lean on
