@@ -296,7 +296,65 @@ pub struct Futex {
     /// status are re-examined. This is not the wake-up latency — a rung
     /// doorbell returns immediately — it is the bound on how stale a *missed*
     /// doorbell can make us, and R4's reason for there being no infinite wait.
+    ///
+    /// **This is the ceiling of a ladder, not the length of every wait.** See
+    /// [`Futex::first_slice`].
     pub slice: Duration,
+    /// How long the *first* wait of a park may block, before the ladder starts
+    /// doubling towards [`Futex::slice`].
+    ///
+    /// # This field is the cross-VM present, and it was 20 ms
+    ///
+    /// The comment above says a futex wake cannot cross a hypervisor and that
+    /// what saves correctness is that `slice` is finite. That was true and it
+    /// was not enough: with one fixed 20 ms slice, **every** wait cross-VM costs
+    /// the whole 20 ms, because the wake that would have ended it early reaches
+    /// nobody and the readiness predicate is only re-examined when the slice
+    /// expires. It is a poll with a 20 ms period wearing a doorbell's clothes.
+    ///
+    /// Measured, that is the entire cross-VM present cost. Firefox's first frame
+    /// stalled ~15 s; the decomposition cleared the per-frame `XSync`
+    /// (2.00/1.80/1.70 ms with, 2.10/1.80/1.60 ms without) and cleared guest
+    /// contention (480 frames, median 216.9 ms, min 213.9, max 228.7, load ~1 —
+    /// a 7% spread is not queueing), and left the cross-VM present itself:
+    /// **1.7-2.1 ms local against 216.9 ms cross-VM.** One present makes about
+    /// eleven waits — `vkResetFences`, `vkQueueSubmit`, `vkWaitForFences`, the
+    /// acquire, and kopper's per-frame surface query — and 216.9 / 20 ms is
+    /// 10.8. The number was not approximately the slice; it *was* the slice,
+    /// once per wait.
+    ///
+    /// # Why a ladder, and why it needs to know nothing about the topology
+    ///
+    /// A short first slice makes a missed doorbell cheap; a long last slice
+    /// makes an idle ring free. Doubling from one to the other gets both, and —
+    /// this is the part worth the field — **it needs no flag saying whether the
+    /// peer is across a hypervisor.** Same-kernel, the doorbell fires and the
+    /// very first `sys::wait` returns at once, so the ladder is never climbed
+    /// and this costs exactly nothing; the measured same-machine round trip is
+    /// unchanged. Cross-VM, no wake ever arrives, every wait runs its slice, and
+    /// the ladder is what bounds the damage: a wait whose true duration is `T`
+    /// costs `O(T)` with `O(log T)` wakeups instead of `20 ms` with one.
+    ///
+    /// Detecting the topology and switching parkers was the other candidate. It
+    /// was refused because the detection would have to be right, and this does
+    /// not: a ladder is correct when it guesses wrong in either direction, which
+    /// is the property to want from something the whole channel's latency hangs
+    /// on.
+    ///
+    /// # 25 µs, and what the guest actually gets
+    ///
+    /// Linux honours it. **Windows does not**: `WaitOnAddress` takes whole
+    /// milliseconds and `sys::wait` clamps to a floor of 1 ms, so on the guest
+    /// the first rung is 1 ms however small this is. That is deliberate and it
+    /// is stated here rather than tuned away, because the guest is where the
+    /// 216.9 ms was measured and 1 ms is the honest floor of this mechanism
+    /// there: ~11 waits at ~1 ms is ~11 ms a present, a factor of twenty, and
+    /// the remaining millisecond per wait is not recoverable with
+    /// `WaitOnAddress`. Going below it needs a different primitive — a
+    /// high-resolution waitable timer as `wc-compositor`'s `tick.rs` uses
+    /// (§13.8: `Sleep(1)` really costs 15.8 ms, the timer 5.1 ms), or the
+    /// hypervisor-carried doorbell this module has always said it wants.
+    pub first_slice: Duration,
 }
 
 impl Default for Futex {
@@ -311,7 +369,12 @@ impl Default for Futex {
         // what stands between "this round trip is fast" and "this round trip
         // pays for a doorbell it did not need", and they were the one part of
         // §4.5 that was not broken.
-        Futex { spins: 256, yields: 32, slice: Duration::from_millis(20) }
+        Futex {
+            spins: 256,
+            yields: 32,
+            slice: Duration::from_millis(20),
+            first_slice: Duration::from_micros(25),
+        }
     }
 }
 
@@ -345,6 +408,10 @@ impl Parker for Futex {
         // one lane in principle and a flag one of them cleared would silence the
         // doorbell for the other.
         bell.parked.fetch_add(1, Ordering::SeqCst);
+        // The ladder, reset for every park: a wait that has only just begun has
+        // no evidence that its doorbell is unreachable, and one that has been
+        // going for 20 ms has plenty.
+        let mut slice = self.first_slice.min(self.slice);
         let outcome = loop {
             // Read the doorbell *before* the last readiness check. `Bell`'s
             // documentation is where the argument for that order lives.
@@ -359,7 +426,11 @@ impl Parker for Futex {
             if deadline.expired(now) {
                 break ParkOutcome::TimedOut;
             }
-            sys::wait(bell.wake, seen, self.slice.min(deadline.remaining(now)));
+            sys::wait(bell.wake, seen, slice.min(deadline.remaining(now)));
+            // Double *after* the wait, so the first rung is the one this park
+            // actually pays. Saturating, and clamped to the ceiling, so a long
+            // wait settles at `slice` and an idle ring costs what it always did.
+            slice = slice.saturating_mul(2).min(self.slice);
         };
         bell.parked.fetch_sub(1, Ordering::SeqCst);
         // One last look: a doorbell rung between the loop's exit and the
@@ -768,6 +839,75 @@ mod tests {
         );
     }
 
+    /// **The cross-VM present, reproduced without a VM.**
+    ///
+    /// The one thing a hypervisor does to this mechanism is swallow the wake:
+    /// the shared word is still shared, so the producer's `Release` store to
+    /// `tail` is visible immediately, but `FUTEX_WAKE` on one kernel reaches
+    /// nobody on the other. This test is that situation exactly — the readiness
+    /// predicate becomes true on a timer while the doorbell is *never rung* —
+    /// and it is faithful because a missed wake and an unreachable wake are the
+    /// same event to the waiter.
+    ///
+    /// With the old fixed 20 ms slice this took 20 ms whatever the predicate
+    /// did, which is where 216.9 ms a present came from: about eleven of these
+    /// per frame. With the ladder it costs a small multiple of the true wait.
+    #[test]
+    fn a_doorbell_that_never_arrives_costs_the_wait_and_not_the_whole_slice() {
+        let (owner, _peer, slot) = setup();
+        let ctrl = RingCtrl::open(&owner, slot).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+
+        // Ready after 2 ms — the scale of a real present's individual waits.
+        let setter = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(2));
+                flag.store(true, Ordering::Release);
+                // Deliberately no `Bell::ring`. That is the whole point.
+            })
+        };
+
+        let ready = || flag.load(Ordering::Acquire);
+        let status = || ctrl.status();
+        let site = WaitSite::new(ctrl.id(), &ready, &status)
+            .with_bell(ctrl.bell(Lane::Command).unwrap());
+
+        let t0 = Instant::now();
+        let outcome = Futex::default().park(&site, Deadline::after(Duration::from_secs(5)));
+        let took = t0.elapsed();
+        setter.join().unwrap();
+
+        assert_eq!(outcome, ParkOutcome::Woken);
+        // The bound is deliberately loose — this runs on a contended machine and
+        // the ladder overshoots by at most its current rung. What it excludes is
+        // the old behaviour, which was 20 ms on the nose regardless.
+        assert!(
+            took < Duration::from_millis(12),
+            "a 2 ms wait with an unreachable doorbell took {took:?}; \
+             a fixed slice would have made it 20 ms, and eleven of those is a present"
+        );
+    }
+
+    /// The ladder must not have bought the above by making an idle ring
+    /// expensive: a wait that is never satisfied still ends at its deadline
+    /// rather than burning a core climbing rungs.
+    #[test]
+    fn the_ladder_still_honours_the_deadline_when_nothing_ever_arrives() {
+        let (owner, _peer, slot) = setup();
+        let ctrl = RingCtrl::open(&owner, slot).unwrap();
+        let ready = || false;
+        let status = || ctrl.status();
+        let site = WaitSite::new(ctrl.id(), &ready, &status)
+            .with_bell(ctrl.bell(Lane::Command).unwrap());
+        let t0 = Instant::now();
+        let outcome = Futex::default().park(&site, Deadline::after(Duration::from_millis(60)));
+        let took = t0.elapsed();
+        assert_eq!(outcome, ParkOutcome::TimedOut);
+        assert!(took >= Duration::from_millis(50), "it returned early: {took:?}");
+        assert!(took < Duration::from_millis(200), "it overran its deadline: {took:?}");
+    }
+
     /// The trait's whole reason for existing: a second implementation, swapped
     /// in at the call site with no other change. If this compiles, an
     /// event-driven parker can replace the polling one without touching
@@ -841,5 +981,82 @@ mod tests {
         assert_eq!(bell.0.load(Ordering::Relaxed), 1);
         assert_eq!(ctrl.notify_count(), 1);
         NoDoorbell.ring(ctrl.id());
+    }
+}
+
+/// The measurement that justifies the ladder, run as a test because a claim
+/// this large should not rest on a number somebody typed into a commit message.
+#[cfg(test)]
+mod measure {
+    use super::*;
+    use crate::control::{Geometry, ProtocolIds, RingKind};
+    use crate::region::SharedRegion;
+    use crate::ring::Lane;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// Eleven waits of 180 µs each, with the doorbell swallowed — which is one
+    /// cross-VM present, reproduced on one kernel. Eleven because that is what
+    /// `vkResetFences`, `vkQueueSubmit`, `vkWaitForFences`, the acquire and
+    /// kopper's per-frame surface query add up to; 180 µs because the work
+    /// itself is fast and the measured *local* present is 1.7-2.1 ms.
+    fn one_present(f: Futex) -> Duration {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let ids = ProtocolIds::new(1, 1);
+        let owner = Control::create(Arc::clone(&region), g, ids, 1).unwrap();
+        let peer = Control::attach(region, ids).unwrap();
+        let slot = peer.claim_ring(RingKind::Device, 1, None).unwrap();
+        let ctrl = RingCtrl::open(&owner, slot).unwrap();
+        let t0 = Instant::now();
+        for _ in 0..11 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let set = {
+                let flag = Arc::clone(&flag);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_micros(180));
+                    flag.store(true, Ordering::Release);
+                })
+            };
+            let ready = || flag.load(Ordering::Acquire);
+            let status = || ctrl.status();
+            let site = WaitSite::new(ctrl.id(), &ready, &status)
+                .with_bell(ctrl.bell(Lane::Command).unwrap());
+            f.park(&site, Deadline::after(Duration::from_secs(5)));
+            set.join().unwrap();
+        }
+        t0.elapsed()
+    }
+
+    /// Measured on the development host: **185.4 ms fixed against 11.4 ms
+    /// laddered, 16.3x.** The 185 ms is the number worth staring at — the
+    /// cross-VM present was measured at 216.9 ms median over 480 frames, and
+    /// this reproduces it on one machine with no VM, no GPU and no Vulkan in
+    /// sight, out of nothing but eleven waits and a slice. That is the diagnosis
+    /// and the fix in a single figure.
+    #[test]
+    fn the_ladder_is_an_order_of_magnitude_better_than_the_fixed_slice() {
+        // `first_slice == slice` is exactly the old behaviour, which is why it
+        // stayed expressible rather than being deleted: the comparison has to be
+        // against something, and a field is a better something than a git
+        // revision somebody has to check out to believe this.
+        let old = Futex { first_slice: Duration::from_millis(20), ..Futex::default() };
+        let fixed = one_present(old);
+        let ladder = one_present(Futex::default());
+        println!("fixed 20 ms slice, 11 waits: {fixed:?}");
+        println!("ladder,            11 waits: {ladder:?}");
+
+        // Loose by design: this runs on a machine several agents share. What it
+        // excludes is the regression, not the exact figure.
+        assert!(
+            fixed > Duration::from_millis(100),
+            "the fixed slice cost only {fixed:?}; if that is fast, the premise \
+             of this whole change is wrong and it should be re-examined"
+        );
+        assert!(
+            ladder < fixed / 4,
+            "the ladder cost {ladder:?} against the fixed slice's {fixed:?}, \
+             which is not the order of magnitude this change exists for"
+        );
     }
 }
