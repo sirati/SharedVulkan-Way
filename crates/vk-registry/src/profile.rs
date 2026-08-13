@@ -522,6 +522,39 @@ pub mod profiles {
         }
     }
 
+    /// Zink's set plus Vulkan Video's H.264 decode path.
+    ///
+    /// **This profile does not resolve, and that is what it is for.** It is the
+    /// one-line experiment `docs/video-decode.md` asks anyone to repeat:
+    ///
+    /// ```text
+    /// cargo run -p sv-codegen -- --profile video --stats
+    /// ```
+    ///
+    /// The failure is in `plan.rs`, on the first `StdVideo*` type it reaches,
+    /// and the reason is structural rather than a missing case. `vk.xml` does
+    /// not define the video std types — it names them, with
+    /// `requires="vk_video/vulkan_video_codec_h264std.h"` — so the registry
+    /// models them as `TypeDef::External` and the wire planner refuses an
+    /// external type because it cannot know its layout. Six of them are on the
+    /// H.264 decode surface, and one of those, `StdVideoH264ProfileIdc`, is
+    /// passed *by value*, so even the "external types only appear behind
+    /// pointers" assumption the C ABI pass makes does not hold.
+    ///
+    /// Keeping the profile in the tree rather than deleting it makes the wall a
+    /// thing a person can walk into in ten seconds, and makes it a build error
+    /// on the day somebody teaches the planner about `vk_video`.
+    pub fn video() -> Profile {
+        let mut p = zink();
+        p.name = "video".into();
+        p.extensions.extend([
+            "VK_KHR_video_queue".into(),
+            "VK_KHR_video_decode_queue".into(),
+            "VK_KHR_video_decode_h264".into(),
+        ]);
+        p
+    }
+
     /// Commands excluded from every profile, with the reason each is out.
     fn excluded_commands() -> Vec<String> {
         [

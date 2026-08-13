@@ -51,7 +51,7 @@ fn sealed_memfd(len: u64) -> Result<OwnedFd, String> {
     let name = c"sv-dmabuf-probe";
     // `MFD_ALLOW_SEALING` at creation is not optional and cannot be added later
     // — which is exactly why `sv_transport::region::memfd` already passes it.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING as u32) };
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(format!("memfd_create: {}", errno_text()));
     }

@@ -320,8 +320,11 @@ pub fn profile_by_name(name: &str) -> Option<Profile> {
     match name {
         "zink" => Some(vk_registry::profiles::zink()),
         "step3-minimal" | "step3" => Some(vk_registry::profiles::step3_minimal()),
+        // Does not resolve, on purpose. See `vk_registry::profiles::video` and
+        // `docs/video-decode.md`.
+        "video" => Some(vk_registry::profiles::video()),
         _ => None,
     }
 }
 
-pub const PROFILE_NAMES: &[&str] = &["zink", "step3-minimal"];
+pub const PROFILE_NAMES: &[&str] = &["zink", "step3-minimal", "video"];

@@ -899,6 +899,93 @@ sides already derive from the session string. A protocol that could not be
 described without saying "count the file descriptors" was a protocol with a
 same-machine assumption in it.
 
+### 0.8 What the video decode stage settled
+
+Measured 2026-08-13, `docs/video-decode.md` and `scripts/sv-video-decode.sh`.
+**H.264 decodes, on all three GPUs this project can reach, byte-identically to
+libavcodec — and none of it crosses the boundary.** The new crate is
+`video-probe`; nothing else in the tree changed except a profile that is in the
+tree precisely because it does not build.
+
+```
+RADV RAPHAEL_MENDOCINO   24 frames, median 0.806 ms, sha256 b3a1374e…
+NVIDIA GeForce RTX 5090  24 frames, median 0.116 ms, sha256 b3a1374e…
+Intel UHD Graphics       24 frames, median 0.664 ms, sha256 b3a1374e…   ← in the testhost guest
+ffmpeg -pix_fmt nv12                                sha256 b3a1374e…
+```
+
+Seven findings, and the first is the one that decides whether this is worth
+building.
+
+**1. The wall is a *type*, not a queue and not a session.** Adding
+`VK_KHR_video_queue`, `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`
+to a profile resolves cleanly and then fails in `plan.rs` on
+`VkVideoDecodeH264CapabilitiesKHR.maxLevelIdc`, because `StdVideoH264LevelIdc`
+is declared in `vk.xml` only as `requires="vk_video/vulkan_video_codec_h264std.h"`
+and §6.1 refuses an external type. Six such types are on the H.264 decode
+surface. §7.1's "one XML file and nothing else" is the design that makes the
+generator trustworthy and it is exactly what stops here; the profile is kept as
+`vk_registry::profiles::video` so the wall is ten seconds away rather than an
+afternoon. **Two of the six are used by value**, which also makes `abi.rs`'s
+zero-sized `AbiType::Opaque` wrong for them — latently, since nothing reaches it
+today.
+
+**2. §0.6's rule has its first real second candidate, and it points at a smaller
+protocol rather than a larger one.** "A capability that is expressible in the
+forwarded API does not deserve a protocol extension" — decode is not expressible,
+because the generator cannot describe the types. But the fix is not to make the
+whole of Vulkan Video cross. If the **GPU side owns the video session, the DPB
+and the decode queue privately**, what crosses is a bitstream and an image id,
+the second ring D8 would otherwise demand never exists, and the app side never
+sees a queue family it cannot use. That is the shape the topology wants anyway,
+and it is what §11's future work should say.
+
+**3. Both video decode queue families in play cannot copy.** RADV's is
+`VIDEO_DECODE` alone and the guest Intel's is `VIDEO_DECODE` alone; only NVIDIA's
+also carries `TRANSFER`. So a decode and its readback are two queues on two
+families even before any forwarding, which `video-probe` handles with
+`VK_SHARING_MODE_CONCURRENT` and a semaphore. §0.4 item 7's "one synthesised
+family" is a decision this stage does not break, but it is the first workload
+that would.
+
+**4. `DPB_AND_OUTPUT_COINCIDE` and `DPB_AND_OUTPUT_DISTINCT` are both real and
+both had to be implemented.** NVIDIA reports only `COINCIDE` — the decoded
+picture *is* the DPB slot; RADV and Intel report `DISTINCT`. An app side cannot
+choose between them, so anything forwarding decode carries both.
+
+**5. Session memory ranges from nothing to four allocations** — Intel 0 binds,
+RADV 1 of 177,152 bytes, NVIDIA 4 totalling 294,912. Another count-then-fill on
+the critical path, which §0.4 item 5 and §0.5 item 4 have now each been got
+wrong once in opposite directions.
+
+**6. The capability numbers of Vulkan Video are not yet believable, and the two
+RADVs in our own dev shell disagree.** Mesa 26.1.1 reports H.264 `maxLevelIdc`
+as **14** (the `StdVideoH264LevelIdc` enum value for level 5.1); Mesa 26.2.0, on
+the same hardware on the same day, reports **52** (the bitstream `level_idc`
+byte). Intel reports **1**, i.e. level 1.1, beside a 4096×4096 coded extent, and
+reports H.265 `decodeFlags` with *neither* required bit set while
+`vkGetPhysicalDeviceVideoFormatPropertiesKHR` returns no formats for a profile it
+says is supported. The *profile* query — will you take this codec, chroma format
+and bit depth — is answered honestly by every driver. The numbers attached to
+the answer are not, and §9.2's "advertise what the driver reports, never
+synthesise" needs the qualifier that some of what it reports is wrong.
+
+**7. Firefox is no longer the obstacle the phase-2 research said it was, and the
+new obstacle is §1a.** Firefox 153 (2026-07-21) ships a Vulkan Video decoder,
+via ffmpeg's `AV_HWDEVICE_TYPE_VULKAN`, opt-in behind
+`media.hardware-video-decoding-vulkan.enabled`. It would *select* a forwarded
+device — it accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`. It then exports every
+decoded frame as a **Linux dma-buf**, with no host-memory fallback anywhere in
+the path. A dma-buf is a host kernel object, the frame is in a Windows guest, and
+a dma-buf is a file descriptor besides. The whole gap is now one output path in
+one Firefox file, and `docs/video-decode.md` §5 says what it would take.
+
+One thing about the harness rather than the result. **A `pNext` that the
+specification requires and the driver does not check is a segfault with no
+message**: `vkGetPhysicalDeviceVideoCapabilitiesKHR` with a bare
+`VkVideoCapabilitiesKHR` kills the process inside RADV before anything is
+printed. Every other mistake in this stage produced a `VkResult`.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on

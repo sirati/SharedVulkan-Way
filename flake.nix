@@ -152,6 +152,19 @@
           xdpyinfo
           netpbm # xwdtopnm, so a captured frame can be inspected without a GUI
 
+          # --- Video -------------------------------------------------------
+          # `video-probe` decodes H.264 through VK_KHR_video_decode_queue, and
+          # both halves of judging that need ffmpeg: it *makes* the fixture —
+          # an all-IDR elementary stream, which no other tool here can produce —
+          # and it *decodes the same stream in software*, which is the control
+          # the Vulkan output is compared against. A hardware decoder that
+          # agrees byte-for-byte with libavcodec is a much stronger statement
+          # than one whose picture looks plausible, and it is the same argument
+          # as comparing zink against llvmpipe.
+          #
+          # It is the "small" ffmpeg, so there is no CUDA/AMF in the closure.
+          ffmpeg
+
           # --- Misc --------------------------------------------------------
           pkg-config
           # Reading the shared-memory region while debugging both ends.

@@ -1,0 +1,16 @@
+[package]
+name = "video-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ask every driver in reach what it can decode, and then decode a frame"
+
+[dependencies]
+anyhow.workspace = true
+# The same ash the rest of the project uses. 0.38.0+1.3.281 carries the whole
+# of VK_KHR_video_queue, VK_KHR_video_decode_queue and the three decode codec
+# extensions, including the `vk::native` StdVideo* types — which matters,
+# because those types come from `vk_video/*.h` and not from `vk.xml`, and
+# nothing in this workspace generates them.
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
