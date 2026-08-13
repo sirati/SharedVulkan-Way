@@ -89,6 +89,9 @@ struct Args {
     /// slots in the control region it creates at this path — the `accept()` half
     /// of §36.2's table. The socket listener stays up alongside it.
     wayland_ring: Option<String>,
+    /// §36, cross-VM. Publish the ring region out of the guest's own RAM over
+    /// this cold path, instead of creating it as a file.
+    wayland_cold: Option<String>,
     idle_timeout: Duration,
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
@@ -259,6 +262,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         once: false,
         socket: None,
         wayland_ring: None,
+        wayland_cold: None,
         idle_timeout: Duration::from_secs(30),
         dump_frames: None,
         debug_icon: false,
@@ -292,6 +296,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--log" => args.log = it.next().map(Into::into),
             "--socket" => args.socket = it.next(),
             "--wayland-ring" => args.wayland_ring = it.next(),
+            "--wayland-cold" => args.wayland_cold = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -813,7 +818,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let wayland = std::thread::Builder::new()
         .name("wayland".into())
         .spawn(move || {
-            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.idle_timeout, args.debug_icon,
+            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
@@ -842,6 +847,7 @@ fn wayland_thread(
     once: bool,
     socket: Option<String>,
     wayland_ring: Option<String>,
+    wayland_cold: Option<String>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -913,20 +919,40 @@ fn wayland_thread(
     // Both produce a `wc_transport::Stream` for `insert_client`; only one of
     // them involves anything crossing the VM boundary.
     #[cfg(unix)]
-    let mut ring_link = match wayland_ring.as_deref() {
-        None => None,
-        Some(path) => match ringlink::RingLink::create(path) {
-            Ok(rl) => {
-                println!("wc-compositor: accepting Wayland rings in {path}");
+    let mut ring_link = {
+        // Two ways to obtain the region and one directory to poll afterwards.
+        // `--wayland-cold` is the cross-VM one: the region is guest RAM the host
+        // locates. `--wayland-ring` is a file, for one machine.
+        let made = match (wayland_cold.as_deref(), wayland_ring.as_deref()) {
+            (Some(port), _) => {
+                #[cfg(target_os = "linux")]
+                {
+                    Some(ringlink::RingLink::publish(port).map(|rl| (rl, format!("guest RAM published on {port}"))))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = port;
+                    Some(Err("--wayland-cold needs the Linux guest-RAM provider".to_string()))
+                }
+            }
+            (None, Some(path)) => {
+                Some(ringlink::RingLink::create(path).map(|rl| (rl, path.to_string())))
+            }
+            (None, None) => None,
+        };
+        match made {
+            None => None,
+            Some(Ok((rl, what))) => {
+                println!("wc-compositor: accepting Wayland rings in {what}");
                 let _ = std::io::stdout().flush();
                 Some(rl)
             }
-            Err(e) => {
-                eprintln!("wc-compositor: could not create the ring region {path}: {e}");
+            Some(Err(e)) => {
+                eprintln!("wc-compositor: could not obtain the ring region: {e}");
                 state.quit();
                 return 2;
             }
-        },
+        }
     };
 
     loop {

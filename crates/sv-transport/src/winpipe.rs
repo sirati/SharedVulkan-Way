@@ -258,6 +258,19 @@ impl Pipe {
 #[cfg(windows)]
 impl std::io::Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+/// `&Pipe` is `Read` and `Write` so that one open handle can serve a reader
+/// thread and a writer thread at once. Neither operation mutates anything in
+/// `Pipe` — both are a syscall on `handle` — and a virtio-serial port permits
+/// exactly one opener, so sharing the handle is not a convenience but the only
+/// way a doorbell can exist at all: a doorbell is by construction a thing you
+/// write while something else is blocked reading. See `vdoorbell::attach`.
+#[cfg(windows)]
+impl std::io::Read for &Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut got: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;
         // SAFETY: `buf` is valid for `len` bytes and `handle` is live.
@@ -282,6 +295,16 @@ impl std::io::Read for Pipe {
 
 #[cfg(windows)]
 impl std::io::Write for Pipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self).flush()
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Write for &Pipe {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut put: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;
