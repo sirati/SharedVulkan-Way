@@ -183,6 +183,24 @@ impl Spec {
         spec.load(include_str!("../protocols/idle-inhibit-unstable-v1.xml"))?;
         spec.load(include_str!("../protocols/xdg-activation-v1.xml"))?;
         spec.load(include_str!("../protocols/keyboard-shortcuts-inhibit-unstable-v1.xml"))?;
+        // ADDED FOR STAGE 12 (docs/design.md §23). `wp_cursor_shape_v1`, so a
+        // client can say "I-beam" instead of shipping cursor pixels.
+        //
+        // It is a **staging** protocol and the copy is taken from the same
+        // `wayland-protocols 0.32.12` the compositor's smithay generates its
+        // server half from, for the reason at the top of this function: a
+        // proxy whose table came from a different revision of the XML than the
+        // compositor's dispatch is a proxy that desynchronises on an argument
+        // nobody changed on purpose.
+        //
+        // Two interfaces, no `h` argument in either, and one loose end worth
+        // naming: `wp_cursor_shape_manager_v1.get_tablet_tool_v2` takes a
+        // `zwp_tablet_tool_v2` that no file here defines. That is fine and is
+        // not an oversight — an `object` argument is four bytes whatever it
+        // points at, and the proxy only needs a definition for an interface
+        // whose *own* messages it has to walk. No tablet global is advertised,
+        // so no client can obtain one to send.
+        spec.load(include_str!("../protocols/cursor-shape-v1.xml"))?;
         Ok(spec)
     }
 
@@ -328,8 +346,9 @@ mod tests {
         //
         // STAGE 21 adds four more protocols of two interfaces each — a manager
         // and the object it hands out, which is the shape all four happen to
-        // have — taking 32 to 40.
-        assert_eq!(s.len(), 40, "interfaces: {:?}", s.names());
+        // have — taking 32 to 40. STAGE 12's `wp_cursor_shape_v1` has the same
+        // shape and takes it to 42.
+        assert_eq!(s.len(), 42, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,
@@ -425,6 +444,44 @@ mod tests {
         assert_eq!(s.event("xdg_toplevel", 1).unwrap().name, "close");
     }
 
+
+    /// The protocol stage 12 added, and the two messages the proxy will
+    /// actually see on the wire.
+    ///
+    /// Both opcodes are 1 because `destroy` is opcode 0 in each interface,
+    /// which is the sort of thing that is obvious until it is not: getting
+    /// either wrong makes the proxy walk a `destroy` — no arguments — as a
+    /// message that has two, and §8.9's silent desynchronisation follows.
+    #[test]
+    fn cursor_shape_is_walkable() {
+        let s = spec();
+
+        let m = s.request("wp_cursor_shape_manager_v1", 1).unwrap();
+        assert_eq!(m.name, "get_pointer");
+        assert_eq!(
+            m.args.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [ArgKind::NewId, ArgKind::Object]
+        );
+        assert_eq!(
+            m.args[0].interface.as_deref(),
+            Some("wp_cursor_shape_device_v1")
+        );
+
+        let m = s.request("wp_cursor_shape_device_v1", 1).unwrap();
+        assert_eq!(m.name, "set_shape");
+        // A serial and an enum: eight bytes of body and nothing else. This is
+        // the whole reason the named half is the cheap half.
+        assert_eq!(
+            m.args.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [ArgKind::Word, ArgKind::Word]
+        );
+        assert!(!m.has_fd());
+
+        // Neither interface has an event at all, so the reverse direction has
+        // nothing to walk.
+        assert!(s.event("wp_cursor_shape_device_v1", 0).is_none());
+    }
+
     /// Every global `wc-compositor` advertises, named here by hand.
     ///
     /// The list is duplicated rather than imported because `wc-proxy` does not
@@ -456,6 +513,7 @@ mod tests {
             "zwp_idle_inhibit_manager_v1",
             "xdg_activation_v1",
             "zwp_keyboard_shortcuts_inhibit_manager_v1",
+            "wp_cursor_shape_manager_v1",
         ] {
             assert!(
                 s.interface(iface).is_some(),
@@ -471,6 +529,7 @@ mod tests {
         // which speaks it from the far side of the boundary rather than
         // through `Session` — see `crate::iconlink`.
         assert!(s.interface("wc_icon_manager_v1").is_none());
+
     }
 
     #[test]

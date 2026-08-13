@@ -3428,7 +3428,7 @@ together.
 |---|---|
 | `cargo test --workspace` | **133 tests**, 0 failures (124 on the branch, 116 in stage 5) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
-| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same, plus one pre-existing in `sv-transport` |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
 | `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
 | `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed |
@@ -6649,7 +6649,7 @@ rates.
 | gate | result |
 |---|---|
 | `cargo test --workspace` | **158 passed**, 0 failed (157 on master, +1: `the_client_prefix_is_found_from_bin_and_from_lib`) |
-| `cargo clippy --workspace --all-targets` | clean in every crate this branch touches (one pre-existing warning in `sv-hostd`) |
+| `cargo clippy --workspace --all-targets` | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | an **executable**, not metadata — §17's trap, and this stage deployed from it four times |
 | `wc-desktop.sh window`, guest-RAM arena, Firefox, interactive desktop | the arena located, the window captured, the caption and taskbar button asserted |
@@ -7528,6 +7528,1089 @@ considered during the stage and deliberately not built:
    sketched; what it needs is somebody to say whether a periodic
    `GetLastInputInfo` on the guest is acceptable, which is a question about the
    deployment and not about the code.
+---
+
+## 23. Stage 12: the mouse cursor
+
+### 23.1 Status in one paragraph
+
+Written 2026-08-13. `wl_pointer.set_cursor` was a stub — it logged once, did
+nothing, and the user saw the Win32 arrow over everything: no I-beam over text,
+no hand over a link, no resize arrow on a client's own edge. It is implemented,
+together with `wp_cursor_shape_v1`, which was absent altogether. Both arrive at
+the same smithay callback and leave through the same platform message, because
+from Win32's point of view they are one act: `SetCursor` with one `HCURSOR`.
+`scripts/wc-cursor.sh` is **5 passed, 0 failed** on the Linux leg and **8
+passed, 0 failed** on the Wine leg, and the sentence the Wine leg buys is:
+*a client's cursor theme — 32x32 pixels with a hotspot of 5,5, drawn by
+somebody else's XCursor theme — crossed the proxy, became a `CreateIconIndirect`
+handle inside `wc-compositor.exe`, and is what the compositor's input queue is
+holding.* `wl_keyboard.repeat_info` stopped being invented at the same time and
+is now `SystemParametersInfo`.
+
+The invariant this stage exists to keep, and the one the user stated: **exactly
+one visible cursor, and it is a real Win32 cursor.** Nothing here draws
+anything. A client's cursor surface becomes an `HCURSOR` and Windows
+composites it above every window on the desktop, with the right hotspot and no
+tearing, for free. Blitting a cursor surface into the window as content is the
+alternative and it is wrong three ways at once — clipped to the window, a frame
+late, and with the system arrow still on top of it, which is the two-cursor bug
+that was live while this was written.
+
+### 23.2 Two protocols, and why the named one first
+
+`wp_cursor_shape_v1` carries a **name** — `default`, `text`, `pointer`,
+`ns_resize` — and `wl_pointer.set_cursor` carries a **surface**. The named one
+was done first and it is not merely the tidier half:
+
+* It maps almost one-to-one onto `LoadCursorW(NULL, IDC_IBEAM)` and friends. No
+  pixels, no hotspot arithmetic, no surface lifetime, no buffer release.
+* The cursor a user gets is then the *system's*, at the system's size and DPI,
+  matching every native application on the machine. A themed Linux cursor is
+  the right shape drawn in the wrong house.
+* It is what GTK4 binds today.
+
+That last claim was checked rather than repeated. `libgtk-4.so.1` contains the
+string `wp_cursor_shape_manager_v1`; `libgtk-3.so.0` does not; and **Firefox
+151's `libxul.so` does not either**. So for the application this project is
+aimed at, the named path is not the one that matters — Firefox reaches the
+compositor entirely through `wl_pointer.set_cursor` with a buffer, which is
+why both halves were done in one stage rather than the easy one being shipped
+alone.
+
+**And that is the second time the same measurement has come back the same way,
+so it is worth stating as a rule rather than as a surprise.** §13.7 found that
+GTK 3 does not implement `xdg-decoration` and binds KDE's
+`org_kde_kwin_server_decoration` instead — checked the same way, by looking for
+the interface name in `libgdk-3.so`. The general form:
+
+> For a GTK3-era client, the modern protocol is frequently **advertised and
+> never bound**. Implementing it is therefore not evidence that anything
+> reaches it, and a compositor that shipped only the modern half would pass
+> every protocol-shaped test and change nothing a user could see.
+
+The cheap check is one `grep` against the client's own shared object, and it
+costs less than the run that would otherwise discover the same thing an hour
+later. It is also why §23.8 item 1 is written as an admission rather than a
+footnote: the *named* path here is currently in exactly the state this rule
+warns about — advertised, carried, unit-tested, and bound by nothing in the
+harness.
+
+### 23.3 The table, and where it lives
+
+`crates/wc-compositor/src/cursor.rs`. It is a new file for one reason: the
+mapping is **lossy** — thirty-six named shapes onto fourteen stock Win32
+cursors — and every lossy entry is a judgement someone should be able to read
+and disagree with. A table like that belongs somewhere it can be unit-tested on
+the machine that builds it, so it deals in the `IDC_*` **resource ordinals**
+(`IDC_IBEAM` is the integer 32513 and has been since Windows 3.0) and never
+mentions `windows-sys`. `platform/win32.rs` is the only file that turns one
+into a `PCWSTR`.
+
+Five tests, and the two that earn their keep are the ones about mistakes that
+are invisible at a glance: `the_diagonals_do_not_swap` (NE/SW is the `/` cursor
+and NW/SE is the `\` one, and both look like "a resize arrow" from a metre
+away) and `only_the_six_documented_shapes_fall_back_to_the_arrow` — because the
+failure mode of a lossy table is entries quietly rotting into the default.
+
+The six given up on are `context_menu`, `alias`, `copy`, `dnd_ask`, `zoom_in`
+and `zoom_out`. Windows draws these as an arrow with a badge, and the badges
+are not stock cursors: they live in the shell's drag-and-drop implementation
+and are reachable only through `IDropTarget`, a COM interface this compositor
+has no business implementing to decorate a pointer. An arrow is honest; a
+crosshair standing in for "copy" is not.
+
+### 23.4 The buffer path, and the four things it has to get right
+
+1. **When the pixels arrive.** A client may `set_cursor(surface)` and *then*
+   attach and commit the buffer (GTK does), or attach and commit and *then*
+   `set_cursor` (Qt does). In the second order, by the time `set_cursor`
+   arrives smithay has already taken the buffer out of the surface's pending
+   state and it cannot be read again. So `State` keeps one slot,
+   `cursor_pixels`, filled by any commit on a surface with the
+   `"cursor_image"` role, and both orders work. The role is the authority on
+   "is this a cursor", not a comparison against the surface the compositor was
+   told about — that field is empty for the first commit of the second order.
+
+2. **Not diverting the commit.** The hook in `commit` reads and returns.
+   Whether a cursor surface is *also* composited as window content is a
+   scene-graph question, answered in `present`/`compose_tree`, and is a
+   different agent's change; doing both here would have been two fixes for one
+   bug in two files.
+
+3. **The alpha.** `wl_shm`'s `Argb8888` is premultiplied and a 32-bit
+   `CreateIconIndirect` wants premultiplied, so there is nothing to convert —
+   but there is something not to *do*, which is discard it. A cursor is mostly
+   transparent and almost entirely antialiased edge; dropping the channel gives
+   a black rectangle with a cursor in it, and forcing it opaque gives a hard
+   jagged outline. Both are worse than the arrow this replaces.
+   `crate::icon::image_from_bytes` was reused unchanged, which also gets
+   `Xrgb8888` right: it forces the undefined fourth byte to 0xFF, and without
+   that an `Xrgb` cursor would be entirely invisible.
+
+4. **The mask.** `CreateBitmap` with a null bit pointer is documented as
+   leaving "the contents of the new bitmap undefined". Every Windows to date
+   zero-fills it and the icon path has relied on that since stage 11. For an
+   icon a stray mask bit is one wrong pixel in a taskbar button; for a cursor
+   the AND mask selects between "transparent" and "invert the screen", so
+   garbage is a cursor with inverted holes punched through it. A 32x32 mask is
+   128 bytes, so it is now supplied rather than assumed — and the scan lines
+   are **word**-aligned, not dword-aligned as they would be in a DIB.
+
+The image is **not** resampled. `make_icon` scales because Windows asks for two
+specific icon sizes; a cursor has no such requirement, and not scaling means
+the hotspot arrives as an exact pixel. Half a pixel of drift on a
+one-pixel-wide I-beam is the difference between clicking before and after a
+character.
+
+### 23.5 `WM_SETCURSOR`, and why the cursor is installed twice
+
+Once from the window procedure and once from the command handler, and both are
+needed:
+
+* **`WM_SETCURSOR` is the only way to keep it.** Windows re-asks on every mouse
+  message and `DefWindowProc` answers with the *class* cursor — the `IDC_ARROW`
+  in `register_classes`. A cursor set only from the command handler survives
+  until the pointer moves one pixel, and presents as a cursor that flickers to
+  the right shape and back.
+* **The command handler is the only way to apply it now.** `WM_SETCURSOR` needs
+  a mouse message, and the interesting changes happen while the pointer is
+  *still*: a page finishing loading, a client hiding the pointer as the user
+  starts typing, a `wl_pointer.leave` restoring the arrow.
+
+`SetCursor` is thread-global, so the immediate call is guarded by
+`Ui::pointer_inside` — set from `on_mouse_move` and cleared from
+`on_mouse_leave`. Without it, a client changing its cursor while the pointer is
+over somebody else's window would repaint *their* cursor until their next mouse
+message.
+
+**The hit-test guard is not a nicety.** `LOWORD(lParam)` is the hit-test code
+and only `HTCLIENT` is the client's business. `HTLEFT`, `HTBOTTOMRIGHT`,
+`HTCAPTION` and the rest are the system frame, where Windows draws the resize
+arrows. Claiming those would replace the resize cursors on the window border
+with whatever the client last asked for — the exact opposite of the goal, which
+wants a resize arrow on the edge.
+
+**How this reads after stage 17**, which landed while this branch was merging
+and which is the other half of the same window. §22 keeps the real system
+frame and does not handle `WM_NCHITTEST` at all — a client-decorated window is
+moved by `xdg_toplevel.move` arriving as `ToUi::BeginMove`, because Wayland has
+no protocol by which a client publishes its draggable region. So the hit-test
+codes here mean exactly what they meant before it: the caption and the resize
+borders are genuinely non-client and keep the system's cursors, and everything
+the client draws is `HTCLIENT` and gets the client's. That is the right answer
+for a client that paints its own title bar — over its tab strip the cursor
+should be whatever the client says — and it is the answer by construction
+rather than by agreement between two stages, which is the only reason the two
+did not have to be merged carefully.
+
+Lifetime: stock cursors from `LoadCursorW` are shared, owned by the system, and
+must never be destroyed. Ours must be, and promptly — a client animating its
+cursor rebuilds several times a second, so leaking these would burn a GDI
+object every 100 ms and hit the 10,000-handle quota in a quarter of an hour.
+The new one is built before the old is destroyed (a failed build leaves the
+previous cursor up rather than leaving the pointer invisible) and the old is
+destroyed *after* `SetCursor` (destroying a cursor that is on screen leaves the
+pointer drawn from freed memory).
+
+`wl_keyboard.repeat_info` was fixed in the same breath because it is the same
+shape of mistake: 500 ms and 30 Hz were Windows' *defaults*, written out as
+constants, so a user who had moved the Control Panel slider got the default in
+every Wayland client and their own rate in every native one.
+`SPI_GETKEYBOARDDELAY` returns 0..3 meaning 250..1000 ms, which is exact;
+`SPI_GETKEYBOARDSPEED` returns 0..31 and Microsoft documents only the endpoints
+(2.5/s and 30/s), so the middle is interpolated linearly in the rate and is
+labelled an estimate rather than presented as a table of thirty-two numbers
+somebody made up. The headless platform still returns 500 and 30, because there
+is no Windows there to ask and the harness must not depend on the build host's
+desktop settings.
+
+### 23.6 What was measured, and how
+
+`scripts/wc-cursor.sh`, two legs, for the reason every stage here splits its
+evidence — the two halves fail in different ways.
+
+**linux — 5 passed, 0 failed.** `wp_cursor_shape_v1` is a name on the wire and
+nothing else, so what can go wrong with it is protocol-shaped. `wayland-info`
+— libwayland's own client, which has never heard of this project — sees
+`wp_cursor_shape_manager_v1` at **version 2** in the registry, and sees it
+again through `wc-proxy`. The proxy needed the XML (`crates/wc-proxy/protocols/
+cursor-shape-v1.xml`, the byte copy from the same `wayland-protocols 0.32.12`
+smithay is generated from) and the three counted assertions moved with it:
+32 interfaces to 34, 376 walked messages to 386, and the fd list did not move
+because neither interface has an `h`.
+
+**wine — 8 passed, 0 failed.** `weston-eventdemo` is the client, and it is the
+right one for a reason that is not convenience: Weston's toytoolkit loads an
+**XCursor theme** and calls `wl_pointer.set_cursor` with a themed surface, so
+the pixels are a real theme's, at whatever size it ships, with a hotspot that
+is not 0,0, and nothing in this project chose any of it. The chain:
+
+```
+wc-compositor: cursor -> 32x32 pixels, hotspot 5,5
+wc-compositor: cursor round-trip: fIcon=0 hotspot=5,5 colour=32x32 at 32 bpp
+probe-cursor:  client-area-msg cursor=custom handle=00000000000b0040
+```
+
+Three different statements. The first is the Wayland thread: a cursor surface
+committed and its pixels were read. The second is Win32 read back through
+`GetIconInfo` — `CreateIconIndirect` accepted the ARGB bitmap, kept 32 bits per
+pixel, and did not move the hotspot. The third is `scripts/probe-cursor.c`, a
+separate process, reporting that the cursor on the compositor's input queue
+matches **none of the sixteen stock cursors** — so what `SetCursor` installed
+is ours.
+
+### 23.7 What Wine could not answer, and what has to be re-checked on the guest
+
+Wine has been wrong four times on this project (§13.6) and a cursor is exactly
+the kind of thing it emulates rather than implements. Two things were measured
+here as *Wine limitations*, not as compositor behaviour, and both are on the
+guest list:
+
+1. **`GetCursorInfo` kills the probe.** Under wine-11.14 on Xvfb, reading the
+   global cursor after injecting a mouse move dies with a fatal
+   `BadWindow (X_QueryPointer)` — Wine's X11 driver, not the compositor. The
+   harness therefore puts its sturdy readings first and treats the
+   `GetCursorInfo` reading as optional. On a real guest it is the reading that
+   says what the *user* sees, and it should be the primary assertion.
+
+2. **A cross-process `SendMessageW(WM_SETCURSOR)` is not delivered.** It
+   returns 0 for both `HTCLIENT` and `HTRIGHT`, and — the tell — the cursor on
+   the queue does not change for `HTRIGHT` either, where `DefWindowProc` would
+   have installed `IDC_SIZEWE` had the message arrived. So the hit-test guard
+   is currently defended by reading and not by measurement. On the guest this
+   is two sharp assertions: `1` for `HTCLIENT`, `0` for `HTRIGHT`.
+
+Beyond those, the guest has to answer the questions no API call can:
+
+3. **Does Windows draw a premultiplied ARGB cursor correctly?** The round-trip
+   says the bitmap went in intact. Whether the compositing on screen is right —
+   no black box, no hard outline, no halo — is a photograph.
+4. **Firefox.** A hand over a link, an I-beam over text, and a resize arrow on
+   the window edge, in one screenshot. §23.2 says this goes entirely through
+   the buffer path, so it is the same code the Wine leg exercised, with a
+   different and much larger client driving it.
+5. **`repeat_info` against a machine whose slider has been moved.** The
+   arithmetic is exercised nowhere but the guest: the headless platform returns
+   the constants and Wine's `SystemParametersInfo` is its own answer.
+6. **A client that hides the pointer.** `CursorSpec::Hidden` is implemented and
+   nothing in the harness reaches it, because neither `weston-eventdemo` nor
+   `wayland-info` ever sends `set_cursor(NULL)`. A terminal that hides the
+   pointer while typing would.
+
+### 23.8 What to do next
+
+1. **A client that actually sends `set_shape`.** Nothing in the harness binds
+   `wp_cursor_shape_v1` — the global is advertised, the proxy carries it, and
+   the table is unit-tested, but no run has taken a named shape end to end.
+   GTK4 is the client that would (§23.2) and none is installed here. This is
+   the one gap in this stage's evidence that is not Wine's fault.
+2. **Cursor scale.** A client on a 2x display sends a 64x64 cursor and expects
+   it drawn at 32 logical pixels. The compositor accepts scale-1 buffers only
+   (the commit handler says so out loud), so this is the same unimplemented
+   `buffer_scale` that everything else here is waiting on, and it will show up
+   as a cursor that is twice the size rather than as an error.
+3. **The named path could serve the buffer path.** A themed Linux cursor drawn
+   at Linux's size next to native Windows applications is the wrong size and
+   the wrong theme. A compositor that recognised the *standard* XCursor names
+   and substituted the stock Win32 cursor would look right — but `set_cursor`
+   carries pixels and no name, so this needs the client's cursor **surface** to
+   be matched against a known theme by hash, which is a guess wearing a
+   measurement's clothes. Not done, and noted so it is not done accidentally.
+
+## 20. Stage 16: an arena that runs out, and a client that lives through it
+
+### 20.1 Status in one paragraph
+
+A user played a YouTube video and Firefox died instantly. The proxy log said
+`could not publish 2340864 bytes: arena 0 has no run of 2342912 bytes (3932160
+free, largest 1744896)`, then `client 2 stopped: the compositor closed the
+connection`, and Firefox said `Exiting due to channel error`. Three defects were
+in that, and only the first had a name. **Running out of arena was fatal, and
+§17.8 said it was not** — that is §20.2 and it is a correction rather than a
+feature. **The allocator could not use free space it had** — 1.7 times the
+request, in pieces — which is §20.4, and where the obvious fix turned out to be
+wrong under measurement. **Nothing frees a pool and it is now guest RAM** — §17.10
+item 1, the stage's largest inherited problem, answered in §20.5 by a policy that
+does not wait to be asked. All three are built, all three are tested, and one of
+them ran in anger against a real Firefox on a deliberately starved arena and
+handed back 18,837,504 bytes the client never offered. What is *not* here is a
+photograph: the pressure harness runs under Wine in an ssh session, where this
+compositor cannot create a window at all, so no run of it has ever painted
+anything. That is §20.7 and it is the honest limit of the evidence.
+
+### 20.2 The failure was not the allocation, it was the message after it
+
+§17.8 describes what happens when the arena has no room:
+
+> The failure mode is now known and is not a crash: `create` refuses with the
+> numbers, `flush_deferred` leaves the pool unannounced and notes it, and the
+> client's window stops updating. That is a compositor that looks frozen.
+
+**Every clause of that is true and the conclusion is false.** `create` does
+refuse with the numbers, `flush_deferred` does leave the pool unannounced, and it
+does note it. What the paragraph does not follow through is what the *client*
+does next, which is not to stop — it is to carry on using a pool it has every
+right to believe in:
+
+```
+wl_shm.create_pool(new_id 31, fd, 2340864)   -> deferred, refused, unannounced
+wl_shm_pool@31.create_buffer(new_id 44, ...) -> forwarded. To what?
+```
+
+The compositor has no object 31. A request on an unknown object is a protocol
+error in every Wayland server there is, and wayland-server answers it by posting
+`wl_display.error` and dropping the connection. So the proxy's own log line about
+the compositor closing the connection was not a second, unrelated event: it was
+the direct consequence of the first, two messages later.
+
+**The allocation failure was survivable. Forwarding past it was not.** That
+distinction is the whole of this item, and it generalises past the arena: any
+time this proxy decides not to emit a message, it has taken on the obligation to
+decide about every later message that depends on it. Deferral was invented in
+stage 4 for `wl_shm_pool.resize` (§9.6) and it was safe there because a resize
+that is absorbed changes nothing the client can observe. A `create_pool` that is
+absorbed creates an object the client can *address*, and nothing was watching for
+that.
+
+The rule the code now states, and the one thing to keep if all of this is
+rewritten: **`Pool::upstream()` — "does the compositor have a `wl_shm_pool` with
+this id right now" — is the question every message naming a pool must ask.** It
+is not the same question as "do we have bytes for it", and stage 12 could get
+away with conflating them only because a region, once published, was never taken
+away. §20.5 takes them away.
+
+### 20.3 What was built, in the order a message meets it
+
+Three answers, in order, and only the third is visible to a user.
+
+1. **Ask for the memory back.** An allocation failure runs the reclaimer
+   (§20.5), which destroys the upstream objects of pools nothing is using. It is
+   demand-driven: nothing is reclaimed while there is room.
+2. **Try again.** Reclamation cannot complete synchronously — the compositor has
+   to acknowledge the teardown before the bytes are safe to reuse, which is
+   §2.5's rule and not caution — so the retry that matters is the next message's,
+   and for a live client there is always a next message.
+3. **Say nothing about a pool that has no upstream object.** Every request
+   naming one is *absorbed*: `create_buffer` is recorded and replayed later from
+   the client's own bytes, `resize` updates the recorded size, `destroy` is
+   answered with an invented acknowledgement. The one request that cannot be
+   absorbed is `wl_surface.attach`, because a client may attach once and commit
+   for ever; it is held on the surface and retried at every commit.
+
+The result is a surface that freezes and a connection that does not. That is a
+real cost and it is counted: `attaches deferred` in the stats line is the number
+of frames the client drew that the compositor never saw.
+
+**Three things this deliberately does not do**, each rejected for a reason:
+
+* **Grow the arena.** §12 makes this much worse than a `realloc`: the region is
+  guest RAM located by a content sweep, so a second region means a second
+  `attach_guest_ram` in the guest, a second 13 GiB sweep on the host (2.4 s,
+  §12.5) and a second plan. Worse, `wc-arena-host` has exited by the time a
+  client is running, and §12.10 records that a region cannot be re-located
+  afterwards because the first pool overwrites the stamps the sweep looks for.
+  Growth is a deployment-time change, not a runtime one.
+* **Fall back to the file transport.** `--transport shared-file` is a Wine-only
+  fixture; §10.3 measured that two live mappings of one file on a virtio-fs
+  export do not see each other's stores. A fallback would be a silent
+  correctness failure on the only deployment that matters, and the guest-RAM
+  rule is standing.
+* **Block until room appears.** The session thread is the client's whole
+  connection. Blocking it stops the `wl_buffer.destroy` and `wl_shm_pool.destroy`
+  that are the only things that could free the arena, so it deadlocks exactly
+  when it is needed.
+
+### 20.4 Fragmentation: six policies, and the obvious answer was wrong
+
+The numbers in the log line are the reason this is a separate item: **3,932,160
+bytes free, largest run 1,744,896, request 2,342,912.** Two-thirds more space
+than the request, in pieces none of which was big enough. Stage 12's allocator is
+address-ordered first fit at 4096-byte granularity, and §17.8 had already shown
+that the machinery under it works — a pool at offset 28672 was reused and
+coalesced — so this is a policy problem and not a plumbing one.
+
+**The reproduction is synthetic and that is the point.** A YouTube video
+fragments the arena in about ten seconds, but it does so through Firefox, a
+compositor, a hypervisor and a guest, and a run of it can only say "it broke
+again". `pool::tests::video_churn` replays a deterministic 4000-round sequence
+with the two ingredients the live failure had and nothing else: large pools whose
+sizes wander in the band the log showed, and a few small pools that are never
+released — cursors and tooltips, which Firefox holds for the life of the process
+and which sit in the middle of the region stopping the large holes on either side
+from coalescing.
+
+One thing had to be fixed in the harness before it measured anything, and it is
+worth recording because it inverted the result. The first version retired a pool
+only when a *new* one had been allocated, so a single refusal froze the live set
+and every later round refused too. That made a bad allocator look catastrophic
+and a good one look bad. **A pool's life is the client's business, not the
+allocator's**: Firefox does not stop destroying pools because this proxy could
+not find room for one. With the schedule fixed — the slot from round `r - live`
+retires at round `r`, whatever happened — the numbers became stable and
+comparable.
+
+Then the matrix, at 64 MiB, 4000 rounds, refusals (and largest free run) by
+policy and by how many pools are live at once:
+
+| live | first-fit | best-fit + classes | first-fit + classes | best-fit, paged | best-fit + far-end + classes | **best-fit + far-end** |
+|---|---|---|---|---|---|---|
+| 16 | 0 | 0 | 0 | 0 | 0 | **0** |
+| 22 | 0 | 0 | 3 | 0 | 0 | **0** |
+| 24 | 62 | 41 | 81 | 19 | 0 | **0** |
+| 25 | 39 | 26 | 155 | 9 | 9 | **0** |
+| 26 | 121 | 46 | 219 | 23 | 27 | **3** |
+| 27 | 165 | 133 | 327 | 31 | 55 | **11** |
+| 28 | 275 | 203 | 393 | 115 | 141 | **53** |
+| 29 | 261 | 311 | 410 | 197 | 213 | **117** |
+| 30 | 267 | 337 | 421 | 191 | 303 | **160** |
+| 31 | 633 | 405 | 740 | 293 | 404 | **262** |
+
+**The design this stage set out to build is the third column, and it is worse
+than doing nothing at several occupancies.** The plan was best fit plus
+TLSF-style size classes: round every request up to one eighth of the power of two
+it sits in, so that the hole a freed pool leaves is exactly the shape the next
+request of its class wants, at a bounded 12.5% of internal fragmentation. The
+argument is sound, it is what TLSF and jemalloc do, and a doc comment explaining
+it was already written. The matrix says it is wrong here: **`first-fit +
+classes` is the worst column at every single occupancy**, and adding classes to
+best fit makes best fit worse at every occupancy too. The classes buy exact reuse
+and pay for it by making every request bigger, and in an arena this close to full
+the second dominates.
+
+What actually does the work is **choosing the run rather than reshaping the
+request**, in two independent halves:
+
+* **Best fit.** The smallest adequate run rather than the lowest. "Lowest" and
+  "smallest" are unrelated, and first fit shaves the low end of whatever large
+  run it meets first — so a region's big runs are eaten by requests a smaller
+  hole would have held perfectly well, and there is nowhere left to put a large
+  pool. This is most of the improvement.
+* **Small pools from the far end.** A pool of at most 64 KiB is cut from the
+  *highest* run, at that run's tail. This is the direct answer to ingredient 2 of
+  the reproduction: a permanent 8 KiB extent in the middle of the region is what
+  stops megabyte holes from coalescing, and sending it to the far end costs
+  nothing. 64 KiB is chosen from what clients create rather than from a round
+  number — a 32x32 cursor is 4096 bytes, a 128x128 icon is 65536, and every
+  content pool Firefox opens is at least fifteen times that, so the line falls in
+  a genuine gap in the distribution.
+
+Shipped: **best fit, small pools from the far end, page granularity, no
+classes.** Zero refusals where first fit refuses 62, a fifth of the refusals
+where first fit refuses 633, and never worse at any occupancy tested. Stage 12's
+policy stays, reachable as `--arena-policy first-fit`, so the comparison can be
+re-run against a live client without a rebuild — and because a claim that one
+allocator beats another should be re-runnable by whoever doubts it.
+
+**What the table also says, and it is the load-bearing caveat**: past about 24
+live pools every policy refuses something, because the working set is genuinely
+larger than the arena. A better allocator moves the cliff; it does not remove it.
+The live failure was at 94% occupancy — 62,128,128 bytes out of a 63 MiB usable
+region — which is past the cliff for anything. **So §20.2 is the fix and §20.4 is
+an improvement**, and it would be a misreading of this section to present them
+the other way round.
+
+### 20.5 Reclamation: a pool's arena bytes are a cache, not the client's memory
+
+§15.11 proposed releasing a pool's region when its last buffer dies, and called
+it "the fix with the best evidence behind it". §17.8 then measured the client it
+was designed for:
+
+| in one 25-second `about:blank` run | count |
+|---|---|
+| `wl_shm.create_pool` | 4 |
+| `wl_shm_pool.destroy` | **0** |
+| `wl_shm_pool.create_buffer` | 3 |
+| `wl_buffer.destroy` | **1** |
+
+Firefox destroys one buffer in three and no pools at all, so a policy that waits
+to be asked frees one pool of four here and none of the 88 in §15.10's startup
+run. **The plan was standing on a quarter of what it looked like.**
+
+The way out is to stop treating the compositor's `wl_shm_pool` as a resource the
+client owns. **A pool's arena bytes are a copy.** The original is the client's own
+`memfd`, which this proxy still holds mapped for the life of the pool
+(`Pool::client`) — it has to, because that is where every commit copies *from*.
+Nothing is lost by throwing the copy away. So the upstream pool is not the
+client's memory at all; it is **a cache this proxy chose to populate, and a cache
+may be evicted.** What the protocol lacks is a way to re-point an existing pool at
+new bytes, and that is worked around rather than defeated: destroy the objects,
+and rebuild them from the client's own requests the moment it touches the pool
+again. The proxy has everything it needs — it kept the `create_buffer` body
+verbatim, precisely so it never has to hold a second opinion about somebody
+else's XML.
+
+The policy, and each condition rules out a specific wrong answer:
+
+* **Under pressure only.** Nothing is reclaimed while there is room. There is no
+  timer and no background sweep: holding 400 MB of a 768 MiB arena is free as
+  long as it can be got back when it is needed, and a timer would churn for
+  nothing.
+* **Coldest first.** LRU by last commit that copied out of the pool.
+* **Never `zombie`.** The client must still own the pool's id, or a rebuilt
+  `create_pool` could collide with whatever the client has since put there. This
+  is also why `weston-presentation-shm` is untouched by any of this: it destroys
+  its pool immediately and then draws 784 frames from the buffers, so its pool is
+  a zombie from the first frame and never a candidate. §9.7's lesson survives
+  intact.
+* **No buffer attached, and none unreleased.** A buffer that is a surface's
+  current or pending contents is being displayed; one the compositor has not
+  `release`d may be being read this instant. `wl_buffer.release` is the
+  compositor's own word for "I am finished with these bytes", and this is the
+  first thing in the project to use it for anything.
+* **Colder than 250 ms.** Against thrash, not against error: a pool in active
+  rotation would be destroyed and rebuilt on alternate frames. Fifteen frames at
+  60 Hz is long enough that nothing in a video's rotation is ever a candidate and
+  short enough that the stale pools a resize leaves behind — which is what
+  actually accumulates — become candidates almost at once.
+
+The cost is stated where it can be watched: `republished` in the stats line. If
+it approaches `reclaimed`, the floor is too low or the arena is too small, and
+both are visible without a debugger.
+
+**And it works on a real client.** Against Firefox on a 24 MiB arena:
+
+```
+pool 3: reclaiming 18837504 bytes, idle 874 ms -- the client never asked for
+        them back and the arena needs 4608000
+... 252 commits, 244 copies, 1077.14 MiB in 47.7 ms; 5 pools (0 released,
+    1 reclaimed, 0 republished, 4 refusals, 1 attaches deferred)
+```
+
+**Zero released, one reclaimed.** That is §17.8's measurement and this stage's
+answer in the same line: the client returned nothing, and 18 MB of guest RAM came
+back anyway.
+
+### 20.6 Two bugs the tests found in the fix, both worth their note
+
+Neither was found by review and both were found by writing the test that was
+supposed to pass trivially.
+
+**Publication had to become demand-driven.** `flush_deferred` publishes every
+pool that has no region, which was right when the only way to have no region was
+never to have been published. After §20.5 a pool can *lose* its region, and the
+very next message the client sent — whatever it was about — rebuilt it. The memory
+came back and left again before anything could use it, and the reclaimer was, in
+effect, a no-op with a log line. `Pool::wanted` is the fix: set when the pool is
+created and when a request names it or one of its buffers, cleared when the
+reclaimer takes it apart. The subtlety is that `wl_shm_pool.destroy` must *not*
+set it — rebuilding a pool in order to forward its destructor is not merely
+wasteful, and it was doing exactly that until the test caught it.
+
+**A stale `BufferInfo` under a recycled id made the rebuild emit a duplicate
+`new_id`.** Wayland ids are recycled: a client destroys `wl_buffer@44`, the server
+acknowledges, and the next `create_region` is `wl_region@44`. `self.buffers` was
+never purged on that transition and it had never mattered, because nothing
+replayed what was in it. The rebuild replays it — so a stale entry left under an
+id that is now a live `wl_region` made the proxy emit
+`wl_shm_pool.create_buffer(new_id = 44)` for an id the compositor already had.
+**That is a protocol error and a dead client: the exact failure this stage exists
+to remove, reintroduced by its own fix.** It was caught on a real Firefox, not in
+a test — `Invalid new_id: 44`, with the upstream dump showing 44 created as a
+region four messages earlier — and the purge now happens at the moment an id is
+declared to be something else, which is the moment it provably stops meaning what
+this file thought.
+
+A third, smaller one: the "nothing could be reclaimed" line was written once per
+message, which for Firefox is thousands a second, and the first pressure run
+produced a log that was 90% that line with the three lines that mattered buried
+in it. Rate-limited, for the same reason `Pool::warned` exists.
+
+### 20.7 The evidence, and what the pressure harness cannot decide
+
+| leg | what it is worth |
+|---|---|
+| `pool::tests::a_video_sized_churn_fragments_first_fit_and_not_the_default` | The fragmentation claim, both directions: first fit still refuses pools it has room for, the default refuses none where the arena genuinely has room, and it is never worse at any occupancy tested — including past the cliff, which is the half that could have been hidden. |
+| `pool::tests::small_pools_are_cut_from_the_far_end_and_large_ones_from_the_near` | The half of the policy that is not best fit, asserted on offsets rather than on outcomes. |
+| `session::tests::a_full_arena_degrades_one_surface_and_never_the_connection` | **§20.2, asserted as a property**: not one message naming an unbacked pool, or a buffer cut from it, reaches the compositor — and the healthy surface next to it keeps working, and the starved one recovers when there is room. |
+| `session::tests::a_cold_pool_is_reclaimed_under_pressure_and_rebuilt_when_the_client_returns` | §20.5 end to end, including the case §17.10 warned about: a client re-attaching a buffer it never destroyed. |
+| `session::tests::an_acknowledgement_goes_to_whoever_asked_for_the_destruction` | The two `delete_id` directions, which are the part of this most likely to be got wrong by a later change. |
+| `scripts/wc-arena-pressure.sh` (new) | A real Firefox against a deliberately starved arena, which is the only place the *compositor's own verdict* on these messages can be had. It asserts three things: the arena really ran out, pools were reclaimed without the client asking, and the compositor reported no request on an object it does not have. |
+
+**What the pressure harness deliberately does not assert, and why.** It does not
+assert that the connection survives to the end of the run, and it does not assert
+that anything is painted — because under Wine in an ssh session this compositor
+cannot create a window at all. Every run of it, on this branch and on master
+alike, logs `could not create a window for surface 1: Invalid window handle. (os
+error 1400)` and dumps zero frames. That is §13.3's window station problem, it is
+nothing to do with the arena, and a pass/fail on it would be measuring the window
+station. What the harness *can* decide is what the compositor says about the
+messages it receives, and that is what it asserts.
+
+The comparison against master's proxy is worth recording even though it is not a
+gate. On the same starved arena, master reaches **2 commits and 0 copies** before
+the connection is dropped; this branch reaches **252 commits, 244 copies and 1077
+MiB copied** with the connection intact and no protocol error. In two further
+runs it reached 13 and 2 commits — the run-to-run spread is large, because how far
+Firefox gets before the windowless compositor upsets it is not controlled — but
+the three assertions held in all of them.
+
+**One thing seen and not explained.** In two early runs, before the stale-id purge
+of §20.6, the compositor reported `Invalid new_id`. After the purge it has not
+recurred in any run. That is consistent with the purge being the whole cause, and
+it is *not* proof: the same runs were also the ones with `--trace` on, which
+changes the timing substantially. Instrumenting the two paths that could produce
+it — invented acknowledgements and rebuilt buffers — showed **zero of each** in the
+run that failed, so whatever it was did not come from the new machinery. It is on
+§20.9's list rather than claimed as fixed.
+
+### 20.8 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **173 tests**, 0 failures |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --target x86_64-pc-windows-gnu` | 8 executables — real binaries, not metadata |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
+| `scripts/wc-input.sh all` (stage 6 + 10, Wine) | 82 passed, 0 failed — unchanged |
+| `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed |
+| `scripts/wc-firefox.sh wine-arena` (stage 12, Wine) | 10 passed, 0 failed — unchanged |
+| **`scripts/wc-arena-pressure.sh` (new)** | **3 passed, 0 failed** |
+| `scripts/wc-guest.sh firefox` (the guest) | **not run — see §20.9 item 1** |
+| `scripts/wc-desktop.sh`, `scripts/wc-icon.sh` | **not run — they need the interactive desktop** |
+
+All of these are from the checkout after the merge with master — stages 13, 17
+and 21, and then §27's damage work, which landed while this section was being
+written — which is §12.12's
+arrangement.
+
+**One gate failed on the way and it is worth its line, because it is the mistake
+the brief for this stage warned about in advance.** `wc-firefox.sh enumerate`
+reported `0 passed, 1 failed` — "the compositor never bound its socket" — and the
+compositor's own log said `unknown argument --decorations`. The merge with master
+brought stage 17's harness, which passes that flag, and the Linux binaries in
+`target/debug` were from before the merge: `cargo clippy` and
+`cargo build --target x86_64-pc-windows-gnu` had both been run, and neither
+builds a Linux executable. **A stale binary, exactly as predicted, and it
+presented as a protocol failure rather than as a missing flag.** `cargo build
+--workspace` and it passes 13 of 13. The rule generalises past this stage: the
+thing that must be rebuilt is whatever the *harness* runs, and this repository's
+harnesses run three different binaries on two targets.
+
+**On the `3 fds in, 1 out` invariant (§14.7): unchanged, and the reasoning is
+short.** Everything this stage added moves *messages*, not descriptors.
+`wl_buffer.destroy`, `wl_shm_pool.destroy`, `wl_shm_pool.create_buffer` and
+`wl_display.delete_id` carry no `h` argument in either direction, and the
+invented events go out on the client socket, which is the side where `SCM_RIGHTS`
+was always legal (§9.4). The Wine gates re-measure the count and it is the same
+number it was.
+
+### 20.9 What is not proven
+
+1. **Nothing here has run on the guest.** Every leg is local or Wine. The guest
+   is contended by three other agents and §16.8's rule about identity applies;
+   what needs a guest re-check is specifically the reclamation path, because a
+   `wl_shm_pool.destroy` this proxy sends unprompted crosses the hypervisor and
+   the compositor's response to it has only ever been seen under Wine.
+2. **The residual `Invalid new_id`** of §20.7. Not reproduced since the stale-id
+   purge, not proven to be caused by it.
+3. **The 250 ms floor is a judgement, not a measurement.** It is short enough
+   for the stale pools a resize leaves and long enough for a 60 Hz rotation, and
+   nothing has measured a client whose working set cycles more slowly than that
+   and is larger than the arena. Such a client would thrash, and `republished`
+   is the number that would say so.
+4. **Reclamation has never been observed rebuilding a pool on a real client.**
+   The test covers it and the live runs never needed it — `0 republished` in
+   every one — because the pools that got reclaimed were ones Firefox had
+   genuinely finished with. That is the good case; the interesting case is
+   untested outside `cargo test`.
+5. **A pool larger than the whole arena can never be published**, and the
+   surface that wants it freezes for ever. This is reachable — the 12 MiB run has
+   Firefox asking for 18,837,504 bytes — and the response is correct but
+   permanent. Nothing warns the operator that the arena is *structurally* too
+   small rather than temporarily full, and it should.
+6. **The best-fit scan is linear in the free list**, where first fit could stop
+   early. Nothing has measured it, the free list is short in every observed run,
+   and if it ever matters the answer is a segregated list rather than a different
+   policy.
+7. **§17.10 items 3 to 8 are unchanged**, and §12.13 items 3, 4 and 9 with them.
+
+### 20.10 What to do next
+
+1. **Run the pressure harness on the guest**, which is the only place the
+   reclamation teardown crosses a real hypervisor, and the only place the arena
+   is really guest RAM. It is §20.9 item 1 and it is one run.
+2. **Say when the arena is structurally too small.** §20.9 item 5: a pool bigger
+   than the region is a configuration error the operator can fix and the current
+   message does not distinguish it from ordinary pressure.
+3. **Carry the measurement into the unification.** The two repositories are
+   being merged into one workspace with one arena and one allocator, and this
+   stage's allocator is one of three being reconciled. The free-list code and the
+   granularity constant should certainly be shared; **the policy should be
+   carried with its matrix**, because the shortest of the three implementations
+   is first fit and first fit is the one that refused a pool it had room for and
+   killed the user's browser. The one thing that must not be unified is the
+   *ranges*: the outbound window and the pool allocator must stay disjoint, or a
+   client's pixels land on a live keymap silently (§14.5).
+
+   **Verified while this stage was being written**: the unified tree
+   (`shared-vulkan-base` at `020022d`) already carries `crates/wc-proxy/src/pool.rs`,
+   and it carries **none** of this — `git show master:crates/wc-proxy/src/pool.rs
+   | grep -c 'Policy\|best_fit'` is `0` there. So the port is a real piece of
+   work rather than a formality, and until it happens the unified tree has the
+   allocator that killed the browser.
+## 27. The damage a client reports is not the damage a *copy* needs
+
+*(No stage number. This branch was assigned §27 and called itself "stage 14"
+until the merge, at which point stage 14 turned out to belong to §19 — the
+Windows desktop shortcut. Section numbers are handed out and stage numbers are
+taken, so this one has only the number it was given.)*
+
+### 27.1 Status in one paragraph
+
+**The user's clause is three symptoms and they are not one bug.** "Screen must
+not tear or stop rendering of scrolling no blank slides (e.g. in about:support)"
+— the tearing was §18's incoherent virtio-fs export and is fixed; the stopping
+did not reproduce and there is a number saying so; the blank regions were a
+real, separate defect in `wc-proxy`, present in every guest run since stage 4,
+and invisible to every harness this project has. `wl_surface.damage` is defined
+against the **surface** — what changed on screen since the last commit — and
+`wc-proxy` was spending it against a **buffer**, of which a scrolling Firefox
+has three. Everything the surface changed while some other buffer was on screen
+was never copied into the region, and a buffer the client had just allocated was
+copied only where the client happened to damage it, so the rest of it was
+whatever the region held before, which for a fresh arena is zeroes. Measured on
+a real Firefox scrolling `about:support` through Wine: **3 commits in 1509 left
+the region stale, the worst of them by 900 rows of a 900-row window** — the
+whole client area, showing nothing. After the fix, 1628 of 1628 commits match,
+and the run copies **2.05x fewer bytes** than it did before.
+
+### 27.2 What the reported damage means, and what a copying proxy needs instead
+
+The protocol sentence is short and the consequence is not. `wl_surface.damage`
+is "the region where the client has updated the contents **relative to the
+previous content of the surface**". Not relative to the previous content of the
+buffer being attached — relative to what was on screen.
+
+For a compositor that reads the client's buffer directly the two are
+interchangeable, and that is why the definition is written the way it is: the
+attached buffer is required to hold the whole current surface content, so
+"what changed on the surface" is exactly the set of pixels the compositor has to
+re-read. Nothing else in the buffer can have changed, because nothing else in
+the surface did.
+
+`wc-proxy` does not read the client's buffer. It keeps a **copy** of it, in a
+region the compositor across the boundary can map, and the copy is per buffer
+because the pool it copies is per buffer. So the question it has to answer is a
+different one: *which bytes of this buffer differ from my copy of this buffer* —
+and the client never answers that question, because no compositor has ever
+needed to ask it.
+
+The gap is one buffer cycle wide. Take a double-buffered client:
+
+| frame | attaches | client wrote into it | proxy copied |
+|-------|----------|----------------------|--------------|
+| n-1   | A        | the whole surface    | D(n-1)       |
+| n     | B        | the whole surface    | D(n)         |
+| n+1   | A        | the whole surface    | D(n+1)       |
+
+At frame n, the proxy's copy of B is correct everywhere except D(n-1) minus
+D(n) — the region that changed while A was on screen. The client has that region
+right in B; it wrote it there, because it had to. It simply never mentions it,
+because on screen it changed a frame ago. And it never will mention it: damage
+is not re-sent.
+
+That is a stale band per frame, growing with the buffer count, on exactly the
+content that is changing — which is why scrolling is where it shows and a static
+page is where it does not.
+
+### 27.3 The other half, which is the one Firefox actually hit
+
+There is a second case in the same shape and it is the one that produced the
+900-row measurement. A buffer the client has just created has *no* copy in the
+region. Its bytes there are whatever was there before — for the file transport,
+the previous pool's; for a freshly truncated arena, zeroes. If the client
+attaches it and damages only part of it, the proxy copies only that part and the
+rest of the window is that stale nothing.
+
+The old code believed it handled this. Its comment said so:
+
+> But the *first* commit of a buffer has nothing in the region yet, so a buffer
+> whose extent has never been copied is copied whole regardless of what the
+> client said.
+
+The code under the comment only did that when the damage list was **empty**:
+
+```rust
+if damage.is_empty() {
+    copy_extent(src, dst, &info, usable)   // "first commit" -- but only if silent
+} else {
+    copy_damage(src, dst, &info, &damage, usable)
+}
+```
+
+A first commit *with* damage — which is what a client does when it allocates a
+buffer to draw a partial update into — took the other branch. §14.9's pattern,
+"'implemented' has meant 'compiled' twice now", has a sibling here: a comment
+can describe an invariant the code beside it does not have, and it reads as
+evidence that the case was considered.
+
+All three of the stale commits in the pre-fix Firefox run are this case, and
+none of them is the cycling case of §27.2. The reason is worth recording because
+it is a fact about the client rather than about the bug: Firefox scrolling
+`about:support` damages **4292 KiB of a 4500 KiB buffer per commit** — 95% of
+the window — so the arrears from one intervening frame are almost entirely
+covered by the next frame's own damage. The cycling defect is real, it is what
+the unit test measures at 96 stale rows of 120, and on this client it is mostly
+masked by a client that repaints nearly everything anyway. Both are the same
+missing fact and both are fixed by the same three lines.
+
+### 27.4 The fix: arrears, per buffer, per surface
+
+Each surface keeps, for every buffer it has attached, what that buffer's copy
+owes: either a list of rectangles or "everything".
+
+```rust
+enum Stale { Everything, Rects(Vec<Rect>) }
+```
+
+On commit, this frame's damage is filed against every *other* buffer of the
+surface, and the buffer being attached pays off its whole arrears — this frame's
+damage plus every frame's since it was last on screen. A buffer this surface has
+never seen owes `Everything`, which is the §27.3 case and needs no special code
+once the question is asked in these terms.
+
+Three properties are worth stating because each one is a way the fix could have
+been wrong:
+
+* **It is still the cheap scope.** There is a trivially correct fix — copy the
+  extent every commit — and it already exists, as `--copy buffer`. The arrears
+  of a two-buffer cycle are one extra frame's damage, not a buffer, and
+  `paying_off_the_arrears_still_costs_less_than_the_extent` asserts a 4x margin
+  on a client whose real ratio is 6.9x. Without that test the fix could
+  degenerate into the safe thing and nothing would notice.
+* **It is keyed on the pair.** A buffer attached to a different surface starts
+  at `Everything` there and is copied whole. The arrears are a property of
+  (surface, buffer), not of the buffer.
+* **It survives id reuse.** This proxy implements `wl_display.delete_id`
+  deliberately, so buffer id 12 can be a *different* buffer a frame after the
+  old one was destroyed. A leftover "owes nothing" against a fresh buffer would
+  skip the one copy that must happen, and only on clients that recycle ids.
+  `forget_buffer_arrears` is called from both ends of a buffer's life and the
+  creation end is the load-bearing one.
+
+The rectangle list is capped at 64, past which it collapses to `Everything`:
+the union of 64 rectangles is close enough to the extent that tracking it costs
+more than copying it, and the cap bounds the pathology of a buffer that is
+allocated, damaged around for a thousand frames and attached once.
+
+### 27.5 The instrument, and why the established technique could not find this
+
+§10.7 and §18 both turned "it looks wrong" into a number by dumping frames and
+counting the distinct ones, and that technique cannot find this bug **at all**.
+A stale band is a *plausible picture*: real content, correctly blitted, from two
+frames ago. It is a distinct frame, so a distinct-frame count counts it; it has
+a normal colour histogram; it is what the page looked like a moment earlier. No
+screenshot distinguishes it from a page that had not finished scrolling.
+
+So the oracle is the client's own memory. `wc-proxy --verify-damage` compares,
+after every copy, the region's bytes for the attached buffer against the
+client's bytes for the same buffer, and counts the rows that differ. The
+comparison is exact and race-free **by protocol**: between `commit` and
+`wl_buffer.release` the client may not touch the buffer it attached, and that
+buffer must hold the whole current surface content. A disagreement at that
+instant has exactly one possible author.
+
+Two things about it are load-bearing:
+
+* **Only commits that attach can be checked.** A state-only commit — an
+  `ack_configure`, an opaque region, a subsurface move — does not re-take
+  ownership of the current buffer, which the compositor released frames ago and
+  which the client is very likely drawing the next frame into right now.
+  Measured before it was believed rather than reasoned into existence: with the
+  check applied to every commit, a fixed build still reported 91 stale of 936,
+  and every one of the twenty logged in full carried no damage at all and no
+  arrears — the signature of a commit that attached nothing. Gating on attach
+  took the same build to 0 of 1360, and the *pre-fix* build still failed under
+  the gate, at 3 of 1509, which is what says the gate removed noise rather than
+  the finding. Firefox's
+  traffic is **half** such commits — 1708 of 3343 — so the number is reported
+  rather than dropped, because a check whose coverage is unstated is a check
+  nobody can size.
+* **It is an instrument and not a clock.** It reads the whole buffer every
+  commit, which is precisely the cost `--copy damage` exists to avoid. §13.8
+  retracted a 2x throughput claim that was really 1.03x because the instrument
+  was inside the loop being timed. Nothing measured with `--verify-damage` on
+  may be quoted about cadence, and `scripts/wc-damage.sh` says so twice.
+
+### 27.6 The other two symptoms, and what the numbers say about them
+
+**Tearing did not reproduce, and §18 covers it.** Its cause was the export, its
+signature was page-granular bands, and the arbiter was that the compositor's own
+frame dump was torn identically to the screen. Nothing in this stage's runs
+tears, and the verifier is a stronger statement than that sounds: a torn copy is
+a row-level disagreement between the region and the client, which is exactly
+what `stale_rows` counts, and 1628 consecutive commits at zero says the copy
+path is not tearing. That says nothing about the coherency of a guest-RAM arena
+across the real VM boundary, which is §18's subject and is fixed there.
+
+**Rendering did not stop.** The compositor presented 1626 of the 1628
+buffer-carrying commits it received, and the ratio holds across every run of
+this stage: 1355/1360, 1506/1509, 1033/1035, 18/20. That is §13.8's 1464/1465
+again, in a harness that is actively scrolling rather than idling, and it means
+frames are not being dropped between the client and the window. If a user still
+sees a scroll stutter, the cause is not in the commit-to-present path and this
+number is the reason to look elsewhere.
+
+**The blank regions were real**, are the subject of §27.2 and §27.3, and are
+fixed.
+
+### 27.7 Why no harness could have caught it
+
+`wc-guest.sh` and `wc-desktop.sh` — the two harnesses that run on the real guest
+and the only ones a person watches — pass `--copy damage`. Every harness that
+exercises the copy scopes does not:
+
+* `scripts/wc-firefox.sh`'s wine leg runs `--copy pool`, which copies the whole
+  pool every commit.
+* `scripts/wc-proxy.sh cost` runs all three scopes, with
+  `weston-presentation-shm` — which damages its entire buffer every frame, so
+  all three scopes copy identical bytes, which is precisely what
+  `every_copy_scope_produces_the_same_image` was written to assert.
+* The unit tests drove a **single-buffered** client. With one buffer there are
+  no arrears, because there is no other buffer for the surface to have changed
+  behind.
+
+So the scope that ships was tested only by clients that cannot expose it. That
+is a sharper version of §18.2's finding — a fix that the only harness anybody
+watched had never used — and the general rule is the same: a configuration that
+no test uses is a configuration that is not tested, however many tests exist.
+
+### 27.8 The evidence
+
+Deterministic, no Wine, `cargo test -p wc-proxy`:
+
+* `a_buffer_cycling_client_is_not_left_with_a_stale_shadow` — a client that
+  cycles 2 and 3 buffers, writes the whole canvas into each, and damages only
+  the band it changed. Pre-fix: **96 of 120 rows** wrong in the region, in the
+  alternating pattern (`rows [0,1,2,3, 8,9,10,11, 16,17,18,19 …]`) that is the
+  double-buffer signature. `Pool` and `Buffer` scope pass in the same run and are
+  the control: the disagreement is damage tracking's alone.
+* `paying_off_the_arrears_still_costs_less_than_the_extent` — 332800 bytes
+  against 2304000, 6.9x, derived in the test rather than asserted as a ratio.
+
+Real client, `scripts/wc-damage.sh`, Firefox scrolling `about:support` with 60
+wheel notches injected by `probe-scroll.exe` from inside the Wine desktop:
+
+| build | commits checked | stale | worst | bytes/commit |
+|-------|-----------------|-------|-------|--------------|
+| pre-fix, `--copy damage` | 1509 | **3** | **900 rows of 900** | 4.19 MiB |
+| fixed, `--copy damage`   | 1628 | 0 | 0 | 2.04 MiB |
+| fixed, `--copy buffer` (control) | 1035 | 0 | 0 | — |
+
+The byte column is exact — it is a count, not a time — and it is the second
+result: the fix copies **2.05x less** than the code it replaces, because the old
+"an empty damage list means copy the extent" fired on all 1708 of Firefox's
+state-only commits and copied a 4.4 MiB buffer for a commit that changed
+nothing.
+
+### 27.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **168 tests**, 0 failures — master's 166 after the cursor merge, plus this stage's two |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --workspace`, both targets | both, and **before** every deploy (§18.8: clippy builds metadata, not an executable) |
+| `scripts/wc-damage.sh scroll` (new) | **5 passed, 0 failed** — 1616 commits checked, 0 stale |
+| `scripts/wc-damage.sh control` (new) | **5 passed, 0 failed** — 1035 commits checked at `--copy buffer`, 0 stale |
+| the same, re-run **after merging master** — twice, because master moved under the merge (§22 title bar, §25 protocols, then §23 cursors) | 162 then 168 tests, clippy clean both targets, `scroll` 5/5 at 432 and 964 commits |
+| `scripts/wc-damage.sh scroll` against the **pre-fix** copy path | **4 passed, 1 failed** — which is the point |
+| `wc-proxy.sh`, `wc-input.sh`, `wc-firefox.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended** |
+
+The six that were not re-run are named rather than omitted, and the argument
+that they are safe is narrower than usual because it can be made from the change
+itself. `--verify-damage` is off unless asked for, and the copy path changed in
+exactly one direction: **strictly more bytes are copied per attaching commit,
+and none at all on a commit that attaches nothing**. Nothing downstream can see
+the first, because it can only make the region *more* like the client's buffer;
+the second is the case where the client asserted nothing changed and the surface
+content is unchanged by definition. The three unit tests that pin the copy
+scopes against each other — `every_copy_scope_produces_the_same_image`,
+`damage_scope_copies_less_than_the_other_two` and the new arrears test — all run
+in `cargo test` and all three scopes still agree.
+
+The merge is worth one more line — two, because master moved *again* between the
+first merge and pushing it, and the second re-run is the reason to say so rather
+than to quietly redo the first. Stage 13 (§18), stage 17 (§22), stage 21 (§25)
+and then stage 12's cursors (§23) all landed under this branch, and in both
+merges only `docs/design.md` conflicted, at the append point, where both sides
+had added a section at the end.
+`session.rs` and `session/tests.rs` merged cleanly despite §25 adding four
+protocols to the same crate. The three exact-count tests that break on protocol
+additions (`spec.rs`'s two and
+`wire.rs::every_message_in_every_protocol_round_trips`) had already been fixed on
+master and needed nothing here. The one thing the merge *did* change is this
+section's name: this branch called itself "stage 14" until it discovered that
+stage 14 is §19, the Windows desktop shortcut.
+
+### 27.10 Three things that cost real time
+
+1. **`set -o pipefail` plus a `--help` that exits non-zero.** The harness's
+   guard against a stale binary — `wc-proxy --help | grep -q -- --verify-damage`
+   — reported "no such flag" for a proxy that had it, because the pipeline's
+   status is the failing `--help`, not the succeeding `grep`. Every other
+   harness here uses the piped spelling on programs that happen to exit zero.
+2. **`wine explorer /desktop=NAME` returns immediately when the desktop already
+   exists.** `wc-input.sh` waits for it and never noticed, because its probe
+   takes about a second. This one scrolls for twenty, so the harness tore the
+   run down two seconds in — and the symptom was *a low commit count*, which is
+   the exact symptom this stage is investigating. A harness that measures a
+   stall it caused itself is worse than no harness. It now waits for the probe's
+   own last line.
+3. **A single run is not a rate.** The first draft of the comment on the
+   control's commit floor explained a 51-commit `--copy buffer` run by the cost
+   of its larger copy. The next `--copy buffer` run was 1035. The counts across
+   this stage's runs span 20 to 4106 on a machine ten agents are sharing, and
+   the honest statement is variance. §13.8's retraction is the precedent; this
+   is the same mistake caught one run earlier.
+
+### 27.11 What is not proven
+
+1. **Surface coordinates are still assumed to be buffer coordinates.**
+   `wl_surface.damage` (opcode 2) is in surface coordinates and
+   `damage_buffer` (opcode 9) is in buffer coordinates, and both `wc-proxy` and
+   `wc-compositor` merge them — the compositor says so in a comment at
+   `state.rs:1530`. They coincide at scale 1, transform `Normal` and attach
+   offset (0,0), which is every run this project has made. **Scale and
+   fractional scaling are unowned**, and this is one more reason for somebody to
+   own them; it is not started here.
+2. **The attach offset is ignored.** `wl_surface.attach`'s `x`/`y` are parsed
+   and dropped. A non-zero offset shifts surface coordinates relative to buffer
+   coordinates and would make item 1 bite at scale 1. Not observed in Firefox,
+   not checked either.
+3. **`--verify-damage` has nothing to say about half of Firefox's commits.**
+   1708 of 3343 attach no buffer. They cannot change what is on screen, so the
+   coverage gap is believed harmless, but it is a gap and it is stated rather
+   than netted out of the denominator.
+4. **This ran under Wine, against the shared-file transport.** Wine is not
+   Windows and has been wrong four times (§13.6). The insulation is unusually
+   good here — `--verify-damage` compares two mappings inside a Linux process
+   and Wine is only an upstream that consumes the stream — but the guest-RAM
+   arena leg has not been run with the verifier on.
+5. **The reproduction rate on Firefox is low.** 3 in 1509. The defect is
+   certain, the unit test is deterministic, and the worst case is the entire
+   client area; but a run of `scripts/wc-damage.sh scroll` against broken code
+   could plausibly come up zero, so the unit test is the regression gate and the
+   script is the reproduction.
+6. **`set_opaque_region` and `set_input_region` are still parsed and ignored.**
+   Neither can produce a stale region — the compositor draws every window opaque
+   because GDI ignores alpha — so neither is part of this stage's symptom.
+   Recorded so that the audit's finding is not read as closed.
+
+### 27.12 What to do next
+
+1. **Run `scripts/wc-damage.sh` against the guest-RAM arena** (§27.11 item 4).
+   The verifier is transport-agnostic and the leg is two flags.
+2. **Own the scale question** (§27.11 items 1 and 2). Two places merge two
+   coordinate spaces on an assumption that is currently true, and the code in
+   both says so; that is a good state to change deliberately and a bad one to
+   discover.
+3. **Ask why half of Firefox's commits carry no buffer.** 1708 of 3343 is a lot
+   of round trips through a proxy, and the answer is either "that is what
+   `ack_configure` and subsurfaces cost" or something worth fixing.
 
 ## 26. Stage 26: the compliance suite, and what a number from it is worth
 
@@ -7764,7 +8847,7 @@ surprised somebody is not evidence; that table is — and on its first run
 against the unified tree it produced one (§26.8), which is one more than every
 anecdote in this document put together has ever localised to a line of code.
 
-### 26.6 The baseline, 2026-08-13, at `020022d` plus this branch
+### 26.6 The baseline, 2026-08-13, at `8fc1f41` plus this branch
 
 `scripts/wc-wlcs.sh globals; scripts/wc-wlcs.sh headless`. 1,228 tests listed,
 3 `DISABLED` upstream, 1,225 run in 98 seconds.
@@ -7779,22 +8862,49 @@ anecdote in this document put together has ever localised to a line of code.
 | **applicable (passed + failed)** | **466** | |
 | **pass rate on applicable tests** | | **49.4%** |
 
-**Two baselines, and keeping both is the point.** This was first measured on
-waycompose `e7ed512` before the repositories were unified, at **231 / 235 /
-759**, and re-measured on the unified tree at `020022d`, which had gained
-`zwp_idle_inhibit_manager_v1`, `xdg_activation_v1`,
-`zwp_keyboard_shortcuts_inhibit_manager_v1`, a native title bar and a damage
-fix. **Not one of the 1,225 verdicts moved** — `scripts/wc-wlcs.sh` writes a
-per-test log precisely so that can be joined and checked, and it was.
+**Three baselines, on three trees, and keeping all of them is the point.**
 
-That is a finding rather than a disappointment, and it says something useful in
-two directions. WLCS has **no tests at all** for idle-inhibit,
-`xdg_activation`, shortcuts-inhibit, cursor shape or toplevel icons, so a
-fortnight of protocol work can land without this number twitching; and
-`XdgDecorationV1Test` was already 5 of 6, so a title bar that is now Windows'
-own changed nothing it measures. **A green WLCS scoreboard is not a statement
-about protocol coverage**, and the existing harnesses (`wc-proxy.sh`,
-`wc-input.sh`, `wc-icon.sh`, `wc-xdg.sh`) are not superseded by it.
+| tree | headless | wine | verdicts moved |
+|---|---|---|---:|
+| waycompose `e7ed512` | 231 / 235 / 759 | 23 / 12 / 0 | — |
+| unified `020022d` | 231 / 235 / 759 | 23 / 12 / 0 | 0 |
+| unified `8fc1f41` | 230 / 236 / 759 | 22 / 13 / 0 | 0 |
+
+The single change between the second row and the third is not the tree: it is
+the `WM_SIZE` fix to this stage's own stand-in (§26.8), applied between them.
+**Across the two merges themselves, not one of the 1,225 verdicts moved** —
+`scripts/wc-wlcs.sh` writes a per-test log precisely so that can be joined and
+checked, and it was, on both legs.
+
+That is a finding rather than a disappointment, and the *reasons* are more
+useful than the number. Between `e7ed512` and `020022d` the compositor gained
+`zwp_idle_inhibit_manager_v1`, `xdg_activation_v1`,
+`zwp_keyboard_shortcuts_inhibit_manager_v1` and a native title bar; between
+`020022d` and `8fc1f41` it gained `wp_cursor_shape_manager_v1`, the arena's
+best-fit allocator (§20) and the damage fix (§27). **WLCS has no tests at all**
+for idle-inhibit, `xdg_activation`, shortcuts-inhibit, cursor shape or toplevel
+icons; `XdgDecorationV1Test` was already 5 of 6, so a title bar that is now
+Windows' own changed nothing it measures; and the last two need saying
+separately, because they are the ones a reader would expect to move a number:
+
+* **The allocator is not on either leg.** The headless leg passes no `--arena`
+  at all, and the Wine leg deliberately uses `--transport shared-file`, because
+  an arena is the *hypervisor* transport and there is no hypervisor here
+  (§26.5). Nor does WLCS ever exhaust a pool, which is the condition §20 is
+  about. Zero coverage, and it is the honest kind: the harness says so rather
+  than reporting a pass.
+* **WLCS never looks at a pixel.** `wl_surface.damage` appears twice in the
+  whole suite, both in `test_bad_buffer.cpp`, and both times as a *call* made
+  to provoke the compositor into reading a buffer — never as an assertion
+  about what was copied. Nothing in `tests/` reads back surface content. So
+  §27's copy scope could be wrong in every direction and this scoreboard would
+  not twitch; `scripts/wc-proxy.sh`'s screenshots and hashes are what measure
+  that, and they are not superseded.
+
+**A green WLCS scoreboard is not a statement about protocol coverage, and it is
+not a statement about pixels at all.** The existing harnesses (`wc-proxy.sh`,
+`wc-input.sh`, `wc-icon.sh`, `wc-xdg.sh`) remain the instruments for everything
+above.
 
 The one verdict that *did* move did so because of a fix to this stage's own
 harness, and it went the right way: see §26.8.
@@ -7836,6 +8946,14 @@ The five unraised protocol errors are the protocol audit's finding restated by a
 independent instrument: `xdg_surface` does not raise `already_constructed`,
 `unconfigured_buffer`, or the role errors, and `wl_shm` accepts a pool larger
 than its file.
+
+**That row must not be read together with §20's correction, because they are
+opposite faults.** §20 found the proxy forwarding a `create_buffer` naming a
+pool the compositor never received, and a request on an unknown object is a
+protocol error the compositor raises *correctly* — the bug was upstream of it.
+This row is the reverse: errors the protocol requires and this compositor does
+not raise at all. One is a client killed by a rule being applied where it
+should not have been; the other is a rule not applied where it should be.
 
 ### 26.7 The exclusions, and the ones the suite never asks about
 
@@ -7935,7 +9053,7 @@ Wine desktop, a Windows binary and a proxy — about three seconds — and 373 o
 them would be twenty minutes of `wineserver` churn on a machine ten worktrees
 share, to re-learn a fact that does not depend on the platform).
 
-### 26.9 Five things that cost real time
+### 26.9 Seven things that cost real time
 
 1. **The activation assumption** (§26.4). Ten seconds per test, 235 tests, and
    every one of them looked like a compositor bug. What found it was reading
@@ -7970,19 +9088,40 @@ share, to re-learn a fact that does not depend on the platform).
    library is what an in-process WLCS shim would need, and §26.12 item 5 is
    where that becomes interesting.
 
+6. **`bind` creates the socket node; `listen` makes it accept.** The shim
+   waited for the node to exist, which does not close that window, and one
+   test in 1,225 failed with `ECONNREFUSED` on a loaded machine. It read as a
+   compositor change, because it moved a SKIP to a FAIL across a merge and
+   the merge was the obvious suspect. Six runs in isolation said otherwise.
+   `connect_client` now retries for five seconds on that one errno. **A
+   scoreboard whose noise floor is one test cannot report a one-test
+   regression**, which is the resolution this stage exists to have.
+7. **gtest spells a parameterised test's name two different ways.** A pass or
+   a failure prints `Suite.test/3, where GetParam() = …`; a skip prints
+   `Suite.test/3 (22ms)`. So the name carries a trailing comma in two verdict
+   kinds out of three, and `compare`'s join silently dropped **every
+   parameterised test whose verdict differed between the legs** — which is
+   exactly the set it exists to find, and which is 700 of the 1,225. It
+   surfaced only because the flake above made one test disagree with itself
+   across two runs. The fix is one `sub(/,$/, "", s)`, and the lesson is that a
+   comparison which reports nothing is indistinguishable from a comparison
+   which found nothing until you make it say how many rows it compared —
+   which `compare` now does.
+
 ### 26.10 The gates
 
 | gate | result |
 |---|---|
 | `cargo clippy --workspace --all-targets` | clean in every crate this branch touches; one pre-existing warning in `sv-hostd` |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same, plus one pre-existing in `sv-transport` |
-| `cargo test --workspace` | 1,148 passed (1,125 at `020022d`; +17 in `control.rs`, +6 in `wc-wlcs`) |
-| `cargo build --workspace --target x86_64-pc-windows-gnu` | `wc-compositor.exe`, 75 MB, links |
-| `scripts/wc-wlcs.sh globals` | 14 globals from `wayland-info`; fallback table matches |
+| `cargo test --workspace` | 1,161 passed (1,138 at `8fc1f41`; +17 in `control.rs`, +6 in `wc-wlcs`) |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | `wc-compositor.exe`, 76 MB, links |
+| `scripts/wc-wlcs.sh globals` | 15 globals from `wayland-info`; fallback table matches |
 | `scripts/wc-wlcs.sh list` | 1,228 tests in 63 suites |
 | `scripts/wc-wlcs.sh headless` | 230 / 236 / 759, every skip attributed |
 | `scripts/wc-wlcs.sh wine` | 35 tests, 22 / 13 / 0, real `.exe` through the proxy |
 | `scripts/wc-wlcs.sh compare` | 35 shared tests, 1 disagreement found and fixed, then 0 |
+| merge of `8fc1f41` (§20, §27, cursor shape) | 0 of 1,225 verdicts moved, on both legs |
 
 ### 26.11 What is not proven
 
@@ -8001,14 +9140,19 @@ share, to re-learn a fact that does not depend on the platform).
    only find them where it looks: the entire pointer path is unlooked-at.
 4. **Wine is not Windows.** Four recorded discrepancies (§13.6). This leg is
    evidence that the code paths are self-consistent and structurally possible.
-5. **The baseline is two runs, on two trees, and they agreed exactly.** That is
-   better evidence of determinism than a repeat on one tree would have been —
-   1,225 verdicts, joined by test name, zero differences — but three of the
-   failures are timeouts, which are the ones a loaded machine could still move.
-6. **The suite does not test the impossible protocols** (§26.7). It also does
-   not test `xdg-toplevel-icon-v1`, `org_kde_kwin_server_decoration`, keyboard
-   layout, or anything about pixels reaching a screen — so the existing
-   harnesses are not superseded by this one.
+5. **The baseline is three runs, on three trees, and they agreed exactly.**
+   That is better evidence of determinism than three repeats on one tree would
+   have been — 1,225 verdicts each, joined by test name, zero differences. But
+   the noise floor was one test until §26.9 item 6 was fixed, and it took a
+   flake to find it, so treat a *single* moved verdict as a hypothesis to
+   re-run rather than a result. Three of the failures are timeouts, which are
+   the ones a loaded machine could still move.
+6. **The suite does not test the impossible protocols** (§26.7), and it never
+   inspects a pixel (§26.6). It also does not test `xdg-toplevel-icon-v1`,
+   `org_kde_kwin_server_decoration`, cursor shape, `xdg_activation`,
+   idle-inhibit, shortcuts-inhibit, the arena, keyboard layout, or anything
+   reaching a screen. Three merges have now landed work in those areas and
+   moved this number by zero. The existing harnesses are not superseded.
 7. **The scoreboard is a moving target by design.** Several agents are fixing
    the protocol gaps the audit found while this was written; the number in
    §26.6 is from a checkout, and the point of the harness is that anyone can

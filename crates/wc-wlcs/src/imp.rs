@@ -168,6 +168,7 @@ const DEFAULT_EXTENSIONS: &[(&str, u32)] = &[
     ("org_kde_kwin_server_decoration_manager", 1),
     ("xdg_toplevel_icon_manager_v1", 1),
     ("wc_icon_manager_v1", 1),
+    ("wp_cursor_shape_manager_v1", 2),
     ("zwp_idle_inhibit_manager_v1", 1),
     ("xdg_activation_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
@@ -607,7 +608,31 @@ impl Server {
     }
 
     fn connect_client(&mut self) -> std::io::Result<c_int> {
-        let stream = UnixStream::connect(self.wayland_socket())?;
+        // **Retried on `ECONNREFUSED`, and that is a race rather than
+        // defensiveness.** `bind` creates the filesystem node and `listen`
+        // makes it accept; between the two, `connect` is refused. `launch`
+        // waits for the node to *exist*, which does not close that window —
+        // and the control socket, which it also waits for, is bound before the
+        // Wayland thread even starts, so it is no guard either.
+        //
+        // Measured: one test in 1,225 failed this way on a loaded machine, and
+        // it read as a compositor change because it moved a SKIP to a FAIL
+        // across a merge. A scoreboard whose noise floor is one test is a
+        // scoreboard that cannot report a one-test regression, which is the
+        // resolution this whole stage is trying to have.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match UnixStream::connect(self.wayland_socket()) {
+                Ok(s) => break s,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let fd = stream.into_raw_fd();
         // The ordinal the compositor will give this connection. Accept order,
         // counted from 1, and it matches because the `connect` above has

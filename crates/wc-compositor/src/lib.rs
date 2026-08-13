@@ -47,6 +47,7 @@
 /// docs/waycompose-design.md §26.
 #[cfg(unix)]
 mod control;
+mod cursor;
 mod icon;
 mod input;
 mod platform;

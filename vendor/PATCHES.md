@@ -475,3 +475,100 @@ x86_64-pc-windows-gnu` compile.
 * **No `h` argument has crossed on a real Windows machine.** It has crossed
   under Wine (`scripts/wc-handshake.sh wine`), which exercises our code but not
   `afunix.sys`. See `docs/design.md` §4.4 for the precise limits of that claim.
+
+---
+
+# Upstreamable: bugs found in `smithay` that are not about Windows
+
+Everything above is a *fork* — a change that exists because the crate had to
+build or run for `x86_64-pc-windows-gnu`, and that upstream has no reason to
+want. This section is the opposite: defects in `smithay` that reproduce on any
+platform, that were found because this project exercised a path nobody else
+had, and that upstream would probably take.
+
+They are listed as **tasks for a human**, because sending a patch to another
+project is a judgement about that project's process, its maintainers and the
+wording of a bug report — none of which an agent should decide unilaterally.
+Each entry is written so that the work left is *submitting* it, not
+rediscovering it.
+
+**Status: none of these has been reported upstream.** Until one is, the fork
+carries a divergence that will conflict on every `smithay` bump, and the cost
+of not sending it is paid again at each rebase.
+
+---
+
+## 1. `wl_touch.cancel` is a no-op for every settled contact
+
+**Where.** `vendor/smithay/src/input/touch/mod.rs`, `TouchInternal::cancel`,
+against smithay 0.7.0. The hunk carries a `WAYCOMPOSE FORK` comment with the
+same reasoning as below.
+
+**The bug.** `cancel` guarded its loop with the same test `frame` uses:
+
+```rust
+for state in self.focus.values_mut() {
+    if state.current.map(|c| c >= state.pending).unwrap_or(false) {
+        continue;                       // <-- wrong here
+    }
+    ...
+}
+```
+
+`current >= pending` means *"this slot has already had a frame sent for
+everything pending on it"*. For `frame` that is exactly right — a second frame
+with nothing new to terminate is a no-op. For `cancel` it is exactly wrong,
+because a settled slot is the normal state of a live contact: a real touch
+stream is `down`, `frame`, `motion`, `frame`, … and at the moment a compositor
+decides the gesture belongs to the system, **every live slot satisfies the
+guard**. So `cancel` skips all of them and sends nothing.
+
+**What the client sees.** Nothing. It keeps its contacts for ever, while the
+compositor's own log says it cancelled them. There is no error, no warning, and
+no protocol violation — the events simply never arrive, which is the hardest
+class of bug to notice from either side.
+
+**The fix**, three lines, no Windows content:
+
+```rust
+fn cancel(&mut self, data: &mut D, seat: &Seat<D>, seq: Serial) {
+    for state in self.focus.values_mut() {
+        state.current = Some(seq);
+        state.frame_pending = None;
+        if let Some((focus, _)) = state.focus.take() {
+            focus.cancel(seat, data, seq);
+        }
+    }
+}
+```
+
+Dropping the guard is safe: a slot that has already been released sends nothing
+anyway, because `up` takes its focus and this arm only fires on a focus that is
+still present — which is the condition the guard was reaching for. `current` is
+still stamped so a `frame` arriving after a cancel stays a no-op, and
+`frame_pending` is cleared because the protocol says outright that *"no frame
+event is required after the cancel event"*, and a frame for a contact that has
+just been told it did not happen is noise.
+
+**How it was found.** `scripts/wc-input.sh` asserts `cancel()` **on the wire**
+rather than asserting that the compositor called it. `weston-eventdemo` — an
+unmodified third-party client using libwayland's own decoder — received the
+`down` and the `frame` and then no cancel. See `docs/design.md` §24.4.
+
+**Why nobody hit it before.** Cancel is rare. It fires when a compositor takes
+a gesture away from a client, and most compositors on most hardware seldom do.
+A test that calls `cancel()` and checks the compositor's state rather than the
+client's would pass.
+
+**What a human has to decide.** Whether to open an issue first or send the pull
+request directly; smithay's maintainers may want a regression test in their own
+harness rather than a description of ours, and if so, the shape of that test is
+the only real work — the fix itself is settled and measured.
+
+---
+
+## 2. (none yet)
+
+When the next one turns up it goes here, in the same shape: where, what, what
+the client sees, the fix, how it was found, why nobody hit it, and what is left
+for a human to decide.

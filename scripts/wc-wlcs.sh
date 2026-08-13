@@ -341,13 +341,30 @@ compare() {
   local h="$OUT/headless.log" w="$OUT/wine.log"
   [ -f "$h" ] || { bad "no $h; run 'headless' first"; return; }
   [ -f "$w" ] || { bad "no $w; run 'wine' first"; return; }
+  # **`sub(/,$/, "", n)` is load-bearing, and it was found the hard way.** A
+  # parameterised test that passes or fails prints
+  # `Suite.test/3, where GetParam() = …`; the same test skipped prints
+  # `Suite.test/3 (22ms)` with no suffix. So the name carries a trailing comma
+  # in two verdict kinds out of three, and a join on the raw field silently
+  # drops **every parameterised test whose verdict differs between the legs** —
+  # which is precisely the set this mode exists to find, and which is 700 of
+  # the 1,225. It showed up as a one-line `comm` mismatch when the same test
+  # went SKIP on one run and FAIL on the next.
   local verdicts='
-    /^\[ +OK +\] .*\([0-9]+ ?ms\)$/     { print $4, "PASS" }
-    /^\[ +FAILED +\] .*\([0-9]+ ?ms\)$/ { print $4, "FAIL" }
-    /^\[ +SKIP +\] .*\([0-9]+ ?ms\)$/   { print $4, "SKIP" }'
+    function name(s) { sub(/,$/, "", s); return s }
+    /^\[ +OK +\] .*\([0-9]+ ?ms\)$/     { print name($4), "PASS" }
+    /^\[ +FAILED +\] .*\([0-9]+ ?ms\)$/ { print name($4), "FAIL" }
+    /^\[ +SKIP +\] .*\([0-9]+ ?ms\)$/   { print name($4), "SKIP" }'
   awk "$verdicts" "$h" | LC_ALL=C sort > "$RUNDIR/h.v"
   awk "$verdicts" "$w" | LC_ALL=C sort > "$RUNDIR/w.v"
   LC_ALL=C join "$RUNDIR/w.v" "$RUNDIR/h.v" > "$RUNDIR/both.v"
+
+  # A test present in one log and not the other is not a disagreement, but it
+  # is not nothing either: it means the two legs ran different sets and the
+  # filter has drifted. Counted separately rather than folded into either.
+  local only
+  only=$(LC_ALL=C join -v1 "$RUNDIR/w.v" "$RUNDIR/h.v" | wc -l)
+  [ "$only" = 0 ] || note "$only test(s) ran on the wine leg only"
 
   local n d
   n=$(wc -l < "$RUNDIR/both.v")

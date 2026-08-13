@@ -918,6 +918,7 @@ version = "0.1.0"
 dependencies = [
  "arena-record",
  "ash",
+ "awe-probe",
  "libc",
  "sv-arena",
  "sv-gpu-entry",

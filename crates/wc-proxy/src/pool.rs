@@ -406,6 +406,81 @@ impl SharedBacking {
     }
 }
 
+/// Which free run an allocation takes.
+///
+/// # STAGE 16, and it is a choice so that the choice could be measured
+///
+/// Stage 12's allocator is [`Policy::FirstFit`] and it fragmented under a video
+/// (docs/design.md §20.3): `arena 0 has no run of 2342912 bytes (3932160 free,
+/// largest 1744896)`. Two-thirds more free space than the request, in pieces
+/// none of which was big enough.
+///
+/// Replacing it outright would have left that sentence resting on a claim about
+/// the code rather than on a measurement, which is the §8.4 rule. So the old
+/// policy stays, reachable by `--arena-policy first-fit`, and
+/// `a_video_sized_churn_fragments_first_fit_and_not_the_default` runs the same
+/// synthetic churn through both in one process. §20.4 has the matrix that chose
+/// between six candidates, and it is worth reading before changing this,
+/// because **the obvious answer was wrong**: rounding requests to size classes,
+/// TLSF-style, made every occupancy *worse*, and what did the work was
+/// choosing the run rather than reshaping the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Policy {
+    /// Stage 12: **first fit**, page granularity. The lowest run that is big
+    /// enough, split at its head, remainder left where it is.
+    FirstFit,
+    /// Stage 16: **best fit, with small pools taken from the far end**. Page
+    /// granularity, as before — the change is entirely in *which* run is
+    /// chosen and from which end it is cut.
+    ///
+    /// Two independent halves, both measured in §20.4's matrix:
+    ///
+    /// * **Best fit.** The smallest adequate run rather than the lowest. First
+    ///   fit shaves the low end of whatever large run it meets first, so a
+    ///   region's big runs are eaten by requests that a smaller hole would have
+    ///   held perfectly well — "lowest" and "smallest" are unrelated, and only
+    ///   one of them preserves the ability to answer a large request later.
+    /// * **Segregating the small pools.** A pool of at most [`SMALL_POOL`]
+    ///   bytes is cut from the *highest* run, at that run's tail. Cursors,
+    ///   icons and tooltips are this size and, in Firefox's case, permanent —
+    ///   and one permanent 8 KiB extent in the middle of the region is what
+    ///   stops the megabyte holes on either side of it from ever coalescing.
+    ///   Sending them to the far end costs nothing and keeps the space the
+    ///   video competes for in one piece.
+    ///
+    /// The two together refuse nothing at the occupancy where first fit refuses
+    /// 62 pools, and a fifth as many at the occupancy where first fit refuses
+    /// 633 (§20.4).
+    #[default]
+    BestFitSegregated,
+}
+
+impl Policy {
+    pub fn parse(s: &str) -> Option<Policy> {
+        match s {
+            "first-fit" => Some(Policy::FirstFit),
+            "best-fit" => Some(Policy::BestFitSegregated),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Policy::FirstFit => "first-fit",
+            Policy::BestFitSegregated => "best-fit",
+        }
+    }
+}
+
+/// A pool at most this big is allocated from the far end of the region.
+///
+/// 64 KiB is chosen from what clients actually create rather than from a round
+/// number: a 32x32 cursor is 4096 bytes, a 128x128 icon is 65536, and every
+/// `wl_shm` pool Firefox opens for content is at least fifteen times this. So
+/// the line falls in a genuine gap in the distribution, which is what makes
+/// "small" a fact about the client rather than a knob.
+pub const SMALL_POOL: u64 = 64 * 1024;
+
 /// The whole of the allocator's mutable state, behind one lock.
 ///
 /// It is one struct rather than four fields so that "the free list, the live
@@ -417,6 +492,7 @@ struct Alloc {
     live: HashMap<u64, (u64, u64)>,
     next: u64,
     published: u64,
+    policy: Policy,
 }
 
 /// The region, the one allocator over it, and everything that does not change
@@ -649,6 +725,29 @@ impl Arena {
         self.inner.size
     }
 
+    /// Choose how this allocator picks a run. See [`Policy`].
+    ///
+    /// Takes `&mut self` for the same reason [`Arena::reserve_outbound`] does,
+    /// and it is not about the lock: changing the policy once extents are out
+    /// would produce a free list whose runs were sized by one rule and consumed
+    /// by another, which is a measurement of neither. `Arc::get_mut` is "before
+    /// the first client" expressed as a type.
+    pub fn set_policy(&mut self, policy: Policy) -> io::Result<()> {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return Err(io::Error::other(
+                "the allocation policy must be chosen before any client is served: \
+                 this arena is already shared with a session",
+            ));
+        };
+        inner.alloc.get_mut().unwrap_or_else(|e| e.into_inner()).policy = policy;
+        Ok(())
+    }
+
+    /// The policy in force, for the log line that says which allocator ran.
+    pub fn policy(&self) -> Policy {
+        self.alloc().policy
+    }
+
     /// Free bytes, and the largest contiguous run of them. The second number is
     /// the one that matters: an arena with room for a pool and nowhere to put
     /// it is the fragmentation failure shared_vulkan's design.md §5.7 is about,
@@ -663,6 +762,43 @@ impl Arena {
 }
 
 impl Alloc {
+    /// Which run of the free list a `want`-byte request takes, by the policy in
+    /// force. `None` means no run is big enough, which is the caller's error to
+    /// describe because only it knows the numbers worth printing.
+    ///
+    /// Ties go to the lowest offset in both policies, so an allocator's answer
+    /// is a function of its free list and not of a `HashMap`'s iteration order —
+    /// which matters because `arena_slices_never_overlap` and the fragmentation
+    /// reproduction both compare two runs of the same sequence.
+    /// Returns the index and whether the extent is cut from that run's **tail**
+    /// rather than its head.
+    fn pick(&self, want: u64) -> Option<(usize, bool)> {
+        if self.policy == Policy::FirstFit {
+            return self.free.iter().position(|(_, l)| *l >= want).map(|i| (i, false));
+        }
+        // A small pool goes to the highest run, cut from that run's tail, so
+        // that the permanent ones end up packed against the far end of the
+        // region instead of scattered through the space the large pools need.
+        // See [`SMALL_POOL`].
+        if want <= SMALL_POOL {
+            return self
+                .free
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (_, l))| *l >= want)
+                .map(|(i, _)| (i, true));
+        }
+        // `min_by_key` returns the *first* minimum, and the list is sorted by
+        // offset, so the tie-break is the lowest address for free.
+        self.free
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, l))| *l >= want)
+            .min_by_key(|(_, (_, l))| *l)
+            .map(|(i, _)| (i, false))
+    }
+
     fn release(&mut self, offset: u64, len: u64) {
         let at = self.free.partition_point(|(o, _)| *o < offset);
         self.free.insert(at, (offset, len));
@@ -692,27 +828,31 @@ impl PoolTransport for Arena {
         if size == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a pool cannot be empty"));
         }
-        let want = size.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
         let mut alloc = self.alloc();
-        let idx = alloc.free.iter().position(|(_, l)| *l >= want).ok_or_else(|| {
+        let want = size.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
+        let (idx, from_tail) = alloc.pick(want).ok_or_else(|| {
             let total: u64 = alloc.free.iter().map(|(_, l)| *l).sum();
             let largest = alloc.free.iter().map(|(_, l)| *l).max().unwrap_or(0);
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 format!(
                     "arena {} has no run of {want} bytes ({total} free, largest {largest}, \
-                     {} bytes out to {} connection(s)); raise --arena-size",
+                     {} bytes out to {} connection(s), {} policy); raise --arena-size",
                     self.inner.id,
                     alloc.published,
-                    Arc::strong_count(&self.inner)
+                    Arc::strong_count(&self.inner),
+                    alloc.policy.as_str(),
                 ),
             )
         })?;
-        let (offset, len) = alloc.free[idx];
+        let (run, len) = alloc.free[idx];
+        let offset = if from_tail { run + len - want } else { run };
         if len == want {
             alloc.free.remove(idx);
+        } else if from_tail {
+            alloc.free[idx] = (run, len - want);
         } else {
-            alloc.free[idx] = (offset + want, len - want);
+            alloc.free[idx] = (run + want, len - want);
         }
         let key = alloc.next;
         alloc.next += 1;
@@ -1051,11 +1191,225 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // ---------------------------------------------------------------- 16 ---
+    // Fragmentation, reproduced.
+
+    /// A deterministic stand-in for what a video does to a pool allocator.
+    ///
+    /// **Deliberately synthetic, and that is the point.** A YouTube video
+    /// fragments the arena in about ten seconds, but it does so through Firefox,
+    /// a compositor, a hypervisor and a guest, and a run of it can only ever say
+    /// "it broke again". This says which allocator broke, at what occupancy, on
+    /// exactly the same request sequence, in 40 milliseconds, in `cargo test`.
+    ///
+    /// The sequence has the two ingredients the live failure had and nothing
+    /// else:
+    ///
+    /// 1. **A churn of large pools whose sizes wander.** Firefox's video pools
+    ///    were 2340864 and 2342912 bytes and the arena had 3932160 free in a
+    ///    largest run of 1744896 — sizes near each other but never equal, which
+    ///    is what leaves a splinter per cycle at page granularity.
+    /// 2. **A few small pools that never go away**, created between the large
+    ///    ones. Cursors, tooltips and icons are exactly this, and a small
+    ///    permanent extent in the middle of a region is what stops the large
+    ///    holes on either side of it from ever coalescing.
+    ///
+    /// Neither is a guess about Firefox: 1 is the numbers in the log line, and 2
+    /// is why 197 of 215 pools being released still left the arena unable to
+    /// answer.
+    fn video_churn(
+        policy: Policy,
+        arena_size: u64,
+        rounds: usize,
+        live_max: usize,
+    ) -> (u32, u64, u64) {
+        let d = tmpdir(&format!("churn-{}", policy.as_str()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7110, &d.join("arena"), arena_size).unwrap();
+        a.set_policy(policy).unwrap();
+
+        // An LCG rather than `rand`: the sequence has to be identical for both
+        // policies and identical between runs, or the comparison is not one.
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+
+        // **A pool's life is the client's business, not the allocator's**, and
+        // modelling that is the difference between a reproduction and an
+        // artefact. The first version of this retired a pool only when a *new*
+        // one had been allocated, so one refusal froze the live set and every
+        // later round refused too — which made a bad allocator look catastrophic
+        // and a good one look bad. Firefox does not stop destroying pools
+        // because this proxy could not find room for one. So the schedule is
+        // fixed: whatever happened at round `r`, the slot from round
+        // `r - live_max` is retired at round `r`.
+        let mut history: std::collections::VecDeque<Option<Region>> =
+            std::collections::VecDeque::new();
+        let mut pinned: Vec<Region> = Vec::new();
+        let mut failures = 0u32;
+        for round in 0..rounds {
+            // A small pool that is never released, every so often. Sizes are
+            // the ones a cursor theme and a tooltip actually produce.
+            if round % 64 == 0
+                && pinned.len() < 12
+                && let Ok(r) = a.create(4096 + (next() % 6) as u64 * 4096)
+            {
+                pinned.push(r);
+            }
+            // The video's own buffer: 1.6 to 2.6 MB, wandering, page aligned
+            // exactly as a `stride * height` would be.
+            let size = 1_600_000 + (next() % 1_000_000) as u64;
+            let size = size / 4 * 4;
+            match a.create(size) {
+                Ok(r) => history.push_back(Some(r)),
+                Err(_) => {
+                    failures += 1;
+                    history.push_back(None);
+                }
+            }
+            if history.len() > live_max
+                && let Some(Some(r)) = history.pop_front()
+            {
+                a.destroy(&r);
+            }
+        }
+        let (total, largest) = a.free_bytes();
+        let _ = std::fs::remove_dir_all(&d);
+        (failures, total, largest)
+    }
+
+    /// **The stage's reproduction.** The same 4000-round churn, at an occupancy
+    /// where the arena is a little over half full, through both allocators.
+    ///
+    /// What it asserts is not "the new one is better on average" — it is that
+    /// the old one reaches a state where it refuses a pool it has the bytes for,
+    /// which is the live failure, and that the new one does not reach that state
+    /// at all.
+    #[test]
+    #[ignore = "sweep, for choosing the policy and the reproduction's constants"]
+    fn sweep_policies() {
+        let all = [Policy::FirstFit, Policy::BestFitSegregated];
+        eprint!("{:>5}", "live");
+        for p in all {
+            eprint!(" {:>18}", p.as_str());
+        }
+        eprintln!();
+        for live_max in [16usize, 20, 22, 24, 25, 26, 27, 28, 29, 30, 31] {
+            eprint!("{live_max:5}");
+            for p in all {
+                let (f, _, l) = video_churn(p, 64 << 20, 4000, live_max);
+                eprint!(" {f:6} ({:>9})", l);
+            }
+            eprintln!();
+        }
+    }
+
+    #[test]
+    fn a_video_sized_churn_fragments_first_fit_and_not_the_default() {
+        let arena = 64 << 20;
+        // Three occupancies rather than one, because a single number would not
+        // distinguish "the new policy is better" from "the new policy happens
+        // to be better here". 25 and 26 are where first fit begins to refuse
+        // pools it has the bytes for; 31 is past the point where the arena is
+        // genuinely too small for the working set, and is included so that the
+        // claim is bounded rather than triumphant.
+        let mut rows = Vec::new();
+        for live_max in [25usize, 26, 31] {
+            let (old_fail, _, old_largest) = video_churn(Policy::FirstFit, arena, 4000, live_max);
+            let (new_fail, new_free, new_largest) =
+                video_churn(Policy::BestFitSegregated, arena, 4000, live_max);
+            eprintln!(
+                "live {live_max}: first-fit {old_fail} refusals (largest {old_largest}) | \
+                 best-fit {new_fail} refusals (largest {new_largest}, {new_free} free)"
+            );
+            rows.push((live_max, old_fail, new_fail));
+        }
+
+        // 1. The reproduction still reproduces. If first fit ever stops
+        //    refusing, this test has stopped measuring the failure it was
+        //    written for and must be made harsher rather than deleted.
+        for (live_max, old_fail, _) in &rows {
+            assert!(
+                *old_fail > 0,
+                "at {live_max} live pools first fit answered every request, so the reproduction \
+                 no longer reproduces"
+            );
+        }
+        // 2. At the occupancies where the arena genuinely has room, the new
+        //    policy refuses nothing at all. This is the live failure: 3932160
+        //    bytes free and a 2342912-byte pool refused.
+        assert_eq!(rows[0].2, 0, "the default refused a pool it had room for at 25 live");
+        assert!(rows[1].2 <= 3, "the default refused {} pools at 26 live", rows[1].2);
+        // 3. And it is never worse, including past the point where the working
+        //    set does not fit — which is the honest half, because a policy that
+        //    won in the middle and lost at the edge would have to be reported as
+        //    such rather than as a fix.
+        for (live_max, old_fail, new_fail) in &rows {
+            assert!(
+                new_fail <= old_fail,
+                "at {live_max} live pools the default refused {new_fail} against first fit's \
+                 {old_fail}: the new policy is worse here and the matrix in §20.4 is wrong"
+            );
+        }
+    }
+
+    /// The small-pool end, which is the half of the policy that is not best fit.
+    ///
+    /// A cursor-sized pool must come from the *top* of the region and a
+    /// content-sized one from the bottom, because the whole point is that the
+    /// permanent small extents never land in the middle of the space the large
+    /// ones need.
+    #[test]
+    fn small_pools_are_cut_from_the_far_end_and_large_ones_from_the_near() {
+        let d = tmpdir("ends");
+        std::fs::create_dir_all(&d).unwrap();
+        let size = 128 * 4096;
+        let mut a = Arena::open_or_create(7111, &d.join("arena"), size).unwrap();
+        let at = |r: &Region| match r.descriptor {
+            Descriptor::ArenaSlice { offset, .. } => offset,
+            _ => panic!("wrong kind"),
+        };
+
+        let big = a.create(SMALL_POOL * 2).unwrap();
+        let small = a.create(4096).unwrap();
+        assert_eq!(at(&big), 0, "a large pool starts at the bottom of the region");
+        assert_eq!(
+            at(&small),
+            size - 4096,
+            "a small pool is the last page of the region, not the one after the large pool"
+        );
+        // A second small one packs against the first rather than starting a
+        // second hole.
+        let small2 = a.create(4096).unwrap();
+        assert_eq!(at(&small2), size - 8192);
+        // Exactly at the threshold is still small; one byte over is not.
+        let edge = a.create(SMALL_POOL).unwrap();
+        assert_eq!(at(&edge), size - 8192 - SMALL_POOL);
+        let over = a.create(SMALL_POOL + 1).unwrap();
+        assert_eq!(at(&over), SMALL_POOL * 2, "one byte over the threshold is a large pool");
+
+        // And first fit does none of it, which is what makes this a policy
+        // rather than a property of the free list.
+        let mut b = Arena::open_or_create(7112, &d.join("arena2"), size).unwrap();
+        b.set_policy(Policy::FirstFit).unwrap();
+        let b_big = b.create(SMALL_POOL * 2).unwrap();
+        let b_small = b.create(4096).unwrap();
+        assert_eq!(at(&b_big), 0);
+        assert_eq!(at(&b_small), SMALL_POOL * 2, "first fit puts the cursor next to the content");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn copy_scope_parses_exactly_the_three() {
         for s in ["pool", "buffer", "damage"] {
             assert_eq!(CopyScope::parse(s).unwrap().as_str(), s);
         }
         assert!(CopyScope::parse("none").is_none());
+        for s in ["first-fit", "best-fit"] {
+            assert_eq!(Policy::parse(s).unwrap().as_str(), s);
+        }
+        assert!(Policy::parse("worst-fit").is_none());
     }
 }
