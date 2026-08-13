@@ -7,10 +7,18 @@ rust-version.workspace = true
 description = "Typed replacement for a Wayland `h` argument on platforms without SCM_RIGHTS"
 
 [target.'cfg(windows)'.dependencies]
+# `Win32_Storage_FileSystem` is `CreateFileW`/`DeleteFileW`, which arrived with
+# `Descriptor::SharedFile` in stage 4. It was missing from this list until stage
+# 5 and the crate still built, because `wc-compositor` enables the same feature
+# and cargo unifies features across a workspace build. `cargo build -p wc-handle
+# --target x86_64-pc-windows-gnu` on its own did not, which is the form nobody
+# was running. Declaring what you use is the fix; the lesson is that a workspace
+# build is not a check that a crate's manifest is complete.
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
   "Win32_System_Memory",
 ] }
 

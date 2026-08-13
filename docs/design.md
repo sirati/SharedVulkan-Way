@@ -2029,6 +2029,11 @@ computed from the wrong place after a splice.
 
 Ahead of §8.11's list, because the stage-4 path reaches the guest differently.
 
+**All five are answered in §10.** Item 1 no, item 2 decisively for `ArenaSlice`,
+items 3 and 5 yes, and item 4's premise turned out to be about the client's
+machine rather than the client. The list is left as written because §10 is a
+better section for having a prediction to be measured against.
+
 1. **Whether a shared filesystem is coherent at all**, which decides whether the
    `SharedFile` transport exists on the real boundary. virtio-fs with DAX should
    be; without DAX it should not be. `scripts/probe-filemap.c` and
@@ -2055,3 +2060,319 @@ Ahead of §8.11's list, because the stage-4 path reaches the guest differently.
    `mapped: N section, N shared-file, N arena-slice` line, which is the only
    thing standing between "the pixels arrived" and "the pixels arrived the way we
    think they did".
+
+---
+
+## 10. Stage 5: the same experiment, with a hypervisor in the middle
+
+### 10.1 Status in one paragraph
+
+**§9.11's five questions are answered, and the answer to the second one changes
+the transport.** `weston-terminal` and `weston-presentation-shm`, unmodified,
+now reach a real `HWND` on the real guest through `wc-proxy`, an `ssh -L`
+forward and `scripts/probe-relay.c` — 23 checks, on Windows, with nothing in the
+path reimplemented by Wine. A pool costs the guest's compositor **485–578 µs to
+open as a `SharedFile` against 1.6–3.4 µs to resolve as an `ArenaSlice`**, a
+factor of about 250 in the warm case and about 3000 in the cold one, and that
+settles §9.11 item 2 in `ArenaSlice`'s favour by a margin no amount of tuning
+closes. It also produced the finding this stage did not go looking for: the
+shared filesystem is **not coherent while mapped**, so the compositor reads its
+own cached copy of a region the proxy is still writing, and 462 of 645 frames
+from a client that redraws every frame were the same picture. Every check above
+that one passed while it happened. That is recorded as a `FAIL` in
+`scripts/wc-guest.sh` and it is the honest result: the pixel path works, and the
+region a file on virtio-fs provides is not one it can be built on.
+
+### 10.2 Where the tests run from, and why it is three machines
+
+Stages 1 to 4 needed one Linux box and one guest. This one needs two Linux
+boxes, and the reason is worth stating because it looks like an accident of the
+lab and is not.
+
+Everything before this stage moved **protocol bytes**, and `probe-relay.c` moves
+those over TCP: an `h` argument is in band on Windows (§2.3), so there is no
+ancillary data for the hop to lose. Stage 4 moves **pixels**, and a pixel has to
+land in memory both sides can name. The only such memory here is virtiofsd's
+export — `/srv/winshare` on the VM host, `Z:` in the guest — and that export
+exists between the guest and *its own host*, not between the guest and whichever
+workstation is driving the tests.
+
+So: blocks 1–6 of `scripts/wc-guest.sh` run from the workstation, which is where
+the toolchain and the third-party clients are and which reaches the guest's sshd
+directly. Blocks 7–9 push `wc-proxy`, a probe and a generated driver to
+`WC_HOST` — the VM host — and run the proxy and the unmodified client there,
+because that is the only Linux machine the shared region is reachable from. With
+`WC_HOST` unset they skip and say so rather than testing something adjacent.
+
+This does not weaken the evidence and it does not bend the rule. The proxy's job
+is to be a Wayland server to a local client and a client of the Windows
+compositor, and it does that on whichever box the region is on. The client's
+file descriptor is consumed by the proxy on `WC_HOST`; what crosses to the guest
+is a path or an `(arena, offset, len)` triple, checked from the compositor's own
+`wc_handle::map_counts` and not from the fact that pixels appeared.
+
+### 10.3 Item 1: the export is not coherent, and it is worth being precise
+
+`probe-filemap.c` and `probe-filemap-peer.c` ran unchanged, as §9.11 said they
+would. Three measurements, because "coherent" turned out to be two questions:
+
+| | result |
+|---|---|
+| local NTFS, two Windows processes, one still mapped and unflushed | **MATCH**, 0 bytes wrong of 65536 |
+| the export, Windows mapping against a Linux `MAP_SHARED` mmap, both live | **MISMATCH**, 65280 wrong of 65536, both directions |
+| the export, host writes and closes, guest then opens for the first time | **MATCH**, 0 bytes wrong of 4096 |
+
+The first row is the control and it is what makes the second mean anything: the
+probe can see coherency when there is coherency, so the second row is the mount
+and not the probe. The 256 bytes the second row scored as correct are the
+pattern's own zero bytes — `(k * 7 + 3) & 0xff` is zero exactly once every 256 —
+so nothing crossed at all, rather than something crossing partially.
+
+The third row is the one that stops this being read as "the mount is broken".
+The export moves bytes perfectly well; what it does not do is let two live
+mappings of the same file see each other's stores. virtiofsd here runs
+`--cache=auto` with no DAX, so the guest caches file pages, and each side ends
+up with its own copy — exactly what §9.10 item 2 predicted and the reason it was
+written down as a prediction rather than assumed away.
+
+### 10.4 Item 2: the number that decides the transport
+
+`crates/wc-handle/src/bin/wc-poolcost.rs` measures the shipping path —
+`Handle::map` — rather than a C imitation of it, and separates three phases
+because they hide in different places. Per pool of 1 MiB, on the guest:
+
+| transport | reach it | touch 1 MiB | release |
+|---|---|---|---|
+| `Section` (named, no filesystem) | 5.7–6.7 µs | 0.32–0.78 ms | 55 µs |
+| `SharedFile`, local NTFS | 47.8–61.3 µs | 0.73–0.80 ms | 104–113 µs |
+| `SharedFile`, the export | **485–578 µs** | 2.3–3.0 ms | 103–114 µs |
+| `ArenaSlice`, the export | **1.6–3.4 µs** | first touch only | 0.2 µs |
+
+The NTFS row is the second control and it is doing real work. A slow
+`CreateFileW` is only evidence about the mount if the identical call on a local
+directory is fast; without that row the whole table would be equally consistent
+with "Windows is slow", and the decision would rest on an attribution nobody had
+checked. It is about a tenfold difference, and it is the hypervisor's.
+
+**The arithmetic.** An arena is attached once — 0.66–8.0 ms for 64 MiB, for the
+life of the process — and every pool after that is a registry lookup and checked
+arithmetic against a region already mapped. A shared file is a `CreateFileW`,
+a `CreateFileMappingW` and a `MapViewOfFile` **per pool, forever**, each one a
+round trip through a filesystem daemon in another operating system. At the
+observed rates a client that opens three pools pays 1.5 ms against 7 µs; the
+nine-pool case §9.6 measured pays 4.5 ms against 20 µs. Neither is fatal on its
+own. What decides it is that the arena's number does not depend on the mount at
+all, and the shared file's is the mount, measured at 10× NTFS warm and — see
+below — 150× when it is cold.
+
+**Two honest caveats.** First, the spread. The first runs after the guest
+rebooted measured 6.3–9.0 ms per open, an order of magnitude above the steady
+state, and four consecutive later runs sat at 485–578 µs. Whether that is
+WinFsp's cache warming, virtiofsd's, or the guest's metadata cache is **unknown**
+and was not chased, because the decision does not turn on it: the cold number
+makes the case more strongly than the warm one. Second, the size series (4 KiB
+1.3 ms, 64 KiB 6.3 ms, 1 MiB 6.9 ms, 4 MiB 9.0 ms) was taken entirely within a
+cold session, so it cannot be read as size dependence. What can be said is that
+the open is dominated by mount state rather than by how much is being mapped.
+
+The `touch` column is the term a "how long does the open take" measurement
+misses, and it is the one place the two transports are equal: both pay ~2.5 ms
+to fault a MiB in over the export, against 0.75 ms locally, because both are the
+same mount. In the real deployment the arena is guest RAM and pays it once for
+the region; a shared file pays it again for every pool.
+
+### 10.5 Item 3: the proxy reaches the guest, exactly as §9.11 sketched it
+
+`wc-proxy --upstream` takes a path, and an `ssh -L <socket>:127.0.0.1:<port>`
+puts a Unix socket at that path whose far end is `probe-relay.exe` inside the
+guest, which forwards byte for byte into the compositor's `afunix.sys` node. The
+proxy cannot tell it is not talking to a local socket, and does not need to.
+
+Three configurations ran: `weston-terminal` over the arena, over a shared file,
+and `weston-presentation-shm` over the arena. All three reached `xdg_toplevel`,
+all three got a real `HWND` — `0x40074` in one run, and `CreateWindowExW`
+succeeding at all is §8.11 item 1 answered on the guest rather than under Wine —
+all three blitted the client's pixels into it, and all three reported `3 fds in,
+0 out`. The rule held with a hypervisor in the path.
+
+One caveat, stated because the screenshot §8.11 asked for still does not exist:
+the compositor runs inside an ssh session, so its window is created in a
+non-interactive window station. `CreateWindowExW` succeeded there and the blits
+happened — the frames are dumped and decode — but **nothing was on a visible
+desktop and nobody looked at it**. §8.11 items 2, 4, 5 and 6 (the caption, the
+modal resize loop, DPI scaling, the taskbar icon) all need an interactive
+session and remain unrun.
+
+### 10.6 Item 4: nine doublings is a property of the client's machine
+
+§9.11 called `weston-terminal`'s nine-doubling pool growth "a property of
+toytoolkit rather than of the platform" and expected it not to change. It
+changed. On the guest run the proxy reported **3 pools, 3 resizes, 0 overflows**,
+with the first pool settling at 38272 bytes; under Wine on the workstation the
+same binary reports **3 pools, 9 resizes, 0 overflows** and 4190208 bytes.
+
+The cause is not the guest at all. `weston-terminal` logs `could not load cursor
+'dnd-move'` on the VM host and not on the workstation, because the host has only
+`hicolor` installed and the workstation has half a dozen cursor themes. Fewer
+cursor images, a smaller cursor pool, fewer doublings. The pool growth is a
+property of *the machine the client runs on*, which is one step further from the
+platform than §9.11 assumed.
+
+What is invariant, and is what `Session::flush_deferred` actually rests on, is
+the other half of that item: **every resize arrived before the pool was used, and
+there were no overflows**, in every run on both machines. That is the property
+worth asserting, and `wc-guest.sh` now asserts it instead of the count.
+
+### 10.7 Item 5: the transport line is right, and it is the only thing that was
+
+Every run reported the transport that actually served the pixels —
+`mapped: 0 section, 0 shared-file, 2 arena-slice` for the arena runs,
+`mapped: 0 section, 2 shared-file, 0 arena-slice` for the shared-file one. §9.11
+item 5 is answered yes.
+
+It is worth dwelling on how little that bought, because it is the stage's real
+lesson. In the `weston-presentation-shm` run every check passed: `xdg_toplevel`,
+a real `HWND`, **645 frames presented**, the right transport line, no descriptor
+sent on, no pool overflow. And the window was frozen. Of those 645 dumped
+frames only **18 were distinct images, and one of them was 462 of them** — from
+a client that redraws every single frame. The same client under Wine, over a
+coherent filesystem, produced 60 distinct images out of 780 with the commonest
+appearing 13 times.
+
+The mechanism is §10.3 arriving as pixels. The compositor maps the arena once at
+startup; the guest caches those pages; the proxy's writes land in the host's
+copy. Fresh content reaches the compositor at about 8 Hz — whenever the guest's
+cache happens to revalidate — while the client presents at 32. A page the
+compositor has never touched is fetched correctly, which is why the *first* frame
+of every pool is right and why `weston-terminal`, which draws three frames and
+stops, looks perfect.
+
+**The same measurement over `SharedFile` gives the same numbers**: 642 frames,
+18 distinct, commonest 459. Coherency is a property of the mount and not of the
+transport, so this does not choose between them. §10.4 does, alone.
+
+`wc-guest.sh` counts distinct dumped frames and fails on this. It is the only
+check in the file that is failing, it is expected to fail on this deployment,
+and it should stay failing until the region is a real one: virtio-fs with DAX,
+or the arena this file is standing in for — guest RAM located through QEMU's
+flat view, which is not a file (§9.10 item 3). Downgrading it to a note would
+make a stale window indistinguishable from a live one, which is exactly the
+distinction it exists to draw.
+
+### 10.8 Wine was wrong a fifth time, and the clock is not the clock
+
+Two things the guest said that Wine did not.
+
+**`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is refused.** §8.10 item
+9 recorded that Wine reports `ok` and that this "says only that the call was
+made". On the guest the same call, resolved the same way by `GetProcAddress`,
+returns failure — the process is already DPI-aware by manifest, or the context
+is unavailable in the station it runs in, and the compositor cannot currently
+tell which. So the item is not merely unverified; the mechanism it depends on
+does not work as written, and a scaled display would virtualise the window.
+
+**`Sleep(1)` takes 15.2 ms.** Measured at a mean of 15.164–15.260 ms over 20
+tries, worst 16.176 ms, against roughly 1 ms under Wine. The `QueryPerformanceCounter`
+frequency is 10 MHz and its resolution really is 100 ns, so the clock is fine;
+it is the scheduler tick that is not. The poll loop's 5 ms sleep is a 15 ms sleep
+on this machine, which puts a floor of about 65 Hz on anything driven by it and
+would put it at 15 Hz if the sleep were ever raised. Nothing here needed
+`timeBeginPeriod` yet. Something will.
+
+### 10.9 Two things that cost an hour each, both worth writing down
+
+**Windows' sshd ignores `~/.ssh/authorized_keys` for administrators.** The stock
+`sshd_config` ends with `Match Group administrators` /
+`AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys`, so a key
+appended to the home-directory file is offered, refused, and looks exactly like a
+key that was not installed. This is the same shape as the two lessons in
+`wc-guest.sh`'s header — a correct-looking diagnosis of the wrong layer — and it
+is now the third bullet there.
+
+**A killed compositor leaves its socket node behind.** Killing the ssh session
+that started a guest process kills the process, but the `afunix.sys` node it bound
+survives it, and the next `bind` fails with `could not bind socket: Could not
+write to XDG_RUNTIME_DIR`. That reads as a permissions problem on a directory
+that is fine. The driver now names its socket per invocation and kills stale
+compositors before it starts; the same leftover also makes `scp` fail with
+`dest open ...: Failure`, because a running `.exe` holds its own file open.
+
+### 10.10 A manifest that was never true
+
+`cargo build -p wc-handle --target x86_64-pc-windows-gnu` did not compile:
+`windows-sys`' `Win32_Storage_FileSystem` feature is what provides `CreateFileW`
+and `DeleteFileW`, which arrived with `Descriptor::SharedFile` in stage 4, and it
+was never added to the crate's own dependency list. The crate still built,
+because `wc-compositor` enables the same feature and cargo unifies features
+across a workspace build, and the workspace build is the only form anyone ran.
+
+The fix is one line. The lesson is that `cargo check --workspace` is not a check
+that a crate's manifest is complete, and this project has three crates whose
+manifests nobody has tested alone.
+
+### 10.11 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | 116 tests, 0 failures — **unchanged** |
+| `cargo clippy --workspace --all-targets` (Linux) | clean, no warnings |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo build -p wc-handle --target x86_64-pc-windows-gnu` | **now builds; did not before** |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 33 passed, 0 failed |
+| `scripts/wc-guest.sh run` (blocks 1–6, the guest) | 18 passed, 0 failed |
+| `scripts/wc-guest.sh stage4` (blocks 7–9, the guest) | **23 passed, 1 failed** |
+| `scripts/wc-guest.sh all` (deploy, all nine blocks, clean) | 41 passed, 1 failed |
+| the same with `WC_HOST` unset | 3 skipped, each with its reason |
+
+The one failure is §10.7's and it is deliberate.
+
+The test count did not move, and that is a real gap rather than an oversight.
+Everything this stage added is either a measurement binary or a harness: the
+whole of `wc-poolcost`'s body is behind `cfg(windows)`, so a unit test for it
+would compile on the target that never runs `cargo test` and would not run on
+the one that does — the same shape §4.1 describes and the same answer. What
+carries stage 5 is `scripts/wc-guest.sh`, and its evidence is in the table above
+rather than in `cargo test`.
+
+### 10.12 What is not proven, updated
+
+§9.10's list, with this stage's changes:
+
+1. ~~Nothing here has run on the real guest.~~ **Closed.** The proxy, the relay,
+   both transports, two unmodified third-party clients and a real `HWND` are
+   guest measurements now. What is *not* closed is that no human has looked at
+   one of these windows — see item 3.
+2. ~~Filesystem coherency is measured for one filesystem.~~ **Measured, and the
+   answer is no** (§10.3). `SharedFile` is not a usable transport for a live
+   surface on this deployment, and neither is a file-backed arena. §9.10 item 2
+   guessed right and for the right reason.
+3. **New: the window has never been seen.** Everything on the guest runs in an
+   ssh session's non-interactive window station. `CreateWindowExW` succeeds and
+   the blits happen, but §8.11's items 2, 4, 5 and 6 need a logged-in desktop and
+   none of them has run. This is now the largest single gap.
+4. **The arena is still a file, and that is now a measured problem rather than a
+   stylistic one.** §9.10 item 3 said substituting the real provider changes
+   `Arena::open_or_create` and nothing above it. That is still true, and §10.7 is
+   the reason it has to happen before anything animates: the shape is proven and
+   the substrate is not.
+5. **`SealedFile` is still not sealed on Windows**; `with_data_mut` is still
+   unimplemented; `KeyboardHandle::new` still cannot succeed. Unchanged from
+   §8.10 items 2–4, and untouched by this stage.
+6. **One client, no input, no clipboard, no scene graph.** §9.10 items 4, 5, 6
+   and §8.10 item 8 are all unchanged. Nothing in stage 5 went near them.
+7. **A hostile client can still fault the proxy** (§9.10 item 7), and now on a
+   machine the compositor cannot see.
+
+### 10.13 What to do next, in the order the evidence puts it
+
+1. **Give the arena a real region.** Guest RAM through QEMU's flat view, which is
+   what `shared_vulkan` already does and what §9.10 item 3 always intended.
+   §10.7 is the measurement that turns this from the tidy choice into the only
+   one, and §10.4 says it costs nothing per pool once it exists.
+2. **Log in to the guest and look at a window.** §8.11 items 2, 4, 5 and 6 have
+   been deferred for two stages and every one of them is a glance.
+3. **`SetProcessDpiAwarenessContext` needs to report *why* it failed** (§10.8),
+   because "refused" is not enough to tell an already-aware process from an
+   unavailable context, and one of those is fine and the other is a bug.
+4. **Decide what to do about a 15 ms tick** (§10.8) before anything depends on
+   the poll loop's cadence.

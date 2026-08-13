@@ -78,11 +78,26 @@ Read the header of `wc-xdg.sh` for why the client is that one and not
 `weston-flower` — the answer is `docs/design.md` §2.4 arriving on schedule, and
 it is a real limit rather than a test convenience.
 
+```
+WC_HOST=you@vm-host WC_HOST_WESTON=/path/to/weston/bin scripts/wc-guest.sh all
+```
+
+The same thing on **real Windows**, in a VM. Blocks 1-6 run from here; blocks
+7-9 are stage 4 and run the proxy and the client on `WC_HOST`, the machine that
+shares a filesystem with the guest, because a pixel has to land in memory both
+sides can name and protocol bytes do not. Without `WC_HOST` those three blocks
+skip and say why.
+
+One check is expected to fail: the shared mount is not coherent while mapped, so
+a client that redraws every frame gets a frozen window and `wc-guest.sh` says
+so. `docs/design.md` §10.7 is the measurement and why it must keep failing.
+
 ## Layout
 
 ```
 crates/
   wc-handle      the `h`-argument shim — what an fd becomes with no SCM_RIGHTS
+                 (and `wc-poolcost`, which measures what reaching one costs)
   wc-transport   AF_UNIX on both platforms, peer credentials, accept
   wc-server      the stage-1 server
   wc-probe       a client that writes the wire format by hand
@@ -110,7 +125,11 @@ scripts/
                      client painting into a Windows window; `cost` measures what
                      a commit costs per copy scope and per transport
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux
-  probe-filemap-peer.c   MAP_SHARED mmap? Measured before stage 4 depended on it
+  probe-filemap-peer.c   MAP_SHARED mmap? Measured before stage 4 depended on it,
+                     and measured again across the hypervisor in stage 5
+  wc-guest.sh        the same acceptance tests on the real guest, plus stage 5:
+                     coherency, what a pool costs per transport, and stage 4
+                     across a real VM boundary
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)
