@@ -453,6 +453,74 @@ pub unsafe extern "system" fn sv_vk_unmap_memory(device: VkDevice, memory: VkDev
     icd().unmap_memory(dev, memory);
 }
 
+/// `vkMapMemory2` — core 1.4's promotion of `VK_KHR_map_memory2`, and it is
+/// `vkMapMemory` with its four arguments moved into a struct.
+///
+/// # Why this is hand-written, and why noticing that mattered
+///
+/// It is here for reason 3 above, exactly as `vkMapMemory` is: the arena is
+/// already mapped and the answer is arithmetic (§5.3). But it arrived by a
+/// different route and nearly arrived broken.
+///
+/// Core 1.4 entered the profile as fourteen generated commands, and thirteen of
+/// them were right. This one was not: `ppData` carries
+/// `VoidPolicy::NotSerialisable`, which drops a parameter from the wire — the
+/// correct treatment for `vkMapMemory`, whose stub is written by hand and never
+/// forwards — so the *generated* `vkMapMemory2` would have encoded the info
+/// struct, sent it to the GPU side, decoded a reply with nothing in it, and
+/// returned `VK_SUCCESS` **without ever writing `*ppData`**. That is a silent
+/// failure of precisely the class §0.19 exists to remove, introduced by the
+/// commit that removed the others. A policy entry says what a member *means*;
+/// it cannot say which side answers the command, and only `HAND_WRITTEN` can.
+///
+/// `VkMemoryMapInfo` is `{flags, memory, offset, size}`, so the body is the
+/// delegation it looks like. `VK_MEMORY_MAP_PLACED_BIT_EXT` cannot appear:
+/// `VK_EXT_map_memory_placed` is excluded from every profile because this ICD,
+/// not the driver, decides where mapped memory lands.
+pub unsafe extern "system" fn sv_vk_map_memory2(
+    device: VkDevice,
+    p_memory_map_info: *const VkMemoryMapInfo,
+    pp_data: *mut *mut c_void,
+) -> VkResult {
+    if p_memory_map_info.is_null() || pp_data.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: the specification's contract — a non-null pointer is valid for
+    // reads of its declared type for the duration of the call (invariant 1).
+    let info = unsafe { &*p_memory_map_info };
+    // SAFETY: a handle this ICD returned.
+    let dev = unsafe { dispatchable_id(device as *const c_void) };
+    match icd().map_memory(dev, info.memory, info.offset, info.size) {
+        Ok(p) => {
+            // SAFETY: writable storage for one pointer.
+            unsafe { *pp_data = p };
+            VkResult::VK_SUCCESS
+        }
+        Err(e) => lower_failed(e),
+    }
+}
+
+/// `vkUnmapMemory2` — the same promotion, and the same delegation.
+///
+/// It returns `VkResult` where `vkUnmapMemory` returns `void`, which is the only
+/// difference that reaches this far. `crate::IcdLocal::unmap_memory` cannot
+/// fail — unmapping an arena view is forgetting a number — so the result is
+/// `VK_SUCCESS` for a well-formed call and a null-check failure otherwise.
+pub unsafe extern "system" fn sv_vk_unmap_memory2(
+    device: VkDevice,
+    p_memory_unmap_info: *const VkMemoryUnmapInfo,
+) -> VkResult {
+    if p_memory_unmap_info.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: as above.
+    let info = unsafe { &*p_memory_unmap_info };
+    // SAFETY: a handle this ICD returned.
+    let dev = unsafe { dispatchable_id(device as *const c_void) };
+    icd().unmap_memory(dev, info.memory);
+    VkResult::VK_SUCCESS
+}
+
 // ---------------------------------------------------------------------------
 // descriptor update templates
 // ---------------------------------------------------------------------------

@@ -589,11 +589,15 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkGetPhysicalDeviceFeatures2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceFeatures2Reply> {
-        forwarded!(self, get_physical_device_features2, args, {
+        let mut reply = forwarded!(self, get_physical_device_features2, args, {
             Ok(p::VkGetPhysicalDeviceFeatures2Reply {
                 p_features: Some(Box::new(p::VkPhysicalDeviceFeatures2::default())),
             })
-        })
+        })?;
+        if let Some(f) = reply.p_features.as_mut() {
+            crate::advertise::withdraw_gated_features(&mut f.p_next);
+        }
+        Ok(reply)
     }
 
     fn get_physical_device_queue_family_properties(

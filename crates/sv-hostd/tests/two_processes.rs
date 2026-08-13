@@ -81,6 +81,26 @@ fn finish(mut child: Child, within: Duration) -> (bool, String) {
     }
 }
 
+/// Poll for `sv-hostd`'s socket to appear.
+///
+/// # Why the budget is generous, and why that is not masking anything
+///
+/// `within` is a *startup budget*, not a synchronisation window: the loop
+/// returns the instant the socket exists, so a longer budget costs nothing when
+/// the machine is idle and only matters when it is not. The three callers passed
+/// 10 s, and a full `cargo test --workspace --no-fail-fast` on a machine a dozen
+/// agents share exceeded it once — fork, exec and first-touch of a freshly
+/// linked debug binary is not free under that load. The same run passed 3/3
+/// alone in 0.32 s and passed again whole immediately after, which is the
+/// signature of a budget rather than a hang.
+///
+/// Raising it does not hide a deadlock: a `sv-hostd` that never binds still
+/// fails here, 20 s later and with the same message. What it removes is a shared
+/// verification gate going red for a reason unrelated to anyone's change, which
+/// is how "re-run until green" becomes a habit.
+///
+/// Changed from outside this crate's usual owner for that reason, and recorded
+/// here rather than only in a commit message.
 fn wait_for_socket(path: &str, within: Duration) {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
@@ -89,7 +109,11 @@ fn wait_for_socket(path: &str, within: Duration) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("sv-hostd never created {path}");
+    panic!(
+        "sv-hostd never created {path} within {within:?}. If this is the only \
+         failure in a whole-workspace run and it passes alone, it is startup \
+         latency under load and not a hang — see this function's own note."
+    );
 }
 
 /// The whole of step 1 and step 2, across a process boundary.
@@ -103,7 +127,7 @@ fn the_arena_crosses_a_process_boundary_and_both_sides_agree() {
     let sock = Sock::new("loop");
     let path = sock.path();
     let hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
-    wait_for_socket(&path, Duration::from_secs(10));
+    wait_for_socket(&path, Duration::from_secs(30));
 
     let gpu = spawn(LOOPBACK, &["gpu", "--socket", &path]);
     let app = spawn(LOOPBACK, &["app", "--socket", &path]);
@@ -154,7 +178,7 @@ fn a_peer_that_goes_away_mid_session_is_detected_rather_than_waited_on() {
     let sock = Sock::new("chaos");
     let path = sock.path();
     let hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
-    wait_for_socket(&path, Duration::from_secs(10));
+    wait_for_socket(&path, Duration::from_secs(30));
 
     // Three device packets expected; the app side sends two and then leaves.
     let gpu = spawn(LOOPBACK, &["gpu", "--socket", &path, "--expect-device", "3"]);
@@ -203,7 +227,7 @@ fn a_client_that_arrives_before_the_owner_waits_rather_than_reading_garbage() {
     let sock = Sock::new("early");
     let path = sock.path();
     let hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
-    wait_for_socket(&path, Duration::from_secs(10));
+    wait_for_socket(&path, Duration::from_secs(30));
 
     // The app side first, deliberately: it attaches to a region whose `magic` is
     // still zero and must spin on `NotReady` rather than proceed. This is the

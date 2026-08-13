@@ -556,6 +556,25 @@ pub mod profiles {
                 "VK_VERSION_1_1".into(),
                 "VK_VERSION_1_2".into(),
                 "VK_VERSION_1_3".into(),
+                // **1.4, and the thing that was in its way was one line.**
+                //
+                // §0.18 tried to add this and was refused by
+                // `VkImageToMemoryCopy.pHostPointer: a void* with no len= and no
+                // policy entry`, then recorded core 1.4 as costing fourteen
+                // commands' worth of work. It costs none: the refusal was §7.4
+                // asking what a host pointer *is* in this design, and §5.3
+                // already answers — `arena_base + offset`. The entry is
+                // `("pHostPointer", VoidPolicy::ArenaOffset)` in
+                // `sv_codegen::exceptions`, and with it every one of core 1.4's
+                // fourteen commands plans, generates and builds.
+                //
+                // What is *not* free is `hostImageCopy`'s runtime: an
+                // application may hand `vkCopyMemoryToImage` a plain `malloc`
+                // buffer rather than arena memory, and the bounce that needs is
+                // not written. That is a *feature* gate rather than a command
+                // gate — see `sv_icd::advertise::gated_features` — which is why
+                // it does not keep the version at 1.3 for everything else.
+                "VK_VERSION_1_4".into(),
             ],
             extensions: vec![
                 // Zink's five hard requirements (design.md §11).
@@ -813,7 +832,11 @@ pub mod profiles {
     pub fn full() -> Profile {
         let mut p = zink();
         p.name = "full".into();
-        p.features.push("VK_VERSION_1_4".into());
+        // Core 1.4 is `zink`'s too, since the `pHostPointer` policy landed. The
+        // difference between the two profiles is now extensions alone, which is
+        // the honest shape: the version is a floor both share and the rule below
+        // is what `full` adds.
+        debug_assert!(p.features.iter().any(|f| f == "VK_VERSION_1_4"));
         p.include_portable_extensions = true;
         p.excluded_extensions = excluded_extensions();
         p
@@ -1118,9 +1141,25 @@ mod tests {
     /// what makes it usable from a build script.
     #[test]
     fn the_core_version_is_the_highest_one_declared() {
-        // The real one. Bump this line and the ICD's manifest together — that is
-        // the whole coupling, and `sv_icd::state`'s manifest test enforces it.
-        assert_eq!(profiles::zink().core_api_version(), (1 << 22) | (3 << 12), "zink is 1.0-1.3");
+        // The real one. The ICD's manifest no longer has to be bumped with it —
+        // `sv-proto` publishes `cargo:core_version` through `links = "sv_proto"`
+        // and `sv-icd`'s build script reads `DEP_SV_PROTO_CORE_VERSION`, so the
+        // manifest tracks the profile in both directions (§0.18). This line is
+        // the profile's own declaration and nothing else now depends on its
+        // value being a particular number.
+        //
+        // **1.4, not 1.3, since the `pHostPointer` policy landed.** §0.18 tried
+        // this and was refused by `VkImageToMemoryCopy.pHostPointer: a void*
+        // with no len= and no policy entry`; §0.19 answered it with §5.3's own
+        // rule — a host pointer here *is* `arena_base + offset` — and core 1.4's
+        // fourteen commands then planned, generated and built with no further
+        // work. What is gated is `hostImageCopy`'s *feature* bit, in
+        // `sv_icd::advertise::withdraw_gated_features`, not the version.
+        assert_eq!(
+            profiles::zink().core_api_version(),
+            (1 << 22) | (4 << 12),
+            "zink is 1.0-1.4"
+        );
 
         let mk = |minor: u32| (1u32 << 22) | (minor << 12);
         let with = |features: &[&str]| Profile {

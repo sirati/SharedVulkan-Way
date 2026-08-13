@@ -326,17 +326,61 @@ fn sample_scalar(s: &Scalar) -> TokenStream {
 }
 
 /// Sample a chain from the extenders the parent actually permits.
+///
+/// # A link's own chain is always empty, and that is the wire's shape
+///
+/// In C a `pNext` chain is a *linked list*: `VkDependencyInfo.pNext` points at
+/// `VkMemoryRangeBarriersInfoKHR`, whose `pNext` points at the next element **of
+/// the same chain**. The wire does not model it that way — `lower_pnext` walks
+/// the list iteratively and flattens it into one `Vec<PNextLink>`, and
+/// `encode_pnext`/`size_pnext`/`decode_pnext` all use each link's `_self` form,
+/// which excludes its `p_next`. So a `PNextLink` whose own `p_next` is non-empty
+/// is a value the C boundary cannot produce and the codec does not carry: it
+/// encodes as empty and decodes as empty, correctly and by design.
+///
+/// Sampling one anyway is how this generator produced two failures under the
+/// `full` profile — `VkDependencyInfo` and `vkCmdWaitEvents2` — that read like a
+/// protocol bug and were not one. **The instrument was generating a value
+/// outside the type's canonical form and then asserting the codec preserved
+/// it.** Nothing an application can call takes that path; `size`, `encode` and
+/// `decode` agree with each other, which is what would matter.
+///
+/// Clearing it here makes the round trip assert the contract the boundary
+/// actually has. What it does *not* do is make the nesting impossible to
+/// construct — the field is `pub` — which is why this comment says why rather
+/// than only what.
+///
+/// The related waste, recorded rather than fixed: each link's `lower_vk_*` calls
+/// `lower_pnext` on its own `pNext` too, so lowering a chain of *n* links walks
+/// *n* tails and discards all but the outermost. Bounded by `MAX_PNEXT_LINKS`
+/// and invisible in behaviour, but it is O(n²) allocation for nothing, and the
+/// fix is a `lower_*_self` for the walker's arms.
 fn sample_pnext(plan: &Plan, owner: &str) -> TokenStream {
     let Some(parent) = plan.struct_plan(owner) else { return quote!(Vec::new()) };
     if parent.extenders.is_empty() {
         return quote!(Vec::new());
     }
     let arms = parent.extenders.iter().enumerate().filter_map(|(i, e)| {
-        plan.struct_plan(e)?;
+        let link = plan.struct_plan(e)?;
         let v = naming::pnext_variant(e);
         let f = sampler_fn(e);
         let i = i as u64;
-        Some(quote!(#i => Some(PNextLink::#v(Box::new(#f(rng)))),))
+        // The link's own chain field, if it has one. Nearly every extender does;
+        // the ones that do not need no clearing.
+        let own_chain = link
+            .fields
+            .iter()
+            .find(|fld| matches!(fld.shape, Shape::PNext))
+            .map(|fld| naming::ident(&fld.rust_name));
+        let build = match own_chain {
+            Some(chain) => quote!({
+                let mut __link = #f(rng);
+                __link.#chain = Vec::new();
+                __link
+            }),
+            None => quote!(#f(rng)),
+        };
+        Some(quote!(#i => Some(PNextLink::#v(Box::new(#build))),))
     });
     let arms: Vec<_> = arms.collect();
     if arms.is_empty() {
