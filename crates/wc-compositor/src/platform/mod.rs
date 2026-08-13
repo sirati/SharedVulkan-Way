@@ -345,6 +345,32 @@ pub enum ToUi {
 /// codes in [`FromUi::Key`].
 pub mod dnd_action {
     pub const NONE: u32 = 0;
+    pub const COPY: u32 = 1;
+    pub const MOVE: u32 = 2;
+    pub const ASK: u32 = 4;
+
+    /// The bits by name, for a log.
+    ///
+    /// Worth a function rather than `{actions:#x}`: the two vocabularies either
+    /// side of this boundary use the *same numbers for different things* —
+    /// `ask` is 4 here and `DROPEFFECT_LINK` is 4 on Win32 — so a trace that
+    /// prints only the number is a trace in which the one mistake that matters
+    /// is invisible. See `drag::to_dropeffect`.
+    pub fn describe(actions: u32) -> String {
+        if actions == NONE {
+            return "none".to_owned();
+        }
+        let mut out = Vec::new();
+        for (bit, name) in [(COPY, "copy"), (MOVE, "move"), (ASK, "ask")] {
+            if actions & bit != 0 {
+                out.push(name);
+            }
+        }
+        if out.is_empty() {
+            return format!("unknown ({actions:#x})");
+        }
+        out.join("|")
+    }
 }
 
 /// UI thread -> Wayland thread.

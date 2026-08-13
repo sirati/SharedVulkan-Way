@@ -7849,36 +7849,59 @@ from the offer's own identity and never from "is this connection dragging" —
 that would be asking about the wrong drag entirely, since a client is the
 *source* of its own drag and never receives from it.
 
-What is **not** built is the two Win32 halves, and `platform/drag.rs` is a file
-that says so and ends every drag with `none` rather than hanging it:
+**The drag source is written.** `platform/drag.rs` is `DoDragDrop` with a
+hand-rolled `IDataObject`, `IDropSource` and `IEnumFORMATETC`: three vtables
+declared by hand, because `windows-sys` types every COM interface pointer as
+`*mut c_void` and ships no vtable definitions. The formats come out of
+`win32::system_formats`, which is the same `to_system` the clipboard publishes
+through — one conversion, so a drag's bytes and a copy's bytes cannot diverge.
 
-1. **Wayland → Windows** needs `DoDragDrop` with a hand-written `IDataObject`
-   and `IDropSource`. The formats come out of the same `to_system` the clipboard
-   uses; the work is the COM vtables, which `windows-sys` does not generate.
-2. **Windows → Wayland** needs `RegisterDragDrop` and an `IDropTarget` per
-   window, `DragEnter`/`DragOver`/`Drop` turned into smithay's `start_dnd` with
-   synthesised pointer motion (during an OLE drag the window receives
-   `IDropTarget::DragOver`, **not** `WM_MOUSEMOVE`, so the existing pointer path
-   is not driven and must be fed), and the `IDataObject` read out eagerly at the
-   drop so `fetch(source=drag)` has something to answer from.
+**The modal-loop question was already answered in this tree, by stage 17.** It
+was on this section's list of things to measure before writing any of it, and
+the measurement had been made: `SC_MOVE`, `SC_SIZE` and `TrackPopupMenu` are
+**posted** rather than sent, and the comment on that arm in `win32.rs` states
+why in terms that apply here word for word — this code runs inside `drain`,
+which holds `ui.draining` and re-posts `WM_WC_COMMAND` while it is set, so a
+modal loop entered from there would spin the pump re-posting a wake it cannot
+service, and the compositor would stop painting for the length of the gesture.
+So `drag::run` does not call `DoDragDrop`. It stages the payload and posts
+`WM_WC_DRAG` to the controller window; the drain returns, `draining` clears, and
+`controller_proc` enters the loop from the pump, where §8.2's finding — a
+*posted* wake still reaches a window from inside a modal loop — applies
+unchanged. Finding this already answered is the one clear argument for the
+repositories having been merged: it was six lines of somebody else's comment and
+it removed an entire investigation.
 
-Two things have to be measured before either is written, and neither is a
-detail:
+Four things in the COM are worth naming because each is silently wrong when it
+is wrong, and each has a test that runs **under Wine, on the Windows target**
+(`wc_compositor-*.exe drag::`, 5 tests):
 
-* **Does `DoDragDrop`'s modal loop starve the message pump?** §8.2's wakeup is a
-  `PostMessage` to a window rather than a `PostThreadMessage` precisely because
-  `DefWindowProc`'s modal resize loop discards thread messages, and OLE's loop
-  has to be asked the same question. There is a second, sharper version of it
-  here: `DoDragDrop` would be called from inside `drain`, which holds
-  `Ui::draining`, so every command that arrives during the drag would be
-  re-posted rather than handled and the compositor would stop painting for the
-  length of the gesture. Whatever the answer about messages, that flag has to be
-  released around the call.
-* **`IDropTarget::DragOver` must return a `DROPEFFECT` synchronously**, and the
-  Wayland client's `accept`/`set_actions` arrive asynchronously across a
-  hypervisor. The honest design answers from the last known accepted action and
-  is therefore one round trip stale. That is a decision to write down, not a bug
-  to discover.
+* **`GetData` hands out a fresh `HGLOBAL` every time.** A null `pUnkForRelease`
+  means the *receiver* frees it, and a drop target is entitled to ask twice; the
+  same handle returned twice is a double free.
+* **`IEnumFORMATETC::Next` returns `S_FALSE` when it produces fewer than asked
+  for**, including zero, and `pceltFetched` may be null only when `celt` is 1.
+  Getting either wrong presents as a drop target that sees no formats at all
+  rather than as an error.
+* **`QueryInterface` nulls its out-pointer even when it refuses**, because OLE
+  reads it either way.
+* **The vtable order is the entire contract** — `IUnknown`'s three, then the
+  interface's own, in IDL order — and getting it wrong is a call into the wrong
+  function rather than a compile error.
+
+What is **not** built is the drop target: `RegisterDragDrop` and an
+`IDropTarget` per window, `DragEnter`/`DragOver`/`Drop` turned into smithay's
+`start_dnd` with synthesised pointer motion (during an OLE drag the window
+receives `IDropTarget::DragOver`, **not** `WM_MOUSEMOVE`, so the existing
+pointer path is not driven and must be fed), and the `IDataObject` read out
+eagerly at the drop so `fetch(source=drag)` has something to answer from.
+`drag::payload` therefore answers `None`, which closes the client's pipe.
+
+One question remains open and belongs to that half: **`IDropTarget::DragOver`
+must return a `DROPEFFECT` synchronously**, and the Wayland client's `accept` /
+`set_actions` arrive asynchronously across a hypervisor. The honest design
+answers from the last known accepted action and is therefore one round trip
+stale. That is a decision to write down, not a bug to discover.
 
 `CF_HDROP` is what makes dragging a file out of Firefox into Explorer work, and
 §28.5's asymmetry has to be revisited for it: the drag case is the one where
@@ -7888,19 +7911,29 @@ dragging a file out will need the file's bytes, not its name — which is a
 Windows as `CF_HDROP` over a temporary file the guest can reach. That is a real
 design question and it is not answered here.
 
-**Where this stopped, precisely.** Built and tested: the whole Wayland side —
-interception, the shared pull and staging, `source` on `fetch`, the
-drag/clipboard distinction above, and `drag_finished` on every path including
-the failure ones. Not built: `platform/drag.rs`'s three functions, which are
-`DoDragDrop`, `RegisterDragDrop` and the `IDataObject` read-out. Nothing about
-them was started, so there is no partial COM implementation in the tree; the
-file's header says so and every entry point in it answers definitively rather
-than hanging. The reason for stopping there rather than half-way is that an
-unverifiable OLE implementation is exactly the half-built drag this work was
-asked to make impossible — and it is unverifiable here in a way the clipboard
-was not: `scripts/wc-clip.sh` can drive a copy with a program, and a drag needs
-a mouse held down across two applications' windows, which under Xvfb is a
-harness problem nobody has solved in this tree.
+**Where this stopped, precisely, and what that claim is worth.** Built: the
+whole Wayland side — interception, the shared pull and staging, `source` on
+`fetch`, the drag/clipboard distinction above, `drag_finished` on every path
+including the failure ones — and the OLE **drag source**. Not built: the drop
+target.
+
+**`DoDragDrop` has never been entered on any run.** That is the honest limit of
+the drag source's evidence and it is worth stating in the same breath as the
+code existing. The five COM tests run under Wine and exercise the real
+`GlobalAlloc`, the real vtable dispatch and the real interface contracts, which
+is where the silent bugs are; what they do not do is put a mouse button down and
+move it across two applications' windows, and no harness in this tree can. The
+compositor is linked with the OLE code and `scripts/wc-clip.sh` still passes
+11/0 with it in, so nothing regressed — but "a Wayland client dragged a link
+into Explorer" is a sentence nobody has yet earned.
+
+The route to earning it is **`nix build .#svGuest`**, and that is a methodology
+correction rather than a convenience: every Wine run in this project so far has
+been one machine with **no VM boundary at all**, so "Wine is not Windows"
+(§13.6) has been understating the gap — the topology was wrong too. Wine on the
+workstation as the Windows side with a Linux VM guest as the client gives a real
+boundary *and* a real desktop with a real Explorer to drop onto, which is
+exactly what a drag needs and what Xvfb cannot provide.
 
 ### 28.9 What is not proven
 
@@ -7923,7 +7956,9 @@ harness problem nobody has solved in this tree.
    is *now*, not as it was when the offer was made. X11 behaves the same way, it
    is documented in the XML, and nobody has copied something between an offer
    and a paste to see what happens.
-5. **Drag and drop, both directions** — §28.8.
+5. **Drag and drop.** The source is written and never entered at runtime; the
+   drop target is not written. §28.8 has both halves and what would earn the
+   claim.
 6. **`zwp_primary_selection_v1` is deliberately absent**, so middle-click paste
    does nothing. That is the stated scope and not a gap.
 7. **Nothing has been copied out of Firefox.** The clients here are
@@ -7939,6 +7974,7 @@ Run from the **unified** tree, after the rebase described at the top of
 | Gate | Result |
 |---|---|
 | `cargo test --workspace` | **1150 tests**, 0 failures (1125 on the unified master; 25 new) |
+| `wine target/x86_64-pc-windows-gnu/debug/deps/wc_compositor-*.exe drag::` | **5 tests**, 0 failures — the COM contracts, on the Windows target |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy -p wc-compositor -p wc-proxy -p wc-handle --all-targets --target x86_64-pc-windows-gnu` | clean |
 | **`bash scripts/wc-proxy.sh`** | **37 passed, 0 failed** |
@@ -7963,6 +7999,14 @@ which are silently wrong when they are wrong), 4 in `wc-proxy/src/clip.rs`
 `wc-proxy/src/session/tests.rs` — the interception, driven end to end through
 real pipes, because the whole design is that both ends of every pipe are local
 and so a test needs no compositor at all.
+
+`platform/drag.rs`'s five are **not** in that 1150. They are `cfg(windows)` and
+the cross target's test binary is a `.exe`, which `cargo test --target` cannot
+execute on a machine with no `binfmt_misc` registration — hence the second row
+of the table, which runs it through Wine by hand. Worth the separate line
+rather than a `#[cfg(unix)]` shim: the thing being tested is COM dispatch
+against a real `ole32`, and a version of it that ran on Linux would be testing
+a mock.
 
 **The three exact-count protocol tests are untouched**, and that is deliberate
 rather than lucky. `docs/one-binary.md` warns that

@@ -553,8 +553,9 @@ impl PumpInner {
             ToUi::StartDrag { payloads, actions } => {
                 println!(
                     "wc-compositor: [headless] a drag was started with {} mime type(s), \
-                     actions {actions:#x}; there is no desktop to drop onto here",
-                    payloads.len()
+                     actions {}; there is no desktop to drop onto here",
+                    payloads.len(),
+                    crate::platform::dnd_action::describe(actions)
                 );
                 let _ = self.events.send(FromUi::DragFinished {
                     action: crate::platform::dnd_action::NONE,

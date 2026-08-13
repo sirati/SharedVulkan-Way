@@ -671,7 +671,7 @@ pub(crate) struct Ui {
     /// messages rather than pumping them — but "should not be possible" is not
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
-    controller: Cell<isize>,
+    pub(crate) controller: Cell<isize>,
     /// Whether a client currently holds an idle inhibitor.
     ///
     /// ADDED FOR STAGE 21. Kept here as well as inside Windows' own execution
@@ -995,6 +995,19 @@ unsafe extern "system" fn controller_proc(
         }
         return 0;
     }
+    // The OLE drag loop, entered **here** rather than from `drain`. See
+    // `super::drag`'s header and stage 17's identical treatment of `SC_MOVE`:
+    // `drain` holds `ui.draining`, and a modal loop under it spins the pump
+    // re-posting a wake it cannot service. By the time this arrives the drain
+    // has returned.
+    if msg == super::drag::WM_WC_DRAG {
+        if let Some(ui) = ui()
+            && let Some(action) = super::drag::enter_modal_loop()
+        {
+            let _ = ui.events.send(FromUi::DragFinished { action });
+        }
+        return 0;
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -1158,6 +1171,24 @@ fn write_format(id: u32, bytes: &[u8]) -> bool {
     true
 }
 
+/// A Wayland selection as the numbered Windows formats it becomes.
+///
+/// The one place the conversion (`crate::clipboard`, which is arithmetic and is
+/// tested on Linux) meets the numbering (which is Win32's and half of it is
+/// minted at runtime). **Shared by the clipboard and the drag source on
+/// purpose**: a drag's data and a selection's data are the same bytes in the
+/// same formats, and building them twice would be two ways for one client's
+/// selection to arrive differently.
+pub(crate) fn system_formats(ui: &Rc<Ui>, payloads: &[(String, Vec<u8>)]) -> Vec<(u32, Vec<u8>)> {
+    crate::clipboard::to_system(payloads)
+        .into_iter()
+        .filter_map(|(format, bytes)| {
+            let id = format_id(ui, format);
+            (id != 0).then_some((id, bytes))
+        })
+        .collect()
+}
+
 fn set_clipboard(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>) {
     let system = crate::clipboard::to_system(&payloads);
     with_clipboard(ui, "publish a selection", || {
@@ -1183,10 +1214,16 @@ fn set_clipboard(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>) {
 /// Hand the staged payloads to OLE as a drag source.
 ///
 /// See [`super::drag`] for the `IDataObject`/`IDropSource` pair and for why
-/// `DoDragDrop`'s modal loop does not starve this pump.
+/// `DoDragDrop` is entered from a posted message rather than from here.
+///
+/// `run` answers immediately only when the drag could not be started at all;
+/// otherwise the answer comes from [`WM_WC_DRAG`](super::drag::WM_WC_DRAG),
+/// after the loop. Either way exactly one `DragFinished` is sent, which is what
+/// stops a client's `wl_data_source` waiting forever.
 fn start_drag(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>, actions: u32) {
-    let action = super::drag::run(ui, &payloads, actions);
-    let _ = ui.events.send(FromUi::DragFinished { action });
+    if let Some(action) = super::drag::run(ui, &payloads, actions) {
+        let _ = ui.events.send(FromUi::DragFinished { action });
+    }
 }
 
 fn cancel_drag(ui: &Rc<Ui>) {

@@ -71,6 +71,15 @@ windows-sys = { workspace = true, features = [
   # format is handed over as a moveable global handle and not as a pointer.
   "Win32_System_DataExchange",
   "Win32_System_Memory",
+  # ADDED FOR THE DRAG SOURCE. Windows' drag and drop is OLE, so this is the
+  # first COM in the project: `FORMATETC` and `STGMEDIUM` are `Com` and
+  # `Com_StructuredStorage`, `DoDragDrop` and `OleInitialize` are `Ole`. No
+  # interface *definitions* come with them — `windows-sys` types every COM
+  # pointer as `*mut c_void` — so the three vtables are written out in
+  # `platform/drag.rs`, which is the honest shape of hand-rolled COM.
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Ole",
   "Win32_System_LibraryLoader",
   # ADDED FOR STAGE 8: the poll loop's wait is a high-resolution waitable timer
   # rather than `Sleep`, whose quantum on the guest is 15.6 ms (§13.8).

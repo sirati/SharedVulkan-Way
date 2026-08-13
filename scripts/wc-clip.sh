@@ -221,8 +221,10 @@ block_wine() {
   # Notepad renders one long line. Checked on the bytes rather than trusted.
   ( wl timeout 40 wl-copy -- "$(printf 'one\ntwo')" >/dev/null 2>&1 ) &
   copier=$!
-  clip_get_until "$(printf 'one\r\ntwo')" 25 >/dev/null
-  got=$(clip get | od -c | head -2)
+  # **One read, not two.** The bytes are examined from the same `clip get` that
+  # the poll accepted; asking a second time would be a second race against
+  # whatever writes the clipboard next, and it failed exactly that way once.
+  got=$(clip_get_until "$(printf 'one\r\ntwo')" 25 | od -c | head -2)
   wait "$copier" 2>/dev/null
   if printf '%s' "$got" | grep -q '\\r'; then
     ok "line endings became CRLF on the way to the Windows clipboard"
