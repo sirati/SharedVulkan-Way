@@ -321,3 +321,68 @@ fn the_count_then_fill_idiom_clamps_to_the_callers_buffer() {
         let _ = Dispatchable::reclaim(handle);
     }
 }
+
+/// **The arm `descriptorType` does not select must not be read at all.**
+///
+/// `VkWriteDescriptorSet` has three array pointers — `pImageInfo`,
+/// `pBufferInfo`, `pTexelBufferView` — of which exactly one is used, and the
+/// specification permits the other two to hold *anything*: an uninitialised
+/// stack slot, a stale pointer, a pointer to an array of a different element
+/// type or a shorter length. The registry marks all three
+/// `noautovalidity="true"`, which is its way of saying a sibling decides and it
+/// cannot express how.
+///
+/// The lowering read whichever were non-null, which is an out-of-bounds read of
+/// the application's own memory. Live, not theoretical: it put a `VkBuffer` id
+/// of `0xFFFFFFFF00000001` on the wire, and an id that fails to map is the
+/// *lucky* case — one that collides with a live object hands the driver a
+/// descriptor pointing at the wrong resource and hangs the GPU with no
+/// diagnostic anywhere (design.md §0.16).
+///
+/// This is the negative control. The two unselected pointers here address a
+/// single-element array while `descriptorCount` is 4, so a lowering that reads
+/// them runs off the end — under Miri that is a hard error, and without Miri the
+/// assertions below still fail, because the wire value would carry the poison
+/// pattern instead of an empty array.
+#[test]
+fn an_unselected_descriptor_arm_is_never_read() {
+    const POISON: u64 = 0xFFFF_FFFF_0000_0001;
+
+    let images = [VkDescriptorImageInfo { sampler: 11, image_view: 12, image_layout: VkImageLayout(1) }; 4];
+    // One element each, deliberately shorter than `descriptorCount`.
+    let stale_buffer = [VkDescriptorBufferInfo { buffer: POISON, offset: 0, range: 0 }];
+    let stale_view = [POISON];
+
+    let mut w = VkWriteDescriptorSet::default();
+    w.s_type = VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dst_set = 5;
+    w.descriptor_count = 4;
+    w.descriptor_type = VkDescriptorType::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w.p_image_info = images.as_ptr();
+    w.p_buffer_info = stale_buffer.as_ptr();
+    w.p_texel_buffer_view = stale_view.as_ptr();
+
+    // SAFETY: `w` is a live local. `pImageInfo` addresses four elements, which
+    // is what `descriptorCount` claims; the other two are the hazard under test
+    // and a correct lowering does not dereference them.
+    let lowered = unsafe { local::lower_write_descriptor_set_for_test(&raw const w) }
+        .expect("a SAMPLED_IMAGE write lowers");
+    assert_eq!(lowered.p_image_info.len(), 4, "the selected arm carries every element");
+    assert!(lowered.p_buffer_info.is_empty(), "pBufferInfo is not selected by SAMPLED_IMAGE");
+    assert!(lowered.p_texel_buffer_view.is_empty(), "pTexelBufferView is not selected either");
+
+    // And the mirror: a buffer type reads the buffer arm and leaves the images.
+    let mut w2 = VkWriteDescriptorSet::default();
+    w2.s_type = VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w2.descriptor_count = 1;
+    w2.descriptor_type = VkDescriptorType::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w2.p_image_info = images.as_ptr();
+    w2.p_buffer_info = stale_buffer.as_ptr();
+    w2.p_texel_buffer_view = stale_view.as_ptr();
+    // SAFETY: as above; `pBufferInfo` addresses the one element it claims.
+    let l2 = unsafe { local::lower_write_descriptor_set_for_test(&raw const w2) }
+        .expect("a STORAGE_BUFFER write lowers");
+    assert_eq!(l2.p_buffer_info.len(), 1);
+    assert_eq!(l2.p_buffer_info[0].buffer.0, POISON, "the *selected* arm is read verbatim");
+    assert!(l2.p_image_info.is_empty(), "pImageInfo is not selected by STORAGE_BUFFER");
+}

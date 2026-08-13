@@ -550,13 +550,57 @@ pub unsafe fn expand_descriptor_template(
                     });
                 }
             }
-            // An inline uniform block's "count" is a byte length and its data is
-            // carried in a `VkWriteDescriptorSetInlineUniformBlock` chain link
-            // rather than in an array. Not in this profile's feature set;
-            // dropped rather than guessed at, and said so.
+            // # INLINE_UNIFORM_BLOCK, which this used to drop on the floor
+            //
+            // The comment that stood here said the type was "not in this
+            // profile's feature set; dropped rather than guessed at, and said
+            // so", and all three clauses were wrong.
+            //
+            // It **is** in the profile: `VK_EXT_inline_uniform_block` was
+            // promoted to core in Vulkan 1.3, the zink profile carries
+            // `VK_VERSION_1_3`, the ICD advertises 1.3, and the generator has
+            // therefore emitted `VkWriteDescriptorSetInlineUniformBlock` and its
+            // `PNextLink` variant all along. Nothing had to be guessed at.
+            //
+            // And it did not say so: `report_transport_failure` is gated behind
+            // `SV_DEBUG`, so in every ordinary run the writes vanished in
+            // silence. One CTS test dropped **64** of them, left the descriptor
+            // set holding uninitialised inline data, and the shader that read it
+            // hung the GPU — `VK_ERROR_DEVICE_LOST`, ten seconds of
+            // `amdgpu: ring gfx_0.0.0 timeout`, and nothing anywhere naming a
+            // descriptor. design.md §0.9's "implemented has more than once meant
+            // compiled", in its most expensive form yet: a branch that exists,
+            // reports into a closed pipe, and discards data.
+            //
+            // The type is the one place in this function where `descriptorCount`
+            // is **a number of bytes rather than a number of elements**, and
+            // `dstArrayElement` is a byte offset into the block rather than an
+            // array index. `stride` is ignored, because there is no array to
+            // stride over. Those three facts are why it cannot share the loop
+            // above and why it is not one more arm of the same shape.
+            t if t == sv_proto::VkDescriptorType::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK.0 => {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(at(0), n)
+                };
+                w.p_next.push(sv_proto::PNextLink::VkWriteDescriptorSetInlineUniformBlock(
+                    Box::new(sv_proto::VkWriteDescriptorSetInlineUniformBlock {
+                        p_next: Vec::new(),
+                        data_size: e.descriptor_count,
+                        p_data: bytes.to_vec(),
+                    }),
+                ));
+            }
+            // Still reachable, and still the right answer for anything genuinely
+            // outside the profile — a descriptor type from an extension we do
+            // not carry cannot be expanded and must not be invented. What
+            // changed is that dropping one is now **loud**: it is the
+            // application's descriptor silently not arriving, which is the most
+            // expensive class of bug this project has, so it does not depend on
+            // a debug variable being set.
             _ => {
-                report_transport_failure(&format_args!(
-                    "vkUpdateDescriptorSetWithTemplate: descriptor type {} is not expandable",
+                report_always(&format_args!(
+                    "vkUpdateDescriptorSetWithTemplate: descriptor type {} cannot be expanded; \
+                     the write is DROPPED and the descriptor set is now incomplete",
                     e.descriptor_type.0
                 ));
                 continue;
@@ -981,4 +1025,22 @@ pub unsafe extern "system" fn sv_vk_queue_present_khr(
         }
     }
     worst
+}
+
+/// The generated `VkWriteDescriptorSet` lowering, reachable from a test.
+///
+/// The generated `lower_*` functions are an implementation detail of the
+/// generated file and are not re-exported, so the one struct whose lowering has
+/// a hand-written rule attached to it (`sv_codegen::exceptions::SIBLING_SELECTED`)
+/// would otherwise be the one struct no test could reach. A four-line
+/// forwarder is cheaper than making the whole generated surface public.
+///
+/// # Safety
+///
+/// As the generated function: `p` must point at a valid `VkWriteDescriptorSet`
+/// whose *selected* array is valid for `descriptorCount` elements.
+pub unsafe fn lower_write_descriptor_set_for_test(
+    p: *const VkWriteDescriptorSet,
+) -> crate::LowerResult<sv_proto::VkWriteDescriptorSet> {
+    unsafe { crate::lower_vk_write_descriptor_set(p) }
 }

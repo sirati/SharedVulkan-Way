@@ -722,6 +722,22 @@ fn lower_expr(
             let inner =
                 lower_expr(cx, elem, abi, &quote!(*(#access).add(__i)), member_access, owner)?;
             let ty = wire_type(elem);
+            // A pointer that a *sibling* decides the validity of. Non-null is
+            // not permission to read it — see `exceptions::SIBLING_SELECTED`,
+            // which is entirely about `VkWriteDescriptorSet` and cost a GPU
+            // hang. The guard comes first so that a `descriptorType` naming a
+            // different arm makes this one an empty array without the pointer
+            // ever being dereferenced.
+            let n = match crate::exceptions::sibling_selected(owner, &abi.name) {
+                Some((sel, vals)) => {
+                    let s = member_access(sel);
+                    let vals = vals.iter().copied();
+                    // `member_access` already unwraps a newtyped enum to its
+                    // integer, so this is the value and not the wrapper.
+                    quote!(if !matches!((#s) as i64, #(#vals)|*) { 0usize } else { #n })
+                }
+                None => n,
+            };
             quote!({
                 let __n = if (#access).is_null() { 0usize } else { #n };
                 let mut __v: Vec<#ty> = Vec::with_capacity(__n);
