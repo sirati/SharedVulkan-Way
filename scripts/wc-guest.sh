@@ -348,6 +348,7 @@ COMP_SECS=$((SECS + 45))
 
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./wc-compositor.exe \
   --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
+  --arena-frames '$SHARE_WIN\\arena.frames' \
   --log '$SHARE_WIN\\s4.log' ${OUT_EXTRA[*]@Q} ${COMP_EXTRA[*]@Q} ${KEYMAP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
 COMP=$!
 sleep 8
@@ -376,11 +377,38 @@ if [ "$TRANSPORT" = guest-ram ]; then
     sed -n '1,20p' "$SHARE/s4.log" 2>/dev/null
     kill $COMP 2>/dev/null; exit 1
   fi
+  # THE FRAME LIST, AND WHY IT IS NOT OPTIONAL IN PRACTICE
+  #
+  # The compositor wrote the page frame behind every page of its arena into the
+  # share, and translating that is what the locate should do. The sweep it
+  # replaces is not merely slow (0.064 s against 2.308 s), it is **unreliable on
+  # a loaded machine**: five consecutive runs of this harness gave `16377 of
+  # 16384 pages`, `1 page index claimed twice`, `28 page index(es) claimed
+  # twice`. Those duplicates are not stale stamps -- the run id hashes the
+  # millisecond with the pid, and the tool counts a previous run's stamps
+  # separately as `other_runs` -- they are two pages carrying *this* run's id at
+  # one page index, found by a search that reads 13 GiB of contents which are
+  # allowed to change while it reads them.
+  #
+  # Reading the kernel's page-frame database instead makes that entire class of
+  # failure inexpressible, because no stamp is read at all.
+  #
+  # Conditional on the file existing rather than required, because the guest may
+  # be a build without the query or an account without the privilege, and a
+  # harness that refused to run at all would be a worse regression than a slow
+  # locate. The locate line below says which locator ran.
+  FRAMES_ARG=""
+  if [ -s "$SHARE/arena.frames" ]; then
+    FRAMES_ARG="--frames '$SHARE/arena.frames'"
+    echo "S4-FRAMES: $(wc -l <"$SHARE/arena.frames") frames from the guest; locating by translation"
+  else
+    echo "S4-FRAMES: none; falling back to the content sweep (slow, and the duplicate-index failure is possible)"
+  fi
   # Root, and only for this: QEMU is a system service here, so its QMP socket
   # and its /proc/<pid>/fd are root-only. See the header.
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 $HERE/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $RUNID --pages $FOUNDPAGES \
-  --outbound $ARENA_OUTBOUND --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
+  --outbound $ARENA_OUTBOUND $FRAMES_ARG --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
 echo \"rc=\$?\" >>'$RUN/locate.log'
 chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | eval "$ROOTC" >/dev/null 2>&1
   echo "S4-LOCATE-BEGIN"; cat "$RUN/locate.log" 2>/dev/null; echo "S4-LOCATE-END"
