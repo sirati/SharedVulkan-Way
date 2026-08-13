@@ -1949,6 +1949,192 @@ the one being chased.
 
 ---
 
+### 0.19 What an uncarried command actually did, and 239 → 509
+
+Measured 2026-08-13 on **devhost**, in `nix develop` unless a line says
+otherwise. §0.2's codegen bought the wire; this section asks what the profile
+left outside it, and answers the question the number 239 was standing in for.
+
+**1. "No-op" was the wrong word, and the right word is three words.** The
+premise for this work was that the 501 registry commands the zink profile does
+not carry are no-ops. They are not, and the distinction decides what kind of
+work this is. `sv-codegen --icd-entry` and the generated proc tables say there
+are exactly three behaviours, and only one of them is a bug:
+
+| what happens | count (zink) | can the application tell? |
+|---|---|---|
+| **absent** — no proc-table entry, `vkGetDeviceProcAddr` returns null | 501 | yes, and it is the *correct* answer |
+| **clean failure** — `VK_ERROR_INITIALIZATION_FAILED` | 6 | yes |
+| **silent** — `void`, or a value type returning `Default::default()` | 6 | **no** |
+
+The 501 were never the problem. `sv_codegen::abi::surface_profile` derives the C
+surface from the wire profile, so a command in no listed extension gets no stub
+and no table entry, `sv_icd_entry::lookup` returns `None`, and a conforming
+application that also never sees the extension advertised never calls it. That
+is what an implementation is *supposed* to do about an extension it does not
+have. Widening the profile was therefore **coverage**, not a correctness fix.
+
+**The correctness fix was the other six**, and they were hiding behind the big
+number. `vkGetDeviceQueue2` is core 1.1 — unconditionally present, no extension
+to decline — and its stub returned without writing `*pQueue`, leaving the
+application's uninitialised memory to be used as a dispatchable handle.
+`vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress` and
+`vkGetDeviceMemoryOpaqueCaptureAddress` returned `Default::default()`, which is
+the address zero, while `bufferDeviceAddress` was advertised.
+`vkSubmitDebugUtilsMessageEXT` and `vkDestroyDebugUtilsMessengerEXT` did nothing
+and said so only under `SV_DEBUG`, which nobody sets.
+
+Two changes, and neither is a list. `sv_icd_entry::not_implemented` now reports
+**always**, once per name, because gating the only evidence of a silent failure
+on an environment variable makes the worst failure mode the quietest one. And
+the advertised set gained a third term, below.
+
+**2. The devices, measured rather than assumed.** From a clean
+`nix shell nixpkgs#vulkan-tools`, never the dev shell:
+
+| device | instance | device `apiVersion` | device extensions |
+|---|---|---|---|
+| RADV RAPHAEL_MENDOCINO (Ryzen 9 9950X3D iGPU) | 1.4.341 | 1.4.348 | 236 |
+| NVIDIA GeForce RTX 5090 | 1.4.341 | 1.4.329 | 276 |
+
+Union 307, of which 304 are extensions this registry supports for `vulkan` with
+no `platform=`. The RTX 5090 *does* enumerate from a clean `nix shell`, which
+settles the open question in the brief for this work; it is the dev shell that
+is the odd one out and the cause is still unknown. **testhost's Intel iGPU was
+not measured**: no live `ssh-agent` socket was reachable from this shell and
+every key offer was refused. Two vendors is enough to define the target set, and
+the assumption recorded here is that an Intel iGPU exposes no portable extension
+that RADV and NVIDIA between them do not.
+
+**3. The profile states a rule, not a list.** `vk_registry::profiles::full` is
+core 1.0–1.4 plus [every extension the registry supports for `vulkan` with no
+`platform=`], less an exclusion list with a reason per line. The rule is one
+sentence a reviewer can check against `vk.xml`; a 304-name list is not
+reviewable, and nobody could tell a missing line in it from a deliberate
+omission. `platform=` is exactly the registry's own mark for "needs a header
+this build does not have" — Win32, Android, Fuchsia, Metal, GGP, QNX, VI, OHOS,
+and usefully `provisional` — so one filter removes nine families.
+
+Auto-included extensions whose `depends=` cannot be satisfied are **dropped**,
+by fixpoint rather than by filter: `VK_QCOM_data_graph_model` → `VK_ARM_data_graph`
+→ `VK_KHR_deferred_host_operations` is three deep and a single pass keeps the
+first two. An *explicitly* listed extension whose dependency is missing still
+bails, because that is a profile bug.
+
+`VK_ARM_tensors` and `VK_NV_ray_tracing` are **not** excluded by name. Nothing in
+this house exposes them, but carrying them costs a few opcodes, and excluding
+them would be a claim about other people's hardware this project cannot check.
+
+| | zink | full |
+|---|---|---|
+| commands carried on the wire | 239 | **509** |
+| C-surface entry points | 261 | **531** |
+| of those, stubs that refuse | 12 | 27 |
+| wire structs | 460 | 1210 |
+
+**4. What is still out, and it is two generator gaps rather than a scope
+decision.** The exclusion list has fourteen entries and they group into three
+kinds. Platform headers and function pointers are the boundary invariant (§1a)
+and the serialisability rule (§6.1) refusing, which is the generator working —
+`VK_EXT_debug_report`'s and `VK_EXT_device_memory_report`'s callbacks are
+pointers into the application's address space and no encoding makes them mean
+anything on the other side of a VM boundary. A dozen `void*` with no `len=` are
+§7.4 asking for a policy entry nobody can write honestly. The two that are worth
+naming as work:
+
+- **The capture-replay class.** `pShaderGroupCaptureReplayHandle` and
+  `opaqueCaptureDescriptorData` are optional `void*` whose extent is a *device
+  property* rather than a `len=`, and both are written only by a tool replaying
+  a trace. The answer is a fourth `sv_codegen::exceptions::VoidPolicy` — "we do
+  not advertise the capture-replay feature, so this is null on the wire and a
+  non-null one is a usage error we refuse by name" — and it is what stands
+  between this profile and `VK_KHR_ray_tracing_pipeline` (7 commands) plus
+  `VK_EXT_descriptor_buffer` (11).
+- **The union-of-handles class.** `VkAccelerationStructureGeometryDataKHR`,
+  `VkIndirectExecutionSetInfoEXT`, `VkDescriptorMappingSourceDataEXT` and
+  `VkResourceDescriptorDataEXT` are unions with a handle in an arm, and the
+  handle-map pass emits a `compile_error!` rather than guess which arm is live.
+  It is the same `noautovalidity` gap `exceptions::SIBLING_SELECTED` already
+  closes for `VkWriteDescriptorSet`, one level in. This is the expensive one:
+  `VK_KHR_acceleration_structure` takes ray query, ray tracing maintenance and
+  position fetch, and `VK_EXT_opacity_micromap` with it — 16 + 14 + 13 commands.
+
+**5. Advertisement is now the intersection of three things, and the third was
+missing.** §9.2 says an extension in the advertised list is a promise its entry
+points work. The list was the profile intersected with what the GPU side's
+driver reports — two terms, neither of which knows whether the *generator*
+produced a working stub. That is how `bufferDeviceAddress` came to be advertised
+with three of its entry points refusing, and an application could call one and
+get a silent zero.
+
+`sv_icd_entry::INCOMPLETE_EXTENSIONS` is generated: an extension is in it when
+any command it introduces is refused. Not "all" — an extension is one promise,
+and half of it working is a driver that fails where the specification says it
+must not. `sv_icd::SharedVulkan::ask_device_extensions` subtracts it.
+
+Two details cost a build each and both are worth keeping. The table has to
+follow **aliases**: `VK_KHR_buffer_device_address` requires
+`vkGetBufferDeviceAddressKHR`, the generator refuses the core
+`vkGetBufferDeviceAddress`, and comparing names alone let the extension straight
+through — the exact bug the table exists to stop, one indirection down. And the
+GPU side's `PROFILE_DEVICE_EXTENSIONS` had to move from `Profile::extensions` to
+`ResolvedProfile::extensions`: under a rule the declared list is thirty names
+and the effective one is 360, so the first `vulkaninfo` through the widened
+forwarder advertised 25 extensions and looked like a failure of the whole
+section.
+
+**6. The proof, and the one thing it caught.** `vulkaninfo` through the
+forwarder against RADV, versus `vulkaninfo` against RADV directly, same machine,
+same `nix shell` for the tool:
+
+```
+RADV, directly            236 device extensions
+through the forwarder     218 device extensions
+advertised but absent       0
+```
+
+Zero over-advertisement is the half that matters — nothing is promised that the
+device does not have. The eighteen differences are exactly the two exclusion
+classes of §4 (11) and `INCOMPLETE_EXTENSIONS` (7: both buffer-device-address
+extensions, `VK_KHR_deferred_host_operations`, `VK_KHR_device_group`,
+`VK_KHR_pipeline_binary`, `VK_KHR_pipeline_executable_properties`,
+`VK_EXT_present_timing`). The device `apiVersion` still reads 1.3.0, which is
+`sv-worktrees/vers`'s §0.18 and deliberately untouched here.
+
+**The run caught one regression, and the ordering of two statements was the
+whole of it.** `VK_KHR_swapchain` is in `INCOMPLETE_EXTENSIONS` —
+`vkAcquireNextImage2KHR` and the three device-group present queries have always
+been stubs — so adding it to the list before filtering removed presentation from
+the advertised set. 218 became 217 and the missing one was the extension every
+windowed application requires. The filter answers "did the *generator* keep the
+promise"; the `VK_KHR_swapchain` line answers "did `crate::wsi`", and those are
+different questions about different code. Nothing but the diff would have found
+it: the count moved by one.
+
+**7. What this cost the default build: nothing.** `zink` remains the default
+profile and its numbers are unchanged — `cargo test --workspace --no-fail-fast`
+is 82 binaries and 1314 tests, the same control as before. `full` is
+`SV_PROTO_PROFILE=full`, and `sv-icd` and `sv-gpu-server` both build and run
+against it. The one behaviour that changed under `zink` is the one that was
+wrong: three buffer-device-address extensions are no longer advertised, which is
+§9.2 being kept rather than a capability lost, and `sv-worktrees/cts2` owns
+making them real.
+
+**8. One instrument was added and it was wrong the first time.**
+`sv-codegen --audit` asks, per extension, whether the generator can carry it —
+resolve, plan the wire, plan the C ABI — and prints a verdict a line each, so
+the profile can be edited from facts rather than by bisecting a build failure.
+Its first run reported 287 carryable and **139 not**, and 118 of those 139 were
+an artefact of the instrument: it tests one extension at a time against the base
+profile, so every extension whose `depends=` names another extension fails for a
+reason that evaporates once both are in. The control was resolving the whole
+candidate set at once, which is what §3 does. Five instruments in this project
+have now produced a wrong number before a control caught them; this is the
+sixth, and the pattern is the same one §0.13 named — an instrument that does not
+hold the venue fixed answers a different question from the one asked.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`

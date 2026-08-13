@@ -92,6 +92,13 @@ const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
     // computed app-side and never crosses (design.md §5.3: "no round trip and
     // no copy"), so the command is forwarded without it.
     ("vkMapMemory", "ppData", VoidPolicy::NotSerialisable),
+    // `vkMapMemory2` is core 1.4's promotion of `VK_KHR_map_memory2` and its
+    // out-parameter is `vkMapMemory`'s, unchanged: the same pointer into our own
+    // mapping, computed app-side, never crossing. Same policy, and it is here by
+    // owner rather than by field name because `ppData` elsewhere — the
+    // descriptor-set host mapping, for one — is a different question.
+    ("vkMapMemory2", "ppData", VoidPolicy::NotSerialisable),
+    ("vkMapMemory2KHR", "ppData", VoidPolicy::NotSerialisable),
     // Explicitly out of scope: a window handle is a WSI handle.
     ("VkAndroidSurfaceCreateInfoKHR", "window", VoidPolicy::NotSerialisable),
     // The descriptor-update-template family, which is the hardest `void*` in
@@ -130,6 +137,21 @@ const BY_FIELD_NAME: &[(&str, VoidPolicy)] = &[
     // (design.md §9.2: we do not advertise handle types we cannot honour).
     ("handle", VoidPolicy::NotSerialisable),
     ("hostAddress", VoidPolicy::ArenaOffset),
+    // Every `pHostPointer` in the registry is the same thing: application memory
+    // the driver reads or writes directly. design.md §5.3 says what an app-side
+    // pointer into mapped memory *is* in this design — `arena_base + offset` —
+    // so the offset is what crosses, and the GPU side resolves it against its
+    // own mapping of the same pages.
+    //
+    // This subsumes the two per-owner entries above; they stay because their
+    // comments carry the argument. What it adds is core 1.4's host image copy
+    // (`VkMemoryToImageCopy`, `VkImageToMemoryCopy`), where the pointer is not
+    // guaranteed to be arena memory — an application may hand
+    // `vkCopyMemoryToImage` a plain `malloc` buffer. That case needs a bounce
+    // through an arena block in `sv-icd`, which is why `hostImageCopy` is
+    // gated in `sv_icd::advertise` rather than advertised from the GPU side's
+    // answer. The wire is right either way; what is not yet written is the copy.
+    ("pHostPointer", VoidPolicy::ArenaOffset),
     ("address", VoidPolicy::NotSerialisable),
     ("pPlacedAddress", VoidPolicy::NotSerialisable),
 ];
