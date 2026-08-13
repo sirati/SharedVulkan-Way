@@ -1534,9 +1534,10 @@ forwarder**, identical to the same six on the same RADV with no forwarding, and
 the ICD's `sv-icd: connected to the GPU side` plus the GPU side's session log
 are what say which implementation ran.
 
-*(The numbers in this section are the 1-in-20000 sample. The wider run is
-`scripts/sv-cts.sh --fraction 2000`; its shape is the same and its numbers
-belong here when it is re-run on a quiet machine.)*
+*(The numbers in the table are the 1-in-20000 sample, which completes. The
+1-in-2000 run was attempted and **stopped deliberately**; what it measured
+before it was stopped is item 10, and it is the most important number in this
+section.)*
 
 | | control (RADV direct) | forwarded |
 |---|---|---|
@@ -1556,8 +1557,9 @@ advertise, which is the profile and not a defect — **12 are `DeviceLost`** and
 fifty-nine gaps in the declared scope*, and no arrangement of the totals says
 that.
 
-Nine findings. The first four are about the instrument, and they are here
-because each was a wrong number first.
+Ten findings. The first four are about the instrument, and they are here
+because each was a wrong number first; the tenth is the one that decides what
+the next stage of this project is.
 
 **1. The standard runner reported zero passes for a driver that passes.**
 `deqp-runner` 0.18.0 is what Mesa CI uses and it does not know deqp's
@@ -1658,6 +1660,41 @@ commands it takes it for is derived from the registry's `externsync=` *and* its
 is marked, and `vkDeviceWaitIdle` is precisely the one that rides a different
 ring from `vkQueueSubmit`.
 
+**10. The forwarder hangs the GPU on about one in ten of the tests RADV
+passes, and that is what stopped the wider run.** The 1-in-2000 sample — 1640
+tests, ten times the table above — was run and abandoned. Its control finished
+in **11 s: 904 Pass, 736 NotSupported, and not one device lost**. Its forwarded
+pass reached **661 of 1640** before it was stopped, with **86 Pass, 503
+NotSupported, 1 Fail and 71 DeviceLost** — and the reason for stopping was in
+the kernel log rather than in the scoreboard:
+
+```
+amdgpu 0000:72:00.0: amdgpu: ring gfx_0.0.0 timeout, signaled seq=887853, emitted seq=887857
+amdgpu 0000:72:00.0: amdgpu: Starting gfx_0.0.0 ring reset
+amdgpu 0000:72:00.0: [drm] device wedged, but recovered through reset
+```
+
+— 313 `amdgpu` messages in ten minutes, on a shared machine at load average 86.
+Every reset succeeded and `dEQP-VK.api.smoke.*` was back to 6/6 within seconds
+of stopping, so nothing was damaged; but a harness that resets somebody else's
+GPU every twenty seconds is not one to leave running, and the rate is the
+finding rather than the inconvenience.
+
+Two things follow, and they are not the same claim. **The upper bound is
+71/661 ≈ 11%**, which is a *batch* figure and therefore includes collateral:
+at the smaller sample, isolation reduced 19 batch `DeviceLost` to 12 real ones,
+about 63%. Scaling that gives roughly **7% of forwarded tests hanging the GPU**,
+which matches the isolated 12/164 directly. And **the control does not do it at
+all** — zero device losses in 1640 tests, and zero in the 164 — so this is not
+CTS being hard on RADV. It is ours.
+
+That is the single largest defect this project has, it was invisible to all six
+existing harnesses, and finding it is the whole return on building this one.
+Nothing about it is diagnosed yet: the twelve isolated names are in
+`/tmp/sv-cts-regressions.txt`, they span `ubo`, `ssbo`, `renderpasses`,
+`subgroups`, `ycbcr`, `query_pool` and `spirv_assembly`, and no two of them
+obviously share a mechanism.
+
 **What is not settled**, and is the honest state of this stage:
 
 - **This is a 1-in-20000 sample of 3.28 million tests, not a conformance run.**
@@ -1671,9 +1708,13 @@ ring from `vkQueueSubmit`.
   per chunk, an isolation phase the control barely uses, and twelve device
   losses at ten seconds of kernel ring reset each. §0.13's sweep is the
   performance measurement; this is not one.
-- **Twelve device losses and one hang are undiagnosed.** Each is reproducible by
-  name, each is in `/tmp/sv-cts-regressions.txt`, and none has been reduced to a
-  command.
+- **The device losses of item 10 are undiagnosed.** Each is reproducible by name
+  and none has been reduced to a command. Two hangs are separate from them —
+  `dEQP-VK.memory.allocation.random.79` and a
+  `synchronization.timeline_semaphore.device_host…` case — and are what item 5's
+  watchdog exists to survive rather than to explain.
+- **The wider run has to be re-run on a machine nobody else is using**, and
+  until then the 1-in-2000 column is 661 tests of 1640 and is quoted as such.
 - **Nothing has run on testhost.** The Intel iGPU in the guest is the device
   the north-star goal needs and the cross-VM stack is what would have to be
   stood up to reach it; every number here is same-machine RADV over a Unix
