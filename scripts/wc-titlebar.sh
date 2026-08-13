@@ -59,7 +59,7 @@ OUT="$ROOT/docs/stage17"
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # Everything this run owns is named from this. See the header.
-TBNAME="${WC_TBNAME:-wcs13tb}"
+TBNAME="${WC_TBNAME:-wcs17tb}"
 GDIR="/c/Users/<guest-user>/$TBNAME"
 GDIR_WIN="C:\\Users\\<guest-user>\\$TBNAME"
 APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
