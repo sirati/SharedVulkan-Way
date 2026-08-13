@@ -6341,9 +6341,388 @@ Wine question, it is a substrate question.
    is one run, and it is the only thing left that would put a photograph behind
    the sentence "Firefox, over the guest's own RAM, in a window".
 
-## 18. Stage 13: one title bar, and it is Windows'
+## 18. Stage 13: somebody *used* it, and four things were wrong at once
 
 ### 18.1 Status in one paragraph
+
+**The window was unusable and every gate was green.** §17.10 item 5 said the
+last missing pair was a guest-RAM arena on the interactive desktop; this stage
+ran it, and on the way discovered that the reason nobody had noticed the defects
+below is that nobody had *used* the thing — every previous stage measured it.
+The client area tore into horizontal stripes, a second cursor appeared inside
+the window, menus came up surrounded by opaque black, every menu the session had
+ever opened was still on the screen, the scroll wheel did nothing, modifiers
+stuck, and the taskbar icon was generic. Seven symptoms; **four causes**, and one
+of them accounts for three of the symptoms. The tearing was the virtio-fs export
+that §10.3 measured incoherent in stage 5 and that stage 7 replaced for
+`wc-guest.sh` and nowhere else — `scripts/wc-desktop.sh`, the only harness that
+puts a window in front of a person, was still passing `--arena 0:N:Z:\wc\arena`
+five stages later. It does not any more, there is no fallback, and
+`docs/stage13/stage13-clean-guest-ram.png` is Firefox on the guest's real
+desktop over the guest's own RAM, rendering cleanly.
+
+### 18.2 The tearing is the export, and the harness had never used the fix
+
+The user's screenshot is `docs/stage13/stage13-torn-file-arena.png`: a block of
+horizontal stripes where a menu should be, correct rows interleaved with stale
+ones. The stripe height is the first measurement worth having — the popup is 460
+pixels wide, which is 1840 bytes a row, so a 4096-byte page is 2.2 rows, and the
+bands are two to three rows tall. That is page granularity, and page granularity
+is the signature of a cache and not of a renderer.
+
+**The compositor's own shadow is torn**, which is what decides where the bug is.
+`docs/stage13/stage13-torn-popup-dump.png` is that popup's `--dump-frames` PPM —
+what the compositor believed it had composited, written from `present` before
+GDI touches anything — and it is the same stripes as the screen. So the blit is
+innocent and the stride is innocent; the bytes were already wrong when the
+compositor read them. §10.3's second row, arriving on somebody's screen four
+months after it was measured:
+
+| | result |
+|---|---|
+| the export, Windows mapping against a Linux `MAP_SHARED` mmap, both live | **MISMATCH**, 65280 wrong of 65536, both directions |
+
+The frame counts say the same thing from the other side. The user's run over the
+file arena dumped **583 frames of which 47 were distinct**. The guest-RAM run
+below dumped **806 of which 462** — and 462 against 806 is the control's shape
+(§12.7's 626/60 was an `about:blank` that had nothing to redraw; this one is a
+browser being driven).
+
+`scripts/wc-desktop.sh` now does what `wc-guest.sh` has done since stage 7:
+`--arena-guest-ram 0:N` plus `--arena-outbound`, `wc-arena-host` run as root on
+the VM host through `rootc`, and `wc-proxy --arena-plan` inside a
+`systemd-run --collect` transient unit because `/proc/<qemu-pid>/fd` is
+root-only (§12.9). One run of the locate, from this stage:
+
+```
+guest RAM in the flat view: 13311 MiB in 4 alias(es)
+located 16384/16384 pages in 2.41s (swept 13312 MiB; 189384 other-run stamps, 0 outside guest RAM)
+coalesced into 1462 run(s) covering 64 MiB — 11.2 pages per run
+stitched 64 MiB into one view with 1462 mmap(MAP_FIXED) call(s) in 4.68ms
+verify: 16384/16384 pages of the stitched view carry their own arena index
+```
+
+**There is deliberately no fallback.** If the compositor never prints its run id,
+or `wc-arena-host` returns non-zero, the run fails and says so; it does not
+truncate a file on the export and carry on. That is the whole lesson of this
+stage stated as code: the previous arrangement degraded silently to the
+incoherent substrate and *every check stayed green*, which is how it reached a
+user. `purge_arena_file` also removes any `arena` left on the export by a
+pre-stage-13 run, so a stale file cannot be picked up by something that was not
+looking.
+
+**Which paths can still reach the file provider, and why each is legitimate:**
+
+* `--arena <id>:<size>:<path>` in `wc-compositor` and `--arena-path` in
+  `wc-proxy` remain, and `arena::provide_file` is what implements them. This is
+  the hypervisor-free twin stage 10 added: a Wine run on one Linux box has no
+  QEMU, therefore no guest RAM to locate, and therefore no way to exercise the
+  arena code path at all without it. `scripts/wc-handshake.sh` and
+  `scripts/wc-xdg.sh` are those runs.
+* `scripts/wc-guest.sh`'s `--transport arena` branch keeps it, and that branch
+  is a *deliberate control*: it is how the incoherence is re-measured rather
+  than assumed, which is what §12.6 is.
+* Nothing that runs against the real guest with a window in front of a person
+  can reach it. `wc-desktop.sh` has no code path that produces one.
+
+### 18.3 There were two cursors because a cursor is not content
+
+The user asked for one thing and it is not negotiable: **the cursor must be the
+Windows cursor.** So `wl_pointer.set_cursor`'s surface must never be composited,
+and this stage makes that a property rather than an accident.
+
+It was *nearly* true already, and the "nearly" is the interesting part. A cursor
+surface is nobody's subsurface, so `compose_tree`'s `with_surface_tree_upward`
+never reached it, and the `is_root_of_a_window` early return caught it on the
+way past — but only *after* its pixels had been blitted into `staging`, where
+they stayed for the life of the process. "Not reached by the traversal we
+currently have" is not something to rely on while the scene graph is still
+growing, and it is not something a reader can check. `commit` now recognises the
+seat's cursor surface by identity, **before** the window test, drops its staging
+entry and returns.
+
+`cursor_image` therefore records the surface and does nothing else. Turning it
+into a real `HCURSOR` — `CreateIconIndirect` with `fIcon: 0` and the client's
+hotspot, plus `WM_SETCURSOR` — is the right next thing and would make an I-beam
+over a text field an I-beam; it belongs to whoever owns `wp_cursor_shape_v1`,
+and this stage deliberately stops at the guarantee it owes: **exactly one
+pointer, and it is Windows'.**
+
+Honest limitation: this stage did not get a photograph of the second cursor
+before it fixed it, so the causal claim is a reading of the code plus the user's
+report, not a measurement. What *is* measured is that the compositor's log says
+`a client set a cursor` on every Firefox run, so a cursor surface exists and is
+committed to on this path.
+
+### 18.4 One empty function body, three user-visible symptoms
+
+This is the finding of the stage and it is worth stating as a shape rather than
+as three bugs.
+
+**`XdgShellHandler::popup_destroyed` has an empty default body in smithay, and
+this compositor never overrode it.** From stage 9 to here, every `xdg_popup`
+Firefox destroyed left its `HWND` on the screen. A live session accumulated
+three stale "New Tab" tooltips at three different positions, a context menu, an
+account panel and the hamburger menu, **all visible at once**, over the page the
+user was reading. Nothing errored. Nothing was logged. The frame dumps were
+healthy. The windows were real, mapped, correctly positioned and correctly
+painted — they were simply never taken away, and there is no measurement in this
+project that would have caught it, because every one of them counts things that
+happened rather than things that stopped happening.
+
+The two consequences were reported as separate bugs and are not:
+
+* **"Clicking elsewhere does not dismiss a menu."** Half of that is the same
+  bug and half of it is `xdg_popup.grab`, which was also an empty body. A menu
+  is dismissed by the *compositor* — the client cannot see a click outside its
+  own surfaces — so with no grab recorded, nothing ever sent `popup_done` and
+  the client had no reason to destroy anything. Both are implemented; the grab
+  is one level rather than a stack, and §18.10 says what that costs.
+* **"The scroll wheel does nothing in Firefox."** `WM_MOUSEWHEEL` is delivered
+  by Win32 to the window with **keyboard focus**, not to the window under the
+  cursor. With half a dozen stale popups on screen the cursor was usually over
+  one of them, so `pointer_focus` was a dead menu while the wheel arrived for
+  the toplevel, and `if self.pointer_focus != Some(id) { return; }` ate it.
+  **Confirmed by the user rather than argued**: with no popup on screen,
+  scrolling always worked. The popup fix is the fix.
+
+  The early return is now deliberate instead of silent — the axis is delivered
+  to whatever the pointer is actually over, which is what `pointer.axis` would
+  do anyway since `id` never routed anything, and a disagreement between the two
+  is logged. A wheel with no pointer focus at all still has nowhere to go.
+
+`xdg_popup.reposition` was the third empty body: `repositioned` was never sent,
+so a submenu GTK moves to keep it on screen stayed where it was first put. It
+now sends `repositioned`, then a `configure`, then a `ToUi::MovePopup` — in that
+order, because a client that gets a configure with no token cannot match the
+answer to its request and GTK ignores the move.
+
+### 18.5 Popup alpha, and why a layered window rather than `AlphaBlend`
+
+With the tearing gone, the menus turned out to render correctly and to be
+**surrounded by an opaque black rectangle** where the client's drop shadow
+should be, with the rounded corners cut out in the same black. That is not a
+client bug: `map_window` has printed `argb: alpha ignored by GDI, drawn opaque`
+since stage 3, and it means what it says. `SetDIBitsToDevice` on a 32-bit
+`BI_RGB` DIB discards the fourth byte, so a GTK menu's transparent margin —
+`A=0`, `RGB=0` — is drawn as black.
+
+`AlphaBlend` is the obvious reach and it is the wrong one: it composites against
+*what is already in the destination DC*, which is the window's own background,
+and it cannot show the desktop behind the window because the window is opaque to
+the system. Per-pixel transparency of a **window** on Win32 is a window-manager
+property, and `WS_EX_LAYERED` + `UpdateLayeredWindow` with
+`BLENDFUNCTION{AC_SRC_OVER, AC_SRC_ALPHA}` is the only mechanism for it.
+
+**Popups only, and the reason is a cost rather than a preference.**
+`UpdateLayeredWindow` replaces `WM_PAINT` entirely and takes the whole window
+each time, so damage cannot be used — a layered window redraws everything on
+every commit. A menu is small and changes rarely; a toplevel is neither. A
+layered toplevel would also lose its native frame, because the bitmap becomes
+the entire window and there is no non-client area left for Windows to draw a
+caption in, which is the opposite of what `docs/goal-firefox.md` asks for. The
+toplevel's own transparent margin is somebody else's fix and it is a better one:
+server-side decorations remove the shadow inset rather than compositing it.
+
+Two things fall out for free and are worth recording because they look like
+work that still needs doing. `ULW_ALPHA` makes Windows hit-test a layered window
+**by its alpha**, so clicks in the fully transparent shadow margin fall through
+to whatever is behind it — which is what `wl_surface.set_input_region` would
+have been asked to arrange, and it is arranged. And the map path now paints
+before `ShowWindow`, because a layered window that has never been given a bitmap
+is undefined rather than blank.
+
+### 18.6 The icon: §17.2 recorded the right symptom and the wrong reason
+
+§17.2 said `wc_icon_manager_v1` published `0 image(s)` for `"firefox"` *"because
+the resolver runs where the proxy runs and the VM host has no icon theme
+carrying Firefox's pixels"*. The first clause is right. **The conclusion drawn
+from it — that the resolver is on the wrong machine — is wrong, and it matters,
+because the fix it implies is to move the resolver across the VM boundary.**
+
+`wc-proxy` is a Wayland *server*, reached by its client over an AF_UNIX socket.
+An AF_UNIX socket has both ends in one kernel. **The proxy is therefore always
+on the client's machine, and the client's machine is by definition the one the
+application is installed on.** There is no wrong machine here and nothing needs
+to cross anything.
+
+What was actually missing was the *directory*, and it is measurable on
+testhost in two commands:
+
+```
+$ ls /run/current-system/sw/share/icons/hicolor/*/apps/firefox.png
+ls: cannot access ...: No such file or directory
+$ ls /run/current-system/sw/share/applications/ | grep -i firefox
+$ ls /nix/store/d8q8…-firefox-151.0.2/share/{applications,icons/hicolor/48x48/apps}/
+applications: firefox.desktop
+apps:         firefox.png
+```
+
+Firefox's desktop entry and its icons are in **Firefox's own package prefix**,
+and on NixOS a package prefix is a store path that appears in `XDG_DATA_DIRS`
+only if somebody put the package into a profile. The resolver's roots were
+`XDG_DATA_HOME` and `XDG_DATA_DIRS`, and the proxy runs inside a `systemd-run`
+transient unit whose environment is systemd's rather than a login shell's — so
+on this rig the list frequently degrades to the hard-coded
+`/usr/local/share:/usr/share`, which holds nothing at all on NixOS.
+
+So the resolver now searches **the client's own installation prefix**, found
+from the client rather than configured. `SO_PEERCRED` on the accepted socket
+gives the client's pid; `/proc/<pid>/exe` is the kernel's answer to what it is
+running, which survives a lying `argv[0]`, a wrapper script that `exec`s
+something else, and a binary replaced on disk since; and every ancestor of that
+path with a `share` directory, up to four levels, joins the search. That finds
+`/usr/share` from `/usr/bin/foo`, `/usr/share` from `/usr/lib/firefox/firefox`,
+and `/nix/store/…-firefox-151.0.2/share` from the store path three levels up —
+which is exactly the file that exists. It is the FHS relationship between `bin/`
+and `share/`, and it holds inside a Nix store path, inside a Flatpak, and inside
+anything unpacked into a home directory, which is why it is preferred to a list
+of special cases for package managers.
+
+Order matters and it is: `--icon-data-dir` (new, repeatable, for callers with no
+session environment to inherit — `scripts/wc-icon.sh` was already exporting
+`XDG_DATA_DIRS` around the process for exactly this reason), then the XDG
+directories, then the client's prefix. A theme the user installed is a
+deliberate override of what a package shipped, so XDG wins; the client's prefix
+is the guaranteed answer rather than the preferred one.
+
+**No descriptor crosses anything.** `SO_PEERCRED` is a `getsockopt` on a socket
+this process already owns, `/proc/<pid>/exe` is a `readlink`, both happen on the
+proxy's own machine, and what leaves is a path. §14.7's count is unchanged: 3
+fds in, 1 out.
+
+### 18.7 Modifiers stick because `leave` tells the client and not us
+
+Two causes, both real, neither large.
+
+`set_keyboard_focus(id, false)` called `keyboard.set_focus(self, None, …)` and
+nothing else. `wl_keyboard.leave` is correct as far as the *client* goes — the
+client is required to treat every key as released — but the compositor's own xkb
+state went on believing they were down, and it is the compositor's state that
+decides what the next `modifiers` event says. Hold Ctrl, lose focus (which with
+§18.4's stale popups was happening constantly), release Ctrl into whatever has
+focus now, come back: smithay sends `enter` with a pressed-keys array and
+`modifiers` with Ctrl depressed, and every keystroke is Ctrl-modified until the
+user happens to press and release Ctrl over our window. Every pressed key is now
+fed back as a release through `input_intercept` — which updates our state
+without sending anything to the client, because `leave` has already said what
+the client needs to hear — *before* `set_focus(None)`.
+
+Caps Lock and Num Lock are the second cause and they are a different kind of
+thing: they are **locked** modifiers, owned by the machine, and a user who
+toggles Caps Lock in another application changes it for us too while we see no
+key event at all. They are now read from the system on every focus gain —
+`GetKeyState(vk) & 1`, the **low** bit, because the high bit is the physical
+up/down of a key that is up almost all the time — and carried in on
+`FromUi::KeyboardFocus` so the headless platform can state them too.
+
+Deliberately unchanged, because it was checked and is correct: the auto-repeat
+filter on bit 30 of `lParam`. The client repeats from `repeat_info`, and
+forwarding Windows' repeat as well would give two repeat streams at different
+rates.
+
+### 18.8 Four things that cost real time
+
+* **A `sed` range whose end pattern did not match deleted 1500 lines of
+  `state.rs`** and the build stayed quiet about it for one command, because what
+  was left still parsed. Recovered from `git` plus the edits re-applied. The
+  lesson is not about `sed`: it is that a file this project keeps its reasoning
+  in is not a file to edit with a range expression.
+* **Backticks inside a double-quoted heredoc that bash expands.** The
+  `wc-desktop.sh` host-side script is written through `ssh "…"`, so a comment
+  containing `` `WAYLAND_DISPLAY` `` is a command substitution. It presented as
+  `WAYLAND_DISPLAY: command not found` and a client that produced no log at all.
+* **`WAYLAND_DISPLAY=wl-proxy` with a private `XDG_RUNTIME_DIR`.** Firefox needs
+  a runtime directory it owns, and the proxy's socket is not in it. libwayland
+  reads a `WAYLAND_DISPLAY` beginning with `/` as a path, which is the only
+  thing that separates the two; §17's `wc-guest.sh` had learned this and
+  `wc-desktop.sh` had to learn it again, which is an argument for the two
+  harnesses sharing more than they do.
+* **`wc-arena-host` is not a workspace member** (`Cargo.toml` excludes it: it
+  links shared_vulkan's `sv-hostd` and has its own lockfile), so
+  `cargo build --workspace` does not produce it and the deploy failed on a
+  missing file. `wc-desktop.sh` now builds it by its own manifest, as
+  `wc-guest.sh` does.
+
+### 18.9 The gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | **158 passed**, 0 failed (157 on master, +1: `the_client_prefix_is_found_from_bin_and_from_lib`) |
+| `cargo clippy --workspace --all-targets` | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | an **executable**, not metadata — §17's trap, and this stage deployed from it four times |
+| `wc-desktop.sh window`, guest-RAM arena, Firefox, interactive desktop | the arena located, the window captured, the caption and taskbar button asserted |
+| the locate | 16384/16384 pages, 2.41 s, verify clean, 1462 runs |
+| frames | 806 dumped, **462 distinct** (the file-arena run: 583 dumped, **47** distinct) |
+| the picture | `docs/stage13/stage13-clean-guest-ram.png` |
+
+### 18.10 What is not proven
+
+1. **The popup grab is one level, not a stack.** Dismissing the innermost popup
+   makes the client destroy it, which clears the record, so a second click
+   dismisses the next one out. That is one click per level where a Linux
+   compositor takes one click for all of them. A submenu is what would show it.
+2. **`xdg_positioner`'s constraint adjustments are still ignored**, in
+   `new_popup` and now in `reposition_request` too. This compositor does not
+   know where the parent window is on the Windows desktop, so it cannot tell
+   whether a placement would fall off the screen. Windows keeps an owned
+   `WS_POPUP` on the monitor by itself, which is why it has not bitten — but
+   that means Windows is silently moving popups and the client is not being told.
+3. **No run in this stage exercised a popup end to end, and that is the largest
+   gap it leaves.** The popup work — destroy, grab, reposition, and the layered
+   window — is compiled, reviewed and reasoned from a live session's evidence,
+   but `wc-desktop.sh window` drives a drag and not a menu, so its Firefox
+   opened no popups and the final run's log contains no `xdg_popup` line at all.
+   The torn run that *did* open four of them was the run whose defects this
+   stage is about, and it predates every fix. **What is needed is a harness step
+   that opens a menu**: right-click the client area through `wc-desk`, then
+   assert on `xdg_popup created`, a `WaycomposeToplevel` in the window
+   enumeration, a click elsewhere, `popup_done`, `xdg_popup destroyed`, and the
+   window being *gone* from the enumeration. That last assertion is the one that
+   would have caught this four stages ago, and nothing in this project asserts
+   that a window stopped existing.
+4. **The layered-window path redraws the whole popup per commit.** Fine for a
+   menu; nobody has measured what it costs for a popup that animates. Nor has
+   anything photographed a menu with its shadow, for the reason above.
+5. **The second cursor was never photographed.** §18.3 is a code reading plus a
+   user report, and the fix is a guarantee rather than a measured before/after.
+6. **The icon fix has not been photographed on the guest either.** The resolver
+   change is unit-tested against all three prefix layouts and the store path was
+   verified by hand on testhost, but no run in this stage produced a Firefox
+   taskbar button with Firefox's icon on it over guest RAM. That is one run and
+   it is the first thing to do.
+7. **`--icon-data-dir` has no harness using it yet.** It exists because the
+   transient unit's environment is not a session's; nothing yet passes it.
+8. **The frame counts are one run each.** 462/806 against 47/583 is a large
+   enough difference not to need a repeat to believe, and it is still one run.
+9. **The compositor's console window is on the desktop.** Both this stage's and
+   another worktree's appear in `wc-desk windows` as visible
+   `ConsoleWindowClass` entries titled with the binary's path — so stage 11's
+   "hide the console when `GetConsoleProcessList == 1`" is not firing when the
+   task scheduler launches the process. Not diagnosed; recorded because a
+   screenshot tool that photographs a console window in front of the thing it is
+   photographing is a poor instrument, and the same argument applies to
+   `wc-desk` itself, which is still console-subsystem.
+
+### 18.11 What to do next
+
+1. **Photograph the icon over guest RAM** (§18.10 item 6). One run, and it
+   closes §16's last gap in the topology `docs/goal-firefox.md` describes.
+2. **Hide the console** — both the compositor's and `wc-desk`'s (§18.10 item 9).
+   It is the difference between an instrument and an anecdote.
+3. **A harness step that opens a menu** (§18.10 item 3), which is what would
+   have caught this stage's largest bug four stages ago.
+4. **A grab stack** (§18.10 item 1), which is what a submenu needs and what
+   `xdg_popup`'s protocol actually describes.
+5. **Ask Windows where the parent window is**, so `xdg_positioner`'s constraint
+   adjustments can be honoured (§18.10 item 2). This is the same missing fact as
+   §15.15 item 3 — nothing asks Windows how big anything is — and the two should
+   be answered together.
+
+## 19. Stage 14: one title bar, and it is Windows'
+
+### 19.1 Status in one paragraph
 
 Every window this project has ever made had **two** title bars — Windows'
 caption, and directly beneath it Firefox's tab strip with its own minimise,
@@ -6352,17 +6731,18 @@ maximise and close buttons. It is in `docs/stage9/stage9-firefox-window.png`,
 it independently, on the crash reporter's window as well as the browser's, so it
 was every window rather than a browser quirk. It is fixed, it took one line of
 compositor and one environment variable, and the picture is
-`docs/stage13/stage13-server.png`: Windows' caption with Firefox's icon and
+`docs/stage14/stage14-server.png`: Windows' caption with Firefox's icon and
 title, and below it Firefox's tabs with no window buttons of their own. The run
-behind that picture is also the one §17.10 item 5 and §17.11 item 4 asked for
-and nobody had done — the interactive desktop **and** Firefox **and** an arena in
-the guest's own RAM, in the same run. What was *not* fixed is the other half of
+behind that picture is the interactive desktop **and** Firefox **and** an arena
+in the guest's own RAM, which is §17.11 item 4's arrangement; stage 13 got there
+first, from the other direction, and §19.6 says what this one has that
+`wc-desktop.sh` does not. What was *not* fixed is the other half of
 the goal clause: Firefox painting its tabs *into* the caption rather than under
-it. §18.7 wires the requests that half needs and §18.8 records the thing that
+it. §19.7 wires the requests that half needs and §19.8 records the thing that
 makes the rest of it impossible, which is that Wayland has no way for a client
 to publish a draggable region.
 
-### 18.2 One line decides it, and it is the manager's default rather than the surface's
+### 19.2 One line decides it, and it is the manager's default rather than the surface's
 
 The compositor now sends `default_mode(2)` — `Server` — when a client binds
 `org_kde_kwin_server_decoration_manager`. Before this stage it sent
@@ -6383,7 +6763,7 @@ surface inside a `WS_OVERLAPPEDWINDOW`, which draws a caption whether anybody
 asked for one or not. Two title bars is exactly what that promise buys, and the
 window would have had two of them however good the client-side story was, right
 up until `FrameStyle::extend_top` moved off zero — which is stage 8's item, was
-still untouched at stage 12, and is §18.7's.
+still untouched at stage 12, and is §19.7's.
 
 So the mode is a flag, `--decorations server|client`, and `server` is the
 default. Windows' caption **is** a server-side decoration; saying so is the
@@ -6403,7 +6783,7 @@ bind. Answering `Server` to the surface's `request_mode` and leaving the
 manager's default at `Client` changes nothing at all, except that GDK
 re-requests the mode it wanted, which was captured as a loop against real KWin.
 
-### 18.3 The second lever is in the client's environment, and no protocol carries it
+### 19.3 The second lever is in the client's environment, and no protocol carries it
 
 `default_mode(2)` on its own is **not enough**, and the control leg in
 `scripts/wc-firefox.sh titlebar` exists to keep saying so. With the compositor
@@ -6440,13 +6820,13 @@ rather than argued about: the only libadwaita knob in Firefox 151 is
 `widget.gtk.libadwaita-colors.enabled`, a palette override, and the binary
 contains no `adw_*` symbols at all — Firefox neither links nor `dlopen`s it.
 
-### 18.4 A client that insists on `Client`, and why it is echoed
+### 19.4 A client that insists on `Client`, and why it is echoed
 
 The KDE protocol's `request_mode` is a request and the compositor's `mode` is
 the answer. This compositor echoes, even when the echo contradicts the default
 it advertised, and that is a decision with three reasons in order of weight.
 
-First, **the per-surface answer is not the lever** (§18.2). Refusing it changes
+First, **the per-surface answer is not the lever** (§19.2). Refusing it changes
 no GTK client's behaviour, because GTK read the manager's default once and is
 not listening. Second, GDK's handler re-requests the mode it wants when it is
 contradicted; against real KWin that was a loop, and KWin capitulates. A
@@ -6460,7 +6840,7 @@ gets two title bars, exactly as every client did before this stage. Measured on
 the control leg, Firefox sends **one** `request_mode` in the whole trace when it
 is echoed, so nothing loops.
 
-### 18.5 The geometry rectangle changes shape, and §15.6's code already handled it
+### 19.5 The geometry rectangle changes shape, and §15.6's code already handled it
 
 §15.6 made the window the `xdg_surface.set_window_geometry` rectangle rather
 than the buffer, because a GTK client's buffer is bigger than its window by an
@@ -6477,17 +6857,31 @@ construction rather than by a branch, which is what §15.6 built and is the
 reason this stage is one line rather than a rework — on the guest, with
 `--output 1100x700`, the window mapped `990x630` under both modes.
 
-### 18.6 The picture, on the real desktop, over the guest's own RAM
+### 19.6 The picture, on the real desktop, over the guest's own RAM
 
-`scripts/wc-titlebar.sh` is a script of its own because the claim is the
-*intersection* of two existing harnesses and neither has the other half.
-`wc-guest.sh` runs Firefox over guest RAM and runs the compositor in an ssh
-session, which is session 0 — every Win32 call succeeds there and nothing is
-ever on a screen (§10.12 item 3), so there is no caption to photograph.
-`wc-desktop.sh` reaches `WinSta0\Default` and photographs windows, and its
-client is `weston-terminal` over a **file** arena on the virtio-fs export. This
-stage needs the desktop *and* Firefox *and* — by the project's standing rule —
-an arena in guest RAM.
+`scripts/wc-titlebar.sh` is a script of its own, and after the merge with stage
+13 that needs a better reason than it had when it was written.
+
+When it was written the reason was that the claim is the *intersection* of two
+harnesses and neither had the other half: `wc-guest.sh` ran Firefox over guest
+RAM with the compositor in an ssh session, which is session 0 — every Win32 call
+succeeds there and nothing is ever on a screen (§10.12 item 3) — and
+`wc-desktop.sh` reached `WinSta0\Default` and photographed windows, over a
+**file** arena on the virtio-fs export. Stage 13 closed the second half of that
+gap independently and for a different reason: §18.2 found the export was what
+had been tearing the user's window, and `wc-desktop.sh` uses guest RAM now.
+
+What is left is the errand rather than the plumbing. `wc-desktop.sh` is stage
+8's harness and photographs a window to answer questions about *the window* —
+orientation, the modal sizing loop, the taskbar button, the frame rate — and it
+runs one client under one arrangement. This script runs the **same client twice
+under two decoration modes** and puts the two captures side by side, which is
+the only form the claim can take: a window with one caption is also what a
+Firefox that failed to start looks like, so a single picture proves nothing.
+It also owns its own guest directory, socket, scheduled-task names and export
+subdirectory (§16.8), which is what let it run against a guest three other
+experiments were using while stage 13's own harness was being changed underneath
+it.
 
 What one leg does, in the order the pieces start: the compositor is registered
 as a scheduled task with an `Interactive` principal so that it lands on the
@@ -6515,11 +6909,11 @@ server: 127 frames of Firefox's pixels were blitted into it
 shot: hwnd 0x3603ae at 26,26 title "Mozilla Firefox" -> 960x543, per-monitor-aware
 ```
 
-`docs/stage13/stage13-server.png` is that capture. One caption, Windows', with
+`docs/stage14/stage14-server.png` is that capture. One caption, Windows', with
 the client's own icon and the client's own title in it, and Firefox's tabs
 directly below with nothing in the corner but the tab-list chevron.
 
-`docs/stage13/stage13-client.png` is the `client` leg, same size, same guest,
+`docs/stage14/stage14-client.png` is the `client` leg, same size, same guest,
 same arena, minutes apart, and it is what every stage before this one shipped:
 Windows' caption with its three buttons, and in the tab strip below it Firefox's
 own close button. The two title bars are one on top of the other and both have a
@@ -6532,22 +6926,22 @@ way to close the window.
 > session's own earlier runs and from the three other experiments sharing the
 > guest. The `server` leg passed every time it was run. It is a §12 problem
 > arriving after a long day on one guest rather than anything this stage
-> touched, and it is §18.12 item 4.
+> touched, and it is §19.12 item 4.
 
 The corner is where the difference lives, and the three crops in
-`docs/stage13/` are the same 420x46 rectangle of the same client's own pixels,
+`docs/stage14/` are the same 420x46 rectangle of the same client's own pixels,
 from the workstation, under three arrangements:
 
 | file | arrangement | what is in the corner |
 |---|---|---|
 | `corner-client.png` | `default_mode(1)`, no variable | chevron, minimise, maximise, close |
 | `corner-server.png` | `default_mode(2)` + the variable | chevron |
-| `corner-menu-only.png` | `default_mode(1)`, `gtk-decoration-layout=menu:` | chevron, close — §18.9 |
+| `corner-menu-only.png` | `default_mode(1)`, `gtk-decoration-layout=menu:` | chevron, close — §19.9 |
 
-### 18.7 The three requests a client-decorated window makes, wired to Win32
+### 19.7 The three requests a client-decorated window makes, wired to Win32
 
 A window whose title bar is the client's cannot be moved by Windows, because
-Windows does not know where its title bar is (§18.8). It moves by *asking*, and
+Windows does not know where its title bar is (§19.8). It moves by *asking*, and
 until this stage all three of the requests it asks with had smithay's empty
 default — so a client-decorated window could be closed, maximised and minimised
 and could not be moved at all. They are wired now:
@@ -6593,7 +6987,7 @@ place, and Windows' own modal loop refuses to start unless a button is really
 down — so the check the serial exists to make is made one layer down, against
 the real hardware state.
 
-### 18.8 What can never work through that path, and it is snap layouts
+### 19.8 What can never work through that path, and it is snap layouts
 
 `WM_NCHITTEST` can never return `HTCAPTION` over Firefox's tab strip, and this
 is a protocol fact rather than an unfinished piece of work. **Wayland has no
@@ -6612,9 +7006,9 @@ same reason.
 
 The way out would be to draw *real* caption buttons in the extended frame, in
 the corner Firefox has left empty, and hit-test them properly. That needs
-Firefox to stop drawing its own, which is what §18.9 measured.
+Firefox to stop drawing its own, which is what §19.9 measured.
 
-### 18.9 `gtk-decoration-layout`, measured: minimise and maximise go, close does not
+### 19.9 `gtk-decoration-layout`, measured: minimise and maximise go, close does not
 
 Firefox reads GTK's `gtk-decoration-layout` and draws only the buttons it names
 (`nsLookAndFeel.cpp`). The hypothesis this stage inherited was that
@@ -6641,25 +7035,25 @@ that names no right-hand buttons at all, and it does not move to the left when
 the layout puts it there. Firefox draws a close button in the corner of a
 tabs-in-title-bar window regardless of what GTK is told.
 
-That is enough to stop the plan in §18.8's last paragraph as stated. Real
+That is enough to stop the plan in §19.8's last paragraph as stated. Real
 caption buttons drawn in the extended frame would sit next to a client-drawn
 close button that cannot be removed, which is the two-title-bars bug again in
 miniature. Anything further here is a Gecko question — `browser.tabs.inTitlebar`
 is the switch that removes the whole bar, and it is the switch this stage
 already uses — rather than a GTK one.
 
-### 18.10 The gates
+### 19.10 The gates
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | **157 tests**, 0 failures — unchanged from master |
+| `cargo test --workspace` | **158 tests**, 0 failures — unchanged from master after the merge with stage 13 |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `scripts/wc-firefox.sh titlebar` (new) | **9 passed, 0 failed** |
 | `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed — unchanged |
 | `scripts/wc-firefox.sh window` | 7 passed, 0 failed — unchanged |
 | **`scripts/wc-titlebar.sh server` (new, the guest's interactive desktop)** | **7 passed, 0 failed** |
-| `scripts/wc-titlebar.sh client` (the same run, for the pair) | 7 passed, 0 failed — on the third attempt; §18.6's box |
+| `scripts/wc-titlebar.sh client` (the same run, for the pair) | 7 passed, 0 failed — on the third attempt; §19.6's box |
 | `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
 | `scripts/wc-proxy.sh`, `wc-input.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended and none of them touches a decoration** |
 
@@ -6671,32 +7065,32 @@ because the default changed. `weston-terminal`, against the Linux compositor wit
 and §15.6 established, unchanged. It never binds the KDE decoration manager: the
 interface appears in its trace once, in the registry burst, and is not taken up.
 It draws its own frame either way, which is what a toolkit that predates the
-protocol does. The three requests §18.7 wires had smithay's empty default before
+protocol does. The three requests §19.7 wires had smithay's empty default before
 and are only sent by a client that decorates itself, so they can only add
 behaviour. `wc-firefox.sh`'s own older blocks *were* re-run, because they are the
-ones that would have noticed (§18.2's last paragraph).
+ones that would have noticed (§19.2's last paragraph).
 
 The stage adds no unit test, and that is a statement rather than an omission:
 everything it changed is a value sent on a global's bind and three requests
 handed to Win32, and neither is reachable from a test that does not run a client.
 The `titlebar` block is the test, it runs the real Firefox against the real
-compositor, and it carries a control leg (§18.3) so that it fails if the second
+compositor, and it carries a control leg (§19.3) so that it fails if the second
 lever stops being needed as well as if it stops working.
 
-### 18.11 What is not proven
+### 19.11 What is not proven
 
-1. **Nothing has been dragged.** §18.7's three requests compile, log and are
+1. **Nothing has been dragged.** §19.7's three requests compile, log and are
    posted, and no run has clicked Firefox's tab strip and watched the window
    follow the pointer. The Linux harness cannot: there is no window manager
    under the headless platform, so a `move_request` there has nowhere to go and
    the headless arm says so rather than pretending. Doing it needs
    `wc-desk.exe drag`'s trick pointed at a client-decorated window on the guest's
-   desktop, which is one run and is item 1 of §18.12.
+   desktop, which is one run and is item 1 of §19.12.
 2. **`FrameStyle::extend_top` is still zero.** `WM_NCCALCSIZE` and
    `DwmExtendFrameIntoClientArea` are not written. The goal clause's second half
-   — tabs *in* the caption rather than under it — is untouched, and §18.8 and
-   §18.9 are the two things anybody starting it should read first.
-3. **The environment variable is unenforced.** §18.3's box. Nothing checks that
+   — tabs *in* the caption rather than under it — is untouched, and §19.8 and
+   §19.9 are the two things anybody starting it should read first.
+3. **The environment variable is unenforced.** §19.3's box. Nothing checks that
    the client was started with it; a deployment that forgets gets two title bars
    and no diagnostic. The compositor *could* notice — a client that asks for
    `Client` when the default is `Server` is exactly that case, and it is already
@@ -6704,24 +7098,24 @@ lever stops being needed as well as if it stops working.
    nobody has made.
 4. **One client, one version.** Firefox 151.0.2. GTK 4 does not implement the
    KDE protocol at all and would need `xdg-decoration`, which this compositor
-   answers consistently (§18.2) and which no client here has ever bound
+   answers consistently (§19.2) and which no client here has ever bound
    (§15.7). §16.11 item 2 has been asking for a GTK 4 client since stage 11 and
    still is.
 
-### 18.12 What to do next
+### 19.12 What to do next
 
-1. **Drag a client-decorated window on the guest's desktop.** §18.11 item 1. It
-   closes the only untested half of §18.7 and it is the run that says whether
+1. **Drag a client-decorated window on the guest's desktop.** §19.11 item 1. It
+   closes the only untested half of §19.7 and it is the run that says whether
    `ReleaseCapture` was the whole story.
 2. **`WM_NCCALCSIZE` and `DwmExtendFrameIntoClientArea`**, which is §15.15 item
-   1 and is now the only part of the goal clause left. Read §18.8 first: the
+   1 and is now the only part of the goal clause left. Read §19.8 first: the
    frame can be extended and the client's pixels can be blitted over it, and the
    corner cannot be given real caption buttons while Firefox insists on drawing a
-   close button there (§18.9). What that leaves is tabs in the caption with the
+   close button there (§19.9). What that leaves is tabs in the caption with the
    window's own buttons in the *extended* strip beside Firefox's close button, or
    `--decorations server` and one native bar. The second is what ships today.
-3. **Warn when the two levers disagree.** §18.11 item 3, and it is four lines.
-4. **The stale-stamp problem.** §18.6's box is the first time the guest-RAM
+3. **Warn when the two levers disagree.** §19.11 item 3, and it is four lines.
+4. **The stale-stamp problem.** §19.6's box is the first time the guest-RAM
    locate has failed repeatedly rather than once, and it failed *because the
    guest had been used*. `wc-arena-host` sweeps for a magic and a run id and
    reports how many pages carried the magic under a different id; that number is

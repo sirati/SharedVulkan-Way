@@ -147,15 +147,15 @@ grouped the window with the compositor's console window.
 WC_HOST=you@vm-host WC_HOST_FIREFOX=/path/to/firefox scripts/wc-titlebar.sh both
 ```
 
-**One title bar, and it is Windows'.** Until stage 13 every window had two —
+**One title bar, and it is Windows'.** Until stage 14 every window had two —
 Windows' caption, and directly beneath it Firefox's tab strip with its own
 minimise, maximise and close buttons. It takes two levers and neither works
 alone: the compositor sends `default_mode(2)` on the KDE decoration manager, and
 the client is started with `MOZ_GTK_TITLEBAR_DECORATION=none`. The second is in
 the *client's* environment and no protocol carries it, so the launcher sets it —
-`docs/design.md` §18.3 is the assumption written down. This script photographs
+`docs/design.md` §19.3 is the assumption written down. This script photographs
 the result on the guest's interactive desktop with the pixels in guest RAM, which
-is the run §17.11 item 4 asked for; `docs/stage13/stage13-server.png` is the
+is the run §17.11 item 4 asked for; `docs/stage14/stage14-server.png` is the
 picture and `scripts/wc-firefox.sh titlebar` is the same claim as protocol
 evidence.
 
@@ -208,15 +208,15 @@ scripts/
                      whole project is for. `enumerate` is the protocol
                      requirement list, read off a WAYLAND_DEBUG trace rather
                      than off a wiki; `window` counts the browser's own pixels;
-                     `titlebar` is stage 13's — the two levers that leave the
+                     `titlebar` is stage 14's — the two levers that leave the
                      window one title bar, with the control leg that shows
                      neither works alone; `menu` right-clicks and gets an
                      xdg_popup; `wine` puts the whole chain together and
                      produces an HWND. docs/stage9/
-  wc-titlebar.sh     the stage-13 acceptance test — the same claim photographed
+  wc-titlebar.sh     the stage-14 acceptance test — the same claim photographed
                      on the guest's **interactive desktop**, with the pixels in
                      the guest's own RAM. It is the intersection wc-guest.sh and
-                     wc-desktop.sh each have half of. docs/stage13/
+                     wc-desktop.sh each have half of. docs/stage14/
   probe-input.c      SendInput/PostMessage into the compositor's window, so the
                      keystrokes in that test are Win32's rather than ours
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux

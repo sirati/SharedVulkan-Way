@@ -80,12 +80,21 @@ OUT="$ROOT/docs/stage8"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
-DESKDIR='/c/Users/<guest-user>/wcdesk'
-DESKDIR_WIN='C:\Users\<guest-user>\wcdesk'
+# STAGE 13: named, not hard-coded, and it is §16.8's rule arriving here one
+# stage late. More than one experiment runs against this guest at a time, and a
+# fixed directory means one deploy overwrites another run's binaries in the
+# middle of it — which presents as the other run testing code nobody wrote. The
+# default is what every previous stage used, so nothing that ran before moves.
+DESKNAME="${WC_DESKNAME:-wcdesk}"
+DESKDIR="/c/Users/<guest-user>/$DESKNAME"
+DESKDIR_WIN="C:\\Users\\<guest-user>\\$DESKNAME"
 APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
 PORT="${WC_PORT_BASE:-57271}"
 
-# The stage-4 half: the machine that shares a filesystem with the guest.
+# The stage-4 half: the machine the VM runs on. It used to be described as "the
+# machine that shares a filesystem with the guest", and stage 13 demoted that:
+# the export still carries the frame dump and the logs, but **not the pixels**.
+# See `locate_arena` below and docs/design.md §18.2.
 HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage8}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc}"
@@ -93,6 +102,36 @@ SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc}"
 HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"
 HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"
 HOST_WESTON="${WC_HOST_WESTON:-}"
+
+# STAGE 13. The arena is guest RAM, always, and this is the block of settings
+# that makes that possible. It is `wc-guest.sh`'s block, with the same names and
+# the same defaults, because the two harnesses had drifted into testing two
+# different transports against the same guest and only one of them was the one
+# anything ships on.
+#
+# WHY THIS REPLACED `--arena 0:N:Z:\wc\arena` RATHER THAN JOINING IT.
+#
+# §10.3 measured the virtio-fs export incoherent for two live mappings — 65280
+# of 65536 bytes wrong, in both directions — and stage 7 replaced it with guest
+# RAM for `wc-guest.sh`. This script kept the file, and because it is the only
+# script that puts a window in front of a human, **the incoherent substrate was
+# the only one anyone ever looked at**. §18.1 is the photograph of what that
+# costs. There is deliberately no fallback: if the region cannot be located this
+# run fails and says so, because a run that quietly degrades to a file is how
+# this reached a user's screen with every check green.
+QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"            # QEMU's monitor, on WC_HOST
+VM_HINT="${WC_VM_HINT:-windows-vm}"                  # how to recognise its process
+ROOTC="${WC_ROOTC:-\$HOME/rootc}"                    # how WC_HOST becomes root
+ARENA_PAGES="${WC_ARENA_PAGES:-16384}"               # 64 MiB, in 4096-byte pages
+ARENA_OUTBOUND="${WC_ARENA_OUTBOUND:-1048576}"       # 1 MiB, the compositor's window
+ARENA_BYTES=$((ARENA_PAGES * 4096))
+
+# STAGE 13. Firefox, as an absolute path on WC_HOST, and the `wl_output` size to
+# advertise — `wc-guest.sh`'s block 11 settings, arriving here because
+# `docs/goal-firefox.md`'s client is the one whose defects this stage is about.
+# With it set, `window` runs Firefox instead of `$WC_CLIENT`.
+HOST_FIREFOX="${WC_HOST_FIREFOX:-}"
+OUTPUT_SIZE="${WC_OUTPUT:-1600x1000}"
 # Which unmodified client to put in the window. `weston-terminal` is the
 # `docs/goal-firefox.md` stand-in and is what the title and taskbar claims use;
 # `weston-presentation-shm` is the one the modal-resize check wants, because it
@@ -101,6 +140,15 @@ HOST_WESTON="${WC_HOST_WESTON:-}"
 # looks like the right choice and is not one: it draws its flower once.
 CLIENT="${WC_CLIENT:-weston-terminal}"
 CLIENT_TITLE="${WC_CLIENT_TITLE:-Wayland Terminal}"
+# STAGE 13. With `WC_HOST_FIREFOX` set the client is Firefox and the caption
+# assertion has to move with it: Firefox's title is the page's, not a constant.
+# Set here rather than at the call site so that a run cannot end up starting
+# Firefox and then asserting on `weston-terminal`'s caption, which is a green
+# run of the wrong test.
+if [ -n "$HOST_FIREFOX" ]; then
+  CLIENT="firefox"
+  CLIENT_TITLE="${WC_CLIENT_TITLE:-Mozilla Firefox}"
+fi
 SUFFIX="${WC_SUFFIX:-}"
 
 SSHOPT=(-o IdentityAgent="$AGENT" -o BatchMode=yes -o LogLevel=ERROR
@@ -117,6 +165,76 @@ miss() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
+
+# ------------------------------------------------------------ the arena ------
+# STAGE 13. Everything the guest-RAM transport needs, in one place, because
+# `do_window` and `do_fps` both need it and a second spelling of it is a second
+# thing to get wrong.
+#
+# The flags the compositor is started with. There is no `--shared-dir` here and
+# that is the point rather than an omission: with a guest-RAM arena the keymap
+# is cut out of the compositor's own outbound window (§14), so no `h` argument
+# is ever published on a filesystem and the export is not on the pixel path at
+# all. §12's `wc-guest.sh` has passed this way for two stages.
+ARENA_COMP_ARGS="--arena-guest-ram 0:$ARENA_BYTES --arena-outbound 0:$ARENA_OUTBOUND"
+
+# Find the region the compositor pinned, and write a plan the proxy can open.
+#   locate_arena <compositor-log-name-on-the-guest> <plan-path-on-WC_HOST>
+#
+# Ordering is the whole of it, and it is §12's: the guest allocates and stamps,
+# and only then can the host find the pages. The compositor prints its run id
+# *after* the stamps are written, so waiting for that line is waiting for the
+# region to be findable — a sweep started earlier returns zero pages, which
+# reads exactly like the arena not being shared at all.
+#
+# Polled over ssh rather than out of `$SHARE`, which is how `wc-guest.sh` does
+# it. That is deliberate: this is the one control path that decides whether the
+# run is on guest RAM, and reading it through the export would make the check
+# depend on the thing the check exists to stop using.
+#
+# Root, and only for this: QEMU is a system service on this host, so its QMP
+# socket and its `/proc/<pid>/fd` are root-only (§12.9).
+locate_arena() {
+  local log="$1" plan="$2"
+  local line="" runid="" pages="" t
+  for t in $(seq 1 40); do
+    line=$(g "cat $DESKDIR/$log 2>/dev/null" 2>/dev/null \
+           | grep -o "arena 0 provided from guest RAM: run 0x[0-9a-f]*, [0-9]* bytes, [0-9]* pages, locked=[a-z]*" \
+           | tail -1)
+    [ -n "$line" ] && break
+    sleep 2
+  done
+  if [ -z "$line" ]; then
+    bad "the compositor never reported a guest-RAM arena -- there is no fallback, so this run stops"
+    g "cat $DESKDIR/$log 2>/dev/null" 2>/dev/null | head -20 | sed 's/^/        /'
+    return 1
+  fi
+  note "$line"
+  runid=$(echo "$line" | grep -o "run 0x[0-9a-f]*" | cut -d' ' -f2)
+  pages=$(echo "$line" | grep -o "[0-9]* pages" | cut -d' ' -f1)
+  h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+$HOST_DIR/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $runid --pages $pages \
+  --outbound $ARENA_OUTBOUND --plan '$plan' >'$plan.log' 2>&1
+echo rc=\\\$? >>'$plan.log'
+chmod a+r '$plan.log' '$plan' 2>/dev/null; true\" | eval $ROOTC" >/dev/null 2>&1
+  h "cat $plan.log 2>/dev/null" >"$RUNDIR/locate.log" 2>&1
+  sed 's/^/        /' "$RUNDIR/locate.log" | head -12
+  if grep -q "^rc=0$" "$RUNDIR/locate.log" 2>/dev/null; then
+    ok "the arena is guest RAM, located through QEMU's flat view  <-- §18.2, and there is no file"
+    return 0
+  fi
+  bad "wc-arena-host did not locate the arena; refusing to fall back to a file on the export"
+  return 1
+}
+
+# The export must not be able to serve pixels behind this script's back. A
+# leftover `arena` file from a run of this harness before stage 13 is openable,
+# the right size, and completely silent -- so it is removed rather than trusted
+# not to be used.
+purge_arena_file() {
+  h "rm -f $SHARE/arena; rm -rf $SHARE/keymaps" >/dev/null 2>&1
+  true
+}
 
 # Run a command line on the interactive desktop and wait for it.
 #   int <name> <exe> <arguments-as-one-string>
@@ -183,6 +301,11 @@ comp_pid() {
 # Written here rather than kept as a file next to this script, for the same
 # reason `wc-guest.sh` generates its stage-4 driver: it is one half of this
 # script and editing it on the guest would fork it silently.
+# **The heredoc is quoted and must stay quoted.** Everything below is
+# PowerShell and is full of `$Exe`, `$env:` and `$_`; letting bash expand it
+# would replace half the script with empty strings. `__DESKDIR__` is therefore
+# substituted afterwards rather than interpolated here — STAGE 13, when the
+# directory stopped being one fixed name (§16.8).
 write_runint() { cat >"$1" <<'PS1'
 # Run a command on the interactive desktop of the logged-on session.
 # Generated by scripts/wc-desktop.sh; do not edit on the guest.
@@ -190,7 +313,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [string]$Arguments = "",
   [string]$Name = "wcdesk",
-  [string]$WorkDir = "C:\Users\<guest-user>\wcdesk",
+  [string]$WorkDir = "__DESKDIR__",
   [switch]$Wait,
   [int]$TimeoutSec = 120
 )
@@ -218,6 +341,10 @@ if ($Wait) {
   Unregister-ScheduledTask -TaskName $Name -Confirm:$false
 }
 PS1
+  # The one interpolation, done after the fact for the reason above. The
+  # backslashes are doubled first: a Windows path is full of them and sed
+  # reads `\U`, `\g` and friends in a replacement as instructions.
+  sed -i "s|__DESKDIR__|${DESKDIR_WIN//\\/\\\\}|" "$1"
 }
 
 # ---------------------------------------------------------------- deploy -----
@@ -250,10 +377,10 @@ do_deploy() {
   # the session that started it. Only this script's own copies are killed:
   # `wcdesk\wc-compositor.exe` is a different file from `wctest\`'s, which
   # another worktree may legitimately be running.
-  kill_ours wcdesk >/dev/null 2>&1
+  kill_ours "$DESKNAME" >/dev/null 2>&1
   g "taskkill //F //IM wc-desk.exe >/dev/null 2>&1; true" >/dev/null 2>&1
   g "mkdir -p $DESKDIR" || exit 1
-  scp "${SSHOPT[@]}" "$stage"/* "$GUEST:wcdesk/" >/dev/null || exit 1
+  scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DESKNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
   rm -rf "$stage"
   mkdir -p "$OUT"
@@ -265,7 +392,7 @@ do_deploy() {
 do_probe() {
   echo
   echo "== 1. the two window stations =="
-  g "cd wcdesk && ./wc-desk.exe station" >"$RUNDIR/station-ssh.txt" 2>&1
+  g "cd $DESKNAME && ./wc-desk.exe station" >"$RUNDIR/station-ssh.txt" 2>&1
   int wcstation "$DESKDIR_WIN\\wc-desk.exe" "station" >/dev/null 2>&1
   # A task's stdout goes nowhere, so the desktop run is done again with its
   # output redirected by the shell *it* starts.
@@ -296,7 +423,7 @@ do_probe() {
   echo "== 2. SetProcessDpiAwarenessContext, and why it is refused (§10.13 item 3) =="
   grep -E "dpi\.|screen\.primary" "$RUNDIR/station-desk.txt" |  g "cat $DESKDIR/shot.txt" >"$RUNDIR/shot.txt" 2>&1
   sed 's/^/        /' "$RUNDIR/shot.txt"
-  g "cd wcdesk && ./wc-desk.exe --unaware station" >"$RUNDIR/unaware-ssh.txt" 2>&1
+  g "cd $DESKNAME && ./wc-desk.exe --unaware station" >"$RUNDIR/unaware-ssh.txt" 2>&1
   int wcstation "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe --unaware station > $DESKDIR_WIN\\unaware.txt 2>&1" >/dev/null 2>&1
   g "cat $DESKDIR/unaware.txt" >"$RUNDIR/unaware-desk.txt" 2>&1
@@ -346,7 +473,7 @@ do_probe() {
 # exactly this (see flake.nix); a PNG is what a repository should hold.
 fetch() {
   local remote="$1" local_png="$2" caption="$3"
-  scp "${SSHOPT[@]}" "$GUEST:wcdesk/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
+  scp "${SSHOPT[@]}" "$GUEST:$DESKNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
     mkdir -p "$OUT"
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null \
@@ -371,7 +498,8 @@ do_window() {
     miss "WC_HOST unset: no window capture"
     return
   fi
-  [ -n "$HOST_WESTON" ] || { miss "WC_HOST_WESTON unset: no weston-terminal to run"; return; }
+  [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || {
+    miss "WC_HOST_WESTON and WC_HOST_FIREFOX both unset: no client to run"; return; }
 
   local sock="wg-s8-$$"
   # Stale compositors go **first**, before the frame directory is emptied. An
@@ -392,13 +520,22 @@ do_window() {
   # is the usual cause. Matched on the full path so that another worktree's
   # proxy, in its own directory, is left alone.
   h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true" >/dev/null 2>&1
-  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$HOST:$HOST_DIR/" >/dev/null || {
-    bad "could not copy wc-proxy to $HOST -- something is still holding it"; return; }
-  h "chmod +x $HOST_DIR/wc-proxy" >/dev/null
-
-  local arena=$((64 * 1024 * 1024))
-  h ": >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
-  h "rm -rf $SHARE/keymaps; mkdir -p $SHARE/keymaps; chmod 777 $SHARE/keymaps" >/dev/null
+  # STAGE 13: `wc-arena-host` as well, because the arena is now a fact about the
+  # hypervisor rather than about the filesystem and this is the program that
+  # turns the compositor's run id into pages the proxy can open.
+  # `wc-arena-host` is **not a workspace member** — it links shared_vulkan's
+  # `sv-hostd` and has its own lockfile, which is why `Cargo.toml` excludes it
+  # (see the comment there). So it is built by its own manifest, exactly as
+  # `wc-guest.sh` does, and a run that forgot to would fail at the locate with
+  # a missing file rather than at the copy.
+  local locator="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
+  if ! cargo build --manifest-path "$ROOT/crates/wc-arena-host/Cargo.toml" >"$RUNDIR/loc.log" 2>&1; then
+    bad "could not build wc-arena-host"; sed 's/^/        /' "$RUNDIR/loc.log" | tail -10; return
+  fi
+  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOST_DIR/" >/dev/null || {
+    bad "could not copy wc-proxy/wc-arena-host to $HOST -- something is still holding one"; return; }
+  h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
+  purge_arena_file
 
   # STAGE 6, and this block would not get a window without it. The compositor
   # advertises a `wl_seat` now, so a client that binds one is sent a
@@ -408,8 +545,12 @@ do_window() {
   # `weston-presentation-shm` does not, so exactly one of this script's two
   # clients would start failing and the other would not. That is the same shape
   # stage 7 hit in `wc-guest.sh` when stage 6 landed under it (§12.11), arriving
-  # here one merge later. §11.2 is the mechanism.
-  local keymap_extra="--shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/"
+  # here one merge later. §11.2 is the mechanism, and STAGE 13 is the stage that
+  # deletes the block: with a guest-RAM arena the keymap comes out of the
+  # compositor's own outbound window, so there is nothing to publish on a
+  # filesystem and nothing for the far side to open. If this run still gets a
+  # window with no `--shared-dir`, the last reason this harness needed a shared
+  # filesystem for *pixels* is gone -- the export keeps only the frame dump.
 
   # The compositor, on the desktop, detached: a scheduled task is not a child of
   # this ssh session and does not die with it.
@@ -418,8 +559,16 @@ do_window() {
   # UI thread woke up and repainted. That is the whole of the modal-loop check
   # below, and it is why the frames go to the *host's* filesystem where they can
   # be counted while the guest is busy.
+  #
+  # STAGE 13. `--timeout` grew from 210 to 330, and it is the locate that spends
+  # it: a 13 GiB sweep of the guest's memory is 2.4 s (§12.5) and the round trip
+  # through `rootc` and `systemd-run` around it is not. A compositor that timed
+  # out mid-run presents as a client that connected and then found the socket
+  # closed, which is a long way from the clock.
+  local out_extra=""
+  [ -n "$HOST_FIREFOX" ] && out_extra=" --output $OUTPUT_SIZE"
   int_bg wccomp "$DESKDIR_WIN\\wc-compositor.exe" \
-    "--socket $sock --timeout 210 --log $DESKDIR_WIN\\comp-$sock.log --arena 0:$arena:$SHARE_WIN\\arena --dump-frames $SHARE_WIN\\frames $keymap_extra" \
+    "--socket $sock --timeout 330 --log $DESKDIR_WIN\\comp-$sock.log $ARENA_COMP_ARGS --dump-frames $SHARE_WIN\\frames$out_extra" \
     >/dev/null 2>&1
   sleep 6
   # Everything below addresses windows by pid rather than by class. See
@@ -440,32 +589,98 @@ do_window() {
   note "our compositor is pid $CPID (socket $sock)"
 
   ssh "${SSHOPT[@]}" "$GUEST" \
-    "export MSYS_NO_PATHCONV=1; cd wcdesk && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 120" \
+    "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 120" \
     >"$RUNDIR/relay.log" 2>&1 &
   local relay=$!
   sleep 3
 
-  # The client and the proxy both live on WC_HOST, which is the machine that can
-  # see the arena. Driven from there because the arena is a filesystem fact.
+  # STAGE 13. The locate, which has to happen between the compositor starting
+  # and the proxy running: the guest allocates and stamps, the host then finds
+  # the pages. This is the step that did not exist while the arena was a file,
+  # and it is the whole difference between the two harnesses.
+  local plan="$HOST_DIR/$sock.plan"
+  if ! locate_arena "comp-$sock.log" "$plan"; then
+    kill $relay 2>/dev/null
+    kill_ours "$sock" >/dev/null 2>&1
+    return
+  fi
+
+  # The client and the proxy both live on WC_HOST, which is the machine the VM
+  # runs on -- and, not by coincidence, the machine the client runs on, because
+  # the client reaches the proxy over an AF_UNIX socket. See §18.5.
+  #
+  # STAGE 13: **as root, in a transient unit.** The proxy has to open
+  # `/proc/<qemu-pid>/fd/<n>` to reach the guest's pages, and QEMU is a system
+  # service here (§12.9), so the whole host side moves under `systemd-run
+  # --collect` rather than running as the invoking user. A root call that blocks
+  # for two minutes frequently comes back with no output at all; the unit's own
+  # files survive it, which is why the script signals completion with a file
+  # rather than with an exit code.
+  #
+  # The `ssh -L` forward stays with the *user*, outside the unit: root has no
+  # `$HOME/.ssh/wc_guest`, and root can open a user-owned socket node anyway.
+  local ffenv="" ffcmd="$HOST_WESTON/$CLIENT"
+  if [ -n "$HOST_FIREFOX" ]; then
+    # `wc-guest.sh`'s block-11 environment, arriving here for the same reasons,
+    # each of which cost a run there: `env -u DISPLAY` because with an X server
+    # reachable `MOZ_ENABLE_WAYLAND=1` is a *preference* and Firefox will
+    # quietly use X11; `HOME` and `XDG_RUNTIME_DIR` of its own because this unit
+    # is root and Firefox refuses to run as root in another user's session; a
+    # fresh `--profile` and `--no-remote` because an already-running Firefox
+    # would take the request and open a tab in *it*, which looks exactly like a
+    # client that connected and drew nothing.
+    # `$RUN/xdg` rather than `$RUN`, and the socket by **absolute path**: this
+    # is `wc-guest.sh`'s block-11 lesson and it cost this stage a run.
+    # Firefox checks the ownership of `$XDG_RUNTIME_DIR`, so it needs one of
+    # its own; but the proxy's socket is in `$RUN`, not in `$RUN/xdg`, and a
+    # bare `WAYLAND_DISPLAY=wl-proxy` is resolved against the runtime
+    # directory. The failure is `Failed to connect to Wayland display
+    # '…/xdg/wl-proxy': No such file or directory`, which reads as a proxy that
+    # never started. libwayland reads a `WAYLAND_DISPLAY` beginning with `/` as
+    # a path, and that is what separates the two.
+    ffenv="env -u DISPLAY HOME=\$RUN/home XDG_RUNTIME_DIR=\$RUN/xdg WAYLAND_DISPLAY=\$RUN/wl-proxy MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland"
+    ffcmd="$HOST_FIREFOX --no-remote --profile \$RUN/profile about:blank"
+  fi
   h "cd $HOST_DIR && cat > s8.sh <<'EOS'
 #!/usr/bin/env bash
 set -uo pipefail
-RUN=\$(mktemp -d /tmp/wc-s8-XXXXXX); chmod 700 \"\$RUN\"
+RUN=\$(mktemp -d /tmp/wc-s8-XXXXXX); chmod 755 \"\$RUN\"
+mkdir -p \"\$RUN/home\" \"\$RUN/profile\" \"\$RUN/xdg\"
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
     -N -L \"\$RUN/up.sock:127.0.0.1:$PORT\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
 sleep 4
 if [ -S \"\$RUN/up.sock\" ]; then
-  XDG_RUNTIME_DIR=\"\$RUN\" $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
-     --runtime-dir \"\$RUN\" --transport arena --arena-path $SHARE/arena --arena-id 0 \
-     --arena-size $arena --copy damage --accept-timeout 25 --timeout 90 >\"\$RUN/proxy.log\" 2>&1 &
-  PROXY=\$!
-  sleep 2
-  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy $HOST_WESTON/$CLIENT >\"\$RUN/cli.log\" 2>&1 &
-  CLI=\$!
+  cat > \"\$RUN/root.sh\" <<'INNER'
+#!/usr/bin/env bash
+export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+RUN=__RUN__
+export XDG_RUNTIME_DIR=\"\$RUN\"
+chown -R 0:0 \"\$RUN/home\" \"\$RUN/profile\" \"\$RUN/xdg\" 2>/dev/null
+chmod 700 \"\$RUN/xdg\" 2>/dev/null
+$HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
+   --runtime-dir \"\$RUN\" --transport arena --arena-plan $plan --arena-id 0 \
+   --copy damage --accept-timeout 25 --timeout 150 >\"\$RUN/proxy.log\" 2>&1 &
+P=\$!
+sleep 2
+# The bare WAYLAND_DISPLAY is the weston case; ffenv overrides it with an
+# absolute path for Firefox, and a later assignment wins. No backticks in this
+# comment: it is inside a double-quoted string and they would be run.
+WAYLAND_DISPLAY=wl-proxy $ffenv timeout 130 $ffcmd >\"\$RUN/cli.log\" 2>&1
+sleep 2
+kill \$P 2>/dev/null; wait 2>/dev/null
+chmod -R a+rwX \"\$RUN\" 2>/dev/null
+touch \"\$RUN/done\"
+INNER
+  sed -i \"s#__RUN__#\$RUN#\" \"\$RUN/root.sh\"
+  chmod 755 \"\$RUN/root.sh\"
+  UNIT=wc-s13-\$\$
+  echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+systemd-run --unit=\$UNIT --collect $(command -v bash 2>/dev/null || echo /bin/bash) \$RUN/root.sh >/dev/null 2>&1
+echo started\" | eval $ROOTC >/dev/null 2>&1
   echo S8-CLIENT-STARTED
-  sleep 120
-  kill \$CLI \$PROXY 2>/dev/null
+  for _ in \$(seq 1 150); do [ -f \"\$RUN/done\" ] && break; sleep 1; done
+  [ -f \"\$RUN/done\" ] || echo \"S8-FAIL: the host-side unit never finished\"
 else
   echo S8-FAIL: no forward socket
 fi
@@ -473,14 +688,15 @@ kill \$FWD 2>/dev/null
 sleep 1
 echo S8-PROXY-BEGIN; cat \"\$RUN/proxy.log\" 2>/dev/null; echo S8-PROXY-END
 echo S8-CLIENT-BEGIN; head -20 \"\$RUN/cli.log\" 2>/dev/null; echo S8-CLIENT-END
-rm -rf \"\$RUN\"
 EOS
 chmod +x s8.sh" >/dev/null
   h "$HOST_DIR/s8.sh" >"$RUNDIR/s8.log" 2>&1 &
   local drv=$!
 
-  # Give the client time to map, then photograph while it is up.
-  sleep 22
+  # Give the client time to map, then photograph while it is up. Firefox needs
+  # longer than a weston demo: §15.5 measured the first pixels arriving several
+  # seconds after the connection, and the window is a bad photograph until then.
+  if [ -n "$HOST_FIREFOX" ]; then sleep 40; else sleep 22; fi
   int wcwin "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe windows > $DESKDIR_WIN\\windows.txt 2>&1" >/dev/null 2>&1
   g "cat $DESKDIR/windows.txt" >"$RUNDIR/windows.txt" 2>&1
@@ -720,15 +936,23 @@ do_fps() {
     local port=$((PORT + pnum)); pnum=$((pnum + 1))
     [ "$mode" = coarse ] && extra=" --poll-coarse"
     kill_ours "wg-s8f" >/dev/null 2>&1
-    h "mkdir -p $SHARE $HOST_DIR; rm -rf $SHARE/keymaps; mkdir -p $SHARE/keymaps; chmod 777 $SHARE/keymaps" >/dev/null
-    local arena=$((64 * 1024 * 1024))
-    h ": >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
+    h "mkdir -p $SHARE $HOST_DIR" >/dev/null
+    # STAGE 13: guest RAM here too. This mode is about the poll loop's cadence
+    # and the transport is incidental to it -- which is exactly the argument
+    # that left the incoherent one in place for five stages. It is one flag.
+    purge_arena_file
     int_bg wcfps "$DESKDIR_WIN\\wc-compositor.exe" \
-      "--socket $sock --timeout $((secs + 60)) --log $DESKDIR_WIN\\fps-$mode.log --arena 0:$arena:$SHARE_WIN\\arena --shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/$extra" \
+      "--socket $sock --timeout $((secs + 150)) --log $DESKDIR_WIN\\fps-$mode.log $ARENA_COMP_ARGS$extra" \
       >/dev/null 2>&1
     sleep 8
+    local plan="$HOST_DIR/$sock.plan"
+    if ! locate_arena "fps-$mode.log" "$plan"; then
+      kill_ours "$sock" >/dev/null 2>&1
+      eval "fps_$mode=0"
+      continue
+    fi
     ssh "${SSHOPT[@]}" "$GUEST" \
-      "export MSYS_NO_PATHCONV=1; cd wcdesk && ./probe-relay.exe $port '$APPDATA_WIN\\$sock' --timeout $((secs + 40))" \
+      "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $port '$APPDATA_WIN\\$sock' --timeout $((secs + 40))" \
       >"$RUNDIR/relay-$mode.log" 2>&1 &
     local relay=$!
     sleep 3
@@ -741,29 +965,41 @@ do_fps() {
     h "cat > $HOST_DIR/s8fps.sh <<'EOS'
 #!/usr/bin/env bash
 set -uo pipefail
-RUN=\$(mktemp -d /tmp/wc-fps-XXXXXX); chmod 700 \"\$RUN\"
+RUN=\$(mktemp -d /tmp/wc-fps-XXXXXX); chmod 755 \"\$RUN\"
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
     -N -L \"\$RUN/up.sock:127.0.0.1:$port\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
 sleep 4
 if [ -S \"\$RUN/up.sock\" ]; then
-  XDG_RUNTIME_DIR=\"\$RUN\" $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
-    --runtime-dir \"\$RUN\" --transport arena --arena-path $SHARE/arena --arena-id 0 \
-    --arena-size $arena --copy damage --accept-timeout 20 --timeout $((secs + 15)) \
-    >\"\$RUN/proxy.log\" 2>&1 &
-  PROXY=\$!
-  sleep 2
-  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy timeout $secs \
-    $HOST_WESTON/weston-presentation-shm >\"\$RUN/cli.log\" 2>&1
-  sleep 2
-  kill \$PROXY 2>/dev/null
-  grep -o '[0-9]* commits, [0-9]* copies' \"\$RUN/proxy.log\" | tail -1
+  cat > \"\$RUN/root.sh\" <<'INNER'
+#!/usr/bin/env bash
+export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+RUN=__RUN__
+export XDG_RUNTIME_DIR=\"\$RUN\"
+$HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
+  --runtime-dir \"\$RUN\" --transport arena --arena-plan $plan --arena-id 0 \
+  --copy damage --accept-timeout 20 --timeout $((secs + 15)) >\"\$RUN/proxy.log\" 2>&1 &
+P=\$!
+sleep 2
+WAYLAND_DISPLAY=wl-proxy timeout $secs $HOST_WESTON/weston-presentation-shm >\"\$RUN/cli.log\" 2>&1
+sleep 2
+kill \$P 2>/dev/null; wait 2>/dev/null
+chmod -R a+rwX \"\$RUN\" 2>/dev/null
+touch \"\$RUN/done\"
+INNER
+  sed -i \"s#__RUN__#\$RUN#\" \"\$RUN/root.sh\"
+  chmod 755 \"\$RUN/root.sh\"
+  UNIT=wc-s13f-\$\$
+  echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+systemd-run --unit=\$UNIT --collect $(command -v bash 2>/dev/null || echo /bin/bash) \$RUN/root.sh >/dev/null 2>&1
+echo started\" | eval $ROOTC >/dev/null 2>&1
+  for _ in \$(seq 1 $((secs + 60))); do [ -f \"\$RUN/done\" ] && break; sleep 1; done
+  grep -o '[0-9]* commits, [0-9]* copies' \"\$RUN/proxy.log\" 2>/dev/null | tail -1
 else
   echo 'no forward socket'
 fi
 kill \$FWD 2>/dev/null
 wait 2>/dev/null
-rm -rf \"\$RUN\"
 EOS
 chmod +x $HOST_DIR/s8fps.sh" >/dev/null 2>&1
     h "$HOST_DIR/s8fps.sh" >"$RUNDIR/fps-$mode.host" 2>&1
@@ -778,7 +1014,7 @@ chmod +x $HOST_DIR/s8fps.sh" >/dev/null 2>&1
     eval "fps_$mode=\${n:-0}"
   done
   {
-    echo "client weston-presentation-shm, ${secs}s, arena over virtiofs, no --dump-frames"
+    echo "client weston-presentation-shm, ${secs}s, guest-RAM arena, no --dump-frames"
     echo "fine   (high-resolution waitable timer) $fps_fine frames"
     echo "coarse (--poll-coarse, Sleep)           $fps_coarse frames"
   } >"$OUT/fps.txt"

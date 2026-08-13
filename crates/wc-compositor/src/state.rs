@@ -38,7 +38,7 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
-// ADDED FOR STAGE 13: the edge a client names when it asks to be resized.
+// ADDED FOR STAGE 14: the edge a client names when it asks to be resized.
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 // ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
@@ -90,7 +90,7 @@ use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSour
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
-/// ADDED FOR STAGE 13, and it is the whole of docs/design.md §18.2. Until this
+/// ADDED FOR STAGE 14, and it is the whole of docs/design.md §19.2. Until this
 /// stage the answer was hard-coded to `Client`, on the reasoning that
 /// docs/goal-firefox.md wants Firefox painting its tabs into the title bar and
 /// only a client that draws a title bar can do that. The reasoning was right
@@ -100,7 +100,7 @@ use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSour
 ///
 /// So the mode is a flag with `Server` as its default — Windows' caption is a
 /// real server-side decoration and claiming it is the honest answer — and
-/// `Client` is what the frame-extension work of §18.7 is developed against.
+/// `Client` is what the frame-extension work of §19.7 is developed against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Decorations {
     /// Windows draws the caption; the client draws none. **The default.**
@@ -226,7 +226,7 @@ pub struct State {
     /// ADDED FOR STAGE 9. Both decoration protocols; see the import.
     _xdg_decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
-    /// ADDED FOR STAGE 13. Which mode is advertised as the manager default and
+    /// ADDED FOR STAGE 14. Which mode is advertised as the manager default and
     /// answered to anything that asks. See [`Decorations`].
     decorations: Decorations,
     /// Owns the seat: `SeatState` keeps every `Seat` it makes, so there is no
@@ -253,6 +253,34 @@ pub struct State {
     pointer_at: (f64, f64),
     /// Said once, the first time a client sets a cursor. See [`SeatHandler`].
     cursor_noted: bool,
+    /// The surface the client last handed to `wl_pointer.set_cursor`, if it
+    /// handed one over rather than naming a shape.
+    ///
+    /// ADDED FOR STAGE 13, and it exists for two jobs that are really one.
+    ///
+    /// A cursor surface arrives *empty*: `set_cursor` names it before the
+    /// client has attached a buffer to it, so the pixels turn up on a later
+    /// commit and there is no way to build an `HCURSOR` at the moment of the
+    /// request. Remembering which surface it was is what lets that commit be
+    /// recognised when it comes.
+    ///
+    /// And recognising it is also what makes the guarantee legible: a surface
+    /// in here is a cursor, is **never** composited into any window, and
+    /// it says so in the log the first time a client sets one. It was
+    /// *nearly* true by accident already — a cursor surface is nobody's
+    /// subsurface, so the tree walk in `compose_tree` never reached it — but
+    /// its pixels were still blitted into `staging` and kept there forever,
+    /// and "not reached by the current traversal" is not a property anybody
+    /// can rely on while the scene graph is still growing.
+    cursor_surface: Option<WlSurface>,
+    /// The popup that called `xdg_popup.grab`, if one is up.
+    ///
+    /// ADDED FOR STAGE 13. See [`XdgShellHandler::grab`] for what it is and
+    /// [`Self::dismiss_grab_if_outside`] for what it does.
+    popup_grab: Option<WindowId>,
+    /// Caps Lock and Num Lock as the system last reported them, carried in on
+    /// [`FromUi::KeyboardFocus`]. See [`Self::sync_locked_modifiers`].
+    locks: (bool, bool),
 
     ui: Ui,
     events: Receiver<FromUi>,
@@ -497,7 +525,7 @@ impl State {
             // it is `default_mode` on the *manager*, sent once at bind, rather
             // than the answer to any per-surface request: GTK 3 reads the
             // manager's default in `gdk_wayland_display_prefers_ssd()` and
-            // ignores what it is told about its own surface. §18.2.
+            // ignores what it is told about its own surface. §19.2.
             kde_decoration: KdeDecorationState::new::<State>(dh, decorations.kde()),
             decorations,
             seat_state,
@@ -507,6 +535,9 @@ impl State {
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
             cursor_noted: false,
+            cursor_surface: None,
+            popup_grab: None,
+            locks: (false, false),
             ui,
             events,
             sources: vec![Box::new(ShmSource)],
@@ -608,7 +639,10 @@ impl State {
                 FromUi::Activated { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
                 }
-                FromUi::KeyboardFocus { id, on } => self.set_keyboard_focus(id, on),
+                FromUi::KeyboardFocus { id, on, caps, num } => {
+                    self.locks = (caps, num);
+                    self.set_keyboard_focus(id, on)
+                }
                 FromUi::Key { id, keycode, pressed, time } => {
                     self.key(id, keycode, pressed, time)
                 }
@@ -660,6 +694,24 @@ impl State {
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
             keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+            // STAGE 13. The locks are Windows', and they are the half of the
+            // modifier state that key events cannot carry.
+            //
+            // Caps Lock and Num Lock are *locked* modifiers: their state is a
+            // property of the machine, it persists while our window is not
+            // focused, and the user can change it while we are not looking —
+            // pressing Caps Lock in another application changes it for
+            // everything, us included, and we see no key event at all. Inferred
+            // from the events we happen to have seen, our idea of the lock
+            // drifts out of step with the keyboard light, and the symptom is
+            // capital letters with the light off.
+            //
+            // So it is read from the system on every focus gain rather than
+            // tracked. The platform supplies it because only the platform can
+            // (`GetKeyState(VK_CAPITAL) & 1`), and it is carried on the focus
+            // event rather than polled, so that the headless platform can state
+            // it too.
+            self.sync_locked_modifiers();
         } else {
             // Only if it is *still* ours. A focus change is two messages, and
             // they can arrive in either order: Windows sends `WM_KILLFOCUS` to
@@ -671,8 +723,57 @@ impl State {
             }
             self.keyboard_focus = None;
             println!("wc-compositor: window {id} lost keyboard focus");
+            // STAGE 13, and it must happen **before** `set_focus(None)`.
+            //
+            // `wl_keyboard.leave` tells the *client* to treat every key as
+            // released, and that part was always right. What was wrong is that
+            // the compositor's own xkb state went on believing the keys were
+            // down — and it is the compositor's state that decides what the
+            // next `modifiers` event says.
+            //
+            // The sequence that bites: the user holds Ctrl, focus moves away
+            // (alt-tab, or a popup taking the foreground), the user releases
+            // Ctrl and the `WM_KEYUP` goes to whoever has focus now rather than
+            // to us, and focus comes back. smithay then sends `enter` with a
+            // pressed-keys array and a `modifiers` event that still has Ctrl
+            // depressed, and every keystroke from then on is Ctrl-modified
+            // until the user happens to press and release Ctrl over our window.
+            //
+            // `input_intercept` rather than `input`: this must not reach the
+            // client as ordinary key-up events. `leave` has already said what
+            // the client needs to hear, and a released key aimed at a surface
+            // that is losing focus is a key event with nowhere legitimate to
+            // go. The pressed set is read from smithay rather than tracked
+            // here, because a second copy is a second thing that can disagree —
+            // and disagreeing about which keys are down is the bug.
+            for keycode in keyboard.pressed_keys() {
+                keyboard.input_intercept::<(), _>(self, keycode, KeyState::Released, |_, _, _| ());
+            }
             keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
+    }
+
+    /// Take Caps Lock and Num Lock from the system rather than from history.
+    ///
+    /// ADDED FOR STAGE 13. See the call site in [`Self::set_keyboard_focus`]
+    /// for why this is read and not tracked. The depressed modifiers are left
+    /// alone: those *are* ours, they follow from key events we received, and
+    /// the focus-loss release above is what keeps them honest.
+    fn sync_locked_modifiers(&mut self) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        let (caps, num) = self.locks;
+        let mut mods = keyboard.modifier_state();
+        if mods.caps_lock == caps && mods.num_lock == num {
+            return;
+        }
+        println!(
+            "wc-compositor: locked modifiers from the system: caps {caps}, num {num} \
+             (were caps {}, num {})",
+            mods.caps_lock, mods.num_lock
+        );
+        mods.caps_lock = caps;
+        mods.num_lock = num;
+        keyboard.set_modifier_state(mods);
     }
 
     /// One key, in evdev numbering, to whatever has focus.
@@ -764,6 +865,9 @@ impl State {
 
     fn pointer_button(&mut self, id: WindowId, button: u32, pressed: bool, time: u32) {
         let pointer = self.pointer.clone();
+        if pressed {
+            self.dismiss_grab_if_outside(id);
+        }
         if self.pointer_focus != Some(id) {
             // A button from a window the pointer is not over. Reachable on
             // Win32 during a drag, where `SetCapture` keeps sending us the
@@ -794,8 +898,38 @@ impl State {
         time: u32,
     ) {
         let pointer = self.pointer.clone();
-        if self.pointer_focus != Some(id) {
+        // MADE DELIBERATE IN STAGE 13. This used to `return` silently, and that
+        // silence is why "the scroll wheel does nothing in Firefox" took a user
+        // report to find.
+        //
+        // The two systems disagree about who a wheel belongs to. **Win32 sends
+        // `WM_MOUSEWHEEL` to the window with keyboard focus**, not to the
+        // window under the cursor; Wayland delivers `wl_pointer.axis` to the
+        // surface with pointer focus, which *is* the one under the cursor. So
+        // `id` here is the focused window and need not be the window being
+        // pointed at.
+        //
+        // The root cause of the reported bug was not this line — it was leaked
+        // popup `HWND`s (see [`XdgShellHandler::popup_destroyed`]) sitting
+        // under the cursor, so `pointer_focus` was a stale menu while the wheel
+        // arrived for the toplevel. Fixing the popups fixed the scrolling, and
+        // that was confirmed by the user before this was touched. But a wheel
+        // arriving for a window that is not the pointer focus is a legitimate
+        // situation on Windows, and eating it without a word is what turned a
+        // one-line symptom into a hunt.
+        //
+        // So: deliver to whatever the pointer is actually over — which is what
+        // `pointer.axis` would do anyway, since `id` was never used to route —
+        // and say when the two disagree. A wheel with no pointer focus at all
+        // has nowhere to go and is still dropped.
+        let Some(over) = self.pointer_focus else {
             return;
+        };
+        if over != id {
+            println!(
+                "wc-compositor: wheel addressed to window {id} (Win32 focus), \
+                 delivered to window {over} (pointer focus)"
+            );
         }
         let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
         if v120_v != 0 || vertical != 0.0 {
@@ -806,6 +940,33 @@ impl State {
         }
         pointer.axis(self, frame);
         pointer.frame(self);
+    }
+
+    /// Dismiss the grabbing popup if the press landed anywhere else.
+    ///
+    /// ADDED FOR STAGE 13. A menu is closed by the compositor and not by the
+    /// client, because the client cannot see a click outside its own surfaces.
+    /// Without this a menu stays up until the application decides to take it
+    /// down, which for a click on the page behind it is never.
+    ///
+    /// The popup itself is not destroyed here. `popup_done` is a *request* —
+    /// the client destroys the object, and that arrives as
+    /// [`XdgShellHandler::popup_destroyed`], which is the only place a window
+    /// is removed. Tearing the `HWND` down from here as well would race the
+    /// client and leave the protocol object pointing at nothing.
+    fn dismiss_grab_if_outside(&mut self, clicked: WindowId) {
+        let Some(grabbing) = self.popup_grab else { return };
+        if grabbing == clicked {
+            return;
+        }
+        if let Some(Window { role: Role::Popup(p), .. }) = self.by_id(grabbing) {
+            println!(
+                "wc-compositor: click on window {clicked} outside the grab -> \
+                 window {grabbing} dismissed (xdg_popup.popup_done)"
+            );
+            p.send_popup_done();
+        }
+        self.popup_grab = None;
     }
 
     /// The user changed their Windows keyboard layout under a running client.
@@ -915,8 +1076,19 @@ impl State {
         if written.is_empty() {
             return;
         }
+        // STAGE 13. A cursor surface leaves here and never reaches
+        // `compose_tree`. Checked before the window test rather than after it,
+        // and by identity rather than by "it has no window", because the
+        // guarantee this stage owes the user is *this* one: a cursor is never
+        // content. The staging entry is dropped as well, so there is nothing
+        // left for a future traversal to find.
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.staging.remove(surface);
+            return;
+        }
         if !is_root_of_a_window {
-            // A subsurface of a window that has not mapped yet, or a cursor.
+            // A subsurface of a window that has not mapped yet, or a cursor
+            // surface for a seat that has since been given a different one.
             // The pixels are kept; there is nowhere to put them.
             return;
         }
@@ -1510,10 +1682,17 @@ impl SeatHandler for State {
         if !self.cursor_noted {
             self.cursor_noted = true;
             println!(
-                "wc-compositor: a client set a cursor ({image:?}); \
-                 client cursors are not drawn yet, the system arrow is shown instead"
+                "wc-compositor: a client set a cursor; cursor surfaces are never composited, \
+                 the pointer on screen is Windows'"
             );
         }
+        // The surface is *recorded*, not drawn. `commit` uses this to recognise
+        // a cursor's pixels and drop them before they can reach a window; see
+        // the check in `commit`, which also drops the staged pixels.
+        self.cursor_surface = match image {
+            CursorImageStatus::Surface(surface) => Some(surface),
+            CursorImageStatus::Hidden | CursorImageStatus::Named(_) => None,
+        };
     }
 }
 
@@ -1613,7 +1792,7 @@ impl XdgShellHandler for State {
         }
     }
 
-    // ADDED FOR STAGE 13. The three requests a client-decorated toplevel makes
+    // ADDED FOR STAGE 14. The three requests a client-decorated toplevel makes
     // when the user grabs its own title bar, all of which had smithay's empty
     // default until now — so a window drawn by Firefox could be closed and
     // maximised but could not be *moved*, and there was no other way to move it
@@ -1825,20 +2004,127 @@ impl XdgShellHandler for State {
         );
     }
 
+    /// The client destroyed an `xdg_popup`.
+    ///
+    /// ADDED FOR STAGE 13, and its absence made the desktop unusable.
+    /// **`XdgShellHandler::popup_destroyed` has an empty default body**, so
+    /// from stage 9 to here every popup Firefox opened left its `HWND` on the
+    /// screen forever. A live session accumulated three stale "New Tab"
+    /// tooltips at three positions, a context menu, an account panel and the
+    /// hamburger menu, all visible at once, over the page being read.
+    ///
+    /// Nothing errored and nothing was logged. The windows were real, mapped
+    /// and correctly painted; they were simply never taken away, and the frame
+    /// dumps looked healthy throughout. It is the clearest example this project
+    /// has produced of a defect that only a person looking at a screen can
+    /// find — and it caused two further symptoms that would have been chased
+    /// separately (§18.4).
+    ///
+    /// The body is [`Self::toplevel_destroyed`]'s and that is the point: the
+    /// two roles differ in how a window is *made* and not at all in how it is
+    /// unmade. A popup can hold the pointer focus — it is the window under the
+    /// cursor while a menu is open — and a pointer handle still pointing at a
+    /// destroyed surface sends `leave` to a dead object.
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let id = window.id;
+            if self.keyboard_focus == Some(id) {
+                self.set_keyboard_focus(id, false);
+            }
+            if self.pointer_focus == Some(id) {
+                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+            }
+            if self.popup_grab == Some(id) {
+                self.popup_grab = None;
+            }
+        }
+        if let Some(window) = self.windows.remove(surface.wl_surface()) {
+            self.staging.remove(surface.wl_surface());
+            println!(
+                "wc-compositor: xdg_popup destroyed -> window {} ({} frames presented)",
+                window.id, window.presented
+            );
+            self.ui.send(ToUi::Destroy { id: window.id });
+        }
+    }
+
+    /// `xdg_popup.grab`: the client wants this popup to own the pointer until
+    /// something outside it is clicked.
+    ///
+    /// IMPLEMENTED IN STAGE 13, and it is the other half of the stale-menu bug.
+    /// A menu is dismissed by *the compositor* — the client cannot see a click
+    /// that lands outside its own surfaces, so if nobody sends `popup_done` the
+    /// menu has no way to know it should go, and clicking elsewhere leaves it
+    /// on screen.
+    ///
+    /// What is recorded is the innermost grabbing popup only, not a stack. A
+    /// stack is what a submenu needs and it is more than this stage can prove:
+    /// dismissing the innermost popup makes the client destroy it, which
+    /// arrives at [`Self::popup_destroyed`] and clears the record, so a second
+    /// click dismisses the next one out. That is one click per level rather
+    /// than one click for all of them — a real difference from how a Linux
+    /// compositor behaves, written down rather than hidden.
     fn grab(
         &mut self,
-        _surface: PopupSurface,
+        surface: PopupSurface,
         _seat: wl_seat::WlSeat,
         _serial: smithay::utils::Serial,
     ) {
+        if let Some(id) = self.windows.get(surface.wl_surface()).map(|w| w.id) {
+            println!("wc-compositor: xdg_popup grab -> window {id} owns the pointer");
+            self.popup_grab = Some(id);
+        }
     }
 
+    /// `xdg_popup.reposition` (xdg-shell v3): move a popup that is already up.
+    ///
+    /// IMPLEMENTED IN STAGE 13. The empty body meant `xdg_popup.repositioned`
+    /// was never sent and the popup never moved, so a submenu that GTK
+    /// repositions because it would fall off the screen stayed where it was
+    /// first placed — off-screen, or on top of its parent.
+    ///
+    /// The protocol's order is fixed and all three parts are required:
+    /// `repositioned` with the client's token, then a `configure` with the new
+    /// rectangle, then the parent surface's `commit` applies it. A compositor
+    /// that sends only the configure leaves the client unable to match the
+    /// answer to its request, which for GTK means it ignores the move.
+    ///
+    /// The positioner's own arithmetic is used unchanged, exactly as
+    /// [`Self::new_popup`] does — anchor rectangle, anchor edge, gravity and
+    /// offset, which smithay implements from the XML. The constraint
+    /// adjustments are still not applied here (§18.6): this compositor does not
+    /// know where the parent window is on the Windows desktop, so it cannot
+    /// tell whether the result would be off-screen. Windows keeps an owned
+    /// `WS_POPUP` on the monitor by itself, which is why that has not bitten.
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        let rect = positioner.get_geometry();
+        let Some(&Window { id, .. }) = self.windows.get(surface.wl_surface()) else {
+            // A reposition for a popup we never mapped. Answering the token
+            // anyway is better than silence: the client is waiting for it.
+            surface.send_repositioned(token);
+            return;
+        };
+        println!(
+            "wc-compositor: xdg_popup reposition -> window {id} to {},{} {}x{} (token {token})",
+            rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+        );
+        surface.with_pending_state(|state| {
+            state.geometry = rect;
+        });
+        surface.send_repositioned(token);
+        let _ = surface.send_configure();
+        self.ui.send(ToUi::MovePopup {
+            id,
+            x: rect.loc.x,
+            y: rect.loc.y,
+            width: rect.size.w,
+            height: rect.size.h,
+        });
     }
 }
 
