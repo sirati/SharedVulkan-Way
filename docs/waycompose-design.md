@@ -12924,7 +12924,7 @@ present makes about eleven waits — `vkResetFences`, `vkQueueSubmit`,
 216.9 / 20 is 10.8. **The number was not approximately the slice. It was the
 slice, once per wait.**
 
-#### 35.6.1 The mitigation, and why it is not the fix
+#### 36.6.1 The mitigation, and why it is not the fix
 
 `Futex` grew a `first_slice` of 25 µs that doubles to the existing 20 ms
 ceiling, reset per park. Its virtue is that it needs to know nothing about the
@@ -12940,7 +12940,7 @@ fix. On the guest its first rung is 1 ms, not 25 µs, because `WaitOnAddress`
 takes whole milliseconds. The honest ceiling of this mechanism on the guest is
 ~11 ms a present — a factor of twenty, and no further.
 
-#### 35.6.2 The fix: a wake the hypervisor carries
+#### 36.6.2 The fix: a wake the hypervisor carries
 
 A virtio-serial port is a byte pipe between guest and host, and a write on one
 side is a virtqueue notification: a vmexit, an interrupt injected into the other
@@ -12971,12 +12971,50 @@ present on one machine, with no VM, no GPU and no Vulkan anywhere near it, out
 of nothing but eleven waits and a slice. What is left in the last row is the
 work itself, 180 µs × 11 — which is what a present costs locally.
 
-**This is a reproduction, not the guest number.** A socketpair stands in for the
-port. It is faithful in every respect that matters — a byte pipe where a write
-ends a blocked read — but 480 frames through a real VM is a different
-measurement and has not been taken.
+**That table is a reproduction, not a boundary measurement.** A socketpair
+stands in for the port, and it stands in correctly for the *mechanism* and not
+at all for the *cost*: a socketpair write is a function call into the same
+kernel, and a virtio-serial write is a vmexit. The entire argument rests on the
+second being small compared to a 20 ms slice, and a socketpair cannot show that.
 
-#### 35.6.3 No framing on the doorbell, deliberately
+#### 36.6.3 So it was measured across a real boundary
+
+`scripts/sv-bell-probe.sh`, on the development guest — `nix build .#svGuest`,
+whose RAM is a `memory-backend-memfd` and whose virtio-serial ports are the same
+mechanism `testhost` carries. The guest half echoes every byte; the host half
+sends one and times the round trip. Two ports on one controller, because the
+cold path is framed and the doorbell deliberately is not (§36.6.4).
+
+Round trip, 2,000 samples, µs:
+
+| | min | median | p99 | max |
+|---|---|---|---|---|
+| same kernel (the socketpair reproduction) | 1.5 | 1.9 | 3.3 | 27.9 |
+| **across the VM (virtio-serial)** | **13.5** | **17.6** | **32.6** | **603.0** |
+
+A doorbell is one way, and a round trip is what can be measured without two
+synchronised clocks — which across a VM boundary there is no cheap way to have.
+So the figure to carry is half the median:
+
+> **A doorbell crosses the hypervisor in ~9 µs.**
+
+Against the alternatives, per wait: the fixed 20 ms slice is **2,266×** that,
+and the ladder's 1 ms floor on the guest is **113×** it. Eleven waits — one
+present — is **0.10 ms of doorbell latency against 220 ms of slice**.
+
+A second run at 10,000 samples agreed on everything that matters (min 12.2,
+median 18.8 → 9.4 µs one way) and disagreed on the tail: p99 980 µs, max 6.5 ms.
+**That tail is the machine, not the transport**, and the control says so — the
+*same-kernel* baseline's max moved from 27.9 µs to 2,064 µs between the same two
+runs, on a workstation several agents share. A socketpair does not acquire a
+2 ms tail because of virtio.
+
+What this does not measure is a present. It measures the quantity a present was
+losing eleven times, which is the quantity that was in doubt; the 480-frame
+figure still wants re-running on the Windows guest, and `vkQueuePresentKHR` has
+other costs than waiting.
+
+#### 36.6.4 No framing on the doorbell, deliberately
 
 One byte, one wake; slot and lane packed into seven bits. Every other byte pipe
 in `sv-transport` carries a magic and a length (`stream.rs`) because a misparsed
