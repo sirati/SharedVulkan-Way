@@ -62,9 +62,15 @@ use windows_sys::Win32::Graphics::Gdi::{
     // ADDED FOR STAGE 9. `ClientToScreen` is filed under GDI rather than under
     // WindowsAndMessaging, which is where one would look for it.
     ClientToScreen,
+    // ADDED FOR STAGE 13, for per-pixel alpha on popups. `BLENDFUNCTION` and
+    // its two constants are filed under GDI even though the call that takes
+    // them, `UpdateLayeredWindow`, is filed under WindowsAndMessaging.
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    // ADDED FOR STAGE 13, for the locked modifiers. See `lock_on`.
+    GetKeyState, VK_CAPITAL, VK_NUMLOCK,
     GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -74,6 +80,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, ICONINFO, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MSG, SM_CXICON, SM_CXSCREEN, SM_CXSMICON, SM_CYICON, SM_CYSCREEN, SM_CYSMICON,
+    // ADDED FOR STAGE 13, for per-pixel alpha on popups. See `update_layered`.
+    UpdateLayeredWindow, ULW_ALPHA, WS_EX_LAYERED,
     SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
@@ -96,7 +104,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
-use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Foundation::{POINT, SIZE};
 
 use crate::input::{evdev, evdev_keycode};
 
@@ -760,11 +768,11 @@ unsafe extern "system" fn toplevel_proc(
         // the user's window manager is Windows and a compositor that decided
         // its own keyboard focus would be fighting it.
         WM_SETFOCUS => {
-            state.send(FromUi::KeyboardFocus { id: state.id, on: true });
+            state.send(FromUi::KeyboardFocus { id: state.id, on: true, caps: lock_on(VK_CAPITAL), num: lock_on(VK_NUMLOCK) });
             0
         }
         WM_KILLFOCUS => {
-            state.send(FromUi::KeyboardFocus { id: state.id, on: false });
+            state.send(FromUi::KeyboardFocus { id: state.id, on: false, caps: false, num: false });
             0
         }
 
@@ -795,6 +803,7 @@ unsafe extern "system" fn toplevel_proc(
             state.send(FromUi::Layout { name });
             0
         }
+
 
         WM_MOUSEMOVE => {
             state.on_mouse_move(lparam, message_time());
@@ -958,6 +967,35 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         ToUi::Map { id, width, height } => {
             if let Some(w) = window(ui, id) {
                 map_window(&w, width, height);
+            }
+        }
+        // ADDED FOR STAGE 13. `SWP_NOACTIVATE` and no `ShowWindow`: the window
+        // is already up, and re-showing it would flicker.
+        ToUi::MovePopup { id, x, y, width, height } => {
+            if let Some(w) = window(ui, id) {
+                let mut origin = POINT { x, y };
+                // SAFETY: live handles; `ClientToScreen` converts in place and
+                // the owner is the one set at creation.
+                unsafe {
+                    let owner = GetWindow(w.hwnd(), GW_OWNER);
+                    if !owner.is_null() {
+                        ClientToScreen(owner, &mut origin);
+                    }
+                    SetWindowPos(
+                        w.hwnd(),
+                        HWND_TOPMOST,
+                        origin.x,
+                        origin.y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE,
+                    );
+                }
+                update_layered(&w);
+                println!(
+                    "wc-compositor: window {id} repositioned to {},{} {width}x{height}",
+                    origin.x, origin.y
+                );
             }
         }
         ToUi::Present { id, damage } => {
@@ -1217,9 +1255,12 @@ fn create_window(
             // window was deactivated, and a GTK menu responds to that by
             // closing itself. `WS_EX_TOOLWINDOW` keeps it out of the taskbar
             // and out of alt-tab. ADDED FOR STAGE 9.
+            // `WS_EX_LAYERED` on a popup is STAGE 13's, and it is the one
+            // thing that gives a menu its shadow and its rounded corners
+            // instead of a black rectangle. See `update_layered`.
             match kind {
                 WindowKind::Toplevel => 0,
-                WindowKind::Popup { .. } => WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                WindowKind::Popup { .. } => WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             },
             class.as_ptr(),
             title_w.as_ptr(),
@@ -1293,7 +1334,15 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
                 height,
                 SWP_NOACTIVATE,
             );
-            if !w.mapped.replace(true) {
+            // STAGE 13: the bitmap **before** the window is shown. A layered
+            // window that has never been given one is not merely blank, it is
+            // undefined — and `ShowWindow` on it is a flash of whatever DWM had
+            // in that memory. `update_layered` is also what makes the window
+            // visible at all in the layered model, so a popup whose shadow is
+            // still empty is deliberately left hidden until it has pixels,
+            // which is the same rule the toplevel path already follows.
+            let painted = update_layered(w);
+            if painted && !w.mapped.replace(true) {
                 ShowWindow(w.hwnd(), SW_SHOWNOACTIVATE);
             }
         }
@@ -1458,8 +1507,189 @@ fn dump_frame(ui: &Rc<Ui>, w: &Rc<WindowState>) {
     }
 }
 
+/// Put the shadow on a layered window, alpha and all.
+///
+/// ADDED FOR STAGE 13, and it is the fix for a menu with a black border.
+///
+/// # What was wrong
+///
+/// `SetDIBitsToDevice` on a 32-bit `BI_RGB` DIB ignores the fourth byte —
+/// `map_window` has said so in every log since stage 3 (*"argb: alpha ignored
+/// by GDI, drawn opaque"*). For an opaque toplevel that costs nothing. For a
+/// GTK menu it is the whole appearance: the surface is `ARGB8888` and its
+/// outer margin is the client's drop shadow, fully transparent, so `A=0` pixels
+/// are drawn with whatever `R`, `G` and `B` happen to be — which for a cleared
+/// buffer is **black**. The rounded corners are the same pixels and the same
+/// black. It reads as a rendering bug in the client and it is our blit.
+///
+/// # Why a layered window rather than `AlphaBlend`
+///
+/// `AlphaBlend` composites the source against *what is already in the target
+/// DC*, and what is in a window's DC is that window's own background. It cannot
+/// show the desktop behind the window because the window is opaque to the
+/// system. Per-pixel transparency of a **window** is a window-manager property
+/// on Win32, and `WS_EX_LAYERED` plus `UpdateLayeredWindow` is the only
+/// mechanism for it: the bitmap becomes the window's shape and DWM composites
+/// it against whatever is behind.
+///
+/// # What it costs, and why only popups get it
+///
+/// `UpdateLayeredWindow` replaces `WM_PAINT` entirely and takes the **whole**
+/// window every time — damage cannot be used, so a layered window redraws
+/// everything on every commit. A menu is small and changes rarely. A toplevel
+/// is neither, and a layered toplevel would also lose its native frame, since
+/// the bitmap becomes the entire window and there is no non-client area left
+/// for Windows to draw a caption in. That is the opposite of what
+/// `docs/goal-firefox.md` asks for, so toplevels keep `SetDIBitsToDevice` and
+/// keep Windows' frame.
+///
+/// The toplevel's own transparent margin — GTK's shadow inset — is dealt with
+/// at the other end instead: `default_mode(Server)` (see `state.rs`) makes
+/// Firefox stop drawing one at all, which removes the pixels rather than
+/// compositing them.
+///
+/// # The alpha convention
+///
+/// `AC_SRC_ALPHA` is defined on **premultiplied** alpha, which is what
+/// `wl_shm`'s `ARGB8888` already is, so the bytes go across untouched. An
+/// `XRGB8888` surface has no alpha at all and its fourth byte is undefined;
+/// those are forced to 255, because a shaped window built from undefined bytes
+/// is a window with holes in it that move.
+fn update_layered(w: &Rc<WindowState>) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, SelectObject,
+    };
+
+    let (pixels, width, height, opaque) = {
+        let shadow = w.shadow.lock().unwrap_or_else(|e| e.into_inner());
+        if shadow.is_empty() || shadow.width() <= 0 || shadow.height() <= 0 {
+            return false;
+        }
+        (
+            shadow.pixels().to_vec(),
+            shadow.width(),
+            shadow.height(),
+            !shadow.format().has_alpha(),
+        )
+    };
+    let need = (width as usize) * (height as usize) * 4;
+    if pixels.len() < need {
+        return false;
+    }
+
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        biSizeImage: (width as u32) * (height as u32) * 4,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    };
+
+    // SAFETY: every handle below is checked before use and every one that is
+    // created is released on all paths.
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return false;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(
+            screen,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if mem.is_null() || dib.is_null() || bits.is_null() {
+            if !dib.is_null() {
+                DeleteObject(dib as _);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return false;
+        }
+        let dst = std::slice::from_raw_parts_mut(bits.cast::<u8>(), need);
+        dst.copy_from_slice(&pixels[..need]);
+        if opaque {
+            for px in dst.chunks_exact_mut(4) {
+                px[3] = 0xff;
+            }
+        }
+        let old = SelectObject(mem, dib as _);
+
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        // A null destination point keeps the window where it is, which is what
+        // `map_window` and `SetWindowPos` already decided; passing one here
+        // would make this a second authority on the window's position.
+        let ok = UpdateLayeredWindow(
+            w.hwnd(),
+            screen,
+            std::ptr::null(),
+            &size,
+            mem,
+            &src,
+            0,
+            &blend,
+            ULW_ALPHA,
+        ) != 0;
+
+        SelectObject(mem, old);
+        DeleteObject(dib as _);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        ok
+    }
+}
+
+/// Whether this window's pixels go through [`update_layered`].
+/// Whether a *locked* modifier is currently on.
+///
+/// ADDED FOR STAGE 13. **The low bit, not the high bit.** `GetKeyState`
+/// returns the physical up/down of the key in bit 15 and the toggle state in
+/// bit 0, and for Caps Lock it is the toggle that matters: the key is up
+/// almost all the time and the lock is on regardless. Reading the sign of the
+/// return value — the reflex, because that is how every other key is tested —
+/// reports the lock as off unless the user is holding the key down at the
+/// instant of the call.
+fn lock_on(vk: u16) -> bool {
+    // SAFETY: a virtual-key constant; the call has no pointer arguments.
+    unsafe { GetKeyState(vk as i32) & 1 != 0 }
+}
+
+fn is_layered(w: &Rc<WindowState>) -> bool {
+    matches!(w.kind, WindowKind::Popup { .. })
+}
+
 fn present(w: &Rc<WindowState>, damage: &[Rect]) {
     if !w.mapped.get() {
+        return;
+    }
+    // STAGE 13. A layered window has no `WM_PAINT`: its content is whatever
+    // was last handed to `UpdateLayeredWindow`, so invalidating a rectangle
+    // would do nothing at all and the menu would keep its first frame forever.
+    if is_layered(w) {
+        update_layered(w);
         return;
     }
     let (ox, oy) = w.frame.content_origin();

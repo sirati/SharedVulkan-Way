@@ -376,6 +376,13 @@ impl PumpInner {
                     }
                 }
             }
+            // ADDED FOR STAGE 13. Printed rather than acted on: there is no
+            // window manager here to move anything, and the thing worth
+            // asserting is that `xdg_popup.reposition` produced a move at all,
+            // which the harness can now read.
+            ToUi::MovePopup { id, x, y, width, height } => println!(
+                "wc-compositor: window {id} repositioned to {x},{y} {width}x{height}"
+            ),
             ToUi::Map { id, width, height } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;
@@ -550,7 +557,7 @@ impl PumpInner {
             click.button, click.x, click.y
         );
         send(FromUi::Activated { id, on: true });
-        send(FromUi::KeyboardFocus { id, on: true });
+        send(FromUi::KeyboardFocus { id, on: true, caps: false, num: false });
         send(FromUi::PointerEnter { id, x: click.x, y: click.y, time: t() });
         // A motion after the enter: GTK decides what is under the pointer from
         // the motion, and a press whose only position came from the enter
@@ -597,7 +604,7 @@ impl PumpInner {
         };
 
         println!("wc-compositor: [simulate-wm] window {id} keyboard focus");
-        send(FromUi::KeyboardFocus { id, on: true });
+        send(FromUi::KeyboardFocus { id, on: true, caps: false, num: false });
 
         println!("wc-compositor: [simulate-wm] window {id} pointer enter at {cx},{cy}");
         send(FromUi::PointerEnter { id, x: cx, y: cy, time: t() });

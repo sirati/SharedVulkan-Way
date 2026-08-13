@@ -196,6 +196,20 @@ pub enum ToUi {
         id: WindowId,
         icons: Vec<IconImage>,
     },
+    /// `xdg_popup.reposition`: an already-mapped popup moves.
+    ///
+    /// ADDED FOR STAGE 13. Separate from [`ToUi::Map`] because a popup that is
+    /// already on screen must not be re-shown — `ShowWindow` again would take
+    /// it through a hide/show and flicker — and separate from a resize because
+    /// the position is in the parent's coordinates and has to be converted
+    /// against the owner window, which only the platform can do.
+    MovePopup {
+        id: WindowId,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },
     /// The surface has committed its first buffer and may now be shown, at
@@ -275,7 +289,15 @@ pub enum FromUi {
     /// They usually move together and they are not the same thing: a window can
     /// be the active one while a child control holds the focus, and only the
     /// focus decides where a key goes.
-    KeyboardFocus { id: WindowId, on: bool },
+    /// Keyboard focus followed the foreground window.
+    ///
+    /// `caps` and `num` are STAGE 13's and travel with the focus rather
+    /// than being polled: they are *locked* modifiers, owned by the machine
+    /// and changeable while this process is not looking, so the only correct
+    /// time to read them is the moment focus is gained. Carrying them here
+    /// rather than calling `GetKeyState` from the Wayland thread is what keeps
+    /// the headless platform able to state them too.
+    KeyboardFocus { id: WindowId, on: bool, caps: bool, num: bool },
     /// A key went down or came up, in evdev numbering.
     Key {
         id: WindowId,
