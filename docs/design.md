@@ -2519,12 +2519,25 @@ Ahead of §9.11, because input reaches the guest differently again.
    one of the four shipped. Wine says `0x0809`; the guest is a different
    installation with different regional settings, and a user whose layout is not
    in the list gets American letters silently.
-3. **Whether the published directory is coherent across the boundary.** This is
-   §9.11 item 1 again with a different consumer: the keymap is a `SharedFile`,
-   and virtio-fs without DAX would give each side its own copy. A keymap is
-   written once and read once, so it is the *easiest* case for a filesystem to
-   get right — which makes it a good first measurement and a bad proof that
-   pixels will work.
+3. **Whether the published directory carries the keymap across the boundary at
+   all.** §9.11 item 1 again with a different consumer, and the *first* thing to
+   check on the guest, because a compositor whose clients die on connect is
+   worse than one that shows nothing.
+
+   The keymap's access pattern is much weaker than a pool's and that is the only
+   reason to expect it to work. `write_section` maps a view, copies, and
+   **unmaps before returning**; the proxy opens and reads the path afterwards.
+   So it is one closed write followed by one read, where a pool is two
+   simultaneously-mapped views of live pages. A mount that gives each side its
+   own copy of a *mapped* file may still carry a written-and-unmapped one.
+
+   The residual risk is precise and worth naming: §2.5's lifetime rule requires
+   the compositor to hold the section — and therefore the file handle — open for
+   as long as the keymap exists. So the write is closed but the file is not, and
+   whether that counts as closed is the filesystem's business rather than ours.
+   If it does not, the answer is not a bigger hammer on `SharedFile`: it is the
+   arena, which is what §9.10 item 2 already said and what the keymap can use
+   unchanged, because `Handle::create_shared` is the only place that decides.
 4. **Whether `WM_MOUSELEAVE` behaves.** `TrackMouseEvent` is a `comctl32`-era
    API and Wine's implementation is its own; a guest run that never produces
    `wl_pointer.leave` would mean the arm is not sticking.
