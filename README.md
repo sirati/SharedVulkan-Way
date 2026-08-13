@@ -159,6 +159,25 @@ is the run §17.11 item 4 asked for; `docs/stage17/stage17-server.png` is the
 picture and `scripts/wc-firefox.sh titlebar` is the same claim as protocol
 evidence.
 
+```
+WC_HOST=you@vm-host WC_HOST_FIREFOX=/path/to/firefox scripts/wc-titlebar.sh tabs
+```
+
+**The other arrangement: Firefox's tabs *inside* Windows' caption.** Stage 17's
+answer is server-side — Windows draws the caption and Firefox draws below it.
+Stage 29 is the client-side one, which is how Firefox on Windows actually looks:
+`WM_NCCALCSIZE` moves the client rectangle's top edge to the top of the window,
+so the client's tab strip *is* the title bar, and the frame stays the system's —
+real border, real shadow, real resize edges. The corner is the interesting part.
+The compositor draws no caption buttons of its own: it leaves the rectangle
+`DWMWA_CAPTION_BUTTON_BOUNDS` reports at zero alpha, which uncovers the ones DWM
+already drew, and forwards the frame's mouse messages to `DwmDefWindowProc` — so
+the buttons are Windows' own, and Windows 11's snap layouts work for the same
+reason they work anywhere else. `docs/stage29/pair-topstrip.png` is the two
+arrangements stacked and `docs/waycompose-design.md` §29 is the argument,
+including the thing that is still not solved: no Wayland protocol can tell
+Firefox that the corner is occupied.
+
 ## Layout
 
 ```
@@ -210,13 +229,20 @@ scripts/
                      than off a wiki; `window` counts the browser's own pixels;
                      `titlebar` is stage 17's — the two levers that leave the
                      window one title bar, with the control leg that shows
-                     neither works alone; `menu` right-clicks and gets an
-                     xdg_popup; `wine` puts the whole chain together and
-                     produces an HWND. docs/stage9/
-  wc-titlebar.sh     the stage-17 acceptance test — the same claim photographed
-                     on the guest's **interactive desktop**, with the pixels in
-                     the guest's own RAM. It is the intersection wc-guest.sh and
-                     wc-desktop.sh each have half of. docs/stage17/
+                     neither works alone; `tabs` is stage 29's client half —
+                     that under client-side decorations the shadow inset is real
+                     and the window is the geometry rectangle; `menu`
+                     right-clicks and gets an xdg_popup; `wine` puts the whole
+                     chain together and produces an HWND. docs/stage9/
+  wc-titlebar.sh     the stage-17 and stage-29 acceptance test — the same claims
+                     photographed on the guest's **interactive desktop**, with
+                     the pixels in the guest's own RAM. It is the intersection
+                     wc-guest.sh and wc-desktop.sh each have half of. Five legs:
+                     `server` and `client` are stage 17's, `tabs` is the caption
+                     folded into the client area, and `noglass` and `nobuttons`
+                     are its two controls — the same window with
+                     DwmExtendFrameIntoClientArea off, and with the caption
+                     buttons left covered. docs/stage17/, docs/stage29/
   probe-input.c      SendInput/PostMessage into the compositor's window, so the
                      keystrokes in that test are Win32's rather than ours
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux

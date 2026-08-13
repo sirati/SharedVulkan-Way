@@ -129,6 +129,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // screensaver half of `zwp_idle_inhibit_manager_v1`.
     FlashWindowEx, GetForegroundWindow, IsIconic, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG,
     FLASHW_TRAY, SC_MONITORPOWER, WM_SYSCOMMAND,
+    // ADDED FOR STAGE 29: the caption folded into the client area. These four
+    // messages and six metrics are the whole of it — see `nccalcsize` and
+    // `nchittest`. `SWP_FRAMECHANGED` is what makes a window that already
+    // exists ask `WM_NCCALCSIZE` again, and without it the fold happens on the
+    // *next* resize instead of at map, which looks like a compositor that
+    // works only after the user grabs a corner.
+    GWL_STYLE, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER,
+    SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOSIZE, WM_DPICHANGED, WM_NCCALCSIZE,
+    WM_NCHITTEST, WS_MAXIMIZE,
+    // The five DWM cares about. `WM_NCHITTEST` is handled on its own path
+    // because it has an answer to fall back to; these five are pure forwarding.
+    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONUP,
 };
 // ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
 // rather than anywhere near the window APIs, because it is not about a window:
@@ -264,6 +276,11 @@ struct WindowState {
     /// How many frames this window has presented, for the dump filenames.
     frames: Cell<u32>,
     icon_small: Cell<isize>,
+    /// ADDED FOR STAGE 29. How many pixels of top frame `DefWindowProc` wanted
+    /// the last time it was asked, which is how many `WM_NCCALCSIZE` handed to
+    /// the client. Recorded rather than computed because it is the *window's*
+    /// number at the *window's* DPI, and `top_inset()`'s is the desktop's.
+    nc_top: Cell<i32>,
 
     // --- input, stage 6 ---------------------------------------------------
     /// Whether `TrackMouseEvent` is currently armed for this window.
@@ -343,7 +360,6 @@ impl WindowState {
             return;
         }
         let (w, h) = (shadow.width(), shadow.height());
-        let (ox, oy) = self.frame.content_origin();
 
         let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -370,8 +386,8 @@ impl WindowState {
         unsafe {
             SetDIBitsToDevice(
                 hdc,
-                ox,
-                oy,
+                0,
+                0,
                 w as u32,
                 h as u32,
                 0,
@@ -382,6 +398,57 @@ impl WindowState {
                 &bmi,
                 DIB_RGB_COLORS,
             );
+        }
+        self.uncover_caption_buttons(hdc);
+    }
+
+    /// Give the caption buttons back to DWM, by making the pixels over them
+    /// **transparent**.
+    ///
+    /// ADDED FOR STAGE 29, and it is the whole mechanism by which a window with
+    /// a custom frame keeps the system's real buttons.
+    ///
+    /// # Why a `FillRect` with black is a hole rather than a black rectangle
+    ///
+    /// Inside a region handed to `DwmExtendFrameIntoClientArea`, DWM composites
+    /// the window's pixels over the frame it drew — buttons and all — using the
+    /// **per-pixel alpha** in the redirection surface. GDI has no notion of
+    /// alpha: every drawing call writes zero into the fourth byte, which is the
+    /// long-standing wart that made "glass" work at all in the first place. So
+    /// `FillRect` here writes `alpha = 0` over the button strip, DWM's own
+    /// caption buttons show through it, and the client's pixels keep the rest
+    /// of the caption because `SetDIBitsToDevice` copied the client's own
+    /// `alpha = 255` there.
+    ///
+    /// That asymmetry is not folklore in this codebase: it is measured, in
+    /// §29.6, by a run of the same window with `--dwm-glass off`, where the
+    /// same `FillRect` produces an actual black rectangle because there is no
+    /// extended frame for anything to show through.
+    ///
+    /// Nothing happens for a client-decorated window that did not ask for the
+    /// fold, and nothing happens when DWM declines to say where its buttons
+    /// are — see `caption_button_rect`.
+    fn uncover_caption_buttons(&self, hdc: HDC) {
+        if !self.frame.extend_top || !self.frame.caption_buttons {
+            return;
+        }
+        let Some(mut rc) = caption_button_rect(self.hwnd()) else {
+            return;
+        };
+        // Down to the bottom of the strip that was folded in, not to the
+        // bottom DWM reported. The two differ by a pixel or two of rounding at
+        // 100% and by more at 150%, and the pixels between them are a sliver of
+        // the client's own title bar showing under the close button — which
+        // reads as a caption button that has been cut off rather than as an
+        // off-by-one. The client's tab strip is taller than the system caption
+        // either way (§29.8) and that is a different problem.
+        rc.bottom = rc.bottom.max(self.nc_top.get());
+        // SAFETY: a fresh stock-black brush over a rectangle inside this
+        // window's client area, on the DC `BeginPaint` supplied.
+        unsafe {
+            let brush = CreateSolidBrush(0);
+            FillRect(hdc, &rc, brush as HBRUSH);
+            DeleteObject(brush as _);
         }
     }
 
@@ -400,7 +467,6 @@ impl WindowState {
             };
             (shadow.width(), shadow.height())
         };
-        let (ox, oy) = self.frame.content_origin();
 
         let mut rc: RECT = unsafe { std::mem::zeroed() };
         // SAFETY: live window, `rc` written by the call.
@@ -412,7 +478,7 @@ impl WindowState {
         unsafe {
             let brush = CreateSolidBrush(BACKGROUND);
             if w > 0 && h > 0 {
-                ExcludeClipRect(hdc, ox, oy, ox + w, oy + h);
+                ExcludeClipRect(hdc, 0, 0, w, h);
             }
             FillRect(hdc, &rc, brush as HBRUSH);
             DeleteObject(brush as _);
@@ -449,7 +515,10 @@ impl WindowState {
             }
         }
 
-        let (w, h) = self.frame.surface_size_for(client_w, client_h);
+        // The client area **is** the surface, in both frame arrangements: with
+        // the caption folded in, `WM_NCCALCSIZE` grew the client rectangle
+        // rather than shifting the content inside it. See `FrameStyle`.
+        let (w, h) = (client_w.max(0), client_h.max(0));
         if w <= 0 || h <= 0 || (w, h) == self.last_configured.get() {
             return;
         }
@@ -471,15 +540,15 @@ impl WindowState {
 
     /// A client-area point, in the surface's own coordinates.
     ///
-    /// The subtraction is [`FrameStyle::content_origin`] and it is not
-    /// decoration: once `DwmExtendFrameIntoClientArea` moves the content origin
-    /// up into the caption, a click at client `y = 0` is *above* the surface and
-    /// the client must be told a negative number or told nothing. Routing every
-    /// coordinate through the same conversion the blit uses is what keeps the
-    /// pointer and the pixels agreeing about where the surface is.
+    /// The identity, and STAGE 29 is where that stopped being an accident of
+    /// `extend_top` being zero and became a fact about both arrangements: the
+    /// caption is folded in by moving the *client rectangle's* top edge, so the
+    /// client origin is the surface origin whether or not the fold happened. A
+    /// click on the tab strip inside the caption arrives at client `y = 4` and
+    /// is surface `y = 4`, which is why nothing on the input path needed a
+    /// branch. See [`FrameStyle`] for what stage 3 assumed instead.
     fn to_surface(&self, x: i32, y: i32) -> (f64, f64) {
-        let (ox, oy) = self.frame.content_origin();
-        (f64::from(x - ox), f64::from(y - oy))
+        (f64::from(x), f64::from(y))
     }
 
     /// `WM_MOUSEMOVE`. Also where the pointer *enters*, because Win32 has no
@@ -813,10 +882,48 @@ unsafe extern "system" fn toplevel_proc(
     // a Win32 call reenters, and a shared reference is the only sound shape.
     let state: &WindowState = unsafe { &*ptr };
 
+    // ADDED FOR STAGE 29, and ahead of the `match` because both arms fall back
+    // to `DefWindowProc`'s own answer rather than replacing it, and an arm that
+    // has to say "otherwise do what you would have done" is clearer as an
+    // `Option` than as a duplicated tail. Neither does anything at all unless
+    // `--decorations tabs` asked for it.
+    if msg == WM_NCCALCSIZE && let Some(r) = nccalcsize(state, hwnd, wparam, lparam) {
+        return r;
+    }
+    if msg == WM_NCHITTEST && let Some(r) = nchittest(state, hwnd, wparam, lparam) {
+        return r;
+    }
+    // The caption buttons are DWM's, so their *behaviour* is DWM's too. These
+    // five messages carry the hover highlight, the pressed state, the click and
+    // the caption's right-click menu, and `DwmDefWindowProc` is the only thing
+    // that can act on them — the buttons are pixels this process never drew and
+    // whose rectangles it learns by asking (`caption_button_rect`). A window
+    // that hit-tests them and does not forward these gets buttons that respond
+    // to nothing, which is worse than not having them.
+    if state.frame.extend_top
+        && state.frame.caption_buttons
+        && matches!(
+            msg,
+            WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCRBUTTONUP
+        )
+        && let Some(r) = dwm_defwindowproc(hwnd, msg, wparam, lparam)
+    {
+        return r;
+    }
+
     match msg {
         WM_PAINT => {
             state.paint();
             0
+        }
+        // The frame's thickness is a per-monitor quantity, so a window dragged
+        // between a 100% and a 150% display has a different caption to fold in
+        // than the one it was created with. Re-asking is one call and the
+        // alternative is a title bar that is the other monitor's height until
+        // something else happens to invalidate the frame.
+        WM_DPICHANGED => {
+            apply_frame(state);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_ERASEBKGND => {
             state.erase(wparam as HDC);
@@ -1553,13 +1660,10 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         }
         ToUi::WindowMenu { id, x, y } => {
             if let Some(w) = window(ui, id) {
-                // Surface coordinates to screen coordinates, through the same
-                // origin the input path uses in reverse.
-                let (ox, oy) = w.frame.content_origin();
-                let mut p = POINT {
-                    x: x + ox,
-                    y: y + oy,
-                };
+                // Surface coordinates to screen coordinates. Surface and client
+                // coordinates are the same thing (`to_surface`), so this is
+                // `ClientToScreen` and nothing else.
+                let mut p = POINT { x, y };
                 // SAFETY: a live window handle; `ClientToScreen` converts in
                 // place. The result is packed into an `LPARAM` the way
                 // `WM_CONTEXTMENU` packs one, because that is what the handler
@@ -1791,6 +1895,7 @@ fn create_window(
         icon_big: Cell::new(0),
         frames: Cell::new(0),
         icon_small: Cell::new(0),
+        nc_top: Cell::new(0),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
@@ -1867,10 +1972,398 @@ fn create_window(
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(state.clone()) as isize);
     }
+    // ADDED FOR STAGE 29, and it has to be *after* the line above: the
+    // `WM_NCCALCSIZE` that `CreateWindowExW` already sent arrived while
+    // `GWLP_USERDATA` was still 0, so `toplevel_proc` saw no state and let
+    // `DefWindowProc` build an ordinary frame. This is the first moment the
+    // window can be asked the question again with an answer available.
+    apply_frame(&state);
     ui.windows.borrow_mut().insert(id, state);
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 29: the caption, folded into the client area
+// ---------------------------------------------------------------------------
+//
+// The goal document's second clause is Firefox's tab strip *inside* the
+// window's own title bar rather than beneath it, which is what Firefox on
+// Windows does natively. Three pieces do it, and only the first is
+// load-bearing:
+//
+// 1. `WM_NCCALCSIZE` moves the client rectangle's **top edge** up to the top of
+//    the window, so the caption's pixels belong to the client area. Everything
+//    else — the side borders, the bottom border, the shadow, the rounded
+//    corners, the snap-to-edge behaviour, `SC_MOVE`, `SC_SIZE`, the system menu
+//    — is still Windows', because the window is still a plain
+//    `WS_OVERLAPPEDWINDOW` and nothing else about the frame was touched.
+// 2. `WM_NCHITTEST` puts the top resize edge back. It was non-client until item
+//    1 took it, and a window that cannot be resized from the top is a
+//    regression a picture does not show.
+// 3. `DwmExtendFrameIntoClientArea` asks DWM to keep drawing its frame behind
+//    the strip. This one is optional and `--dwm-glass off` is how that was
+//    measured rather than assumed; see `FrameStyle::dwm_glass`.
+//
+// **What is deliberately not here is `HTCAPTION`.** §22.8 is the reason and it
+// is a protocol fact: Wayland has no way for a client to publish its draggable
+// region, so this compositor cannot know which parts of Firefox's tab strip are
+// a title bar and which are a tab. Every drag therefore arrives as
+// `xdg_toplevel.move` after the click, which §22.7 wired, and the surface stays
+// `HTCLIENT` throughout. §29.7 says what that costs.
+
+/// `DWMWA_CAPTION_BUTTON_BOUNDS`, the fifth `DWMWINDOWATTRIBUTE`.
+///
+/// Asking Windows where it drew its own minimise, maximise and close buttons.
+/// There is no other way to know: the strip's width is the theme's, the DPI's
+/// and — on Windows 11 — the *build's*, and every hard-coded
+/// `3 * SM_CXSIZE` in the wild is wrong on some machine.
+const DWMWA_CAPTION_BUTTON_BOUNDS: u32 = 5;
+
+/// `MARGINS`, declared here rather than imported.
+///
+/// `windows-sys` files it under `Win32::UI::Controls` — with the common
+/// controls, because that is where `Uxtheme.h` puts it — and pulling that
+/// feature in for four `i32`s would add a large module to every build, which is
+/// the same trade `WM_MOUSELEAVE` above is written out for.
+#[repr(C)]
+struct Margins {
+    left: i32,
+    right: i32,
+    top: i32,
+    bottom: i32,
+}
+
+/// The thickness of the resize border Windows draws around a sizing window.
+///
+/// `SM_CXSIZEFRAME` alone is 4 px on a themed desktop and is *not* the grab
+/// area: since Vista the sensitive band is that plus `SM_CXPADDEDBORDER`, which
+/// is the invisible padding that makes an 8 px target out of a 4 px line. A
+/// hit-test written against `SM_CXSIZEFRAME` on its own produces a window whose
+/// top edge can be grabbed only by pixel-perfect aiming, which reads as a
+/// resize that "sometimes" works.
+fn frame_border() -> (i32, i32) {
+    // SAFETY: `GetSystemMetrics` takes an index and returns an int.
+    unsafe {
+        let pad = GetSystemMetrics(SM_CXPADDEDBORDER);
+        (
+            GetSystemMetrics(SM_CXSIZEFRAME) + pad,
+            GetSystemMetrics(SM_CYSIZEFRAME) + pad,
+        )
+    }
+}
+
+/// The top frame this theme wants, in pixels: caption, buttons and top border.
+///
+/// Measured with `AdjustWindowRectEx` rather than assembled out of
+/// `SM_CYCAPTION` and the border metrics, for the reason `map_window` already
+/// gives: the sum of the metrics is not what Windows uses, and on a themed or
+/// scaled desktop it is not even close. Only used for the DWM margin and for
+/// the log line; the number `WM_NCCALCSIZE` needs is taken from
+/// `DefWindowProc`'s own answer, which is correct at any DPI by construction.
+fn top_inset() -> i32 {
+    let mut rc = RECT { left: 0, top: 0, right: 100, bottom: 100 };
+    // SAFETY: `rc` is written in place; the style matches `create_window`'s.
+    unsafe {
+        AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0);
+    }
+    -rc.top
+}
+
+fn is_maximized(hwnd: HWND) -> bool {
+    // SAFETY: a live window handle. `GWL_STYLE` is a plain read.
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+    style & WS_MAXIMIZE != 0
+}
+
+/// `WM_NCCALCSIZE`, and it is the whole of the arrangement.
+///
+/// Returns `None` when this window is not extended, which leaves
+/// `DefWindowProc` in charge and is stage 17's window exactly.
+///
+/// # The three lines, in the order they matter
+///
+/// **The requested window rectangle is read before `DefWindowProc` runs**,
+/// because `DefWindowProc` overwrites `rgrc[0]` in place: on entry it is the
+/// window rectangle Windows is proposing, on exit it is the client rectangle it
+/// decided on. The number this function needs — where the *window* starts — is
+/// only available before the call.
+///
+/// **`DefWindowProc` still runs.** Returning a client rectangle out of nothing
+/// would have to reproduce the side and bottom insets, which are the theme's
+/// and the DPI's, and would get the maximised case wrong. Letting Windows do
+/// the ordinary arithmetic and then moving one edge is the smallest change that
+/// can be correct.
+///
+/// **A maximised window is inset by the border and a restored one is not.** A
+/// maximised `WS_OVERLAPPEDWINDOW` is deliberately larger than the work area by
+/// the resize border on every side — that is how Windows hides the border off
+/// the edge of the screen — so a client rectangle whose top is the window's top
+/// starts `SM_CYSIZEFRAME + SM_CXPADDEDBORDER` pixels *above the monitor*. The
+/// visible symptom is a tab strip with its first row of pixels cut off, only
+/// when maximised, which is exactly the kind of thing a single screenshot of a
+/// restored window does not show.
+fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    if !state.frame.extend_top || wparam == 0 || matches!(state.kind, WindowKind::Popup { .. }) {
+        return None;
+    }
+    let params = lparam as *mut NCCALCSIZE_PARAMS;
+    if params.is_null() {
+        return None;
+    }
+    // SAFETY: with `wParam` non-zero the `LPARAM` is an `NCCALCSIZE_PARAMS`
+    // owned by the caller and valid for the duration of the message. Read
+    // first, then written once, and never aliased — `DefWindowProcW` writes
+    // through the same pointer, which is why the read happens before the call.
+    unsafe {
+        let window_top = (*params).rgrc[0].top;
+        let r = DefWindowProcW(hwnd, WM_NCCALCSIZE, wparam, lparam);
+        let ordinary_top = (*params).rgrc[0].top;
+        let inset = if is_maximized(hwnd) { frame_border().1 } else { 0 };
+        (*params).rgrc[0].top = window_top + inset;
+        state.nc_top.set(ordinary_top - window_top);
+        Some(r)
+    }
+}
+
+/// `WM_NCHITTEST`, and it exists only to put the top resize edge back.
+///
+/// `DefWindowProc` answers first and its answer is kept for everything it still
+/// owns — the side and bottom borders, the corners, and `HTNOWHERE` outside the
+/// window. The only case that is overridden is the one `WM_NCCALCSIZE` created:
+/// a band at the top of the window that used to be non-client and now reports
+/// `HTCLIENT`, because the client area starts there.
+///
+/// A maximised window is left alone: it has no top edge to drag, and returning
+/// `HTTOP` there would put a resize cursor over the first eight pixels of the
+/// tab strip for no reason.
+///
+/// **DWM is asked before anything else**, and that is what puts the caption
+/// buttons back. `DwmDefWindowProc` answers `HTMINBUTTON`, `HTMAXBUTTON` or
+/// `HTCLOSE` for a point over the buttons it drew, and Windows 11 raises the
+/// snap-layouts flyout on a hover that hit-tests as `HTMAXBUTTON` — so this one
+/// call is the difference between §22.8's documented casualty and a window that
+/// snaps like any other. See `dwm_defwindowproc`.
+///
+/// **No `HTCAPTION`, and this part of §22.8 does still stand.** The compositor
+/// cannot know which parts of Firefox's tab strip are draggable, because
+/// Wayland has no protocol by which a client publishes its draggable region, so
+/// the strip stays `HTCLIENT` and a drag arrives afterwards as
+/// `xdg_toplevel.move` (§22.7). The buttons are a different question and have a
+/// different answer only because they are *Windows'* buttons.
+fn nchittest(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    if !state.frame.extend_top || matches!(state.kind, WindowKind::Popup { .. }) {
+        return None;
+    }
+    if state.frame.caption_buttons
+        && let Some(r) = dwm_defwindowproc(hwnd, WM_NCHITTEST, wparam, lparam)
+    {
+        return Some(r);
+    }
+    // SAFETY: a live window handle; `wr` is written in place.
+    let hit = unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, wparam, lparam) };
+    if hit as u32 != HTCLIENT || is_maximized(hwnd) {
+        return Some(hit);
+    }
+    // Screen coordinates, signed: a window can be at a negative x on a
+    // left-hand monitor, and the classic bug is an `as u16` that turns -3 into
+    // 65533 and puts the hit test on the wrong side of the desktop.
+    let x = (lparam & 0xffff) as i16 as i32;
+    let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: live window handle; the rectangle is written in place.
+    unsafe {
+        GetWindowRect(hwnd, &mut wr);
+    }
+    let (bx, by) = frame_border();
+    if y < wr.top + by {
+        return Some(if x < wr.left + bx {
+            HTTOPLEFT as LRESULT
+        } else if x >= wr.right - bx {
+            HTTOPRIGHT as LRESULT
+        } else {
+            HTTOP as LRESULT
+        });
+    }
+    Some(hit)
+}
+
+/// `DwmExtendFrameIntoClientArea`, resolved rather than linked.
+///
+/// The same treatment `GetDpiForWindow` gets in `window_geometry`, and for a
+/// stronger reason: `dwmapi.dll` is the one library in this file that a
+/// non-Windows implementation of Win32 is most likely to answer with a stub, so
+/// the return value is reported rather than discarded. A run whose log says the
+/// call succeeded and whose picture shows no glass has learned something; a run
+/// that never says is a run that has to be repeated.
+fn dwm_extend_frame(hwnd: HWND, top: i32) -> Option<i32> {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> = std::sync::OnceLock::new();
+    let f = dwmapi(&SYM, c"DwmExtendFrameIntoClientArea")?;
+    let margins = Margins { left: 0, right: 0, top, bottom: 0 };
+    // SAFETY: a live window handle and a `MARGINS` that outlives the call. The
+    // transmute is to `DwmExtendFrameIntoClientArea(HWND, const MARGINS*)`.
+    let hr = unsafe {
+        let f: unsafe extern "system" fn(HWND, *const Margins) -> i32 = std::mem::transmute(f);
+        f(hwnd, &margins)
+    };
+    Some(hr)
+}
+
+/// `DwmDefWindowProc`, which is how a window with a custom frame keeps
+/// **Windows' own** caption buttons rather than drawing three of its own.
+///
+/// This is the entry point the arrangement turns on. DWM draws the minimise,
+/// maximise and close buttons into the frame it is compositing behind the
+/// extended strip, and this procedure is what gives them their behaviour: the
+/// hover highlight, the pressed state, the click, and — the reason it matters
+/// here — `HTMAXBUTTON`, which is what Windows 11 watches for to raise the snap
+/// layouts flyout. §22.8 recorded snap layouts as unreachable because *this
+/// compositor* cannot know where a maximise button is. It does not have to
+/// know: the buttons are Windows', so the hit test is Windows' too.
+///
+/// Returns `Some(result)` when DWM handled the message, exactly as the C API's
+/// `BOOL` out-parameter says, and `None` when the caller must carry on.
+fn dwm_defwindowproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> = std::sync::OnceLock::new();
+    let f = dwmapi(&SYM, c"DwmDefWindowProc")?;
+    let mut result: LRESULT = 0;
+    // SAFETY: a live window handle on its own thread; the transmute is to
+    // `DwmDefWindowProc(HWND, UINT, WPARAM, LPARAM, LRESULT*) -> BOOL`, and the
+    // out-parameter is written only when the return is non-zero.
+    let handled = unsafe {
+        let f: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, *mut LRESULT) -> i32 =
+            std::mem::transmute(f);
+        f(hwnd, msg, wparam, lparam, &mut result)
+    };
+    (handled != 0).then_some(result)
+}
+
+/// One entry point out of `dwmapi.dll`, resolved by name.
+///
+/// Three of them are needed and none is linked, for `window_geometry`'s reason
+/// applied harder: `dwmapi.dll` is the library a non-Windows implementation of
+/// Win32 is likeliest to answer with a stub, so a missing export has to be a
+/// value this code can see rather than a load failure at process start.
+fn dwmapi(
+    cache: &'static std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>>,
+    symbol: &std::ffi::CStr,
+) -> Option<unsafe extern "system" fn() -> isize> {
+    // Cached, and that is not premature: `DwmDefWindowProc` is consulted on
+    // every mouse message that touches the frame and `DwmGetWindowAttribute`
+    // on every paint, so an uncached `LoadLibraryW` + `GetProcAddress` here
+    // would be two string lookups per frame of every animation the client runs.
+    *cache.get_or_init(|| dwmapi_uncached(symbol))
+}
+
+fn dwmapi_uncached(symbol: &std::ffi::CStr) -> Option<unsafe extern "system" fn() -> isize> {
+    let name = wide("dwmapi.dll");
+    // SAFETY: a NUL-terminated module name; the handle is deliberately not
+    // freed, matching `window_geometry`'s treatment of `user32`.
+    let dll = unsafe { LoadLibraryW(name.as_ptr()) };
+    if dll.is_null() {
+        return None;
+    }
+    // SAFETY: an ASCII, NUL-terminated export name.
+    unsafe { GetProcAddress(dll, symbol.as_ptr().cast()) }
+}
+
+/// Where Windows drew its caption buttons, in **client** coordinates.
+///
+/// ADDED FOR STAGE 29, and it is the piece that makes this arrangement the
+/// Windows one rather than an imitation of it. `DWMWA_CAPTION_BUTTON_BOUNDS`
+/// answers in window-relative coordinates; the client origin is not the window
+/// origin — the side border is still Windows' — so the answer is translated
+/// through `ClientToScreen` rather than assumed.
+///
+/// `None` when DWM will not say, which is a real case: a window with no caption
+/// has no buttons, and an implementation of Win32 that stubs `dwmapi` returns a
+/// failing `HRESULT` here. Either way the caller reserves nothing and the
+/// client's pixels cover the whole strip, which is the arrangement
+/// `--caption-buttons off` asks for on purpose.
+fn caption_button_rect(hwnd: HWND) -> Option<RECT> {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> = std::sync::OnceLock::new();
+    let f = dwmapi(&SYM, c"DwmGetWindowAttribute")?;
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: the transmute is to
+    // `DwmGetWindowAttribute(HWND, DWORD, PVOID, DWORD) -> HRESULT`; the buffer
+    // is a `RECT` and the size passed is its own.
+    let hr = unsafe {
+        let f: unsafe extern "system" fn(HWND, u32, *mut c_void, u32) -> i32 =
+            std::mem::transmute(f);
+        f(
+            hwnd,
+            DWMWA_CAPTION_BUTTON_BOUNDS,
+            (&raw mut r).cast::<c_void>(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if hr != 0 || r.right <= r.left || r.bottom <= r.top {
+        return None;
+    }
+    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut origin = POINT { x: 0, y: 0 };
+    // SAFETY: live window handle; both are written in place.
+    unsafe {
+        GetWindowRect(hwnd, &mut wr);
+        ClientToScreen(hwnd, &mut origin);
+    }
+    let dx = wr.left - origin.x;
+    let dy = wr.top - origin.y;
+    Some(RECT {
+        left: r.left + dx,
+        // Up to the top of the client area, whatever DWM said. The bounds it
+        // reports start below the window's top border, and a strip of the
+        // client's own pixels left above the buttons is a one-pixel line of
+        // tab strip over the close button, which looks like a rendering fault.
+        top: 0,
+        right: r.right + dx,
+        bottom: r.bottom + dy,
+    })
+}
+
+/// Tell an existing window its frame has changed, and extend it if it should be.
+///
+/// `SWP_FRAMECHANGED` is the only way to make Windows ask `WM_NCCALCSIZE` again
+/// for a window that is not being moved or sized. Without it the fold happens
+/// on whatever resize comes next, which on a client that maps at its final size
+/// is never — a window that looks like stage 17's until the user grabs a
+/// corner, and then silently becomes right.
+fn apply_frame(w: &WindowState) {
+    if !w.frame.extend_top || matches!(w.kind, WindowKind::Popup { .. }) {
+        return;
+    }
+    let inset = top_inset();
+    let dwm = if w.frame.dwm_glass {
+        dwm_extend_frame(w.hwnd(), inset)
+    } else {
+        None
+    };
+    // SAFETY: a live window handle on its own thread. Sends `WM_NCCALCSIZE`
+    // and `WM_WINDOWPOSCHANGED` to `toplevel_proc` before returning, which is
+    // sound here for the reason this module's header gives: no `&mut` to
+    // per-window state exists.
+    unsafe {
+        SetWindowPos(
+            w.hwnd(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    println!(
+        "wc-compositor: window {} folds {inset} px of caption into its client area{}",
+        w.id,
+        match dwm {
+            Some(0) => ", DwmExtendFrameIntoClientArea ok",
+            Some(_) => ", DwmExtendFrameIntoClientArea FAILED",
+            None if w.frame.dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",
+            None => ", without DWM glass (--dwm-glass off)",
+        }
+    );
 }
 
 /// Hand a gesture the client started over to Windows' own modal loop.
@@ -1937,12 +2430,11 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
         return;
     }
 
-    let (cw, ch) = w.frame.client_size_for(width, height);
     let mut rc = RECT {
         left: 0,
         top: 0,
-        right: cw,
-        bottom: ch,
+        right: width,
+        bottom: height,
     };
     // The Wayland size is the *content* size, which is Win32's *client* size —
     // the frame is Windows' and is not the client's business. So the outer
@@ -1952,6 +2444,16 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // SAFETY: `rc` is written in place; the style must match the window's.
     unsafe {
         AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0);
+    }
+    // ADDED FOR STAGE 29, and it is one line because `AdjustWindowRectEx` has
+    // already measured the thing that has to be undone. Its `rc.top` is the
+    // negative of the top inset the theme wants — caption, buttons and top
+    // border — and `WM_NCCALCSIZE` is about to give every pixel of it back to
+    // the client area. Growing the window by it *and* handing it back would
+    // make the window taller than the client asked for by exactly a caption,
+    // once per map, which reads as a client that will not settle on a size.
+    if w.frame.extend_top {
+        rc.top = 0;
     }
     w.self_driven.set(true);
     // SAFETY: live window handle; both calls send messages to `toplevel_proc`
@@ -1975,6 +2477,34 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // it here stops the `WM_SIZE` above from being echoed back as a configure.
     w.last_configured.set((width, height));
 
+    // STAGE 29, and after `ShowWindow` on purpose: DWM has no caption buttons
+    // to report the bounds of until the window has been shown, and asking in
+    // `apply_frame` — which runs at create, before the window exists on a
+    // screen — answers `None` on a window that will have them a moment later.
+    if w.frame.extend_top {
+        match (w.frame.caption_buttons, caption_button_rect(w.hwnd())) {
+            (true, Some(rc)) => println!(
+                "wc-compositor: window {} keeps Windows' own caption buttons: \
+                 client rect {},{} {}x{} left transparent for DWM",
+                w.id,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top
+            ),
+            (true, None) => println!(
+                "wc-compositor: window {} asked for Windows' caption buttons and DWM \
+                 would not say where they are: the client's pixels cover the whole caption",
+                w.id
+            ),
+            (false, _) => println!(
+                "wc-compositor: window {} has no caption buttons (--caption-buttons off): \
+                 the client's pixels cover the whole caption",
+                w.id
+            ),
+        }
+    }
+
     // Say once, per window, whether the client's alpha is being thrown away.
     // GDI's `SetDIBitsToDevice` treats a 32-bit `BI_RGB` DIB as opaque, so an
     // `Argb8888` surface is composited against nothing and its translucent
@@ -1986,8 +2516,16 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
         shadow.format().has_alpha()
     };
     println!(
-        "wc-compositor: window {} mapped {width}x{height}{}",
+        "wc-compositor: window {} mapped {width}x{height}{}{}",
         w.id,
+        if w.frame.extend_top {
+            format!(
+                " (tabs in the title bar: {} px of caption is the client's)",
+                w.nc_top.get()
+            )
+        } else {
+            String::new()
+        },
         if alpha {
             " (argb: alpha ignored by GDI, drawn opaque)"
         } else {
@@ -2275,13 +2813,12 @@ fn present(w: &Rc<WindowState>, damage: &[Rect]) {
         update_layered(w);
         return;
     }
-    let (ox, oy) = w.frame.content_origin();
     for r in damage {
         let rc = RECT {
-            left: r.x + ox,
-            top: r.y + oy,
-            right: r.x + ox + r.w,
-            bottom: r.y + oy + r.h,
+            left: r.x,
+            top: r.y,
+            right: r.x + r.w,
+            bottom: r.y + r.h,
         };
         // `erase = FALSE`: the content rectangle is fully overwritten by the
         // blit, so erasing it first would be a visible flash of background

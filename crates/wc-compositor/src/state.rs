@@ -141,9 +141,21 @@ pub enum Decorations {
     /// Windows draws the caption; the client draws none. **The default.**
     #[default]
     Server,
-    /// The client draws its own title bar, and the Win32 side is expected to
-    /// extend the frame into it (`FrameStyle::extend_top`).
+    /// The client draws its own title bar, and Windows draws its caption above
+    /// it. This is the two-title-bar arrangement every stage before 17 shipped,
+    /// kept as a flag because it is the control leg every claim about the other
+    /// two is measured against.
     Client,
+    /// ADDED FOR STAGE 29. The client draws its own title bar **and the system
+    /// caption is folded into the client area** (`FrameStyle::extend_top`), so
+    /// the client's tab strip is inside the window's own frame rather than
+    /// below it.
+    ///
+    /// On the wire this is `Client` — it has to be, because the tab strip only
+    /// exists when the client is decorating itself, and the one lever that
+    /// decides that is the manager's `default_mode` (§22.2). The difference is
+    /// entirely on the Win32 side, and it is `WM_NCCALCSIZE`.
+    Tabs,
 }
 
 impl Decorations {
@@ -152,8 +164,14 @@ impl Decorations {
         match s {
             "server" => Some(Self::Server),
             "client" => Some(Self::Client),
+            "tabs" => Some(Self::Tabs),
             _ => None,
         }
+    }
+
+    /// Whether the Win32 side should fold the caption into the client area.
+    pub fn extends_frame(self) -> bool {
+        matches!(self, Self::Tabs)
     }
 
     /// The KDE protocol's spelling, which is the one that decides GTK's
@@ -163,7 +181,11 @@ impl Decorations {
     fn kde(self) -> KdeDefaultMode {
         match self {
             Self::Server => KdeDefaultMode::Server,
-            Self::Client => KdeDefaultMode::Client,
+            // `Tabs` is `Client` here, and that is the whole reason it is not a
+            // third value on the wire: the tab strip this arrangement puts in
+            // the caption is drawn by the client, and it only exists at all
+            // when the manager's default says `Client`.
+            Self::Client | Self::Tabs => KdeDefaultMode::Client,
         }
     }
 
@@ -172,7 +194,7 @@ impl Decorations {
     fn xdg(self) -> DecorationMode {
         match self {
             Self::Server => DecorationMode::ServerSide,
-            Self::Client => DecorationMode::ClientSide,
+            Self::Client | Self::Tabs => DecorationMode::ClientSide,
         }
     }
 }

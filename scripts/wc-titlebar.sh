@@ -5,10 +5,31 @@
 #   scripts/wc-titlebar.sh deploy   cross-compile and copy what this run needs
 #   scripts/wc-titlebar.sh server   one caption: default_mode(2) + the env var
 #   scripts/wc-titlebar.sh client   the arrangement before this stage, for the pair
-#   scripts/wc-titlebar.sh both     deploy, then both legs
+#   scripts/wc-titlebar.sh tabs     STAGE 29: the caption folded into the client
+#                                   area, so the tab strip is *inside* the frame
+#   scripts/wc-titlebar.sh noglass  the same, without DwmExtendFrameIntoClientArea
+#   scripts/wc-titlebar.sh both     deploy, then server and client
+#   scripts/wc-titlebar.sh all      deploy, then all four
 #   scripts/wc-titlebar.sh clean    remove what this script put on the guest
 #
-# Run from inside `nix develop`. Pictures land in docs/stage17/.
+# Run from inside `nix develop`. Pictures land in docs/stage17/ and, for the
+# two legs stage 29 added, docs/stage29/.
+#
+# WHY STAGE 29's LEGS ARE HERE AND NOT IN A SCRIPT OF THEIR OWN
+#
+# Because the plumbing below is the claim's other half and duplicating it would
+# fork it. §22.6's argument was that a picture of a window with one caption
+# proves nothing on its own, and stage 29's is the same shape but stronger: a
+# window whose tab strip is inside the caption and a window whose tab strip is
+# under a caption differ by about thirty pixels of vertical offset, so the pair
+# — the *same* client, the same arena, the same desktop, minutes apart, one
+# flag apart — is the only form the evidence can take.
+#
+# `noglass` is a third leg for the same reason in miniature. It answers "which
+# half of the arrangement is load-bearing" with a picture rather than an
+# opinion: `WM_NCCALCSIZE` with `DwmExtendFrameIntoClientArea` and
+# `WM_NCCALCSIZE` without it, and the difference between the two captures is
+# exactly what the DWM call is worth here.
 #
 # WHY A SCRIPT OF ITS OWN, AND NOT A BLOCK IN wc-desktop.sh OR wc-guest.sh
 #
@@ -55,6 +76,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage17"
+OUT29="$ROOT/docs/stage29"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
@@ -225,20 +247,36 @@ do_deploy() {
 }
 
 # ------------------------------------------------------------------ run ------
-# One leg. `$1` is the `--decorations` mode, and it is also the only difference
-# between the two runs: same binaries, same arena, same client, same output
-# size, minutes apart. The environment variable moves with it because the two
-# levers are a pair (§22.4) and a run that changed one without the other would
-# be the control rather than the result.
+# One leg. `$1` names it, and it is the only difference between the runs: same
+# binaries, same arena, same client, same output size, minutes apart. The
+# environment variable moves with the mode because the two levers are a pair
+# (§22.4) and a run that changed one without the other would be the control
+# rather than the result.
+#
+# STAGE 29 turned the leg name and the `--decorations` value into two different
+# things, because `noglass` is `tabs` with one more flag and giving it a name of
+# its own is what keeps its socket, its port, its log and its picture separate
+# from the leg it is being compared with.
 do_run() {
-  local mode=$1
+  local leg=$1 mode glass_arg="" outdir="$OUT" picture
+  case "$leg" in
+    server|client) mode=$leg ;;
+    tabs)          mode=tabs; outdir="$OUT29" ;;
+    noglass)       mode=tabs; glass_arg="--dwm-glass off"; outdir="$OUT29" ;;
+    nobuttons)     mode=tabs; glass_arg="--caption-buttons off"; outdir="$OUT29" ;;
+    *) bad "unknown leg $leg"; return ;;
+  esac
+  case "$leg" in
+    server|client) picture="$outdir/stage17-$leg.png" ;;
+    *)             picture="$outdir/stage29-$leg.png" ;;
+  esac
   echo
-  echo "== $mode: Firefox on the guest's desktop, over the guest's own RAM =="
+  echo "== $leg: Firefox on the guest's desktop, over the guest's own RAM =="
   [ -n "$HOST" ]         || { miss "WC_HOST unset: the proxy has to run where QEMU is"; return; }
   [ -n "$HOST_FIREFOX" ] || { miss "WC_HOST_FIREFOX unset: no Firefox path on $HOST"; return; }
   have magick            || { miss "no imagemagick here: nothing could be converted"; return; }
 
-  local sock="wtb-$mode-$$"
+  local sock="wtb-$leg-$$"
   # A port of its own per leg. The two legs run minutes apart and a relay from
   # the first can still hold the port when the second binds: the second bind
   # then fails, the *first* relay accepts the connection, forwards it into a
@@ -246,20 +284,53 @@ do_run() {
   # `we don't have any display` — which reads as a client that never started and
   # is a stale listener. It cost one leg to find.
   local port=$PORT
-  [ "$mode" = client ] && port=$((PORT + 1))
+  case "$leg" in
+    client)    port=$((PORT + 1)) ;;
+    tabs)      port=$((PORT + 2)) ;;
+    noglass)   port=$((PORT + 3)) ;;
+    nobuttons) port=$((PORT + 4)) ;;
+  esac
   local arena=$((ARENA_PAGES * 4096))
   local fxenv=""
-  [ "$mode" = server ] && fxenv="MOZ_GTK_TITLEBAR_DECORATION=none"
+  # Only the `server` leg. The other three want Firefox decorating itself —
+  # `client` so there is a second title bar to photograph, `tabs` and `noglass`
+  # because the tab strip they put inside the caption is the thing this
+  # variable turns off (§22.3).
+  [ "$leg" = server ] && fxenv="MOZ_GTK_TITLEBAR_DECORATION=none"
+
+  # ----- STAGE 29: the corner Windows' own caption buttons are drawn in -------
+  #
+  # **There is no Wayland protocol that carries this**, and the shape of the
+  # problem is §22.8's again rather than a new one: the protocol has no way for
+  # a compositor to say "this rectangle of your surface is mine". Firefox does
+  # not know that Windows is drawing a minimise, a maximise and a close button
+  # over the last 146 px of its tab strip, so it goes on drawing its own
+  # widgets underneath them and goes on putting tabs there when there are
+  # enough tabs to reach.
+  #
+  # The one lever that exists is the client's own GTK configuration, and it is
+  # delivered exactly the way §22.3's environment variable is — out of band, on
+  # the machine the client runs on, by whatever launches it. §22.9 measured what
+  # it can and cannot do: `menu:` takes minimise and maximise away and **close
+  # survives**. That is enough here and it was not enough there, because the
+  # close button it leaves is in the corner Windows is now painting over, so it
+  # ends up *underneath* the system's own close button rather than beside it.
+  #
+  # Written for the three `tabs` legs only. The `server` leg has no client-side
+  # title bar to lay out and the `client` leg is the before-picture.
+  local gtkini=""
+  [ "$mode" = tabs ] && gtkini="printf '[Settings]\\\\ngtk-decoration-layout=menu:\\\\n' \
+> \"\\\$RUN/config/gtk-3.0/settings.ini\""
 
   # Ours only, and before the share is emptied: an interrupted run leaves a
   # compositor alive for up to its `--timeout`, still writing into the same
   # directory, and a wipe that happens first leaves this run reading the last
   # one's log.
-  ours "wtb-$mode-" >/dev/null 2>&1
-  g "rm -f $APPDATA_WIN/wtb-$mode-* 2>/dev/null; true" >/dev/null 2>&1
+  ours "wtb-$leg-" >/dev/null 2>&1
+  g "rm -f $APPDATA_WIN/wtb-$leg-* 2>/dev/null; true" >/dev/null 2>&1
   sleep 2
-  h "rm -rf $SHARE/frames-$mode; mkdir -p $SHARE/frames-$mode; chmod 777 $SHARE/frames-$mode;
-     rm -f $SHARE/tb-$mode.log" >/dev/null
+  h "rm -rf $SHARE/frames-$leg; mkdir -p $SHARE/frames-$leg; chmod 777 $SHARE/frames-$leg;
+     rm -f $SHARE/tb-$leg.log" >/dev/null
 
   # ----- 1. the compositor, on WinSta0\Default, over guest RAM ---------------
   #
@@ -268,9 +339,9 @@ do_run() {
   # log and the frame dumps go to the export because this side has to read them
   # while the guest is busy; neither is a protocol object.
   int_bg "$GDIR_WIN\\wc-compositor.exe" \
-    "--socket $sock --timeout $((SECS + 150)) --output $OUTPUT --decorations $mode \
+    "--socket $sock --timeout $((SECS + 150)) --output $OUTPUT --decorations $mode $glass_arg \
 --arena-guest-ram 0:$arena --arena-outbound 0:$ARENA_OUTBOUND \
---dump-frames $SHARE_WIN\\frames-$mode --log $SHARE_WIN\\tb-$mode.log" comp >/dev/null 2>&1
+--dump-frames $SHARE_WIN\\frames-$leg --log $SHARE_WIN\\tb-$leg.log" comp >/dev/null 2>&1
 
   local cpid="" t
   for t in 1 2 3 4 5 6 7 8; do
@@ -278,8 +349,8 @@ do_run() {
     cpid=$(ours "$sock" -PidOnly | head -1)
     [ -n "$cpid" ] && break
   done
-  [ -n "$cpid" ] || { bad "$mode: the compositor never started on the interactive desktop"; return; }
-  note "$mode: our compositor is pid $cpid, socket $sock"
+  [ -n "$cpid" ] || { bad "$leg: the compositor never started on the interactive desktop"; return; }
+  note "$leg: our compositor is pid $cpid, socket $sock"
 
   # ----- 2. find the guest's pages from outside the guest --------------------
   #
@@ -290,33 +361,33 @@ do_run() {
   # never shared.
   local line runid pages
   for t in $(seq 1 40); do
-    line=$(h "grep -o 'arena 0 provided from guest RAM: run 0x[0-9a-f]*, [0-9]* bytes, [0-9]* pages, locked=[a-z]*' $SHARE/tb-$mode.log 2>/dev/null | tail -1" | tr -d '\r')
+    line=$(h "grep -o 'arena 0 provided from guest RAM: run 0x[0-9a-f]*, [0-9]* bytes, [0-9]* pages, locked=[a-z]*' $SHARE/tb-$leg.log 2>/dev/null | tail -1" | tr -d '\r')
     [ -n "$line" ] && break
     sleep 1
   done
   if [ -z "$line" ]; then
-    bad "$mode: the compositor never reported a guest-RAM arena"
-    h "head -20 $SHARE/tb-$mode.log 2>/dev/null" | sed 's/^/        /'
+    bad "$leg: the compositor never reported a guest-RAM arena"
+    h "head -20 $SHARE/tb-$leg.log 2>/dev/null" | sed 's/^/        /'
     ours "$sock" >/dev/null 2>&1
     return
   fi
   runid=$(echo "$line" | grep -o 'run 0x[0-9a-f]*' | cut -d' ' -f2)
   pages=$(echo "$line" | grep -o '[0-9]* pages' | cut -d' ' -f1)
-  note "$mode: $line"
+  note "$leg: $line"
 
   h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 $HOST_DIR/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $runid --pages $pages \
-  --outbound $ARENA_OUTBOUND --plan '$HOST_DIR/arena-$mode.plan' >'$HOST_DIR/locate-$mode.log' 2>&1
-echo rc=\\\$? >>'$HOST_DIR/locate-$mode.log'
-chmod a+r '$HOST_DIR/locate-$mode.log' '$HOST_DIR/arena-$mode.plan' 2>/dev/null; true\" | $ROOTC" \
+  --outbound $ARENA_OUTBOUND --plan '$HOST_DIR/arena-$leg.plan' >'$HOST_DIR/locate-$leg.log' 2>&1
+echo rc=\\\$? >>'$HOST_DIR/locate-$leg.log'
+chmod a+r '$HOST_DIR/locate-$leg.log' '$HOST_DIR/arena-$leg.plan' 2>/dev/null; true\" | $ROOTC" \
     >/dev/null 2>&1
   local verify
-  verify=$(h "grep -o 'verify: [0-9]*/[0-9]* pages of the stitched view carry their own arena index' $HOST_DIR/locate-$mode.log 2>/dev/null" | tr -d '\r')
-  if h "grep -q '^rc=0$' $HOST_DIR/locate-$mode.log" 2>/dev/null; then
-    ok "$mode: the guest's arena was located in QEMU's backend — $verify"
+  verify=$(h "grep -o 'verify: [0-9]*/[0-9]* pages of the stitched view carry their own arena index' $HOST_DIR/locate-$leg.log 2>/dev/null" | tr -d '\r')
+  if h "grep -q '^rc=0$' $HOST_DIR/locate-$leg.log" 2>/dev/null; then
+    ok "$leg: the guest's arena was located in QEMU's backend — $verify"
   else
-    bad "$mode: wc-arena-host did not locate the arena"
-    h "tail -12 $HOST_DIR/locate-$mode.log 2>/dev/null" | sed 's/^/        /'
+    bad "$leg: wc-arena-host did not locate the arena"
+    h "tail -12 $HOST_DIR/locate-$leg.log 2>/dev/null" | sed 's/^/        /'
     ours "$sock" >/dev/null 2>&1
     return
   fi
@@ -324,7 +395,7 @@ chmod a+r '$HOST_DIR/locate-$mode.log' '$HOST_DIR/arena-$mode.plan' 2>/dev/null;
   # ----- 3. the relay, on its own held connection ---------------------------
   ssh "${SSHOPT[@]}" "$GUEST" \
     "export MSYS_NO_PATHCONV=1; cd $TBNAME && ./probe-relay.exe $port '$APPDATA_WIN\\$sock' --timeout $((SECS + 60))" \
-    >"$RUNDIR/relay-$mode.log" 2>&1 &
+    >"$RUNDIR/relay-$leg.log" 2>&1 &
   local relay=$!
   sleep 3
 
@@ -334,24 +405,26 @@ chmod a+r '$HOST_DIR/locate-$mode.log' '$HOST_DIR/arena-$mode.plan' 2>/dev/null;
   # (§12.9). Firefox refuses to run as root in somebody else's session — a real
   # check against a real mistake — so the unit gives it a home, a profile and an
   # `XDG_RUNTIME_DIR` of its own rather than arguing with it.
-  h "cat > $HOST_DIR/tb-$mode.sh <<'EOS'
+  h "cat > $HOST_DIR/tb-$leg.sh <<'EOS'
 #!/usr/bin/env bash
 export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-RUN=/tmp/$TBNAME-$mode-run
-rm -rf \"\$RUN\"; mkdir -p \"\$RUN/home\" \"\$RUN/profile\" \"\$RUN/xdg\"
+RUN=/tmp/$TBNAME-$leg-run
+rm -rf \"\$RUN\"; mkdir -p \"\$RUN/home\" \"\$RUN/profile\" \"\$RUN/xdg\" \"\$RUN/config/gtk-3.0\"
 chmod 700 \"\$RUN/xdg\"
+$gtkini
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
     -N -L \"\$RUN/up.sock:127.0.0.1:$port\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
 sleep 5
 if [ ! -S \"\$RUN/up.sock\" ]; then echo TB-FAIL: no forward socket >\"\$RUN/why\"; fi
 XDG_RUNTIME_DIR=\"\$RUN\" $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
-  --runtime-dir \"\$RUN\" --transport arena --arena-plan $HOST_DIR/arena-$mode.plan \
+  --runtime-dir \"\$RUN\" --transport arena --arena-plan $HOST_DIR/arena-$leg.plan \
   --arena-id 0 --copy damage --accept-timeout 30 --timeout $((SECS + 10)) \
   >\"\$RUN/proxy.log\" 2>&1 &
 P=\$!
 sleep 2
 env -u DISPLAY HOME=\"\$RUN/home\" XDG_RUNTIME_DIR=\"\$RUN/xdg\" \
+  XDG_CONFIG_HOME=\"\$RUN/config\" \
   WAYLAND_DISPLAY=\"\$RUN/wl-proxy\" MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland $fxenv \
   timeout $SECS $HOST_FIREFOX --no-remote --profile \"\$RUN/profile\" about:blank \
   >\"\$RUN/fx.log\" 2>&1
@@ -361,14 +434,14 @@ kill \$P \$FWD 2>/dev/null; wait 2>/dev/null
 chmod -R a+rwX \"\$RUN\" 2>/dev/null
 touch \"\$RUN/done\"
 EOS
-chmod 755 $HOST_DIR/tb-$mode.sh" >/dev/null
+chmod 755 $HOST_DIR/tb-$leg.sh" >/dev/null
   # `systemd-run` gives the unit systemd's PATH, which on NixOS has no `bash`
   # and no `env`, so a `#!/usr/bin/env bash` script exits 127 before its first
   # line with nothing but `env: 'bash': No such file or directory` in the
   # journal. Naming the interpreter is the fix.
   h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-systemd-run --unit=$TBNAME-$mode --collect /run/current-system/sw/bin/bash \
-  $HOST_DIR/tb-$mode.sh >/dev/null 2>&1; echo started\" | $ROOTC" >/dev/null 2>&1
+systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
+  $HOST_DIR/tb-$leg.sh >/dev/null 2>&1; echo started\" | $ROOTC" >/dev/null 2>&1
 
   # ----- 5. photograph it while it is up -------------------------------------
   #
@@ -379,62 +452,116 @@ systemd-run --unit=$TBNAME-$mode --collect /run/current-system/sw/bin/bash \
   # By **pid**, because another worktree's compositor registers the same class.
   sleep 35
   int "cmd.exe" \
-    "/c $GDIR_WIN\\wc-desk.exe shot --pid $cpid --class WaycomposeToplevel --out $GDIR_WIN\\tb-$mode.bmp > $GDIR_WIN\\shot-$mode.txt 2>&1" \
+    "/c $GDIR_WIN\\wc-desk.exe shot --pid $cpid --class WaycomposeToplevel --out $GDIR_WIN\\tb-$leg.bmp > $GDIR_WIN\\shot-$leg.txt 2>&1" \
     shot >/dev/null 2>&1
   int "cmd.exe" \
-    "/c $GDIR_WIN\\wc-desk.exe windows > $GDIR_WIN\\windows-$mode.txt 2>&1" wins >/dev/null 2>&1
-  g "cat $GDIR/shot-$mode.txt" >"$RUNDIR/shot-$mode.txt" 2>&1
-  sed 's/^/        /' "$RUNDIR/shot-$mode.txt"
+    "/c $GDIR_WIN\\wc-desk.exe windows > $GDIR_WIN\\windows-$leg.txt 2>&1" wins >/dev/null 2>&1
+  g "cat $GDIR/shot-$leg.txt" >"$RUNDIR/shot-$leg.txt" 2>&1
+  sed 's/^/        /' "$RUNDIR/shot-$leg.txt"
 
-  scp "${SSHOPT[@]}" "$GUEST:$TBNAME/tb-$mode.bmp" "$RUNDIR/tb-$mode.bmp" >/dev/null 2>&1
-  mkdir -p "$OUT"
-  if [ -s "$RUNDIR/tb-$mode.bmp" ] && magick "$RUNDIR/tb-$mode.bmp" "$OUT/stage17-$mode.png" 2>/dev/null; then
-    ok "$mode: the window, frame and all -> docs/stage17/stage17-$mode.png ($(magick identify -format '%wx%h' "$OUT/stage17-$mode.png"))"
+  scp "${SSHOPT[@]}" "$GUEST:$TBNAME/tb-$leg.bmp" "$RUNDIR/tb-$leg.bmp" >/dev/null 2>&1
+  mkdir -p "$outdir"
+  if [ -s "$RUNDIR/tb-$leg.bmp" ] && magick "$RUNDIR/tb-$leg.bmp" "$picture" 2>/dev/null; then
+    ok "$leg: the window, frame and all -> ${picture#"$ROOT"/} ($(magick identify -format '%wx%h' "$picture"))"
   else
-    bad "$mode: nothing came back from the capture"
+    bad "$leg: nothing came back from the capture"
   fi
 
   # ----- 6. what the run says about itself -----------------------------------
-  h "test -f /tmp/$TBNAME-$mode-run/done && echo done" >/dev/null 2>&1
+  h "test -f /tmp/$TBNAME-$leg-run/done && echo done" >/dev/null 2>&1
   for t in $(seq 1 $((SECS + 40))); do
-    h "test -f /tmp/$TBNAME-$mode-run/done && echo yes" 2>/dev/null | grep -q yes && break
+    h "test -f /tmp/$TBNAME-$leg-run/done && echo yes" 2>/dev/null | grep -q yes && break
     sleep 2
   done
-  h "cat /tmp/$TBNAME-$mode-run/proxy.log 2>/dev/null" >"$RUNDIR/proxy-$mode.log"
-  h "cat $SHARE/tb-$mode.log 2>/dev/null" >"$RUNDIR/comp-$mode.log"
-  cp "$RUNDIR/comp-$mode.log" "$OUT/compositor-$mode.log" 2>/dev/null
+  h "cat /tmp/$TBNAME-$leg-run/proxy.log 2>/dev/null" >"$RUNDIR/proxy-$leg.log"
+  h "cat $SHARE/tb-$leg.log 2>/dev/null" >"$RUNDIR/comp-$leg.log"
+  cp "$RUNDIR/comp-$leg.log" "$outdir/compositor-$leg.log" 2>/dev/null
 
-  grep -q "decorations: manager default is ${mode^}" "$RUNDIR/comp-$mode.log" \
-    && ok "$mode: the compositor advertised ${mode^} as the manager default" \
-    || bad "$mode: the compositor's log does not say which mode it advertised"
+  grep -q "decorations: manager default is ${mode^}" "$RUNDIR/comp-$leg.log" \
+    && ok "$leg: the compositor advertised ${mode^} as the manager default" \
+    || bad "$leg: the compositor's log does not say which mode it advertised"
 
   local asked
-  asked=$(grep -o 'kde-decoration: client asked for Value([A-Za-z]*)' "$RUNDIR/comp-$mode.log" \
+  asked=$(grep -o 'kde-decoration: client asked for Value([A-Za-z]*)' "$RUNDIR/comp-$leg.log" \
           | tail -1 | grep -o 'Value([A-Za-z]*)')
   case "$mode:$asked" in
-    "server:Value(Server)") ok "$mode: Firefox asked for Server, on real Windows" ;;
-    "client:Value(Client)") ok "$mode: Firefox asked for Client, on real Windows" ;;
-    *) bad "$mode: Firefox asked for ${asked:-nothing}" ;;
+    "server:Value(Server)") ok "$leg: Firefox asked for Server, on real Windows" ;;
+    "client:Value(Client)") ok "$leg: Firefox asked for Client, on real Windows" ;;
+    # STAGE 29. `Tabs` is `Client` on the wire and has to be: the tab strip this
+    # leg is putting in the caption is drawn by the client, and it only exists
+    # when the manager's default says so. A `tabs` leg where Firefox asked for
+    # Server has lost the thing it is photographing.
+    "tabs:Value(Client)") ok "$leg: Firefox asked for Client, on real Windows" ;;
+    *) bad "$leg: Firefox asked for ${asked:-nothing}" ;;
   esac
 
   local mapped
-  mapped=$(grep -o 'window 1 mapped [0-9]*x[0-9]*' "$RUNDIR/comp-$mode.log" | tail -1)
+  mapped=$(grep -o 'window 1 mapped [0-9]*x[0-9]*' "$RUNDIR/comp-$leg.log" | tail -1)
   [ -n "$mapped" ] \
-    && ok "$mode: a real HWND, sized from the geometry rectangle: $mapped" \
-    || bad "$mode: the window never mapped"
+    && ok "$leg: a real HWND, sized from the geometry rectangle: $mapped" \
+    || bad "$leg: the window never mapped"
+
+  # ----- STAGE 29: the frame arithmetic, from the compositor's own log --------
+  #
+  # The picture is the claim, and these two lines are what stop a *pretty*
+  # picture from being believed on its own. The first says Win32 answered
+  # `WM_NCCALCSIZE` with a client rectangle that reaches the top of the window
+  # and how many pixels that was worth; the second says whether DWM's half
+  # happened. Both are absent by construction in the `server` and `client`
+  # legs, and asserting their absence there is what makes the `tabs` leg's
+  # presence mean something.
+  local folded
+  folded=$(grep -o 'folds [0-9]* px of caption into its client area[^"]*' \
+           "$RUNDIR/comp-$leg.log" | tail -1)
+  case "$mode" in
+    tabs)
+      [ -n "$folded" ] \
+        && ok "$leg: $folded" \
+        || bad "$leg: the compositor never folded the caption into the client area"
+      case "$leg:$folded" in
+        tabs:*"DwmExtendFrameIntoClientArea ok"* | nobuttons:*"DwmExtendFrameIntoClientArea ok"*)
+          ok "$leg: DwmExtendFrameIntoClientArea returned S_OK on real Windows" ;;
+        noglass:*"--dwm-glass off"*)
+          ok "$leg: the DWM call was skipped, which is what this leg is for" ;;
+        *) bad "$leg: the DWM half of the arrangement is not what the flag asked for" ;;
+      esac
+
+      # The caption buttons, which are the difference between this arrangement
+      # and a picture of it. DWM is asked where it put them and the answer is
+      # the rectangle the blit leaves transparent, so a leg that reports a
+      # rectangle has buttons and a leg that does not, does not.
+      local buttons
+      buttons=$(grep -o "window 1 \(keeps Windows' own caption buttons: .*\|asked for Windows' \
+caption buttons and DWM would not say.*\|has no caption buttons.*\)" \
+                "$RUNDIR/comp-$leg.log" | tail -1)
+      case "$leg:$buttons" in
+        nobuttons:*"has no caption buttons"*)
+          ok "$leg: no caption buttons, which is this leg's whole point" ;;
+        nobuttons:*) bad "$leg: --caption-buttons off did not take" ;;
+        *:*"keeps Windows' own caption buttons"*)
+          ok "$leg: ${buttons#window 1 }" ;;
+        *) bad "$leg: DWM would not say where its caption buttons are: ${buttons:-nothing logged}" ;;
+      esac
+      ;;
+    *)
+      [ -z "$folded" ] \
+        && ok "$leg: no caption was folded in, which is this leg's whole point" \
+        || bad "$leg: a leg that is not \`tabs\` folded the caption in anyway"
+      ;;
+  esac
 
   local counts
-  counts=$(grep -o 'mapped: [0-9]* section, [0-9]* shared-file, [0-9]* arena-slice' "$RUNDIR/comp-$mode.log" | tail -1)
+  counts=$(grep -o 'mapped: [0-9]* section, [0-9]* shared-file, [0-9]* arena-slice' "$RUNDIR/comp-$leg.log" | tail -1)
   case "$counts" in
-    "mapped: 0 section, 0 shared-file, "[1-9]*) ok "$mode: every pixel came out of guest RAM ($counts)" ;;
-    *) bad "$mode: wrong transport served the pixels: ${counts:-nothing recorded}" ;;
+    "mapped: 0 section, 0 shared-file, "[1-9]*) ok "$leg: every pixel came out of guest RAM ($counts)" ;;
+    *) bad "$leg: wrong transport served the pixels: ${counts:-nothing recorded}" ;;
   esac
 
   local presents
-  presents=$(grep -o '([0-9]* frames presented)' "$RUNDIR/comp-$mode.log" | grep -o '[0-9]*' | tail -1)
+  presents=$(grep -o '([0-9]* frames presented)' "$RUNDIR/comp-$leg.log" | grep -o '[0-9]*' | tail -1)
   [ "${presents:-0}" -ge 2 ] \
-    && ok "$mode: $presents frames of Firefox's pixels were blitted into it" \
-    || note "$mode: ${presents:-0} frames presented (the count is printed when the toplevel goes away)"
+    && ok "$leg: $presents frames of Firefox's pixels were blitted into it" \
+    || note "$leg: ${presents:-0} frames presented (the count is printed when the toplevel goes away)"
 
   ours "$sock" >/dev/null 2>&1
   kill "$relay" 2>/dev/null; wait "$relay" 2>/dev/null
@@ -450,12 +577,22 @@ do_clean() {
 }
 
 case "$MODE" in
-  deploy) do_deploy ;;
-  server) do_run server ;;
-  client) do_run client ;;
-  both)   do_deploy; do_run server; do_run client ;;
-  clean)  do_clean ;;
-  *) echo "usage: $0 [deploy|server|client|both|clean]"; exit 2 ;;
+  deploy)  do_deploy ;;
+  server)  do_run server ;;
+  client)  do_run client ;;
+  tabs)    do_run tabs ;;
+  noglass)   do_run noglass ;;
+  nobuttons) do_run nobuttons ;;
+  both)    do_deploy; do_run server; do_run client ;;
+  # STAGE 29's pair, and the order is deliberate: `tabs` first, so that a run
+  # which has to be abandoned because the guest is contended has produced the
+  # picture the section is about rather than its control.
+  pair)    do_deploy; do_run tabs; do_run server ;;
+  all)     do_deploy; do_run tabs; do_run noglass; do_run nobuttons
+           do_run server; do_run client ;;
+  clean)   do_clean ;;
+  *) echo "usage: $0 [deploy|server|client|tabs|noglass|nobuttons|both|pair|all|clean]"
+     exit 2 ;;
 esac
 
 echo

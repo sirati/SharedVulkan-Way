@@ -4,10 +4,11 @@
 #   scripts/wc-firefox.sh enumerate   what Firefox binds, and what it does without
 #   scripts/wc-firefox.sh window      the browser's own pixels, measured from outside
 #   scripts/wc-firefox.sh titlebar    the two levers that leave exactly one title bar
+#   scripts/wc-firefox.sh tabs        the client half of --decorations tabs
 #   scripts/wc-firefox.sh menu        a click, an xdg_popup, and a second window
 #   scripts/wc-firefox.sh wine        the same client into a real HWND, through the proxy
 #   scripts/wc-firefox.sh wine-arena  the same run with the pixels in an arena
-#   scripts/wc-firefox.sh all         all six
+#   scripts/wc-firefox.sh all         all seven
 #
 # Run from inside `nix develop`.
 #
@@ -447,6 +448,87 @@ block_titlebar() {
 }
 
 # ---------------------------------------------------------------------------
+# tabs: what `--decorations tabs` asks of the *client*, which is all Linux can
+# say about it
+# ---------------------------------------------------------------------------
+#
+# STAGE 29. The arrangement itself is `WM_NCCALCSIZE` and cannot be tested here
+# at all: there is no Win32 under this compositor and no window manager under
+# the headless platform. What *can* be tested here is the half of it that is a
+# fact about the client, and it is the half §22.5 got a free pass on.
+#
+# §22.5 said the geometry-rectangle arithmetic was mode-agnostic "by
+# construction rather than by a branch", and cited a `server` run where Firefox
+# reported a zero origin — a run in which the subtraction §15.6 exists for is a
+# no-op. The `tabs` arrangement is the one where it is *not*: Firefox decorates
+# itself, so it insets by GTK's invisible resize margin and drop shadow, and the
+# window has to be the rectangle rather than the buffer or the tab strip lands
+# 23 px below the top of the caption it is supposed to be inside. That is what
+# this block asserts, and it is a check rather than an assumption because the
+# brief for stage 29 said in as many words not to assume it.
+block_tabs() {
+  echo "== tabs: the client half of --decorations tabs, on Linux"
+  have "$FIREFOX" || { non "no firefox on PATH"; return; }
+
+  local dir="$RUNDIR/tabs"
+  FX_DECOR=tabs; FX_ENV=()
+  WC_WAYLAND_DEBUG=1 run_firefox "$dir" wc-tabs 25 \
+    || { bad "the compositor never bound its socket"; return; }
+
+  grep -q 'decorations: manager default is Tabs' "$dir/srv.log" \
+    && ok "the compositor advertised Tabs as the manager default" \
+    || bad "the compositor did not advertise Tabs"
+
+  # `Tabs` is `Client` on the wire and has to be (§22.2): the tab strip this
+  # mode puts inside the caption is drawn by the client, and it exists only
+  # while the manager's default says Client. A `tabs` run in which Firefox
+  # heard `default_mode(2)` has lost the thing it is arranging.
+  grep -q 'default_mode(1)' "$dir/fx.txt" \
+    && ok "Firefox's own trace shows it received default_mode(1): Tabs is Client on the wire" \
+    || bad "Firefox did not receive default_mode(1)"
+
+  local asked
+  asked=$(grep -o 'org_kde_kwin_server_decoration#[0-9]*\.request_mode([0-9]*)' "$dir/fx.txt" \
+          | grep -o '([0-9]*)' | tr -d '()' | sort -u | tr '\n' ' ')
+  case "$asked" in
+    "1 ") ok "Firefox asked for mode 1 (Client) and nothing else" ;;
+    "")   bad "Firefox made no decoration request at all" ;;
+    *)    bad "Firefox asked for mode(s) $asked; 1 (Client) was expected" ;;
+  esac
+
+  # THE NUMBER THE WIN32 SIDE HAS TO LIVE WITH, and the point of the block.
+  local insets
+  insets=$(grep -o 'set_window_geometry([0-9-]*, [0-9-]*, [0-9-]*, [0-9-]*)' "$dir/fx.txt" \
+           | tr -d 'a-z_()' | tr -d ' ' | awk -F, '$3 >= 640 { print $1 "," $2 }' | sort -u | tr '\n' ' ')
+  case "$insets" in
+    "0,0 ") bad "the toplevel's geometry origin is 0,0 under Tabs: Firefox is not decorating itself, so there is no tab strip to put in the caption" ;;
+    "")     bad "Firefox set no toplevel window geometry" ;;
+    *)      ok "the toplevel's geometry origin is ${insets% }: a real CSD shadow inset, which §15.6's subtraction has to remove" ;;
+  esac
+
+  # And that it *was* removed. The window is the geometry rectangle's size, not
+  # the buffer's, and under CSD those differ by twice the inset on each axis.
+  local geom mapped
+  geom=$(grep -o 'set_window_geometry([0-9-]*, [0-9-]*, [0-9-]*, [0-9-]*)' "$dir/fx.txt" \
+         | tr -d 'a-z_()' | tr -d ' ' | awk -F, '$3 >= 640 { print $3 "x" $4 }' | tail -1)
+  mapped=$(grep -o 'window 1 mapped surface [0-9]*x[0-9]*' "$dir/srv.log" | tail -1 \
+           | grep -o '[0-9]*x[0-9]*')
+  if [ -n "$geom" ] && [ "$geom" = "$mapped" ]; then
+    ok "the window is the geometry rectangle and not the buffer: $mapped"
+  else
+    bad "the window is ${mapped:-nothing}, and the geometry rectangle is ${geom:-nothing}"
+  fi
+
+  # The client area is the surface in this mode too, which is what stage 29
+  # replaced three conversions with (§29.2). The headless platform prints both.
+  grep -q "window 1 mapped surface $mapped client $mapped" "$dir/srv.log" \
+    && ok "the client area is the surface: no conversion left between them" \
+    || bad "the platform reports a client area that is not the surface"
+
+  FX_DECOR=client; FX_ENV=()
+}
+
+# ---------------------------------------------------------------------------
 # menu: the thing stage 6 could not do
 # ---------------------------------------------------------------------------
 
@@ -726,12 +808,13 @@ case "${1:-all}" in
   enumerate)  block_enumerate ;;
   window)     block_window ;;
   titlebar)   block_titlebar ;;
+  tabs)       block_tabs ;;
   menu)       block_menu ;;
   wine)       block_wine shared-file ;;
   wine-arena) block_wine arena ;;
-  all)        block_enumerate; block_window; block_titlebar; block_menu
+  all)        block_enumerate; block_window; block_titlebar; block_tabs; block_menu
               block_wine shared-file; block_wine arena ;;
-  *) echo "usage: $0 [enumerate|window|titlebar|menu|wine|wine-arena|all]"; exit 2 ;;
+  *) echo "usage: $0 [enumerate|window|titlebar|tabs|menu|wine|wine-arena|all]"; exit 2 ;;
 esac
 
 echo
