@@ -575,3 +575,154 @@ Neither is a change to the cross-VM transport, which is done and measured.
   region and its own arena.
 - Not the deployment: the unified `sv-guest` binary runs both halves in the
   guest and both were exercised in one run.
+
+---
+
+# The Wayland WSI, and the gate that is not ours
+
+Built and measured 2026-08-13 on **devhost** (`nix develop`, GPU side on the
+system NVIDIA driver, Firefox 151.0.1, Mesa 26.1.1) and on **testhost** against
+the live guest. The section above named two ways forward and said the Wayland one
+"is the larger piece and it is the one that makes the result general". Both were
+tried. **The finding is that neither of them turns on the variable that section
+identified**, and the evidence for that sentence is a Mesa source line rather
+than an inference.
+
+## 1. `VK_KHR_wayland_surface` is built, and it is not enough
+
+`sv-icd` now advertises `VK_KHR_wayland_surface` and implements it:
+`vkCreateWaylandSurfaceKHR`, `vkGetPhysicalDeviceWaylandPresentationSupportKHR`,
+and a present that attaches a `wl_shm` buffer to the application's own
+`wl_surface` on the application's own `wl_display`, from an event queue of ours
+(`sv_icd::present::wayland`). No descriptor crosses the VM boundary: the `memfd`
+is created on the host, sent to `wc-proxy` on the same host, and copied by it
+into the arena, which is the route `wc_proxy::pool` already documents.
+
+`vulkaninfo` against the ICD reports `VK_KHR_wayland_surface : extension
+revision 6`. **And Mesa still loads swrast.**
+
+## 2. Why, exactly — and it is four lines of Mesa
+
+`src/egl/drivers/dri2/platform_wayland.c`:
+
+```c
+dri2_initialize_wayland(_EGLDisplay *disp)
+{
+   if (disp->Options.ForceSoftware)
+      return dri2_initialize_wayland_swrast(disp);
+   else
+      return dri2_initialize_wayland_drm(disp);
+}
+```
+
+Zink on the Wayland platform is reachable through exactly two doors and both are
+shut here:
+
+- **`dri2_initialize_wayland_drm`** needs a DRM render node *from the
+  compositor* — `zwp_linux_dmabuf_v1` feedback or `wl_drm` —
+  and gives up when it has neither (`dri2_initialize_wayland_drm_extensions`:
+  "wl_drm not advertised by compositor, so can't continue"). `wc-proxy` offers
+  neither and cannot: the host has no DRM device, and §1a forbids the
+  descriptors a dmabuf path is made of. `eglInitialize` then fails, and
+  `eglapi.c` retries with **`Options.Zink = EGL_FALSE`** — which is where the
+  `swrast` in `EGL driver name: swrast` comes from.
+- **`dri2_initialize_wayland_swrast`** does honour `Options.Zink`
+  (`driver_name = strdup(disp->Options.Zink ? "zink" : "swrast")`) and would take
+  the kopper path — but it only runs under `LIBGL_ALWAYS_SOFTWARE`, and that same
+  variable is read by Zink's `choose_pdev`, which then accepts **only** a
+  `VK_PHYSICAL_DEVICE_TYPE_CPU` device. Measured: `MESA: error: ZINK: CPU device
+  requested but none found!`. The only way through that door is for this driver
+  to call itself a CPU, which is a lie that would make Firefox right to reject
+  it.
+
+So on a `wl_shm`-only Wayland with no DRM device anywhere, **Mesa will not use a
+Vulkan driver at all, whatever that driver advertises.** The gate is above us.
+
+This corrects the section above. Its control — real RADV on a
+`weston --renderer=pixman` — differed from the testhost topology in a second
+way that was not held fixed: devhost *has* `/dev/dri`, so that weston could
+advertise a device and Mesa could take the DRM door. "RADV has
+`VK_KHR_wayland_surface`" was true and was not the variable.
+
+## 3. The X11 path does work, and it needed one environment variable
+
+`platform_x11.c` has an override the Wayland platform has no equivalent of:
+
+```c
+   const bool force_zink =
+      disp->Options.Zink && debug_get_bool_option("LIBGL_KOPPER_DRI2", false);
+```
+
+With it, Mesa skips the DRI3-multibuffer and render-device checks and goes
+straight to `dri2_initialize_x11_kopper`. Without it, an Xwayland that has no DRM
+device is refused outright — which is what the first three attempts here
+measured, as `DRI3 not available` and `couldn't find RGB GLX visual or fbconfig`.
+
+Measured on **devhost**, rootful Xwayland on the shm-only weston,
+`scripts/sv-firefox-wayland.sh x11`:
+
+| | before | with `LIBGL_KOPPER_DRI2=1` |
+|---|---|---|
+| `EGL driver name` (X11 platform) | *no configs at all* | **`zink`** |
+| `eglgears_x11` | no fbconfig | **renders, on the real GPU, through the forwarder** — screenshot |
+| Firefox: `Failed to create EGLConfig for WebRender!` | yes | **no** |
+| Firefox: `Fallback WR to SW-WR` | yes | **no** |
+| Firefox: `vkCreateSwapchainKHR` on our ICD | never | **yes**, `512x416 format 44 images 2 mode 2` |
+
+The gears picture is the load-bearing one: OpenGL executing on a real GPU,
+presented by this ICD's `XPutImage` into an Xwayland window that has no DRM
+device, composited by a compositor that speaks only `wl_shm`. That is the whole
+chain the topology needs, with the VM taken out.
+
+## 4. On testhost, the same result and then a stall
+
+Same configuration on the machine with no GPU, against the live guest
+(`scripts/sv-firefox-guest.sh 8 150 x11`, `LIBGL_KOPPER_DRI2=1`):
+
+```
+sv-icd: connected to the GPU side at /tmp/svff-wsi/icd.sock
+sv-icd: transport: vkGetPhysicalDeviceSurfacePresentModesKHR: X11 { window: 6291472 }
+sv-icd: transport: vkCreateSwapchainKHR: X11 { window: 6291472 } 512x416 format 44 usage 0x17 images 2 mode 2
+[GFX1-]: Calling WaitFlushedEvent::Run: is delayed: 14608
+Exiting due to channel error.
+```
+
+**The EGLConfig failure is gone**: Firefox's hardware WebRender accepted the
+display and built a swapchain on the guest's Intel iGPU from a host that has
+none. Then its compositor thread is late by ~15 s and Firefox's GPU process
+gives up. Reproduced twice, at 4 and at 8 sessions.
+
+That is not `about:support` and it is not a browser anybody can use, so it is
+reported as what it is: **the config rejection that this whole line of work was
+about is fixed, and the first frame through the new path is too slow to keep
+Firefox alive.** What is not yet separated is how much of the 15 s is the
+cross-VM round trip per present, how much is the `XSync` this ICD's X11 target
+does per frame (`sv_icd::present::x11::quietly`, a round trip to Xwayland on top
+of the round trip to the GPU), and how much is a guest that a dozen other
+experiments were using at the time.
+
+## 5. What was added to tell "presented" from "visible"
+
+`sv_icd::wsi::frame_note` samples one pixel per 4 KiB of every sixtieth
+presented frame and says how many are not black, under `SV_DEBUG`. It exists
+because this round confused the two claims twice: a Firefox whose swapchain,
+fence, blit and `XPutImage` all succeed still showed a black window, and only
+
+```
+vkQueuePresentKHR: swapchain 0x55 frame 0 512x416 — 208/208 sampled pixels are not black
+```
+
+distinguished "the application rendered nothing" from "the display target is
+broken". It said the frame had content — **and that there was exactly one of
+them**, which is the fact that turns a rendering question into a lifecycle one.
+
+## 6. Still not proven
+
+- **`about:support` reading `WebRender`.** The arbiter named in the brief. On
+  testhost Firefox does not survive to have one; on devhost it survives,
+  logs no failure, and paints one frame.
+- **A frame rate against the software baseline.** There is no steady state to
+  measure yet.
+- **The Wayland WSI end to end.** It is built, it is tested, and no Mesa on this
+  topology will call it. It is the right answer for a compositor that can
+  advertise a device, and a `wc-proxy` that could is a different piece of work.

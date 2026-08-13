@@ -1096,12 +1096,14 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkCreateHeadlessSurfaceEXT",
     "vkCreateXlibSurfaceKHR",
     "vkCreateXcbSurfaceKHR",
+    "vkCreateWaylandSurfaceKHR",
     "vkGetPhysicalDeviceSurfaceSupportKHR",
     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
     "vkGetPhysicalDeviceSurfaceFormatsKHR",
     "vkGetPhysicalDeviceSurfacePresentModesKHR",
     "vkGetPhysicalDeviceXlibPresentationSupportKHR",
     "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+    "vkGetPhysicalDeviceWaylandPresentationSupportKHR",
     "vkCreateSwapchainKHR",
     "vkDestroySwapchainKHR",
     "vkGetSwapchainImagesKHR",
@@ -1950,7 +1952,7 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
 /// Entry points that are hand-written **and not on the generated C surface**,
 /// which have to be put in the proc tables by name.
 ///
-/// Three, all surface creators, and they are here for two facts that only make
+/// Four, all surface creators, and they are here for two facts that only make
 /// sense together.
 ///
 /// **The registry cannot give them a signature.** `vkCreateXcbSurfaceKHR` takes
@@ -1979,6 +1981,7 @@ const EXTRA_LOCAL: &[(&str, &str)] = &[
     ("vkCreateHeadlessSurfaceEXT", "sv_vk_create_headless_surface_ext"),
     ("vkCreateXlibSurfaceKHR", "sv_vk_create_xlib_surface_khr"),
     ("vkCreateXcbSurfaceKHR", "sv_vk_create_xcb_surface_khr"),
+    ("vkCreateWaylandSurfaceKHR", "sv_vk_create_wayland_surface_khr"),
 ];
 
 fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
