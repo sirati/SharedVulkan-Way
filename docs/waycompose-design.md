@@ -15757,3 +15757,62 @@ stops at the first failing binary and under-reports the total. What catches this
 class is `cargo build --workspace --target …` with the warnings read, plus
 `cargo test --workspace --no-fail-fast` with the **binary** count checked
 alongside the test count (§36.9).
+
+### 36.15 The number moves: 18.96 ms → 1.06 ms per wait, across a real hypervisor
+
+§36.10 failed to measure the doorbell and said exactly what a real measurement
+would need: *"a command-heavy workload with a fixed, known number of round trips;
+timing taken in-process around the calls rather than around the process; the
+parker's `first_slice` settable at run time so that fixed-slice, ladder and
+doorbell are three conditions of one experiment rather than three builds."*
+
+All three were built, and the measurement now resolves.
+
+**The instrument.** `park::park_stats` counts every wait and accumulates the time
+spent in it, in `wait_until` — the one place every ring wait goes through — via a
+`Drop` accountant so that waits ending in a timeout or an error are counted too.
+The app side reports it at exit. Wall clock was the wrong instrument and §36.10
+is the record of why; **time spent parked** is precisely the quantity a doorbell
+changes.
+
+`SV_PARK_FIRST_SLICE_US` makes the old fixed-slice behaviour reachable from the
+shipping binary, so the comparison does not require checking out an older
+revision — which would change more than the variable under test.
+
+**The result**, `scripts/sv-guest-e2e.sh` on the development guest, two rounds:
+
+| condition | ring waits | parked | **mean per wait** |
+|---|---|---|---|
+| fixed 20 ms slice (what shipped) | 95 | 1801.5 / 1697.5 ms | **18.96 / 17.87 ms** |
+| slice ladder | 95 | 416.2 / 440.5 ms | **4.38 / 4.64 ms** |
+| **ladder + virtio-serial doorbell** | 95 | 100.8 / 113.7 ms | **1.06 / 1.20 ms** |
+
+App-side wall clock moved with it — 1933 → 506 → 159 ms — but the wall clock is
+the weaker number and is only quoted second.
+
+**Read the control first: 95 ring waits in every condition, both rounds.** The
+workload is identical and only the cost of waiting changed. That is what §36.10's
+experiment could not establish and is why this one can.
+
+Three things follow.
+
+1. **The diagnosis was right, exactly.** 18.96 ms per wait against a 20 ms
+   slice. §36.6 claimed the number "was not approximately the slice, it *was* the
+   slice, once per wait", from arithmetic on 216.9/20 = 10.8. This measures it
+   directly and it is the slice, less the fraction of waits satisfied during the
+   spin phase.
+2. **The ladder is a real mitigation and really is not the fix.** 4.3× better and
+   still 4 ms a wait, because it is a poll and the ladder's own ceiling bounds it.
+3. **The doorbell is the fix: 17.9× against the fixed slice**, and what is left —
+   about 1 ms — is the residue of the waits that the ladder is still climbing
+   before the byte arrives, plus scheduling. The doorbell itself crosses in ~9 µs
+   (§36.6.3), so there is more available here; the ladder and the doorbell are
+   currently additive rather than the doorbell simply winning.
+
+**Caveats, in the order they matter.** The guest is Linux, so the Windows
+`WaitOnAddress` floor of 1 ms is not in this measurement and the deployment guest
+will not do as well until §36.13's port question is answered. `vulkaninfo` is
+still a setup-heavy workload — but that no longer matters, because the instrument
+measures the waits rather than the process. And 95 waits is `vulkaninfo`'s
+enumeration, not a frame: a present is ~11 waits and the per-wait figure is what
+transfers, not the total.

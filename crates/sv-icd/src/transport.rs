@@ -287,6 +287,7 @@ pub struct RingTransport {
 impl Drop for RingTransport {
     fn drop(&mut self) {
         self.beating.store(false, std::sync::atomic::Ordering::Relaxed);
+        report_park_time();
     }
 }
 
@@ -699,6 +700,8 @@ impl RingTransport {
 
         #[cfg(not(unix))]
         let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
+
+        arm_park_report();
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -1253,5 +1256,55 @@ impl RingTransport {
         if let Some(b) = blobs.open.remove(&command_buffer) {
             Self::release(&mut blobs, b);
         }
+    }
+}
+
+/// Print how long this process spent blocked on a ring, once.
+///
+/// §36.10's instrument. Wall clock could not resolve the doorbell — most of a
+/// run is setup, and one sample includes a VM boot — but **time spent parked**
+/// is exactly the quantity a doorbell changes, and the app side is the side that
+/// does the waiting.
+///
+/// # Why an `atexit` and not just `Drop`
+///
+/// `RingTransport` is reached through a process-lifetime singleton, so its
+/// `Drop` never runs: an application that exits without destroying its instance
+/// — which `vulkaninfo` does, and which is legal — takes the number with it. The
+/// first version of this printed nothing for exactly that reason and the log
+/// looked as though the ICD had never waited at all.
+///
+/// Registered once, on the first attach, so a process that never talks to a ring
+/// prints nothing.
+fn report_park_time() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(s) = sv_transport::park::park_summary() {
+            eprintln!("[icd] {s}");
+        }
+    });
+}
+
+#[cfg(unix)]
+extern "C" fn park_time_atexit() {
+    report_park_time();
+}
+
+/// Arrange for [`report_park_time`] to run however the process ends.
+///
+/// Unix only, and that is the measurement's venue rather than a limitation: in
+/// the cross-VM topology the app side — this side — runs on the **host**, which
+/// is Linux, and the guest is the GPU half. A Windows app side is the
+/// same-machine topology, where the peer is on this kernel, the ordinary futex
+/// wake already reaches it, and there is no hypervisor latency to account for.
+pub(crate) fn arm_park_report() {
+    #[cfg(unix)]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            // SAFETY: `park_time_atexit` is a plain `extern "C"` function with
+            // no arguments that touches only atomics and stderr.
+            unsafe { libc::atexit(park_time_atexit) };
+        });
     }
 }
