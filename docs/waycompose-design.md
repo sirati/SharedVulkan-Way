@@ -13082,3 +13082,49 @@ would be worse than the TCP path it replaces, so:
 works end to end.** It is retired when a Wayland client drives a guest window
 through a ring and the latency is measured against it — not before, because two
 paths with no statement of which is real is worse than one path that is wrong.
+
+### 36.9 A process-global in a parallel test suite is a flake generator, and this tree now has two
+
+`cargo test` runs a binary's tests as **threads of one process**. Anything
+process-global is therefore shared between tests that were written as though
+they were alone, and the failure it produces has three properties that make it
+expensive out of all proportion to the bug: it is intermittent, it appears in a
+test that has nothing to do with the cause, and a failing binary stops
+`cargo test --workspace` where it stands so the run reports a *truncated total*
+rather than a failure.
+
+Two instances, found within hours of each other by different people:
+
+| | the global | how it presented |
+|---|---|---|
+| §32.2 | `/dev/shm/sv.arena.{run_id:016x}`, `O_CREAT\|O_EXCL`, two tests passing `run_id = 1` | `errno 17`, and the workspace run reporting **169 tests of 1253** |
+| §36.6 | `park::CROSS_WAKE`, the process's cross-VM doorbell | `a_rung_doorbell_wakes_the_consumer` failing about **one run in four**, in a test that does not use the doorbell |
+
+The second is the more instructive, because the sharing is not a name collision
+but a *behaviour* one. While any test had a doorbell installed, `Bell::ring`
+**everywhere in the suite** wrote a byte into that test's pipe — so an unrelated
+test's timing changed, and the test that failed was not the test that was wrong.
+The fix is an `Installed` guard holding a `static Mutex` for the duration and
+uninstalling on `Drop`, including on a panic; a leaked install would break tests
+that have nothing to do with the module.
+
+**And the truncated total is the part to learn.** Before the merge, one
+`cargo test --workspace` in this branch reported `TOTAL: 138` where the next two
+reported 1255. It was written off as a mid-compile artefact. It was not: that
+branch predated §32.2's fix, so it was carrying the `/dev/shm` collision, and
+138 is precisely that bug's signature — a binary dying early and taking the rest
+of the run's terms with it.
+
+A test count that drops by an order of magnitude and then recovers is never
+noise. It looks like noise only because the number is a **sum**, and nothing
+draws attention to a missing term. The cheap fix is to count the terms:
+
+```
+$ cargo test 2>&1 | grep -cE '^test result: ok\.'      # binaries that finished
+$ cargo test 2>&1 | grep -cE '^test result: FAILED'    # binaries that did not
+```
+
+On this branch, post-merge, five consecutive runs: **82 binaries, 1302 tests, 0
+failed binaries**, every time. The binary count is the thing that would have
+made the earlier 138 unmistakable in the moment rather than a week later —
+anything reporting a total should report how many binaries contributed to it.
