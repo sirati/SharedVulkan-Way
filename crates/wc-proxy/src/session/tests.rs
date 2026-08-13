@@ -973,3 +973,410 @@ fn every_protocol_stage_21_added_survives_its_first_request() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+// ---------------------------------------------------------------------------
+// The clipboard
+// ---------------------------------------------------------------------------
+//
+// These are the tests for the defect stage 13 exists to remove and for the
+// feature that replaces it, and neither needs a compositor: the whole point of
+// the design is that the transfer is **terminated in this process**, so both
+// ends of every pipe in these tests are real and local, exactly as they are in
+// a running proxy.
+
+/// A request's opcode, by name, out of the vendored XML — because the messages
+/// below are the client's and a hand-written opcode here would be testing this
+/// file's arithmetic against itself.
+fn rq(iface: &str, name: &str) -> u16 {
+    let s = Spec::builtin().unwrap();
+    s.interface(iface)
+        .unwrap_or_else(|| panic!("no {iface}"))
+        .requests
+        .iter()
+        .position(|m| m.name == name)
+        .unwrap_or_else(|| panic!("{iface} has no {name}")) as u16
+}
+
+fn ev(iface: &str, name: &str) -> u16 {
+    let s = Spec::builtin().unwrap();
+    s.interface(iface)
+        .unwrap()
+        .events
+        .iter()
+        .position(|m| m.name == name)
+        .unwrap_or_else(|| panic!("{iface} has no {name} event")) as u16
+}
+
+fn nul_bytes(s: &str) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.push(0);
+    v
+}
+
+fn string_body(s: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    wire::push_bytes(&mut b, &nul_bytes(s));
+    b
+}
+
+/// A session with a `wl_data_device_manager` and a `wl_data_device` bound, which
+/// is what every GTK client does before it has a seat at all (docs/design.md
+/// §15.4).
+fn clipboard_harness() -> (Harness, u32, u32) {
+    let d = tmpdir("clip");
+    let t = SharedFile::new(&d, "Z:\\").unwrap();
+    let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let seat = h.bind(registry, 3, "wl_seat", 7);
+    let manager = h.bind(registry, 4, "wl_data_device_manager", 3);
+    let device = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "get_data_device"), &[device, seat]);
+    (h, manager, device)
+}
+
+/// Everything the proxy sent its own client on its own account, re-walked from
+/// the concatenated stream so that the framing is asserted rather than assumed.
+fn client_messages(bytes: &[u8]) -> Vec<(u32, u16, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(hdr) = Header::parse(&bytes[at..]) {
+        assert!(hdr.size >= 8 && at + hdr.size <= bytes.len(), "stream is not framed");
+        out.push((hdr.object, hdr.opcode, bytes[at + 8..at + hdr.size].to_vec()));
+        at += hdr.size;
+    }
+    assert_eq!(at, bytes.len(), "trailing bytes toward the client");
+    out
+}
+
+/// **The defect, gone.**
+///
+/// Before stage 13 this exact message returned `Error::UnsupportedFd`, which
+/// `proxy.rs` turns into a failed drain, which closes the connection. A client
+/// that pasted did not fail to paste — it died. The assertion is therefore on
+/// `is_ok` first and on the feature second.
+#[test]
+fn a_paste_is_answered_here_instead_of_ending_the_connection() {
+    let (mut h, _manager, device) = clipboard_harness();
+
+    // The compositor announces a selection: data_offer, offer, selection. All
+    // three are forwarded verbatim, which is why they are driven through
+    // `server_message` rather than invented.
+    let offer = 0xff00_0001u32;
+    let (to_client, fds) = h
+        .session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+            &offer.to_ne_bytes(),
+        )
+        .expect("a data_offer is an ordinary event");
+    assert!(fds.is_empty(), "an announcement carries no descriptor");
+    assert!(!to_client.is_empty());
+    assert_eq!(h.session.objects.interface(offer), Some("wl_data_offer"));
+
+    // The client pastes. Its pipe is real, because the whole design is that
+    // this fd stops here.
+    let (read, write) = pipe().unwrap();
+    let mut fds = VecDeque::from([write]);
+    let body = string_body("text/plain;charset=utf-8");
+    let hdr = Header {
+        object: offer,
+        opcode: rq("wl_data_offer", "receive"),
+        size: 8 + body.len(),
+    };
+    let out = h.session.client_message(hdr, &body, &mut fds);
+    assert!(out.is_ok(), "a paste must not be an error: {:?}", out.err());
+    assert!(out.unwrap().is_empty(), "receive must not reach the compositor");
+    assert!(fds.is_empty(), "the client's descriptor must be consumed, not left to desync");
+
+    // One fetch is pending, for the clipboard rather than for a drag.
+    let fetches = h.session.take_fetches();
+    assert_eq!(fetches.len(), 1);
+    assert_eq!(fetches[0].1, Source::Clipboard);
+    assert_eq!(fetches[0].2, "text/plain;charset=utf-8");
+
+    // The compositor answers, and the bytes appear in the client's pipe.
+    h.session.deliver(fetches[0].0, Answer::Bytes(b"from Notepad".to_vec()));
+    h.session.pump_transfers();
+    assert!(!h.session.clip_busy(), "the transfer is finished and the pipe closed");
+
+    use std::io::Read as _;
+    let mut f = std::fs::File::from(read);
+    let mut got = String::new();
+    f.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "from Notepad", "and EOF arrived, or read_to_string would hang");
+    assert_eq!(h.session.stats.pastes_served, 1);
+    assert_eq!(h.session.stats.clip_bytes_in, 12);
+}
+
+/// A fetch the compositor refuses closes the pipe rather than leaving it open.
+///
+/// The difference matters more than it looks: a client blocked in `read` on a
+/// descriptor nobody will ever write to or close is hung, and hung is the one
+/// outcome worse than the connection error this stage removed.
+#[test]
+fn a_refused_paste_closes_the_pipe_rather_than_hanging_the_client() {
+    let (mut h, _m, device) = clipboard_harness();
+    let offer = 0xff00_0002u32;
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+            &offer.to_ne_bytes(),
+        )
+        .unwrap();
+
+    let (read, write) = pipe().unwrap();
+    let body = string_body("image/png");
+    h.session
+        .client_message(
+            Header { object: offer, opcode: rq("wl_data_offer", "receive"), size: 8 + body.len() },
+            &body,
+            &mut VecDeque::from([write]),
+        )
+        .unwrap();
+    let token = h.session.take_fetches()[0].0;
+    h.session.deliver(token, Answer::Failed("the clipboard holds no such format".into()));
+    h.session.pump_transfers();
+
+    use std::io::Read as _;
+    let mut f = std::fs::File::from(read);
+    let mut got = Vec::new();
+    f.read_to_end(&mut got).unwrap();
+    assert!(got.is_empty(), "a refusal is an empty paste");
+}
+
+/// The other direction: the client copies, and the proxy reads the bytes out of
+/// it through a pipe it made itself.
+#[test]
+fn a_copy_pulls_the_clients_bytes_out_through_a_pipe_this_side_made() {
+    let (mut h, manager, device) = clipboard_harness();
+
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    assert_eq!(
+        h.session.objects.interface(source),
+        Some("wl_data_source"),
+        "the id is tracked here even though the compositor never hears of it"
+    );
+    // The five names GTK offers one string under, plus HTML.
+    for mime in [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+        "text/html",
+    ] {
+        let body = string_body(mime);
+        h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    }
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    // Nothing of the family reached the compositor. This is the property that
+    // makes the whole design work: with no source upstream, the compositor can
+    // never be asked to write into a descriptor.
+    let upstream = h.upstream_messages();
+    let spec = Spec::builtin().unwrap();
+    for (object, opcode, _) in &upstream {
+        if let Some(iface) = h.session.objects.interface(*object)
+            && iface.starts_with("wl_data_")
+        {
+            let name = spec.request(iface, *opcode).map(|m| m.name.clone()).unwrap_or_default();
+            assert_eq!(
+                name, "get_data_device",
+                "{iface}.{name} reached the compositor and should not have"
+            );
+        }
+    }
+
+    // Two pipes went to the client: one text flavour and one HTML, which is
+    // `WANTED_TEXT` doing its job — five names for one string is one pipe.
+    let (bytes, fds) = h.session.take_client_messages();
+    assert_eq!(fds.len(), 2, "one pipe per mime type actually wanted");
+    let msgs = client_messages(&bytes);
+    let send = ev("wl_data_source", "send");
+    let sent: Vec<String> = msgs
+        .iter()
+        .filter(|(o, op, _)| *o == source && *op == send)
+        .map(|(_, _, b)| {
+            let len = u32::from_ne_bytes(b[0..4].try_into().unwrap()) as usize;
+            String::from_utf8_lossy(&b[4..4 + len - 1]).into_owned()
+        })
+        .collect();
+    assert_eq!(sent, ["text/plain;charset=utf-8", "text/html"]);
+
+    // The client writes and closes, exactly as libwayland's own clipboard code
+    // does. The order of the fds is the order of the messages, which is what
+    // libwayland's positional matching requires.
+    {
+        use std::io::Write as _;
+        let mut it = fds.into_iter();
+        let mut text = std::fs::File::from(it.next().unwrap());
+        text.write_all(b"hello from Firefox").unwrap();
+        let mut html = std::fs::File::from(it.next().unwrap());
+        html.write_all(b"<b>hello from Firefox</b>").unwrap();
+        // Both dropped here: the client closing its end is the EOF the proxy
+        // waits for.
+    }
+    for _ in 0..8 {
+        h.session.pump_transfers();
+        if !h.session.clip_busy() {
+            break;
+        }
+    }
+    let pulled = h.session.take_selection().expect("the pull completed");
+    assert!(!pulled.for_drag);
+    assert_eq!(
+        pulled.payloads,
+        vec![
+            ("text/plain;charset=utf-8".to_owned(), b"hello from Firefox".to_vec()),
+            ("text/html".to_owned(), b"<b>hello from Firefox</b>".to_vec()),
+        ]
+    );
+    assert_eq!(h.session.stats.selections_copied, 1);
+    assert_eq!(h.session.stats.clip_bytes_out, 18 + 25);
+
+    // And the client is told it no longer owns the selection, which is what
+    // lets a clipboard tool exit instead of waiting to serve a `send` that
+    // will never come.
+    let (after, _) = h.session.take_client_messages();
+    let cancelled = ev("wl_data_source", "cancelled");
+    assert!(
+        client_messages(&after).iter().any(|(o, op, _)| *o == source && *op == cancelled),
+        "the source must be cancelled once the system holds the bytes"
+    );
+}
+
+/// A selection this clipboard cannot carry leaves the system clipboard alone.
+///
+/// Publishing an empty set instead would be *destructive*: a client that copied
+/// an image would silently wipe whatever the user had copied in a Windows
+/// application a moment earlier.
+#[test]
+fn a_selection_of_formats_we_cannot_carry_does_not_wipe_the_clipboard() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("image/png");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    assert!(h.session.take_selection().is_none(), "nothing to publish");
+    assert!(!h.session.clip_busy(), "and no pipe was opened");
+    let (bytes, fds) = h.session.take_client_messages();
+    assert!(fds.is_empty());
+    assert!(client_messages(&bytes).is_empty());
+
+    // A null source, by contrast, is an explicit clear and must publish one.
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[0, 2]);
+    let pulled = h.session.take_selection().expect("clearing publishes an empty selection");
+    assert!(pulled.payloads.is_empty());
+}
+
+/// Destroying a source retires its id toward the client, because the compositor
+/// never knew the id and so will never send `wl_display.delete_id` for it.
+#[test]
+fn a_destroyed_source_gets_its_delete_id_from_the_proxy() {
+    let (mut h, manager, _device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let _ = h.session.take_client_messages();
+    h.send_words(source, rq("wl_data_source", "destroy"), &[]);
+    let (bytes, _) = h.session.take_client_messages();
+    assert_eq!(
+        client_messages(&bytes),
+        vec![(1u32, op::DISPLAY_DELETE_ID, source.to_ne_bytes().to_vec())]
+    );
+    assert_eq!(h.session.objects.interface(source), None);
+}
+
+/// A drag is the same pull with a different destination, and it **always
+/// ends**.
+///
+/// The second half is the point. A `wl_data_source` that starts a drag and is
+/// never told what happened leaves the client waiting forever, and a drag that
+/// does not end is worse than one that does not start.
+#[test]
+fn a_drag_uses_the_same_pull_and_is_always_answered() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("text/uri-list");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    let body = string_body("text/plain");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    // start_drag(source, origin, icon, serial)
+    h.send_words(device, rq("wl_data_device", "start_drag"), &[source, 0, 0, 1]);
+
+    let (_, fds) = h.session.take_client_messages();
+    assert_eq!(fds.len(), 1, "one pipe, for the one text flavour offered");
+    drop(fds);
+    for _ in 0..8 {
+        h.session.pump_transfers();
+        if !h.session.clip_busy() {
+            break;
+        }
+    }
+    let pulled = h.session.take_selection().expect("the pull completed");
+    assert!(pulled.for_drag, "and it is marked as a drag rather than a copy");
+
+    // The platform says the drag ended with nothing. The source is told.
+    h.session.drag_finished(0);
+    let (bytes, _) = h.session.take_client_messages();
+    let cancelled = ev("wl_data_source", "cancelled");
+    assert!(
+        client_messages(&bytes).iter().any(|(o, op, _)| *o == source && *op == cancelled),
+        "a drag that dropped nowhere must cancel its source"
+    );
+
+    // And a drop is the other answer, in the order the protocol requires.
+    let source2 = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source2]);
+    let body = string_body("text/plain");
+    h.send(source2, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "start_drag"), &[source2, 0, 0, 2]);
+    let _ = h.session.take_client_messages();
+    h.session.drag_finished(1); // copy
+    let (bytes, _) = h.session.take_client_messages();
+    let names: Vec<u16> = client_messages(&bytes)
+        .into_iter()
+        .filter(|(o, _, _)| *o == source2)
+        .map(|(_, op, _)| op)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ev("wl_data_source", "action"),
+            ev("wl_data_source", "dnd_drop_performed"),
+            ev("wl_data_source", "dnd_finished"),
+        ]
+    );
+}
+
+/// A client that holds its pipe open forever is published anyway, once.
+#[test]
+fn a_client_that_never_closes_its_pipe_is_not_a_selection_lost_forever() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("text/plain");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    let (_, fds) = h.session.take_client_messages();
+    let mut it = fds.into_iter();
+    let held = std::fs::File::from(it.next().unwrap());
+    {
+        use std::io::Write as _;
+        let mut w = &held;
+        w.write_all(b"half a sentence").unwrap();
+    }
+    // Held open on purpose. Without the deadline this would never publish.
+    h.session.pump_transfers();
+    assert!(h.session.take_selection().is_none(), "not yet: nothing has expired");
+    std::thread::sleep(COPY_DEADLINE + std::time::Duration::from_millis(50));
+    h.session.pump_transfers();
+    let pulled = h.session.take_selection().expect("the deadline published what arrived");
+    assert_eq!(pulled.payloads[0].1, b"half a sentence");
+    assert_eq!(h.session.stats.copy_timeouts, 1);
+    drop(held);
+}

@@ -69,6 +69,11 @@ struct Args {
     /// is how this proxy runs on the VM host, gets systemd's environment and
     /// not a login shell's.
     icon_dirs: Vec<std::path::PathBuf>,
+    /// STAGE 13. Carry the clipboard across on a third connection
+    /// (`crate::clip`). Off, a client that copies or pastes gets nothing —
+    /// which is what the compositor did before this stage, minus the part
+    /// where the connection died.
+    clipboard: bool,
 }
 
 fn usage() -> &'static str {
@@ -102,6 +107,8 @@ usage: wc-proxy --upstream <path> [options]
 
   --icon-theme NAME      the icon theme to search before hicolor
                          (default $WC_ICON_THEME, else hicolor)
+  --no-clipboard         do not carry the clipboard: no third connection to the
+                         compositor, and copy and paste do nothing
   --no-icons             do not resolve app ids to icons at all: no second
                          connection to the compositor, no directory walk
   --icon-data-dir DIR    an extra XDG data directory to search first; may be
@@ -135,6 +142,7 @@ fn parse_args() -> Result<Args, String> {
         icons: true,
         icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
         icon_dirs: Vec::new(),
+        clipboard: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -162,6 +170,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--trace" => a.trace = true,
             "--no-icons" => a.icons = false,
+            "--no-clipboard" => a.clipboard = false,
             "--icon-theme" => a.icon_theme = next()?,
             "--icon-data-dir" => a.icon_dirs.push(next()?.into()),
             "--pool-headroom" => {
@@ -435,6 +444,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .map(wc_proxy::icons::dirs_for_pid)
             .unwrap_or_default();
         let extra_dirs = args.icon_dirs.clone();
+        let want_clipboard = args.clipboard;
         threads.push(std::thread::spawn(move || {
             // The `+ Send` is only needed to cross this boundary; `Session`
             // itself has no opinion, and widening its signature would push the
@@ -477,16 +487,49 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            // STAGE 13. The clipboard's byte path, one per served connection
+            // and for the same reasons the icon feed is per connection: the
+            // state is per client, a feed that fails takes only its own
+            // client's clipboard with it, and a socket is cheap.
+            //
+            // **A separate connection from the icon feed on purpose.**
+            // `--no-icons` exists, and an icon resolver that cannot reach the
+            // theme must not be the reason copy and paste stop working.
+            let mut clip = if want_clipboard {
+                match wc_proxy::clip::ClipLink::connect(&upstream_path, &spec) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!(
+                            "[proxy] client {n}: no clipboard feed ({e}); copy and paste will \
+                             do nothing rather than failing"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
-            match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
+            match proxy::pump(
+                &mut session,
+                client,
+                upstream,
+                icons.as_mut(),
+                clip.as_mut(),
+                idle,
+                &mut log,
+            ) {
                 Ok(why) => println!("[proxy] client {n} stopped: {why}"),
                 Err(e) => println!("[proxy] client {n} failed: {e}"),
             }
             println!("[proxy] client {n} transport {}", session.transport_name());
             println!("[proxy] client {n} {}", session.stats.summary());
             if let Some(link) = &icons {
+                println!("[proxy] client {n} {}", link.summary());
+            }
+            if let Some(link) = &clip {
                 println!("[proxy] client {n} {}", link.summary());
             }
         }));

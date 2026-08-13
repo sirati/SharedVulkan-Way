@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wc_clipboard_v1">
+
+  <copyright>
+    SPDX-License-Identifier: MIT OR Apache-2.0
+  </copyright>
+
+  <description summary="the system clipboard as bytes, for a client that cannot be handed a pipe">
+    wl_data_offer.receive hands the compositor a **file descriptor** and asks it
+    to write the selection into it. wl_data_source.send does the mirror image.
+    Both are unimplementable across this project's boundary, and not because
+    they are hard: docs/design.md §2.1 forbids a descriptor crossing at all, and
+    a pipe is the one kind of shared object that cannot be replaced by a name —
+    a name can be opened by the far side, a pipe's *other end* cannot be
+    conjured from one.
+
+    So the transfer is terminated where the descriptor is real. wc-proxy runs on
+    the same machine as the Wayland client, keeps the client's fd, and speaks
+    this interface to the compositor instead. Nothing here is a descriptor;
+    everything is an array or a string.
+
+    That is the same trade wc_icon_manager_v1 made for icon pixels (§16.5), for
+    the same reason and with the same chunking limit: wayland-backend's buffers
+    are 4096 bytes in both directions, so a payload of any size has to arrive in
+    pieces.
+
+    **This interface does not announce anything.** Which client may see the
+    selection, and when, is wl_data_device's business and smithay's; the
+    compositor sets a normal compositor-provided selection from whatever the
+    Win32 clipboard holds and the offers reach the client over the ordinary
+    protocol, proxied verbatim. This interface carries only the two things that
+    would otherwise need a pipe: the bytes out, and the bytes back.
+  </description>
+
+  <interface name="wc_clipboard_manager_v1" version="1">
+    <description summary="publishes and fetches the system clipboard's contents">
+      A publisher builds one selection out of band and then installs it:
+      chunk* data, repeated once per mime type, and finally publish. A reader
+      asks for one mime type with fetch and is answered with chunk* done, or
+      with fail.
+
+      Requests and events are matched by a **token** chosen by the client
+      rather than by object, because a fetch is not an object and minting one
+      per paste would put a round trip in front of every one. Tokens are the
+      client's to reuse once done or fail has arrived for them.
+    </description>
+
+    <enum name="error">
+      <entry name="too_big" value="0"
+             summary="more staged bytes than the compositor will hold"/>
+      <entry name="too_many" value="1"
+             summary="more mime types in one selection than the compositor will hold"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop using the clipboard">
+        Whatever was published stays on the system clipboard. Destroying this
+        object does not take it back, for the same reason closing a Windows
+        application does not empty the clipboard.
+
+        Fetches still outstanding are abandoned; no done or fail will arrive
+        for them.
+      </description>
+    </request>
+
+    <request name="chunk">
+      <description summary="append bytes to the staging area">
+        The bytes are the payload for the mime type the next data request will
+        name, in whatever encoding that mime type implies. Send as many chunks
+        as it takes; the split points carry no meaning.
+      </description>
+      <arg name="data" type="array" summary="a piece of the next payload"/>
+    </request>
+
+    <request name="data">
+      <description summary="close off the payload for one mime type">
+        Takes everything staged so far as the contents for this mime type and
+        empties the staging area. A mime type named twice in one selection
+        replaces the earlier payload.
+      </description>
+      <arg name="mime_type" type="string"/>
+    </request>
+
+    <request name="publish">
+      <description summary="install the staged selection as the system clipboard">
+        Replaces the clipboard's entire contents. Publishing with nothing
+        staged empties it, which is what a client clearing its selection
+        (wl_data_device.set_selection with a null source) means.
+
+        Mime types the compositor has no system format for are dropped rather
+        than refused: a Wayland client offers everything it can produce and a
+        clipboard holds what the system knows how to hold, so a selection
+        offering fifteen flavours of text and one image is a success even if
+        only two of them survive.
+      </description>
+    </request>
+
+    <request name="start_drag">
+      <description summary="begin a system drag carrying the staged selection">
+        Takes the staged set exactly as publish does — same chunk, same data,
+        same staging area — and hands it to the system's own drag and drop
+        instead of to the clipboard. On Windows that is DoDragDrop with an
+        IDataObject built from the same formats a publish would have set.
+
+        **The payload is staged before the drag starts, and that is forced
+        rather than chosen.** OLE asks the drag source for the bytes with a
+        synchronous IDataObject::GetData call from inside a modal loop; there
+        is no round trip available to a Wayland client on another machine at
+        that moment. So a drag costs the same eager read a copy does, which is
+        the same read, in the same place, through the same code.
+
+        Ends with drag_finished, always: a drop, a cancellation and a failure
+        to start are all answered.
+      </description>
+      <arg name="actions" type="uint" summary="wl_data_device_manager.dnd_action bitmask the source allows"/>
+    </request>
+
+    <request name="cancel_drag">
+      <description summary="the source withdrew the drag">
+        A Wayland client that destroys its data source mid-drag means this. If
+        no drag is running it is ignored.
+      </description>
+    </request>
+
+    <enum name="source">
+      <description summary="which system selection a fetch is asking about">
+        Two, because Windows keeps them apart: the clipboard is a global that
+        outlives every window, and a drag's data belongs to one gesture and is
+        gone when it ends. Asking the wrong one is how a paste picks up the
+        last thing dragged.
+      </description>
+      <entry name="clipboard" value="0"/>
+      <entry name="drag" value="1" summary="the drag currently over one of this compositor's windows"/>
+    </enum>
+
+    <request name="fetch">
+      <description summary="ask for the system clipboard, or the current drag, in one mime type">
+        Answered with chunk* done, or with fail if the source holds nothing
+        convertible to this mime type.
+
+        **The answer is the clipboard as it is now, not as it was when the
+        offer was made.** There is no serial and no snapshot: Windows'
+        clipboard has one current owner and asking it is the only way to read
+        it, so a user who copies again between the offer and the paste pastes
+        the newer thing. X11 behaves the same way for the same reason.
+
+        A drag's data does not have that problem, because the compositor reads
+        the whole IDataObject at the drop and answers out of that copy.
+      </description>
+      <arg name="token" type="uint" summary="echoed back on every answer"/>
+      <arg name="source" type="uint" summary="a value from the source enum"/>
+      <arg name="mime_type" type="string"/>
+    </request>
+
+    <event name="chunk">
+      <description summary="a piece of a fetched payload">
+        Pieces arrive in order and are concatenated. An empty payload is zero
+        chunks followed by done, which is not the same as fail: the clipboard
+        can legitimately hold an empty string.
+      </description>
+      <arg name="token" type="uint"/>
+      <arg name="data" type="array"/>
+    </event>
+
+    <event name="done">
+      <description summary="the fetched payload is complete"/>
+      <arg name="token" type="uint"/>
+    </event>
+
+    <event name="fail">
+      <description summary="the fetch cannot be answered">
+        The clipboard does not hold this mime type, or could not be opened.
+        The reason is for a log, not for a client to match on.
+      </description>
+      <arg name="token" type="uint"/>
+      <arg name="reason" type="string"/>
+    </event>
+
+    <event name="drag_finished">
+      <description summary="a drag started with start_drag has ended">
+        The action is what the drop target actually did, as a
+        wl_data_device_manager.dnd_action value: none means the drag was
+        cancelled or refused, and anything else means a drop happened and the
+        source should tell its client so.
+
+        Exactly one of these arrives per start_drag.
+      </description>
+      <arg name="action" type="uint" summary="wl_data_device_manager.dnd_action"/>
+    </event>
+  </interface>
+
+</protocol>

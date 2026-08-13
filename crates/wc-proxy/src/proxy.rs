@@ -178,6 +178,7 @@ pub fn pump(
     client: UnixStream,
     upstream: UnixStream,
     icons: Option<&mut crate::iconlink::IconLink>,
+    clip: Option<&mut crate::clip::ClipLink>,
     idle_timeout: std::time::Duration,
     log: &mut dyn FnMut(&str),
 ) -> io::Result<&'static str> {
@@ -192,16 +193,22 @@ pub fn pump(
     let mut to_client_fds = Vec::<OwnedFd>::new();
     let mut last_traffic = std::time::Instant::now();
     let mut icons = icons;
+    let mut clip = clip;
 
     loop {
-        // Three descriptors at most, and the third is this program's *own*
-        // connection to the compositor rather than anything a client gave it —
-        // see `iconlink` for why the icon feed cannot ride the first one.
+        // Four descriptors at most, and the last two are this program's *own*
+        // connections to the compositor rather than anything a client gave it —
+        // see `iconlink` and `clip` for why neither feed can ride the first one.
         let mut pollfds = [
             libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: upstream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd {
                 fd: icons.as_ref().map_or(-1, |l| l.fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: clip.as_ref().map_or(-1, |l| l.fd()),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -215,11 +222,21 @@ pub fn pump(
         if icons.as_ref().is_some_and(|l| l.wants_write()) {
             pollfds[2].events |= libc::POLLOUT;
         }
+        if clip.as_ref().is_some_and(|l| l.wants_write()) {
+            pollfds[3].events |= libc::POLLOUT;
+        }
+        // **1 ms while a clipboard transfer is running, 20 otherwise.** The
+        // clipboard's pipes are deliberately not in this array — see
+        // `Session::pump_transfers` for why matching a variable-length pollfd
+        // list back to a variable-length transfer list is not worth its cost —
+        // so the wait is what bounds a transfer's latency. A copy or a paste is
+        // a few turns of this loop and a human pressed a key to start it.
+        let wait = if session.clip_busy() { 1 } else { 20 };
         // A negative fd in a `pollfd` is ignored by `poll`, which is how the
         // no-icons case costs nothing and needs no second loop.
-        // SAFETY: a live array of three `pollfd`s whose length is passed
+        // SAFETY: a live array of four `pollfd`s whose length is passed
         // truthfully.
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 3, 20) };
+        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 4, wait) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -290,6 +307,59 @@ pub fn pump(
             }
         }
 
+        // --- the clipboard ---------------------------------------------------
+        //
+        // Between the reads and the writes on purpose: a `wl_data_source.send`
+        // this turn produced has to reach the client in the same turn, or the
+        // client cannot write into the pipe this loop is about to read from.
+        // The two halves are one deadlock away from each other and the order
+        // is what keeps them apart.
+        session.pump_transfers();
+        if let Some(link) = clip.as_deref_mut() {
+            for (token, source, mime) in session.take_fetches() {
+                if !link.fetch(token, source, &mime) {
+                    session.deliver(
+                        token,
+                        crate::clip::Answer::Failed("no clipboard feed".into()),
+                    );
+                }
+            }
+            if let Some(pulled) = session.take_selection() {
+                if pulled.for_drag {
+                    if !link.start_drag(pulled.payloads, session.drag_actions()) {
+                        // Answered rather than dropped, so the client's source
+                        // is not left waiting for a `dnd_finished`.
+                        session.drag_finished(0);
+                    }
+                } else {
+                    link.publish(pulled.payloads);
+                }
+            }
+            for (token, answer) in link.take_answers() {
+                session.deliver(token, answer);
+            }
+            if let Some(action) = link.take_drag_result() {
+                session.drag_finished(action);
+            }
+        } else {
+            // No feed at all: every request is answered negatively rather than
+            // ignored, which is the difference between a clipboard that does
+            // nothing and a client that hangs.
+            for (token, _, _) in session.take_fetches() {
+                session.deliver(token, crate::clip::Answer::Failed("no clipboard feed".into()));
+            }
+            if let Some(pulled) = session.take_selection()
+                && pulled.for_drag
+            {
+                session.drag_finished(0);
+            }
+        }
+        {
+            let (bytes, mut new_fds) = session.take_client_messages();
+            to_client.extend_from_slice(&bytes);
+            to_client_fds.append(&mut new_fds);
+        }
+
         // --- writes ---------------------------------------------------------
         if !to_server.is_empty() {
             // Never with a control message. There is no code path here that
@@ -331,7 +401,21 @@ pub fn pump(
                 link.on_writable()?;
             }
         }
+        if let Some(link) = clip.as_deref_mut() {
+            if pollfds[3].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                link.on_readable(log)?;
+            }
+            if link.wants_write() {
+                link.on_writable()?;
+            }
+        }
 
+        // A transfer in flight keeps the connection alive. Without this a copy
+        // of a large selection from a client that is otherwise idle would time
+        // the whole session out halfway through.
+        if session.clip_busy() {
+            last_traffic = std::time::Instant::now();
+        }
         if last_traffic.elapsed() > idle_timeout {
             return Ok("idle timeout");
         }

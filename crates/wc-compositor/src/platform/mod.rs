@@ -56,6 +56,8 @@ use std::sync::{Arc, Mutex};
 use crate::surface::{Rect, Shadow};
 
 #[cfg(windows)]
+mod drag;
+#[cfg(windows)]
 mod win32;
 #[cfg(windows)]
 pub use win32::{current_layout, start};
@@ -286,9 +288,63 @@ pub enum ToUi {
     /// `win32::activate_window` for exactly when it is allowed to succeed and
     /// what happens when it is not.
     Activate { id: WindowId },
+    // --- the clipboard, stage 13 -------------------------------------------
+    //
+    // Bytes, in both directions, and **never a descriptor**. That is the whole
+    // shape of the clipboard feature and it is visible here: `wl_data_offer.
+    // receive` hands a compositor a pipe to write into, and there is no pipe
+    // between a Wayland client on Linux and a compositor in a VM, so the
+    // transfer is terminated in wc-proxy and only the payload crosses. By the
+    // time it reaches this queue it is a `Vec<u8>` with a mime type on it.
+    //
+    /// Replace the system clipboard's contents.
+    ///
+    /// One payload per mime type, already in the client's own encoding. The
+    /// conversion to `CF_UNICODETEXT` and friends is `crate::clipboard`'s, so
+    /// that it is unit-tested on the machine that runs `cargo test`; what
+    /// crosses here is what the Wayland client said.
+    SetClipboard { payloads: Vec<(String, Vec<u8>)> },
+    /// Read the system clipboard — or the drag currently over a window — and
+    /// answer with [`FromUi::ClipboardData`].
+    ///
+    /// **Asynchronous, and it has to be.** The clipboard can only be read on
+    /// the thread that owns a window, and the Wayland thread does not own one;
+    /// a synchronous call would be the Wayland thread blocking on the UI
+    /// thread, which is the deadlock this file's whole design avoids.
+    FetchClipboard {
+        token: u64,
+        /// Read the drag in progress rather than the clipboard. Two sources,
+        /// because Windows keeps them apart and reading the wrong one is how a
+        /// paste picks up the last thing dragged.
+        from_drag: bool,
+        mime: String,
+    },
+    /// Begin a system drag carrying these payloads.
+    ///
+    /// The same bytes a [`ToUi::SetClipboard`] would carry, staged the same
+    /// way, because a drag's data and a selection's data are the same thing
+    /// with a different gesture attached. Answered exactly once with
+    /// [`FromUi::DragFinished`].
+    StartDrag {
+        payloads: Vec<(String, Vec<u8>)>,
+        /// `wl_data_device_manager.dnd_action` bits the source permits.
+        actions: u32,
+    },
+    /// The Wayland source withdrew its drag.
+    CancelDrag,
 
     /// End the pump.
     Quit,
+}
+
+/// `wl_data_device_manager.dnd_action`, which both sides of the boundary speak.
+///
+/// Wayland's numbering rather than `DROPEFFECT`'s, because the Wayland client
+/// is the one that has to understand it and the platform is the one that has to
+/// convert — the same rule that puts evdev keycodes rather than virtual-key
+/// codes in [`FromUi::Key`].
+pub mod dnd_action {
+    pub const NONE: u32 = 0;
 }
 
 /// UI thread -> Wayland thread.
@@ -390,6 +446,26 @@ pub enum FromUi {
     /// The keyboard layout changed under us (`WM_INPUTLANGCHANGE`), naming one
     /// of `crate::input::LAYOUTS`.
     Layout { name: &'static str },
+
+    // --- the clipboard, stage 13 -------------------------------------------
+    /// The system clipboard changed, and now holds these mime types.
+    ///
+    /// On Win32 this is `WM_CLIPBOARDUPDATE`, which arrives for **every**
+    /// change including this compositor's own — see the note in
+    /// `win32.rs::on_clipboard_update` for why that echo is kept rather than
+    /// filtered, and what breaks if it is not.
+    ClipboardChanged { mimes: Vec<String> },
+    /// The answer to a [`ToUi::FetchClipboard`]. `None` is "the clipboard has
+    /// nothing convertible to that mime type", which is an ordinary outcome
+    /// rather than an error: the user copied a bitmap and the client wanted
+    /// text.
+    ClipboardData { token: u64, data: Option<Vec<u8>> },
+    /// A drag started with [`ToUi::StartDrag`] has ended, with the action the
+    /// drop target actually took. Exactly one per `StartDrag`, on every path
+    /// including "the drag could not be started" — a client waiting forever on
+    /// a drag that never ends is the failure this whole feature exists not to
+    /// build.
+    DragFinished { action: u32 },
 
     /// The pump has stopped. Nothing more is coming and no window will paint
     /// again.

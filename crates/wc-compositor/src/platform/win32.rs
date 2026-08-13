@@ -107,7 +107,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
-use windows_sys::Win32::Foundation::{POINT, SIZE};
+use windows_sys::Win32::Foundation::{GlobalFree, POINT, SIZE};
+// ADDED FOR STAGE 13. The clipboard lives in `DataExchange` rather than with
+// the window messages, and its payloads are moveable global handles rather than
+// pointers, which is why `Memory` comes with it. See `set_clipboard`.
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+    GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+
+use crate::clipboard::SystemFormat;
 
 use crate::input::{evdev, evdev_keycode};
 
@@ -152,6 +163,23 @@ const SC_SCREENSAVE: u32 = 0xF140;
 /// to test a system command is `(wParam & 0xFFF0) == SC_...`. Comparing the raw
 /// `wParam` works most of the time, which is worse than never working.
 const SC_MASK: usize = 0xFFF0;
+/// `WM_CLIPBOARDUPDATE`, 0x031D: the system clipboard's contents changed.
+///
+/// Delivered to every window registered with `AddClipboardFormatListener`,
+/// which is how a clipboard is watched now — the old route was a
+/// `SetClipboardViewer` chain, where one badly behaved application that forgot
+/// to forward broke the notification for everything after it. There is nothing
+/// to unhook here except our own registration.
+const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+
+/// `CF_UNICODETEXT` and `CF_HDROP`.
+///
+/// Written out for the reason [`WM_MOUSELEAVE`] is: `windows-sys` files the
+/// clipboard format constants under `Win32::System::Ole`, which is a large
+/// module to compile into every build in order to say `13`. The numbers are in
+/// `winuser.h` and have not moved since Windows 3.1.
+const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -633,7 +661,7 @@ pub fn current_layout() -> &'static str {
 // The thread-local registry
 // ---------------------------------------------------------------------------
 
-struct Ui {
+pub(crate) struct Ui {
     windows: RefCell<HashMap<WindowId, Rc<WindowState>>>,
     commands: Commands,
     events: Sender<FromUi>,
@@ -651,6 +679,15 @@ struct Ui {
     /// *previous* state, and there is no "what is it now" query — and because
     /// `toplevel_proc` has to read it to answer `WM_SYSCOMMAND`.
     idle_inhibited: Cell<bool>,
+    /// `RegisterClipboardFormatW("HTML Format")`, resolved once.
+    ///
+    /// A **registered** format has no compile-time number: the id is minted per
+    /// session and two processes get the same one only because they registered
+    /// the same string. 0 means "not resolved yet"; the registration cannot
+    /// fail in any way worth a second code path — if it does, `html_format`
+    /// returns 0 and no HTML crosses, which is the same outcome as a clipboard
+    /// with no HTML on it.
+    html_format: Cell<u32>,
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
@@ -952,7 +989,270 @@ unsafe extern "system" fn controller_proc(
         }
         return 0;
     }
+    if msg == WM_CLIPBOARDUPDATE {
+        if let Some(ui) = ui() {
+            on_clipboard_update(&ui);
+        }
+        return 0;
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+// ---------------------------------------------------------------------------
+// The clipboard
+// ---------------------------------------------------------------------------
+
+/// The clipboard changed. Tell the Wayland side what is on it now.
+///
+/// # This fires for our own writes too, and that is kept deliberately
+///
+/// `SetClipboard` below posts a `WM_CLIPBOARDUPDATE` straight back at us, so a
+/// Wayland client that copies immediately gets a selection offer describing its
+/// own bytes. The obvious tidy-up is to remember `GetClipboardSequenceNumber`
+/// after our own write and swallow the echo.
+///
+/// **That would break copying and pasting inside one client.** wc-proxy does
+/// not forward `wl_data_device.set_selection` — it cannot, because the
+/// compositor would then have to answer `wl_data_source.send` with a
+/// descriptor — so a client that copies has told the compositor nothing about
+/// having a selection. The echo is the *only* thing that gives that client a
+/// `wl_data_offer` for what it just copied. Swallow it and Ctrl-C followed by
+/// Ctrl-V in the same window pastes nothing, which is the first thing anybody
+/// tries.
+///
+/// The cost of keeping it is one extra round trip per copy. That is the right
+/// side of the trade, and it is also what makes client-to-client copying work
+/// transitively through Windows' own clipboard.
+fn on_clipboard_update(ui: &Rc<Ui>) {
+    let formats = available_formats(ui);
+    let mimes = crate::clipboard::mimes_for(&formats);
+    println!(
+        "wc-compositor: WM_CLIPBOARDUPDATE: [{}] -> {} mime type(s)",
+        formats.iter().map(|f| f.name()).collect::<Vec<_>>().join(", "),
+        mimes.len()
+    );
+    let _ = ui.events.send(FromUi::ClipboardChanged { mimes });
+}
+
+/// `RegisterClipboardFormatW("HTML Format")`, once per process.
+fn html_format(ui: &Rc<Ui>) -> u32 {
+    if ui.html_format.get() != 0 {
+        return ui.html_format.get();
+    }
+    let name = wide("HTML Format");
+    // SAFETY: a NUL-terminated UTF-16 buffer that outlives the call.
+    let id = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
+    ui.html_format.set(id);
+    id
+}
+
+fn format_id(ui: &Rc<Ui>, format: SystemFormat) -> u32 {
+    match format {
+        SystemFormat::UnicodeText => CF_UNICODETEXT,
+        SystemFormat::Html => html_format(ui),
+        SystemFormat::HDrop => CF_HDROP,
+    }
+}
+
+/// Which of the three formats this compositor carries are on the clipboard.
+///
+/// `IsClipboardFormatAvailable` rather than `EnumClipboardFormats`, because it
+/// does **not** require the clipboard to be open — which matters more than the
+/// three calls it saves. Opening the clipboard inside a `WM_CLIPBOARDUPDATE`
+/// handler is a fight with whichever application has just finished writing to
+/// it and has not yet closed it, and losing that fight would mean announcing an
+/// empty clipboard to Wayland at precisely the moment something was copied.
+fn available_formats(ui: &Rc<Ui>) -> Vec<SystemFormat> {
+    [SystemFormat::UnicodeText, SystemFormat::Html, SystemFormat::HDrop]
+        .into_iter()
+        .filter(|f| {
+            let id = format_id(ui, *f);
+            // SAFETY: a pure query taking a format number.
+            id != 0 && unsafe { IsClipboardFormatAvailable(id) } != 0
+        })
+        .collect()
+}
+
+/// Run `f` with the clipboard open, or return `None`.
+///
+/// **The retry is not defensive coding.** The clipboard is a single global
+/// lock held by whichever process is reading or writing it, `OpenClipboard`
+/// fails outright rather than waiting, and the documented remedy is to try
+/// again. Losing the race silently would mean a copy that did nothing, so the
+/// failure is logged with the reason and the window that holds it.
+fn with_clipboard<T>(ui: &Rc<Ui>, what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    let hwnd = ui.controller.get() as HWND;
+    for attempt in 0..8 {
+        // SAFETY: a live window handle owned by this thread.
+        if unsafe { OpenClipboard(hwnd) } != 0 {
+            let out = f();
+            // SAFETY: the clipboard was opened by this thread just above.
+            unsafe { CloseClipboard() };
+            return Some(out);
+        }
+        if attempt < 7 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    eprintln!(
+        "wc-compositor: could not open the clipboard to {what}: {}",
+        std::io::Error::last_os_error()
+    );
+    None
+}
+
+/// One format's bytes, copied out of the clipboard's global handle.
+///
+/// The handle belongs to the clipboard and is **not** freed here; only the lock
+/// is released. Freeing it is how an application takes the clipboard down with
+/// it, and it is the classic Win32 clipboard bug.
+fn read_format(id: u32) -> Option<Vec<u8>> {
+    // SAFETY: the clipboard is open (the caller is inside `with_clipboard`).
+    let handle = unsafe { GetClipboardData(id) };
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: a handle the clipboard just gave us.
+    let ptr = unsafe { GlobalLock(handle) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the same handle, still locked.
+    let len = unsafe { GlobalSize(handle) };
+    // SAFETY: `ptr` addresses `len` bytes for as long as the lock is held.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec();
+    // SAFETY: balancing the lock taken above.
+    unsafe { GlobalUnlock(handle) };
+    Some(bytes)
+}
+
+/// Put one format on the clipboard. The clipboard must already be open and
+/// emptied.
+fn write_format(id: u32, bytes: &[u8]) -> bool {
+    // SAFETY: an allocation request; the handle is checked below.
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: a handle just allocated here.
+    let ptr = unsafe { GlobalLock(handle) };
+    if ptr.is_null() {
+        // SAFETY: ours, never handed to the clipboard.
+        unsafe { GlobalFree(handle) };
+        return false;
+    }
+    // SAFETY: `ptr` addresses at least `bytes.len()` bytes and the source is a
+    // live slice; the two cannot overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        GlobalUnlock(handle);
+    }
+    // SAFETY: the clipboard is open and owned by this thread. **On success the
+    // system owns `handle`** — which is why there is no `GlobalFree` on this
+    // path and why there must be one on the other.
+    if unsafe { SetClipboardData(id, handle) }.is_null() {
+        // SAFETY: the call failed, so ownership never transferred.
+        unsafe { GlobalFree(handle) };
+        return false;
+    }
+    true
+}
+
+fn set_clipboard(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>) {
+    let system = crate::clipboard::to_system(&payloads);
+    with_clipboard(ui, "publish a selection", || {
+        // SAFETY: the clipboard is open. `EmptyClipboard` also makes this
+        // process the owner, which is required before `SetClipboardData`.
+        unsafe { EmptyClipboard() };
+        for (format, bytes) in &system {
+            let id = format_id(ui, *format);
+            let ok = id != 0 && write_format(id, bytes);
+            println!(
+                "wc-compositor: clipboard set {} ({} bytes): {}",
+                format.name(),
+                bytes.len(),
+                if ok { "ok" } else { "failed" }
+            );
+        }
+        if system.is_empty() {
+            println!("wc-compositor: clipboard cleared");
+        }
+    });
+}
+
+/// Hand the staged payloads to OLE as a drag source.
+///
+/// See [`super::drag`] for the `IDataObject`/`IDropSource` pair and for why
+/// `DoDragDrop`'s modal loop does not starve this pump.
+fn start_drag(ui: &Rc<Ui>, payloads: Vec<(String, Vec<u8>)>, actions: u32) {
+    let action = super::drag::run(ui, &payloads, actions);
+    let _ = ui.events.send(FromUi::DragFinished { action });
+}
+
+fn cancel_drag(ui: &Rc<Ui>) {
+    super::drag::cancel(ui);
+}
+
+fn fetch_clipboard(ui: &Rc<Ui>, token: u64, from_drag: bool, mime: &str) {
+    if from_drag {
+        let data = super::drag::payload(ui, mime);
+        println!(
+            "wc-compositor: drag fetch token={token} mime={mime:?} -> {}",
+            match &data {
+                Some(b) => format!("{} bytes", b.len()),
+                None => "nothing".to_owned(),
+            }
+        );
+        let _ = ui.events.send(FromUi::ClipboardData { token, data });
+        return;
+    }
+    let formats = available_formats(ui);
+    let data = with_clipboard(ui, "answer a paste", || {
+        formats.iter().find_map(|f| {
+            let bytes = read_format(format_id(ui, *f))?;
+            crate::clipboard::from_system(mime, *f, &bytes)
+        })
+    })
+    .flatten();
+    match &data {
+        Some(b) => println!(
+            "wc-compositor: clipboard fetch token={token} mime={mime:?} -> {} bytes",
+            b.len()
+        ),
+        // The one case worth the extra open: the answer was nothing, and the
+        // difference between "the clipboard is empty" and "it holds a bitmap"
+        // is otherwise invisible.
+        None => println!(
+            "wc-compositor: clipboard fetch token={token} mime={mime:?} -> nothing; \
+             the clipboard holds formats [{}]",
+            describe_clipboard(ui)
+        ),
+    }
+    let _ = ui.events.send(FromUi::ClipboardData { token, data });
+}
+
+/// Every clipboard format on the clipboard right now, by number, for the log.
+///
+/// Only called when `--trace`-ish curiosity is warranted — a paste that found
+/// nothing — because it needs the clipboard open and the answer is a list of
+/// integers that mean nothing without a registry lookup. It is here because
+/// "the client asked for text/plain and got nothing" and "the clipboard held
+/// only CF_BITMAP" are the same log line otherwise.
+fn describe_clipboard(ui: &Rc<Ui>) -> String {
+    with_clipboard(ui, "list its formats", || {
+        let mut out = Vec::new();
+        let mut id = 0u32;
+        loop {
+            // SAFETY: the clipboard is open; 0 starts the enumeration.
+            id = unsafe { EnumClipboardFormats(id) };
+            if id == 0 {
+                break;
+            }
+            out.push(id.to_string());
+        }
+        out.join(", ")
+    })
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1442,12 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 activate_window(&w);
             }
         }
+        ToUi::SetClipboard { payloads } => set_clipboard(ui, payloads),
+        ToUi::FetchClipboard { token, from_drag, mime } => {
+            fetch_clipboard(ui, token, from_drag, &mime)
+        }
+        ToUi::StartDrag { payloads, actions } => start_drag(ui, payloads, actions),
+        ToUi::CancelDrag => cancel_drag(ui),
         ToUi::Destroy { id } => {
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
@@ -2145,9 +2451,29 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         draining: Cell::new(false),
         controller: Cell::new(controller as isize),
         idle_inhibited: Cell::new(false),
+        html_format: Cell::new(0),
         dump_frames: config.dump_frames.clone(),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
+
+    // Watch the clipboard from here on. A message-only window is a perfectly
+    // good listener — the notification is posted to the handle rather than
+    // broadcast to visible windows — and it is the right one, because the
+    // clipboard belongs to the compositor and not to any client's window.
+    //
+    // A failure is logged and shrugged off: without it the Windows-to-Wayland
+    // direction stops being automatic and nothing else changes, which is worth
+    // a degraded run rather than a refusal to start.
+    // SAFETY: a live window handle owned by this thread.
+    if unsafe { AddClipboardFormatListener(controller) } == 0 {
+        eprintln!(
+            "wc-compositor: AddClipboardFormatListener failed ({}); \
+             Windows-to-Wayland clipboard changes will not be announced",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        println!("wc-compositor: watching the system clipboard (WM_CLIPBOARDUPDATE)");
+    }
 
     Ok(assemble(
         tx,
@@ -2186,8 +2512,13 @@ impl PumpInner {
         let controller = self.ui.controller.replace(0);
         if controller != 0 {
             // SAFETY: created on this thread, destroyed once, and no `Ui`
-            // handle can post to it after `Stopped` is observed.
+            // handle can post to it after `Stopped` is observed. The clipboard
+            // registration is removed first: `DestroyWindow` would take it with
+            // the window, and unhooking explicitly is what makes a run that
+            // ends cleanly leave nothing behind in the window station — which
+            // matters on a guest several worktrees share (§16.8).
             unsafe {
+                RemoveClipboardFormatListener(controller as HWND);
                 DestroyWindow(controller as HWND);
             }
         }

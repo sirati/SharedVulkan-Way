@@ -64,6 +64,13 @@ windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_System_Console",
+  # ADDED FOR STAGE 13: the clipboard. `DataExchange` is where the Windows
+  # metadata files `OpenClipboard`, `SetClipboardData` and
+  # `AddClipboardFormatListener` — not with the other window messages, which is
+  # where one would look — and `Memory` is `GlobalAlloc`, because a clipboard
+  # format is handed over as a moveable global handle and not as a pointer.
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
   "Win32_System_LibraryLoader",
   # ADDED FOR STAGE 8: the poll loop's wait is a high-resolution waitable timer
   # rather than `Sleep`, whose quantum on the guest is 15.6 ms (§13.8).
