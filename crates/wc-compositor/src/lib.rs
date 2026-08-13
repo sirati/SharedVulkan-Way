@@ -641,6 +641,97 @@ fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> Stri
     }
 }
 
+/// What to do about the file arenas named on a command line.
+///
+/// Split out of [`run_from`] so it can be *tested*, which is the whole reason
+/// it exists as a function. The refusal it implements was added over
+/// `--arena-provide` alone while its own message named `--arena` too, and
+/// `--arena <id>:<size>:<path>` therefore attached a file in silence — on the
+/// two harnesses that used exactly that flag against the real guest, over the
+/// export §10.3 measured incoherent for live mappings. Nothing could have
+/// caught that: the check lived four statements into a function that starts a
+/// compositor, so no test could reach it, and the message asserted a coverage
+/// the condition did not have. §41.4.
+#[derive(Debug, PartialEq, Eq)]
+enum FileArenaVerdict {
+    /// No `--arena` and no `--arena-provide`: nothing to decide.
+    NoFileArena,
+    /// A file arena, and no `SV_ALLOW_FILE_ARENA`. The run stops.
+    Refuse(String),
+    /// A file arena a fixture asked for by name. The run continues and says so,
+    /// so that a fixture cannot be mistaken for a result in a log read later.
+    Warn(String),
+}
+
+fn file_arena_verdict(file_arenas: usize, allowed: bool) -> FileArenaVerdict {
+    if file_arenas == 0 {
+        return FileArenaVerdict::NoFileArena;
+    }
+    if !allowed {
+        return FileArenaVerdict::Refuse(
+            "wc-compositor: the FILE arena is not a target. `--arena` and \
+             `--arena-provide` open files, which is a Wine-only fixture for a machine \
+             with no hypervisor. Use `--arena-guest-ram <id>:<bytes>`. Set \
+             SV_ALLOW_FILE_ARENA=1 for a fixture run — never to make a guest run pass."
+                .to_owned(),
+        );
+    }
+    FileArenaVerdict::Warn(format!(
+        "wc-compositor: WARNING: FILE arena in use ({file_arenas} region(s), \
+         SV_ALLOW_FILE_ARENA is set). This is a fixture, not a target; guest RAM is \
+         the only real substrate."
+    ))
+}
+
+#[cfg(test)]
+mod file_arena_tests {
+    use super::*;
+
+    /// The regression that motivated splitting this out. `--arena` and
+    /// `--arena-provide` are counted together, so a run that names only the
+    /// first is refused exactly like a run that names only the second — which
+    /// was not true when the condition read `!args.provide_arenas.is_empty()`.
+    #[test]
+    fn either_file_arena_flag_is_refused_without_the_fixture_permission() {
+        for n in 1..=3 {
+            match file_arena_verdict(n, false) {
+                FileArenaVerdict::Refuse(m) => {
+                    assert!(m.contains("not a target"), "{m}");
+                    // The message names both flags, and now the condition
+                    // covers both. A message that claims more coverage than the
+                    // code has is how the hole survived review.
+                    assert!(m.contains("`--arena`"), "{m}");
+                    assert!(m.contains("`--arena-provide`"), "{m}");
+                    assert!(m.contains("--arena-guest-ram"), "the way out must be named: {m}");
+                }
+                other => panic!("{n} file arena(s) were not refused: {other:?}"),
+            }
+        }
+    }
+
+    /// Guest RAM is not a file arena and must never be touched by this check.
+    #[test]
+    fn a_run_with_no_file_arena_is_not_asked_for_permission() {
+        assert_eq!(file_arena_verdict(0, false), FileArenaVerdict::NoFileArena);
+        assert_eq!(file_arena_verdict(0, true), FileArenaVerdict::NoFileArena);
+    }
+
+    /// A fixture that asked for it by name runs, and **says so**: a fixture
+    /// that produced a silent green log is how a file result gets quoted later
+    /// as a result about the deployment.
+    #[test]
+    fn a_fixture_run_is_allowed_and_announces_itself() {
+        match file_arena_verdict(2, true) {
+            FileArenaVerdict::Warn(m) => {
+                assert!(m.contains("WARNING"), "{m}");
+                assert!(m.contains("not a target"), "{m}");
+                assert!(m.contains("2 region(s)"), "the count is in it: {m}");
+            }
+            other => panic!("a permitted fixture was not allowed to run: {other:?}"),
+        }
+    }
+}
+
 /// Run the compositor.
 ///
 /// This was `fn main` until the unification (one-binary.md §2.2). It is `pub`
@@ -680,6 +771,33 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // a filesystem open on the frame path exactly once in a way no measurement
     // would catch. Attaching here also means a wrong `--arena` is a startup
     // failure with a path in it rather than a pool that cannot be mapped.
+    //
+    // THE FILE ARENA IS NOT A TARGET, AND `--arena` IS ONE — which is the whole
+    // reason this check is *here* rather than only over `provide_arenas` below.
+    //
+    // The refusal added with `--arena-provide` names both flags in its message
+    // and tested only one of them, so `--arena <id>:<size>:<path>` attached a
+    // file in silence. That is not an academic gap: `--arena 0:N:Z:\wc11\arena`
+    // and `--arena 0:N:Z:\wc32\arena` are exactly what `wc-icon.sh` and
+    // `wc-taskbar.sh` passed on every run they ever made against the real
+    // guest, over the export §10.3 measured incoherent for live mappings. The
+    // escape hatch had a hole in the shape of the defect it was added to close.
+    //
+    // Both flags open a file; they differ only in whether it is opened
+    // read-write, which is what `--arena-provide` adds so that an outbound
+    // window is possible on a machine with no hypervisor. Neither is guest RAM,
+    // so neither is a target, and one condition covers both.
+    match file_arena_verdict(
+        args.arenas.len() + args.provide_arenas.len(),
+        std::env::var_os("SV_ALLOW_FILE_ARENA").is_some(),
+    ) {
+        FileArenaVerdict::Refuse(msg) => {
+            eprintln!("{msg}");
+            return std::process::ExitCode::from(2);
+        }
+        FileArenaVerdict::Warn(msg) => eprintln!("{msg}"),
+        FileArenaVerdict::NoFileArena => {}
+    }
     for (id, size, path) in &args.arenas {
         match wc_handle::arena::attach(*id, path, *size) {
             Ok(()) => println!("wc-compositor: arena {id} attached: {size} bytes at {path}"),
@@ -736,27 +854,10 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // possible on a machine with no hypervisor in it.
     //
     // THE FILE ARENA IS NOT A TARGET — guest RAM is (design.md §1a), and
-    // `--arena-guest-ram` is how this process provides one. The file path is a
-    // Wine-only fixture, kept because it is the only way to run the arena code
-    // without a hypervisor, and refused because a run that quietly lands here
-    // is measuring a substrate §10.3 measured incoherent for live mappings:
-    // 65280 of 65536 bytes wrong, both directions, which reached a user's
-    // screen as a torn window that passed every other check.
-    if !args.provide_arenas.is_empty() && std::env::var_os("SV_ALLOW_FILE_ARENA").is_none() {
-        eprintln!(
-            "wc-compositor: the FILE arena is not a target. `--arena-provide` and \
-             `--arena` open files, which is a Wine-only fixture for a machine with no \
-             hypervisor. Use `--arena-guest-ram <id>:<bytes>`. Set SV_ALLOW_FILE_ARENA=1 \
-             for a fixture run — never to make a guest run pass."
-        );
-        return std::process::ExitCode::from(2);
-    }
-    if !args.provide_arenas.is_empty() {
-        eprintln!(
-            "wc-compositor: WARNING: FILE arena in use (SV_ALLOW_FILE_ARENA is set). This \
-             is a fixture, not a target; guest RAM is the only real substrate."
-        );
-    }
+    // `--arena-guest-ram` is how this process provides one. The refusal for
+    // both this flag and `--arena` is above, before either is opened: it was
+    // here and tested only `provide_arenas`, which let `--arena` through in
+    // silence. §41.4.
     for (id, size, path) in &args.provide_arenas {
         match wc_handle::arena::provide_file(*id, path, *size) {
             Ok(()) => println!(

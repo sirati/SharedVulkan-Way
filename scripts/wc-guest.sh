@@ -272,6 +272,30 @@ case "$TRANSPORT" in
     # Provided out of band, before either side starts, which is what an arena
     # is. Truncated to zero first: a region left full of the previous run's
     # pixels is a way for a frozen frame to look like a live one.
+    #
+    # STAGE 41. **This is the file arena on a machine that has a guest, which is
+    # the one combination the rest of stage 41 exists to make impossible — and
+    # it is licensed here, by name, for the one reason that survives.** §18.2's
+    # second bullet: this branch is a *control*. It is how the export's
+    # incoherence is re-measured rather than assumed, and §12.6 is the section
+    # made of its output. A control that cannot be run is an assumption.
+    #
+    # What makes that legitimate rather than the defect §41 removed is that it
+    # is never silent. The transport is a positional argument of this driver —
+    # `s4_run term arena …`, `s4_run termg guest-ram …` — it is in the tag of
+    # every line the run prints, and `s4_run`'s `case "$transport:$counts"`
+    # asserts that the substrate named is the substrate that served the pixels.
+    # `SV_ALLOW_FILE_ARENA` is exported for this branch alone, so the two
+    # `guest-ram` legs below cannot inherit it and degrade to a file if their
+    # locate fails; they fail instead, which is the whole point.
+    #
+    # `wc-proxy` and `wc-compositor` each print their own warning on top of this
+    # one. Three lines saying "not a target" is the correct number for a
+    # substrate §10.3 measured 65280-of-65536 bytes wrong in both directions.
+    echo "S4-SUBSTRATE: FILE arena on the export -- a CONTROL for §12.6's incoherence"
+    echo "S4-SUBSTRATE: measurement, NOT a result about the deployment. Guest RAM is"
+    echo "S4-SUBSTRATE: the substrate; the guest-ram legs are the ones that measure it."
+    export SV_ALLOW_FILE_ARENA=1
     : >"$SHARE/arena"; truncate -s $ARENA_SIZE "$SHARE/arena"; chmod 666 "$SHARE/arena"
     COMP_EXTRA=(--arena "0:$ARENA_SIZE:$SHARE_WIN\\arena")
     PROXY_EXTRA=(--transport arena --arena-path "$SHARE/arena" --arena-id 0 --arena-size $ARENA_SIZE) ;;
@@ -285,6 +309,11 @@ case "$TRANSPORT" in
     # tell the compositor about, and PROXY_EXTRA cannot be filled in yet -- the
     # plan does not exist until the compositor has printed its run id.
     ARENA_SIZE=$((PAGES * 4096))
+    # STAGE 41. Actively removed rather than merely not set, so that a value
+    # inherited from the shell of somebody who ran the control an hour ago
+    # cannot license a file if this leg's locate fails. This leg has no file to
+    # fall back to and must not acquire one.
+    unset SV_ALLOW_FILE_ARENA
     COMP_EXTRA=(--arena-guest-ram "0:$ARENA_SIZE" --arena-outbound "0:$ARENA_OUTBOUND")
     # STAGE 10: no shared directory. The keymap comes out of the arena, so
     # there is nothing for the compositor to publish and nothing for this side
