@@ -27,7 +27,7 @@ use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::reexports::wayland_server::protocol::{
     wl_buffer, wl_output, wl_seat, wl_surface::WlSurface,
 };
-use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -38,6 +38,8 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
+// ADDED FOR STAGE 17: the edge a client names when it asks to be resized.
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 // ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
 // than guessed at, and they are requirements for different reasons — see
@@ -78,15 +80,79 @@ use smithay::reexports::wayland_protocols_misc::server_decoration::server
 use smithay::reexports::wayland_server::WEnum;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+// ADDED FOR STAGE 21: three protocols whose implementation is a Win32 call, and
+// which are here because the Win32 call exists rather than because the protocol
+// is short. docs/design.md §25 has the argument for each and — for the two that
+// were considered and left out — for their absence.
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
+use smithay::wayland::keyboard_shortcuts_inhibit::{
+    KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
+};
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_kde_decoration, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_idle_inhibit, delegate_kde_decoration,
+    delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
-use crate::platform::{
-    FromUi, IconImage, ToUi, Ui, WindowId, WindowKind,
-};
+use crate::platform::{Edge, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
 use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource};
+
+/// Which decoration mode the compositor advertises, and answers with.
+///
+/// ADDED FOR STAGE 17, and it is the whole of docs/design.md §22.2. Until this
+/// stage the answer was hard-coded to `Client`, on the reasoning that
+/// docs/goal-firefox.md wants Firefox painting its tabs into the title bar and
+/// only a client that draws a title bar can do that. The reasoning was right
+/// and the *default* was wrong: the compositor was promising a frame it had not
+/// built, so every window came up with Windows' caption **and** the client's,
+/// one directly above the other, which is the bug the user reported.
+///
+/// So the mode is a flag with `Server` as its default — Windows' caption is a
+/// real server-side decoration and claiming it is the honest answer — and
+/// `Client` is what the frame-extension work of §22.7 is developed against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Decorations {
+    /// Windows draws the caption; the client draws none. **The default.**
+    #[default]
+    Server,
+    /// The client draws its own title bar, and the Win32 side is expected to
+    /// extend the frame into it (`FrameStyle::extend_top`).
+    Client,
+}
+
+impl Decorations {
+    /// Parse the `--decorations` argument. `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "server" => Some(Self::Server),
+            "client" => Some(Self::Client),
+            _ => None,
+        }
+    }
+
+    /// The KDE protocol's spelling, which is the one that decides GTK's
+    /// behaviour: `gtk_window_should_use_csd()` consults nothing else on
+    /// Wayland, and it reads the **manager's** default rather than the answer
+    /// to any per-surface request.
+    fn kde(self) -> KdeDefaultMode {
+        match self {
+            Self::Server => KdeDefaultMode::Server,
+            Self::Client => KdeDefaultMode::Client,
+        }
+    }
+
+    /// The `xdg-decoration` spelling. Measured to be used by nothing this
+    /// project runs (§15.7), and answered consistently anyway.
+    fn xdg(self) -> DecorationMode {
+        match self {
+            Self::Server => DecorationMode::ServerSide,
+            Self::Client => DecorationMode::ClientSide,
+        }
+    }
+}
 
 /// What kind of shell surface a window is.
 ///
@@ -127,6 +193,13 @@ struct Window {
     /// here rather than in the command queue.
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
+    /// ADDED FOR STAGE 21, and only one thing reads it: an idle inhibitor on a
+    /// minimised window must not keep the display awake, because a minimised
+    /// window is one the protocol calls invisible. Tracked here rather than
+    /// asked of Win32 because the answer has to be available on the Wayland
+    /// thread, which may not call Win32 at all; the value is `WM_SIZE`'s
+    /// `SIZE_MINIMIZED` arriving as [`FromUi::Minimized`].
+    minimized: bool,
     title: String,
     app_id: String,
     /// Callbacks the client is waiting on before it draws its next frame.
@@ -172,6 +245,9 @@ pub struct State {
     /// ADDED FOR STAGE 9. Both decoration protocols; see the import.
     _xdg_decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
+    /// ADDED FOR STAGE 17. Which mode is advertised as the manager default and
+    /// answered to anything that asks. See [`Decorations`].
+    decorations: Decorations,
     /// Owns the seat: `SeatState` keeps every `Seat` it makes, so there is no
     /// separate field for the one seat and dropping the local from `new` does
     /// not destroy the global.
@@ -255,6 +331,24 @@ pub struct State {
     /// The same, for the standard protocol; it also owns the size list that
     /// every binding client is told about.
     _toplevel_icon: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+
+    // --- stage 21 ----------------------------------------------------------
+    /// Kept alive so `zwp_idle_inhibit_manager_v1` stays advertised.
+    _idle_inhibit: IdleInhibitManagerState,
+    /// Surfaces holding at least one `zwp_idle_inhibitor_v1`, and how many.
+    ///
+    /// **A count, not a set**, because one surface may hold several: the
+    /// protocol puts no limit on it and a toolkit that inhibits once for the
+    /// video and once for the fullscreen state is doing nothing wrong. A set
+    /// would have the first destroy cancel the second inhibitor's effect.
+    idle_inhibitors: HashMap<WlSurface, usize>,
+    /// What was last sent to the platform, so an unchanged answer costs nothing.
+    idle_inhibited: bool,
+    /// `xdg_activation_v1`'s token pool. Held rather than dropped because it is
+    /// mutable state — tokens are minted, spent and expired through it.
+    xdg_activation: XdgActivationState,
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1`'s inhibitor list.
+    shortcuts_inhibit: KeyboardShortcutsInhibitState,
     /// Icons this compositor has actually put on a window, and how many were
     /// asked for and had nothing to answer with. Printed at shutdown, because
     /// "the icon is generic" is otherwise indistinguishable from "the icon
@@ -305,6 +399,7 @@ const REPEAT_DELAY_MS: i32 = 500;
 const REPEAT_RATE_HZ: i32 = 30;
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dh: &DisplayHandle,
         ui: Ui,
@@ -312,6 +407,7 @@ impl State {
         debug_icon: bool,
         layout: &str,
         output_size: (i32, i32),
+        decorations: Decorations,
     ) -> Self {
         let mut seat_state = SeatState::new();
         // The local is dropped at the end of this function and that is safe:
@@ -450,6 +546,10 @@ impl State {
         output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
         output.set_preferred(mode);
         println!("wc-compositor: output WC-1 {ow}x{oh} at 60 Hz, scale 1");
+        // Greppable, because "how many title bars does this window have" is
+        // decided here and nowhere else, and a run that answers it wrongly
+        // looks like a rendering bug rather than a negotiation one.
+        println!("wc-compositor: decorations: manager default is {decorations:?}");
 
         State {
             compositor: CompositorState::new::<State>(dh),
@@ -458,16 +558,13 @@ impl State {
             output,
             _data_device: DataDeviceState::new::<State>(dh),
             _xdg_decoration: XdgDecorationState::new::<State>(dh),
-            // **`Client` is the default mode this compositor advertises, and
-            // that is the goal document's decision rather than a shrug.**
-            // docs/goal-firefox.md wants Firefox painting its tabs into the
-            // title bar, which is only possible if Firefox is drawing the title
-            // bar — a server-decorated window has a caption the client cannot
-            // touch. So the compositor asks for client-side decorations and the
-            // Win32 side's job becomes extending the frame into them
-            // (`FrameStyle::extend_top`), which is the shape
-            // `DwmExtendFrameIntoClientArea` wants.
-            kde_decoration: KdeDecorationState::new::<State>(dh, KdeDefaultMode::Client),
+            // **This one line decides how many title bars the window has**, and
+            // it is `default_mode` on the *manager*, sent once at bind, rather
+            // than the answer to any per-surface request: GTK 3 reads the
+            // manager's default in `gdk_wayland_display_prefers_ssd()` and
+            // ignores what it is told about its own surface. §22.2.
+            kde_decoration: KdeDecorationState::new::<State>(dh, decorations.kde()),
+            decorations,
             seat_state,
             keyboard,
             pointer,
@@ -490,6 +587,14 @@ impl State {
             icons: crate::icon::IconStore::default(),
             _icon_manager: icon_manager,
             _toplevel_icon: toplevel_icon,
+            // STAGE 21. Three globals whose Windows implementation is one call
+            // each; see the handlers at the bottom of this file, and §25 for
+            // why these three and not the rest of the list.
+            _idle_inhibit: IdleInhibitManagerState::new::<State>(dh),
+            idle_inhibitors: HashMap::new(),
+            idle_inhibited: false,
+            xdg_activation: XdgActivationState::new::<State>(dh),
+            shortcuts_inhibit: KeyboardShortcutsInhibitState::new::<State>(dh),
             icons_applied: 0,
             icons_missing: 0,
             clients_seen: 0,
@@ -531,6 +636,77 @@ impl State {
         }
     }
 
+    /// Decide whether the display should be kept awake, and tell the platform
+    /// when the answer changes.
+    ///
+    /// ADDED FOR STAGE 21. Called once per turn of the dispatch loop rather
+    /// than only from the two protocol handlers, and that is the whole reason
+    /// this is a function instead of two lines inside them.
+    ///
+    /// # smithay never tells us the inhibitor is gone
+    ///
+    /// `IdleInhibitHandler::uninhibit` is called from exactly one place —
+    /// `zwp_idle_inhibitor_v1.destroy`, the client's explicit request. There is
+    /// no `destroyed` hook on that object. So a client that crashes, is killed,
+    /// or simply closes its connection with an inhibitor still alive leaves one
+    /// behind that nothing will ever revoke, and an idle inhibitor that cannot
+    /// be revoked is a display that never sleeps again for the life of the
+    /// compositor. On a guest VM that is a real bill.
+    ///
+    /// Handling that is not optional and it cannot be done by being careful in
+    /// the handlers, because the event never arrives. What does arrive is that
+    /// the `WlSurface` stops being alive, and this is where that is noticed.
+    ///
+    /// # Invisible surfaces
+    ///
+    /// The protocol says the inhibitor applies while the surface is visible and
+    /// leaves "visible" to the compositor. Two things are checked and both are
+    /// the user's own doing: the window has committed a buffer (`mapped`) and
+    /// it is not minimised. Minimising the window playing the video is about as
+    /// clear a statement as a user can make that they are done watching it.
+    ///
+    /// # Cost
+    ///
+    /// One `HashMap::is_empty` per turn in the ordinary case, because the
+    /// ordinary case is that nobody has ever created an inhibitor. When one
+    /// exists, a scan of a map that holds one or two entries.
+    pub fn tick_idle_inhibit(&mut self) {
+        if self.idle_inhibitors.is_empty() && !self.idle_inhibited {
+            return;
+        }
+        let before = self.idle_inhibitors.len();
+        self.idle_inhibitors
+            .retain(|surface, _| smithay::utils::IsAlive::alive(surface));
+        if self.idle_inhibitors.len() != before {
+            println!(
+                "wc-compositor: {} idle inhibitor(s) went away with their surface",
+                before - self.idle_inhibitors.len()
+            );
+        }
+
+        // `root_of`, not the surface itself: `windows` is keyed by the surface
+        // that has the shell role, and a client is entitled to inhibit on a
+        // subsurface — the video, rather than the window containing it. Every
+        // toolkit measured so far inhibits on the toplevel, so this line has
+        // never yet made a difference, and the day it does the alternative is
+        // an inhibitor that is silently ignored.
+        let want = self.idle_inhibitors.keys().any(|surface| {
+            self.windows
+                .get(&root_of(surface))
+                .is_some_and(|w| w.mapped && !w.minimized)
+        });
+        if want == self.idle_inhibited {
+            return;
+        }
+        self.idle_inhibited = want;
+        println!(
+            "wc-compositor: idle inhibit -> {} ({} inhibitor(s) held)",
+            if want { "on" } else { "off" },
+            self.idle_inhibitors.len()
+        );
+        self.ui.send(ToUi::IdleInhibit { on: want });
+    }
+
     /// Drain everything the UI thread has said since the last turn.
     pub fn pump_ui_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
@@ -562,7 +738,14 @@ impl State {
                 FromUi::Maximized { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Maximized, on))
                 }
-                FromUi::Minimized { id, on } => self.set_state(id, |s| {
+                FromUi::Minimized { id, on } => {
+                    // STAGE 21: remembered, because an idle inhibitor held by a
+                    // window the user has minimised must stop keeping the
+                    // display awake. See [`State::tick_idle_inhibit`].
+                    if let Some(w) = self.windows.values_mut().find(|w| w.id == id) {
+                        w.minimized = on;
+                    }
+                    self.set_state(id, |s| {
                     // xdg-shell has **no minimised state**. `set_minimized` is a
                     // request a client makes; there is no matching entry in the
                     // `state` enum for the compositor to report back, which is a
@@ -574,8 +757,9 @@ impl State {
                     // smithay filters it out for clients that predate v6, which
                     // then keep drawing into a window nobody can see —
                     // wasteful, and correct.
-                    toggle(s, xdg_state::Suspended, on)
-                }),
+                        toggle(s, xdg_state::Suspended, on)
+                    });
+                }
                 FromUi::Activated { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
                 }
@@ -1689,6 +1873,7 @@ impl XdgShellHandler for State {
                 role: Role::Toplevel(surface),
                 shadow,
                 mapped: false,
+                minimized: false,
                 title,
                 app_id,
                 frame_callbacks: Vec::new(),
@@ -1729,6 +1914,77 @@ impl XdgShellHandler for State {
             if !own {
                 self.apply_stored_icon(id, &app_id);
             }
+        }
+    }
+
+    // ADDED FOR STAGE 17. The three requests a client-decorated toplevel makes
+    // when the user grabs its own title bar, all of which had smithay's empty
+    // default until now — so a window drawn by Firefox could be closed and
+    // maximised but could not be *moved*, and there was no other way to move it
+    // (see [`ToUi::BeginMove`]).
+    //
+    // The seat and the serial are ignored in all three, and that is a decision
+    // rather than an omission. The protocol wants them checked against a recent
+    // input event so that a client cannot start a drag out of nothing; on this
+    // compositor there is one seat, the events came from Win32 in the first
+    // place, and Windows' own modal loop refuses to start unless a button is
+    // actually down — so the check the serial exists to make is made by the
+    // platform, one layer down, against the real hardware state.
+
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            println!("wc-compositor: window {} asked to be moved", window.id);
+            self.ui.send(ToUi::BeginMove { id: window.id });
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        edges: ResizeEdge,
+    ) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let edge = match edges {
+                ResizeEdge::Top => Edge::Top,
+                ResizeEdge::Bottom => Edge::Bottom,
+                ResizeEdge::Left => Edge::Left,
+                ResizeEdge::TopLeft => Edge::TopLeft,
+                ResizeEdge::BottomLeft => Edge::BottomLeft,
+                ResizeEdge::Right => Edge::Right,
+                ResizeEdge::TopRight => Edge::TopRight,
+                ResizeEdge::BottomRight => Edge::BottomRight,
+                // `None`, and anything a newer protocol version adds. The enum
+                // is `#[non_exhaustive]`, and treating an unknown edge as "no
+                // edge" starts a keyboard-driven resize rather than refusing.
+                _ => Edge::None,
+            };
+            println!("wc-compositor: window {} asked to be resized from {edge:?}", window.id);
+            self.ui.send(ToUi::BeginResize {
+                id: window.id,
+                edge,
+            });
+        }
+    }
+
+    fn show_window_menu(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        location: Point<i32, Logical>,
+    ) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            println!(
+                "wc-compositor: window {} asked for the window menu at {},{}",
+                window.id, location.x, location.y
+            );
+            self.ui.send(ToUi::WindowMenu {
+                id: window.id,
+                x: location.x,
+                y: location.y,
+            });
         }
     }
 
@@ -1860,6 +2116,7 @@ impl XdgShellHandler for State {
                 role: Role::Popup(surface),
                 shadow,
                 mapped: false,
+                minimized: false,
                 title: String::new(),
                 app_id: String::new(),
                 frame_callbacks: Vec::new(),
@@ -2142,32 +2399,36 @@ impl ServerDndGrabHandler for State {}
 /// `xdg-decoration`, which is the standard one and — measured — the one Firefox
 /// does not use.
 ///
-/// Implemented anyway, and answered honestly: a client that asks for
-/// `ServerSide` is told `ClientSide`, because this compositor has no frame of
-/// its own to draw and Windows' caption is not something the Wayland side can
-/// promise. Saying `ServerSide` and drawing nothing is how a client ends up
-/// with a window that has no way to be moved.
+/// Implemented anyway, and answered with whatever [`Decorations`] this run was
+/// started with, so that the two protocols cannot disagree. Note that
+/// `xdg-decoration` gives the compositor the last word — the client *requests*
+/// and the compositor *configures* — so this handler is entitled to overrule,
+/// and does. GTK 3 has no code for this protocol at all (§15.7), so nothing
+/// this project runs is affected either way.
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        println!("wc-compositor: xdg-decoration: client created a decoration object");
+        let mode = self.decorations.xdg();
+        println!("wc-compositor: xdg-decoration: client created a decoration object, telling it {mode:?}");
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ClientSide);
+            state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
     }
 
-    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
-        println!("wc-compositor: xdg-decoration: client asked for {mode:?}, answering ClientSide");
+    fn request_mode(&mut self, toplevel: ToplevelSurface, requested: DecorationMode) {
+        let mode = self.decorations.xdg();
+        println!("wc-compositor: xdg-decoration: client asked for {requested:?}, answering {mode:?}");
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ClientSide);
+            state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        println!("wc-compositor: xdg-decoration: client unset its mode, answering ClientSide");
+        let mode = self.decorations.xdg();
+        println!("wc-compositor: xdg-decoration: client unset its mode, answering {mode:?}");
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ClientSide);
+            state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
     }
@@ -2198,15 +2459,183 @@ impl KdeDecorationHandler for State {
         decoration: &OrgKdeKwinServerDecoration,
         mode: WEnum<KdeMode>,
     ) {
-        println!("wc-compositor: kde-decoration: client asked for {mode:?}");
-        // Echo, which is what smithay's default does: the client has told us
-        // how it intends to decorate itself and there is nothing to negotiate
-        // when the answer is always "you draw it".
+        println!(
+            "wc-compositor: kde-decoration: client asked for {mode:?} (default is {:?})",
+            self.decorations
+        );
+        // **Echoed, deliberately, even when it contradicts the default**, and
+        // that is this stage's answer to "what happens for a client that
+        // insists on Client".
+        //
+        // Three reasons, in order of weight. First, the per-surface answer is
+        // not the lever: GTK 3 decides whether to draw a title bar from the
+        // *manager's* `default_mode` and re-reads nothing afterwards, so
+        // refusing here changes no client's behaviour. Second, GDK's handler
+        // re-requests the mode it wants when it is contradicted, which was
+        // captured as a loop against real KWin — KWin eventually capitulates,
+        // and a compositor that does not is a compositor that spins. Third, a
+        // client that has decided to draw its own title bar and is told it may
+        // not still draws one; the only thing refusing buys is a client that
+        // draws none and cannot be moved.
+        //
+        // The cost is honest and small: under `--decorations server` a client
+        // that insists on `Client` gets two title bars, exactly as every client
+        // did before this stage. Its shadow inset is still reported as window
+        // geometry and `compose_tree` still honours it, so the *window* is
+        // right even when the picture inside it has a bar too many.
         if let WEnum::Value(mode) = mode {
             decoration.mode(mode);
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// STAGE 21: three protocols that are a Win32 call each
+// ---------------------------------------------------------------------------
+
+/// `zwp_idle_inhibit_manager_v1` — the screen must not blank during a video.
+///
+/// Both methods do bookkeeping only. The decision, and the one message that
+/// crosses to the UI thread, are in [`State::tick_idle_inhibit`], for the reason
+/// documented there: the interesting case is the one where `uninhibit` is never
+/// called at all.
+impl IdleInhibitHandler for State {
+    fn inhibit(&mut self, surface: WlSurface) {
+        let n = self.idle_inhibitors.entry(surface).or_insert(0);
+        *n += 1;
+        println!(
+            "wc-compositor: a client created an idle inhibitor ({} on this surface)",
+            *n
+        );
+        self.tick_idle_inhibit();
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        if let Some(n) = self.idle_inhibitors.get_mut(&surface) {
+            *n -= 1;
+            if *n == 0 {
+                self.idle_inhibitors.remove(&surface);
+            }
+        }
+        println!("wc-compositor: a client destroyed an idle inhibitor");
+        self.tick_idle_inhibit();
+    }
+}
+
+delegate_idle_inhibit!(State);
+
+/// How stale an activation token may be before it is refused.
+///
+/// **Thirty seconds, not the ten in smithay's own example.** The token is minted
+/// by the application the user clicked in and spent by the application that is
+/// then *started*, and a cold Firefox on this guest takes longer than ten
+/// seconds to reach the point where it has a surface to activate. A limit that
+/// expires during the ordinary case is not a security measure, it is a feature
+/// that works only on a warm cache.
+const ACTIVATION_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `xdg_activation_v1` — clicking a link in one application raises another.
+impl XdgActivationHandler for State {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation
+    }
+
+    /// Minting is where the pool is swept, so it is bounded by the rate at
+    /// which tokens are asked for rather than by anything running on a timer.
+    /// GTK requests a token for every launch it contemplates and spends only
+    /// some of them; without this, a long session accumulates every one it did
+    /// not use.
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        self.xdg_activation
+            .retain_tokens(|_, d| d.timestamp.elapsed() < ACTIVATION_TOKEN_MAX_AGE);
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let age = data.timestamp.elapsed();
+        // Spent, whatever happens next: `xdg_activation_v1` says a token is
+        // good for one activation, and leaving a used one in the pool would let
+        // a client raise itself repeatedly off a single click the user made
+        // somewhere else.
+        self.xdg_activation.remove_token(&token);
+
+        if age >= ACTIVATION_TOKEN_MAX_AGE {
+            println!(
+                "wc-compositor: xdg_activation: ignoring a token {} s old",
+                age.as_secs()
+            );
+            return;
+        }
+        let Some(window) = self.windows.get(&root_of(&surface)) else {
+            // A surface with no window: either it has not mapped yet, or it is
+            // not a shell surface at all. Nothing to raise either way.
+            println!("wc-compositor: xdg_activation: no window for the surface named; ignoring");
+            return;
+        };
+        println!(
+            "wc-compositor: xdg_activation: window {} asked to be raised (token from {:?}, \
+             {} ms old)",
+            window.id,
+            data.app_id.as_deref().unwrap_or("an unnamed app"),
+            age.as_millis()
+        );
+        // Whether it *is* raised is Windows' decision and is not this side's
+        // business; `platform::win32::activate_window` documents when the
+        // answer is no, and the protocol gives us no way to tell the client
+        // either way.
+        self.ui.send(ToUi::Activate { id: window.id });
+    }
+}
+
+delegate_xdg_activation!(State);
+
+/// `zwp_keyboard_shortcuts_inhibit_v1` — and this one is complete because there
+/// is nothing to inhibit.
+///
+/// **Granting every request is the accurate description of this compositor, not
+/// a shortcut taken.** The inhibitor's meaning is "stop applying your own
+/// keyboard shortcuts and give the client every key". [`State::key`] already
+/// forwards every key to the focused client with `FilterResult::Forward` and no
+/// compositor-level binding exists to suppress; the comment there explains why,
+/// and it is the same reason: the window manager is Windows, which has taken
+/// the combinations it reserves before the message loop ever sees them.
+///
+/// So the inhibitor is activated the moment it is created, and the client that
+/// binds this protocol gets exactly what it asked for. The two ways this could
+/// become a lie are worth naming, because both are things a later stage might
+/// do without thinking of this file: adding a compositor-level key binding, and
+/// intercepting a key in `win32::toplevel_proc` before it becomes a
+/// `FromUi::Key`. Either one has to consult
+/// `Seat::keyboard_shortcuts_inhibited` — smithay keeps the answer, this
+/// compositor simply has no question to ask it yet.
+///
+/// What this cannot do, and what no compositor on Windows can, is hand over the
+/// combinations the *system* takes first: Ctrl-Alt-Del is the secure attention
+/// sequence and Win-L is handled by the shell, neither of which reaches a
+/// window procedure at all. A Linux compositor grabbing the keyboard has the
+/// same hole for the same kind of key, so this is not a Windows tax; it is
+/// worth writing down because a client asking to inhibit shortcuts is often
+/// asking for exactly those.
+impl KeyboardShortcutsInhibitHandler for State {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.shortcuts_inhibit
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
+        println!(
+            "wc-compositor: keyboard shortcuts inhibited for a surface, and granted immediately \
+             — this compositor forwards every key to the focused client already"
+        );
+    }
+}
+
+delegate_keyboard_shortcuts_inhibit!(State);
 
 delegate_compositor!(State);
 delegate_shm!(State);

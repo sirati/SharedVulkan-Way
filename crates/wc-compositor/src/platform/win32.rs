@@ -84,6 +84,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, ULW_ALPHA, WS_EX_LAYERED,
     SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
+    // ADDED FOR STAGE 17: the three toplevel requests a client-decorated
+    // window makes, handed to Windows' own modal loops.
+    GetSystemMenu, TrackPopupMenu, SC_MOVE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
@@ -93,19 +96,36 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
+    // ADDED FOR STAGE 21: `xdg_activation_v1` (raise a window) and the
+    // screensaver half of `zwp_idle_inhibit_manager_v1`.
+    FlashWindowEx, GetForegroundWindow, IsIconic, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG,
+    FLASHW_TRAY, SC_MONITORPOWER, WM_SYSCOMMAND,
+};
+// ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
+// rather than anywhere near the window APIs, because it is not about a window:
+// it is a property of the calling thread. See `set_idle_inhibit`.
+use windows_sys::Win32::System::Power::{
+    SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
 use windows_sys::Win32::Foundation::{POINT, SIZE};
 
 use crate::input::{evdev, evdev_keycode};
 
 use super::{
-    assemble, Commands, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
+    assemble, Commands, Edge, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
     WindowKind,
 };
 use crate::surface::{Rect, Shadow};
 
 /// "Drain the command queue." The only message this module posts.
 const WM_WC_COMMAND: u32 = WM_APP + 1;
+/// "Put up the system menu", with the screen position packed into the `LPARAM`
+/// the way `WM_CONTEXTMENU` packs one.
+///
+/// ADDED FOR STAGE 17. A message of its own rather than a call from `drain`,
+/// for the reason the `ToUi::WindowMenu` arm gives: `TrackPopupMenu` does not
+/// return until the menu closes.
+const WM_WC_SYSMENU: u32 = WM_APP + 2;
 
 /// `WM_MOUSELEAVE`, 0x02A3.
 ///
@@ -116,6 +136,22 @@ const WM_WC_COMMAND: u32 = WM_APP + 1;
 /// `WM_MOUSEHOVER` and `TrackMouseEvent`; the metadata's placement is a fact
 /// about the Windows SDK's headers rather than about the message.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// `SC_SCREENSAVE`, 0xF140 — the `WM_SYSCOMMAND` the system sends to the
+/// foreground window when the screen saver is about to start.
+///
+/// Written out for the same reason as `WM_MOUSELEAVE`: `windows-sys` has
+/// `SC_MONITORPOWER` and does not have this one, which is a fact about which
+/// constants the Windows metadata chose to export rather than about the message.
+/// `winuser.h` declares the two on consecutive lines.
+const SC_SCREENSAVE: u32 = 0xF140;
+
+/// The mask `WM_SYSCOMMAND` requires before comparing `wParam`.
+///
+/// The low four bits are used internally by the system, so the documented way
+/// to test a system command is `(wParam & 0xFFF0) == SC_...`. Comparing the raw
+/// `wParam` works most of the time, which is worse than never working.
+const SC_MASK: usize = 0xFFF0;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -608,6 +644,13 @@ struct Ui {
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
     controller: Cell<isize>,
+    /// Whether a client currently holds an idle inhibitor.
+    ///
+    /// ADDED FOR STAGE 21. Kept here as well as inside Windows' own execution
+    /// state because `SetThreadExecutionState` is write-only — it returns the
+    /// *previous* state, and there is no "what is it now" query — and because
+    /// `toplevel_proc` has to read it to answer `WM_SYSCOMMAND`.
+    idle_inhibited: Cell<bool>,
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
@@ -697,6 +740,80 @@ unsafe extern "system" fn toplevel_proc(
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
+            0
+        }
+        // ADDED FOR STAGE 17. `xdg_toplevel.show_window_menu`, arriving as a
+        // posted message so that the modal `TrackPopupMenu` is entered from the
+        // pump rather than from inside `drain`.
+        //
+        // **The system menu, not an imitation of it.** `GetSystemMenu` returns
+        // the very menu the caption's right-click and Alt+Space put up, with
+        // Windows' own strings, its own accelerators and its own greying — a
+        // maximised window's *Maximize* is disabled and a fixed-size window has
+        // no *Size*, and none of that has to be reimplemented. `TPM_RETURNCMD`
+        // asks for the chosen item back instead of a `WM_COMMAND`, and it is
+        // then posted as the `WM_SYSCOMMAND` the caption would have produced,
+        // so *Close* on this menu is the same code path as the close button.
+        WM_WC_SYSMENU => {
+            let x = (lparam & 0xffff) as i16 as i32;
+            let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+            // SAFETY: live window handle on its own thread. `GetSystemMenu`
+            // with `revert = 0` returns a handle owned by the window, which
+            // must not be destroyed here. `TrackPopupMenu` runs a modal loop
+            // and returns the command id because of `TPM_RETURNCMD`.
+            let chosen = unsafe {
+                let menu = GetSystemMenu(hwnd, 0);
+                if menu.is_null() {
+                    0
+                } else {
+                    TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        x,
+                        y,
+                        0,
+                        hwnd,
+                        std::ptr::null(),
+                    )
+                }
+            };
+            if chosen != 0 {
+                // SAFETY: live handle; posted rather than sent for the same
+                // reason the gesture is — `SC_MOVE` and `SC_SIZE` are among the
+                // things this menu can choose.
+                unsafe {
+                    PostMessageW(hwnd, WM_SYSCOMMAND, chosen as usize, 0);
+                }
+            }
+            println!(
+                "wc-compositor: window {} system menu at {x},{y} chose 0x{chosen:04x}",
+                state.id
+            );
+            0
+        }
+
+        // ADDED FOR STAGE 21: the second half of `zwp_idle_inhibit`.
+        //
+        // `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` resets the display
+        // idle timer and does not touch the screen saver, which runs on the
+        // *input* idle timer — and a client holding an idle inhibitor is
+        // usually playing a video, which is exactly the situation with no
+        // input. So the execution state alone leaves the screen saver free to
+        // start. Refusing the `WM_SYSCOMMAND` is the documented way for the
+        // foreground application to veto it, and `DefWindowProc` is what would
+        // otherwise let it through.
+        //
+        // Only while something actually holds an inhibitor: a compositor that
+        // permanently blocked the screen saver would be making a policy
+        // decision on the user's behalf that no client asked for.
+        WM_SYSCOMMAND
+            if matches!(wparam & SC_MASK, x if x == SC_SCREENSAVE as usize
+                || x == SC_MONITORPOWER as usize)
+                && ui().is_some_and(|ui| ui.idle_inhibited.get()) =>
+        {
+            println!(
+                "wc-compositor: refused a screen-blank request; a client holds an idle inhibitor"
+            );
             0
         }
 
@@ -955,6 +1072,76 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 set_window_state(&w, maximized, minimized);
             }
         }
+        // ADDED FOR STAGE 17. All three **post** rather than send, and that is
+        // the only interesting thing about them.
+        //
+        // `SC_MOVE`, `SC_SIZE` and `TrackPopupMenu` each enter a modal loop
+        // that does not return until the user lets go. This code runs inside
+        // `drain`, which sets `ui.draining` for its duration and re-posts
+        // `WM_WC_COMMAND` whenever another arrives while it is set — so a
+        // `SendMessageW` here would hold `draining` for the whole gesture and
+        // spin the pump re-posting a wake it cannot service. Posting lets the
+        // drain finish; the loop is then entered from the pump, where §8.2's
+        // finding applies and a posted wake still reaches the window.
+        ToUi::BeginMove { id } => {
+            if let Some(w) = window(ui, id) {
+                begin_sysmenu_gesture(&w, SC_MOVE, "move");
+            }
+        }
+        ToUi::BeginResize { id, edge } => {
+            if let Some(w) = window(ui, id) {
+                // Win32 encodes the edge in the low four bits of the
+                // `WM_SYSCOMMAND` argument, as `WMSZ_*` + 1. Wayland encodes it
+                // as a bitmask. Neither is derivable from the other, so this is
+                // a table.
+                let wmsz = match edge {
+                    Edge::Left => 1,
+                    Edge::Right => 2,
+                    Edge::Top => 3,
+                    Edge::TopLeft => 4,
+                    Edge::TopRight => 5,
+                    Edge::Bottom => 6,
+                    Edge::BottomLeft => 7,
+                    Edge::BottomRight => 8,
+                    // No edge: `SC_SIZE` on its own is the keyboard-driven
+                    // resize, which is what the protocol's `none` means.
+                    Edge::None => 0,
+                };
+                begin_sysmenu_gesture(&w, SC_SIZE | wmsz, "resize");
+            }
+        }
+        ToUi::WindowMenu { id, x, y } => {
+            if let Some(w) = window(ui, id) {
+                // Surface coordinates to screen coordinates, through the same
+                // origin the input path uses in reverse.
+                let (ox, oy) = w.frame.content_origin();
+                let mut p = POINT {
+                    x: x + ox,
+                    y: y + oy,
+                };
+                // SAFETY: a live window handle; `ClientToScreen` converts in
+                // place. The result is packed into an `LPARAM` the way
+                // `WM_CONTEXTMENU` packs one, because that is what the handler
+                // in `toplevel_proc` unpacks.
+                unsafe {
+                    ClientToScreen(w.hwnd(), &mut p);
+                    PostMessageW(
+                        w.hwnd(),
+                        WM_WC_SYSMENU,
+                        0,
+                        ((p.x as u32 as isize) & 0xffff) | (((p.y as u32 as isize) & 0xffff) << 16),
+                    );
+                }
+                println!("wc-compositor: window {id} window menu at {},{} on screen", p.x, p.y);
+            }
+        }
+        // ADDED FOR STAGE 21.
+        ToUi::IdleInhibit { on } => set_idle_inhibit(ui, on),
+        ToUi::Activate { id } => {
+            if let Some(w) = window(ui, id) {
+                activate_window(&w);
+            }
+        }
         ToUi::Destroy { id } => {
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
@@ -978,6 +1165,165 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             }
         }
         ToUi::Quit => unreachable!("handled in drain"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle inhibition and activation — stage 21
+// ---------------------------------------------------------------------------
+
+/// Keep the display awake while a client holds an idle inhibitor.
+///
+/// # `SetThreadExecutionState` is per *thread*, and this is the thread
+///
+/// The state is a property of the calling thread and the system takes the union
+/// over every thread that has one. It is released when that thread exits, which
+/// is exactly the cleanup this feature wants and exactly the trap it would be if
+/// it were called from anywhere else: the Wayland thread is where the protocol
+/// lives, and had the call been made there, a compositor whose Wayland thread
+/// wound up first would drop the inhibition a moment before the process ended —
+/// harmless — while a compositor that later moved that work to a worker thread
+/// would silently stop inhibiting anything. So it is made from the UI thread,
+/// which is `main`'s thread and outlives everything. `handle` runs on it, and
+/// it is the only caller.
+///
+/// # `ES_CONTINUOUS` is what makes it a state rather than a nudge
+///
+/// Without it the call is a one-shot "the display is in use right now" that
+/// resets the idle timer once. With it, the flags stay set until they are
+/// cleared, which is what `zwp_idle_inhibitor_v1` means — the inhibitor lasts
+/// until the client destroys it. Clearing is `ES_CONTINUOUS` **alone**: passing
+/// zero is documented as an error, and passing `ES_CONTINUOUS` with no other
+/// flag is how the state is reset.
+///
+/// # What is deliberately not asked for
+///
+/// `ES_SYSTEM_REQUIRED`, which would also stop the machine suspending. The
+/// protocol asks the compositor not to blank, lock or screensave — display
+/// idleness — and says nothing about whether the computer may sleep. Asking for
+/// both would be this compositor deciding a power policy the client did not ask
+/// for, on a machine that is a guest VM whose host can suspend it regardless.
+///
+/// # Why `WM_SYSCOMMAND` is handled too
+///
+/// `ES_DISPLAY_REQUIRED` resets the *display* idle timer. The screen saver has
+/// its own timer, driven by input idleness, and a video playing is precisely the
+/// case with no input — so on a machine with a screen saver configured, the
+/// execution state alone leaves the hole open. `toplevel_proc` refuses
+/// `SC_SCREENSAVE` and `SC_MONITORPOWER` while this is set, which is the
+/// documented way for a foreground application to say no.
+fn set_idle_inhibit(ui: &Rc<Ui>, on: bool) {
+    if ui.idle_inhibited.replace(on) == on {
+        return;
+    }
+    let flags = if on {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    // SAFETY: a scalar in, a scalar out, no handles and no memory. The only
+    // requirement is the thread one, which is discharged above.
+    let previous = unsafe { SetThreadExecutionState(flags) };
+    if previous == 0 {
+        // The one documented failure. Said rather than swallowed, because the
+        // symptom otherwise is "the screen blanked during a video" with nothing
+        // anywhere to say the compositor tried.
+        eprintln!(
+            "wc-compositor: SetThreadExecutionState({flags:#x}) failed; the display will \
+             blank on its own timer"
+        );
+        return;
+    }
+    println!(
+        "wc-compositor: idle inhibit {} (SetThreadExecutionState {flags:#x}, was {previous:#x})",
+        if on { "on" } else { "off" }
+    );
+}
+
+/// `xdg_activation_v1.activate`: bring a window to the foreground.
+///
+/// # Windows decides, and here is when it says yes
+///
+/// `SetForegroundWindow` is not a command. Windows refuses it from a process
+/// that is not entitled to steal the foreground, and the entitlement rules are
+/// roughly: the calling process already owns the foreground window, or it
+/// received the last input event, or there is no foreground window at all, or
+/// the foreground lock timeout has expired.
+///
+/// **The common case is the permitted one, and that is a property of this
+/// design rather than luck.** Every toplevel in this compositor is an `HWND`
+/// owned by one process — wc-compositor — no matter how many Wayland clients
+/// are behind them. So "the user clicks a link in one client's window and
+/// another client's window raises" is a foreground request made by the process
+/// that already owns the foreground window, which Windows allows. Two clients
+/// on two machines, one Win32 process, one set of foreground rights.
+///
+/// The case that is refused is a client that asks unprompted while the user is
+/// in some other application — Notepad, a browser outside the compositor. There
+/// Windows says no, and it is right to: that is the behaviour the rule exists to
+/// stop, and a Wayland compositor on Linux would apply a policy of its own for
+/// the same reason. What the user gets instead is the flashing taskbar button,
+/// which is the platform's own idiom for "this window wants you" — requested
+/// explicitly here rather than relying on the system's implicit flash, so the
+/// outcome does not depend on an undocumented courtesy.
+///
+/// `FLASHW_TIMERNOFG` means "flash until the window comes to the foreground",
+/// so the notification clears itself when the user acts on it and there is
+/// nothing to cancel.
+///
+/// # Why `AllowSetForegroundWindow` is not called
+///
+/// It grants foreground rights to a *different process*, by pid. There is no
+/// different process: the request comes from a Wayland client over a socket and
+/// the window is ours. Calling it would be handing a right to somebody who does
+/// not need it. It becomes relevant the day the compositor launches a Windows
+/// application on a client's behalf, and not before.
+///
+/// # The client cannot be told
+///
+/// `xdg_activation_v1` version 1 has no failure event: `activate` is a request
+/// with no reply, and a client that asks has no way to learn that Windows said
+/// no. So the log line below is the only place the answer exists, and it says
+/// which of the two happened rather than just that something was attempted.
+fn activate_window(w: &Rc<WindowState>) {
+    let hwnd = w.hwnd();
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: a live window handle created on this thread, and this is that
+    // thread. Every call below is a plain query or a window-manager request.
+    unsafe {
+        // A minimised window cannot be the foreground one. Restoring first is
+        // what the user means by "raise it", and doing it before the foreground
+        // request means the request is not spent on a window that is still an
+        // icon.
+        if IsIconic(hwnd) != 0 {
+            w.self_driven.set(true);
+            ShowWindow(hwnd, SW_RESTORE);
+            w.self_driven.set(false);
+        }
+        if SetForegroundWindow(hwnd) != 0 {
+            println!("wc-compositor: window {} activated (SetForegroundWindow)", w.id);
+            return;
+        }
+        // Refused. `GetForegroundWindow` is read only to say *why* in the log:
+        // a null result is "nobody has it", anything else is another
+        // application's window and the answer is the foreground lock.
+        let owner = GetForegroundWindow();
+        println!(
+            "wc-compositor: window {} asked to be activated and Windows refused (the \
+             foreground belongs to {}); flashing its taskbar button instead",
+            w.id,
+            if owner.is_null() { "nothing" } else { "another application" }
+        );
+        let info = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        FlashWindowEx(&info);
     }
 }
 
@@ -1084,6 +1430,26 @@ fn create_window(
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
     Ok(())
+}
+
+/// Hand a gesture the client started over to Windows' own modal loop.
+///
+/// ADDED FOR STAGE 17, and it is the whole of `xdg_toplevel.move` and
+/// `xdg_toplevel.resize` on this platform.
+///
+/// `ReleaseCapture` first, and it is not optional: the client's drag began with
+/// a `WM_LBUTTONDOWN` that `toplevel_proc` answered with `SetCapture`, and
+/// `DefWindowProc` refuses to start a sizing or moving loop for a window that
+/// holds the capture. The symptom is a window that simply does not move, with
+/// nothing in any log.
+fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
+    // SAFETY: a live window handle, on the thread that created it.
+    // `ReleaseCapture` is a no-op when this thread holds no capture.
+    unsafe {
+        ReleaseCapture();
+        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, 0);
+    }
+    println!("wc-compositor: window {} handed a {what} to Windows", w.id);
 }
 
 /// Show the window for the first time, at the size the client chose.
@@ -1778,6 +2144,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         frame: config.frame,
         draining: Cell::new(false),
         controller: Cell::new(controller as isize),
+        idle_inhibited: Cell::new(false),
         dump_frames: config.dump_frames.clone(),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));

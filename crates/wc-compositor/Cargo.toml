@@ -77,4 +77,9 @@ windows-sys = { workspace = true, features = [
   # chooses the keymap).
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
+  # ADDED FOR STAGE 21: `SetThreadExecutionState`, which is
+  # `zwp_idle_inhibit_manager_v1`'s whole implementation. It is filed under
+  # Power rather than with the window APIs because it is a property of the
+  # calling thread rather than of a window — see `win32::set_idle_inhibit`.
+  "Win32_System_Power",
 ] }
