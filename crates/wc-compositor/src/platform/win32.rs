@@ -3148,10 +3148,39 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // size it actually got. It is only suppressed when nothing changed, which
     // is the original reason it was here — a client being told its own request
     // back is noise that makes toolkits resend.
-    w.self_driven.set(!fitted);
+    // **`ShowWindow` first, then place it, and that order was measured.**
+    //
+    // Until stage 38 this was the other way round, and it worked because the
+    // `SetWindowPos` kept `SWP_NOMOVE`: only the size was being set, and a
+    // window created with `CW_USEDEFAULT` keeps a size somebody has given it.
+    // Setting a *position* as well does not survive the first `ShowWindow`.
+    // `CW_USEDEFAULT` for x and y means "decide when it is first shown", and
+    // `SW_SHOWNORMAL` decides — for the whole placement, size included. The
+    // first guest run of this stage has it in the log: the window was fitted
+    // to `1220x752 at 0,0` and appeared at `960x543 at 104,104`, which is the
+    // cascade, and the client was configured twice for its trouble.
+    //
+    // So: show it, then place it. The window is only shown at all once its
+    // shadow has pixels, and the placement lands before the first `WM_PAINT`.
+    //
+    // `self_driven` covers the `SetWindowPos`: the `WM_SIZE` it produces is
+    // the client's own request unless the work area forced a change, and then
+    // it is exactly what the client has to be told.
+    //
+    // **A client is still configured twice at map, and it is not this.** The
+    // guest's logs show `1280x729`, then the cascade size, then the fitted one
+    // — the last is right and the middle one is noise. A flag that dropped
+    // every `WM_SIZE` across `ShowWindow` was tried and changed the sequence by
+    // nothing at all, so whatever sends it is not this call, and guessing again
+    // would be shipping a fix with no measurement behind it. Written down here
+    // rather than left for the next reader to rediscover.
     // SAFETY: live window handle; both calls send messages to `toplevel_proc`
     // on this thread before returning.
     unsafe {
+        if !w.mapped.replace(true) {
+            ShowWindow(w.hwnd(), SW_SHOWNORMAL);
+        }
+        w.self_driven.set(!fitted);
         SetWindowPos(
             w.hwnd(),
             std::ptr::null_mut(),
@@ -3161,9 +3190,6 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
             wh,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        if !w.mapped.replace(true) {
-            ShowWindow(w.hwnd(), SW_SHOWNORMAL);
-        }
     }
     w.self_driven.set(false);
     // The size we just imposed is the size the client already has, so recording
@@ -3174,6 +3200,26 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // window never had.
     if !fitted {
         w.last_configured.set((width, height));
+    }
+    // What the window actually turned out to be, once, in the log — because
+    // the placement above is the one thing here that Windows is entitled to
+    // overrule, and a line that says so is the difference between finding that
+    // out in a minute and finding it out in a run.
+    {
+        let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window handle; the rectangle is written in place.
+        unsafe { GetWindowRect(w.hwnd(), &mut rc) };
+        if (rc.right - rc.left, rc.bottom - rc.top, rc.left, rc.top) != (ww, wh, x, y) {
+            println!(
+                "wc-compositor: window {} was placed at {ww}x{wh} at {x},{y} and Windows made \
+                 it {}x{} at {},{}",
+                w.id,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                rc.left,
+                rc.top
+            );
+        }
     }
 
     // TABS IN THE TITLE BAR, and after `ShowWindow` on purpose: DWM has no caption buttons
