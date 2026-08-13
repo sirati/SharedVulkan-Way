@@ -14191,11 +14191,59 @@ been wrong about on this project before. §37.8 item 1.
      cheap cross-check of one section's conclusion by another section's harness
      is worth more than either alone.
 
-   The one attempt failed in the arena locate (16377 of 16384 pages, a contended
-   sweep) before the client started, and the machine was then embargoed by its
-   owner. A deploy directory `C:\Users\<guest-user>\wcptr` is left on the guest; the
-   compositor that run started carried `--timeout 330` and has long since
-   exited.
+   **Five attempts, and none of them reached step 5c.** The blocker is not in
+   the input path; it is `wc-arena-host`, and it failed a different way each
+   time:
+
+   | attempt | where it stopped |
+   |---|---|
+   | 1 | locate: `16377 of 16384 pages` after sweeping 13312 MiB, 140 pages carrying the magic with a different run id |
+   | 2 | locate: `1 page index claimed twice` |
+   | 3 | **located**, proxy attached, client died: `failed to create display: Broken pipe` |
+   | 4 | locate: `28 page index(es) claimed twice` |
+   | 5 | locate: `1 page index claimed twice` |
+
+   Attempt 3 is the one that taught something, and its lesson is now fixed in
+   the harness: `probe-relay.exe` was started with `--timeout 120` **before**
+   the arena locate, and the locate on a contended guest takes minutes rather
+   than the 2.4 s §12.5 measured on an idle one. So the relay exited part-way
+   through a healthy run. What the harness printed was the *client* — "Broken
+   pipe" — and what the proxy printed was "the compositor closed the
+   connection"; the compositor had closed nothing and its log ends at
+   "listening", never mentioning a client. **A relay that has exited looks to
+   the proxy like a dead compositor and to the harness like a dead client, and
+   both readings blame the wrong end.** It is now `--timeout 330`, the
+   compositor's own, since there is no run in which one should outlive the
+   other; and the relay's log — the only process in this topology that nothing
+   ever printed — is dumped when the client fails to get a display.
+
+   The remaining failure is the stamp sweep and it is **not** a stale-stamp
+   problem, which is the reading the error message invites. `new_run_id()` is a
+   hash of the millisecond mixed with the pid, so a previous run's stamps carry
+   a different id and are counted as `other_runs` — attempt 1 shows the tool
+   doing exactly that with 140 of them. A *duplicate* means two pages carry
+   **this** run's id and the same page index, at two offsets in the backing
+   object, with no compositor running and 6.8 GiB free. That is either the same
+   guest page reachable at two file offsets in the flat view, or pages moving
+   under a sweep that takes seconds — and it is `sv-hostd`'s subject, not this
+   section's.
+
+   **The unblock already exists and is unwired.** `wc-arena-host --frames` reads
+   a frame list and uses `PfnLocator`, which reads the kernel's PFN database
+   instead of the extent's contents: 0.064 s against the scan's 2.308 s, with
+   byte-identical offset tables, and no stamps involved at all — so duplicates
+   and stale stamps both stop being possible. The producer exists too:
+   `wc_compositor::grow::frame_list_text` writes exactly the format the locator
+   parses. It has **no caller outside the growth path**, so nothing emits a
+   frame list at arena-publish time and the harness has nothing to pass. Wiring
+   that up is §34's work and one call site, and it would make this harness
+   deterministic rather than a coin flip on a busy guest.
+
+   A deploy directory `C:\Users\<guest-user>\wcptr` is left on the guest. No process
+   and no scheduled task of this branch's survives; the five compositors all
+   exited on their own `--timeout 330` or were killed by the harness, and the
+   two `wc-wcptr-*-wccomp` task definitions left `Ready` by `int_bg` were
+   unregistered by hand after checking each was not `Running`.
 2. **Subsurfaces still route to the root.** `surface_and_origin` gives the
    root surface's origin, and every pointer event goes to the toplevel's surface
    with no hit test — `control.rs`'s header says so and it is unchanged. For a
