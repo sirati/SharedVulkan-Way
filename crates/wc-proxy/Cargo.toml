@@ -34,6 +34,14 @@ wc-handle = { workspace = true }
 # See wc-handle: one definition of the arena's granularity, in the crate that
 # owns the arena. `ARENA_GRANULARITY` is now `sv_arena::GRANULARITY`.
 sv-arena = { workspace = true }
+# §35: the Wayland byte stream rides shared_vulkan's rings, so the proxy needs
+# the same transport the ICD uses. Not a new dependency direction — wc-proxy
+# already depends on sv-arena, which is the other half of the same channel.
+sv-transport = { workspace = true }
+# For `ProtocolIds`: the ring the proxy claims is in the same control region as
+# the Vulkan rings, so it must agree about the protocol hash or R13 says the two
+# builds would desynchronise rather than fail to connect.
+sv-proto = { workspace = true }
 libc = "0.2"
 # The same parser `vendor/wayland-scanner` uses, reading the same XML files, so
 # the proxy's idea of the wire format and the compositor's cannot drift apart.

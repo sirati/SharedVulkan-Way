@@ -28,6 +28,17 @@ struct Args {
     /// inside the prefix, which is what lets a Linux process reach a `.exe`
     /// (docs/design.md §4.2); on the guest it is the far end of a relay.
     upstream: PathBuf,
+    /// §35. The control region of the shared_vulkan session whose rings carry
+    /// the Wayland stream. When set, `--upstream` is not used at all and no
+    /// socket, no TCP and no ssh is in the data path.
+    ///
+    /// A path rather than a cold-path endpoint, deliberately and for now: this
+    /// is the region as `sv-hostd` or `sv-gpu-server` published it, and opening
+    /// it by name is what `Attach` would have told us to do anyway. The
+    /// cold-path handshake belongs here eventually — see §35.8 item 3 — and
+    /// putting it in before a client has driven a window through a ring would be
+    /// building the bring-up for a mechanism nobody has watched work.
+    upstream_ring: Option<PathBuf>,
     runtime_dir: PathBuf,
     socket: String,
     transport: String,
@@ -108,7 +119,12 @@ fn usage() -> &'static str {
     "\
 usage: wc-proxy --upstream <path> [options]
 
-  --upstream PATH        the compositor's AF_UNIX socket (required)
+  --upstream PATH        the compositor's AF_UNIX socket (required unless
+                         --upstream-ring is given)
+  --upstream-ring PATH   §35: the shared_vulkan session's control region. Each
+                         client claims a ring of RingKind::Wayland in it and the
+                         bytes cross as shared memory -- no socket, no TCP and
+                         no ssh in the data path. --upstream is then unused.
   --runtime-dir DIR      where to put our own socket (default $XDG_RUNTIME_DIR)
   --socket NAME          our socket's name (default wl-proxy)
 
@@ -173,6 +189,7 @@ usage: wc-proxy --upstream <path> [options]
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         upstream: PathBuf::new(),
+        upstream_ring: None,
         runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir),
@@ -204,6 +221,7 @@ fn parse_args() -> Result<Args, String> {
         let mut next = || it.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--upstream" => a.upstream = next()?.into(),
+            "--upstream-ring" => a.upstream_ring = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -258,8 +276,8 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if a.upstream.as_os_str().is_empty() {
-        return Err("--upstream is required".into());
+    if a.upstream.as_os_str().is_empty() && a.upstream_ring.is_none() {
+        return Err("--upstream or --upstream-ring is required".into());
     }
     if a.pool_dir.as_os_str().is_empty() {
         a.pool_dir = a.runtime_dir.join("wc-pools");
@@ -480,6 +498,37 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // compositor expects: object ids are per-connection, and multiplexing two
     // clients onto one would need an id-rewriting layer that this deliberately
     // is not (§9.3).
+    // §35. The session's control region, when the Wayland stream is riding
+    // shared_vulkan's rings. Attached once for the whole proxy and shared by
+    // every client thread, because the *region* is one session — it is the
+    // *rings* that are per connection, which is the distinction §35.3 is about.
+    let ring: Option<std::sync::Arc<sv_transport::control::Control>> = match &args.upstream_ring {
+        None => None,
+        Some(path) => {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            let len = f.metadata()?.len() as usize;
+            let region = std::sync::Arc::new(sv_transport::region::SharedRegion::map_fd(
+                std::os::fd::AsFd::as_fd(&f),
+                0,
+                len,
+            )?);
+            // The same `ProtocolIds` the ICD and the GPU server use. R13: two
+            // builds that disagree must fail to connect rather than
+            // desynchronise, and this is where that is checked for the Wayland
+            // half exactly as it is for the Vulkan half.
+            let ids = sv_transport::control::ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+            let control = sv_transport::control::Control::attach(region, ids)?;
+            println!(
+                "[proxy] upstream is the shared_vulkan session at {} \
+                 ({} ring slots, generation {})",
+                path.display(),
+                control.layout().geometry.ring_slot_count,
+                control.generation()
+            );
+            Some(std::sync::Arc::new(control))
+        }
+    };
+
     let mut served: usize = 0;
     let deadline = std::time::Instant::now() + args.accept_timeout;
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -505,17 +554,45 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // being accepted into a proxy with nowhere to forward to; that is still
         // true and is now handled by failing the connection immediately, which
         // is a closed socket at the same moment either way.
-        let upstream = match std::os::unix::net::UnixStream::connect(&args.upstream) {
-            Ok(u) => u,
-            Err(e) => {
-                println!(
-                    "[proxy] client {n}: cannot reach the compositor at {}: {e}",
-                    args.upstream.display()
-                );
-                continue;
+        // §35. A ring claim is this connection's `connect()`: it is a CAS on the
+        // ring directory of the session's control region, and the compositor's
+        // poll of that directory is the matching `accept()`. Nothing is
+        // negotiated and nothing rides the cold path, because the directory is
+        // inside the region the cold path already located.
+        let upstream = match ring.as_ref() {
+            Some(control) => {
+                match sv_transport::wlbytes::ByteChannel::claim(control, n as u64) {
+                    Ok(ch) => {
+                        println!(
+                            "[proxy] client {n} connected, upstream ring slot {} \
+                             (no socket, no TCP, no ssh)",
+                            ch.slot()
+                        );
+                        proxy::Upstream::Ring(Box::new(ch))
+                    }
+                    Err(e) => {
+                        println!("[proxy] client {n}: no free Wayland ring: {e}");
+                        continue;
+                    }
+                }
             }
+            None => match std::os::unix::net::UnixStream::connect(&args.upstream) {
+                Ok(u) => {
+                    println!(
+                        "[proxy] client {n} connected, upstream {} connected",
+                        args.upstream.display()
+                    );
+                    proxy::Upstream::Socket(u)
+                }
+                Err(e) => {
+                    println!(
+                        "[proxy] client {n}: cannot reach the compositor at {}: {e}",
+                        args.upstream.display()
+                    );
+                    continue;
+                }
+            },
         };
-        println!("[proxy] client {n} connected, upstream {} connected", args.upstream.display());
 
         // A transport per session: a fresh `SharedFile`, or a handle on the one
         // arena. docs/design.md §16.2.
@@ -542,6 +619,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // client's icons with it and nobody else's.
         let (want_icons, icon_theme, upstream_path) =
             (args.icons, args.icon_theme.clone(), args.upstream.clone());
+        let on_ring = ring.is_some();
         // STAGE 13. Where *this* client's application is installed, asked of
         // the kernel before the socket is moved into the thread. Read here
         // rather than inside the thread only because the answer is about the
@@ -582,11 +660,27 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 // is cosmetic: a compositor too old to have the global, or a
                 // socket that will not take a second connection, must cost a
                 // picture rather than a window.
-                match wc_proxy::iconlink::IconLink::connect(&upstream_path, &spec, search) {
-                    Ok(link) => Some(link),
-                    Err(e) => {
-                        println!("[proxy] client {n}: no icon feed ({e}); icons will be generic");
-                        None
+                if on_ring {
+                    // §35. The icon feed is a *second* connection to the
+                    // compositor (`iconlink`, and §16.7's argument for why it
+                    // cannot ride the first), so on the ring it would be a
+                    // second ring claim — which is right, and is not built. It
+                    // is said out loud rather than silently skipped because a
+                    // generic icon looks like a bug in the icon code.
+                    println!(
+                        "[proxy] client {n}: no icon feed on the ring upstream (§35.8); \
+                         icons will be generic"
+                    );
+                    None
+                } else {
+                    match wc_proxy::iconlink::IconLink::connect(&upstream_path, &spec, search) {
+                        Ok(link) => Some(link),
+                        Err(e) => {
+                            println!(
+                                "[proxy] client {n}: no icon feed ({e}); icons will be generic"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
