@@ -344,7 +344,21 @@ released, which is the condition that was wanted. `current` is still stamped so
 a later `frame` stays a no-op, and `frame_pending` is now cleared because the
 protocol says "no frame event is required after the cancel event".
 
-Upstreamable as-is — it has no Windows content and is a strict bug fix.
+**This is an upstream candidate and not a local divergence, and the difference
+matters for how it is maintained.** Every other smithay hunk in this file is
+here because upstream's code assumes Linux and ours cannot; this one is here
+because upstream's code is wrong on Linux too. It has no Windows content, no
+`cfg`, no dependency on anything in this tree, and it is a strict bug fix
+against `smithay` 0.7.0 that any compositor built on smithay wants. §5.3's
+position applies at its strongest — smithay has merged this patch class three
+times — so the correct end state is that this hunk **disappears from this file**
+when a release contains it, rather than being carried.
+
+Until then it is the one hunk in `vendor/smithay` that a rebase must not drop
+silently: a lost feature-gate fails to compile, and a lost `cancel` fix compiles
+and quietly stops sending an event. Listed under "What was NOT done" at the
+bottom of this file so it is read as outstanding work rather than as settled
+divergence.
 
 ### `cfg(unix)` where the API is Unix by subject matter
 
@@ -492,6 +506,12 @@ x86_64-pc-windows-gnu` compile.
 
 ## What was NOT done, and would need doing next
 
+* **The `wl_touch.cancel` fix has not been sent upstream.** Stage 20, three
+  lines in `smithay/src/input/touch/mod.rs`, and it is the only hunk in this
+  whole file that is a bug fix against upstream's own platform rather than a
+  port. It should be a pull request and should then be *removed* from this fork
+  rather than kept; carrying it is how a bug fix becomes a divergence. See the
+  stage-20 entry under `smithay` for what it is and how it was found.
 * **`wayland-client` is not forked.** Nothing here needs it: `wayland-server`
   does not depend on it, and the stage-1 probe writes the wire format by hand.
   `wayland-backend`'s *client* half is ported (it is in the same crate and had
