@@ -750,6 +750,12 @@ impl Session {
         self.transport.name()
     }
 
+    /// What the arena is holding. See `PoolTransport::memory` for why this is
+    /// reported per connection.
+    pub fn transport_memory(&self) -> Option<crate::pool::MemoryReport> {
+        self.transport.memory()
+    }
+
     pub fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
     }

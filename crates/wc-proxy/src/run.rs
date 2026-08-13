@@ -65,10 +65,13 @@ struct Args {
     /// compares policies at a fixed size. Growth is what happens after the
     /// allocator has already failed, and a run has to say it wants it.
     arena_grow: bool,
-    /// The least a grown region will be, for the file fixture. Zero means "the
-    /// same as `--arena-size`", which keeps the region a familiar size rather
-    /// than inventing a second number. A pool larger than this still gets a
-    /// region big enough for it, because a pool may not straddle two.
+    /// The base of the geometric growth series. Zero keeps
+    /// [`wc_proxy::pool::GROW_STEP`] — 16 MiB, argued from the pool sizes
+    /// clients actually ask for.
+    ///
+    /// It used to default to `--arena-size`, which meant a session started at
+    /// 768 MiB grew in 768 MiB jumps. That was two unrelated quantities sharing
+    /// a default rather than a number anybody chose.
     arena_grow_step: u64,
     /// How many frames a region must be empty before it is returned. Not a
     /// timer: what makes a region cold is that nothing drew in it, and a clock
@@ -131,9 +134,13 @@ usage: wc-proxy --upstream <path> [options]
                          default so that --arena-policy stays measurable: an
                          arena that grew when tight would hide how well it
                          places what it already has.
-  --arena-grow-step N    arena: the least a grown region will be (default: the
-                         same as --arena-size). A pool larger than this gets a
-                         region big enough for it; a pool never straddles two.
+  --arena-grow-step N    arena: base of the geometric growth series, doubling
+                         to a 64 MiB cap (default 16 MiB, from the pool sizes
+                         clients ask for). Growing costs a locate -- ~0.4 s on
+                         the deployment -- so the number of growths is what
+                         wants bounding, and the cap bounds the overshoot in
+                         exchange. A pool larger than the step gets a region big
+                         enough for it; a pool never straddles two.
   --arena-grow-idle N    arena: frames a region must be empty before it is
                          returned (default 120). Frames, not seconds — a clock
                          cannot tell a cold region from a paused video.
@@ -365,6 +372,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 let src = PlanGrowth::new(&args.arena_plan, &ids);
                 println!("[proxy] arena {} may grow: {}", t.id(), src.describe());
                 t.set_source(Box::new(src))?;
+                t.set_grow_step(args.arena_grow_step)?;
                 t.set_reclaim_idle(args.arena_grow_idle)?;
             }
             announce_outbound(&t);
@@ -395,14 +403,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     .parent()
                     .unwrap_or(std::path::Path::new("."))
                     .to_path_buf();
-                let step = if args.arena_grow_step != 0 {
-                    args.arena_grow_step
-                } else {
-                    args.arena_size
-                };
-                let src = FileGrowth::new(&dir, step);
+                let src = FileGrowth::new(&dir, 0);
                 println!("[proxy] arena {} may grow: {}", t.id(), src.describe());
                 t.set_source(Box::new(src))?;
+                t.set_grow_step(args.arena_grow_step)?;
                 t.set_reclaim_idle(args.arena_grow_idle)?;
             }
             announce_outbound(&t);
@@ -598,6 +602,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("[proxy] client {n} transport {}", session.transport_name());
             println!("[proxy] client {n} {}", session.stats.summary());
+            if let Some(m) = session.transport_memory() {
+                println!("[proxy] client {n} {m}");
+            }
             if let Some(link) = &icons {
                 println!("[proxy] client {n} {}", link.summary());
             }
@@ -606,6 +613,41 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     for t in threads {
         let _ = t.join();
+    }
+    // DYNAMIC ARENA. The memory figure, printed once for the process because
+    // the arena is one region set shared by every connection and a per-client
+    // number would be four readings of the same bytes.
+    //
+    // **Peak resident, not bytes copied.** Every other number this proxy prints
+    // is throughput — MiB copied, per-copy microseconds — and a throughput
+    // figure standing next to a memory question gets read as an answer to it.
+    // A run that copied 1158 MiB held nothing like 1158 MiB; the two differ by
+    // the number of frames. So the memory line says what it is, says the floor
+    // release cannot go below, and says how many regions were up at the peak,
+    // because "1.2 GiB in one region" and "1.2 GiB in nineteen" are different
+    // facts about whether release can help at all.
+    if let Some(a) = &shared_arena {
+        let (peak, peak_regions) = a.peak();
+        let (grown, grow_nanos, refused, released, released_bytes) = a.growth();
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        println!(
+            "[proxy] arena {} memory: peak resident {:.1} MiB in {} region(s); \
+             now {:.1} MiB in {} region(s); floor {:.1} MiB (the startup region, \
+             which is never returned)",
+            a.id(),
+            mib(peak),
+            peak_regions,
+            mib(a.size()),
+            a.regions(),
+            mib(a.floor()),
+        );
+        println!(
+            "[proxy] arena {} churn: grew {grown} time(s) in {:.1} ms total, \
+             {refused} refused; released {released} region(s), {:.1} MiB",
+            a.id(),
+            grow_nanos as f64 / 1e6,
+            mib(released_bytes),
+        );
     }
     println!("[proxy] stopped: {served} client(s) served");
     Ok(())
