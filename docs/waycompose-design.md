@@ -11060,6 +11060,24 @@ slice. `--copy damage` narrowed that to the damaged rows and §27 cut it 2.05×,
 but the shape is unchanged — **126 µs per 4.5 MiB copy, 262 copies and 1158 MiB
 in one Firefox session** — and none of that is what "directly written" means.
 
+**Read those numbers next to the one that arrived while this section was being
+written, because it changes what they are worth.** The WSI work decomposed
+Firefox's first-frame stall and found a cross-VM present costs **216.9 ms**
+against 1.7–2.1 ms for the same present locally, essentially all of it because
+`sv_transport::park`'s futex doorbell cannot cross a hypervisor: every waiter
+runs out a 20 ms scheduler slice instead of being woken, about **eleven waits per
+present**. Set the copy against that. One copy is 126 µs, so it is 0.06% of one
+present; and the *entire* session's copying — all 262 of them, all 1158 MiB — is
+33 ms, which is **about a seventh of a single present**. A day spent removing
+every copy in this document would be invisible next to one doorbell that wakes.
+
+That does not make this section pointless, and it is not an argument for
+sloppiness about memory: the user asked for two things, copying *and* memory,
+and §30.10 records that the memory side of this trade is still unmeasured. But
+it does settle the ordering. The doorbell is being fixed as top priority, and it
+should be; this is the work that comes after it, when microseconds are the units
+that remain.
+
 `crates/wc-proxy/src/pool.rs`'s module header already argues why the copy is
 there, and this section does not overturn it. It says `wl_shm.create_pool` is
 the client handing the server memory it has *already* allocated, that the
@@ -11573,6 +11591,25 @@ after. None of those is a reason to doubt the mechanism and all of them are
 reasons not to switch to it this week — with a firm memory of what the module
 header says, which remains the best short statement of why this is hard, and
 which this section narrows in exactly one place (§30.1) and contradicts nowhere.
+
+**A second argument arrives at the same place from a completely different
+direction, and it is the stronger one.** The 216.9 ms doorbell above is not a
+reason to build this carefully; it is a reason not to build it *yet*. Every
+hazard in §30.6 is a way to lose a frame silently, and the whole prize for
+running that risk is 126 µs against a 217 ms present. Taking a silent-corruption
+risk to win 0.06% would be a bad trade at any level of care. When the doorbell
+wakes and a present costs single-digit milliseconds, the same 126 µs is a real
+fraction of a real budget and this becomes worth its hazards. Two independent
+arguments now converge on "not yet", which is a much better place to stand than
+one.
+
+One thing to do *before* any of it, and it is small: end the pool record at
+`wl_shm_pool.destroy`. The experiment leaks it, and §30.10 explains why that
+cannot ship — `(st_dev, st_ino)` is a much better identity than a descriptor
+number but a released memfd's inode can be reissued, so a leaked record
+eventually matches a stranger. That is §30.6d a third time, and the pattern by
+now is unmistakable: **every identity in this mechanism must end when the thing
+it names ends.** The protocol already says when that is.
 
 And keep the ordering straight. The accelerated path — WebRender rendering
 through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all
