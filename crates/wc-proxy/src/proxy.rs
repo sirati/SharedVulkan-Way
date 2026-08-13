@@ -244,6 +244,12 @@ pub fn pump(
                 }
             })
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("client: {e}")))?;
+            // STAGE 16. Events the session invented for its own client, which
+            // today is `wl_display.delete_id` for objects the proxy destroyed
+            // or whose destructor it absorbed. They ride the ordinary client
+            // write path and never carry a descriptor — see
+            // `Session::take_client_bytes`.
+            to_client.extend_from_slice(&session.take_client_bytes());
             for note in session.take_notes() {
                 log(&note);
             }
@@ -285,6 +291,7 @@ pub fn pump(
                 Err(e) => Err(format!("{e}")),
             })
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("compositor: {e}")))?;
+            to_client.extend_from_slice(&session.take_client_bytes());
             for note in session.take_notes() {
                 log(&note);
             }

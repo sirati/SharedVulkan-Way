@@ -418,3 +418,160 @@ using. It was not attempted, so **there is no forwarded-versus-llvmpipe number o
 the machine where that comparison is the only one there is.** The half of it that
 is cheap — llvmpipe on the testhost host — was not taken either, because half a
 comparison is not one.
+
+---
+
+# testhost, reached — and where Firefox stops
+
+Measured 2026-08-13 on **testhost**, the machine the section above says was
+not reached. Host: `/dev/dri` empty, no `/run/opengl-driver` at all, the iGPU
+bound to `vfio-pci` and passed to the guest. Guest: Windows, Intel UHD Graphics,
+Intel's proprietary driver. Harnesses: `scripts/sv-guest-host.sh` and
+`scripts/sv-firefox-guest.sh`, both run *on* testhost.
+
+**The short version: GL 4.3 on the guest's real GPU works from a host that has
+none, including on the very Wayland socket Firefox uses — and Firefox still
+renders in software, because its hardware WebRender wants an EGL config this
+Wayland has no way to offer.** The forwarder is not what stops it, and the
+evidence for that sentence is below rather than asserted.
+
+## 1. What had to be built, because it did not exist
+
+The Windows GPU side had **no cross-VM mode**. `serve` publishes two named
+sections and a named pipe — objects with no meaning outside that kernel — so no
+application on the Linux host could reach it however it was started. Only the
+Linux guest path had `guest`, and this guest is Windows. The commit that adds
+`sv-gpu-server guest --port` (now `sv-guest gpu guest --port`) is the missing
+half; §1's table there says what differs from the Linux one and why the cold
+path is a loopback TCP listener rather than a virtio-serial port.
+
+`sv-hostd qemu-serve` also learned to take `--cold` more than once, because a
+cross-VM session is one pinned window, one extent and one control region, and
+Firefox needs several — §0.12's split, arriving on this path.
+
+## 2. The chain, on the machine with no GPU
+
+```
+sv-hostd: the guest offers run 0x3dc2aaac7d4d5fe5, 4096 control pages
+          + 16384 arena pages, locator Scan
+sv-hostd: located 20480/20480 pages in 2.63s over 13311 MiB of guest RAM;
+          25 run(s), 0 outside RAM
+sv-hostd: stitched 80 MiB with 25 mmap call(s); all 20480 pages carry
+          their own index
+[gpu] Intel(R) UHD Graphics (intel), provider GuestRam (VirtualAlloc, pinned)
+[gpu] serving rings [1, 2, 3] on Intel(R) UHD Graphics (intel)
+
+OpenGL core profile renderer: zink Vulkan 1.3(Intel(R) UHD Graphics
+                              (INTEL_PROPRIETARY_WINDOWS))
+OpenGL core profile version:  4.3 (Core Profile) Mesa 26.2.0
+```
+
+Four sessions were located and served independently in one run. The guest got
+**large pages** — 80 MiB in 25 physical runs rather than the 1471 that
+`measured-gpu-side.md` records for 4 KiB locked pages — so the run list is small
+and the stitch is 25 `mmap` calls.
+
+## 3. The two facts about software fallback that this machine makes visible
+
+Both are properties of the venue rather than of the work, and both were measured
+here rather than reasoned about:
+
+- **The default is llvmpipe, silently.** With Mesa present and no override,
+  `eglinfo` on this host reports `llvmpipe (LLVM 21.1.8)` and GL 4.6. On a host
+  with no GPU, a CPU implementation is what you get by *not asking*.
+- **Forcing Zink fails loudly.** With `MESA_LOADER_DRIVER_OVERRIDE=zink
+  GALLIUM_DRIVER=zink` and no ICD reachable at all, EGL returns
+  `eglInitialize failed` and does **not** fall back. So a renderer string from
+  that configuration is a device, and an absent one is not a quiet substitution.
+
+## 4. `LIBGL_KOPPER_DISABLE=1`, and why it is needed
+
+`sv-icd` advertises `VK_KHR_surface`, `VK_EXT_headless_surface`,
+`VK_KHR_xlib_surface` and `VK_KHR_xcb_surface` — and **no
+`VK_KHR_wayland_surface`**. So on the Wayland platform `zink_kopper` cannot make
+a `VkSurfaceKHR`, and EGL initialisation hangs.
+
+With kopper disabled, Mesa loads the **swrast** DRI driver for the Wayland
+platform and puts Zink behind it as the *gallium* driver. `eglinfo` on the
+Wayland platform, connected to waycompose's proxy and thence to the compositor
+inside the VM:
+
+```
+Wayland platform:
+EGL driver name: swrast
+OpenGL core profile renderer: zink Vulkan 1.3(Intel(R) UHD Graphics
+                              (INTEL_PROPRIETARY_WINDOWS))
+OpenGL core profile version:  4.3 (Core Profile) Mesa 26.2.0
+```
+
+"swrast" names the *presentation* path — `wl_shm`, a CPU copy into the
+compositor's buffer, which is §7's copy 2 — while every draw call still executes
+on the Intel iGPU inside the VM. That is the arrangement this project wants and
+it is running.
+
+## 5. Where Firefox stops, exactly
+
+Firefox loads the ICD — `sv-icd: connected to the GPU side at
+/tmp/svff-int/icd.sock` is in its own stderr — and then:
+
+```
+MESA-EGL: warning: egl: failed to create dri2 screen
+[GFX1-]: Failed to create EGLConfig for WebRender!
+[GFX1-]: Failed GL context creation for hardware WebRender: true
+[GFX1-]: Fallback WR to SW-WR
+```
+
+The window maps (`wc-compositor: window 1 mapped 1280x900`), frames arrive, and
+`about:support` is a real browser on the guest's desktop — rendered by
+**Software WebRender**.
+
+Four things were varied and none of them moved it:
+
+| varied | result |
+|---|---|
+| `LIBGL_KOPPER_DISABLE=1` | same failure — and `eglinfo` succeeds with it, so the GL stack is not what fails |
+| dropping `MESA_LOADER_DRIVER_OVERRIDE=zink`, keeping `GALLIUM_DRIVER=zink` | same failure |
+| the compositor's arena at 768 MiB instead of 64 MiB | same failure; 6 pools, 43 copies, 152 MiB, **0 overflows** — no exhaustion |
+| `LIBGL_ALWAYS_SOFTWARE=1` (the control) | Firefox comes up and paints, via Software WebRender, with no EGL error at all |
+
+**The EGL configs exist.** The Wayland platform's table has window-capable
+`ARGB8888` (`0x34325241`) configs with depth 24 and stencil 8. So "no config"
+is Firefox's own matching rule rejecting them, not Mesa having none.
+
+The reading that fits every row: **Firefox's hardware WebRender on Wayland wants
+a dmabuf-capable EGL display, and this topology cannot have one** — the host has
+no DRM device to make dmabufs from, and `wc-proxy` offers `wl_shm` and nothing
+else because no descriptor may cross the VM boundary. It is the same conclusion
+the live session reaches on its own: `about:support` there reads
+`WebRender (Software)` with `FEATURE_FAILURE_WEBGL_EXHAUSTED_DRIVERS`.
+
+A control on **devhost** — real RADV, a `weston --renderer=pixman`
+compositor offering `wl_shm` and no dmabuf, same Mesa, same Firefox — does *not*
+hit the EGLConfig failure. The difference is that RADV has
+`VK_KHR_wayland_surface`, so kopper works and Mesa loads the **zink** DRI driver
+rather than swrast. That is the one variable between a Firefox that gets a
+hardware GL context on a shm-only Wayland and one that does not.
+
+## 6. So the two ways forward, named
+
+1. **Give `sv-icd` a Wayland WSI** — `VK_KHR_wayland_surface` plus a present
+   that attaches a `wl_shm` buffer to the client's surface. Then Mesa takes the
+   kopper path it takes on devhost, which is measured to satisfy Firefox.
+   This is the larger piece and it is the one that makes the result general.
+2. **Put Firefox on X11 under an Xwayland whose backend is `wc-proxy`.** The ICD
+   already has `VK_KHR_xlib_surface`, and §0.11 measured GLX through
+   `zink_kopper` working. Cheaper, and it inherits §0.12's warning that X11 core
+   protocol presentation is expensive.
+
+Neither is a change to the cross-VM transport, which is done and measured.
+
+## 7. What is *not* the problem, said plainly
+
+- Not the arena: 0 overflows at 768 MiB, and the 64 MiB exhaustion that kills
+  Firefox on a video (`arena 0 has no run of 2342912`) did not fire here.
+- Not the forwarder: GL 4.3 on the real GPU, on the same Wayland connection,
+  in the same run.
+- Not multi-session: four sessions, four ICD clients, each on its own control
+  region and its own arena.
+- Not the deployment: the unified `sv-guest` binary runs both halves in the
+  guest and both were exercised in one run.

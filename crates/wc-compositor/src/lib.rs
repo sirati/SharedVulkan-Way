@@ -42,6 +42,7 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+mod cursor;
 mod icon;
 mod input;
 mod platform;

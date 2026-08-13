@@ -58,12 +58,12 @@ use crate::surface::{Rect, Shadow};
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
-pub use win32::{current_layout, has_touch, start};
+pub use win32::{current_layout, has_touch, keyboard_repeat, start};
 
 #[cfg(not(windows))]
 mod headless;
 #[cfg(not(windows))]
-pub use headless::{current_layout, has_touch, start, Click};
+pub use headless::{current_layout, has_touch, keyboard_repeat, start, Click};
 
 /// ADDED FOR STAGE 20. The ellipse a `wl_touch.shape`/`.orientation` pair
 /// describes, derived from Win32's contact rectangle by
@@ -179,6 +179,47 @@ pub struct IconImage {
     pub pixels: Vec<u8>,
 }
 
+/// What the pointer should look like.
+///
+/// ADDED FOR STAGE 12 (docs/design.md §23). One message for both halves of the
+/// protocol, because Win32 has one mechanism: `wl_pointer.set_cursor` sends a
+/// surface and `wp_cursor_shape_v1.set_shape` sends a name, and both end as a
+/// single `SetCursor` with a single `HCURSOR`.
+///
+/// **The cursor is a property of the seat, not of a window**, which is why
+/// there is no [`WindowId`] here. Wayland scopes the cursor to the pointer's
+/// current focus and the compositor is the one that decides what the pointer
+/// looks like at any moment; Win32 agrees, in the sense that `SetCursor` sets
+/// the cursor for the calling thread and every window it owns. Attaching this
+/// to a window would need a policy for what happens when the pointer is over a
+/// window whose client last spoke about a different one, and there is no such
+/// moment: only one surface has pointer focus at a time.
+#[derive(Clone, Debug)]
+pub enum CursorSpec {
+    /// `wl_pointer.set_cursor` with a null surface. The pointer is invisible
+    /// over this client's windows and reappears everywhere else, which is what
+    /// a text editor hiding the pointer while typing means.
+    Hidden,
+    /// A named shape. Resolved to a stock `IDC_*` by [`crate::cursor`]; the
+    /// name is carried rather than the ordinal so the log says what the client
+    /// asked for and not only what it got.
+    Named(smithay::input::pointer::CursorIcon),
+    /// The client's own pixels, from `wl_pointer.set_cursor` with a surface.
+    ///
+    /// The hotspot is in surface coordinates, which after
+    /// `CursorImageAttributes` has divided out the client scale is the same as
+    /// buffer coordinates for every buffer this compositor accepts (scale 1,
+    /// no transform — see `state.rs`'s commit handler).
+    Image {
+        /// BGRA, tightly packed, alpha **premultiplied** — the same layout and
+        /// the same convention as [`IconImage`], which is what a 32-bit
+        /// `CreateIconIndirect` needs.
+        image: IconImage,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+}
+
 /// What sort of window to make.
 ///
 /// ADDED FOR STAGE 9. The distinction is not cosmetic: a popup must not take
@@ -250,6 +291,15 @@ pub enum ToUi {
         maximized: Option<bool>,
         minimized: Option<bool>,
     },
+
+    /// The pointer should look like this from now on.
+    ///
+    /// ADDED FOR STAGE 12. Sent on every `wl_pointer.set_cursor`, every
+    /// `wp_cursor_shape_device_v1.set_shape`, every commit of the surface a
+    /// client is using as its cursor, and — from smithay, without any client
+    /// asking — on every pointer leave, which is what puts the arrow back.
+    Cursor { spec: CursorSpec },
+
     /// `xdg_toplevel.move`: a drag has begun somewhere the client considers a
     /// title bar, and it wants the window manager to take over.
     ///
@@ -270,6 +320,7 @@ pub enum ToUi {
     /// Alt+Space produce, so a client that asks for one gets the system's
     /// rather than an imitation of it.
     WindowMenu { id: WindowId, x: i32, y: i32 },
+
     /// The toplevel is gone.
     Destroy { id: WindowId },
 

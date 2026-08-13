@@ -516,7 +516,7 @@ mod tests {
                 }
             }
         }
-        // 188 messages across the four vendored protocols, walked in both
+        // 193 messages across the five vendored protocols, walked in both
         // dialects. An exact figure rather than a floor: adding a protocol
         // should be a visible change to this line, because the set of messages
         // the proxy can walk is exactly the set of clients it can carry.
@@ -531,6 +531,12 @@ mod tests {
         // by the compositor for two stages while this table did not know it,
         // and the price of that disagreement is a killed connection rather
         // than a missing feature.
-        assert_eq!(checked, 426, "the vendored protocols changed shape");
+        //
+        // 426 to 436 in stage 12, when `wp_cursor_shape_v1` was added
+        // (docs/design.md §23): five requests — `destroy`, `get_pointer` and
+        // `get_tablet_tool_v2` on the manager, `destroy` and `set_shape` on the
+        // device — and no events at all, which is what a protocol that only
+        // ever tells the compositor something looks like.
+        assert_eq!(checked, 436, "the vendored protocols changed shape");
     }
 }
