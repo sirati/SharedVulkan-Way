@@ -1266,7 +1266,12 @@ pub(crate) fn register(hwnd: HWND, window: u64) {
     // SAFETY: a live window handle on the thread that owns it, and a COM object
     // this module allocated. OLE takes its own reference.
     let hr = unsafe { RegisterDragDrop(hwnd, target.cast()) };
-    if hr != S_OK {
+    if hr == S_OK {
+        println!("wc-compositor: window {window} accepts drops from Windows applications");
+    } else {
+        // Not fatal, and said out loud rather than swallowed: a compositor
+        // whose windows silently refuse drops looks exactly like one whose
+        // clients refuse them, and the two have nothing in common.
         println!("wc-compositor: window {window} could not be made a drop target ({hr:#010x})");
     }
     // Ours is released either way: on success OLE holds its own reference, and
