@@ -5651,7 +5651,7 @@ guess is wrong and the harness was written against the guess: it is
 §13.9 said an image name is not an identity on this guest. Stage 11 found two
 more ways for that to be true and two ways to photograph the wrong instant.
 
-> **The rule, because this is the seventh time and it will not be the last.**
+> **The rule, because this is the eighth time and it will not be the last.**
 >
 > There is one Windows guest, one `/srv/winshare`, one taskbar, and as many
 > experiments as there are worktrees. Everything below is a special case of two
@@ -5716,6 +5716,43 @@ more ways for that to be true and two ways to photograph the wrong instant.
 > symptom it was built to detect has to be assumed to have done so until it
 > proves otherwise, which is why the probe now refuses to inject and the script
 > takes no photograph rather than an unattributable one.
+>
+> **The eighth is the last member of the family, and it was found by tidying
+> up.** `runint.ps1` registers its scheduled task as whatever `int`/`int_bg` was
+> called with, and those names are constants: `wccomp`, `wcshot`, `wcwin`. So
+> every worktree registered `wccomp`, and `Register-ScheduledTask -Force` means
+> the last run to start silently redefines the others'. §33 had made the socket
+> unique and the window selectable by pid, and §16.8 had separated the binaries
+> since stage 11 — the *task* name was the one identifier nobody had looked at,
+> because nothing had ever failed because of it. What found it was §37's author
+> removing a stale `Ready` task that pointed at their own deploy directory, from
+> a run started with `int_bg` — which, unlike `int -Wait`, never unregisters.
+>
+> Two things follow, and the second is the reusable one.
+>
+> The names are now `wc-<DESKNAME>-<pid>-<what>`: `DESKNAME` separates
+> worktrees, and the pid separates two runs of the same worktree, which is the
+> case that actually bites — `Unregister-ScheduledTask` on a name another run is
+> about to `Start-ScheduledTask` loses that run's step with no error at either
+> end.
+>
+> And **removing a task by name needs two checks**, which is the rule §37's
+> author applied by hand and the script did not apply to itself:
+>
+> * its `Actions` must run something under *this* run's `DESKDIR` — the name can
+>   have been redefined between registering it and reaping it, and rule 1 says a
+>   name is not an identity; what it will actually execute is. `Execute` alone
+>   does not answer it, because half of these tasks are
+>   `cmd.exe /c <DESKDIR>\wc-desk.exe …` (a task's stdout goes nowhere, so the
+>   redirect has to be a shell's) and the identity is then in the arguments;
+> * and its `State` must not be `Running`, because unregistering a running task
+>   is the very interference this is cleaning up after.
+>
+> That rule is not about scheduled tasks. It is rule 1 applied to *deletion*
+> rather than to selection, and it is the generalisation the first seven
+> instances were each a special case of: **check what a thing is, not what it is
+> called, at the moment you act on it** — not at the moment you named it, which
+> for a shared namespace is a different moment with a different answer.
 >
 > **The fourth: `scripts/sv-firefox-guest.sh`, and it is rule 1 twice over.**
 > Its `clean` step runs
@@ -13795,7 +13832,7 @@ visible bar is delivered inside it, and a press there is `xdg_toplevel.move`.
 Two title bars and a 32-pixel pointer offset are the same measurement read
 twice, which is the only reason this section mentions the second one.
 
-### 33.10 The harness, and three things it was doing to other people's runs (§16.8, instances five to seven)
+### 33.10 The harness, and four things it was doing to other people's runs (§16.8, instances five to eight)
 
 `scripts/wc-desktop.sh window` could not run at all on this branch, and the
 other three are contention bugs the guest has enough of already. **They are
@@ -13842,6 +13879,73 @@ instead of a run:
 the second exists for `weston-eventdemo`, whose every log is off by default and
 which is silent without `--log-key` in a way that looks exactly like a client
 receiving nothing.
+
+#### The eighth, which arrived after this section was written
+
+§37.8 item 5 found the member none of the above closed: **the scheduled task's
+name**. `runint.ps1` registers whatever `int`/`int_bg` was called with, and
+those are constants — `wccomp`, `wcshot`, `wcwin` — so every worktree registered
+`wccomp` and `Register-ScheduledTask -Force` let the last run to start redefine
+the others'. Three identifiers had been made unique by then (the deploy
+directory in §16.8, the socket and the window selector in §33) and this one had
+never been looked at, because nothing had failed because of it. It was found by
+somebody cleaning up a `Ready` task from a run that had finished.
+
+Names are now `wc-<DESKNAME>-<pid>-<what>`, and `reaptasks.ps1` clears this
+worktree's leftovers after the deploy and after the run — `int_bg` cannot
+unregister its own task, because the task has to outlive the ssh call that
+starts it, which is why the leftovers existed at all.
+
+The part worth carrying elsewhere is the **removal** rule, which both that
+script and `runint.ps1` now apply: a task is only unregistered if its `Actions`
+run something under this run's `DESKDIR` *and* its `State` is not `Running`.
+`Execute` alone does not answer the first, because half of these tasks are
+`cmd.exe /c <DESKDIR>\wc-desk.exe …` — a task's stdout goes nowhere, so the
+redirect has to be a shell's — and the identity is then in the arguments.
+§16.8's block states the generalisation: this is rule 1 applied to deletion
+rather than to selection, and *"check what a thing is, not what it is called, at
+the moment you act on it"* is what the other seven instances were each a special
+case of.
+
+**It was routed here rather than patched where it was found**, by an author who
+had the fix in their hand and wrote it down instead. That is why there is one
+implementation of it and not two, and it is worth naming as the thing that went
+right in a section otherwise full of things that did not.
+
+##### `wc-desktop.sh psgate`, because the fix was written during an embargo
+
+Three of the four files this script deploys are PowerShell written inside quoted
+heredocs, and until now the only way to find out whether any of it parsed was to
+run it on the guest — a contended machine, regularly unavailable, which answers
+a syntax error and a logic error with the same silence, because a scheduled
+task's stdout goes nowhere. `reaptasks.ps1` was written while the guest was
+embargoed, so it needed a way to be checked that was not the guest.
+
+`psgate` generates the files and runs two things over them with `pwsh` on the
+workstation: the PowerShell **parser** on each, and a **unit test** of the
+ownership rule against the seven cases it exists to separate. It skips with a
+note when `pwsh` is absent, which is the §26 convention.
+
+The second level is the one that earned its keep, twice.
+
+* Writing the test found a defect in the code under test immediately — but only
+  after the test's own `function T($exe, $args)` reported a *false* failure,
+  because `$args` is an automatic variable and a parameter named after one binds
+  nothing. That is the same hazard as the `-Home` parameter this section's fix
+  had already avoided, arriving from the other side within ten minutes. Both are
+  now commented where somebody would repeat them.
+* And the gate can fail, which §35 is the argument for. Deleting the trailing
+  separator from the path comparison — the one line in `Ours` whose reason is
+  not obvious — makes it report, precisely:
+
+  ```
+  FAIL  the ownership rule is wrong
+        FAIL the prefix collision, wcterm2 -> True, want False
+  ```
+
+  A `Contains` without it says a sibling worktree deployed to `…\wcterm2` is
+  ours, and reaping its tasks is the interference the whole function exists to
+  stop causing.
 
 ## 37. The pointer and the pixels disagreed by the client's own inset
 
@@ -14112,7 +14216,16 @@ been wrong about on this project before. §37.8 item 1.
    and reports what it received. The headless `--simulate-wm` gesture drives
    `weston-eventdemo`, which binds `wl_touch` and prints nothing about it
    (§24.6 says so), and there is no `--click` equivalent for a contact.
-5. **The scheduled-task *name* is still shared between worktrees.** §33 made the
+5. **The scheduled-task *name* is still shared between worktrees.**
+   *(**Fixed** in `wc-desktop.sh` after this was written, by §33's author, whose
+   file it is: names are `wc-<DESKNAME>-<pid>-<what>`, `reaptasks.ps1` clears
+   this worktree's leftovers at both ends of a run, and both it and
+   `runint.ps1` apply the two checks below before removing anything. §16.8's
+   rule block has it as the eighth instance and states the general form. The
+   diagnosis below is unchanged and is the reason the fix has the shape it has —
+   it is left standing because routing a finding to the file's owner rather than
+   patching it in passing is what made one fix instead of two.)*
+   §33 made the
    socket unique per run and the window selectable by pid, and `WC_DESKNAME`
    has separated the binaries since §16.8 — but `runint.ps1` registers its task
    as whatever `int`/`int_bg` was called with, and those names (`wccomp`,
