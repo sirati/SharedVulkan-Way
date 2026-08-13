@@ -9791,8 +9791,13 @@ first.)*
 Written 2026-08-13. **There is an icon on the guest's Windows desktop called
 "Firefox (Linux)", wearing Firefox's own pixels, and double-clicking it puts
 Firefox on the screen in a second and a half.** `docs/stage14/stage14-desktop.png`
-is that desktop, with the icon at the top left and the window behind it;
-`docs/stage14/stage14-firefox-shortcut.png` is the window. This is the first
+is that desktop, with the icon at the top left, the window behind it and — this
+being somebody's actual laptop — the taskbar, the folder icons and a black
+rectangle where the capture tool's own console got in the way of the first
+attempt (§28.6's third item is the same lesson from the other end).
+`docs/stage14/stage14-firefox-shortcut.png` is the window: Windows' own title
+bar with Firefox's icon in it and one set of window buttons, and Firefox's tab
+strip underneath rather than beside it. This is the first
 stage whose deliverable is a product rather than a measurement, and the
 difference shows in what is *not* in the picture: no developer workstation, no
 ssh from this room, no harness holding a tunnel open. `wc-launch.exe` runs in the
