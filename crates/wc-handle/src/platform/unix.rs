@@ -372,3 +372,13 @@ impl Drop for WritableView {
         }
     }
 }
+
+/// This process's resident set, in bytes, from `/proc/self/statm`.
+///
+/// The Linux analogue of the Windows working set, for the development guest of
+/// §13 step 7. See [`crate::arena::committed_bytes`].
+pub fn working_set_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    Some(rss_pages * 4096)
+}

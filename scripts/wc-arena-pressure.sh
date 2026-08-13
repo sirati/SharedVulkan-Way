@@ -103,7 +103,7 @@ run_one() {
 # The three strings from the original report, plus what the run achieved.
 verdict() {
   local dir=$1 label=$2
-  local closed died refusals frames unknown reclaimed
+  local closed died refusals frames unknown reclaimed peak floor
   # `grep -c` prints 0 *and* exits 1 when it matches nothing, so the obvious
   # `|| echo 0` appends a second line and every arithmetic test then says
   # "integer expected". Count lines instead and let a missing file be zero.
@@ -118,13 +118,23 @@ verdict() {
   reclaimed=$(grep -aoE '[0-9]+ reclaimed' "$dir/proxy.log" 2>/dev/null \
     | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}')
   frames=$(ls "$dir/frames" 2>/dev/null | wc -l)
+  # DYNAMIC ARENA. Peak resident arena bytes, which is the memory question and
+  # is a different number from every MiB figure on the stats line -- those are
+  # bytes copied, cumulative over every frame. A run that copied 1158 MiB held
+  # nothing like it. Printing throughput without this invites exactly that
+  # misreading, so both go in the report or neither does.
+  peak=$(grep -aoE "peak resident [0-9.]+ MiB in [0-9]+ region\\(s\\)" "$dir/proxy.log" 2>/dev/null | tail -1)
+  floor=$(grep -aoE "floor [0-9.]+ MiB" "$dir/proxy.log" 2>/dev/null | tail -1)
+  [ -n "$peak" ] || peak="peak resident unknown (no arena line)"
   {
     note "$label: $refusals refusal(s), $reclaimed reclaimed, $frames frame(s), $unknown unknown-object error(s)"
+    note "$label: $peak; $floor -- memory held, NOT bytes copied"
     grep -aoE 'message: "[^"]*"' "$dir/srv.log" 2>/dev/null | sort -u | head -3 \
       | sed 's/^/          /'
     grep -aE 'reclaiming|could not publish' "$dir/proxy.log" 2>/dev/null | tail -2 \
       | sed 's/^/          /'
     grep -aE '[0-9]+ commits,' "$dir/proxy.log" 2>/dev/null | tail -1 | sed 's/^/          /'
+    grep -aE 'arena [0-9]+ (memory|churn):' "$dir/proxy.log" 2>/dev/null | sed 's/^/          /'
   } >&2
   echo "$label|$closed|$died|$refusals|$frames|$reclaimed|$unknown"
 }
