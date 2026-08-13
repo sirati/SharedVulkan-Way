@@ -281,6 +281,8 @@ port       = $PORT
 title = Firefox (Linux)
 icon  = firefox
 exec  = $FIREFOX --profile ~/.wc-launch/firefox
+prefs = middlemouse.paste=false
+titlebar = none
 INI
 
   # A running .exe holds its own file open, so a session that is up must end

@@ -130,6 +130,55 @@ pub fn tunnel_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
     a
 }
 
+/// The `user.js` the deployment writes into the application's profile.
+///
+/// `user.js` rather than `prefs.js` because it is re-applied on **every** start
+/// and cannot be undone by the application writing its own settings out — which
+/// is what "the deployment says so" has to mean. The alternative, setting the
+/// pref once at install time, lasts until the first time somebody changes it in
+/// the UI and then silently stops being true.
+///
+/// Values are rendered by shape: `true`, `false` and integers are bare, and
+/// everything else is a quoted string, because `user_pref("x", true)` and
+/// `user_pref("x", "true")` are different settings and Firefox takes the second
+/// one as a string.
+pub fn user_js(prefs: &str) -> String {
+    let mut out = String::from(
+        "// Written by wc-launch on every start. See docs/waycompose-design.md §28.5.\n",
+    );
+    for item in prefs.split(';') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = item.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() {
+            continue;
+        }
+        let bare = v == "true" || v == "false" || v.parse::<i64>().is_ok();
+        if bare {
+            out.push_str(&format!("user_pref(\"{k}\", {v});\n"));
+        } else {
+            out.push_str(&format!("user_pref(\"{k}\", \"{}\");\n", v.replace('"', "\\\"")));
+        }
+    }
+    out
+}
+
+/// The directory an application was told to keep its profile in, if it was told
+/// at all — `--profile <dir>` or `-profile <dir>`. It is the only argument this
+/// launcher looks *inside* a command line for, and it is here rather than in
+/// `wc-session` so that it is tested.
+pub fn profile_dir(exec: &str) -> Option<String> {
+    let words: Vec<&str> = exec.split_whitespace().collect();
+    words
+        .iter()
+        .position(|w| *w == "--profile" || *w == "-profile")
+        .and_then(|i| words.get(i + 1))
+        .map(|s| (*s).to_string())
+}
+
 /// base64, because the application's command line crosses in
 /// `$SSH_ORIGINAL_COMMAND` and a quoting bug in that path would be a shell
 /// injection on the VM host rather than a wrong window.
@@ -278,5 +327,39 @@ mod tests {
         assert_eq!(id, "wcl-1234");
         assert_eq!(remote_dir(&id), "/tmp/wc-launch/wcl-1234");
         assert_eq!(remote_upstream(&id), "/tmp/wc-launch/wcl-1234/up.sock");
+    }
+
+    /// The user asked for one thing by name: a middle click must not paste.
+    #[test]
+    fn the_deployment_can_state_a_preference_and_it_is_rendered_by_shape() {
+        let js = user_js("middlemouse.paste=false;browser.tabs.warnOnClose=true;ui.key.x=3;a.b=hello");
+        assert!(js.contains("user_pref(\"middlemouse.paste\", false);\n"), "{js}");
+        assert!(js.contains("user_pref(\"browser.tabs.warnOnClose\", true);\n"), "{js}");
+        assert!(js.contains("user_pref(\"ui.key.x\", 3);\n"), "{js}");
+        // A string value is quoted; `false` as a string would be a different
+        // setting and Firefox would take it as one.
+        assert!(js.contains("user_pref(\"a.b\", \"hello\");\n"), "{js}");
+        // Nothing at all is still a valid file, so the host never has to decide.
+        assert!(!user_js("").contains("user_pref"));
+        assert!(!user_js(" ; ; ").contains("user_pref"));
+    }
+
+    #[test]
+    fn the_shipped_configuration_turns_off_the_middle_click_paste() {
+        let c = cfg();
+        let app = c.app("firefox").unwrap();
+        assert!(app.prefs.contains("middlemouse.paste=false"), "{}", app.prefs);
+        assert!(user_js(&app.prefs).contains("user_pref(\"middlemouse.paste\", false);"));
+    }
+
+    #[test]
+    fn the_profile_directory_is_read_off_the_command_line_or_absent() {
+        assert_eq!(
+            profile_dir("firefox --profile /home/s/.wc-launch/firefox about:blank").as_deref(),
+            Some("/home/s/.wc-launch/firefox")
+        );
+        assert_eq!(profile_dir("firefox -profile /tmp/p").as_deref(), Some("/tmp/p"));
+        assert_eq!(profile_dir("firefox"), None);
+        assert_eq!(profile_dir("firefox --profile"), None);
     }
 }

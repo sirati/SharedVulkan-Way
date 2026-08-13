@@ -667,7 +667,21 @@ mod win {
         app: &crate::config::App,
     ) -> Result<(), String> {
         let t = Instant::now();
-        let said = ssh(cfg, p, &["run", id, &plan::b64(app.exec.as_bytes())])?;
+        // Four things cross, all base64'd because they go through
+        // `$SSH_ORIGINAL_COMMAND`: the command line, the profile directory the
+        // deployment's preferences belong in, those preferences already rendered
+        // as a `user.js`, and what the application is told about its own title
+        // bar. The rendering happens here rather than on the host because it is
+        // the part with a shape to get wrong, and here it is tested.
+        let profile = plan::profile_dir(&app.exec).unwrap_or_default();
+        let (exec64, profile64) =
+            (plan::b64(app.exec.as_bytes()), plan::b64(profile.as_bytes()));
+        let (prefs64, titlebar64) = (
+            plan::b64(plan::user_js(&app.prefs).as_bytes()),
+            plan::b64(app.titlebar.as_bytes()),
+        );
+        let said =
+            ssh(cfg, p, &["run", id, &exec64, &profile64, &prefs64, &titlebar64])?;
         log.say(&format!("run {}: {said} ({} ms)", app.title, t.elapsed().as_millis()));
         Ok(())
     }

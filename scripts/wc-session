@@ -202,6 +202,7 @@ EOF
 # Windows application does too.
 run)
   ID="${1:-}"; check_id "$ID"; B64="${2:-}"
+  B64PROFILE="${3:-}"; B64PREFS="${4:-}"; B64TITLEBAR="${5:-}"
   D=$(dir_of "$ID")
   [ -S "$D/wl-proxy" ] || die "no session $ID"
   CMD=$(printf '%s' "$B64" | base64 -d 2>/dev/null) || die "run: bad base64"
@@ -224,6 +225,36 @@ run)
       "$HOME"/.wc-launch/*) mkdir -p "$w" 2>/dev/null ;;
     esac
   done
+
+  # THE PREFERENCES THE DEPLOYMENT SETS, RE-APPLIED ON EVERY START.
+  #
+  # `user.js` rather than a one-off edit of `prefs.js`, because "the deployment
+  # says so" has to survive the user changing it in the UI and the application
+  # writing its settings back out. The file is rendered by `wc_launch::plan::
+  # user_js` on the guest, where it is tested; nothing here parses it.
+  #
+  # The one that made this necessary is `middlemouse.paste=false`: on Linux a
+  # middle click pastes the primary selection, and this window is on a Windows
+  # desktop where a middle click does not — which is a difference between the two
+  # sides that no protocol expresses and only the deployment can settle.
+  #
+  # Written **only** under this launcher's own tree, so a profile somewhere else
+  # is never touched.
+  PROFILE=$(printf '%s' "$B64PROFILE" | base64 -d 2>/dev/null)
+  case "$PROFILE" in
+    "$HOME"/.wc-launch/*)
+      mkdir -p "$PROFILE" 2>/dev/null
+      printf '%s' "$B64PREFS" | base64 -d > "$PROFILE/user.js" 2>/dev/null
+      ;;
+  esac
+
+  # And what the application is told about its own title bar. §22 established
+  # that one bar takes two levers and this is the client's; `none` stops Firefox
+  # drawing a second one under Windows'. It is passed rather than hard-coded
+  # because the *goal* is `client` plus a compositor that extends the frame into
+  # the client area, and that compositor does not exist yet.
+  TITLEBAR=$(printf '%s' "$B64TITLEBAR" | base64 -d 2>/dev/null)
+  [ -n "$TITLEBAR" ] || TITLEBAR=none
   DBUS=""
   [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
   # MOZ_GTK_TITLEBAR_DECORATION=none is a **deployment assumption and there is no
@@ -239,7 +270,7 @@ run)
     XDG_RUNTIME_DIR="$D/xdg" \
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
-    MOZ_GTK_TITLEBAR_DECORATION=none $DBUS \
+    MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
     $CMD >>"$D/app.log" 2>&1 &
   echo "run ok $!"
   ;;

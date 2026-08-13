@@ -23,6 +23,31 @@ pub struct App {
     pub icon: String,
     /// The command line to run on the VM host, as written.
     pub exec: String,
+    /// Preferences the *deployment* sets on the application's profile, as
+    /// `key=value` separated by `;`.
+    ///
+    /// This is the same class of thing as `MOZ_GTK_TITLEBAR_DECORATION=none` in
+    /// `wc-session run` and it exists for the same reason: a setting that has to
+    /// be true on the client's machine, that no protocol carries, and that the
+    /// launcher is the only thing in a position to state. `middlemouse.paste` is
+    /// the one that made it necessary — on Linux a middle click pastes the
+    /// primary selection, and the window this launcher opens is on a Windows
+    /// desktop where a middle click does not.
+    pub prefs: String,
+    /// What the application is told to do with its own title bar:
+    /// `MOZ_GTK_TITLEBAR_DECORATION`, by any other name.
+    ///
+    /// **`none` today, and that is a waypoint rather than the goal.** §22
+    /// established that one title bar takes two levers, and `none` is the one
+    /// that stops Firefox drawing a *second* bar under Windows'. The goal
+    /// `docs/goal-firefox.md` actually states is different and larger: Firefox's
+    /// tab strip drawn **inside** the native caption, which is
+    /// `DwmExtendFrameIntoClientArea` plus `WM_NCHITTEST` on the compositor's
+    /// side and `client` — not `none` — on this one. Neither lever works without
+    /// the other, and the compositor's half does not exist yet (§17.11 item 1),
+    /// so this is a key rather than a constant: when it does, the deployment
+    /// changes one line instead of a binary.
+    pub titlebar: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +128,8 @@ impl Config {
                         title: id.to_string(),
                         icon: id.to_string(),
                         exec: String::new(),
+                        prefs: String::new(),
+                        titlebar: "none".into(),
                     });
                 }
                 continue;
@@ -120,6 +147,8 @@ impl Config {
                     "title" => app.title = v.into(),
                     "icon" => app.icon = v.into(),
                     "exec" => app.exec = v.into(),
+                    "prefs" => app.prefs = v.into(),
+                    "titlebar" => app.titlebar = v.into(),
                     other => return Err(format!("line {}: [app.{id}] has no {other}", n + 1)),
                 }
                 continue;
@@ -225,6 +254,11 @@ port       = 57431
 title = Firefox (Linux)
 icon  = firefox
 exec  = firefox --profile ~/.wc-launch/firefox
+# A middle click on Windows does not paste, so it must not paste here either.
+prefs = middlemouse.paste=false
+# `none` stops Firefox drawing a second title bar under Windows'. `client` is
+# what tabs-in-the-caption will need, once the compositor extends the frame.
+titlebar = none
 "#;
 
 #[cfg(test)]
