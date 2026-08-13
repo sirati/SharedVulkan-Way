@@ -8781,7 +8781,10 @@ whatever the region held before, which for a fresh arena is zeroes. Measured on
 a real Firefox scrolling `about:support` through Wine: **3 commits in 1509 left
 the region stale, the worst of them by 900 rows of a 900-row window** — the
 whole client area, showing nothing. After the fix, 1628 of 1628 commits match,
-and the run copies **2.05x fewer bytes** than it did before.
+and the run copies **2.05x fewer bytes** than it did before. The fix then
+shipped a 51x cost regression of its own for one commit, which `wc-proxy.sh`
+measured, printed and passed anyway — §27.9, and the most useful part of this
+section.
 
 ### 27.2 What the reported damage means, and what a copying proxy needs instead
 
@@ -8996,6 +8999,9 @@ Deterministic, no Wine, `cargo test -p wc-proxy`:
   the control: the disagreement is damage tracking's alone.
 * `paying_off_the_arrears_still_costs_less_than_the_extent` — 332800 bytes
   against 2304000, 6.9x, derived in the test rather than asserted as a ratio.
+* `whole_buffer_damage_never_costs_more_than_the_extent` — the same client with
+  whole-buffer damage, at 2 and 4 buffers, which is §27.9's regression. Without
+  the area bound it fails at 7488000 bytes against 3840000.
 
 Real client, `scripts/wc-damage.sh`, Firefox scrolling `about:support` with 60
 wheel notches injected by `probe-scroll.exe` from inside the Wine desktop:
@@ -9012,7 +9018,76 @@ result: the fix copies **2.05x less** than the code it replaces, because the old
 state-only commits and copied a 4.4 MiB buffer for a commit that changed
 nothing.
 
-### 27.9 The gates
+### 27.9 The fix was 51x too expensive for one commit, and the harness said 37/0
+
+The arrears above shipped with a defect of their own, and it is the most useful
+thing in this section because of *how* it was caught.
+
+`copy_damage` copies overlapping rectangles as many times as it is given them.
+That is deliberate and it is documented in the function: unioning two
+rectangles costs more than copying the overlap twice. The comment says "two".
+Arrears can make it sixty. `weston-presentation-shm` damages its **whole**
+250x250 buffer every frame and cycles buffers, so a buffer coming back round
+owed one full-buffer rectangle for every frame it had been away — and paying
+those arrears copied the buffer once per rectangle.
+
+Measured by `scripts/wc-proxy.sh cost`, which runs exactly that client:
+
+| | MiB copied, 700-odd commits | per copy |
+|---|---|---|
+| before this stage | 167.61 | 244 KiB — the buffer |
+| the arrears fix, as first written | **8583.07** | **13 MiB — the buffer, 55 times** |
+| with the bound below | 172.38 | 244 KiB |
+
+**And the harness reported 37 passed, 0 failed.** It prints those six numbers
+in a table for a human to read and asserts on none of them, so a 51x regression
+in the one path the guest actually runs walked straight through the gate the
+unified tree's own instructions name as "the regression gate that matters".
+
+**It reached master before the fix did**, and that is worth recording rather
+than tidying away. This branch was still measuring the regression in its own
+worktree when somebody else's routine catch-up brought the arrears fix across
+from waycompose into the unified tree — correctly, from the last commit
+waycompose had. For about an hour, master's `--copy damage` copied a buffer
+once per intervening frame. The lesson is not "coordinate better": it is that
+the window between *shipping a fix* and *finishing the cost measurement on it*
+is a window in which the fix is already other people's problem, and the only
+thing that closes it is a harness that would have failed.
+
+The bound is one line and it is exact rather than a heuristic: the sum of the
+rectangle areas is precisely what `copy_damage` will move, so comparing it
+against the extent picks the cheaper of the two every time.
+
+```rust
+if damage_area(&rects, &info) >= extent_area(&info) {
+    copy_extent(src, dst, &info, usable)
+} else {
+    copy_damage(src, dst, &info, &rects, usable)
+}
+```
+
+It also closes a case that predates this stage: a client sending many
+overlapping rectangles in a *single* frame had the same pathology, with no
+arrears involved.
+
+Two things were added so that this cannot happen again, and the pairing is the
+point — a unit test that is deterministic, and a harness assertion where the
+measurement already was:
+
+* `whole_buffer_damage_never_costs_more_than_the_extent` drives the cycling
+  client with whole-buffer damage at 2 and 4 buffers and asserts damage ≤
+  buffer. Without the bound it fails at 7488000 bytes against 3840000.
+* `scripts/wc-proxy.sh cost` now checks its own table, per transport, at a 1.5x
+  ceiling — loose enough never to be noise, tight enough that the regression
+  above fails it by 34x. The harness goes from 37 assertions to 39.
+
+The lesson generalises past this bug. §27.7 explains why no harness *exercised*
+the broken configuration; this is the other failure mode, where the harness
+exercised it, measured it, printed the number, and had no opinion about it. A
+measurement nothing asserts on has stopped being a test — which is §14.9's
+finding about comments, arriving in the harness layer.
+
+### 27.10 The gates
 
 | Gate | Result |
 |---|---|
@@ -9024,9 +9099,12 @@ nothing.
 | `scripts/wc-damage.sh control` (new) | **5 passed, 0 failed** — 1035 commits checked at `--copy buffer`, 0 stale |
 | the same, re-run **after merging master** — twice, because master moved under the merge (§22 title bar, §25 protocols, then §23 cursors) | 162 then 168 tests, clippy clean both targets, `scroll` 5/5 at 432 and 964 commits |
 | `scripts/wc-damage.sh scroll` against the **pre-fix** copy path | **4 passed, 1 failed** — which is the point |
-| `wc-proxy.sh`, `wc-input.sh`, `wc-firefox.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended** |
+| **on the unified tree**, `cargo test --workspace` | **1206 tests**, 0 failures — the tree moved five times under this merge; the number is whatever it was at the last one |
+| **on the unified tree**, `scripts/wc-proxy.sh` | **39 passed, 0 failed** — its 37 plus the two §27.9 adds |
+| **on the unified tree**, `scripts/wc-damage.sh scroll` | 5 passed, 0 failed — 1402 commits checked, 0 stale |
+| `wc-input.sh`, `wc-firefox.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended** |
 
-The six that were not re-run are named rather than omitted, and the argument
+The five that were not re-run are named rather than omitted, and the argument
 that they are safe is narrower than usual because it can be made from the change
 itself. `--verify-damage` is off unless asked for, and the copy path changed in
 exactly one direction: **strictly more bytes are copied per attaching commit,
@@ -9052,7 +9130,7 @@ master and needed nothing here. The one thing the merge *did* change is this
 section's name: this branch called itself "stage 14" until it discovered that
 stage 14 is §19, the Windows desktop shortcut.
 
-### 27.10 Three things that cost real time
+### 27.11 Four things that cost real time
 
 1. **`set -o pipefail` plus a `--help` that exits non-zero.** The harness's
    guard against a stale binary — `wc-proxy --help | grep -q -- --verify-damage`
@@ -9072,8 +9150,15 @@ stage 14 is §19, the Windows desktop shortcut.
    this stage's runs span 20 to 4106 on a machine ten agents are sharing, and
    the honest statement is variance. §13.8's retraction is the precedent; this
    is the same mistake caught one run earlier.
+4. **Reusing an X display number between runs.** `scripts/wc-proxy.sh` reported
+   19 passed 11 failed, immediately after reporting 39 passed 0 failed on the
+   same tree, because the previous run's Xvfb and `wineserver` were still on
+   that display. It is §8.9's finding about desktop names in its other clothes,
+   and it cost a real diagnosis of a real regression's fix — for ten minutes the
+   evidence said the fix had broken the milestone. A fresh display number, and
+   the failure was not there.
 
-### 27.11 What is not proven
+### 27.12 What is not proven
 
 1. **Surface coordinates are still assumed to be buffer coordinates.**
    `wl_surface.damage` (opcode 2) is in surface coordinates and
@@ -9106,11 +9191,11 @@ stage 14 is §19, the Windows desktop shortcut.
    because GDI ignores alpha — so neither is part of this stage's symptom.
    Recorded so that the audit's finding is not read as closed.
 
-### 27.12 What to do next
+### 27.13 What to do next
 
-1. **Run `scripts/wc-damage.sh` against the guest-RAM arena** (§27.11 item 4).
+1. **Run `scripts/wc-damage.sh` against the guest-RAM arena** (§27.12 item 4).
    The verifier is transport-agnostic and the leg is two flags.
-2. **Own the scale question** (§27.11 items 1 and 2). Two places merge two
+2. **Own the scale question** (§27.12 items 1 and 2). Two places merge two
    coordinate spaces on an assumption that is currently true, and the code in
    both says so; that is a good state to change deliberately and a bad one to
    discover.
