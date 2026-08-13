@@ -1245,6 +1245,72 @@ design from one that can be any of it.
 
 ---
 
+### 0.11 Firefox, and the one property no instrument measured
+
+Measured 2026-08-13 on **devhost** in `nix develop`, `docs/firefox-accel.md`.
+`goal-firefox.md`'s fourth clause — accelerated rendering — had never been tested
+with Firefox; the chain Firefox → WebRender → GL → Zink → shared_vulkan was
+measured at every link but the first.
+
+**1. Firefox selects the ICD, and GL through Zink through the forwarder works in
+both entry points.** `eglinfo` on surfaceless and — new, and the one that matters
+— **`glxinfo` under X11**, which is the path Firefox actually takes through
+`zink_kopper` and a `VK_KHR_swapchain`, both report
+`zink Vulkan 1.3(… RADV RAPHAEL_MENDOCINO …)` at GL 4.6. Firefox's own stderr
+carries `sv-icd: connected to the GPU side` and the GPU side logs the attach and
+`serving rings`. Nothing about the loader, the manifest, Zink's device selection
+or the profile is in the way.
+
+**2. Firefox still cannot use it, and the reason is ours.** With
+`LIBGL_ALWAYS_SOFTWARE=1` in the identical harness Firefox runs for the full 60 s
+with empty stderr, reports WebGL 2.0 on `llvmpipe, or similar`, and reads back
+`clearColor(0.2,0.6,0.9,1)` as exactly `51,153,230,255`. Through the forwarder it
+exits within seconds on `poll failed` and `Exiting due to channel error`. The
+control establishes that the harness is sound.
+
+**3. `--clients N` is one *shared* session, not N sessions, and the GPU side
+serves exactly one per process lifetime.** The accept loop gathers N handshakes
+into one control region and one ring set and only then runs a single
+`session::serve`, which then holds the socket for 30 s of idle. Firefox forks
+`glxtest` before the browser exists; that child takes the session, the browser
+gets nothing, Firefox gives up. A respawn loop does not help, because the server
+does not exit when its client disconnects.
+
+**4. The measurement that makes it not about Firefox: two ordinary GL programs,
+one after another, against one GPU side — the second is not served.** `glxinfo`
+then `glxgears` twelve seconds later gave one attach, not two.
+
+**5. And the reason it was never found: every instrument in this project is
+single-process.** `sv-end-to-end.sh`, `sv-zink-gl.sh`, `sv-dxvk-d3d11.sh`,
+`sv-present.sh`, `sv-bench.sh` and `sv-video-decode.sh` all run one client;
+so do `vulkaninfo`, `eglinfo`, `glxgears` and `video-probe`. The one property a
+real application needs is the one nothing exercised — §0.9's "implemented meant
+compiled" in its third form.
+
+**What it costs to fix** is a stage: one control region and one ring set per
+client, an accept loop that spawns sessions rather than falling through to one,
+and a decision about whether sessions share an arena (they should — one arena per
+device is the design) given that the slab allocator and object table are
+currently per-session. Nothing in the ICD, in Zink or in the protocol changes.
+
+**Not answered**: the cost against llvmpipe, which needs a Firefox that runs;
+whether WebRender picks a hardware backend, since `about:support` is the arbiter
+and Firefox never reached one; and anything on testhost, where §0.10's finding
+that the host has no GPU makes "forwarded versus llvmpipe" the only comparison
+there is.
+
+**And the copy count**, which is design rather than measurement
+(`firefox-accel.md` §7): today a Firefox frame reaching the compositor's buffer
+is two copies — a GPU-side `vkCmdCopyImageToBuffer` into a linear arena buffer
+(§0.6), then a CPU-side copy from the arena into the compositor's `wl_buffer`.
+The second should not exist, and removing it needs a shared handle that is **not
+a descriptor**: an arena slab id, an offset and length, and a layout — the same
+triple the protocol already carries — with the `wl_buffer` bound to that range
+rather than to a copy of it. §1a permits that because nothing crosses; what is
+missing is the two sides agreeing on one allocator.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`

@@ -320,6 +320,29 @@ fn serve(
     let listener = UnixListener::bind(socket)?;
     eprintln!("[gpu] listening on {socket} for {clients} client(s)");
 
+    // **`--clients N` is one *shared* session, not N sessions.**
+    //
+    // The loop below gathers N attach handshakes into the *one* control region
+    // and ring set built above, and nothing is served until all N have arrived;
+    // then a single `session::serve` runs until 30 s of idle and the process
+    // exits. So this process serves exactly one session in its lifetime, and a
+    // client that arrives after `session::serve` has started finds a socket that
+    // exists and is never answered.
+    //
+    // That is fine for every harness in this tree and for `vulkaninfo`,
+    // `eglinfo`, `glxgears` and `video-probe` — all of which are one process —
+    // and it is the whole of what stops a real application. Measured 2026-08-13
+    // (design.md §0.11, docs/firefox-accel.md): Firefox forks `glxtest` before
+    // the browser exists, that child takes the session, the browser is never
+    // served, and Firefox exits. A respawn loop does not help, because this
+    // process does not exit when its client disconnects. Two ordinary GL
+    // programs run one after another against one GPU side give one attach, not
+    // two.
+    //
+    // Serving independent sessions needs a control region and ring set per
+    // client, an accept loop that spawns rather than falling through, and a
+    // decision about sharing the arena between them. It is written down here so
+    // that the next person to read `--clients` does not read it as "serves N".
     for i in 0..clients {
         let (sock, _) = listener.accept()?;
         let msg = recv(&sock)?;
