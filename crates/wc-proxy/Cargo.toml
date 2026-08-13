@@ -1,0 +1,37 @@
+[package]
+name = "wc-proxy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A Wayland server to a local client and a client of the Windows compositor"
+
+# LINUX ONLY, AND THAT IS THE POINT.
+#
+# Every other crate in this workspace is built for both targets, because the
+# port is the project. This one is the *host* half of a host/guest pair: it
+# exists because the client is on Linux and the compositor is not, and it uses
+# `SCM_RIGHTS`, `memfd_create` and `mremap` to do the one job the compositor
+# must never do — receive a real file descriptor. Building it for Windows would
+# mean writing a second implementation of a thing that has no reason to exist
+# there, and the workspace gate `cargo check --target x86_64-pc-windows-gnu`
+# would then be checking code nothing runs.
+#
+# The `cfg(unix)` target table below is what keeps the Windows gate green: on
+# that target this crate has no dependencies and no modules, so it compiles to
+# an empty rlib rather than failing.
+
+[lib]
+name = "wc_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wc-proxy"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+wc-handle = { workspace = true }
+libc = "0.2"
+# The same parser `vendor/wayland-scanner` uses, reading the same XML files, so
+# the proxy's idea of the wire format and the compositor's cannot drift apart.
+quick-xml = "0.41"

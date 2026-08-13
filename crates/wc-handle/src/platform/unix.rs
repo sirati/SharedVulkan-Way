@@ -31,11 +31,17 @@ use std::path::PathBuf;
 pub struct OwnedObject {
     file: File,
     path: PathBuf,
+    /// False for an object this process only *opened* — an arena somebody else
+    /// provided. See `Handle::open_shared_file` for why the distinction is
+    /// about who may delete it rather than about who may write to it.
+    unlink_on_drop: bool,
 }
 
 impl Drop for OwnedObject {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.unlink_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -113,7 +119,22 @@ pub fn create_section(name: &str, size: u64) -> io::Result<OwnedObject> {
         .create_new(true) // never adopt somebody else's file
         .open(&path)?;
     file.set_len(size)?;
-    Ok(OwnedObject { file, path })
+    Ok(OwnedObject { file, path, unlink_on_drop: true })
+}
+
+/// Open an object somebody else created, for writing, without taking on the
+/// job of deleting it. See `crate::Handle::open_shared_file`.
+pub fn open_file_object(name: &str, size: u64) -> io::Result<OwnedObject> {
+    let path = PathBuf::from(name);
+    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let have = file.metadata()?.len();
+    if have < size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is {have} bytes, not the {size} it was said to be"),
+        ));
+    }
+    Ok(OwnedObject { file, path, unlink_on_drop: false })
 }
 
 /// Open the object by name and map it read-only.
@@ -140,6 +161,23 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
         return Err(io::Error::last_os_error());
     }
     Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len })
+}
+
+/// Create an object named by a filesystem path.
+///
+/// On Unix this is `create_section` under another name, and that identity is
+/// the point rather than an accident: the Unix analogue of a named section was
+/// always a file at a path (see this module's header). The two names exist so
+/// that the *Windows* side, where they are genuinely different system calls,
+/// can be reached by one spelling from the shared code in `lib.rs`.
+pub fn create_file_object(path: &str, size: u64) -> io::Result<OwnedObject> {
+    create_section(path, size)
+}
+
+/// Open an object by filesystem path and map it read-only. See
+/// [`create_file_object`] for why this is `map_section` under another name.
+pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
+    map_section(path, len)
 }
 
 /// Write into an object this process owns.

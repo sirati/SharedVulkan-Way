@@ -157,6 +157,8 @@ struct WindowState {
     /// event and toolkits that resend on change oscillate.
     self_driven: Cell<bool>,
     icon_big: Cell<isize>,
+    /// How many frames this window has presented, for the dump filenames.
+    frames: Cell<u32>,
     icon_small: Cell<isize>,
 }
 
@@ -353,6 +355,14 @@ struct Ui {
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
     controller: Cell<isize>,
+    /// Where to write a PPM of every presented frame, if asked.
+    ///
+    /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
+    /// is exactly what docs/design.md §8.5 had to apologise for: the half of
+    /// the evidence that produced an `HWND` was also the half whose pixels
+    /// nobody outside the process ever measured. A frame dumped here is read
+    /// back by `identify` and `compare`, which are not ours.
+    dump_frames: Option<std::path::PathBuf>,
 }
 
 thread_local! {
@@ -533,6 +543,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         ToUi::Present { id, damage } => {
             if let Some(w) = window(ui, id) {
                 present(&w, &damage);
+                dump_frame(ui, &w);
             }
         }
         ToUi::SetWindowState {
@@ -584,6 +595,7 @@ fn create_window(
         mapped: Cell::new(false),
         self_driven: Cell::new(false),
         icon_big: Cell::new(0),
+        frames: Cell::new(0),
         icon_small: Cell::new(0),
     });
 
@@ -695,6 +707,42 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
             " (xrgb)"
         }
     );
+}
+
+/// Write this frame out as a PPM, if `--dump-frames` asked for it.
+///
+/// # Why it is worth doing here as well as headless
+///
+/// `present` above invalidates a rectangle and lets `WM_PAINT` blit it, so
+/// everything after this point is GDI's and the operating system's. A dump
+/// taken here is therefore the compositor's **last** view of the pixels — what
+/// it is about to hand to `SetDIBitsToDevice` — which is exactly the right
+/// place to read from if the question is "did the client's bytes survive the
+/// journey", and exactly the wrong place if the question is "did GDI draw
+/// them". The screenshot answers the second; a harness that had only one of the
+/// two could not tell a stride bug from a blit bug.
+///
+/// Done from the shadow rather than by reading the window back with `BitBlt`
+/// for the same reason: reading the window back would measure the X server
+/// under Wine, which `xwd` already does better and from outside.
+fn dump_frame(ui: &Rc<Ui>, w: &Rc<WindowState>) {
+    let Some(dir) = &ui.dump_frames else {
+        return;
+    };
+    let n = w.frames.get();
+    w.frames.set(n + 1);
+    let path = dir.join(format!("window{}-{n:04}.ppm", w.id));
+    let shadow = w.shadow.lock().unwrap_or_else(|e| e.into_inner());
+    match crate::surface::write_ppm(&path, &shadow) {
+        Ok(()) => {
+            // Only the first, or an animating client fills the log with one
+            // line per frame and buries everything the harness greps for.
+            if n == 0 {
+                println!("wc-compositor: writing frames to {}", dir.display());
+            }
+        }
+        Err(e) => eprintln!("wc-compositor: could not write {}: {e}", path.display()),
+    }
 }
 
 fn present(w: &Rc<WindowState>, damage: &[Rect]) {
@@ -954,6 +1002,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         frame: config.frame,
         draining: Cell::new(false),
         controller: Cell::new(controller as isize),
+        dump_frames: config.dump_frames.clone(),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 

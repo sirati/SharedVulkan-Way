@@ -23,6 +23,17 @@ estimate, it says so in those words.
 > for what has changed: `libxkbcommon` is measured, smithay compiles for Windows,
 > and a mingw-built compositor reaches `xdg_toplevel`.
 
+> **Where the project is, as of stage 4.** An **unmodified** third-party Wayland
+> client — `weston-terminal`, and `weston-presentation-shm` at 778 frames —
+> paints into a window created by `wc-compositor.exe`, with a Linux proxy
+> (`wc-proxy`) between them and **no file descriptor or handle crossing the
+> boundary in either direction**. That is §9, and it is what makes
+> `docs/goal-firefox.md` reachable at all: until it existed, §2.4's in-band `h`
+> argument meant no stock libwayland client could send a buffer to the Windows
+> build, and Firefox is a stock libwayland client. Sections 0–8 below are the
+> stages that got there and are unchanged except where a later measurement
+> contradicted them, which is marked in place.
+
 ## 0. Status: what stage 1 settled, and what it did not
 
 The research was explicit that one question dominated the schedule risk
@@ -1322,6 +1333,14 @@ Two smaller facts worth recording:
 
 ### 8.5 The evidence, in two halves, and what each is worth
 
+> **[CLOSED BY STAGE 4 — §9.8.]** The split below is real for stage 3 and the
+> reasoning is unchanged, but the caveat it ends on no longer stands.
+> `wc-proxy` terminates the Wayland connection on the client's side of the
+> boundary, so `weston-terminal` and `weston-presentation-shm` — unmodified,
+> stock libwayland, no knowledge of this project — now drive the whole buffer
+> path **and** produce an `HWND`, in one experiment. What follows is why that
+> was not possible when it was written.
+
 This is the part to read sceptically, because the stage cannot make one claim
 with one experiment.
 
@@ -1579,3 +1598,460 @@ because `scripts/wc-guest.sh` already does the deployment.
    describes, arriving early and from an unexpected direction — a stage 4 design
    question rather than a bug, and the reason `FrameStyle::extend_top` exists
    already.
+
+---
+
+## 9. Stage 4: the host-side proxy, and an unmodified client in a Windows window
+
+### 9.1 Status in one paragraph
+
+**`weston-terminal` and `weston-presentation-shm`, unmodified, now paint into
+windows created by `wc-compositor.exe`.** A new Linux binary, `wc-proxy`, is a
+Wayland server to the local client — a real `AF_UNIX` socket, `SCM_RIGHTS` and
+all — and a client of the Windows compositor in the dialect of §2.3. The
+client's `wl_shm` pool descriptor is received here, mapped here, and goes no
+further; what crosses is a **name the compositor opens itself** or an **offset
+into a region it mapped before any protocol traffic existed**. §8.5's
+split-evidence caveat is closed: one experiment now produces both halves.
+
+### 9.2 Why this had to exist, and why §2.4 predicted its shape
+
+§2.3 made `h` arguments in-band because Windows `AF_UNIX` carries no ancillary
+data and `DuplicateHandle` would mean a compositor holding `PROCESS_DUP_HANDLE`
+over every client. That decision stands. Its consequence was measured twice
+independently — §7.8's `weston-flower` against the **real guest**, and §8.6's
+Weston client under Wine reaching `xdg_toplevel` and then delivering **zero
+frames** — and it is fatal to `docs/goal-firefox.md` on its own terms: Firefox
+is a stock libwayland client, and no stock libwayland client can send a buffer
+to the Windows build.
+
+§2.4 already named the way out, and it is worth quoting because this stage is
+that paragraph implemented rather than a new idea:
+
+> "It does not foreclose Architecture B. In the 'Linux clients over a proxy'
+> topology the proxy terminates the Wayland connection and re-materialises fds
+> at the boundary anyway — it speaks ordinary Wayland to the Linux client and
+> ours to the compositor. The deviation is confined to the hop that was always
+> going to be special."
+
+### 9.3 It is a wire forwarder, not a pair of protocol implementations
+
+The obvious build is `wayland-server` on one side and `wayland-client` on the
+other with a typed handler per interface. **`wc-proxy` is a byte forwarder
+instead**, and the reason is `docs/goal-firefox.md` rather than economy: Firefox
+binds `wl_seat`, `wl_output`, `wl_data_device_manager`, `xdg-decoration`,
+`wp_viewporter`, `wp_fractional_scale` and whatever else it turns out to want,
+and a typed proxy needs code for every one. A forwarder needs code only for the
+messages that carry an `h`, and there are **four in the whole of `wayland.xml`
+and `xdg-shell.xml`** — asserted as a set in a test, so that adding a protocol
+with a fifth is a visible change rather than a silent one:
+
+| message | direction | status |
+|---|---|---|
+| `wl_shm.create_pool` | request | the stage |
+| `wl_keyboard.keymap` | event | implemented, unexercised (§9.10 item 5) |
+| `wl_data_offer.receive` | request | named error, stage 5 |
+| `wl_data_source.send` | event | named error, stage 5 |
+
+**What it does need is a signature table**, and that is the one place this
+project pays a cost §2.3 says it escapes. §2.3's claim is exact and still true:
+
+> "the type is on the wire. This is the cost waypipe could not avoid — it needed
+> a full protocol parser because one cannot determine which passed file
+> descriptor corresponds to which message without parsing the message."
+
+That escape is real **on the Windows side**, where a descriptor is
+self-describing bytes in the body. It does not reach the host side, where the
+client is a stock libwayland client whose `create_pool` carries zero bytes of
+body and an fd in a control message. So the proxy pays waypipe's cost once, on
+the side that has fds, and the compositor still does not. That asymmetry is the
+design working rather than a hole in it.
+
+The table is read from **the vendored XML** — `wayland.xml` copied byte for byte
+from `vendor/wayland-server`, `xdg-shell.xml` from wayland-protocols 1.49 —
+parsed with the same `quick-xml` the scanner uses. A hand-written table would
+fit today and would be a second implementation of the protocol to keep in step
+with the first; reading upstream's own description means a protocol is added by
+copying a file, and means the proxy's idea of the wire format cannot disagree
+with the compositor's.
+
+Object ids get their interface from exactly three places and there is no fourth,
+which is what makes complete knowledge of the object graph possible from
+watching alone: object 1 is `wl_display`; a `new_id` argument whose XML names an
+interface; and `wl_registry.bind`'s untyped `new_id`, the only place the wire
+carries the type instead of the table. Ids are retired on
+`wl_display.delete_id` and on nothing else — a client sending a destructor does
+not free the id, the server does, and retiring early would mean disagreeing with
+the compositor for exactly as long as a round trip takes, which is precisely
+when a client is allowed to have messages in flight.
+
+### 9.4 The rule, and the two things that may cross
+
+**No descriptor and no handle crosses the boundary, ever, even here where both
+sides are on one machine.** The boundary is always treated as a VM boundary. A
+descriptor created locally out of memory that side already reaches is fine; a
+descriptor *passed* is not. A name crossing, which the peer then opens itself,
+is the sanctioned pattern.
+
+`SCM_RIGHTS` on the client socket is not an exception to that: it is between the
+client and the proxy, both on the host, and the fd it carries is created by the
+client and consumed by the proxy. The upstream writer has **no fd path at all**,
+so a descriptor cannot leak across by accident — there is no code that would
+send one.
+
+Two transports satisfy the rule, both now constructed, and `wc_handle` gained
+one new descriptor kind for the first:
+
+| transport | what crosses | what the peer does |
+|---|---|---|
+| `Descriptor::SharedFile { path, size }` | a path | `CreateFileW` + `CreateFileMappingW` |
+| `Descriptor::ArenaSlice { arena, offset, len }` | three integers | arithmetic |
+
+**`SharedFile` is new and `ArenaSlice` is not.** `ArenaSlice` has been in the
+type since stage 1 precisely so that constructing it later would not be a
+wire-format break (§2.2's option (c)); stage 4 constructs it. `SharedFile`
+exists because `Local\wc-…` is a name only the NT object manager understands and
+a Linux process can neither create one nor open one — a filesystem path is the
+one name both namespaces share.
+
+**Measured before anything was built on it** (`scripts/probe-filemap.c`, with
+its Linux half `probe-filemap-peer.c`): a Wine process's `CreateFileMappingA`
+view of a `Z:` path is coherent with a Linux `MAP_SHARED` mmap of the same file,
+in **both directions**, with no flush and no reopen. The handshake is
+deliberately two-way, because a one-way check passes if the reader merely
+happens to fault in a page the writer already flushed, which is a much weaker
+property than shared-page coherency and is not enough to carry a frame that is
+being written while the compositor reads it. **This must be re-measured per
+deployment**: virtio-fs without DAX caches file pages in the guest, and there
+the two sides would each see their own copy — a correctness failure that looks
+like a rendering bug. That is §9.11 item 1.
+
+An arena is not a per-message fact and cannot be one. It is attached **out of
+band, before any protocol traffic**, by whatever brought the two sides together:
+shared_vulkan's cold-path handshake (its design.md §4.3) in the real deployment,
+a `--arena id:size:path` flag on both processes here. `wc_handle::arena` is a
+process-global registry for that reason. Threading it through `Handle::map()`
+instead would mean a diff through smithay's `ShmState`, its `Client` data and
+its `wl_shm` dispatch — exactly the "spread through the commit path" cost §8.4
+says the seam exists to avoid. The fork's diff for arenas is **zero lines**.
+
+**Which mechanism served a frame is counted rather than inferred.** All three
+kinds arrive through the same smithay code, so the compositor cannot tell them
+apart from its own side; `Handle::map()` can, because it is the function that
+opens them, and it keeps a counter per kind. Every window logs
+`pixels served by wl_shm (mapped: N section, N shared-file, N arena-slice)` and
+the harness asserts on it. §8.4's rule — *"a stage that added a second provider
+with no way to tell which one ran would not really have added it"* — applied to
+a stage that added two.
+
+### 9.5 The copy, and the question the brief asked
+
+**The pool cannot be arena-backed directly, and the reason is structural rather
+than an implementation gap.** `wl_shm.create_pool` is the client handing the
+server memory it has *already allocated*; the protocol has no request in the
+other direction, no way for a server to say "allocate your next pool here". By
+the time the proxy learns a pool exists, libwayland has already called
+`memfd_create`, sized it, mapped it and drawn into it. Nothing on Linux can
+re-point an existing mapping at another object's pages. So the bytes must be
+copied at least once on this side.
+
+Stated honestly: **a copy per frame is the price of the client being
+unmodified**, and it is paid on the host, which has spare CPU, rather than in
+the guest, which has the GPU. A genuinely arena-backed pool is reachable only by
+a client that *allocates* from the arena — which is what
+`docs/goal-firefox.md`'s accelerated path is, where WebRender renders through
+shared_vulkan into arena memory and no `wl_shm` pool exists at all. That is why
+the transport seam matters more than the copy it currently performs.
+
+So the measurable question is how much to copy. Three scopes, all correct,
+differing in how much they copy and how much they must understand: `pool`
+(everything, understands nothing), `buffer` (the attached buffer's extent),
+`damage` (the rows the client damaged). Measured with `scripts/wc-proxy.sh cost`
+— `weston-presentation-shm`, 250x250 `Xrgb8888`, a 15 MB pool, ~680 commits per
+run:
+
+| transport | scope | commits | MiB copied | µs/copy |
+|---|---|---|---|---|
+| shared-file | pool | 681 | 9727 | 561 |
+| shared-file | buffer | 683 | 163 | 19 |
+| shared-file | damage | 684 | 163 | 18 |
+| arena | pool | 707 | 10099 | 1070 |
+| arena | buffer | 690 | 164 | 26 |
+| arena | damage | 688 | 164 | 25 |
+
+Three things this says, and two it does not:
+
+* **Pool scope costs 60x the bytes** — 14.3 MiB per commit against 244 KiB —
+  because a client's pool is sized for its allocation habits and not for what it
+  drew. It is the simplest correct proxy and it is not the one to ship.
+* **`buffer` and `damage` are indistinguishable here**, which is right: this
+  client damages its whole buffer every frame, so there is nothing for damage
+  scoping to save. `weston-terminal` damages partially and there it wins.
+* **A commit costs about 20 µs at 244 KiB**, or roughly 12 GB/s, which is memory
+  bandwidth and not a bottleneck at any frame rate a window has.
+* It does **not** distinguish the two transports at buffer or damage scope. The
+  pool-scope figures differ between them by more than they differ between runs
+  of the same configuration, so no claim is made there.
+* It says **nothing about the cost across a hypervisor**, where `SharedFile`'s
+  per-pool `CreateFileW` is a round trip through a filesystem daemon and
+  `ArenaSlice`'s is arithmetic. That is the measurement that decides between them
+  and it needs the guest (§9.11 item 2).
+
+**One measured fix came out of this table.** The first run had damage scope at
+41 µs against buffer's 20 for *identical bytes*, because a full-buffer damage
+rectangle was being copied as 250 separate 1000-byte `copy_from_slice` calls
+where buffer scope did one of 244 KiB. Damage-scoped copying is supposed to be
+the cheap one; it only is if it does not shred a large contiguous run. A
+full-width rectangle is now one copy, padding included, and the two scopes agree.
+
+### 9.6 `wl_shm_pool.resize`, and the measurement that changed the design
+
+A shared region cannot grow once the peer has mapped it: a Windows section's
+size is fixed at `CreateFileMappingW` time (§2.5) and an arena slice's
+neighbours are already allocated. The two apparent answers are to over-allocate
+by some factor, or to re-key the pool onto a new object — and the second is not
+available, because the pool's id belongs to the client and the protocol has no
+way to say "that object now means this memory".
+
+So: over-allocate by how much? **`weston-terminal` creates a 4096-byte pool and
+then grows it nine times, by doubling, to 4190208 bytes — a factor of 1023.** No
+headroom anyone would write down covers that, and the first version of this
+proxy announced the pool immediately and then failed all nine resizes, logging
+`resize to 12288 exceeds the 4096-byte region` nine times and presenting zero
+frames.
+
+The same `--trace` run showed the way out. All nine resizes arrive **back to
+back, before any other request**, because toytoolkit sizes its pool during
+`display_create()` and only afterwards makes a surface. So `create_pool` is now
+**held** until the client does something that is not a resize on that pool, and
+the pool is announced once, at the size the client settled on. Zero
+over-allocation and zero failed resizes for the measured clients. It is a delay
+and not a reordering: any other message flushes the pending pools first, so the
+upstream order is the client's own apart from the absorbed resizes.
+`--pool-headroom` survives for a client that resizes *later* — which neither of
+these does, but a window dragged bigger will — and a resize past it is counted
+and named rather than silently producing a short buffer.
+
+### 9.7 The lifetime rule, arriving from the direction §2.5 warned about
+
+§2.5 is the one thing that section says a caller must know:
+
+> "Sending a descriptor transfers nothing… a sender that drops its handle
+> immediately after `send` — which is legal on Unix — leaves the receiver with a
+> name for an object that no longer exists."
+
+**`weston-presentation-shm` does exactly that**, and not as an edge case: it
+creates a pool, creates its buffers, and destroys the `wl_shm_pool` at once,
+which is idiomatic because the `wl_shm` spec keeps the memory alive for the
+buffers. All three requests reached the proxy before the compositor had read any
+of them, so releasing on `destroy` unlinked the file the compositor was about to
+open — `could not map SharedFile { … }: File not found`, delivered to the client
+as a `wl_shm` protocol error, **zero frames presented**.
+
+The fix is the receiver-side eagerness §2.5 asks for, implemented on the side
+that can observe it. A pool's region is released only when all three hold:
+
+1. the client has destroyed the `wl_shm_pool`;
+2. **every buffer cut from it is gone** — the spec's own rule, and the one a
+   first fix missed: releasing on the compositor's acknowledgement alone gave
+   784 presented frames with **one** copy behind them, a window frozen on frame
+   one while the compositor cheerfully redrew the same bytes 783 more times;
+3. the compositor has sent `wl_display.delete_id` for the pool, which is a real
+   acknowledgement that it processed the destructor and therefore opened the
+   name.
+
+All three are asserted in one test, each with the failure it prevents in its
+comment.
+
+**One diagnostic change came out of this and is worth keeping.** The failure was
+invisible: `shm/handlers.rs` reports `Failed to mmap fd {fd:?}` because it holds
+the handle and not the error, and the one line in `shm/pool.rs` that said *why*
+was a `debug!` in a binary with no `tracing` subscriber. It is an `eprintln!`
+now. A protocol-fatal failure is not a debug detail.
+
+### 9.8 The evidence, in one piece
+
+This is the part §8.5 could not write. There, the pixels and the protocol were
+proved on Linux against clients that cannot share our bugs, and the window was
+proved under Wine against a client that is ours — *"a real weakening and should
+be read as one"*. `scripts/wc-proxy.sh window` is one experiment producing both,
+and it runs each client over each transport so the result is a property of the
+path rather than of one client's habits.
+
+Everything below is measured from **outside every process involved**: `xwd`
+reads the X root, ImageMagick measures it, and the compositor's own
+`--dump-frames` output — new on Win32 for this stage, and the second thing §8.5
+lacked — is read back as PPM by `identify`.
+
+| measured | `weston-terminal` | `weston-presentation-shm` |
+|---|---|---|
+| reached `xdg_toplevel` through the proxy | yes | yes |
+| a real `HWND` | yes | yes |
+| frames of the client's pixels in it | 3 | 778 |
+| what the compositor opened, shared-file run | 2 shared-file, 0 section, 0 arena | — |
+| what the compositor opened, arena run | 2 arena-slice, 0 section, 0 shared-file | 1 arena-slice, 0 section, 0 shared-file |
+| descriptors received / sent onward | 3 / **0** | 1 / **0** |
+| title reaching the caption | `"Wayland Terminal"` | — |
+| `set_app_id` | `org.freedesktop.weston.wayland-terminal` | — |
+| window geometry | 806x491, as asked | — |
+| dumped frame | 869x555, 234 distinct colours | 250x250 |
+| two shots 1.5 s apart | identical (static client) | **24864 pixels differ** |
+| the primaries on screen | — | red, green and blue all present |
+| the picture's extent on screen | — | 219x213, inside a 250x250 buffer drawn 1:1 |
+| orientation | 27 light rows top half, 6 bottom | — |
+
+Five of those deserve a sentence each, because they are the ones that would pass
+by accident otherwise.
+
+**"Descriptors received / sent onward: 3 / 0"** is the rule, checked rather than
+assumed. A run that got the pixels there by passing something would produce an
+identical picture and fail this line.
+
+**The transport counts** come from `wc_handle::Handle::map`, the function that
+actually opened the object, and not from anything the compositor could infer.
+
+**The orientation check took three attempts and each failure is instructive**,
+because each looked like the right measurement. A band at the very top and the
+very bottom of the buffer: both are toytoolkit's drop shadow, 0 against 0. A
+band a tenth of the way in: lands just below the title bar, 0.20 against 0.01 —
+right sign, unconvincing margin. The *brightest* row of each half: 0.95 against
+0.76, because the frame's bottom border is a light line one or two rows tall and
+a maximum cannot tell a title bar from a border. Counting light rows separates
+them, because a title bar is tens of rows and a border is one or two. This is
+§8.11 item 3 — `SetDIBitsToDevice` with a negative `biHeight`, the one place the
+documentation is ambiguous — answered under Wine and still owed on the guest.
+
+**`219x213 inside 250x250`** is the scale check. A DPI-virtualised window (§8.10
+item 9) would be drawn larger and a stride error would smear the wedges past the
+buffer's width; neither fails a "the colours are there" check.
+
+**The buffer being 869x555 for an 806x491 window is correct**, not a bug:
+toytoolkit draws a drop shadow around its frame and declares the visible part
+with `xdg_surface.set_window_geometry`. Asserting equality there would have been
+asserting that the client does not do something it is entitled to do.
+
+**And the honest limits.** This is Wine, and Wine has now been wrong four times
+on this project, so a *negative* here is not a result — `scripts/wc-guest.sh` is
+the arbiter and §9.11 is the list. What a pass buys is that the whole chain runs
+end to end: third-party client, host proxy, in-band descriptor, named shared
+memory opened by the peer, GDI, an `HWND`, with nothing passed. One Wine
+artefact was diagnosed rather than reported as a finding, and it is exactly the
+kind that would have been written up as a limitation: three compositors run back
+to back **in one virtual desktop name** collide, because the previous
+`wineserver` is still winding down, and `CreateWindowExW` then fails for every
+visible top-level window — §8.11 item 1's failure mode arriving as a test
+artefact. A distinct desktop per run and a three-second gap fixed it, and §8.9's
+warning about the shared `WINEPREFIX` is now a sharper rule than it was.
+
+### 9.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo clippy --workspace --all-targets` (Linux) | clean, no warnings |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo test --workspace` | **116 tests**, 0 failures (was 62) |
+| `scripts/wc-handshake.sh` (stage 1) | 6 passed, 0 failed |
+| `scripts/wc-xkb.sh` (stage 2) | 5 passed, 0 failed |
+| `scripts/wc-xdg.sh all` (stage 2) | 10 passed, 0 failed |
+| `scripts/wc-window.sh linux` (stage 3) | 19 passed, 0 failed |
+| `scripts/wc-window.sh wine` (stage 3) | 18 passed, 0 failed |
+| `scripts/wc-proxy.sh window` (stage 4) | **33 passed, 0 failed** |
+| `scripts/wc-proxy.sh cost` (stage 4) | 6 configurations measured |
+
+The 54 new tests are concentrated where they can be run, which on this project
+means "not behind `cfg(windows)`" (§4.1). `wc-proxy` is Linux-only by design —
+it is the host half of a host/guest pair and its whole job is to receive a
+descriptor, which is the one thing the Windows side must never do — so all of it
+is testable, and the tests drive the entire `wl_shm` path with a scripted client
+against a real `memfd`, reading the result back through `wc_handle::Handle::map`
+exactly as the compositor does. The picture they paint is stage 3's: markers in
+three corners and **not** the fourth, so a flip cannot pass.
+
+Two are worth naming. `every_message_in_every_protocol_round_trips` encodes and
+walks all 177 messages of both vendored protocols in both dialects, because the
+proxy forwards messages it does not understand and a walk that is wrong about
+one of *those* corrupts the stream for everything after it.
+`the_upstream_stream_is_well_framed_in_our_dialect` re-walks the whole
+concatenated output as a compositor would, which is what catches a size field
+computed from the wrong place after a splice.
+
+### 9.10 What is not proven
+
+1. **Nothing here has run on the real guest.** Everything in §9.8 is Wine, and
+   §8.10 item 1's warning is undiminished. §9.11 is the list.
+2. **Filesystem coherency is measured for one filesystem.** `probe-filemap.c`
+   says a `Z:` path under Wine is coherent both ways with a Linux `MAP_SHARED`
+   mmap. It says nothing about virtio-fs, which without DAX caches file pages in
+   the guest and would give each side its own copy. The `SharedFile` transport is
+   unusable on the real boundary until that is measured; `ArenaSlice` does not
+   depend on it, which is one more reason it is the real deployment's answer.
+3. **The arena here is a file, not shared_vulkan's arena.** What is proven is the
+   *shape*: one region attached out of band by both sides before any traffic,
+   sliced per pool at 4096-byte granularity — `sv_arena::GRANULARITY`, which is
+   the measured `minImportedHostPointerAlignment` on the target — with only
+   `(arena, offset, len)` crossing and nothing opened per pool. What is not
+   proven is that region being guest RAM located by walking QEMU's flat view.
+   Substituting the real provider changes `Arena::open_or_create` and nothing
+   above it.
+4. **One client, and the proxy enforces it.** Multiple clients need a session per
+   connection and an arena allocator that is not per-session. Out of scope by the
+   brief and not started.
+5. **No input is forwarded.** `wl_seat` is bound and its messages pass through,
+   but the compositor advertises no capabilities, so no `wl_keyboard.keymap`
+   event is ever sent — which means the reverse `h` path is **implemented and
+   unexercised by a real client**. It is tested with a synthetic keymap event
+   that a real descriptor round-trips through, so the code has executed; it has
+   not met a compositor that sends one. §8.10 item 4 still stands underneath it.
+6. **Clipboard and drag-and-drop are a named error, not a gap.**
+   `wl_data_offer.receive` and `wl_data_source.send` carry an `h` that is a pipe
+   rather than memory, and `Descriptor::Pipe` has no transport here. The proxy
+   refuses with the message's name in it rather than splicing a zero-length
+   descriptor, which would be §2.4's silent desynchronisation in its purest form.
+7. **A hostile client can still fault the proxy.** It can `ftruncate` its pool
+   smaller between the proxy's size check and the copy, and the proxy would die
+   where `libwayland-server` recovers, because libwayland installs a `SIGBUS`
+   handler and this does not. Cooperative resizes are handled; this is the
+   uncooperative one. Note the asymmetry with §2.6: the *compositor* is immune
+   because a Windows section cannot shrink, and it is the host side that inherits
+   the Linux hazard.
+8. **`weston-terminal` presents three frames and stops**, which is correct — a
+   terminal redraws when its content changes — but it means the static-client
+   path carries no animation evidence. `weston-presentation-shm` is what carries
+   it, and the two-shot check is meaningful only for that one. §8.9 recorded the
+   same asymmetry for the Linux harness and it has not gone away.
+9. **Two title bars, now visible.** The screenshot shows Windows' caption around
+   toytoolkit's own, which is `goal-firefox.md`'s CSD-versus-native-frame tension
+   arriving in a photograph rather than in prose. §8.11 item 7 predicted it;
+   nothing has been done about it and `FrameStyle::extend_top` is still zero.
+
+### 9.11 What to re-check on the guest
+
+Ahead of §8.11's list, because the stage-4 path reaches the guest differently.
+
+1. **Whether a shared filesystem is coherent at all**, which decides whether the
+   `SharedFile` transport exists on the real boundary. virtio-fs with DAX should
+   be; without DAX it should not be. `scripts/probe-filemap.c` and
+   `probe-filemap-peer.c` are exactly this measurement and run unchanged — the
+   Windows half needs only the guest's path to the shared mount.
+2. **What `SharedFile` costs per pool across the boundary**, against
+   `ArenaSlice`'s arithmetic. On one machine they measure the same; across a
+   hypervisor the peer's `CreateFileW` is a round trip through a filesystem
+   daemon and the arena's is nothing. This is the measurement that turns a
+   preference into a decision.
+3. **`wc-proxy` cannot reach the guest's compositor directly.** Under Wine the
+   compositor's `AF_UNIX` node is a real host socket, which is the only reason
+   this stage runs on one machine at all (§4.2). On the guest `afunix.sys` makes
+   an NTFS reparse point and no Linux process can connect to it by any path, so
+   the proxy's upstream has to be `scripts/probe-relay.c` over an `ssh -L`
+   forward — which the relay's own header says it was built for, and which now
+   has a client that needs it for more than a handshake.
+4. **`weston-terminal`'s nine-doubling pool growth**, which is the fact the
+   deferral design rests on. It is a property of toytoolkit rather than of the
+   platform and should not change, but the whole design assumes the resizes
+   arrive before any other request and that is worth confirming once where it
+   matters.
+5. **Whether the run still reports the right transport** in the
+   `mapped: N section, N shared-file, N arena-slice` line, which is the only
+   thing standing between "the pixels arrived" and "the pixels arrived the way we
+   think they did".

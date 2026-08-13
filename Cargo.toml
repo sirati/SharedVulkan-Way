@@ -8,6 +8,7 @@ members = [
   "crates/wc-xkb-probe",
   "crates/wc-compositor",
   "crates/wc-shmclient",
+  "crates/wc-proxy",
   "vendor/wayland-backend",
   "vendor/wayland-scanner",
   "vendor/wayland-server",

@@ -335,6 +335,16 @@ pointer stands alone, whereas `MapViewOfFile` returns a view whose lifetime is
 the mapping's, so dropping it dangles the pointer. And the guard is factored
 into `guard_enter`/`guard_leave`, which are no-ops on Windows.
 
+**Stage 4 changed one more thing here, and it is a diagnostic rather than a
+port.** The Windows `map()` reported its failure with `debug!`, and this binary
+installs no `tracing` subscriber, so the line went nowhere — while the caller in
+`shm/handlers.rs` disconnected the client with `Failed to mmap fd {fd:?}`,
+having the handle and not the error. Stage 4 spent an hour guessing at a
+`MapViewOfFile` failure whose cause (`File not found`, because the sending side
+had unlinked the object; `docs/design.md` §9.7) was already known here. Both
+arms are `eprintln!` now. A protocol-fatal failure is not a debug detail, and
+this is the one place in the fork where that judgement differs from upstream's.
+
 **`with_data_mut` returns `Err(())` on Windows** rather than pretending. The
 mapping is `FILE_MAP_READ`, so a `*mut u8` into it would fault on the first
 store. Its only caller is the public `with_buffer_contents_mut`, which nothing

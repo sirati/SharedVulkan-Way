@@ -82,11 +82,73 @@
 //! `CreatePrivateNamespace` with a boundary descriptor is the next step and is
 //! deliberately not taken yet, because it needs the client to be launched by us.
 
+//! # Stage 4: the two kinds a *cross-machine* peer can open
+//!
+//! Everything above is about two Windows processes. Stage 4 puts a Linux proxy
+//! on one side of the boundary and the Windows compositor on the other
+//! (docs/goal-firefox.md), and there the `Local\` namespace is no help at all:
+//! a Linux process can neither create an NT object name nor open one. The rule
+//! does not relax — **no descriptor and no handle crosses, ever, even when both
+//! sides happen to be on one machine** — so the question is only which *names*
+//! both namespaces understand.
+//!
+//! Two do, and they are the two kinds added here:
+//!
+//! * [`Descriptor::SharedFile`] — a **path** on a filesystem both sides can
+//!   reach. Under Wine that is the `Z:` drive; on the real guest it is the
+//!   virtio-fs mount. The peer calls `CreateFileW` + `CreateFileMappingW` on it
+//!   itself, which is the sanctioned pattern with a different namespace, not a
+//!   new mechanism. Measured with `scripts/probe-filemap.c`: a Wine process's
+//!   view of a `Z:` path is coherent with a Linux `MAP_SHARED` mmap of the same
+//!   file in both directions, with no flush.
+//!
+//! * [`Descriptor::ArenaSlice`] — reserved since stage 1 and now constructed.
+//!   Nothing is opened at all: both sides mapped the arena before any Wayland
+//!   traffic, out of band, so only `(arena, offset, len)` crosses. This is the
+//!   real deployment's answer, because there is no filesystem call cheap enough
+//!   to make per pool across a hypervisor and no name a guest can mint that a
+//!   host can open.
+//!
+//! Note what is *absent* from both: any duplication, any `PROCESS_DUP_HANDLE`,
+//! any ancillary data. `SharedFile` names an object; `ArenaSlice` names a
+//! window into one that is already mapped.
+
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod arena;
 mod platform;
+
+/// How many objects of each kind this process has mapped.
+///
+/// See [`map_counts`]. Deliberately process-global and deliberately not
+/// resettable: they answer "which mechanism actually carried these pixels",
+/// which is a question about the run, not about a moment in it.
+mod counters {
+    use super::AtomicU64;
+    pub static SECTION: AtomicU64 = AtomicU64::new(0);
+    pub static SHARED_FILE: AtomicU64 = AtomicU64::new(0);
+    pub static ARENA_SLICE: AtomicU64 = AtomicU64::new(0);
+}
+
+/// How many objects of each kind have been mapped: `(sections, shared files,
+/// arena slices)`.
+///
+/// This exists because of docs/design.md §8.4's rule about the pixel-source
+/// seam: *"a stage that added a second provider with no way to tell which one
+/// ran would not really have added it."* Stage 4 adds two, and both arrive
+/// through the same `wl_shm` code in smithay, so the compositor cannot tell
+/// them apart from its own side. [`Handle::map`] can, because it is the
+/// function that opens them, and this is what it reports.
+pub fn map_counts() -> (u64, u64, u64) {
+    (
+        counters::SECTION.load(Ordering::Relaxed),
+        counters::SHARED_FILE.load(Ordering::Relaxed),
+        counters::ARENA_SLICE.load(Ordering::Relaxed),
+    )
+}
 
 /// How big a descriptor is allowed to be on the wire.
 ///
@@ -150,14 +212,45 @@ pub enum Descriptor {
         /// What kind of object it is, so the receiver knows what to do with it.
         object_kind: u32,
     },
+    /// A shared-memory object named by a **filesystem path** rather than by an
+    /// entry in the NT object namespace.
+    ///
+    /// ADDED FOR STAGE 4. `Section` is the right kind between two Windows
+    /// processes and is unreachable between a Linux one and a Windows one:
+    /// `Local\wc-…` is a name only the NT object manager understands. A path is
+    /// the name both namespaces share — the `Z:` drive under Wine, the
+    /// virtio-fs mount on the real guest.
+    ///
+    /// The peer opens the path itself, exactly as it opens a section by name.
+    /// Nothing is duplicated and nothing is passed; this is the same rule with
+    /// a different namespace.
+    SharedFile {
+        /// The path **as the peer will spell it**, which is generally not how
+        /// the creator spells it: the same bytes live at `/tmp/wc-pool-…` on
+        /// Linux and at `Z:\tmp\wc-pool-…` inside Wine. The creator therefore
+        /// keeps its own path in the object it holds open and puts the peer's
+        /// spelling here. Getting this backwards produces a descriptor that
+        /// looks perfectly well-formed and cannot be opened, so the asymmetry
+        /// is in the type's documentation rather than in a caller's memory.
+        path: String,
+        /// Size in bytes. Unlike a Windows section this *can* grow — a file can
+        /// be extended and re-mapped — but the peer is told a size and maps
+        /// exactly that, so growth still needs a new descriptor.
+        size: u64,
+    },
     /// A window into the phase-1 shared arena: `(arena, offset, len)`.
     ///
-    /// Reserved, not yet constructed. This is the variant that makes phase 1
-    /// load-bearing rather than incidental — a `wl_shm` pool that is already a
-    /// slice of the arena needs no new kernel object at all, and a client
-    /// rendering with the forwarded Vulkan has already put its pixels there. It
-    /// is deliberately part of the type from the start so that adding it later
-    /// is not a wire-format break.
+    /// This is the variant that makes phase 1 load-bearing rather than
+    /// incidental — a `wl_shm` pool that is a slice of the arena needs no new
+    /// kernel object at all, and a client rendering with the forwarded Vulkan
+    /// has already put its pixels there. It was deliberately part of the type
+    /// from stage 1 so that constructing it later would not be a wire-format
+    /// break, and stage 4 constructs it.
+    ///
+    /// **Nothing is opened when one of these is received.** The arena was
+    /// mapped by both sides out of band, before any Wayland traffic, which is
+    /// what makes this the only kind that can be minted per pool at frame rate
+    /// across a hypervisor. See [`arena`] for the receiving side.
     ArenaSlice {
         /// Which arena, in phase 1's numbering.
         arena: u32,
@@ -172,6 +265,7 @@ const KIND_SECTION: u32 = 1;
 const KIND_PIPE: u32 = 2;
 const KIND_NT_HANDLE: u32 = 3;
 const KIND_ARENA_SLICE: u32 = 4;
+const KIND_SHARED_FILE: u32 = 5;
 
 /// A descriptor that could not be understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +349,11 @@ impl Descriptor {
                 out.extend_from_slice(&offset.to_le_bytes());
                 out.extend_from_slice(&len.to_le_bytes());
             }
+            Self::SharedFile { path, size } => {
+                out.extend_from_slice(&KIND_SHARED_FILE.to_le_bytes());
+                out.extend_from_slice(&size.to_le_bytes());
+                put_string(&mut out, path);
+            }
         }
         out
     }
@@ -279,6 +378,10 @@ impl Descriptor {
             }
             KIND_ARENA_SLICE => {
                 Self::ArenaSlice { arena: r.u32()?, offset: r.u64()?, len: r.u64()? }
+            }
+            KIND_SHARED_FILE => {
+                let size = r.u64()?;
+                Self::SharedFile { path: r.string()?, size }
             }
             _ => return Err(DecodeError("unknown descriptor kind")),
         };
@@ -360,15 +463,87 @@ impl Handle {
         })
     }
 
+    /// Create a shared-memory object at `local_path` and describe it to the
+    /// peer as `peer_path`.
+    ///
+    /// The two paths are the same bytes seen from two namespaces —
+    /// `/tmp/wc-pool-3f…` here, `Z:\tmp\wc-pool-3f…` in the guest — and the
+    /// caller supplies both because only the caller knows how the peer reaches
+    /// this filesystem. Nothing in this crate can derive one from the other,
+    /// and a crate that guessed would be wrong on the deployment that matters.
+    ///
+    /// ADDED FOR STAGE 4; see the module header.
+    pub fn create_shared_file(
+        local_path: &str,
+        peer_path: &str,
+        size: u64,
+    ) -> io::Result<Self> {
+        let object = platform::create_file_object(local_path, size)?;
+        Ok(Self {
+            descriptor: Descriptor::SharedFile { path: peer_path.to_owned(), size },
+            keepalive: Some(Arc::new(object)),
+        })
+    }
+
+    /// Take writable ownership of a shared-memory object **somebody else
+    /// provided**.
+    ///
+    /// # Why this is not `create_shared_file` with a different flag
+    ///
+    /// Because of who deletes it. A created object is this process's to remove
+    /// when it is done — that is what makes a crashed compositor not leave
+    /// shared-memory files behind, and it mirrors a Windows section ceasing to
+    /// exist with its last handle. An object that was provided is not: an arena
+    /// belongs to whatever brought the two sides together (shared_vulkan's
+    /// cold-path handshake in the real deployment, a harness here), it outlives
+    /// every process that maps it, and a peer that unlinked it on exit would
+    /// take the region away from everybody else.
+    ///
+    /// So this opens rather than creates, and drops rather than deletes. It is
+    /// the *provider's* half of an arena — the side that writes — and the
+    /// read-only half is [`arena::attach`].
+    pub fn open_shared_file(
+        local_path: &str,
+        peer_path: &str,
+        size: u64,
+    ) -> io::Result<Self> {
+        let object = platform::open_file_object(local_path, size)?;
+        Ok(Self {
+            descriptor: Descriptor::SharedFile { path: peer_path.to_owned(), size },
+            keepalive: Some(Arc::new(object)),
+        })
+    }
+
     /// Map this handle's object into the current address space, read-only.
     ///
     /// Fails for descriptor kinds that are not memory.
+    ///
+    /// **This is the one place that knows how each kind is reached**, which is
+    /// why the counters live here too: [`map_counts`] is what lets a caller
+    /// state *which* mechanism served a frame rather than assert it. A stage
+    /// that added a second way for pixels to arrive with no way to tell which
+    /// one ran would not really have added it (docs/design.md §8.4).
     pub fn map(&self) -> io::Result<Mapping> {
         match &self.descriptor {
             Descriptor::Section { name, size } => {
                 let len = usize::try_from(*size)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "section too large"))?;
-                platform::map_section(name, len).map(|inner| Mapping { inner, len })
+                let inner = platform::map_section(name, len)?;
+                counters::SECTION.fetch_add(1, Ordering::Relaxed);
+                Ok(Mapping { inner: MappingInner::Owned(inner), offset: 0, len })
+            }
+            Descriptor::SharedFile { path, size } => {
+                let len = usize::try_from(*size).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "shared file too large")
+                })?;
+                let inner = platform::map_file(path, len)?;
+                counters::SHARED_FILE.fetch_add(1, Ordering::Relaxed);
+                Ok(Mapping { inner: MappingInner::Owned(inner), offset: 0, len })
+            }
+            Descriptor::ArenaSlice { arena, offset, len } => {
+                let mapping = arena::window(*arena, *offset, *len)?;
+                counters::ARENA_SLICE.fetch_add(1, Ordering::Relaxed);
+                Ok(mapping)
             }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -396,12 +571,28 @@ impl Handle {
                 "not the owner of this object",
             ));
         };
-        let Descriptor::Section { size, .. } = &self.descriptor else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a section"));
-        };
-        let len = usize::try_from(*size)
+        let size = self.owned_object_size()?;
+        let len = usize::try_from(size)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "section too large"))?;
         platform::map_section_mut(object, len).map(|inner| MappingMut { inner, len })
+    }
+
+    /// The size of the OS object this handle *created*, for the two writer
+    /// paths.
+    ///
+    /// `Section` and `SharedFile` differ in how the peer names the object and
+    /// not at all in what the creator holds, so both are writable by their
+    /// creator. `ArenaSlice` is not: the creator of an arena slice did not
+    /// create an OS object, it was given a window into one, and the arena's own
+    /// allocator decides who may write where.
+    fn owned_object_size(&self) -> io::Result<u64> {
+        match &self.descriptor {
+            Descriptor::Section { size, .. } | Descriptor::SharedFile { size, .. } => Ok(*size),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{other:?} is not an object this process created"),
+            )),
+        }
     }
 
     /// Write into the object this handle owns.
@@ -416,9 +607,7 @@ impl Handle {
                 "not the owner of this object",
             ));
         };
-        let Descriptor::Section { size, .. } = &self.descriptor else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a section"));
-        };
+        let size = &self.owned_object_size()?;
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write overflows"))?;
@@ -468,9 +657,35 @@ impl fmt::Debug for MappingMut {
     }
 }
 
-/// A read-only view of a shared-memory object.
+/// What a [`Mapping`] is a view of.
+///
+/// Two cases, and the second is why this enum exists rather than a bare
+/// `MappedView`. A `Section` or a `SharedFile` is mapped for this one handle
+/// and unmapped when the handle's mapping is dropped. An `ArenaSlice` is a
+/// *window* into a region that was mapped once, before any Wayland traffic, and
+/// that outlives every pool cut from it — so the window must keep the region
+/// alive without owning it, and must not unmap on drop.
+enum MappingInner {
+    Owned(platform::MappedView),
+    /// A window into a region held by the [`arena`] registry.
+    Window(Arc<platform::MappedView>),
+}
+
+impl MappingInner {
+    fn ptr(&self) -> *const u8 {
+        match self {
+            MappingInner::Owned(v) => v.ptr(),
+            MappingInner::Window(v) => v.ptr(),
+        }
+    }
+}
+
+/// A read-only view of a shared-memory object, or of a window into one.
 pub struct Mapping {
-    inner: platform::MappedView,
+    inner: MappingInner,
+    /// Bytes from the start of `inner` at which this view begins. Always 0 for
+    /// an owned mapping; the slice offset for an arena window.
+    offset: usize,
     len: usize,
 }
 
@@ -489,7 +704,12 @@ impl Mapping {
         // installs a `SIGBUS` handler. On Windows a section cannot shrink, so
         // that entire attack class does not exist here — a genuine, if small,
         // way in which the Windows port is safer than the original.
-        unsafe { std::slice::from_raw_parts(self.inner.ptr(), self.len) }
+        //
+        // For an arena window `offset` was bounds-checked against the region's
+        // length by `arena::window` before this value was constructed, so
+        // `ptr + offset .. + len` is inside the one mapping the `Arc` keeps
+        // alive.
+        unsafe { std::slice::from_raw_parts(self.inner.ptr().add(self.offset), self.len) }
     }
 
     /// Length of the mapping in bytes.

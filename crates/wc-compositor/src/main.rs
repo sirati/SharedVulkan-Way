@@ -64,6 +64,16 @@ struct Args {
     /// Exit successfully only after this many frames have been presented.
     /// `--once` alone proves a window was made; this proves pixels reached it.
     expect_presents: usize,
+    /// Arenas to attach before any client connects, as `id:size:path`.
+    ///
+    /// ADDED FOR STAGE 4. An arena is not a per-message fact and cannot be one:
+    /// it is the region both sides mapped *before* any protocol traffic, so
+    /// that a `wl_shm` pool can cross by arithmetic rather than by opening
+    /// anything (`wc_handle::arena`). In the real deployment the attach is
+    /// shared_vulkan's cold-path handshake, which has run long before a
+    /// compositor starts; here it is a flag, which is the same fact supplied
+    /// the same way — out of band.
+    arenas: Vec<(u32, u64, String)>,
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -76,6 +86,7 @@ fn parse_args() -> Result<Args, u8> {
         simulate_wm: false,
         log: None,
         expect_presents: 0,
+        arenas: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -86,6 +97,27 @@ fn parse_args() -> Result<Args, u8> {
             "--log" => args.log = it.next().map(Into::into),
             "--socket" => args.socket = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
+            // `id:size:path`, split from the left twice so a Windows path with
+            // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
+            // the normal spelling and a naive split on ':' would eat it.
+            "--arena" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena needs id:size:path");
+                    return Err(2);
+                };
+                let mut parts = v.splitn(3, ':');
+                let (Some(id), Some(size), Some(path)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    eprintln!("wc-compositor: --arena wants id:size:path, got {v:?}");
+                    return Err(2);
+                };
+                let (Ok(id), Ok(size)) = (id.parse::<u32>(), size.parse::<u64>()) else {
+                    eprintln!("wc-compositor: --arena {v:?}: id and size must be numbers");
+                    return Err(2);
+                };
+                args.arenas.push((id, size, path.to_owned()));
+            }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
             }
@@ -183,6 +215,22 @@ fn main() -> std::process::ExitCode {
     {
         eprintln!("wc-compositor: could not redirect output to {}: {e}", path.display());
         return std::process::ExitCode::from(2);
+    }
+
+    // Arenas first, and before the socket exists. An arena that were attached
+    // lazily — on the first `ArenaSlice` that named it — would make the first
+    // client of a run take a different path from every later one, and would put
+    // a filesystem open on the frame path exactly once in a way no measurement
+    // would catch. Attaching here also means a wrong `--arena` is a startup
+    // failure with a path in it rather than a pool that cannot be mapped.
+    for (id, size, path) in &args.arenas {
+        match wc_handle::arena::attach(*id, path, *size) {
+            Ok(()) => println!("wc-compositor: arena {id} attached: {size} bytes at {path}"),
+            Err(e) => {
+                eprintln!("wc-compositor: could not attach arena {id} at {path}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
     }
 
     // The two channels. `ui_events` goes UI -> Wayland; the command channel in

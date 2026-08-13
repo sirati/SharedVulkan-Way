@@ -24,6 +24,13 @@ smithay = { path = "../../vendor/smithay", default-features = false, features = 
 ] }
 wayland-server = { workspace = true }
 wc-transport = { workspace = true }
+# Unconditional as of stage 4, where it was `cfg(windows)` before. Two things
+# moved it: `--arena` attaches regions on both platforms, and `map_counts()` is
+# how a run says which of the three shared-memory mechanisms actually carried
+# its pixels. Both are facts about the *boundary* rather than about Windows,
+# and the Unix build of `wc-handle` exists precisely so that the shim is
+# testable on the machine that builds it (see that crate's `platform/unix.rs`).
+wc-handle = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Only for `dup2`, so `--log` means the same thing on both platforms. std has
@@ -31,7 +38,6 @@ wc-transport = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-wc-handle = { workspace = true }
 # The window half. Raw bindings rather than the `windows` crate for the reason
 # in the workspace manifest: everything called here is a plain C entry point —
 # `CreateWindowExW`, `SetDIBitsToDevice`, `GetMessageW` — with no COM and no

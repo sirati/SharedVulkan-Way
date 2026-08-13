@@ -394,14 +394,22 @@ unsafe fn map(fd: BorrowedFd<'_>, size: NonZeroUsize) -> Result<*mut u8, ()> {
 #[cfg(windows)]
 fn map(fd: BorrowedFd<'_>, size: NonZeroUsize) -> Result<(*mut u8, crate::utils::os::Mapping), ()> {
     let handle = fd.as_raw_fd();
+    // `eprintln!` and not `debug!`, and that was learned rather than chosen.
+    // Failing to map a client's pool is protocol-fatal: the client is
+    // disconnected and told only "Failed to mmap fd", because the caller in
+    // `shm/handlers.rs` has the handle and not the error. This binary installs
+    // no `tracing` subscriber, so the one line that says *why* went nowhere,
+    // and stage 4 spent an hour guessing at a `MapViewOfFile` failure whose
+    // cause was already known here.
     let mapping = handle.map().map_err(|err| {
-        debug!(?err, "failed to map shm section");
+        eprintln!("wc-compositor: could not map {:?}: {err}", handle.descriptor());
     })?;
     if mapping.len() < usize::from(size) {
-        debug!(
-            requested = usize::from(size),
-            available = mapping.len(),
-            "shm pool larger than the section backing it"
+        eprintln!(
+            "wc-compositor: pool wants {} bytes, {:?} has {}",
+            usize::from(size),
+            handle.descriptor(),
+            mapping.len()
         );
         return Err(());
     }

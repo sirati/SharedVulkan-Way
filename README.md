@@ -86,7 +86,11 @@ crates/
   wc-transport   AF_UNIX on both platforms, peer credentials, accept
   wc-server      the stage-1 server
   wc-probe       a client that writes the wire format by hand
-  wc-compositor  the stage-2 smithay compositor — wl_display, xdg_shell, no pixels
+  wc-compositor  the smithay compositor — xdg_shell, one HWND per toplevel, GDI
+  wc-shmclient   a Windows client that speaks the dialect, for stage 3
+  wc-proxy       stage 4, **Linux only**: a Wayland server to an unmodified
+                 local client and a client of the Windows compositor, so a
+                 `wl_shm` buffer crosses the boundary with nothing passed
   wc-xkb-probe   proves the xkbcommon crate links and runs as a Windows binary
 vendor/
   wayland-backend    forked 0.3.16      | ours; workspace members, linted
@@ -101,6 +105,12 @@ scripts/
   wc-handshake.sh    the stage-1 acceptance test
   wc-xdg.sh          the stage-2 acceptance test
   wc-xkb.sh          libxkbcommon, linked and run
+  wc-window.sh       the stage-3 acceptance test — a surface becomes a window
+  wc-proxy.sh        the stage-4 acceptance test — an **unmodified** third-party
+                     client painting into a Windows window; `cost` measures what
+                     a commit costs per copy scope and per transport
+  probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux
+  probe-filemap-peer.c   MAP_SHARED mmap? Measured before stage 4 depended on it
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)

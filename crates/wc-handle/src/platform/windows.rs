@@ -16,14 +16,18 @@
 use std::io;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CREATE_NEW, CreateFileW, DeleteFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
-    FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
 /// A section object held open by its creator.
@@ -37,6 +41,13 @@ use windows_sys::Win32::System::Memory::{
 #[derive(Debug)]
 pub struct OwnedObject {
     section: HANDLE,
+    /// Set only for a file-backed object (`create_file_object`), and deleted on
+    /// drop so that a finished process leaves no shared-memory files behind.
+    ///
+    /// A pagefile-backed section needs nothing here: its name ceases to exist
+    /// with its last handle, which is the behaviour this field reproduces for
+    /// the one kind of object that would otherwise outlive its creator.
+    path: Option<Vec<u16>>,
 }
 
 // SAFETY: an NT handle is a process-wide value, not thread-affine, and every
@@ -50,6 +61,16 @@ impl Drop for OwnedObject {
         // non-null, and is closed exactly once here.
         unsafe {
             CloseHandle(self.section);
+        }
+        if let Some(path) = &self.path {
+            // After the section handle, never before: a file with a live
+            // mapping cannot be deleted, and the order matters more here than
+            // the failure does. Nothing can be done if it fails, and a leftover
+            // file is a tidiness problem rather than a correctness one.
+            // SAFETY: a live NUL-terminated UTF-16 buffer owned by `self`.
+            unsafe {
+                DeleteFileW(path.as_ptr());
+            }
         }
     }
 }
@@ -176,7 +197,7 @@ pub fn create_section(name: &str, size: u64) -> io::Result<OwnedObject> {
             format!("section name {name} was already taken"),
         ));
     }
-    Ok(OwnedObject { section })
+    Ok(OwnedObject { section, path: None })
 }
 
 /// Open a section by name and map it read-only.
@@ -205,6 +226,190 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
     // The view holds its own reference to the section object, so the handle can
     // go now; the mapping stays valid until `UnmapViewOfFile`.
     // SAFETY: closing the handle exactly once, after the view is established.
+    unsafe {
+        CloseHandle(section);
+    }
+    if address.Value.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(MappedView { address, len })
+}
+
+/// Create a shared-memory object named by a **filesystem path**.
+///
+/// ADDED FOR STAGE 4. The difference from `create_section` is the first
+/// argument to `CreateFileMappingW`: a real file handle instead of
+/// `INVALID_HANDLE_VALUE`, so the object's identity is a path rather than an
+/// entry in the NT object namespace. That is what makes it reachable from a
+/// process that is not running on this operating system at all — see
+/// `crate::Descriptor::SharedFile`.
+///
+/// `CREATE_NEW` for the same reason `create_section` refuses
+/// `ERROR_ALREADY_EXISTS`: silently adopting an existing object would mean two
+/// clients sharing a buffer neither asked to share.
+pub fn create_file_object(path: &str, size: u64) -> io::Result<OwnedObject> {
+    let path_w = wide(path);
+    // SAFETY: a live NUL-terminated UTF-16 path for the duration of the call.
+    let file = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // `CreateFileMappingW` extends the file to the size requested, so there is
+    // no separate `SetEndOfFile`. A zero size would mean "the file's current
+    // length", which is zero here, so it is refused rather than silently
+    // producing an unmappable object.
+    if size == 0 {
+        // SAFETY: closing the handle we just opened, exactly once.
+        unsafe {
+            CloseHandle(file);
+            DeleteFileW(path_w.as_ptr());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a shared file must have a non-zero size",
+        ));
+    }
+    // SAFETY: a live file handle and a null name, which is what asks for an
+    // unnamed section backed by that file.
+    let section = unsafe {
+        CreateFileMappingW(
+            file,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            (size >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    // The section holds its own reference to the file, so the file handle can
+    // go now.
+    // SAFETY: closing the file handle exactly once, after the section exists.
+    unsafe {
+        CloseHandle(file);
+    }
+    if section.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: a live NUL-terminated path; removing the file we just made.
+        unsafe {
+            DeleteFileW(path_w.as_ptr());
+        }
+        return Err(err);
+    }
+    Ok(OwnedObject { section, path: Some(path_w) })
+}
+
+/// Open a shared-memory object somebody else created, for writing, without
+/// taking on the job of deleting it. See `crate::Handle::open_shared_file`.
+pub fn open_file_object(path: &str, size: u64) -> io::Result<OwnedObject> {
+    let path_w = wide(path);
+    // SAFETY: a live NUL-terminated UTF-16 path for the duration of the call.
+    let file = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // Size 0: take the file's own length, so opening cannot silently extend an
+    // arena somebody else sized.
+    // SAFETY: a live file handle and a null name.
+    let section = unsafe {
+        CreateFileMappingW(file, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null())
+    };
+    // SAFETY: closing the file handle once, after the section holds its own
+    // reference.
+    unsafe {
+        CloseHandle(file);
+    }
+    if section.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let _ = size;
+    Ok(OwnedObject { section, path: None })
+}
+
+/// Open a shared-memory object by **filesystem path** and map it read-only.
+///
+/// ADDED FOR STAGE 4, and the receiving half of the stage: this is what the
+/// compositor calls when a `wl_shm` pool arrives from a Linux proxy that could
+/// not have created an NT object name.
+///
+/// Measured with `scripts/probe-filemap.c` before anything was built on it: a
+/// view obtained this way from a `Z:` path under Wine is coherent with a Linux
+/// `MAP_SHARED` mmap of the same file, in both directions, with no flush. That
+/// is not a property a network or paravirtual filesystem is obliged to have —
+/// virtio-fs without DAX caches file pages in the guest — so it is checked on
+/// each deployment rather than assumed from this one.
+pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
+    let path_w = wide(path);
+    // Read-only throughout: `GENERIC_READ`, `PAGE_READONLY`, `FILE_MAP_READ`.
+    // A compositor's view of a client's buffer is read-only by design
+    // (docs/design.md §7.4), and asking for write access here would also make
+    // the open fail against a genuinely read-only mount.
+    // SAFETY: a live NUL-terminated UTF-16 path for the duration of the call.
+    let file = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    if len == 0 {
+        // SAFETY: closing the handle we just opened.
+        unsafe {
+            CloseHandle(file);
+        }
+        return Ok(MappedView {
+            address: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            },
+            len: 0,
+        });
+    }
+    // Size 0 means "the whole file", which is what a receiver wants: it was
+    // told a length in the descriptor and `MapViewOfFile` below asks for
+    // exactly that, so a file shorter than advertised fails there rather than
+    // handing back a short view.
+    // SAFETY: a live file handle and a null name.
+    let section = unsafe {
+        CreateFileMappingW(file, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+    };
+    // SAFETY: closing the file handle once, after the section holds its own
+    // reference to it.
+    unsafe {
+        CloseHandle(file);
+    }
+    if section.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: mapping `len` bytes of the section we just made, read-only.
+    let address = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, len) };
+    // SAFETY: closing the section handle once; the view keeps its own
+    // reference, exactly as in `map_section`.
     unsafe {
         CloseHandle(section);
     }

@@ -285,7 +285,18 @@ impl State {
             // of a hypervisor (docs/goal-firefox.md) — this line is how anyone
             // tells which path a window actually took, and a stage that added a
             // provider without that would not really have added it.
-            println!("wc-compositor: window {id} pixels served by {served_by}");
+            // The counters come from `wc_handle::Handle::map`, which is the
+            // function that actually opened the object, rather than from
+            // anything this file could infer. Stage 4 gives a `wl_shm` pool
+            // three possible homes — a named section, a path both sides can
+            // reach, and a window into an arena — and all three arrive through
+            // the same smithay code, so `served_by` alone stopped being enough
+            // to answer "which mechanism carried these pixels".
+            let (sections, files, slices) = wc_handle::map_counts();
+            println!(
+                "wc-compositor: window {id} pixels served by {served_by} \
+                 (mapped: {sections} section, {files} shared-file, {slices} arena-slice)"
+            );
             self.ui.send(ToUi::Map {
                 id,
                 width: w,

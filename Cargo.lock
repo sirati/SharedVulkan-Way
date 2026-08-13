@@ -1007,6 +1007,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-proxy"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "quick-xml",
+ "wc-handle",
+]
+
+[[package]]
 name = "wc-server"
 version = "0.1.0"
 dependencies = [

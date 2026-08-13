@@ -287,6 +287,42 @@ impl Shadow {
     }
 }
 
+/// Write a shadow out as a binary PPM.
+///
+/// # Why this is here rather than in one platform
+///
+/// It was in `platform/headless.rs` until stage 4, and being there was the
+/// reason docs/design.md §8.5's evidence had to be split: the Linux runs could
+/// read their pixels back with `identify` and the Wine runs could not, so the
+/// half that produced an `HWND` was also the half whose pixels nobody outside
+/// the process ever measured. A `Shadow` is platform-neutral — it is packed
+/// BGRA and a width and a height — so there was never a reason for the reader
+/// to be.
+///
+/// PPM rather than PNG because it needs no encoder, and `P6` because a text
+/// PPM of a 4 MiB frame is 12 MiB of ASCII. ImageMagick reads both.
+pub fn write_ppm(path: &std::path::Path, shadow: &Shadow) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let (w, h) = (shadow.width(), shadow.height());
+    if w <= 0 || h <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nothing committed yet",
+        ));
+    }
+    let src = shadow.pixels();
+    let mut out = Vec::with_capacity(16 + src.len() / 4 * 3);
+    out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
+    for px in src.chunks_exact(PixelFormat::BYTES_PER_PIXEL) {
+        // B, G, R in memory; R, G, B in the file. The swap is the whole of the
+        // difference between a Wayland `Xrgb8888` buffer and a PPM, and getting
+        // it backwards would make every harness's colour assertion measure the
+        // reader rather than the compositor.
+        out.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    std::fs::File::create(path)?.write_all(&out)
+}
+
 /// A place client pixels can come from.
 ///
 /// The one implementation today is [`ShmSource`]. The trait exists for the

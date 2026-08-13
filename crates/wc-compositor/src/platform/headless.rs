@@ -45,7 +45,6 @@
 //! because on Windows the only client available is ours.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -393,19 +392,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// BGRA and PPM is RGB, so this is the one place a channel swizzle happens —
 /// and it happens on the *diagnostic* path, not the display path, which is the
 /// right side for it to be on.
-fn write_ppm(path: &std::path::Path, shadow: &Shadow) -> std::io::Result<()> {
-    let (w, h) = (shadow.width(), shadow.height());
-    if w <= 0 || h <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "nothing committed yet",
-        ));
-    }
-    let src = shadow.pixels();
-    let mut out = Vec::with_capacity(16 + src.len() / 4 * 3);
-    out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
-    for px in src.chunks_exact(PixelFormat::BYTES_PER_PIXEL) {
-        out.extend_from_slice(&[px[2], px[1], px[0]]);
-    }
-    std::fs::File::create(path)?.write_all(&out)
-}
+/// Moved to `crate::surface` in stage 4, so that the Win32 platform can dump
+/// frames too — which is what lets the Wine and guest runs read their pixels
+/// back with tools that are not ours, exactly as this one always could.
+use crate::surface::write_ppm;
