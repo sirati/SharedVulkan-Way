@@ -13,6 +13,14 @@
 #     --chunk N        tests per deqp-vk invocation (default 200)
 #     --keep           do not delete the run directory
 #
+#   The three budgets check 3 and check 4 assert against, as environment
+#   variables, all defaulting to this tree's recorded state:
+#
+#     SV_CTS_MAX_LOSS_PCT=80          share of the control's passes the
+#                                     forwarder may lose (design.md §0.15)
+#     SV_CTS_MAX_RING_FATALS=0        ring fatals the GPU side may take
+#     SV_CTS_MAX_HARD_RECOVERIES=0    GPU resets the forwarded run may cause
+#
 # Every other harness in this tree judges one workload. This one judges the
 # *API*: "a lot of functions are still missing, they must all be impl" is a
 # claim about surface area, and surface area is exactly what a workload cannot
@@ -130,6 +138,32 @@ trap cleanup EXIT
 say() { printf '\n=== %s ===\n' "$*"; }
 ok()  { printf '  ok   %s\n' "$*"; }
 bad() { printf '  FAIL %s\n' "$*"; fail=1; }
+
+# **THE BUDGETS, AND WHY THIS SCRIPT NEEDED THEM — §31**
+#
+# Until now check 4 — the join, which this file's own header calls "the output
+# with any information in it" — computed the number of tests that pass on RADV
+# and fail forwarded, printed it, listed up to forty of them by name, grouped
+# them by suite, wrote them to a file, and **never called `bad`**. `sv-cts.sh`
+# could report several hundred forwarding regressions and still print
+# `sv-cts: PASS` and exit 0, provided each of the two runs produced some output
+# at all. The ring-fatal block below did the same thing one paragraph after
+# saying "a ring that goes fatal is a forwarding defect by definition".
+#
+# The reason it was written that way is real and is not an excuse: this project
+# *has* a large, known, undiagnosed forwarding gap (design.md §0.15 — roughly
+# 70-75% of the control's passes lost, and about 7% of forwarded tests hanging
+# the GPU), so a check that failed on any regression at all would be red on
+# every run and would teach everyone to ignore it. The answer to that is not to
+# assert nothing. It is to **write the known number down** and assert against
+# it, so that the gate reports a *change* and the number itself is somewhere a
+# person has to consciously edit.
+#
+# The defaults below are the recorded state, not a target. Lowering them is the
+# work; raising one is a decision with a name on it.
+MAX_LOSS_PCT=${SV_CTS_MAX_LOSS_PCT:-80}
+MAX_RING_FATALS=${SV_CTS_MAX_RING_FATALS:-0}
+MAX_HARD_RECOVERIES=${SV_CTS_MAX_HARD_RECOVERIES:-0}
 
 # ---------------------------------------------------------------------------
 say "0. the suite, the driver, and the caselist"
@@ -546,14 +580,28 @@ fi
 # distinct shapes are counted and printed rather than left in a log nobody
 # opens. The ids are stripped so that a hundred instances of one bug read as
 # one line.
-if grep -q FATAL "$RUNDIR/gpu.log"; then
+FATALS=$(grep -c FATAL "$RUNDIR/gpu.log")
+if [ "$FATALS" -gt 0 ]; then
   echo "  the GPU side took a ring fatal, by shape:"
   grep FATAL "$RUNDIR/gpu.log" \
     | sed 's/^\[gpu\] //; s/ring [0-9]*/ring N/; s/seqno [0-9]*/seqno N/; s/id [0-9]*/id X/' \
     | sort | uniq -c | sort -rn | head -12 | sed 's/^/    /'
 fi
+# §31: counted *and* asserted. The sentence above — "a forwarding defect by
+# definition" — was true when it was written and the code under it did nothing
+# with the count.
+if [ "$FATALS" -le "$MAX_RING_FATALS" ]; then
+  ok "$FATALS ring fatal(s) on the GPU side, within the $MAX_RING_FATALS this tree admits to"
+else
+  bad "$FATALS ring fatal(s) on the GPU side against a budget of $MAX_RING_FATALS -- this project's code declined to continue; raise SV_CTS_MAX_RING_FATALS only with a reason"
+fi
 LOST=$(grep -c 'hard recovery' "$RUNDIR/gpu.log")
 [ "$LOST" -gt 0 ] && echo "  RADV reported $LOST hard GPU recovery/recoveries under the forwarded run"
+if [ "$LOST" -le "$MAX_HARD_RECOVERIES" ]; then
+  ok "$LOST hard GPU recovery/recoveries, within the $MAX_HARD_RECOVERIES this tree admits to"
+else
+  bad "$LOST hard GPU recovery/recoveries against a budget of $MAX_HARD_RECOVERIES -- the forwarded run is resetting somebody else's GPU; raise SV_CTS_MAX_HARD_RECOVERIES only with a reason"
+fi
 
 # ---------------------------------------------------------------------------
 say "4. the join: which tests the forwarder alone loses"
@@ -598,6 +646,32 @@ if [ -s "$CTL" ] && [ -s "$FWD" ]; then
     fi
   else
     ok "the forwarder loses nothing the control passes"
+  fi
+
+  # **§31: the number this whole script exists to produce is now asserted.**
+  #
+  # As a share of the control's passes rather than as an absolute, because the
+  # absolute is a function of `--fraction`: the same tree loses 72 tests at
+  # 1-in-20000 and would lose ten times that at 1-in-2000, and a fixed number
+  # would then mean "somebody changed the sample size". The share is the
+  # property of the code.
+  #
+  # 80% is design.md §0.15's recorded state (96 control passes, 24 and 29
+  # forwarded across two runs of the same 164 tests — 75% and 70% lost), with
+  # room for the ±5-tests-in-164 variance that section measures. It is a
+  # ceiling on a defect, not a target, and the only good direction for it is
+  # down.
+  CTL_PASS=$(awk -F, '$2=="Pass"' "$CTL" | wc -l)
+  if [ "$CTL_PASS" -eq 0 ]; then
+    bad "the control passed nothing, so there is no denominator and no verdict"
+  else
+    LOSS_PCT=$(awk -v r="$REG" -v c="$CTL_PASS" 'BEGIN { printf "%.1f", 100 * r / c }')
+    printf '  %-34s %6s%%\n' "of the control's passes, lost" "$LOSS_PCT"
+    if awk -v l="$LOSS_PCT" -v m="$MAX_LOSS_PCT" 'BEGIN { exit !(l <= m) }'; then
+      ok "the forwarder loses ${LOSS_PCT}% of what the control passes, within the ${MAX_LOSS_PCT}% this tree admits to"
+    else
+      bad "the forwarder loses ${LOSS_PCT}% of what the control passes ($REG of $CTL_PASS), against a budget of ${MAX_LOSS_PCT}%; the list is above, and SV_CTS_MAX_LOSS_PCT is only to be raised with a reason"
+    fi
   fi
 else
   bad "cannot join: one of the two runs is missing"
