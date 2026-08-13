@@ -15885,21 +15885,23 @@ about the stand-in rather than about the compositor.
 
 | | before | after |
 |---|---:|---:|
-| passed | 232 | **279** |
-| failed | 234 | **187** |
+| passed | 351 | **398** |
+| failed | 115 | **68** |
 | skipped | 759 | 759 |
 
 1,225 verdicts joined by test name: **47 moved, every one of them FAIL to
-PASS, and nothing regressed.** The before column is `8cb82b1`'s, measured by
+PASS, and nothing regressed.** The before column is `d3240e3`'s, measured by
 checking master's `crates/wc-compositor` out over this branch's and building
-again, so the two runs differ in nothing but this change; it is two verdicts off
-§26.6's recorded baseline of 230/236, which six merges have moved since.
+again, so the two runs differ in nothing but this change.
 
-The same measurement was taken four times more, at `7da9a58` (230 -> 277),
-`e3409ba` (231 -> 278), `4a5dfb4` (231 -> 278) and `a7210e8` (232 -> 279), with
-the same 47 tests moving each time. Five trees, one number: it is not sensitive
-to what else has landed — including §37, which changed how every pointer
-coordinate is computed and moved none of these.
+The same measurement was taken five times more, at `7da9a58` (230 -> 277),
+`e3409ba` (231 -> 278), `4a5dfb4` (231 -> 278), `a7210e8` (232 -> 279) and
+`8cb82b1` (232 -> 279), with **the same 47 tests** moving each time. Six trees,
+one number, and the last pair is the one that means something: §40 landed a
+scene lookup between them and took the baseline from 232 passing to 351 — a
+larger change to this scoreboard than this section is — and the 47 are still
+the same 47, still disjoint from it. Two sections fixed two different halves of
+"where is this", and neither number is doing the other's work.
 
 | suite | failures before | after |
 |---|---:|---:|
@@ -15914,8 +15916,11 @@ coordinate is computed and moved none of these.
 | `XdgPopupStable/XdgPopupTest` | 6 | 4 |
 | `XdgPopupTest` | 4 | 3 |
 
-**The 44-failure `xdg_positioner` cluster — the second largest on the
-scoreboard, and §26.12 item 2 — is gone entirely.** Three more went with it.
+**The 44-failure `xdg_positioner` cluster — §26.12 item 2, and the second
+largest on the scoreboard when that list was written — is gone entirely.**
+Three more went with it, and the 44 were still 44 on every tree this was
+measured on, including the one where §40 had already closed the largest
+cluster: the two do not overlap by a single test.
 
 The `ConstraintAdjustmentSlide` cases are the ones that show the fix rather
 than the bookkeeping: before, the compositor answered `(-60, -40)` where the
