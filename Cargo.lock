@@ -1336,6 +1336,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-wlcs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "wc-xkb-probe"
 version = "0.1.0"
 dependencies = [

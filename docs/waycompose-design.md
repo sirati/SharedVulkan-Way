@@ -3428,7 +3428,7 @@ together.
 |---|---|
 | `cargo test --workspace` | **133 tests**, 0 failures (124 on the branch, 116 in stage 5) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
-| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same, plus one pre-existing in `sv-transport` |
 | `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
 | `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
 | `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed |
@@ -6649,7 +6649,7 @@ rates.
 | gate | result |
 |---|---|
 | `cargo test --workspace` | **158 passed**, 0 failed (157 on master, +1: `the_client_prefix_is_found_from_bin_and_from_lib`) |
-| `cargo clippy --workspace --all-targets` | clean |
+| `cargo clippy --workspace --all-targets` | clean in every crate this branch touches (one pre-existing warning in `sv-hostd`) |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | an **executable**, not metadata — §17's trap, and this stage deployed from it four times |
 | `wc-desktop.sh window`, guest-RAM arena, Firefox, interactive desktop | the arena located, the window captured, the caption and taskbar button asserted |
@@ -7528,3 +7528,517 @@ considered during the stage and deliberately not built:
    sketched; what it needs is somebody to say whether a periodic
    `GetLastInputInfo` on the guest is acceptable, which is a question about the
    deployment and not about the code.
+
+## 26. Stage 26: the compliance suite, and what a number from it is worth
+
+### 26.1 Status in one paragraph
+
+**WLCS 1.8.1 runs against this compositor, and the baseline is 230 passed, 236
+failed, 759 skipped of 1,225.** The suite is the Wayland Conformance Suite from
+the Mir project; it is C++ with a CMake build and it did not need one, because
+it is in the pinned nixpkgs and in the binary cache, and its runner is a
+**binary** that `dlopen`s a compositor integration module. That module is
+`crates/wc-wlcs`, and it is Rust, because the integration API is plain C. Of
+the 759 skips, **677 are justified exclusions** — protocols that cannot be
+implemented here or whose implementation would contradict what this project is
+— **79 are gaps** in protocols that Windows could support and we have not
+written, and 3 are WLCS testing its own skip machinery. So the number that
+moves is **230 of 466 applicable tests, 49.4%**. The harness is
+`scripts/wc-wlcs.sh`; it runs two legs, the Linux build and a real
+`wc-compositor.exe` under Wine through `wc-proxy`, and **on the 35 tests both
+legs ran, they agree on all 35**.
+
+Read §26.5 before quoting any of it. Neither leg has a hypervisor in it.
+
+### 26.2 Which suite, and what else was looked at
+
+There is no official Wayland conformance suite. Four things were considered and
+one was chosen.
+
+**WLCS** (Canonical, for Mir; 1,228 tests, 63 suites). Chosen. It is the only
+candidate that is a *conformance* suite in the sense the goal clause needs: it
+links **our** compositor in and drives it, rather than testing a reference
+implementation. Its integration API (`wlcs/display_server.h`) is 190 lines of C
+— four structs of function pointers — and its skip mechanism is exactly the
+shape a justified exclusion needs (§26.7). It is also actively maintained and
+used by Mir, Sway, KWin and Mutter, which means a failure here is a failure
+against a bar somebody else set.
+
+**Weston's test suite.** Rejected. It is `weston`'s own regression suite: it
+builds against Weston's internals, uses Weston-specific test clients, and much
+of it drives Weston's private `weston_test` protocol. There is no seam to put
+another compositor into. What it *would* have given is the reference clients,
+and we already run those (`weston-simple-shm`, `weston-terminal`,
+`weston-eventdemo` — §8.5, §11.6) as a separate and complementary kind of
+evidence.
+
+**The `wayland` repository's own tests.** Rejected as a compliance suite, and
+worth saying why precisely: they test **libwayland**, not a compositor. They
+exercise the wire format, the object map, the connection buffer and the
+scanner. We do not use libwayland — the server side is the vendored
+`wayland-backend`/`wayland-server` fork (`vendor/PATCHES.md`) — so those tests
+would be testing a library we replaced. The *client* half of libwayland is
+under test constantly, because it is what every WLCS test and every Weston
+client is built on.
+
+**The `wayland-rs` / smithay ecosystem.** There is nothing to run. `smithay`
+has unit tests and an `anvil` example; the ecosystem's compositor-facing
+conformance answer *is* WLCS — smithay ships a `wlcs_anvil` integration module
+for exactly this. Ours is the same idea against a different compositor, and it
+is a useful sanity check that the approach is the one the ecosystem already
+takes.
+
+One more thing was considered and rejected as a category error: writing our own
+protocol tests. We have 169 of those and they are worth having; they cannot
+answer the goal clause, because a suite we wrote tests what we thought of.
+
+### 26.3 The shim: WLCS assumes a library, and this is a program on another machine
+
+WLCS was written for Mir and assumes the compositor is a library it can
+instantiate **in its own process**. `create_server` returns a struct of
+function pointers, `start` spins the compositor's mainloop on a thread, and
+`create_client_socket` hands back one end of a socketpair the server object
+already holds the other end of.
+
+Every part of that is unavailable here. `wc-compositor` is a program, not a
+library; in the configuration it ships in it is a *Windows* program on the far
+side of a hypervisor; and the one currency the whole integration API is
+denominated in — the file descriptor — is the one thing that must never cross
+the boundary (§2.1).
+
+So the shim is a **process supervisor and a socket client**:
+
+```text
+  wlcs (this process)                    wc-compositor (another process)
+  ───────────────────                    ───────────────────────────────
+  create_server  ─ mkdtemp
+  start          ─ spawn ──────────────► argv, XDG_RUNTIME_DIR=rundir
+                   wait for two sockets    ├── rundir/wc-wlcs   (wayland)
+                                           └── rundir/control   (§26.4)
+  create_client_socket ─ connect ───────► the wayland socket, one fd back
+  position_window_absolute ─ "position"─► the control socket
+  create_pointer → move/button  ────────► the control socket
+  stop           ─ SIGTERM, waitpid
+```
+
+**No descriptor crosses anything.** The fd handed to WLCS is the client end of
+a connection this process made on this machine, which is exactly what a Wayland
+client here would have. The rule is not bent; it never comes up, because the
+suite and the client are on the same side of the boundary by construction — the
+suite *is* a client.
+
+Two problems had non-obvious answers.
+
+**Which client is this?** `position_window_absolute` is handed a client-side
+`wl_display*` and `wl_surface*` and has to name a window to a compositor that
+has never heard of either. The answer is that the shim opened every client
+socket WLCS has, so `wl_display_get_fd` identifies the connection and
+`wl_proxy_get_id` identifies the object; the compositor counts connections in
+accept order (`ClientState::index`) and the shim counts `create_client_socket`
+calls, and the two agree because a `connect` puts the connection in the listen
+queue before the next one is made. Those two libwayland entry points are
+resolved with `dlsym(RTLD_DEFAULT)` rather than linked, so `crates/wc-wlcs` has
+no link-time dependency on libwayland and the Windows cross gate compiles it to
+an empty library instead of failing at the linker.
+
+**A `cdylib`, not a C++ shim.** The runner is prebuilt; the API is `extern
+"C"`. Writing the module in Rust means it is built by the same toolchain, is a
+workspace member, and is linted by the same gate as everything else. There is
+no CMake anywhere in this tree.
+
+### 26.4 `--control`: a synthetic Win32, standing exactly where Win32 stands
+
+Two of WLCS's three hooks have no answer in this architecture, and the reason
+is the architecture rather than an omission. **This compositor does not place
+windows and does not hit-test a pointer.** Windows does. A window is an `HWND`,
+`SetWindowPos` moves it, and the `WM_MOUSEMOVE` that arrives has already been
+routed to the window under the cursor; `win32.rs` converts the coordinates and
+forwards them, and `State::pointer_motion` sends them to the toplevel's surface
+with a hard-coded `(0, 0)` surface origin for precisely this reason.
+
+So those hooks are answered by something that stands in for Windows:
+`crates/wc-compositor/src/control.rs`, bound by `--control PATH`, Linux only.
+It owns window positions, does the between-windows hit test, and emits
+`platform::FromUi` events — **the same enum, into the same channel, that
+`win32.rs` fills from real window messages**. Nothing below that seam is
+replaced and nothing above it is bypassed.
+
+The seam is drawn where it is because that is where Win32 already is. The
+consequence is stated rather than buried: a WLCS pointer test that passes on
+this leg proves that everything from `FromUi` upwards is right — focus,
+enter/leave bookkeeping, serials, `wl_pointer.frame`, surface-local
+coordinates, popup grabs. It proves nothing about `WM_MOUSEMOVE`,
+`TrackMouseEvent`, `SetCapture` or `FrameStyle`'s pixel conversion.
+
+**The stand-in has to do what Windows does, and finding out cost a run.** WLCS's
+`ConfigurationWindow` constructor ends with `dispatch_until([]{ return
+state.activated; })` and the comment *"WLCS makes the assumption that
+newly-mapped windows are active"*. That is not in the protocol — and it is what
+`ShowWindow` on a `WS_OVERLAPPEDWINDOW` does, via `WM_ACTIVATE` and
+`WM_SETFOCUS`. Without it the *harness* hung every test that mapped a window,
+for ten seconds each: the first attempt at this baseline scored 235 failures
+that were nothing but that one omission, and the compositor was innocent of all
+of them. `Control::follow_focus` is the fix, it is eight unit tests, and a
+popup deliberately does not take activation (§15.6 — a menu that stole focus
+would dismiss itself).
+
+That episode is the argument for the seam being where it is, made backwards: a
+stand-in that is *kinder* than Windows produces false passes, and one that is
+*meaner* produces false failures. §26.9 has the check that catches both.
+
+### 26.5 Three legs, and the correction that reshaped this section
+
+Three topologies were considered. The brief offered two; a mid-stage correction
+from the user added a third, and it is the right one.
+
+**Leg 1, `headless`.** `wc-compositor` built for Linux, `--control` standing in
+for Win32. All 1,225 tests, 98 seconds. Covers the protocol and the surface
+tree, which is most of what a conformance suite is about. **Does not cover**
+`HWND`, `WM_*`, GDI, `FrameStyle`, or the fd shim — a Linux client's
+`SCM_RIGHTS` is delivered by the kernel, so §2.3's in-band `h` argument never
+runs.
+
+**Leg 2, `wine`.** `wc-compositor.exe` in a Wine virtual desktop with
+`wc-proxy` in front of it, driven by the same shim through `WC_WLCS_LAUNCH`
+(`scripts/wc-wlcs-wine.sh`). Covers the two things leg 1 structurally cannot: a
+real message pump — so the activation WLCS waits for arrives from Windows
+rather than from a stand-in — and the fd shim, because Wine's AF_UNIX carries
+no ancillary data (§7.5) and therefore every `wl_shm` pool from a stock
+libwayland client reaches the Windows binary only if `wc-proxy` translated it.
+Every passing test on this leg is a test of the proxy too. **Does not cover**
+pointers or window placement: `control.rs` is `#[cfg(unix)]`, the Windows
+binary has no AF_UNIX listener, and those tests are filtered out and named
+rather than run and failed.
+
+**Leg 3, the one that does not exist yet.** Neither leg above has a hypervisor
+in it, and that is the gap the goal clause cares about.
+
+> **A correction to how this project has used Wine, which arrived during this
+> stage and is more important than anything else in it.** Every Wine run in
+> this document — stages 1 through 13 — has been **one machine with no VM
+> boundary at all**: the compositor under Wine and the client both on
+> devhost, over a Unix socket Wine backs with a real host socket node.
+> That arrangement made stage 1 possible, and several of its consequences were
+> then written up as "Wine lied" when they were really "there was no
+> hypervisor in the test". The count this document settles on is **four
+> recorded discrepancies** (§13.6, which withdrew a fifth after finding the
+> cause was a session-0 window station with no display) — and it should be
+> read as four recorded discrepancies, not as a measure of Wine's reliability.
+> §13.6's own lesson is the one that applies to the rig itself: *a negative
+> result is only evidence if the question was asked where the code will really
+> run.*
+
+The topology that fixes it, and which this section adopts as the design for leg
+3: **Wine on devhost plays the Windows side, and a Linux VM guest runs the
+client.** Since the repositories were unified this is a one-repo affair: this tree's own
+flake already builds that guest — `nix build
+.#svGuest` boots a NixOS VM with `memory-backend-memfd` and a QMP socket,
+existing precisely so the cross-VM topology can be exercised on a machine that
+can be rebooted, as against testhost, which cannot. WLCS is a Linux binary
+and runs in the guest; a real hypervisor, real guest RAM and a real arena
+locate are all in the path.
+
+What it needs first, concretely, is one thing: **a control channel that crosses
+the boundary.** `--control` is `AF_UNIX` on the compositor's own machine, and
+on leg 3 the compositor and the suite are on opposite sides. The honest
+implementations are `SetWindowPos` for placement and `SendInput` for the
+pointer, driven from a Windows-side helper (`scripts/probe-input.c` already
+does the second), reached over the relay — *not* a port of `control.rs` to
+Windows, which would move the hit test out of Win32 and quietly test the
+stand-in again on the one leg where the real thing is available. Until that
+exists, leg 3 can run the same 35-test subset leg 2 runs, and that is worth
+doing on its own.
+
+One more thing the unification settles: `sv-guest --no-default-features -F
+wayland` builds the compositor alone, and that is the configuration a
+compliance run should target — a Vulkan dependency in the picture would make
+every failure ambiguous about which half produced it. `WC_WLCS_COMPOSITOR`
+already takes any program that listens on a socket, so pointing it there is a
+one-line change to the harness when somebody wants it.
+
+The real guest remains the arbiter for anything Windows-specific, and the
+periodic-truth run belongs there. But the artefact that makes Wine's difference
+*measurable* rather than anecdotal is `scripts/wc-wlcs.sh compare`: the same
+tests on two legs, and the disagreements listed. A tally of times Wine
+surprised somebody is not evidence; that table is — and on its first run
+against the unified tree it produced one (§26.8), which is one more than every
+anecdote in this document put together has ever localised to a line of code.
+
+### 26.6 The baseline, 2026-08-13, at `020022d` plus this branch
+
+`scripts/wc-wlcs.sh globals; scripts/wc-wlcs.sh headless`. 1,228 tests listed,
+3 `DISABLED` upstream, 1,225 run in 98 seconds.
+
+| | count | share |
+|---|---:|---:|
+| passed | 230 | 18.8% |
+| failed | 236 | 19.3% |
+| skipped — justified exclusion | 677 | 55.3% |
+| skipped — gap (implementable, not implemented) | 79 | 6.4% |
+| skipped — WLCS testing itself | 3 | 0.2% |
+| **applicable (passed + failed)** | **466** | |
+| **pass rate on applicable tests** | | **49.4%** |
+
+**Two baselines, and keeping both is the point.** This was first measured on
+waycompose `e7ed512` before the repositories were unified, at **231 / 235 /
+759**, and re-measured on the unified tree at `020022d`, which had gained
+`zwp_idle_inhibit_manager_v1`, `xdg_activation_v1`,
+`zwp_keyboard_shortcuts_inhibit_manager_v1`, a native title bar and a damage
+fix. **Not one of the 1,225 verdicts moved** — `scripts/wc-wlcs.sh` writes a
+per-test log precisely so that can be joined and checked, and it was.
+
+That is a finding rather than a disappointment, and it says something useful in
+two directions. WLCS has **no tests at all** for idle-inhibit,
+`xdg_activation`, shortcuts-inhibit, cursor shape or toplevel icons, so a
+fortnight of protocol work can land without this number twitching; and
+`XdgDecorationV1Test` was already 5 of 6, so a title bar that is now Windows'
+own changed nothing it measures. **A green WLCS scoreboard is not a statement
+about protocol coverage**, and the existing harnesses (`wc-proxy.sh`,
+`wc-input.sh`, `wc-icon.sh`, `wc-xdg.sh`) are not superseded by it.
+
+The one verdict that *did* move did so because of a fix to this stage's own
+harness, and it went the right way: see §26.8.
+
+The 236 failures, by cause:
+
+| cause | tests |
+|---|---:|
+| input regions and surface-tree routing | 136 |
+| `xdg_positioner` anchor / gravity / constraint adjustment | 44 |
+| `xdg_popup` behaviour (grab, dismissal, reposition) | 10 |
+| subsurfaces | 13 |
+| touch | 12 |
+| `xdg_toplevel` state — maximise, fullscreen, parent, initial size | 12 |
+| protocol errors that should be raised and are not | 5 |
+| clipboard (`wl_data_device`) | 2 |
+| decoration, surface events | 2 |
+
+**One line causes 136 of the 236.** `State::pointer_motion` hands smithay
+`(surface, (0,0))` — the toplevel's own surface, at the origin — with no scene
+lookup. So `wl_surface.set_input_region` is not honoured, a subsurface never
+receives a pointer event of its own, and input does not fall through a null
+region to the parent. The comment at that call site already predicted this in
+stage 3: *"the moment a scene graph exists — subsurfaces, popups — it stops
+being true"*. It exists now, and this is the measurement of what that costs.
+
+The clipboard failure is worth a sentence of its own: `CopyCutPaste` fails
+because a selection one Wayland client offers is never offered to another.
+The clipboard bridge that exists goes between a client and the *Windows*
+clipboard, which is the direction the goal document cares about and is not the
+direction this test asks about.
+
+The second largest, 44, is §18.11 item 5 and §15.15 item 3 arriving from a
+third direction: nothing asks Windows where or how big anything is, so
+`xdg_positioner`'s constraint adjustments cannot be computed. Three sections
+now name the same missing fact.
+
+The five unraised protocol errors are the protocol audit's finding restated by an
+independent instrument: `xdg_surface` does not raise `already_constructed`,
+`unconfigured_buffer`, or the role errors, and `wl_shm` accepts a pool larger
+than its file.
+
+### 26.7 The exclusions, and the ones the suite never asks about
+
+WLCS's own mechanism is what makes this honest. `bind_if_supported` turns a
+global that is absent **and** undeclared into `ExtensionExpectedlyNotSupported`
+— a skip — and prints `Missing extension: <name>` on the line before it. An
+absent global that we *did* declare is a hard failure. So the declaration is
+the load-bearing artefact, and it must not be a wish: `scripts/wc-wlcs.sh
+globals` generates it by running **`wayland-info`** — libwayland, written by
+somebody else — against the compositor under test, immediately before the
+suite. The fallback table in `crates/wc-wlcs/src/imp.rs` exists for hand-runs
+and the harness FAILs if it has drifted from the registry.
+
+The scoreboard classifies every skip by the extension WLCS named, not by suite,
+because nearly every suite is parameterised over shell types and a suite-keyed
+table has to explain three different causes with one sentence. The first draft
+did exactly that and left thirteen suites unexplained.
+
+**Justified — 677.** Not debts.
+
+| extension | tests | why |
+|---|---:|---|
+| `zwlr_layer_shell_v1` | 368 | a layer surface is a panel, a wallpaper or a lock screen, and on this desktop Windows owns all three |
+| `zxdg_shell_v6` | 180 | superseded by xdg-shell stable in 2017; no client this project targets requires it |
+| `wl_shell` | 89 | removed from the protocol |
+| `zwlr_foreign_toplevel_manager_v1` | 30 | it exists so a Linux dock can list windows, and the dock here is the Windows taskbar |
+| `zwp_primary_selection_device_manager_v1` | 5 | Windows has no middle-click selection; a compositor-side one would be a clipboard no Windows application can see |
+| `gtk_primary_selection_device_manager` | 5 | the same, older spelling |
+
+**Gaps — 79.** Debts, and the number that should go down.
+
+| extension | tests | what it would take |
+|---|---:|---|
+| `wp_viewporter` | 23 | the blitter could scale and crop; it does not |
+| `zwp_pointer_constraints_v1` | 15 | `ClipCursor` and `SetCursorPos` exist on Win32 |
+| `zwp_text_input_manager_v2` / `_v3` | 23 | Windows has an IME (TSF); none of it is wired up |
+| `zwlr_virtual_pointer_manager_v1` | 12 | not implemented |
+| `zwp_relative_pointer_manager_v1` | 3 | `WM_INPUT` raw motion exists on Win32 |
+| `wp_fractional_scale_manager_v1` | 2 | the pair to `wl_compositor` v6's `preferred_buffer_scale` |
+| `zxdg_output_manager_v1` | 1 | not implemented |
+
+**And the category that matters most is the one with no row.** The three
+protocols this project judged genuinely impossible — `zwp_linux_dmabuf_v1` and
+`wl_drm`, because every one of their arguments is a descriptor to a kernel GPU
+allocation and no descriptor may cross the boundary (§15.9), and
+`wp_presentation`, because its timestamps would compare a guest clock against a
+host vblank (§10.8) — **have no tests in WLCS at all.** So passing this suite
+is not evidence about them in either direction. That is the most important
+sentence in this section, because it is exactly the shape of claim §13.6 and
+§14.9 are about: the suite does not ask the question, so a green scoreboard
+must not be read as having answered it.
+
+### 26.8 The two legs agree, on everything they both ran
+
+`scripts/wc-wlcs.sh wine` runs 35 tests through a real `wc-compositor.exe` in a
+Wine virtual desktop with `wc-proxy` in front: 22 passed, 13 failed, 0 skipped.
+`scripts/wc-wlcs.sh compare` joins the two logs by test name.
+
+**They disagreed on one test, and that one test is the whole argument for this
+mode existing.** `XdgToplevelStableConfigurationTest.defaults` passed headless
+and failed under Wine, with `state.width` 200 where the test wants 0. The cause
+is real and it is not Wine: **`ShowWindow` sends `WM_SIZE`**, so on Windows a
+window that appears is immediately told its size and `win32.rs` turns that into
+an `xdg_toplevel.configure` carrying it. `crate::control` did not, so the
+headless leg sat at 0x0 for ever.
+
+That is the *dangerous* direction — the stand-in being kinder than Windows —
+and it is exactly the failure §26.4 said had to be guarded against. The fix is
+in the stand-in, not in the scoreboard: `follow_focus` now sends
+`FromUi::Resized` with the mapped size, both legs fail the test, and the
+headless total went from 231 to 230. **One worse and one truer**, which is the
+trade this whole section is about. Nothing about the compositor changed.
+
+With that fixed, **all 35 verdicts are identical.** Two things follow, and they
+are different claims.
+
+1. **The stand-in is faithful, on this subset -- once it was corrected.** Every
+   test that passes with
+   `crate::control` supplying activation, focus and window identity also passes
+   with a real `WM_ACTIVATE` and a real `HWND`, and every test that fails,
+   fails the same way. That is the check §26.4 said the stand-in needs, and it
+   is the only kind of evidence that can rule out a harness that is kinder than
+   Windows. It found one, on the first run against the unified tree.
+2. **`wc-proxy` carried every buffer.** WLCS is a stock libwayland client;
+   §7.5 measured that such a client cannot send a buffer to the Windows build
+   at all without the proxy's in-band `h` translation. 22 passing tests
+   include `FrameSubmission`, `BadBufferTest` and `ClientSurfaceEventsTest`,
+   all of which attach and commit real `wl_shm` buffers. This is the first time
+   the fd shim has been exercised by a third-party test suite rather than by a
+   client we chose.
+
+The subset is 35 rather than 466 because the Wine leg excludes everything
+needing a pointer or a window position (no control socket, §26.5) and
+everything already skipped for a missing global (WLCS builds a server before it
+discovers an extension is missing, so a skipped test on this leg still starts a
+Wine desktop, a Windows binary and a proxy — about three seconds — and 373 of
+them would be twenty minutes of `wineserver` churn on a machine ten worktrees
+share, to re-learn a fact that does not depend on the platform).
+
+### 26.9 Five things that cost real time
+
+1. **The activation assumption** (§26.4). Ten seconds per test, 235 tests, and
+   every one of them looked like a compositor bug. What found it was reading
+   WLCS's source rather than its output — the comment in `xdg_toplevel_stable.cpp`
+   says outright that the assumption is being made and is not in the protocol.
+2. **gtest prints every verdict twice**, once per test with a duration and
+   once in the closing summary without one. The first scoreboard counted both
+   and reported 1,437 verdicts for a suite of 1,225. A scoreboard whose
+   arithmetic does not close is worse than none, so the parser now requires the
+   trailing `(N ms)` and the harness prints the suite's own total beside its
+   own.
+3. **The skip reasons were keyed by suite, and that cannot work.** WLCS
+   parameterises `SurfaceInputRegions/SurfaceInputCombinations` over `wl_shell`,
+   `zxdg_shell_v6`, `xdg_wm_base` and a subsurface, so one suite's skips have
+   three different causes. Keying on the extension WLCS names in the log took
+   the unexplained count from thirteen suites to zero and made the table
+   self-maintaining.
+4. **`cargo test -p wc-compositor` does not rebuild the binary.** Twenty
+   minutes were spent looking at a compositor log that did not contain a
+   feature that had been written, compiled and unit-tested — because the
+   *binary* the shim spawns had not been rebuilt. This is §14.9's pattern
+   ("implemented" meaning "compiled") in its most literal form, and the answer
+   is the one that section already gave: build the artefact that will be run.
+
+5. **The rebase, and where §26 landed.** The two repositories were unified
+   mid-stage. `docs/design.md` became `docs/waycompose-design.md` and
+   `wc-compositor/src/main.rs` became `lib.rs` with a three-line `main.rs` over
+   it; git followed neither rename through the rebase, so §26 tried to append
+   itself to *shared_vulkan*'s design document and the `--control` wiring tried
+   to apply to the shim. Both were resolved by hand. The `lib.rs` split is a
+   gift to this stage rather than an obstacle — a compositor core that is a
+   library is what an in-process WLCS shim would need, and §26.12 item 5 is
+   where that becomes interesting.
+
+### 26.10 The gates
+
+| gate | result |
+|---|---|
+| `cargo clippy --workspace --all-targets` | clean in every crate this branch touches; one pre-existing warning in `sv-hostd` |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | the same, plus one pre-existing in `sv-transport` |
+| `cargo test --workspace` | 1,148 passed (1,125 at `020022d`; +17 in `control.rs`, +6 in `wc-wlcs`) |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | `wc-compositor.exe`, 75 MB, links |
+| `scripts/wc-wlcs.sh globals` | 14 globals from `wayland-info`; fallback table matches |
+| `scripts/wc-wlcs.sh list` | 1,228 tests in 63 suites |
+| `scripts/wc-wlcs.sh headless` | 230 / 236 / 759, every skip attributed |
+| `scripts/wc-wlcs.sh wine` | 35 tests, 22 / 13 / 0, real `.exe` through the proxy |
+| `scripts/wc-wlcs.sh compare` | 35 shared tests, 1 disagreement found and fixed, then 0 |
+
+### 26.11 What is not proven
+
+1. **Nothing here has run across a hypervisor.** Both legs are one machine.
+   §26.5 is the design for the leg that would fix it and the one thing it needs
+   first. Until then, no scoreboard in this section may be quoted as one from
+   the shipping configuration.
+2. **The Win32 leg covers 35 tests, not 466.** Everything about pointer
+   routing, window placement, popup positioning and input regions on Windows is
+   untested by this suite — which is unfortunate, because §26.6 says those are
+   136 and 44 of the failures.
+3. **`crate::control` is only checked against Win32 on those 35.** Agreement on
+   a subset that contains no pointer test is agreement about activation, focus,
+   sizing, buffers and the shell, not about the hit test. §26.8 is a
+   demonstration that this check finds real things and a reminder that it can
+   only find them where it looks: the entire pointer path is unlooked-at.
+4. **Wine is not Windows.** Four recorded discrepancies (§13.6). This leg is
+   evidence that the code paths are self-consistent and structurally possible.
+5. **The baseline is two runs, on two trees, and they agreed exactly.** That is
+   better evidence of determinism than a repeat on one tree would have been —
+   1,225 verdicts, joined by test name, zero differences — but three of the
+   failures are timeouts, which are the ones a loaded machine could still move.
+6. **The suite does not test the impossible protocols** (§26.7). It also does
+   not test `xdg-toplevel-icon-v1`, `org_kde_kwin_server_decoration`, keyboard
+   layout, or anything about pixels reaching a screen — so the existing
+   harnesses are not superseded by this one.
+7. **The scoreboard is a moving target by design.** Several agents are fixing
+   the protocol gaps the audit found while this was written; the number in
+   §26.6 is from a checkout, and the point of the harness is that anyone can
+   re-run it rather than trust it.
+
+### 26.12 What to do next
+
+1. **Route pointer input through the surface tree** — 136 failures, one call
+   site, and the comment there already predicted it (§26.6). It is the single
+   largest thing on this scoreboard by a factor of three.
+2. **Ask Windows where and how big things are**, so `xdg_positioner` can be
+   computed — 44 failures, and the third section to ask for it (§15.15 item 3,
+   §18.11 item 5).
+3. **Raise the protocol errors** — 5 failures, and the cheapest of these by a
+   wide margin.
+4. **Build leg 3 on `svGuest`** (§26.5), starting with the 35-test subset,
+   which needs no control channel. That converts "Wine is not Windows" from a
+   caveat into a diff.
+5. **A control channel that crosses the boundary** — `SetWindowPos` and
+   `SendInput` from a Windows-side helper over the relay, not a port of
+   `control.rs`. It is what turns leg 3 from 35 tests into 466.
+   The unification makes a second option available and it is worth weighing:
+   `wc-compositor` is now a **library** (`lib.rs`), so a WLCS shim could link
+   the compositor core in-process the way WLCS was designed for. That would
+   remove the socket entirely — and it would also remove Win32, so it is a
+   third leg rather than a replacement for either.
+6. **Run the suite on the real guest, periodically**, and diff it against Wine
+   with `compare`. The divergence is the measurement.
+7. **Give the shim a real touch device.** `WlcsTouch` is a no-op today, so the
+   48 touch tests measure the harness rather than the compositor. It is a
+   control-socket verb and a `FromUi` variant, and it should be done at the
+   same time as `wl_touch` itself so that neither is scored against the other's
+   absence.
