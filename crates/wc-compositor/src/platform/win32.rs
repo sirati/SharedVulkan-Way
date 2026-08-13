@@ -309,6 +309,10 @@ struct WindowState {
     /// the client. Recorded rather than computed because it is the *window's*
     /// number at the *window's* DPI, and `top_inset()`'s is the desktop's.
     nc_top: Cell<i32>,
+    /// The last colour handed to `DWMWA_CAPTION_COLOR`, so the three DWM calls
+    /// happen when the client's title bar changes colour and not once per
+    /// frame of every animation it runs.
+    caption_colour: Cell<Option<u32>>,
 
     // --- input, stage 6 ---------------------------------------------------
     /// Whether `TrackMouseEvent` is currently armed for this window.
@@ -368,6 +372,11 @@ impl WindowState {
         let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
         if !hdc.is_null() {
             self.blit(hdc);
+            // After the blit and inside the paint, because it reads the same
+            // buffer the blit just used and must not disagree with what is on
+            // the screen. It is a no-op on every frame where the client's title
+            // bar has not changed colour, which is almost all of them.
+            self.match_caption_colour();
         }
         // SAFETY: paired with the `BeginPaint` above, same `ps`.
         unsafe {
@@ -456,6 +465,105 @@ impl WindowState {
     /// Nothing happens for a client-decorated window that did not ask for the
     /// fold, and nothing happens when DWM declines to say where its buttons
     /// are — see `caption_button_rect`.
+    /// Make **Windows' caption match the client's title bar**, by sampling the
+    /// client's own pixels and telling DWM what colour to paint.
+    ///
+    /// # Why this direction, and not the one that was asked for
+    ///
+    /// The obvious statement of the problem is the other way round: tell
+    /// *Firefox* what colour Windows' title bar is, so that it draws a tab strip
+    /// that matches. There is no way to do that. It is §30.8 for the third time
+    /// — Wayland carries sizes and states, not a palette, and GTK 3 takes its
+    /// colours from a theme on the client's own machine, which is the far side
+    /// of a boundary this compositor cannot reach across. Anything built that
+    /// way would be a launcher writing a `gtk.css`, out of band, per client, per
+    /// theme, and wrong the moment the user switched to dark mode.
+    ///
+    /// Reversing it makes the problem disappear, and the reversal is the correct
+    /// ownership rather than a trick: **the frame is the compositor's**, the
+    /// client's pixels are already in this process's address space, and Windows
+    /// 11 has an attribute for precisely this. So the strip DWM paints behind
+    /// the caption buttons is set to the colour the client is painting beside
+    /// it — sampled, every frame, from the buffer that is about to be blitted —
+    /// and it follows the client into dark mode, a different theme or a
+    /// different page with no protocol, no configuration and no launcher.
+    ///
+    /// `DWMWA_TEXT_COLOR` moves with it, chosen by luminance, or the caption
+    /// glyphs on a dark title bar are black on black.
+    ///
+    /// # What is sampled
+    ///
+    /// Eight pixels immediately to the **left** of the button strip, halfway
+    /// down it, averaged. Left of the strip because that is the pixel the
+    /// caption is continuing from, and the one a seam would show against;
+    /// halfway down because the top row of a GTK header bar is a one-pixel
+    /// highlight and the bottom row is a border. Averaged because a single
+    /// sample that lands on an anti-aliased glyph edge produces a caption that
+    /// is subtly the wrong colour on some frames and not others.
+    fn match_caption_colour(&self) {
+        if !self.frame.extend_top || !self.frame.caption_buttons {
+            return;
+        }
+        let Some(rc) = caption_button_rect(self.hwnd()) else {
+            return;
+        };
+        let sampled = {
+            let shadow = match self.shadow.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            let (w, h) = (shadow.width(), shadow.height());
+            // **Before the clamps, not after.** A window that has been created
+            // and has not yet committed a buffer has a 0x0 shadow, `blit`
+            // returns early for it, and this runs anyway — so `clamp(0, h - 1)`
+            // is `clamp(0, -1)`, whose min exceeds its max, which is a *panic*
+            // rather than a wrong answer. On the UI thread, inside `WM_PAINT`,
+            // across an `extern "system"` boundary, that is a non-unwinding
+            // panic and the process aborts: the guest leg came back with a
+            // truncated log, a compositor that had gone, and a picture of a
+            // window that no longer existed. It cost one guest run.
+            if w < 8 || h <= 0 {
+                return;
+            }
+            let y = (rc.bottom / 2).clamp(0, h - 1);
+            let x0 = (rc.left - 8).clamp(0, w - 8);
+            let px = shadow.pixels();
+            let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
+            for i in 0..8 {
+                let o = (((y * w) + x0 + i) * 4) as usize;
+                let Some(p) = px.get(o..o + 4) else { return };
+                // BGRA, which is the layout `Shadow` guarantees.
+                b += u32::from(p[0]);
+                g += u32::from(p[1]);
+                r += u32::from(p[2]);
+            }
+            (r / 8, g / 8, b / 8)
+        };
+        let (r, g, b) = sampled;
+        // COLORREF is 0x00BBGGRR. See the constants' doc comment.
+        let colour = (b << 16) | (g << 8) | r;
+        if self.caption_colour.replace(Some(colour)) == Some(colour) {
+            return;
+        }
+        // Rec. 601 luma, which is what every "is this background light or dark"
+        // decision in a UI toolkit uses and is close enough for a two-way
+        // choice between black glyphs and white ones.
+        let luma = (299 * r + 587 * g + 114 * b) / 1000;
+        let text = if luma >= 140 { 0x0000_0000 } else { 0x00FF_FFFF };
+        dwm_set_colour(self.hwnd(), DWMWA_CAPTION_COLOR, colour);
+        dwm_set_colour(self.hwnd(), DWMWA_TEXT_COLOR, text);
+        // The border too, or a window whose caption is now the client's colour
+        // keeps a hairline of the system's around it, which is more visible
+        // than the caption was.
+        dwm_set_colour(self.hwnd(), DWMWA_BORDER_COLOR, colour);
+        println!(
+            "wc-compositor: window {} caption colour follows the client: \
+             #{r:02x}{g:02x}{b:02x} (luma {luma}, {} glyphs)",
+            self.id,
+            if luma >= 140 { "dark" } else { "light" }
+        );
+    }
+
     fn uncover_caption_buttons(&self, hdc: HDC) {
         if !self.frame.extend_top || !self.frame.caption_buttons {
             return;
@@ -2239,6 +2347,7 @@ fn create_window(
         frames: Cell::new(0),
         icon_small: Cell::new(0),
         nc_top: Cell::new(0),
+        caption_colour: Cell::new(None),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
@@ -2363,6 +2472,18 @@ fn create_window(
 /// and — on Windows 11 — the *build's*, and every hard-coded
 /// `3 * SM_CXSIZE` in the wild is wrong on some machine.
 const DWMWA_CAPTION_BUTTON_BOUNDS: u32 = 5;
+
+/// `DWMWA_BORDER_COLOR`, `DWMWA_CAPTION_COLOR` and `DWMWA_TEXT_COLOR`, the
+/// three `DWMWINDOWATTRIBUTE`s Windows 11 added for exactly this arrangement.
+///
+/// They take a `COLORREF` — `0x00BBGGRR`, which is the *opposite* byte order
+/// from the `BGRA` a client's buffer is in and from the `RGB` anybody writing
+/// this from memory would produce. Getting it backwards gives a caption that is
+/// a plausible colour and the wrong one, which is the failure mode that does
+/// not look like a failure.
+const DWMWA_BORDER_COLOR: u32 = 34;
+const DWMWA_CAPTION_COLOR: u32 = 35;
+const DWMWA_TEXT_COLOR: u32 = 36;
 
 /// `MARGINS`, declared here rather than imported.
 ///
@@ -2609,6 +2730,28 @@ fn dwmapi_uncached(symbol: &std::ffi::CStr) -> Option<unsafe extern "system" fn(
     }
     // SAFETY: an ASCII, NUL-terminated export name.
     unsafe { GetProcAddress(dll, symbol.as_ptr().cast()) }
+}
+
+/// Set one of the Windows 11 frame colours. `None` when DWM has no such export
+/// or refuses the attribute, which is every Windows before build 22000.
+fn dwm_set_colour(hwnd: HWND, attribute: u32, colour: u32) -> Option<i32> {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> =
+        std::sync::OnceLock::new();
+    let f = dwmapi(&SYM, c"DwmSetWindowAttribute")?;
+    // SAFETY: a live window handle; the buffer is a `u32` and the size passed
+    // is its own. The transmute is to
+    // `DwmSetWindowAttribute(HWND, DWORD, LPCVOID, DWORD) -> HRESULT`.
+    let hr = unsafe {
+        let f: unsafe extern "system" fn(HWND, u32, *const c_void, u32) -> i32 =
+            std::mem::transmute(f);
+        f(
+            hwnd,
+            attribute,
+            (&raw const colour).cast::<c_void>(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    Some(hr)
 }
 
 /// Where Windows drew its caption buttons, in **client** coordinates.

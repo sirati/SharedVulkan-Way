@@ -8,8 +8,11 @@
 #   scripts/wc-titlebar.sh tabs     TABS IN THE TITLE BAR: the caption folded into the client
 #                                   area, so the tab strip is *inside* the frame
 #   scripts/wc-titlebar.sh noglass  the same, without DwmExtendFrameIntoClientArea
+#   scripts/wc-titlebar.sh nobuttons  the same, with the client's pixels over the
+#                                   whole caption and no system buttons at all
 #   scripts/wc-titlebar.sh both     deploy, then server and client
-#   scripts/wc-titlebar.sh all      deploy, then all four
+#   scripts/wc-titlebar.sh pair     deploy, then tabs and server
+#   scripts/wc-titlebar.sh all      deploy, then all five
 #   scripts/wc-titlebar.sh clean    remove what this script put on the guest
 #
 # Run from inside `nix develop`. Pictures land in docs/stage17/ and, for the
@@ -310,17 +313,42 @@ do_run() {
   #
   # The one lever that exists is the client's own GTK configuration, and it is
   # delivered exactly the way §22.3's environment variable is — out of band, on
-  # the machine the client runs on, by whatever launches it. §22.9 measured what
-  # it can and cannot do: `menu:` takes minimise and maximise away and **close
-  # survives**. That is enough here and it was not enough there, because the
-  # close button it leaves is in the corner Windows is now painting over, so it
-  # ends up *underneath* the system's own close button rather than beside it.
+  # the machine the client runs on, by whatever launches it.
+  #
+  # **The layout is `:minimize,maximize,close`, and the first attempt at this
+  # was `menu:`, which was exactly backwards.** `menu:` names no right-hand
+  # buttons, so Firefox draws none — and a tab strip with no buttons to make
+  # room for extends its tabs and its tab-list chevron all the way to the right
+  # edge, which is the corner Windows is painting three caption buttons over.
+  # The chevron ends up *behind* them. Naming three buttons is what makes
+  # Firefox **reserve** that corner: it lays out its own minimise, maximise and
+  # close there, stops the tab strip before them, and the transparent rectangle
+  # then covers Firefox's three with Windows' three instead of covering
+  # something that needed to be seen.
+  #
+  # So the reservation is real and it is a coincidence of widths rather than an
+  # agreement: GTK's three buttons and DWM's three are within a few pixels of
+  # each other at 100%, and nothing makes that true at another scale. §30.8 is
+  # still the honest statement — there is no protocol for "this rectangle is
+  # mine" — but this is much closer to right than leaving the corner unclaimed.
   #
   # Written for the three `tabs` legs only. The `server` leg has no client-side
   # title bar to lay out and the `client` leg is the before-picture.
+  #
+  # THE ESCAPING HERE IS THE THIRD ATTEMPT AND THE FIRST TWO LOOKED LIKE
+  # SUCCESSES. This string is interpolated into a double-quoted argument to
+  # `h`, and lands inside a **quoted** heredoc (`<<'EOS'`) on the VM host, so
+  # `$RUN` must survive this side to be expanded when the script runs there —
+  # `\$RUN`, one backslash, not two. `\\n` likewise becomes `\n` in the file,
+  # where `\\\\n` becomes a literal backslash-n and `printf` writes the
+  # characters rather than a newline. Both mistakes produce a run in which
+  # everything passes: the leg is green, the picture is plausible, and the
+  # setting simply never reached the client. The check that catches it is
+  # reading `$RUN/config/gtk-3.0/settings.ini` on the host afterwards, and it
+  # is worth doing whenever this line is edited.
   local gtkini=""
-  [ "$mode" = tabs ] && gtkini="printf '[Settings]\\\\ngtk-decoration-layout=menu:\\\\n' \
-> \"\\\$RUN/config/gtk-3.0/settings.ini\""
+  [ "$mode" = tabs ] && gtkini="printf '[Settings]\\ngtk-decoration-layout=:minimize,maximize,close\\n' \
+> \"\$RUN/config/gtk-3.0/settings.ini\""
 
   # Ours only, and before the share is emptied: an interrupted run leaves a
   # compositor alive for up to its `--timeout`, still writing into the same
@@ -502,6 +530,20 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
     h "test -f /tmp/$TBNAME-$leg-run/done && echo yes" 2>/dev/null | grep -q yes && break
     sleep 2
   done
+  # Did the client's GTK configuration actually arrive? Asserted rather than
+  # assumed, because the two ways of getting the escaping wrong above both
+  # produce a green leg with the setting missing — see the comment on `gtkini`.
+  if [ "$mode" = tabs ]; then
+    local ini
+    ini=$(h "cat /tmp/$TBNAME-$leg-run/config/gtk-3.0/settings.ini 2>/dev/null" | tr -d '\r' | tr '\n' ' ')
+    case "$ini" in
+      *"gtk-decoration-layout=:minimize,maximize,close"*)
+        ok "$leg: the client was given a layout naming all three window buttons" ;;
+      "") bad "$leg: no settings.ini reached the client; Firefox laid its title bar out with the host's default" ;;
+      *)  bad "$leg: the client's settings.ini is ${ini}" ;;
+    esac
+  fi
+
   h "cat /tmp/$TBNAME-$leg-run/proxy.log 2>/dev/null" >"$RUNDIR/proxy-$leg.log"
   h "cat $SHARE/tb-$leg.log 2>/dev/null" >"$RUNDIR/comp-$leg.log"
   cp "$RUNDIR/comp-$leg.log" "$outdir/compositor-$leg.log" 2>/dev/null
