@@ -2040,10 +2040,92 @@ either, so no run in this stage ever saw the field say `HWDEC`. That is stated
 as a gap rather than glossed.
 
 **So: no. Hardware decode does not engage, and the guest's Intel iGPU is not
-reachable from here by any path this binary has.** §1's capability tables are
-still correct — that iGPU decodes H.264 baseline, main and high, 8×8 to
+reachable from `151.0.2` by any path that binary has.** §1's capability tables
+are still correct — that iGPU decodes H.264 baseline, main and high, 8×8 to
 4096×4096 — and they are correct about a GPU on the *other side of the
 hypervisor* from the browser that would need it.
+
+#### 153 is a `nix build` away, its Vulkan decoder is real, and the wall is ours
+
+The paragraph above says "this binary" four times, and that qualifier turned out
+to be the whole story. The user's correction: *Firefox recently added Vulkan
+based video decoding, i.e. using Vulkan to address the video decoder; you can
+get that version and enable the backend — after all this is NixOS.* Both halves
+are right, and no compiling was needed for either.
+
+**The version is one flake input away.** The pinned nixpkgs carries 151.0.2;
+`github:NixOS/nixpkgs/nixpkgs-unstable` today carries **153.0.4**, and
+`firefox-bin` is Mozilla's own prebuilt binary, so it arrives from a substituter
+rather than from a three-hour build. Asked of *that* `libxul.so` with the same
+`strings` method:
+
+| symbol | 151.0.2 | 153.0.4 |
+|---|---|---|
+| `FFmpegVulkanVideoDecoder` | 0 | **10** |
+| `media.hardware-video-decoding-vulkan.enabled` | 0 | **3** |
+| `media.hardware-video-decoding-vulkan.direct-export.enabled` | 0 | **2** |
+| `vkGetMemoryFdKHR` | 0 | **1** |
+
+**And it engages.** Firefox 153.0.4 under a GL weston on devhost, with the
+pref on, grows an `about:support` row that does not exist in 151 at all, and it
+tracks the preference:
+
+| pref | `HARDWARE_VIDEO_DECODING_VULKAN` |
+|---|---|
+| `true` | **available** |
+| `false` | disabled, `FEATURE_HARDWARE_VIDEO_DECODING_VULKAN_PREF_DISABLED` |
+
+with `FFMPEG: VulkanDeviceHolder: created shared VkDevice for NVIDIA GeForce
+RTX 5090` in `MOZ_LOG=PlatformDecoderModule:5` to say a device was really made.
+
+**This is also the positive control §0.17 was missing**, and it is worth being
+precise about what it does and does not license. `codecSupportInfo` on 153 reads
+`H264 SWDEC HWDEC`, `AV1 SWDEC HWDEC`, and so on — so the field *can* say
+`HWDEC`, and the all-`SWDEC` reading on testhost's host is a real measurement
+and not a stuck string. It does **not** show that Vulkan decoded anything: the
+`HWDEC` appears with the Vulkan pref both on and off, because
+`media.hardware-video-decoding.force-enabled` had also been set and VA-API
+answers on that machine. An A-B-A-B of the Vulkan pref alone measured 0.10 cores
+either way for 1080p60 AV1, which separates nothing — VA-API served both arms,
+and a 9950X3D decodes this content in software for about the same price. **What
+Vulkan decode costs, on its own, is not measured here.**
+
+**The wall that matters is ours, and it is one line of output.** Firefox's
+decoder is irrelevant until a forwarded device can decode at all, so that was
+asked directly, with `video-probe` — the same instrument as §1–§3 — built for
+the video profile and pointed at our own ICD:
+
+```
+$ video-probe decode idr.264 out.nv12          # direct, RADV
+decoded 24 frames of 320x180 (coded 320x192) as G8_B8R8_2PLANE_420_UNORM
+decode submit->fence: median 0.784 ms over 24 frames
+
+$ SV_SOCKET=… VK_DRIVER_FILES=…/sv_icd.json video-probe decode idr.264 out.nv12
+Error: no device can decode this profile:
+  AMD Ryzen 9 9950X3D … (RADV RAPHAEL_MENDOCINO): no queue family with VIDEO_DECODE
+```
+
+The forwarded device advertises `VK_KHR_video_queue`, `VK_KHR_video_decode_h264`
+and `VK_KHR_video_decode_queue` and answers every capability query with the
+driver's own numbers — and then offers exactly one queue family,
+`GRAPHICS|COMPUTE|TRANSFER|SPARSE`, `codecs -`. This reproduces
+`video-decode.md` §6 on this branch rather than taking it on trust.
+
+So the ordering changes, and in the project's favour:
+
+1. **"Firefox cannot speak Vulkan Video" is dead.** It was true of 151 and is
+   false of 153, and 153 is a prebuilt binary in a channel we already use.
+2. **The blocker is now `advertise.rs`, not Mozilla.** A Firefox 153 on the host
+   with our ICD installed would be refused at device selection, for the same
+   reason `video-probe` is — before it ever reached §5a's dma-buf question. That
+   is a *better* failure to have, because it is ours.
+3. **It is still not a small thing to fix**, and §0.8 item 2 already says the
+   shape: not a second visible queue family, but a video session owned privately
+   by the GPU side, so that what crosses is a bitstream and an image id.
+   `video-decode.md` §6 costs that out. Nothing here shortens it.
+4. **§5a's dma-buf wall is not disproved, only deferred.** It stands behind the
+   queue-family wall and will be met next, on a topology where the frame is in a
+   Windows guest and a dma-buf is a host-kernel object.
 
 #### The codec can be forced, and the obvious preference for it is the wrong one
 
