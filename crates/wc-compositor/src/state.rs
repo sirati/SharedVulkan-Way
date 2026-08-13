@@ -64,6 +64,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::utils::Transform;
 use smithay::wayland::output::OutputHandler;
+use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
@@ -525,6 +526,28 @@ pub struct State {
     pub clip_offered: usize,
     pub clip_drags: usize,
 
+    /// The Windows drag currently over one of our windows, if any: which
+    /// window, and what it offers.
+    ///
+    /// ADDED FOR §42. `None` between drags, which is what makes a stray
+    /// `DragMotion` — OLE is entitled to send one after a `DragLeave` if the
+    /// user re-enters fast enough, and Wine does — a no-op rather than a
+    /// motion delivered into a grab that is not running.
+    dnd_over: Option<(WindowId, Vec<String>)>,
+    /// The mime type the client under the drag last accepted, if any.
+    ///
+    /// `Some(None)` and `None` mean different things and the difference is the
+    /// drop: `None` is "no client has said anything yet", `Some(None)` is "a
+    /// client answered and refuses everything". Both forbid a drop; only the
+    /// second is a decision.
+    dnd_accepted: Option<Option<String>>,
+    /// How many drags from Windows have entered a window of ours, and how many
+    /// of those were dropped. The harness asserts on both: a drag that enters
+    /// and never resolves is the failure this half exists not to build, and it
+    /// is invisible in a count that only rises on success.
+    pub dnd_entered: usize,
+    pub dnd_dropped: usize,
+
     pub clients_seen: usize,
     pub toplevels: usize,
     /// ADDED FOR STAGE 9, so the harness can assert that a menu opened rather
@@ -846,6 +869,10 @@ impl State {
             clip_fetched: 0,
             clip_offered: 0,
             clip_drags: 0,
+            dnd_over: None,
+            dnd_accepted: None,
+            dnd_entered: 0,
+            dnd_dropped: 0,
             clients_seen: 0,
             toplevels: 0,
             popups: 0,
@@ -1041,6 +1068,12 @@ impl State {
                         source.drag_finished(action);
                     }
                 }
+                FromUi::DragEnter { id, x, y, mimes, actions, time } => {
+                    self.dnd_enter(id, x, y, mimes, actions, time)
+                }
+                FromUi::DragMotion { id, x, y, time } => self.dnd_motion(id, x, y, time),
+                FromUi::DragLeave { id, time } => self.dnd_leave(id, time),
+                FromUi::DragDrop { id, x, y, time } => self.dnd_drop(id, x, y, time),
                 FromUi::TouchDown { id, slot, x, y, shape, time } => {
                     self.touch_down(id, slot, x, y, shape, time)
                 }
@@ -1097,6 +1130,137 @@ impl State {
             mimes,
             (),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The drop target: a Windows drag, over one of our windows (§42)
+    // -----------------------------------------------------------------------
+
+    /// `IDropTarget::DragEnter`: something from a Windows application is over
+    /// one of our windows.
+    ///
+    /// This is a **server-side** drag in Wayland's terms — the compositor is
+    /// the source and no client owns a `wl_data_source` — which is exactly what
+    /// `start_dnd` is for, and it is why `ServerDndGrabHandler` exists and has
+    /// been empty since §29.
+    ///
+    /// # The grab needs a pointer that is already where the drag is
+    ///
+    /// `start_dnd` takes a `PointerGrabStartData` whose `focus` and `location`
+    /// are where the gesture *began*, and smithay's DnD grab sends
+    /// `wl_data_device.enter` to whatever is under that location. During an OLE
+    /// drag there is no `WM_MOUSEMOVE` at all (§29.8), so the compositor's idea
+    /// of where the pointer is can be arbitrarily old — it is wherever the
+    /// mouse was when the user pressed the button in the *other* application.
+    /// So the location is taken from `DragEnter`'s own coordinates, which
+    /// Windows measured, and not from `self.pointer_at`.
+    fn dnd_enter(&mut self, id: WindowId, x: f64, y: f64, mimes: Vec<String>, actions: u32, time: u32) {
+        if self.dnd_over.is_some() {
+            // OLE guarantees enter/leave are balanced per window, but a drag
+            // that crosses from one of our windows straight into another
+            // produces the second enter before the first leave under Wine.
+            // Ending the old grab first keeps at most one running, which is
+            // what "there is one mouse" means.
+            self.dnd_leave_inner(time);
+        }
+        let Some(window) = self.by_id(id) else { return };
+        let surface = window.role.surface().clone();
+        self.dnd_entered += 1;
+        self.dnd_over = Some((id, mimes.clone()));
+        println!(
+            "wc-compositor: a Windows drag entered window {id} at {x},{y} offering {} \
+             mime type(s): {} (actions {})",
+            mimes.len(),
+            mimes.join(", "),
+            crate::platform::dnd_action::describe(actions)
+        );
+
+        // The pointer has to be *at* the drag before the grab starts, or the
+        // grab's first `enter` names whatever was under the stale position.
+        self.pointer_motion(Some(id), x, y, time);
+
+        let start_data = smithay::input::pointer::GrabStartData {
+            focus: self
+                .surface_under(id, x, y)
+                .map(|(s, origin)| (s, origin.into()))
+                .or(Some((surface, (0.0, 0.0).into()))),
+            button: 0x110,
+            location: (x, y).into(),
+        };
+        smithay::wayland::selection::data_device::start_dnd(
+            &self.display.clone(),
+            &self.seat.clone(),
+            self,
+            SERIAL_COUNTER.next_serial(),
+            Some(start_data),
+            None,
+            smithay::wayland::selection::data_device::SourceMetadata {
+                mime_types: mimes,
+                dnd_action: dnd_actions_from_bits(actions),
+            },
+        );
+    }
+
+    /// `IDropTarget::DragOver`. The grab is running, so an ordinary pointer
+    /// motion is what moves it: smithay's DnD grab intercepts `motion` and
+    /// turns it into `wl_data_device.motion`, or into a `leave`/`enter` pair
+    /// when it crosses a surface boundary.
+    fn dnd_motion(&mut self, id: WindowId, x: f64, y: f64, time: u32) {
+        if self.dnd_over.as_ref().map(|(w, _)| *w) != Some(id) {
+            return;
+        }
+        self.pointer_motion(Some(id), x, y, time);
+    }
+
+    /// `IDropTarget::DragLeave`, and the cancellation path for everything else.
+    fn dnd_leave(&mut self, id: WindowId, time: u32) {
+        if self.dnd_over.as_ref().map(|(w, _)| *w) != Some(id) {
+            return;
+        }
+        println!("wc-compositor: the Windows drag left window {id} without dropping");
+        self.dnd_leave_inner(time);
+    }
+
+    /// End the grab without a drop, whatever the reason.
+    ///
+    /// **A button release is what ends a pointer grab in smithay**, not a
+    /// method call: the grab holds the pointer until the button that started it
+    /// goes up, and `ServerDnDGrab` treats that release as the drop. So a
+    /// cancel is a release with the accepted-action bookkeeping already
+    /// cleared, which makes smithay send `wl_data_device.leave` and finish the
+    /// grab rather than `drop`.
+    fn dnd_leave_inner(&mut self, time: u32) {
+        self.dnd_over = None;
+        // Nothing accepted, so the release cannot be read as a drop.
+        self.dnd_accepted = None;
+        self.dnd_release(time);
+    }
+
+    /// `IDropTarget::Drop`. The bytes are already staged on the platform side.
+    fn dnd_drop(&mut self, id: WindowId, x: f64, y: f64, time: u32) {
+        if self.dnd_over.as_ref().map(|(w, _)| *w) != Some(id) {
+            return;
+        }
+        self.dnd_dropped += 1;
+        println!("wc-compositor: the Windows drag was dropped on window {id} at {x},{y}");
+        self.pointer_motion(Some(id), x, y, time);
+        self.dnd_over = None;
+        self.dnd_release(time);
+    }
+
+    /// The button release that ends the grab, one way or the other.
+    fn dnd_release(&mut self, time: u32) {
+        let pointer = self.pointer.clone();
+        pointer.button(
+            self,
+            &smithay::input::pointer::ButtonEvent {
+                button: 0x110,
+                state: smithay::backend::input::ButtonState::Released,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
     }
 
     /// The UI thread has read the clipboard. Send it back to whoever asked.
@@ -3824,21 +3988,136 @@ impl DataDeviceHandler for State {
     }
 }
 
-// Drag and drop, both directions, at their defaults: the events are accepted
-// and nothing is done with them. A drag *within* one client works because
-// smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
-// is not started here.
-//
-// §29 left this alone on purpose. Drag and drop is the same interface
-// family as the clipboard and it is **not implemented**, which is a decision
-// and not an oversight: a half-built DnD is a drag that starts, offers a
-// format, and then hangs on the drop, and that failure — a client waiting
-// forever on a transfer nobody will finish — is precisely what this stage
-// exists to remove. wc-proxy answers `wl_data_device.start_drag` with an
-// immediate `wl_data_source.cancelled`, so a client that tries gets a drag that
-// does not begin instead of one that does not end. docs/waycompose-design.md §29.8.
+/// A drag started by a **client**, within Wayland.
+///
+/// Still at its defaults, and §29's reasoning for that is unchanged: a client
+/// dragging out of its own window is intercepted by `wc-proxy`, which pulls the
+/// payload and calls `wc_clipboard_v1.start_drag`, so the compositor is told
+/// about it through that protocol rather than through this handler. The one
+/// case this trait would serve — a drag from one Wayland window to another,
+/// both on this compositor — smithay runs entirely by itself.
+///
+/// (The comment that used to be here said wc-proxy answers `start_drag` with an
+/// immediate `cancelled`. That was true when it was written and stopped being
+/// true in §29, which built the pull. Corrected rather than deleted, because a
+/// stale comment about a *behaviour* is the §35 failure in miniature.)
 impl ClientDndGrabHandler for State {}
-impl ServerDndGrabHandler for State {}
+
+/// A drag started by the **compositor**, which here means by Windows: something
+/// is being dragged out of a Windows application and over one of our windows,
+/// and `dnd_enter` has called `start_dnd`.
+///
+/// ADDED FOR §42. Every method here is a client's answer arriving
+/// asynchronously, and the two that matter are `accept` and `action`, because
+/// `IDropTarget::DragOver` has to answer OLE *synchronously* — see
+/// [`crate::platform::ToUi::DragFeedback`] for that decision and its cost.
+impl ServerDndGrabHandler for State {
+    fn accept(&mut self, mime_type: Option<String>, _seat: Seat<Self>) {
+        println!(
+            "wc-compositor: the client under the drag accepts {}",
+            match &mime_type {
+                Some(m) => m.as_str(),
+                None => "nothing",
+            }
+        );
+        let accepted = mime_type.is_some();
+        self.dnd_accepted = Some(mime_type);
+        self.ui.send(ToUi::DragFeedback {
+            accepted,
+            // The action is reported separately by `action` below; until it
+            // arrives, "accepted" alone means copy, which is what every
+            // toolkit's default is and what `DROPEFFECT_COPY` shows.
+            action: if accepted {
+                crate::platform::dnd_action::COPY
+            } else {
+                crate::platform::dnd_action::NONE
+            },
+        });
+    }
+
+    fn action(&mut self, action: DndAction, _seat: Seat<Self>) {
+        let bits = dnd_action_bits(action);
+        println!(
+            "wc-compositor: the client under the drag chose {}",
+            crate::platform::dnd_action::describe(bits)
+        );
+        self.ui.send(ToUi::DragFeedback {
+            accepted: self.dnd_accepted.as_ref().is_some_and(|m| m.is_some()),
+            action: bits,
+        });
+    }
+
+    /// The user let go. smithay has sent `wl_data_device.drop` to the client,
+    /// which is now entitled to `receive` on the offer.
+    fn dropped(&mut self, _seat: Seat<Self>) {
+        println!("wc-compositor: the client under the drag was told about the drop");
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>) {
+        println!("wc-compositor: the drag over our window was cancelled");
+        self.dnd_accepted = None;
+    }
+
+    /// `wl_data_offer.receive` on a **drag** offer, which carries an `h`.
+    ///
+    /// Closed rather than written, for exactly the reason
+    /// [`SelectionHandler::send_selection`] closes its own — and it is the same
+    /// sentence with one word changed, so it is worth being explicit that this
+    /// is not an oversight in a new feature. The bytes reach the client through
+    /// `wc_clipboard_v1.fetch(source=drag)`, which `wc-proxy` issues *instead*
+    /// of forwarding this request; a `receive` that reaches here at all came
+    /// from a client with no proxy in front of it (§29.6).
+    fn send(&mut self, mime_type: String, fd: smithay::utils::os::OwnedFd, _seat: Seat<Self>) {
+        drop(fd);
+        println!(
+            "wc-compositor: a client asked for the drag's bytes as {mime_type:?} through \
+             wl_data_offer.receive, which carries a descriptor this compositor cannot \
+             write into across the boundary; the bytes go through wc_clipboard_v1's \
+             fetch(source=drag) instead. Closing the descriptor: an empty drop rather \
+             than a dead client."
+        );
+    }
+
+    fn finished(&mut self, _seat: Seat<Self>) {
+        println!("wc-compositor: the client has finished with the drag");
+        self.dnd_accepted = None;
+    }
+}
+
+/// Wayland's `DndAction` bitflags from the plain bits that cross the platform
+/// boundary, and back.
+///
+/// Two functions rather than a cast in four places, and they are here rather
+/// than in `crate::platform` because `DndAction` is smithay's type and the
+/// platform side must not link a protocol crate — the same rule that keeps
+/// `Edge` and evdev keycodes in the boundary's own vocabulary.
+fn dnd_actions_from_bits(bits: u32) -> DndAction {
+    let mut out = DndAction::empty();
+    if bits & crate::platform::dnd_action::COPY != 0 {
+        out |= DndAction::Copy;
+    }
+    if bits & crate::platform::dnd_action::MOVE != 0 {
+        out |= DndAction::Move;
+    }
+    if bits & crate::platform::dnd_action::ASK != 0 {
+        out |= DndAction::Ask;
+    }
+    out
+}
+
+fn dnd_action_bits(action: DndAction) -> u32 {
+    let mut out = 0;
+    if action.contains(DndAction::Copy) {
+        out |= crate::platform::dnd_action::COPY;
+    }
+    if action.contains(DndAction::Move) {
+        out |= crate::platform::dnd_action::MOVE;
+    }
+    if action.contains(DndAction::Ask) {
+        out |= crate::platform::dnd_action::ASK;
+    }
+    out
+}
 
 /// `xdg-decoration`, which is the standard one and — measured — the one Firefox
 /// does not use.

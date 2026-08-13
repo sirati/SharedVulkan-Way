@@ -16730,3 +16730,229 @@ been a third way to get this wrong.
    `sv-present.sh` are on §35.6 item 6's list and run built binaries; their
    gates came back clean, so they have no vacuous checks, but they still have no
    freshness guard. That is the remaining half of item 6.
+---
+
+## 43. The drop target: the other half of drag and drop
+
+### 43.1 Status in one paragraph
+
+§29 built the drag **source** — a Wayland client dragging out onto the Windows
+desktop — and said in its own status paragraph that the **target** was not
+written at all: *"`RegisterDragDrop` and an `IDropTarget` per window,
+`DragEnter`/`DragOver`/`Drop` turned into smithay's `start_dnd` with synthesised
+pointer motion, and the `IDataObject` read out eagerly at the drop so
+`fetch(source=drag)` has something to answer from. `drag::payload` therefore
+answers `None`, which closes the client's pipe."* That is what this section
+builds, and every clause of it is now written. **`RegisterDragDrop` has been
+called and has succeeded** — three windows in one `scripts/wc-clip.sh wine` run
+report `accepts drops from Windows applications` — and ten COM tests run against
+a real `ole32` on the Windows target. What has **not** happened is a human
+holding a mouse button down over one of these windows: no run has produced a
+`DragEnter`, because that needs a desktop with two applications on it and this
+project's Wine leg has neither (§29.8's own correction). The honest claim is
+"the target is built, registered and unit-tested; it has never received a drag".
+
+### 43.2 What the requirement asks, and which half this is
+
+> "drag and drop must work from a wayland window into a windows window and visa
+> versa"
+
+Two directions, two protocols, meeting in the middle:
+
+| | Wayland | Win32 | built by |
+|---|---|---|---|
+| out | `wl_data_device.start_drag` | `DoDragDrop` + `IDataObject` + `IDropSource` | §29 |
+| **in** | **`start_dnd` + `wl_data_device.enter`** | **`RegisterDragDrop` + `IDropTarget`** | **§42** |
+
+The two halves share one conversion table (`crate::clipboard`) and one staging
+discipline, which was §29's reason for building the source before the target was
+wanted: a drag and a copy differ in one boolean and in what the far side does
+with the result.
+
+### 43.3 Three questions that decide the design, and where each was already answered
+
+**Which thread runs the modal loop** — answered by §29.8, from stage 17's
+comment on an unrelated `match` arm. `DoDragDrop` is entered from a *posted*
+`WM_WC_DRAG` rather than called from `drain`, because `drain` holds
+`ui.draining` and a modal loop under it spins the pump re-posting a wake it
+cannot service. **The drop target inverts this and the inversion is free**: OLE
+calls `IDropTarget`'s methods from *its* modal loop, on the UI thread, and each
+one returns immediately. Nothing here blocks, so nothing here needs posting.
+
+**Where the dragged bytes live** — the same staging area a copy uses, and the
+pull is eager on both sides. §29.5 argues that for the source (OLE asks with a
+synchronous `GetData` from inside a modal loop); the target has the mirror
+argument with a harder deadline, in 43.5.
+
+**What a drag out of a Wayland window is when the client is across a
+hypervisor** — `wc-proxy` intercepts `start_drag`, pulls the payload through
+pipes that are local to the client, and ships it over `wc_clipboard_v1`. Built
+in §29 and untouched here.
+
+### 43.4 The synchronous answer to an asynchronous question
+
+This is the one §29.8 left open, and it is the only genuinely new decision in
+this section:
+
+> `IDropTarget::DragOver` must return a `DROPEFFECT` synchronously, and the
+> Wayland client's `accept` / `set_actions` arrive asynchronously across a
+> hypervisor. The honest design answers from the last known accepted action and
+> is therefore one round trip stale. That is a decision to write down, not a bug
+> to discover.
+
+It is written down, and it is implemented exactly that way. `FEEDBACK` is a
+thread-local `DROPEFFECT` that `ToUi::DragFeedback` updates whenever
+`ServerDndGrabHandler::accept` or `::action` fires; `DragOver` returns whatever
+is in it. Three properties are worth stating because each is a decision:
+
+* **It starts at `DROPEFFECT_NONE`.** A drag that has just entered shows the
+  no-entry cursor until the client says otherwise. The alternative — assume
+  copy, correct later — promises a drop the compositor cannot deliver, and the
+  user finds out by letting go.
+* **The cursor can be one round trip behind. The drop cannot.** `Drop` is
+  called after the client has been told about the drag, has accepted, and has
+  had every intervening `DragOver` to change its mind; the effect it reports is
+  the one the *source application* uses to decide whether to delete its
+  original on a move. Staleness that costs a cursor glyph is acceptable;
+  staleness that deletes a file is not, and these are different moments.
+* **Blocking was considered and refused.** Waiting inside `DragOver` for a
+  round trip would put a hypervisor crossing inside a synchronous OLE callback
+  while a modal loop holds the pump — §29.5's argument against delayed
+  clipboard rendering, with the same shape and a worse deadline, since OLE
+  calls `DragOver` several times a second for as long as the mouse moves.
+
+### 43.5 Why the bytes are read at the drop and not when the client asks
+
+`IDataObject` is pull-based, which looks like a perfect fit for a client that
+has not decided whether it wants the data. It is not, and the reason is
+lifetime rather than laziness: **the data object belongs to the source
+application and is released when `Drop` returns.** The Wayland client's
+`fetch(source=drag)` arrives later — after `wl_data_device.drop`, after the
+client has decided, after a hypervisor crossing. Holding the interface pointer
+past the drop and calling `GetData` on it then would be calling into another
+process's object after telling that process the gesture was over.
+
+So `Drop` reads every format this compositor understands, into `DROPPED`, before
+it returns; `payload(mime)` answers out of that copy through
+`crate::clipboard::from_system` — the same function a paste goes through, so a
+drop and a paste cannot decode the same bytes differently.
+
+`ReleaseStgMedium` on every medium, always, and it is worth naming: the medium
+is the source's memory and the *receiver* frees it. Skipping it leaks whatever
+was dragged, once per drop, in the compositor rather than in the application
+that dragged it — which is the leak that gets blamed on the wrong process.
+
+### 43.6 The pointer that is not there
+
+**During an OLE drag the window receives `IDropTarget::DragOver` and no
+`WM_MOUSEMOVE` at all.** Nothing drives the ordinary pointer path, so the
+compositor's idea of where the pointer is stays wherever it was when the user
+pressed the button — in the *other* application, minutes ago and possibly on
+another monitor.
+
+That matters twice. smithay's `start_dnd` takes a `PointerGrabStartData` whose
+location decides which surface gets `wl_data_device.enter`, and its DnD grab
+turns later pointer motion into `wl_data_device.motion`. Both are fed from
+`DragEnter`/`DragOver`'s own coordinates, which Windows measured, and never from
+the compositor's stale `pointer_at`.
+
+The conversion from `POINTL` to surface coordinates goes through
+`WindowState::to_surface` — the same one the pointer, the touch and §38's popup
+bounds use. There is deliberately no second conversion: a drop that landed
+somewhere the clicks do not would be the §38 failure again, in a feature where
+"plausible but wrong" means a file dropped on the wrong pane.
+
+`POINTL` is passed **by value**, unlike the three pointer arguments beside it,
+and it is declared here rather than imported so the layout is visible at the
+call site. A `*const POINTL` in that slot compiles and reads the pointer as
+coordinates, which places every drop at an address.
+
+### 43.7 What is registered, and what deliberately is not
+
+`RegisterDragDrop` per **toplevel**, at window creation, and `RevokeDragDrop`
+before `DestroyWindow` — before, because OLE keys the registration on the
+`HWND` and a destroyed handle cannot be revoked; the entry would sit in OLE's
+table until the process exits, which on a compositor whose windows come and go
+with a client's menus grows with use.
+
+**Popups are not registered.** A menu is not a drop destination, and a
+registration whose lifetime is a gesture is the one most likely to be missed. A
+drag over a menu is a drag over the toplevel underneath it, which is what the
+rest of the desktop does.
+
+`OleInitialize` now runs at the first window creation rather than at the first
+drag. That is a real change to a path §29 shipped — the compositor now enters an
+OLE apartment on every run rather than only on runs that drag — so
+`scripts/wc-clip.sh wine` was re-run against it: **15 passed, 0 failed**, and
+the three `accepts drops from Windows applications` lines in
+`docs/clipboard/compositor.log` are the first evidence in this project that
+`RegisterDragDrop` succeeds at all.
+
+### 43.8 The COM contracts, and the one that can only be tested by index
+
+Five new tests join §29's five, all `cfg(windows)` and all run against a real
+`ole32` under Wine (`wine target/x86_64-pc-windows-gnu/debug/deps/wc_compositor-*.exe drag::`,
+**10 tests**). Four of them cover the same silent-wrongness classes §29.8 lists,
+from the other side of the interface. The fifth is new in kind:
+
+**`the_drop_target_vtable_is_in_idl_order` calls through the vtable by
+position.** A vtable is a struct of function pointers whose order *is* the
+contract, and a field named `drop` that happens to sit where OLE expects
+`DragLeave` compiles perfectly and calls the wrong function at runtime —
+§29.8's "a call into the wrong function rather than a compile error". Indexing
+the raw layout is the only way to assert the order, and it is the only test here
+that would fail if somebody reordered the struct while keeping it type-correct.
+
+The others: `QueryInterface` nulls its out-pointer even when refusing (OLE reads
+it either way); `DragOver` reports `DROPEFFECT_NONE` before anyone has accepted
+and the last feedback afterwards; a null `IDataObject` is refused rather than
+dereferenced, because the four methods should be total functions of what they
+are given; and the dropped bytes come back as the mime type the client asked
+for, with a mime the drag never held answering `None` rather than the wrong
+bytes.
+
+### 43.9 What is not proven
+
+1. **No drag has ever entered.** `DragEnter` has not run outside a unit test.
+   It needs a desktop with a Windows application on it and a mouse button held
+   across two windows, and §29.8 already identified the venue that could
+   provide one: `nix build .#svGuest`, Wine as the Windows side and a Linux VM
+   as the client, which is a real hypervisor with a real Explorer. That
+   arrangement is built and this section did not run it.
+2. **The stale cursor has never been seen.** 43.4 argues the round trip is
+   invisible in practice because a client answers in microseconds and a mouse
+   moves in milliseconds. Nobody has measured the gap.
+3. **`CF_HDROP` in, still one-directional.** A drag *out* of a Wayland window
+   carrying a file is §29.8's open design question and is untouched here: it
+   needs the file's bytes, not its name. A drag *in* carrying files works
+   through the existing `hdrop_to_uri_list`, whose limit §29.5 states — the
+   URIs name the guest's filesystem — and which has still never been read from
+   a real Explorer.
+4. **Nothing has been dropped from a real application.** The formats a real
+   `IDataObject` offers, and whether `QueryGetData` answers the way this code
+   expects for each, is a claim about other people's software that only a real
+   drag can check.
+5. **The action a `move` should take is not implemented on our side.** A
+   Windows source that is told `DROPEFFECT_MOVE` deletes its original; a
+   Wayland client that asks for `move` gets it reported, and what the *source*
+   does about it is the source's business. That is correct and it means a move
+   out of Explorer into a Wayland client removes the file, which nobody has
+   tried.
+6. **WLCS still has nothing to say about any of this**, for §29.9 item 8's
+   reason: it drives the compositor with no proxy in the loop, and the proxy is
+   where the design lives.
+
+### 43.10 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace && cargo test --workspace --no-fail-fast` | 82 binaries, **1355 tests**, 0 failures |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `wine …/wc_compositor-*.exe drag::` | **10 tests**, 0 failures |
+| `cargo clippy -p wc-compositor --all-targets` | clean |
+| `scripts/wc-clip.sh wine` | **15 passed, 0 failed** |
+
+The test count does not move: the new tests are `cfg(windows)` and the cross
+target's test binary is a `.exe`, which `cargo test --target` cannot execute
+without a `binfmt_misc` registration — §29.10's second row, for the same reason
+and with five more tests in it.

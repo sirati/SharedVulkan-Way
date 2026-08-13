@@ -522,6 +522,40 @@ pub enum ToUi {
     /// The Wayland source withdrew its drag.
     CancelDrag,
 
+    /// What the client under the pointer has said about the drag **Windows** is
+    /// running over it: whether it accepted a mime type at all, and which
+    /// action it chose.
+    ///
+    /// ADDED FOR §42, and it is the answer to the one question §29.8 left open.
+    ///
+    /// # Why this is a message and not a return value
+    ///
+    /// `IDropTarget::DragOver` must return a `DROPEFFECT` **synchronously** —
+    /// OLE is inside its modal loop, the cursor it draws is decided by that
+    /// return value, and there is nowhere for it to wait. The client's answer
+    /// is `wl_data_offer.accept` and `.set_actions`, which arrive when the
+    /// client gets round to them, across a hypervisor.
+    ///
+    /// Those two facts cannot both be honoured, so this is the decision:
+    /// **`DragOver` answers from the last feedback that arrived, and is
+    /// therefore up to one round trip stale.** The cursor can show "copy" for
+    /// one motion after the client has stopped accepting, and the effect
+    /// reported by the *drop* cannot — `Drop` is answered after the client has
+    /// been told about the drop and has replied, which is the moment the answer
+    /// has to be right. Stale feedback costs a cursor glyph; a wrong drop costs
+    /// data.
+    ///
+    /// The alternative — blocking `DragOver` on a round trip — puts a
+    /// hypervisor crossing inside a synchronous OLE callback while a modal loop
+    /// holds the pump, which is §29.5's argument against delayed rendering with
+    /// the same shape and a worse deadline.
+    DragFeedback {
+        /// The client accepted one of the offered mime types.
+        accepted: bool,
+        /// `dnd_action` bits the client chose. Meaningful only when `accepted`.
+        action: u32,
+    },
+
     /// End the pump.
     Quit,
 }
@@ -681,6 +715,52 @@ pub enum FromUi {
     /// a drag that never ends is the failure this whole feature exists not to
     /// build.
     DragFinished { action: u32 },
+
+    // --- the drop target, §42 -----------------------------------------------
+    //
+    // The other direction: something is being dragged **out of a Windows
+    // application and over one of our windows**. These four are `IDropTarget`'s
+    // four methods, in the order OLE calls them, with the coordinates already
+    // converted to the surface's own — the conversion is `WindowState::to_surface`,
+    // the same one the pointer, the touch and §38's popup bounds go through, so
+    // a drop cannot land somewhere the clicks do not.
+    //
+    // **They are separate from the pointer events on purpose.** During an OLE
+    // drag the window receives `IDropTarget::DragOver` and **no**
+    // `WM_MOUSEMOVE` at all, so nothing drives the ordinary pointer path; and
+    // the drag has to reach smithay's DnD grab, which is a different
+    // destination from `wl_pointer.motion`. Synthesising a `PointerMotion` here
+    // would put the compositor's idea of where the pointer is somewhere Windows
+    // never said it was, and leave it there when the drag left.
+    /// The pointer entered a window of ours carrying a Windows drag.
+    ///
+    /// These four are constructed only by the Win32 drop target, so off
+    /// Windows the compiler is right that nothing builds them. Saying so beats
+    /// giving the headless platform a drag it has no desktop to receive.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragEnter {
+        id: WindowId,
+        /// Surface coordinates, converted on the platform side.
+        x: f64,
+        y: f64,
+        /// What the `IDataObject` offers, already translated to mime types by
+        /// `crate::clipboard::mimes_for` — the same table the clipboard uses.
+        mimes: Vec<String>,
+        /// `dnd_action` bits the Windows source permits, from `DROPEFFECT`.
+        actions: u32,
+        time: u32,
+    },
+    /// It moved. One per `IDropTarget::DragOver`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragMotion { id: WindowId, x: f64, y: f64, time: u32 },
+    /// It left without dropping, or the drag was cancelled.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragLeave { id: WindowId, time: u32 },
+    /// The user let go over our window. The bytes have already been read out of
+    /// the `IDataObject` by the time this is sent — see `drag::payload` and
+    /// §29.5's argument for why the pull is eager on both sides.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragDrop { id: WindowId, x: f64, y: f64, time: u32 },
     // --- touch, stage 20 ---------------------------------------------------
     //
     // Already in Wayland's units, like everything above: surface-local
