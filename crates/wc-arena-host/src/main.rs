@@ -1,6 +1,38 @@
 //! Find the guest compositor's arena in QEMU's memory backend, prove it is the
 //! right memory, and write the plan `wc-proxy` maps.
 //!
+//! # DO NOT DELETE THIS CRATE. IT HAS BEEN DELETED TWICE.
+//!
+//! **Nothing in this tree depends on it at compile time.** No crate imports it,
+//! no test links it, and until stage 14 made it a member no `--workspace`
+//! command even resolved it. Every automated signal a cleanup consults says
+//! *dead*. It is not. Its callers are four shell scripts, which invoke it by
+//! path, on a different machine, as root, under `systemd-run`:
+//!
+//! ```text
+//!   scripts/wc-titlebar.sh   scripts/wc-desktop.sh
+//!   scripts/wc-guest.sh      scripts/sv-firefox-guest.sh
+//! ```
+//!
+//! Those are **every run this project has that puts a real client's pixels in
+//! the guest's own RAM**, which is the standing rule docs/waycompose-design.md
+//! §12 set. Without this binary all four stop at the locate step and no
+//! photograph of a real window over a real arena can be taken again.
+//!
+//! `crates/arena-host` is **not** a replacement and is the reason this looks
+//! redundant. It is a different tool with a different argument set — `scan`,
+//! `translate`, `write1`, `gpufill` — and handed this one's arguments it panics
+//! with `--fd is required`. That panic is what a desktop shortcut got instead of
+//! a window (§28) and what a `wc-titlebar.sh` leg got instead of a capture
+//! (§31.9).
+//!
+//! It was deleted once as "a crate that exists only to hold an absolute path
+//! dependency" — true of the *manifest*, and the manifest was a workaround; the
+//! **binary** was the product — and restored independently by two stages within
+//! days of each other, neither knowing about the other. There is no test that
+//! can fail when this file is missing, because the thing that breaks is a run on
+//! a Windows VM on another machine. This comment is the whole mitigation.
+//!
 //! ```text
 //!   wc-arena-host --qmp /run/windows-vm/qmp.sock --vm windows-vm \
 //!                 --run 0x… --pages 16384 --plan /tmp/wc-arena.plan \
@@ -23,9 +55,9 @@
 //! A copy of that in `waycompose` would be a second thing to keep correct
 //! against a machine neither of us controls, and being wrong would look exactly
 //! like working. So this binary **depends on** `sv-hostd` and does none of it
-//! itself. It is the only crate in this repository that does, it is deliberately
-//! not a workspace member (see `Cargo.toml`), and the split keeps the sibling
-//! repository out of the Windows cross gate entirely.
+//! itself. It is the only crate in this repository that does; stage 14 made it an ordinary
+//! workspace member and the `cfg(unix)` gate below is what keeps the Windows
+//! cross gate green — see `Cargo.toml`.
 //!
 //! **Second: privilege.** Reading `/proc/<qemu-pid>/fd` and connecting to
 //! QEMU's QMP socket both need root on the VM host. `wc-proxy` should not, and

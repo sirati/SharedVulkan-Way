@@ -171,11 +171,27 @@ struct Args {
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
     #[cfg(not(windows))]
     click: Option<platform::Click>,
-    /// Which decoration mode to advertise, as `server` or `client`.
+    /// Which decoration mode to advertise, as `server`, `client` or `tabs`.
     ///
-    /// ADDED FOR STAGE 17. See [`Decorations`] for why it defaults to `server`
-    /// and what a run that asks for `client` is for.
+    /// ADDED FOR STAGE 17, and given a third value by TABS IN THE TITLE BAR. See
+    /// [`Decorations`] for why it defaults to `server`, what a run that asks
+    /// for `client` is for, and what `tabs` changes on the Win32 side.
     decorations: Decorations,
+    /// Whether `--decorations tabs` also calls `DwmExtendFrameIntoClientArea`.
+    ///
+    /// ADDED FOR TABS IN THE TITLE BAR, defaulting to on, and the reason it can be turned
+    /// off is in [`platform::FrameStyle`]: the DWM call is the half of the
+    /// arrangement that is *not* load-bearing, and a run with it off is how
+    /// that claim was measured rather than asserted.
+    dwm_glass: bool,
+    /// Whether `--decorations tabs` keeps Windows' own caption buttons.
+    ///
+    /// ADDED FOR TABS IN THE TITLE BAR, defaulting to on, and it is what makes the
+    /// arrangement Windows' rather than an imitation — see
+    /// [`platform::FrameStyle::caption_buttons`]. `off` is the control leg: the
+    /// same window with the client's pixels over the whole caption and no
+    /// buttons at all.
+    caption_buttons: bool,
     /// Where to bind the conformance-suite control socket.
     ///
     /// ADDED FOR STAGE 26. `--click` is one scripted event decided before the
@@ -254,6 +270,8 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
+        dwm_glass: true,
+        caption_buttons: true,
         control: None,
     };
     let mut it = argv.iter().skip(1).cloned();
@@ -413,14 +431,40 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             // ADDED FOR STAGE 17, and it is the flag §22.2 is about.
             "--decorations" => {
                 let Some(v) = it.next() else {
-                    eprintln!("wc-compositor: --decorations needs server or client");
+                    eprintln!("wc-compositor: --decorations needs server, client or tabs");
                     return Err(2);
                 };
                 let Some(d) = Decorations::parse(&v) else {
-                    eprintln!("wc-compositor: --decorations {v}: expected server or client");
+                    eprintln!(
+                        "wc-compositor: --decorations {v}: expected server, client or tabs"
+                    );
                     return Err(2);
                 };
                 args.decorations = d;
+            }
+            // ADDED FOR TABS IN THE TITLE BAR. Only meaningful with `--decorations tabs`.
+            "--dwm-glass" => {
+                let v = it.next().unwrap_or_default();
+                match v.as_str() {
+                    "on" => args.dwm_glass = true,
+                    "off" => args.dwm_glass = false,
+                    _ => {
+                        eprintln!("wc-compositor: --dwm-glass {v}: expected on or off");
+                        return Err(2);
+                    }
+                }
+            }
+            // ADDED FOR TABS IN THE TITLE BAR. Only meaningful with `--decorations tabs`.
+            "--caption-buttons" => {
+                let v = it.next().unwrap_or_default();
+                match v.as_str() {
+                    "on" => args.caption_buttons = true,
+                    "off" => args.caption_buttons = false,
+                    _ => {
+                        eprintln!("wc-compositor: --caption-buttons {v}: expected on or off");
+                        return Err(2);
+                    }
+                }
             }
             "--timeout" => {
                 args.idle_timeout = it
@@ -718,10 +762,16 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
 
     let started = match platform::start(PlatformConfig {
         events: event_tx,
-        // Stage 3 gives Windows the whole frame. The field is what
-        // `DwmExtendFrameIntoClientArea` will move, and every size conversion
-        // already goes through it — see `platform::FrameStyle`.
-        frame: FrameStyle { extend_top: 0 },
+        // Stage 3 gave Windows the whole frame and stage 17 kept it that way.
+        // `--decorations tabs` is what moves it: the caption is folded into the
+        // client area by `WM_NCCALCSIZE` so the client's own tab strip lands
+        // inside the frame. See `platform::FrameStyle`, which also records why
+        // the field used to be a pixel count and is now a decision.
+        frame: FrameStyle {
+            extend_top: args.decorations.extends_frame(),
+            dwm_glass: args.dwm_glass,
+            caption_buttons: args.caption_buttons,
+        },
         dump_frames: args.dump_frames,
         simulate_wm: args.simulate_wm,
         #[cfg(not(windows))]
