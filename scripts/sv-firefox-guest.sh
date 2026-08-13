@@ -171,7 +171,7 @@ COMP_SECS=$((SECS + 150))
 say "starting wc-compositor.exe in the guest (guest-RAM arena, $OUTPUT output)"
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./sv-guest.exe wayland \
   --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
-  --log '$SHARE_WIN\\s.log' --output $OUTPUT \
+  --log '$SHARE_WIN\\s.log' --output $OUTPUT --arena-frames '$SHARE_WIN\\arena.frames' \
   --arena-guest-ram '0:$((ARENA_PAGES * 4096))' --arena-outbound '0:$ARENA_OUTBOUND'" \
   >"$DIR/comp.out" 2>&1 &
 KIDS+=($!)
@@ -206,10 +206,23 @@ for _ in $(seq 1 60); do
 done
 [ -n "$RUNID" ] || { echo "FAIL: the compositor never reported a guest-RAM arena"; sed -n '1,20p' "$SHARE/s.log" 2>/dev/null; cat "$DIR/comp.out"; exit 1; }
 
+# The frame list the compositor wrote into the share. Translating it is 0.064 s
+# where the content sweep is 2.308 s, and — the reason it is wired here rather
+# than left as an optimisation — it reads no stamps, so the `page index claimed
+# twice` failure that made five consecutive guest runs unusable cannot happen.
+# Conditional, because a guest without the query is a slow run and not a broken
+# one; the locate line says which locator ran.
+FRAMES_ARG=""
+if [ -s "$SHARE/arena.frames" ]; then
+  FRAMES_ARG="--frames '$SHARE/arena.frames'"
+  say "locating by frame list ($(wc -l <"$SHARE/arena.frames") frames from the guest)"
+else
+  say "no frame list from the guest; falling back to the content sweep"
+fi
 say "locating the compositor's arena in QEMU's memory"
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 $DIR/wc-arena-host --qmp /run/windows-vm/qmp.sock --vm windows-vm --run $RUNID \
-  --pages $FOUNDPAGES --outbound $ARENA_OUTBOUND --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
+  --pages $FOUNDPAGES --outbound $ARENA_OUTBOUND $FRAMES_ARG --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
 echo \"rc=\$?\" >>'$RUN/locate.log'
 chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | "$ROOTC" >/dev/null 2>&1
 sed 's/^/  /' "$RUN/locate.log" 2>/dev/null

@@ -403,6 +403,36 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Some(t)
         }
         "arena" => {
+            // THE FILE ARENA IS NOT A TARGET. Guest RAM is (design.md §1a). This
+            // branch exists so a Wine run on one Linux machine — which has no
+            // QEMU and therefore no guest RAM to locate — can exercise the arena
+            // path at all. It is **kept** rather than deleted, because deleting
+            // it would delete the only way to run this code without a
+            // hypervisor. It is **refused** rather than allowed, because a run
+            // that quietly lands here is measuring the wrong substrate: §10.3
+            // measured that substrate incoherent for live mappings — 65280 of
+            // 65536 bytes wrong, in both directions — and it reached a user's
+            // screen once as a torn window that had passed every other check.
+            //
+            // `SV_ALLOW_FILE_ARENA=1` is how a fixture run says it means it.
+            // Any change to arena behaviour must be implemented fully and
+            // correctly on guest RAM; making the fixture pass is never enough.
+            if std::env::var_os("SV_ALLOW_FILE_ARENA").is_none() {
+                return Err(format!(
+                    "the FILE arena is not a target. `--transport arena --arena-path {}` \
+                     opens a file, which is a Wine-only fixture for a machine with no \
+                     hypervisor. Guest RAM is the only real substrate: pass `--arena-plan` \
+                     here and `--arena-guest-ram` to the compositor. Set \
+                     SV_ALLOW_FILE_ARENA=1 for a fixture run — never to make a guest run \
+                     pass.",
+                    args.arena_path.display()
+                )
+                .into());
+            }
+            eprintln!(
+                "[proxy] WARNING: FILE arena in use (SV_ALLOW_FILE_ARENA is set). This is \
+                 a fixture, not a target; guest RAM is the only real substrate."
+            );
             let mut t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
             t.set_policy(args.arena_policy)?;
             if args.arena_outbound != 0 {
