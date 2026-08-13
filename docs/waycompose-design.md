@@ -14449,12 +14449,11 @@ would be worse than the TCP path it replaces, so:
    doorbell under them. What is *not* done is showing that it made anything
    faster in an application: see §36.10, where the instrument turned out to be
    inadequate and the numbers say so.
-4. **The host half is done; the guest half is not.** `wc-proxy --upstream-ring
-   <control-region>` claims a ring per client and pumps it, with the
-   0/1/5/20 ms poll ladder described above. `wc-compositor`'s Wayland thread
-   still only `accept()`s on `ListeningSocket` — it does not yet poll the ring
-   directory, which is the `accept()` half of §36.2's table and is the one
-   remaining piece of the data path.
+4. ~~The host half is done; the guest half is not.~~ **Both halves are done and
+   a client has run through them** — `wc-proxy --upstream-ring` claims, and
+   `wc-compositor --wayland-ring` accepts by polling the directory. See §36.11.
+   What remains on this item is the socketpair between `RingLink` and smithay,
+   which is guest-local and is described there.
 5. **No icon feed on the ring.** The icon link is a second connection to the
    compositor (§16.7), so on the ring it is a second ring claim. The proxy says
    so on the client's log line rather than skipping it silently, because a
@@ -14467,8 +14466,14 @@ would be worse than the TCP path it replaces, so:
    That measurement is on `testhost`, which is somebody's working machine, and
    it waits for a window when nobody is using it rather than for a gap in the
    schedule.
-7. **No Wayland client has driven a guest window through a ring.** Which is the
-   milestone the whole section is for, and item 4 is what stands in the way.
+7. **No Wayland client has driven a *guest* window through a ring.** One has
+   driven a compositor through a ring (§36.11), on one machine. What is left
+   between the two is deployment rather than design: the compositor's control
+   region has to be the guest's pinned RAM published over the cold path rather
+   than a file it creates, which is `win_guest`'s existing `Hello`/`Accept` with
+   a different owner — and the compositor is a second guest *process*, which
+   §1.6 of `one-binary.md` argues is the thing to fix rather than to work
+   around.
 
 **`scripts/probe-relay.c` therefore stays, and is still the only thing that
 works end to end.** It is retired when a Wayland client drives a guest window
@@ -14584,3 +14589,46 @@ workload and is the obvious candidate.
 This is recorded as a section rather than deleted because a measurement that
 failed to resolve its effect is a result, and an unrecorded one gets taken
 again.
+
+### 36.11 The milestone: a Wayland client, through a ring
+
+`scripts/wc-ring.sh`:
+
+```
+wc-compositor: accepting Wayland rings in /tmp/wc-ring-4RGQVu/ctl
+wc-compositor: client 1 accepted on ring slot 1 (no socket crossed the VM boundary)
+[proxy] upstream is the shared_vulkan session at ...ctl (16 ring slots, generation 1)
+[proxy] client 1 connected, upstream ring slot 1 (no socket, no TCP, no ssh)
+[proxy] client 1 ... 0 fds in, 0 out; 8 client msgs, 31 server msgs
+ring: PASS — an unmodified Wayland client drove a compositor with no socket upstream
+```
+
+`wayland-info`, which knows nothing about any of this, enumerated **16
+interfaces** — `wl_seat` with pointer, keyboard and touch among them — over a
+connection whose upstream hop is a memcpy into a mapped region. 8 client
+messages and 31 server messages, so it is real bidirectional protocol traffic
+and not a handshake that happened to complete.
+
+Everything in §36.2's table ran: the claim was the `connect()`, the directory
+poll was the `accept()`, the command lane carried the requests and the reply
+lane the events, and the chunking and reassembly of §36.4 held for a stream
+whose messages are 4-byte aligned and never 16.
+
+**What this is not, stated because the difference is the whole point of the
+project.** Both halves are Linux processes on one machine, so the ring is
+shared memory between two processes rather than across a hypervisor. The ring
+code does not know the difference — `SharedRegion` is a mapping either way, and
+that is exactly why this is worth running — but a guest window is not yet
+proven, and §36.8 tracks what separates them.
+
+**And the socket that remains, precisely.** smithay's `insert_client` takes a
+`wc_transport::Stream`, a concrete socket type that a ring cannot become (and
+`wepoll` needs a real socket handle, so even an enum would not do). So each
+accepted ring is bridged to smithay through a `Stream::pair()` inside the
+compositor. That socketpair is between two threads of one process **inside the
+guest**; what crosses the VM boundary is the ring and only the ring. The
+remaining hop is a memcpy through a loopback buffer where there used to be a
+WiFi round trip. Removing it means teaching the vendored `wayland-backend` to
+take a `Read + Write` client rather than a socket, which is a change to vendored
+code and a `wepoll` problem, and is not worth doing before a client has driven a
+*guest* window through a ring.
