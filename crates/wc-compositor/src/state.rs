@@ -441,7 +441,7 @@ impl State {
         let mut seat_state = SeatState::new();
         // `SeatState` keeps every seat it makes and `Seat` is an `Arc` handle
         // rather than the seat itself, so this local used to be dropped here.
-        // STAGE 13 keeps it: `set_data_device_focus` and
+        // The clipboard work keeps it: `set_data_device_focus` and
         // `set_data_device_selection` both take one and are called from the UI
         // event pump, where there is no seat in scope.
         let mut seat: Seat<State> = seat_state.new_wl_seat(dh, "seat0");
@@ -535,7 +535,7 @@ impl State {
                 1,
                 (),
             );
-        // STAGE 13. The clipboard's side door, for the one thing
+        // §28. The clipboard's side door, for the one thing
         // `wl_data_device` cannot express across this boundary: the bytes
         // themselves. See `protocols/wc-clipboard-v1.xml` and `crate::clipboard`.
         let clipboard_manager = dh
@@ -939,7 +939,7 @@ impl State {
             let Some(surface) = self.surface_of(id) else { return };
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
-            // **The clipboard follows the keyboard, and until stage 13 nothing
+            // **The clipboard follows the keyboard, and until §28 nothing
             // said so.** `wl_data_device`'s selection is offered to the client
             // with *data device focus*, which smithay keeps separately and
             // which nothing here had ever set — so a compositor-provided
@@ -2597,7 +2597,7 @@ impl Dispatch<WcClipboardManagerV1, ClipboardState> for State {
                     mime: mime_type,
                 });
             }
-            // Drag and drop, from a Wayland client outward. STAGE 13 stages the
+            // Drag and drop, from a Wayland client outward. §28 stages the
             // payload through exactly the same `chunk`/`data` path a publish
             // uses (see the XML) and hands it to the platform; a platform with
             // no OLE drag source answers `none` at once.
@@ -2638,7 +2638,7 @@ impl OutputHandler for State {}
 
 /// The clipboard, from `wl_data_device`'s side.
 ///
-/// # What stage 13 changed, and what it deliberately did not
+/// # What §28 changed, and what it deliberately did not
 ///
 /// This used to be smithay's defaults with a paragraph saying a Windows
 /// clipboard could not be built on them, because `send_selection` hands the
@@ -2696,14 +2696,14 @@ impl DataDeviceHandler for State {
 // smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
 // is not started here.
 //
-// STAGE 13 left this alone on purpose. Drag and drop is the same interface
+// §28 left this alone on purpose. Drag and drop is the same interface
 // family as the clipboard and it is **not implemented**, which is a decision
 // and not an oversight: a half-built DnD is a drag that starts, offers a
 // format, and then hangs on the drop, and that failure — a client waiting
 // forever on a transfer nobody will finish — is precisely what this stage
 // exists to remove. wc-proxy answers `wl_data_device.start_drag` with an
 // immediate `wl_data_source.cancelled`, so a client that tries gets a drag that
-// does not begin instead of one that does not end. docs/design.md §22.7.
+// does not begin instead of one that does not end. docs/waycompose-design.md §28.8.
 impl ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 

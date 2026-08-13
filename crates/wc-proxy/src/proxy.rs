@@ -247,7 +247,16 @@ pub fn pump(
 
         // --- client -> compositor -------------------------------------------
         if pollfds[0].revents & libc::POLLIN != 0 {
-            match recv_with_fds(client.as_raw_fd(), &mut from_client, &mut fds)? {
+            let read = match recv_with_fds(client.as_raw_fd(), &mut from_client, &mut fds) {
+                Ok(n) => n,
+                // The same ending seen from the reading side. See the note on
+                // the write.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    return Ok("the client closed the connection abruptly");
+                }
+                Err(e) => return Err(e),
+            };
+            match read {
                 0 => return Ok("the client closed the connection"),
                 _ => last_traffic = std::time::Instant::now(),
             }
@@ -381,7 +390,17 @@ pub fn pump(
                     to_client_fds.clear();
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                // **`ConnectionReset` is an ordinary ending, not a failure**,
+                // and the clipboard is where that became worth saying. A client that
+                // calls `exit()` with data still queued for it — which
+                // `wl-paste` does the moment it has the bytes, and which is
+                // entirely legal — resets the socket rather than closing it,
+                // and reporting that as `client N failed:` makes a successful
+                // paste look like the connection error this stage removed.
+                Err(e)
+                    if e.kind() == io::ErrorKind::BrokenPipe
+                        || e.kind() == io::ErrorKind::ConnectionReset =>
+                {
                     return Ok("the client stopped reading");
                 }
                 Err(e) => return Err(e),

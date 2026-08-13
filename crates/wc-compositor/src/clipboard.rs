@@ -386,7 +386,7 @@ pub const MAX_MIMES: usize = 16;
 /// message that does not fit cannot be sent or read at all. 3072 leaves room
 /// for the header, the token, the length word and the padding several times
 /// over. The same number and the same reason as `wc-proxy`'s icon chunk
-/// (docs/design.md §16.5); it is a fact about the far end rather than a tuning
+/// (docs/waycompose-design.md §16.5); it is a fact about the far end rather than a tuning
 /// choice, which is why it is written down twice rather than shared.
 pub const CHUNK: usize = 3072;
 

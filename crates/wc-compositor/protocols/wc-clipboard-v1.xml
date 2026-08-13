@@ -9,7 +9,7 @@
     wl_data_offer.receive hands the compositor a **file descriptor** and asks it
     to write the selection into it. wl_data_source.send does the mirror image.
     Both are unimplementable across this project's boundary, and not because
-    they are hard: docs/design.md §2.1 forbids a descriptor crossing at all, and
+    they are hard: docs/waycompose-design.md §2.1 forbids a descriptor crossing at all, and
     a pipe is the one kind of shared object that cannot be replaced by a name —
     a name can be opened by the far side, a pipe's *other end* cannot be
     conjured from one.

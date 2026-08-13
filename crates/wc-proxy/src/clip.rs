@@ -11,7 +11,7 @@
 //! is *which way the data flows through the descriptor*. A keymap is data
 //! flowing **compositor → client**, so the proxy can create a `memfd` on this
 //! side, copy the bytes the compositor named into it, and hand the client a
-//! descriptor it made itself (docs/design.md §14.7). A clipboard transfer is a
+//! descriptor it made itself (docs/waycompose-design.md §14.7). A clipboard transfer is a
 //! **pipe**: the client writes and somebody on the other side of a hypervisor
 //! reads, or the reverse. A name can be opened by the far side; a pipe's other
 //! end cannot be conjured from a name, and there is nothing to copy at the

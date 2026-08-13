@@ -977,7 +977,7 @@ fn every_protocol_stage_21_added_survives_its_first_request() {
 // The clipboard
 // ---------------------------------------------------------------------------
 //
-// These are the tests for the defect stage 13 exists to remove and for the
+// These are the tests for the defect §28 exists to remove and for the
 // feature that replaces it, and neither needs a compositor: the whole point of
 // the design is that the transfer is **terminated in this process**, so both
 // ends of every pipe in these tests are real and local, exactly as they are in
@@ -1050,7 +1050,7 @@ fn client_messages(bytes: &[u8]) -> Vec<(u32, u16, Vec<u8>)> {
 
 /// **The defect, gone.**
 ///
-/// Before stage 13 this exact message returned `Error::UnsupportedFd`, which
+/// Before the clipboard work this exact message returned `Error::UnsupportedFd`, which
 /// `proxy.rs` turns into a failed drain, which closes the connection. A client
 /// that pasted did not fail to paste — it died. The assertion is therefore on
 /// `is_ok` first and on the feature second.
@@ -1171,22 +1171,30 @@ fn a_copy_pulls_the_clients_bytes_out_through_a_pipe_this_side_made() {
     }
     h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
 
-    // Nothing of the family reached the compositor. This is the property that
-    // makes the whole design work: with no source upstream, the compositor can
-    // never be asked to write into a descriptor.
+    // **`set_selection` did not reach the compositor, and nothing else in the
+    // family was held back.** That pair is the whole design: the object graph
+    // upstream stays identical to the client's, so no id sequence is broken,
+    // and the compositor still never holds a source — which is what makes
+    // `wl_data_source.send`, the event that cannot cross, unreachable.
     let upstream = h.upstream_messages();
     let spec = Spec::builtin().unwrap();
+    let mut forwarded = Vec::new();
     for (object, opcode, _) in &upstream {
         if let Some(iface) = h.session.objects.interface(*object)
             && iface.starts_with("wl_data_")
         {
             let name = spec.request(iface, *opcode).map(|m| m.name.clone()).unwrap_or_default();
-            assert_eq!(
-                name, "get_data_device",
-                "{iface}.{name} reached the compositor and should not have"
-            );
+            assert_ne!(name, "set_selection", "set_selection reached the compositor");
+            assert_ne!(name, "receive", "receive reached the compositor");
+            forwarded.push(name);
         }
     }
+    assert_eq!(forwarded.iter().filter(|n| *n == "create_data_source").count(), 1);
+    assert_eq!(
+        forwarded.iter().filter(|n| *n == "offer").count(),
+        6,
+        "every offer is forwarded, so the compositor's object graph matches the client's"
+    );
 
     // Two pipes went to the client: one text flavour and one HTML, which is
     // `WANTED_TEXT` doing its job — five names for one string is one pipe.
@@ -1272,21 +1280,54 @@ fn a_selection_of_formats_we_cannot_carry_does_not_wipe_the_clipboard() {
     assert!(pulled.payloads.is_empty());
 }
 
-/// Destroying a source retires its id toward the client, because the compositor
-/// never knew the id and so will never send `wl_display.delete_id` for it.
+/// **A swallowed `new_id` breaks the client's id sequence**, so none is
+/// swallowed.
+///
+/// This is a regression test for a design that was tried and measured wrong.
+/// `wayland-backend`'s server-side object map accepts a new id only when it is
+/// the next free one (`rs/map.rs`), so a proxy that keeps a `create_data_source`
+/// to itself makes the client's *next* request fail — `wl-copy` died with
+/// `wl_display#1: error 0: Invalid new_id: 10.` on the message after the one
+/// that was held back. The assertion is therefore on the shape of the upstream
+/// stream: every id the client allocated is allocated upstream too, in order,
+/// with no gaps.
 #[test]
-fn a_destroyed_source_gets_its_delete_id_from_the_proxy() {
+fn every_id_the_client_allocates_reaches_the_compositor_in_sequence() {
     let (mut h, manager, _device) = clipboard_harness();
-    let source = h.id();
-    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
-    let _ = h.session.take_client_messages();
-    h.send_words(source, rq("wl_data_source", "destroy"), &[]);
-    let (bytes, _) = h.session.take_client_messages();
+    let spec = Spec::builtin().unwrap();
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        let source = h.id();
+        expected.push(source);
+        h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+        let body = string_body("text/plain");
+        h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+        h.send_words(source, rq("wl_data_source", "destroy"), &[]);
+    }
+    let create = rq("wl_data_device_manager", "create_data_source");
+    let got: Vec<u32> = h
+        .upstream_messages()
+        .into_iter()
+        .filter(|(o, op, _)| *o == manager && *op == create)
+        .map(|(_, _, b)| u32::from_ne_bytes(b[0..4].try_into().unwrap()))
+        .collect();
+    assert_eq!(got, expected, "an id the client allocated did not reach the compositor");
+
+    // And the destructor is forwarded too, so `wl_display.delete_id` comes from
+    // the compositor as it does for every other object rather than being
+    // manufactured here and racing it.
+    let destroy = rq("wl_data_source", "destroy");
     assert_eq!(
-        client_messages(&bytes),
-        vec![(1u32, op::DISPLAY_DELETE_ID, source.to_ne_bytes().to_vec())]
+        h.upstream_messages()
+            .into_iter()
+            .filter(|(o, op, _)| expected.contains(o) && *op == destroy)
+            .count(),
+        3
     );
-    assert_eq!(h.session.objects.interface(source), None);
+    // Nothing was sent to the client on its own account by any of that.
+    let (bytes, fds) = h.session.take_client_messages();
+    assert!(bytes.is_empty() && fds.is_empty());
+    assert!(spec.request("wl_data_source", destroy).unwrap().destructor);
 }
 
 /// A drag is the same pull with a different destination, and it **always

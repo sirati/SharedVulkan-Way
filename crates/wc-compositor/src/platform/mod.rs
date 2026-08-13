@@ -288,7 +288,7 @@ pub enum ToUi {
     /// `win32::activate_window` for exactly when it is allowed to succeed and
     /// what happens when it is not.
     Activate { id: WindowId },
-    // --- the clipboard, stage 13 -------------------------------------------
+    // --- the clipboard, §28 -------------------------------------------
     //
     // Bytes, in both directions, and **never a descriptor**. That is the whole
     // shape of the clipboard feature and it is visible here: `wl_data_offer.
@@ -447,7 +447,7 @@ pub enum FromUi {
     /// of `crate::input::LAYOUTS`.
     Layout { name: &'static str },
 
-    // --- the clipboard, stage 13 -------------------------------------------
+    // --- the clipboard, §28 -------------------------------------------
     /// The system clipboard changed, and now holds these mime types.
     ///
     /// On Win32 this is `WM_CLIPBOARDUPDATE`, which arrives for **every**

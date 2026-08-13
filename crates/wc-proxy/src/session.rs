@@ -272,11 +272,11 @@ pub struct Stats {
     pub messages_client: u64,
     pub messages_server: u64,
 
-    // --- the clipboard, stage 13 -------------------------------------------
+    // --- the clipboard, §28 -------------------------------------------
     //
     // Counted separately from `fds_received` / `fds_materialised` even though
     // both of those move too, because §14.7's line is an assertion about the
-    // *boundary* and these are an assertion about a feature. See §22.4 for
+    // *boundary* and these are an assertion about a feature. See §28.4 for
     // what the fd line reads now and why it is still the same claim.
     /// Selections pulled out of a client and shipped to the system clipboard.
     pub selections_copied: u64,
@@ -525,13 +525,24 @@ impl DataOps {
 /// exist yet at the moment the descriptor changes hands — which is the property
 /// that separates them from `wl_keyboard.keymap` (§14.7).
 ///
-/// So the proxy answers them itself. It never forwards `create_data_source`,
-/// so the compositor has no source of ours to send `send` on; it never forwards
-/// `receive`, so the compositor is never asked to write into a descriptor. What
-/// it *does* forward, unchanged, is every announcement: `wl_data_device.
-/// data_offer`, `wl_data_offer.offer` and `wl_data_device.selection` are plain
-/// bytes and the compositor is much better placed to decide who may see the
-/// selection than a proxy is.
+/// So the proxy answers those two itself, and **exactly those two plus the two
+/// requests that would cause them**:
+///
+/// * `wl_data_offer.receive` is answered here, so the compositor is never asked
+///   to write into a descriptor.
+/// * `wl_data_device.set_selection` and `.start_drag` are not forwarded, so the
+///   compositor never holds a client source and can never be asked to send one
+///   — which is what makes `wl_data_source.send` unreachable rather than merely
+///   unimplemented.
+///
+/// Everything else in the family is forwarded unchanged, including the requests
+/// that *create* objects. That is not a softening of the rule, it is what makes
+/// it survivable: a client's ids are a sequence and a swallowed `new_id` breaks
+/// the next one (see `create_data_source` in [`Session::clip_request`], where
+/// the measurement is). And every announcement — `wl_data_device.data_offer`,
+/// `wl_data_offer.offer`, `wl_data_device.selection` — is plain bytes, with the
+/// compositor much better placed than a proxy to decide who may see the
+/// selection.
 #[derive(Default)]
 struct Clip {
     /// Client-created `wl_data_source`s and the mime types each has offered.
@@ -877,15 +888,35 @@ impl Session {
         fds: &mut std::collections::VecDeque<OwnedFd>,
     ) -> bool {
         match (interface, name) {
-            // The source is created **here and nowhere else**. The compositor
-            // never learns the id, which is exactly what makes it impossible
-            // for it to send `wl_data_source.send` — the event that would carry
-            // a descriptor the wrong way across the boundary.
+            // **Watched and forwarded, not swallowed**, and the difference was
+            // measured rather than reasoned about.
+            //
+            // The first design swallowed `create_data_source`, on the argument
+            // that a compositor which never learns the source's id can never
+            // send `wl_data_source.send` on it. That is true and it is fatal:
+            // a client's object ids are a *sequence*, and `wayland-backend`'s
+            // server-side map accepts a new id only when it is the next free
+            // one (`rs/map.rs`, the same check `iconlink`'s header quotes).
+            // Skipping id 10 means the client's next request, for 11, is
+            // refused — and the failure is not subtle. `wl-copy` died with
+            //
+            //     wl_display#1: error 0: Invalid new_id: 10.
+            //
+            // on the request *after* the one that was swallowed.
+            //
+            // So the object is created upstream and simply never used: the
+            // compositor holds a `wl_data_source` with mime types on it that is
+            // never made a selection and never starts a drag, because
+            // `set_selection` and `start_drag` are the requests that do not get
+            // forwarded. smithay sends `send` only for a source it has been
+            // given as the selection or as a drag's, so the event that cannot
+            // cross is unreachable by construction — which is the same property
+            // the first design wanted, obtained one message later.
             ("wl_data_device_manager", "create_data_source") => {
                 if let Some(id) = wire::word_at(body, &spans[0]) {
                     self.clip.sources.insert(id, Vec::new());
                 }
-                true
+                false
             }
             ("wl_data_source", "offer") => {
                 if let Some(mime) = wire::string_at(body, &spans[0])
@@ -894,13 +925,13 @@ impl Session {
                 {
                     list.push(mime);
                 }
-                true
+                false
             }
             ("wl_data_source", "set_actions") => {
                 if let Some(actions) = wire::word_at(body, &spans[0]) {
                     self.clip.drag_actions = actions;
                 }
-                true
+                false
             }
             ("wl_data_source", "destroy") => {
                 self.clip.sources.remove(&object);
@@ -910,13 +941,11 @@ impl Session {
                 if self.clip.dragging == Some(object) {
                     self.clip.dragging = None;
                 }
-                // The id is the client's and the compositor never knew it, so
-                // the `wl_display.delete_id` that lets libwayland reuse the
-                // number has to come from here. Without it the client's id
-                // allocator leaks one number per copy — harmless for an hour
-                // and not for a day.
-                self.forget_client_object(object);
-                true
+                // Forwarded like the rest, so the `wl_display.delete_id` that
+                // retires the number comes from the compositor as it does for
+                // every other object. Synthesising one here would race the real
+                // one and retire the id twice.
+                false
             }
             ("wl_data_device", "set_selection") => {
                 let source = wire::word_at(body, &spans[0]).unwrap_or(0);
@@ -947,14 +976,6 @@ impl Session {
             }
             _ => false,
         }
-    }
-
-    /// Retire an id the compositor never knew about.
-    fn forget_client_object(&mut self, id: u32) {
-        self.objects.forget(id);
-        self.clip
-            .to_client
-            .extend_from_slice(&wire::message(1, op::DISPLAY_DELETE_ID, &id.to_ne_bytes()));
     }
 
     /// One event on a client-owned `wl_data_source`, sent as though this were

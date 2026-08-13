@@ -66,7 +66,7 @@
 //! library on the Windows target rather than to a second implementation of
 //! something with no reason to exist there.
 
-/// STAGE 13. The clipboard's byte path: a third connection to the compositor,
+/// THE CLIPBOARD. The byte path's byte path: a third connection to the compositor,
 /// because `wl_data_offer.receive` hands over a pipe and no descriptor may
 /// cross the boundary. Unix-only for the same reason `iconlink` is — it is a
 /// Wayland client of the far end and only the host side has one.

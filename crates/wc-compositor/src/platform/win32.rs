@@ -108,7 +108,7 @@ use windows_sys::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
 use windows_sys::Win32::Foundation::{GlobalFree, POINT, SIZE};
-// ADDED FOR STAGE 13. The clipboard lives in `DataExchange` rather than with
+// ADDED FOR THE CLIPBOARD. The clipboard lives in `DataExchange` rather than with
 // the window messages, and its payloads are moveable global handles rather than
 // pointers, which is why `Memory` comes with it. See `set_clipboard`.
 use windows_sys::Win32::System::DataExchange::{

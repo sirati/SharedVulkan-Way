@@ -7528,3 +7528,402 @@ considered during the stage and deliberately not built:
    sketched; what it needs is somebody to say whether a periodic
    `GetLastInputInfo` on the guest is acceptable, which is a question about the
    deployment and not about the code.
+
+## 28. The clipboard, and the two `h`s that cannot cross
+
+### 28.1 Status in one paragraph
+
+**A client that pasted did not fail to paste — it died.** `wl_data_offer.receive`
+carries an `h`, `wc-proxy` had no transport for it, `session.rs` returned
+`Error::UnsupportedFd`, and `proxy.rs` turns that into a failed drain, which
+closes the connection. `wl_data_device_manager` v3 is advertised and **every GTK
+client binds it before it will create a seat at all** (§15.4), so this was live
+on every run, waiting for a user to press Ctrl-V. That is gone, and the feature
+is there instead: copy in a Linux client and paste in a Windows application,
+copy in a Windows application and paste in a Linux client, text and HTML, both
+demonstrated end to end by programs that are not ours
+(`scripts/wc-clip.sh`, 11 passed / 0 failed). Drag and drop shares the same
+mechanism by construction and is **not finished**: the Wayland half is built and
+answers every path, the two OLE halves are not written, and §28.8 says exactly
+what is missing. `zwp_primary_selection_v1` is out of scope and untouched.
+
+### 28.2 Why these two `h`s are different from the keymap's
+
+§14.7 established that a descriptor may be *manufactured* on the side that needs
+it, out of a name that crossed, and that this is not the forbidden direction.
+`wl_keyboard.keymap` works exactly that way: the compositor names some bytes,
+`wc-proxy` opens or slices them, copies them into a fresh `memfd`, and hands the
+client a descriptor it made itself.
+
+**That trick does not generalise, and the reason is not size.** It is direction
+in time. A keymap is *data that already exists*, flowing compositor to client; a
+name is enough because the far side can go and fetch the bytes whenever it
+likes. A clipboard transfer is a **pipe**, and its two properties are exactly the
+two a name cannot supply:
+
+* The bytes do not exist yet at the moment the descriptor changes hands. There
+  is nothing to copy.
+* The *other end* is the thing being shared. A name can be opened by anyone who
+  can reach the namespace; a pipe's other end cannot be conjured from a name at
+  all, on any operating system, which is why `SCM_RIGHTS` exists.
+
+So there is no in-band `Descriptor` variant that could carry one, and inventing
+`Descriptor::Pipe` would be inventing `Descriptor::NtHandle` — the variant §14.7
+names as the shape of a violation — with a friendlier name.
+
+**`wl_data_offer.receive` as literally specified is therefore impossible here.
+The feature is not.** The specification says "the compositor writes into this
+descriptor". The requirement says "the user copies in one place and pastes in
+another". The second does not mention descriptors, and the whole of this stage
+is the observation that the first can be answered somewhere other than the
+compositor.
+
+### 28.3 The shape: terminate the transfer where the pipe is real
+
+`wc-proxy` runs on the client's own machine. The client's pipe is an ordinary
+Linux pipe between two ordinary Linux processes, and §9's rule has never had
+anything to say about it — `proxy.rs`'s header already argues that the
+`SCM_RIGHTS` on that socket is not a boundary crossing, because the descriptor
+is created and consumed on one machine.
+
+So the proxy answers the two `h`-carrying messages itself, and **exactly the two
+requests that would otherwise cause them**:
+
+| message | what happens |
+|---|---|
+| `wl_data_offer.receive` | not forwarded. The client's write-end is kept here, the payload is fetched from the compositor as bytes, written in, and the descriptor closed. |
+| `wl_data_device.set_selection` | not forwarded. The proxy pulls the bytes out of the client through pipes it makes itself and ships them across. |
+| `wl_data_device.start_drag` | not forwarded, same pull, different destination. |
+| everything else in the family | **forwarded unchanged** |
+
+The last row is the one that took a measurement. The first design swallowed
+`wl_data_device_manager.create_data_source` too, on the reasonable argument that
+a compositor which never learns a source's id can never be asked to send on it.
+It is fatal. A client's object ids are a *sequence*, and `wayland-backend`'s
+server-side map accepts a new id only when it is the next free one (`rs/map.rs`,
+the check `iconlink.rs`'s header already quotes for the other direction).
+Skipping id 10 means the client's next request, for 11, is refused, and the
+failure surfaces one message later and on the wrong object:
+
+```text
+wl_display#1: error 0: Invalid new_id: 10.
+wl_display_dispatch: Invalid argument
+```
+
+`wl-copy` died there and nothing in the log mentioned the clipboard. Forwarding
+the creation and withholding only `set_selection` obtains the same property one
+message later: the compositor holds a perfectly ordinary `wl_data_source` that
+is never made a selection and never starts a drag, and smithay sends
+`wl_data_source.send` only for a source it has been *given*. The event that
+cannot cross is unreachable by construction rather than by omission, and the
+object graph upstream stays byte-identical to the client's — which is §9.3's
+property, and the reason this proxy can forward messages it does not understand.
+
+The announcements are the other half of the trade and they need no help at all.
+`wl_data_device.data_offer`, `wl_data_offer.offer` and
+`wl_data_device.selection` are plain bytes; they are forwarded verbatim, and the
+compositor keeps deciding *who* may see the selection. A proxy is not better
+placed to make that decision than the thing that owns the focus.
+
+**One call was missing and nothing had noticed.** smithay keeps *data device
+focus* separately from keyboard focus, and `set_data_device_focus` had never
+been called, so a compositor-provided selection would have been offered to
+nobody. It is one line in `set_keyboard_focus`, its absence is invisible until
+something actually has a selection to offer, and it would have looked exactly
+like a clipboard that did not work.
+
+### 28.4 `1 fds in, 2 out` on a copy and `2 fds in, 1 out` on a paste
+
+§14.7 is the standard: a count a reader cannot judge from the document is not an
+assertion, it is a number. The line moved, so here is what it reads now, from
+`scripts/wc-clip.sh`'s own run:
+
+```text
+client 1 ... 1 fds in, 2 out; ... clipboard: 1 copied (38 bytes), 0 pasted
+client 3 ... 2 fds in, 1 out; ... clipboard: 0 copied, 1 pasted (54 bytes)
+```
+
+**A copy: one in, two out.** In is the client's `wl_shm` pool (`wl-copy` opens a
+1x1 surface to obtain focus). Out is the keymap `memfd` §14.7 already accounts
+for, plus **one pipe write-end per mime type pulled** — manufactured here by
+`pipe2`, handed to the local client in a `wl_data_source.send` that this process
+wrote, and not held afterwards. That last part is load-bearing rather than
+tidiness: the proxy keeps no copy of the write end, so the EOF it waits for
+means "the client has finished writing" instead of "nobody has written yet".
+
+**A paste: two in, one out.** The second `in` is the client's own pipe,
+delivered by `SCM_RIGHTS` on `wl_data_offer.receive` and **consumed** here.
+
+Both directions are between `wc-proxy` and a Wayland client on the same host,
+over the `AF_UNIX` socket `wc-proxy` itself binds. The hop that crosses is the
+other one, and §14.7's construction argument is unchanged and unweakened:
+`proxy.rs` writes that socket with `write_some(upstream.as_raw_fd(), ...)` — a
+plain `write`, no `sendmsg`, **no fd argument to pass one through**. The count
+on the hop that crosses is not merely zero, it is unrepresentable.
+
+The three violated states §14.7 enumerates are each still false, and the second
+one is worth re-checking because this work is the first to receive a descriptor
+that is not a pool:
+
+* any descriptor on the upstream socket — no code can produce one;
+* a descriptor `wc-proxy` *received* being forwarded rather than consumed — the
+  `receive` fd is written into and closed here, and the count of descriptors
+  passed on unchanged is still zero;
+* the descriptor handed to the client having originated in the guest — a pipe
+  made by `pipe2` in this process cannot have.
+
+`wc_clipboard_v1` adds a fourth thing worth asserting and it is asserted rather
+than argued: `no_message_in_the_clipboard_protocol_carries_an_h` walks the XML
+and fails if any request or event in it grows an `h`. The file is shared with
+the compositor by `include_str!`, so somebody adding one there would compile
+perfectly and be unrepresentable on the wire that crosses; the test is what
+turns that into a failure at `cargo test`.
+
+There is one more line that must stay at zero: `fds_dropped`. See §28.6.
+
+### 28.5 What crosses, and what Windows is told
+
+`wc_clipboard_v1` carries `wl_array` chunks at **3072 bytes**, which is §16.5's
+measurement of `wayland-backend`'s buffers (`DEFAULT_MAX_BUFFER_SIZE` on the
+receiving side, `MAX_BYTES_OUT` on the sending one) and not a preference. A
+selection is `chunk* data` per mime type and then `publish`; a paste is
+`fetch(token, source, mime)` answered with `chunk* done` or `fail`.
+
+**The pull is eager, and that is forced rather than chosen.** Windows takes the
+data at `SetClipboardData` time, and OLE asks a drag source for its bytes with a
+synchronous `IDataObject::GetData` from inside a modal loop. Delayed rendering —
+`SetClipboardData(fmt, NULL)` and answer `WM_RENDERFORMAT` — is the Win32 way to
+avoid the copy, and it would put a hypervisor crossing inside a synchronous
+message handler, waiting on a client that may be busy. So a copy costs one read
+of the selection at the moment of copying. Every clipboard bridge does this.
+
+The proxy pulls **one text flavour plus HTML**, not everything offered. GTK
+offers the same string under five names, and pulling all five would open five
+pipes and wake the client five times for the compositor to pick one. The
+compositor picks by that same order anyway, so the choice is made once, where
+the pipes are.
+
+Three system formats, and the third is asymmetric on purpose:
+
+* **`CF_UNICODETEXT`**, both ways, UTF-16 with CRLF. The line endings are the
+  part that is silently wrong if it is skipped: a bare LF renders as one long
+  line in Notepad, which looks exactly like a client that sent no newlines. The
+  harness checks for the `\r` in the bytes a *separate Windows process* read
+  back, not in ours.
+* **A registered `"HTML Format"`**, both ways, with the byte-offset header
+  Windows requires. The header is not decoration — a reader is told where the
+  fragment starts by those offsets and shows **nothing** without them — so
+  `html_wrap` computes them and a unit test asserts that
+  `text[StartFragment..EndFragment]` really is the fragment. Its id is minted by
+  `RegisterClipboardFormatW` at runtime, which is why `crate::clipboard` names
+  formats with an enum and only `win32.rs` knows a number.
+* **`CF_HDROP` on the reading side only.** A `CF_HDROP` names files on the
+  Windows machine; converting it to `text/uri-list` is useful and its limit is
+  stated rather than discovered — the URIs name the guest's filesystem and a
+  Linux client that opens one will fail unless that path is shared by other
+  means. The reverse is refused: writing Linux paths into a `CF_HDROP` produces
+  a clipboard Explorer will cheerfully try to paste and always fail to, which is
+  worse than one that does not claim to hold files.
+
+**The echo is kept deliberately.** `SetClipboardData` posts a
+`WM_CLIPBOARDUPDATE` straight back, so a client that copies is immediately
+offered its own bytes as a selection. The obvious tidy-up is to remember
+`GetClipboardSequenceNumber` and swallow it. That breaks copy-and-paste inside
+one client: the proxy does not forward `set_selection`, so the compositor knows
+nothing about that client having a selection, and the echo is the *only* thing
+that gives it a `wl_data_offer` for what it just copied. Ctrl-C then Ctrl-V in
+the same window is the first thing anybody tries. It is also what makes
+client-to-client copying work transitively through Windows' own clipboard, which
+is what a user expects anyway.
+
+### 28.6 The paths that are not implemented still cannot kill a client
+
+The brief for this stage was not only "make the clipboard work"; it was "make
+the connection-killing behaviour impossible, including in the paths you do not
+implement". Four places answer that, and each is an *answer* rather than a
+silence:
+
+1. **An `h` with no transport drops the message and consumes its descriptors.**
+   `Error::UnsupportedFd` is gone from `session.rs`. The fd queue stays in step,
+   so nothing after it desynchronises — the §2.4 property the old error was
+   protecting — and the client waits for an answer instead of losing its
+   connection. It is loud in the log and counted in `fds_dropped`, which is zero
+   for every protocol in the tree and is the number to watch when somebody adds
+   an XML with an `h` in it.
+2. **A refused fetch closes the pipe.** `Answer::Failed` becomes an empty
+   payload and the descriptor is dropped, which is an EOF. A client blocked in
+   `read` on a descriptor nobody will write to or close is *hung*, and hung is
+   the one outcome worse than the error this stage removed.
+3. **A client that never closes its write end is published anyway**, after a
+   two-second deadline, with whatever arrived and a counter (`copy_timeouts`).
+   Without it, a client that offers a mime type it cannot actually produce loses
+   the selection permanently and says nothing.
+4. **Every drag is answered**, on every path, including "there is no OLE drag
+   source on this platform" and "the clipboard feed died mid-gesture". See
+   §28.8.
+5. `SelectionHandler::send_selection` is implemented in the compositor even
+   though the proxy makes it unreachable, because "unreachable" is a claim about
+   the proxy and the trait is reachable by anything that connects directly. It
+   closes the descriptor and says why: an empty paste, not a protocol error.
+
+One more, from outside: `ConnectionReset` on the client socket is now an
+ordinary ending rather than a failure. `wl-paste` calls `exit()` the moment it
+has its bytes, which resets the socket, and reporting that as `client N failed:`
+made a *successful* paste look exactly like the defect this stage removed.
+
+### 28.7 The evidence, and why it is one leg
+
+Every other stage splits its evidence in two (§8.5): a Linux leg with a real
+third-party client and no Windows, and a Wine leg with a real window. **The
+clipboard cannot be split that way, and the reason is structural.** The in-band
+`h` dialect is `cfg(windows)` in the vendored `wayland-backend`
+(`src/rs/wire.rs`), so the Linux build of `wc-compositor` speaks libwayland's
+ordinary out-of-band descriptors and `wc-proxy` cannot talk to it at all. A
+Linux leg would have to be a client talking straight to the compositor with no
+proxy in it — and the proxy is the half that matters here.
+
+So `scripts/wc-clip.sh` runs the whole chain under Wine, and **three of the four
+programs in it are not the code under test**:
+
+| program | whose | what it proves |
+|---|---|---|
+| `wl-copy` / `wl-paste` (wl-clipboard 2.3) | somebody else's | drives `create_data_source`, `offer`, `set_selection`, and `wl_data_offer.receive` — the exact request that used to kill the connection |
+| `wc-proxy` | ours | the thing under test |
+| `wc-compositor.exe` | ours | the thing under test |
+| `probe-clip.exe` | ours, but a **separate process** | calls `OpenClipboard`/`GetClipboardData` the way Notepad does, and shares no code with the compositor |
+
+`wl-paste` is a better witness than it looks. A compositor only offers the
+selection to the client with data-device focus, so `wl-paste` opens an
+`xdg_toplevel` of its own to acquire focus — which means the test also drives a
+real window, a real `wl_shm` pool and a real `WM_SETFOCUS` through the whole
+stack before it pastes anything.
+
+**11 passed, 0 failed**, including:
+
+* a Windows application pasting what a Linux client copied, byte for byte;
+* the CRLF conversion, checked in the bytes that other process read back;
+* a Linux client pasting what a Windows application copied;
+* `text/html` surviving with the `CF_HTML` header stripped;
+* *no client connection failed* — asserted against the proxy's own log, which is
+  the observable form of the defect being gone.
+
+The compositor's log from that run is in `docs/clipboard/compositor.log`
+and the proxy's in `docs/clipboard/proxy.log`.
+
+**Wine is not Windows and has been wrong four times (§13.6.)** This leg
+establishes that the code paths are self-consistent against a real `user32`
+clipboard with a real second process reading it. §28.9 lists what needs a guest
+re-check.
+
+### 28.8 Drag and drop: one mechanism, and the half that is missing
+
+The requirement is both directions, and it is not met. What is built is the part
+that had to be built now, because building it later would have meant two
+mechanisms:
+
+**The bytes are shared, by construction.** `start_drag` on `wc_clipboard_v1`
+consumes the *same staging area* `publish` does, filled by the same `chunk` and
+`data` requests, from the same eager pull through the same pipes in
+`Session::begin_pull`. A drag and a copy differ in one boolean and in what the
+far side does with the result. `fetch` takes a `source` argument — clipboard or
+drag — because Windows keeps the two apart and asking the wrong one is how a
+paste picks up the last thing dragged.
+
+**Every path answers.** `wl_data_device.start_drag` is intercepted, the payload
+is pulled, and a `drag_finished` comes back — from the platform, from a feed
+that died mid-gesture, or from the proxy itself if there is no feed at all.
+`Session::drag_finished` turns it into `action` + `dnd_drop_performed` +
+`dnd_finished`, or into `cancelled`. **A `wl_data_source` is never left waiting**,
+which is the specific failure a half-built DnD produces and the one this stage
+exists not to ship.
+
+What is **not** built is the two Win32 halves, and `platform/drag.rs` is a file
+that says so and ends every drag with `none` rather than hanging it:
+
+1. **Wayland → Windows** needs `DoDragDrop` with a hand-written `IDataObject`
+   and `IDropSource`. The formats come out of the same `to_system` the clipboard
+   uses; the work is the COM vtables, which `windows-sys` does not generate.
+2. **Windows → Wayland** needs `RegisterDragDrop` and an `IDropTarget` per
+   window, `DragEnter`/`DragOver`/`Drop` turned into smithay's `start_dnd` with
+   synthesised pointer motion (during an OLE drag the window receives
+   `IDropTarget::DragOver`, **not** `WM_MOUSEMOVE`, so the existing pointer path
+   is not driven and must be fed), and the `IDataObject` read out eagerly at the
+   drop so `fetch(source=drag)` has something to answer from.
+
+Two things have to be measured before either is written, and neither is a
+detail:
+
+* **Does `DoDragDrop`'s modal loop starve the message pump?** §8.2's wakeup is a
+  `PostMessage` to a window rather than a `PostThreadMessage` precisely because
+  `DefWindowProc`'s modal resize loop discards thread messages, and OLE's loop
+  has to be asked the same question. There is a second, sharper version of it
+  here: `DoDragDrop` would be called from inside `drain`, which holds
+  `Ui::draining`, so every command that arrives during the drag would be
+  re-posted rather than handled and the compositor would stop painting for the
+  length of the gesture. Whatever the answer about messages, that flag has to be
+  released around the call.
+* **`IDropTarget::DragOver` must return a `DROPEFFECT` synchronously**, and the
+  Wayland client's `accept`/`set_actions` arrive asynchronously across a
+  hypervisor. The honest design answers from the last known accepted action and
+  is therefore one round trip stale. That is a decision to write down, not a bug
+  to discover.
+
+`CF_HDROP` is what makes dragging a file out of Firefox into Explorer work, and
+§28.5's asymmetry has to be revisited for it: the drag case is the one where
+writing Linux paths into a `CF_HDROP` is *still* wrong for the same reason, so
+dragging a file out will need the file's bytes, not its name — which is a
+`text/uri-list` that has to be dereferenced on the Linux side and offered to
+Windows as `CF_HDROP` over a temporary file the guest can reach. That is a real
+design question and it is not answered here.
+
+### 28.9 What is not proven
+
+1. **No guest run.** Everything in §28.7 is Wine. The specific things worth
+   re-checking on the guest, in order: that `AddClipboardFormatListener`
+   delivers `WM_CLIPBOARDUPDATE` to a message-only window on a real window
+   station (Wine's clipboard is backed by X selections and the guest's is not);
+   that `RegisterClipboardFormatW("HTML Format")` gets the same id a real
+   browser uses; and that `OpenClipboard` retries are enough when a real
+   application holds the clipboard, which under Wine and one Xvfb they were
+   never tested against.
+2. **Nothing large has crossed.** The biggest payload in the harness is 78
+   bytes. The chunking is exercised by unit tests and by the icon feed's
+   identical path, and `MAX_SELECTION_BYTES` is 4 MiB, but no run has copied a
+   web page. The number to watch is `copy_timeouts`.
+3. **`CF_HDROP` has never been read from a real clipboard.**
+   `hdrop_to_uri_list` is unit-tested against a `DROPFILES` block this project
+   built, which is a test of the parser and not of Explorer's output.
+4. **The paste race is real and unmeasured.** `fetch` reads the clipboard as it
+   is *now*, not as it was when the offer was made. X11 behaves the same way, it
+   is documented in the XML, and nobody has copied something between an offer
+   and a paste to see what happens.
+5. **Drag and drop, both directions** — §28.8.
+6. **`zwp_primary_selection_v1` is deliberately absent**, so middle-click paste
+   does nothing. That is the stated scope and not a gap.
+7. **Nothing has been copied out of Firefox.** The clients here are
+   `wl-copy` and `wl-paste`, which are real libwayland clients and are not a
+   browser: Firefox offers more mime types, offers `text/html` with a byte-order
+   mark, and copies megabytes at a time.
+
+### 28.10 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **181 tests**, 0 failures (157 on master; 24 new) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-clip.sh wine` (new) | **11 passed, 0 failed** |
+
+The 24 new tests are: 13 in `wc-compositor/src/clipboard.rs` (the conversions,
+which are silently wrong when they are wrong), 4 in `wc-proxy/src/clip.rs`
+(including the one that walks the XML for an `h`), and 7 in
+`wc-proxy/src/session/tests.rs` — the interception, driven end to end through
+real pipes, because the whole design is that both ends of every pipe are local
+and so a test needs no compositor at all.
+
+`crates/wc-proxy/src/spec.rs`'s two counting tests are **unchanged**, and that is
+deliberate: `wc-clipboard-v1.xml` is loaded into a *clone* of the spec by
+`clip.rs`, exactly as `wc-icon-v1.xml` is by `iconlink.rs`, so it never enters
+`Spec::builtin()`. Adding a protocol to the proxy's own vocabulary and adding one
+to a private side channel are different acts and only the first should move
+those numbers.

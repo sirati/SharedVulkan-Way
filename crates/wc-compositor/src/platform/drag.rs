@@ -16,7 +16,7 @@
 //! receives `dnd_finished`, or whose `wl_data_offer.receive` pipe is never
 //! closed, hangs, and a hung drag is worse than one that does not start.
 //!
-//! docs/design.md §22.8 records what the two halves cost and, in particular,
+//! docs/waycompose-design.md §28.8 records what the two halves cost and, in particular,
 //! the one thing that has to be measured before either is written: whether
 //! `DoDragDrop`'s modal loop starves this process's message pump. The
 //! precedent is §8.2 — the wakeup is a `PostMessage` to a window rather than a
@@ -34,7 +34,7 @@ pub(crate) fn run(_ui: &Rc<Ui>, payloads: &[(String, Vec<u8>)], actions: u32) ->
     println!(
         "wc-compositor: a client started a drag with {} mime type(s) and actions {actions:#x}; \
          this compositor is not an OLE drag source yet, so the drag ends now with no drop. \
-         The client is told so rather than being left waiting (docs/design.md §22.8).",
+         The client is told so rather than being left waiting (docs/waycompose-design.md §28.8).",
         payloads.len()
     );
     dnd_action::NONE

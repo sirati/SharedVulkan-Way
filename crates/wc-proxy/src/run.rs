@@ -69,7 +69,7 @@ struct Args {
     /// is how this proxy runs on the VM host, gets systemd's environment and
     /// not a login shell's.
     icon_dirs: Vec<std::path::PathBuf>,
-    /// STAGE 13. Carry the clipboard across on a third connection
+    /// THE CLIPBOARD. Carry the clipboard across on a third connection
     /// (`crate::clip`). Off, a client that copies or pastes gets nothing —
     /// which is what the compositor did before this stage, minus the part
     /// where the connection died.
@@ -487,7 +487,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            // STAGE 13. The clipboard's byte path, one per served connection
+            // THE CLIPBOARD. The byte path's byte path, one per served connection
             // and for the same reasons the icon feed is per connection: the
             // state is per client, a feed that fails takes only its own
             // client's clipboard with it, and a socket is cheap.
