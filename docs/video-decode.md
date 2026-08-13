@@ -388,15 +388,150 @@ that VA-API-on-Vulkan does not exist. Checked 2026-08-13:
 So the gap the phase-2 research named — "Firefox does not speak Vulkan Video" —
 is closed. A different one is open, and it is worse for this topology.
 
-**Firefox's Vulkan decoder ends in a Linux dma-buf, and there is no fallback.**
-`FFmpegVulkanVideoDecoder` has two output paths. The direct-export path creates
-the decode target with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and negotiates
-modifiers with the compositor. The default path copies into a Firefox-allocated
-NV12 image and calls `vkGetMemoryFdKHR` with
-`VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`; on failure it returns
-`NS_ERROR_DOM_MEDIA_FATAL_ERR("Failed to export NV12 FD")`. There is no
-`av_hwframe_transfer_data`, no host-visible staging path, no way to accept a
-frame that arrives as bytes.
+### 5a. What the decoder actually does with a frame — read, not inferred
+
+The first version of this section asserted "ends in a dma-buf, no fallback" from
+search results. That is not evidence, and the claim decides whether hardware
+decode is reachable at all, so it was checked against the source. Everything
+below is from **mozilla-firefox/firefox at `265f4b8f` (2026-08-07)**, the last
+revision to touch `FFmpegVulkanVideoDecoder.cpp`, plus **FFmpeg master's
+`libavutil/hwcontext_vulkan.c`**. The conclusion did not change. Five things
+about it did.
+
+**There are exactly two output paths, and the pref chooses between them at the
+first frame.** `FFmpegVideoDecoder.cpp`:
+
+```cpp
+if (hf->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && vkf &&
+    mVulkanDecoder.mGetImageDrmFormatModifierPropertiesEXT &&
+    VulkanDirectDecodeExportEnabled()) {
+  …
+  mVulkanDecodeUsesDrmModifier = r == VK_SUCCESS;
+  FFMPEG_LOG("[VULKAN] DRM modifier query: 0x{:x} -> {}", …,
+             mVulkanDecodeUsesDrmModifier ? "direct export" : "copy");
+} else {
+  FFMPEG_LOG("[VULKAN] Tiling: OPTIMAL -> copy");
+}
+bool directExport = mVulkanDecodeUsesDrmModifier;
+```
+
+`VulkanDirectDecodeExportEnabled()` is the conjunction of both prefs, so with
+`direct-export.enabled = false` — the default — `directExport` is always false
+and the **copy path is the only one that runs**. That much the coordinator's
+reading had right.
+
+**1. The copy path's destination is another exportable `VkImage`, never host
+memory.** `InitCopyRingBuffer` allocates a ring of 32 images
+(`kNumBuffers = 32`), and every one of them is built for export:
+
+```cpp
+extImgInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+…
+imgInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+imgInfo.usage  = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+…
+fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+res = mGetMemoryFdKHR(mDevice, &fdInfo, &mNv12BaseFd[buf]);
+```
+
+The copy itself is `vkCmdCopyImage` — image to image, twice, once per plane —
+and the header says so in as many words:
+
+> *Export the decoded Vulkan frame as a DMA-BUF fd (`AVDRMFrameDescriptor`) …
+> **Used for the copy path**, when FFmpeg decoded into opaque/optimal tiling
+> that the compositor cannot directly import. … **The copy path is the
+> default** and serves as a reliable fallback for all currently released FFmpeg
+> versions.*
+
+So "copy path" means *copy into a differently-tiled dma-buf*, not *copy to the
+CPU*. **The whole file contains no `av_hwframe_transfer_data`, no
+`vkCmdCopyImageToBuffer` and no `vkMapMemory`.** The grep is in §5c.
+
+**2. Both paths converge on the same type, and it is a dma-buf descriptor.**
+Direct export calls `av_hwframe_map(drmFrame, mFrame, 0)` into an
+`AV_PIX_FMT_DRM_PRIME` frame; the copy path calls
+`FillDRMDescriptorYUVSingleObject(format, baseFd, …)`. Both then hand the same
+`AVDRMFrameDescriptor` to `mVideoFramePool->GetVideoFrameSurface(*desc, …)`,
+whose product is a `DMABufSurface`. There is no third branch and nothing
+downstream that takes bytes.
+
+**3. There is a *second* descriptor per frame, which the first version of this
+section missed.** The copy is synchronised with an exported semaphore:
+
+```cpp
+int fd = dup(mVulkanDecoder.mCopyDoneSemFd[vulkanCopyBufIdx]);
+…
+surface->GetDMABufSurface()->SetSemaphoreFd(fd, useSyncFd);
+```
+
+with `mSemHandleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`. So the
+per-frame contract is *two* file descriptors, a dma-buf and a `sync_fd`. §1a
+rules out both, and the sync_fd has no more of a Windows equivalent than the
+dma-buf does.
+
+**4. The no-`TRANSFER` decode queue is already handled upstream, and that is
+good news we did not have.** §1 measured that neither RADV's nor the guest
+Intel's video decode family carries `VK_QUEUE_TRANSFER_BIT`. Firefox's `InitCtx`
+scans for a transfer-only family itself, in exactly the shape `video-probe` had
+to invent:
+
+```cpp
+if (props[i].queueCount > 0 &&
+    (props[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0 &&
+    (props[i].queueFlags & VK_QUEUE_TRANSFER_BIT)) {
+  copyQueueFamilyIndex = i;
+```
+
+falling back to ffmpeg's `queue_family_tx_index`, then to family 0, and retrying
+the command-pool creation on the fallback family if the chosen one is refused.
+The comment on the member list is `// Device & copy queues (decode queue is
+owned by FFmpeg)`. On the guest Intel that lands on family 0
+(`GRAPHICS|COMPUTE|TRANSFER`), which is correct. **This constraint is not part of
+the gap.**
+
+**5. The device would be selected, and the failure would land in the worst
+place.** `PhysicalDeviceHasVulkanVideoDecodeStack` requires exactly
+`VK_KHR_video_queue` and `VK_KHR_video_decode_queue`; the enumeration also
+requires non-CPU and Vulkan ≥ 1.3, and sorts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`
+last but accepts it. **It does not check `VK_EXT_image_drm_format_modifier` at
+selection time**, and ffmpeg does not fail without it either —
+`hwcontext_vulkan.c` says
+
+```c
+av_log(ctx, AV_LOG_WARNING, "%s extension \"%s\" not found, excluding.\n", …);
+```
+
+for every extension in Firefox's requested `device_extensions` string that the
+device lacks. So a forwarded device is chosen, a `VkDevice` is created without
+the modifier extension, and the first frame reaches `vkCreateImage` with
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` on a device that never enabled it.
+
+**And that failure is fatal, not a fallback.** The failure classification is
+sharp and it matters:
+
+| where it fails | result code | what happens |
+|---|---|---|
+| `SelectVulkanDecoderPhysicalDevice`, `CreateVulkanDeviceContext` | `InitVulkanDecoder` returns failure | `InitHWDecoderIfAllowed` falls through to VA-API → V4L2 → software. **Clean.** |
+| `InitCopyRingBuffer`, `PrepareImageToDRM` — i.e. the first frame | `NS_ERROR_DOM_MEDIA_FATAL_ERR` (`"Failed to create NV12 image"`, `"Failed to export NV12 FD"`) | **No retry.** |
+
+`MediaFormatReader`'s hardware-to-software recovery — the block that sets
+`decoder.mHardwareDecodingDisabled = true` and asks for a new decoder — is
+guarded by `if (decoder.mError && !decoder.HasFatalError())`, and
+`HasFatalError()` returns false only for `NS_ERROR_DOM_MEDIA_DECODE_ERR` under a
+retry budget and for `NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER`. `FATAL_ERR` is
+neither. **A forwarded device with the Vulkan pref on would not fall back to
+software; the video element would error out.** That is a stronger negative than
+the first version of this section claimed, and it is an argument for leaving the
+pref alone rather than for trying it.
+
+### 5b. So the conclusion stands, for the reason the coordinator called plausible
+
+Both paths end in `vkGetMemoryFdKHR`. The copy path copies into another
+exportable image; it does not copy to the CPU. There is no host-memory output
+anywhere in `FFmpegVulkanVideoDecoder`, and the `direct-export` pref does not
+choose between "GPU" and "CPU" — it chooses between *zero copies and one copy*,
+both of which end in a descriptor.
 
 That is fatal here for two independent reasons, and they should not be
 conflated:
@@ -404,36 +539,58 @@ conflated:
 1. **A dma-buf is a host-kernel object and the frame is in a Windows guest.**
    No forwarded Vulkan can mint one, whatever else it does. This is not a
    limitation of our design; it is what dma-buf *is*.
-2. **§1a forbids it anyway.** A dma-buf is a file descriptor, and no descriptor
-   crosses the boundary. Even on the same machine, §0.7 measured that the one
-   local route to a dma-buf — `/dev/udmabuf` over a named object — is closed,
-   because a named object cannot be sealed.
+2. **§1a forbids it anyway**, and now twice over — the dma-buf and the
+   `sync_fd`. Even on the same machine, §0.7 measured that the one local route
+   to a dma-buf, `/dev/udmabuf` over a named object, is closed, because a named
+   object cannot be sealed.
 
-Firefox's device selection, for the record, would not be what stops us: it wants
-Vulkan 1.3, a non-CPU device, and `VK_KHR_video_queue` +
-`VK_KHR_video_decode_queue`, and it explicitly accepts
-`VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`. ffmpeg's `hwcontext_vulkan.c` warns and
-excludes a missing extension from Firefox's request list rather than failing.
-A forwarded device would be *selected*. It would then fail at the export.
+### 5c. The greps, so this can be checked rather than believed
+
+```
+$ for f in FFmpegVulkanVideoDecoder.cpp FFmpegVulkanVideoDecoder.h; do
+    curl -sO https://raw.githubusercontent.com/mozilla-firefox/firefox/main/dom/media/platforms/ffmpeg/$f; done
+
+$ grep -n 'GetMemoryFdKHR\|GetSemaphoreFdKHR\|CmdCopyImage\|CmdCopyImageToBuffer\|
+          av_hwframe_transfer_data\|MapMemory' FFmpegVulkanVideoDecoder.cpp
+266:  load(mCmdCopyImage, "vkCmdCopyImage");
+282:  load(mGetMemoryFdKHR, "vkGetMemoryFdKHR");
+288:  load(mGetSemaphoreFdKHR, "vkGetSemaphoreFdKHR");
+1034:    res = mGetMemoryFdKHR(mDevice, &fdInfo, &mNv12BaseFd[buf]);
+1269:    mCmdCopyImage(mCopyCmdBuf[copySlot], srcVkFrame->img[0],
+1278:    mCmdCopyImage(mCopyCmdBuf[copySlot], srcVkFrame->img[0],
+1396:    if (mGetSemaphoreFdKHR(mDevice, &fdInfo, &mCopyDoneSemFd[bufIdx]) !=
+```
+
+No `vkCmdCopyImageToBuffer`, no `av_hwframe_transfer_data`, no `vkMapMemory`.
 
 ### The honest ordering
 
 1. **Software decode on the host is the answer today**, and it costs nothing to
    implement because it is what happens when the pref stays false. 1080p is
-   unremarkable on this host's CPU. This is the recommendation.
-2. **If hardware decode is wanted, the work is a Firefox patch and not a
-   forwarder feature.** Add a non-dma-buf output path to
-   `FFmpegVulkanVideoDecoder`: `vkCmdCopyImageToBuffer` into host-visible memory
-   — which for us is *the arena*, so the copy lands in memory the host already
-   maps — and hand up a `PlanarYCbCrImage`. That is the path `video-probe`
-   already implements in forty lines, and it is the whole of the difference. It
-   is explicitly the slow path: 187 MB/s at 1080p60 across the boundary, against
-   0.5 MB/s if the frame could stay put. It is also a patch nobody upstream
-   wants, so it would have to be carried.
-3. **Do not build a VA-API bridge.** Firefox no longer needs one, and a VA-API
+   unremarkable on this host's CPU. This is the recommendation, and §5a's fatal
+   classification makes it a stronger one than it was: turning the pref on
+   against a forwarded device does not degrade, it breaks.
+2. **It is not a pref flip.** The `direct-export` pref's *off* state — the
+   default, the copy path — is the one that calls `vkGetMemoryFdKHR` directly.
+   There is no combination of prefs that produces a frame in host memory.
+3. **If hardware decode is wanted, the work is a Firefox patch and not a
+   forwarder feature**, and it is a *third* output path rather than a change to
+   either existing one. Copy into a host-visible buffer — which for us is *the
+   arena*, so the copy lands in memory the host already maps — and produce a
+   `PlanarYCbCrImage` instead of a `DMABufSurface`. The Vulkan half is the forty
+   lines `video-probe` already has; the awkward half is that
+   `GetVideoFrameSurface` takes an `AVDRMFrameDescriptor` and everything below it
+   is dma-buf typed, so the patch has to bypass `FFmpegVideoFramePool` and reach
+   the software path's image construction instead. Still a few hundred lines,
+   still in one file plus its pool — but it is a new branch through the frame
+   plumbing, not a substitution at the copy destination, and that is the
+   correction to the earlier estimate. It costs 187 MB/s at 1080p60 across the
+   boundary against 0.5 MB/s if the frame could stay put, and no upstream
+   reviewer wants it, so it would have to be carried.
+4. **Do not build a VA-API bridge.** Firefox no longer needs one, and a VA-API
    surface is exported to Firefox as a DRM PRIME dma-buf, so it ends at the same
    wall one layer lower.
-4. **The version of this that is actually good does not involve Firefox's
+5. **The version of this that is actually good does not involve Firefox's
    decoder at all**, and it is the one the topology wants: the compositor is on
    the Windows side, so a decoded frame that stays GPU-side is already where it
    needs to be. That needs a Wayland buffer type carrying a guest-side image
@@ -467,6 +624,16 @@ A forwarded device would be *selected*. It would then fail at the export.
 - **`maxLevelIdc` is not believed** (§1) and no attempt was made to find out
   which reading is right. It did not block anything: the fixture is level 1.2
   and every device decoded it.
+- **Firefox has not been run against the forwarded device.** §5a is a reading of
+  `FFmpegVulkanVideoDecoder.cpp` at `265f4b8f`, which is mozilla-central tip on
+  2026-08-07 and therefore *newer* than the 153 release; the shipped 153 code may
+  differ in detail, though the two output paths and both prefs are present in the
+  original landing. The failure sequence it predicts — device selected, `VkDevice`
+  created without `VK_EXT_image_drm_format_modifier`, first frame fatal at
+  `vkCreateImage` — is a prediction from source and not an observation. Running
+  it would need a Firefox with `MOZ_ENABLE_VULKAN_VIDEO`, an FFmpeg ≥ 6.1 and a
+  forwarded ICD in the same process, and would be worth an afternoon before
+  anyone acts on the estimate in §5's item 3.
 
 ## Re-running it
 

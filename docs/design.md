@@ -974,11 +974,42 @@ synthesise" needs the qualifier that some of what it reports is wrong.
 new obstacle is §1a.** Firefox 153 (2026-07-21) ships a Vulkan Video decoder,
 via ffmpeg's `AV_HWDEVICE_TYPE_VULKAN`, opt-in behind
 `media.hardware-video-decoding-vulkan.enabled`. It would *select* a forwarded
-device — it accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`. It then exports every
-decoded frame as a **Linux dma-buf**, with no host-memory fallback anywhere in
-the path. A dma-buf is a host kernel object, the frame is in a Windows guest, and
-a dma-buf is a file descriptor besides. The whole gap is now one output path in
-one Firefox file, and `docs/video-decode.md` §5 says what it would take.
+device — it accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, and it requires only
+`VK_KHR_video_queue` and `VK_KHR_video_decode_queue` to do so. It then exports
+every decoded frame as a **Linux dma-buf**, with no host-memory fallback
+anywhere in the path. A dma-buf is a host kernel object, the frame is in a
+Windows guest, and a dma-buf is a file descriptor besides.
+
+Read from source rather than from search results — `FFmpegVulkanVideoDecoder.cpp`
+at `265f4b8f`, 2026-08-07 — because the claim decides whether hardware decode is
+reachable at all. Four refinements, and the conclusion survived all of them:
+
+  - **The "copy path" copies into another *exportable image*, not to the CPU.**
+    `media.hardware-video-decoding-vulkan.direct-export.enabled` defaults off,
+    so the copy path is the only one that runs; it is `vkCmdCopyImage` into a
+    ring of 32 images created `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with
+    `VkExportMemoryAllocateInfo{DMA_BUF}`, and then `vkGetMemoryFdKHR`. The file
+    contains no `vkCmdCopyImageToBuffer`, no `av_hwframe_transfer_data` and no
+    `vkMapMemory`. The pref chooses between *zero copies and one copy*, not
+    between GPU and host.
+  - **Every frame carries a second descriptor**, an exported semaphore
+    `sync_fd` handed to `DMABufSurface::SetSemaphoreFd`. §1a rules out both.
+  - **§0.8 item 3's queue-family awkwardness is already solved upstream.**
+    Firefox's `InitCtx` scans for a transfer-only family itself and falls back to
+    ffmpeg's `queue_family_tx_index` and then to family 0, so neither RADV's nor
+    the guest Intel's `VIDEO_DECODE`-only family is part of the gap.
+  - **The failure would be fatal rather than a fallback.** Init-time failures
+    fall cleanly through `InitHWDecoderIfAllowed` to VA-API and then software;
+    the first-frame failures — `"Failed to create NV12 image"`, `"Failed to
+    export NV12 FD"` — are `NS_ERROR_DOM_MEDIA_FATAL_ERR`, and
+    `MediaFormatReader`'s hardware-to-software recovery is guarded by
+    `!decoder.HasFatalError()`, which admits only `DECODE_ERR` and
+    `NEED_NEW_DECODER`. Turning the pref on against a forwarded device does not
+    degrade to software; it breaks playback.
+
+The gap is one output path in one Firefox file — a *third* one, since neither
+existing branch can be redirected: everything below `GetVideoFrameSurface` is
+typed on `AVDRMFrameDescriptor`. `docs/video-decode.md` §5 has the code.
 
 One thing about the harness rather than the result. **A `pNext` that the
 specification requires and the driver does not check is a segfault with no
