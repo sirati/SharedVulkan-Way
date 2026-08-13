@@ -28,7 +28,7 @@
 
     - **Pixels, never a path or a name.** The whole point is that the
       filesystem holding the icon is on the other side of a hypervisor
-      (docs/design.md §2.1). A request carrying a file name would work on one
+      (docs/waycompose-design.md §2.1). A request carrying a file name would work on one
       machine and be unimplementable on the one that matters.
     - **No wl_buffer, so no file descriptor.** An icon is a few kilobytes sent
       once per application. Routing it through a wl_shm pool would put an

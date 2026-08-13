@@ -71,4 +71,22 @@ fn main() {
     println!("cargo:warning=sv-icd: manifest at {}", manifest_path.display());
     println!("cargo:rustc-env=SV_ICD_MANIFEST={}", manifest_path.display());
     println!("cargo:rustc-env=SV_ICD_MANIFEST_API_VERSION={API_VERSION}");
+
+    // The absolute path of the `cdylib` the manifest names, and the profile it
+    // belongs to, so that `tests/loader.rs` can tell "the driver is broken"
+    // apart from "the driver has not been built yet".
+    //
+    // `cargo test` builds the `rlib` — the integration test links against it —
+    // and *not* the `cdylib`, which nothing in the test graph depends on. So on
+    // a freshly cloned tree the loader finds a manifest whose `library_path`
+    // does not exist, silently skips the driver, and `vkCreateInstance` returns
+    // `VK_ERROR_INCOMPATIBLE_DRIVER`. That failure is about build ordering and
+    // says nothing about the code — and because a failing test binary aborts
+    // `cargo test --workspace`, it also truncated the reported test total to a
+    // fraction of the real one. See `tests/loader.rs`.
+    println!("cargo:rustc-env=SV_ICD_LIBRARY_PATH={}", lib_path.display());
+    println!(
+        "cargo:rustc-env=SV_ICD_PROFILE={}",
+        std::env::var("PROFILE").unwrap_or_else(|_| "debug".into())
+    );
 }

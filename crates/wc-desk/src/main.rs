@@ -9,7 +9,7 @@
 //!
 //! # Why this exists
 //!
-//! docs/design.md §10.12 item 3: *the window has never been seen*. Everything
+//! docs/waycompose-design.md §10.12 item 3: *the window has never been seen*. Everything
 //! the compositor has ever done on the guest ran inside an ssh session, whose
 //! window station is not `WinSta0` and has no display behind it —
 //! `CreateWindowExW` succeeds there, `SetDIBitsToDevice` succeeds there, and
@@ -915,7 +915,7 @@ usage: wc-desk <command> [options]
     ///
     /// # What is being tested, and why it needs a second process
     ///
-    /// docs/design.md §8.2 chose to wake the UI thread with a `PostMessage` to a
+    /// docs/waycompose-design.md §8.2 chose to wake the UI thread with a `PostMessage` to a
     /// **message-only window** rather than a `PostThreadMessage`, because a
     /// thread message has no `hwnd` and the modal loops `DefWindowProc` runs
     /// during a window drag or resize discard it. §8.11 item 4 is the check that

@@ -87,7 +87,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus,
     GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-// ADDED FOR STAGE 12, for the cursor (docs/design.md §23). `SetCursor` and
+// ADDED FOR STAGE 12, for the cursor (docs/waycompose-design.md §23). `SetCursor` and
 // `DestroyCursor` are the whole of the Win32 half; `HTCLIENT` is the hit-test
 // code that decides whether the client's cursor applies or the system's frame
 // keeps its own.
@@ -925,7 +925,7 @@ pub(crate) struct Ui {
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
-    /// is exactly what docs/design.md §8.5 had to apologise for: the half of
+    /// is exactly what docs/waycompose-design.md §8.5 had to apologise for: the half of
     /// the evidence that produced an `HWND` was also the half whose pixels
     /// nobody outside the process ever measured. A frame dumped here is read
     /// back by `identify` and `compare`, which are not ours.
@@ -935,7 +935,7 @@ pub(crate) struct Ui {
     //
     // Three cells rather than one, because the `HCURSOR` a window shows, the
     // `HCURSOR` this process must destroy, and whether the pointer is
-    // anywhere it matters are three independent facts (docs/design.md §23).
+    // anywhere it matters are three independent facts (docs/waycompose-design.md §23).
     /// What `WM_SETCURSOR` should install over the client area. `0` means
     /// "hidden", which is a value `SetCursor` accepts and is what
     /// `wl_pointer.set_cursor` with a null surface asks for; it is therefore
@@ -1266,7 +1266,7 @@ unsafe extern "system" fn toplevel_proc(
             // button message.
             1
         }
-        // ADDED FOR STAGE 12 (docs/design.md §23). **The only place a client's
+        // ADDED FOR STAGE 12 (docs/waycompose-design.md §23). **The only place a client's
         // cursor is installed on a mouse message**, and the reason it has to be
         // handled rather than left to `DefWindowProc` is that `DefWindowProc`
         // sets the *class* cursor — the `IDC_ARROW` in `register_classes` —
@@ -3049,7 +3049,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     );
 
     // What the window turned out to be, in the units the window manager uses.
-    // docs/design.md §8.11 item 5 asks what happens on a scaled display, and the
+    // docs/waycompose-design.md §8.11 item 5 asks what happens on a scaled display, and the
     // answer is three numbers rather than a yes: the DPI Windows assigned this
     // window, the outer rectangle it gave us for the client size we asked for,
     // and the client rectangle it ended up with. On a 150% desktop a virtualised
@@ -3892,7 +3892,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
     // documentation says that with a null bit pointer "the contents of the new
     // bitmap is undefined" — the zero-fill every Windows to date has actually
     // done is not contractual, and this is the kind of thing Wine has already
-    // lied about four times (docs/design.md §13.6). For an icon a stray mask
+    // lied about four times (docs/waycompose-design.md §13.6). For an icon a stray mask
     // bit is one wrong pixel in a taskbar button; for a *cursor* the AND mask
     // is what selects between "transparent" and "invert the screen", so a
     // garbage mask is a cursor with inverted holes punched through it. Cheap
@@ -3943,7 +3943,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
 
 /// Install what the client asked the pointer to look like.
 ///
-/// ADDED FOR STAGE 12 (docs/design.md §23).
+/// ADDED FOR STAGE 12 (docs/waycompose-design.md §23).
 ///
 /// # The invariant this exists to keep
 ///
@@ -4199,7 +4199,7 @@ fn verify_cursor_once(hcursor: isize) {
 /// perceive as anything but "about right".
 ///
 /// A failed call keeps the old constants. `SystemParametersInfo` failing is not
-/// something Windows does, and is something Wine might (docs/design.md §13.6).
+/// something Windows does, and is something Wine might (docs/waycompose-design.md §13.6).
 pub fn keyboard_repeat() -> (i32, i32) {
     let mut delay: u32 = 1;
     let mut speed: u32 = 31;
@@ -4463,7 +4463,7 @@ fn register_classes() -> std::io::Result<()> {
 /// degradation for a failure. Everything else read here is resolved the same
 /// way and for the same reason.
 ///
-/// # Why "refused" was not enough (docs/design.md §10.13 item 3)
+/// # Why "refused" was not enough (docs/waycompose-design.md §10.13 item 3)
 ///
 /// §10.8 recorded that Wine reports `ok` and the guest reports failure, and
 /// that the compositor could not tell an **already-aware** process from an
@@ -4499,7 +4499,7 @@ fn register_classes() -> std::io::Result<()> {
 ///
 /// So this is not tidiness. It is the difference between the taskbar showing
 /// the client's icon and showing the generic one, and it was invisible to every
-/// check that looked at the compositor's own logs (docs/design.md §16.6).
+/// check that looked at the compositor's own logs (docs/waycompose-design.md §16.6).
 ///
 /// **`GetConsoleProcessList` is what makes this safe.** A console shared with
 /// anything else — a `cmd.exe` or an ssh session that started us — belongs to

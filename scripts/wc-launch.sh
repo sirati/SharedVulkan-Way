@@ -426,8 +426,30 @@ do_click() {
     read_clock | sed 's/^/        /' | tail -20
     return 1
   fi
+  # **§35: the milliseconds are informational and the check is on the number's
+  # own coherence.** This was `ok "…${ms} ms…"` unconditionally, so it passed at
+  # any value including none at all — `grep` finding no digits yields an empty
+  # string and the line still read as a pass.
+  #
+  # It is deliberately *not* given a ceiling. Click-to-window on a contended
+  # guest is a rate, and §35.3 records what asserting on a rate costs: the same
+  # tree measured 37 us and 103 us for one 244 KiB copy. A bound loose enough to
+  # survive that catches nothing; a tight one fails on load.
+  #
+  # What can be asserted, and cannot be defeated by load, is that the number is
+  # real: positive, and **no larger than the wall time the harness itself
+  # waited**. A guest-side clock reporting more milliseconds than elapsed out
+  # here is a broken clock, which is the one way this measurement can be wrong
+  # rather than merely slow — and §13.8 is the retracted throughput number that
+  # says an instrument nobody sanity-checks will eventually publish one.
   local ms; ms=$(echo "$line" | grep -o 'CLICK-TO-WINDOW [0-9]*' | awk '{print $2}')
-  ok "$kind click to window: ${ms} ms   (the harness waited ${waited}s for the scheduler around it)"
+  if [ -z "$ms" ] || [ "$ms" -lt 1 ]; then
+    bad "$kind: the clock line carried no usable figure: ${line}"
+  elif [ "$ms" -gt $(( (waited + 5) * 1000 )) ]; then
+    bad "$kind: the guest reports ${ms} ms but only ${waited}s elapsed here; the clock is wrong, not slow"
+  else
+    ok "$kind click to window: ${ms} ms, inside the ${waited}s the harness waited (the figure itself is informational: it is a rate on a contended guest)"
+  fi
   read_clock | grep -E 'arena:|locate:|proxy:|run Firefox|cold start|session up' | sed 's/^/        /'
   echo "$ms"
 }
@@ -470,7 +492,15 @@ do_native() {
     bad "native Firefox produced only ${n:-0} usable sample(s)"
     return
   fi
-  ok "native Firefox on Windows: ${avg} ms to a top-level window (mean of $n with a window handle)"
+  # §35, as above: the mean is informational — it is the control for a rate —
+  # but a mean of nothing is not. `awk` prints an empty string when it divided
+  # no samples, and the old line reported that as a pass with a blank where the
+  # number should be.
+  if [ -z "$avg" ] || [ "$avg" -lt 1 ]; then
+    bad "native Firefox: $n sample(s) kept but no usable mean came out of them"
+  else
+    ok "native Firefox on Windows: ${avg} ms to a top-level window (mean of $n with a window handle; the figure is the control for a rate and is informational)"
+  fi
 }
 
 # ------------------------------------------------------------------ shot -----
@@ -638,11 +668,45 @@ do_verify() {
   else
     bad "$served connection(s) served, $joins joined the arena"
   fi
-  local fds
+  # **§35: the descriptor line is checked, not echoed.** The `note` beside it
+  # asserted the property in *prose* — "none of them crossed the VM boundary" —
+  # and the code did nothing with the numbers that would show it. A `note` whose
+  # text makes a claim is the most misleading form of this defect, because a
+  # reader takes the sentence for the check.
+  #
+  # What is assertable without inventing a bound: the line must exist at all
+  # (its absence meant silence), and **every descriptor out must have come from
+  # the arena**. `N from the arena` is the count this side manufactured by
+  # resolving an offset rather than by receiving anything; if `out` exceeds it,
+  # something was handed to a client that was not cut from guest RAM, which is
+  # exactly the boundary claim the sentence makes.
+  local fds fds_out fds_arena
   fds=$(echo "$hostlog$comp" | grep -o '[0-9]* fds in, [0-9]* out ([0-9]* from the arena)' | tail -1)
-  [ -n "$fds" ] && note "descriptors: $fds  (none of them crossed the VM boundary; §14.7)"
-  echo "$hostlog" | grep -o '[0-9]* pools ([0-9]* released, [0-9]* resizes, [0-9]* overflows)' | tail -1 \
-    | sed 's/^/  ----  Firefox through the arena: /'
+  if [ -z "$fds" ]; then
+    bad "the proxy reported no descriptor counts; §14.7's claim is unchecked for this run"
+  else
+    fds_out=$(echo "$fds" | grep -o '[0-9]* out' | grep -o '[0-9]*')
+    fds_arena=$(echo "$fds" | grep -o '([0-9]* from the arena)' | grep -o '[0-9]*')
+    if [ "${fds_out:-0}" -eq "${fds_arena:-0}" ]; then
+      ok "descriptors: $fds -- every one handed out was cut from the arena, so none crossed (§14.7)"
+    else
+      bad "descriptors: $fds -- ${fds_out} handed out but only ${fds_arena} from the arena; the rest came from somewhere else"
+    fi
+  fi
+
+  # **And the pool line, which was piped through `sed` into something that looks
+  # like a `note` and is not even that.** `wc-guest.sh` asserts exactly this
+  # shape — `*"0 overflows)"` — and has since stage 9; here the same numbers
+  # were formatted for a reader. An overflow is a client that asked for arena
+  # space and was refused, which is the failure §20 exists about, and it printed
+  # as a decorated line.
+  local pools
+  pools=$(echo "$hostlog" | grep -o '[0-9]* pools ([0-9]* released, [0-9]* resizes, [0-9]* overflows)' | tail -1)
+  case "$pools" in
+    "") bad "the proxy reported no pool counts; the arena's own accounting is unchecked" ;;
+    *"0 overflows)") ok "Firefox through the arena: $pools -- every resize was absorbed" ;;
+    *) bad "Firefox through the arena: $pools -- an overflow is a client refused arena space" ;;
+  esac
 }
 
 n=""; warms=""; i=""

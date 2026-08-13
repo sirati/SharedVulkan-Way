@@ -83,7 +83,7 @@
 //! not look at the index — and it is `sv-hostd qemu --verify`'s check applied to
 //! our arena.
 //!
-//! `--watch` is the live-coherency measurement, and it is the one docs/design.md
+//! `--watch` is the live-coherency measurement, and it is the one docs/waycompose-design.md
 //! §10.3 could not make about a file: this process writes at an offset while the
 //! guest holds a live mapping of the same region, and then waits for the guest
 //! to answer at another offset. Both halves have to work for a window to
@@ -486,7 +486,7 @@ mod host {
         }
 
         // ------------------------------------------------------------------ live
-        // The measurement docs/design.md §10.3 could not make about a file. Both
+        // The measurement docs/waycompose-design.md §10.3 could not make about a file. Both
         // sides hold a live mapping of the same region; this one writes, the other
         // answers. The numbers printed here are what block 10 asserts on.
         if let Some((off, text)) = &args.poke {

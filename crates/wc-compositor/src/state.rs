@@ -49,7 +49,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::Res
 use smithay::wayland::shm::{ShmHandler, ShmState};
 // ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
 // than guessed at, and they are requirements for different reasons — see
-// docs/design.md §13.3.
+// docs/waycompose-design.md §13.3.
 //
 // `Output` is the monitor. Without one a GTK client has an empty
 // `GdkDisplay` monitor list, sizes its first window from a fallback and never
@@ -75,7 +75,7 @@ use smithay::wayland::selection::SelectionHandler;
 // instead. That is checkable two ways and both were done: `libgdk-3.so`
 // contains the string `org_kde_kwin_server_decoration_manager` and does not
 // contain `zxdg_decoration_manager_v1`, and a compositor that offers both is
-// told which one is bound. docs/design.md §13.7 has the answer and what it
+// told which one is bound. docs/waycompose-design.md §13.7 has the answer and what it
 // costs.
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server
     ::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -87,7 +87,7 @@ use smithay::reexports::wayland_server::WEnum;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 
-// ADDED FOR STAGE 12 (docs/design.md §23), the cursor.
+// ADDED FOR STAGE 12 (docs/waycompose-design.md §23), the cursor.
 //
 // `CursorShapeManagerState` is `wp_cursor_shape_v1`: a client names a shape
 // instead of shipping pixels, which is what GTK4 binds and is the half of the
@@ -105,7 +105,7 @@ use smithay::wayland::seat::CURSOR_IMAGE_ROLE;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 // ADDED FOR STAGE 21: three protocols whose implementation is a Win32 call, and
 // which are here because the Win32 call exists rather than because the protocol
-// is short. docs/design.md §25 has the argument for each and — for the two that
+// is short. docs/waycompose-design.md §25 has the argument for each and — for the two that
 // were considered and left out — for their absence.
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use smithay::wayland::keyboard_shortcuts_inhibit::{
@@ -125,7 +125,7 @@ use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSour
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
-/// ADDED FOR STAGE 17, and it is the whole of docs/design.md §22.2. Until this
+/// ADDED FOR STAGE 17, and it is the whole of docs/waycompose-design.md §22.2. Until this
 /// stage the answer was hard-coded to `Client`, on the reasoning that
 /// docs/goal-firefox.md wants Firefox painting its tabs into the title bar and
 /// only a client that draws a title bar can do that. The reasoning was right
@@ -475,7 +475,7 @@ pub struct ClientState {
     compositor_state: CompositorClientState,
     /// Which connection this is, counted from 1 in accept order.
     ///
-    /// ADDED FOR STAGE 26 (docs/design.md §26). A conformance suite driving
+    /// ADDED FOR STAGE 26 (docs/waycompose-design.md §26). A conformance suite driving
     /// this compositor from outside knows a client-side `wl_surface*` and
     /// nothing about our window ids, so the only handle it can name a window
     /// by is *which connection* plus *which object id on it*. The connection
@@ -518,7 +518,7 @@ impl ClientData for ClientState {
 // well would give a client two repeat streams at different rates. So they are
 // dropped, in `win32.rs`, and this is the only rate anyone sees.
 //
-// > **[SUPERSEDED — 2026-08-13, see docs/design.md §23.5]** The numbers are
+// > **[SUPERSEDED — 2026-08-13, see docs/waycompose-design.md §23.5]** The numbers are
 // > Windows' own defaults expressed the way Wayland wants them:
 // > `SPI_GETKEYBOARDDELAY` 1 is 500 ms, `SPI_GETKEYBOARDSPEED` is around 30/s
 // > at its default. Reading the real values is a `SystemParametersInfo` call
@@ -655,7 +655,7 @@ impl State {
         //
         // `xdg-toplevel-icon-v1` is the protocol; a client that implements it
         // is the authority on its own icon and needs nothing else. Measured
-        // against real clients (docs/design.md §15.3) that is GTK 4.20 and not
+        // against real clients (docs/waycompose-design.md §15.3) that is GTK 4.20 and not
         // Firefox 151, weston 15 or GTK 3 — so the second global exists for the
         // ones that do not, and is bound by the resolver rather than by them.
         let icon_manager = dh
@@ -790,7 +790,7 @@ impl State {
     /// Milliseconds since the compositor started, which is what a frame
     /// callback carries.
     ///
-    /// Note the known wrongness, recorded in docs/design.md §7.7 item 5: the
+    /// Note the known wrongness, recorded in docs/waycompose-design.md §7.7 item 5: the
     /// epoch is process start rather than boot, which is right for every
     /// current consumer (a client comparing successive callbacks) and wrong for
     /// `wp_presentation`. Not fixed here because nothing yet compares this
@@ -1629,7 +1629,7 @@ impl State {
         // client-side-decoration surface, which is **transparent**, and every
         // pixel of the browser is in a `wl_subsurface` of it. A compositor with
         // no scene graph does not draw Firefox badly — it draws a black
-        // rectangle. docs/design.md §13.5 has the measurement.
+        // rectangle. docs/waycompose-design.md §13.5 has the measurement.
         //
         // So a commit now lands in a per-surface staging shadow, and the
         // window's shadow is the composite of the tree.
@@ -2315,7 +2315,7 @@ impl CompositorHandler for State {
 
         match buffer {
             Some(BufferAssignment::NewBuffer(buffer)) => {
-                // ADDED FOR STAGE 12 (docs/design.md §23). A cursor surface's
+                // ADDED FOR STAGE 12 (docs/waycompose-design.md §23). A cursor surface's
                 // buffer is read for the `HCURSOR` and then handed on
                 // unchanged — this reads and does not divert, so what the
                 // scene graph does with a cursor surface stays the scene
@@ -2384,7 +2384,7 @@ impl SeatHandler for State {
 
     /// What the pointer should look like.
     ///
-    /// IMPLEMENTED IN STAGE 12 (docs/design.md §23); before it, this logged
+    /// IMPLEMENTED IN STAGE 12 (docs/waycompose-design.md §23); before it, this logged
     /// once and the user saw the Win32 arrow over everything — no I-beam over
     /// text, no hand over a link.
     ///
@@ -2737,7 +2737,7 @@ impl XdgShellHandler for State {
         // the compositor's job, and on Windows the compositor that owns the
         // monitor is Windows. Letting `SetWindowPos` place it and reporting no
         // constraint back is honest; recomputing it here would be a second,
-        // disagreeing, opinion. See docs/design.md §13.6.
+        // disagreeing, opinion. See docs/waycompose-design.md §13.6.
         let rect = positioner.get_geometry();
         let parent = surface.get_parent_surface().map(|s| root_of(&s));
         let parent_id = parent.as_ref().and_then(|p| self.windows.get(p)).map(|w| w.id);
@@ -3175,7 +3175,7 @@ impl OutputHandler for State {}
 /// This used to be smithay's defaults with a paragraph saying a Windows
 /// clipboard could not be built on them, because `send_selection` hands the
 /// compositor **a file descriptor to write into** and on the guest an `OwnedFd`
-/// is a `wc_handle::Handle` — an object docs/design.md §12.13 item 7 says has
+/// is a `wc_handle::Handle` — an object docs/waycompose-design.md §12.13 item 7 says has
 /// no route to a client across the hypervisor. That paragraph was right about
 /// the descriptor and wrong about the feature.
 ///

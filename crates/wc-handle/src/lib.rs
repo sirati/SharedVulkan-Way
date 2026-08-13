@@ -141,7 +141,7 @@ mod counters {
 /// How many objects of each kind have been mapped: `(sections, shared files,
 /// arena slices)`.
 ///
-/// This exists because of docs/design.md §8.4's rule about the pixel-source
+/// This exists because of docs/waycompose-design.md §8.4's rule about the pixel-source
 /// seam: *"a stage that added a second provider with no way to tell which one
 /// ran would not really have added it."* Stage 4 adds two, and both arrive
 /// through the same `wl_shm` code in smithay, so the compositor cannot tell
@@ -428,7 +428,7 @@ pub struct Handle {
 ///
 /// Both arms mean exactly the same thing to every caller: **this process made
 /// these bytes and must hold them for as long as the protocol object they back**
-/// (docs/design.md §2.5). What differs is what release means — closing a
+/// (docs/waycompose-design.md §2.5). What differs is what release means — closing a
 /// section and unlinking a file for one, returning a range to the outbound
 /// window's free list for the other.
 enum Owned {
@@ -524,14 +524,14 @@ impl Handle {
     /// * With one, the object is a file in that directory and the descriptor
     ///   carries the path **as the peer spells it**. That is the only kind a
     ///   process on the other side of the boundary can open, because an NT
-    ///   object name means nothing to a Linux process (docs/design.md §9.4).
+    ///   object name means nothing to a Linux process (docs/waycompose-design.md §9.4).
     ///
     /// The caller does not choose, and that is deliberate: every call site that
     /// creates an object for a peer wants the same answer, and the answer is a
     /// property of the deployment rather than of the call. A caller that
     /// genuinely wants a same-machine section still says so by name.
     ///
-    /// **The lifetime rule applies unchanged** (docs/design.md §2.5): the
+    /// **The lifetime rule applies unchanged** (docs/waycompose-design.md §2.5): the
     /// returned handle must be held for at least as long as the protocol object
     /// it backs. For a file-backed object it is stronger than a courtesy —
     /// dropping the handle deletes the file.
@@ -543,7 +543,7 @@ impl Handle {
     /// directory, and the order is the argument:
     ///
     /// * An arena slice needs no filesystem both sides can reach. A published
-    ///   directory needs one, and docs/design.md §10.4 measured what such a
+    ///   directory needs one, and docs/waycompose-design.md §10.4 measured what such a
     ///   filesystem costs on the deployment that matters — 330× slower to touch
     ///   — and §10.3 measured that it is not even coherent for a live mapping.
     ///   The keymap survived it because a keymap is a closed write (§12.11);
@@ -627,7 +627,7 @@ impl Handle {
     /// why the counters live here too: [`map_counts`] is what lets a caller
     /// state *which* mechanism served a frame rather than assert it. A stage
     /// that added a second way for pixels to arrive with no way to tell which
-    /// one ran would not really have added it (docs/design.md §8.4).
+    /// one ran would not really have added it (docs/waycompose-design.md §8.4).
     pub fn map(&self) -> io::Result<Mapping> {
         match &self.descriptor {
             Descriptor::Section { name, size } => {
@@ -666,7 +666,7 @@ impl Handle {
     /// decoded from the wire owns nothing and gets no write path. That is what
     /// keeps a compositor's view of a client's buffer read-only, which is the
     /// correct default and is what `vendor/smithay`'s `shm/pool.rs` relies on
-    /// (docs/design.md §7.4). This is the *producer's* side of the same
+    /// (docs/waycompose-design.md §7.4). This is the *producer's* side of the same
     /// section: a client drawing frames needs one persistent view, because
     /// mapping and unmapping per damaged row would cost more than the drawing.
     ///

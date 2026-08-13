@@ -236,8 +236,31 @@ check_run() {
   worst=$(grep -o 'worst [0-9]* rows' "$dir/proxy.log" | grep -o '[0-9]*' | sort -n | tail -1)
   worst=${worst:-0}
 
-  local skipped
+  local skipped commits
   skipped=$(grep -o '([0-9]* state-only, unverifiable)' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  # **§31: `skipped` is now part of an equation instead of part of a sentence.**
+  #
+  # It was interpolated into the pass message and compared with nothing, which
+  # matters because it is the *coverage* of the check below: `verified` says how
+  # much was looked at and `skipped` says how much was not, and a run where the
+  # second dwarfs the first is a strong assertion over a small corner of the
+  # traffic.
+  #
+  # What is asserted is an identity rather than a threshold, because an identity
+  # needs no number chosen on a machine: `Session::flush_deferred` increments
+  # exactly one of `verified` and `verify_skipped` on every commit it sees, so
+  # the two must add up to the commit count. If they do not, commits are passing
+  # through the instrument without being classified either way — the check has
+  # a blind spot, and the size of the blind spot is the discrepancy. That is a
+  # bound on coverage that cannot be defeated by load, by the client, or by how
+  # long the run happened to last.
+  commits=$(grep -o '[0-9]* commits,' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  local classified=$(( ${verified:-0} + ${skipped:-0} ))
+  if [ "$classified" -ne "${commits:-0}" ]; then
+    bad "$tag: $classified of $commits commits were classified as verified or unverifiable; $(( ${commits:-0} - classified )) went through the check unaccounted for"
+  else
+    ok "$tag: every one of $commits commits is accounted for -- $verified checked, $skipped attached no buffer"
+  fi
   if [ "${verified:-0}" -ge "$floor" ]; then
     ok "$tag: $verified commits were checked against the client's own bytes (${skipped:-0} more attached no buffer, so there was nothing to check)"
   else

@@ -16,13 +16,13 @@
 //! upstream calls with nothing but an fd, and giving it a context parameter
 //! would mean carrying a diff through smithay's `ShmState`, its `Client` data
 //! and its `wl_shm` dispatch — precisely the "spread through the commit path"
-//! cost docs/design.md §8.4 says the seam exists to avoid. An arena is
+//! cost docs/waycompose-design.md §8.4 says the seam exists to avoid. An arena is
 //! genuinely process-wide state; modelling it as such is honest, and it keeps
 //! the fork's diff at zero lines.
 //!
 //! # The lifetime rule, which is the opposite of a section's
 //!
-//! docs/design.md §2.5 says the *creator* of a section must hold it open until
+//! docs/waycompose-design.md §2.5 says the *creator* of a section must hold it open until
 //! the receiver has opened it. An arena inverts that: the receiver holds the
 //! region open for the life of the process, and the sender's slices are pure
 //! arithmetic that cannot dangle. Nothing has to be raced. That is the second
@@ -108,7 +108,7 @@ fn registry() -> &'static Registry {
 ///
 /// Read-only, because the receiving side of an arena slice is a compositor
 /// reading a client's pixels — the same default `Handle::map` has for a
-/// section, and for the same reason (docs/design.md §7.4).
+/// section, and for the same reason (docs/waycompose-design.md §7.4).
 ///
 /// Idempotent per id only in the sense that re-attaching replaces: an arena is
 /// identified by its number on the wire, and if the two sides ever disagree
@@ -151,7 +151,7 @@ pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
 ///
 /// The peer opens the same file read-write through its own allocator. On the
 /// deployment this is for — Wine, or two processes on one Linux box — that is a
-/// coherent shared mapping and was measured to be one (docs/design.md §9.4,
+/// coherent shared mapping and was measured to be one (docs/waycompose-design.md §9.4,
 /// `scripts/probe-filemap.c`). On a virtio-fs export it is **not**, which is
 /// §10.3, and is exactly why the deployment that matters uses guest RAM.
 pub fn provide_file(id: u32, path: &str, size: u64) -> io::Result<()> {
@@ -259,7 +259,7 @@ pub struct GuestRegion {
 /// process outside the virtual machine can find those pages in the hypervisor's
 /// backing object.
 ///
-/// This is docs/design.md §9.10 item 3 and §10.13 item 1: the region stops being
+/// This is docs/waycompose-design.md §9.10 item 3 and §10.13 item 1: the region stops being
 /// a file. Everything above `Handle::map` is unchanged — a `Descriptor` is still
 /// three integers, `window()` is still checked arithmetic — and what changes is
 /// only who provided the pages.
@@ -322,7 +322,7 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
 
 /// The sub-range of one arena that this process may hand *out*.
 ///
-/// docs/design.md §12.11 item 3: "which arena, and which sub-range, is the
+/// docs/waycompose-design.md §12.11 item 3: "which arena, and which sub-range, is the
 /// compositor's to give away is not expressed anywhere". This is that
 /// expression, and it is three integers because that is all it ever was — the
 /// wire has carried `Descriptor::ArenaSlice` in this direction since stage 1
@@ -517,7 +517,7 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
 ///
 /// # STAGE 12, and it is a correction to a claim rather than a feature
 ///
-/// docs/design.md §14.12 item 1 said the ordering held by construction:
+/// docs/waycompose-design.md §14.12 item 1 said the ordering held by construction:
 ///
 /// > A gift written before the host's locate would take pages of stamps with it
 /// > and the sweep would report `located 16366 of 16384`. The order holds in
@@ -661,7 +661,7 @@ pub fn outbound_usage() -> Option<(u64, u64)> {
 /// to arbitrary arena memory?" has a type-level answer — a client's buffer is a
 /// `Descriptor` and a `Descriptor` never becomes a `Gift`.
 ///
-/// Dropping it returns the bytes. That is the lifetime rule of docs/design.md
+/// Dropping it returns the bytes. That is the lifetime rule of docs/waycompose-design.md
 /// §2.5 arriving from the other end: a section has to be *held* because its name
 /// dies with the last handle, and a gift has to be held because its bytes are
 /// reused by the next one. `crate::Handle` keeps it in an `Arc` for exactly as
@@ -876,7 +876,7 @@ fn write_provided(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
 /// The live-coherency probe: the host writes into the guest's arena while the
 /// guest holds a live mapping, and the guest answers at another offset so the
 /// host can measure the other direction. On a virtio-fs export neither
-/// direction worked (docs/design.md §10.3) and every check above the pixels
+/// direction worked (docs/waycompose-design.md §10.3) and every check above the pixels
 /// passed anyway (§10.7), which is why this is measured directly rather than
 /// inferred from a window looking right.
 ///

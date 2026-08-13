@@ -204,8 +204,29 @@ fetch() {
   scp "${SSHOPT[@]}" "$GUEST:$GUESTNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
     mkdir -p "$OUT"
+    # **§35: the geometry and the colour count are compared, not printed.** This
+    # was gated only on `magick` converting the file, and the `%wx%h` it printed
+    # was decoration — a 1x1 capture, or an all-black one, converted fine and
+    # read as a pass. `wc-launch.sh`'s `do_shot` gates on both; this one did
+    # not, for either of its callers.
+    #
+    # The bounds are deliberately weak and absolute rather than exact: this is a
+    # screenshot of a Windows desktop whose size the harness does not fix, so
+    # what is excluded is a capture that cannot be of a desktop at all. 200x200
+    # against a 1280x1024 screen, and 16 colours against the 1 a blank surface
+    # gives -- the same floor and the same reasoning as §35.3's screenshot check.
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      ok "$caption -> docs/stage32/$local_png ($(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null))"
+      local geo w hgt colours
+      geo=$(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null)
+      colours=$(identify -format '%k' "$OUT/$local_png" 2>/dev/null)
+      w=${geo%x*}; hgt=${geo#*x}
+      if [ "${w:-0}" -lt 200 ] || [ "${hgt:-0}" -lt 200 ]; then
+        bad "$caption: the capture is ${geo:-nothing}, too small to be a desktop"
+      elif [ "${colours:-0}" -lt 16 ]; then
+        bad "$caption: the capture is $geo with only ${colours:-0} distinct colours -- a blank surface"
+      else
+        ok "$caption -> docs/stage32/$local_png ($geo, $colours distinct colours)"
+      fi
     else
       bad "could not convert $remote"
     fi
@@ -537,9 +558,21 @@ chmod +x $HOST_DIR/s32.sh" >/dev/null
     bad "two real applications -> $d identities over $n windows"
     grep WaycomposeToplevel "$RUNDIR/windows-apps.txt" 2>/dev/null | sed 's/^/        /' | head -6
   fi
-  grep -q "icon set: 2 of 2 slots" "$RUNDIR/comp-$tag.log" \
-    && ok "and both windows carry an icon resolved on the host" \
-    || note "the icons did not both resolve; the identity claim is unaffected"
+  # **§35: the failing arm was a `note`, so this could not fail.** "The identity
+  # claim is unaffected" is true and is a reason to keep the two checks
+  # *separate*, not a reason for one of them to have no verdict — a taskbar
+  # button with the right identity and no icon is a defect §16 spent a whole
+  # stage on, and it would have passed here in silence.
+  #
+  # The count is quoted from the compositor's own line rather than inferred, so
+  # "1 of 2" reads as the partial failure it is instead of as an absence.
+  local icons
+  icons=$(grep -o "icon set: [0-9]* of [0-9]* slots" "$RUNDIR/comp-$tag.log" | tail -1)
+  case "$icons" in
+    "icon set: 2 of 2 slots") ok "and both windows carry an icon resolved on the host ($icons)" ;;
+    "") bad "the compositor never reported an icon slot count; nothing here says an icon was set" ;;
+    *) bad "only some icons resolved: $icons -- the identity is right and the picture is not" ;;
+  esac
   kill_ours "$sock" >/dev/null 2>&1
   unreg "wctb32-$tag"
 }

@@ -2,7 +2,7 @@
 //!
 //! # Why this exists at all, when the point of the project is Windows
 //!
-//! Because of docs/design.md §7.5, which is the most expensive fact stage 2
+//! Because of docs/waycompose-design.md §7.5, which is the most expensive fact stage 2
 //! established: **a stock libwayland client cannot send a buffer to the Windows
 //! build.** An `h` argument travels out-of-band by `SCM_RIGHTS` on Unix and
 //! in-band as a descriptor on Windows (§2.3), Wine's AF_UNIX carries no
@@ -192,7 +192,7 @@ pub(crate) struct PumpInner {
     /// window, which in a browser is the middle of a web page and opens
     /// nothing. There is no window manager on this platform and no `SendInput`,
     /// so without a way to say *where*, the popup path can only be exercised
-    /// under Wine — and Wine is a hypothesis (docs/design.md §4.4).
+    /// under Wine — and Wine is a hypothesis (docs/waycompose-design.md §4.4).
     ///
     /// Deliberately a single click rather than a scripting language: the
     /// question is whether one press at a known point produces an `xdg_popup`
@@ -771,7 +771,7 @@ impl PumpInner {
     ///
     /// # Why this is worth having when the whole point is Win32
     ///
-    /// Because of docs/design.md §8.5's split, which stage 6 inherits in a
+    /// Because of docs/waycompose-design.md §8.5's split, which stage 6 inherits in a
     /// sharper form than stage 3 had it. On Windows the only clients that can
     /// reach the compositor are ours or come through the proxy; on Linux any
     /// Weston client connects directly. `weston-eventdemo` **prints every input

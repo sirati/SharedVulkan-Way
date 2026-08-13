@@ -27,7 +27,7 @@ path = "src/main.rs"
 # gate honest.
 #
 # `wayland_frontend` is the protocol implementations. `desktop` is the space and
-# window management (4,768 lines, docs/design.md §5.2).
+# window management (4,768 lines, docs/waycompose-design.md §5.2).
 smithay = { path = "../../vendor/smithay", default-features = false, features = [
   "wayland_frontend",
   "desktop",

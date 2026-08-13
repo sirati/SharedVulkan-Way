@@ -26,7 +26,7 @@ use wc_proxy::spec::Spec;
 struct Args {
     /// The compositor's `AF_UNIX` node. Under Wine this is a real host socket
     /// inside the prefix, which is what lets a Linux process reach a `.exe`
-    /// (docs/design.md §4.2); on the guest it is the far end of a relay.
+    /// (docs/waycompose-design.md §4.2); on the guest it is the far end of a relay.
     upstream: PathBuf,
     runtime_dir: PathBuf,
     socket: String,
@@ -61,7 +61,7 @@ struct Args {
     /// **Off by default, and that is a decision rather than caution.** An arena
     /// that grew whenever it was tight would make [`Policy`] untestable — every
     /// measurement of how well runs are chosen would be contaminated by memory
-    /// that was added instead of used — and `docs/design.md` §20.4's matrix
+    /// that was added instead of used — and `docs/waycompose-design.md` §20.4's matrix
     /// compares policies at a fixed size. Growth is what happens after the
     /// allocator has already failed, and a run has to say it wants it.
     arena_grow: bool,
@@ -151,7 +151,7 @@ usage: wc-proxy --upstream <path> [options]
                          cannot tell a cold region from a paused video.
   --arena-policy KIND    arena: first-fit | best-fit    (default best-fit)
                          which run of free bytes a pool takes. best-fit is
-                         stage 16's, measured in docs/design.md 20.4; first-fit
+                         stage 16's, measured in docs/waycompose-design.md 20.4; first-fit
                          is stage 12's, kept so a live run can be compared
                          against the synthetic one without a rebuild.
 
@@ -337,7 +337,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // client exists, and each session gets a handle on the same region and the
     // same allocator (`Arena::share`). Stage 9 refused the second call by name —
     // one region, one allocator, no protocol for a second arena id
-    // (docs/design.md §12.13 item 6) — and that refusal was the reason Firefox,
+    // (docs/waycompose-design.md §12.13 item 6) — and that refusal was the reason Firefox,
     // which opens four connections, had never touched an arena (§15.14). The
     // premise was right and the conclusion was not: what must not be duplicated
     // is the *allocator*, and one allocator serves four connections for exactly
@@ -483,7 +483,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // real. Against a one-shot proxy the throwaway is the only connection that
     // is ever served; the real one finds a closed socket, and Firefox reports
     // `Wayland protocol error: Compositor () crashed` and dumps core. Measured,
-    // and it is docs/design.md §13.8.
+    // and it is docs/waycompose-design.md §13.8.
     //
     // Each client gets its **own upstream connection**, which is what a
     // compositor expects: object ids are per-connection, and multiplexing two
@@ -514,7 +514,25 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // being accepted into a proxy with nowhere to forward to; that is still
         // true and is now handled by failing the connection immediately, which
         // is a closed socket at the same moment either way.
-        let upstream = match std::os::unix::net::UnixStream::connect(&args.upstream) {
+        //
+        // **Retried on `ECONNREFUSED`, for the reason `wc-wlcs` retries.** `bind`
+        // creates the filesystem node and `listen` makes it accept; between the
+        // two, `connect` is refused. Every harness that starts a compositor and
+        // then a proxy waits for the *node*, which does not close that window,
+        // and the symptom is one leg of a run failing with "cannot reach the
+        // compositor" while an identical tree passes — a red that is not a
+        // regression, which teaches everyone to re-run until green.
+        //
+        // Bounded and reported: the retry is printed, so a run that needed it
+        // says so rather than hiding a slow compositor behind a pass. A refusal
+        // that outlives the deadline is still a failure, because a compositor
+        // that is not listening after five seconds is not a race.
+        let upstream = match proxy::connect_upstream(&args.upstream, |refusals, ms| {
+            println!(
+                "[proxy] client {n}: the compositor refused {refusals} connect(s) over {ms:.0} ms \
+                 before it was listening"
+            );
+        }) {
             Ok(u) => u,
             Err(e) => {
                 println!(
@@ -527,7 +545,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("[proxy] client {n} connected, upstream {} connected", args.upstream.display());
 
         // A transport per session: a fresh `SharedFile`, or a handle on the one
-        // arena. docs/design.md §16.2.
+        // arena. docs/waycompose-design.md §16.2.
         let transport = match make_transport(n) {
             Ok(t) => t,
             Err(e) => {
