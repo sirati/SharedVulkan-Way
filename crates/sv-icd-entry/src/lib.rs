@@ -633,12 +633,19 @@ pub trait IcdLocal {
 
 /// Where a presented frame goes, once the app side holds its pixels.
 ///
-/// **Deliberately not a `Display*` or an `xcb_connection_t*`.** The ICD reads a
-/// window id out of the loader's `VkIcdSurface` and nothing else: it never calls
-/// into the application's X connection, because doing so would need this crate
-/// to link a window-system library and would put us inside somebody else's
-/// locking discipline. What the display target does with the id is its business
-/// (`sv_icd::present`).
+/// **This crate never dereferences any of it**, and that is the whole of the
+/// rule it keeps. It reads the fields out of the loader's `VkIcdSurface`,
+/// carries them as integers, and hands them on; what the display target does
+/// with them is `sv_icd::present`'s business, and it is that module — not this
+/// one — that `dlopen`s a window-system library.
+///
+/// The X11 variant is an id and could not be anything else: X window ids are
+/// global to the display, so `sv_icd::present::x11` opens a connection of its
+/// own. The Wayland variant *is* two pointers, and cannot be an id, because
+/// **a `wl_surface` is a proxy private to one connection**. There is no name for
+/// it that a second connection could resolve, so the only way to put a frame on
+/// the application's surface is to speak on the application's own display —
+/// which is what `sv_icd::present::wayland` does, on an event queue of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentTarget {
     /// `VK_EXT_headless_surface`, which is what Wine maps `VK_KHR_win32_surface`
@@ -647,6 +654,10 @@ pub enum PresentTarget {
     Headless,
     /// An X11 window, by XID.
     X11 { window: u64 },
+    /// A `wl_display*` and a `wl_surface*`, as `usize` so that this stays
+    /// `Copy`, `Send` and free of raw pointers in a safe signature. Both belong
+    /// to the application and are valid for as long as the surface is.
+    Wayland { display: usize, surface: usize },
 }
 
 /// The parts of `VkSurfaceCapabilitiesKHR` that are not constants.
@@ -1028,8 +1039,10 @@ mod tests {
             "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
             "vkGetPhysicalDeviceSurfaceFormatsKHR",
             "vkGetPhysicalDeviceSurfacePresentModesKHR",
+            "vkCreateWaylandSurfaceKHR",
             "vkGetPhysicalDeviceXlibPresentationSupportKHR",
             "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+            "vkGetPhysicalDeviceWaylandPresentationSupportKHR",
             "vkCreateSwapchainKHR",
             "vkDestroySwapchainKHR",
             "vkGetSwapchainImagesKHR",

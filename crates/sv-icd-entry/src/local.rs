@@ -613,6 +613,21 @@ mod surface_ci {
         pub dpy: *mut core::ffi::c_void,
         pub window: core::ffi::c_ulong,
     }
+
+    /// `{ VkStructureType sType; const void* pNext; VkFlags flags;
+    /// struct wl_display* display; struct wl_surface* surface; }`.
+    ///
+    /// The one whose pointers are not merely carried: see [`PresentTarget`] for
+    /// why a `wl_surface` has no name a second connection could resolve, and
+    /// `sv_icd::present::wayland` for what is done with them.
+    #[repr(C)]
+    pub struct Wayland {
+        pub s_type: i32,
+        pub p_next: *const core::ffi::c_void,
+        pub flags: u32,
+        pub display: *mut core::ffi::c_void,
+        pub surface: *mut core::ffi::c_void,
+    }
 }
 
 /// The `VkSurfaceKHR` a terminator handed us, resolved to what it points at.
@@ -686,6 +701,35 @@ pub unsafe extern "system" fn sv_vk_create_xcb_surface_khr(
     create_surface(PresentTarget::X11 { window: ci.window as u64 }, p_surface)
 }
 
+/// `vkCreateWaylandSurfaceKHR`.
+///
+/// A null `display` or `surface` is refused rather than carried, because a
+/// Wayland target with either missing is not a headless surface that shows
+/// nothing — it is a pointer that something downstream would dereference.
+pub unsafe extern "system" fn sv_vk_create_wayland_surface_khr(
+    _instance: VkInstance,
+    p_create_info: *const c_void,
+    _p_allocator: *const VkAllocationCallbacks,
+    p_surface: *mut VkSurfaceKHR,
+) -> VkResult {
+    if p_create_info.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: as above, for `VkWaylandSurfaceCreateInfoKHR`.
+    let ci = unsafe { &*(p_create_info as *const surface_ci::Wayland) };
+    if ci.display.is_null() || ci.surface.is_null() {
+        report_transport_failure(&format_args!(
+            "vkCreateWaylandSurfaceKHR: display {:?} surface {:?} — one of them is null",
+            ci.display, ci.surface
+        ));
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    create_surface(
+        PresentTarget::Wayland { display: ci.display as usize, surface: ci.surface as usize },
+        p_surface,
+    )
+}
+
 /// `vkDestroySurfaceKHR`.
 pub unsafe extern "system" fn sv_vk_destroy_surface_khr(
     _instance: VkInstance,
@@ -744,6 +788,22 @@ pub unsafe extern "system" fn sv_vk_get_physical_device_xcb_presentation_support
     queue_family_index: u32,
     _connection: *mut c_void,
     _visual_id: u32,
+) -> VkBool32 {
+    u32::from(queue_family_index == 0)
+}
+
+/// `vkGetPhysicalDeviceWaylandPresentationSupportKHR`.
+///
+/// Same obligation as the two above, and the same answer, but the reason it is
+/// *true* is different and worth one line: on Wayland the presentation engine
+/// really is this driver — a `wl_shm` buffer attached to the application's own
+/// surface — so there is no compositor-side capability that could say no. What
+/// this must not do is dereference the `wl_display`: the loader calls it before
+/// any surface exists, from whatever thread the application asked on.
+pub unsafe extern "system" fn sv_vk_get_physical_device_wayland_presentation_support_khr(
+    _physical_device: VkPhysicalDevice,
+    queue_family_index: u32,
+    _display: *mut c_void,
 ) -> VkBool32 {
     u32::from(queue_family_index == 0)
 }

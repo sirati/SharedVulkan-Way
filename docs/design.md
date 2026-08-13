@@ -1744,6 +1744,83 @@ obviously share a mechanism.
 
 ---
 
+### 0.15 The Wayland WSI, and the gate that turned out to be Mesa's
+
+Built and measured 2026-08-13 on **devhost** and on **testhost** against
+the live guest, `docs/firefox-accel.md`, "The Wayland WSI, and the gate that is
+not ours". §0.14's section named `VK_KHR_wayland_surface` as the one thing
+between this project and Firefox's hardware WebRender. It was built. It is not
+the one thing, and the correction is the point of this entry.
+
+**1. The extension exists and works as designed.** `sv-icd` advertises
+`VK_KHR_wayland_surface` and implements it app-side, like the rest of §10:
+`vkCreateWaylandSurfaceKHR` reads a `wl_display*` and a `wl_surface*` out of the
+loader's `VkIcdSurfaceWayland`, and `vkQueuePresentKHR` attaches a `wl_shm`
+buffer to that surface **on the application's own connection**, from an event
+queue of ours. The X11 target could open a connection of its own because an X
+window id is global to the display; a `wl_surface` is a proxy private to one
+connection and has no such name, so there is no choice. libwayland is `dlopen`ed
+and driven through `wl_proxy_marshal_array_flags`, because the functions that
+would be linked are `static inline` in the protocol header and only the
+marshaller is an exported symbol. **No descriptor crosses**: the `memfd` is
+created on the host, consumed by `wc-proxy` on the host, and what reaches the
+guest is the `(slab, offset, len)` triple `wc_proxy::pool` already carries.
+
+**2. And Mesa will not call it, for a reason above this project.**
+`dri2_initialize_wayland` reaches Zink through two doors. The DRM one needs a
+render node advertised *by the compositor* — `zwp_linux_dmabuf_v1` or `wl_drm` —
+which a `wl_shm`-only proxy on a host with no `/dev/dri` cannot give it, and
+`eglapi.c`'s retry then clears `Options.Zink` outright. The swrast one honours
+`Options.Zink` but only runs under `LIBGL_ALWAYS_SOFTWARE`, and Zink's
+`choose_pdev` reads that same variable and then accepts only a device that says
+`VK_PHYSICAL_DEVICE_TYPE_CPU` — measured, as `ZINK: CPU device requested but
+none found!`. **On this topology no Vulkan driver is reachable from the Wayland
+EGL platform, whatever it advertises.**
+
+**3. So §0.14's control was not a control.** It compared real RADV on a pixman
+weston against our ICD on `wc-proxy` and concluded that the variable was the
+extension. The second, unheld variable was `/dev/dri`: devhost has one and
+testhost has none, so the two runs went through different doors. The lesson is
+§0.13's exactly — a control that does not hold the venue fixed answers a
+different question — and it is recorded here rather than quietly fixed.
+
+**4. The X11 path does reach the GPU, and needed one environment variable.**
+`platform_x11.c` has the override the Wayland platform lacks: with
+`LIBGL_KOPPER_DRI2=1` Mesa skips the DRI3-multibuffer and render-device checks
+and goes straight to `dri2_initialize_x11_kopper`, which presents through
+`VK_KHR_xcb_surface` — an extension this ICD has had since §0.4. Under a rootful
+Xwayland with no DRM device, on a compositor that speaks only `wl_shm`,
+`eglgears_x11` renders on the real GPU through the forwarder, and **Firefox
+stops reporting `Failed to create EGLConfig for WebRender!` and
+`Fallback WR to SW-WR` and builds a swapchain on this ICD instead**. Without the
+variable the same Xwayland yields `DRI3 not available` and `couldn't find RGB
+GLX visual or fbconfig`, which is what three runs measured before it was found.
+
+**5. On testhost that path puts GL on the guest's desktop, and Firefox still
+stalls.** `eglgears_x11` through the same harness renders on the guest's Intel
+iGPU, is presented by this ICD into a DRM-less Xwayland, reaches the guest as
+`wl_shm` over `wc-proxy` into the guest-RAM arena, and appears in the
+compositor's dumped frame on the Windows desktop — every layer of
+`goal-firefox.md` except the browser, on the machine the goal is about. Firefox
+gets further than it ever has and no further:
+`vkCreateSwapchainKHR: X11 { window: 6291472 } 512x416` on the guest's
+Intel iGPU from a host with no GPU, then `WaitFlushedEvent::Run: is delayed:
+14608` and `Exiting due to channel error`, twice, at four sessions and at eight.
+What is *not* separated is how much of that is the cross-VM round trip per
+present, how much is the `XSync` per frame that `sv_icd::present::x11::quietly`
+pays on top of it, and how much is a guest a dozen other experiments were using.
+**So `about:support` still has no answer, and there is still no frame rate.**
+
+**6. One instrument was added, and it is the one that made §5 sayable.**
+`sv_icd::wsi::frame_note` samples every sixtieth presented frame and reports how
+many pixels are not black, under `SV_DEBUG`. A swapchain whose every entry point
+returns `VK_SUCCESS` and whose window is nonetheless black is indistinguishable
+from a broken display target without it; with it the answer was "the frame has
+content, and there is exactly one of them", which is a different problem from
+the one being chased.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
