@@ -7528,6 +7528,295 @@ considered during the stage and deliberately not built:
    sketched; what it needs is somebody to say whether a periodic
    `GetLastInputInfo` on the guest is acceptable, which is a question about the
    deployment and not about the code.
+---
+
+## 23. Stage 12: the mouse cursor
+
+### 23.1 Status in one paragraph
+
+Written 2026-08-13. `wl_pointer.set_cursor` was a stub — it logged once, did
+nothing, and the user saw the Win32 arrow over everything: no I-beam over text,
+no hand over a link, no resize arrow on a client's own edge. It is implemented,
+together with `wp_cursor_shape_v1`, which was absent altogether. Both arrive at
+the same smithay callback and leave through the same platform message, because
+from Win32's point of view they are one act: `SetCursor` with one `HCURSOR`.
+`scripts/wc-cursor.sh` is **5 passed, 0 failed** on the Linux leg and **8
+passed, 0 failed** on the Wine leg, and the sentence the Wine leg buys is:
+*a client's cursor theme — 32x32 pixels with a hotspot of 5,5, drawn by
+somebody else's XCursor theme — crossed the proxy, became a `CreateIconIndirect`
+handle inside `wc-compositor.exe`, and is what the compositor's input queue is
+holding.* `wl_keyboard.repeat_info` stopped being invented at the same time and
+is now `SystemParametersInfo`.
+
+The invariant this stage exists to keep, and the one the user stated: **exactly
+one visible cursor, and it is a real Win32 cursor.** Nothing here draws
+anything. A client's cursor surface becomes an `HCURSOR` and Windows
+composites it above every window on the desktop, with the right hotspot and no
+tearing, for free. Blitting a cursor surface into the window as content is the
+alternative and it is wrong three ways at once — clipped to the window, a frame
+late, and with the system arrow still on top of it, which is the two-cursor bug
+that was live while this was written.
+
+### 23.2 Two protocols, and why the named one first
+
+`wp_cursor_shape_v1` carries a **name** — `default`, `text`, `pointer`,
+`ns_resize` — and `wl_pointer.set_cursor` carries a **surface**. The named one
+was done first and it is not merely the tidier half:
+
+* It maps almost one-to-one onto `LoadCursorW(NULL, IDC_IBEAM)` and friends. No
+  pixels, no hotspot arithmetic, no surface lifetime, no buffer release.
+* The cursor a user gets is then the *system's*, at the system's size and DPI,
+  matching every native application on the machine. A themed Linux cursor is
+  the right shape drawn in the wrong house.
+* It is what GTK4 binds today.
+
+That last claim was checked rather than repeated. `libgtk-4.so.1` contains the
+string `wp_cursor_shape_manager_v1`; `libgtk-3.so.0` does not; and **Firefox
+151's `libxul.so` does not either**. So for the application this project is
+aimed at, the named path is not the one that matters — Firefox reaches the
+compositor entirely through `wl_pointer.set_cursor` with a buffer, which is
+why both halves were done in one stage rather than the easy one being shipped
+alone.
+
+**And that is the second time the same measurement has come back the same way,
+so it is worth stating as a rule rather than as a surprise.** §13.7 found that
+GTK 3 does not implement `xdg-decoration` and binds KDE's
+`org_kde_kwin_server_decoration` instead — checked the same way, by looking for
+the interface name in `libgdk-3.so`. The general form:
+
+> For a GTK3-era client, the modern protocol is frequently **advertised and
+> never bound**. Implementing it is therefore not evidence that anything
+> reaches it, and a compositor that shipped only the modern half would pass
+> every protocol-shaped test and change nothing a user could see.
+
+The cheap check is one `grep` against the client's own shared object, and it
+costs less than the run that would otherwise discover the same thing an hour
+later. It is also why §23.8 item 1 is written as an admission rather than a
+footnote: the *named* path here is currently in exactly the state this rule
+warns about — advertised, carried, unit-tested, and bound by nothing in the
+harness.
+
+### 23.3 The table, and where it lives
+
+`crates/wc-compositor/src/cursor.rs`. It is a new file for one reason: the
+mapping is **lossy** — thirty-six named shapes onto fourteen stock Win32
+cursors — and every lossy entry is a judgement someone should be able to read
+and disagree with. A table like that belongs somewhere it can be unit-tested on
+the machine that builds it, so it deals in the `IDC_*` **resource ordinals**
+(`IDC_IBEAM` is the integer 32513 and has been since Windows 3.0) and never
+mentions `windows-sys`. `platform/win32.rs` is the only file that turns one
+into a `PCWSTR`.
+
+Five tests, and the two that earn their keep are the ones about mistakes that
+are invisible at a glance: `the_diagonals_do_not_swap` (NE/SW is the `/` cursor
+and NW/SE is the `\` one, and both look like "a resize arrow" from a metre
+away) and `only_the_six_documented_shapes_fall_back_to_the_arrow` — because the
+failure mode of a lossy table is entries quietly rotting into the default.
+
+The six given up on are `context_menu`, `alias`, `copy`, `dnd_ask`, `zoom_in`
+and `zoom_out`. Windows draws these as an arrow with a badge, and the badges
+are not stock cursors: they live in the shell's drag-and-drop implementation
+and are reachable only through `IDropTarget`, a COM interface this compositor
+has no business implementing to decorate a pointer. An arrow is honest; a
+crosshair standing in for "copy" is not.
+
+### 23.4 The buffer path, and the four things it has to get right
+
+1. **When the pixels arrive.** A client may `set_cursor(surface)` and *then*
+   attach and commit the buffer (GTK does), or attach and commit and *then*
+   `set_cursor` (Qt does). In the second order, by the time `set_cursor`
+   arrives smithay has already taken the buffer out of the surface's pending
+   state and it cannot be read again. So `State` keeps one slot,
+   `cursor_pixels`, filled by any commit on a surface with the
+   `"cursor_image"` role, and both orders work. The role is the authority on
+   "is this a cursor", not a comparison against the surface the compositor was
+   told about — that field is empty for the first commit of the second order.
+
+2. **Not diverting the commit.** The hook in `commit` reads and returns.
+   Whether a cursor surface is *also* composited as window content is a
+   scene-graph question, answered in `present`/`compose_tree`, and is a
+   different agent's change; doing both here would have been two fixes for one
+   bug in two files.
+
+3. **The alpha.** `wl_shm`'s `Argb8888` is premultiplied and a 32-bit
+   `CreateIconIndirect` wants premultiplied, so there is nothing to convert —
+   but there is something not to *do*, which is discard it. A cursor is mostly
+   transparent and almost entirely antialiased edge; dropping the channel gives
+   a black rectangle with a cursor in it, and forcing it opaque gives a hard
+   jagged outline. Both are worse than the arrow this replaces.
+   `crate::icon::image_from_bytes` was reused unchanged, which also gets
+   `Xrgb8888` right: it forces the undefined fourth byte to 0xFF, and without
+   that an `Xrgb` cursor would be entirely invisible.
+
+4. **The mask.** `CreateBitmap` with a null bit pointer is documented as
+   leaving "the contents of the new bitmap undefined". Every Windows to date
+   zero-fills it and the icon path has relied on that since stage 11. For an
+   icon a stray mask bit is one wrong pixel in a taskbar button; for a cursor
+   the AND mask selects between "transparent" and "invert the screen", so
+   garbage is a cursor with inverted holes punched through it. A 32x32 mask is
+   128 bytes, so it is now supplied rather than assumed — and the scan lines
+   are **word**-aligned, not dword-aligned as they would be in a DIB.
+
+The image is **not** resampled. `make_icon` scales because Windows asks for two
+specific icon sizes; a cursor has no such requirement, and not scaling means
+the hotspot arrives as an exact pixel. Half a pixel of drift on a
+one-pixel-wide I-beam is the difference between clicking before and after a
+character.
+
+### 23.5 `WM_SETCURSOR`, and why the cursor is installed twice
+
+Once from the window procedure and once from the command handler, and both are
+needed:
+
+* **`WM_SETCURSOR` is the only way to keep it.** Windows re-asks on every mouse
+  message and `DefWindowProc` answers with the *class* cursor — the `IDC_ARROW`
+  in `register_classes`. A cursor set only from the command handler survives
+  until the pointer moves one pixel, and presents as a cursor that flickers to
+  the right shape and back.
+* **The command handler is the only way to apply it now.** `WM_SETCURSOR` needs
+  a mouse message, and the interesting changes happen while the pointer is
+  *still*: a page finishing loading, a client hiding the pointer as the user
+  starts typing, a `wl_pointer.leave` restoring the arrow.
+
+`SetCursor` is thread-global, so the immediate call is guarded by
+`Ui::pointer_inside` — set from `on_mouse_move` and cleared from
+`on_mouse_leave`. Without it, a client changing its cursor while the pointer is
+over somebody else's window would repaint *their* cursor until their next mouse
+message.
+
+**The hit-test guard is not a nicety.** `LOWORD(lParam)` is the hit-test code
+and only `HTCLIENT` is the client's business. `HTLEFT`, `HTBOTTOMRIGHT`,
+`HTCAPTION` and the rest are the system frame, where Windows draws the resize
+arrows. Claiming those would replace the resize cursors on the window border
+with whatever the client last asked for — the exact opposite of the goal, which
+wants a resize arrow on the edge.
+
+**How this reads after stage 17**, which landed while this branch was merging
+and which is the other half of the same window. §22 keeps the real system
+frame and does not handle `WM_NCHITTEST` at all — a client-decorated window is
+moved by `xdg_toplevel.move` arriving as `ToUi::BeginMove`, because Wayland has
+no protocol by which a client publishes its draggable region. So the hit-test
+codes here mean exactly what they meant before it: the caption and the resize
+borders are genuinely non-client and keep the system's cursors, and everything
+the client draws is `HTCLIENT` and gets the client's. That is the right answer
+for a client that paints its own title bar — over its tab strip the cursor
+should be whatever the client says — and it is the answer by construction
+rather than by agreement between two stages, which is the only reason the two
+did not have to be merged carefully.
+
+Lifetime: stock cursors from `LoadCursorW` are shared, owned by the system, and
+must never be destroyed. Ours must be, and promptly — a client animating its
+cursor rebuilds several times a second, so leaking these would burn a GDI
+object every 100 ms and hit the 10,000-handle quota in a quarter of an hour.
+The new one is built before the old is destroyed (a failed build leaves the
+previous cursor up rather than leaving the pointer invisible) and the old is
+destroyed *after* `SetCursor` (destroying a cursor that is on screen leaves the
+pointer drawn from freed memory).
+
+`wl_keyboard.repeat_info` was fixed in the same breath because it is the same
+shape of mistake: 500 ms and 30 Hz were Windows' *defaults*, written out as
+constants, so a user who had moved the Control Panel slider got the default in
+every Wayland client and their own rate in every native one.
+`SPI_GETKEYBOARDDELAY` returns 0..3 meaning 250..1000 ms, which is exact;
+`SPI_GETKEYBOARDSPEED` returns 0..31 and Microsoft documents only the endpoints
+(2.5/s and 30/s), so the middle is interpolated linearly in the rate and is
+labelled an estimate rather than presented as a table of thirty-two numbers
+somebody made up. The headless platform still returns 500 and 30, because there
+is no Windows there to ask and the harness must not depend on the build host's
+desktop settings.
+
+### 23.6 What was measured, and how
+
+`scripts/wc-cursor.sh`, two legs, for the reason every stage here splits its
+evidence — the two halves fail in different ways.
+
+**linux — 5 passed, 0 failed.** `wp_cursor_shape_v1` is a name on the wire and
+nothing else, so what can go wrong with it is protocol-shaped. `wayland-info`
+— libwayland's own client, which has never heard of this project — sees
+`wp_cursor_shape_manager_v1` at **version 2** in the registry, and sees it
+again through `wc-proxy`. The proxy needed the XML (`crates/wc-proxy/protocols/
+cursor-shape-v1.xml`, the byte copy from the same `wayland-protocols 0.32.12`
+smithay is generated from) and the three counted assertions moved with it:
+32 interfaces to 34, 376 walked messages to 386, and the fd list did not move
+because neither interface has an `h`.
+
+**wine — 8 passed, 0 failed.** `weston-eventdemo` is the client, and it is the
+right one for a reason that is not convenience: Weston's toytoolkit loads an
+**XCursor theme** and calls `wl_pointer.set_cursor` with a themed surface, so
+the pixels are a real theme's, at whatever size it ships, with a hotspot that
+is not 0,0, and nothing in this project chose any of it. The chain:
+
+```
+wc-compositor: cursor -> 32x32 pixels, hotspot 5,5
+wc-compositor: cursor round-trip: fIcon=0 hotspot=5,5 colour=32x32 at 32 bpp
+probe-cursor:  client-area-msg cursor=custom handle=00000000000b0040
+```
+
+Three different statements. The first is the Wayland thread: a cursor surface
+committed and its pixels were read. The second is Win32 read back through
+`GetIconInfo` — `CreateIconIndirect` accepted the ARGB bitmap, kept 32 bits per
+pixel, and did not move the hotspot. The third is `scripts/probe-cursor.c`, a
+separate process, reporting that the cursor on the compositor's input queue
+matches **none of the sixteen stock cursors** — so what `SetCursor` installed
+is ours.
+
+### 23.7 What Wine could not answer, and what has to be re-checked on the guest
+
+Wine has been wrong four times on this project (§13.6) and a cursor is exactly
+the kind of thing it emulates rather than implements. Two things were measured
+here as *Wine limitations*, not as compositor behaviour, and both are on the
+guest list:
+
+1. **`GetCursorInfo` kills the probe.** Under wine-11.14 on Xvfb, reading the
+   global cursor after injecting a mouse move dies with a fatal
+   `BadWindow (X_QueryPointer)` — Wine's X11 driver, not the compositor. The
+   harness therefore puts its sturdy readings first and treats the
+   `GetCursorInfo` reading as optional. On a real guest it is the reading that
+   says what the *user* sees, and it should be the primary assertion.
+
+2. **A cross-process `SendMessageW(WM_SETCURSOR)` is not delivered.** It
+   returns 0 for both `HTCLIENT` and `HTRIGHT`, and — the tell — the cursor on
+   the queue does not change for `HTRIGHT` either, where `DefWindowProc` would
+   have installed `IDC_SIZEWE` had the message arrived. So the hit-test guard
+   is currently defended by reading and not by measurement. On the guest this
+   is two sharp assertions: `1` for `HTCLIENT`, `0` for `HTRIGHT`.
+
+Beyond those, the guest has to answer the questions no API call can:
+
+3. **Does Windows draw a premultiplied ARGB cursor correctly?** The round-trip
+   says the bitmap went in intact. Whether the compositing on screen is right —
+   no black box, no hard outline, no halo — is a photograph.
+4. **Firefox.** A hand over a link, an I-beam over text, and a resize arrow on
+   the window edge, in one screenshot. §23.2 says this goes entirely through
+   the buffer path, so it is the same code the Wine leg exercised, with a
+   different and much larger client driving it.
+5. **`repeat_info` against a machine whose slider has been moved.** The
+   arithmetic is exercised nowhere but the guest: the headless platform returns
+   the constants and Wine's `SystemParametersInfo` is its own answer.
+6. **A client that hides the pointer.** `CursorSpec::Hidden` is implemented and
+   nothing in the harness reaches it, because neither `weston-eventdemo` nor
+   `wayland-info` ever sends `set_cursor(NULL)`. A terminal that hides the
+   pointer while typing would.
+
+### 23.8 What to do next
+
+1. **A client that actually sends `set_shape`.** Nothing in the harness binds
+   `wp_cursor_shape_v1` — the global is advertised, the proxy carries it, and
+   the table is unit-tested, but no run has taken a named shape end to end.
+   GTK4 is the client that would (§23.2) and none is installed here. This is
+   the one gap in this stage's evidence that is not Wine's fault.
+2. **Cursor scale.** A client on a 2x display sends a 64x64 cursor and expects
+   it drawn at 32 logical pixels. The compositor accepts scale-1 buffers only
+   (the commit handler says so out loud), so this is the same unimplemented
+   `buffer_scale` that everything else here is waiting on, and it will show up
+   as a cursor that is twice the size rather than as an error.
+3. **The named path could serve the buffer path.** A themed Linux cursor drawn
+   at Linux's size next to native Windows applications is the wrong size and
+   the wrong theme. A compositor that recognised the *standard* XCursor names
+   and substituted the stock Win32 cursor would look right — but `set_cursor`
+   carries pixels and no name, so this needs the client's cursor **surface** to
+   be matched against a known theme by hash, which is a guess wearing a
+   measurement's clothes. Not done, and noted so it is not done accidentally.
 
 ## 27. The damage a client reports is not the damage a *copy* needs
 
@@ -7788,13 +8077,13 @@ nothing.
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | **162 tests**, 0 failures — master's 160 plus this stage's two |
+| `cargo test --workspace` | **168 tests**, 0 failures — master's 166 after the cursor merge, plus this stage's two |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo build --workspace`, both targets | both, and **before** every deploy (§18.8: clippy builds metadata, not an executable) |
 | `scripts/wc-damage.sh scroll` (new) | **5 passed, 0 failed** — 1616 commits checked, 0 stale |
 | `scripts/wc-damage.sh control` (new) | **5 passed, 0 failed** — 1035 commits checked at `--copy buffer`, 0 stale |
-| the same, re-run **after merging master** (§22 title bar, §25 protocols) | 162 tests, clippy clean both targets, `scroll` 5/5 at 432 commits |
+| the same, re-run **after merging master** — twice, because master moved under the merge (§22 title bar, §25 protocols, then §23 cursors) | 162 then 168 tests, clippy clean both targets, `scroll` 5/5 at 432 and 964 commits |
 | `scripts/wc-damage.sh scroll` against the **pre-fix** copy path | **4 passed, 1 failed** — which is the point |
 | `wc-proxy.sh`, `wc-input.sh`, `wc-firefox.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended** |
 
@@ -7810,9 +8099,12 @@ scopes against each other — `every_copy_scope_produces_the_same_image`,
 `damage_scope_copies_less_than_the_other_two` and the new arrears test — all run
 in `cargo test` and all three scopes still agree.
 
-The merge is worth one more line. Master moved four times under this branch —
-stage 13 (§18), stage 17 (§22) and stage 21 (§25) — and only `docs/design.md`
-conflicted, at the append point, where both sides had added a section at the end.
+The merge is worth one more line — two, because master moved *again* between the
+first merge and pushing it, and the second re-run is the reason to say so rather
+than to quietly redo the first. Stage 13 (§18), stage 17 (§22), stage 21 (§25)
+and then stage 12's cursors (§23) all landed under this branch, and in both
+merges only `docs/design.md` conflicted, at the append point, where both sides
+had added a section at the end.
 `session.rs` and `session/tests.rs` merged cleanly despite §25 adding four
 protocols to the same crate. The three exact-count tests that break on protocol
 additions (`spec.rs`'s two and
