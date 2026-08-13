@@ -1,0 +1,31 @@
+[package]
+name = "sv-guest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The one binary that runs inside the VM: the Vulkan GPU server and the Wayland compositor"
+
+# THE FEATURES GATE COMPOSITION, NEVER A PRIMITIVE.
+#
+# docs/one-binary.md §2.3. The user asked for the Wayland half to be "behind a
+# compilation flag" and that is a requirement. Neither predecessor workspace had
+# a feature table and both argued for `cfg(target_os)` instead; that argument is
+# right and this does not contradict it, because the two answer different
+# questions. `cfg(target_os)` is platform — not a choice, the target decides.
+# A feature is composition — which halves am I building, which IS a choice, and
+# there is no cfg that expresses it.
+#
+# `sv-arena`, `sv-transport`, `sv-wire` and `arena-record` have no features and
+# must not acquire any: they are what "one arena" means, and a feature on one of
+# them would make the arena mean two different things depending on who built it.
+[features]
+default = ["gpu", "wayland"]
+# Exactly the old `sv-gpu-server` executable.
+gpu = ["dep:sv-gpu-server"]
+# Exactly the old `wc-compositor.exe`.
+wayland = ["dep:wc-compositor"]
+
+[dependencies]
+sv-gpu-server = { path = "../sv-gpu-server", optional = true }
+wc-compositor = { path = "../wc-compositor", optional = true }

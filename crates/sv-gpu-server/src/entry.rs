@@ -46,8 +46,8 @@
 /// rather than being a detail — it removes a privilege relationship between the
 /// GPU side and every application that attaches.
 #[cfg(windows)]
-fn main() -> std::process::ExitCode {
-    match win_run() {
+pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
+    match win_run(&argv) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sv-gpu-server: {e}");
@@ -57,7 +57,7 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(windows)]
-fn win_run() -> Result<(), Box<dyn std::error::Error>> {
+fn win_run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use sv_gpu_server::driver::Driver;
     use sv_gpu_server::{arena, server::Shared, session, table::Objects};
@@ -67,7 +67,7 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
     use sv_transport::stream::{read_message, write_message};
     use sv_transport::{winpipe, winshm};
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = argv.to_vec();
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
@@ -185,14 +185,14 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn main() {
+pub fn run_main(_argv: Vec<String>) -> std::process::ExitCode {
     eprintln!("sv-gpu-server: only Linux and Windows have a cold path in this build");
     std::process::exit(1);
 }
 
 #[cfg(target_os = "linux")]
-fn main() -> std::process::ExitCode {
-    match run() {
+pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
+    match run(&argv) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sv-gpu-server: {e}");
@@ -202,11 +202,11 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use sv_gpu_server::arena;
     use sv_gpu_server::driver::Driver;
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = argv.to_vec();
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };

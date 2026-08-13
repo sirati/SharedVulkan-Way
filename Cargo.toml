@@ -34,6 +34,9 @@ members = [
   "crates/sv-hostd",
   "crates/sv-gpu-server",
 
+  # The composition point: one binary, both halves, features per one-binary.md §2.3.
+  "crates/sv-guest",
+
   # The Wayland side.
   "crates/wc-transport",
   "crates/wc-handle",

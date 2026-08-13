@@ -929,6 +929,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-guest"
+version = "0.1.0"
+dependencies = [
+ "sv-gpu-server",
+ "wc-compositor",
+]
+
+[[package]]
 name = "sv-hostd"
 version = "0.1.0"
 dependencies = [

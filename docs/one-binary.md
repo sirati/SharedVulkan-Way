@@ -18,6 +18,69 @@ and the requirement that gives it its point:
 
 ---
 
+## THE REBASE RECIPE — read this first if you have work out against waycompose
+
+waycompose has been merged into this tree. **Your branch is not lost and almost
+certainly rebases cleanly**, because of 502 files that arrived, exactly six
+collided and only one was renamed.
+
+Run this from a checkout of **this** repository:
+
+```
+git remote add waycompose /mnt/datasets/builds/waycompose-base
+git fetch waycompose
+git rebase --onto one-binary waycompose/master waycompose/<your-branch>
+```
+
+### The path mapping, in full
+
+| was | is now |
+|---|---|
+| `crates/wc-*/**` | **unchanged** |
+| `vendor/**` | **unchanged** |
+| `scripts/wc-*.sh` | **unchanged** |
+| `docs/goal-firefox.md` | **unchanged** |
+| `docs/design.md` | **`docs/waycompose-design.md`** — the only rename |
+| `crates/wc-compositor/src/main.rs` | `crates/wc-compositor/src/lib.rs` (+ a new thin `main.rs`) |
+| `crates/wc-arena-host/**` | **deleted** — see §1.3 |
+| `Cargo.toml`, `flake.nix` | reconciled as a union; re-apply your member/dependency/package additions by hand, they are a few lines |
+
+Both renames are **pure rename commits that do nothing else** (`f1a9f2e` and the
+`wc-compositor` one), so `git rebase` follows them. That is the entire reason
+they are separate commits.
+
+### Four things that will look like breakage and are not
+
+1. **Three exact-count tests fail on any protocol addition.**
+   `spec.rs::the_builtin_protocols_parse` (interface count),
+   `spec.rs::the_reverse_direction_has_fds_too` (the fd list), and
+   `wire.rs::every_message_in_every_protocol_round_trips` (messages walked). A
+   mismatch is somebody else's correct addition, not your regression — update
+   the number. The small-protocols bundle documents them as a table in its
+   §25.10.
+2. **`docs/design.md` section numbers.** §18–§27 are assigned to other agents;
+   take **§28 or later**, and note the file is `docs/waycompose-design.md` now.
+3. **`sv_arena::GRANULARITY` where `ARENA_GRANULARITY` or `GIFT_GRANULARITY`
+   used to be.** Same value, one definition — §1.1. If your branch touches
+   either constant, take this tree's version.
+4. **`wc_compositor::run()` where `fn main` used to be.** Same body.
+
+### After you rebase, run this rather than only `cargo test`
+
+```
+cargo test --workspace                    # 1123 at the time of writing
+bash scripts/wc-proxy.sh                  # 37/0 — the regression gate that matters
+```
+
+`scripts/wc-proxy.sh` drives weston's own clients over both transports and three
+compositors, none of which has heard of anything we added. It is the gate for
+anything touching `Spec::builtin`, and a green `cargo test` does not imply it.
+
+If a rebase does go wrong, nothing is lost: `waycompose-base` is untouched and
+still has every branch. Say so and it can be redone by hand.
+
+---
+
 ## The requirement, as a measurement
 
 The third quote is the requirement, and it can be stated as a number rather than

@@ -6,6 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 description = "A smithay compositor that stands up wl_display and xdg_shell as a Windows binary"
 
+# lib + bin since the unification. The library is half of `sv-guest`, the
+# binary is the Wayland-only executable that shipped before. one-binary.md §2.2.
+[lib]
+name = "wc_compositor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wc-compositor"
+path = "src/main.rs"
+
 [dependencies]
 # The feature set is the whole point of this crate existing separately from the
 # vendored fork. `vendor/smithay` is deliberately NOT a workspace member: as a

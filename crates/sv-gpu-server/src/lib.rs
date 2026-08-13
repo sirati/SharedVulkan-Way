@@ -13,7 +13,14 @@
 //! | [`convert`] | `ash` → wire, for the values reported back |
 //! | [`session`] | publish, then one thread per ring |
 
+// The former `main.rs`, now a module so that `sv-guest` can be this and the
+// compositor at once. `extern crate self` lets its 15 `sv_gpu_server::…` paths
+// keep working verbatim, so the rename commit before this one really was a
+// rename and this one really is only the entry points. one-binary.md §2.2.
+extern crate self as sv_gpu_server;
+
 pub mod arena;
+pub mod entry;
 pub mod convert;
 pub mod driver;
 pub mod server;

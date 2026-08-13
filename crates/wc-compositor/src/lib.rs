@@ -159,7 +159,7 @@ struct Args {
     click: Option<platform::Click>,
 }
 
-fn parse_args() -> Result<Args, u8> {
+fn parse_args(argv: &[String]) -> Result<Args, u8> {
     let mut args = Args {
         once: false,
         socket: None,
@@ -181,7 +181,7 @@ fn parse_args() -> Result<Args, u8> {
         #[cfg(not(windows))]
         click: None,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--once" => args.once = true,
@@ -408,8 +408,26 @@ fn redirect_output(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
-    let args = match parse_args() {
+/// Run the compositor.
+///
+/// This was `fn main` until the unification (one-binary.md §2.2). It is `pub`
+/// so that the guest binary can be the GPU server and the compositor at once —
+/// the whole point of one binary per side — while `--no-default-features
+/// --features wayland` still produces exactly the executable that shipped
+/// before.
+pub fn run() -> std::process::ExitCode {
+    run_from(std::env::args().collect())
+}
+
+/// Run the compositor with an explicit argument vector.
+///
+/// `argv[0]` is the program name and `argv[1..]` are the arguments, exactly as
+/// `std::env::args()` yields them. This exists so that `sv-guest` can consume
+/// its own half-selecting argument and hand the rest on unchanged, rather than
+/// each half re-reading a process-wide `env::args` that has one extra token in
+/// it. one-binary.md §2.2.
+pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
+    let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(code) => return std::process::ExitCode::from(code),
     };
