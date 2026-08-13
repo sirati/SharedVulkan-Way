@@ -242,7 +242,7 @@ mod tests {
         let argv = compositor_argv(&cfg, "wl-x", "log");
         assert_eq!(argv[0], "wayland", "the one binary needs its half named first");
         assert!(argv.iter().any(|a| a == "--arena-guest-ram"), "{argv:?}");
-        assert!(argv.contains(&format!("0:{}", 768u64 * 1024 * 1024)));
+        assert!(argv.contains(&format!("0:{}", 64u64 * 1024 * 1024)));
         for forbidden in ["--arena", "--arena-provide", "--shared-dir", "--shared-peer-prefix"] {
             assert!(
                 !argv.iter().any(|a| a == forbidden),

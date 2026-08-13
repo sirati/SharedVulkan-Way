@@ -150,6 +150,29 @@ up)
 # than a long-lived root shell because a root call that blocks for a session's
 # lifetime comes back with no output at all (testhost's rootc habits).
 #
+# `--arena-grow` IS ARMED AND THE APPENDER DOES NOT EXIST YET.
+#
+# The launcher starts a **32 MiB** region rather than the 768 MiB it reserved for
+# one afternoon, because those pages are `VirtualLock`ed — non-pageable, gone
+# from Windows entirely — and because the startup region is the one that can
+# never be given back: it holds the outbound window. So the size of it is a
+# floor for the whole session and the only safe direction is small.
+#
+# `--arena-grow` says what to do when 32 MiB is not enough: take another region
+# instead of refusing. Over guest RAM the proxy's `PlanGrowth` obtains one by
+# **re-reading the plan** — "the guest commits and stamps another region and the
+# locator appends it to this same plan". Nothing on this deployment does either
+# of those things yet. Growth is therefore armed and inert: a pool that does not
+# fit gets `the guest has not committed one, or the locator has not appended it
+# yet`, which since §20 is a refusal the client survives rather than a dead
+# window.
+#
+# It is passed anyway, deliberately. The flag is where the behaviour turns on,
+# the appender is one `wc-session` verb away — commit a region in the guest, run
+# the locator with `--append`, and this proxy picks it up on its next pool — and
+# a launcher that quietly did not ask for growth would make that verb look
+# unnecessary. See docs/waycompose-design.md §28.12.
+#
 # The socket it creates is chowned to the invoking user, so the *application*
 # is not privileged. §17.7 gave the run its own root-owned home instead; this is
 # the other half of the same problem and the cheaper answer, because a Firefox
@@ -168,6 +191,7 @@ export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 rm -f "$D/wl-proxy"
 "$BIN/wc-proxy" --upstream "$D/up.sock" --socket wl-proxy --runtime-dir "$D" \\
   --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage \\
+  --arena-grow --arena-grow-step ${WC_LAUNCH_GROW_STEP:-16777216} \\
   --accept-timeout ${WC_LAUNCH_SESSION_SECS:-43200} --timeout ${WC_LAUNCH_SESSION_SECS:-43200} \\
   >"$D/proxy.log" 2>&1 &
 P=\$!

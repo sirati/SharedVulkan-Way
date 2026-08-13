@@ -65,15 +65,44 @@ pub struct Config {
     /// A name, not a path: this deployment's session, and the last component of
     /// the mutex, the state file and the run id on the host.
     pub session: String,
-    /// The arena, in MiB of the guest's own pinned RAM.
+    /// The **startup** region, in MiB of the guest's own pinned RAM.
     ///
-    /// **768, and that is a workaround rather than a size.** The default of 64
-    /// fragments and dies: a YouTube video killed Firefox with
-    /// `no run of 2342912 bytes (3932160 free, largest 1744896)` — two thirds
-    /// more free space than the request, in pieces none of which was big enough.
-    /// The allocator fix is somebody else's and is not landed, so until it is,
-    /// a session that lasts hours is given room to fragment in. Nothing here
-    /// makes a large arena *correct*; it makes it survive longer.
+    /// **64, and the number is measured rather than guessed.** This was 768 for
+    /// one afternoon, as a workaround for an allocator that fragmented — and a
+    /// workaround is what it stayed for about six hours too long, because
+    /// `VirtualLock`ed pages are not merely committed, they are **non-pageable**:
+    /// 768 MiB of the guest's RAM was unavailable to Windows for anything, with
+    /// no client connected, and the user noticed before this file did.
+    ///
+    /// **32 MiB was tried first and is too small**, which is why this comment
+    /// has a measurement in it instead of a rule of thumb. A `6877184 of …
+    /// bytes out` high-water taken seconds after start-up looked like the
+    /// number and was not: a Firefox that has finished starting puts
+    /// **28–30 MB out on two connections**, and asks for 4.6 MB pools on top of
+    /// that. Three warm clicks on 32 MiB produced **ten refusals** —
+    /// `cannot serve 4608000 bytes … 4419584 free across 1 region(s), largest
+    /// run 3575808` — free space that fragmentation had made unusable, and warm
+    /// clicks of **2144–2777 ms** against 1414–1601 before, because a held-back
+    /// pool is a surface that stops updating until there is room.
+    ///
+    /// So the number is set by what one region has to hold **alone**:
+    ///
+    /// * **28–30 MB** — measured out to two connections by a running Firefox.
+    /// * **40 MiB in 2 regions** — peak resident in a heavier session elsewhere.
+    /// * **64 MiB** — also the cap of the growth series, so it is where growth
+    ///   would converge anyway.
+    ///
+    /// It has to hold it alone because **growth is armed and inert** on this
+    /// deployment (`scripts/wc-session`): over guest RAM the proxy takes a new
+    /// region by re-reading the plan, and nothing appends to the plan yet.
+    ///
+    /// 64 MiB, then — twelve times smaller than the 768 that reached the user,
+    /// and large enough that nothing measured here refuses. The asymmetry that
+    /// makes over-reserving the worse error still holds and is why this is not
+    /// 256: the pages are `VirtualLock`ed, so they are non-pageable rather than
+    /// merely committed, and **the startup region is never reclaimed** — it
+    /// holds the outbound window, so its size is a floor for the whole session
+    /// that release can never recover.
     pub arena_mib: u64,
     /// How much of it the compositor keeps for the objects it makes for clients.
     pub outbound: u64,
@@ -96,7 +125,7 @@ impl Default for Config {
             compositor: String::new(),
             relay: String::new(),
             session: "wcl".into(),
-            arena_mib: 768,
+            arena_mib: 64,
             outbound: 1024 * 1024,
             output: "1600x1000".into(),
             port: 57431,
@@ -239,7 +268,7 @@ key        = C:\Users\<guest-user>\wclaunch\id_host
 compositor = C:\Users\<guest-user>\wclaunch\sv-guest.exe
 relay      = C:\Users\<guest-user>\wclaunch\probe-relay.exe
 name       = wcl
-arena-mib  = 768
+arena-mib  = 64
 outbound   = 1048576
 output     = 1600x1000
 port       = 57431
@@ -287,7 +316,7 @@ mod tests {
     #[test]
     fn defaults_and_overrides() {
         let cfg = ok("");
-        assert_eq!(cfg.arena_mib, 768);
+        assert_eq!(cfg.arena_mib, 64);
         assert_eq!(cfg.port, 57431);
         let cfg = ok("arena-mib=64\nport=1\noutput=800x600\n");
         assert_eq!((cfg.arena_mib, cfg.port, cfg.output.as_str()), (64, 1, "800x600"));

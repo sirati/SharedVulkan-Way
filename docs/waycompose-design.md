@@ -9910,20 +9910,22 @@ same half hour.
 
 | | samples | ms |
 |---|---|---|
-| **warm click to window** | 7 | **1414, 1475, 1497, 1506, 1520, 1521, 1601** — mean **1505** |
+| **warm click to window** | 10 | **1414, 1475, 1494, 1494, 1497, 1506, 1520, 1521, 1554, 1601** — mean **1508** |
 | **native Firefox on Windows** | 5 | **591, 593, 617, 624, 844** — mean **653** |
-| cold click to window (no session at all) | 4 | 5661, 5775, 5919, 6682 |
+| cold click to window (no session at all) | 7 | 5661, 5775, 5919, 6573, 6618, 6682, 7069 |
 
 Both browsers get a **fresh profile** for every sample, because that is what the
 native measurement does and a Linux run that reused a populated one would be
 measuring something else — spectacularly so, which is §28.6.
 
 Four of the warm samples and three of the cold ones are from a 256 MiB arena
-before the repositories merged, and the rest from a 768 MiB arena and `sv-guest`
-after; they are pooled because the arena's size moves the *cold* number (more
-pages to stitch) and does not touch the warm one, and the numbers say so.
+before the repositories merged, and the rest from 768 MiB and then 64 MiB with
+`sv-guest` after. They are pooled because the arena's size turns out not to move
+either number: it changes how many pages the guest commits and stitches (673 ms
+at 32 MiB and 629 at 64 against 807 at 768) and not what the host's sweep costs, which is
+§28.12.
 
-So a click is **2.3× a native Firefox, 852 ms behind it**, and the answer to
+So a click is **2.3× a native Firefox, 855 ms behind it**, and the answer to
 "where does the remaining time go" is not the transport:
 
 | | ms |
@@ -9942,18 +9944,18 @@ The cold path, broken down by the launcher's own log:
 
 | step | ms |
 |---|---|
-| compositor start, the arena committed, `VirtualLock`ed and stamped (65536 pages at 256 MiB, 196608 at 768) | 673–807 |
+| compositor start, the arena committed, `VirtualLock`ed and stamped (16384 pages at 64 MiB; 196608 at 768) | 629–807 |
 | **the host's locate** — `wc-arena-host` through `rootc`, sweeping for stamps | 2832–4098 |
 | relay, ssh remote-forward tunnel, and the host's proxy in a root transient unit | 327–1544 |
 | `wc-session run` | 222–266 |
 | Firefox itself, to its first mapped toplevel | ≈1200–1500 |
 
 The locate is 45–70% of a cold start and nothing else in it is worth optimising
-until it is. Tripling the arena from 256 MiB to 768 cost **134 ms** at the
-guest's end (three times the pages to commit, lock and stamp) and **nothing
-measurable** at the host's, because the sweep is a content search of the whole
-13 GiB guest either way — which is the same fact §12.5 states from the other
-side.
+until it is. The arena's own size barely shows: 768 MiB against 32 is **134 ms**
+at the guest's end — twenty-four times the pages to commit, `VirtualLock` and
+stamp — and **nothing measurable** at the host's, because the sweep is a content
+search of the whole 13 GiB guest either way. That is the same fact §12.5 states
+from the other side, and §28.12 is where it stopped being a prediction.
 
 ### 28.5 The host's half is a forced command, not a shell
 
@@ -10171,16 +10173,15 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    rather than how long it may sit idle. A session that outlives it ends with the
    window disappearing and the next click paying for a cold start — survivable,
    and not what the flag's name suggests.
-2. **The arena is 768 MiB and that is a workaround, not a size.** §17.8 is the
+2. **The startup region is 64 MiB and growth is armed but inert.** §17.8 is the
    largest open problem in the project and this stage makes it worse in the only
    way that matters: a 60-second run is now a session that lasts as long as
-   somebody leaves the browser open. A YouTube video killed Firefox on the
-   default 64 MiB with `no run of 2342912 bytes (3932160 free, largest 1744896)`
-   — *more free space than the request*, in pieces none of them big enough — and
-   the allocator fix for that is somebody else's and is not landed. So the
-   launcher asks for room to fragment in, which buys time and settles nothing.
-   §17.8 says plainly that sizing is not the fix and it is right; nothing here
-   has run long enough to see `overflows` become non-zero.
+   somebody leaves the browser open. §28.12 is the whole of it — how the 768 MiB
+   workaround became a defect the user saw, what replaced it, and why
+   `--arena-grow` is passed to a proxy that has nothing to grow into. The honest
+   statement is that a session heavier than 64 MiB gets refusals it survives
+   rather than the extra region it asks for, and that the appender which would
+   change that is the launcher's to write.
 3. **The sweep is off the click path but not off the cold path, and the numbers
    here are the old regime's.** 2.8–4.1 s of a 5.7 s cold start is `arena-host`
    sweeping guest RAM for stamps. A locate through
@@ -10215,7 +10216,7 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    too, both measured; the *taskbar button* is `scripts/wc-icon.sh`'s claim and
    that script has not been run here.
 9. **Closing the window does not end anything.** The compositor, the relay, the
-   tunnel and the proxy stay up holding 768 MiB of the guest's pinned RAM, which
+   tunnel and the proxy stay up holding 64 MiB of the guest's pinned RAM, which
    is right for the next click and wrong for the rest of the day.
 10. **A session whose start-up fails part-way leaves a directory on the VM host.**
    The teardown runs when the compositor exits, and a launcher killed by a deploy
@@ -10227,7 +10228,7 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    `coredumpctl` has no Firefox core at all (only QEMU's from July and a Weston
    demo's from this morning), every connection in the proxy's log ends
    `stopped: the client closed the connection` rather than with the compositor
-   dropping it, and the arena reports `0 overflows` throughout — on 768 MiB,
+   dropping it, and the arena reports `0 overflows` throughout, on 768 MiB and then on 32,
    which is the point of §28.9 item 2.
    **What is in the log and reads exactly like a crash is `Exiting due to channel
    error.`, eighteen times.** That is Firefox's *content* processes noticing that
@@ -10258,9 +10259,20 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    nothing acts on it. An idle session that ends itself would make item 9 of
    §28.9 disappear and would cost one cold start a day.
 5. **Give the VM host more than two cores, and measure again.** §28.4 attributes
-   873 ms of the 873 ms gap to a browser starting on the smaller half of a laptop.
+   855 ms of the 855 ms gap to a browser starting on the smaller half of a laptop.
    That is a claim about a deployment rather than about this project, and it is
    one `-smp` away from being tested.
+6. **Write the appender, and growth stops being a flag.** `--arena-grow` is armed
+   and there is nothing to grow into (§28.12): over guest RAM the proxy takes a
+   new region by re-reading the plan, and the plan only ever gets the one the
+   session started with. It is one `wc-session` verb — ask the guest to commit and
+   stamp another region, run the locator with an append, and the running proxy
+   picks it up on its next pool — and it is the difference between a 64 MiB
+   startup region being *small* and being a *ceiling*.
+7. **Grep the tree for 805306368.** A second harness on the same guest copied the
+   768 MiB hardcode and is holding 778 MB of non-pageable memory while this is
+   being written. One launcher is not the guest's memory.
+
 
 ### 28.11 What the merge broke, and what this stage put back
 
@@ -10299,3 +10311,102 @@ that a merge has removed a working thing on a correct argument about a different
 property:** the question a deletion has to answer is not "is the reason this
 exists still true" but "is anything else doing its job", and a crate whose only
 consumer is a shell script has nobody to answer it.
+### 28.12 768 MiB of the user's RAM, and the number that replaced it
+
+This section is here because the defect reached the user before it reached a
+test, and the shape of it is worth more than the fix.
+
+For one afternoon the launcher started a **768 MiB** arena. It was a workaround
+for an allocator that fragmented — §28.9 item 2 said so, in those words, and
+said it settled nothing — and the two things it was waiting for landed the same
+day: §20's best-fit placement, and dynamic growth. The workaround outlived its
+reason by about six hours, and what the user saw was
+
+> "sv-guest.exe is currently hogging 890Mb ram on windows even though no wayland
+> or vulkan clients are up right now at all"
+
+with **817 MB working set and 815 MB private, no client connected**.
+
+**Why it is worse than an ordinary over-reservation.** The arena is
+`VirtualLock`ed. Those pages are not merely committed, they are *non-pageable* —
+Windows cannot reclaim them under pressure, cannot page them out, cannot use them
+for anything. And the startup region is the one region that can **never** be
+given back, because it holds the outbound window: `floor 64.0 MiB (the startup
+region, never returned)` is what the proxy prints about it now. So a startup size
+is a floor for the whole session in memory that the operating system cannot touch,
+which makes it the single worst number in this program to guess high.
+
+**The number, and the one that was wrong first.** 32 MiB was tried and is too
+small — which is the reason this section has measurements in it rather than a
+rule of thumb. The `6877184 of … bytes out` high-water this launcher had recorded
+looked like the answer and was taken seconds after start-up; a Firefox that has
+*finished* starting puts **28–30 MB out on two connections** and then asks for
+4.6 MB pools on top of that. Three warm clicks on 32 MiB produced **ten
+refusals**:
+
+```
+[proxy] client 5: pool 42: could not publish 4608000 bytes: arena 0 cannot serve
+        4608000 bytes and cannot grow … (4419584 free across 1 region(s),
+        largest run 3575808, 28086272 bytes out to 2 connection(s), best-fit
+        policy) -- the pool is held back … so this surface stops updating until
+        there is room. The connection is not affected.
+```
+
+Free space that fragmentation had made unusable, a surface that stops updating,
+and warm clicks of **2144–2777 ms** against 1414–1601 before — the refusal is
+survivable (§20) and it is not free.
+
+So the size is set by what one region must hold **alone**, because growth is
+inert here:
+
+| | |
+|---|---|
+| a running Firefox, out to two connections | **28–30 MB** |
+| a heavier Firefox session, peak resident | **40 MiB in 2 regions** |
+| the growth series' cap | **64 MiB** — where growth would converge anyway |
+
+**64 MiB**, then: twelve times smaller than the 768 that reached the user, and
+the smallest size at which nothing measured here refuses. Measured after the
+change, with Firefox up and drawing:
+
+```
+[proxy] arena 0 memory: peak resident 64.0 MiB in 1 region(s); now 64.0 MiB in
+        1 region(s); floor 64.0 MiB (the startup region, never returned);
+        grew 0, released 0 region(s) / 0.0 MiB      … 0 refusals
+sv-guest.exe pid 21712  ws=120MB  priv=101MB      (was ws=783MB priv=774MB)
+warm clicks 1554, 1494, 1494 ms                   (was 2144–2777 at 32 MiB)
+```
+
+**774 MB of private bytes became 101**, and the click is back where it was.
+
+**Two things that were expected and did not happen.**
+
+*A smaller region does not locate faster.* The prediction was that a small region would
+cut materially into the 2832–4098 ms locate. It did not: **2965 ms at 32 MiB, 3101 at 64,
+against 2832–2999 ms at 768 MiB**, which is one number with noise on it. The sweeping locator
+is a *content* search for stamps across the whole 13 GiB guest, so it costs what
+the guest costs and not what the arena costs — §28.4 already said this from the
+other direction and it is now measured in both. A locator that asks where the
+pages are instead of searching for them would be the thing that moves it, and
+that is §28.9 item 3. The cold click is 6573 ms at 64 MiB, inside the range it was
+already in.
+
+*Growth is armed and inert.* `--arena-grow` is passed and the proxy says
+`arena 0 may grow: guest RAM, as the locator appends it to …/arena.plan` — but
+over guest RAM `PlanGrowth` obtains a region by **re-reading that plan**, and
+nothing on this deployment appends to it. The guest has to commit and stamp a
+new region and the locator has to append it, and neither has a caller: the only
+harness in the tree that drives growth drives it over the *file* fixture with
+`--arena-grow-dir`. So a session that outgrows 32 MiB gets
+`the guest has not committed one, or the locator has not appended it yet`, which
+since §20 is a refusal a client survives rather than a dead window — but it is a
+refusal, not growth. **The flag is passed anyway**, because the flag is where the
+behaviour turns on and the appender is one `wc-session` verb away; a launcher
+that quietly did not ask for growth would make that verb look optional.
+
+**And the number spread before it was fixed.** At the moment of writing, a second
+compositor on the same guest — `C:\Users\<guest-user>\svffwsi\sv-guest.exe`, not this
+launcher's — is running with `--arena-guest-ram 0:805306368` and **778 MB
+working set**. The hardcode was copied. Fixing one harness does not fix the
+guest's memory, and 768 MiB is now a string to grep the tree for.
+
