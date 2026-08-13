@@ -141,6 +141,19 @@ pub trait PoolTransport {
     /// Bytes currently published, for the log.
     fn published(&self) -> u64;
 
+    /// One frame has gone by. Returns every region handed back as a result,
+    /// as `(id, bytes, origin)`, for the caller to log.
+    ///
+    /// DYNAMIC ARENA. The release policy is written in frames rather than
+    /// seconds because what makes a region cold is that nothing drew in it, and
+    /// a clock cannot tell a cold region from a paused video. A transport with
+    /// nothing to give back says so by giving back nothing, which is the honest
+    /// answer for [`SharedFile`] — it has one object per pool and unlinks it on
+    /// `destroy`, so it has no notion of a region at all.
+    fn frame(&mut self) -> Vec<(u32, u64, String)> {
+        Vec::new()
+    }
+
     /// Read `(arena, offset, len)` of a region this transport holds, if it holds
     /// one.
     ///
@@ -481,7 +494,7 @@ impl Policy {
 /// "small" a fact about the client rather than a knob.
 pub const SMALL_POOL: u64 = 64 * 1024;
 
-/// The whole of the allocator's mutable state, behind one lock.
+/// The whole of **one region's** allocator state, behind the arena's lock.
 ///
 /// It is one struct rather than four fields so that "the free list, the live
 /// map and the counters move together" is a property of the type instead of a
@@ -490,23 +503,300 @@ pub const SMALL_POOL: u64 = 64 * 1024;
 struct Alloc {
     free: Vec<(u64, u64)>,
     live: HashMap<u64, (u64, u64)>,
-    next: u64,
     published: u64,
     policy: Policy,
 }
 
-/// The region, the one allocator over it, and everything that does not change
-/// once a client exists.
-struct ArenaInner {
+/// One mapped region of a multi-region arena: the bytes, and the facts about
+/// them that never change once it is mapped.
+///
+/// DYNAMIC ARENA. This is what used to be spread across [`ArenaInner`]'s
+/// `region`, `origin`, `size` and `outbound` fields, when there was exactly one
+/// of each.
+///
+/// # A pool may not straddle two regions, and that is a refusal rather than a
+/// gap
+///
+/// Two regions are two separate `VirtualAlloc`s in the guest, located at two
+/// unrelated ranges of QEMU's backing object and `mmap`ped at two unrelated
+/// host addresses. There is no arithmetic that reaches from one into the other.
+/// A buffer spanning both would therefore have to be described to the
+/// compositor as a *list* of runs — which is precisely the guest's own page
+/// layout, and design.md §5.7 is explicit that "the run list does not cross the
+/// wire, and it never did have to".
+///
+/// So `Descriptor::ArenaSlice { arena, offset, len }` names one region and one
+/// contiguous range of it, and a pool too large for any single region is
+/// refused rather than split. This is the same refusal `sv_arena::handle::
+/// Slice::validate` makes for a handle spanning two slabs (D4): naming memory
+/// that is two imports is naming something nobody ever mapped as one thing.
+struct RegionMap {
+    /// The number in `Descriptor::ArenaSlice { arena, .. }`. **An integer, and
+    /// never a descriptor** (design.md §1a): growth adds regions, and a region
+    /// is named the same way the first one always was.
     id: u32,
-    region: SharedBacking,
+    backing: SharedBacking,
     /// How the region was obtained, for the one log line that says it.
     origin: String,
-    size: u64,
+    len: u64,
     /// The peer's outbound window, `(offset, len)`, which this allocator has
     /// been told to stay out of. See [`Arena::reserve_outbound`].
+    ///
+    /// Per region, because `one-binary.md` §3.1a is emphatic that the two
+    /// ranges must not be merged into one free list: one holds client pixels,
+    /// the other holds objects the compositor has already handed to clients and
+    /// which are still live. A grown region has no outbound window at all — the
+    /// compositor declared one, once, in the region it committed at startup,
+    /// and nothing about growth gives it a second.
     outbound: Option<(u64, u64)>,
-    alloc: Mutex<Alloc>,
+}
+
+/// One region and the allocator over it.
+struct Slot {
+    map: Arc<RegionMap>,
+    alloc: Alloc,
+    /// The tick at which this region last became empty, or `None` while it
+    /// holds anything. See [`Arena::reclaim_regions`].
+    idle_since: Option<u64>,
+}
+
+/// Every region, the one key space over all of them, and the counters growth
+/// and release are judged by.
+struct Arenas {
+    slots: Vec<Slot>,
+    /// Allocation keys are unique across *regions*, not within one, so a
+    /// `Region` can be looked up without being told which region it is in.
+    next_key: u64,
+    /// The next region id to hand out. Monotonic and **never reused**: a
+    /// released region's id must not come back, because a client may still name
+    /// it in a request already in flight, and answering that with a different
+    /// region's bytes is the silent wrong answer this file exists to prevent.
+    next_id: u32,
+    policy: Policy,
+    /// Advanced by the session once per commit. The unit of the release policy
+    /// is a frame rather than a second, because what makes a pool cold is that
+    /// nothing drew with it, and a clock cannot tell a cold pool from a paused
+    /// video.
+    tick: u64,
+    grown: u32,
+    grow_nanos: u64,
+    grow_refused: u32,
+    released_regions: u32,
+    released_bytes: u64,
+    /// Frames a region must be empty before it is returned. Zero means never.
+    /// See [`Arena::reclaim_regions`] for why this is frames and not seconds.
+    reclaim_idle: u64,
+}
+
+/// Where another region comes from when the arena runs out.
+///
+/// # Why this is a port and not a function
+///
+/// Because the two substrates get a region by genuinely different means and
+/// only one of them is the deployment. Over guest RAM the guest commits, pins
+/// and stamps a region and the *host* goes and finds it (waycompose §12.2: "the
+/// side inside the VM allocates, because only it can produce pages the
+/// hypervisor can locate"), which is a round trip through a program running at
+/// a different privilege. Over a file — the Wine fixture, and only ever the
+/// Wine fixture — it is one `set_len`.
+///
+/// Making it a trait keeps the second from pretending to be the first.
+/// design.md §5.1's rule is that a failed locate fails the run and there is
+/// deliberately no fallback, so a `RegionSource` that quietly served a file
+/// when guest RAM was asked for would be exactly the "same-machine path wearing
+/// the design's clothes" §1a warns about. Each implementation serves one
+/// substrate and refuses rather than substitutes.
+pub trait RegionSource: Send {
+    /// Obtain a region of at least `min_len` bytes, to be known as `id`.
+    ///
+    /// Returning `Err` is normal and survivable — the guest can simply be out
+    /// of RAM — and the error must carry the size asked for and whatever the
+    /// source can say about why, because that message is the only evidence a
+    /// user will have. `wc_handle::arena::give`'s `OutOfMemory` is the house
+    /// style and the one this follows.
+    fn provide(&mut self, id: u32, min_len: u64) -> io::Result<ProvidedRegion>;
+
+    /// Hand a region back. Called once the arena has stopped listing it and
+    /// nothing can still be naming its bytes.
+    ///
+    /// Best-effort by construction: the mapping is already gone by the time
+    /// this runs, so a source that cannot tell the guest to decommit has
+    /// nothing to do and says so by doing nothing.
+    fn release(&mut self, _id: u32) {}
+
+    /// What this source is, for the log line that says where a region came
+    /// from — the one difference a reader of the output can see between the
+    /// deployment and the fixture.
+    fn describe(&self) -> String;
+}
+
+/// A region a [`RegionSource`] produced.
+///
+/// Constructed only through the two functions below, which is what keeps
+/// [`Backing`] private. That is not tidiness: the two substrates are not
+/// interchangeable — design.md §5.1 says a failed locate fails the run and
+/// there is deliberately no fallback — and a constructor taking an arbitrary
+/// backing would be the seam through which a file quietly stood in for guest
+/// RAM.
+pub struct ProvidedRegion {
+    backing: Backing,
+    origin: String,
+    len: u64,
+}
+
+impl ProvidedRegion {
+    /// A region of the guest's RAM, described by a plan the locator wrote.
+    ///
+    /// The deployment path. Everything expensive already happened: the guest
+    /// committed, pinned and stamped the pages and the host located them. What
+    /// is left is `mmap(MAP_FIXED)` per run into one reservation, which §12.5
+    /// measured at **4.16–4.24 ms** for ~1510 runs.
+    pub fn guest_ram(plan: &crate::guestram::Plan) -> io::Result<ProvidedRegion> {
+        let region = crate::guestram::StitchedRegion::attach(plan)?;
+        let origin = format!(
+            "guest RAM, run 0x{:016x}, {} run(s) of {}",
+            plan.run_id,
+            region.runs(),
+            region.origin()
+        );
+        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len })
+    }
+
+    /// A region backed by a file on this machine.
+    ///
+    /// **The Wine fixture, and only ever the Wine fixture.** design.md §5.1 is
+    /// explicit that guest RAM is the substrate and that the file-backed arena
+    /// exists so a machine with no hypervisor can run the same code. A
+    /// deployment that reached this by accident would be a same-machine path
+    /// wearing the design's clothes, so the caller has to ask for it by name.
+    pub fn file(path: &Path, len: u64) -> io::Result<ProvidedRegion> {
+        let len = len.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let name = path.to_string_lossy().into_owned();
+        let handle = if path.exists() {
+            Handle::open_shared_file(&name, &name, len)?
+        } else {
+            Handle::create_shared_file(&name, &name, len)?
+        };
+        let view = handle.map_mut()?;
+        Ok(ProvidedRegion {
+            backing: Backing::File { _handle: handle, view },
+            origin: name,
+            len,
+        })
+    }
+}
+
+/// Growth over guest RAM: re-read the plan and take up any region the locator
+/// has added since the last look.
+///
+/// # Why the proxy reads a file rather than asking for memory
+///
+/// Because it cannot ask. waycompose §12.2: "the side inside the VM allocates,
+/// because only it can produce pages the hypervisor can locate", and the host
+/// then *finds* them. This process is on the host and has no channel into the
+/// guest at all — the guest says a 64-bit run id and the host goes and reads
+/// its memory. So the shape of growth is the shape of the original handshake,
+/// run again: the guest commits and stamps another region, the locator finds it
+/// and **appends** it to the plan, and this notices.
+///
+/// Appending rather than rewriting is what makes it work at all. The first pool
+/// writes pixels over the stamps of the region it lands in (§12.10), so a
+/// locator that rewrote the plan from scratch would have to re-locate regions
+/// whose stamps are gone — which the content sweep cannot do, and which is
+/// exactly stage 16's objection to growth. `SuperfetchPfnQuery` answers it
+/// (§0.14 item 4) and is what makes a rewrite safe; until it is wired, append
+/// is what is *correct*, and this reads an appended plan either way.
+pub struct PlanGrowth {
+    path: PathBuf,
+    /// Region ids already taken up, so the same region is never mapped twice.
+    taken: Vec<u32>,
+}
+
+impl PlanGrowth {
+    pub fn new(path: &Path, already: &[u32]) -> PlanGrowth {
+        PlanGrowth { path: path.to_path_buf(), taken: already.to_vec() }
+    }
+}
+
+impl RegionSource for PlanGrowth {
+    fn provide(&mut self, _id: u32, min_len: u64) -> io::Result<ProvidedRegion> {
+        let plans = crate::guestram::Plan::read_all(&self.path)?;
+        let Some(plan) = plans
+            .iter()
+            .find(|p| !self.taken.contains(&p.id) && p.len >= min_len)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "{} names {} region(s) and none is both unmapped and at least \
+                     {min_len} bytes: the guest has not committed one, or the locator \
+                     has not appended it yet",
+                    self.path.display(),
+                    plans.len()
+                ),
+            ));
+        };
+        let provided = ProvidedRegion::guest_ram(plan)?;
+        self.taken.push(plan.id);
+        Ok(provided)
+    }
+
+    fn describe(&self) -> String {
+        format!("guest RAM, as the locator appends it to {}", self.path.display())
+    }
+}
+
+/// Growth over files, for the fixture. One file per region, in a directory.
+///
+/// Named apart from [`PlanGrowth`] rather than being a mode of it, because a
+/// deployment must not be able to reach this by misconfiguration — see
+/// [`ProvidedRegion::file`].
+pub struct FileGrowth {
+    dir: PathBuf,
+    step: u64,
+}
+
+impl FileGrowth {
+    /// `step` is the least a region will be; a request larger than it is served
+    /// by a region exactly big enough, because a pool may not straddle two.
+    pub fn new(dir: &Path, step: u64) -> FileGrowth {
+        FileGrowth { dir: dir.to_path_buf(), step }
+    }
+}
+
+impl RegionSource for FileGrowth {
+    fn provide(&mut self, id: u32, min_len: u64) -> io::Result<ProvidedRegion> {
+        ProvidedRegion::file(&self.dir.join(format!("region-{id}")), min_len.max(self.step))
+    }
+
+    fn release(&mut self, id: u32) {
+        // The fixture's analogue of the guest decommitting: the bytes stop
+        // being charged to anybody the moment the name is gone and the last
+        // mapping is dropped. `du` on the directory is what "the memory came
+        // back" looks like here.
+        let _ = std::fs::remove_file(self.dir.join(format!("region-{id}")));
+    }
+
+    fn describe(&self) -> String {
+        format!("files under {} in {}-byte steps (fixture)", self.dir.display(), self.step)
+    }
+}
+
+/// The regions, the one allocator over them, and everything that does not
+/// change once a client exists.
+struct ArenaInner {
+    /// The id of the region committed at startup. `Arena::id()` still answers
+    /// this, because it is what every log line and every existing harness means
+    /// by "the arena".
+    id: u32,
+    arenas: Mutex<Arenas>,
+    /// `None` means this arena cannot grow, which is every arena built before
+    /// this stage and is still the right answer for a test that wants to
+    /// observe a refusal.
+    source: Mutex<Option<Box<dyn RegionSource>>>,
 }
 
 pub struct Arena {
@@ -594,8 +884,8 @@ impl Arena {
     /// free list half-updated. Refusing to serve the other three connections
     /// because a fourth panicked would be turning a contained failure into a
     /// total one, which is the opposite of what the accept loop is for.
-    fn alloc(&self) -> MutexGuard<'_, Alloc> {
-        self.inner.alloc.lock().unwrap_or_else(|e| e.into_inner())
+    fn alloc(&self) -> MutexGuard<'_, Arenas> {
+        self.inner.arenas.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Take the region `wc-arena-host` located in the guest as arena `id`.
@@ -613,27 +903,73 @@ impl Arena {
     /// would either truncate the arena — leaving guest pages nobody uses — or
     /// run off the end of it, and the second is a fault in the proxy on the
     /// first large client. Taking it from the plan removes the disagreement.
+    ///
+    /// # A plan may name more than one region
+    ///
+    /// DYNAMIC ARENA. All of them are taken up here, in the order the plan
+    /// lists them, and the *first* is the startup region — the one whose id
+    /// `Arena::id()` answers and the only one that may carry the compositor's
+    /// outbound window. A plan written before this stage names one region and
+    /// means exactly what it always did.
+    ///
+    /// `id` still names the startup region because it is what `--arena-id` has
+    /// always meant and what the compositor was told; a plan that numbers its
+    /// first region differently is refused rather than quietly renumbered,
+    /// because the compositor and this proxy disagreeing about which number is
+    /// which is the failure `outbound` travelling in the plan exists to prevent.
     pub fn from_plan(id: u32, plan_path: &Path) -> io::Result<Arena> {
-        let plan = crate::guestram::Plan::read(plan_path)?;
-        let size = plan.len;
-        if size % ARENA_GRANULARITY != 0 {
+        let plans = crate::guestram::Plan::read_all(plan_path)?;
+        let first = &plans[0];
+        if first.id != id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("a {size}-byte arena is not a whole number of {ARENA_GRANULARITY}-byte pages"),
+                format!(
+                    "{}: the first region is {} and --arena-id says {id}; the compositor \
+                     was told one number and this would map another",
+                    plan_path.display(),
+                    first.id
+                ),
             ));
         }
-        let region = crate::guestram::StitchedRegion::attach(&plan)?;
-        let origin = format!(
-            "guest RAM, run 0x{:016x}, {} run(s) of {}",
-            plan.run_id,
-            region.runs(),
-            region.origin()
-        );
-        let mut arena = Arena::over(id, Backing::GuestRam(region), &origin, size);
-        if let Some((_, len)) = plan.outbound {
+        for plan in &plans {
+            if plan.len % ARENA_GRANULARITY != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "region {}: a {}-byte region is not a whole number of \
+                         {ARENA_GRANULARITY}-byte pages",
+                        plan.id, plan.len
+                    ),
+                ));
+            }
+        }
+        let provided = ProvidedRegion::guest_ram(first)?;
+        let mut arena =
+            Arena::over(id, provided.backing, &provided.origin, provided.len);
+        if let Some((_, len)) = first.outbound {
             arena.reserve_outbound(len)?;
         }
+        for plan in &plans[1..] {
+            let provided = ProvidedRegion::guest_ram(plan)?;
+            let mut a = arena.alloc();
+            Arena::adopt(
+                &mut a,
+                RegionMap {
+                    id: plan.id,
+                    backing: SharedBacking::new(provided.backing),
+                    origin: provided.origin,
+                    len: provided.len,
+                    outbound: None,
+                },
+            );
+        }
         Ok(arena)
+    }
+
+    /// Every region id this arena currently holds, for handing to a
+    /// [`PlanGrowth`] so it does not map one twice.
+    pub fn region_ids(&self) -> Vec<u32> {
+        self.alloc().slots.iter().map(|s| s.map.id).collect()
     }
 
     /// Take the last `len` bytes of this arena out of the free list, because the
@@ -667,14 +1003,22 @@ impl Arena {
                  this arena is already shared with a session",
             ));
         };
-        let size = inner.size;
-        {
-            let alloc = inner.alloc.get_mut().unwrap_or_else(|e| e.into_inner());
-            if alloc.published > 0 || alloc.free != vec![(0, size)] {
-                return Err(io::Error::other(
-                    "the peer's outbound window must be reserved before anything is allocated",
-                ));
-            }
+        let arenas = inner.arenas.get_mut().unwrap_or_else(|e| e.into_inner());
+        // The window belongs to the region the compositor committed at startup,
+        // which is the first one. A grown region is memory the compositor never
+        // declared anything in.
+        if arenas.slots.len() != 1 {
+            return Err(io::Error::other(
+                "the peer's outbound window must be reserved before the arena has grown: \
+                 the window is a fact about the region the compositor committed, and a \
+                 later region is not that region",
+            ));
+        }
+        let size = arenas.slots[0].map.len;
+        if arenas.slots[0].alloc.published > 0 || arenas.slots[0].alloc.free != vec![(0, size)] {
+            return Err(io::Error::other(
+                "the peer's outbound window must be reserved before anything is allocated",
+            ));
         }
         if len == 0 || len >= size {
             return Err(io::Error::new(
@@ -683,32 +1027,71 @@ impl Arena {
             ));
         }
         let len = len.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
-        inner.outbound = Some((size - len, len));
-        inner.alloc.get_mut().unwrap_or_else(|e| e.into_inner()).free = vec![(0, size - len)];
+        let slot = &mut arenas.slots[0];
+        // `RegionMap` is behind an `Arc` because a released region's mapping
+        // outlives the allocator's listing of it. Nothing is sharing this one
+        // yet — `Arc::get_mut` on the outer handle has already proved no session
+        // holds the arena — so the window can still be written into it.
+        Arc::get_mut(&mut slot.map)
+            .expect("no session holds the arena, so nothing holds its first region")
+            .outbound = Some((size - len, len));
+        slot.alloc.free = vec![(0, size - len)];
         Ok(())
     }
 
     /// The peer's window, `(offset, len)`, for the log line that says this proxy
     /// knows about it. `None` is the answer for every deployment before stage 10
     /// and for every one whose compositor creates nothing.
+    ///
+    /// The window of the *startup* region, which is the only one that has one.
     pub fn outbound(&self) -> Option<(u64, u64)> {
-        self.inner.outbound
+        let arenas = self.alloc();
+        arenas.slots.iter().find(|s| s.map.id == self.inner.id)?.map.outbound
     }
 
     fn over(id: u32, backing: Backing, origin: &str, size: u64) -> Arena {
         Arena {
             inner: Arc::new(ArenaInner {
                 id,
-                region: SharedBacking::new(backing),
-                origin: origin.to_owned(),
-                size,
-                outbound: None,
-                alloc: Mutex::new(Alloc {
-                    free: vec![(0, size)],
-                    ..Alloc::default()
+                arenas: Mutex::new(Arenas {
+                    slots: vec![Slot::new(
+                        Arc::new(RegionMap {
+                            id,
+                            backing: SharedBacking::new(backing),
+                            origin: origin.to_owned(),
+                            len: size,
+                            outbound: None,
+                        }),
+                        Policy::default(),
+                    )],
+                    next_key: 0,
+                    next_id: id.saturating_add(1),
+                    policy: Policy::default(),
+                    tick: 0,
+                    grown: 0,
+                    grow_nanos: 0,
+                    grow_refused: 0,
+                    released_regions: 0,
+                    released_bytes: 0,
+                    reclaim_idle: 0,
                 }),
+                source: Mutex::new(None),
             }),
         }
+    }
+
+    /// Add a region this arena already holds a mapping for.
+    ///
+    /// DYNAMIC ARENA. The plan-reading path uses this for every region after
+    /// the first, and growth uses it for the ones it obtains later. Both go
+    /// through one function so that "a region joins the arena" has one spelling
+    /// and one place to get the bookkeeping right.
+    fn adopt(arenas: &mut Arenas, map: RegionMap) -> u32 {
+        let id = map.id;
+        let policy = arenas.policy;
+        arenas.slots.push(Slot::new(Arc::new(map), policy));
+        arenas.next_id = arenas.next_id.max(id.saturating_add(1));
+        id
     }
 
     pub fn id(&self) -> u32 {
@@ -717,12 +1100,73 @@ impl Arena {
 
     /// Where the region came from, for the log line that is the only difference
     /// a reader of the output can see between the two substrates.
-    pub fn origin(&self) -> &str {
-        &self.inner.origin
+    ///
+    /// The startup region's origin. A grown arena says how it grew through
+    /// [`Arena::growth`] rather than by making this string longer every time,
+    /// because this one is printed once at startup and the other is the thing
+    /// that changes.
+    pub fn origin(&self) -> String {
+        let arenas = self.alloc();
+        arenas
+            .slots
+            .iter()
+            .find(|s| s.map.id == self.inner.id)
+            .map(|s| s.map.origin.clone())
+            .unwrap_or_default()
     }
 
+    /// Every byte this arena currently holds, across every region.
     pub fn size(&self) -> u64 {
-        self.inner.size
+        self.alloc().size()
+    }
+
+    /// How many regions are mapped right now.
+    pub fn regions(&self) -> usize {
+        self.alloc().slots.len()
+    }
+
+    /// `(times grown, nanoseconds spent growing, times growth was refused,
+    /// regions released, bytes released)`.
+    ///
+    /// The numbers a run has to print for growth to be a claim rather than a
+    /// hope. The second is the one that decides whether this is a product: a
+    /// 2.3 s stall mid-video and a 64 ms one are different features, and only a
+    /// measurement can say which was built.
+    pub fn growth(&self) -> (u32, u64, u32, u32, u64) {
+        let a = self.alloc();
+        (a.grown, a.grow_nanos, a.grow_refused, a.released_regions, a.released_bytes)
+    }
+
+    /// Give this arena a way to obtain more memory.
+    ///
+    /// `&mut self`, for the same reason [`Arena::reserve_outbound`] takes it:
+    /// an arena that acquired the ability to grow half way through a session
+    /// would make the log of what it did depend on when the flag arrived.
+    pub fn set_source(&mut self, source: Box<dyn RegionSource>) -> io::Result<()> {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return Err(io::Error::other(
+                "the region source must be set before any client is served: \
+                 this arena is already shared with a session",
+            ));
+        };
+        *inner.source.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(source);
+        Ok(())
+    }
+
+    /// How many frames a region must be empty before [`PoolTransport::frame`]
+    /// returns it. Zero — the default — never returns one.
+    ///
+    /// Off unless asked for, like growth itself, so that a run that did not opt
+    /// into this stage behaves exactly as it did before it.
+    pub fn set_reclaim_idle(&mut self, frames: u64) -> io::Result<()> {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return Err(io::Error::other(
+                "the reclamation threshold must be chosen before any client is served: \
+                 this arena is already shared with a session",
+            ));
+        };
+        inner.arenas.get_mut().unwrap_or_else(|e| e.into_inner()).reclaim_idle = frames;
+        Ok(())
     }
 
     /// Choose how this allocator picks a run. See [`Policy`].
@@ -739,7 +1183,11 @@ impl Arena {
                  this arena is already shared with a session",
             ));
         };
-        inner.alloc.get_mut().unwrap_or_else(|e| e.into_inner()).policy = policy;
+        let arenas = inner.arenas.get_mut().unwrap_or_else(|e| e.into_inner());
+        arenas.policy = policy;
+        for slot in &mut arenas.slots {
+            slot.alloc.policy = policy;
+        }
         Ok(())
     }
 
@@ -748,16 +1196,197 @@ impl Arena {
         self.alloc().policy
     }
 
-    /// Free bytes, and the largest contiguous run of them. The second number is
-    /// the one that matters: an arena with room for a pool and nowhere to put
-    /// it is the fragmentation failure shared_vulkan's design.md §5.7 is about,
-    /// and reporting only the total would hide it.
+    /// Free bytes, and the largest contiguous run of them **in any one region**.
+    ///
+    /// The second number is the one that matters: an arena with room for a pool
+    /// and nowhere to put it is the fragmentation failure shared_vulkan's
+    /// design.md §5.7 is about, and reporting only the total would hide it.
+    /// Growth does not change that — it adds a region whose largest run is the
+    /// whole of it — and summing the largest runs across regions would be a
+    /// second way to hide the same thing, since no pool may straddle two.
     pub fn free_bytes(&self) -> (u64, u64) {
-        let alloc = self.alloc();
-        (
-            alloc.free.iter().map(|(_, l)| *l).sum(),
-            alloc.free.iter().map(|(_, l)| *l).max().unwrap_or(0),
-        )
+        self.alloc().free_bytes()
+    }
+
+    /// Advance the frame counter the release policy is written in terms of, and
+    /// return any region that has become returnable.
+    ///
+    /// Called once per commit by the session. See [`Arena::reclaim_regions`]
+    /// for what "returnable" means and why it is not simply "empty".
+    pub fn tick(&self) -> u64 {
+        let mut a = self.alloc();
+        a.tick += 1;
+        a.tick
+    }
+
+    /// Give back every region that is empty and has stayed empty.
+    ///
+    /// # The policy, and why it cannot wait for the client to say so
+    ///
+    /// waycompose §17.8 measured Firefox over a 25-second run: **`wl_shm_pool.
+    /// destroy` zero times**, one `wl_buffer` destroyed in three, against 18
+    /// `wl_region`s and 2 `wl_surface`s destroyed in the same trace. It is not a
+    /// client that destroys nothing; it is a client that does not destroy
+    /// *these*. So a policy that returns a region when its last pool is
+    /// destroyed returns almost nothing, and the machinery underneath is not
+    /// what is missing — §17.8 also measured a pool at offset 28672 being reused
+    /// and coalesced, so the free list works.
+    ///
+    /// What makes a region returnable here is therefore a fact about this
+    /// process rather than a message from the client: **nothing is allocated in
+    /// it, and nothing has been for `idle_frames` frames.** The second clause is
+    /// not a timer, it is a guard against thrash — a region emptied and refilled
+    /// on alternate frames would be unmapped and re-located every other frame,
+    /// and a re-locate is the most expensive thing this design does.
+    ///
+    /// # What is safe to return, and what is not
+    ///
+    /// Only a region with no live extents, which is stronger than "no live
+    /// pools". A client is entitled to re-attach a buffer it never destroyed,
+    /// and an extent it might name is a live extent — `destroy` is the only
+    /// thing that ends one, and until it runs the region stays. So this can
+    /// only ever return memory the *proxy* has already stopped using, which is
+    /// why it is safe without knowing anything about the client's intentions.
+    ///
+    /// The startup region is never returned. It carries the compositor's
+    /// outbound window — live keymaps the compositor has already handed to
+    /// clients (`one-binary.md` §3.1a) — and unmapping it would take those with
+    /// it.
+    pub fn reclaim_regions(&self, idle_frames: u64) -> Vec<(u32, u64, String)> {
+        let mut released = Vec::new();
+        {
+            let mut a = self.alloc();
+            let (tick, base) = (a.tick, self.inner.id);
+            // Mark newly empty regions, so that "empty since" is a fact the
+            // policy can read rather than one it has to guess.
+            for slot in &mut a.slots {
+                if slot.is_empty() {
+                    slot.idle_since.get_or_insert(tick);
+                } else {
+                    slot.idle_since = None;
+                }
+            }
+            let mut i = 0;
+            while i < a.slots.len() {
+                let slot = &a.slots[i];
+                let cold = slot.map.id != base
+                    && slot.is_empty()
+                    && slot.idle_since.is_some_and(|t| tick.saturating_sub(t) >= idle_frames);
+                if !cold {
+                    i += 1;
+                    continue;
+                }
+                let slot = a.slots.remove(i);
+                a.released_regions += 1;
+                a.released_bytes += slot.map.len;
+                released.push((slot.map.id, slot.map.len, slot.map.origin.clone()));
+                // Dropping the last `Arc` here is what actually unmaps the
+                // region — `StitchedRegion`'s `Drop` munmaps the whole
+                // reservation in one call regardless of how many runs are in
+                // it (§5.7). The guest's committed bytes go down when it is
+                // told, below, and not before.
+                drop(slot);
+            }
+        }
+        if !released.is_empty()
+            && let Ok(mut src) = self.inner.source.lock()
+            && let Some(src) = src.as_mut()
+        {
+            for (id, _, _) in &released {
+                src.release(*id);
+            }
+        }
+        released
+    }
+}
+
+impl Slot {
+    fn new(map: Arc<RegionMap>, policy: Policy) -> Slot {
+        // A region's free list starts as the whole of it minus the outbound
+        // window, which is the tail. `reserve_outbound` shortens it in place
+        // for the startup region; a grown region has no window and so is free
+        // to its end.
+        let usable = match map.outbound {
+            Some((base, _)) => base,
+            None => map.len,
+        };
+        Slot {
+            map,
+            alloc: Alloc { free: vec![(0, usable)], policy, ..Alloc::default() },
+            idle_since: Some(0),
+        }
+    }
+
+    /// Nothing is out of this region and nothing ever will be until something
+    /// is allocated from it again.
+    fn is_empty(&self) -> bool {
+        self.alloc.live.is_empty() && self.alloc.published == 0
+    }
+}
+
+impl Arenas {
+    /// Total free bytes, and the largest run in any one region.
+    ///
+    /// The second number stays per-region rather than being summed, and that is
+    /// the honest one: an arena with 200 MiB free across four regions still
+    /// cannot serve a 100 MiB pool if no single region has 100 MiB contiguous.
+    /// Summing it would turn "the allocator cannot place this" into a number
+    /// that says it can.
+    fn free_bytes(&self) -> (u64, u64) {
+        let total = self
+            .slots
+            .iter()
+            .flat_map(|s| s.alloc.free.iter())
+            .map(|(_, l)| *l)
+            .sum();
+        let largest = self
+            .slots
+            .iter()
+            .flat_map(|s| s.alloc.free.iter())
+            .map(|(_, l)| *l)
+            .max()
+            .unwrap_or(0);
+        (total, largest)
+    }
+
+    fn published(&self) -> u64 {
+        self.slots.iter().map(|s| s.alloc.published).sum()
+    }
+
+    fn size(&self) -> u64 {
+        self.slots.iter().map(|s| s.map.len).sum()
+    }
+
+    /// Place `want` bytes in whichever region can take them, returning the
+    /// region and the offset within it.
+    ///
+    /// **Regions are tried oldest first, and that is deliberate.** Packing into
+    /// the regions that already exist is what makes the newest one become empty
+    /// and therefore returnable; spreading allocations evenly would keep every
+    /// region a little bit occupied and nothing would ever come back. Release
+    /// is a consequence of allocation order as much as of any policy.
+    fn place(&mut self, want: u64) -> Option<(Arc<RegionMap>, u64, u64)> {
+        for slot in &mut self.slots {
+            let Some((idx, from_tail)) = slot.alloc.pick(want) else {
+                continue;
+            };
+            let (offset, len) = slot.alloc.free[idx];
+            let at = if from_tail { offset + len - want } else { offset };
+            if len == want {
+                slot.alloc.free.remove(idx);
+            } else if from_tail {
+                slot.alloc.free[idx] = (offset, len - want);
+            } else {
+                slot.alloc.free[idx] = (offset + want, len - want);
+            }
+            let key = self.next_key;
+            self.next_key += 1;
+            slot.alloc.live.insert(key, (at, want));
+            slot.alloc.published += want;
+            slot.idle_since = None;
+            return Some((Arc::clone(&slot.map), at, key));
+        }
+        None
     }
 }
 
@@ -824,52 +1453,97 @@ impl PoolTransport for Arena {
         "arena"
     }
 
+    /// Place a pool, growing the arena if no region can take it.
+    ///
+    /// # The order — place, then grow, then place again — is the whole policy
+    ///
+    /// Growth is what happens when the allocator has already failed, never
+    /// before. That ordering is not an optimisation, it is what keeps the
+    /// fragmentation work honest: an arena that grew whenever a region was
+    /// merely *tight* would make [`Policy::BestFitSegregated`] untestable,
+    /// because every measurement of how well runs are chosen would be
+    /// contaminated by memory that was added instead of used. §20.4's matrix
+    /// compares policies at a fixed size, and it still can.
+    ///
+    /// # Refusing is still a thing this function does
+    ///
+    /// Even with growth the guest can be out of RAM, and then this returns
+    /// `OutOfMemory` with the numbers exactly as it always did. **That is not a
+    /// regression to be designed away.** The connection Firefox lost was not
+    /// closed by this refusal; it was closed because an unannounced pool is an
+    /// object the compositor does not have, and the client's next
+    /// `wl_shm_pool.create_buffer` was forwarded to it anyway — a request on an
+    /// unknown object is a protocol error. The caller absorbs the refusal and
+    /// replays from the client's own bytes, and an allocator that never refused
+    /// would have hidden that bug rather than fixed it.
     fn create(&mut self, size: u64) -> io::Result<Region> {
         if size == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a pool cannot be empty"));
         }
-        let mut alloc = self.alloc();
         let want = size.div_ceil(ARENA_GRANULARITY) * ARENA_GRANULARITY;
-        let (idx, from_tail) = alloc.pick(want).ok_or_else(|| {
-            let total: u64 = alloc.free.iter().map(|(_, l)| *l).sum();
-            let largest = alloc.free.iter().map(|(_, l)| *l).max().unwrap_or(0);
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!(
-                    "arena {} has no run of {want} bytes ({total} free, largest {largest}, \
-                     {} bytes out to {} connection(s), {} policy); raise --arena-size",
-                    self.inner.id,
-                    alloc.published,
-                    Arc::strong_count(&self.inner),
-                    alloc.policy.as_str(),
-                ),
-            )
-        })?;
-        let (run, len) = alloc.free[idx];
-        let offset = if from_tail { run + len - want } else { run };
-        if len == want {
-            alloc.free.remove(idx);
-        } else if from_tail {
-            alloc.free[idx] = (run, len - want);
-        } else {
-            alloc.free[idx] = (run + want, len - want);
+        if let Some(region) = self.place(want, size) {
+            return Ok(region);
         }
-        let key = alloc.next;
-        alloc.next += 1;
-        alloc.live.insert(key, (offset, want));
-        alloc.published += want;
-        Ok(Region {
-            descriptor: Descriptor::ArenaSlice { arena: self.inner.id, offset, len: size },
-            size,
-            key,
-        })
+        // Nothing had room. Ask for another region, and say how much is needed
+        // rather than a fixed step, so that a pool larger than the growth step
+        // is served by one region rather than by a sequence of regions none of
+        // which can hold it. A pool may not straddle two (see [`RegionMap`]).
+        match self.grow(want) {
+            Ok(Some(note)) => {
+                if let Some(region) = self.place(want, size) {
+                    let _ = note;
+                    return Ok(region);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.alloc().grow_refused += 1;
+                let a = self.alloc();
+                let (total, largest) = a.free_bytes();
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!(
+                        "arena {} cannot serve {want} bytes and cannot grow: {e} \
+                         ({total} free across {} region(s), largest run {largest}, \
+                         {} bytes out to {} connection(s), {} policy)",
+                        self.inner.id,
+                        a.slots.len(),
+                        a.published(),
+                        Arc::strong_count(&self.inner),
+                        a.policy.as_str(),
+                    ),
+                ));
+            }
+        }
+        let a = self.alloc();
+        let (total, largest) = a.free_bytes();
+        Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "arena {} has no run of {want} bytes ({total} free across {} region(s), \
+                 largest run {largest}, {} bytes out to {} connection(s), {} policy); \
+                 raise --arena-size",
+                self.inner.id,
+                a.slots.len(),
+                a.published(),
+                Arc::strong_count(&self.inner),
+                a.policy.as_str(),
+            ),
+        ))
     }
 
     fn destroy(&mut self, region: &Region) {
-        let mut alloc = self.alloc();
-        if let Some((offset, len)) = alloc.live.remove(&region.key) {
-            alloc.published -= len;
-            alloc.release(offset, len);
+        let mut a = self.alloc();
+        let tick = a.tick;
+        for slot in &mut a.slots {
+            if let Some((offset, len)) = slot.alloc.live.remove(&region.key) {
+                slot.alloc.published -= len;
+                slot.alloc.release(offset, len);
+                if slot.alloc.live.is_empty() && slot.alloc.published == 0 {
+                    slot.idle_since = Some(tick);
+                }
+                return;
+            }
         }
     }
 
@@ -880,21 +1554,42 @@ impl PoolTransport for Arena {
         // frame path against every other's — which would be a real cost of
         // sharing the arena, and there is no reason to pay it: the extent this
         // returns cannot be handed to anybody else while it is live.
-        let (offset, _) = *self.alloc().live.get(&region.key)?;
+        let (map, offset) = {
+            let a = self.alloc();
+            let slot = a.slots.iter().find(|s| s.alloc.live.contains_key(&region.key))?;
+            (Arc::clone(&slot.map), slot.alloc.live[&region.key].0)
+        };
         let start = usize::try_from(offset).ok()?;
         let len = usize::try_from(region.size).ok()?;
-        let p = self.inner.region.range(start, len)?;
+        let p = map.backing.range(start, len)?;
         // SAFETY: `region.key` is live in the allocator, so `start..start + len`
         // is an extent no other `Region` overlaps — the allocator hands out
         // disjoint runs and a key belongs to exactly one session — and `&mut
         // self` rules out a second reference to it from this handle. The
         // compositor may be reading these bytes at the same time, which is the
         // `wl_shm` race `wl_buffer.release` arbitrates and not a Rust one.
+        //
+        // The mapping outlives the returned slice: a region is only ever
+        // unmapped by `reclaim_regions`, which refuses any region with a live
+        // extent in it, and this key is one. So the `Arc` dropped at the end of
+        // this function is never the last.
         Some(unsafe { std::slice::from_raw_parts_mut(p, len) })
     }
 
     fn published(&self) -> u64 {
-        self.alloc().published
+        self.alloc().published()
+    }
+
+    fn frame(&mut self) -> Vec<(u32, u64, String)> {
+        self.tick();
+        // `reclaim_idle == 0` means "never", not "immediately". Returning a
+        // region the instant it empties is the thrash the idle count exists to
+        // prevent, and it is not a behaviour worth having a spelling for.
+        let idle = self.alloc().reclaim_idle;
+        if idle == 0 {
+            return Vec::new();
+        }
+        self.reclaim_regions(idle)
     }
 
     /// **Only the compositor's outbound window**, and the narrowness is the
@@ -915,21 +1610,111 @@ impl PoolTransport for Arena {
     /// written, and the check is what makes [`SharedBacking`]'s two accessors
     /// provably disjoint instead of merely conventionally so.
     fn peer_slice(&self, arena: u32, offset: u64, len: u64) -> Option<&[u8]> {
+        // Growth does not widen this. Only the startup region has an outbound
+        // window, so naming any other region here is a compositor describing
+        // something it did not mint.
         if arena != self.inner.id {
             return None;
         }
-        let (base, wlen) = self.inner.outbound?;
+        let map = {
+            let a = self.alloc();
+            Arc::clone(&a.slots.iter().find(|s| s.map.id == arena)?.map)
+        };
+        let (base, wlen) = map.outbound?;
         if offset < base || offset.checked_add(len)? > base + wlen {
             return None;
         }
         let start = usize::try_from(offset).ok()?;
         let len = usize::try_from(len).ok()?;
-        let p = self.inner.region.range(start, len)?;
+        let p = map.backing.range(start, len)?;
         // SAFETY: the range is inside the mapping and inside the outbound
         // window, which the allocator never hands out — so no `bytes_mut` on any
         // thread can be holding a `&mut` that overlaps it. The compositor writes
         // it, once, before it names it in a message this proxy has yet to read.
+        // The region is the startup one, which `reclaim_regions` never returns.
         Some(unsafe { std::slice::from_raw_parts(p.cast_const(), len) })
+    }
+}
+
+impl Arena {
+    /// Try every region, in the order they joined. `None` means none had room,
+    /// which is the caller's cue to grow.
+    fn place(&self, want: u64, size: u64) -> Option<Region> {
+        let mut a = self.alloc();
+        let (map, offset, key) = a.place(want)?;
+        Some(Region {
+            descriptor: Descriptor::ArenaSlice { arena: map.id, offset, len: size },
+            size,
+            key,
+        })
+    }
+
+    /// Obtain another region big enough for `want`, and take it into the arena.
+    ///
+    /// `Ok(None)` means this arena has no source and therefore cannot grow,
+    /// which is the pre-growth behaviour and is a normal answer rather than a
+    /// failure — a test that wants to observe a refusal builds one this way.
+    ///
+    /// # What growth costs, and why the number is recorded rather than assumed
+    ///
+    /// Over guest RAM a new region is a `VirtualAlloc` and a *locate*. The
+    /// locate is the whole cost: design.md §12.5 measured the content sweep at
+    /// **2.37–2.42 s** for a 13312 MiB backing object, and it is a function of
+    /// the guest's RAM rather than of the region's size. A 2.4 s stall in the
+    /// middle of a video is not a feature, which is why §0.14's
+    /// `SuperfetchPfnQuery` — **0.064 s** on the host, ~330 ms of guest CPU,
+    /// verified against the sweep 16384/16384 — is a prerequisite of this stage
+    /// and not an optimisation of it.
+    ///
+    /// It is also what makes growth *possible* rather than merely fast. Stage
+    /// 16 rejected growth on the grounds that §12.10's stamps are overwritten
+    /// by the first pool, so a region cannot be re-located; that objection was
+    /// correct against the sweep and is answered by the query, which re-located
+    /// a window whose every byte had been overwritten and returned the same
+    /// 16384 frames where the sweep found **0 pages**.
+    ///
+    /// Either way the elapsed time is measured here and reported by
+    /// [`Arena::growth`], because a stage that claimed a cost it did not record
+    /// would be making the mistake §8.4 is about.
+    fn grow(&self, want: u64) -> io::Result<Option<String>> {
+        let (id, min_len) = {
+            let a = self.alloc();
+            (a.next_id, want)
+        };
+        let started = std::time::Instant::now();
+        let provided = {
+            let mut src = self.inner.source.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(src) = src.as_mut() else {
+                return Ok(None);
+            };
+            src.provide(id, min_len)?
+        };
+        let elapsed = started.elapsed().as_nanos() as u64;
+        if provided.len < want {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "a region of {} bytes was asked for and {} came back; a pool may not \
+                     straddle two regions, so a short one cannot serve it",
+                    want, provided.len
+                ),
+            ));
+        }
+        let note = format!("region {id}: {} bytes from {}", provided.len, provided.origin);
+        let mut a = self.alloc();
+        Arena::adopt(
+            &mut a,
+            RegionMap {
+                id,
+                backing: SharedBacking::new(provided.backing),
+                origin: provided.origin,
+                len: provided.len,
+                outbound: None,
+            },
+        );
+        a.grown += 1;
+        a.grow_nanos += elapsed;
+        Ok(Some(note))
     }
 }
 
@@ -1411,5 +2196,283 @@ mod tests {
             assert_eq!(Policy::parse(s).unwrap().as_str(), s);
         }
         assert!(Policy::parse("worst-fit").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // DYNAMIC ARENA: growth, and returning what growth took
+    // -----------------------------------------------------------------
+
+    /// The crash, reproduced and then survived.
+    ///
+    /// The user's YouTube failure in one assertion: an arena with no room for
+    /// the next pool. Before this stage `create` returned `OutOfMemory` and the
+    /// pool went unannounced; now the arena obtains another region and the pool
+    /// is served. The numbers are the shape of the real one — a video-sized
+    /// pool against an arena that has already been filled — rather than a round
+    /// number chosen to make the test pass.
+    #[test]
+    fn an_arena_with_no_room_grows_instead_of_refusing() {
+        let d = tmpdir("grow");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7200, &d.join("arena"), 64 * 4096).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 64 * 4096))).unwrap();
+
+        // Fill the startup region completely.
+        let _hold = a.create(64 * 4096).unwrap();
+        assert_eq!(a.free_bytes(), (0, 0), "the startup region is full");
+        assert_eq!(a.regions(), 1);
+
+        // The request that used to be fatal.
+        let grown = a.create(32 * 4096).expect("an arena that can grow must not refuse this");
+        assert_eq!(a.regions(), 2, "a second region was taken up");
+        let (times, nanos, refused, _, _) = a.growth();
+        assert_eq!((times, refused), (1, 0));
+        assert!(nanos > 0, "growth must record what it cost, not assume it");
+
+        // And the pool really is in the new region, named by its own id.
+        match grown.descriptor {
+            Descriptor::ArenaSlice { arena, .. } => {
+                assert_ne!(arena, 7200, "a grown pool lives in the region that was added");
+                assert_eq!(arena, 7201, "region ids are handed out in order and never reused");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A pool larger than the growth step gets a region big enough for it,
+    /// because a pool may not straddle two regions.
+    ///
+    /// The alternative — growing by a fixed step and then failing anyway
+    /// because no single region can hold the request — is the failure mode that
+    /// would make growth look like it worked while the client still froze.
+    #[test]
+    fn a_pool_larger_than_the_growth_step_gets_a_region_that_fits_it() {
+        let d = tmpdir("grow-big");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7201, &d.join("arena"), 8 * 4096).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 4096))).unwrap();
+        let _fill = a.create(8 * 4096).unwrap();
+
+        let big = a.create(100 * 4096).expect("one region must be able to hold it");
+        assert_eq!(big.size, 100 * 4096);
+        // One region, not twenty-five of the step size.
+        assert_eq!(a.regions(), 2);
+        assert!(a.size() >= 108 * 4096);
+    }
+
+    /// An arena with no source behaves exactly as it did before this stage, and
+    /// the message still carries both numbers.
+    ///
+    /// This is the case the fragmentation matrix measures. If growth had been
+    /// made unconditional, `a_video_sized_churn_fragments_first_fit_and_not_the_default`
+    /// would pass by adding memory rather than by placing it well, and the
+    /// comparison between the two policies would mean nothing.
+    #[test]
+    fn an_arena_with_no_source_still_refuses_with_the_numbers() {
+        let d = tmpdir("nogrow");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7202, &d.join("arena"), 8 * 4096).unwrap();
+        let _fill = a.create(8 * 4096).unwrap();
+        let e = a.create(4096).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::OutOfMemory);
+        let m = e.to_string();
+        assert!(m.contains("no run of 4096 bytes"), "{m}");
+        assert!(m.contains("0 free across 1 region(s)"), "{m}");
+        assert_eq!(a.regions(), 1, "no source means no growth, silently or otherwise");
+    }
+
+    /// A source that cannot serve the request produces `OutOfMemory` carrying
+    /// both the size asked for and the source's own reason — and the arena
+    /// stays usable.
+    ///
+    /// `one-binary.md` §3.1b: arena exhaustion "is a thing a compositor
+    /// survives in a degraded state, not a thing that kills a client".
+    #[test]
+    fn a_guest_that_is_out_of_ram_refuses_survivably_and_says_both_numbers() {
+        struct Broke;
+        impl RegionSource for Broke {
+            fn provide(&mut self, _id: u32, min_len: u64) -> io::Result<ProvidedRegion> {
+                Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!("the guest has no {min_len} bytes to commit"),
+                ))
+            }
+            fn describe(&self) -> String {
+                "a guest with no memory left".into()
+            }
+        }
+        let d = tmpdir("oom");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7203, &d.join("arena"), 8 * 4096).unwrap();
+        a.set_source(Box::new(Broke)).unwrap();
+        let fill = a.create(8 * 4096).unwrap();
+
+        let e = a.create(4096).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::OutOfMemory);
+        let m = e.to_string();
+        assert!(m.contains("cannot serve 4096 bytes"), "{m}");
+        assert!(m.contains("the guest has no 4096 bytes to commit"), "{m}");
+        assert_eq!(a.growth().2, 1, "the refusal is counted");
+
+        // Degraded, alive: the arena still serves what it can once space frees.
+        a.destroy(&fill);
+        assert!(a.create(4096).is_ok(), "a refusal must not poison the allocator");
+    }
+
+    /// A region that empties is returned, and the bytes stop being charged.
+    ///
+    /// The measurement that matters is the last one: `FileGrowth::release`
+    /// unlinks the file, so "the memory came back" is a fact about the
+    /// filesystem rather than a log line claiming it. On guest RAM the same
+    /// drop unmaps the stitched reservation and the guest is told to decommit.
+    #[test]
+    fn an_empty_region_is_returned_and_its_bytes_actually_go_away() {
+        let d = tmpdir("release");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7204, &d.join("arena"), 8 * 4096).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 16 * 4096))).unwrap();
+        let _fill = a.create(8 * 4096).unwrap();
+        let grown = a.create(4096).unwrap();
+        assert_eq!(a.regions(), 2);
+        let region_file = d.join("region-7205");
+        assert!(region_file.exists(), "the grown region is a real object");
+
+        // Still live: nothing is returned while an extent is out, whatever the
+        // client did or did not say.
+        for _ in 0..10 {
+            a.tick();
+        }
+        assert!(a.reclaim_regions(2).is_empty(), "a live extent pins its region");
+        assert_eq!(a.regions(), 2);
+
+        // Now empty, but not yet cold. The delay is the anti-thrash guard.
+        a.destroy(&grown);
+        a.tick();
+        assert!(a.reclaim_regions(4).is_empty(), "emptiness alone is not enough");
+
+        // Cold.
+        for _ in 0..5 {
+            a.tick();
+        }
+        let released = a.reclaim_regions(4);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].0, 7205);
+        assert_eq!(a.regions(), 1);
+        assert_eq!(a.growth().3, 1, "one region released");
+        assert_eq!(a.growth().4, 16 * 4096, "and the bytes are counted");
+        assert!(!region_file.exists(), "the bytes are gone, not merely unlisted");
+    }
+
+    /// The startup region is never returned, however empty and however cold.
+    ///
+    /// It carries the compositor's outbound window — keymaps the compositor has
+    /// already handed to clients — and unmapping it would take those with it.
+    /// `one-binary.md` §3.1a is the argument; this is the assertion.
+    #[test]
+    fn the_startup_region_is_never_reclaimed() {
+        let d = tmpdir("keep-base");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7206, &d.join("arena"), 8 * 4096).unwrap();
+        a.reserve_outbound(4096).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 4096))).unwrap();
+        for _ in 0..100 {
+            a.tick();
+        }
+        assert!(a.reclaim_regions(1).is_empty());
+        assert_eq!(a.regions(), 1);
+        assert_eq!(a.outbound(), Some((7 * 4096, 4096)));
+    }
+
+    /// Growth does not widen what the compositor may describe back to a client.
+    ///
+    /// Only the startup region has an outbound window, so a `peer_slice` naming
+    /// a grown region is a compositor describing something it did not mint —
+    /// refused rather than served, exactly as an out-of-window offset is.
+    #[test]
+    fn a_grown_region_has_no_outbound_window_and_cannot_be_peer_read() {
+        let d = tmpdir("peer");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7207, &d.join("arena"), 8 * 4096).unwrap();
+        a.reserve_outbound(4096).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 8 * 4096))).unwrap();
+        let _fill = a.create(7 * 4096).unwrap();
+        let grown = a.create(4096).unwrap();
+        let Descriptor::ArenaSlice { arena: grown_id, .. } = grown.descriptor else {
+            panic!("expected an arena slice");
+        };
+
+        // The startup region's window still reads.
+        assert!(a.peer_slice(7207, 7 * 4096, 4096).is_some());
+        // The grown region has none, and asking for one is refused.
+        assert!(a.peer_slice(grown_id, 0, 4096).is_none());
+    }
+
+    /// Extents in two different regions may share neither an offset nor a
+    /// meaning: the region id is part of the name.
+    ///
+    /// Two regions are mapped at unrelated host addresses, so offset 0 of
+    /// region A and offset 0 of region B are different bytes. This is the
+    /// property that makes `Descriptor::ArenaSlice`'s `arena` field
+    /// load-bearing rather than decorative.
+    #[test]
+    fn the_same_offset_in_two_regions_is_two_different_places() {
+        let d = tmpdir("distinct");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut a = Arena::open_or_create(7208, &d.join("arena"), 4096).unwrap();
+        a.set_source(Box::new(FileGrowth::new(&d, 4096))).unwrap();
+        let first = a.create(4096).unwrap();
+        let second = a.create(4096).unwrap();
+        assert_eq!(a.regions(), 2);
+
+        let (Descriptor::ArenaSlice { arena: a1, offset: o1, .. }, Descriptor::ArenaSlice { arena: a2, offset: o2, .. }) =
+            (&first.descriptor, &second.descriptor)
+        else {
+            panic!("expected arena slices");
+        };
+        assert_eq!((*o1, *o2), (0, 0), "both at offset 0 of their own region");
+        assert_ne!(a1, a2, "and told apart by the region id alone");
+
+        // Writing one must not disturb the other, which is what "different
+        // bytes" actually means.
+        a.bytes_mut(&first).unwrap()[0..4].copy_from_slice(b"ONE.");
+        a.bytes_mut(&second).unwrap()[0..4].copy_from_slice(b"TWO.");
+        assert_eq!(&a.bytes_mut(&first).unwrap()[0..4], b"ONE.");
+        assert_eq!(&a.bytes_mut(&second).unwrap()[0..4], b"TWO.");
+    }
+
+    /// A plan naming several regions maps all of them, and the first is the one
+    /// the compositor was told about.
+    #[test]
+    fn a_multi_region_plan_is_taken_up_whole() {
+        use crate::guestram::{Plan, Run};
+        let d = tmpdir("plan-multi");
+        std::fs::create_dir_all(&d).unwrap();
+        let backing = d.join("backing");
+        std::fs::write(&backing, vec![0u8; 3 * 4096]).unwrap();
+        let plan_path = d.join("plan");
+        std::fs::write(
+            &plan_path,
+            format!(
+                "region 4\nobject {0}\nlen 4096\nrun 0x1\nr 0 0 4096\n\
+                 region 9\nobject {0}\nlen 8192\nrun 0x2\nr 0 4096 8192\n",
+                backing.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(Plan::read_all(&plan_path).unwrap().len(), 2);
+
+        let a = Arena::from_plan(4, &plan_path).unwrap();
+        assert_eq!(a.id(), 4, "the first region is the arena the compositor knows");
+        assert_eq!(a.regions(), 2);
+        assert_eq!(a.size(), 3 * 4096);
+        assert_eq!(a.region_ids(), vec![4, 9]);
+        let _ = Run { arena_offset: 0, file_offset: 0, len: 0 };
+
+        // And a plan whose first region is not `--arena-id` is refused rather
+        // than renumbered.
+        let Err(e) = Arena::from_plan(9, &plan_path) else {
+            panic!("a plan whose first region is not --arena-id must be refused");
+        };
+        assert!(e.to_string().contains("the first region is 4"), "{e}");
     }
 }
