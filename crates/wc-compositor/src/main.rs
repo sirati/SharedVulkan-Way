@@ -733,6 +733,10 @@ fn wayland_thread(
             break;
         }
         state.tick_frames();
+        // STAGE 21. After dispatch, because dispatch is where an inhibitor is
+        // created, destroyed, or silently lost with the client that held it —
+        // and the last of those three is the one nothing else would notice.
+        state.tick_idle_inhibit();
         if let Err(e) = display.flush_clients() {
             eprintln!("wc-compositor: flush failed: {e}");
             break;

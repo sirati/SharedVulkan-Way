@@ -85,6 +85,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
+    // ADDED FOR STAGE 21: `xdg_activation_v1` (raise a window) and the
+    // screensaver half of `zwp_idle_inhibit_manager_v1`.
+    FlashWindowEx, GetForegroundWindow, IsIconic, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG,
+    FLASHW_TRAY, SC_MONITORPOWER, WM_SYSCOMMAND,
+};
+// ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
+// rather than anywhere near the window APIs, because it is not about a window:
+// it is a property of the calling thread. See `set_idle_inhibit`.
+use windows_sys::Win32::System::Power::{
+    SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
 };
 use windows_sys::Win32::Foundation::POINT;
 
@@ -108,6 +118,22 @@ const WM_WC_COMMAND: u32 = WM_APP + 1;
 /// `WM_MOUSEHOVER` and `TrackMouseEvent`; the metadata's placement is a fact
 /// about the Windows SDK's headers rather than about the message.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// `SC_SCREENSAVE`, 0xF140 — the `WM_SYSCOMMAND` the system sends to the
+/// foreground window when the screen saver is about to start.
+///
+/// Written out for the same reason as `WM_MOUSELEAVE`: `windows-sys` has
+/// `SC_MONITORPOWER` and does not have this one, which is a fact about which
+/// constants the Windows metadata chose to export rather than about the message.
+/// `winuser.h` declares the two on consecutive lines.
+const SC_SCREENSAVE: u32 = 0xF140;
+
+/// The mask `WM_SYSCOMMAND` requires before comparing `wParam`.
+///
+/// The low four bits are used internally by the system, so the documented way
+/// to test a system command is `(wParam & 0xFFF0) == SC_...`. Comparing the raw
+/// `wParam` works most of the time, which is worse than never working.
+const SC_MASK: usize = 0xFFF0;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -600,6 +626,13 @@ struct Ui {
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
     controller: Cell<isize>,
+    /// Whether a client currently holds an idle inhibitor.
+    ///
+    /// ADDED FOR STAGE 21. Kept here as well as inside Windows' own execution
+    /// state because `SetThreadExecutionState` is write-only — it returns the
+    /// *previous* state, and there is no "what is it now" query — and because
+    /// `toplevel_proc` has to read it to answer `WM_SYSCOMMAND`.
+    idle_inhibited: Cell<bool>,
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
@@ -689,6 +722,31 @@ unsafe extern "system" fn toplevel_proc(
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
+            0
+        }
+
+        // ADDED FOR STAGE 21: the second half of `zwp_idle_inhibit`.
+        //
+        // `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` resets the display
+        // idle timer and does not touch the screen saver, which runs on the
+        // *input* idle timer — and a client holding an idle inhibitor is
+        // usually playing a video, which is exactly the situation with no
+        // input. So the execution state alone leaves the screen saver free to
+        // start. Refusing the `WM_SYSCOMMAND` is the documented way for the
+        // foreground application to veto it, and `DefWindowProc` is what would
+        // otherwise let it through.
+        //
+        // Only while something actually holds an inhibitor: a compositor that
+        // permanently blocked the screen saver would be making a policy
+        // decision on the user's behalf that no client asked for.
+        WM_SYSCOMMAND
+            if matches!(wparam & SC_MASK, x if x == SC_SCREENSAVE as usize
+                || x == SC_MONITORPOWER as usize)
+                && ui().is_some_and(|ui| ui.idle_inhibited.get()) =>
+        {
+            println!(
+                "wc-compositor: refused a screen-blank request; a client holds an idle inhibitor"
+            );
             0
         }
 
@@ -917,6 +975,13 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 set_window_state(&w, maximized, minimized);
             }
         }
+        // ADDED FOR STAGE 21.
+        ToUi::IdleInhibit { on } => set_idle_inhibit(ui, on),
+        ToUi::Activate { id } => {
+            if let Some(w) = window(ui, id) {
+                activate_window(&w);
+            }
+        }
         ToUi::Destroy { id } => {
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
@@ -940,6 +1005,165 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             }
         }
         ToUi::Quit => unreachable!("handled in drain"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle inhibition and activation — stage 21
+// ---------------------------------------------------------------------------
+
+/// Keep the display awake while a client holds an idle inhibitor.
+///
+/// # `SetThreadExecutionState` is per *thread*, and this is the thread
+///
+/// The state is a property of the calling thread and the system takes the union
+/// over every thread that has one. It is released when that thread exits, which
+/// is exactly the cleanup this feature wants and exactly the trap it would be if
+/// it were called from anywhere else: the Wayland thread is where the protocol
+/// lives, and had the call been made there, a compositor whose Wayland thread
+/// wound up first would drop the inhibition a moment before the process ended —
+/// harmless — while a compositor that later moved that work to a worker thread
+/// would silently stop inhibiting anything. So it is made from the UI thread,
+/// which is `main`'s thread and outlives everything. `handle` runs on it, and
+/// it is the only caller.
+///
+/// # `ES_CONTINUOUS` is what makes it a state rather than a nudge
+///
+/// Without it the call is a one-shot "the display is in use right now" that
+/// resets the idle timer once. With it, the flags stay set until they are
+/// cleared, which is what `zwp_idle_inhibitor_v1` means — the inhibitor lasts
+/// until the client destroys it. Clearing is `ES_CONTINUOUS` **alone**: passing
+/// zero is documented as an error, and passing `ES_CONTINUOUS` with no other
+/// flag is how the state is reset.
+///
+/// # What is deliberately not asked for
+///
+/// `ES_SYSTEM_REQUIRED`, which would also stop the machine suspending. The
+/// protocol asks the compositor not to blank, lock or screensave — display
+/// idleness — and says nothing about whether the computer may sleep. Asking for
+/// both would be this compositor deciding a power policy the client did not ask
+/// for, on a machine that is a guest VM whose host can suspend it regardless.
+///
+/// # Why `WM_SYSCOMMAND` is handled too
+///
+/// `ES_DISPLAY_REQUIRED` resets the *display* idle timer. The screen saver has
+/// its own timer, driven by input idleness, and a video playing is precisely the
+/// case with no input — so on a machine with a screen saver configured, the
+/// execution state alone leaves the hole open. `toplevel_proc` refuses
+/// `SC_SCREENSAVE` and `SC_MONITORPOWER` while this is set, which is the
+/// documented way for a foreground application to say no.
+fn set_idle_inhibit(ui: &Rc<Ui>, on: bool) {
+    if ui.idle_inhibited.replace(on) == on {
+        return;
+    }
+    let flags = if on {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    // SAFETY: a scalar in, a scalar out, no handles and no memory. The only
+    // requirement is the thread one, which is discharged above.
+    let previous = unsafe { SetThreadExecutionState(flags) };
+    if previous == 0 {
+        // The one documented failure. Said rather than swallowed, because the
+        // symptom otherwise is "the screen blanked during a video" with nothing
+        // anywhere to say the compositor tried.
+        eprintln!(
+            "wc-compositor: SetThreadExecutionState({flags:#x}) failed; the display will \
+             blank on its own timer"
+        );
+        return;
+    }
+    println!(
+        "wc-compositor: idle inhibit {} (SetThreadExecutionState {flags:#x}, was {previous:#x})",
+        if on { "on" } else { "off" }
+    );
+}
+
+/// `xdg_activation_v1.activate`: bring a window to the foreground.
+///
+/// # Windows decides, and here is when it says yes
+///
+/// `SetForegroundWindow` is not a command. Windows refuses it from a process
+/// that is not entitled to steal the foreground, and the entitlement rules are
+/// roughly: the calling process already owns the foreground window, or it
+/// received the last input event, or there is no foreground window at all, or
+/// the foreground lock timeout has expired.
+///
+/// **The common case is the permitted one, and that is a property of this
+/// design rather than luck.** Every toplevel in this compositor is an `HWND`
+/// owned by one process — wc-compositor — no matter how many Wayland clients
+/// are behind them. So "the user clicks a link in one client's window and
+/// another client's window raises" is a foreground request made by the process
+/// that already owns the foreground window, which Windows allows. Two clients
+/// on two machines, one Win32 process, one set of foreground rights.
+///
+/// The case that is refused is a client that asks unprompted while the user is
+/// in some other application — Notepad, a browser outside the compositor. There
+/// Windows says no, and it is right to: that is the behaviour the rule exists to
+/// stop, and a Wayland compositor on Linux would apply a policy of its own for
+/// the same reason. What the user gets instead is the flashing taskbar button,
+/// which is the platform's own idiom for "this window wants you" — requested
+/// explicitly here rather than relying on the system's implicit flash, so the
+/// outcome does not depend on an undocumented courtesy.
+///
+/// `FLASHW_TIMERNOFG` means "flash until the window comes to the foreground",
+/// so the notification clears itself when the user acts on it and there is
+/// nothing to cancel.
+///
+/// # Why `AllowSetForegroundWindow` is not called
+///
+/// It grants foreground rights to a *different process*, by pid. There is no
+/// different process: the request comes from a Wayland client over a socket and
+/// the window is ours. Calling it would be handing a right to somebody who does
+/// not need it. It becomes relevant the day the compositor launches a Windows
+/// application on a client's behalf, and not before.
+///
+/// # The client cannot be told
+///
+/// `xdg_activation_v1` version 1 has no failure event: `activate` is a request
+/// with no reply, and a client that asks has no way to learn that Windows said
+/// no. So the log line below is the only place the answer exists, and it says
+/// which of the two happened rather than just that something was attempted.
+fn activate_window(w: &Rc<WindowState>) {
+    let hwnd = w.hwnd();
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: a live window handle created on this thread, and this is that
+    // thread. Every call below is a plain query or a window-manager request.
+    unsafe {
+        // A minimised window cannot be the foreground one. Restoring first is
+        // what the user means by "raise it", and doing it before the foreground
+        // request means the request is not spent on a window that is still an
+        // icon.
+        if IsIconic(hwnd) != 0 {
+            w.self_driven.set(true);
+            ShowWindow(hwnd, SW_RESTORE);
+            w.self_driven.set(false);
+        }
+        if SetForegroundWindow(hwnd) != 0 {
+            println!("wc-compositor: window {} activated (SetForegroundWindow)", w.id);
+            return;
+        }
+        // Refused. `GetForegroundWindow` is read only to say *why* in the log:
+        // a null result is "nobody has it", anything else is another
+        // application's window and the answer is the foreground lock.
+        let owner = GetForegroundWindow();
+        println!(
+            "wc-compositor: window {} asked to be activated and Windows refused (the \
+             foreground belongs to {}); flashing its taskbar button instead",
+            w.id,
+            if owner.is_null() { "nothing" } else { "another application" }
+        );
+        let info = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        FlashWindowEx(&info);
     }
 }
 
@@ -1548,6 +1772,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         frame: config.frame,
         draining: Cell::new(false),
         controller: Cell::new(controller as isize),
+        idle_inhibited: Cell::new(false),
         dump_frames: config.dump_frames.clone(),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));

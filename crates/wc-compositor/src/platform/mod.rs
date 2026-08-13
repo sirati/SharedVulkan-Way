@@ -209,6 +209,27 @@ pub enum ToUi {
     },
     /// The toplevel is gone.
     Destroy { id: WindowId },
+
+    // --- stage 21 ----------------------------------------------------------
+    /// Keep the display awake, or stop keeping it awake.
+    ///
+    /// **Not per window, deliberately.** `zwp_idle_inhibit_manager_v1` hands
+    /// out an inhibitor per surface and Win32's counterpart —
+    /// `SetThreadExecutionState` — has no window argument at all: it is a
+    /// property of the calling *thread*, and there is one UI thread. So the
+    /// Wayland side does the "any surface still holds one?" arithmetic, where
+    /// it can see which surfaces are alive and mapped, and what crosses is the
+    /// answer. Sent only on a change, so a client that creates and destroys
+    /// inhibitors around every video frame does not produce a Win32 call per
+    /// frame.
+    IdleInhibit { on: bool },
+    /// Bring this window to the foreground: `xdg_activation_v1.activate`.
+    ///
+    /// A request rather than a command, and it is Windows that decides — see
+    /// `win32::activate_window` for exactly when it is allowed to succeed and
+    /// what happens when it is not.
+    Activate { id: WindowId },
+
     /// End the pump.
     Quit,
 }

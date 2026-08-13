@@ -78,9 +78,21 @@ use smithay::reexports::wayland_protocols_misc::server_decoration::server
 use smithay::reexports::wayland_server::WEnum;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+// ADDED FOR STAGE 21: three protocols whose implementation is a Win32 call, and
+// which are here because the Win32 call exists rather than because the protocol
+// is short. docs/design.md §25 has the argument for each and — for the two that
+// were considered and left out — for their absence.
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
+use smithay::wayland::keyboard_shortcuts_inhibit::{
+    KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
+};
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_kde_decoration, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_idle_inhibit, delegate_kde_decoration,
+    delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 use crate::platform::{FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
@@ -125,6 +137,13 @@ struct Window {
     /// here rather than in the command queue.
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
+    /// ADDED FOR STAGE 21, and only one thing reads it: an idle inhibitor on a
+    /// minimised window must not keep the display awake, because a minimised
+    /// window is one the protocol calls invisible. Tracked here rather than
+    /// asked of Win32 because the answer has to be available on the Wayland
+    /// thread, which may not call Win32 at all; the value is `WM_SIZE`'s
+    /// `SIZE_MINIMIZED` arriving as [`FromUi::Minimized`].
+    minimized: bool,
     title: String,
     app_id: String,
     /// Callbacks the client is waiting on before it draws its next frame.
@@ -225,6 +244,24 @@ pub struct State {
     /// The same, for the standard protocol; it also owns the size list that
     /// every binding client is told about.
     _toplevel_icon: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+
+    // --- stage 21 ----------------------------------------------------------
+    /// Kept alive so `zwp_idle_inhibit_manager_v1` stays advertised.
+    _idle_inhibit: IdleInhibitManagerState,
+    /// Surfaces holding at least one `zwp_idle_inhibitor_v1`, and how many.
+    ///
+    /// **A count, not a set**, because one surface may hold several: the
+    /// protocol puts no limit on it and a toolkit that inhibits once for the
+    /// video and once for the fullscreen state is doing nothing wrong. A set
+    /// would have the first destroy cancel the second inhibitor's effect.
+    idle_inhibitors: HashMap<WlSurface, usize>,
+    /// What was last sent to the platform, so an unchanged answer costs nothing.
+    idle_inhibited: bool,
+    /// `xdg_activation_v1`'s token pool. Held rather than dropped because it is
+    /// mutable state — tokens are minted, spent and expired through it.
+    xdg_activation: XdgActivationState,
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1`'s inhibitor list.
+    shortcuts_inhibit: KeyboardShortcutsInhibitState,
     /// Icons this compositor has actually put on a window, and how many were
     /// asked for and had nothing to answer with. Printed at shutdown, because
     /// "the icon is generic" is otherwise indistinguishable from "the icon
@@ -457,6 +494,14 @@ impl State {
             icons: crate::icon::IconStore::default(),
             _icon_manager: icon_manager,
             _toplevel_icon: toplevel_icon,
+            // STAGE 21. Three globals whose Windows implementation is one call
+            // each; see the handlers at the bottom of this file, and §25 for
+            // why these three and not the rest of the list.
+            _idle_inhibit: IdleInhibitManagerState::new::<State>(dh),
+            idle_inhibitors: HashMap::new(),
+            idle_inhibited: false,
+            xdg_activation: XdgActivationState::new::<State>(dh),
+            shortcuts_inhibit: KeyboardShortcutsInhibitState::new::<State>(dh),
             icons_applied: 0,
             icons_missing: 0,
             clients_seen: 0,
@@ -498,6 +543,77 @@ impl State {
         }
     }
 
+    /// Decide whether the display should be kept awake, and tell the platform
+    /// when the answer changes.
+    ///
+    /// ADDED FOR STAGE 21. Called once per turn of the dispatch loop rather
+    /// than only from the two protocol handlers, and that is the whole reason
+    /// this is a function instead of two lines inside them.
+    ///
+    /// # smithay never tells us the inhibitor is gone
+    ///
+    /// `IdleInhibitHandler::uninhibit` is called from exactly one place —
+    /// `zwp_idle_inhibitor_v1.destroy`, the client's explicit request. There is
+    /// no `destroyed` hook on that object. So a client that crashes, is killed,
+    /// or simply closes its connection with an inhibitor still alive leaves one
+    /// behind that nothing will ever revoke, and an idle inhibitor that cannot
+    /// be revoked is a display that never sleeps again for the life of the
+    /// compositor. On a guest VM that is a real bill.
+    ///
+    /// Handling that is not optional and it cannot be done by being careful in
+    /// the handlers, because the event never arrives. What does arrive is that
+    /// the `WlSurface` stops being alive, and this is where that is noticed.
+    ///
+    /// # Invisible surfaces
+    ///
+    /// The protocol says the inhibitor applies while the surface is visible and
+    /// leaves "visible" to the compositor. Two things are checked and both are
+    /// the user's own doing: the window has committed a buffer (`mapped`) and
+    /// it is not minimised. Minimising the window playing the video is about as
+    /// clear a statement as a user can make that they are done watching it.
+    ///
+    /// # Cost
+    ///
+    /// One `HashMap::is_empty` per turn in the ordinary case, because the
+    /// ordinary case is that nobody has ever created an inhibitor. When one
+    /// exists, a scan of a map that holds one or two entries.
+    pub fn tick_idle_inhibit(&mut self) {
+        if self.idle_inhibitors.is_empty() && !self.idle_inhibited {
+            return;
+        }
+        let before = self.idle_inhibitors.len();
+        self.idle_inhibitors
+            .retain(|surface, _| smithay::utils::IsAlive::alive(surface));
+        if self.idle_inhibitors.len() != before {
+            println!(
+                "wc-compositor: {} idle inhibitor(s) went away with their surface",
+                before - self.idle_inhibitors.len()
+            );
+        }
+
+        // `root_of`, not the surface itself: `windows` is keyed by the surface
+        // that has the shell role, and a client is entitled to inhibit on a
+        // subsurface — the video, rather than the window containing it. Every
+        // toolkit measured so far inhibits on the toplevel, so this line has
+        // never yet made a difference, and the day it does the alternative is
+        // an inhibitor that is silently ignored.
+        let want = self.idle_inhibitors.keys().any(|surface| {
+            self.windows
+                .get(&root_of(surface))
+                .is_some_and(|w| w.mapped && !w.minimized)
+        });
+        if want == self.idle_inhibited {
+            return;
+        }
+        self.idle_inhibited = want;
+        println!(
+            "wc-compositor: idle inhibit -> {} ({} inhibitor(s) held)",
+            if want { "on" } else { "off" },
+            self.idle_inhibitors.len()
+        );
+        self.ui.send(ToUi::IdleInhibit { on: want });
+    }
+
     /// Drain everything the UI thread has said since the last turn.
     pub fn pump_ui_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
@@ -529,7 +645,14 @@ impl State {
                 FromUi::Maximized { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Maximized, on))
                 }
-                FromUi::Minimized { id, on } => self.set_state(id, |s| {
+                FromUi::Minimized { id, on } => {
+                    // STAGE 21: remembered, because an idle inhibitor held by a
+                    // window the user has minimised must stop keeping the
+                    // display awake. See [`State::tick_idle_inhibit`].
+                    if let Some(w) = self.windows.values_mut().find(|w| w.id == id) {
+                        w.minimized = on;
+                    }
+                    self.set_state(id, |s| {
                     // xdg-shell has **no minimised state**. `set_minimized` is a
                     // request a client makes; there is no matching entry in the
                     // `state` enum for the compositor to report back, which is a
@@ -541,8 +664,9 @@ impl State {
                     // smithay filters it out for clients that predate v6, which
                     // then keep drawing into a window nobody can see —
                     // wasteful, and correct.
-                    toggle(s, xdg_state::Suspended, on)
-                }),
+                        toggle(s, xdg_state::Suspended, on)
+                    });
+                }
                 FromUi::Activated { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
                 }
@@ -1508,6 +1632,7 @@ impl XdgShellHandler for State {
                 role: Role::Toplevel(surface),
                 shadow,
                 mapped: false,
+                minimized: false,
                 title,
                 app_id,
                 frame_callbacks: Vec::new(),
@@ -1679,6 +1804,7 @@ impl XdgShellHandler for State {
                 role: Role::Popup(surface),
                 shadow,
                 mapped: false,
+                minimized: false,
                 title: String::new(),
                 app_id: String::new(),
                 frame_callbacks: Vec::new(),
@@ -1919,6 +2045,154 @@ impl KdeDecorationHandler for State {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// STAGE 21: three protocols that are a Win32 call each
+// ---------------------------------------------------------------------------
+
+/// `zwp_idle_inhibit_manager_v1` — the screen must not blank during a video.
+///
+/// Both methods do bookkeeping only. The decision, and the one message that
+/// crosses to the UI thread, are in [`State::tick_idle_inhibit`], for the reason
+/// documented there: the interesting case is the one where `uninhibit` is never
+/// called at all.
+impl IdleInhibitHandler for State {
+    fn inhibit(&mut self, surface: WlSurface) {
+        let n = self.idle_inhibitors.entry(surface).or_insert(0);
+        *n += 1;
+        println!(
+            "wc-compositor: a client created an idle inhibitor ({} on this surface)",
+            *n
+        );
+        self.tick_idle_inhibit();
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        if let Some(n) = self.idle_inhibitors.get_mut(&surface) {
+            *n -= 1;
+            if *n == 0 {
+                self.idle_inhibitors.remove(&surface);
+            }
+        }
+        println!("wc-compositor: a client destroyed an idle inhibitor");
+        self.tick_idle_inhibit();
+    }
+}
+
+delegate_idle_inhibit!(State);
+
+/// How stale an activation token may be before it is refused.
+///
+/// **Thirty seconds, not the ten in smithay's own example.** The token is minted
+/// by the application the user clicked in and spent by the application that is
+/// then *started*, and a cold Firefox on this guest takes longer than ten
+/// seconds to reach the point where it has a surface to activate. A limit that
+/// expires during the ordinary case is not a security measure, it is a feature
+/// that works only on a warm cache.
+const ACTIVATION_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `xdg_activation_v1` — clicking a link in one application raises another.
+impl XdgActivationHandler for State {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation
+    }
+
+    /// Minting is where the pool is swept, so it is bounded by the rate at
+    /// which tokens are asked for rather than by anything running on a timer.
+    /// GTK requests a token for every launch it contemplates and spends only
+    /// some of them; without this, a long session accumulates every one it did
+    /// not use.
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        self.xdg_activation
+            .retain_tokens(|_, d| d.timestamp.elapsed() < ACTIVATION_TOKEN_MAX_AGE);
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let age = data.timestamp.elapsed();
+        // Spent, whatever happens next: `xdg_activation_v1` says a token is
+        // good for one activation, and leaving a used one in the pool would let
+        // a client raise itself repeatedly off a single click the user made
+        // somewhere else.
+        self.xdg_activation.remove_token(&token);
+
+        if age >= ACTIVATION_TOKEN_MAX_AGE {
+            println!(
+                "wc-compositor: xdg_activation: ignoring a token {} s old",
+                age.as_secs()
+            );
+            return;
+        }
+        let Some(window) = self.windows.get(&root_of(&surface)) else {
+            // A surface with no window: either it has not mapped yet, or it is
+            // not a shell surface at all. Nothing to raise either way.
+            println!("wc-compositor: xdg_activation: no window for the surface named; ignoring");
+            return;
+        };
+        println!(
+            "wc-compositor: xdg_activation: window {} asked to be raised (token from {:?}, \
+             {} ms old)",
+            window.id,
+            data.app_id.as_deref().unwrap_or("an unnamed app"),
+            age.as_millis()
+        );
+        // Whether it *is* raised is Windows' decision and is not this side's
+        // business; `platform::win32::activate_window` documents when the
+        // answer is no, and the protocol gives us no way to tell the client
+        // either way.
+        self.ui.send(ToUi::Activate { id: window.id });
+    }
+}
+
+delegate_xdg_activation!(State);
+
+/// `zwp_keyboard_shortcuts_inhibit_v1` — and this one is complete because there
+/// is nothing to inhibit.
+///
+/// **Granting every request is the accurate description of this compositor, not
+/// a shortcut taken.** The inhibitor's meaning is "stop applying your own
+/// keyboard shortcuts and give the client every key". [`State::key`] already
+/// forwards every key to the focused client with `FilterResult::Forward` and no
+/// compositor-level binding exists to suppress; the comment there explains why,
+/// and it is the same reason: the window manager is Windows, which has taken
+/// the combinations it reserves before the message loop ever sees them.
+///
+/// So the inhibitor is activated the moment it is created, and the client that
+/// binds this protocol gets exactly what it asked for. The two ways this could
+/// become a lie are worth naming, because both are things a later stage might
+/// do without thinking of this file: adding a compositor-level key binding, and
+/// intercepting a key in `win32::toplevel_proc` before it becomes a
+/// `FromUi::Key`. Either one has to consult
+/// `Seat::keyboard_shortcuts_inhibited` — smithay keeps the answer, this
+/// compositor simply has no question to ask it yet.
+///
+/// What this cannot do, and what no compositor on Windows can, is hand over the
+/// combinations the *system* takes first: Ctrl-Alt-Del is the secure attention
+/// sequence and Win-L is handled by the shell, neither of which reaches a
+/// window procedure at all. A Linux compositor grabbing the keyboard has the
+/// same hole for the same kind of key, so this is not a Windows tax; it is
+/// worth writing down because a client asking to inhibit shortcuts is often
+/// asking for exactly those.
+impl KeyboardShortcutsInhibitHandler for State {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.shortcuts_inhibit
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
+        println!(
+            "wc-compositor: keyboard shortcuts inhibited for a surface, and granted immediately \
+             — this compositor forwards every key to the focused client already"
+        );
+    }
+}
+
+delegate_keyboard_shortcuts_inhibit!(State);
 
 delegate_compositor!(State);
 delegate_shm!(State);

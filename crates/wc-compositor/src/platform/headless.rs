@@ -446,6 +446,25 @@ impl PumpInner {
                     let _ = self.events.send(FromUi::Minimized { id, on });
                 }
             }
+            // ADDED FOR STAGE 21. Both of these are Win32 calls with no
+            // equivalent here — there is no display to keep awake and no
+            // foreground to take — so what the headless platform owes them is
+            // the line in the log, which is what the harness reads to check
+            // that the Wayland half decided the right thing. Answering
+            // `Activate` with a synthetic `FromUi::Activated`, the way
+            // `SetWindowState` above answers itself, would be *worse*: on
+            // Windows the activation may be refused, and a headless platform
+            // that always succeeded would make the one interesting outcome
+            // untestable.
+            ToUi::IdleInhibit { on } => {
+                println!(
+                    "wc-compositor: idle inhibit {} (no display to keep awake here)",
+                    if on { "on" } else { "off" }
+                );
+            }
+            ToUi::Activate { id } => {
+                println!("wc-compositor: window {id} asked to be activated (no foreground here)");
+            }
             ToUi::Destroy { id } => {
                 println!("wc-compositor: window {id} destroyed");
                 windows.remove(&id);
