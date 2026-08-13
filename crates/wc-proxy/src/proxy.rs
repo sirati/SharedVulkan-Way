@@ -92,6 +92,50 @@ impl Listener {
         &self.path
     }
 
+    /// The process id on the other end of a connection, if the kernel will say.
+    ///
+    /// ADDED FOR STAGE 13, for one purpose: finding where the client's own
+    /// application is installed, so its icon can be resolved from its own
+    /// package prefix rather than from whatever happens to be in
+    /// `XDG_DATA_DIRS` (`icons::dirs_for_pid`, and docs/design.md §18.5).
+    ///
+    /// `SO_PEERCRED` is a property of the socket the kernel filled in at
+    /// `connect` time; it cannot be forged by the client and it costs one
+    /// `getsockopt`. **Nothing crosses the VM boundary because of it** — the
+    /// answer is an integer used locally, on the proxy's own machine, and what
+    /// eventually reaches the guest is still an array of pixels (§14.7).
+    ///
+    /// `None` where the platform declines, which is not an error: every
+    /// consumer of this treats a missing pid as "no extra directories", and the
+    /// icon path's whole design is that a miss costs a picture (§16.7).
+    #[cfg(target_os = "linux")]
+    pub fn peer_pid(s: &UnixStream) -> Option<i32> {
+        use std::os::unix::io::AsRawFd;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: a live socket fd, a correctly sized output buffer, and the
+        // length is passed by pointer as `getsockopt` requires.
+        let rc = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && cred.pid > 0 {
+            Some(cred.pid)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn peer_pid(_s: &UnixStream) -> Option<i32> {
+        None
+    }
+
     /// Wait up to `timeout` for the one client this stage serves.
     pub fn accept_one(&self, timeout: std::time::Duration) -> io::Result<UnixStream> {
         self.inner.set_nonblocking(true)?;

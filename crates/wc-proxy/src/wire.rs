@@ -526,11 +526,17 @@ mod tests {
         // is docs/design.md §13.7: the compositor advertises both to find out
         // which one Firefox uses, and a global that is advertised can be bound.
         //
-        // 376 to 386 in stage 12, when `wp_cursor_shape_v1` was added
+        // 376 to 426 in stage 21, for four protocols and the same reason
+        // stated more sharply (§25.1): `xdg-toplevel-icon` had been advertised
+        // by the compositor for two stages while this table did not know it,
+        // and the price of that disagreement is a killed connection rather
+        // than a missing feature.
+        //
+        // 426 to 436 in stage 12, when `wp_cursor_shape_v1` was added
         // (docs/design.md §23): five requests — `destroy`, `get_pointer` and
         // `get_tablet_tool_v2` on the manager, `destroy` and `set_shape` on the
         // device — and no events at all, which is what a protocol that only
         // ever tells the compositor something looks like.
-        assert_eq!(checked, 386, "the vendored protocols changed shape");
+        assert_eq!(checked, 436, "the vendored protocols changed shape");
     }
 }

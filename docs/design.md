@@ -6341,6 +6341,763 @@ Wine question, it is a substrate question.
    is one run, and it is the only thing left that would put a photograph behind
    the sentence "Firefox, over the guest's own RAM, in a window".
 
+## 18. Stage 13: somebody *used* it, and four things were wrong at once
+
+### 18.1 Status in one paragraph
+
+**The window was unusable and every gate was green.** §17.10 item 5 said the
+last missing pair was a guest-RAM arena on the interactive desktop; this stage
+ran it, and on the way discovered that the reason nobody had noticed the defects
+below is that nobody had *used* the thing — every previous stage measured it.
+The client area tore into horizontal stripes, a second cursor appeared inside
+the window, menus came up surrounded by opaque black, every menu the session had
+ever opened was still on the screen, the scroll wheel did nothing, modifiers
+stuck, and the taskbar icon was generic. Seven symptoms; **four causes**, and one
+of them accounts for three of the symptoms. The tearing was the virtio-fs export
+that §10.3 measured incoherent in stage 5 and that stage 7 replaced for
+`wc-guest.sh` and nowhere else — `scripts/wc-desktop.sh`, the only harness that
+puts a window in front of a person, was still passing `--arena 0:N:Z:\wc\arena`
+five stages later. It does not any more, there is no fallback, and
+`docs/stage13/stage13-clean-guest-ram.png` is Firefox on the guest's real
+desktop over the guest's own RAM, rendering cleanly.
+
+### 18.2 The tearing is the export, and the harness had never used the fix
+
+The user's screenshot is `docs/stage13/stage13-torn-file-arena.png`: a block of
+horizontal stripes where a menu should be, correct rows interleaved with stale
+ones. The stripe height is the first measurement worth having — the popup is 460
+pixels wide, which is 1840 bytes a row, so a 4096-byte page is 2.2 rows, and the
+bands are two to three rows tall. That is page granularity, and page granularity
+is the signature of a cache and not of a renderer.
+
+**The compositor's own shadow is torn**, which is what decides where the bug is.
+`docs/stage13/stage13-torn-popup-dump.png` is that popup's `--dump-frames` PPM —
+what the compositor believed it had composited, written from `present` before
+GDI touches anything — and it is the same stripes as the screen. So the blit is
+innocent and the stride is innocent; the bytes were already wrong when the
+compositor read them. §10.3's second row, arriving on somebody's screen four
+months after it was measured:
+
+| | result |
+|---|---|
+| the export, Windows mapping against a Linux `MAP_SHARED` mmap, both live | **MISMATCH**, 65280 wrong of 65536, both directions |
+
+The frame counts say the same thing from the other side. The user's run over the
+file arena dumped **583 frames of which 47 were distinct**. The guest-RAM run
+below dumped **806 of which 462** — and 462 against 806 is the control's shape
+(§12.7's 626/60 was an `about:blank` that had nothing to redraw; this one is a
+browser being driven).
+
+`scripts/wc-desktop.sh` now does what `wc-guest.sh` has done since stage 7:
+`--arena-guest-ram 0:N` plus `--arena-outbound`, `wc-arena-host` run as root on
+the VM host through `rootc`, and `wc-proxy --arena-plan` inside a
+`systemd-run --collect` transient unit because `/proc/<qemu-pid>/fd` is
+root-only (§12.9). One run of the locate, from this stage:
+
+```
+guest RAM in the flat view: 13311 MiB in 4 alias(es)
+located 16384/16384 pages in 2.41s (swept 13312 MiB; 189384 other-run stamps, 0 outside guest RAM)
+coalesced into 1462 run(s) covering 64 MiB — 11.2 pages per run
+stitched 64 MiB into one view with 1462 mmap(MAP_FIXED) call(s) in 4.68ms
+verify: 16384/16384 pages of the stitched view carry their own arena index
+```
+
+**There is deliberately no fallback.** If the compositor never prints its run id,
+or `wc-arena-host` returns non-zero, the run fails and says so; it does not
+truncate a file on the export and carry on. That is the whole lesson of this
+stage stated as code: the previous arrangement degraded silently to the
+incoherent substrate and *every check stayed green*, which is how it reached a
+user. `purge_arena_file` also removes any `arena` left on the export by a
+pre-stage-13 run, so a stale file cannot be picked up by something that was not
+looking.
+
+**Which paths can still reach the file provider, and why each is legitimate:**
+
+* `--arena <id>:<size>:<path>` in `wc-compositor` and `--arena-path` in
+  `wc-proxy` remain, and `arena::provide_file` is what implements them. This is
+  the hypervisor-free twin stage 10 added: a Wine run on one Linux box has no
+  QEMU, therefore no guest RAM to locate, and therefore no way to exercise the
+  arena code path at all without it. `scripts/wc-handshake.sh` and
+  `scripts/wc-xdg.sh` are those runs.
+* `scripts/wc-guest.sh`'s `--transport arena` branch keeps it, and that branch
+  is a *deliberate control*: it is how the incoherence is re-measured rather
+  than assumed, which is what §12.6 is.
+* Nothing that runs against the real guest with a window in front of a person
+  can reach it. `wc-desktop.sh` has no code path that produces one.
+
+### 18.3 There were two cursors because a cursor is not content
+
+The user asked for one thing and it is not negotiable: **the cursor must be the
+Windows cursor.** So `wl_pointer.set_cursor`'s surface must never be composited,
+and this stage makes that a property rather than an accident.
+
+It was *nearly* true already, and the "nearly" is the interesting part. A cursor
+surface is nobody's subsurface, so `compose_tree`'s `with_surface_tree_upward`
+never reached it, and the `is_root_of_a_window` early return caught it on the
+way past — but only *after* its pixels had been blitted into `staging`, where
+they stayed for the life of the process. "Not reached by the traversal we
+currently have" is not something to rely on while the scene graph is still
+growing, and it is not something a reader can check. `commit` now recognises the
+seat's cursor surface by identity, **before** the window test, drops its staging
+entry and returns.
+
+`cursor_image` therefore records the surface and does nothing else. Turning it
+into a real `HCURSOR` — `CreateIconIndirect` with `fIcon: 0` and the client's
+hotspot, plus `WM_SETCURSOR` — is the right next thing and would make an I-beam
+over a text field an I-beam; it belongs to whoever owns `wp_cursor_shape_v1`,
+and this stage deliberately stops at the guarantee it owes: **exactly one
+pointer, and it is Windows'.**
+
+Honest limitation: this stage did not get a photograph of the second cursor
+before it fixed it, so the causal claim is a reading of the code plus the user's
+report, not a measurement. What *is* measured is that the compositor's log says
+`a client set a cursor` on every Firefox run, so a cursor surface exists and is
+committed to on this path.
+
+### 18.4 One empty function body, three user-visible symptoms
+
+This is the finding of the stage and it is worth stating as a shape rather than
+as three bugs.
+
+**`XdgShellHandler::popup_destroyed` has an empty default body in smithay, and
+this compositor never overrode it.** From stage 9 to here, every `xdg_popup`
+Firefox destroyed left its `HWND` on the screen. A live session accumulated
+three stale "New Tab" tooltips at three different positions, a context menu, an
+account panel and the hamburger menu, **all visible at once**, over the page the
+user was reading. Nothing errored. Nothing was logged. The frame dumps were
+healthy. The windows were real, mapped, correctly positioned and correctly
+painted — they were simply never taken away, and there is no measurement in this
+project that would have caught it, because every one of them counts things that
+happened rather than things that stopped happening.
+
+The two consequences were reported as separate bugs and are not:
+
+* **"Clicking elsewhere does not dismiss a menu."** Half of that is the same
+  bug and half of it is `xdg_popup.grab`, which was also an empty body. A menu
+  is dismissed by the *compositor* — the client cannot see a click outside its
+  own surfaces — so with no grab recorded, nothing ever sent `popup_done` and
+  the client had no reason to destroy anything. Both are implemented; the grab
+  is one level rather than a stack, and §18.10 says what that costs.
+* **"The scroll wheel does nothing in Firefox."** `WM_MOUSEWHEEL` is delivered
+  by Win32 to the window with **keyboard focus**, not to the window under the
+  cursor. With half a dozen stale popups on screen the cursor was usually over
+  one of them, so `pointer_focus` was a dead menu while the wheel arrived for
+  the toplevel, and `if self.pointer_focus != Some(id) { return; }` ate it.
+  **Confirmed by the user rather than argued**: with no popup on screen,
+  scrolling always worked. The popup fix is the fix.
+
+  The early return is now deliberate instead of silent — the axis is delivered
+  to whatever the pointer is actually over, which is what `pointer.axis` would
+  do anyway since `id` never routed anything, and a disagreement between the two
+  is logged. A wheel with no pointer focus at all still has nowhere to go.
+
+`xdg_popup.reposition` was the third empty body: `repositioned` was never sent,
+so a submenu GTK moves to keep it on screen stayed where it was first put. It
+now sends `repositioned`, then a `configure`, then a `ToUi::MovePopup` — in that
+order, because a client that gets a configure with no token cannot match the
+answer to its request and GTK ignores the move.
+
+### 18.5 Popup alpha, and why a layered window rather than `AlphaBlend`
+
+With the tearing gone, the menus turned out to render correctly and to be
+**surrounded by an opaque black rectangle** where the client's drop shadow
+should be, with the rounded corners cut out in the same black. That is not a
+client bug: `map_window` has printed `argb: alpha ignored by GDI, drawn opaque`
+since stage 3, and it means what it says. `SetDIBitsToDevice` on a 32-bit
+`BI_RGB` DIB discards the fourth byte, so a GTK menu's transparent margin —
+`A=0`, `RGB=0` — is drawn as black.
+
+`AlphaBlend` is the obvious reach and it is the wrong one: it composites against
+*what is already in the destination DC*, which is the window's own background,
+and it cannot show the desktop behind the window because the window is opaque to
+the system. Per-pixel transparency of a **window** on Win32 is a window-manager
+property, and `WS_EX_LAYERED` + `UpdateLayeredWindow` with
+`BLENDFUNCTION{AC_SRC_OVER, AC_SRC_ALPHA}` is the only mechanism for it.
+
+**Popups only, and the reason is a cost rather than a preference.**
+`UpdateLayeredWindow` replaces `WM_PAINT` entirely and takes the whole window
+each time, so damage cannot be used — a layered window redraws everything on
+every commit. A menu is small and changes rarely; a toplevel is neither. A
+layered toplevel would also lose its native frame, because the bitmap becomes
+the entire window and there is no non-client area left for Windows to draw a
+caption in, which is the opposite of what `docs/goal-firefox.md` asks for. The
+toplevel's own transparent margin is somebody else's fix and it is a better one:
+server-side decorations remove the shadow inset rather than compositing it.
+
+Two things fall out for free and are worth recording because they look like
+work that still needs doing. `ULW_ALPHA` makes Windows hit-test a layered window
+**by its alpha**, so clicks in the fully transparent shadow margin fall through
+to whatever is behind it — which is what `wl_surface.set_input_region` would
+have been asked to arrange, and it is arranged. And the map path now paints
+before `ShowWindow`, because a layered window that has never been given a bitmap
+is undefined rather than blank.
+
+### 18.6 The icon: §17.2 recorded the right symptom and the wrong reason
+
+§17.2 said `wc_icon_manager_v1` published `0 image(s)` for `"firefox"` *"because
+the resolver runs where the proxy runs and the VM host has no icon theme
+carrying Firefox's pixels"*. The first clause is right. **The conclusion drawn
+from it — that the resolver is on the wrong machine — is wrong, and it matters,
+because the fix it implies is to move the resolver across the VM boundary.**
+
+`wc-proxy` is a Wayland *server*, reached by its client over an AF_UNIX socket.
+An AF_UNIX socket has both ends in one kernel. **The proxy is therefore always
+on the client's machine, and the client's machine is by definition the one the
+application is installed on.** There is no wrong machine here and nothing needs
+to cross anything.
+
+What was actually missing was the *directory*, and it is measurable on
+testhost in two commands:
+
+```
+$ ls /run/current-system/sw/share/icons/hicolor/*/apps/firefox.png
+ls: cannot access ...: No such file or directory
+$ ls /run/current-system/sw/share/applications/ | grep -i firefox
+$ ls /nix/store/d8q8…-firefox-151.0.2/share/{applications,icons/hicolor/48x48/apps}/
+applications: firefox.desktop
+apps:         firefox.png
+```
+
+Firefox's desktop entry and its icons are in **Firefox's own package prefix**,
+and on NixOS a package prefix is a store path that appears in `XDG_DATA_DIRS`
+only if somebody put the package into a profile. The resolver's roots were
+`XDG_DATA_HOME` and `XDG_DATA_DIRS`, and the proxy runs inside a `systemd-run`
+transient unit whose environment is systemd's rather than a login shell's — so
+on this rig the list frequently degrades to the hard-coded
+`/usr/local/share:/usr/share`, which holds nothing at all on NixOS.
+
+So the resolver now searches **the client's own installation prefix**, found
+from the client rather than configured. `SO_PEERCRED` on the accepted socket
+gives the client's pid; `/proc/<pid>/exe` is the kernel's answer to what it is
+running, which survives a lying `argv[0]`, a wrapper script that `exec`s
+something else, and a binary replaced on disk since; and every ancestor of that
+path with a `share` directory, up to four levels, joins the search. That finds
+`/usr/share` from `/usr/bin/foo`, `/usr/share` from `/usr/lib/firefox/firefox`,
+and `/nix/store/…-firefox-151.0.2/share` from the store path three levels up —
+which is exactly the file that exists. It is the FHS relationship between `bin/`
+and `share/`, and it holds inside a Nix store path, inside a Flatpak, and inside
+anything unpacked into a home directory, which is why it is preferred to a list
+of special cases for package managers.
+
+Order matters and it is: `--icon-data-dir` (new, repeatable, for callers with no
+session environment to inherit — `scripts/wc-icon.sh` was already exporting
+`XDG_DATA_DIRS` around the process for exactly this reason), then the XDG
+directories, then the client's prefix. A theme the user installed is a
+deliberate override of what a package shipped, so XDG wins; the client's prefix
+is the guaranteed answer rather than the preferred one.
+
+**No descriptor crosses anything.** `SO_PEERCRED` is a `getsockopt` on a socket
+this process already owns, `/proc/<pid>/exe` is a `readlink`, both happen on the
+proxy's own machine, and what leaves is a path. §14.7's count is unchanged: 3
+fds in, 1 out.
+
+### 18.7 Modifiers stick because `leave` tells the client and not us
+
+Two causes, both real, neither large.
+
+`set_keyboard_focus(id, false)` called `keyboard.set_focus(self, None, …)` and
+nothing else. `wl_keyboard.leave` is correct as far as the *client* goes — the
+client is required to treat every key as released — but the compositor's own xkb
+state went on believing they were down, and it is the compositor's state that
+decides what the next `modifiers` event says. Hold Ctrl, lose focus (which with
+§18.4's stale popups was happening constantly), release Ctrl into whatever has
+focus now, come back: smithay sends `enter` with a pressed-keys array and
+`modifiers` with Ctrl depressed, and every keystroke is Ctrl-modified until the
+user happens to press and release Ctrl over our window. Every pressed key is now
+fed back as a release through `input_intercept` — which updates our state
+without sending anything to the client, because `leave` has already said what
+the client needs to hear — *before* `set_focus(None)`.
+
+Caps Lock and Num Lock are the second cause and they are a different kind of
+thing: they are **locked** modifiers, owned by the machine, and a user who
+toggles Caps Lock in another application changes it for us too while we see no
+key event at all. They are now read from the system on every focus gain —
+`GetKeyState(vk) & 1`, the **low** bit, because the high bit is the physical
+up/down of a key that is up almost all the time — and carried in on
+`FromUi::KeyboardFocus` so the headless platform can state them too.
+
+Deliberately unchanged, because it was checked and is correct: the auto-repeat
+filter on bit 30 of `lParam`. The client repeats from `repeat_info`, and
+forwarding Windows' repeat as well would give two repeat streams at different
+rates.
+
+### 18.8 Four things that cost real time
+
+* **A `sed` range whose end pattern did not match deleted 1500 lines of
+  `state.rs`** and the build stayed quiet about it for one command, because what
+  was left still parsed. Recovered from `git` plus the edits re-applied. The
+  lesson is not about `sed`: it is that a file this project keeps its reasoning
+  in is not a file to edit with a range expression.
+* **Backticks inside a double-quoted heredoc that bash expands.** The
+  `wc-desktop.sh` host-side script is written through `ssh "…"`, so a comment
+  containing `` `WAYLAND_DISPLAY` `` is a command substitution. It presented as
+  `WAYLAND_DISPLAY: command not found` and a client that produced no log at all.
+* **`WAYLAND_DISPLAY=wl-proxy` with a private `XDG_RUNTIME_DIR`.** Firefox needs
+  a runtime directory it owns, and the proxy's socket is not in it. libwayland
+  reads a `WAYLAND_DISPLAY` beginning with `/` as a path, which is the only
+  thing that separates the two; §17's `wc-guest.sh` had learned this and
+  `wc-desktop.sh` had to learn it again, which is an argument for the two
+  harnesses sharing more than they do.
+* **`wc-arena-host` is not a workspace member** (`Cargo.toml` excludes it: it
+  links shared_vulkan's `sv-hostd` and has its own lockfile), so
+  `cargo build --workspace` does not produce it and the deploy failed on a
+  missing file. `wc-desktop.sh` now builds it by its own manifest, as
+  `wc-guest.sh` does.
+
+### 18.9 The gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | **158 passed**, 0 failed (157 on master, +1: `the_client_prefix_is_found_from_bin_and_from_lib`) |
+| `cargo clippy --workspace --all-targets` | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | an **executable**, not metadata — §17's trap, and this stage deployed from it four times |
+| `wc-desktop.sh window`, guest-RAM arena, Firefox, interactive desktop | the arena located, the window captured, the caption and taskbar button asserted |
+| the locate | 16384/16384 pages, 2.41 s, verify clean, 1462 runs |
+| frames | 806 dumped, **462 distinct** (the file-arena run: 583 dumped, **47** distinct) |
+| the picture | `docs/stage13/stage13-clean-guest-ram.png` |
+
+### 18.10 What is not proven
+
+1. **The popup grab is one level, not a stack.** Dismissing the innermost popup
+   makes the client destroy it, which clears the record, so a second click
+   dismisses the next one out. That is one click per level where a Linux
+   compositor takes one click for all of them. A submenu is what would show it.
+2. **`xdg_positioner`'s constraint adjustments are still ignored**, in
+   `new_popup` and now in `reposition_request` too. This compositor does not
+   know where the parent window is on the Windows desktop, so it cannot tell
+   whether a placement would fall off the screen. Windows keeps an owned
+   `WS_POPUP` on the monitor by itself, which is why it has not bitten — but
+   that means Windows is silently moving popups and the client is not being told.
+3. **No run in this stage exercised a popup end to end, and that is the largest
+   gap it leaves.** The popup work — destroy, grab, reposition, and the layered
+   window — is compiled, reviewed and reasoned from a live session's evidence,
+   but `wc-desktop.sh window` drives a drag and not a menu, so its Firefox
+   opened no popups and the final run's log contains no `xdg_popup` line at all.
+   The torn run that *did* open four of them was the run whose defects this
+   stage is about, and it predates every fix. **What is needed is a harness step
+   that opens a menu**: right-click the client area through `wc-desk`, then
+   assert on `xdg_popup created`, a `WaycomposeToplevel` in the window
+   enumeration, a click elsewhere, `popup_done`, `xdg_popup destroyed`, and the
+   window being *gone* from the enumeration. That last assertion is the one that
+   would have caught this four stages ago, and nothing in this project asserts
+   that a window stopped existing.
+4. **The layered-window path redraws the whole popup per commit.** Fine for a
+   menu; nobody has measured what it costs for a popup that animates. Nor has
+   anything photographed a menu with its shadow, for the reason above.
+5. **The second cursor was never photographed.** §18.3 is a code reading plus a
+   user report, and the fix is a guarantee rather than a measured before/after.
+6. **The icon fix has not been photographed on the guest either.** The resolver
+   change is unit-tested against all three prefix layouts and the store path was
+   verified by hand on testhost, but no run in this stage produced a Firefox
+   taskbar button with Firefox's icon on it over guest RAM. That is one run and
+   it is the first thing to do.
+7. **`--icon-data-dir` has no harness using it yet.** It exists because the
+   transient unit's environment is not a session's; nothing yet passes it.
+8. **The frame counts are one run each.** 462/806 against 47/583 is a large
+   enough difference not to need a repeat to believe, and it is still one run.
+9. **The compositor's console window is on the desktop.** Both this stage's and
+   another worktree's appear in `wc-desk windows` as visible
+   `ConsoleWindowClass` entries titled with the binary's path — so stage 11's
+   "hide the console when `GetConsoleProcessList == 1`" is not firing when the
+   task scheduler launches the process. Not diagnosed; recorded because a
+   screenshot tool that photographs a console window in front of the thing it is
+   photographing is a poor instrument, and the same argument applies to
+   `wc-desk` itself, which is still console-subsystem.
+
+### 18.11 What to do next
+
+1. **Photograph the icon over guest RAM** (§18.10 item 6). One run, and it
+   closes §16's last gap in the topology `docs/goal-firefox.md` describes.
+2. **Hide the console** — both the compositor's and `wc-desk`'s (§18.10 item 9).
+   It is the difference between an instrument and an anecdote.
+3. **A harness step that opens a menu** (§18.10 item 3), which is what would
+   have caught this stage's largest bug four stages ago.
+4. **A grab stack** (§18.10 item 1), which is what a submenu needs and what
+   `xdg_popup`'s protocol actually describes.
+5. **Ask Windows where the parent window is**, so `xdg_positioner`'s constraint
+   adjustments can be honoured (§18.10 item 2). This is the same missing fact as
+   §15.15 item 3 — nothing asks Windows how big anything is — and the two should
+   be answered together.
+
+## 25. Stage 21: four protocols, one of which was a trap
+
+### 25.1 Status in one paragraph
+
+Written 2026-08-13, branched from master at `08f66b8` and **merged after stage
+13** — so §18 is stage 13's and this is §25, and every gate below was re-run
+from master's checkout after that merge rather than carried over from the
+branch, which is the arrangement §12.12, §14.11, §15.13 and §17.1 all used. The
+merge touched `state.rs` and `platform/mod.rs`, which stage 13 had edited
+heavily for popup lifecycle and cursor-surface suppression, and neither
+conflicted: this stage's `Window::minimized` and `ToUi::IdleInhibit` land beside
+stage 13's `ToUi::MovePopup` rather than on top of it. Four items, grouped
+because they are small and share files, and the first of them is not a feature
+at all — it is a live foot-gun that has been in the tree since stage 11.
+`xdg-toplevel-icon-v1` is genuinely complete in the compositor: `set_icon`, the
+commit-time read of the double-buffered state, buffers through the
+[`PixelSource`] list so an arena buffer works like any other, the `icon_name`
+fallback, the size list announced at bind (§16.4). It was **not** in
+`crates/wc-proxy/protocols/` and not in `Spec::builtin`. A guest client that
+binds that global gets `Error::UnknownOpcode` on its first request and the proxy
+ends the connection. The other three items are new globals:
+`zwp_idle_inhibit_manager_v1`, `xdg_activation_v1` and
+`zwp_keyboard_shortcuts_inhibit_v1`. All four now pass
+`scripts/wc-inhibit.sh` in both modes — against the Linux compositor directly,
+and against `wc-compositor.exe` through `wc-proxy`, which is the real topology.
+
+### 25.2 The trap, and why nothing had tripped it
+
+`Session::client_message` does this, in this order:
+
+```rust
+let interface = self.objects.interface(header.object).ok_or(...)?;
+let msg = self.spec.request(&interface, header.opcode).ok_or_else(...)?;
+let spans = wire::walk(body, &msg.args, FdEncoding::OutOfBand)...;
+```
+
+The opcode is resolved against the vendored XML **before** anything is walked.
+So an interface the table does not know is fatal on the first message on that
+object, whatever the message is. There is no fd involved and no walk attempted;
+there is nothing to walk *with*.
+
+The note the proxy wrote when it saw the bind said otherwise:
+
+> client bound {iface}, which is not in the vendored protocols; messages on it
+> cannot be walked and the connection will fail **if it ever carries an `h`**
+
+That sentence is wrong and it is wrong in the most expensive direction: it tells
+a reader that an fd-free protocol is safe to leave out, which is exactly the
+conclusion that produced this bug. Four of the eight interfaces stage 21 adds
+carry no fd anywhere and all four would have killed a connection. The note now
+says "its first request cannot be walked and will end the connection".
+
+Why nothing noticed for two stages is the part worth keeping. **A bind always
+succeeds.** `wl_registry.bind` is a message on `wl_registry`, which is in the
+table; the interface name is a string argument the proxy copies through, and the
+new object is recorded under a name the proxy does not recognise without
+anything going wrong yet. The failure is one message later, in the client. So
+the shape of the bug is:
+
+* the compositor advertises the global — correct, and it really is implemented;
+* the client binds it and feature-detection *succeeds*;
+* the client sends its first request and the connection dies.
+
+That is strictly worse than not advertising it. §14.9 already names two
+independent cases of "implemented" meaning "compiled"; this is a third kind —
+"implemented" meaning "implemented in one of the two processes it takes". The
+compositor's implementation was never the problem and reviewing the compositor
+would never have found it.
+
+The two halves cannot depend on each other: `wc-compositor` is a Windows binary
+and `wc-proxy` is a Linux one, and they are only ever in one process during a
+Wine smoke test. So there is no type that can enforce the agreement. What there
+is now is `spec::tests::every_global_the_compositor_advertises_can_be_walked`,
+which lists the compositor's globals by hand and asserts each has a request 0 in
+the proxy's table. Duplication, deliberately, because the alternative is nothing.
+
+### 25.3 What reproduced it
+
+`scripts/wc-inhibit.sh wine`, off a stale `target/debug/wc-proxy` that predated
+the fix — the binary had not been rebuilt after the XML was added. The run
+printed, in the proxy's own words:
+
+```
+client bound xdg_toplevel_icon_manager_v1, which is not in the vendored
+  protocols; messages on it cannot be walked and the connection will fail if
+  it ever carries an h
+```
+
+four times, once per new interface, and every assertion in the gate failed. The
+accident is a better demonstration than anything written on purpose: it is the
+pre-fix behaviour, on the real topology, with the message that misdescribes it.
+It also cost ten minutes to diagnose, which is the same ten minutes the
+"build before you deploy" rule exists to prevent — `cargo clippy` had been green
+against a `wc-proxy` that was never built.
+
+### 25.4 `zwp_idle_inhibit`: the call is one line, the bookkeeping is not
+
+The Windows side is `SetThreadExecutionState(ES_CONTINUOUS |
+ES_DISPLAY_REQUIRED)` to inhibit and `SetThreadExecutionState(ES_CONTINUOUS)` to
+release. Three things about it are decisions rather than transcription.
+
+**It is per *thread*.** The state belongs to the calling thread and the system
+takes the union across threads; it is released when that thread exits. So the
+call is made from the UI thread, which is `main`'s and outlives everything, and
+the Wayland side does the arithmetic and sends a `ToUi::IdleInhibit { on }` only
+when the answer changes. Had it been called from the Wayland thread it would
+work today and stop working silently the day that work moved.
+
+**`ES_SYSTEM_REQUIRED` is deliberately not asked for.** The protocol asks the
+compositor not to blank, lock or screensave. It says nothing about whether the
+machine may suspend, and adding it would be this compositor setting a power
+policy no client requested, on a guest whose host can suspend it regardless.
+
+**`ES_DISPLAY_REQUIRED` does not stop the screen saver.** It resets the
+*display* idle timer. The screen saver runs on the *input* idle timer, and a
+client holding an idle inhibitor is usually playing a video — which is precisely
+the case with no input. So `toplevel_proc` also refuses `WM_SYSCOMMAND` with
+`SC_SCREENSAVE` or `SC_MONITORPOWER` while an inhibitor is held, which is the
+documented way for a foreground application to veto it, and only while one is
+held.
+
+The bookkeeping is the part that is not a transcription of anything. smithay's
+`IdleInhibitHandler::uninhibit` is called from exactly one place —
+`zwp_idle_inhibitor_v1.destroy`, the client's explicit request. There is no
+`destroyed` hook on that object. So a client that **crashes, is killed, or just
+closes its connection** with an inhibitor alive leaves behind one that nothing
+will ever revoke, and an idle inhibitor that cannot be revoked is a display that
+never sleeps again for the life of the compositor.
+
+That cannot be handled by being careful inside the handlers, because the event
+never arrives. What does arrive is that the `WlSurface` stops being alive.
+`State::tick_idle_inhibit` runs once per turn of the dispatch loop, sweeps
+inhibitors whose surface is dead, and recomputes. It costs one
+`HashMap::is_empty` in the ordinary case, because the ordinary case is that
+nobody ever created one.
+
+It also decides what "visible" means, which the protocol leaves to the
+compositor: the window has committed a buffer and is not minimised. Minimising
+the window playing the video is about as clear a statement as a user can make.
+That is why `Window` gained a `minimized` field this stage — `FromUi::Minimized`
+already arrived and nothing had kept it.
+
+The gate creates an inhibitor, destroys it, then creates a second one and
+**disconnects without destroying it**. Two on transitions and two off
+transitions are asserted. One of each would pass a compositor that had the sweep
+missing entirely.
+
+### 25.5 `xdg_activation`: Windows decides, and the common case is the permitted one
+
+`SetForegroundWindow` is not a command. Windows refuses it from a process that
+is not entitled to steal the foreground; the entitlement is roughly that the
+calling process already owns the foreground window, or received the last input
+event, or there is no foreground window, or the foreground lock timeout has
+expired.
+
+**Every toplevel in this compositor is an `HWND` owned by one process**, however
+many Wayland clients are behind them, and that turns out to matter here. "The
+user clicks a link in one client's window and another client's window raises" is
+a foreground request made by the process that already owns the foreground
+window. Windows allows it. Two clients on two machines, one Win32 process, one
+set of foreground rights — this is the topology paying a dividend rather than a
+tax, which is rare enough to write down.
+
+The case Windows refuses is a client asking unprompted while the user is in some
+other application. It is right to refuse: that is the behaviour the rule exists
+to stop, and a Linux compositor would apply a policy of its own for the same
+reason. What the user gets instead is the flashing taskbar button —
+`FlashWindowEx` with `FLASHW_TRAY | FLASHW_TIMERNOFG`, requested explicitly
+rather than relying on the system's implicit flash, so the outcome does not
+depend on an undocumented courtesy. `TIMERNOFG` means it stops when the window
+reaches the foreground, so there is nothing to cancel.
+
+`AllowSetForegroundWindow` is **not** called, and this is the one place the
+brief and the code disagree. It grants foreground rights to a *different
+process*, by pid. There is no different process. It becomes relevant the day the
+compositor launches a Windows application on a client's behalf, and not before.
+
+Token policy: single-use, and thirty seconds rather than the ten in smithay's
+own example. The token is minted by the application the user clicked in and
+spent by the application that is then *started*; a cold Firefox on this guest
+takes longer than ten seconds to reach a surface. A limit that expires during
+the ordinary case is not a security measure, it is a feature that works on a
+warm cache. The pool is swept whenever a token is minted, so it is bounded by
+the rate tokens are asked for — GTK requests one for every launch it
+contemplates and spends only some.
+
+**The client cannot be told.** `xdg_activation_v1` version 1 has no failure
+event; `activate` is a request with no reply. So a client has no way to learn
+that Windows said no, and the compositor's log is the only place the answer
+exists. It says which of the two happened rather than that something was tried.
+
+### 25.6 `zwp_keyboard_shortcuts_inhibit`: honestly complete, for nothing
+
+Every inhibitor is granted the moment it is created. That reads like a cop-out
+and is not one, and the distinction is the whole reason this item is in the
+stage.
+
+The inhibitor means "stop applying your own keyboard shortcuts and give the
+client every key". `State::key` already hands every key to the focused client
+with `FilterResult::Forward`, and the comment there predates this stage:
+
+> No compositor-level bindings. Every key goes to the client, which is the right
+> default for a compositor whose window manager is somebody else: Windows has
+> already taken the combinations it reserves (Alt-Tab, the Windows key) before
+> the message loop sees them, and intercepting more here would silently steal
+> keys the application expects.
+
+So there is no shortcut to suppress. Granting is not a stub standing in for
+work; it is a true statement about what this compositor does with a key. This is
+the rare case where advertising a protocol costs nothing and claims nothing
+false, and it is worth naming as such because the same three lines in a
+compositor that *did* have bindings would be a lie.
+
+Two things would make it one, and both are things a later stage could do without
+opening this file: adding a compositor-level key binding, and intercepting a key
+in `win32::toplevel_proc` before it becomes a `FromUi::Key`. Either has to
+consult `Seat::keyboard_shortcuts_inhibited` — smithay keeps the answer already;
+this compositor simply has no question to ask it yet.
+
+What it cannot deliver, and no compositor on Windows can, is the combinations
+the *system* takes first: Ctrl-Alt-Del is the secure attention sequence and
+Win-L is the shell's, and neither reaches a window procedure. A Linux compositor
+grabbing the keyboard has the same hole for the same kind of key, so this is not
+a Windows tax — but a client asking to inhibit shortcuts is often asking for
+exactly those, so it is stated rather than left to be discovered.
+
+### 25.7 The gate
+
+`scripts/wc-inhibit.sh`, and it is a C client rather than a Rust test on
+purpose. A unit test in `wc-proxy` proves the wire table; `wayland-info` proves
+the globals are advertised. Neither proves that a client which binds one and
+then *uses* it gets what the protocol promises — and "binds, then misbehaves" is
+the failure this stage is about, because it is the one a client cannot
+feature-detect its way around.
+
+`scripts/probe-inhibit.c` is libwayland-client, built from the XML in
+`crates/wc-proxy/protocols` — our vendored copies, so the probe's idea of an
+opcode is the same file the compositor was generated from rather than whatever
+`wayland-protocols` the machine has. It maps a real window, because an inhibitor
+on an unmapped surface is one the compositor is supposed to ignore and a probe
+that never mapped would pass against a compositor that ignored all of them.
+
+What each protocol can prove differs, and the script says which is which:
+
+| protocol | observable from the client? |
+| --- | --- |
+| `zwp_keyboard_shortcuts_inhibit` | **yes** — the grant is an `active` event |
+| `xdg_toplevel_icon` | partly — `icon_size` events arrive; the pixels are the compositor's log |
+| `xdg_activation` | partly — the token dance; the raise has no reply either way |
+| `zwp_idle_inhibit` | **no** — the protocol has no events at all |
+
+Two modes. `linux` runs the Linux build directly. `wine` runs
+`wc-compositor.exe` with `wc-proxy` in between, and the proxy is not optional
+there: the first attempt pointed the probe straight at the Wine socket the way
+`scripts/wc-xdg.sh wine` does, and it stopped at `wl_surface commit`. That is
+§2.4 arriving on schedule — the probe attaches a `wl_shm` buffer,
+`wl_shm.create_pool` carries an `h`, a stock libwayland client sends it out of
+band by `SCM_RIGHTS`, and Wine's AF_UNIX carries no ancillary data, so the
+descriptor is absent and the parser desynchronises at that request. **A client
+that maps a window cannot reach a Windows compositor without the proxy, by
+construction.** Which makes the `wine` mode the better test anyway: it is the
+only local run that proves §25.1's first item end to end.
+
+Both modes pass, ten assertions each.
+
+### 25.8 What Wine says, and what it cannot
+
+The `wine` run reaches the Win32 calls and they return:
+
+```
+wc-compositor: window 1 activated (SetForegroundWindow)
+wc-compositor: idle inhibit on  (SetThreadExecutionState 0x80000002, was 0x7)
+wc-compositor: idle inhibit off (SetThreadExecutionState 0x80000000, was 0x80000002)
+```
+
+That is worth exactly what it is worth: a wrong argument width, a missing
+import, a call made from the wrong thread would show up here. It says nothing
+about whether a display stays on. Wine has no display to keep awake, and its
+`SetForegroundWindow` answers about an X11 window on an Xvfb nobody is looking
+at — it succeeded here, which on the real guest it may not. §13.6 counts four
+occasions where Wine's answer and the guest's differed, and `SetThreadExecutionState`
+and `SetForegroundWindow` are exactly the class of API it stubs.
+
+Note the `was 0x7` in the first line: Wine reports a previous state of
+`ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_USER_PRESENT`, which is its
+stub's idea of a starting value and is not what a real thread returns. The code
+only tests for the documented failure (a return of 0), so this is a curiosity
+rather than a dependency — but it is a concrete example of Wine answering
+plausibly and differently.
+
+**What needs a real-guest re-check, in order of how much it would cost to be
+wrong about:**
+
+1. **`SetThreadExecutionState` actually keeps the display on.** Play a video in
+   Firefox on the guest with the power plan's display timeout set low, and watch.
+   The log line says what was asked for; only the guest says what happened.
+2. **The `WM_SYSCOMMAND` veto reaches us.** `SC_SCREENSAVE` goes to the
+   foreground window. If the guest's foreground window is not one of ours at the
+   moment the timer fires, we never see it — the execution state still applies,
+   the veto does not, and the difference only shows on a machine with a screen
+   saver configured.
+3. **`SetForegroundWindow` succeeds in the case that matters.** The claim in
+   §25.5 is that clicking a link in one client's window raises another client's
+   window because both are one process. That is an argument from the Windows
+   rules, and it is the sort of argument that is right until the guest has a
+   foreground lock timeout set differently. The test is two clients on the guest
+   and a real click.
+4. **`FlashWindowEx` when refused.** Only reachable by deliberately arranging for
+   the compositor not to own the foreground — click into Notepad, then have a
+   client activate. Worth one run, because the fallback is the entire user-visible
+   behaviour in the refused case.
+
+### 25.9 What was left out, and why
+
+Nothing among the four. Each is either whole or not advertised. What was
+considered during the stage and deliberately not built:
+
+1. **`ext-idle-notify-v1` / `zwp_idle_notifier_v1`**, the reverse of
+   idle-inhibit: the compositor tells clients when the *user* has gone idle.
+   Not built, and not because it is large. Windows' answer is
+   `GetLastInputInfo`, which is a poll — there is no notification — so a correct
+   implementation is a timer on the UI thread whose period is the shortest
+   timeout any client has requested. That is a real design with a real cost
+   (a wakeup on an otherwise idle machine, on a guest, forever), and the
+   protocol has clients that would then rely on it. It is a stage, not a
+   footnote, and advertising a global that fired late or not at all would be
+   §25.2's bug wearing a different hat.
+2. **`ES_SYSTEM_REQUIRED`** — §25.4.
+3. **`AllowSetForegroundWindow`** — §25.5.
+4. **Validating an activation token's serial and seat.** `XdgActivationTokenData`
+   carries the `(Serial, WlSeat)` the requesting client attached, and a stricter
+   compositor refuses tokens without a recent input serial. Not done, because
+   the serials that would be checked are ones this compositor minted from
+   `SERIAL_COUNTER` in response to Win32 input, and it has no record of which of
+   them was a click. Checking a serial for existence rather than for recency
+   would be a validation that always passes, which is worse than none. The age
+   check in §25.5 is the real limit today.
+5. **Icon sizes from the guest rather than from a constant.** `[16, 32, 48]` is
+   still hard-coded (§16.4); `GetSystemMetrics(SM_CXSMICON)` and `SM_CXICON` are
+   the true answers and change with DPI. Unrelated to this stage, noticed while
+   reading the code it touches, and left where it was.
+
+### 25.10 What to do next
+
+1. **Re-run `scripts/wc-inhibit.sh wine` after any protocol is added by anyone.**
+
+   **The counts below are a moving target, and a mismatch is not a regression.**
+   Three tests in `wc-proxy` assert exact figures and all three move on every
+   protocol addition:
+
+   | test | at this merge | what moves it |
+   | --- | --- | --- |
+   | `spec::the_builtin_protocols_parse` | 40 interfaces | any `<interface>` added |
+   | `wire::every_message_in_every_protocol_round_trips` | 426 messages | any `<request>` or `<event>` added |
+   | `spec::the_reverse_direction_has_fds_too` | 4 messages, unchanged | only a protocol carrying an `h` |
+
+   The third one is the interesting one and it did **not** move this stage: an
+   icon crosses as a `wl_buffer` object id, an activation token as a string, and
+   an inhibitor carries nothing at all, so none of the four needs the fd shim
+   and none of them can be broken by it. Having that asserted rather than
+   believed is the point of the list being exact.
+
+   The figures were 32 and 376 before this stage and four more protocols are
+   being added by other branches as this is written — clipboard, cursor shapes,
+   touch and the decorations work. So the next person to see 40 and 426 fail is
+   almost certainly looking at somebody else's correct addition. Recount, do not
+   revert: `grep -c '<interface name=' crates/wc-proxy/protocols/*.xml` answers
+   the first, and the test prints its own actual for the second. The reason
+   these are exact rather than a floor is §9.3's — the set of messages the proxy
+   can walk is exactly the set of clients it can carry, so adding one should be
+   a *visible* change to a line somebody has to edit, which is precisely the
+   check that was missing when `xdg-toplevel-icon` went in without it (§25.2).
+2. **The four guest re-checks in §25.8.** None needs a long session; all four
+   are one interactive run with Firefox already open.
+3. **Decide whether `ext-idle-notify` is a stage.** §25.9 item 1 has the design
+   sketched; what it needs is somebody to say whether a periodic
+   `GetLastInputInfo` on the guest is acceptable, which is a question about the
+   deployment and not about the code.
 ---
 
 ## 23. Stage 12: the mouse cursor

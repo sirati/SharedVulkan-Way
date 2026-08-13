@@ -60,6 +60,15 @@ struct Args {
     icons: bool,
     /// Which icon theme to try before `hicolor`.
     icon_theme: String,
+    /// STAGE 13. Extra roots to search, ahead of the XDG ones.
+    ///
+    /// Repeatable, because a machine can have more than one place worth
+    /// searching and because the alternative -- one colon-joined string --
+    /// re-invents `XDG_DATA_DIRS` badly. It exists for callers that have no
+    /// session environment to inherit: a `systemd-run` transient unit, which
+    /// is how this proxy runs on the VM host, gets systemd's environment and
+    /// not a login shell's.
+    icon_dirs: Vec<std::path::PathBuf>,
 }
 
 fn usage() -> &'static str {
@@ -95,6 +104,9 @@ usage: wc-proxy --upstream <path> [options]
                          (default $WC_ICON_THEME, else hicolor)
   --no-icons             do not resolve app ids to icons at all: no second
                          connection to the compositor, no directory walk
+  --icon-data-dir DIR    an extra XDG data directory to search first; may be
+                         given more than once. The client's own package prefix
+                         is always searched last, whether or not this is given
   --accept-timeout SEC   how long to wait for a client (default 20)
   --timeout SEC          exit after this long with no traffic (default 20)
 "
@@ -122,6 +134,7 @@ fn parse_args() -> Result<Args, String> {
         idle_timeout: Duration::from_secs(20),
         icons: true,
         icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
+        icon_dirs: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -150,6 +163,7 @@ fn parse_args() -> Result<Args, String> {
             "--trace" => a.trace = true,
             "--no-icons" => a.icons = false,
             "--icon-theme" => a.icon_theme = next()?,
+            "--icon-data-dir" => a.icon_dirs.push(next()?.into()),
             "--pool-headroom" => {
                 a.headroom = next()?.parse().map_err(|e| format!("--pool-headroom: {e}"))?
             }
@@ -413,14 +427,40 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // client's icons with it and nobody else's.
         let (want_icons, icon_theme, upstream_path) =
             (args.icons, args.icon_theme.clone(), args.upstream.clone());
+        // STAGE 13. Where *this* client's application is installed, asked of
+        // the kernel before the socket is moved into the thread. Read here
+        // rather than inside the thread only because the answer is about the
+        // connection and this is where the connection still is.
+        let client_dirs = wc_proxy::proxy::Listener::peer_pid(&client)
+            .map(wc_proxy::icons::dirs_for_pid)
+            .unwrap_or_default();
+        let extra_dirs = args.icon_dirs.clone();
         threads.push(std::thread::spawn(move || {
             // The `+ Send` is only needed to cross this boundary; `Session`
             // itself has no opinion, and widening its signature would push the
             // bound into every test that builds one.
             let transport: Box<dyn PoolTransport> = transport;
             let mut icons = if want_icons {
+                // STAGE 13. Three sources, in this order and for this reason:
+                //
+                // 1. `--icon-data-dir`, because a proxy started by a systemd
+                //    transient unit has no session environment at all and a
+                //    harness must be able to say what to search rather than
+                //    hope. `scripts/wc-icon.sh` was already doing this by
+                //    exporting `XDG_DATA_DIRS` around the process, which works
+                //    for one client and not for a run with two.
+                // 2. The XDG directories, which are the user's and the
+                //    system's themes and must win: an icon theme the user
+                //    installed is a deliberate override of what a package
+                //    shipped.
+                // 3. The client's own package prefix, last, because it is the
+                //    guaranteed answer rather than the preferred one — the
+                //    application's own pixels, found where the application is.
+                let mut data_dirs = extra_dirs;
+                data_dirs.extend(wc_proxy::icons::default_data_dirs());
+                data_dirs.extend(client_dirs);
                 let search = wc_proxy::icons::Search {
-                    data_dirs: wc_proxy::icons::default_data_dirs(),
+                    data_dirs,
                     theme: icon_theme,
                 };
                 // A failure here is logged and shrugged off. The whole feature

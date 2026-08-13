@@ -144,6 +144,75 @@ pub fn default_data_dirs() -> Vec<PathBuf> {
     out
 }
 
+/// How far up from the client's executable to look for a `share` directory.
+///
+/// Four is chosen against real layouts rather than as a round number:
+/// `/usr/bin/foo` needs one, `/usr/lib/firefox/firefox` needs three, and a Nix
+/// store path of the same shape needs three. Going further starts adding `/` to
+/// the search, which would put every `.desktop` file on the machine into a
+/// lookup that is already the expensive case when it misses (§16.4).
+const CLIENT_PREFIX_DEPTH: usize = 4;
+
+/// The data directories belonging to whatever `exe` was installed as.
+///
+/// ADDED FOR STAGE 13, and it is the fix for `0 image(s)` on the machine
+/// `docs/goal-firefox.md` describes. §17.2 recorded the cause as *"the resolver
+/// runs where the proxy runs, and the VM host has no icon theme carrying
+/// Firefox's pixels"*. The first half is right and the second is the wrong
+/// diagnosis: the proxy is a Wayland **server** reached over an AF_UNIX socket,
+/// so it is always on the client's own machine, and that machine is by
+/// definition the one the application is installed on. What was missing was not
+/// the machine but the *directory* — Firefox's `.desktop` and its icons are in
+/// its own package prefix, and on NixOS that prefix is a store path which
+/// appears in `XDG_DATA_DIRS` only if somebody put the package in a profile.
+/// Measured: `/run/current-system/sw/share` on the VM host has no
+/// `firefox.desktop` and no `firefox.png`, and
+/// `/nix/store/…-firefox-151.0.2/share` has both. See docs/design.md §18.5.
+///
+/// So: walk up from the executable and take every ancestor that has a `share`.
+/// That is the FHS relationship between `bin/` and `share/`, it is the same
+/// relationship inside a Nix store path, inside a Flatpak, and inside anything
+/// unpacked into a home directory — which is why it is preferred to a list of
+/// special cases for package managers.
+///
+/// Root (`/`) is never a candidate: `/share` is not a thing, and adding it
+/// would make a client installed at `/bin/x` search the whole filesystem root.
+pub fn client_prefix_dirs(exe: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dir = exe.parent();
+    for _ in 0..CLIENT_PREFIX_DEPTH {
+        let Some(d) = dir else { break };
+        if d.parent().is_none() {
+            break;
+        }
+        let share = d.join("share");
+        if share.is_dir() && !out.contains(&share) {
+            out.push(share);
+        }
+        dir = d.parent();
+    }
+    out
+}
+
+/// The same, for a live process id.
+///
+/// `/proc/<pid>/exe` is the kernel's answer and not the client's: it survives
+/// an `argv[0]` that lies, a wrapper script that `exec`s something else, and a
+/// binary that has since been replaced on disk. Unreadable for a process
+/// belonging to another user, which is a `None` and not an error — the icon is
+/// cosmetic and the fallbacks below it are the whole design (§16.7).
+///
+/// **No descriptor crosses anything here.** This is a `readlink` on the
+/// proxy's own machine, in the proxy's own namespace, and what leaves the
+/// function is a path. §14.7's count is unchanged.
+#[cfg(unix)]
+pub fn dirs_for_pid(pid: i32) -> Vec<PathBuf> {
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(exe) => client_prefix_dirs(&exe),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The whole lookup: app id in, pixels out.
 pub fn resolve(app_id: &str, search: &Search) -> Resolution {
     let (desktop, icon_name) = match desktop_entry(app_id, search) {
@@ -514,6 +583,51 @@ mod tests {
     /// The end-to-end lookup, against a theme built in a temporary directory —
     /// so it asserts the same code path the guest runs without depending on
     /// what happens to be installed on the machine running the tests.
+    /// STAGE 13. The three layouts this has to work on, in one test, because
+    /// the walk depth is the only thing that separates them and a depth chosen
+    /// by eye is a depth that is wrong for the fourth one.
+    ///
+    /// `/usr/bin/foo` is FHS, `/usr/lib/firefox/firefox` is how a distribution
+    /// actually ships a browser, and the Nix store path is the case that
+    /// produced the bug — Firefox's own prefix, three levels above the binary
+    /// the kernel reports for the process.
+    #[test]
+    fn the_client_prefix_is_found_from_bin_and_from_lib() {
+        let root = std::env::temp_dir().join(format!("wc-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for p in [
+            "usr/bin",
+            "usr/share",
+            "usr/lib/firefox",
+            "store/firefox-151.0.2/lib/firefox",
+            "store/firefox-151.0.2/share",
+        ] {
+            std::fs::create_dir_all(root.join(p)).unwrap();
+        }
+
+        // FHS, and `/usr/lib/firefox/firefox` reaches the same `share` from
+        // one level deeper.
+        assert_eq!(
+            client_prefix_dirs(&root.join("usr/bin/foo")),
+            vec![root.join("usr/share")]
+        );
+        assert_eq!(
+            client_prefix_dirs(&root.join("usr/lib/firefox/firefox")),
+            vec![root.join("usr/share")]
+        );
+        // The store path: the prefix is three levels up and it is the only
+        // place `firefox.desktop` exists on the machine this was measured on.
+        assert_eq!(
+            client_prefix_dirs(&root.join("store/firefox-151.0.2/lib/firefox/firefox")),
+            vec![root.join("store/firefox-151.0.2/share")]
+        );
+        // A binary with no `share` anywhere above it contributes nothing,
+        // rather than contributing a directory that does not exist.
+        assert!(client_prefix_dirs(&root.join("store/nothing/bin/x")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_desktop_entry_and_a_theme_become_pixels() {
         let root = std::env::temp_dir().join(format!("wc-icons-{}", std::process::id()));

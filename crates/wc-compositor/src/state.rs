@@ -78,6 +78,7 @@ use smithay::reexports::wayland_protocols_misc::server_decoration::server
 use smithay::reexports::wayland_server::WEnum;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+
 // ADDED FOR STAGE 12 (docs/design.md §23), the cursor.
 //
 // `CursorShapeManagerState` is `wp_cursor_shape_v1`: a client names a shape
@@ -94,12 +95,26 @@ use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorati
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::seat::CURSOR_IMAGE_ROLE;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
+// ADDED FOR STAGE 21: three protocols whose implementation is a Win32 call, and
+// which are here because the Win32 call exists rather than because the protocol
+// is short. docs/design.md §25 has the argument for each and — for the two that
+// were considered and left out — for their absence.
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
+use smithay::wayland::keyboard_shortcuts_inhibit::{
+    KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
+};
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::{
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_kde_decoration,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_idle_inhibit,
+    delegate_kde_decoration, delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_seat,
+    delegate_shm, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
-use crate::platform::{CursorSpec, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
+use crate::platform::{
+    CursorSpec, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind,
+};
 use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource};
 
 /// What kind of shell surface a window is.
@@ -141,6 +156,13 @@ struct Window {
     /// here rather than in the command queue.
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
+    /// ADDED FOR STAGE 21, and only one thing reads it: an idle inhibitor on a
+    /// minimised window must not keep the display awake, because a minimised
+    /// window is one the protocol calls invisible. Tracked here rather than
+    /// asked of Win32 because the answer has to be available on the Wayland
+    /// thread, which may not call Win32 at all; the value is `WM_SIZE`'s
+    /// `SIZE_MINIMIZED` arriving as [`FromUi::Minimized`].
+    minimized: bool,
     title: String,
     app_id: String,
     /// Callbacks the client is waiting on before it draws its next frame.
@@ -214,26 +236,47 @@ pub struct State {
     /// as `_data_device`: nothing calls a method on it, and dropping it would
     /// destroy the global.
     _cursor_shape: CursorShapeManagerState,
-    /// The surface a client last handed to `wl_pointer.set_cursor`, if the
-    /// last thing it asked for was pixels rather than a name.
-    ///
-    /// ADDED FOR STAGE 12. Kept so that a *later* commit on that surface —
-    /// which is how an animated cursor advances, and how a client that
-    /// changes shape without a new `set_cursor` works — is recognised as a
-    /// cursor frame rather than as content nobody wants.
-    cursor_surface: Option<WlSurface>,
     /// The pixels of the last cursor-role surface to commit, and which surface
     /// they came from.
     ///
-    /// **This is a cache, and it exists because the two requests arrive in
-    /// either order.** A client may `set_cursor(surface)` and *then* attach and
-    /// commit the buffer (GTK does), or attach and commit and *then*
-    /// `set_cursor` (Qt does). In the first order the commit is what has the
-    /// pixels; in the second the `set_cursor` is, and by then smithay has
-    /// already taken the buffer out of the surface's pending state and it
-    /// cannot be read again. One slot covers both, because a client has one
-    /// cursor at a time.
+    /// ADDED FOR STAGE 12. **This is a cache, and it exists because the two
+    /// requests arrive in either order.** A client may `set_cursor(surface)`
+    /// and *then* attach and commit the buffer (GTK does), or attach and
+    /// commit and *then* `set_cursor` (Qt does). In the first order the commit
+    /// is what has the pixels; in the second the `set_cursor` is, and by then
+    /// smithay has already taken the buffer out of the surface's pending state
+    /// and it cannot be read again. One slot covers both, because a client has
+    /// one cursor at a time.
     cursor_pixels: Option<(WlSurface, IconImage)>,
+    /// The surface the client last handed to `wl_pointer.set_cursor`, if it
+    /// handed one over rather than naming a shape.
+    ///
+    /// ADDED FOR STAGE 13, and it exists for two jobs that are really one.
+    ///
+    /// A cursor surface arrives *empty*: `set_cursor` names it before the
+    /// client has attached a buffer to it, so the pixels turn up on a later
+    /// commit and there is no way to build an `HCURSOR` at the moment of the
+    /// request. Remembering which surface it was is what lets that commit be
+    /// recognised when it comes.
+    ///
+    /// And recognising it is also what makes the guarantee legible: a surface
+    /// in here is a cursor, is **never** composited into any window, and
+    /// it says so in the log the first time a client sets one. It was
+    /// *nearly* true by accident already — a cursor surface is nobody's
+    /// subsurface, so the tree walk in `compose_tree` never reached it — but
+    /// its pixels were still blitted into `staging` and kept there forever,
+    /// and "not reached by the current traversal" is not a property anybody
+    /// can rely on while the scene graph is still growing.
+    cursor_surface: Option<WlSurface>,
+    /// The popup that called `xdg_popup.grab`, if one is up.
+    ///
+    /// ADDED FOR STAGE 13. See [`XdgShellHandler::grab`] for what it is and
+    /// [`Self::dismiss_grab_if_outside`] for what it does.
+    popup_grab: Option<WindowId>,
+    /// Caps Lock and Num Lock as the system last reported them, carried in on
+    /// [`FromUi::KeyboardFocus`]. See [`Self::sync_locked_modifiers`].
+    locks: (bool, bool),
+
 
     ui: Ui,
     events: Receiver<FromUi>,
@@ -265,6 +308,24 @@ pub struct State {
     /// The same, for the standard protocol; it also owns the size list that
     /// every binding client is told about.
     _toplevel_icon: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+
+    // --- stage 21 ----------------------------------------------------------
+    /// Kept alive so `zwp_idle_inhibit_manager_v1` stays advertised.
+    _idle_inhibit: IdleInhibitManagerState,
+    /// Surfaces holding at least one `zwp_idle_inhibitor_v1`, and how many.
+    ///
+    /// **A count, not a set**, because one surface may hold several: the
+    /// protocol puts no limit on it and a toolkit that inhibits once for the
+    /// video and once for the fullscreen state is doing nothing wrong. A set
+    /// would have the first destroy cancel the second inhibitor's effect.
+    idle_inhibitors: HashMap<WlSurface, usize>,
+    /// What was last sent to the platform, so an unchanged answer costs nothing.
+    idle_inhibited: bool,
+    /// `xdg_activation_v1`'s token pool. Held rather than dropped because it is
+    /// mutable state — tokens are minted, spent and expired through it.
+    xdg_activation: XdgActivationState,
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1`'s inhibitor list.
+    shortcuts_inhibit: KeyboardShortcutsInhibitState,
     /// Icons this compositor has actually put on a window, and how many were
     /// asked for and had nothing to answer with. Printed at shutdown, because
     /// "the icon is generic" is otherwise indistinguishable from "the icon
@@ -501,8 +562,10 @@ impl State {
             // smithay's global advertises and what adds `dnd_ask` and
             // `all_resize` to the shape enum.
             _cursor_shape: CursorShapeManagerState::new::<State>(dh),
-            cursor_surface: None,
             cursor_pixels: None,
+            cursor_surface: None,
+            popup_grab: None,
+            locks: (false, false),
             ui,
             events,
             sources: vec![Box::new(ShmSource)],
@@ -515,6 +578,14 @@ impl State {
             icons: crate::icon::IconStore::default(),
             _icon_manager: icon_manager,
             _toplevel_icon: toplevel_icon,
+            // STAGE 21. Three globals whose Windows implementation is one call
+            // each; see the handlers at the bottom of this file, and §25 for
+            // why these three and not the rest of the list.
+            _idle_inhibit: IdleInhibitManagerState::new::<State>(dh),
+            idle_inhibitors: HashMap::new(),
+            idle_inhibited: false,
+            xdg_activation: XdgActivationState::new::<State>(dh),
+            shortcuts_inhibit: KeyboardShortcutsInhibitState::new::<State>(dh),
             icons_applied: 0,
             icons_missing: 0,
             clients_seen: 0,
@@ -556,6 +627,77 @@ impl State {
         }
     }
 
+    /// Decide whether the display should be kept awake, and tell the platform
+    /// when the answer changes.
+    ///
+    /// ADDED FOR STAGE 21. Called once per turn of the dispatch loop rather
+    /// than only from the two protocol handlers, and that is the whole reason
+    /// this is a function instead of two lines inside them.
+    ///
+    /// # smithay never tells us the inhibitor is gone
+    ///
+    /// `IdleInhibitHandler::uninhibit` is called from exactly one place —
+    /// `zwp_idle_inhibitor_v1.destroy`, the client's explicit request. There is
+    /// no `destroyed` hook on that object. So a client that crashes, is killed,
+    /// or simply closes its connection with an inhibitor still alive leaves one
+    /// behind that nothing will ever revoke, and an idle inhibitor that cannot
+    /// be revoked is a display that never sleeps again for the life of the
+    /// compositor. On a guest VM that is a real bill.
+    ///
+    /// Handling that is not optional and it cannot be done by being careful in
+    /// the handlers, because the event never arrives. What does arrive is that
+    /// the `WlSurface` stops being alive, and this is where that is noticed.
+    ///
+    /// # Invisible surfaces
+    ///
+    /// The protocol says the inhibitor applies while the surface is visible and
+    /// leaves "visible" to the compositor. Two things are checked and both are
+    /// the user's own doing: the window has committed a buffer (`mapped`) and
+    /// it is not minimised. Minimising the window playing the video is about as
+    /// clear a statement as a user can make that they are done watching it.
+    ///
+    /// # Cost
+    ///
+    /// One `HashMap::is_empty` per turn in the ordinary case, because the
+    /// ordinary case is that nobody has ever created an inhibitor. When one
+    /// exists, a scan of a map that holds one or two entries.
+    pub fn tick_idle_inhibit(&mut self) {
+        if self.idle_inhibitors.is_empty() && !self.idle_inhibited {
+            return;
+        }
+        let before = self.idle_inhibitors.len();
+        self.idle_inhibitors
+            .retain(|surface, _| smithay::utils::IsAlive::alive(surface));
+        if self.idle_inhibitors.len() != before {
+            println!(
+                "wc-compositor: {} idle inhibitor(s) went away with their surface",
+                before - self.idle_inhibitors.len()
+            );
+        }
+
+        // `root_of`, not the surface itself: `windows` is keyed by the surface
+        // that has the shell role, and a client is entitled to inhibit on a
+        // subsurface — the video, rather than the window containing it. Every
+        // toolkit measured so far inhibits on the toplevel, so this line has
+        // never yet made a difference, and the day it does the alternative is
+        // an inhibitor that is silently ignored.
+        let want = self.idle_inhibitors.keys().any(|surface| {
+            self.windows
+                .get(&root_of(surface))
+                .is_some_and(|w| w.mapped && !w.minimized)
+        });
+        if want == self.idle_inhibited {
+            return;
+        }
+        self.idle_inhibited = want;
+        println!(
+            "wc-compositor: idle inhibit -> {} ({} inhibitor(s) held)",
+            if want { "on" } else { "off" },
+            self.idle_inhibitors.len()
+        );
+        self.ui.send(ToUi::IdleInhibit { on: want });
+    }
+
     /// Drain everything the UI thread has said since the last turn.
     pub fn pump_ui_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
@@ -587,7 +729,14 @@ impl State {
                 FromUi::Maximized { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Maximized, on))
                 }
-                FromUi::Minimized { id, on } => self.set_state(id, |s| {
+                FromUi::Minimized { id, on } => {
+                    // STAGE 21: remembered, because an idle inhibitor held by a
+                    // window the user has minimised must stop keeping the
+                    // display awake. See [`State::tick_idle_inhibit`].
+                    if let Some(w) = self.windows.values_mut().find(|w| w.id == id) {
+                        w.minimized = on;
+                    }
+                    self.set_state(id, |s| {
                     // xdg-shell has **no minimised state**. `set_minimized` is a
                     // request a client makes; there is no matching entry in the
                     // `state` enum for the compositor to report back, which is a
@@ -599,12 +748,16 @@ impl State {
                     // smithay filters it out for clients that predate v6, which
                     // then keep drawing into a window nobody can see —
                     // wasteful, and correct.
-                    toggle(s, xdg_state::Suspended, on)
-                }),
+                        toggle(s, xdg_state::Suspended, on)
+                    });
+                }
                 FromUi::Activated { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
                 }
-                FromUi::KeyboardFocus { id, on } => self.set_keyboard_focus(id, on),
+                FromUi::KeyboardFocus { id, on, caps, num } => {
+                    self.locks = (caps, num);
+                    self.set_keyboard_focus(id, on)
+                }
                 FromUi::Key { id, keycode, pressed, time } => {
                     self.key(id, keycode, pressed, time)
                 }
@@ -656,6 +809,24 @@ impl State {
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
             keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+            // STAGE 13. The locks are Windows', and they are the half of the
+            // modifier state that key events cannot carry.
+            //
+            // Caps Lock and Num Lock are *locked* modifiers: their state is a
+            // property of the machine, it persists while our window is not
+            // focused, and the user can change it while we are not looking —
+            // pressing Caps Lock in another application changes it for
+            // everything, us included, and we see no key event at all. Inferred
+            // from the events we happen to have seen, our idea of the lock
+            // drifts out of step with the keyboard light, and the symptom is
+            // capital letters with the light off.
+            //
+            // So it is read from the system on every focus gain rather than
+            // tracked. The platform supplies it because only the platform can
+            // (`GetKeyState(VK_CAPITAL) & 1`), and it is carried on the focus
+            // event rather than polled, so that the headless platform can state
+            // it too.
+            self.sync_locked_modifiers();
         } else {
             // Only if it is *still* ours. A focus change is two messages, and
             // they can arrive in either order: Windows sends `WM_KILLFOCUS` to
@@ -667,8 +838,57 @@ impl State {
             }
             self.keyboard_focus = None;
             println!("wc-compositor: window {id} lost keyboard focus");
+            // STAGE 13, and it must happen **before** `set_focus(None)`.
+            //
+            // `wl_keyboard.leave` tells the *client* to treat every key as
+            // released, and that part was always right. What was wrong is that
+            // the compositor's own xkb state went on believing the keys were
+            // down — and it is the compositor's state that decides what the
+            // next `modifiers` event says.
+            //
+            // The sequence that bites: the user holds Ctrl, focus moves away
+            // (alt-tab, or a popup taking the foreground), the user releases
+            // Ctrl and the `WM_KEYUP` goes to whoever has focus now rather than
+            // to us, and focus comes back. smithay then sends `enter` with a
+            // pressed-keys array and a `modifiers` event that still has Ctrl
+            // depressed, and every keystroke from then on is Ctrl-modified
+            // until the user happens to press and release Ctrl over our window.
+            //
+            // `input_intercept` rather than `input`: this must not reach the
+            // client as ordinary key-up events. `leave` has already said what
+            // the client needs to hear, and a released key aimed at a surface
+            // that is losing focus is a key event with nowhere legitimate to
+            // go. The pressed set is read from smithay rather than tracked
+            // here, because a second copy is a second thing that can disagree —
+            // and disagreeing about which keys are down is the bug.
+            for keycode in keyboard.pressed_keys() {
+                keyboard.input_intercept::<(), _>(self, keycode, KeyState::Released, |_, _, _| ());
+            }
             keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
+    }
+
+    /// Take Caps Lock and Num Lock from the system rather than from history.
+    ///
+    /// ADDED FOR STAGE 13. See the call site in [`Self::set_keyboard_focus`]
+    /// for why this is read and not tracked. The depressed modifiers are left
+    /// alone: those *are* ours, they follow from key events we received, and
+    /// the focus-loss release above is what keeps them honest.
+    fn sync_locked_modifiers(&mut self) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        let (caps, num) = self.locks;
+        let mut mods = keyboard.modifier_state();
+        if mods.caps_lock == caps && mods.num_lock == num {
+            return;
+        }
+        println!(
+            "wc-compositor: locked modifiers from the system: caps {caps}, num {num} \
+             (were caps {}, num {})",
+            mods.caps_lock, mods.num_lock
+        );
+        mods.caps_lock = caps;
+        mods.num_lock = num;
+        keyboard.set_modifier_state(mods);
     }
 
     /// One key, in evdev numbering, to whatever has focus.
@@ -760,6 +980,9 @@ impl State {
 
     fn pointer_button(&mut self, id: WindowId, button: u32, pressed: bool, time: u32) {
         let pointer = self.pointer.clone();
+        if pressed {
+            self.dismiss_grab_if_outside(id);
+        }
         if self.pointer_focus != Some(id) {
             // A button from a window the pointer is not over. Reachable on
             // Win32 during a drag, where `SetCapture` keeps sending us the
@@ -790,8 +1013,38 @@ impl State {
         time: u32,
     ) {
         let pointer = self.pointer.clone();
-        if self.pointer_focus != Some(id) {
+        // MADE DELIBERATE IN STAGE 13. This used to `return` silently, and that
+        // silence is why "the scroll wheel does nothing in Firefox" took a user
+        // report to find.
+        //
+        // The two systems disagree about who a wheel belongs to. **Win32 sends
+        // `WM_MOUSEWHEEL` to the window with keyboard focus**, not to the
+        // window under the cursor; Wayland delivers `wl_pointer.axis` to the
+        // surface with pointer focus, which *is* the one under the cursor. So
+        // `id` here is the focused window and need not be the window being
+        // pointed at.
+        //
+        // The root cause of the reported bug was not this line — it was leaked
+        // popup `HWND`s (see [`XdgShellHandler::popup_destroyed`]) sitting
+        // under the cursor, so `pointer_focus` was a stale menu while the wheel
+        // arrived for the toplevel. Fixing the popups fixed the scrolling, and
+        // that was confirmed by the user before this was touched. But a wheel
+        // arriving for a window that is not the pointer focus is a legitimate
+        // situation on Windows, and eating it without a word is what turned a
+        // one-line symptom into a hunt.
+        //
+        // So: deliver to whatever the pointer is actually over — which is what
+        // `pointer.axis` would do anyway, since `id` was never used to route —
+        // and say when the two disagree. A wheel with no pointer focus at all
+        // has nowhere to go and is still dropped.
+        let Some(over) = self.pointer_focus else {
             return;
+        };
+        if over != id {
+            println!(
+                "wc-compositor: wheel addressed to window {id} (Win32 focus), \
+                 delivered to window {over} (pointer focus)"
+            );
         }
         let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
         if v120_v != 0 || vertical != 0.0 {
@@ -802,6 +1055,33 @@ impl State {
         }
         pointer.axis(self, frame);
         pointer.frame(self);
+    }
+
+    /// Dismiss the grabbing popup if the press landed anywhere else.
+    ///
+    /// ADDED FOR STAGE 13. A menu is closed by the compositor and not by the
+    /// client, because the client cannot see a click outside its own surfaces.
+    /// Without this a menu stays up until the application decides to take it
+    /// down, which for a click on the page behind it is never.
+    ///
+    /// The popup itself is not destroyed here. `popup_done` is a *request* —
+    /// the client destroys the object, and that arrives as
+    /// [`XdgShellHandler::popup_destroyed`], which is the only place a window
+    /// is removed. Tearing the `HWND` down from here as well would race the
+    /// client and leave the protocol object pointing at nothing.
+    fn dismiss_grab_if_outside(&mut self, clicked: WindowId) {
+        let Some(grabbing) = self.popup_grab else { return };
+        if grabbing == clicked {
+            return;
+        }
+        if let Some(Window { role: Role::Popup(p), .. }) = self.by_id(grabbing) {
+            println!(
+                "wc-compositor: click on window {clicked} outside the grab -> \
+                 window {grabbing} dismissed (xdg_popup.popup_done)"
+            );
+            p.send_popup_done();
+        }
+        self.popup_grab = None;
     }
 
     /// The user changed their Windows keyboard layout under a running client.
@@ -911,8 +1191,19 @@ impl State {
         if written.is_empty() {
             return;
         }
+        // STAGE 13. A cursor surface leaves here and never reaches
+        // `compose_tree`. Checked before the window test rather than after it,
+        // and by identity rather than by "it has no window", because the
+        // guarantee this stage owes the user is *this* one: a cursor is never
+        // content. The staging entry is dropped as well, so there is nothing
+        // left for a future traversal to find.
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.staging.remove(surface);
+            return;
+        }
         if !is_root_of_a_window {
-            // A subsurface of a window that has not mapped yet, or a cursor.
+            // A subsurface of a window that has not mapped yet, or a cursor
+            // surface for a seat that has since been given a different one.
             // The pixels are kept; there is nowhere to put them.
             return;
         }
@@ -1614,17 +1905,27 @@ impl SeatHandler for State {
     /// window a frame late and clipped to it, under the system's own. That was
     /// a live bug when this was written.
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // The surface is *recorded*, not drawn — stage 13's half of this, and
+        // it is unchanged. `commit` uses it to recognise a cursor's pixels and
+        // drop them before they can reach a window.
+        //
+        // What stage 12 adds is the other half: the same pixels also become an
+        // `HCURSOR`, so that dropping them costs nothing a user can see. The
+        // two changes are the same sentence read in both directions — a cursor
+        // surface is never composited *because* Windows is drawing it.
+        self.cursor_surface = match &image {
+            CursorImageStatus::Surface(surface) => Some(surface.clone()),
+            CursorImageStatus::Hidden | CursorImageStatus::Named(_) => None,
+        };
+
         match image {
             CursorImageStatus::Hidden => {
-                self.cursor_surface = None;
                 self.ui.send(ToUi::Cursor { spec: CursorSpec::Hidden });
             }
             CursorImageStatus::Named(icon) => {
-                self.cursor_surface = None;
                 self.ui.send(ToUi::Cursor { spec: CursorSpec::Named(icon) });
             }
             CursorImageStatus::Surface(surface) => {
-                self.cursor_surface = Some(surface.clone());
                 // If this surface has already committed its buffer — the
                 // attach-then-set_cursor order — the pixels are in the cache
                 // and the cursor can change now. If it has not, the commit
@@ -1695,6 +1996,7 @@ impl XdgShellHandler for State {
                 role: Role::Toplevel(surface),
                 shadow,
                 mapped: false,
+                minimized: false,
                 title,
                 app_id,
                 frame_callbacks: Vec::new(),
@@ -1866,6 +2168,7 @@ impl XdgShellHandler for State {
                 role: Role::Popup(surface),
                 shadow,
                 mapped: false,
+                minimized: false,
                 title: String::new(),
                 app_id: String::new(),
                 frame_callbacks: Vec::new(),
@@ -1879,20 +2182,127 @@ impl XdgShellHandler for State {
         );
     }
 
+    /// The client destroyed an `xdg_popup`.
+    ///
+    /// ADDED FOR STAGE 13, and its absence made the desktop unusable.
+    /// **`XdgShellHandler::popup_destroyed` has an empty default body**, so
+    /// from stage 9 to here every popup Firefox opened left its `HWND` on the
+    /// screen forever. A live session accumulated three stale "New Tab"
+    /// tooltips at three positions, a context menu, an account panel and the
+    /// hamburger menu, all visible at once, over the page being read.
+    ///
+    /// Nothing errored and nothing was logged. The windows were real, mapped
+    /// and correctly painted; they were simply never taken away, and the frame
+    /// dumps looked healthy throughout. It is the clearest example this project
+    /// has produced of a defect that only a person looking at a screen can
+    /// find — and it caused two further symptoms that would have been chased
+    /// separately (§18.4).
+    ///
+    /// The body is [`Self::toplevel_destroyed`]'s and that is the point: the
+    /// two roles differ in how a window is *made* and not at all in how it is
+    /// unmade. A popup can hold the pointer focus — it is the window under the
+    /// cursor while a menu is open — and a pointer handle still pointing at a
+    /// destroyed surface sends `leave` to a dead object.
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let id = window.id;
+            if self.keyboard_focus == Some(id) {
+                self.set_keyboard_focus(id, false);
+            }
+            if self.pointer_focus == Some(id) {
+                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+            }
+            if self.popup_grab == Some(id) {
+                self.popup_grab = None;
+            }
+        }
+        if let Some(window) = self.windows.remove(surface.wl_surface()) {
+            self.staging.remove(surface.wl_surface());
+            println!(
+                "wc-compositor: xdg_popup destroyed -> window {} ({} frames presented)",
+                window.id, window.presented
+            );
+            self.ui.send(ToUi::Destroy { id: window.id });
+        }
+    }
+
+    /// `xdg_popup.grab`: the client wants this popup to own the pointer until
+    /// something outside it is clicked.
+    ///
+    /// IMPLEMENTED IN STAGE 13, and it is the other half of the stale-menu bug.
+    /// A menu is dismissed by *the compositor* — the client cannot see a click
+    /// that lands outside its own surfaces, so if nobody sends `popup_done` the
+    /// menu has no way to know it should go, and clicking elsewhere leaves it
+    /// on screen.
+    ///
+    /// What is recorded is the innermost grabbing popup only, not a stack. A
+    /// stack is what a submenu needs and it is more than this stage can prove:
+    /// dismissing the innermost popup makes the client destroy it, which
+    /// arrives at [`Self::popup_destroyed`] and clears the record, so a second
+    /// click dismisses the next one out. That is one click per level rather
+    /// than one click for all of them — a real difference from how a Linux
+    /// compositor behaves, written down rather than hidden.
     fn grab(
         &mut self,
-        _surface: PopupSurface,
+        surface: PopupSurface,
         _seat: wl_seat::WlSeat,
         _serial: smithay::utils::Serial,
     ) {
+        if let Some(id) = self.windows.get(surface.wl_surface()).map(|w| w.id) {
+            println!("wc-compositor: xdg_popup grab -> window {id} owns the pointer");
+            self.popup_grab = Some(id);
+        }
     }
 
+    /// `xdg_popup.reposition` (xdg-shell v3): move a popup that is already up.
+    ///
+    /// IMPLEMENTED IN STAGE 13. The empty body meant `xdg_popup.repositioned`
+    /// was never sent and the popup never moved, so a submenu that GTK
+    /// repositions because it would fall off the screen stayed where it was
+    /// first placed — off-screen, or on top of its parent.
+    ///
+    /// The protocol's order is fixed and all three parts are required:
+    /// `repositioned` with the client's token, then a `configure` with the new
+    /// rectangle, then the parent surface's `commit` applies it. A compositor
+    /// that sends only the configure leaves the client unable to match the
+    /// answer to its request, which for GTK means it ignores the move.
+    ///
+    /// The positioner's own arithmetic is used unchanged, exactly as
+    /// [`Self::new_popup`] does — anchor rectangle, anchor edge, gravity and
+    /// offset, which smithay implements from the XML. The constraint
+    /// adjustments are still not applied here (§18.6): this compositor does not
+    /// know where the parent window is on the Windows desktop, so it cannot
+    /// tell whether the result would be off-screen. Windows keeps an owned
+    /// `WS_POPUP` on the monitor by itself, which is why that has not bitten.
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        let rect = positioner.get_geometry();
+        let Some(&Window { id, .. }) = self.windows.get(surface.wl_surface()) else {
+            // A reposition for a popup we never mapped. Answering the token
+            // anyway is better than silence: the client is waiting for it.
+            surface.send_repositioned(token);
+            return;
+        };
+        println!(
+            "wc-compositor: xdg_popup reposition -> window {id} to {},{} {}x{} (token {token})",
+            rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+        );
+        surface.with_pending_state(|state| {
+            state.geometry = rect;
+        });
+        surface.send_repositioned(token);
+        let _ = surface.send_configure();
+        self.ui.send(ToUi::MovePopup {
+            id,
+            x: rect.loc.x,
+            y: rect.loc.y,
+            width: rect.size.w,
+            height: rect.size.h,
+        });
     }
 }
 
@@ -2106,6 +2516,154 @@ impl KdeDecorationHandler for State {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// STAGE 21: three protocols that are a Win32 call each
+// ---------------------------------------------------------------------------
+
+/// `zwp_idle_inhibit_manager_v1` — the screen must not blank during a video.
+///
+/// Both methods do bookkeeping only. The decision, and the one message that
+/// crosses to the UI thread, are in [`State::tick_idle_inhibit`], for the reason
+/// documented there: the interesting case is the one where `uninhibit` is never
+/// called at all.
+impl IdleInhibitHandler for State {
+    fn inhibit(&mut self, surface: WlSurface) {
+        let n = self.idle_inhibitors.entry(surface).or_insert(0);
+        *n += 1;
+        println!(
+            "wc-compositor: a client created an idle inhibitor ({} on this surface)",
+            *n
+        );
+        self.tick_idle_inhibit();
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        if let Some(n) = self.idle_inhibitors.get_mut(&surface) {
+            *n -= 1;
+            if *n == 0 {
+                self.idle_inhibitors.remove(&surface);
+            }
+        }
+        println!("wc-compositor: a client destroyed an idle inhibitor");
+        self.tick_idle_inhibit();
+    }
+}
+
+delegate_idle_inhibit!(State);
+
+/// How stale an activation token may be before it is refused.
+///
+/// **Thirty seconds, not the ten in smithay's own example.** The token is minted
+/// by the application the user clicked in and spent by the application that is
+/// then *started*, and a cold Firefox on this guest takes longer than ten
+/// seconds to reach the point where it has a surface to activate. A limit that
+/// expires during the ordinary case is not a security measure, it is a feature
+/// that works only on a warm cache.
+const ACTIVATION_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `xdg_activation_v1` — clicking a link in one application raises another.
+impl XdgActivationHandler for State {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation
+    }
+
+    /// Minting is where the pool is swept, so it is bounded by the rate at
+    /// which tokens are asked for rather than by anything running on a timer.
+    /// GTK requests a token for every launch it contemplates and spends only
+    /// some of them; without this, a long session accumulates every one it did
+    /// not use.
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        self.xdg_activation
+            .retain_tokens(|_, d| d.timestamp.elapsed() < ACTIVATION_TOKEN_MAX_AGE);
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let age = data.timestamp.elapsed();
+        // Spent, whatever happens next: `xdg_activation_v1` says a token is
+        // good for one activation, and leaving a used one in the pool would let
+        // a client raise itself repeatedly off a single click the user made
+        // somewhere else.
+        self.xdg_activation.remove_token(&token);
+
+        if age >= ACTIVATION_TOKEN_MAX_AGE {
+            println!(
+                "wc-compositor: xdg_activation: ignoring a token {} s old",
+                age.as_secs()
+            );
+            return;
+        }
+        let Some(window) = self.windows.get(&root_of(&surface)) else {
+            // A surface with no window: either it has not mapped yet, or it is
+            // not a shell surface at all. Nothing to raise either way.
+            println!("wc-compositor: xdg_activation: no window for the surface named; ignoring");
+            return;
+        };
+        println!(
+            "wc-compositor: xdg_activation: window {} asked to be raised (token from {:?}, \
+             {} ms old)",
+            window.id,
+            data.app_id.as_deref().unwrap_or("an unnamed app"),
+            age.as_millis()
+        );
+        // Whether it *is* raised is Windows' decision and is not this side's
+        // business; `platform::win32::activate_window` documents when the
+        // answer is no, and the protocol gives us no way to tell the client
+        // either way.
+        self.ui.send(ToUi::Activate { id: window.id });
+    }
+}
+
+delegate_xdg_activation!(State);
+
+/// `zwp_keyboard_shortcuts_inhibit_v1` — and this one is complete because there
+/// is nothing to inhibit.
+///
+/// **Granting every request is the accurate description of this compositor, not
+/// a shortcut taken.** The inhibitor's meaning is "stop applying your own
+/// keyboard shortcuts and give the client every key". [`State::key`] already
+/// forwards every key to the focused client with `FilterResult::Forward` and no
+/// compositor-level binding exists to suppress; the comment there explains why,
+/// and it is the same reason: the window manager is Windows, which has taken
+/// the combinations it reserves before the message loop ever sees them.
+///
+/// So the inhibitor is activated the moment it is created, and the client that
+/// binds this protocol gets exactly what it asked for. The two ways this could
+/// become a lie are worth naming, because both are things a later stage might
+/// do without thinking of this file: adding a compositor-level key binding, and
+/// intercepting a key in `win32::toplevel_proc` before it becomes a
+/// `FromUi::Key`. Either one has to consult
+/// `Seat::keyboard_shortcuts_inhibited` — smithay keeps the answer, this
+/// compositor simply has no question to ask it yet.
+///
+/// What this cannot do, and what no compositor on Windows can, is hand over the
+/// combinations the *system* takes first: Ctrl-Alt-Del is the secure attention
+/// sequence and Win-L is handled by the shell, neither of which reaches a
+/// window procedure at all. A Linux compositor grabbing the keyboard has the
+/// same hole for the same kind of key, so this is not a Windows tax; it is
+/// worth writing down because a client asking to inhibit shortcuts is often
+/// asking for exactly those.
+impl KeyboardShortcutsInhibitHandler for State {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.shortcuts_inhibit
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
+        println!(
+            "wc-compositor: keyboard shortcuts inhibited for a surface, and granted immediately \
+             — this compositor forwards every key to the focused client already"
+        );
+    }
+}
+
+delegate_keyboard_shortcuts_inhibit!(State);
 
 delegate_compositor!(State);
 delegate_shm!(State);

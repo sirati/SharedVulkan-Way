@@ -392,6 +392,7 @@ impl PumpInner {
                     }
                 }
             }
+
             // ADDED FOR STAGE 12. There is no pointer here to put a cursor on,
             // so the command is reported — and reported in the terms the Win32
             // side would act on, including the `IDC_*` a named shape resolves
@@ -428,6 +429,15 @@ impl PumpInner {
                     );
                 }
             },
+
+            // ADDED FOR STAGE 13. Printed rather than acted on: there is no
+            // window manager here to move anything, and the thing worth
+            // asserting is that `xdg_popup.reposition` produced a move at all,
+            // which the harness can now read.
+            ToUi::MovePopup { id, x, y, width, height } => println!(
+                "wc-compositor: window {id} repositioned to {x},{y} {width}x{height}"
+            ),
+
             ToUi::Map { id, width, height } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;
@@ -497,6 +507,25 @@ impl PumpInner {
                 if let Some(on) = minimized {
                     let _ = self.events.send(FromUi::Minimized { id, on });
                 }
+            }
+            // ADDED FOR STAGE 21. Both of these are Win32 calls with no
+            // equivalent here — there is no display to keep awake and no
+            // foreground to take — so what the headless platform owes them is
+            // the line in the log, which is what the harness reads to check
+            // that the Wayland half decided the right thing. Answering
+            // `Activate` with a synthetic `FromUi::Activated`, the way
+            // `SetWindowState` above answers itself, would be *worse*: on
+            // Windows the activation may be refused, and a headless platform
+            // that always succeeded would make the one interesting outcome
+            // untestable.
+            ToUi::IdleInhibit { on } => {
+                println!(
+                    "wc-compositor: idle inhibit {} (no display to keep awake here)",
+                    if on { "on" } else { "off" }
+                );
+            }
+            ToUi::Activate { id } => {
+                println!("wc-compositor: window {id} asked to be activated (no foreground here)");
             }
             ToUi::Destroy { id } => {
                 println!("wc-compositor: window {id} destroyed");
@@ -583,7 +612,7 @@ impl PumpInner {
             click.button, click.x, click.y
         );
         send(FromUi::Activated { id, on: true });
-        send(FromUi::KeyboardFocus { id, on: true });
+        send(FromUi::KeyboardFocus { id, on: true, caps: false, num: false });
         send(FromUi::PointerEnter { id, x: click.x, y: click.y, time: t() });
         // A motion after the enter: GTK decides what is under the pointer from
         // the motion, and a press whose only position came from the enter
@@ -630,7 +659,7 @@ impl PumpInner {
         };
 
         println!("wc-compositor: [simulate-wm] window {id} keyboard focus");
-        send(FromUi::KeyboardFocus { id, on: true });
+        send(FromUi::KeyboardFocus { id, on: true, caps: false, num: false });
 
         println!("wc-compositor: [simulate-wm] window {id} pointer enter at {cx},{cy}");
         send(FromUi::PointerEnter { id, x: cx, y: cy, time: t() });

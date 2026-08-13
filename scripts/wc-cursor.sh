@@ -155,9 +155,17 @@ run_linux() {
   # (docs/design.md §9.3) — so a run where `crates/wc-proxy/protocols/` was not
   # updated fails *here*, loudly, and not on the guest a week later.
   [ -x "$LINUX_BIN/wc-proxy" ] || { note "SKIP the proxy leg (no wc-proxy built)"; return; }
-  mkdir -p "$dir/prt" "$dir/pools"; chmod 700 "$dir/prt"
+  mkdir -p "$dir/prt" "$dir/pools" "$dir/keymaps"; chmod 700 "$dir/prt"
 
+  # `--shared-dir`, and it is required rather than tidy. Without somewhere to
+  # put the keymap the compositor sends `wl_keyboard.keymap` as an in-band
+  # descriptor the proxy cannot materialise, and the connection dies with
+  # `argument 1 claims 35572 bytes, 0 available`. That is a **race** against the
+  # registry burst, not a hard failure: `wayland-info` sometimes prints its
+  # globals first and sometimes does not, so without this the leg passes about
+  # half the time. Measured, on the run that first showed it.
   XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-compositor" --socket wl-cur-up --once --timeout 25 \
+    --shared-dir "$dir/keymaps" --shared-peer-prefix "$dir/keymaps/" \
     >"$dir/up-srv.log" 2>&1 &
   srv=$!
   sleep 1
