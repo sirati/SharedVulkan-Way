@@ -870,6 +870,19 @@ this host the only real GPU is RADV, and all three routes are closed:
 | a dma-buf the GPU side makes locally from that object | impossible: the object cannot be sealed (finding 4) |
 | …from a sealable memfd instead | `/dev/udmabuf`: `Permission denied` — `root:kvm` 0660, this account is not in `kvm` |
 
+> **[CORRECTED — 2026-08-13, §0.10.] That last row is a fact about the wrong
+> host.** It was measured on **devhost**, where `sirati` is in
+> `users wheel lp networkmanager scanner libvirtd` and the device is
+> `crw-rw----+ root kvm`. On **testhost** — the machine the VM runs on, and the
+> only machine where the cross-VM question arises — the same account is in
+> `302(kvm)`, `/dev/udmabuf` opens, and a `UDMABUF_CREATE_LIST` over QEMU's
+> memfd succeeds. Both were re-measured. The row stays as written because it is
+> true of devhost and devhost is where the five local harnesses run;
+> what was wrong was reading it as a property of the project.
+>
+> This is the same shape as `flake.nix`'s RTX 5090 note: a measurement taken on
+> one machine, recorded without the machine in it, and then read as a limit.
+
 Five harnesses — `sv-end-to-end.sh`, `sv-zink-gl.sh`, `sv-dxvk-d3d11.sh`,
 `sv-present.sh`, `sv-bench.sh` — are the project's only evidence against a real
 GPU, and every one of them runs the GPU side on RADV through this provider.
@@ -888,6 +901,13 @@ it is not sufficient on its own — and, more usefully, would unblock the
 *cross-VM* AMD topology that `Provider::for_driver_across_a_vm` currently answers
 `None` for. That answer is a permission, not a limit, and §5.4 should be read
 that way.
+
+> **[CONFIRMED — 2026-08-13, §0.10.]** On testhost the membership is already
+> there, and the whole chain runs: QEMU's memfd carries `F_SEAL_SHRINK`,
+> `/dev/udmabuf` opens, `UDMABUF_CREATE_LIST` over the guest's pages returns a
+> dma-buf, and reading the guest's own records back through it shows it is the
+> same memory. So "a permission, not a limit" was right, and on the machine that
+> matters the permission is held.
 
 **6. An `Attachment` needed two names, and that is §4.1 becoming visible.** The
 control region and the arena are "two independent mappings with independent
@@ -1056,6 +1076,15 @@ line that gives each width. This is the third realised instance of R8's shape �
 a wrong answer with no symptom — and the second one found by adding an assertion
 rather than by hitting it.
 
+It is also the project's other recurring pattern, and the pattern deserves the
+name rather than a third separate note: **"implemented" here has more than once
+meant "compiled".** The generated `extern "system"` signature existed, the ICD
+exported it, the loader found it, and nothing anywhere read the parameter — so
+every check the project had said yes. The same shape produced §0.2's 55-vs-239
+command set and §0.3's null function pointers. What breaks it is always the same
+move: assert against something outside the code that says what the answer
+*should* be.
+
 **3. Bitfields come back into scope, narrowly and by data.** §7.4 put them out
 because `vk.xml` has one bitfield struct and it is ray tracing. `video.xml` has
 **293 members of the form `uint32_t x : 1`**. `plan::FlagWordPlan` carries a
@@ -1113,6 +1142,106 @@ specification requires and the driver does not check is a segfault with no
 message**: `vkGetPhysicalDeviceVideoCapabilitiesKHR` with a bare
 `VkVideoCapabilitiesKHR` kills the process inside RADV before anything is
 printed. Every other mistake in this stage produced a `VkResult`.
+
+---
+
+### 0.10 Where the driver's own memory lives, measured
+
+Measured 2026-08-13 on **testhost**, `docs/measured-gpu-side.md`, "Where the
+*driver's* memory lives, and a dma-buf made out of it". Asked because §0.7's
+`Provider::for_driver_across_a_vm` answers `None` for the one driver that cannot
+import a host pointer, and because the reason recorded for that was a permission
+measured on a machine with no VM on it.
+
+**Five results, and they do not all point the same way.**
+
+**1. The guest driver's own `vkAllocateMemory` is ordinary guest RAM.** 64 MiB
+through each of the Intel iGPU's two host-visible memory types; **16384 of 16384
+pages of each were found in QEMU's `memory-backend-memfd`**. Not stolen memory,
+not behind a BAR, nowhere the host cannot map. The `x-igd-opregion=on`
+passthrough does not change that for ordinary allocations.
+
+**2. It is nearly as contiguous as the best allocator this project found, and
+needs no privilege.** 26–55 runs for 64 MiB, against `VirtualAlloc(MEM_LARGE_PAGES)`
+at 22, `VirtualLock`ed 4 KiB pages at **1471** and AWE at 5863–16339 (§0.1). So
+attaching a slab this way is tens of `mmap(MAP_FIXED)` calls rather than about
+fifteen hundred, and `SeLockMemoryPrivilege` — which §0.1 had to have granted
+before large pages were measurable at all — does not enter into it.
+
+**3. The host can write it and the driver's own mapping sees the write.**
+`arena-host write1` through `MAP_SHARED` of the memfd into all 16384 located
+pages of each type, read back through the `vkMapMemory` pointer the driver
+returned: **16384/16384 on both types, each at the page index the host
+computed.** A run in which the host deliberately did not write reported 0, which
+is the negative control for the same path.
+
+**4. A real Linux dma-buf can be made out of it, on the Linux side, with nothing
+crossing.** QEMU's memfd carries seals `SEAL|SHRINK|GROW` — read with
+`F_GET_SEALS` from the running process, not from QEMU's documentation — and
+`F_SEAL_SHRINK` is exactly what udmabuf requires. `/dev/udmabuf` opens on
+testhost, `UDMABUF_CREATE_LIST` over the 31 runs returns a dma-buf, and the
+guest's own records read back through it: **3760/3760 pages at the index the map
+says.** §1a permits this and says why — *"that fd is made on one side and never
+leaves it"* — and it is now a thing that has been done rather than a thing that
+was argued.
+
+`/sys/module/udmabuf/parameters/size_limit_mb` is **64**, so §0.1 item 4's 1 GiB
+slab is not available this way without changing a module parameter.
+
+**5. And the premise that this removes the sweep and the root requirement is
+wrong.** The pages were found by sweeping 13 GiB of guest RAM for the stamp, and
+the memfd was reached through `/proc/<qemu-pid>/fd/35`. Neither has anything to
+do with *who allocated*: §0.1 item 5 measured that Windows reports no frame
+numbers to user mode outside AWE, and this is the driver's memory, so AWE does
+not apply to it at all. Whichever side allocates, the host still has to find the
+pages, and finding them needs the sweep and the sweep needs root. What inverting
+the direction buys is item 2 — fragmentation — and item 4, which is a capability
+the other direction does not have. It does not buy an unprivileged design.
+
+**What is not measured, and one of them is the important one.**
+
+- **`DEVICE_LOCAL`-only memory is unmeasured**, because it cannot be mapped and
+  so cannot be stamped. That is type 0 on this device and it is exactly where a
+  decoded video frame lives — a `VkImage` with `VIDEO_DECODE_DST`/`DPB` usage and
+  `OPTIMAL` tiling. On a unified iGPU with one heap it is plausible that type 0
+  is also guest RAM; plausible is what this project does not accept. Measuring it
+  needs a staging copy or a dispatch that writes the pattern into device-local
+  memory.
+- **Relocation.** The allocations were held about 17 seconds. R26's 3m14s is
+  stronger evidence and was itself explicitly not taken under memory pressure.
+- **No GPU read the host's write.** The probe does no dispatch.
+- **This is a unified iGPU.** A discrete card passed through would very likely
+  put `DEVICE_LOCAL` memory behind a BAR and the answer could be entirely
+  different. Nothing here generalises to one.
+
+**The finding that decides what the dma-buf is worth: testhost's Linux host has
+no GPU.** `00:02.0` is bound to `vfio-pci` and handed to the guest, there is no
+second GPU, and **`/dev/dri` is empty**. A dma-buf is a handle to memory;
+importing one into a GL or Vulkan context needs a DRM render node and there is
+none. So the dma-buf measured here is real and its consumers on this machine can
+only be CPU-side — a `wl_shm`-shaped path with no copy, which is worth having and
+is not the same claim as "Firefox can hardware-decode into it".
+
+**Consequences for §0.8 item 2 and for `docs/video-decode.md` §6.** The earlier
+conclusion — Firefox's Vulkan decode path ends in `vkGetMemoryFdKHR` on both
+branches, so hardware decode needs a Firefox patch — rested on "no forwarded
+Vulkan can mint a dma-buf". That premise is now false in general: on testhost a
+dma-buf over guest RAM can be minted. It is still true *in the way that matters
+for Firefox on this machine*, for a different and more concrete reason: the frame
+would have to be device-local memory whose placement is unmeasured, wrapped in a
+dma-buf carrying a DRM format modifier, imported by a GPU the host does not have.
+Two of those three are open questions and the third is a fact. **The honest
+statement is that the blocker moved from "impossible" to "three specific
+unknowns, one of which is currently insurmountable on this hardware", and that
+`video-decode.md` §5's recommendation — software decode on the host — is
+unchanged for now.**
+
+**No code was changed.** `sv_gpu_server::arena`'s provider table still answers
+`None` for RADV across a VM and still prefers `AppNamedShm` everywhere else; the
+comments now point at this measurement instead of at a permission on the wrong
+host. Inverting the direction is a decision that wants the type-0 measurement
+first, because an arena that can only be `HOST_VISIBLE` memory is a different
+design from one that can be any of it.
 
 ---
 

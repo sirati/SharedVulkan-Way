@@ -47,6 +47,18 @@
 //! | lavapipe | works — it adopts the pointer | **no**: no dma-buf export, and its opaque-fd export is *not the same pages* |
 //! | Intel, Windows guest | works (step 0, up to 2 GiB) | n/a — a descriptor cannot cross the VM boundary |
 //!
+//! **The last cell is right about descriptors and wrong about the direction.**
+//! Measured 2026-08-13 (design.md §0.10): the guest driver's *own*
+//! `vkAllocateMemory` lands in ordinary guest RAM — 16384 of 16384 pages of a
+//! 64 MiB allocation located in QEMU's memfd, on both host-visible memory types
+//! — the host can write it and the driver's mapping sees the write, and the
+//! located pages can be wrapped in a real dma-buf with `/dev/udmabuf` on the
+//! Linux side. So "the GPU allocates, then exports" *does* have a cross-VM form;
+//! what cannot cross is the descriptor, and it does not have to, because the
+//! descriptor is made on the side that consumes it.
+//!
+//! It is not adopted, and `for_driver_across_a_vm` says why.
+//!
 //! **The NVIDIA row is a correction, and it matters for the reverse direction.**
 //! The `OUT_OF_DEVICE_MEMORY` this table used to record was measured against
 //! `gpu-probe --file /tmp/window`, and `/tmp` is ext4. `dmabuf-probe` isolated
@@ -169,11 +181,38 @@ impl Provider {
     /// 0660 and this account is not in `kvm`. Saying so in the type stops a
     /// caller from discovering it as an `INVALID_EXTERNAL_HANDLE` three layers
     /// down.
+    /// # The blocker was measured on the wrong machine
+    ///
+    /// **[CORRECTED — 2026-08-13, design.md §0.10.]** The `None` below was
+    /// recorded as "`/dev/udmabuf` is `root:kvm` 0660 and this account is not in
+    /// the group". That was measured on **devhost**, which runs no VM. On
+    /// **testhost**, where the cross-VM topology actually exists, the account
+    /// *is* in `kvm`, and the whole chain has now been run end to end: QEMU's
+    /// memfd carries `F_SEAL_SHRINK`, `UDMABUF_CREATE_LIST` over the guest's
+    /// pages returns a dma-buf, and the guest's own records read back through it
+    /// unchanged.
+    ///
+    /// **The answer stays `None` anyway, and deliberately.** What was measured
+    /// is that the mechanism exists, not that this provider should use it. Two
+    /// things have to be settled first and neither is settled:
+    ///
+    /// - the pages still have to be *found*, by the 13 GiB content sweep, as
+    ///   root — inverting who allocates does not change that, because Windows
+    ///   reports no frame numbers to user mode outside AWE and driver memory is
+    ///   not AWE memory (§0.1 item 5);
+    /// - only `HOST_VISIBLE` memory has been located. `DEVICE_LOCAL`-only
+    ///   memory cannot be mapped and so could not be stamped, and an arena that
+    ///   can only be host-visible memory is a different design from one that can
+    ///   be any of it.
+    ///
+    /// Changing this table is a decision that wants those two answers, not this
+    /// one. It is written down here rather than left in a document so that
+    /// whoever changes it reads the reason it did not change before.
     pub fn for_driver_across_a_vm(key: &str) -> Option<Provider> {
         match key {
             // Structural refusal of host pointers. The legal answer is a local
-            // udmabuf over QEMU's sealed memfd; `/dev/udmabuf` is `root:kvm`
-            // 0660 and this account is not in the group, measured 2026-08-13.
+            // udmabuf over QEMU's sealed memfd — measured possible on testhost
+            // 2026-08-13, and not adopted; see this function's documentation.
             "radv" | "amdgpu" => None,
             // Corrected 2026-08-12: imports a shared mapping of shmem, which is
             // what QEMU's `memory-backend-memfd` is.

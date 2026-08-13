@@ -198,6 +198,13 @@ pub fn run() {
             let found = scan(&file, size, run);
             report_map(&found, &regions, arg(&args, "--out"));
         }
+        "udmabuf" => {
+            let map = read_map(&arg(&args, "--map").expect("--map"));
+            let limit_mb: u64 = arg(&args, "--limit-mb")
+                .map(|s| s.parse().expect("--limit-mb takes a number"))
+                .unwrap_or(16);
+            udmabuf_probe(&file, &map, limit_mb);
+        }
         "translate" => {
             let run = hexarg(&args, "--run").expect("--run");
             let path = arg(&args, "--gpas").expect("--gpas");
@@ -829,3 +836,184 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// udmabuf: can the located pages become a real Linux dma-buf?
+// ---------------------------------------------------------------------------
+//
+// design.md §0.7 recorded three closed routes for RADV and gave the third as
+// "`/dev/udmabuf`: `Permission denied` — `root:kvm` 0660, this account is not in
+// `kvm`". That was measured on **devhost**, where `sirati` is in
+// `users wheel lp networkmanager scanner libvirtd` and not in `kvm`. On
+// **testhost**, which is where the VM actually runs, the same account is in
+// `302(kvm)` and the device opens. So the recorded blocker is a fact about a
+// host that has no VM on it.
+//
+// That makes the question live rather than settled, and the question is not
+// "can we open the device" — it is "does `/dev/udmabuf` accept **QEMU's** memfd".
+// udmabuf requires `F_SEAL_SHRINK` on the memfd it wraps. QEMU's
+// `memory-backend-memfd` seals by default, but "by default" is a claim about a
+// version, and this project's rule is that a claim about somebody else's code
+// gets asserted rather than believed.
+//
+// So this reports `F_GET_SEALS` and then actually performs the ioctl over the
+// located pages, mapping the result and comparing its bytes with the memfd's.
+// A dma-buf whose bytes are not the same memory is exactly the failure
+// `sv_gpu_server::arena` records lavapipe producing, and only reading through
+// both mappings catches it.
+
+const F_GET_SEALS: i32 = 1034;
+const F_SEAL_SEAL: i32 = 0x0001;
+const F_SEAL_SHRINK: i32 = 0x0002;
+const F_SEAL_GROW: i32 = 0x0004;
+const F_SEAL_WRITE: i32 = 0x0008;
+
+/// `_IOW('u', 0x43, struct udmabuf_create_list)` — the scatter form.
+///
+/// The single-item `UDMABUF_CREATE` would do for one contiguous run and the
+/// pages are never one run: the driver's own 64 MiB allocation came back as
+/// 26–55 discontiguous runs in the memfd. The list form takes up to
+/// `/sys/module/udmabuf/parameters/list_limit` items, which is 1024 here.
+const UDMABUF_CREATE_LIST: u64 = 0x4008_7543;
+const UDMABUF_FLAGS_CLOEXEC: u32 = 0x01;
+
+#[repr(C)]
+struct UdmabufCreateItem {
+    memfd: u32,
+    pad: u32,
+    offset: u64,
+    size: u64,
+}
+
+unsafe extern "C" {
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn ioctl(fd: i32, req: u64, ...) -> i32;
+    fn __errno_location() -> *mut i32;
+}
+
+fn errno() -> i32 {
+    unsafe { *__errno_location() }
+}
+
+fn udmabuf_probe(file: &File, map: &[(u32, u64)], limit_mb: u64) {
+    use std::os::unix::io::AsRawFd;
+    let memfd = file.as_raw_fd();
+
+    // 1. The precondition, read rather than assumed.
+    let seals = unsafe { fcntl(memfd, F_GET_SEALS) };
+    if seals < 0 {
+        println!("F_GET_SEALS failed (errno {}) — this fd is not a memfd", errno());
+        return;
+    }
+    let names = [
+        (F_SEAL_SEAL, "SEAL"),
+        (F_SEAL_SHRINK, "SHRINK"),
+        (F_SEAL_GROW, "GROW"),
+        (F_SEAL_WRITE, "WRITE"),
+    ];
+    let set: Vec<&str> =
+        names.iter().filter(|(b, _)| seals & b != 0).map(|(_, n)| *n).collect();
+    println!("QEMU's memfd seals: 0x{seals:x} [{}]", set.join(" "));
+    if seals & F_SEAL_SHRINK == 0 {
+        println!("  no F_SEAL_SHRINK — udmabuf will refuse this memfd, and that is the answer");
+    }
+
+    // 2. Coalesce the located pages into runs, which is what the list wants.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (_, off) in map {
+        match runs.last_mut() {
+            Some((start, len)) if *start + *len == *off => *len += rec::PAGE as u64,
+            _ => runs.push((*off, rec::PAGE as u64)),
+        }
+    }
+    let mut total = 0u64;
+    let cap = limit_mb << 20;
+    let mut items: Vec<UdmabufCreateItem> = Vec::new();
+    for (off, len) in &runs {
+        if total + len > cap {
+            break;
+        }
+        total += len;
+        items.push(UdmabufCreateItem { memfd: memfd as u32, pad: 0, offset: *off, size: *len });
+    }
+    println!(
+        "located pages coalesce into {} run(s); offering the first {} ({} MiB) to udmabuf \
+         (module size_limit_mb caps this)",
+        runs.len(),
+        items.len(),
+        total >> 20
+    );
+    if items.is_empty() {
+        println!("nothing to offer");
+        return;
+    }
+
+    // 3. The ioctl. `udmabuf_create_list` is `{u32 flags; u32 count; item[]}`.
+    let mut blob = Vec::with_capacity(8 + items.len() * std::mem::size_of::<UdmabufCreateItem>());
+    blob.extend_from_slice(&UDMABUF_FLAGS_CLOEXEC.to_ne_bytes());
+    blob.extend_from_slice(&(items.len() as u32).to_ne_bytes());
+    for it in &items {
+        blob.extend_from_slice(&it.memfd.to_ne_bytes());
+        blob.extend_from_slice(&it.pad.to_ne_bytes());
+        blob.extend_from_slice(&it.offset.to_ne_bytes());
+        blob.extend_from_slice(&it.size.to_ne_bytes());
+    }
+
+    let dev = match OpenOptions::new().read(true).write(true).open("/dev/udmabuf") {
+        Ok(f) => f,
+        Err(e) => {
+            println!("open /dev/udmabuf: {e} — this is the permission §0.7 recorded");
+            return;
+        }
+    };
+    println!("/dev/udmabuf: opened");
+    let dmabuf = unsafe { ioctl(dev.as_raw_fd(), UDMABUF_CREATE_LIST, blob.as_ptr()) };
+    if dmabuf < 0 {
+        println!("UDMABUF_CREATE_LIST failed: errno {}", errno());
+        return;
+    }
+    println!("UDMABUF_CREATE_LIST: got dma-buf fd {dmabuf}");
+
+    // 4. The check that matters: are its bytes the same memory? A mapping that
+    //    succeeds and shows different pages is the lavapipe failure, and only
+    //    reading through both catches it.
+    let pm = PageMap::new(&dev_file(dmabuf), 0, total as usize);
+    match pm {
+        Ok(m) => {
+            let s = m.as_slice();
+            let mut same = 0usize;
+            let mut checked = 0usize;
+            for (i, (idx, off)) in map.iter().enumerate() {
+                let at = i * rec::PAGE;
+                if at + rec::PAGE > s.len() {
+                    break;
+                }
+                checked += 1;
+                let page = &s[at..at + rec::PAGE];
+                if rec::tag_at(page, rec::OFF_MAGIC) == *rec::MAGIC
+                    && rec::get_u32(page, rec::OFF_PAGE_INDEX) == *idx
+                {
+                    same += 1;
+                }
+                let _ = off;
+            }
+            println!(
+                "mapped the dma-buf: {same}/{checked} pages carry the guest's record at the \
+                 index the map says — the dma-buf and the memfd are the same memory"
+            );
+        }
+        Err(e) => println!("mmap of the dma-buf failed: {e}"),
+    }
+    // `dev_file` took ownership and has already closed it; closing again would
+    // close whatever fd the number has since been reused for.
+}
+
+/// Wrap a raw fd as an owning `File`, so the dma-buf is closed when the
+/// borrow that maps it goes out of scope. The mapping outlives the descriptor,
+/// which is ordinary `mmap` behaviour and is also the point: **the fd is made
+/// on this side and never leaves it** (design.md §1a).
+fn dev_file(fd: i32) -> File {
+    use std::os::unix::io::FromRawFd;
+    unsafe { File::from_raw_fd(fd) }
+}
+

@@ -1406,3 +1406,188 @@ application against a live GPU side gets `CreateFileW … errno 231`
 (`ERROR_PIPE_BUSY`) after the connect timeout. One session, one client is the
 current design; serving several would need the `ConnectNamedPipe` loop the Linux
 `--clients N` path already has.
+
+---
+
+# Where the *driver's* memory lives, and a dma-buf made out of it
+
+Measured 2026-08-13 on **testhost**, the machine the VM actually runs on.
+Everything before this section asks one direction of one question: *can the
+guest's driver import memory the arena chose?* This asks the other direction —
+**can the Linux host reach memory the driver chose?** — because that is what
+decides whether `sv_gpu_server::arena`'s `GpuExport` provider is available
+across a hypervisor at all, and `Provider::for_driver_across_a_vm` currently
+answers `None` for the one driver that cannot import a host pointer.
+
+The instrument is `gpu-probe --vk-alloc`, which is deliberately not a workload:
+it opens the device, allocates through `vkAllocateMemory`, maps, writes the same
+`arena_record` pages every other phase writes, and waits. `arena-host scan` —
+unchanged, the step-0 instrument — is the reader.
+
+## What the guest driver offers
+
+```
+device: Intel(R) UHD Graphics
+memory heaps:
+  heap 0: 6624 MiB flags DEVICE_LOCAL
+memory types:
+  type 0: heap 0 flags DEVICE_LOCAL
+  type 1: heap 0 flags DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT
+  type 2: heap 0 flags DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | HOST_CACHED
+```
+
+One heap, unified, no separate VRAM. Types 1 and 2 are `memoryTypeBits = 0x6`,
+which is the same pair step 0's import was given — the two measurements agree
+about the device from opposite directions.
+
+## 1. The driver's own allocation is ordinary guest RAM
+
+64 MiB allocated and stamped through each host-visible type, then swept for in
+QEMU's `memory-backend-memfd` (13312 MiB, fd 35 of the `windows-vm` process):
+
+| type | flags | pages located | contiguous runs in the memfd |
+|---|---|---|---|
+| 1 | `DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT` | **16384 / 16384** | 26, then 31 on a second run |
+| 2 | …`HOST_CACHED` | **16384 / 16384** | 31, then 55 on a second run |
+
+**Every page of a `vkAllocateMemory` allocation was in the memfd.** It is not
+Intel stolen memory, it is not behind a BAR, and it is not anywhere the host
+cannot map. The `x-igd-opregion=on` passthrough does not put ordinary allocations
+anywhere special.
+
+The contiguity is the surprise. Against the four allocators of "Large pages,
+AWE, and the privilege that unlocks both", for the same 64 MiB window:
+
+| allocator | runs |
+|---|---|
+| `VirtualLock`ed 4 KiB pages | 1471 |
+| AWE | 5863–16339 |
+| `AllocateUserPhysicalPages2` + `NONPAGED_LARGE` | 3992 |
+| `VirtualAlloc(MEM_LARGE_PAGES)` | 22 |
+| **the driver's own `vkAllocateMemory`** | **26–55** |
+
+Mean run ≈ 1.2–2.5 MiB, which is the shape of 2 MiB-backed memory. The driver
+gets within about 1.5× of the best allocator this project found **and needs no
+`SeLockMemoryPrivilege`** — the privilege §0.1 had to have granted before large
+pages were measurable at all.
+
+## 2. The host can write it, and the driver's own mapping sees the write
+
+`arena-host write1` through `MAP_SHARED` of the memfd, into all 16384 located
+pages of each type, while the guest still held the allocations; then the guest
+read back **through the `vkMapMemory` pointer the driver gave it**:
+
+```
+type 1: of 16384 pages, 16384 still carry our run id, 16384 carry the host's
+        write, 16384 of those at the page index the host believed
+type 2: of 16384 pages, 16384 still carry our run id, 16384 carry the host's
+        write, 16384 of those at the page index the host believed
+```
+
+Every page, both types, and the page index the host computed matches the index
+the guest reads it at — so the mapping is not merely "some shared memory", it is
+aligned the way an arena needs. A later run in which the host deliberately
+**did not** call `write1` reported `0 carry the host's write` for both types,
+which is the negative control for the same code path.
+
+## 3. And it can be turned into a real Linux dma-buf
+
+`/dev/udmabuf` on **testhost** is `crw-rw---- root kvm` and `sirati` is in
+`302(kvm)`, so it opens. Over the located pages of a live driver allocation:
+
+```
+QEMU's memfd seals: 0x7 [SEAL SHRINK GROW]
+located pages coalesce into 31 run(s); offering the first 10 (14 MiB) to udmabuf
+/dev/udmabuf: opened
+UDMABUF_CREATE_LIST: got dma-buf fd 5
+mapped the dma-buf: 3760/3760 pages carry the guest's record at the index the
+map says — the dma-buf and the memfd are the same memory
+```
+
+Three things in that, each of which was an assumption before:
+
+- **QEMU seals its memfd, and with the seal udmabuf needs.** `F_GET_SEALS`
+  returns `SEAL|SHRINK|GROW`; udmabuf requires `F_SEAL_SHRINK`. This is read
+  from the running process rather than from QEMU's documentation.
+- **The scatter is expressible.** 31 runs is far under
+  `/sys/module/udmabuf/parameters/list_limit`, which is 1024 here.
+- **The dma-buf's bytes are the same memory**, checked by reading the guest's own
+  records back through it — the check `sv_gpu_server::arena` records lavapipe
+  failing, applied here rather than assumed.
+
+`size_limit_mb` is **64**, so a 64 MiB arena is exactly at the ceiling and the
+1 GiB slab §0.1 item 4 recommends is not possible without changing the module
+parameter. That is a number to know before designing around this.
+
+## What this does *not* establish
+
+Four things, and the first two are corrections to the premise this measurement
+was asked under rather than footnotes to it.
+
+1. **It does not remove the content sweep, and it does not remove root.** The
+   pages were found by sweeping 13 GiB of guest RAM for the stamp, and the memfd
+   was reached through `/proc/<qemu-pid>/fd/35`. Nothing about the driver
+   allocating instead of the application changes either: §0.1 item 5 measured
+   that Windows reports no frame numbers to user mode outside AWE, and this is
+   the *driver's* memory, so AWE does not even apply to it. Whichever side
+   allocates, the host still has to *find* the pages. What did improve is
+   fragmentation — 26–55 runs instead of 1471, so attaching a slab is tens of
+   `mmap(MAP_FIXED)` calls rather than about fifteen hundred.
+2. **Nothing here is measured about relocation.** The allocations were held for
+   about 17 seconds. R26 measured a `VirtualLock`ed window stable over 3m14s and
+   explicitly not under memory pressure; this is weaker evidence than that, not
+   stronger.
+3. **`DEVICE_LOCAL`-only memory — type 0 — is unmeasured, and it is the type
+   that matters most for video.** It cannot be mapped, so this probe cannot
+   stamp it, and a decoded video frame lives in exactly that kind of memory: a
+   `VkImage` with `VIDEO_DECODE_DST`/`DPB` usage and `OPTIMAL` tiling. On a
+   unified iGPU with one heap it is *plausible* that type 0 is also guest RAM,
+   and plausible is what this project does not accept. Measuring it needs a
+   staging copy or a dispatch that writes the record pattern into device-local
+   memory, which is a piece of work rather than a flag.
+4. **No GPU has read the host's write.** The probe does no dispatch. The
+   converse — a GPU reading imported host memory — is what "a GPU has now run"
+   established; this direction has not been established for either side.
+
+## The thing that decides what any of it is worth: the host has no GPU
+
+```
+$ lspci -nnk | grep -A3 VGA
+00:02.0 VGA compatible controller: Intel Corporation Raptor Lake-P [UHD Graphics]
+	Kernel driver in use: vfio-pci
+	Kernel modules: i915, xe
+$ ls /dev/dri/
+by-path
+```
+
+`/dev/dri` on the testhost host is **empty**. The only GPU is bound to
+`vfio-pci` and handed to the guest, and there is no second one. A dma-buf is a
+handle to memory; importing one into a GL or Vulkan context needs a DRM render
+node, and there is none to import it into.
+
+So the dma-buf measured above is real, and on this machine its consumers can
+only be CPU-side. That is not nothing — it is a `wl_shm`-shaped path with no
+copy — but it is not "Firefox can hardware-decode into it", and the difference
+matters. See design.md §0.10.
+
+## Re-running it
+
+```
+# guest half, from the dev shell
+cargo build --release -p gpu-probe --target x86_64-pc-windows-gnu
+scripts/pl.sh push target/x86_64-pc-windows-gnu/release/gpu-probe.exe
+scripts/pl.sh root 'install -d -m0775 -g users /srv/winshare/svvkalloc &&
+                    install -m0755 /tmp/gpu-probe.exe /srv/winshare/svvkalloc/'
+scripts/pl.sh guest 'cd /z/svvkalloc && ./gpu-probe.exe --vk-alloc \
+                     --workdir "Z:\svvkalloc" --pages 16384'      # holds, waits
+
+# host half, as root, while the guest holds the allocations
+QP=$(pgrep -f 'qemu-system-x86_64 -name windows-vm'); FD=35
+arena-host scan    --fd /proc/$QP/fd/$FD --run <id> --out map.txt
+arena-host udmabuf --fd /proc/$QP/fd/$FD --map map.txt --limit-mb 16
+arena-host write1  --fd /proc/$QP/fd/$FD --map map.txt --stamp <hex>
+echo stamp=<hex> > /srv/winshare/svvkalloc/host-vkalloc-fill.txt
+```
+
+The guest half releases as soon as the fill file appears, so it holds somebody's
+laptop memory for seconds rather than minutes.

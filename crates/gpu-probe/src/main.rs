@@ -61,6 +61,23 @@ struct Opts {
     /// Skip the perf comparison. Useful when the only question is correctness
     /// and the machine should be disturbed as little as possible.
     no_perf: bool,
+    /// **The reverse question.** Everything else in this program asks "can the
+    /// driver import memory the arena chose?". This asks "can the host reach
+    /// memory the *driver* chose?" — allocate through `vkAllocateMemory`, map
+    /// it, stamp it with the same `arena_record` pages every other phase uses,
+    /// and let `arena-host scan` look for them in QEMU's memfd.
+    ///
+    /// It is the measurement that decides whether the `GpuExport` direction is
+    /// available across a hypervisor at all. If the driver's own allocation is
+    /// ordinary guest RAM, the host can map it and the arena never has to be
+    /// memory the guest was told to allocate; if it is not — Intel's *stolen*
+    /// memory, or something behind a BAR — the sweep finds nothing and the
+    /// answer is a different and more expensive one.
+    ///
+    /// Nothing about it is a workload: no buffer, no dispatch, no fence. It
+    /// allocates, maps, writes and waits, so it disturbs a machine somebody is
+    /// using as little as any Vulkan program can.
+    vk_alloc: bool,
     /// Non-Windows only: back the window with a shared mapping of this file
     /// instead of anonymous memory, so `arena-host` can play the host half
     /// against it. That makes the entire three-party protocol — fill, dispatch,
@@ -80,6 +97,7 @@ fn parse_args() -> Opts {
         perf_iters: 7,
         concurrent: false,
         no_perf: false,
+        vk_alloc: false,
         file: None,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -121,6 +139,10 @@ fn parse_args() -> Opts {
             }
             "--concurrent" => {
                 o.concurrent = true;
+                i += 1;
+            }
+            "--vk-alloc" => {
+                o.vk_alloc = true;
                 i += 1;
             }
             other => panic!("unknown argument {other}"),
@@ -335,6 +357,9 @@ fn acquire(opts: &Opts) -> Result<Region, Fail> {
 // ---------------------------------------------------------------------------
 
 fn run(opts: &Opts) -> Result<(), Fail> {
+    if opts.vk_alloc {
+        return run_vk_alloc(opts);
+    }
     let run_id = awe_probe::new_run_id();
     log!(
         "gpu-probe: run_id=0x{run_id:016x} pages={} ({} MiB) workdir={:?}",
@@ -551,6 +576,248 @@ fn run(opts: &Opts) -> Result<(), Fail> {
     // objects go first, then the window. Releasing guest RAM while the driver
     // still holds an import of it is the one sequencing mistake available here.
     drop(region);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// the reverse question: where does the *driver's* memory live?
+// ---------------------------------------------------------------------------
+
+/// Allocate through `vkAllocateMemory`, map it, stamp it, and stop.
+///
+/// # What this is for
+///
+/// `sv_gpu_server::arena` has two providers and the whole of `design.md` §5.4
+/// rests on which is possible where. `AppNamedShm` — the app side allocates,
+/// the driver imports a host pointer — is the only one that works across a
+/// hypervisor *if* a descriptor is the only way to hand over driver memory. On
+/// `testhost` that costs a content sweep of 13 GiB of guest RAM, root to open
+/// `/proc/<qemu>/fd/<n>`, and `info mtree -f` for the GPA→offset map, because
+/// §0.1 item 5 measured that Windows reports no frame numbers to user mode
+/// outside AWE.
+///
+/// None of that is needed if the driver's *own* allocation is ordinary guest
+/// RAM, because then the host reaches it through QEMU's memfd like any other
+/// guest page and the direction can be inverted. Whether it is, is a question
+/// about this specific driver on this specific passed-through device, and it
+/// has never been asked. The Intel iGPU has no VRAM — it uses system memory —
+/// but "system memory" on an IGD may be ordinary RAM *or* the BIOS-reserved
+/// stolen range (DSM/GSM), and QEMU maps the latter separately with
+/// `x-igd-opregion=on`. Those two answers have very different costs and only a
+/// measurement separates them.
+///
+/// # How it answers
+///
+/// It writes exactly the `arena_record` pages every other phase writes, so
+/// `arena-host scan --run <id>` — unchanged, already tested, already used for
+/// step 0 — is the reader. A page found in the memfd is a page of guest RAM the
+/// host can map. A page not found is a page that is somewhere else.
+///
+/// Every **host-visible** memory type is allocated and stamped, each with its
+/// own run id, so the answer is per type rather than for whichever one the
+/// probe happened to pick. Types without `HOST_VISIBLE` cannot be mapped and
+/// are listed and skipped, which is itself part of the answer.
+fn run_vk_alloc(opts: &Opts) -> Result<(), Fail> {
+    use ash::vk;
+
+    let gpu = Gpu::open(opts.device_index)?;
+    log!(
+        "device: {} — queue family {}, VK_EXT_external_memory_host: {}",
+        gpu.name,
+        gpu.queue_family,
+        if gpu.has_host_import { "yes" } else { "NO" }
+    );
+
+    let mp = &gpu.mem_props;
+    log!("memory heaps:");
+    for h in 0..mp.memory_heap_count {
+        let heap = mp.memory_heaps[h as usize];
+        log!(
+            "  heap {h}: {} MiB flags {:?}",
+            heap.size / (1 << 20),
+            heap.flags
+        );
+    }
+    log!("memory types:");
+    for t in 0..mp.memory_type_count {
+        let ty = mp.memory_types[t as usize];
+        log!("  type {t}: heap {} flags {:?}", ty.heap_index, ty.property_flags);
+    }
+
+    let size = opts.pages * PAGE;
+    let mut status = String::new();
+    status.push_str(&format!("probe=vk-alloc\ndevice={}\n", gpu.name));
+    status.push_str(&format!("pages={}\npage_size={PAGE}\n", opts.pages));
+
+    // One base id per run, and the per-type ids derived from it.
+    //
+    // `awe_probe::new_run_id()` is a function of the millisecond and the pid, so
+    // calling it in a loop hands the same id to every type that allocates inside
+    // one millisecond — which is all of them. The local smoke run on RADV gave
+    // four types `0xa04bcc4e…` and four `0x93c6cee5…`, and a per-type answer
+    // whose ids are not per type is not a per-type answer at all. It is fixed
+    // here rather than in `awe-probe`, whose one-id-per-process contract other
+    // measurements depend on.
+    let base_run = awe_probe::new_run_id();
+    let run_id_for = |t: u32| base_run ^ (t as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    status.push_str(&format!("base_run_id={base_run:016x}\n"));
+
+    let mut allocated = Vec::new();
+    // Indexed by memory type, so the read-back can find the mapping it already
+    // has: `vkMapMemory` on an allocation that is already mapped is illegal.
+    let mut ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); mp.memory_type_count as usize];
+    for t in 0..mp.memory_type_count {
+        let ty = mp.memory_types[t as usize];
+        if !ty.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+            log!("type {t}: not HOST_VISIBLE — cannot be mapped, so it cannot be stamped");
+            status.push_str(&format!("type {t} skipped not-host-visible\n"));
+            continue;
+        }
+        let mem = match gpu.allocate(size, t) {
+            Ok(m) => m,
+            Err(e) => {
+                log!("type {t}: vkAllocateMemory({} MiB) failed: {e}", size / (1 << 20));
+                status.push_str(&format!("type {t} alloc-failed\n"));
+                continue;
+            }
+        };
+        let ptr = match unsafe {
+            gpu.device.map_memory(mem.mem, 0, size as u64, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                log!("type {t}: vkMapMemory failed: {e}");
+                gpu.free(mem);
+                status.push_str(&format!("type {t} map-failed\n"));
+                continue;
+            }
+        };
+
+        let run_id = run_id_for(t);
+        let w = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
+        for p in 0..opts.pages {
+            // `gpa = 0` — unknown, and honestly so. This allocation's physical
+            // placement is exactly what is being measured; claiming a number
+            // here would be the thing under test answering for itself.
+            let page = rec::make_guest_page(run_id, p as u32, rec::MODE_LOCKED_VA, 0);
+            w[p * PAGE..(p + 1) * PAGE].copy_from_slice(&page);
+        }
+        // A non-coherent type keeps the writes in the CPU's cache until they are
+        // flushed, and the host sweep reads the memfd rather than the cache. On
+        // a coherent type this is a no-op and costs nothing; leaving it out on a
+        // non-coherent one would produce a false negative that looks exactly
+        // like "the memory is not in guest RAM".
+        if !ty.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT) {
+            let range = vk::MappedMemoryRange::default()
+                .memory(mem.mem)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            if let Err(e) = unsafe { gpu.device.flush_mapped_memory_ranges(&[range]) } {
+                log!("type {t}: vkFlushMappedMemoryRanges failed: {e}");
+            }
+        }
+
+        log!(
+            "type {t}: allocated and stamped {} MiB at VA 0x{:x}, run_id=0x{run_id:016x} \
+             flags {:?}",
+            size / (1 << 20),
+            ptr as usize,
+            ty.property_flags
+        );
+        status.push_str(&format!(
+            "type {t} run_id={run_id:016x} va={:016x} flags={:?} heap={}\n",
+            ptr as usize, ty.property_flags, ty.heap_index
+        ));
+        ptrs[t as usize] = ptr;
+        allocated.push((t, mem, run_id));
+    }
+
+    if allocated.is_empty() {
+        return Err(Fail::Other(
+            "no host-visible memory type could be allocated and mapped — nothing to look for"
+                .into(),
+        ));
+    }
+
+    write_file(&opts.workdir.join("guest-vkalloc.txt"), &status);
+    log!("wrote guest-vkalloc.txt — the host can scan for these run ids now");
+    log!("holding the allocations; waiting for host-vkalloc-fill.txt (600 s)");
+
+    // The allocations must still be live while the host sweeps and writes:
+    // freeing them first would let the driver hand the pages back, and the sweep
+    // would then be measuring whatever landed there afterwards.
+    let filled = wait_for(&opts.workdir.join("host-vkalloc-fill.txt"), 600);
+    let host_stamp = filled.as_deref().and_then(|t| parse_hex_field(t, "stamp"));
+    match host_stamp {
+        Some(s) => log!("host says it wrote stamp=0x{s:016x} into the located pages"),
+        None if filled.is_some() => {
+            log!("host-vkalloc-fill.txt has no parsable stamp= field — skipping the read-back")
+        }
+        None => log!("timed out waiting for the host"),
+    }
+
+    // **The half that makes this a measurement of an arena rather than of a
+    // sweep.** Finding the pages in the memfd shows the host can *reach* memory
+    // the driver allocated. Reading the host's write back through the driver's
+    // own `vkMapMemory` pointer shows the two are the same memory — which is the
+    // property `Provider::GpuExport` would need across a hypervisor, and the
+    // property `AppNamedShm` gets today by allocating on the other side.
+    let mut verdict = String::new();
+    if let Some(stamp) = host_stamp {
+        for (t, mem, run_id) in &allocated {
+            let ty = mp.memory_types[*t as usize];
+            if !ty.property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT) {
+                let range = vk::MappedMemoryRange::default()
+                    .memory(mem.mem)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                if let Err(e) = unsafe { gpu.device.invalidate_mapped_memory_ranges(&[range]) } {
+                    log!("type {t}: vkInvalidateMappedMemoryRanges failed: {e}");
+                }
+            }
+            // Re-map rather than caching the pointer: `vkMapMemory` on an
+            // already-mapped allocation is illegal, so the pointer is the one
+            // taken above — held in `ptrs` alongside the allocation.
+            let ptr = ptrs[*t as usize];
+            let w = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
+            let (mut host_ok, mut idx_ok, mut mine) = (0u64, 0u64, 0u64);
+            for p in 0..opts.pages {
+                let page = &w[p * PAGE..(p + 1) * PAGE];
+                if rec::tag_at(page, rec::OFF_MAGIC) == *rec::MAGIC
+                    && rec::get_u64(page, rec::OFF_RUN_ID) == *run_id
+                {
+                    mine += 1;
+                }
+                if rec::tag_at(page, rec::OFF_HOST1) == *rec::HOST1_TAG
+                    && rec::get_u64(page, rec::OFF_HOST1_STAMP) == stamp
+                {
+                    host_ok += 1;
+                    if rec::get_u32(page, rec::OFF_HOST1_INDEX) == p as u32 {
+                        idx_ok += 1;
+                    }
+                }
+            }
+            log!(
+                "type {t}: of {} pages, {mine} still carry our run id, {host_ok} carry the \
+                 host's write, {idx_ok} of those at the page index the host believed",
+                opts.pages
+            );
+            verdict.push_str(&format!(
+                "type {t} pages={} mine={mine} host={host_ok} host_index_ok={idx_ok}\n",
+                opts.pages
+            ));
+        }
+    }
+    write_file(&opts.workdir.join("guest-vkalloc-verdict.txt"), &verdict);
+
+    for (t, mem, _) in allocated {
+        unsafe { gpu.device.unmap_memory(mem.mem) };
+        gpu.free(mem);
+        log!("type {t}: released");
+    }
+    if filled.is_none() {
+        return Err(Fail::Other("no host-vkalloc-fill.txt within 600 s".into()));
+    }
     Ok(())
 }
 
