@@ -8,7 +8,7 @@
 //! all, and `guest_ram_is_the_only_transport` is the test that says so.
 //!
 //! That is a hard requirement rather than a preference, and the reason is in
-//! docs/design.md §19.2: the file-backed arena is stage 10's hypervisor-free
+//! docs/waycompose-design.md §28.2: the file-backed arena is stage 10's hypervisor-free
 //! twin, a fixture for the Wine leg, and a launcher that could fall back to it
 //! would produce a window that works and pixels that tear, with nothing in any
 //! log saying which of the two ran.
@@ -30,12 +30,23 @@ pub fn remote_upstream(id: &str) -> String {
     format!("{}/up.sock", remote_dir(id))
 }
 
-/// `wc-compositor.exe`'s arguments. Guest RAM, an outbound window, one output,
+/// The compositor half of `sv-guest`, and its arguments. Guest RAM, an outbound window, one output,
 /// a socket and a log — and nothing else. In particular **no `--dump-frames`**:
 /// a Firefox frame is a 2.3 MB PPM and a session is not a 60-second run
 /// (§17.7).
 pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
     vec![
+        // `sv-guest` is one binary with two halves and the first argument picks
+        // one; `sv-guest wayland …` takes exactly the arguments the old
+        // `wc-compositor.exe` took (docs/one-binary.md). It is written here
+        // rather than made configurable for the same reason the arena flags
+        // are: there is one compositor in this design and the launcher's job is
+        // to start *it*.
+        //
+        // It also means "ensure the compositor is up" stays one process to
+        // check for when the GPU half is wired in beside it, rather than two
+        // that would have to come up in the right order.
+        "wayland".into(),
         "--socket".into(),
         socket.into(),
         "--log".into(),
@@ -180,8 +191,9 @@ mod tests {
     fn guest_ram_is_the_only_transport() {
         let cfg = cfg();
         let argv = compositor_argv(&cfg, "wl-x", "log");
+        assert_eq!(argv[0], "wayland", "the one binary needs its half named first");
         assert!(argv.iter().any(|a| a == "--arena-guest-ram"), "{argv:?}");
-        assert!(argv.contains(&format!("0:{}", 256 * 1024 * 1024)));
+        assert!(argv.contains(&format!("0:{}", 768u64 * 1024 * 1024)));
         for forbidden in ["--arena", "--arena-provide", "--shared-dir", "--shared-peer-prefix"] {
             assert!(
                 !argv.iter().any(|a| a == forbidden),

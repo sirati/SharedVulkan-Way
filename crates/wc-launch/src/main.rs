@@ -13,7 +13,7 @@
 //! `wc-launch` — double-click an icon on the Windows desktop, and a Linux
 //! application appears in a window, over the guest's own RAM.
 //!
-//! Read docs/design.md §19. In one paragraph: the compositor runs here, in the
+//! Read docs/waycompose-design.md §28. In one paragraph: the compositor runs here, in the
 //! guest, on the interactive desktop, and provides an arena out of its own
 //! pinned pages; the VM host locates those pages once, runs `wc-proxy` on the
 //! plan, and runs the application; the Wayland bytes cross on a loopback relay
@@ -715,7 +715,7 @@ mod win {
         let app = cfg.app(id)?;
         // The executable goes with the request, because the icon that is
         // certainly right is the one inside the package this launcher is about
-        // to run — see `wc-session icon`, and §19.7 for what that says about
+        // to run — see `wc-session icon`, and §28.6 for what that says about
         // stage 11's `0 image(s)`.
         let exec = app.exec.split_whitespace().next().unwrap_or_default().to_string();
         let icon = match ssh(cfg, p, &["icon", &app.icon, &exec]) {

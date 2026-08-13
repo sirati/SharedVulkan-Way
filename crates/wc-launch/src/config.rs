@@ -41,6 +41,14 @@ pub struct Config {
     /// the mutex, the state file and the run id on the host.
     pub session: String,
     /// The arena, in MiB of the guest's own pinned RAM.
+    ///
+    /// **768, and that is a workaround rather than a size.** The default of 64
+    /// fragments and dies: a YouTube video killed Firefox with
+    /// `no run of 2342912 bytes (3932160 free, largest 1744896)` — two thirds
+    /// more free space than the request, in pieces none of which was big enough.
+    /// The allocator fix is somebody else's and is not landed, so until it is,
+    /// a session that lasts hours is given room to fragment in. Nothing here
+    /// makes a large arena *correct*; it makes it survive longer.
     pub arena_mib: u64,
     /// How much of it the compositor keeps for the objects it makes for clients.
     pub outbound: u64,
@@ -49,7 +57,7 @@ pub struct Config {
     /// The relay's loopback port inside the guest.
     pub port: u16,
     /// How long a session may last before the compositor's own deadline ends
-    /// it. Not an idle timeout — see docs/design.md §19.6.
+    /// it. Not an idle timeout — see docs/waycompose-design.md §28.9.
     pub session_secs: u64,
     pub apps: BTreeMap<String, App>,
 }
@@ -63,7 +71,7 @@ impl Default for Config {
             compositor: String::new(),
             relay: String::new(),
             session: "wcl".into(),
-            arena_mib: 256,
+            arena_mib: 768,
             outbound: 1024 * 1024,
             output: "1600x1000".into(),
             port: 57431,
@@ -192,17 +200,17 @@ impl Config {
 /// The example the install step writes when there is no file yet. It is here
 /// rather than in a data file so that a deployed `wc-launch.exe` can always
 /// produce one.
-pub const EXAMPLE: &str = r#"# wc-launch.ini -- see docs/design.md §19.
+pub const EXAMPLE: &str = r#"# wc-launch.ini -- see docs/waycompose-design.md §28.
 #
 # The VM host, over the host-only virtio-net link. No developer workstation is
 # in this path and none may be.
 [session]
 host       = <host-user>@<host-nat-ip>
 key        = C:\Users\<guest-user>\wclaunch\id_host
-compositor = C:\Users\<guest-user>\wclaunch\wc-compositor.exe
+compositor = C:\Users\<guest-user>\wclaunch\sv-guest.exe
 relay      = C:\Users\<guest-user>\wclaunch\probe-relay.exe
 name       = wcl
-arena-mib  = 256
+arena-mib  = 768
 outbound   = 1048576
 output     = 1600x1000
 port       = 57431
@@ -245,7 +253,7 @@ mod tests {
     #[test]
     fn defaults_and_overrides() {
         let cfg = ok("");
-        assert_eq!(cfg.arena_mib, 256);
+        assert_eq!(cfg.arena_mib, 768);
         assert_eq!(cfg.port, 57431);
         let cfg = ok("arena-mib=64\nport=1\noutput=800x600\n");
         assert_eq!((cfg.arena_mib, cfg.port, cfg.output.as_str()), (64, 1, "800x600"));

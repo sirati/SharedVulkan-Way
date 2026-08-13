@@ -26,20 +26,20 @@
 # and stamped its own memory can produce, and `proxy` starts wc-proxy with
 # `--transport arena --arena-plan`, spelled in this file and reachable from no
 # argument. There is no verb that names a file-backed arena and no flag that
-# selects one. docs/design.md §19.2: a file arena is a Wine-only fixture, and a
+# selects one. docs/waycompose-design.md §28.2: a file arena is a Wine-only fixture, and a
 # launcher that could quietly fall back to one is how tearing reaches a screen.
 #
 # WHY ROOT, AND ONLY FOR TWO STEPS
 #
 # QEMU is a *system* service on this machine, so its QMP socket and its
-# /proc/<pid>/fd are root-only (§12.9). `wc-arena-host` reads both to find the
+# /proc/<pid>/fd are root-only (§12.9). `arena-host` reads both to find the
 # arena's pages, and `wc-proxy` opens the backing object by that path. Nothing
 # else here is privileged: the application runs as the invoking user, with that
 # user's home and that user's Firefox cache, and reaches the proxy through a
 # socket the proxy's unit chowns to them.
 #
 # $ROOTC is how this deployment becomes root and is the deployment's business.
-# On testhost it is ~/rootc (docs/design.md §12.9). A machine that ran QEMU as
+# On testhost it is ~/rootc (docs/waycompose-design.md §12.9). A machine that ran QEMU as
 # the developer -- which is how shared_vulkan's own boundary is deployed --
 # would set ROOTC=bash and lose nothing.
 set -uo pipefail
@@ -129,9 +129,9 @@ up)
   case "$PAGES$OUTBOUND" in *[!0-9]*|"") die "bad page count" ;; esac
   D=$(dir_of "$ID")
   rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
-  [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host"
+  [ -x "$BIN/arena-host" ] || die "no $BIN/arena-host"
   printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
-    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
+    "$BIN/arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
     "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
     "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
     | "$ROOTC" >/dev/null 2>&1
@@ -218,7 +218,7 @@ run)
   # and the window said **"Your Firefox profile cannot be loaded"**: `--profile`
   # names a directory Firefox will not create, and a modal dialog is a mapped
   # toplevel like any other. Every number in that run was real and measured the
-  # wrong window, which is why §19 has a photograph next to every one of them.
+  # wrong window, which is why §28 has a photograph next to every one of them.
   for w in $REST; do
     case "$w" in
       "$HOME"/.wc-launch/*) mkdir -p "$w" 2>/dev/null ;;
@@ -226,11 +226,20 @@ run)
   done
   DBUS=""
   [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
+  # MOZ_GTK_TITLEBAR_DECORATION=none is a **deployment assumption and there is no
+  # protocol that carries it**. Without it Firefox draws its own titlebar on top
+  # of the one the compositor's HWND already has, with no diagnostic anywhere:
+  # two title bars, and nothing in either log saying so. The compositor's half of
+  # the fix -- answering the KDE decoration manager's bind with `default_mode(2)`
+  # -- is necessary and not sufficient; both levers are needed, and this is the
+  # one that lives where the client is started. So it lives here, in the launcher
+  # that *is* the deployment.
   # shellcheck disable=SC2086
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$D/xdg" \
     WAYLAND_DISPLAY="$D/wl-proxy" \
-    MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland $DBUS \
+    MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
+    MOZ_GTK_TITLEBAR_DECORATION=none $DBUS \
     $CMD >>"$D/app.log" 2>&1 &
   echo "run ok $!"
   ;;
