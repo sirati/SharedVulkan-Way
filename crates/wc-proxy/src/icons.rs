@@ -36,7 +36,7 @@
 //! **Not implemented: SVG.** A scalable icon needs a renderer, and a renderer
 //! is a dependency this crate does not have. A theme with only SVG resolves to
 //! nothing, which degrades to the generic Windows icon — recorded in
-//! docs/design.md §15.7 rather than hidden here, because "Adwaita is
+//! docs/design.md §16.4 rather than hidden here, because "Adwaita is
 //! SVG-first" is exactly the kind of thing that makes a feature look broken on
 //! somebody else's machine.
 

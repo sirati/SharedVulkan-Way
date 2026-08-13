@@ -4159,8 +4159,22 @@ Two things after the merge that were not true before it, both from
 
 ### 13.12 What to do next, in the order the evidence puts it
 
-**1. Implement `xdg_surface.set_window_geometry`. Nothing else on this list is
-close.**
+**1. ~~Implement `xdg_surface.set_window_geometry`. Nothing else on this list is
+close.~~**
+
+> **[CLOSED BY STAGE 9 — §15.6, and the prediction below was exact.]**
+> It hit Firefox immediately and in the shape written here. The implementation
+> landed one layer above where this item points: `FrameStyle::content_origin`
+> is still zero and still purely the titlebar-extension parameter, because once
+> the window shows a composited **tree** rather than one buffer (§15.5), the
+> geometry origin has to be subtracted while the tree is assembled or every
+> subsurface inherits the offset. The rest of this item is unchanged and is the
+> reason the fix was not argued about.
+>
+> Two assertions in `scripts/wc-proxy.sh` had been encoding the bug — the window
+> expected at 806x491, which is `weston-terminal`'s *buffer* — and are now
+> 742x427, the geometry rectangle. A stage that finds them failing should
+> suspect a regression here before it changes them.
 
 It is not implemented anywhere — `grep -r set_window_geometry crates/` finds
 nothing in `wc-compositor` or `wc-proxy` — and the consequence is that **every
@@ -4563,14 +4577,20 @@ in the smallest client available, and the guess has to be generous.
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | **136 tests**, 0 failures (133 on master) |
+| `cargo test --workspace` | **138 tests**, 0 failures (135 on master, which is 133 plus stage 8's two) |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
 | `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
 | `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
 | `scripts/wc-input.sh all` (stage 6 + this, Wine) | **82 passed, 0 failed** (52 before) |
-| `scripts/wc-guest.sh` (the guest) | **not run — see §14.10 item 1** |
+| `scripts/wc-desktop.sh` (stage 8, the interactive desktop) | **not run — needs the guest, same as below** |
+| `scripts/wc-guest.sh` (the guest) | **not run — see the boxed item in §14.12** |
+
+All of these are from **master's checkout after the merge with stage 8**, not
+from the branch before it. Every one was re-run there rather than carried over,
+which is the arrangement §12.12 used and the reason the test count in the first
+row is not the one the branch reported.
 
 The three new tests are one each side of the boundary plus the plan's parser,
 and two of them are deliberately
@@ -4685,3 +4705,1005 @@ report a perfectly true `AlreadyExists` about somebody else's arena.
    disagreement this design otherwise avoids. The fix is probably a header in the
    arena file itself, and nothing yet needs it because the file arena is a test
    substrate.
+
+---
+
+## 15. Stage 9: Firefox, and the list it hands us
+
+### 15.1 Status in one paragraph
+
+**Firefox runs on this compositor, draws its whole interface, opens its menus,
+and appears in a Windows window with Windows' own caption.** It got there by
+closing five things that were missing, four of which were found by running it
+rather than by reading anything: `wl_output`, `wl_data_device_manager`, a scene
+graph, `xdg_popup`, and the window-geometry rectangle. The two questions the
+brief called strategic are answered with evidence and neither answer is the
+feared one — Firefox **falls back to `wl_shm`** when `zwp_linux_dmabuf_v1` is
+absent, so no file descriptor has to cross anything; and it uses **KDE's**
+`org_kde_kwin_server_decoration`, asking for *client-side*, which is what
+`docs/goal-firefox.md`'s tabs-in-titlebar clause needs. What is still missing is
+the titlebar clause itself, an icon, and everything about acceleration.
+
+`docs/stage9/stage9-firefox-window.png` is the artefact: Firefox, unmodified, on the
+Linux host, through `wc-proxy`, in an `HWND` made by `wc-compositor.exe`.
+
+### 15.2 The requirement list, which is the point of the stage
+
+`docs/goal-firefox.md` closes with *"Firefox needs a specific set. Enumerate
+what it actually binds and implement that, rather than the 137 the research
+classified."* This is that enumeration, measured with `WAYLAND_DEBUG=1` against
+this compositor (`scripts/wc-firefox.sh enumerate`), and it is **nine globals**,
+not 137.
+
+Firefox opens **two Wayland connections that matter** and binds a different set
+on each, which is worth stating first because it explains every version number
+below: GTK's `GdkDisplay` is one client and Gecko's `nsWaylandDisplay` is
+another, inside one process.
+
+| global | bound by | version asked | what happens without it |
+|---|---|---|---|
+| `wl_compositor` | GTK, Gecko | 3, 4 | nothing runs |
+| `wl_shm` | GTK, Gecko | 1, 1 | nothing draws |
+| `wl_subcompositor` | GTK, Gecko | 1, 1 | **the window is empty** (§15.5) |
+| `wl_seat` | GTK, Gecko | 5, 8 | no input |
+| `wl_output` | GTK, Gecko | 2, 2 | **the window is 552x172** (§15.3) |
+| `wl_data_device_manager` | GTK | 3 | **GTK never creates a seat** (§15.4) |
+| `xdg_wm_base` | GTK, Gecko | 6, 6 | no window |
+| `org_kde_kwin_server_decoration_manager` | GTK | 1 | CSD anyway, silently (§15.7) |
+| `zxdg_decoration_manager_v1` | **nobody** | — | nothing (§15.7) |
+
+And the requests it makes on them, counted over one 25-second run, because a
+list of globals is not a list of what has to work:
+
+| request | count | implemented |
+|---|---|---|
+| `wl_surface.commit` / `.attach` / `.damage_buffer` | 519 / 181 / 158 | yes |
+| `wl_surface.frame` | 320 | yes, throttled to 16 ms |
+| `wl_shm.create_pool` + `wl_shm_pool.create_buffer` | 161 / 160 | yes |
+| `wl_compositor.create_region` + `wl_surface.set_opaque_region` | 77 / 47 | parsed, **ignored** |
+| `wl_surface.set_input_region` | 24 | parsed, **ignored** |
+| `xdg_toplevel.set_min_size` / `.set_max_size` | 25 / 25 | parsed, **ignored** |
+| `wl_surface.set_buffer_scale` | 25 | honoured only at 1, and it says so |
+| `xdg_surface.set_window_geometry` | 23 | **yes, new in this stage** |
+| `wl_subsurface.set_position` / `.set_desync` | 3 / 1 | **yes, new in this stage** |
+| `xdg_toplevel.set_title` / `.set_app_id` / `.set_parent` / `.set_maximized` | 1 each | title and app_id yes; parent ignored |
+| `xdg_popup` + `xdg_positioner` | on demand | **yes, new in this stage** |
+
+The three "parsed, ignored" rows are honest rather than alarming: an opaque
+region is an optimisation, an input region matters only where the compositor
+does hit-testing (Windows does it), and min/max size is a constraint on a
+resize this compositor does not initiate. They are listed because a later stage
+that starts doing its own hit-testing needs to know the data is already
+arriving.
+
+**What Firefox binds that we do not offer** is the other half of the list, and
+it was measured twice. Against Weston 16 headless with the GL renderer — a
+compositor that offers everything — Firefox additionally bound
+`zwp_linux_dmabuf_v1` v4, `wl_drm` v1, `wp_presentation` v2,
+`wp_viewporter` v1, `wp_commit_timing_manager_v1`, `wp_fifo_manager_v1`,
+`wp_color_representation_manager_v1`, `zxdg_output_manager_v1` v2,
+`zwp_relative_pointer_manager_v1` and `zwp_pointer_constraints_v1`. Several of
+those are **Mesa's**, not Gecko's: `wl_drm`, `wp_fifo` and `wp_commit_timing`
+come from the Wayland WSI inside the GL driver and appear only when Firefox
+gets a GL context, which is the acceleration path and not this stage.
+
+And the *upper bound* on the list, which needs no compositor at all: the
+interface-name strings compiled into the binaries. `libxul.so` contains
+`xdg_activation_v1`, `wp_fractional_scale_manager_v1`,
+`zwp_pointer_gestures_v1`, `zwp_primary_selection_device_manager_v1`,
+`gtk_primary_selection_device_manager`, `zwp_idle_inhibit_manager_v1` and
+`wp_color_manager_v1`; `libgdk-3.so` adds `gtk_shell1`, `zxdg_shell_v6`,
+`zwp_keyboard_shortcuts_inhibit_manager_v1`, `zwp_tablet_manager_v2` and
+`wp_cursor_shape_manager_v1`. **Nothing outside those two lists can ever be
+asked for**, which bounds every future stage's protocol work at roughly
+twenty-five interfaces rather than 137.
+
+### 15.3 `wl_output`: without one, the window is 552x172
+
+The compositor advertised no output until this stage, and the symptom was not
+an error. Firefox started, mapped, drew, and was **552x172 pixels** — a browser
+window smaller than its own toolbar. With one output at 1600x1000 the same
+build maps at 1280x900.
+
+That is GTK sizing a window against an empty monitor list and falling back. It
+is worth recording as the shape of the whole stage's findings: **the failure was
+silent, plausible and wrong**, and nothing in the compositor's log said
+anything.
+
+The object is `smithay::output::Output` with a mode from `--output WxH`,
+`create_global`, and `Output::enter` on each surface as it maps. The numbers are
+a flag: on the guest they should come from `EnumDisplayMonitors` and do not, and
+that is §15.14 item 3 rather than a comment nobody reads.
+
+### 15.4 The clipboard gates the keyboard, and that is not a joke
+
+The most surprising measurement of the stage. With `wl_seat` advertised at
+version 9 and working, GTK's connection **did not bind it** and Firefox printed:
+
+```
+Gdk-CRITICAL **: gdk_seat_get_keyboard: assertion 'GDK_IS_SEAT (seat)' failed
+```
+
+Adding `DataDeviceState` — thirty lines, all of them smithay's defaults — made
+GTK bind `wl_seat` v5 on the next run. So a compositor with a perfect seat and
+no clipboard gives a GTK client **no keyboard and no pointer at all**.
+
+**Why, and it is worth the paragraph, because "no input unless an unrelated
+global is present" is exactly the coupling that will bite the next person
+building a minimal compositor.** GDK does not handle `wl_seat` in its registry
+callback at all. It registers a *deferred closure* against a named list of
+globals it needs first, and runs it only when every one of them has been
+announced. The mechanism is visible in the binary: `libgdk-3.so` carries the
+symbols `required_device_manager_globals`, `seat_added_closure_run`,
+`invoke_exported_closures` — and, tellingly, a second user of the same machinery,
+`required_cursor_theme_globals` with `load_cursor_theme_closure_run`. It is a
+general dependency-declaration mechanism with two clients, not a guard bolted
+onto the seat.
+
+The dependency is real rather than defensive: `GdkWaylandSeat` construction calls
+`wl_data_device_manager_get_data_device()` unconditionally, because in GDK's
+model a seat *owns* a data device. It will not build half of one, so it does not
+build one at all, and the only thing the application sees is a `GDK_IS_SEAT`
+assertion much later from whatever first asked the display for a keyboard.
+
+Two things follow for anyone reading this as a specification. `wl_seat` alone
+satisfied nothing; `wl_data_device_manager` alone satisfied the whole list on
+3.24.51, with no primary-selection global present. And **the failure is silent
+and late** — the registry trace shows the global announced and never bound,
+which reads like a client that did not want it.
+
+There is no clipboard *content* crossing yet. The two directions are
+`SelectionHandler::send_selection` and its reverse, both of which hand the
+compositor an fd to write into — on the guest, a `wc_handle::Handle` the
+*compositor* creates. Until stage 10 that was the end of the sentence, because
+§12.13 item 7 said a server-created object had no route across the hypervisor.
+**§14 closed that**: there is an outbound arena window and a `Gift` now, and
+§14.8 makes the point that where there is an arena the export directory can go
+away entirely. So the clipboard is no longer blocked on a missing mechanism —
+it is unbuilt, which is a different and much smaller statement than the one this
+paragraph could make a stage ago.
+
+### 15.5 Firefox's pixels are not on the surface you would expect
+
+This is the finding that decides how much of a compositor this has to be.
+
+Firefox's `xdg_toplevel` surface is **GTK's client-side-decoration surface**,
+and it is transparent. Every pixel of the browser — chrome, tabs, URL bar,
+content — is in a `wl_subsurface` of it, offset by the shadow margin
+(`set_position(26, 23)` in every run). A compositor that blits the toplevel's
+buffer and discards subsurfaces does not draw Firefox badly. It draws **nothing**:
+
+```
+present window=1 1332x952 argb hash=6a8459acffa14925 centre=00000000
+```
+
+and the dumped frame is 1,268,064 pixels of `#000000`, measured with
+ImageMagick. All three hashes differed between frames, so the compositor was
+certain it was presenting; the alpha channel was the only thing changing.
+
+So this stage has a scene graph. It is the smallest one that is correct:
+
+* Every surface gets a **staging shadow** of its own, filled at commit. The
+  extra copy is what preserves stage 3's rule that the client's buffer is
+  released immediately (`surface.rs`), while still allowing a subsurface that
+  did not commit this frame to be redrawn.
+* On any commit, the whole tree of the root surface is composited into the
+  window's shadow with `with_surface_tree_upward`, parent first, in the order
+  the protocol stacks it.
+* The composite is a **copy, not a blend**. Firefox's tree is one transparent
+  surface with one opaque rectangle over it, for which they are identical. The
+  comment in `Shadow::compose` says what will break first.
+* The **damage** reported to the platform is still only the committing
+  surface's, translated — so a repaint of one subsurface does not invalidate the
+  window.
+
+The result is `docs/stage9/stage9-firefox-window.png`, and the check that says so
+without a human looking is a colour count: 406 distinct colours where there
+were 2.
+
+### 15.6 The window is the geometry rectangle, and stage 8 called this exactly
+
+**Credit where it is due: the diagnosis is stage 8's, not ours.** §13.12 item 1
+is a page long, is the only item on that list with "nothing else is close"
+attached to it, and predicted this stage's failure by name:
+
+> **This will hit Firefox immediately.** Firefox is a GTK client, GTK uses
+> client-side decorations with a shadow margin of exactly this shape, and stage
+> 9 is pointing it at this compositor now. The failure will look like a window
+> that is offset and clipped, and it will look like a blit bug, and it is not
+> one: the blit is correct and reads the wrong rectangle.
+
+It did hit Firefox immediately, and the shape was exactly as written. Stage 8
+measured it on `weston-terminal` on the real guest — a 946x555 buffer against a
+window-geometry rectangle of 882x491 at +32,+32, the compositor blitting the
+buffer's top-left 886x491 — and left it as an item rather than a patch, which
+was the right call for a stage whose errand was to look at the window.
+
+**It is implemented here**, because the scene graph had to decide how big the
+canvas was and picking the buffer would have been picking the wrong answer
+knowingly. The canvas is `SurfaceCachedState::geometry` when the client sets one
+and the root buffer's bounds when it does not; every surface is drawn at its
+tree offset **minus the geometry origin**. Firefox's numbers: a 1332x952 buffer,
+a 1280x900 window, 26 px of margin each side and 23 on top. `weston-terminal`'s
+on this workstation: an 806x491 buffer and a 742x427 window.
+
+The fix landed a layer above where §13.12 predicted. That section named
+`FrameStyle::content_origin` and the blit, which is where it belongs if the
+window shows one buffer; once the window shows a composited *tree* the origin
+has to be subtracted while the tree is being assembled, or every subsurface is
+offset by it too. `FrameStyle::content_origin` is untouched and still zero,
+which is now purely the titlebar-extension parameter it was built to be.
+
+> **For whoever merges next.** Two assertions in `scripts/wc-proxy.sh` had been
+> asserting that this bug was *present*, and they are updated in place rather
+> than relaxed: `weston-terminal`'s window was expected to be `806x491`, which
+> is its buffer, and its dumped frame to be at least that, which was 869x555 of
+> buffer. They are now `742x427` for both — the window-geometry rectangle, and a
+> dump that is exactly the window because the shadow *is* the window now. A
+> stage that finds those two numbers failing should check whether it has
+> reintroduced §13.12 item 1 before it changes them.
+
+### 15.7 Decorations: both offered, and the answer is KDE's
+
+The research said GTK does not implement `xdg-decoration` and uses KDE's
+instead, and the goal document said to measure rather than assume. Measured
+three ways, all agreeing:
+
+1. **Strings in the binaries.** `libgdk-3.so.0.2419.32` contains
+   `org_kde_kwin_server_decoration_manager` and does **not** contain
+   `zxdg_decoration_manager_v1`. `libxul.so` contains neither, so this is GTK's
+   decision and Gecko has no say in it.
+2. **The registry, with both advertised.** The compositor now offers both
+   globals. Firefox binds `org_kde_kwin_server_decoration_manager` v1 and
+   ignores `zxdg_decoration_manager_v1` — it is announced in the same
+   `wl_registry.global` burst and never bound.
+3. **What it then asks for**: `org_kde_kwin_server_decoration.request_mode` with
+   `Mode::Client`. Firefox intends to draw its own titlebar.
+
+That last line is the good news the goal document needed. Its hard clause —
+*"firefox being able to paint its UI elements into the windows titlebar"* — is
+only possible if Firefox is drawing a titlebar, and a client that had asked for
+server-side decorations would have to be argued out of it. It has not; it is
+already drawing one, and `docs/stage9/stage9-firefox-window.png` shows the consequence
+plainly: **two titlebars**, Windows' caption above Firefox's tab strip. Closing
+that gap is `DwmExtendFrameIntoClientArea` plus `WM_NCHITTEST`, moving
+`FrameStyle::extend_top` off zero, and it is the single largest remaining item.
+
+The compositor advertises `Client` as its default mode and answers
+`xdg-decoration` with `ClientSide` for anything that does ask, because it has no
+frame of its own to draw and Windows' caption is not something the Wayland side
+can promise.
+
+### 15.8 The proxy served one client. Firefox opens four
+
+Everything above is the Linux compositor. Putting `wc-proxy` and
+`wc-compositor.exe` in the path failed completely and instructively:
+
+```
+[GFX1-]: Wayland protocol error: Compositor () crashed, proxy: WP:E WP:CA WP:CR WP:CPCA WP:CPCF
+ExceptionHandler::GenerateDump ... timeout: the monitored command dumped core
+```
+
+The proxy accepted exactly one connection and exited when it closed, which was
+true of every client it had ever been given: `weston-terminal` and
+`weston-presentation-shm` each open one and keep it. Firefox's own
+`WaylandProxy` opens a **throwaway connection first** to check the compositor is
+alive, closes it, and only then connects for real. Against a one-shot proxy the
+throwaway is the only connection ever served, the real one finds a closed
+socket, and Firefox reports the compositor as crashed and dumps core.
+
+One run of Firefox makes **four** connections — the probe, GTK's, Gecko's, and one
+more that binds a registry and goes away. So `wc-proxy` now accepts in a
+loop, one thread and one **upstream connection per client**, which is what a
+compositor expects — object ids are per-connection and multiplexing would need
+the id-rewriting layer §9.3 exists to avoid. The pool transport is built per
+session; `SharedFile`'s names carry 128 bits of randomness so two of them over
+one directory cannot collide, and `Arena` **refuses the second client by name**,
+which is §12.13 item 6 arriving as a real limitation instead of a note.
+
+Two more things that cost time and are worth writing down:
+
+* **A protocol the compositor advertises must be in the proxy's XML.** Adding
+  the KDE decoration global made the proxy end the connection with
+  `org_kde_kwin_server_decoration_manager has no message 0`. That is §9.3's
+  design working — an interface it cannot walk is refused rather than
+  desynchronised — and the fix was §9.3's promised cost exactly: copy two files
+  into `crates/wc-proxy/protocols/`, add two lines. The message count in
+  `wire.rs`'s round-trip test moved 354 → 376 and the interface count 28 → 32,
+  which is the change being visible rather than silent.
+* **§8.9 again, and it looks like a code bug.** Reusing a `wine explorer
+  /desktop=NAME` name across back-to-back runs attaches to the previous,
+  dying desktop, and then `CreateWindowExW` fails for every visible top-level
+  window. It presents as `X Error: BadWindow ... X_CreateWindow` in the loader
+  log and, in the compositor's own log, as `xdg_toplevel created` followed by no
+  `HWND` — which is indistinguishable from the popup code being broken. The
+  harness now generates a fresh desktop name per run.
+
+With those closed, the Wine leg is green: 26 frames of Firefox's pixels into an
+`HWND` sized 1280x900, `mapped: 0 section, 4 shared-file, 0 arena-slice`.
+
+### 15.9 dmabuf, and the answer the rule wanted
+
+The brief called this one strategically important, because a dmabuf is a Linux
+kernel object *and* a file descriptor, and no descriptor may ever cross the VM
+boundary. The measurement:
+
+* **When `zwp_linux_dmabuf_v1` is advertised, Firefox uses it.** Against Weston
+  16 headless with the GL renderer it bound it at v4, three times, alongside
+  `wl_drm`.
+* **When it is absent, Firefox falls back to `wl_shm` and renders correctly.**
+  Not "fails", not "hangs" — the three answers the harness distinguishes. Every
+  screenshot in this section is a `wl_shm` fallback.
+
+So the rule is not in tension with the goal for *rendering*: the compositor
+simply does not advertise dmabuf, and Firefox draws through shared memory.
+
+What it costs is a copy per frame and the bandwidth in §15.10, and it costs the
+`goal-firefox.md` acceleration clause **in this form** — a software-composited
+`wl_shm` path is not "hardware acceleration is working for the renderer". The
+resolution is not a dmabuf that crosses; it is that the swapchain is already
+supposed to end up in an arena buffer on the GPU side (goal doc, "Accelerated
+rendering"), so the thing Firefox hands the compositor stays memory both sides
+mapped rather than becoming a descriptor. Nothing measured here contradicts
+that, and nothing measured here supports it either.
+
+### 15.10 What a Firefox arena costs
+
+§12.13 item 5 said 64 MiB was a guess and that the number to measure was what
+Firefox's `wl_shm` pools actually total. Measured, over runs of 25 to 150
+seconds:
+
+| what | bytes |
+|---|---|
+| GTK's pool, initially | 36,864 |
+| GTK's pool after nine doublings | 18,837,504 |
+| the CSD toplevel surface, per buffer | 5,072,256 (1332x952x4) |
+| the content subsurface, per buffer | 4,608,000 (1280x900x4) |
+| **settled, idle**: 4 pools | **14,325,120** |
+| **a 40-second startup**: 88 pools | **401,397,120** |
+
+Two things in that table matter more than the totals. The first is the doubling
+run — nine of them, from 36 KB to 18 MB — which is §10.6's "nine doublings is a
+property of the client's machine" appearing again in a completely different
+client. The second is the last column of a row that is not there: **`0` pools
+were destroyed.** In every run, of every length, `wl_shm_pool.destroy` was sent
+zero times. Firefox creates a pool per buffer and keeps them.
+
+The copy cost, from the Wine leg: 268 commits, 261 copies, 1,147.86 MiB in
+33.0 ms — 4,503.5 KiB and **126 µs per copy**, at pool scope. That is the price
+of the client being unmodified (§9.5), and on the host, which has spare CPU.
+
+### 15.11 Nothing is ever freed, and in the real topology that is guest RAM
+
+The zero in §15.10 deserves its own section, because it is not a curiosity about
+Firefox. It is **an unbounded resource the compositor holds on behalf of a client
+that never asks for it back**, and on the deployment this project is for, that
+resource is the guest's pinned physical memory.
+
+The measurement, restated so it cannot be read as a sampling artefact:
+`wl_shm_pool.destroy` was sent **zero** times, in **every** run, at every length
+from 25 seconds to 150. Not "rarely". Not "fewer than the creates". Never. The
+same trace shows 39 `wl_region.destroy` and 2 `wl_surface.destroy`, so the client
+is destroying objects it is finished with; pools are simply not among them.
+Firefox allocates a pool per buffer and keeps every one for the life of the
+process. 88 of them, 401 MB, in forty seconds of starting up.
+
+**Why it is worse here than on Linux.** On an ordinary compositor a `wl_shm` pool
+is a `memfd` the client owns; the compositor maps it, and the pages are charged
+to the client's own address space and its own machine. Nothing about "the client
+leaks pools" is the compositor's problem. Cross the hypervisor and every clause
+of that changes: the pool's bytes are copied into an arena region that lives in
+the **guest**, allocated by the guest's compositor, `VirtualLock`ed so the host
+can find the pages (§12.2), and never returned because the only signal that would
+return them is a `destroy` that never comes. A client on one machine can pin
+memory on another machine without bound, and the machine it pins is the one with
+the GPU and the smaller RAM.
+
+**What the compositor should do about it, in the order the evidence supports.**
+The instinct is to size the arena for the peak, and that is the one answer the
+numbers rule out: 400 MB in forty seconds is a *rate*, not a ceiling, and nothing
+has measured what a long session does.
+
+1. **Release on `wl_buffer.destroy`, not on `wl_shm_pool.destroy`.** The protocol
+   already allows this and it is the fix with the best evidence behind it: a pool
+   is only alive because a buffer in it is, and a client is required to destroy
+   its buffers. What is *not* yet measured is whether Firefox destroys buffers
+   either — the traces here were taken to enumerate protocol, not to audit
+   object lifetime, and the counts above are of `wl_shm_pool.destroy`
+   specifically. That measurement is one grep of a trace and it should be the
+   first thing the next stage does, because the whole design of a fix depends on
+   the answer.
+2. **Make the arena's region reusable rather than its size large.** §14 built a
+   free list with coalescing for the outbound direction and §14.12 item 2 notes
+   it has never run in anger. The inbound direction has the same shape and a much
+   higher turnover; a pool that is dropped has to return its extent, or the
+   allocator is an arena-shaped bump pointer.
+3. **Refuse loudly, and early.** `wc-proxy` already reports overflows
+   (`0 overflows` in every run here). An arena that fills should end the
+   connection with the number, not fail the next commit — a compositor that stops
+   painting because a client would not free a buffer is indistinguishable from a
+   compositor that crashed, which is exactly the failure mode §15.8 spent two
+   runs diagnosing from the other side.
+4. **Do not copy pools that nothing reads.** §9.5's copy is per commit, but the
+   *region* is per pool, and 86 of the 88 here are the same 4,608,000 bytes for
+   the same surface. A transport that recognised a re-created pool of identical
+   size for a surface it already has a region for would turn this from a leak
+   into a cache. That is speculative and is written down as speculative.
+
+None of this is built. What is built is the measurement, and the reason it is a
+section rather than a line is that **the arena flag is not the fix and sizing it
+larger would look like one**.
+
+### 15.12 The evidence
+
+| leg | what it is worth |
+|---|---|
+| `scripts/wc-firefox.sh enumerate` | the requirement list, from `WAYLAND_DEBUG=1`, against the Linux build. A stock libwayland client and a stock `wayland-server`; nothing Windows-specific can be hiding in it. |
+| `scripts/wc-firefox.sh window` | the pixels, counted by ImageMagick from a file the compositor wrote. 406 colours where a missing scene graph gives 2. |
+| `scripts/wc-firefox.sh menu` | a right-click at a named point, an `xdg_popup`, a second window, 293 colours in it. `docs/stage9/stage9-firefox-menu.png`. |
+| `scripts/wc-firefox.sh wine` | the whole chain, and the only leg that produces an `HWND`. **Wine, so a hypothesis.** |
+| `strings` over `libxul.so` and `libgdk-3.so` | the upper bound on the protocol list, and the decoration answer, from the binaries rather than from behaviour. |
+| Weston 16 headless, GL renderer | what Firefox binds when a compositor offers everything — a third-party control for the enumeration. |
+
+The `--click X,Y[,BUTTON][,MS]` flag exists because of this stage's shape:
+`--simulate-wm` clicks the centre of the window, which in a browser opens
+nothing. There is no window manager on the headless platform and no `SendInput`,
+so without a way to say *where*, the popup path could only ever be exercised
+under Wine — and Wine is a hypothesis. On Windows the flag is accepted and
+ignored, with a line saying so, because there a click comes from
+`scripts/probe-input.c` and the real message path is the better test.
+
+### 15.13 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **138 tests**, 0 failures (master's 138; this stage adds none — see below) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+| `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
+| `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed |
+| `scripts/wc-firefox.sh window` | 7 passed, 0 failed |
+| `scripts/wc-firefox.sh menu` | 6 passed, 0 failed |
+| `scripts/wc-firefox.sh wine` | 7 passed, 0 failed |
+| `scripts/wc-proxy.sh window` (stage 4, Wine) | 36 passed, 0 failed — unchanged |
+| `scripts/wc-input.sh all` (stage 6 + stage 10, Wine) | 82 passed, 0 failed — unchanged |
+| `scripts/wc-desktop.sh` (stage 8, the interactive desktop) | **not run — needs the guest** |
+| `scripts/wc-guest.sh` (the guest) | **not run — §14.13 item 1 still owns it** |
+
+All of these are from **master's checkout after the merge**, not from the branch
+before it, which is §12.12's arrangement and §14.11's. Every one was re-run
+there rather than carried over.
+
+**Two assertions in `wc-proxy.sh` had to change, and they are the honest kind of
+change.** That harness expected `weston-terminal`'s window to be 806x491, which
+is its *buffer*; with the geometry rectangle honoured it is 742x427, and the
+dumped frame is now exactly the window rather than 869x555 of buffer. Both old
+numbers were assertions that the bug in §13.12 item 1 was still present. They
+are updated in place with a comment saying so, rather than relaxed — see the
+boxed note in §15.6.
+
+**The test count did not move, and it is worth saying why rather than leaving it
+to be read as a gap.** 138 is master's number — 133 through stage 7, plus stage
+8's two and stage 10's three — and this stage adds none, which `git diff
+master...HEAD | grep -c '^+.*#\[test\]'` reports as `0`. What it changes is two
+*existing* assertions, both of which are exact figures precisely so that adding
+a protocol is a visible change rather than a silent one (§9.3): 28 interfaces to
+32, and 354 walked messages to 376.
+
+Nothing else in this stage is unit-testable in the way the earlier ones were.
+"GTK will not make a seat without a data device" is not a property of our code,
+and a test asserting it would be asserting our belief about somebody else's;
+"Firefox's pixels are in a subsurface" is a fact about a browser that a mock
+would simply restate. The harness is where those live, and it runs the real
+client — which is why `wc-firefox.sh` has 33 assertions in it and the unit
+suite has none.
+
+### 15.14 What is not proven
+
+**One item is not like the others, so it is not on the list.** §14.12 set this
+format for exactly this reason and the two boxes are the same shape, which is
+not a coincidence — they are the same gap seen from the two ends of the arena.
+
+> **Firefox has never touched the arena. Every run in this stage was
+> `shared-file`.**
+>
+> Not because of a bug: `--transport arena` **refuses the second connection by
+> name**, one region has one allocator, and there is no protocol for handing out
+> a second arena id (§12.13 item 6). Firefox opens four connections (§15.8). So
+> the two are simply incompatible today, and the incompatibility is loud rather
+> than silent, which is the only good thing about it.
+>
+> That means every claim in this section about pixels reaching a Windows window
+> is a claim about a **shared file that both sides open by path**. Everything
+> above `wc_handle::Handle::map` is identical between the two transports — the
+> proxy, the copy, the compositor, smithay's `wl_shm`, the blit — and
+> **"identical above the provider" is exactly what stage 5 spent a whole stage
+> disproving.** §10.7: every check above the pixels passed, over a transport
+> that was not delivering them, for two stages. §14.12's boxed item makes this
+> admission for the outbound direction and one stage later; this is the inbound
+> one, with a real client on it.
+>
+> What is specifically unexercised is a Firefox `wl_shm` pool copied into an
+> arena region and read by the compositor as three integers of arithmetic. The
+> pool direction over an arena *is* measured — `wc-proxy.sh window`'s
+> `term-arena` leg, and `wc-guest.sh` block 10 over real guest RAM — but with
+> `weston-terminal`, which opens one connection and allocates 15 MB. The client
+> that matters opens four and allocated 401 MB in forty seconds (§15.11).
+>
+> **Multi-connection arena support is the next stage**, and it is not a
+> compositor change: it is one arena id per client, which is a `shared_vulkan`
+> cold-path handshake question. Nothing here should be read as evidence that
+> the deployment's transport works with the deployment's client, because
+> nothing here tested that pair.
+
+§12.13's list, with the rest of this stage's changes:
+
+1. ~~The window has still never been seen.~~ **Closed by §13**, and this stage
+   inherits the closure rather than repeating it — but only for the window stage
+   8 looked at. **Nothing in §15 has run anywhere but this workstation**: no
+   Firefox window, no popup and no `WS_POPUP` has been in front of a human on the
+   guest, and §13.6's lesson says that matters more than it sounds. The good news
+   is that §15.6's fix is the one §13.7 said the guest's picture needed, so the
+   next guest run has something specific to check.
+2. **Everything in §15 is Wine or Linux.** In particular the `HWND` sizing, the
+   `WS_POPUP` placement and `ClientToScreen` are Wine's implementations of
+   them. Popups especially: `WS_EX_NOACTIVATE` and owner-window z-ordering are
+   exactly the sort of thing Wine approximates.
+
+   The count of things Wine has actually lied about is **four**, and this stage
+   takes that from §13.6 rather than from a handover: that section withdrew the
+   `SetProcessDpiAwarenessContext` entry with the measurement attached, and
+   §14.12 item 6 explains why eight, seven and four were all in circulation at
+   once. The operational rule does not depend on the number and this stage
+   inherited a live example of it — §15.8's `X Error: BadWindow` was not Wine
+   being wrong about `CreateWindowExW`, it was §8.9's reused desktop name, asked
+   in a window station that was going away.
+3. **New: nothing here has been typed into.** The seat exists and GTK now builds
+   one, and the only input this stage delivered was a single synthetic click on
+   the headless platform. §11.10's list is otherwise unchanged.
+4. **New: a menu has never been dismissed.** The popup is created, placed, drawn
+   and destroyed by the client. Nothing tests what happens when the user clicks
+   elsewhere — `xdg_popup.popup_done` is wired to `WM_CLOSE`, which is not the
+   message a click outside a menu produces.
+5. **New: alpha is still thrown away** (§8.7), and it now matters more. The
+   composite is a copy rather than a blend, so a client whose subsurfaces are
+   genuinely translucent will show hard edges. Firefox's are not.
+6. **New: two clients, one output, no idea what a second monitor does.**
+7. **New: nothing frees a pool** (§15.11), which is a resource question rather
+   than a correctness one until the transport is an arena, and then it is both.
+8. **§12.13 items 3, 4 and 9 are unchanged**; item 5 is now measured (§15.10)
+   rather than a guess, without being solved; and **item 7 is closed by §14**,
+   which is what lets §15.4's clipboard paragraph end differently than it would
+   have a stage ago.
+
+### 15.15 What to do next, in the order the evidence puts it
+
+1. **`DwmExtendFrameIntoClientArea`.** The goal document's hardest clause, and
+   the prerequisite §13.7 named is now met: *"the first step is not the DWM call:
+   it is honouring the geometry rectangle, because until the compositor knows
+   where the client thinks its window is, it cannot decide what to extend."* It
+   knows (§15.6). And §15.7 settles the other half — Firefox has already asked
+   for client-side decorations through KDE's protocol, so there is nothing to
+   negotiate, only room to make. `FrameStyle::extend_top` has been parameterised
+   since stage 3 and is still zero; `docs/stage9/stage9-firefox-window.png` with its two
+   title bars is the bug report, and it is §8.11 item 7 for the third time.
+2. **Make the arena serve more than one connection**, and then run Firefox over
+   it. This is the boxed item in §15.14 and it is the only thing on this list
+   that changes what the evidence is worth rather than adding to it. One arena id
+   per client is a `shared_vulkan` cold-path handshake question rather than a
+   compositor one; the compositor's side of it is already a registry keyed by id
+   (`wc_handle::arena`).
+
+   It pairs naturally with §14.13 item 1 — that stage's boxed item needs a guest
+   run over guest RAM, this one needs a client that opens four connections, and
+   a single `wc-guest.sh` run with Firefox on the far end would close both. **The
+   guest is not free**: §12.8 exists because an experiment took another agent's,
+   and `WC_GUESTNAME` / `WC_HOST_SHARE` are how this is done without repeating
+   it.
+3. **Ask Windows how big the desktop is.** `--output` is a flag with a plausible
+   default, which is exactly the shape of the bug §15.3 describes.
+4. **Find out whether Firefox's pool cache ever releases.** §15.10. Zero
+   `wl_shm_pool.destroy` in every run is either a cache that never shrinks or a
+   cache we never put under pressure, and those need different fixes.
+5. **`WM_SETICON`.** Stage 8 confirmed the taskbar button exists with the
+   generic icon. `set_app_id` is `"firefox"`, arriving and logged; nothing
+   resolves it to pixels. `xdg-toplevel-icon-v1` is **not** in either binary's
+   strings, so the goal document's "check rather than assume" is answered: it
+   will not be handed to us and the app-id route is the only one.
+
+---
+
+## 16. Stage 11: the taskbar shows the client's own icon
+
+### 16.1 Status in one paragraph
+
+**The Windows taskbar carries the client's real icon, and the pixels came from
+an icon theme on the other side of a hypervisor.** There is a photograph
+(`docs/stage11/stage11-taskbar-icons.png`), a control taken minutes later with
+one flag changed (`stage11-taskbar-generic.png`, which is stage 8's generic
+icon), and a measurement that does not need an eye: the host's own
+`16x16/apps/qemu.png` is found inside the guest's window caption by
+`compare -subimage-search` at +16,+7 with an RMSE of 595, against 26741 for the
+same search in the control. `docs/goal-firefox.md`'s first clause — *taskbar
+icon and title correct* — is closed.
+
+Three things are worth saying before the detail. First, the interesting half of
+this was never `WM_SETICON`: it was that `xdg_toplevel.set_app_id` names a
+desktop entry in an icon theme that exists only on the *client's* machine, so
+something on the Linux side has to resolve it and ship pixels. Second,
+`xdg-toplevel-icon-v1` — the protocol that would do this properly — is
+implemented here and **cannot** carry this case, for a reason that is a
+measurement rather than an opinion (§16.2). Third, the taskbar showed the
+generic icon for an entire run *after* both `HICON`s were set successfully, and
+the reason was a console window (§16.6).
+
+### 16.2 `xdg-toplevel-icon-v1`, measured in real clients, and why it cannot carry this anyway
+
+`docs/goal-firefox.md` says to *"check rather than assume"* whether Firefox
+implements it. Checked, on this machine's store, by looking for the interface
+name in the binaries that would contain it:
+
+| binary | `xdg_toplevel_icon_manager_v1` | control: `xdg_wm_base` |
+|---|---|---|
+| Firefox 151's `libxul.so` | **0** | 2 |
+| GTK 3.24.51 and 3.24.52 (`libgdk-3.so`) | **0** | 3 |
+| GTK 4.20.3 and 4.22.4 (`libgtk-4.so`) | **present**, both interfaces | 2 |
+| weston 15 and 16 (`weston-terminal`) | **0** | 2 |
+
+So the answer is no for everything this project has ever run, and yes for GTK 4
+— which matters, because it means the protocol is not theoretical and a
+compositor that ignored it would be wrong about a real toolkit. The XML is in
+`wayland-protocols` 1.48 and 1.49 under `staging/`, and the vendored smithay
+already has a `wayland::xdg_toplevel_icon` module, so implementing it cost about
+forty lines. Stage 9 reached the same conclusion from the other direction
+(§15.15 item 5) by grepping both of Firefox's binaries.
+
+**But even a client that implements it would not have helped here, and this is
+the part worth keeping.** The protocol attaches an icon to an `xdg_toplevel`
+*object*. A Wayland object belongs to exactly one client, so only the
+application can use it on its own behalf. The resolver in this topology is
+wc-proxy, which is a *different* client of the compositor — it cannot touch the
+application's objects, and the obvious workaround, injecting requests into the
+application's own connection with ids the proxy mints, does not work:
+
+```rust
+// wayland-backend/src/rs/map.rs
+match id.cmp(&store.len()) {
+    Ordering::Greater => Err(()),      // "not the next free id"
+```
+
+Client ids must be *the next free one*. There is no high reserved band to take
+from — an id above the end of the map is a protocol error — so the only ids a
+proxy could inject are exactly the ones the client is about to allocate, and the
+client's next `new_id` would then be a duplicate. The alternative is renumbering
+every object id in both directions, which puts a rewrite in front of every
+message in the protocol; §9.3's whole argument for this proxy being small enough
+to trust is that it does *not* understand most of what it carries.
+
+So the icon feed is keyed by **application id** rather than by object, on a
+second connection, and `xdg-toplevel-icon-v1` is implemented alongside it for
+the clients that do send it. The two are not alternatives: a client that sets
+its own icon wins, always, because it is the application saying what it looks
+like and the other is a guess made from a string.
+
+### 16.3 What was built, in the order the bytes move
+
+```
+weston-terminal / firefox        wc-proxy                    wc-compositor.exe
+   (unmodified, on Linux)      (has the icon theme)          (on the guest)
+        │ set_app_id ─────────────▶ crates/wc-proxy/icons.rs
+        │                            .desktop → Icon= → theme → PNG → BGRA
+        │                                │
+        │                                │ wc_icon_manager_v1, on a second
+        │                                │ connection: chunk* image* publish
+        │                                └──────────────────▶ icon::IconStore
+        │ commit ──────────────────▶ arena ─────────────────▶ window maps
+        │                                                     best_match(16,32)
+        │                                                     WM_SETICON ×2
+```
+
+Five pieces, and each is where it is because of the boundary:
+
+* **`crates/wc-proxy/src/icons.rs`** — app id to pixels. Desktop entry lookup,
+  `Icon=`, an icon-theme search, PNG decode, premultiply. On the host, because
+  that is the only machine with `$XDG_DATA_DIRS` on it.
+* **`crates/wc-compositor/protocols/wc-icon-v1.xml`** — `wc_icon_manager_v1`:
+  `chunk(array)`, `image(w,h)`, `publish(app_id)`, `forget(app_id)`.
+* **`crates/wc-proxy/src/iconlink.rs`** — a hand-written Wayland client for
+  exactly that interface, which reads its opcodes out of the compositor's own
+  copy of the XML with `include_str!`, so the two ends cannot drift.
+* **`crates/wc-compositor/src/icon.rs`** — the store, the staging arithmetic,
+  buffer-to-image conversion, and `best_match`, which is the choice of which
+  image fills which Win32 slot.
+* **`platform/win32.rs`** — `set_icon` was written in stage 3 and had never
+  run against anything but `--debug-icon`. It now takes a *set*.
+
+### 16.4 The resolver, and the three things it does not do
+
+The lookup is the XDG icon-theme specification's, implemented to the depth that
+finds what real themes actually contain:
+
+1. `$XDG_DATA_HOME`, then `$XDG_DATA_DIRS`, in order.
+2. `<app_id>.desktop`, then the lower-cased name, then — and this is the one a
+   panel actually relies on — any entry whose `StartupWMClass` is this app id.
+3. `Icon=` from the `[Desktop Entry]` group **only**. Firefox's own desktop file
+   has three further groups with their own `Icon=` keys, and a parser that took
+   the first match in the file would give a window the "New Private Window"
+   icon on some machines and the right one on others.
+4. Inside a theme: the directory tree is walked and the size is taken from
+   whichever path component looks like one, so `48x48/apps/firefox.png` and
+   `apps/48/firefox.png` are both found. `index.theme` is read only for
+   `Inherits`; `hicolor` is always last, as the specification requires.
+5. `pixmaps/` as a final resort, treated as unsized.
+
+Three sizes are shipped — 16, 32 and 48 — because Windows asks for two
+(`SM_CXSMICON`, `SM_CXICON`) and a theme has both *drawn* rather than resampled.
+Scaling one image at the far end would throw away information we were given for
+free.
+
+**Not implemented, and each is a real limit:**
+
+* **SVG.** A scalable icon needs a renderer. A theme with only SVG resolves to
+  nothing and degrades to the generic icon. Adwaita on this machine is largely
+  SVG, which is exactly the sort of thing that makes a feature look broken on
+  somebody else's machine, so it is recorded here rather than discovered there.
+* **The icon *name* half of `xdg-toplevel-icon-v1`.** A client may send a name
+  instead of buffers; the compositor has no theme to resolve it against. It is
+  looked up in the published store instead (an application's icon name is
+  usually its app id) and says so in the log when that misses.
+* **A cache across runs.** Each proxy process resolves each app id once.
+
+The cost, measured on the host: **3.4 to 6.3 ms** for an app id that resolves,
+and **112 ms** for one that does not — the miss is expensive because it scans
+every `.desktop` file in every data directory looking for a `StartupWMClass`.
+Once per app id per connection, off the frame path, several round trips before
+the window is ever shown.
+
+### 16.5 What crosses, and why it is an array rather than a `wl_buffer`
+
+Icon pixels are **data on the wire**: a `wl_array` argument, in chunks. Not a
+`wl_shm` buffer, which is what `xdg-toplevel-icon-v1` uses and what the pool
+machinery in this proxy already knows how to make.
+
+The rule (§9.4) is that no descriptor crosses, and a `wl_shm` pool would not
+have broken it — the proxy would have named a region the way it names every
+other one. It would have put an `h`-shaped argument on a wire for a few
+kilobytes sent once per application, to save a copy nobody can measure, and it
+would have made the icon path depend on the pool allocator. An array is a
+`memcpy` into a message.
+
+The chunk size is **3072 bytes**, and that number is a measurement of the far
+end rather than a preference: `wayland-backend`'s receive buffer is
+`DEFAULT_MAX_BUFFER_SIZE = 4096` (`rs/mod.rs`), a message that does not fit in
+it cannot be read at all, and a 48x48 BGRA image is 9216 bytes. So an icon is
+`chunk chunk chunk image`, repeated per size, then `publish`.
+
+Two conventions travel with the bytes and both are silent if wrong. The layout
+is BGRA, which is what `wl_shm`'s ARGB8888, this compositor's shadow buffers and
+a 32-bit `BI_RGB` DIB all already are (§8.4). The alpha is **premultiplied**,
+which is what `wl_shm` specifies and what `AlphaBlend` — which is how the shell
+composites a 32-bit icon — is defined on; PNG's is straight, so the resolver
+multiplies through at decode. Getting that wrong is a pale halo round the icon
+rather than an error, so it is asserted in a unit test rather than left to a
+photograph.
+
+### 16.6 Both `HICON`s were set, and the taskbar showed the generic icon anyway
+
+This is the finding of the stage, it cost a run, and no log on either side could
+have shown it.
+
+The compositor's own account was unambiguous — `icon big <- 32x32`,
+`icon small <- 16x16`, `icon set: 2 of 2 slots` — and the window's caption
+carried the icon in the photograph. The taskbar button did not: it had Windows'
+generic application icon on it, which is precisely the picture stage 8 took when
+nothing called `WM_SETICON` at all.
+
+The cause is that **the shell groups taskbar buttons by process, and a console
+window is a window.** The compositor is started by a scheduled task (§13.3),
+which gives it a console; the shell put the console window and the toplevel
+under one button; and the icon on a *grouped* button comes from the executable
+rather than from either window's `WM_SETICON`. `wc-compositor.exe` has no icon
+resource, so the group got `IDI_APPLICATION`.
+
+The fix is three lines and one guard: hide the console window, but only if
+`GetConsoleProcessList` says this process is the only one attached to it. A
+console shared with a `cmd.exe` or an ssh session belongs to that other process
+and hiding it would take away somebody's terminal; a console with exactly one
+process attached was created for this process and dies with it. It is not
+tidiness — it is the difference between the taskbar showing the client's icon
+and showing the generic one.
+
+**Windows had not lied. Nothing had.** Every call succeeded and every log line
+was true; the icon was on one of the process's two windows and the shell was
+showing the other one's group. This is the same shape as §13.7 — the mistake was
+not in the operation, it was in which of two things the answer was about — and
+the only instrument that shows it is a picture of the taskbar.
+
+### 16.7 What happens when the app id resolves to nothing
+
+Deliberately the same length of code path as success, because a missing icon is
+the *common* case and it must not degrade to a blank button, a crash or a
+silence.
+
+* A client with **no app id at all** — `weston-presentation-shm` sets none,
+  measured — gets an empty set and a log line saying nothing can be resolved for
+  it.
+* An app id with **no desktop entry and no theme file** — `weston-terminal`'s
+  own `org.freedesktop.weston.wayland-terminal` on a machine without a weston
+  desktop entry, which is every machine, because weston installs none — resolves
+  to zero images, and the proxy publishes *that*, which the compositor stores as
+  a negative answer so the next window with the same app id costs nothing.
+* An empty set reaching the platform destroys both `HICON`s and sets neither, so
+  the window falls back to its **class icon**, which is `IDI_APPLICATION` — the
+  generic one. That is what `stage11-taskbar-generic.png` is a photograph of.
+* A compositor with no `wc_icon_manager_v1` global — an older build — makes the
+  proxy's second connection bind nothing; it says so once and stops resolving.
+  The `wl_display.sync` that follows `get_registry` is what makes "the manager
+  has not arrived yet" distinguishable from "this compositor has no manager".
+* A publisher that miscounts its bytes gets a protocol error on the *icon*
+  connection, which is the one real advantage of the feed being a separate
+  client: it costs an icon rather than a window.
+
+`weston-terminal`'s app id is worth recording on its own, because the obvious
+guess is wrong and the harness was written against the guess: it is
+**`org.freedesktop.weston.wayland-terminal`**, not `weston-terminal`.
+
+### 16.8 Four things that cost a run each, all of them about sharing a guest
+
+§13.9 said an image name is not an identity on this guest. Stage 11 found two
+more ways for that to be true and two ways to photograph the wrong instant.
+
+* **`taskkill /IM wc-compositor.exe` without `/F` sends `WM_CLOSE`.** Another
+  worktree running an older `wc-guest.sh` reaps nothing of ours — our process
+  survives — but our *window* closes, the compositor correctly sends
+  `xdg_toplevel.close`, the client exits politely, and the photograph is of a
+  taskbar with no button on it. The compositor's own log says `window 1 close
+  requested` with nothing on this side having asked. This stage now deploys the
+  compositor under its own image name, `wc-s11-compositor.exe`, which no other
+  harness kills. It happened again afterwards, so the rename is not a complete
+  defence and the harness retries a pass whose window did not survive.
+* **A scheduled task costs about a minute, and the first version of the harness
+  did not know that.** It held the client for 60 seconds, photographed the
+  window inside that, and then took the taskbar's picture two tasks later — by
+  which time the window had been gone for a minute. The result was a taskbar
+  with the right number of buttons and none of them ours, which reads exactly
+  like "Windows refused the icon". The client is now held for 210 seconds and
+  every picture is taken by one task.
+* **A shot of a window that is not there leaves the previous shot's file.** The
+  harness fetched it and reported a photograph it had not taken; the two passes'
+  images were byte-identical and the comparison between them said the icon was
+  in both. The output files are deleted on the guest before every attempt now.
+* **Two runs on one TCP port**, which is §13.10's lesson arriving unchanged: the
+  second run's relay listener sits in `TIME_WAIT`, the client never connects, and
+  what the harness prints is the *client's* "Failed to process Wayland
+  connection: Broken pipe" — which reads as the compositor having gone away. The
+  port is derived from the run's pid now.
+
+A fifth, smaller: registering two scheduled tasks with the same name in one run
+leaves `Start-ScheduledTask` with nothing to start and no error, which printed
+as "the compositor did not start" for the second pass only — with the
+compositor's own log on the guest proving that it had.
+
+### 16.9 The evidence
+
+`docs/stage11/README.md` is the exhibit list. The two that carry the claim:
+
+| | |
+|---|---|
+| `stage11-taskbar-icons.png` | the guest's taskbar, our window's button, the host's QEMU icon on it |
+| `stage11-taskbar-generic.png` | the same run with `--no-icons`: the same button, the generic icon |
+
+The icon is QEMU's rather than Firefox's **on purpose**, and it is about the
+measurement rather than about taste: the guest's taskbar has Firefox pinned to
+it, so a search for the Firefox icon in a taskbar capture finds one whether or
+not any of this works. The QEMU icon is in the host's theme, is not in the
+guest's taskbar and is not in Windows at all, so finding it there is only
+possible if it crossed.
+
+The client is `weston-terminal`, unmodified, on the far side of a hypervisor —
+and because weston ships no desktop entry for it, the harness writes a
+three-line one naming an icon that the *host's own theme* holds. What is
+synthetic is that file; the theme search, the size choice, the decode, the
+premultiply, the chunking and `WM_SETICON` are all the real path.
+
+**And then the goal's own client, with nothing synthetic in it at all.**
+`stage11-taskbar-icons-firefox.png` is Firefox on the Linux host, through the
+proxy, in a window made by `wc-compositor.exe`, with **Firefox's icon on its
+taskbar button** — resolved from the `firefox.desktop` and the
+`hicolor/32x32/apps/firefox.png` that the Firefox package on the host installs,
+with no file written by this harness (`WC_ICON_NAME=` empty refuses to write
+one). Two things about that run are worth keeping:
+
+* It needs `--transport shared-file`, because Firefox opens two connections and
+  the arena serves one (§12.13 item 6, §15.14's boxed item). The icon path does
+  not care which transport carries the pixels — it does not use one — but the
+  window will not appear without it.
+* The window in the picture is Firefox's *"Profile Missing"* dialog, because the
+  harness named a profile directory that did not exist. That is a fault in a
+  command line and not in anything below it: the window, the caption, the button
+  and the icon are all real, and the app id Firefox set on the way to
+  complaining is the same `"firefox"` stage 9 measured.
+
+### 16.10 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **154 tests**, 0 failures (138 on master, +16 here) |
+| `cargo clippy --workspace --all-targets` (Linux) | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-icon.sh deploy` | builds and copies |
+| `scripts/wc-icon.sh taskbar` (`weston-terminal`, the guest's desktop) | 12 passed, 0 failed |
+| `scripts/wc-icon.sh taskbar` (Firefox, `--transport shared-file`) | 7 passed, 0 failed, 1 skipped |
+
+The skip is the caption comparison in the Firefox run, which wants a 16x16
+reference file to search for and is looking in the Firefox package's own theme;
+it is a harness gap rather than a result, and the taskbar picture from that run
+is the one that matters.
+
+The sixteen tests are the parts that are arithmetic rather than Win32 or
+filesystem: `best_match`'s preference for scaling down over scaling up, the
+staging arithmetic that splits one run of chunks into several images, the
+strided-buffer repack, the opaque-format alpha fix, the desktop-entry group
+parser, the size-from-path rule, the theme chain, a path-traversal refusal, and
+an end-to-end resolution against a theme built in a temporary directory — which
+asserts the premultiply on a two-pixel PNG written by hand, because that is the
+conversion whose failure is a halo rather than an error.
+
+What is *not* a unit test is the whole of §16.6, and could not be: the icon was
+set correctly on a window whose button the shell was not drawing.
+
+### 16.11 What is not proven
+
+1. **The taskbar claim rests on one photograph and its control.** The window
+   caption's copy of the same icon is measured — `subimage-search`, RMSE 595
+   against 26741 — and the taskbar's is not, because a taskbar button draws the
+   icon scaled to 24 px and the search finds nothing at that size. A crop
+   comparison against the button rectangle would close it and needs the button's
+   position, which nothing here knows.
+2. **`xdg-toplevel-icon-v1` is implemented and has never been exercised by a
+   client.** No client this project can run implements it (§16.2), and the only
+   thing that has driven the code path is the compositor's own `--debug-icon`.
+   The right test is a GTK 4.20 application, which needs `wl_output`,
+   `wl_subcompositor` and a data device — all of which stage 9 added — and one
+   was not run here.
+3. **Nothing has resolved an icon on the machine the goal describes.** The
+   resolver reads the *host's* theme, which is right; but on this rig the host
+   is the VM host rather than a general Linux desktop, and its theme has two
+   application icons in it. A machine with Adwaita and SVG-only icons will
+   resolve less than this one did, and §16.4 says so rather than finding out
+   later.
+4. **The icon is never updated after the window is mapped, except by a
+   publish.** A client that changes its app id gets a fresh lookup; a client
+   whose *theme* changes does not, and neither does a window whose DPI changes,
+   which is where `SM_CXICON` would move.
+5. **`forget` is implemented and unused.** Nothing in the proxy calls it.
+6. **The second connection is a second client to the compositor**, so a
+   compositor that counted clients or exited with `--once` when the last one
+   left now sees two. `--once` is a harness flag and the change is benign, but
+   it is a change.
+7. **Any client can bind `wc_icon_manager_v1` and publish an icon for any app
+   id.** There is no notion of who is entitled to say what an application looks
+   like. That is the same trust model as the rest of this compositor (§2.6) and
+   it is worth naming rather than assuming.
+
+### 16.12 What to do next
+
+1. **Give the compositor's window an `AppUserModelID`.** §16.6 is a symptom of
+   the shell deciding what our window belongs to by looking at the process. A
+   per-window `SetCurrentProcessExplicitAppUserModelID` — or the per-window
+   property — is how a Windows application controls grouping, and it is what a
+   compositor showing several clients' windows will need anyway: two toplevels
+   from two different applications should not share a taskbar button, and today
+   they would.
+2. **Run a GTK 4 client** and close §16.11 item 2. The compositor advertises
+   `xdg_toplevel_icon_manager_v1` with the sizes it wants; GTK 4.20 binds it; the
+   whole path is written and untested against anything but ourselves.
+3. **Resolve icon *names*, not just app ids.** A client that sends
+   `xdg_toplevel_icon_v1.set_name` is asking for a theme lookup on the
+   compositor's side, which is the one thing the compositor cannot do. The proxy
+   could answer it — it is the same resolver, keyed by the same string — if the
+   compositor could ask, which needs a request in the other direction.
+4. **Cache resolutions across proxy runs**, or don't, but measure the 112 ms
+   miss first: it is a full scan of every desktop file, and it happens once per
+   app id that has no icon, which on a busy desktop is most of them.

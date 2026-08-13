@@ -223,7 +223,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let spec = Spec::builtin()?;
     println!("[proxy] {} interfaces from the vendored protocols", spec.len());
 
-    let transport: Box<dyn PoolTransport> = match args.transport.as_str() {
+    // CHANGED IN STAGE 9: a **factory**, called once per client, rather than
+    // one transport for the process. See the accept loop below for why there is
+    // more than one client now.
+    //
+    // `arena` refuses the second call, and refusing loudly is the point: one
+    // region, one allocator, and no protocol for handing out a second arena id
+    // (docs/design.md §12.13 item 6). A silent share would give two clients
+    // overlapping offsets into the same guest pages, which presents as one
+    // window showing another's pixels.
+    let mut arena_taken = false;
+    let mut make_transport =
+        || -> Result<Box<dyn PoolTransport + Send>, Box<dyn std::error::Error>> {
+        Ok(match args.transport.as_str() {
         "shared-file" => {
             if args.peer_prefix.is_empty() {
                 return Err(
@@ -246,7 +258,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // for it to open. What it was started with is
         // `--arena-guest-ram <id>:<size>`, and what it printed is the run id
         // this plan was made from.
+        "arena" if arena_taken => {
+            return Err("the arena is already serving a client, and there is one arena \
+                        (docs/design.md §12.13 item 6). Use --transport shared-file for a \
+                        client that opens more than one connection."
+                .into());
+        }
         "arena" if !args.arena_plan.as_os_str().is_empty() => {
+            arena_taken = true;
             if args.arena_outbound != 0 {
                 return Err(
                     "--arena-outbound and --arena-plan are mutually exclusive: the window \
@@ -267,6 +286,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Box::new(t)
         }
         "arena" => {
+            arena_taken = true;
             let mut t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
             if args.arena_outbound != 0 {
                 t.reserve_outbound(args.arena_outbound)?;
@@ -284,6 +304,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Box::new(t)
         }
         other => return Err(format!("--transport {other}? try shared-file or arena").into()),
+        })
     };
 
     let listener = Listener::bind(&args.runtime_dir, &args.socket)?;
@@ -294,67 +315,129 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.headroom
     );
 
-    // Connect upstream *before* accepting, so that a client is never accepted
-    // into a proxy with nowhere to forward to. A client that connects and then
-    // sees the socket close has no way to distinguish that from a compositor
-    // crash and generally exits with a confusing message.
-    let upstream = std::os::unix::net::UnixStream::connect(&args.upstream).map_err(|e| {
-        format!("cannot reach the compositor at {}: {e}", args.upstream.display())
-    })?;
-    println!("[proxy] upstream {} connected", args.upstream.display());
-
-    let client = listener.accept_one(args.accept_timeout)?;
-    println!("[proxy] client connected");
-
-    // STAGE 11. A second connection, for icons, opened only if it is wanted.
-    // A failure here is logged and shrugged off: this whole feature is
-    // cosmetic, and a compositor that is too old to have the global, or a
-    // socket that will not take a second client, must cost a picture rather
-    // than a window.
-    let mut icons = if args.icons {
-        let search = wc_proxy::icons::Search {
-            data_dirs: wc_proxy::icons::default_data_dirs(),
-            theme: args.icon_theme.clone(),
+    // CHANGED IN STAGE 9: **the proxy serves more than one connection.**
+    //
+    // Until this stage it accepted exactly one client and exited when that
+    // client closed, which was true of every client it had been given —
+    // `weston-terminal` and `weston-presentation-shm` each open one connection
+    // and keep it. Firefox does not, and the failure is total rather than
+    // partial: its `WaylandProxy` opens a **throwaway connection first** to
+    // check the compositor is alive, closes it, and only then connects for
+    // real. Against a one-shot proxy the throwaway is the only connection that
+    // is ever served; the real one finds a closed socket, and Firefox reports
+    // `Wayland protocol error: Compositor () crashed` and dumps core. Measured,
+    // and it is docs/design.md §13.8.
+    //
+    // Each client gets its **own upstream connection**, which is what a
+    // compositor expects: object ids are per-connection, and multiplexing two
+    // clients onto one would need an id-rewriting layer that this deliberately
+    // is not (§9.3).
+    let mut served: usize = 0;
+    let deadline = std::time::Instant::now() + args.accept_timeout;
+    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    loop {
+        // The first client is waited for; later ones are only accepted while
+        // something is still running, so a proxy whose client has finished does
+        // not sit forever.
+        let wait = if served == 0 {
+            deadline.saturating_duration_since(std::time::Instant::now())
+        } else {
+            args.idle_timeout
         };
-        println!(
-            "[proxy] icons: theme {:?}, data dirs {}",
-            search.theme,
-            search
-                .data_dirs
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(":")
-        );
-        match wc_proxy::iconlink::IconLink::connect(&args.upstream, &spec, search) {
-            Ok(link) => Some(link),
+        let client = match listener.accept_one(wait) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => return Err(e.into()),
+        };
+        served += 1;
+        let n = served;
+
+        // Upstream is connected per client and **after** the accept, unlike
+        // stage 4's order. The old comment said connecting first stops a client
+        // being accepted into a proxy with nowhere to forward to; that is still
+        // true and is now handled by failing the connection immediately, which
+        // is a closed socket at the same moment either way.
+        let upstream = match std::os::unix::net::UnixStream::connect(&args.upstream) {
+            Ok(u) => u,
             Err(e) => {
-                eprintln!("[proxy] icons: no icon feed ({e}); windows will get generic icons");
-                None
+                println!(
+                    "[proxy] client {n}: cannot reach the compositor at {}: {e}",
+                    args.upstream.display()
+                );
+                continue;
             }
-        }
-    } else {
-        println!("[proxy] icons: --no-icons, so app ids are forwarded and not resolved");
-        None
-    };
+        };
+        println!("[proxy] client {n} connected, upstream {} connected", args.upstream.display());
 
-    let mut session = Session::new(spec, transport, args.scope, args.headroom);
-    session.set_trace(args.trace);
-    let mut log = |s: &str| println!("[proxy] {s}");
-    let why = proxy::pump(
-        &mut session,
-        client,
-        upstream,
-        icons.as_mut(),
-        args.idle_timeout,
-        &mut log,
-    )?;
+        // A transport per session. The names `SharedFile` gives pool files
+        // carry 128 bits of randomness, so two of them over one directory
+        // cannot collide; an `Arena` is a single region with one allocator and
+        // **cannot** be shared, which is docs/design.md §12.13 item 6 arriving
+        // as a real limitation rather than a note.
+        let transport = match make_transport() {
+            Ok(t) => t,
+            Err(e) => {
+                println!("[proxy] client {n}: no transport for it: {e}");
+                continue;
+            }
+        };
 
-    println!("[proxy] stopped: {why}");
-    println!("[proxy] transport {}", session.transport_name());
-    println!("[proxy] {}", session.stats.summary());
-    if let Some(link) = &icons {
-        println!("[proxy] {}", link.summary());
+        let (spec, scope, headroom, trace, idle) =
+            (spec.clone(), args.scope, args.headroom, args.trace, args.idle_timeout);
+        // STAGE 11. The icon feed, one per served connection.
+        //
+        // **Per connection rather than per process**, which is a decision and
+        // not an accident of where the code sits. A shared feed would be one
+        // more thing behind a mutex for no gain: an icon is published once per
+        // distinct app id, `IconLink` already remembers which ones it has done,
+        // and Firefox's throwaway connection (§15.2) sets no app id at all, so
+        // the second connection costs a socket and nothing else. Keeping it
+        // inside the thread also means a resolver that fails takes its own
+        // client's icons with it and nobody else's.
+        let (want_icons, icon_theme, upstream_path) =
+            (args.icons, args.icon_theme.clone(), args.upstream.clone());
+        threads.push(std::thread::spawn(move || {
+            // The `+ Send` is only needed to cross this boundary; `Session`
+            // itself has no opinion, and widening its signature would push the
+            // bound into every test that builds one.
+            let transport: Box<dyn PoolTransport> = transport;
+            let mut icons = if want_icons {
+                let search = wc_proxy::icons::Search {
+                    data_dirs: wc_proxy::icons::default_data_dirs(),
+                    theme: icon_theme,
+                };
+                // A failure here is logged and shrugged off. The whole feature
+                // is cosmetic: a compositor too old to have the global, or a
+                // socket that will not take a second connection, must cost a
+                // picture rather than a window.
+                match wc_proxy::iconlink::IconLink::connect(&upstream_path, &spec, search) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!("[proxy] client {n}: no icon feed ({e}); icons will be generic");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut session = Session::new(spec, transport, scope, headroom);
+            session.set_trace(trace);
+            let mut log = |s: &str| println!("[proxy] client {n}: {s}");
+            match proxy::pump(&mut session, client, upstream, icons.as_mut(), idle, &mut log) {
+                Ok(why) => println!("[proxy] client {n} stopped: {why}"),
+                Err(e) => println!("[proxy] client {n} failed: {e}"),
+            }
+            println!("[proxy] client {n} transport {}", session.transport_name());
+            println!("[proxy] client {n} {}", session.stats.summary());
+            if let Some(link) = &icons {
+                println!("[proxy] client {n} {}", link.summary());
+            }
+        }));
     }
+
+    for t in threads {
+        let _ = t.join();
+    }
+    println!("[proxy] stopped: {served} client(s) served");
     Ok(())
 }

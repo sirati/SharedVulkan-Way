@@ -174,6 +174,13 @@ scripts/
                      Weston clients, `wine` is real WM_KEYDOWN across the
                      boundary, `term` types into weston-terminal and photographs
                      the result
+  wc-firefox.sh      the stage-9 acceptance test — **Firefox**, the client the
+                     whole project is for. `enumerate` is the protocol
+                     requirement list, read off a WAYLAND_DEBUG trace rather
+                     than off a wiki; `window` counts the browser's own pixels;
+                     `menu` right-clicks and gets an xdg_popup; `wine` puts the
+                     whole chain together and produces an HWND. Everything it
+                     produces is in docs/stage9/
   probe-input.c      SendInput/PostMessage into the compositor's window, so the
                      keystrokes in that test are Win32's rather than ours
   probe-filemap.c    is a Windows view of a filesystem path coherent with a Linux

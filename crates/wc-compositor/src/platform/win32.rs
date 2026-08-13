@@ -59,6 +59,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, ExcludeClipRect, FillRect,
     InvalidateRect, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     HBRUSH, HDC, PAINTSTRUCT,
+    // ADDED FOR STAGE 9. `ClientToScreen` is filed under GDI rather than under
+    // WindowsAndMessaging, which is where one would look for it.
+    ClientToScreen,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -79,12 +82,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, XBUTTON1,
+    // ADDED FOR STAGE 9, for popups.
+    GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
+use windows_sys::Win32::Foundation::POINT;
 
 use crate::input::{evdev, evdev_keycode};
 
 use super::{
     assemble, Commands, FrameStyle, FromUi, IconImage, PlatformConfig, Started, ToUi, WindowId,
+    WindowKind,
 };
 use crate::surface::{Rect, Shadow};
 
@@ -157,6 +165,10 @@ impl Wake {
 /// only shape that makes that sound without relying on anyone being careful.
 struct WindowState {
     id: WindowId,
+    /// ADDED FOR STAGE 9. Read at map time, to decide whether the window is
+    /// placed by Windows or by an `xdg_positioner`, and whether showing it may
+    /// take the foreground.
+    kind: WindowKind,
     hwnd: Cell<isize>,
     shadow: Arc<Mutex<Shadow>>,
     events: Sender<FromUi>,
@@ -855,9 +867,10 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             title,
             app_id,
             shadow,
+            kind,
         } => {
-            if let Err(e) = create_window(ui, id, &title, &app_id, shadow) {
-                eprintln!("wc-compositor: could not create a window for toplevel {id}: {e}");
+            if let Err(e) = create_window(ui, id, &title, &app_id, shadow, kind) {
+                eprintln!("wc-compositor: could not create a window for surface {id}: {e}");
             }
         }
         ToUi::Title { id, title } => {
@@ -875,7 +888,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         ToUi::AppId { id, app_id } => {
             // Nothing to do on Win32. `set_app_id` names a desktop entry, and
             // turning that into pixels happens on the machine the client is on
-            // (docs/design.md §15.4); by the time an icon reaches this thread
+            // (docs/design.md §16.4); by the time an icon reaches this thread
             // it is a `ToUi::Icon`. Logged so the harness can see it arrive.
             println!("wc-compositor: window {id} app_id -> {app_id:?}");
         }
@@ -936,9 +949,11 @@ fn create_window(
     title: &str,
     app_id: &str,
     shadow: Arc<Mutex<Shadow>>,
+    kind: WindowKind,
 ) -> std::io::Result<()> {
     let state = Rc::new(WindowState {
         id,
+        kind,
         hwnd: Cell::new(0),
         shadow,
         events: ui.events.clone(),
@@ -958,30 +973,55 @@ fn create_window(
 
     let class = wide(CLASS_TOPLEVEL);
     let title_w = wide(title);
+    // The owner of a popup, so Windows keeps it above the parent, destroys it
+    // with the parent and keeps it off the taskbar. ADDED FOR STAGE 9.
+    let owner = match kind {
+        WindowKind::Toplevel => std::ptr::null_mut(),
+        WindowKind::Popup { parent, .. } => window(ui, parent)
+            .map(|w| w.hwnd())
+            .unwrap_or(std::ptr::null_mut()),
+    };
     // SAFETY: both string buffers outlive the call. The window is created
     // *hidden* — no `WS_VISIBLE` — because a Wayland surface is not mapped
     // until it has committed a buffer, and showing it earlier is a white flash
     // of an empty window before the first frame.
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            // `WS_EX_NOACTIVATE` on a popup, and it is load-bearing rather
+            // than tidy: a menu that took the foreground would take keyboard
+            // focus away from the toplevel, the client would be told its
+            // window was deactivated, and a GTK menu responds to that by
+            // closing itself. `WS_EX_TOOLWINDOW` keeps it out of the taskbar
+            // and out of alt-tab. ADDED FOR STAGE 9.
+            match kind {
+                WindowKind::Toplevel => 0,
+                WindowKind::Popup { .. } => WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            },
             class.as_ptr(),
             title_w.as_ptr(),
-            // `WS_OVERLAPPEDWINDOW` is the whole point of the stage: the
+            // `WS_OVERLAPPEDWINDOW` is the whole point of stage 3: the
             // caption, the border, the sizing grip and the minimise / maximise
             // / close buttons are Windows', not ours. Everything the brief
             // asks for in item 1 follows from this constant and from *not*
             // handling `WM_NCPAINT`.
             //
+            // `WS_POPUP` is the opposite and is right for the opposite reason:
+            // a menu has no frame of its own to be native, and giving one a
+            // caption would put a title bar on every dropdown in Firefox.
+            //
             // `WS_CLIPCHILDREN | WS_CLIPSIBLINGS` cost nothing now and are what
             // subsurfaces will need when they become child windows or when a
             // scene graph starts compositing into this one.
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            match kind {
+                WindowKind::Toplevel => WS_OVERLAPPEDWINDOW,
+                WindowKind::Popup { .. } => WS_POPUP,
+            } | WS_CLIPCHILDREN
+                | WS_CLIPSIBLINGS,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            std::ptr::null_mut(),
+            owner,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -1007,6 +1047,40 @@ fn create_window(
 
 /// Show the window for the first time, at the size the client chose.
 fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
+    // ADDED FOR STAGE 9. A popup is a different act of window management from a
+    // toplevel and shares only the blit: it is placed where the positioner said
+    // relative to its owner's client area, it has no frame to adjust for, and
+    // it is shown without activation so the toplevel keeps the keyboard.
+    if let WindowKind::Popup { parent: _, x, y } = w.kind {
+        let mut origin = POINT { x, y };
+        // SAFETY: live handles. `GetWindow(GW_OWNER)` is the owner set at
+        // creation; `ClientToScreen` converts in place.
+        unsafe {
+            let owner = GetWindow(w.hwnd(), GW_OWNER);
+            if !owner.is_null() {
+                ClientToScreen(owner, &mut origin);
+            }
+            SetWindowPos(
+                w.hwnd(),
+                HWND_TOPMOST,
+                origin.x,
+                origin.y,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+            if !w.mapped.replace(true) {
+                ShowWindow(w.hwnd(), SW_SHOWNOACTIVATE);
+            }
+        }
+        w.last_configured.set((width, height));
+        println!(
+            "wc-compositor: window {} mapped {width}x{height} as a popup at {},{}",
+            w.id, origin.x, origin.y
+        );
+        return;
+    }
+
     let (cw, ch) = w.frame.client_size_for(width, height);
     let mut rc = RECT {
         left: 0,
@@ -1623,7 +1697,7 @@ fn register_classes() -> std::io::Result<()> {
 ///
 /// So this is not tidiness. It is the difference between the taskbar showing
 /// the client's icon and showing the generic one, and it was invisible to every
-/// check that looked at the compositor's own logs (docs/design.md §15.6).
+/// check that looked at the compositor's own logs (docs/design.md §16.6).
 ///
 /// **`GetConsoleProcessList` is what makes this safe.** A console shared with
 /// anything else — a `cmd.exe` or an ssh session that started us — belongs to

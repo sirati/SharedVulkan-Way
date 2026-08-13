@@ -151,6 +151,18 @@ impl Spec {
         let mut spec = Spec::default();
         spec.load(include_str!("../protocols/wayland.xml"))?;
         spec.load(include_str!("../protocols/xdg-shell.xml"))?;
+        // ADDED FOR STAGE 9, and this is what §9.3 promised adding a protocol
+        // would cost: copy a file, add a line.
+        //
+        // Both decoration protocols, because the compositor advertises both to
+        // find out which one Firefox uses (docs/design.md §13.7) and a global
+        // that is advertised can be bound. The failure without them is not
+        // subtle and is not silent — the proxy refuses the connection with
+        // `org_kde_kwin_server_decoration_manager has no message 0` — which is
+        // §9.3's design working: an unknown interface cannot be walked, so it
+        // says so instead of desynchronising.
+        spec.load(include_str!("../protocols/xdg-decoration-unstable-v1.xml"))?;
+        spec.load(include_str!("../protocols/server-decoration.xml"))?;
         Ok(spec)
     }
 
@@ -289,10 +301,11 @@ mod tests {
     #[test]
     fn the_builtin_protocols_parse() {
         let s = spec();
-        // 23 in wayland.xml plus 5 in xdg-shell.xml, counted with grep. A
-        // number rather than "not empty", so that a parser that silently
-        // dropped a trailing interface would be caught.
-        assert_eq!(s.len(), 28, "interfaces: {:?}", s.names());
+        // 23 in wayland.xml, 5 in xdg-shell.xml, 2 in each of the two
+        // decoration protocols, counted with grep. A number rather than "not
+        // empty", so that a parser that silently dropped a trailing interface
+        // would be caught.
+        assert_eq!(s.len(), 32, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,

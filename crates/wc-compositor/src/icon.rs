@@ -6,7 +6,7 @@
 //! 1. **`xdg-toplevel-icon-v1`**, which is the protocol for this and is
 //!    implemented by [`crate::state`] through smithay. A client attaches
 //!    `wl_buffer`s to an icon object and the compositor reads them. Measured
-//!    support in real clients is in docs/design.md §15.3, and the short version
+//!    support in real clients is in docs/design.md §16.2, and the short version
 //!    is that GTK 4.20 sends it and Firefox 151 does not.
 //! 2. **[`crate::icon::proto`]**, this project's own interface, for everything
 //!    else. A resolver on the Linux side turns an app id into pixels and
@@ -94,7 +94,7 @@ pub fn best_match(images: &[IconImage], want: i32) -> Option<&IconImage> {
 /// `None` for anything that is not a plausible icon — a zero or negative size,
 /// a size past [`MAX_IMAGE_BYTES`], or a buffer shorter than the rows it
 /// claims. A refusal here degrades to the generic Windows icon, which is the
-/// behaviour docs/design.md §15.7 argues for.
+/// behaviour docs/design.md §16.7 argues for.
 pub fn image_from_bytes(bytes: &[u8], spec: BufferSpec) -> Option<IconImage> {
     let (w, h) = (spec.width, spec.height);
     if w <= 0 || h <= 0 {

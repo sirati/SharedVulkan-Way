@@ -285,6 +285,69 @@ impl Shadow {
         }
         written
     }
+
+    /// Make this shadow `w`x`h` of `format`, filled with transparent black,
+    /// reallocating only when the shape actually changes.
+    ///
+    /// ADDED FOR STAGE 9, for the scene graph. A window's shadow is no longer a
+    /// copy of one client buffer — it is the surface **tree** composited
+    /// together — so something has to decide how big the canvas is before any
+    /// of the pieces are drawn into it. Returns whether it reallocated, which
+    /// is the caller's cue that every pixel is damaged.
+    pub fn reset(&mut self, w: i32, h: i32, format: PixelFormat) -> bool {
+        let bpp = PixelFormat::BYTES_PER_PIXEL;
+        if self.spec.width == w && self.spec.height == h && self.spec.format == format {
+            return false;
+        }
+        self.spec = BufferSpec {
+            width: w,
+            height: h,
+            stride: w.saturating_mul(bpp as i32),
+            format,
+        };
+        self.pixels = vec![0u8; (w.max(0) as usize) * (h.max(0) as usize) * bpp];
+        true
+    }
+
+    /// Copy `src` into this shadow with its top-left corner at `at`, clipped to
+    /// both.
+    ///
+    /// ADDED FOR STAGE 9. **This is a copy and not a blend, and that is a
+    /// decision rather than an omission.** Wayland's `wl_shm` alpha is
+    /// premultiplied, so a correct sibling blend is one multiply-add per
+    /// channel per pixel and the surfaces that need it are the ones where a
+    /// client has told us, through `wl_surface.set_opaque_region`, that it does
+    /// not. Firefox's own tree is a transparent GTK shadow surface with one
+    /// opaque rectangular subsurface on top of it (docs/design.md §13.5), for
+    /// which copy and blend give identical pixels. When something arrives whose
+    /// subsurfaces really are translucent — a rounded corner over a background
+    /// this compositor drew — the difference will show as a hard edge, and that
+    /// is the point at which this becomes a blend.
+    pub fn compose(&mut self, src: &Shadow, at: (i32, i32)) {
+        if src.is_empty() || self.is_empty() {
+            return;
+        }
+        let bpp = PixelFormat::BYTES_PER_PIXEL;
+        let Some(dst) = Rect::new(at.0, at.1, src.width(), src.height())
+            .clip(self.spec.width, self.spec.height)
+        else {
+            return;
+        };
+        // Where in the source the clipped destination starts: non-zero exactly
+        // when the child hangs off the top or left of the canvas, which is the
+        // normal case for a GTK client whose window geometry crops its own
+        // shadow margin away.
+        let sx = dst.x - at.0;
+        let sy = dst.y - at.1;
+        let src_stride = src.spec.stride as usize;
+        let dst_stride = self.spec.stride as usize;
+        let bytes = dst.w as usize * bpp;
+        for row in 0..dst.h as usize {
+            let s = (sy as usize + row) * src_stride + sx as usize * bpp;
+            let d = (dst.y as usize + row) * dst_stride + dst.x as usize * bpp;
+            self.pixels[d..d + bytes].copy_from_slice(&src.pixels[s..s + bytes]);
+        }
+    }
 }
 
 /// Write a shadow out as a binary PPM.

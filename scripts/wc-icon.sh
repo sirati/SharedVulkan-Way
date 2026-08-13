@@ -45,7 +45,7 @@
 # WESTON SHIPS NO DESKTOP ENTRY, WHICH IS MEASURED AND NOT A COMPLAINT
 #
 # `weston-terminal`'s app id is `org.freedesktop.weston.wayland-terminal` (it is
-# not "weston-terminal": measured, §15.3) and the weston package installs no
+# not "weston-terminal": measured, §16.7) and the weston package installs no
 # `.desktop` file for it at all. So this harness writes one, in its own data
 # directory, naming an icon that the *host's real theme* holds. Everything after
 # that is the real path: the theme search, the size choice, the PNG decode, the
@@ -101,9 +101,24 @@ HOST_WESTON="${WC_HOST_WESTON:-}"
 # Where the host's icon theme is. Not guessed from the host's environment: this
 # runs over ssh, where `XDG_DATA_DIRS` is not what a session would have.
 HOST_ICONS="${WC_HOST_ICONS:-/run/current-system/sw/share}"
-ICON_NAME="${WC_ICON_NAME:-qemu}"
 CLIENT="${WC_CLIENT:-weston-terminal}"
 APP_ID="${WC_APP_ID:-org.freedesktop.weston.wayland-terminal}"
+# The whole client command line, if the default `$WC_HOST_WESTON/$WC_CLIENT` is
+# not enough. Firefox is the reason: it needs `MOZ_ENABLE_WAYLAND=1`, a profile
+# of its own and `env -u DISPLAY` (§15), and hard-coding that here would put
+# stage 9's harness in this one.
+CLIENT_CMD="${WC_CLIENT_CMD:-}"
+# Which pool transport the proxy uses. The arena is the deployment's answer and
+# is the default here, but **it serves exactly one connection** (§12.13 item 6),
+# and Firefox opens two — so the Firefox run needs `shared-file`, whose pool
+# names carry enough randomness to share a directory. That is a limitation of
+# the arena rather than of this stage, and it decides one flag.
+TRANSPORT="${WC_TRANSPORT:-arena}"
+# Empty means "do not write a desktop entry": the app id already has a real one
+# somewhere in WC_HOST_ICONS, and writing ours would shadow the thing being
+# tested. That is the Firefox case, where the resolution is entirely the
+# machine's own data.
+ICON_NAME="${WC_ICON_NAME-qemu}"
 SUFFIX="${WC_SUFFIX:-}"
 
 SSHOPT=(-o IdentityAgent="$AGENT" -o BatchMode=yes -o LogLevel=ERROR
@@ -275,13 +290,29 @@ one_run() {
      : >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
 
   # The desktop entry, written here because weston ships none. Three lines, and
-  # the icon it names is one the host's own theme holds.
-  h "mkdir -p $HOST_DIR/data/applications && cat > $HOST_DIR/data/applications/$APP_ID.desktop <<EOD
+  # the icon it names is one the host's own theme holds. With `WC_ICON_NAME=`
+  # empty nothing is written at all and the app id has to resolve against the
+  # machine's own data — which is the Firefox run, where it does.
+  h "rm -rf $HOST_DIR/data; mkdir -p $HOST_DIR/data/applications" >/dev/null
+  if [ -n "$ICON_NAME" ]; then
+    h "cat > $HOST_DIR/data/applications/$APP_ID.desktop <<EOD
 [Desktop Entry]
 Type=Application
 Name=Wayland Terminal
 Icon=$ICON_NAME
 EOD" >/dev/null
+  else
+    note "no desktop entry written: $APP_ID must resolve against $HOST_ICONS itself"
+  fi
+
+  # The pool transport, and the arena's one real limit. See TRANSPORT.
+  local transport_args
+  if [ "$TRANSPORT" = arena ]; then
+    transport_args="--transport arena --arena-path $SHARE/arena --arena-id 0 --arena-size $arena"
+  else
+    h "rm -rf $SHARE/pools; mkdir -p $SHARE/pools; chmod 777 $SHARE/pools" >/dev/null
+    transport_args="--transport shared-file --pool-dir $SHARE/pools --peer-prefix $SHARE_WIN\\\\pools\\\\"
+  fi
 
   h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$HOST:$HOST_DIR/" >/dev/null || {
@@ -349,12 +380,12 @@ sleep 4
 if [ -S \"\$RUN/up.sock\" ]; then
   XDG_RUNTIME_DIR=\"\$RUN\" XDG_DATA_DIRS=$HOST_DIR/data:$HOST_ICONS \
     $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
-     --runtime-dir \"\$RUN\" --transport arena --arena-path $SHARE/arena --arena-id 0 \
-     --arena-size $arena --copy damage --accept-timeout 25 --timeout 240$iconflag \
+     --runtime-dir \"\$RUN\" $transport_args \
+     --copy damage --accept-timeout 25 --timeout 240$iconflag \
      >\"\$RUN/proxy.log\" 2>&1 &
   PROXY=\$!
   sleep 2
-  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy $HOST_WESTON/$CLIENT >\"\$RUN/cli.log\" 2>&1 &
+  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy ${CLIENT_CMD:-$HOST_WESTON/$CLIENT} >\"\$RUN/cli.log\" 2>&1 &
   CLI=\$!
   echo S11-CLIENT-STARTED
   # LONG, AND MEASURED RATHER THAN GENEROUS. Every photograph below is taken by
@@ -486,14 +517,18 @@ $DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DES
 do_compare() {
   echo
   echo "== is the host's icon in the guest's picture? =="
+  # With no desktop entry of our own the icon's name is the app id's own
+  # business, and the app id is the best guess at it — which is exactly what
+  # the resolver falls back to.
+  local name="${ICON_NAME:-$APP_ID}"
   local ref="$RUNDIR/ref16.png"
-  scp "${SSHOPT[@]}" "$HOST:$HOST_ICONS/icons/hicolor/16x16/apps/$ICON_NAME.png" "$ref" \
+  scp "${SSHOPT[@]}" "$HOST:$HOST_ICONS/icons/hicolor/16x16/apps/$name.png" "$ref" \
     >/dev/null 2>&1
   if [ ! -s "$ref" ]; then
-    miss "no 16x16 reference icon for $ICON_NAME on the host"
+    miss "no 16x16 reference icon for $name on the host"
     return
   fi
-  cp "$ref" "$OUT/reference-16-$ICON_NAME.png" 2>/dev/null
+  cp "$ref" "$OUT/reference-16-$name.png" 2>/dev/null
 
   local target
   for target in "$OUT/stage11-window-icons$SUFFIX.png" "$OUT/stage11-window-generic$SUFFIX.png"; do
@@ -515,7 +550,7 @@ do_compare() {
     out=$(magick compare -metric RMSE -subimage-search "$RUNDIR/strip.png" "$RUNDIR/ref-flat.png" null: 2>&1)
     rmse=$(echo "$out" | awk '{print $1}')
     at=$(echo "$out" | grep -oE "@ [0-9]+,[0-9]+" | head -1)
-    note "$(basename "$target"): best match for ${ICON_NAME}16 is ${rmse:-?} $at"
+    note "$(basename "$target"): best match for ${name}16 is ${rmse:-?} $at"
     case "$target" in
       *icons*) icons_rmse="$rmse" ;;
       *generic*) generic_rmse="$rmse" ;;
@@ -558,8 +593,8 @@ retried() {
 }
 
 do_taskbar() {
-  if [ -z "$HOST" ] || [ -z "$HOST_WESTON" ]; then
-    miss "WC_HOST/WC_HOST_WESTON unset: no client, no icon, no picture"
+  if [ -z "$HOST" ] || { [ -z "$HOST_WESTON" ] && [ -z "$CLIENT_CMD" ]; }; then
+    miss "WC_HOST and one of WC_HOST_WESTON / WC_CLIENT_CMD unset: no client, no picture"
     return
   fi
   # `WC_ONLY=icons` re-takes one half without disturbing the other's pictures,

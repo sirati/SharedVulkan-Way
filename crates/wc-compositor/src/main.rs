@@ -144,6 +144,19 @@ struct Args {
     /// Which of `input::LAYOUTS` to compile. Empty means "ask Windows", which
     /// is what a user wants and what a harness cannot depend on.
     layout: Option<String>,
+    /// The size of the one `wl_output`, as `WxH`.
+    ///
+    /// ADDED FOR STAGE 9. A flag rather than `GetSystemMetrics` because the
+    /// harness has to be able to ask for a known desktop, and because the
+    /// headless platform has no desktop to ask. The Win32 platform ought to
+    /// override it with the real monitor and does not yet; that is named in
+    /// docs/design.md §13.9 rather than left for someone to find.
+    output: (i32, i32),
+    /// One scripted click, as `X,Y[,BUTTON][,MS]`. Headless only.
+    ///
+    /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
+    #[cfg(not(windows))]
+    click: Option<platform::Click>,
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -164,6 +177,9 @@ fn parse_args() -> Result<Args, u8> {
         shared_dir: None,
         shared_peer_prefix: String::new(),
         layout: None,
+        output: (1920, 1080),
+        #[cfg(not(windows))]
+        click: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -253,6 +269,61 @@ fn parse_args() -> Result<Args, u8> {
             "--shared-dir" => args.shared_dir = it.next(),
             "--shared-peer-prefix" => args.shared_peer_prefix = it.next().unwrap_or_default(),
             "--layout" => args.layout = it.next(),
+            // `X,Y[,BUTTON][,MS]`. ADDED FOR STAGE 9. Accepted and ignored on
+            // Windows rather than rejected, so one harness line runs on both.
+            "--click" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --click needs X,Y[,BUTTON][,MS]");
+                    return Err(2);
+                };
+                #[cfg(not(windows))]
+                {
+                    let f: Vec<&str> = v.split(',').collect();
+                    let (Some(Ok(x)), Some(Ok(y))) =
+                        (f.first().map(|s| s.parse::<f64>()), f.get(1).map(|s| s.parse::<f64>()))
+                    else {
+                        eprintln!("wc-compositor: --click wants X,Y[,BUTTON][,MS], got {v:?}");
+                        return Err(2);
+                    };
+                    args.click = Some(platform::Click {
+                        x,
+                        y,
+                        button: f
+                            .get(2)
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(input::evdev::BTN_LEFT),
+                        after: Duration::from_millis(
+                            f.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(4000),
+                        ),
+                    });
+                }
+                #[cfg(windows)]
+                eprintln!(
+                    "wc-compositor: --click {v:?} ignored; on Windows a click comes from \
+                     SendInput in another process"
+                );
+            }
+            // `WxH`. ADDED FOR STAGE 9.
+            "--output" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --output needs WxH");
+                    return Err(2);
+                };
+                let mut p = v.split(['x', 'X']);
+                let (Some(Ok(w)), Some(Ok(h)), None) = (
+                    p.next().map(str::parse::<i32>),
+                    p.next().map(str::parse::<i32>),
+                    p.next(),
+                ) else {
+                    eprintln!("wc-compositor: --output wants WxH, got {v:?}");
+                    return Err(2);
+                };
+                if w <= 0 || h <= 0 {
+                    eprintln!("wc-compositor: --output {v:?}: both sides must be positive");
+                    return Err(2);
+                }
+                args.output = (w, h);
+            }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
             }
@@ -470,6 +541,8 @@ fn main() -> std::process::ExitCode {
         frame: FrameStyle { extend_top: 0 },
         dump_frames: args.dump_frames,
         simulate_wm: args.simulate_wm,
+        #[cfg(not(windows))]
+        click: args.click,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -499,7 +572,7 @@ fn main() -> std::process::ExitCode {
         .name("wayland".into())
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
-                args.expect_presents, args.poll_coarse, layout, ui, event_rx);
+                args.expect_presents, args.poll_coarse, layout, args.output, ui, event_rx);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -530,6 +603,7 @@ fn wayland_thread(
     expect_presents: usize,
     poll_coarse: bool,
     layout: String,
+    output: (i32, i32),
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
 ) -> u8 {
@@ -544,7 +618,7 @@ fn wayland_thread(
         }
     };
     let dh = display.handle();
-    let mut state = State::new(&dh, ui, events, debug_icon, &layout);
+    let mut state = State::new(&dh, ui, events, debug_icon, &layout, output);
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
