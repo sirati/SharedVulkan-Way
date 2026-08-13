@@ -1368,6 +1368,58 @@ alternative.
 Not attempted, deliberately: the second copy (§0.11's copy 2). Two copies that
 render beat one copy that does not exist.
 
+### 0.13 The resolution sweep, and the control that changed its meaning
+
+Measured 2026-08-13 on **devhost** in `nix develop`,
+`docs/firefox-accel.md`. §0.12's 0.61× was a `gl.finish()` microbenchmark at
+256×256 and said so; this is the fill-heavy sweep that was supposed to replace
+it. `glxgears` under Xvfb, `vblank_mode=0`, four sizes, three paths.
+
+| size | forwarded | zink on real RADV | llvmpipe | fwd / zink-RADV |
+|---|---|---|---|---|
+| 256² | 920.9 | 1140.3 | 6802.8 | 0.81 |
+| 512² | 214.9 | 289.3 | 5431.4 | 0.74 |
+| 1024² | 69.4 | 73.0 | 2598.2 | **0.95** |
+| 2048² | 18.3 | 18.2 | 806.6 | **1.01** |
+
+**1. The forwarder converges on native as the frame gets more expensive.**
+0.81 → 0.74 → 0.95 → **1.01**; at 2048² it is indistinguishable from the same GL
+on the same GPU with no forwarding at all. The cost is per frame and fixed, so it
+vanishes as a proportion once the frame costs more than the round trip.
+`sv-bench.sh` agrees from the other end: `frame-200` 73.7 µs native against
+293.3 µs forwarded, and glxgears at its default size 726 FPS against 795, 0.91.
+
+**2. Both hardware paths lose to llvmpipe by 6–43×, and the forwarder is not
+why.** Zink on the *real* RADV, no forwarding anywhere, is 0.17× llvmpipe at 256²
+and 0.02× at 2048². Under Xvfb there is no DRI3 and no MIT-SHM, so `zink_kopper`
+presents every frame through X11 core protocol — 16.8 MB per frame at 2048² —
+while llvmpipe renders straight into the X server's memory. A `glxinfo` with no
+environment set at all reports `llvmpipe` as the *native* GL under Xvfb: **there
+is no hardware GLX path on this machine under Xvfb**, and the forwarder is the
+only route to the GPU here.
+
+**3. So the question is not settled, and the first version of this table would
+have answered a different one.** The control column failed to start on the first
+attempt — setting `VK_DRIVER_FILES` for the *control* breaks Zink, while leaving
+it unset works, which `sv-bench.sh` had right — and without it the honest-looking
+conclusion was "the forwarder is 43× slower than software rendering". It is not:
+real hardware is, in this harness. A true number answering a different question is
+§0.9's pattern again, and this time it was caught by adding the control rather
+than by shipping it.
+
+**4. What would settle it is a present path that is not X11 core protocol**, and
+on testhost that is what exists: the consumer there is waycompose's compositor
+reading an **arena slice**, not an X server reading a socket. That makes §0.11's
+copy 2 and this measurement one piece of work rather than two — the shared handle
+is not an optimisation, it is the thing that makes the comparison meaningful.
+
+**testhost was not reached.** A forwarded number on the GPU-less host needs the
+full cross-VM stack — `sv-hostd qemu-serve`, QMP, the memfd sweep, root, a
+virtio-serial cold path — on a guest two other experiments are using. So **there
+is no forwarded-versus-llvmpipe number on the machine where that comparison is
+the only one there is**, and §0.12's "how much acceleration is worth here is not
+yet measured" stands.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on

@@ -341,3 +341,80 @@ llvmpipe is the only alternative.
   weaker arbiter than the graphics feature table and it is the one measured here.
 - **testhost.** Everything above is devhost, which has a real local GPU.
 - **The queue race**, above.
+
+---
+
+# The resolution sweep, and what it actually measures
+
+Measured 2026-08-13 on **devhost**, `nix develop`, GPU side on the system
+RADV. `glxgears` under Xvfb at four sizes, `vblank_mode=0`, twelve seconds each,
+last FPS sample. Three paths: our forwarder, **Zink on the real RADV with no
+forwarding at all**, and llvmpipe.
+
+The third column is the one that decides how to read the other two, and the
+first attempt at this sweep did not have it — the control failed to start and
+the table went out with two columns and a wrong conclusion drafted from them.
+The reason it failed is worth recording: setting `VK_DRIVER_FILES` to the RADV
+manifest for the *control* breaks Zink, while leaving it unset (so the loader
+sees every ICD and Zink picks the real device) works. `sv-bench.sh` had it right
+and this sweep had it wrong.
+
+| size | forwarded | zink on real RADV | llvmpipe | fwd / zink-RADV | zink-RADV / llvmpipe |
+|---|---|---|---|---|---|
+| 256×256 | 920.9 | 1140.3 | 6802.8 | 0.81 | 0.17 |
+| 512×512 | 214.9 | 289.3 | 5431.4 | 0.74 | 0.05 |
+| 1024×1024 | 69.4 | 73.0 | 2598.2 | **0.95** | 0.03 |
+| 2048×2048 | 18.3 | 18.2 | 806.6 | **1.01** | 0.02 |
+
+## Two findings, and they point in opposite directions
+
+**1. The forwarder converges on native as the frame gets more expensive.**
+0.81 → 0.74 → 0.95 → **1.01**. At 2048×2048 the forwarded path is
+indistinguishable from the same GL on the same GPU with no forwarding at all,
+within the noise of a twelve-second sample. That is the right shape: the
+forwarder's cost is **per frame and fixed**, so it disappears as a proportion the
+moment the frame costs more than the round trip. `sv-bench.sh` says the same
+thing from the other end — `frame-200` is 73.7 µs native against 293.3 µs
+forwarded, and glxgears at its default size is 726 FPS forwarded against 795
+native, 0.91.
+
+**2. Both hardware paths lose to llvmpipe by 6–43×, and the forwarder is not
+why.** Zink on the *real* RADV, no forwarding anywhere in the picture, is 0.17×
+llvmpipe at 256² and 0.02× at 2048². Whatever is costing that is costing it to
+real hardware too.
+
+The cause is the harness rather than either driver: under **Xvfb** there is no
+DRI3 and no MIT-SHM path for a windowed GL client, so `zink_kopper` presents
+every frame through X11 core protocol over a socket — 16.8 MB per frame at
+2048×2048. llvmpipe pays nothing for that, because it renders directly into the
+X server's own memory. The `glxinfo` run in the middle of the first sweep is the
+proof and it was an accident: with no environment set at all, the "native GL"
+renderer string under Xvfb is `llvmpipe (LLVM 21.1.8, 256 bits)`. **There is no
+hardware GLX path on this machine under Xvfb.** The forwarder is the only route
+to the GPU here, and it is riding a present path that Xvfb makes expensive for
+anything that is not already inside the X server.
+
+## So the question the sweep was meant to settle is not settled
+
+There is **no crossover in this harness** — llvmpipe wins at every size — and the
+number is not about the forwarder, because it beats real hardware by the same
+margin. Reporting "0.02× of software rendering" as a fact about this project
+would have been wrong in the way §0.9 keeps naming: a true number that answers a
+different question.
+
+What would settle it is a present path that is not X11 core protocol. On
+testhost that is exactly what exists: the consumer is waycompose's compositor
+reading an **arena slice**, not an X server reading a socket. That is the same
+path §7's shared handle is about, which makes the copy-2 work and this
+measurement the same piece of work rather than two.
+
+## testhost was not reached
+
+Stated plainly rather than left to be inferred. The honest venue is the machine
+with no GPU (§0.10), and getting a forwarded number there needs the full cross-VM
+stack — `sv-hostd qemu-serve`, QMP, the memfd sweep, root, and a virtio-serial
+cold path (`scripts/sv-guest-e2e.sh`) — on a guest two other experiments are
+using. It was not attempted, so **there is no forwarded-versus-llvmpipe number on
+the machine where that comparison is the only one there is.** The half of it that
+is cheap — llvmpipe on the testhost host — was not taken either, because half a
+comparison is not one.
