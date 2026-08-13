@@ -99,6 +99,196 @@ pub mod evdev {
     pub const BTN_EXTRA: u32 = 0x114;
 }
 
+/// The arithmetic behind `wl_touch`, with no Win32 and no smithay in it.
+///
+/// STAGE 20. Same argument as the scan-code table above, and it is the reason
+/// this is here rather than in `platform/win32.rs`: the two things most likely
+/// to be quietly wrong about touch are **which number identifies a contact**
+/// and **how a Win32 contact rectangle becomes an ellipse**, and neither of
+/// them needs a window, a digitiser or Wine to check. `win32.rs` is
+/// `cfg(windows)`, so anything living there is compiled by the cross gate and
+/// run by nothing.
+pub mod touch {
+    /// How many simultaneous contacts are tracked.
+    ///
+    /// A bound rather than an unbounded map, because the table is keyed on
+    /// Windows pointer ids and freed on `WM_POINTERUP`: an up that never
+    /// arrives — a bug in this code, a message eaten by a modal loop, a
+    /// digitiser that lies — would otherwise grow the table for the life of
+    /// the process and hand out ever-larger contact ids. Ten is what Windows
+    /// requires a certified digitiser to support and what `SM_MAXIMUMTOUCHES`
+    /// reports on essentially every one; thirty-two is that with room, and a
+    /// contact past it is dropped loudly rather than mis-identified.
+    pub const MAX_CONTACTS: usize = 32;
+
+    /// Windows pointer ids to `wl_touch` contact ids.
+    ///
+    /// **The two numberings are not the same and cannot be used
+    /// interchangeably.** A Win32 `pointerId` is a `u32` handed out by the
+    /// input stack; it is unique while the contact exists, it is recycled
+    /// afterwards, and its *value* is whatever the stack has got to — measured
+    /// on the guest, two contacts injected as 0 and 1 arrived as **4 and 5**,
+    /// and the number climbs with everything else the session has pointed at.
+    /// `wl_touch.down` carries an `int` id which the protocol only
+    /// requires to be unique among the contacts currently down, and every
+    /// client in existence has been written against libinput's slot numbers,
+    /// which are small and dense: 0, 1, 2.
+    ///
+    /// Handing a client a raw `pointerId` would be legal and would be the kind
+    /// of legal that gets found later — a client that sizes an array by the
+    /// largest id it has seen is not a hypothetical, it is how touch is
+    /// commonly implemented. So this allocates the **lowest free index**, which
+    /// is exactly what an evdev multi-touch slot is.
+    ///
+    /// **Seat-wide, not per-window.** There is one `wl_touch` per seat and its
+    /// ids namespace the seat; two windows each allocating from their own table
+    /// would both hand out 0 and the client would see one contact in two
+    /// places. Win32 has no seat, so the table lives on the pump.
+    #[derive(Debug, Default)]
+    pub struct Slots {
+        /// `by_slot[i] == Some(pointer_id)` while contact `i` is down. A `Vec`
+        /// of `Option` rather than a map because the allocation policy *is*
+        /// "the lowest free index", and that is a scan of this.
+        by_slot: Vec<Option<u32>>,
+    }
+
+    impl Slots {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Claim a contact id for a pointer that has just gone down.
+        ///
+        /// `None` when the table is full, which is a dropped contact and is
+        /// worth a line at the call site: silently reusing a live id would put
+        /// two fingers on one contact, which looks to a client like a finger
+        /// teleporting and is far harder to diagnose than a missing one.
+        pub fn down(&mut self, pointer_id: u32) -> Option<i32> {
+            // An id that is already down. Windows does not do this; if it ever
+            // does, the answer is the id the contact already has rather than a
+            // second one for the same finger.
+            if let Some(slot) = self.get(pointer_id) {
+                return Some(slot);
+            }
+            if let Some(i) = self.by_slot.iter().position(Option::is_none) {
+                self.by_slot[i] = Some(pointer_id);
+                return Some(i as i32);
+            }
+            if self.by_slot.len() >= MAX_CONTACTS {
+                return None;
+            }
+            self.by_slot.push(Some(pointer_id));
+            Some((self.by_slot.len() - 1) as i32)
+        }
+
+        /// The contact id of a pointer that is down, without changing anything.
+        pub fn get(&self, pointer_id: u32) -> Option<i32> {
+            self.by_slot
+                .iter()
+                .position(|s| *s == Some(pointer_id))
+                .map(|i| i as i32)
+        }
+
+        /// Release a contact id. `None` for a pointer that was not down, which
+        /// happens for real: a `WM_POINTERUP` can arrive for a contact whose
+        /// down went to another window, or after a cancel has already cleared
+        /// the table.
+        pub fn up(&mut self, pointer_id: u32) -> Option<i32> {
+            let i = self.by_slot.iter().position(|s| *s == Some(pointer_id))?;
+            self.by_slot[i] = None;
+            // Keep the tail tidy so a long session does not leave the table
+            // permanently as wide as the widest gesture ever made.
+            while matches!(self.by_slot.last(), Some(None)) {
+                self.by_slot.pop();
+            }
+            Some(i as i32)
+        }
+
+        /// Everything is gone: `wl_touch.cancel`, or the window died holding
+        /// contacts. Returns whether there was anything to cancel, because
+        /// `cancel` must not be sent when no contact is down.
+        pub fn clear(&mut self) -> bool {
+            let had = self.by_slot.iter().any(Option::is_some);
+            self.by_slot.clear();
+            had
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.by_slot.iter().all(Option::is_none)
+        }
+    }
+
+    /// The ellipse `wl_touch.shape` and `wl_touch.orientation` describe.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Shape {
+        /// The longer diameter, in surface-local units.
+        pub major: f64,
+        /// The shorter diameter, orthogonal to `major`.
+        pub minor: f64,
+        /// Clockwise degrees from the positive surface **y** axis, normalised
+        /// to -180..=180 as the protocol requires.
+        pub orientation: f64,
+    }
+
+    /// Turn a Win32 contact rectangle into the protocol's ellipse, or refuse.
+    ///
+    /// # What Windows actually gives, and what is not invented here
+    ///
+    /// `POINTER_TOUCH_INFO` carries `rcContact` — an **axis-aligned rectangle**
+    /// bounding the contact patch — and `orientation`, in whole degrees 0..359.
+    /// Both are optional and both announce themselves in `touchMask`
+    /// (`TOUCH_MASK_CONTACTAREA`, `TOUCH_MASK_ORIENTATION`); a digitiser that
+    /// reports neither leaves the fields zeroed. That flag is the whole reason
+    /// this function returns an `Option`: the protocol says `shape` "is only
+    /// sent by the compositor if the touch device supports shape reports", and
+    /// a compositor that answered every contact with a plausible 10x10 circle
+    /// would be telling clients a fact it does not have. **No fallback ellipse
+    /// is manufactured.** `None` means no `shape` and no `orientation` event.
+    ///
+    /// # The two conversions
+    ///
+    /// * **Which side is major.** The protocol requires `major` to be the
+    ///   longer diameter, so the rectangle's larger extent is it — and the
+    ///   orientation has to say which axis that was, or the client draws the
+    ///   ellipse the wrong way round. When Windows reports no orientation the
+    ///   rectangle is still axis-aligned, so the answer is *read off it*: 0 if
+    ///   the tall side is the major one (major along y, the protocol's zero),
+    ///   90 if the wide side is. That is implied by the rectangle rather than
+    ///   guessed at, which is why it is done and the ellipse itself is not.
+    /// * **The angle's range.** Windows says 0..359, Wayland says -180..=180
+    ///   clockwise from +y. So anything over 180 is that value minus 360. Both
+    ///   are clockwise from the vertical, which is the assumption in this
+    ///   function that no test here can check — see docs/design.md §24.5.
+    ///
+    /// The known imprecision, stated rather than hidden: when Windows *does*
+    /// report a non-zero orientation, `rcContact` is the bounding box of an
+    /// ellipse that is already rotated, so its extents are an over-estimate of
+    /// the axes rather than the axes themselves. Windows exposes no other
+    /// description of the patch. An over-estimate from the real rectangle is a
+    /// better answer than a number this file made up, and it is only reachable
+    /// on hardware that reports orientation at all.
+    pub fn shape_from_contact(width: f64, height: f64, reported: Option<f64>) -> Option<Shape> {
+        // An empty rectangle is what `rcContact` holds when the flag was set
+        // and the digitiser filled in nothing, which happens; it is a missing
+        // answer rather than a zero-sized finger.
+        let measured = |v: f64| v.is_finite() && v > 0.0;
+        if !measured(width) || !measured(height) {
+            return None;
+        }
+        let tall = height >= width;
+        let (major, minor) = if tall { (height, width) } else { (width, height) };
+        let orientation = match reported {
+            Some(d) => {
+                let d = d.rem_euclid(360.0);
+                if d > 180.0 { d - 360.0 } else { d }
+            }
+            None if tall => 0.0,
+            None => 90.0,
+        };
+        Some(Shape { major, minor, orientation })
+    }
+}
+
 /// Virtual-key codes used only to *disambiguate* — never to translate.
 ///
 /// Three keys report a scan code that is genuinely ambiguous on Windows, and
@@ -293,6 +483,133 @@ pub fn layout_for_langid(langid: u16) -> &'static str {
         .find(|(id, _)| *id == langid & 0x03ff)
         .map(|(_, l)| *l)
         .unwrap_or(FALLBACK)
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::touch::*;
+
+    /// The contract a client depends on: ids are small, dense, and start at
+    /// zero. Every toolkit that has ever implemented `wl_touch` was written
+    /// against libinput's slots, and this is the property those have.
+    #[test]
+    fn contact_ids_are_small_and_dense_whatever_windows_numbers_them() {
+        let mut s = Slots::new();
+        // Pointer ids as Windows actually hands them out: large and arbitrary.
+        assert_eq!(s.down(0x0001_86a0), Some(0));
+        assert_eq!(s.down(0x0001_86a1), Some(1));
+        assert_eq!(s.down(0x0002_ffff), Some(2));
+        assert_eq!(s.get(0x0001_86a1), Some(1));
+    }
+
+    /// **Stable for the life of the contact.** A second finger landing must not
+    /// renumber the first one — the protocol says future events reference the
+    /// id from `down`, and a client tracking a drag by id would see the drag
+    /// jump to the other finger.
+    #[test]
+    fn an_id_does_not_move_while_the_contact_is_down() {
+        let mut s = Slots::new();
+        let a = s.down(700).unwrap();
+        for other in 701..710 {
+            s.down(other);
+        }
+        for other in 701..710 {
+            s.up(other);
+        }
+        assert_eq!(s.get(700), Some(a), "the surviving contact was renumbered");
+    }
+
+    /// The protocol says an id "ceases to be valid after a touch up event and
+    /// may be reused". Reusing the *lowest* free one is what keeps the ids
+    /// dense across a long session of taps.
+    #[test]
+    fn a_released_id_is_reused_lowest_first() {
+        let mut s = Slots::new();
+        s.down(10);
+        s.down(11);
+        s.down(12);
+        assert_eq!(s.up(11), Some(1));
+        assert_eq!(s.down(99), Some(1), "the freed middle slot was not reused");
+        assert_eq!(s.up(10), Some(0));
+        assert_eq!(s.up(12), Some(2));
+        assert_eq!(s.up(99), Some(1));
+        assert!(s.is_empty());
+    }
+
+    /// An up for something that was never down is not an error and must not
+    /// invent an id. It happens: a contact whose down went to another window,
+    /// or an up after a cancel already cleared the table.
+    #[test]
+    fn an_unknown_pointer_has_no_id() {
+        let mut s = Slots::new();
+        s.down(1);
+        assert_eq!(s.up(2), None);
+        assert_eq!(s.get(2), None);
+        assert!(s.clear());
+        assert_eq!(s.up(1), None, "cancel did not release the live contact");
+        assert!(!s.clear(), "cancel would be sent with nothing down");
+    }
+
+    /// The bound, and that crossing it drops a contact rather than duplicating
+    /// a live id.
+    #[test]
+    fn the_table_is_bounded() {
+        let mut s = Slots::new();
+        for i in 0..MAX_CONTACTS {
+            assert_eq!(s.down(i as u32), Some(i as i32));
+        }
+        assert_eq!(s.down(9999), None);
+        assert_eq!(s.get(9999), None);
+        s.up(0);
+        assert_eq!(s.down(9999), Some(0), "a freed slot was not available again");
+    }
+
+    /// No contact area reported means **no `shape` event**, not a plausible
+    /// circle. This is the honesty requirement written as a test.
+    #[test]
+    fn a_device_without_contact_geometry_gets_no_ellipse() {
+        assert_eq!(shape_from_contact(0.0, 0.0, None), None);
+        assert_eq!(shape_from_contact(12.0, 0.0, None), None);
+        assert_eq!(shape_from_contact(0.0, 12.0, Some(45.0)), None);
+    }
+
+    /// A rectangle taller than it is wide is an ellipse whose major axis lies
+    /// along y, which is the protocol's zero.
+    #[test]
+    fn a_tall_contact_is_major_along_y() {
+        let s = shape_from_contact(8.0, 14.0, None).unwrap();
+        assert_eq!(s.major, 14.0);
+        assert_eq!(s.minor, 8.0);
+        assert_eq!(s.orientation, 0.0);
+    }
+
+    /// And a wide one is the same ellipse turned a quarter turn — which has to
+    /// be *said*, because `major` is required to be the longer diameter and a
+    /// silent 0 there would draw it upright.
+    #[test]
+    fn a_wide_contact_is_major_along_x() {
+        let s = shape_from_contact(14.0, 8.0, None).unwrap();
+        assert_eq!(s.major, 14.0);
+        assert_eq!(s.minor, 8.0);
+        assert_eq!(s.orientation, 90.0, "a wide patch was reported as upright");
+    }
+
+    /// Windows' 0..359 into Wayland's -180..=180, clockwise from +y in both.
+    #[test]
+    fn the_reported_angle_is_normalised_to_the_protocols_range() {
+        let at = |d: f64| shape_from_contact(6.0, 10.0, Some(d)).unwrap().orientation;
+        assert_eq!(at(0.0), 0.0);
+        assert_eq!(at(90.0), 90.0);
+        assert_eq!(at(180.0), 180.0);
+        assert_eq!(at(181.0), -179.0);
+        assert_eq!(at(270.0), -90.0);
+        assert_eq!(at(359.0), -1.0);
+        // Out of Windows' documented range: still has to land inside the
+        // protocol's, because an out-of-range fixed-point angle is a client's
+        // problem and not a diagnosable one.
+        assert_eq!(at(360.0), 0.0);
+        assert_eq!(at(-90.0), -90.0);
+    }
 }
 
 #[cfg(test)]

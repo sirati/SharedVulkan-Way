@@ -7131,6 +7131,441 @@ lever stops being needed as well as if it stops working.
    now six figures. Whether a long-lived guest eventually becomes unusable for
    this transport is a real question and it is not this stage's.
 
+## 24. Stage 20: `wl_touch`, and a seat that grows a third capability
+
+### 24.1 Status in one paragraph
+
+Written 2026-08-13, branched from `waycompose-base` at `08f66b8`, merged there
+after stages 13, 17 and 21, and then **rebased onto the unified tree** when the
+two repositories became one — so this is a section of
+`docs/waycompose-design.md` rather than of `docs/design.md`, which is now the
+Vulkan side's. §18, §22 and §25 belong to other stages and this sits among them
+by number rather than by date. Every gate in §24.7 was re-run from the rebased
+tree rather than carried over, which is the arrangement §12.12, §14.11, §15.13
+and §17.1 all used. `wl_seat` advertised
+`pointer keyboard` and the touch capability was correctly absent — `add_touch`
+was never called and no touch event existed anywhere in the tree, so the absence
+was honest rather than partial. It is present now, on the same terms: the events
+behind it are real, and the capability is **conditional on the machine having a
+digitiser** rather than hard-coded, so the guest — which has none — still says
+`pointer keyboard` and is still telling the truth. The Linux leg drives a
+scripted two-finger pinch into `weston-eventdemo` and libwayland decodes
+`down`, `motion`, `frame`, `up`, `shape`, `orientation` and `cancel` off the
+wire; `scripts/wc-input.sh linux` is **29 passed, 0 failed**. On the guest,
+`scripts/probe-touch.c` injects two synthetic contacts through
+`InjectTouchInput` and the compositor reports them at the right surface
+coordinates with the right ids — real `WM_POINTER*` messages, no finger.
+
+Three things cost more than the advertised work. **`wl_touch.cancel` was never
+sent**, and it was smithay rather than this code (§24.4). **An ssh session on
+the guest cannot be used for this at all**, for two independent reasons that
+both had to be worked around (§24.6). And the choice between the two Win32
+touch APIs turned out to be forced rather than a preference (§24.2).
+
+### 24.2 `WM_POINTER*` and not `WM_TOUCH` — and what the window was doing before
+
+A window must opt into one of them. Do neither and **Windows synthesises mouse
+messages** from the primary contact, which is what this compositor was doing
+until this stage: a tap arrived as `WM_LBUTTONDOWN`, became `wl_pointer.button`,
+and mostly worked. Touch was therefore never *absent* here, it was arriving as a
+mouse — which is worth saying plainly, because "touch does nothing" and "touch
+is a mouse" are different bugs and the second one hides.
+
+The two ways in:
+
+* **`RegisterTouchWindow` + `WM_TOUCH`.** Simpler and universally available.
+  `TOUCHINPUT` carries `dwID`, a position, and — with
+  `TOUCHINPUTMASKF_CONTACTAREA` — a contact *size* in `cxContact`/`cyContact`.
+* **`WM_POINTERDOWN`/`UPDATE`/`UP` + `GetPointerTouchInfo`.** Windows 8 and
+  after. `POINTER_TOUCH_INFO` carries `rcContact`, `orientation` and `pressure`,
+  each announced by a bit in `touchMask`.
+
+The pointer family is taken, and one reason decides it: **`WM_TOUCH` cannot
+express `wl_touch.orientation` at all.** `TOUCHINPUT` has no angle field. Since
+`wl_seat` is advertised at 9, `shape` *and* `orientation` are both in scope, and
+choosing `WM_TOUCH` would mean one of the two could never be sent by
+construction rather than for want of hardware — which is a different kind of
+absence from the one this stage is trying to keep. `touchMask` is also exactly
+the conditionality the protocol asks for: `shape` "is only sent by the
+compositor if the touch device supports shape reports", and Windows says whether
+it does.
+
+Two supporting reasons. `RegisterTouchWindow` switches a window *away* from
+pointer messages, so taking it would forfeit pen and every later input type as
+well. And `InjectTouchInput` drives the pointer family, which is the only way
+this path can be exercised at all on a machine with no digitiser — which is
+every machine this project has.
+
+**Consuming the message is the whole of the opt-in, and it is what suppresses
+the mouse.** `DefWindowProc`'s handling of `WM_POINTERDOWN`/`UPDATE`/`UP` is
+what *generates* the legacy `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`, so
+returning 0 is not a formality: left in place, every single-finger tap would
+reach the client twice, once as `wl_touch` and once as `wl_pointer`, and a
+toolkit that handles both — Firefox does — would act on it twice. There is no
+message that announces the duplication. `State::pointer_button` now logs, so
+that a button appearing beside a contact is visible in a log rather than only in
+a client behaving oddly; the guest run in §24.6 has no such line.
+
+The suppression is deliberately *narrow*. Anything that is not `PT_TOUCH` goes
+straight to `DefWindowProc`, so a pen still becomes mouse messages and still
+works exactly as before — a `wl_tablet_tool` this compositor does not implement
+is worse than a mouse it does.
+
+Two consequences of consuming the message that had to be put back by hand:
+
+* **Focus.** The `DefWindowProc` that would have moved the keyboard focus on a
+  tap is the one being suppressed, so `WM_POINTERDOWN` calls `SetFocus`
+  explicitly. Without it, tapping a window moves no focus and the client cannot
+  be typed into afterwards — a failure that looks like a keyboard bug.
+* **`WM_POINTERENTER`/`LEAVE` are consumed too**, doing nothing. Handed to
+  `DefWindowProc` they produce the synthesised mouse enter and leave, and
+  `wl_pointer` would report a pointer wandering in and out of the window every
+  time somebody tapped it.
+
+**What is not needed, and this is the pleasant surprise:** no `SetCapture`. A
+touch contact is implicitly captured by Windows to the window that received its
+`WM_POINTERDOWN`, so `UPDATE` and `UP` arrive there even when the finger leaves
+the window — which is exactly `wl_touch`'s model, where `down` names the surface
+and every later event for that contact belongs to it. The mouse needed
+`SetCapture` and `TrackMouseEvent` (§11) to get the same property; touch has it
+for free, on both sides, and the two protocols agree by accident.
+
+### 24.3 Contact ids: two numberings, and the one the client is entitled to
+
+Wayland tracks contacts by id and requires them stable for the life of a
+contact. Windows' `pointerId` is not that number. It is a `u32` from the input
+stack: unique while the contact exists, recycled afterwards, and with a value
+that is whatever the session has got to. **Measured on the guest: two contacts
+injected as 0 and 1 arrived as `pointerId` 4 and 5.**
+
+Passing those through would be legal — the protocol only requires an `int` that
+is unique among the contacts currently down — and it would be the kind of legal
+that gets found later, because every client in existence was written against
+libinput's slot numbers, which are small and dense. So
+`crate::input::touch::Slots` allocates **the lowest free index**, which is
+exactly what an evdev multi-touch slot is: `down` claims one, `up` frees it,
+`clear` is a cancel.
+
+Two decisions in it that are not obvious:
+
+* **The table is on the pump, not on the window.** `wl_touch`'s ids namespace
+  the *seat*, and there is one seat. A per-window table would let two windows
+  each hand out contact 0 and the client would see one finger in two places.
+  Win32 has no seat, so the nearest thing that exists — the thread that pumps
+  every window — owns it.
+* **It is bounded, at 32.** The table is keyed on pointer ids and freed on
+  `WM_POINTERUP`; an up that never arrives would otherwise grow it for the life
+  of the process and hand out ever-larger ids. A contact past the bound is
+  dropped with a line, because silently reusing a live id puts two fingers on
+  one contact, which looks to a client like a finger teleporting and is much
+  harder to diagnose than a missing one.
+
+The whole of it is in `crate::input`, tested by `cargo test` on Linux, for the
+reason that file already exists: `platform/win32.rs` is `cfg(windows)`, so
+anything living there is compiled by the cross gate and **run by nothing**. Nine
+tests, and the one that would have caught the worst bug is
+`an_id_does_not_move_while_the_contact_is_down`.
+
+### 24.4 `frame`, `cancel`, and the smithay bug the cancel found
+
+**`frame` grouping is not optional.** A client is entitled to accumulate
+everything since the last frame and act on none of it until the frame closes, so
+a compositor that omits it leaves touches buffered indefinitely — the same class
+of bug as a missing `wl_pointer.frame`, with the same symptom: input that looks
+right in a debug log and does nothing on screen.
+
+**One frame per Win32 message**, and the simplification is deliberate. Win32
+delivers one `WM_POINTER*` per contact; there is no message carrying two.
+Windows does offer `GetPointerFrameTouchInfo` plus `SkipPointerFrameMessages`,
+which would gather every contact sharing a `frameId` into one frame, and it is
+not used: `Skip…` discards the queued messages for the whole frame *including*
+`WM_POINTERDOWN`s, whose implicit capture and whose `DefWindowProc` suppression
+this design depends on, and there is no digitiser here to establish that doing
+so is safe. Nothing is lost by the simpler shape — the protocol says a frame
+"terminates at least one event but otherwise no guarantee is provided about the
+set of events within a frame", and a frame per changed contact is what libinput
+and Weston produce for the same gesture, one evdev `SYN_REPORT` at a time. A
+pinch arrives as alternating single-contact frames with equal timestamps, which
+is a correct description of it.
+
+`cancel` is the event a compositor is likeliest never to send, because nothing a
+user does produces one: it comes from the platform deciding the stream was a
+system gesture. Three things produce it here — `WM_POINTERCAPTURECHANGED`, a
+contact Windows has flagged `POINTER_FLAG_CANCELED` (palm rejection), and a
+window destroyed while holding contacts.
+
+The second of those is a real trade and is taken deliberately. The protocol has
+**no per-contact cancel**: `wl_touch.cancel` ends the whole stream. So one
+rejected palm cancels every live contact. The two ways to be wrong are not
+symmetric — over-cancelling loses a gesture the user repeats, while delivering a
+rejected contact as a normal `up` completes a tap the user never made, on
+whatever control the palm was resting on.
+
+**And then it did not arrive.** The Linux leg drove a contact, closed its frame,
+cancelled it, and `weston-eventdemo` received the `down` and the `frame` and
+nothing else, while the compositor's log said it had cancelled. The cause is
+upstream smithay: `TouchInternal::cancel` opened with the same guard `frame`
+uses —
+
+```rust
+if state.current.map(|c| c >= state.pending).unwrap_or(false) { continue; }
+```
+
+— which for `frame` correctly means "this slot has already had a frame for
+everything pending on it" and for `cancel` means "this slot is in a settled
+state, so do not cancel it". That is *every live contact in an ordinary
+gesture*, because an ordinary gesture is `down`, `frame`, `motion`, `frame`, and
+only then a cancel. `wl_touch.cancel` was emitted only for a contact with an
+unframed event outstanding, and never in the case the event exists for.
+
+The guard is dropped; `state.focus.take()` already skips contacts that `up` has
+released, which is the condition that was wanted. Three lines, no Windows
+content, upstreamable as a strict bug fix — `vendor/PATCHES.md` has it under
+stage 20. Worth recording for how it was found: not by reading the code but by
+`scripts/wc-input.sh` asserting on a `cancel()` that had to be on the wire.
+
+### 24.5 Shape and orientation, and the one number nobody here can check
+
+`POINTER_TOUCH_INFO` carries `rcContact`, an **axis-aligned rectangle** bounding
+the contact patch, and `orientation` in whole degrees 0..359. Both are optional
+and both announce themselves in `touchMask`. A digitiser that reports neither
+leaves the fields zeroed.
+
+`crate::input::touch::shape_from_contact` returns an `Option`, and the `None` is
+the point: **no fallback ellipse is manufactured.** A compositor that answered
+every contact with a plausible 10x10 circle would be telling clients a fact it
+does not have, and the protocol explicitly allows for not knowing — a client
+"has to make reasonable assumptions about the shape if it did not receive this
+event". `None` means no `shape` and no `orientation`, and the Linux leg asserts
+that the pinch — which reports no geometry — produces neither.
+
+Two conversions are done, and both are read off the data rather than invented:
+
+* **Which side is major.** The protocol requires `major` to be the longer
+  diameter, so the rectangle's larger extent is it — and the orientation then
+  has to say which axis that was, or the client draws the ellipse the wrong way
+  round. When Windows reports no orientation the rectangle is still
+  axis-aligned, so the answer is implied by it: 0 if the tall side is the major
+  one (the protocol's zero is "major along +y"), 90 if the wide side is.
+* **The angle's range.** Windows says 0..359, Wayland says -180..=180. Anything
+  over 180 is that value minus 360.
+
+**The assumption that cannot be checked here**, stated rather than buried:
+Wayland defines orientation as the clockwise angle from the positive surface y
+axis, and Microsoft's documentation of `POINTER_TOUCH_INFO::orientation` says
+only "in a range of 0 to 359". The code takes them to be the same convention.
+Settling that needs a digitiser that reports orientation, which is a narrower
+class of hardware than a touchscreen — no injection API offers an orientation
+either, so `probe-touch.c` deliberately does not claim `TOUCH_MASK_ORIENTATION`
+rather than test that the compositor forwards the probe's fiction.
+
+One known imprecision, on a path only reachable on hardware that reports
+orientation at all: when Windows *does* report a non-zero angle, `rcContact` is
+the bounding box of an already-rotated ellipse, so its extents over-estimate the
+axes. Windows exposes no other description of the patch. An over-estimate from
+the real rectangle beats a number this code made up.
+
+### 24.6 What each leg proves, and the hole in the middle
+
+The §8.5 split again, with a sharper edge than usual because the arbiter is
+weaker on one side.
+
+**linux — a real client, a scripted gesture.** `--simulate-wm` drives a
+two-finger pinch, both contacts up one at a time, then a contact the system
+cancels; `weston-eventdemo` connects directly and `WAYLAND_DEBUG=1` prints what
+libwayland decoded. Every `wl_touch` event exists on the wire, the contacts keep
+their ids across the pinch (0: 183→138, 1: 253→298 — diverging, so nothing was
+renumbered), every event is inside a closed frame, and `shape`/`orientation`
+appear exactly once, for the one contact that has geometry.
+
+This leg is **one step weaker than the keyboard's**, and it is worth saying why:
+`weston-eventdemo` has no touch logging flag. The toytoolkit binds `wl_touch`
+and handles the events and says nothing about them, so the claim is "libwayland
+decoded these and the client did not disconnect in protocol error" rather than
+the keyboard leg's "the client told us which letter it made of it". What this
+leg cannot say anything about at all is the translation: there is no
+`WM_POINTERDOWN` here.
+
+**wine — nothing, and it says so twice.** `scripts/wc-input.sh wine` is 26
+passed, 0 failed, and its seat line reads `wl_seat.capabilities(3) =
+pointer|keyboard; no touch digitiser on this machine` — Wine's
+`SM_MAXIMUMTOUCHES` is 0, so the conditional capability is exercised on a
+Windows-ish platform and correctly withholds the bit. Then Wine 11.14 staging
+exports `InitializeTouchInjection` and **not** `InjectTouchInput`, so
+`probe-touch.exe` exits 4 with both addresses printed. That is a distinct exit
+code on purpose:
+"the platform has no touch injection" is a fact about the platform and must not
+be read as "the compositor mishandled a touch". Wine has lied four times on this
+project (§13.6) and has no touch hardware behind it; on this stage it is a
+compile check and not evidence.
+
+**guest — synthetic contacts, real `WM_POINTER*`.** The guest is Windows 11
+26200.9168 and **`SM_MAXIMUMTOUCHES` is 0 and `SM_DIGITIZER` is 0**: there is no
+digitiser, so nothing on it can be exercised by a finger, and `has_touch()`
+correctly refuses to advertise the capability there. `WC_FORCE_TOUCH=1` overrides
+that for a run whose events are all injected, and says so in its startup line so
+that a synthetic run cannot be mistaken for a hardware one.
+
+`InitializeTouchInjection` succeeds on that machine — injection does not need a
+digitiser — and with the compositor, `wc-shmclient` and `probe-touch` all on the
+interactive desktop, the compositor logged:
+
+```
+window 1 touch contact: Windows pointer 4 -> wl_touch id 0
+window 1 touch contact: Windows pointer 5 -> wl_touch id 1
+window 1 touch down contact 0 at 230,200 (12x12 at 0 deg)
+window 1 touch down contact 1 at 270,200 (12x12 at 0 deg)
+window 1 touch up contact 0
+window 1 touch up contact 1
+```
+
+Four things in six lines. The id mapping is not the identity and is measured
+saying so. The coordinates are right: the contacts were injected at screen
+`388±20, 361`, the window is 500x400, and its client centre is surface
+`250,200` — so `230,200` and `270,200` is the screen-to-client-to-surface chain
+end to end. The contact patch is the probe's twelve pixels, arriving through
+`TOUCH_MASK_CONTACTAREA`. And **there is no `pointer button` line anywhere in
+that log**, which is the measurement that the legacy mouse promotion was
+suppressed and the client was not told about the tap twice.
+
+**Two things about the guest that are about the deployment and not about
+touch**, both of which had to be solved before any of the above:
+
+1. **An ssh session is not on the desktop.** §10.12 item 3 already knew this —
+   sshd logs the user into session 0 with its own window station,
+   `Service-0x0-<luid>$` — and the consequence for injected input is total:
+   `FindWindow` from an ssh-launched process does not find the compositor's
+   toplevel, so `probe-touch.exe` had nothing to inject into. This is also why
+   `wc-guest.sh` has never run `probe-input.c`. The fix is stage 8's:
+   `runint.ps1`, a scheduled task with an `Interactive` principal, which is
+   already in `scripts/wc-desktop.sh` and was reused unchanged.
+2. **And then the client has to go with it.** With the compositor on the
+   interactive desktop and `wc-shmclient` still in the ssh session, the
+   compositor refused the client's buffer:
+   `protocol error on object 5, code 2: Failed to mmap fd … Section { name:
+   "Local\\wc-…" }`. `Local\` is the **per-session** NT object namespace, so a
+   section made in session 0 does not exist in session 1. That is the same fact
+   §11.2 records about a keymap crossing the VM boundary, met from a new
+   direction: two Windows processes on one machine are not necessarily in one
+   namespace either. Both ends run on the interactive desktop now.
+
+**The hole**: nothing here has been touched by a finger. No machine on this
+project has a digitiser. Contact geometry from real hardware, orientation from
+any hardware, palm rejection, `WM_POINTERCAPTURECHANGED` from a real shell
+gesture, and the behaviour of a client under a gesture that is actually
+continuous rather than four scripted steps are all unexercised and are all
+hardware nobody here has.
+
+### 24.7 The gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | 169 passed (master `9ae2223` measured at 160; 9 new, all in `input::touch_tests`) |
+| `cargo clippy --workspace --all-targets` | clean |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
+| `cargo build --target x86_64-pc-windows-gnu -p wc-compositor` | links an `.exe`, not just metadata |
+| `scripts/wc-input.sh linux` | 29 passed, 0 failed |
+| `scripts/wc-input.sh wine` | 26 passed, 0 failed; seat correctly `capabilities(3)` |
+| `probe-touch.exe` under Wine | exit 4, "this user32 has no touch injection" |
+| `probe-touch.exe` on the guest's interactive desktop | exit 0, contacts decoded (§24.6) |
+
+Every row above except the last was re-run from the merged tree. The guest row
+is the one carried over from the branch, and the reason is worth stating rather
+than hiding: re-running it means putting a window on a desktop where somebody is
+working, and the merges touched no touch code — the conflicts were an import
+block, two adjacent-but-unrelated statements in `pointer_button`, and section
+ordering in this file.
+
+**Two other stages touch something this stage depends on**, and both are worth
+naming because in one case the answer is "nothing to do" and in the other it is
+"do nothing, deliberately" — and the second of them has not reached this tree
+yet, which is exactly why it is written down.
+
+* **Stage 17 (§22) changed what the frame is**, and a touch position becomes a
+  surface position through `WindowState::to_surface`, which is
+  `FrameStyle::content_origin` — the *same* conversion the mouse uses,
+  deliberately, and the reason `on_pointer` converts screen to client first
+  rather than doing its own arithmetic. The title-bar change therefore reaches
+  touch for free, and the check that it did is the Linux leg's `the contacts
+  kept their ids across the pinch (0: 183->138, 1: 253->298)`, unchanged across
+  every merge.
+* **The cursor stage is not in this tree yet, and when it arrives touch must
+  stay out of its guard.** This is written down here rather than in a code
+  comment because the code it is about does not exist on this branch: stage 12's
+  cursor work (`waycompose-base` `49f9d7b`) adds `Ui::pointer_inside`, which
+  means "the mouse cursor is over our client area" and guards a
+  **thread-global** `SetCursor` that `set_cursor` calls immediately, so that a
+  client changing its cursor while the pointer is still is seen without waiting
+  for a mouse move.
+
+  **A touch must never set that flag.** A finger does not move the cursor, and
+  `on_pointer` suppresses the mouse messages Windows would otherwise synthesise
+  from a contact, so a tap leaves the real cursor wherever it was — possibly
+  over a different application's window. If `WM_POINTERENTER` were left to
+  `DefWindowProc`, the synthesised `WM_MOUSEMOVE` would set the flag and a tap
+  would license this compositor to repaint somebody else's cursor: the failure
+  the guard exists to prevent, reached from the one direction that has no cursor
+  in it at all. `on_pointer` consuming those two messages is what prevents it,
+  and that is now one of its two reasons rather than one.
+
+  Nothing is lost by staying out: `set_cursor` always stores into `ui.cursor`
+  and only the *immediate* `SetCursor` is guarded, so a cursor change made
+  during a touch is installed by the next real `WM_SETCURSOR`. The suppression
+  costs a cursor update that had no cursor to update. This was worked out and
+  committed against the pre-unification tree (`waycompose-base` `daf5af8`), and
+  the field comment there can be lifted verbatim when the two meet.
+
+The three exact-count tests that the small-protocols work breaks —
+`wire::tests::every_message_in_every_protocol_round_trips`,
+`spec::tests::the_builtin_protocols_parse` and
+`spec::tests::the_reverse_direction_has_fds_too` — all pass unchanged here. This
+stage added no XML and touched no proxy file, so it has nothing to renumber;
+noted only because the next merge into this branch may.
+
+### 24.8 What is not proven
+
+1. **A finger.** §24.6's hole, and it is the whole of the hardware gap. Every
+   contact in this stage was manufactured by software.
+2. **Orientation, in either direction.** The convention is assumed to match
+   (§24.5) and nothing available can report one.
+3. **Firefox.** It has touch handling in `nsWindow` and it was never put in
+   front of this: the guest run used `wc-shmclient`, which binds no seat, so
+   what was measured is the `WM_POINTER*`-to-`FromUi` half on real Windows and
+   the `FromUi`-to-`wl_touch` half on Linux. Nothing has yet run both halves
+   with a real client in front of them.
+4. **A frame that genuinely contains two contacts, on Win32.** The Linux leg
+   sends one; Win32 cannot produce one because it delivers a message per
+   contact, and the API that would group them is not used (§24.4).
+5. **Long sessions.** `Slots` is bounded and reuses lowest-first, and no run has
+   been longer than a few gestures. A digitiser that stops sending an up would
+   leak a slot until the bound, and nothing has ever done that here.
+
+### 24.9 What to do next
+
+1. **Put Firefox in front of it.** Item 3 above is the cheapest remaining gain
+   by a distance: `scripts/wc-guest.sh firefox` already runs Firefox against the
+   compositor on the guest, and adding `WC_FORCE_TOUCH=1` plus a `probe-touch`
+   call to that leg would join the two halves with a client that has never heard
+   of this project. It needs the interactive desktop, which §24.6 shows how to
+   reach.
+2. **Ask for a digitiser.** One cheap USB touchscreen or one tablet passed
+   through to the guest closes items 1 and 2 and nothing else will. Until then
+   `shape` is exercised only by rectangles this project wrote.
+3. **Send the smithay patch upstream.** §24.4 is a plain bug in a released
+   crate, with no Windows content, and every compositor built on smithay that
+   cancels a settled touch stream has it. `vendor/PATCHES.md` carries it under
+   the `smithay` stage-20 entry, with the maintenance rule that matters: the
+   hunk should **disappear** when a release contains it rather than be carried,
+   and it is the one hunk a rebase must not drop silently, because a lost
+   feature gate fails to compile and a lost `cancel` fix compiles and quietly
+   stops sending an event. A fuller write-up as a submittable task exists in
+   `waycompose-base` (`7b30a26`, a standalone "Upstreamable" section) and should
+   be folded in when that commit reaches this tree; what is left either way is a
+   human deciding how to approach that project, not rediscovering the fix.
+4. **Reconsider `GetPointerFrameTouchInfo`** if a digitiser ever appears. The
+   reason for not using it is "no hardware to establish that
+   `SkipPointerFrameMessages` is safe", which is a reason that expires.
+
 ## 25. Stage 21: four protocols, one of which was a trap
 
 ### 25.1 Status in one paragraph

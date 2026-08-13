@@ -13,6 +13,12 @@ use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
 };
+// ADDED FOR STAGE 20. smithay's touch handle is the same shape as the pointer
+// one — it owns the per-contact focus map and the `frame` bookkeeping, so this
+// file supplies events and never a `WlTouch`.
+use smithay::input::touch::{
+    DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchHandle, UpEvent,
+};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
@@ -258,6 +264,12 @@ pub struct State {
     /// without a keyboard and says so.
     keyboard: Option<KeyboardHandle<Self>>,
     pointer: PointerHandle<Self>,
+    /// ADDED FOR STAGE 20. `None` on a machine with no digitiser, and then
+    /// `wl_seat` never advertises the touch capability — see `platform::
+    /// has_touch`. The `Option` is the honesty: a capability is a promise that
+    /// events of that kind can happen, and adding the handle unconditionally
+    /// would make the promise on every laptop without a touchscreen.
+    touch: Option<TouchHandle<Self>>,
     /// Which window the platform says has keyboard focus, and which one the
     /// pointer is over. Kept as ids rather than surfaces because that is what
     /// arrives from the UI thread, and resolved to a surface at the moment of
@@ -423,6 +435,19 @@ impl State {
         // client that binds later gets the current set in its `bind`.
         let pointer = seat.add_pointer();
 
+        // STAGE 20, and the condition is the point. `add_touch` is what makes
+        // smithay put `touch` in `wl_seat.capabilities`, so calling it is a
+        // statement that this seat can produce `wl_touch` events — which on a
+        // machine with no digitiser it cannot. `platform::has_touch` asks the
+        // platform; on Windows that is `SM_MAXIMUMTOUCHES`, and on the headless
+        // platform it is `--simulate-wm`'s scripted gesture, which is a real
+        // source of the events even though it is not a finger.
+        //
+        // Until this stage the capability was correctly absent because
+        // `add_touch` was never called and no touch event existed. It is
+        // present now for the same reason: the events behind it are real.
+        let touch = crate::platform::has_touch().then(|| seat.add_touch());
+
         // The keyboard is the one that can fail, because it compiles a keymap.
         // On Windows this is the *only* way it can succeed: `XkbConfig`'s RMLVO
         // fields go through `xkb_keymap_new_from_names`, which resolves against
@@ -459,7 +484,11 @@ impl State {
                 }
             }
         });
-        println!("wc-compositor: seat0 capabilities: pointer{}", if keyboard.is_some() { ", keyboard" } else { "" });
+        println!(
+            "wc-compositor: seat0 capabilities: pointer{}{}",
+            if keyboard.is_some() { ", keyboard" } else { "" },
+            if touch.is_some() { ", touch" } else { "" }
+        );
 
         // Said at startup, on the side that created the object, because the
         // failure it predicts happens later and somewhere else. A keyboard on
@@ -568,6 +597,7 @@ impl State {
             seat_state,
             keyboard,
             pointer,
+            touch,
             keyboard_focus: None,
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
@@ -784,6 +814,27 @@ impl State {
                     self.pointer_axis(id, horizontal, vertical, v120_h, v120_v, time)
                 }
                 FromUi::Layout { name } => self.set_layout(name),
+                FromUi::TouchDown { id, slot, x, y, shape, time } => {
+                    self.touch_down(id, slot, x, y, shape, time)
+                }
+                FromUi::TouchMotion { id, slot, x, y, shape, time } => {
+                    self.touch_motion(id, slot, x, y, shape, time)
+                }
+                FromUi::TouchUp { id, slot, time } => self.touch_up(id, slot, time),
+                FromUi::TouchFrame => {
+                    if let Some(touch) = self.touch.clone() {
+                        touch.frame(self);
+                    }
+                }
+                FromUi::TouchCancel => {
+                    if let Some(touch) = self.touch.clone() {
+                        // No `frame` after this: the protocol says outright
+                        // that none is required, and smithay's `cancel` drops
+                        // every focus, so a frame afterwards would be sent to
+                        // nobody.
+                        touch.cancel(self);
+                    }
+                }
             }
         }
     }
@@ -989,6 +1040,18 @@ impl State {
 
     fn pointer_button(&mut self, id: WindowId, button: u32, pressed: bool, time: u32) {
         let pointer = self.pointer.clone();
+        // ADDED FOR STAGE 20, and it is about touch rather than about the
+        // mouse. A window that does not consume `WM_POINTERDOWN` gets a
+        // `WM_LBUTTONDOWN` synthesised from the primary contact as well, so a
+        // tap would arrive at the client twice — once as `wl_touch` and once as
+        // `wl_pointer` — and a toolkit that handles both, which Firefox does,
+        // would act on it twice. There is no message that announces the
+        // duplication; the only way to see it is a button appearing beside a
+        // contact, and until this line nothing said a button had happened.
+        println!(
+            "wc-compositor: window {id} pointer button {button:#x} {}",
+            if pressed { "pressed" } else { "released" }
+        );
         if pressed {
             self.dismiss_grab_if_outside(id);
         }
@@ -1091,6 +1154,131 @@ impl State {
             p.send_popup_done();
         }
         self.popup_grab = None;
+    }
+
+    // --- touch, stage 20 ---------------------------------------------------
+    //
+    // Three routing facts that make this shorter than the pointer above rather
+    // than longer, and all three are the protocol rather than a shortcut:
+    //
+    // * **There is no enter or leave.** `wl_touch.down` names the surface, and
+    //   every later event for that contact belongs to it whatever it moves
+    //   over. So there is no focus to track here, and no equivalent of
+    //   `pointer_focus`; smithay's `TouchHandle` keeps the per-contact focus
+    //   map that `down` establishes and `up` retires.
+    // * **The contact id is already right.** It arrives from the platform in
+    //   the protocol's numbering, small and dense, because Windows' pointer
+    //   ids are not usable as contact ids and the mapping belongs where the
+    //   pointer ids are (`crate::input::touch::Slots`).
+    // * **`frame` is a separate event and it is required.** It is not emitted
+    //   from these three functions, because one Win32 message can be a `down`
+    //   and a `shape` and an `orientation`, and those are one logical update
+    //   that has to close once. The platform decides where a frame ends; this
+    //   file forwards that decision.
+
+    /// A contact landed. This is the only event that carries a surface, and it
+    /// is therefore the only one that can be dropped for want of a window.
+    fn touch_down(
+        &mut self,
+        id: WindowId,
+        slot: i32,
+        x: f64,
+        y: f64,
+        shape: Option<crate::platform::TouchShape>,
+        time: u32,
+    ) {
+        let Some(touch) = self.touch.clone() else { return };
+        let Some(surface) = self.surface_of(id) else { return };
+        // Logged, unlike pointer motion, because a contact is rare — a few per
+        // gesture rather than one per pixel — and because "touch does nothing"
+        // is otherwise indistinguishable from "no touch message ever arrived",
+        // which on Win32 is the difference between this compositor being wrong
+        // and the window never having opted out of synthesised mouse input.
+        // The shape is in the line for the same reason it is conditional: a
+        // client that gets no `shape` should be able to see that the digitiser
+        // reported none.
+        println!(
+            "wc-compositor: window {id} touch down contact {slot} at {x:.0},{y:.0} ({})",
+            match shape {
+                Some(s) => format!(
+                    "{:.0}x{:.0} at {:.0} deg",
+                    s.major, s.minor, s.orientation
+                ),
+                None => "no contact geometry reported".to_owned(),
+            }
+        );
+        touch.down(
+            self,
+            // The surface origin in compositor space, `(0, 0)` for the same
+            // reason it is in `pointer_motion`: one `HWND` per window, and the
+            // platform has already subtracted the frame.
+            Some((surface, (0.0, 0.0).into())),
+            &DownEvent {
+                slot: Some(slot as u32).into(),
+                location: (x, y).into(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        self.touch_shape(slot, shape);
+    }
+
+    fn touch_motion(
+        &mut self,
+        id: WindowId,
+        slot: i32,
+        x: f64,
+        y: f64,
+        shape: Option<crate::platform::TouchShape>,
+        time: u32,
+    ) {
+        let Some(touch) = self.touch.clone() else { return };
+        // Passed for smithay's benefit and **not** to change the focus:
+        // `TouchHandle::motion` documents that the focus is only ever set by
+        // `down`, and uses this to find drag-and-drop targets under a moving
+        // contact. Which is why a motion for a window that has gone away is
+        // still worth delivering — the contact's focus is the surface it landed
+        // on, not this one.
+        let focus = self.surface_of(id).map(|s| (s, (0.0, 0.0).into()));
+        touch.motion(
+            self,
+            focus,
+            &TouchMotionEvent { slot: Some(slot as u32).into(), location: (x, y).into(), time },
+        );
+        self.touch_shape(slot, shape);
+    }
+
+    fn touch_up(&mut self, id: WindowId, slot: i32, time: u32) {
+        let Some(touch) = self.touch.clone() else { return };
+        println!("wc-compositor: window {id} touch up contact {slot}");
+        touch.up(
+            self,
+            &UpEvent {
+                slot: Some(slot as u32).into(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+    }
+
+    /// The `shape`/`orientation` pair, or neither.
+    ///
+    /// `None` is the ordinary case and it is not a gap being papered over: the
+    /// protocol says `shape` "is only sent by the compositor if the touch
+    /// device supports shape reports" and that a client "has to make reasonable
+    /// assumptions about the shape if it did not receive this event". Windows
+    /// says whether it has one in `POINTER_TOUCH_INFO::touchMask`, that answer
+    /// is carried here unchanged, and nothing is manufactured to fill it in.
+    ///
+    /// Both events go out **before** the `frame` the platform will send, which
+    /// is what the protocol requires and is why this is called from inside the
+    /// down and motion handlers rather than being an event of its own.
+    fn touch_shape(&mut self, slot: i32, shape: Option<crate::platform::TouchShape>) {
+        let Some(touch) = self.touch.clone() else { return };
+        let Some(shape) = shape else { return };
+        let slot = Some(slot as u32).into();
+        touch.shape(self, &ShapeEvent { slot, major: shape.major, minor: shape.minor });
+        touch.orientation(self, &OrientationEvent { slot, orientation: shape.orientation });
     }
 
     /// The user changed their Windows keyboard layout under a running client.

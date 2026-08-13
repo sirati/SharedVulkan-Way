@@ -66,11 +66,25 @@ use windows_sys::Win32::Graphics::Gdi::{
     // its two constants are filed under GDI even though the call that takes
     // them, `UpdateLayeredWindow`, is filed under WindowsAndMessaging.
     AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
+    // ADDED FOR STAGE 20, filed in the same surprising place, and needed
+    // because `POINTER_INFO` reports in **screen** coordinates while every
+    // other input message this file handles reports in client ones.
+    ScreenToClient,
+};
+// ADDED FOR STAGE 20. See `on_pointer`: the `WM_POINTER*` family rather than
+// `RegisterTouchWindow`/`WM_TOUCH`, and this is the whole of the extra API.
+use windows_sys::Win32::UI::Input::Pointer::{
+    GetPointerTouchInfo, GetPointerType, POINTER_FLAG_CANCELED, POINTER_FLAG_INCONTACT,
+    POINTER_TOUCH_INFO,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     // ADDED FOR STAGE 13, for the locked modifiers. See `lock_on`.
     GetKeyState, VK_CAPITAL, VK_NUMLOCK,
+    // ADDED FOR STAGE 20: a touch that consumes `WM_POINTERDOWN` also consumes
+    // the `DefWindowProc` that would have moved the focus, so `on_pointer`
+    // moves it by hand.
+    GetFocus, SetFocus,
     GetKeyboardLayout, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -93,6 +107,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, XBUTTON1,
+    // ADDED FOR STAGE 20: touch. `SM_MAXIMUMTOUCHES` is how a machine says
+    // whether it has a digitiser at all, and the `PT_*` and `TOUCH_MASK_*`
+    // constants are filed here rather than beside the functions that produce
+    // them.
+    PT_TOUCH, POINTER_INPUT_TYPE, SM_MAXIMUMTOUCHES, TOUCH_MASK_CONTACTAREA,
+    TOUCH_MASK_ORIENTATION, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER,
+    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE,
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
@@ -659,6 +680,15 @@ struct Ui {
     /// nobody outside the process ever measured. A frame dumped here is read
     /// back by `identify` and `compare`, which are not ours.
     dump_frames: Option<std::path::PathBuf>,
+    /// ADDED FOR STAGE 20. Windows pointer ids to `wl_touch` contact ids.
+    ///
+    /// **On the pump and not on the window**, which is the one structural
+    /// decision in the touch path. `wl_touch`'s ids namespace the *seat*, and
+    /// there is one seat; a per-window table would let two windows each hand
+    /// out contact 0 and the client would see one finger in two places. Win32
+    /// has no seat, so the nearest thing that exists — the thread that pumps
+    /// every window — owns it. See `crate::input::touch::Slots`.
+    slots: RefCell<crate::input::touch::Slots>,
 }
 
 thread_local! {
@@ -914,6 +944,23 @@ unsafe extern "system" fn toplevel_proc(
             state.on_wheel(wparam, true, message_time());
             0
         }
+
+        // --- touch, stage 20 -----------------------------------------------
+        //
+        // Deliberately falling through to `DefWindowProc` when `on_pointer`
+        // declines: that is what turns a pen — or a touch whose details have
+        // already been discarded — back into the mouse messages above, rather
+        // than into nothing. See `on_pointer` for why consuming the message is
+        // the whole of the opt-in, and why not consuming it would deliver every
+        // tap twice.
+        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERENTER | WM_POINTERLEAVE
+        | WM_POINTERCAPTURECHANGED => {
+            if on_pointer(state, msg, wparam) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_CLOSE => {
             // Deliberately **not** `DefWindowProc`, which would destroy the
             // window. In Wayland the close button is a request: the compositor
@@ -927,6 +974,20 @@ unsafe extern "system" fn toplevel_proc(
             0
         }
         WM_DESTROY => {
+            // ADDED FOR STAGE 20. A window that goes away holding contacts
+            // would leak their ids for the life of the process — Windows sends
+            // no `WM_POINTERUP` to a window that no longer exists — and would
+            // leave the client believing fingers are still down on a surface it
+            // has destroyed. Both are fixed by the event the protocol already
+            // has for "these did not finish".
+            //
+            // Seat-wide, so it also ends contacts on *other* windows, which is
+            // the same asymmetry `on_pointer` accepts for a cancelled contact
+            // and for the same reason: one finger is on one window in practice,
+            // and a lost gesture beats a stuck one.
+            if let Some(ui) = ui() {
+                cancel_all(state, &ui, "the window was destroyed");
+            }
             // SAFETY: clearing the slot before reclaiming the `Rc` means any
             // message still to be delivered to this window sees a null pointer
             // and takes the `DefWindowProc` path above.
@@ -938,6 +999,286 @@ unsafe extern "system" fn toplevel_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Touch
+// ---------------------------------------------------------------------------
+
+/// Whether this machine has a touch digitiser.
+///
+/// **Read at startup so that `wl_seat` does not claim a capability the hardware
+/// cannot produce.** `SM_MAXIMUMTOUCHES` is the number of simultaneous contacts
+/// the installed digitisers support and is 0 when there is none — the same
+/// question `GetSystemMetrics(SM_DIGITIZER)` answers with flags, asked in the
+/// form that has a useful number in it. A laptop without a touchscreen
+/// therefore advertises pointer and keyboard and not touch, which is what the
+/// protocol means by a capability and is why this is not simply hard-coded
+/// true.
+///
+/// `WC_FORCE_TOUCH` overrides it, and exists for exactly one purpose: driving
+/// the path with `InjectSyntheticPointerInput` on a machine with no digitiser.
+/// It is an environment variable rather than a flag so that a run which used it
+/// is visible in the process environment of the thing under test, and the
+/// startup line says so — a synthetic run must not be mistakable for a hardware
+/// one (docs/design.md §24.6).
+pub fn has_touch() -> bool {
+    if std::env::var_os("WC_FORCE_TOUCH").is_some() {
+        println!(
+            "wc-compositor: WC_FORCE_TOUCH is set, so wl_seat will advertise touch whatever the \
+             hardware says. Any touch event in this run is synthetic."
+        );
+        return true;
+    }
+    // SAFETY: a pure query taking a documented index.
+    let n = unsafe { GetSystemMetrics(SM_MAXIMUMTOUCHES) };
+    if n <= 0 {
+        println!(
+            "wc-compositor: SM_MAXIMUMTOUCHES is {n}, so this machine has no touch digitiser and \
+             wl_seat will not advertise touch."
+        );
+        return false;
+    }
+    println!("wc-compositor: touch digitiser reports {n} simultaneous contacts");
+    true
+}
+
+/// One `WM_POINTER*` message. Returns whether it was consumed.
+///
+/// # Why `WM_POINTER*` and not `RegisterTouchWindow`/`WM_TOUCH`
+///
+/// Both are real, both work, and a window must opt into one of them or Windows
+/// synthesises **mouse messages** from the primary contact instead — which is
+/// what this compositor was doing before this stage, and is worth stating
+/// because it means touch was never *absent* here, it was arriving as a mouse.
+/// A tap became `WM_LBUTTONDOWN`, Firefox saw `wl_pointer.button`, and it
+/// mostly worked; what it could not do was two fingers, or tell a client that
+/// the input was a finger at all.
+///
+/// The pointer family is chosen for one reason that decides it and two that
+/// support it:
+///
+/// * **`WM_TOUCH` cannot express `wl_touch.orientation` at all.** `TOUCHINPUT`
+///   carries `cxContact`/`cyContact` — a contact *size* — and no angle
+///   whatsoever. `wl_seat` is advertised at 9, so `shape` and `orientation`
+///   are both in scope, and choosing `WM_TOUCH` would mean one of the two
+///   events could never be sent by construction rather than for want of
+///   hardware. `POINTER_TOUCH_INFO` has `rcContact` *and* `orientation`, each
+///   with a bit in `touchMask` saying whether the digitiser filled it in,
+///   which is exactly the conditionality the protocol wants.
+/// * It is the supported family. `WM_TOUCH` is documented as legacy and
+///   `RegisterTouchWindow` switches the window *away* from pointer messages,
+///   so taking it would also forfeit pen and every later input type.
+/// * `InjectSyntheticPointerInput` drives it, which is the only way this path
+///   can be exercised at all on a machine with no digitiser.
+///
+/// The cost is Windows 8, and this compositor already requires far newer.
+///
+/// # Consuming the message is what suppresses the mouse
+///
+/// Returning 0 rather than falling through to `DefWindowProc` is not a
+/// formality: the default handling of `WM_POINTERDOWN`/`UPDATE`/`UP` is what
+/// *generates* the legacy `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`. Left
+/// in place, every single-finger tap would reach the client twice — once as
+/// `wl_touch` and once as `wl_pointer` — and a client that handles both, which
+/// Firefox does, would act on it twice.
+///
+/// So the suppression is deliberate and it is also *narrow*: anything that is
+/// not `PT_TOUCH` is handed straight to `DefWindowProc`. A pen still becomes
+/// mouse messages and still works exactly as it did, because a `wl_tablet_tool`
+/// this compositor does not implement is worse than a mouse it does.
+///
+/// # Focus
+///
+/// `SetFocus` is called explicitly on the first contact, because the
+/// `DefWindowProc` handling that would have done it is the same handling being
+/// suppressed. Without it, tapping a window would move no keyboard focus and
+/// the client could not be typed into after being touched — a failure that
+/// looks like a keyboard bug and is a touch one.
+fn on_pointer(state: &WindowState, msg: u32, wparam: WPARAM) -> bool {
+    // `GET_POINTERID_WPARAM` is the low word, on every message in the family.
+    let pointer_id = (wparam & 0xffff) as u32;
+
+    let mut kind: POINTER_INPUT_TYPE = 0;
+    // SAFETY: `kind` is written by the call; a failure leaves it alone, which
+    // is why it is initialised to a value that is not `PT_TOUCH`.
+    if unsafe { GetPointerType(pointer_id, &mut kind) } == 0 || kind != PT_TOUCH {
+        // A pen, or a pointer that has already gone away. Let Windows make
+        // mouse messages out of it; the existing path handles those.
+        return false;
+    }
+
+    let Some(ui) = ui() else { return false };
+
+    // Capture taken away by the system — an edge swipe, the touch keyboard,
+    // a shell gesture. Every live contact is finished at once, which is what
+    // `wl_touch.cancel` means, and no per-contact information is needed.
+    if msg == WM_POINTERCAPTURECHANGED {
+        cancel_all(state, &ui, "the system took the pointer capture");
+        return true;
+    }
+
+    // A touch contact has no hover, so these carry nothing this compositor
+    // wants. They are still consumed: handed to `DefWindowProc` they would
+    // produce the synthesised mouse enter and leave that the rest of this
+    // function exists to prevent, and `wl_pointer` would report a pointer
+    // wandering in and out of the window every time somebody tapped it.
+    if msg == WM_POINTERENTER || msg == WM_POINTERLEAVE {
+        return true;
+    }
+
+    let mut ti: POINTER_TOUCH_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `ti` is fully owned here and written by the call.
+    if unsafe { GetPointerTouchInfo(pointer_id, &mut ti) } == 0 {
+        // The type said touch and the details are gone, which means the contact
+        // ended between the two calls. Not consumed: a mouse message is a
+        // better outcome than a dropped one.
+        return false;
+    }
+
+    // **Screen coordinates.** `ptPixelLocation` is on the desktop, unlike every
+    // other input message in this file, whose `lParam` is already client-local.
+    // Converting here and then through `to_surface` is what keeps a touch and a
+    // click landing on the same pixel of the same surface.
+    let mut pt = POINT {
+        x: ti.pointerInfo.ptPixelLocation.x,
+        y: ti.pointerInfo.ptPixelLocation.y,
+    };
+    // SAFETY: a live window handle and a stack point written by the call.
+    unsafe {
+        ScreenToClient(state.hwnd(), &mut pt);
+    }
+    let (sx, sy) = state.to_surface(pt.x, pt.y);
+
+    // `message_time()` and **not** `ti.pointerInfo.dwTime`, which is the
+    // digitiser's own stamp. Wayland says only that timestamps within a seat
+    // are comparable, and mixing two epochs on one seat would make a
+    // touch-then-click sequence appear to go backwards in time — which is
+    // precisely what a client's double-tap and gesture timing reads.
+    let time = message_time();
+
+    // The contact patch, only if the digitiser said it has one. Both halves are
+    // conditional and neither is invented; see `shape_from_contact`.
+    let shape = if ti.touchMask & TOUCH_MASK_CONTACTAREA != 0 {
+        let r = ti.rcContact;
+        let orientation = if ti.touchMask & TOUCH_MASK_ORIENTATION != 0 {
+            Some(f64::from(ti.orientation))
+        } else {
+            None
+        };
+        crate::input::touch::shape_from_contact(
+            f64::from(r.right - r.left),
+            f64::from(r.bottom - r.top),
+            orientation,
+        )
+    } else {
+        None
+    };
+
+    // A contact Windows has marked as not meant — palm rejection is the usual
+    // one. There is no per-contact cancel in the protocol: `wl_touch.cancel`
+    // ends the whole stream. Cancelling everything is the deliberate choice,
+    // because the two ways to be wrong are not symmetric — over-cancelling
+    // loses a gesture the user must repeat, while delivering it as a normal
+    // `up` completes a tap the user never made, on whatever control the palm
+    // was resting on.
+    if ti.pointerInfo.pointerFlags & POINTER_FLAG_CANCELED != 0 {
+        cancel_all(state, &ui, "Windows marked the contact cancelled");
+        return true;
+    }
+
+    match msg {
+        WM_POINTERDOWN => {
+            let slot = ui.slots.borrow_mut().down(pointer_id);
+            let Some(slot) = slot else {
+                eprintln!(
+                    "wc-compositor: window {} dropped touch contact {pointer_id}: more than {} \
+                     down at once",
+                    state.id,
+                    crate::input::touch::MAX_CONTACTS
+                );
+                return true;
+            };
+            // The two numberings, side by side, once per contact. Cheap — a
+            // contact is a few messages, not one per pixel — and it is the only
+            // place the mapping is observable from outside: Windows' id is the
+            // input stack's own and the client is told a small dense one, and
+            // on the guest they were 4 and 5 against 0 and 1 for the same two
+            // fingers. A reader who suspects the ids are wrong can
+            // check them here rather than infer it from a client behaving oddly.
+            println!(
+                "wc-compositor: window {} touch contact: Windows pointer {pointer_id} \
+                 -> wl_touch id {slot}",
+                state.id
+            );
+            // See this function's header: the `DefWindowProc` that would have
+            // moved the focus is the one being suppressed.
+            // SAFETY: both are pure queries on a live handle owned by this
+            // thread; `SetFocus` on the already-focused window is a no-op.
+            unsafe {
+                if GetFocus() != state.hwnd() {
+                    SetFocus(state.hwnd());
+                }
+            }
+            state.send(FromUi::TouchDown { id: state.id, slot, x: sx, y: sy, shape, time });
+        }
+        WM_POINTERUPDATE => {
+            // A contact that is in range but not touching. Touch digitisers
+            // rarely do this and pens always do; the flag is checked rather
+            // than assumed, because a hovering contact reported as motion is a
+            // finger that a client believes is dragging.
+            if ti.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT == 0 {
+                return true;
+            }
+            let Some(slot) = ui.slots.borrow().get(pointer_id) else {
+                // An update for a contact whose down went somewhere else. Not
+                // an error and not deliverable: `wl_touch.motion` may only name
+                // an id that a `down` has already introduced.
+                return true;
+            };
+            state.send(FromUi::TouchMotion { id: state.id, slot, x: sx, y: sy, shape, time });
+        }
+        WM_POINTERUP => {
+            let Some(slot) = ui.slots.borrow_mut().up(pointer_id) else {
+                return true;
+            };
+            state.send(FromUi::TouchUp { id: state.id, slot, time });
+        }
+        _ => return false,
+    }
+
+    // **One frame per message, and every message closes its own.**
+    //
+    // Win32 delivers one `WM_POINTER*` per contact; there is no message that
+    // carries two. Windows does offer `GetPointerFrameTouchInfo` plus
+    // `SkipPointerFrameMessages`, which would gather every contact sharing a
+    // `frameId` into one frame — and it is not used, because `Skip…` discards
+    // the queued messages for the whole frame including `WM_POINTERDOWN`s whose
+    // implicit capture and whose focus handling this function depends on, and
+    // there is no digitiser here to establish that doing so is safe.
+    //
+    // Nothing is lost by the simpler shape. The protocol says a frame
+    // "terminates at least one event but otherwise no guarantee is provided
+    // about the set of events within a frame", and a client "must assume that
+    // any state not updated in a frame is unchanged" — so a frame per changed
+    // contact is exactly what libinput and Weston produce for the same
+    // gesture, one evdev `SYN_REPORT` at a time. A pinch arrives as alternating
+    // single-contact frames with equal timestamps, which is a correct
+    // description of it.
+    state.send(FromUi::TouchFrame);
+    true
+}
+
+/// End every live contact at once, if there is one.
+///
+/// Guarded on there being something down, because `wl_touch.cancel` with no
+/// contact is a client being told to finalise touch points it does not have.
+fn cancel_all(state: &WindowState, ui: &Rc<Ui>, why: &str) {
+    if !ui.slots.borrow_mut().clear() {
+        return;
+    }
+    println!("wc-compositor: window {} touch cancelled: {why}", state.id);
+    state.send(FromUi::TouchCancel);
 }
 
 unsafe extern "system" fn controller_proc(
@@ -2146,6 +2487,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         controller: Cell::new(controller as isize),
         idle_inhibited: Cell::new(false),
         dump_frames: config.dump_frames.clone(),
+        slots: RefCell::new(crate::input::touch::Slots::new()),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 

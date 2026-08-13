@@ -313,6 +313,39 @@ things this file already records rather than new positions.
 Nothing else in smithay changed for stage 6. The seat, the capabilities, the
 pointer and the keyboard are upstream code driven from `wc-compositor`.
 
+### Stage 20: `wl_touch.cancel` was never sent
+
+**`input/touch/mod.rs`: `TouchInternal::cancel` loses a guard, three lines.**
+The only change touch needed, and it is a plain upstream bug rather than a
+portability one — nothing in it mentions Windows.
+
+`cancel` opened with the same test `frame` uses:
+
+```rust
+if state.current.map(|c| c >= state.pending).unwrap_or(false) {
+    continue;
+}
+```
+
+For `frame` that reads "this slot has already had a frame for everything
+pending on it, so there is nothing to terminate", and is right. For `cancel` it
+reads "this slot is in a settled state, so do not cancel it" — which is every
+live contact in an ordinary gesture, because an ordinary gesture is `down`,
+`frame`, `motion`, `frame`, and only then the compositor deciding the stream was
+a system gesture. So `wl_touch.cancel` was emitted **only** for a contact with
+an unframed event outstanding, and never in the case the event exists for.
+
+Found by measurement, not by reading: `weston-eventdemo` against this
+compositor received the `down` and the `frame` and then nothing, while the
+compositor's own log said it had cancelled. See `docs/design.md` §24.4.
+
+The guard goes; `state.focus.take()` already skips contacts that `up` has
+released, which is the condition that was wanted. `current` is still stamped so
+a later `frame` stays a no-op, and `frame_pending` is now cleared because the
+protocol says "no frame event is required after the cancel event".
+
+Upstreamable as-is — it has no Windows content and is a strict bug fix.
+
 ### `cfg(unix)` where the API is Unix by subject matter
 
 Not "does not port yet" — cannot exist elsewhere:

@@ -103,8 +103,12 @@ run_linux() {
     grep -q "interface: 'wl_seat'" "$dir/info.log" \
       && ok "wayland-info sees a wl_seat" \
       || { bad "wayland-info found no wl_seat"; sed 's/^/        /' "$dir/info.log" | head -20; }
-    grep -q "capabilities: pointer keyboard" "$dir/info.log" \
-      && ok "the seat advertises both capabilities: $(grep -o 'capabilities: .*' "$dir/info.log")" \
+    # STAGE 20 added `touch`, which this leg always has because
+    # `headless::has_touch` is true — the scripted gesture is a real source of
+    # the events. On Windows the same line reads `pointer keyboard` on a machine
+    # with no digitiser, which is why the wire check further down accepts both.
+    grep -q "capabilities: pointer keyboard touch" "$dir/info.log" \
+      && ok "the seat advertises all three capabilities: $(grep -o 'capabilities: .*' "$dir/info.log")" \
       || bad "wrong capabilities: $(grep -o 'capabilities: .*' "$dir/info.log")"
     # repeat_info is a v4 event and its absence is silent — a client simply
     # never repeats, which reads as a stuck keyboard rather than as a missing
@@ -143,6 +147,14 @@ run_linux() {
                     || bad "the compositor exited $srv_rc"
   check_client_events "$dir/cli.log" eventdemo
 
+  # STAGE 20, and it belongs to this leg rather than to `check_client_events`:
+  # only `--simulate-wm` drives a touch stream, so only this leg may insist one
+  # happened. A capability advertised with nothing behind it is the exact
+  # failure this stage set out not to commit.
+  grep -q "wl_touch@[0-9]*\.down(" "$dir/cli.log.clean" \
+    && ok "eventdemo: --simulate-wm drove a wl_touch stream a client decoded" \
+    || bad "eventdemo: touch is advertised and no wl_touch.down ever reached a client"
+
   # --- the layout change, proved from the client's side ------------------
   #
   # On Windows this is `WM_INPUTLANGCHANGE`; here `--simulate-wm` drives it.
@@ -170,6 +182,89 @@ run_linux() {
   ok "eventdemo: keymaps delivered, in bytes: $sizes"
 }
 
+# STAGE 20. What a `wl_touch` stream must look like on the wire.
+#
+# Read out of libwayland's own decode rather than out of anything the client
+# printed, because `weston-eventdemo` has no touch logging flag: the toytoolkit
+# binds `wl_touch` and handles the events, and says nothing about them. So the
+# arbiter here is one step weaker than it is for the keyboard — "libwayland
+# decoded these events and the client did not disconnect in protocol error" and
+# not "the client told us what it made of them". That is the honest strength of
+# this leg and is stated in docs/design.md §24.6.
+#
+# Silent when no touch events were driven, because both legs call this and only
+# the one with `--simulate-wm` drives any; the caller that expected them asserts
+# that separately.
+check_touch_events() {
+  local log=$1 tag=$2 caps=$3
+  # `-v " -> "` drops the client's own requests, so `wl_touch.release` at
+  # shutdown is not mistaken for an event the compositor sent.
+  local seq
+  seq=$(grep -v ' -> ' "$log" | grep -o "wl_touch@[0-9]*\.[a-z_]*(" \
+        | sed 's/.*\.//; s/(//' | tr '\n' ' ')
+  if [ -z "$seq" ]; then
+    [ "$caps" = 7 ] && note "$tag: touch advertised, no touch events driven on this leg"
+    return 0
+  fi
+  [ "$caps" = 7 ] || bad "$tag: wl_touch events arrived but capabilities said $caps"
+
+  # **Two contacts, and both in one frame.** The single fact that distinguishes
+  # a touch implementation from a mouse pretending to be one.
+  case "$seq" in
+    "down down frame"*) ok "$tag: two contacts landed together and closed one frame" ;;
+    *) bad "$tag: the stream did not open with two contacts and a frame: ${seq:0:60}" ;;
+  esac
+
+  # **Nothing is left unframed.** A client is entitled to hold everything since
+  # the last frame, so a trailing event with no frame after it is a touch the
+  # client may never act on. `cancel` is the documented exception — the protocol
+  # says outright that no frame is required after it.
+  local unframed
+  unframed=$(printf '%s' "$seq" | sed 's/.*frame //')
+  case "$unframed" in
+    "" | "cancel ") ok "$tag: every touch event is inside a closed frame" ;;
+    *) bad "$tag: touch events after the last frame: '$unframed'" ;;
+  esac
+
+  # **The ids did not swap.** Two fingers moving apart: contact 0 must end left
+  # of where it started and contact 1 right of it. A compositor that renumbered
+  # contacts, or keyed them on Windows' pointer ids and let one be reused, makes
+  # the two converge — which is visible here and in no other check.
+  local x0f x0l x1f x1l
+  x0f=$(grep -o "\.motion([0-9]*, 0, [0-9]*\." "$log" | head -1 | awk -F', ' '{print $3}' | tr -d '.')
+  x0l=$(grep -o "\.motion([0-9]*, 0, [0-9]*\." "$log" | tail -1 | awk -F', ' '{print $3}' | tr -d '.')
+  x1f=$(grep -o "\.motion([0-9]*, 1, [0-9]*\." "$log" | head -1 | awk -F', ' '{print $3}' | tr -d '.')
+  x1l=$(grep -o "\.motion([0-9]*, 1, [0-9]*\." "$log" | tail -1 | awk -F', ' '{print $3}' | tr -d '.')
+  if [ -n "$x0f" ] && [ -n "$x1f" ] && [ "$x0l" -lt "$x0f" ] && [ "$x1l" -gt "$x1f" ]; then
+    ok "$tag: the contacts kept their ids across the pinch (0: $x0f->$x0l, 1: $x1f->$x1l)"
+  else
+    bad "$tag: the contacts did not diverge (0: $x0f->$x0l, 1: $x1f->$x1l) — ids were swapped or reused"
+  fi
+
+  grep -q "\.up([0-9]*, [0-9]*, 0)" "$log" && grep -q "\.up([0-9]*, [0-9]*, 1)" "$log" \
+    && ok "$tag: both contacts were released by id" \
+    || bad "$tag: a contact was never released; its id is stuck down in the client"
+
+  # `cancel` is the event a compositor is likeliest never to send, because
+  # nothing a user does produces one. It is also the one smithay was dropping
+  # (vendor/PATCHES.md, stage 20), and this line is what caught it.
+  grep -q "wl_touch@[0-9]*\.cancel()" "$log" \
+    && ok "$tag: wl_touch.cancel reached the client" \
+    || bad "$tag: no cancel; a client would hold the cancelled contact for ever"
+
+  # The conditional half. One contact in the scripted gesture has a measured
+  # patch and the rest have none, so exactly one of each must appear — a
+  # compositor that manufactured an ellipse for every contact would show six.
+  local shapes orients
+  shapes=$(grep -c "wl_touch@[0-9]*\.shape(" "$log")
+  orients=$(grep -c "wl_touch@[0-9]*\.orientation(" "$log")
+  if [ "$shapes" = 1 ] && [ "$orients" = 1 ]; then
+    ok "$tag: shape and orientation sent for the one contact that has geometry, and no other"
+  else
+    bad "$tag: $shapes shape and $orients orientation events; expected exactly one of each"
+  fi
+}
+
 # Everything a `weston-eventdemo` log must contain, whichever side it ran on.
 # One function, called by both legs, so that the wine leg is held to exactly the
 # standard the linux leg is and a weaker check cannot creep into the harder
@@ -192,9 +287,23 @@ check_client_events() {
   sed -e 's/\x1b\[[0-9;]*m//g' -e 's/#\([0-9]\)/@\1/g' "$raw" >"$log"
 
   # --- the wire, as libwayland decoded it -------------------------------
-  grep -q "wl_seat@[0-9]*\.capabilities(3)" "$log" \
-    && ok "$tag: libwayland decoded wl_seat.capabilities(3) = pointer|keyboard" \
-    || bad "$tag: no capabilities event on the wire"
+  # `capabilities` is a bitmask: 1 pointer, 2 keyboard, 4 touch. **Both 3 and 7
+  # are correct answers and which one is right is a fact about the machine**,
+  # not about this code: stage 20 made the touch bit conditional on there being
+  # a digitiser (`SM_MAXIMUMTOUCHES` on Windows), so a laptop without a
+  # touchscreen must say 3 and saying 7 there would be the compositor promising
+  # events it cannot produce. The check therefore reports which was seen rather
+  # than demanding one, and fails on anything else — a missing keyboard bit is
+  # a 1, and that is the failure worth catching here.
+  local caps
+  caps=$(grep -o "wl_seat@[0-9]*\.capabilities([0-9]*)" "$log" | head -1 \
+         | grep -o "([0-9]*)" | tr -d '()')
+  case "$caps" in
+    3) ok "$tag: wl_seat.capabilities(3) = pointer|keyboard; no touch digitiser on this machine" ;;
+    7) ok "$tag: wl_seat.capabilities(7) = pointer|keyboard|touch" ;;
+    "") bad "$tag: no capabilities event on the wire" ;;
+    *) bad "$tag: wl_seat.capabilities($caps), which is neither pointer|keyboard nor pointer|keyboard|touch" ;;
+  esac
   # format 1 is XKB_V1; the size is the keymap's, and the fd is a real
   # descriptor libwayland received. On the wine leg that fd was manufactured on
   # this side of the boundary from a *name*, which is the whole point.
@@ -221,6 +330,8 @@ check_client_events() {
       && ok "$tag: wl_pointer.frame — events are grouped as the protocol requires" \
       || bad "$tag: no frame events; clients batching on frame would stall"
   fi
+
+  check_touch_events "$log" "$tag" "$caps"
 
   # --- what the client made of it ---------------------------------------
   #
