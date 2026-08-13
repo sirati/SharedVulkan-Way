@@ -10766,14 +10766,43 @@ descriptor.
 That is worth noticing, because it means **route 1 and route 2 converge**. Once
 the descriptor is a token rather than memory, an `LD_PRELOAD` shim and a private
 "arena-backed pool" protocol are the same mechanism with different spellings of
-the handshake — and the protocol version is the honest one for clients that can
-ask, with the shim as the way to serve Firefox, which never will.
+the handshake — the shim being the spelling that serves Firefox, which will
+never ask.
+
+**This survives the transport change, and it is worth saying why.** The Wayland
+byte stream is moving off `probe-relay` and TCP onto shared_vulkan's existing
+channel, on the principle that Wayland is an addon to shared_vulkan and must use
+the channel that already exists. Nothing in this section rests on that. The
+scattering that forces the decoy is a property of **the arena** — of how the
+guest's pages sit in QEMU's backing object — not of how bytes reach the
+compositor, and `wl_shm.create_pool` will still take one descriptor mapped from
+offset 0 whatever carries the stream. The one descriptor this section moves goes
+client → proxy over the local Wayland socket, on the host, upstream of the
+boundary entirely (§30.3); it never touches the transport under discussion.
+
+What the change *does* settle is ownership, and this section should not be read
+as a claim on it. The handshake has two halves and they sit at different layers.
+The client-facing half — how a client asks for an arena-backed pool — is a
+Wayland-level affair between the client and `wc-proxy`, host-side. The
+allocating half — asking the guest, which owns the arena, for a region and being
+told yes or no — is a message class on shared_vulkan's channel, and belongs to
+the agents on that plumbing rather than here. **Neither is to be built from this
+section.** §30.9 states what the allocating half has to promise; it deliberately
+does not state how it is spelled.
 
 ### 30.9 What the arena has to promise, as a requirement rather than a workaround
 
 An arena-backed pool **pins its region**, and this is the interface the dynamic
 arena work should accommodate rather than something to be worked around
-afterwards. Stated as requirements:
+afterwards.
+
+These are requirements about **lifetime**, not about wire format, and they are
+deliberately stated that way so they survive the transport moving onto
+shared_vulkan's channel. Every one of them is a statement about when a region
+may be taken away relative to when a Wayland object exists; none of them says
+who asks whom, or how. A contract written against a particular transport would
+have to be rewritten when the transport moved, which is exactly the failure this
+phrasing avoids. Stated as requirements:
 
 1. **A region with a live pool cannot be reclaimed.** Not deferred, not
    reclaimed-and-repointed: refused. Idle-frame counting sees no drawing in a
@@ -10786,10 +10815,15 @@ afterwards. Stated as requirements:
    region or fail; there is no offset arithmetic that reaches from one region
    into another (§12), which is exactly why the region id travels in every
    descriptor.
-4. **Refusal must be expressible.** If no region can satisfy a pool, the shim
-   has to be told so it can leave the client on its own memory and let the
-   existing copy path run. A silent partial success here is the §30.6d failure
-   again, one layer down.
+4. **Refusal must be expressible**, and it is the clause that keeps a failure
+   recoverable rather than fatal. If no region can satisfy a pool, the shim has
+   to be *told so*, as an answer — not left to infer it from a timeout, a zero,
+   or a reply that never comes. Given the answer, it leaves the client on its
+   own memory and the existing copy path runs; the frame is slower and correct.
+   Without it the only options are to guess and to hang, and §30.6 is the
+   measurement of what guessing looks like: a session with no crash, no protocol
+   error, 2284 attaches and none of the pixels. A refusal that cannot be spoken
+   turns a recoverable allocation failure into a blank window.
 5. **Region release needs a pinned-bytes number in the log.** Reclamation that
    silently does nothing because everything is pinned looks identical to
    reclamation that is working, until the arena runs out (§20).
