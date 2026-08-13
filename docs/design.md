@@ -5685,6 +5685,14 @@ one). Two things about that run are worth keeping:
 | `scripts/wc-icon.sh taskbar` (`weston-terminal`, the guest's desktop) | 12 passed, 0 failed |
 | `scripts/wc-icon.sh taskbar` (Firefox, `--transport shared-file`) | 7 passed, 0 failed, 1 skipped |
 | `scripts/wc-icon.sh` teardown check — `Win32_Process` count on the guest | 0 left behind |
+| `cargo test --manifest-path crates/wc-arena-host/Cargo.toml` | 1 test, 0 failures |
+
+The three `cargo` rows were **re-run from master's checkout after the merge**,
+which is §12.12's arrangement and §14.11's and §15.13's; the guest rows are from
+the branch, because the guest is one machine and re-running them would be the
+same experiment against the same binaries. 154 is 138 plus this stage's 16 —
+`git diff 1ab9f80..HEAD | grep -c '^+.*#\[test\]'` reports 16, and no existing
+assertion changed, which is the difference between this merge and stage 9's.
 
 The skip is the caption comparison in the Firefox run, which wants a 16x16
 reference file to search for and is looking in the Firefox package's own theme;
