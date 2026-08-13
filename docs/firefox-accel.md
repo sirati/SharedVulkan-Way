@@ -674,9 +674,25 @@ presented by this ICD's `XPutImage` into an Xwayland window that has no DRM
 device, composited by a compositor that speaks only `wl_shm`. That is the whole
 chain the topology needs, with the VM taken out.
 
-## 4. On testhost, the same result and then a stall
+## 4. On testhost: GL on the guest's desktop through kopper, and then a stall
 
-Same configuration on the machine with no GPU, against the live guest
+**The picture first**, because it is the whole chain and it is not a log line.
+`scripts/sv-firefox-guest.sh 2 60 x11` with `SVFF_X11_CMD=eglgears_x11` puts
+this on the Windows guest's interactive desktop:
+
+```
+wc-compositor: window 1 mapped 1600x1000 (xrgb)
+```
+
+and the composited frame the compositor dumps has the gears in it. That is
+OpenGL executing on the guest's Intel iGPU, driven from a Linux host with no GPU
+at all, presented by this ICD's `XPutImage` into an Xwayland that has no DRM
+device, carried to the guest as `wl_shm` over `wc-proxy` into a guest-RAM arena,
+and composited onto a real desktop. **Every layer of the goal except Firefox, on
+the machine the goal is about.**
+
+Firefox is the layer that is left. Same configuration on the same machine,
+against the live guest
 (`scripts/sv-firefox-guest.sh 8 150 x11`, `LIBGL_KOPPER_DRI2=1`):
 
 ```

@@ -1574,8 +1574,14 @@ stops reporting `Failed to create EGLConfig for WebRender!` and
 variable the same Xwayland yields `DRI3 not available` and `couldn't find RGB
 GLX visual or fbconfig`, which is what three runs measured before it was found.
 
-**5. On testhost the config rejection is gone and the first frame is too
-slow.** `vkCreateSwapchainKHR: X11 { window: 6291472 } 512x416` on the guest's
+**5. On testhost that path puts GL on the guest's desktop, and Firefox still
+stalls.** `eglgears_x11` through the same harness renders on the guest's Intel
+iGPU, is presented by this ICD into a DRM-less Xwayland, reaches the guest as
+`wl_shm` over `wc-proxy` into the guest-RAM arena, and appears in the
+compositor's dumped frame on the Windows desktop — every layer of
+`goal-firefox.md` except the browser, on the machine the goal is about. Firefox
+gets further than it ever has and no further:
+`vkCreateSwapchainKHR: X11 { window: 6291472 } 512x416` on the guest's
 Intel iGPU from a host with no GPU, then `WaitFlushedEvent::Run: is delayed:
 14608` and `Exiting due to channel error`, twice, at four sessions and at eight.
 What is *not* separated is how much of that is the cross-VM round trip per
