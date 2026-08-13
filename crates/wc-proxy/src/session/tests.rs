@@ -1648,7 +1648,7 @@ fn string_body(s: &str) -> Vec<u8> {
 }
 
 /// A session with a `wl_data_device_manager` and a `wl_data_device` bound, which
-/// is what every GTK client does before it has a seat at all (docs/design.md
+/// is what every GTK client does before it has a seat at all (docs/waycompose-design.md
 /// §15.4).
 fn clipboard_harness() -> (Harness, u32, u32) {
     let d = tmpdir("clip");

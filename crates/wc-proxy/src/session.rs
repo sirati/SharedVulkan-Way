@@ -653,7 +653,7 @@ const COPY_DEADLINE: Duration = Duration::from_secs(2);
 ///
 /// **At most one text flavour plus HTML**, which is a policy and not a
 /// limitation of the wire. GTK offers the same string under five names
-/// (docs/design.md §22.3); pulling all five would open five pipes, wake the
+/// (docs/waycompose-design.md §22.3); pulling all five would open five pipes, wake the
 /// client five times and hand the compositor five copies of one paragraph to
 /// pick one from. The compositor picks by exactly this order anyway
 /// (`wc-compositor`'s `clipboard::TEXT_MIMES`), so the choice is made once,
@@ -695,7 +695,7 @@ struct Incoming {
     token: u32,
     /// The **write** end of a pipe the *client* made, which arrived by
     /// `SCM_RIGHTS` on `wl_data_offer.receive` and stops here. This is the
-    /// descriptor that used to end the connection (docs/design.md §22.1).
+    /// descriptor that used to end the connection (docs/waycompose-design.md §22.1).
     fd: OwnedFd,
     /// `None` until the compositor answers. `Some` — including `Some(empty)` —
     /// means write it and close.
@@ -1256,7 +1256,7 @@ impl Session {
                      for an answer that is not coming, which is better than the connection \
                      being closed under it — but nothing here can carry that fd across the \
                      boundary, so the protocol needs a by-bytes route the way the clipboard \
-                     got one (docs/design.md §22.2).",
+                     got one (docs/waycompose-design.md §22.2).",
                     msg.name,
                     msg.fd_count()
                 ));
