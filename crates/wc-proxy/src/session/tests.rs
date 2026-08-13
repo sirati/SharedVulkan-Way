@@ -1421,3 +1421,74 @@ fn a_client_that_never_closes_its_pipe_is_not_a_selection_lost_forever() {
     assert_eq!(h.session.stats.copy_timeouts, 1);
     drop(held);
 }
+
+/// A paste from a **drag** asks Windows for the drag, not for the clipboard.
+///
+/// The two are separate selections on Windows and the offer's own identity is
+/// the only thing that distinguishes them: an offer announced by
+/// `wl_data_device.enter` belongs to a drag over one of our surfaces, one
+/// announced by `.selection` belongs to the clipboard. Deciding it any other
+/// way returns the last thing dragged to somebody who pressed Ctrl-V.
+#[test]
+fn an_offer_from_a_drag_is_fetched_from_the_drag_and_not_the_clipboard() {
+    let (mut h, _m, device) = clipboard_harness();
+    let dragged = 0xff00_0010u32;
+    let copied = 0xff00_0011u32;
+
+    // The compositor announces a drag: data_offer, then enter(serial, surface,
+    // x, y, id).
+    for id in [dragged, copied] {
+        h.session
+            .server_message(
+                Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+                &id.to_ne_bytes(),
+            )
+            .unwrap();
+    }
+    let mut body = Vec::new();
+    for w in [1u32, 0, 0, 0] {
+        body.extend_from_slice(&w.to_ne_bytes());
+    }
+    body.extend_from_slice(&dragged.to_ne_bytes());
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "enter"), size: 8 + body.len() },
+            &body,
+        )
+        .unwrap();
+
+    let receive = rq("wl_data_offer", "receive");
+    let mime = string_body("text/uri-list");
+    for offer in [dragged, copied] {
+        let (_r, w) = pipe().unwrap();
+        h.session
+            .client_message(
+                Header { object: offer, opcode: receive, size: 8 + mime.len() },
+                &mime,
+                &mut VecDeque::from([w]),
+            )
+            .unwrap();
+    }
+    let fetches = h.session.take_fetches();
+    assert_eq!(fetches.len(), 2);
+    assert_eq!(fetches[0].1, Source::Drag, "the offer that came with an enter");
+    assert_eq!(fetches[1].1, Source::Clipboard, "the one that did not");
+
+    // A `leave` ends it: the same offer id would now be the clipboard's, which
+    // is wrong in a way nothing else would notice, so it is asserted.
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "leave"), size: 8 },
+            &[],
+        )
+        .unwrap();
+    let (_r, w) = pipe().unwrap();
+    h.session
+        .client_message(
+            Header { object: dragged, opcode: receive, size: 8 + mime.len() },
+            &mime,
+            &mut VecDeque::from([w]),
+        )
+        .unwrap();
+    assert_eq!(h.session.take_fetches()[0].1, Source::Clipboard);
+}

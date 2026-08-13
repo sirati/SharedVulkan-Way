@@ -7834,8 +7834,20 @@ is pulled, and a `drag_finished` comes back — from the platform, from a feed
 that died mid-gesture, or from the proxy itself if there is no feed at all.
 `Session::drag_finished` turns it into `action` + `dnd_drop_performed` +
 `dnd_finished`, or into `cancelled`. **A `wl_data_source` is never left waiting**,
-which is the specific failure a half-built DnD produces and the one this stage
+which is the specific failure a half-built DnD produces and the one this work
 exists not to ship.
+
+**The two selections are already told apart.** A `wl_data_offer` announced by
+`wl_data_device.enter` belongs to a drag over one of our surfaces; one announced
+by `.selection` belongs to the clipboard. The proxy watches those two events go
+past — the same "watched rather than understood" treatment
+`xdg_toplevel.set_app_id` gets — and a `receive` on a drag's offer asks Windows
+for the drag rather than for the clipboard. Windows keeps the two apart, so
+getting this wrong returns *the last thing dragged* to somebody who pressed
+Ctrl-V, which is a data-disclosure bug wearing a paste's clothes. It is decided
+from the offer's own identity and never from "is this connection dragging" —
+that would be asking about the wrong drag entirely, since a client is the
+*source* of its own drag and never receives from it.
 
 What is **not** built is the two Win32 halves, and `platform/drag.rs` is a file
 that says so and ends every drag with `none` rather than hanging it:
@@ -7876,6 +7888,20 @@ dragging a file out will need the file's bytes, not its name — which is a
 Windows as `CF_HDROP` over a temporary file the guest can reach. That is a real
 design question and it is not answered here.
 
+**Where this stopped, precisely.** Built and tested: the whole Wayland side —
+interception, the shared pull and staging, `source` on `fetch`, the
+drag/clipboard distinction above, and `drag_finished` on every path including
+the failure ones. Not built: `platform/drag.rs`'s three functions, which are
+`DoDragDrop`, `RegisterDragDrop` and the `IDataObject` read-out. Nothing about
+them was started, so there is no partial COM implementation in the tree; the
+file's header says so and every entry point in it answers definitively rather
+than hanging. The reason for stopping there rather than half-way is that an
+unverifiable OLE implementation is exactly the half-built drag this work was
+asked to make impossible — and it is unverifiable here in a way the clipboard
+was not: `scripts/wc-clip.sh` can drive a copy with a program, and a drag needs
+a mouse held down across two applications' windows, which under Xvfb is a
+harness problem nobody has solved in this tree.
+
 ### 28.9 What is not proven
 
 1. **No guest run.** Everything in §28.7 is Wine. The specific things worth
@@ -7909,14 +7935,14 @@ design question and it is not answered here.
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace` | **181 tests**, 0 failures (157 on master; 24 new) |
+| `cargo test --workspace` | see below |
 | `cargo clippy --workspace --all-targets` (Linux) | clean |
 | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean |
 | `scripts/wc-clip.sh wine` (new) | **11 passed, 0 failed** |
 
-The 24 new tests are: 13 in `wc-compositor/src/clipboard.rs` (the conversions,
+The 25 new tests are: 13 in `wc-compositor/src/clipboard.rs` (the conversions,
 which are silently wrong when they are wrong), 4 in `wc-proxy/src/clip.rs`
-(including the one that walks the XML for an `h`), and 7 in
+(including the one that walks the XML for an `h`), and 8 in
 `wc-proxy/src/session/tests.rs` — the interception, driven end to end through
 real pipes, because the whole design is that both ends of every pipe are local
 and so a test needs no compositor at all.

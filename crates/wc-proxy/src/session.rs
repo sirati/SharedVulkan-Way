@@ -551,6 +551,14 @@ struct Clip {
     selection: Option<u32>,
     /// A source in the middle of a drag, if any.
     dragging: Option<u32>,
+    /// `wl_data_offer`s the compositor announced as belonging to a **drag over
+    /// one of our surfaces** rather than to the clipboard, learned by watching
+    /// `wl_data_device.enter` go past. See [`Session::begin_paste`].
+    ///
+    /// A set rather than one id because the protocol permits a new offer per
+    /// `enter` and nothing says the old one is destroyed first; the ids are
+    /// retired by `wl_display.delete_id` like every other object.
+    drag_offers: std::collections::HashSet<u32>,
     outgoing: Vec<Outgoing>,
     /// When the current pull started, for [`COPY_DEADLINE`].
     started: Option<Instant>,
@@ -965,7 +973,7 @@ impl Session {
                 match fds.pop_front() {
                     Some(fd) => {
                         self.stats.fds_received += 1;
-                        self.begin_paste(mime, fd);
+                        self.begin_paste(object, mime, fd);
                     }
                     None => self.note(format!(
                         "wl_data_offer.receive for {mime:?} arrived with no descriptor; \
@@ -1067,7 +1075,16 @@ impl Session {
     }
 
     /// `wl_data_offer.receive`: the client wants to paste.
-    fn begin_paste(&mut self, mime: String, fd: OwnedFd) {
+    ///
+    /// `offer` decides **which system selection is asked for**, and it has to be
+    /// the offer's own identity rather than anything about this connection's
+    /// state. An offer the compositor announced with `wl_data_device.enter` is a
+    /// drag's; one announced with `.selection` is the clipboard's. Deciding from
+    /// "is this client dragging" instead would be asking about the wrong drag
+    /// entirely — the client is the *source* of its own drag and never receives
+    /// from it — and Windows keeps the two selections apart, so a paste that
+    /// asked the wrong one would quietly return the last thing dragged.
+    fn begin_paste(&mut self, offer: u32, mime: String, fd: OwnedFd) {
         let token = self.clip.next_token;
         self.clip.next_token = self.clip.next_token.wrapping_add(1).max(1);
         // Non-blocking on **the write end this process now holds**. A pipe's
@@ -1076,7 +1093,11 @@ impl Session {
         // pipe buffer would block the pump on a client that is not reading yet.
         let _ = set_nonblocking(&fd);
         self.stats.pastes_served += 1;
-        let source = if self.clip.dragging.is_some() { Source::Drag } else { Source::Clipboard };
+        let source = if self.clip.drag_offers.contains(&offer) {
+            Source::Drag
+        } else {
+            Source::Clipboard
+        };
         self.clip.fetches.push((token, source, mime));
         self.clip.incoming.push(Incoming { token, fd, data: None, at: 0 });
     }
@@ -1370,11 +1391,37 @@ impl Session {
 
         self.record_new_ids(body, &spans, &msg.args);
 
+        // STAGE 13. The compositor's own announcements are forwarded untouched,
+        // and two of them are *watched* on the way past for the same reason
+        // `xdg_toplevel.set_app_id` is: this side has to know something the
+        // message is not addressed to it about. `wl_data_device.enter` marks an
+        // offer as a drag's rather than the clipboard's, which decides what a
+        // later `receive` on it asks Windows for.
+        if interface == "wl_data_device" {
+            match msg.name.as_str() {
+                // enter(serial, surface, x, y, id)
+                "enter" => {
+                    if let Some(span) = spans.get(4)
+                        && let Some(id) = wire::word_at(body, span)
+                        && id != 0
+                    {
+                        self.clip.drag_offers.insert(id);
+                    }
+                }
+                // The drag is over one way or the other. The ids stay valid
+                // until the client destroys them, but nothing more will be
+                // received from them.
+                "leave" => self.clip.drag_offers.clear(),
+                _ => {}
+            }
+        }
+
         if interface == "wl_display"
             && header.opcode == op::DISPLAY_DELETE_ID
             && let Some(id) = wire::word_at(body, &spans[0])
         {
             self.objects.forget(id);
+            self.clip.drag_offers.remove(&id);
             // The compositor has finished with this object. For a pool that
             // means it has certainly opened the region by now, so one of the
             // three conditions on releasing it is met. See the note on
