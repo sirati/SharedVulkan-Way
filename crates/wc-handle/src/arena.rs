@@ -363,13 +363,21 @@ fn outbound_slot() -> &'static Mutex<Option<Window>> {
 
 /// The granularity every gift is aligned and rounded to.
 ///
-/// `wc_proxy::pool::ARENA_GRANULARITY` and `sv_arena::GRANULARITY` are the same
-/// number for the same reason (docs/design.md §12.4): it is the page the host
-/// sweeps in and the alignment the peer's mapping wants. Nothing here needs the
-/// alignment — the peer copies a keymap out byte by byte — but an allocator in
-/// this region that used a different unit from the one next door would be a
-/// difference with no reason behind it.
-pub const GIFT_GRANULARITY: u64 = REGION_PAGE as u64;
+/// **This is now `sv_arena::GRANULARITY` itself rather than a number equal to
+/// it**, and that is the whole of what the unification changed here. It used to
+/// read `REGION_PAGE as u64` with a doc comment explaining that
+/// `wc_proxy::pool::ARENA_GRANULARITY` and `sv_arena::GRANULARITY` were "the
+/// same number for the same reason" — three definitions of 4096 in three
+/// crates, each unable to reach the others, in two repositories. The comment
+/// was correct and it was also the evidence: somebody stood at the boundary,
+/// saw the shared constant, and could not name it. one-binary.md §1.1.
+///
+/// It is the page the host sweeps in and the alignment the peer's mapping
+/// wants. Nothing in *this* module needs the alignment — the peer copies a
+/// keymap out byte by byte — but an allocator in this region using a different
+/// unit from the one next door would be a difference with no reason behind it,
+/// and now it cannot be one.
+pub const GIFT_GRANULARITY: u64 = sv_arena::GRANULARITY;
 
 /// Declare the **last `len` bytes** of arena `arena` to be this process's to
 /// give away, and take them out of nobody's hands but its own.

@@ -439,7 +439,14 @@ pub struct Arena {
 
 /// The allocator's granularity, and the alignment of every offset it returns.
 /// See the note on [`Arena`].
-pub const ARENA_GRANULARITY: u64 = 4096;
+///
+/// **One definition, in the crate that owns the arena.** This was a literal
+/// `4096` while shared_vulkan was a different repository; it is now
+/// `sv_arena::GRANULARITY`, which is where the number is argued from the
+/// measured `minImportedHostPointerAlignment` and the page granularity of the
+/// shared mapping. `wc_handle::arena::GIFT_GRANULARITY` is the same constant
+/// for the same reason. one-binary.md §1.1.
+pub const ARENA_GRANULARITY: u64 = sv_arena::GRANULARITY;
 
 impl Arena {
     /// Take the region at `local_path` as arena `id`, creating it only if it is

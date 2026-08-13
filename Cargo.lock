@@ -1278,6 +1278,7 @@ name = "wc-handle"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sv-arena",
  "windows-sys",
 ]
 
@@ -1296,6 +1297,7 @@ dependencies = [
  "libc",
  "png",
  "quick-xml",
+ "sv-arena",
  "wc-handle",
 ]
 

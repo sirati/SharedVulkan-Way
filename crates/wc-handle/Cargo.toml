@@ -30,3 +30,17 @@ windows-sys = { workspace = true, features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dependencies]
+# ONE ARENA, ONE DEFINITION OF WHAT A PAGE IS.
+#
+# `GIFT_GRANULARITY` used to be a local `4096` whose doc comment said it matched
+# `sv_arena::GRANULARITY` — a constant copied across a repository boundary
+# because it could not be reached across one. It can now.
+#
+# This is a *shared primitive* dependency and it is deliberately unconditional:
+# `sv-arena` cross-compiles clean for `x86_64-pc-windows-gnu` (measured,
+# one-binary.md §1.3), and `wc-handle` is in the guest binary, which is a
+# Windows binary. A `cfg(unix)` gate here would mean the Windows build kept its
+# own copy of the number, which is the thing being deleted.
+sv-arena = { workspace = true }

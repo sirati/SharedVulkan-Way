@@ -31,6 +31,9 @@ path = "src/main.rs"
 
 [target.'cfg(unix)'.dependencies]
 wc-handle = { workspace = true }
+# See wc-handle: one definition of the arena's granularity, in the crate that
+# owns the arena. `ARENA_GRANULARITY` is now `sv_arena::GRANULARITY`.
+sv-arena = { workspace = true }
 libc = "0.2"
 # The same parser `vendor/wayland-scanner` uses, reading the same XML files, so
 # the proxy's idea of the wire format and the compositor's cannot drift apart.
