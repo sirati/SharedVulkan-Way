@@ -51,6 +51,26 @@
 # that is the real path: the theme search, the size choice, the PNG decode, the
 # premultiply, the chunking, and `WM_SETICON`. What is synthetic is one file
 # with three lines in it, and it is written here rather than pretended about.
+#
+# STAGE 41. WHICH MEMORY THESE PICTURES WERE TAKEN ON, WHICH WAS THE WRONG ONE
+#
+# Everything above was measured, photographed and written up while this harness
+# had **no guest-RAM path at all**. Its arena was `--arena 0:N:Z:\wc11\arena` —
+# a file on the virtio-fs export — and its `WC_TRANSPORT=shared-file` half put
+# the pools on that same export by name. So every stage-11 result in
+# docs/stage11/ and every number quoted from them in §16 crossed the substrate
+# §10.3 measured incoherent for live mappings, on a harness that never said so.
+#
+# The results are not thereby wrong: an icon that reaches `WM_SETICON` reaches
+# it whatever carried the pixels, and §10.3's incoherence is about *live*
+# mappings rather than about whether a window appears. But they were taken on
+# the fixture, and a run that cannot say which memory it used is a run nobody
+# can check. §41 gives this harness the guest-RAM path `wc-guest.sh` has had
+# since stage 7, makes it the default and the only thing reachable from a run
+# that can see the guest, and makes the substrate an assertion instead of a
+# line in a log. The old pictures are **not** re-taken here — that is somebody
+# else's measurement to make, and §16.11 records what is on the fixture so the
+# choice is an informed one.
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -60,6 +80,10 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage11"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# STAGE 41. This harness ssh's into a real Windows guest, which is exactly the
+# fact `wc_substrate_fixture_guard` needs in order to refuse a file. Set before
+# the library is sourced, because the guard reads it.
+WC_GUEST_CONFIGURED=1
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # STAGE 8 §13.9's rule, applied before the first run rather than after it: this
 # stage deploys into its own directory, kills only processes whose command line
@@ -108,18 +132,41 @@ APP_ID="${WC_APP_ID:-org.freedesktop.weston.wayland-terminal}"
 # of its own and `env -u DISPLAY` (§15), and hard-coding that here would put
 # stage 9's harness in this one.
 CLIENT_CMD="${WC_CLIENT_CMD:-}"
-# Which pool transport the proxy uses. The arena is the deployment's answer and
-# is the default here, but **it serves exactly one connection** (§12.13 item 6),
-# and Firefox opens two — so the Firefox run needs `shared-file`, whose pool
-# names carry enough randomness to share a directory. That is a limitation of
-# the arena rather than of this stage, and it decides one flag.
-TRANSPORT="${WC_TRANSPORT:-arena}"
+# Which memory the pixels cross. **`guest-ram` is the only value a run against
+# this guest can have**, and §41 is the change that made that true.
+#
+# What it used to say, and why the reason expired: "the arena is the
+# deployment's answer and is the default here, but it serves exactly one
+# connection (§12.13 item 6), and Firefox opens two — so the Firefox run needs
+# `shared-file`". That limit was lifted in stage 12 (§15.14): `wc-proxy`'s
+# `make_transport` now calls `Arena::share()` per session and prints "client N:
+# joins arena 0 (M connection(s) on it now)", and §15.13 measured four of
+# Firefox's connections on one region and one allocator. So the sentence
+# survived four stages after the thing it described was fixed, and it was the
+# argument keeping this harness on a file.
+#
+# `shared-file` and the file-backed `arena` remain spellable because the Wine
+# fixture needs them (see `wc-substrate.sh`), and `wc_substrate_fixture_guard`
+# is what stops this harness — which has a guest — from reaching either.
+TRANSPORT="${WC_TRANSPORT:-guest-ram}"
 # Empty means "do not write a desktop entry": the app id already has a real one
 # somewhere in WC_HOST_ICONS, and writing ours would shadow the thing being
 # tested. That is the Firefox case, where the resolution is entirely the
 # machine's own data.
 ICON_NAME="${WC_ICON_NAME-qemu}"
 SUFFIX="${WC_SUFFIX:-}"
+
+# STAGE 41. The three settings the guest-RAM locate needs, spelled exactly as
+# `wc-guest.sh` and `wc-desktop.sh` spell them so that one export in a shell
+# configures all three harnesses. `wc-arena-host` reads QEMU's QMP monitor and
+# `/proc/<qemu-pid>/fd`, and QEMU is a *system* service on this VM host, so both
+# are root-only — see §12.9, which records that as a property of how testhost
+# starts the VM rather than of the design. No descriptor crosses the boundary in
+# either direction: what comes back is a plan, which is a list of offsets into
+# an object the host opens by name for itself.
+QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"
+VM_HINT="${WC_VM_HINT:-windows-vm}"
+ROOTC="${WC_ROOTC:-\$HOME/rootc}"
 
 SSHOPT=(-o IdentityAgent="$AGENT" -o BatchMode=yes -o LogLevel=ERROR
         -o StrictHostKeyChecking=accept-new)
@@ -135,6 +182,11 @@ miss() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
+
+# STAGE 41. Sourced after `ok`/`bad`/`note`/`g`/`h` exist, because the library
+# uses all five and defining them twice is how two harnesses end up counting
+# different things.
+. "$(dirname "$0")/wc-substrate.sh"
 
 # Run a command line on the interactive desktop and wait for it.
 int() {
