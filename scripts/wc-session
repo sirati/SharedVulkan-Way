@@ -32,7 +32,7 @@
 # WHY ROOT, AND ONLY FOR TWO STEPS
 #
 # QEMU is a *system* service on this machine, so its QMP socket and its
-# /proc/<pid>/fd are root-only (§12.9). `arena-host` reads both to find the
+# /proc/<pid>/fd are root-only (§12.9). `wc-arena-host` reads both to find the
 # arena's pages, and `wc-proxy` opens the backing object by that path. Nothing
 # else here is privileged: the application runs as the invoking user, with that
 # user's home and that user's Firefox cache, and reaches the proxy through a
@@ -129,9 +129,9 @@ up)
   case "$PAGES$OUTBOUND" in *[!0-9]*|"") die "bad page count" ;; esac
   D=$(dir_of "$ID")
   rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
-  [ -x "$BIN/arena-host" ] || die "no $BIN/arena-host"
+  [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host"
   printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
-    "$BIN/arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
+    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
     "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
     "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
     | "$ROOTC" >/dev/null 2>&1

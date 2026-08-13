@@ -1263,6 +1263,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-arena-host"
+version = "0.1.0"
+dependencies = [
+ "arena-record",
+ "sv-arena",
+ "sv-hostd",
+ "sv-transport",
+ "wc-handle",
+]
+
+[[package]]
 name = "wc-compositor"
 version = "0.1.0"
 dependencies = [

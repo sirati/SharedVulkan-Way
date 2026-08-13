@@ -242,12 +242,12 @@ do_deploy() {
   done
 
   echo "  building the Linux half"
-  # `arena-host` is an ordinary workspace member now: the repositories are one,
-  # so the absolute path dependency that kept it excluded no longer exists
-  # (one-binary.md §1.3). It was `crates/wc-arena-host` with its own manifest and
-  # its own lock file when this script was written.
-  cargo build -p wc-proxy -p arena-host 2>&1 | grep -E '^error' | head -5
-  local locator="$LINUX_BIN/arena-host"
+  # `wc-arena-host` is an ordinary workspace member now rather than a crate with its
+  # own manifest and its own lock file: the repositories are one, so the absolute
+  # path dependency that kept it excluded no longer exists (one-binary.md §1.3). The
+  # merge deleted it outright; stage 14 put it back, because nothing replaced it.
+  cargo build -p wc-proxy -p wc-arena-host 2>&1 | grep -E '^error' | head -5
+  local locator="$LINUX_BIN/wc-arena-host"
   for b in "$LINUX_BIN/wc-proxy" "$locator"; do
     [ -x "$b" ] || { echo "error: no $b"; exit 1; }
   done
@@ -306,7 +306,7 @@ INI
   # Windows, and a session left up from the last run is running exactly these
   # two. Unlinking first replaces the name and leaves the running process on the
   # inode it already has, which is the whole point of the trick.
-  h "rm -f $HOSTDIR/bin/wc-proxy $HOSTDIR/bin/arena-host" >/dev/null 2>&1
+  h "rm -f $HOSTDIR/bin/wc-proxy $HOSTDIR/bin/wc-arena-host" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$ROOT/scripts/wc-session" "$HOST:$HOSTDIR/" >/dev/null
   scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOSTDIR/bin/" >/dev/null \
     || { echo "error: scp to the VM host"; exit 1; }
@@ -315,7 +315,7 @@ INI
      grep -q '$(echo "$pub" | awk '{print $2}')' ~/.ssh/authorized_keys || \
        echo 'restrict,port-forwarding,command=\"$HOSTDIR/wc-session\" $pub' >> ~/.ssh/authorized_keys; \
      grep -c wc-launch-guest ~/.ssh/authorized_keys" >/dev/null
-  echo "  copied wc-session, wc-proxy and arena-host to $HOST:$HOSTDIR, and restricted the guest's key to it"
+  echo "  copied wc-session, wc-proxy and wc-arena-host to $HOST:$HOSTDIR, and restricted the guest's key to it"
 
   # And the one end-to-end check of the path that does not need a compositor.
   # Asked of `wc-launch.exe` itself rather than of a hand-built ssh command

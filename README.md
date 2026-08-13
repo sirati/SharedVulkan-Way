@@ -153,7 +153,7 @@ minimise, maximise and close buttons. It takes two levers and neither works
 alone: the compositor sends `default_mode(2)` on the KDE decoration manager, and
 the client is started with `MOZ_GTK_TITLEBAR_DECORATION=none`. The second is in
 the *client's* environment and no protocol carries it, so the launcher sets it —
-`docs/design.md` §22.3 is the assumption written down. This script photographs
+`docs/waycompose-design.md` §22.3 is the assumption written down. This script photographs
 the result on the guest's interactive desktop with the pixels in guest RAM, which
 is the run §17.11 item 4 asked for; `docs/stage17/stage17-server.png` is the
 picture and `scripts/wc-firefox.sh titlebar` is the same claim as protocol

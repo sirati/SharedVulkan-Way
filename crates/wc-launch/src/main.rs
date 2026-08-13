@@ -554,17 +554,34 @@ mod win {
             let pages = rest.split(", ").nth(2)?.split_whitespace().next()?.parse::<u64>().ok()?;
             Some((run, pages))
         })
-        .map_err(|_| "the compositor never provided a guest-RAM arena".to_string())?;
+        .map_err(|_| {
+            kill(comp_pid);
+            "the compositor never provided a guest-RAM arena".to_string()
+        })?;
         log.say(&format!("arena: run {run_id}, {pages} pages, {} ms", t.elapsed().as_millis()));
 
         // 3. The locate, on the VM host. §12.5's 2.4 s, paid here and not on a
         //    click.
+        //
+        // **Every failure from here on kills the compositor**, and that is a
+        // fix rather than tidiness: a compositor left running holds 768 MiB of
+        // the guest's pinned RAM, holds its own executable open — so the next
+        // deploy fails with `scp: dest open "sv-guest.exe": Failure`, which
+        // reads as a permissions problem — and holds the mutex's session
+        // half-built. The first version returned `?` here and the next click
+        // met a guest with a compositor nobody owned.
         let t_locate = Instant::now();
-        let said = ssh(
+        let said = match ssh(
             cfg,
             p,
             &["up", &id, &run_id, &pages.to_string(), &cfg.outbound.to_string()],
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                kill(comp_pid);
+                return Err(e);
+            }
+        };
         log.say(&format!("locate: {} ({} ms)", said.replace('\n', " | "), t_locate.elapsed().as_millis()));
 
         // 4. The relay, and the tunnel that gives the host an end of it.
