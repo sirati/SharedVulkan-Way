@@ -145,10 +145,22 @@ CLIENT_CMD="${WC_CLIENT_CMD:-}"
 # survived four stages after the thing it described was fixed, and it was the
 # argument keeping this harness on a file.
 #
-# `shared-file` and the file-backed `arena` remain spellable because the Wine
-# fixture needs them (see `wc-substrate.sh`), and `wc_substrate_fixture_guard`
-# is what stops this harness — which has a guest — from reaching either.
+# `WC_TRANSPORT` is kept rather than deleted so that a person who exports the
+# old value gets a sentence instead of silence — deleting the knob would make
+# `WC_TRANSPORT=shared-file wc-icon.sh` run on guest RAM while its author
+# believed otherwise, which is the same class of quiet disagreement this stage
+# is about. Anything but `guest-ram` stops the run, and `wc-guest.sh` is named
+# because that is where the file transports are still a deliberate control.
 TRANSPORT="${WC_TRANSPORT:-guest-ram}"
+if [ "$TRANSPORT" != guest-ram ]; then
+  echo "wc-icon.sh: WC_TRANSPORT=$TRANSPORT is refused: this harness has a guest, and"
+  echo "  the arena is guest RAM. The file-backed arena and shared-file pools are the"
+  echo "  Wine fixture (§18.2) and no result from them is a result about the guest."
+  echo "  §10.3 measured that export incoherent for live mappings: 65280 of 65536 bytes"
+  echo "  wrong, in both directions. Use scripts/wc-guest.sh, where the file transports"
+  echo "  are a deliberate control and the incoherence is re-measured rather than assumed."
+  exit 2
+fi
 # Empty means "do not write a desktop entry": the app id already has a real one
 # somewhere in WC_HOST_ICONS, and writing ours would shadow the thing being
 # tested. That is the Firefox case, where the resolution is entirely the
@@ -337,9 +349,17 @@ one_run() {
   g "rm -f $APPDATA_WIN/wg-s11-* 2>/dev/null; true" >/dev/null 2>&1
   sleep 2
 
-  local arena=$((64 * 1024 * 1024))
-  h "mkdir -p $HOST_DIR $SHARE $SHARE/keymaps; chmod 777 $SHARE $SHARE/keymaps;
-     : >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
+  # STAGE 41. The substrate, declared before anything is measured on it. The
+  # `guest-ram` arm unsets `SV_ALLOW_FILE_ARENA`, so if anything below still
+  # reaches for a file the binaries refuse it by name rather than serving it.
+  wc_substrate_declare guest-ram || return
+
+  # And the export loses the two things it used to hold for this harness: the
+  # arena, and the keymap directory. Removed rather than left and trusted not to
+  # be used -- a leftover `arena` is openable, the right size, and completely
+  # silent to anything that was not looking. §18's `purge_arena_file`.
+  h "mkdir -p $HOST_DIR" >/dev/null
+  wc_purge_arena_file "$SHARE"
 
   # The desktop entry, written here because weston ships none. Three lines, and
   # the icon it names is one the host's own theme holds. With `WC_ICON_NAME=`
@@ -357,23 +377,40 @@ EOD" >/dev/null
     note "no desktop entry written: $APP_ID must resolve against $HOST_ICONS itself"
   fi
 
-  # The pool transport, and the arena's one real limit. See TRANSPORT.
-  local transport_args
-  if [ "$TRANSPORT" = arena ]; then
-    transport_args="--transport arena --arena-path $SHARE/arena --arena-id 0 --arena-size $arena"
-  else
-    h "rm -rf $SHARE/pools; mkdir -p $SHARE/pools; chmod 777 $SHARE/pools" >/dev/null
-    transport_args="--transport shared-file --pool-dir $SHARE/pools --peer-prefix $SHARE_WIN\\\\pools\\\\"
-  fi
-
+  # `wc-proxy` and, new in §41, `wc-arena-host`. The locator is **not a
+  # workspace member** — it links shared_vulkan's `sv-hostd` — so it is built
+  # through its own manifest, exactly as `wc-desktop.sh` does it.
   h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true" >/dev/null 2>&1
-  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$HOST:$HOST_DIR/" >/dev/null || {
-    bad "could not copy wc-proxy to $HOST"; return; }
-  h "chmod +x $HOST_DIR/wc-proxy" >/dev/null
+  local locator="$LINUX_BIN/wc-arena-host"
+  [ -x "$locator" ] || locator="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
+  if ! cargo build --manifest-path "$ROOT/crates/wc-arena-host/Cargo.toml" \
+        >"$RUNDIR/loc-$mode.log" 2>&1; then
+    bad "could not build wc-arena-host"; tail -10 "$RUNDIR/loc-$mode.log" | sed 's/^/        /'; return
+  fi
+  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOST_DIR/" >/dev/null || {
+    bad "could not copy wc-proxy/wc-arena-host to $HOST -- something is still holding one"; return; }
+  h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
 
-  # Stage 6's keymap needs somewhere both sides can reach, or the proxy ends the
-  # connection the moment `weston-terminal` binds a seat (§13.10).
-  local keymap_extra="--shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/"
+  # STAGE 41. No `--shared-dir`, and its absence is the point rather than an
+  # omission. What used to be here was:
+  #
+  #   keymap_extra="--shared-dir $SHARE_WIN\keymaps --shared-peer-prefix $SHARE/keymaps/"
+  #
+  # because stage 6's `wl_keyboard.keymap` is an `h` in the server-to-client
+  # direction and a `Local\wc-…` section is unopenable by a Linux process
+  # (§11.2, §13.10). With a guest-RAM arena the compositor cuts the keymap out
+  # of its own outbound window instead (§14), so nothing is published on any
+  # filesystem and the export is off this run entirely -- which is what makes
+  # the assertion at the bottom of this function able to demand zero shared
+  # files rather than merely few.
+  #
+  # The frame list is the one file that still crosses, and it is not the arena:
+  # it says *where the guest's pages are*, not what is in them. Written to the
+  # guest's own directory and fetched over ssh, so this harness needs no export
+  # at all now.
+  local gframes_win="$DESKDIR_WIN\\arena-$mode.frames"
+  local gframes="$DESKDIR/arena-$mode.frames"
+  g "rm -f $gframes" >/dev/null 2>&1
 
   # A task name per pass. Registering the same name twice while the first
   # instance is still winding down leaves `Start-ScheduledTask` with nothing to
@@ -381,7 +418,7 @@ EOD" >/dev/null
   # the second pass only — with the compositor's own log on the guest proving it
   # had started. One name each is a line; diagnosing it twice was not.
   int_bg "wciconcomp-$mode" "$DESKDIR_WIN\\$COMP_EXE" \
-    "--socket $sock --timeout 320 --log $DESKDIR_WIN\\comp-$mode.log --arena 0:$arena:$SHARE_WIN\\arena $keymap_extra" \
+    "--socket $sock --timeout 320 --log $DESKDIR_WIN\\comp-$mode.log $(wc_arena_comp_args "$gframes_win")" \
     >"$RUNDIR/start-$mode.log" 2>&1
   sleep 6
   # Polled rather than slept for: a scheduled task's process appears when the
@@ -417,38 +454,79 @@ EOD" >/dev/null
   local relay=$!
   sleep 3
 
+  # STAGE 41. THE LOCATE, and it has to be exactly here: after the compositor
+  # has committed and pinned the region inside the VM, and before the proxy that
+  # will map it starts. That ordering is the whole difference between this
+  # harness and the one it replaces, which had nothing to locate because its
+  # arena was a file somebody truncated in advance.
+  local plan="$HOST_DIR/$sock.plan"
+  if ! wc_locate_arena "$DESKDIR/comp-$mode.log" "$gframes" "$plan" "$RUNDIR"; then
+    kill $relay 2>/dev/null
+    kill_ours "$sock" >/dev/null 2>&1
+    return
+  fi
+
   # Everything below runs on WC_HOST, which is the machine with the icon theme
-  # and the arena on it. Written to a file and invoked: every background process
-  # on the far side must have its stdout redirected or the outer ssh never
-  # returns (§13.10).
+  # on it and the machine the VM runs on. Written to a file and invoked: every
+  # background process on the far side must have its stdout redirected or the
+  # outer ssh never returns (§13.10).
+  #
+  # STAGE 41: **the proxy and the client are now root, in a transient unit.**
+  # The proxy has to open `/proc/<qemu-pid>/fd/<n>` to reach the guest's pages
+  # and QEMU is a system service on this host (§12.9), so the whole host side
+  # moves under `systemd-run --collect`. This is `wc-desktop.sh`'s arrangement
+  # and its two lessons come with it: a root call that blocks for minutes often
+  # returns with no output at all, so completion is signalled by a *file* rather
+  # than by an exit code; and the `ssh -L` forward stays with the invoking user,
+  # outside the unit, because root has no `$HOME/.ssh/wc_guest` and can open a
+  # user-owned socket node anyway.
+  #
+  # `XDG_DATA_DIRS` moves inside the unit with the client, because the icon
+  # theme is resolved by the *proxy* and the proxy is now the root process.
   h "cat > $HOST_DIR/s11-$mode.sh <<'EOS'
 #!/usr/bin/env bash
 set -uo pipefail
-RUN=\$(mktemp -d /tmp/wc-s11-XXXXXX); chmod 700 \"\$RUN\"
+RUN=\$(mktemp -d /tmp/wc-s11-XXXXXX); chmod 755 \"\$RUN\"
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
     -N -L \"\$RUN/up.sock:127.0.0.1:$port\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
 sleep 4
 if [ -S \"\$RUN/up.sock\" ]; then
-  XDG_RUNTIME_DIR=\"\$RUN\" XDG_DATA_DIRS=$HOST_DIR/data:$HOST_ICONS \
-    $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
-     --runtime-dir \"\$RUN\" $transport_args \
-     --copy damage --accept-timeout 25 --timeout 240$iconflag \
-     >\"\$RUN/proxy.log\" 2>&1 &
-  PROXY=\$!
-  sleep 2
-  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy ${CLIENT_CMD:-$HOST_WESTON/$CLIENT} >\"\$RUN/cli.log\" 2>&1 &
-  CLI=\$!
+  cat > \"\$RUN/root.sh\" <<'INNER'
+#!/usr/bin/env bash
+export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+RUN=__RUN__
+export XDG_RUNTIME_DIR=\"\$RUN\"
+export XDG_DATA_DIRS=__DATA__
+$HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
+   --runtime-dir \"\$RUN\" --transport arena --arena-plan $plan --arena-id 0 \
+   --copy damage --accept-timeout 25 --timeout 240$iconflag \
+   >\"\$RUN/proxy.log\" 2>&1 &
+PROXY=\$!
+sleep 2
+WAYLAND_DISPLAY=wl-proxy ${CLIENT_CMD:-$HOST_WESTON/$CLIENT} >\"\$RUN/cli.log\" 2>&1 &
+CLI=\$!
+# LONG, AND MEASURED RATHER THAN GENEROUS. Every photograph below is taken by
+# a *scheduled task*, and registering, starting, waiting for and unregistering
+# one costs the better part of a minute — so the first version of this held
+# the client for 60 seconds, took the window's picture inside that, and took
+# the taskbar's two tasks later, by which time the window had been gone for a
+# minute. The taskbar came out with the right number of buttons and none of
+# them ours, which reads exactly like \"Windows refused the icon\".
+sleep 210
+kill \$CLI \$PROXY 2>/dev/null; wait 2>/dev/null
+chmod -R a+rwX \"\$RUN\" 2>/dev/null
+touch \"\$RUN/done\"
+INNER
+  sed -i \"s#__RUN__#\$RUN#; s#__DATA__#$HOST_DIR/data:$HOST_ICONS#\" \"\$RUN/root.sh\"
+  chmod 755 \"\$RUN/root.sh\"
+  UNIT=wc-s11-$mode-\$\$
+  echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+systemd-run --unit=\$UNIT --collect /run/current-system/sw/bin/bash \$RUN/root.sh >/dev/null 2>&1
+echo started\" | eval $ROOTC >/dev/null 2>&1
   echo S11-CLIENT-STARTED
-  # LONG, AND MEASURED RATHER THAN GENEROUS. Every photograph below is taken by
-  # a *scheduled task*, and registering, starting, waiting for and unregistering
-  # one costs the better part of a minute — so the first version of this held
-  # the client for 60 seconds, took the window's picture inside that, and took
-  # the taskbar's two tasks later, by which time the window had been gone for a
-  # minute. The taskbar came out with the right number of buttons and none of
-  # them ours, which reads exactly like "Windows refused the icon".
-  sleep 210
-  kill \$CLI \$PROXY 2>/dev/null
+  for _ in \$(seq 1 260); do [ -f \"\$RUN/done\" ] && break; sleep 1; done
+  [ -f \"\$RUN/done\" ] || echo \"S11-FAIL: the host-side unit never finished\"
 else
   echo S11-FAIL: no forward socket
 fi
@@ -520,6 +598,14 @@ $DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DES
     | grep -v "^S11-" | sed 's/^/        client: /' | head -8
 
   # ---- the claims ----------------------------------------------------------
+  # STAGE 41, AND FIRST, BECAUSE EVERY CLAIM BELOW IS ABOUT SOMETHING THIS ONE
+  # NAMES THE SUBSTRATE OF. An icon on a taskbar is an icon on a taskbar
+  # whatever carried the pixels — which is exactly why a run has to say what
+  # carried them, or four stages of photographs turn out to have been taken on
+  # the fixture and nobody notices. This is an assertion rather than the `note`
+  # this line used to be: §35.
+  wc_assert_substrate "$RUNDIR/comp-$mode.log" "$mode"
+
   # The *last* handle in `shot.txt`, because the window's picture is taken
   # after the taskbar's and taking the first one identifies `Shell_TrayWnd`.
   # Addressed this way rather than by class for §13.9's reason: another

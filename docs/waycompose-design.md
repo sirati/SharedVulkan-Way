@@ -5929,6 +5929,28 @@ set correctly on a window whose button the shell was not drawing.
 2. **`xdg-toplevel-icon-v1` is implemented and has never been exercised by a
    client.** No client this project can run implements it (§16.2), and the only
    thing that has driven the code path is the compositor's own `--debug-icon`.
+
+   **6. Every photograph and every number in §16 was taken on the file arena,
+   not on guest RAM.** Added by §41, which found it. `wc-icon.sh` had no
+   guest-RAM path at all: its compositor was started with
+   `--arena 0:N:Z:\wc11\arena` — a file on the virtio-fs export — and its
+   `WC_TRANSPORT=shared-file` mode put the pools on that same export by name.
+   So the taskbar pictures, the `subimage-search` RMSE of 595 against 26741, the
+   `icon set: 2 of 2 slots` line and the whole of §16.9's evidence crossed the
+   substrate §10.3 measured incoherent for live mappings: 65280 of 65536 bytes
+   wrong, in both directions.
+
+   **This is a note about the substrate, not a retraction.** An icon that
+   reaches `WM_SETICON` reaches it whatever carried the pixels, the icon bytes
+   cross as protocol messages rather than through the pool at all (§16.5), and
+   §10.3's incoherence is about *live* mappings rather than about whether a
+   window appears. Nothing here is known to be wrong. But it was measured on the
+   wrong memory by a harness that never said so, and the honest thing is to say
+   which — a silent re-run would replace evidence somebody may want to compare
+   against, and re-taking these on guest RAM is a measurement somebody should
+   make on purpose. `wc-icon.sh` now runs on guest RAM by default, cannot reach
+   a file at all, and asserts on the substrate it used, so the next run of it
+   will say `SUBSTRATE guest-ram` in its own output or fail.
    The right test is a GTK 4.20 application, which needs `wl_output`,
    `wl_subcompositor` and a data device — all of which stage 9 added — and one
    was not run here.
@@ -12357,6 +12379,34 @@ not something this compositor can assert.
    this process makes that somehow escapes `apply_identity` falls back to the
    executable. Setting a process-wide default would give those a nicer name; it
    would also hide exactly the bug that would have produced them.
+5. **The `apps` photographs — the two-application ones, which are the pictures
+   the requirement is actually about — were taken on the file arena, not on
+   guest RAM.** Added by §41, which found it. `wc-taskbar.sh`'s `apps` block had
+   no guest-RAM path: its pools were `--transport shared-file` on the virtio-fs
+   export and its compositor was started with `--arena 0:N:Z:\wc32\arena`, a
+   file on that same export — the substrate §10.3 measured incoherent for live
+   mappings, 65280 of 65536 bytes wrong in both directions. The reason given for
+   it, in a comment in the harness, was that "the arena serves exactly one
+   connection (§12.13 item 6)"; that limit was lifted in stage 12 (§15.14) and
+   measured gone in §15.13, four stages before this harness was written. A stale
+   comment kept the experiment on a file.
+
+   **This is a note about the substrate, not a retraction.** Two buttons come
+   apart because of `PKEY_AppUserModel_ID` and not because of what carried the
+   pixels, and `windows.groups` reads the identity back off the desktop with
+   `SHGetPropertyStoreForWindow` regardless. Nothing here is known to be wrong.
+   But it was measured on the wrong memory by a harness that never said so, and
+   re-taking it is a measurement somebody should make on purpose rather than a
+   silent re-run. `apps` now runs on guest RAM, cannot reach a file, asserts on
+   the substrate, and additionally asserts that **both** connections joined
+   arena 0 — a claim the shared-file version could not make at all, and which
+   makes the guest-RAM version the stronger form of this experiment rather than
+   a weaker one: the buttons must come apart while both clients' pixels are in
+   the same region.
+
+   `local` is unaffected and needed no change: it runs two of our own clients on
+   the guest itself with no proxy and no arena, so it has no substrate to
+   declare.
 
 ## 35. Gates that reported success while something was wrong
 
@@ -14793,3 +14843,291 @@ WiFi round trip. Removing it means teaching the vendored `wayland-backend` to
 take a `Read + Write` client rather than a socket, which is a change to vendored
 code and a `wepoll` problem, and is not worth doing before a client has driven a
 *guest* window through a ring.
+
+## 41. Five guest harnesses could still reach a file, and three of them only ever had one
+
+### 41.1 Status in one paragraph
+
+The arena is guest RAM. That had been stated to this project three times, §18
+had already built the shape of the refusal for one harness, and five harnesses
+could still put a run's pixels on a file. Three of them — `wc-icon.sh`,
+`wc-taskbar.sh` and `wc-firefox.sh` — had **no guest-RAM path at all**, so every
+measurement they had ever produced was taken on the fixture; and for two of
+those three the fixture was reached over ssh from a real Windows guest, which is
+the one combination that is never legitimate. This stage gives the two guest
+harnesses the guest-RAM path `wc-guest.sh` has had since stage 7 and makes it
+the only one they can reach, routes every remaining file-arena run through the
+permission the binaries now demand, and turns "which substrate served these
+pixels" from a line a harness printed into a line a harness **fails on**. The
+recorded results taken on the fixture are annotated rather than re-run: §16.11
+item 6 and §32.9 item 5.
+
+### 41.2 The inventory, which was not what it looked like
+
+The five, and what each turned out to be:
+
+| harness | guest? | reached a file? | verdict |
+|---|---|---|---|
+| `wc-desktop.sh` | yes | no | already clean — §18.2 did it |
+| `wc-guest.sh` | yes | yes, deliberately | a **control**, kept and licensed |
+| `wc-icon.sh` | yes | yes, by default | the defect |
+| `wc-taskbar.sh` | yes (`apps`) | yes, by default | the defect |
+| `wc-firefox.sh` | **no** | yes | a fixture that was correctly a fixture |
+
+Two corrections to the account this stage started from, and both matter.
+
+`wc-firefox.sh` has never had a guest and never claimed one — its header says
+"nothing here runs on the real guest, and the `wine` block is Wine" — so its
+file arena was legitimate all along. There was nothing to give it a guest-RAM
+path *with*: the Linux box it runs on has no QEMU. What it was missing was not a
+substrate, it was the word: a reader of its PASS lines had no way to see that
+`wine-arena` is a fixture without reading the header. That is now printed as
+part of the assertion.
+
+`wc-desktop.sh` was already clean. §18.2's `purge_arena_file` and its
+no-fallback `locate_arena` are the design this stage generalises; the file it
+still names is one it *deletes*.
+
+So the real defect was two harnesses, not five — and it was worse than five
+would have been, because both of them were photographing a Windows desktop over
+an export §10.3 measured incoherent for live mappings, and saying nothing.
+
+### 41.3 The premise that expired four stages before the harnesses that quoted it
+
+Both defective harnesses gave the same reason for being on a file, and
+`wc-taskbar.sh` wrote it down:
+
+```
+# shared-file rather than the arena: the arena serves exactly one connection
+# (§12.13 item 6) and this experiment is *about* having two.
+```
+
+That was true when §12.13 was written and stopped being true in stage 12.
+`wc-proxy`'s `make_transport` calls `Arena::share()` per session and prints
+`client N: joins arena 0 (M connection(s) on it now, …)`; §15.14 is the stage
+that fixed it and §15.13 is the measurement — four of Firefox's connections on
+one region and one allocator. `wc-icon.sh` carried the same sentence as the
+reason for its `WC_TRANSPORT=shared-file` mode.
+
+**A stale comment kept two harnesses on the wrong substrate for four stages.**
+It is worth being exact about why that was possible: nothing in either harness
+ever asserted the thing the comment was about, so the comment could go on being
+believed after the code stopped agreeing with it. §35's rule generalises — a
+number nobody asserts on is a number nobody is watching — and this is the same
+failure in prose rather than in numbers.
+
+The two-application experiment is *stronger* on guest RAM, not weaker: the two
+taskbar buttons now have to come apart while both clients' pixels are in the
+same region. `wc-taskbar.sh` asserts that both connections joined arena 0, which
+is a claim the shared-file version could not make at all.
+
+### 41.4 What enforces it, in three places that do different jobs
+
+Three mechanisms, deliberately not three copies of one mechanism.
+
+**1. The binaries refuse.** `wc-proxy`'s `arena` branch and `wc-compositor`'s
+`--arena`/`--arena-provide` exit with the reason unless `SV_ALLOW_FILE_ARENA=1`
+is set, and a run that sets it prints a warning saying the substrate is not a
+target. This is the enforcement and it is the only enforcement: a rule
+implemented twice is a rule that can disagree with itself. Verified against the
+built binary rather than assumed:
+
+```
+$ env -u SV_ALLOW_FILE_ARENA wc-proxy --transport arena --arena-path …/arena …
+wc-proxy: the FILE arena is not a target. `--transport arena --arena-path …`
+opens a file, which is a Wine-only fixture for a machine with no hypervisor.
+Guest RAM is the only real substrate: pass `--arena-plan` here and
+`--arena-guest-ram` to the compositor. …
+
+$ SV_ALLOW_FILE_ARENA=1 wc-proxy …
+[proxy] WARNING: FILE arena in use (SV_ALLOW_FILE_ARENA is set). This is a
+fixture, not a target; guest RAM is the only real substrate.
+```
+
+**1a. The refusal had a hole in the shape of the defect it was added to close,
+and this stage found it by testing it rather than by reading it.** The condition
+was `!args.provide_arenas.is_empty()` — `--arena-provide` only — while the
+message it printed named both flags:
+
+```
+`--arena-provide` and `--arena` open files, which is a Wine-only fixture …
+```
+
+`--arena <id>:<size>:<path>` populates a different vector, is attached earlier
+in `run_from`, and went straight through:
+
+```
+$ env -u SV_ALLOW_FILE_ARENA wc-compositor --arena 0:1048576:…/arena …
+wc-compositor: arena 0 attached: 1048576 bytes at …/arena     ← no refusal
+```
+
+That is not an academic gap. `--arena 0:N:Z:\wc11\arena` and
+`--arena 0:N:Z:\wc32\arena` are **exactly** what `wc-icon.sh` and
+`wc-taskbar.sh` passed on every run they ever made against the real guest. The
+one flag the two defective harnesses actually used was the one the guard did not
+cover, so the enforcement this stage was told to build on would have let both of
+them keep doing it.
+
+Two things were wrong and both are fixed. The condition now counts
+`arenas.len() + provide_arenas.len()` and runs *before* either is opened. And
+the decision was moved out of `run_from` into `file_arena_verdict`, because it
+had been unreachable by any test — four statements into a function that starts a
+compositor — so nothing could have caught a message that asserted a coverage the
+condition did not have. Three tests now cover it, including one that asserts the
+message names both flags.
+
+**The lesson is §35's again, one level up.** A refusal that is never exercised is
+a comment with a `return` in it. This one was written, reviewed, described
+accurately in a commit message, and did not do what all three said.
+
+**2. `scripts/wc-substrate.sh` decides who gets the key.** The refusal above has
+exactly one way past it, so the remaining question is which harness may set the
+variable. `wc_substrate_declare wine-fixture` exports it; `wc_substrate_declare
+guest-ram` **unsets** it — actively, not merely omitting it, so that a value
+inherited from the shell of somebody who ran a fixture an hour ago cannot
+license a file on a guest run. And the fixture arm refuses to export it at all
+when `WC_HOST` names a VM host or the harness declared a guest:
+
+```
+  FAIL  REFUSED to declare a fixture: WC_HOST=vmhost names a VM host, so this
+        run can reach guest RAM
+  ----  The file arena stands in for guest RAM on a box that has none. This box
+        has one.
+```
+
+This is not a second enforcement of the same rule. The binaries decide whether a
+file may be opened; this decides whether a harness may ask. A harness with a
+guest never asks, so it cannot be told yes.
+
+**3. Every run states its substrate, as an assertion.** The compositor already
+printed, once per window, which of the three homes a `wl_shm` pool had:
+
+```
+mapped: N section, N shared-file, N arena-slice
+```
+
+Three harnesses grepped that line and *printed* it. Printing is not watching:
+`wc-icon.sh` and `wc-taskbar.sh` printed it in every green run while every pixel
+crossed the fixture. `wc_assert_substrate` checks it instead, and for `guest-ram`
+it needs two legs, because the `mapped:` line alone cannot tell a guest-RAM arena
+from a file one — both are `arena-slice`. What separates them is that the locate
+ran and verified every page:
+
+```
+  PASS  icons: SUBSTRATE guest-ram: 3 arena slice(s) over 16384 pages located
+        by frames, 0 sections, 0 shared files
+  FAIL  icons: SUBSTRATE UNPROVEN: no locate verified this arena, so
+        'mapped: 0 section, 0 shared-file, 3 arena-slice' could be a file
+  FAIL  icons: SUBSTRATE WRONG: mapped: 0 section, 2 shared-file, 0 arena-slice
+        -- something was opened by name on a guest-RAM run
+```
+
+The `UNPROVEN` arm is the one worth keeping. It is what a harness that had been
+given the guest-RAM flags and whose locate silently did nothing would report,
+and it is the exact shape of the failure this stage exists to remove.
+
+### 41.5 What the two converted harnesses now do
+
+The recipe is `wc-guest.sh`'s and `wc-desktop.sh`'s, unchanged, because a second
+spelling of it would be a second thing to get wrong:
+
+* `--arena-guest-ram 0:67108864 --arena-outbound 0:1048576` on the compositor,
+  and **no `--shared-dir`**. Its absence is the point rather than an omission:
+  with a guest-RAM arena the keymap is cut from the compositor's own outbound
+  window (§14), so no protocol object is published on any filesystem and the
+  assertion can demand *zero* shared files rather than merely few. Both
+  harnesses previously passed `--shared-dir` for stage 6's keymap (§11.2,
+  §13.10); neither needs it now.
+* `--arena-frames` on the compositor, and `wc-arena-host --frames` on the host,
+  which is the call site §41 was told to build against and which landed while it
+  was being built. The frame list is **not** a file arena and cannot become one:
+  what it carries is where the guest's pages are, not the pages. It is written
+  to the guest's own directory and fetched over ssh, so neither harness needs a
+  shared filesystem at all now.
+* `wc-arena-host` as root on the VM host through `rootc`, because QEMU is a
+  system service here and both its QMP socket and its `/proc/<pid>/fd` are
+  root-only (§12.9). No descriptor crosses the boundary in either direction:
+  what comes back is a plan, a list of offsets into an object the host opens by
+  name for itself.
+* `wc-proxy --transport arena --arena-plan … --arena-id 0`, inside a
+  `systemd-run --collect` transient unit, for the same reason. Both of
+  `wc-desktop.sh`'s lessons come with the arrangement: a root call that blocks
+  for minutes frequently returns with no output at all, so the unit signals
+  completion with a **file** rather than an exit code; and the `ssh -L` forward
+  stays with the invoking user, outside the unit, because root has no
+  `$HOME/.ssh/wc_guest` and can open a user-owned socket node anyway.
+* `XDG_DATA_DIRS` moves inside the unit, because the icon theme is resolved by
+  the *proxy* and the proxy is now the root process. That is the one thing about
+  this conversion that is specific to these two harnesses rather than copied.
+
+The locate is placed between the compositor starting and the proxy running, and
+that ordering is the whole difference between these harnesses and the ones they
+replace — which had nothing to locate, because their arena was a file somebody
+truncated in advance.
+
+### 41.6 The file transports that are kept, and why each is not a hole
+
+Three, and the test for each is the same: can a run reach it *silently*.
+
+1. **`wc-firefox.sh`, `wc-proxy.sh`, `wc-input.sh`, `wc-arena-pressure.sh`** —
+   Wine harnesses on a machine with no QEMU. There is no guest RAM to locate, so
+   a file standing in for the region is the only way to exercise the arena code
+   path at all. Each declares itself a fixture, which both obtains the
+   permission and prints the word next to its results.
+2. **`wc-guest.sh`'s `arena` and `shared-file` legs** — the one place a machine
+   *with* a guest may open a file, and §18.2 already licensed it: this branch is
+   how the export's incoherence is re-measured rather than assumed, and §12.6 is
+   the section made of its output. **A control that cannot be run is an
+   assumption.** It is not silent — the transport is a positional argument of
+   the driver, it is in the tag of every line the run prints, and `s4_run`'s
+   `case "$transport:$counts"` already asserted that the substrate named is the
+   substrate that served the pixels. `SV_ALLOW_FILE_ARENA` is exported for that
+   branch alone and unset in the `guest-ram` branch, so the guest-RAM legs
+   cannot inherit it and degrade to a file when their locate fails. They fail
+   instead, which is the point.
+3. **A stale `arena` file left on the export by an older run.** Openable, the
+   right size, and completely silent to anything that was not looking, which is
+   why it is *removed* rather than trusted not to be used. `wc_purge_arena_file`
+   generalises §18's `purge_arena_file` and now runs in both converted
+   harnesses; it also takes the keymap and pool directories, which is what those
+   two harnesses actually put on the export. The refusal stops this tree opening
+   such a file; the removal stops an older `wc-proxy` somebody has lying around.
+
+### 41.7 What is not done
+
+1. **Nothing here was run against the guest.** This stage is a change to what
+   five harnesses *can* do, verified by unit tests, by shell syntax, by
+   exercising `wc-substrate.sh`'s decision table directly, and by running the
+   built `wc-proxy` against a file arena with and without the permission to
+   confirm both arms. The two converted harnesses have not been driven end to
+   end on the guest, and the first agent to do so should expect the locate to be
+   the interesting part — see item 3.
+2. **The recorded results are still the fixture's.** Deliberately: §16.11 item 6
+   and §32.9 item 5 say so, and a silent re-run would replace evidence somebody
+   might want to compare against. Re-taking them is a measurement, and it is
+   somebody's to make on purpose.
+3. **The `--frames` arm is used when the guest manages to publish a list, and
+   the sweep is still reachable.** That asymmetry is deliberate and is not a
+   substrate fallback — both arms locate guest RAM and differ only in how its
+   pages are named. A guest without `SuperfetchPfnQuery` or without the
+   privilege is a *slow* run, not a broken one, and a harness that refused to
+   start would be a worse regression than the one being fixed. The run says
+   which locator it got, and a sweep says so as a note rather than as a pass.
+4. **`wc_assert_substrate` reads the compositor's last `mapped:` line.** With
+   two clients that is the second window's counters, not a total. It is
+   sufficient for the claim being made — no window on a guest-RAM run may open
+   anything by name — but a harness with a client that maps late and a client
+   that maps early is asserting about one of them. Per-window assertion needs
+   the compositor to key the line by window id, which it already does; nothing
+   consumes it that way yet.
+5. **`wc-proxy`'s refusal has not been re-read as carefully as the
+   compositor's.** The compositor's covered one of its two flags (§41.4 item
+   1a); `wc-proxy`'s covers the `arena` transport branch, which is the only
+   place `--arena-path` is consumed, and was verified by running the binary both
+   ways. But it is still a check inside `run` rather than a tested function, so
+   it has the property that let the compositor's rot. Giving it the same
+   `file_arena_verdict` treatment is one commit and was not done here.
+6. **`wc-taskbar.sh`'s `local` block is untouched and did not need to be.** It
+   runs two of our own clients on the guest itself with no proxy and no arena,
+   so it has no substrate to declare. Worth stating because "every block of
+   every harness" is the kind of claim that is easy to make and wrong.

@@ -106,6 +106,15 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 41. No QEMU on this box, so no guest RAM to locate: this harness is the
+# Wine fixture and its `arena` transport is a file. `wc_substrate_declare
+# wine-fixture` is what hands it the `SV_ALLOW_FILE_ARENA=1` that `wc-proxy` and
+# `wc-compositor` now require, and it refuses to hand that out to any harness
+# that has a guest.
+. "$(dirname "$0")/wc-substrate.sh"
+wc_substrate_declare wine-fixture \
+  "no QEMU on this box: a Wine run has no guest RAM to locate" || exit 2
+
 RUNDIR=$(mktemp -d /tmp/wc-proxy-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
