@@ -6391,6 +6391,24 @@ compositor entirely through `wl_pointer.set_cursor` with a buffer, which is
 why both halves were done in one stage rather than the easy one being shipped
 alone.
 
+**And that is the second time the same measurement has come back the same way,
+so it is worth stating as a rule rather than as a surprise.** §13.7 found that
+GTK 3 does not implement `xdg-decoration` and binds KDE's
+`org_kde_kwin_server_decoration` instead — checked the same way, by looking for
+the interface name in `libgdk-3.so`. The general form:
+
+> For a GTK3-era client, the modern protocol is frequently **advertised and
+> never bound**. Implementing it is therefore not evidence that anything
+> reaches it, and a compositor that shipped only the modern half would pass
+> every protocol-shaped test and change nothing a user could see.
+
+The cheap check is one `grep` against the client's own shared object, and it
+costs less than the run that would otherwise discover the same thing an hour
+later. It is also why §23.8 item 1 is written as an admission rather than a
+footnote: the *named* path here is currently in exactly the state this rule
+warns about — advertised, carried, unit-tested, and bound by nothing in the
+harness.
+
 ### 23.3 The table, and where it lives
 
 `crates/wc-compositor/src/cursor.rs`. It is a new file for one reason: the
