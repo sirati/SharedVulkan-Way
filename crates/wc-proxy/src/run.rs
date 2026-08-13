@@ -501,7 +501,25 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // being accepted into a proxy with nowhere to forward to; that is still
         // true and is now handled by failing the connection immediately, which
         // is a closed socket at the same moment either way.
-        let upstream = match std::os::unix::net::UnixStream::connect(&args.upstream) {
+        //
+        // **Retried on `ECONNREFUSED`, for the reason `wc-wlcs` retries.** `bind`
+        // creates the filesystem node and `listen` makes it accept; between the
+        // two, `connect` is refused. Every harness that starts a compositor and
+        // then a proxy waits for the *node*, which does not close that window,
+        // and the symptom is one leg of a run failing with "cannot reach the
+        // compositor" while an identical tree passes — a red that is not a
+        // regression, which teaches everyone to re-run until green.
+        //
+        // Bounded and reported: the retry is printed, so a run that needed it
+        // says so rather than hiding a slow compositor behind a pass. A refusal
+        // that outlives the deadline is still a failure, because a compositor
+        // that is not listening after five seconds is not a race.
+        let upstream = match proxy::connect_upstream(&args.upstream, |refusals, ms| {
+            println!(
+                "[proxy] client {n}: the compositor refused {refusals} connect(s) over {ms:.0} ms \
+                 before it was listening"
+            );
+        }) {
             Ok(u) => u,
             Err(e) => {
                 println!(
