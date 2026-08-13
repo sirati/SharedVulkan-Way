@@ -217,6 +217,10 @@ pub struct Click {
 struct Headless {
     title: String,
     app_id: String,
+    /// The taskbar identity this window would be given on Windows. ADDED FOR
+    /// STAGE 32; kept so that a second `AppId` for the same one is not
+    /// announced twice.
+    aumid: String,
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
     /// Surface size, as reported at `Map`, which on every platform is also the
@@ -347,6 +351,7 @@ impl PumpInner {
                 id,
                 title,
                 app_id,
+                aumid,
                 shadow,
                 kind,
             } => {
@@ -362,11 +367,17 @@ impl PumpInner {
                          parent={parent} at {x},{y}"
                     ),
                 }
+                // ADDED FOR STAGE 32. There is no taskbar here either, so the
+                // identity is *said* — which is enough for a Linux-side test to
+                // assert that two clients got two of them and that two windows
+                // of one client did not.
+                println!("wc-compositor: window {id} taskbar identity -> {aumid:?}");
                 windows.insert(
                     id,
                     Headless {
                         title,
                         app_id,
+                        aumid,
                         shadow,
                         mapped: false,
                         surface: (0, 0),
@@ -390,9 +401,15 @@ impl PumpInner {
                     w.title = title;
                 }
             }
-            ToUi::AppId { id, app_id } => {
+            ToUi::AppId { id, app_id, aumid } => {
                 if let Some(w) = windows.get_mut(&id) {
                     println!("wc-compositor: window {id} app_id -> {app_id:?}");
+                    if w.aumid != aumid {
+                        println!(
+                            "wc-compositor: window {id} taskbar identity -> {aumid:?}"
+                        );
+                        w.aumid = aumid;
+                    }
                     w.app_id = app_id;
                 }
             }

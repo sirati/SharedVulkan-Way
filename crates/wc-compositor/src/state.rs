@@ -247,6 +247,14 @@ struct Window {
     minimized: bool,
     title: String,
     app_id: String,
+    /// Which connection this window's client arrived on.
+    ///
+    /// ADDED FOR STAGE 32, and it is the whole of the answer for a client that
+    /// never calls `set_app_id`: there is no name to group such windows by, so
+    /// they are grouped by the thing that is still true of them. Cached here
+    /// rather than looked up per use, because a window outlives the moments at
+    /// which its surface is convenient to ask.
+    client: u32,
     /// Callbacks the client is waiting on before it draws its next frame.
     ///
     /// Held rather than answered immediately. Answering at once is legal and is
@@ -1705,6 +1713,14 @@ impl State {
         let first = !window.mapped;
         window.mapped = true;
         let (title, app_id) = (window.title.clone(), window.app_id.clone());
+        let client = window.client;
+        // ADDED FOR STAGE 32. A popup has no taskbar button — it is
+        // `WS_EX_TOOLWINDOW` with an owner — so there is nothing for an
+        // identity to group, and stamping one on a menu would be a claim about
+        // a button that does not exist. Measured, and not hypothetical: the
+        // first run of the `apps` experiment put `Waycompose.unnamed.c1` on
+        // three of `weston-terminal`'s context menus, harmlessly and wrongly.
+        let toplevel = window.role.toplevel().is_some();
         self.presents += 1;
 
         if first {
@@ -1732,6 +1748,29 @@ impl State {
             // smithay's `Output::enter` walks the surface's client list, which
             // needs the surface to be alive on the wire.
             self.output.enter(&root);
+            // BEFORE `Map`, AND THAT IS THE WHOLE OF STAGE 32'S ORDERING.
+            //
+            // `Map` is what shows the window, and the shell makes the taskbar
+            // button when the window is shown — it reads the identity property
+            // then. Until stage 32 this went out *after* `Map`, which was
+            // harmless when nothing read it and is not harmless now: the button
+            // would be created under whatever identity the window was created
+            // with, and a client that called `set_app_id` between creation and
+            // its first buffer — which is every client, because `set_app_id`
+            // costs no round trip and drawing does — would have its real name
+            // arrive one message too late.
+            //
+            // Sent unconditionally, empty app id included: "this client never
+            // named itself" is an identity too (`crate::taskbar`), and skipping
+            // it would leave the nameless windows sharing whatever the shell
+            // decided for the process.
+            if toplevel {
+                self.ui.send(ToUi::AppId {
+                    id,
+                    app_id: app_id.clone(),
+                    aumid: crate::taskbar::identity(&app_id, client),
+                });
+            }
             self.ui.send(ToUi::Map {
                 id,
                 width: w,
@@ -1739,12 +1778,6 @@ impl State {
             });
             if !title.is_empty() {
                 self.ui.send(ToUi::Title { id, title });
-            }
-            if !app_id.is_empty() {
-                self.ui.send(ToUi::AppId {
-                    id,
-                    app_id: app_id.clone(),
-                });
             }
             // At map, and not before: a window that is not on screen has no
             // taskbar button to put an icon on, and `WM_SETICON` to a hidden
@@ -2431,6 +2464,26 @@ fn metadata(toplevel: &ToplevelSurface) -> (String, String) {
     })
 }
 
+/// Which connection a surface belongs to, counted from 1 in accept order.
+///
+/// ADDED FOR STAGE 32. [`ClientState::index`] already exists and is already
+/// counted for every client; this is the one place outside the control socket
+/// that needs it, because a window whose client never named itself still has to
+/// be told apart from a *different* client that never named itself
+/// (`crate::taskbar`).
+///
+/// `0` for a surface whose client is gone, which cannot happen on the paths
+/// that call this — the surface is live enough to have a role — and is a
+/// deliberate non-panic if it ever does: a wrong taskbar group is a cosmetic
+/// defect and killing the compositor over one is not.
+fn client_index(surface: &WlSurface) -> u32 {
+    use smithay::reexports::wayland_server::Resource as _;
+    surface
+        .client()
+        .and_then(|c| c.get_data::<ClientState>().map(|d| d.index))
+        .unwrap_or(0)
+}
+
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell
@@ -2442,6 +2495,7 @@ impl XdgShellHandler for State {
         self.toplevels += 1;
 
         let (title, app_id) = metadata(&surface);
+        let client = client_index(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
         println!(
             "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
@@ -2452,6 +2506,14 @@ impl XdgShellHandler for State {
             id,
             title: title.clone(),
             app_id: app_id.clone(),
+            // ADDED FOR STAGE 32. Stamped at creation, while the window is
+            // still hidden, because that is the only moment that is certainly
+            // before the shell has made a button for it. Most clients have not
+            // called `set_app_id` yet at this point and get their connection's
+            // identity here and their real one at map; a client that set it
+            // before the first round trip — `weston-terminal` does — gets the
+            // real one immediately.
+            aumid: crate::taskbar::identity(&app_id, client),
             shadow: shadow.clone(),
             kind: WindowKind::Toplevel,
         });
@@ -2473,6 +2535,7 @@ impl XdgShellHandler for State {
                 minimized: false,
                 title,
                 app_id,
+                client,
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 icon_from_client: false,
@@ -2500,10 +2563,17 @@ impl XdgShellHandler for State {
         };
         window.app_id = app_id.clone();
         let (id, mapped, own) = (window.id, window.mapped, window.icon_from_client);
+        let client = window.client;
         if mapped {
             self.ui.send(ToUi::AppId {
                 id,
                 app_id: app_id.clone(),
+                // ADDED FOR STAGE 32, and this is the *late* case: the window
+                // is already on screen, so the shell has already made a button
+                // for it under the old identity. What that costs is measured in
+                // docs/waycompose-design.md §32.6; the platform is told, and
+                // the platform decides what it can do about it.
+                aumid: crate::taskbar::identity(&app_id, client),
             });
             // A new app id is a new answer to "what is this application", so
             // the icon is looked up again — unless the client has said what its
@@ -2690,6 +2760,11 @@ impl XdgShellHandler for State {
             id,
             title: String::new(),
             app_id: String::new(),
+            // A popup is `WS_EX_TOOLWINDOW` with an owner, so the shell gives
+            // it no taskbar button at all and there is nothing for an identity
+            // to group. Empty rather than invented: a string here would be a
+            // claim about a button that does not exist.
+            aumid: String::new(),
             shadow: shadow.clone(),
             kind: WindowKind::Popup {
                 parent: parent_id,
@@ -2706,6 +2781,7 @@ impl XdgShellHandler for State {
         });
         let _ = surface.send_configure();
 
+        let client = client_index(surface.wl_surface());
         self.windows.insert(
             surface.wl_surface().clone(),
             Window {
@@ -2716,6 +2792,7 @@ impl XdgShellHandler for State {
                 minimized: false,
                 title: String::new(),
                 app_id: String::new(),
+                client,
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 // A popup has no taskbar button and no caption, so neither of

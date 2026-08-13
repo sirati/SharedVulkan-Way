@@ -174,7 +174,7 @@ The compositor draws no caption buttons of its own: it leaves the rectangle
 already drew, and forwards the frame's mouse messages to `DwmDefWindowProc` — so
 the buttons are Windows' own, and Windows 11's snap layouts work for the same
 reason they work anywhere else. `docs/tabs-in-titlebar/pair-topstrip.png` is the
-two arrangements stacked and `docs/waycompose-design.md` §30 is the argument,
+two arrangements stacked and `docs/waycompose-design.md` §31 is the argument,
 including the thing that is still not solved: no Wayland protocol can tell
 Firefox that the corner is occupied.
 

@@ -49,11 +49,15 @@ mod clipboard;
 #[cfg(unix)]
 mod control;
 mod cursor;
+pub mod grow;
 mod icon;
 mod input;
 mod platform;
 mod state;
 mod surface;
+/// Which taskbar button a window belongs to. See its header, and
+/// docs/waycompose-design.md §32.
+mod taskbar;
 mod tick;
 
 /// How long the Wayland thread waits between turns.

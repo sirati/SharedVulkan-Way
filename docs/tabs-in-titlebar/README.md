@@ -1,6 +1,6 @@
 # Tabs in the title bar: Firefox's tabs inside Windows' own caption
 
-`docs/waycompose-design.md` §30 is the account. These are the pictures it rests
+`docs/waycompose-design.md` §31 is the account. These are the pictures it rests
 on, and they are the *other half* of stage 17's pair: §22 removed the second
 title bar by making Windows draw the only one, and this removes it by making
 Firefox draw the only one — inside the system frame, with the system's own
@@ -18,11 +18,11 @@ that are transparent on screen and come back as zero alpha in a BMP. It is in
 | file | what it is |
 |---|---|
 | `tabs.png` | the claim. `--decorations tabs`: no Windows caption above the tab strip, because there is no Windows caption — `WM_NCCALCSIZE` gave those 31 pixels to the client area. Firefox's tabs are at the very top of the window, and in the corner of that same strip are **Windows' own** minimise, maximise and close buttons, drawn by DWM and revealed by leaving `alpha = 0` over the rectangle `DWMWA_CAPTION_BUTTON_BOUNDS` reported. |
-| `noglass.png` | the same window, same guest, minutes apart, with `--dwm-glass off`. The same `FillRect` that is a hole in the picture above is a **black rectangle** here, because there is no extended frame region for anything to show through. §30.6 is that measurement; this is what it looks like. |
-| `nobuttons.png` | the same window with `--caption-buttons off`: the client's pixels over the whole caption and no buttons at all. What the arrangement is worth without `DwmDefWindowProc`. It is also the picture of the *other* problem: with nothing reserving the corner, Firefox's tab-list chevron runs under where the buttons would be. §30.9. |
+| `noglass.png` | the same window, same guest, minutes apart, with `--dwm-glass off`. The same `FillRect` that is a hole in the picture above is a **black rectangle** here, because there is no extended frame region for anything to show through. §31.6 is that measurement; this is what it looks like. |
+| `nobuttons.png` | the same window with `--caption-buttons off`: the client's pixels over the whole caption and no buttons at all. What the arrangement is worth without `DwmDefWindowProc`. It is also the picture of what is *underneath* the buttons in `tabs.png` — Firefox's tab-list chevron and its own close button, which nothing can move out of that corner. §31.9. |
 | `server.png` | **the pair.** §22's arrangement, re-run in this session on the same guest with the same arena and the same output size, minutes apart, one flag apart. Windows' caption with Firefox's icon and title in it, and Firefox's tab strip below. `docs/stage17/stage17-server.png` is stage 17's own capture of the same thing and is left untouched. |
 | `pair-topstrip.png` | the top 100 rows of both, stacked: the caption-above-tabs arrangement over the tabs-in-caption one. It is the whole of this stage in one picture, and it is the only form the claim can take — the two windows differ by about thirty pixels of vertical offset, which is also what a client that started at a different size looks like. |
-| `corner-three.png` | the same 210x50 rectangle of the same corner from all three, stacked and magnified three times. Top: Windows' minimise, maximise and close, through the hole. Middle: the same hole with `--dwm-glass off`, which is black. Bottom: no hole at all, and what is in the corner is Firefox's own tab-list chevron and its own close button. Three flags, one picture. |
+| `corner-three.png` | the same 260x46 rectangle of the same corner from all three, stacked and magnified three times. Top: Windows' minimise, maximise and close, through the hole. Middle: the same hole with `--dwm-glass off`, which is black. Bottom: no hole at all, which is what the top row is hiding — Firefox's own tab-list chevron and its own close button. Three flags, one picture. |
 | `compositor-*.log` | each leg's compositor log, from inside the VM. The two lines that make the picture believable are `folds 31 px of caption into its client area, DwmExtendFrameIntoClientArea ok` and `keeps Windows' own caption buttons: client rect …`, plus `nonclient 16x8` — eight pixels of border on each side, eight at the bottom, and **zero at the top**. |
 
 The comparison is `docs/stage17/stage17-server.png` and
@@ -40,22 +40,23 @@ clause:
 * **The snap-layouts flyout.** It follows from `DwmDefWindowProc` returning
   `HTMAXBUTTON` over the button it drew, and nobody has hovered it and taken a
   capture — `wc-desk.exe shot` photographs a *window*, and the flyout is a
-  separate one. §30.12 item 1.
+  separate one. §31.12 item 1.
 * **A window being dragged by its tab strip.** §22.11 item 1, inherited whole.
-* **Firefox knowing the corner is taken.** It does not, and no Wayland protocol
-  can tell it — §30.9 is the account. What the harness does instead is give the
-  client `gtk-decoration-layout=:minimize,maximize,close`, so Firefox lays out
-  three buttons of its own there and stops its tab strip before them; the
-  transparent rectangle then covers three buttons nobody needs rather than the
-  tab-list chevron. That is a **coincidence of widths, not an agreement**, and
-  it is the residue: the compositor knows the exact rectangle and cannot say so.
-* **Anything but 100% scaling and this one GTK theme.** Both the corner
-  reservation above and the caption colour in §30.6 are measured at 96 DPI on
-  one theme.
+* **Firefox knowing the corner is taken.** It does not, no Wayland protocol can
+  tell it, and the one out-of-band lever that might have — giving the client
+  `gtk-decoration-layout=:minimize,maximize,close`, so that a toolkit which
+  draws three buttons reserves room for three buttons — **was tried and
+  measured and does not work**: Firefox 151 draws a tab-list chevron and one
+  close button whatever the layout names, on the guest and on the workstation,
+  with the file verified to have arrived both times. §31.9 has the table. So
+  the chevron and Firefox's own close button are *underneath* Windows' three,
+  hidden and unreachable, and the chevron is a real control a user has lost.
+* **Anything but 100% scaling and this one GTK theme.** The caption colour in
+  §31.6 is measured at 96 DPI on one theme.
 
 ## What is not in a picture and is in the logs
 
-The caption colour (§30.6) is the part of this that a still photograph
+The caption colour (§31.6) is the part of this that a still photograph
 under-sells, because it is a *following* behaviour. `compositor-tabs.log` has
 the line:
 
@@ -100,7 +101,7 @@ runs**. The tells are `schtasks /Query /TN <name> /V` reporting
 *success* code — and no `explorer.exe` in the process list. It cost this stage
 two runs and a session of staring at a binary that ran perfectly by hand.
 `scripts/wc-titlebar.sh` now makes that check itself and says which of the two
-causes it is; the other three do not, and that is §30.13 item 5. The check is
+causes it is; the other three do not, and that is §31.13 item 5. The check is
 one line:
 
 ```
@@ -108,7 +109,7 @@ ssh <guest> 'powershell.exe -NoProfile -Command "(Get-Process explorer).Count"'
 ```
 
 The Linux half, which needs no guest and asserts the part of the arrangement
-that is a fact about the client (§30.2's shadow inset, and that the client area
+that is a fact about the client (§31.2's shadow inset, and that the client area
 is the surface):
 
 ```

@@ -24,7 +24,7 @@
 //! `translate`, `write1`, `gpufill` — and handed this one's arguments it panics
 //! with `--fd is required`. That panic is what a desktop shortcut got instead of
 //! a window (§28) and what a `wc-titlebar.sh` leg got instead of a capture
-//! (§30.9).
+//! (§31.9).
 //!
 //! It was deleted once as "a crate that exists only to hold an absolute path
 //! dependency" — true of the *manifest*, and the manifest was a workaround; the
@@ -55,9 +55,9 @@
 //! A copy of that in `waycompose` would be a second thing to keep correct
 //! against a machine neither of us controls, and being wrong would look exactly
 //! like working. So this binary **depends on** `sv-hostd` and does none of it
-//! itself. It is the only crate in this repository that does, it is deliberately
-//! not a workspace member (see `Cargo.toml`), and the split keeps the sibling
-//! repository out of the Windows cross gate entirely.
+//! itself. It is the only crate in this repository that does; stage 14 made it an ordinary
+//! workspace member and the `cfg(unix)` gate below is what keeps the Windows
+//! cross gate green — see `Cargo.toml`.
 //!
 //! **Second: privilege.** Reading `/proc/<qemu-pid>/fd` and connecting to
 //! QEMU's QMP socket both need root on the VM host. `wc-proxy` should not, and
@@ -131,6 +131,40 @@ mod host {
         verify: bool,
         poke: Option<(u64, String)>,
         watch: Option<(u64, u64)>,
+        /// DYNAMIC ARENA. Which region of the arena family this run describes —
+        /// the number `wc_proxy::guestram::Plan::id` reads and every
+        /// `Descriptor::ArenaSlice { arena, .. }` names.
+        ///
+        /// It is on the command line rather than derived from the plan's
+        /// current contents because the id is **decided by the proxy's
+        /// allocator**, before the guest is asked to commit anything: `next_id`
+        /// is what `Arena::grow` passes to `RegionSource::provide`, and the
+        /// guest registers the region under that same number. A locator that
+        /// invented its own id here would write a plan naming a region the
+        /// compositor has never heard of, and the symptom is a slice resolved
+        /// against a mapping that does not exist.
+        region: u32,
+        /// Append to the plan instead of truncating it.
+        ///
+        /// The whole of what makes growth expressible. A plan is a **log of
+        /// regions**, and the reason it has to be one is §12.10: the first pool
+        /// allocated into a region writes pixels over the stamps the sweep
+        /// locates by. Rewriting the file from scratch would mean re-locating
+        /// regions whose stamps are gone — which the sweep structurally cannot
+        /// do — so a region is written once, when it is new, and never
+        /// rewritten.
+        append: bool,
+        /// A frame list from the guest, in `sv-hostd qemu --frames`' format, to
+        /// be used **instead of the content sweep**.
+        ///
+        /// This is the difference between growth being a feature and being a
+        /// three-second stall. The sweep costs what the *guest* costs, not what
+        /// the region costs — 2832–3101 ms across a 24x range of arena sizes,
+        /// because it is a content search across the whole 13 GiB backing
+        /// object — and it is paid on every growth. The frame list is
+        /// `SuperfetchPfnQuery`'s answer, and translating it is a table lookup
+        /// per page against `info mtree -f`: 0.064 s host-side.
+        frames: Option<PathBuf>,
         /// STAGE 10. How many bytes at the end of the arena the guest compositor
         /// reserved for the objects **it** creates for clients — a `wl_keyboard`
         /// keymap first. Copied into the plan so that `wc-proxy`'s pool allocator
@@ -160,6 +194,18 @@ mod host {
                         for objects it creates for clients; record it in the plan
                         so wc-proxy's pool allocator leaves them alone
 
+      --region N        which region of the arena family this is (default 0).
+                        The number wc-proxy's allocator chose and the guest
+                        registered the region under.
+      --append          add this region to an existing plan instead of replacing
+                        it. A plan is a log of regions: a region's stamps are
+                        overwritten by the first pool allocated into it, so a
+                        region is located once, when it is new.
+      --frames PATH     a guest frame list (`pfn <index> <frame hex> ...`) to
+                        translate instead of sweeping for stamps. 0.064 s rather
+                        than ~3 s, because the sweep's cost is the guest's RAM
+                        and this is a table lookup per page.
+
       --no-verify       skip the per-page index check (do not)
       --poke OFF:TEXT   write TEXT at arena offset OFF once the arena is mapped
       --watch OFF:SECS  then wait up to SECS for the guest to change 32 bytes at OFF
@@ -177,6 +223,9 @@ mod host {
             poke: None,
             watch: None,
             outbound: 0,
+            region: 0,
+            append: false,
+            frames: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -195,6 +244,9 @@ mod host {
                 "--outbound" => {
                     a.outbound = next()?.parse().map_err(|e| format!("--outbound: {e}"))?
                 }
+                "--region" => a.region = next()?.parse().map_err(|e| format!("--region: {e}"))?,
+                "--append" => a.append = true,
+                "--frames" => a.frames = Some(next()?.into()),
                 "--poke" => {
                     let v = next()?;
                     let (off, text) = v.split_once(':').ok_or("--poke wants OFFSET:TEXT")?;
@@ -231,22 +283,81 @@ mod host {
             }
         };
 
+        // Refuse a duplicate id **before** the locate rather than after it.
+        // `Plan::read_all` refuses one too, and that refusal is the one that
+        // matters for correctness — two regions with one id would be two
+        // mappings a descriptor cannot tell apart. This one is about the clock:
+        // a growth that spends its locate and then writes a plan the proxy will
+        // not read is a stall the user paid for and got nothing from.
+        if args.append && args.plan.exists() {
+            let text = std::fs::read_to_string(&args.plan)?;
+            let named = |id: u32| {
+                text.lines()
+                    .map(|l| l.split('#').next().unwrap_or("").trim())
+                    .any(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        f.as_slice() == ["region", &id.to_string()]
+                    })
+            };
+            if named(args.region) {
+                return Err(format!(
+                    "{} already names region {}: a region id names a mapping and two \
+                     mappings cannot share one",
+                    args.plan.display(),
+                    args.region
+                )
+                .into());
+            }
+        }
+
         // The arena has no control region: `wc-proxy`'s allocator owns the whole
         // thing and there is no slab directory to publish. `Granularity::Small4K`
-        // because the guest stamps every 4096-byte page whatever the allocator did,
-        // and `Locator::Scan` because content is the only locator available — see
-        // `wc_handle::arena::attach_guest_ram`.
+        // because the guest stamps every 4096-byte page whatever the allocator did.
+        //
+        // The locator is the one thing that is now a choice, and the choice is
+        // the guest's rather than this program's: if the guest could answer
+        // `SuperfetchPfnQuery` it sent a frame list, and if it could not it sent
+        // nothing and the sweep is what is left. There is no flag that makes
+        // this program *prefer* one — a fallback that could be selected by
+        // configuration is a fallback that gets selected by accident, which is
+        // design.md §5.1's objection to fallbacks generally.
+        let frames = match &args.frames {
+            None => None,
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("--frames {}: {e}", path.display()))?;
+                let frames = sv_hostd::locate::parse_frame_list(&text)
+                    .map_err(|e| format!("--frames {}: {e}", path.display()))?;
+                if frames.len() as u64 != args.pages {
+                    return Err(format!(
+                        "--frames {} has {} frames and --pages says {}: a frame list that \
+                         does not describe the whole region would locate part of it and \
+                         leave the rest reading as somebody else's memory",
+                        path.display(),
+                        frames.len(),
+                        args.pages
+                    )
+                    .into());
+                }
+                Some(frames)
+            }
+        };
+        let (locator, choice) = match &frames {
+            Some(f) => (Locator::from_frames(f), sv_hostd::LocatorChoice::Pfns),
+            None => (Locator::Scan, sv_hostd::LocatorChoice::Scan),
+        };
         let desc = ExtentDesc {
             run_id: args.run_id,
             granularity: Granularity::Small4K,
             control_pages: 0,
             arena_pages: args.pages,
-            locator: Locator::Scan,
+            locator,
         };
         let len = args.pages * PAGE;
 
         let t0 = Instant::now();
-        let (hostd, regions, report) = sv_hostd::Hostd::qemu(&args.qmp, &args.vm, &desc, 1)?;
+        let (hostd, regions, outcome) =
+            sv_hostd::Hostd::qemu_located(&args.qmp, &args.vm, &desc, 1, choice)?;
         let located = t0.elapsed();
 
         println!(
@@ -254,20 +365,43 @@ mod host {
             regions.total_ram() >> 20,
             regions.aliases().len()
         );
-        println!(
-            "located {}/{} pages in {:.2?} (swept {} MiB; {} other-run stamps, {} outside guest RAM)",
-            report.pages_found,
-            report.pages_expected,
-            located,
-            report.bytes_swept >> 20,
-            report.other_runs,
-            report.outside_ram
-        );
+        // One line, in one shape, whichever locator ran. `wc-session`'s `up`
+        // greps this and so does every transcript in docs/; a second spelling of
+        // "how many pages did we find" would be a second thing to grep for.
+        if let Some(report) = &outcome.scan {
+            println!(
+                "located {} of {} pages in {:.2?} by sweep (swept {} MiB; {} other-run \
+                 stamps, {} outside guest RAM)",
+                report.pages_found,
+                report.pages_expected,
+                located,
+                report.bytes_swept >> 20,
+                report.other_runs,
+                report.outside_ram
+            );
+        }
+        if let Some(report) = &outcome.pfns {
+            // `bytes_swept` has no counterpart here and that absence *is* the
+            // result: nothing was read. The cost is one table lookup per page
+            // against `info mtree -f`, which is why this is 0.064 s where the
+            // sweep is ~3 s, and why the number does not move with the guest's
+            // RAM.
+            println!(
+                "located {} of {} pages in {:.2?} by frame list (swept 0 MiB; {} frame \
+                 run(s) became {} file run(s), first frame 0x{:x})",
+                report.pages,
+                args.pages,
+                located,
+                report.frame_runs,
+                report.file_runs,
+                report.first_frame
+            );
+        }
         println!(
             "coalesced into {} run(s) covering {} MiB — {:.1} pages per run",
             hostd.runs.len(),
             hostd.runs.bytes() >> 20,
-            report.pages_found as f64 / hostd.runs.len().max(1) as f64
+            args.pages as f64 / hostd.runs.len().max(1) as f64
         );
         if let Some(first) = hostd.runs.runs().first() {
             println!(
@@ -325,8 +459,24 @@ mod host {
             )
             .into());
         }
-        write_plan(&args.plan, &hostd.object, len, args.run_id, args.outbound, &hostd.runs)?;
-        println!("plan: {} ({} run(s), object {})", args.plan.display(), hostd.runs.len(), hostd.object);
+        write_plan(
+            &args.plan,
+            &hostd.object,
+            len,
+            args.run_id,
+            args.outbound,
+            &hostd.runs,
+            args.region,
+            args.append,
+        )?;
+        println!(
+            "plan: {} region {} ({} run(s), object {}){}",
+            args.plan.display(),
+            args.region,
+            hostd.runs.len(),
+            hostd.object,
+            if args.append { " [appended]" } else { "" }
+        );
         if args.outbound > 0 {
             println!(
                 "outbound: the last {} bytes (offset {}) are the guest compositor's",
@@ -370,6 +520,31 @@ mod host {
     }
 
     /// The plan, in the format `wc_proxy::guestram::Plan` reads.
+    ///
+    /// # Why appending is the only way to add a region, and not a mode of
+    /// convenience
+    ///
+    /// The stamps a region is located by are **destroyed by the first pool
+    /// allocated into it** (§12.10): the host copies a client's pixels over
+    /// them within milliseconds of the region joining the arena. A locator that
+    /// rewrote this file from scratch would therefore have to re-locate every
+    /// region already in it, and for the regions in use there is nothing left
+    /// to locate — the sweep would report `located 0 of 4096 pages` for memory
+    /// that is working perfectly.
+    ///
+    /// So the file is a log. Each region is written exactly once, at the one
+    /// moment it is findable, and `Plan::read_all` reads back everything ever
+    /// appended. That the `--frames` path *can* re-locate an overwritten region
+    /// does not change this: a log is still the cheaper and more honest
+    /// artefact, and it is the one a human reads after a frozen window.
+    ///
+    /// A `region <id>` line is written on **every** path, including the first,
+    /// once anything might append. The one exception is the pre-growth
+    /// spelling — no `--region`, no `--append` — which still writes exactly the
+    /// bytes it always did, because `Plan::read_all` reads a file with no
+    /// `region` line as one region numbered zero and every existing harness
+    /// compares that text.
+    #[allow(clippy::too_many_arguments)]
     fn write_plan(
         path: &Path,
         object: &str,
@@ -377,9 +552,22 @@ mod host {
         run_id: u64,
         outbound: u64,
         runs: &RunList,
+        region: u32,
+        append: bool,
     ) -> std::io::Result<()> {
-        let mut f = std::fs::File::create(path)?;
+        let mut f = if append {
+            std::fs::OpenOptions::new().create(true).append(true).open(path)?
+        } else {
+            std::fs::File::create(path)?
+        };
         writeln!(f, "# wc-arena-host plan — {} run(s), {len} bytes", runs.len())?;
+        if append || region != 0 {
+            // The id names the mapping a `Descriptor::ArenaSlice { arena, .. }`
+            // resolves against, so it has to be stated rather than counted:
+            // this program does not know how many regions the proxy has, only
+            // which one it was asked to describe.
+            writeln!(f, "region {region}")?;
+        }
         writeln!(f, "# object is QEMU's memory backend; wc-proxy opens it itself.")?;
         writeln!(f, "object {object}")?;
         writeln!(f, "len {len}")?;
@@ -398,6 +586,57 @@ mod host {
 
     #[cfg(test)]
     mod tests {
+        use super::write_plan;
+        use sv_arena::extent::{Run, RunList};
+
+        /// DYNAMIC ARENA. The append is the whole of growth's host half, and
+        /// what it has to produce is a file whose *second* record does not
+        /// disturb the first — because the first describes memory that is full
+        /// of a client's pixels and can never be located again.
+        ///
+        /// The assertions are on the text rather than on a parse, deliberately:
+        /// `wc_proxy::guestram::Plan` is the reader and this crate cannot depend
+        /// on it (that dependency is what makes the Windows gate resolve
+        /// `sv_hostd`, see the crate header). What is checked here is the
+        /// property the reader relies on — one `region` line per record, the
+        /// records in the order they were appended, and the first record's run
+        /// list still byte-for-byte where it was.
+        #[test]
+        fn appending_a_region_leaves_the_first_one_alone() {
+            let dir = std::env::temp_dir().join(format!("wc-arena-host-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("arena.plan");
+
+            let first = RunList::new(vec![Run { extent_offset: 0, file_offset: 0x1000, len: 8192 }]);
+            write_plan(&path, "/proc/9/fd/3", 8192, 0xaaa, 4096, &first, 0, false).unwrap();
+            let after_first = std::fs::read_to_string(&path).unwrap();
+            // The pre-growth spelling is unchanged: no `--region`, no
+            // `--append`, and therefore no `region` line at all. Every plan ever
+            // written still reads as region 0.
+            assert!(!after_first.contains("region 0"), "{after_first}");
+            assert!(after_first.contains("outbound 4096 4096"), "{after_first}");
+
+            let second =
+                RunList::new(vec![Run { extent_offset: 0, file_offset: 0x40000, len: 4096 }]);
+            write_plan(&path, "/proc/9/fd/3", 4096, 0xbbb, 0, &second, 1, true).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+
+            // The first record survived intact, which is the point.
+            assert!(text.starts_with(&after_first), "the append rewrote the first record:\n{text}");
+            // And the second is a record of its own, named.
+            assert!(text.contains("\nregion 1\n"), "{text}");
+            assert!(text.contains("run 0x0000000000000bbb"), "{text}");
+            assert!(text.contains("r 0 0x40000 4096"), "{text}");
+            // A grown region has no outbound window: the compositor declares
+            // one only in the region it committed at startup, and a second
+            // `outbound` line would take bytes out of the new region's free
+            // list that nothing had claimed.
+            assert_eq!(text.matches("outbound ").count(), 1, "{text}");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// THE TEST THIS CRATE EXISTS FOR, apart from its binary.
         ///
         /// `wc_handle::arena` spells the stamp layout out for itself rather than

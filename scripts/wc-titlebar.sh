@@ -328,7 +328,7 @@ do_run() {
   #
   # So the reservation is real and it is a coincidence of widths rather than an
   # agreement: GTK's three buttons and DWM's three are within a few pixels of
-  # each other at 100%, and nothing makes that true at another scale. §30.8 is
+  # each other at 100%, and nothing makes that true at another scale. §31.8 is
   # still the honest statement — there is no protocol for "this rectangle is
   # mine" — but this is much closer to right than leaving the corner unclaimed.
   #
@@ -402,7 +402,7 @@ do_run() {
       note "     Log on to the guest's console and re-run this leg."
     else
       bad "$leg: the compositor never started on the interactive desktop"
-      note "     the guest has a logged-on session ($shell_n explorer.exe), so this is not §30.10's"
+      note "     the guest has a logged-on session ($shell_n explorer.exe), so this is not §31.10's"
       note "     no-session case: look at $SHARE/tb-$leg.log and at schtasks /Query /TN $TBNAME-comp /V"
     fi
     return

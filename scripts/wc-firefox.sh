@@ -520,7 +520,7 @@ block_tabs() {
   fi
 
   # The client area is the surface in this mode too, which is what the tabs-in-title-bar stage
-  # replaced three conversions with (§30.2). The headless platform prints both.
+  # replaced three conversions with (§31.2). The headless platform prints both.
   grep -q "window 1 mapped surface $mapped client $mapped" "$dir/srv.log" \
     && ok "the client area is the surface: no conversion left between them" \
     || bad "the platform reports a client area that is not the surface"
