@@ -53,6 +53,9 @@ pub mod grow;
 mod icon;
 mod input;
 mod platform;
+/// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
+#[cfg(unix)]
+mod ringlink;
 mod state;
 mod surface;
 /// Which taskbar button a window belongs to. See its header, and
@@ -82,6 +85,10 @@ use state::{ClientState, Decorations, State};
 struct Args {
     once: bool,
     socket: Option<String>,
+    /// §36. When set, the compositor also accepts Wayland connections as ring
+    /// slots in the control region it creates at this path — the `accept()` half
+    /// of §36.2's table. The socket listener stays up alongside it.
+    wayland_ring: Option<String>,
     idle_timeout: Duration,
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
@@ -119,6 +126,40 @@ struct Args {
     /// backend and write into them. The compositor prints the run id, which is
     /// the only thing the host needs and the only thing that crosses.
     guest_arenas: Vec<(u32, u64)>,
+    /// Where to write the **page frame list** of every region this process
+    /// commits, so the host can locate it by translation instead of by
+    /// searching guest RAM for its stamps.
+    ///
+    /// # Why this is the flag that unblocks the guest harnesses
+    ///
+    /// The content sweep is not merely slow, it is **unreliable on a loaded
+    /// machine**, and five consecutive guest runs demonstrated it: `16377 of
+    /// 16384 pages`, `1 page index claimed twice`, `28 page index(es) claimed
+    /// twice`. A duplicate is not the stale-stamp case — `new_run_id` hashes
+    /// the millisecond with the pid, so a previous run's stamps land in
+    /// `other_runs` and the tool counts them separately — it is two pages
+    /// carrying *this* run's id at the same page index at two different file
+    /// offsets. Whatever the cause (the flat view reaching one guest page at
+    /// two offsets, or pages moving under a sweep that takes seconds), the
+    /// sweep is reading **contents that are allowed to change while it reads
+    /// them**, over 13 GiB, and it is a coin flip.
+    ///
+    /// `SuperfetchPfnQuery` reads the kernel's page-frame database rather than
+    /// the extent's contents. **No stamps are read, so neither a stale stamp
+    /// nor a duplicate is expressible**, and it is 0.064 s against the sweep's
+    /// 2.3 s. That is the whole argument: it turns a locate from something that
+    /// usually works into something that either works or says why.
+    ///
+    /// The file is written where *both sides can see it* — the harnesses
+    /// already share a folder with the guest for `--log` — because the frame
+    /// list is 16 bytes a page and a 64 MiB arena's is 256 KiB, which is a file
+    /// and not a command-line argument.
+    ///
+    /// One file per committed region: exactly `PATH` when this process commits
+    /// one region, and `PATH.<id>` for any region after the first, because a
+    /// second region committed for the outbound window (§28's split) has its
+    /// own run id and needs its own locate.
+    arena_frames: Option<String>,
     /// Arenas to provide as a **file both sides open**, as `id:size:path`.
     ///
     /// ADDED FOR STAGE 10. `--arena` opens the region read-only, which is all a
@@ -262,6 +303,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     let mut args = Args {
         once: false,
         socket: None,
+        wayland_ring: None,
         idle_timeout: Duration::from_secs(30),
         dump_frames: None,
         debug_icon: false,
@@ -272,6 +314,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         arenas: Vec::new(),
         arena_grow_dir: None,
         guest_arenas: Vec::new(),
+        arena_frames: None,
         provide_arenas: Vec::new(),
         outbound: None,
         shared_dir: None,
@@ -294,7 +337,9 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--simulate-wm" => args.simulate_wm = true,
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
+            "--arena-frames" => args.arena_frames = it.next(),
             "--socket" => args.socket = it.next(),
+            "--wayland-ring" => args.wayland_ring = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -560,6 +605,50 @@ fn redirect_output(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write one region's page frame list where the host can read it, and say what
+/// happened in a few words that fit on the region's own report line.
+///
+/// # Why a failure here is a note and not an exit
+///
+/// Because the sweep still works. A frame list makes the locate fast and
+/// deterministic; its absence makes the locate slow and a coin flip, which is
+/// bad and is not "the compositor cannot run". A process that refused to start
+/// because it could not open the PFN database would take a machine that has
+/// been working all along and stop it, which is a worse failure than the one
+/// being fixed.
+///
+/// So the reason travels instead, on the line a harness is already grepping,
+/// and `wc-arena-host` falls back to the sweep. That is the only fallback in
+/// the path and it is the right one: it degrades *speed and reliability*, never
+/// correctness, and it says so out loud.
+fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> String {
+    let Some(base) = &args.arena_frames else {
+        return String::new();
+    };
+    // Exactly `PATH` for the first region and `PATH.<id>` after it. A second
+    // region is the outbound window's own commit, which has its own run id and
+    // needs its own locate — and its own file, or the two would overwrite each
+    // other and the survivor would be located against the wrong run.
+    let path = if *written == 0 { base.clone() } else { format!("{base}.{id}") };
+    let (frames, ms) = match crate::grow::frames(id, pages) {
+        Ok(v) => v,
+        Err(e) => return format!(", frames=none ({e})"),
+    };
+    if frames.len() != pages as usize {
+        return format!(
+            ", frames=none (the query returned {} frames for a {pages}-page region)",
+            frames.len()
+        );
+    }
+    match std::fs::write(&path, crate::grow::frame_list_text(&frames)) {
+        Ok(()) => {
+            *written += 1;
+            format!(", frames={path} ({} in {ms} ms)", frames.len())
+        }
+        Err(e) => format!(", frames=none ({path}: {e})"),
+    }
+}
+
 /// Run the compositor.
 ///
 /// This was `fn main` until the unification (one-binary.md §2.2). It is `pub`
@@ -628,13 +717,21 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // line because a region that is findable now and movable later is the one
     // failure mode that would look like a working arena for the first few
     // seconds. See `wc_handle::arena::attach_guest_ram`.
+    let mut frames_written = 0usize;
     for (id, size) in &args.guest_arenas {
         match wc_handle::arena::attach_guest_ram(*id, *size) {
-            Ok(r) => println!(
-                "wc-compositor: arena {id} provided from guest RAM: \
-                 run 0x{:016x}, {} bytes, {} pages, locked={}",
-                r.run_id, r.len, r.pages, r.locked
-            ),
+            Ok(r) => {
+                // The frame list, on the same line as the run id and for the
+                // same reason: the host's locator cannot start without the run
+                // id, and it should not have to *guess* whether a frame list
+                // exists. A harness greps one line and gets both.
+                let note = publish_frames(&args, *id, r.pages, &mut frames_written);
+                println!(
+                    "wc-compositor: arena {id} provided from guest RAM: \
+                     run 0x{:016x}, {} bytes, {} pages, locked={}{note}",
+                    r.run_id, r.len, r.pages, r.locked
+                );
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not provide arena {id} from guest RAM: {e}");
                 return std::process::ExitCode::from(2);
@@ -673,12 +770,17 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 // one the compositor writes keymaps into that no client ever
                 // reads.
                 if let Some(run) = w.run_id {
+                    let pages = (w.len / wc_handle::arena::GIFT_GRANULARITY) as u32;
+                    // Its own region, so its own frame list. Locating it by
+                    // sweep would be a second ~2.3 s search of the whole guest
+                    // with the same chance of a duplicate, for a region whose
+                    // stamps this process is about to write keymaps over.
+                    let note = publish_frames(&args, id, pages, &mut frames_written);
                     println!(
                         "wc-compositor: arena {id} provided from guest RAM: \
-                         run 0x{run:016x}, {} bytes, {} pages, locked=true \
+                         run 0x{run:016x}, {} bytes, {pages} pages, locked=true{note} \
                          (the outbound window's own region)",
                         w.len,
-                        w.len / wc_handle::arena::GIFT_GRANULARITY,
                     );
                 }
                 println!(
@@ -839,7 +941,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let wayland = std::thread::Builder::new()
         .name("wayland".into())
         .spawn(move || {
-            let code = wayland_thread(args.once, args.socket, args.idle_timeout, args.debug_icon,
+            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
@@ -867,6 +969,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
 fn wayland_thread(
     once: bool,
     socket: Option<String>,
+    wayland_ring: Option<String>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -934,7 +1037,50 @@ fn wayland_thread(
     println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
     let _ = std::io::stdout().flush();
 
+    // §36. `accept()` on the ring directory, beside `accept()` on the socket.
+    // Both produce a `wc_transport::Stream` for `insert_client`; only one of
+    // them involves anything crossing the VM boundary.
+    #[cfg(unix)]
+    let mut ring_link = match wayland_ring.as_deref() {
+        None => None,
+        Some(path) => match ringlink::RingLink::create(path) {
+            Ok(rl) => {
+                println!("wc-compositor: accepting Wayland rings in {path}");
+                let _ = std::io::stdout().flush();
+                Some(rl)
+            }
+            Err(e) => {
+                eprintln!("wc-compositor: could not create the ring region {path}: {e}");
+                state.quit();
+                return 2;
+            }
+        },
+    };
+
     loop {
+        // The ring's accept, first, so a connection that arrived between turns
+        // is dispatched in the same turn as one that arrived on the socket.
+        #[cfg(unix)]
+        if let Some(rl) = ring_link.as_mut() {
+            for (slot, stream) in rl.accept() {
+                let index = (state.clients_seen + 1) as u32;
+                match display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::new(index)))
+                {
+                    Ok(_) => {
+                        state.clients_seen += 1;
+                        println!(
+                            "wc-compositor: client {index} accepted on ring slot {slot} \
+                             (no socket crossed the VM boundary)"
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                    Err(e) => eprintln!("wc-compositor: ring slot {slot} not inserted: {e}"),
+                }
+            }
+        }
+
         match listener.accept() {
             Ok(Some(stream)) => {
                 // The ordinal is assigned *before* the insert, so it counts
@@ -994,6 +1140,15 @@ fn wayland_thread(
             println!("wc-compositor: the platform stopped; winding up");
             code = 0;
             break;
+        }
+
+        // §36. Before dispatch: bytes that arrived from the ring have to be in
+        // the local socket *before* smithay reads it, or they wait a whole 5 ms
+        // tick. `pump` also drains what smithay wrote last turn, which is why it
+        // is one call and not two.
+        #[cfg(unix)]
+        if let Some(rl) = ring_link.as_mut() {
+            rl.pump();
         }
 
         if let Err(e) = display.dispatch_clients(&mut state) {
