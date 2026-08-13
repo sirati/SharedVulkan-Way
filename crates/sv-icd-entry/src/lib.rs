@@ -57,6 +57,11 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::redundant_field_names)]
 #![allow(clippy::unusual_byte_groupings)]
+// `matches!(descriptorType, 6 | 7 | 8 | 9)` from `exceptions::SIBLING_SELECTED`.
+// The lint wants `6..=9`, and the table is a list of *enumerants* that happen to
+// be adjacent in this registry — writing it as a range would make the generated
+// code depend on an adjacency Khronos never promised, to satisfy a style rule.
+#![allow(clippy::manual_range_patterns)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::needless_borrow)]
 #![allow(clippy::borrow_deref_ref)]
@@ -361,6 +366,30 @@ pub fn report_failure(e: LowerError) {
 pub fn report_transport_failure(e: &dyn core::fmt::Display) {
     if debug_enabled() {
         eprintln!("sv-icd: transport: {e}");
+    }
+}
+
+/// Say something that must be said whether or not anyone asked for debugging.
+///
+/// The reserved use is **data this ICD is about to discard**. Everything else
+/// belongs behind `SV_DEBUG`, because an ICD that chatters is an ICD people
+/// silence; but a descriptor write that does not arrive produces no error, no
+/// `VkResult` and no validation message, and the next thing that happens is the
+/// GPU reading uninitialised memory. `expand_descriptor_template` dropped 64
+/// inline-uniform-block writes per CTS test for exactly as long as its
+/// complaint was gated (design.md §0.16), and the cost was a device loss whose
+/// diagnosis started three layers away.
+///
+/// Once per distinct message, so a per-descriptor fault cannot become the
+/// output.
+pub fn report_always(e: &dyn core::fmt::Display) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SAID: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let msg = e.to_string();
+    let mut g = SAID.lock().unwrap_or_else(|p| p.into_inner());
+    if g.get_or_insert_with(HashSet::new).insert(msg.clone()) {
+        eprintln!("sv-icd: {msg}");
     }
 }
 

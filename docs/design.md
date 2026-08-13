@@ -1742,6 +1742,134 @@ obviously share a mechanism.
   socket. §0.13 said the same thing about the resolution sweep and it is still
   true.
 
+### 0.16 Why the forwarder was hanging the GPU
+
+Measured 2026-08-13 on **devhost** in `nix develop`, RADV RAPHAEL_MENDOCINO,
+CTS 1.4.6.1. §0.15 item 10 left "about 7% of forwarded tests hang the GPU" as
+the largest open defect and undiagnosed. It is three defects, and the diagnosis
+begins with the shape of the list rather than with any one test.
+
+**The names were the diagnosis.** The 84 tests that ever reported `DeviceLost`
+spread across fifteen top-level groups — 18 `api`, 12 `renderpasses`, 12
+`pipeline`, 10 `spirv_assembly`, 7 `glsl`, 6 `binding_model`, 4 each of `ssbo`,
+`query_pool` and `draw`. `api.copy_and_blit` and `api.image_clearing` do not
+run shaders at all; `spirv_assembly` is nothing but shaders. Nothing about a
+*feature* is common to that set, which is what said the cause was in the
+transport or in something every test does — and every test writes descriptors.
+
+**The measurement that matters is paired and per-test**, because most of those
+84 names are collateral: deqp holds one `VkDevice` per invocation, so a test
+that loses it takes the rest of the process with it (§0.15 item 3). Run one test
+per process, before and after:
+
+| | before | after |
+|---|---|---|
+| Pass | 72 | 75 |
+| DeviceLost | **12** | **5** |
+| NotSupported | 0 | 4 |
+| Fail | 0 | — |
+
+Twelve genuine wedges, of which **seven are accounted for and five are not**.
+
+**1. Inline uniform block writes were being dropped, silently.**
+`expand_descriptor_template` — the app-side rewrite of
+`vkUpdateDescriptorSetWithTemplate` into `vkUpdateDescriptorSets` (§0.4 item 10)
+— had a catch-all arm whose comment read *"an inline uniform block's data is
+carried in a `VkWriteDescriptorSetInlineUniformBlock` chain link rather than in
+an array. Not in this profile's feature set; dropped rather than guessed at, and
+said so."* All three clauses were false. `VK_EXT_inline_uniform_block` was
+promoted to core in **1.3**, the zink profile carries `VK_VERSION_1_3`, the ICD
+advertises 1.3, and the generator had emitted
+`VkWriteDescriptorSetInlineUniformBlock` and its `PNextLink` variant all along —
+nothing had to be guessed at. And it did not say so: the complaint went through
+`report_transport_failure`, which is gated behind `SV_DEBUG`, so in an ordinary
+run **64 descriptor writes per test vanished in silence**, the set was left
+holding uninitialised inline data, and the shader that read it hung the GPU.
+
+  The type is the one place in that function where `descriptorCount` is a
+  **byte count** and `dstArrayElement` a **byte offset**, with `stride` ignored,
+  which is why it cannot be one more arm of the same loop. `report_always` is
+  new and its reserved use is stated: **data this ICD is about to discard**.
+  Everything else stays behind `SV_DEBUG`, because an ICD that chatters gets
+  silenced; a descriptor that does not arrive produces no error, no `VkResult`
+  and no validation message.
+
+**2. The generated lowering read descriptor arms the application never filled
+in.** This is the one that did the damage. `VkWriteDescriptorSet` carries
+`pImageInfo`, `pBufferInfo` and `pTexelBufferView`; exactly one is used and
+`descriptorType` says which, and **the specification permits the other two to
+hold anything at all** — an uninitialised stack slot, a stale pointer, a pointer
+to an array of a different element type or a shorter length. The registry marks
+all three `noautovalidity="true"`, which is its way of saying a sibling decides
+and it cannot express how, and nothing read it. The generated lowering read
+whichever were non-null.
+
+  That is an out-of-bounds read of the *application's* memory — §0.3 item 2's
+  hazard, met for the second time and this time live. What it put on the wire
+  was a `VkBuffer` id of `0xFFFFFFFF00000001`, and the GPU side said `no VkBuffer
+  with id …` and took the ring fatal. **That is the lucky outcome.** An id that
+  fails to map is reported; an id that happens to collide with a live object maps
+  successfully, the driver is handed a descriptor pointing at the wrong resource,
+  and the GPU hangs with no diagnostic anywhere. `exceptions::SIBLING_SELECTED`
+  is the fix and `an_unselected_descriptor_arm_is_never_read` is the negative
+  control — the unselected pointers there address a one-element array while
+  `descriptorCount` is 4, so a lowering that reads them runs off the end.
+
+  **Why nothing had caught it in six harnesses:** Zink uses descriptor update
+  *templates* unconditionally in its default mode (§0.4 item 10), and this
+  project expands those app-side into wire structs directly, never touching this
+  lowering. DXVK leans on templates too. So the direct `vkUpdateDescriptorSets`
+  path — the one an ordinary Vulkan application uses — had never been executed by
+  anything in this tree. §0.15's argument for owning a CTS harness, in one
+  struct.
+
+  The wire format does not move: the struct still has all three arrays and the
+  protocol hash is unchanged at `0x44c19f913c79a5fa`. What changed is what we
+  put in them.
+
+**3. We advertise `bufferDeviceAddress` and do not implement it.** Four of the
+remaining wedges were `binding_model.buffer_device_address.*` and `ssbo.phys.*`
+— physical storage buffers, every one. `vulkaninfo` against this ICD prints
+`bufferDeviceAddress = true`, because §0.4 item 9 has the GPU side enable
+everything the physical device reports and `vkGetPhysicalDeviceFeatures2` is
+forwarded whole, so RADV's answer is ours. Meanwhile all three of
+`vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress` and
+`vkGetDeviceMemoryOpaqueCaptureAddress` sit in `sv_icd_entry`'s
+`NOT_IMPLEMENTED` list. The application asks for an address, gets nothing back,
+writes it into a buffer, a shader dereferences it, and the GPU faults.
+
+  So **§0.3 item 5's "latent rather than live" is falsified**: it reasoned that
+  the protocol hole behind those three commands — a command returning a value
+  that is neither `void` nor `VkResult` has no reply to put it in — could not be
+  reached because "§9.2 does not advertise `bufferDeviceAddress`, so a conforming
+  application never calls them". §9.2 says that; no code implements it; and a
+  conforming application called them on the first afternoon anyone asked.
+  `advertise::we_do_not_advertise_buffer_device_address` passes and asserts about
+  the 1.0 feature struct, where the feature does not live.
+
+  **This is not to be fixed by advertising `false`.** Buffer device address
+  support is a stated goal of the project, translation at the boundary is
+  expected, and §11's own "honest caveat" already says the address itself is
+  workable — *"if we return the GPU side's true device address from
+  `vkGetBufferDeviceAddress` and never relocate, an address the application
+  writes into arena memory is dereferenceable by a GPU-side shader"*. Reporting
+  the feature false was tried, measured (it turns all four device losses into
+  `NotSupported`), and **reverted**, because converting a goal into a skip is not
+  a fix. The work is the one `plan.rs` change §0.3 item 5 already named — a reply
+  exists whenever a command returns anything at all — plus the reply field, the
+  GPU-side fill, the app-side fold, and the boundary translation. That is a
+  stage, and it is the next one.
+
+**What is not settled.** Five wedges remain and they cluster into two families
+that share no obvious mechanism with the above: four
+`query_pool.statistics_query.*` (all of them `cmdcopyquerypoolresults` or
+`host_query_reset` variants) and one
+`ycbcr.copy.g8_b8r8_2plane_444_unorm…linear_disjoint_buffer_linear`. Each is
+reproducible by name with `scripts/sv-cts.sh --include`. And the rate itself has
+not been re-measured on a fresh CTS sample — the paired 12 → 5 is on the
+known-wedging set, which is not a random sample of anything, so it says these
+three defects are real and does **not** say the 7% is now 3%.
+
 ---
 
 ### 0.15 The Wayland WSI, and the gate that turned out to be Mesa's
