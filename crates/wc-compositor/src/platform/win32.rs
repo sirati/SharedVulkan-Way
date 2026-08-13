@@ -84,7 +84,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, ULW_ALPHA, WS_EX_LAYERED,
     SIZE_MAXIMIZED,
     SIZE_MINIMIZED, SIZE_RESTORED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_MAXIMIZE,
-    // ADDED FOR STAGE 14: the three toplevel requests a client-decorated
+    // ADDED FOR STAGE 17: the three toplevel requests a client-decorated
     // window makes, handed to Windows' own modal loops.
     GetSystemMenu, TrackPopupMenu, SC_MOVE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
@@ -122,7 +122,7 @@ const WM_WC_COMMAND: u32 = WM_APP + 1;
 /// "Put up the system menu", with the screen position packed into the `LPARAM`
 /// the way `WM_CONTEXTMENU` packs one.
 ///
-/// ADDED FOR STAGE 14. A message of its own rather than a call from `drain`,
+/// ADDED FOR STAGE 17. A message of its own rather than a call from `drain`,
 /// for the reason the `ToUi::WindowMenu` arm gives: `TrackPopupMenu` does not
 /// return until the menu closes.
 const WM_WC_SYSMENU: u32 = WM_APP + 2;
@@ -742,7 +742,7 @@ unsafe extern "system" fn toplevel_proc(
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
             0
         }
-        // ADDED FOR STAGE 14. `xdg_toplevel.show_window_menu`, arriving as a
+        // ADDED FOR STAGE 17. `xdg_toplevel.show_window_menu`, arriving as a
         // posted message so that the modal `TrackPopupMenu` is entered from the
         // pump rather than from inside `drain`.
         //
@@ -1072,7 +1072,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 set_window_state(&w, maximized, minimized);
             }
         }
-        // ADDED FOR STAGE 14. All three **post** rather than send, and that is
+        // ADDED FOR STAGE 17. All three **post** rather than send, and that is
         // the only interesting thing about them.
         //
         // `SC_MOVE`, `SC_SIZE` and `TrackPopupMenu` each enter a modal loop
@@ -1434,7 +1434,7 @@ fn create_window(
 
 /// Hand a gesture the client started over to Windows' own modal loop.
 ///
-/// ADDED FOR STAGE 14, and it is the whole of `xdg_toplevel.move` and
+/// ADDED FOR STAGE 17, and it is the whole of `xdg_toplevel.move` and
 /// `xdg_toplevel.resize` on this platform.
 ///
 /// `ReleaseCapture` first, and it is not optional: the client's drag began with

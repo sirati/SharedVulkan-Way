@@ -8,7 +8,7 @@
 #   scripts/wc-titlebar.sh both     deploy, then both legs
 #   scripts/wc-titlebar.sh clean    remove what this script put on the guest
 #
-# Run from inside `nix develop`. Pictures land in docs/stage14/.
+# Run from inside `nix develop`. Pictures land in docs/stage17/.
 #
 # WHY A SCRIPT OF ITS OWN, AND NOT A BLOCK IN wc-desktop.sh OR wc-guest.sh
 #
@@ -54,7 +54,7 @@ MODE="${1:-both}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
-OUT="$ROOT/docs/stage14"
+OUT="$ROOT/docs/stage17"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
@@ -228,7 +228,7 @@ do_deploy() {
 # One leg. `$1` is the `--decorations` mode, and it is also the only difference
 # between the two runs: same binaries, same arena, same client, same output
 # size, minutes apart. The environment variable moves with it because the two
-# levers are a pair (§19.4) and a run that changed one without the other would
+# levers are a pair (§22.4) and a run that changed one without the other would
 # be the control rather than the result.
 do_run() {
   local mode=$1
@@ -388,8 +388,8 @@ systemd-run --unit=$TBNAME-$mode --collect /run/current-system/sw/bin/bash \
 
   scp "${SSHOPT[@]}" "$GUEST:$TBNAME/tb-$mode.bmp" "$RUNDIR/tb-$mode.bmp" >/dev/null 2>&1
   mkdir -p "$OUT"
-  if [ -s "$RUNDIR/tb-$mode.bmp" ] && magick "$RUNDIR/tb-$mode.bmp" "$OUT/stage14-$mode.png" 2>/dev/null; then
-    ok "$mode: the window, frame and all -> docs/stage14/stage14-$mode.png ($(magick identify -format '%wx%h' "$OUT/stage14-$mode.png"))"
+  if [ -s "$RUNDIR/tb-$mode.bmp" ] && magick "$RUNDIR/tb-$mode.bmp" "$OUT/stage17-$mode.png" 2>/dev/null; then
+    ok "$mode: the window, frame and all -> docs/stage17/stage17-$mode.png ($(magick identify -format '%wx%h' "$OUT/stage17-$mode.png"))"
   else
     bad "$mode: nothing came back from the capture"
   fi

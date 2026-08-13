@@ -453,7 +453,7 @@ impl PumpInner {
                     let _ = self.events.send(FromUi::Minimized { id, on });
                 }
             }
-            // ADDED FOR STAGE 14. There is no window manager here to hand a
+            // ADDED FOR STAGE 17. There is no window manager here to hand a
             // gesture to, and inventing one would be testing this file. Logged
             // in the same greppable shape as everything else, so that a harness
             // can assert the request *arrived* — which is the half of the path

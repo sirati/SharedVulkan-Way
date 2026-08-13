@@ -38,7 +38,7 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
-// ADDED FOR STAGE 14: the edge a client names when it asks to be resized.
+// ADDED FOR STAGE 17: the edge a client names when it asks to be resized.
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 // ADDED FOR STAGE 9. Both of these are Firefox requirements measured rather
@@ -102,7 +102,7 @@ use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSour
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
-/// ADDED FOR STAGE 14, and it is the whole of docs/design.md §19.2. Until this
+/// ADDED FOR STAGE 17, and it is the whole of docs/design.md §22.2. Until this
 /// stage the answer was hard-coded to `Client`, on the reasoning that
 /// docs/goal-firefox.md wants Firefox painting its tabs into the title bar and
 /// only a client that draws a title bar can do that. The reasoning was right
@@ -112,7 +112,7 @@ use crate::surface::{PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSour
 ///
 /// So the mode is a flag with `Server` as its default — Windows' caption is a
 /// real server-side decoration and claiming it is the honest answer — and
-/// `Client` is what the frame-extension work of §19.7 is developed against.
+/// `Client` is what the frame-extension work of §22.7 is developed against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Decorations {
     /// Windows draws the caption; the client draws none. **The default.**
@@ -245,7 +245,7 @@ pub struct State {
     /// ADDED FOR STAGE 9. Both decoration protocols; see the import.
     _xdg_decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
-    /// ADDED FOR STAGE 14. Which mode is advertised as the manager default and
+    /// ADDED FOR STAGE 17. Which mode is advertised as the manager default and
     /// answered to anything that asks. See [`Decorations`].
     decorations: Decorations,
     /// Owns the seat: `SeatState` keeps every `Seat` it makes, so there is no
@@ -562,7 +562,7 @@ impl State {
             // it is `default_mode` on the *manager*, sent once at bind, rather
             // than the answer to any per-surface request: GTK 3 reads the
             // manager's default in `gdk_wayland_display_prefers_ssd()` and
-            // ignores what it is told about its own surface. §19.2.
+            // ignores what it is told about its own surface. §22.2.
             kde_decoration: KdeDecorationState::new::<State>(dh, decorations.kde()),
             decorations,
             seat_state,
@@ -1917,7 +1917,7 @@ impl XdgShellHandler for State {
         }
     }
 
-    // ADDED FOR STAGE 14. The three requests a client-decorated toplevel makes
+    // ADDED FOR STAGE 17. The three requests a client-decorated toplevel makes
     // when the user grabs its own title bar, all of which had smithay's empty
     // default until now — so a window drawn by Firefox could be closed and
     // maximised but could not be *moved*, and there was no other way to move it

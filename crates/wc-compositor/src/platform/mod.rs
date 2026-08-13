@@ -131,7 +131,7 @@ impl FrameStyle {
 
 /// Which edge an interactive resize is being driven from.
 ///
-/// ADDED FOR STAGE 14. Spelled out here rather than passing Wayland's
+/// ADDED FOR STAGE 17. Spelled out here rather than passing Wayland's
 /// `xdg_toplevel::ResizeEdge` through, for the reason the whole file exists: the
 /// Wayland thread must not have to know what an `HWND` is and the platform must
 /// not have to link a protocol crate. The two encodings are the same idea with
@@ -247,12 +247,12 @@ pub enum ToUi {
     /// `xdg_toplevel.move`: a drag has begun somewhere the client considers a
     /// title bar, and it wants the window manager to take over.
     ///
-    /// ADDED FOR STAGE 14, and it is the **only** way a client-decorated window
+    /// ADDED FOR STAGE 17, and it is the **only** way a client-decorated window
     /// can be moved here. Wayland has no protocol by which a client publishes
     /// its draggable region: Firefox's `mDraggableRegion` is internal and is
     /// observable only *after* a click, as this request. So `WM_NCHITTEST` can
     /// never answer `HTCAPTION` over the tab strip, the whole surface stays
-    /// `HTCLIENT`, and every drag arrives here instead. §19.8 records what that
+    /// `HTCLIENT`, and every drag arrives here instead. §22.8 records what that
     /// costs, which is Windows 11's snap-layout flyout.
     BeginMove { id: WindowId },
     /// `xdg_toplevel.resize`, with the edge the client named.

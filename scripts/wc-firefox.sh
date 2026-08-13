@@ -75,7 +75,7 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # assertions below reproducible.
 OUTPUT=1600x1000
 
-# STAGE 14. See `run_firefox`. Declared here so that `set -u` cannot turn an
+# STAGE 17. See `run_firefox`. Declared here so that `set -u` cannot turn an
 # unset array into a run that dies three functions deep.
 FX_DECOR=client
 FX_ENV=()
@@ -95,12 +95,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # user's desktop would otherwise take the request and open a tab there instead
 # — which looks exactly like a client that connected and drew nothing.
 #
-# STAGE 14. Two knobs, both empty by default so that every block written before
+# STAGE 17. Two knobs, both empty by default so that every block written before
 # this stage passes exactly what it passed before:
 #
 #   FX_DECOR   the `--decorations` the compositor is started with. Every block
 #              names it explicitly now, because the compiled-in default changed
-#              in this stage (§19.2) and a block that relied on it would be
+#              in this stage (§22.2) and a block that relied on it would be
 #              measuring the flag rather than the client.
 #   FX_ENV     extra `VAR=value` words put in front of Firefox. This is where
 #              `MOZ_GTK_TITLEBAR_DECORATION` goes, and it is an *array* because
@@ -159,10 +159,10 @@ block_enumerate() {
   echo "== enumerate: what Firefox binds, and what it does when a thing is missing"
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
 
-  # Explicit since stage 14: this block's claims are all about the *client-side*
+  # Explicit since stage 17: this block's claims are all about the *client-side*
   # arrangement — the shadow inset, the tab strip, the mode Firefox picks when
   # nothing is done to it — so it names the mode it wants rather than inheriting
-  # a compiled-in default that has now changed. §19.2.
+  # a compiled-in default that has now changed. §22.2.
   FX_DECOR=client; FX_ENV=()
 
   local dir="$RUNDIR/enum"
@@ -195,7 +195,7 @@ block_enumerate() {
   fi
   # Offered `Client`, Firefox asks for `Client`. Stage 13 changed what that is
   # evidence *for*: §15.7 read it as the goal document's clause arriving for
-  # free, and §19.3 shows it is the client agreeing with whatever the manager
+  # free, and §22.3 shows it is the client agreeing with whatever the manager
   # said. The other half of the pair is `block_titlebar`'s.
   grep -q 'kde-decoration: client asked for Value(Client)' "$dir/srv.log" \
     && ok "decorations: offered Client, Firefox asked for Client" \
@@ -315,7 +315,7 @@ block_window() {
 # titlebar: one title bar, and it is the window manager's
 # ---------------------------------------------------------------------------
 #
-# ADDED FOR STAGE 14, and it is the stage. Every window this project has ever
+# ADDED FOR STAGE 17, and it is the stage. Every window this project has ever
 # made has had **two** title bars — the host window manager's caption, and
 # directly beneath it Firefox's tab strip with its own minimise, maximise and
 # close buttons. The user reported it, on the crash reporter's window as well as
@@ -332,7 +332,7 @@ block_window() {
 #   * `MOZ_GTK_TITLEBAR_DECORATION=none` in the *client's* environment, which is
 #     what makes Gecko stop drawing a title bar of its own. The compositor
 #     cannot set this and there is no protocol that carries it, which is why
-#     §19.4 records it as a deployment requirement rather than a fix.
+#     §22.4 records it as a deployment requirement rather than a fix.
 #
 # The control leg below is the one that earns the paragraph: with the compositor
 # sending `default_mode(2)` and the environment variable absent, Firefox still
@@ -428,10 +428,10 @@ block_titlebar() {
   if [ "$casked" = "1 " ] && [ "$cinsets" != "0,0 " ]; then
     ok "control: with default_mode(2) alone Firefox still asks for Client and still insets by ${cinsets% }"
   else
-    bad "control: default_mode(2) alone gave mode(s) ${casked:-none} and origin ${cinsets:-none}; the environment variable may no longer be needed, which would change §19.4"
+    bad "control: default_mode(2) alone gave mode(s) ${casked:-none} and origin ${cinsets:-none}; the environment variable may no longer be needed, which would change §22.4"
   fi
 
-  # And the compositor did not fight it. §19.2's decision: the per-surface
+  # And the compositor did not fight it. §22.2's decision: the per-surface
   # request is echoed even when it contradicts the default, because refusing it
   # changes no client's behaviour and makes GDK re-request in a loop.
   grep -q 'kde-decoration: client asked for Value(Client) (default is Server)' "$ctl/srv.log" \
@@ -584,7 +584,7 @@ block_wine() {
     *) bad "unknown transport $transport"; return ;;
   esac
 
-  # `--decorations client` since stage 14, and named rather than inherited: this
+  # `--decorations client` since stage 17, and named rather than inherited: this
   # leg's `1280x900` assertion below is the *client-side* geometry rectangle,
   # which is what a client-decorated Firefox reports and is the number §15.6
   # established. The stage's own arrangement is `block_titlebar`'s.

@@ -6720,9 +6720,9 @@ rates.
    §15.15 item 3 — nothing asks Windows how big anything is — and the two should
    be answered together.
 
-## 19. Stage 14: one title bar, and it is Windows'
+## 22. Stage 17: one title bar, and it is Windows'
 
-### 19.1 Status in one paragraph
+### 22.1 Status in one paragraph
 
 Every window this project has ever made had **two** title bars — Windows'
 caption, and directly beneath it Firefox's tab strip with its own minimise,
@@ -6731,18 +6731,18 @@ maximise and close buttons. It is in `docs/stage9/stage9-firefox-window.png`,
 it independently, on the crash reporter's window as well as the browser's, so it
 was every window rather than a browser quirk. It is fixed, it took one line of
 compositor and one environment variable, and the picture is
-`docs/stage14/stage14-server.png`: Windows' caption with Firefox's icon and
+`docs/stage17/stage17-server.png`: Windows' caption with Firefox's icon and
 title, and below it Firefox's tabs with no window buttons of their own. The run
 behind that picture is the interactive desktop **and** Firefox **and** an arena
 in the guest's own RAM, which is §17.11 item 4's arrangement; stage 13 got there
-first, from the other direction, and §19.6 says what this one has that
+first, from the other direction, and §22.6 says what this one has that
 `wc-desktop.sh` does not. What was *not* fixed is the other half of
 the goal clause: Firefox painting its tabs *into* the caption rather than under
-it. §19.7 wires the requests that half needs and §19.8 records the thing that
+it. §22.7 wires the requests that half needs and §22.8 records the thing that
 makes the rest of it impossible, which is that Wayland has no way for a client
 to publish a draggable region.
 
-### 19.2 One line decides it, and it is the manager's default rather than the surface's
+### 22.2 One line decides it, and it is the manager's default rather than the surface's
 
 The compositor now sends `default_mode(2)` — `Server` — when a client binds
 `org_kde_kwin_server_decoration_manager`. Before this stage it sent
@@ -6763,7 +6763,7 @@ surface inside a `WS_OVERLAPPEDWINDOW`, which draws a caption whether anybody
 asked for one or not. Two title bars is exactly what that promise buys, and the
 window would have had two of them however good the client-side story was, right
 up until `FrameStyle::extend_top` moved off zero — which is stage 8's item, was
-still untouched at stage 12, and is §19.7's.
+still untouched at stage 12, and is §22.7's.
 
 So the mode is a flag, `--decorations server|client`, and `server` is the
 default. Windows' caption **is** a server-side decoration; saying so is the
@@ -6783,7 +6783,7 @@ bind. Answering `Server` to the surface's `request_mode` and leaving the
 manager's default at `Client` changes nothing at all, except that GDK
 re-requests the mode it wanted, which was captured as a loop against real KWin.
 
-### 19.3 The second lever is in the client's environment, and no protocol carries it
+### 22.3 The second lever is in the client's environment, and no protocol carries it
 
 `default_mode(2)` on its own is **not enough**, and the control leg in
 `scripts/wc-firefox.sh titlebar` exists to keep saying so. With the compositor
@@ -6820,13 +6820,13 @@ rather than argued about: the only libadwaita knob in Firefox 151 is
 `widget.gtk.libadwaita-colors.enabled`, a palette override, and the binary
 contains no `adw_*` symbols at all — Firefox neither links nor `dlopen`s it.
 
-### 19.4 A client that insists on `Client`, and why it is echoed
+### 22.4 A client that insists on `Client`, and why it is echoed
 
 The KDE protocol's `request_mode` is a request and the compositor's `mode` is
 the answer. This compositor echoes, even when the echo contradicts the default
 it advertised, and that is a decision with three reasons in order of weight.
 
-First, **the per-surface answer is not the lever** (§19.2). Refusing it changes
+First, **the per-surface answer is not the lever** (§22.2). Refusing it changes
 no GTK client's behaviour, because GTK read the manager's default once and is
 not listening. Second, GDK's handler re-requests the mode it wants when it is
 contradicted; against real KWin that was a loop, and KWin capitulates. A
@@ -6840,7 +6840,7 @@ gets two title bars, exactly as every client did before this stage. Measured on
 the control leg, Firefox sends **one** `request_mode` in the whole trace when it
 is echoed, so nothing loops.
 
-### 19.5 The geometry rectangle changes shape, and §15.6's code already handled it
+### 22.5 The geometry rectangle changes shape, and §15.6's code already handled it
 
 §15.6 made the window the `xdg_surface.set_window_geometry` rectangle rather
 than the buffer, because a GTK client's buffer is bigger than its window by an
@@ -6857,7 +6857,7 @@ construction rather than by a branch, which is what §15.6 built and is the
 reason this stage is one line rather than a rework — on the guest, with
 `--output 1100x700`, the window mapped `990x630` under both modes.
 
-### 19.6 The picture, on the real desktop, over the guest's own RAM
+### 22.6 The picture, on the real desktop, over the guest's own RAM
 
 `scripts/wc-titlebar.sh` is a script of its own, and after the merge with stage
 13 that needs a better reason than it had when it was written.
@@ -6909,12 +6909,12 @@ server: 120 frames of Firefox's pixels were blitted into it
 shot: hwnd 0x400ea at 156,156 title "Mozilla Firefox" -> 960x543, per-monitor-aware
 ```
 
-`docs/stage14/stage14-server.png` is that capture. One caption, Windows', with
+`docs/stage17/stage17-server.png` is that capture. One caption, Windows', with
 the client's own icon — stage 11's feed, resolving on the far side — and the
 client's own title in it, and Firefox's tabs directly below with nothing in the
 corner but the tab-list chevron.
 
-`docs/stage14/stage14-client.png` is the `client` leg, same size, same guest,
+`docs/stage17/stage17-client.png` is the `client` leg, same size, same guest,
 same arena, minutes apart, and it is what every stage before this one shipped:
 Windows' caption with its three buttons, and in the tab strip below it Firefox's
 own close button. The two title bars are one on top of the other and both have a
@@ -6935,22 +6935,22 @@ guest, in the picture.
 > are recorded because a harness that needs three attempts on a busy guest
 > should say so rather than be discovered. It is a §12 problem arriving after a
 > long day on one guest rather than anything this stage touched, and it is
-> §19.12 item 4.
+> §22.12 item 4.
 
 The corner is where the difference lives, and the three crops in
-`docs/stage14/` are the same 420x46 rectangle of the same client's own pixels,
+`docs/stage17/` are the same 420x46 rectangle of the same client's own pixels,
 from the workstation, under three arrangements:
 
 | file | arrangement | what is in the corner |
 |---|---|---|
 | `corner-client.png` | `default_mode(1)`, no variable | chevron, minimise, maximise, close |
 | `corner-server.png` | `default_mode(2)` + the variable | chevron |
-| `corner-menu-only.png` | `default_mode(1)`, `gtk-decoration-layout=menu:` | chevron, close — §19.9 |
+| `corner-menu-only.png` | `default_mode(1)`, `gtk-decoration-layout=menu:` | chevron, close — §22.9 |
 
-### 19.7 The three requests a client-decorated window makes, wired to Win32
+### 22.7 The three requests a client-decorated window makes, wired to Win32
 
 A window whose title bar is the client's cannot be moved by Windows, because
-Windows does not know where its title bar is (§19.8). It moves by *asking*, and
+Windows does not know where its title bar is (§22.8). It moves by *asking*, and
 until this stage all three of the requests it asks with had smithay's empty
 default — so a client-decorated window could be closed, maximised and minimised
 and could not be moved at all. They are wired now:
@@ -6996,7 +6996,7 @@ place, and Windows' own modal loop refuses to start unless a button is really
 down — so the check the serial exists to make is made one layer down, against
 the real hardware state.
 
-### 19.8 What can never work through that path, and it is snap layouts
+### 22.8 What can never work through that path, and it is snap layouts
 
 `WM_NCHITTEST` can never return `HTCAPTION` over Firefox's tab strip, and this
 is a protocol fact rather than an unfinished piece of work. **Wayland has no
@@ -7015,9 +7015,9 @@ same reason.
 
 The way out would be to draw *real* caption buttons in the extended frame, in
 the corner Firefox has left empty, and hit-test them properly. That needs
-Firefox to stop drawing its own, which is what §19.9 measured.
+Firefox to stop drawing its own, which is what §22.9 measured.
 
-### 19.9 `gtk-decoration-layout`, measured: minimise and maximise go, close does not
+### 22.9 `gtk-decoration-layout`, measured: minimise and maximise go, close does not
 
 Firefox reads GTK's `gtk-decoration-layout` and draws only the buttons it names
 (`nsLookAndFeel.cpp`). The hypothesis this stage inherited was that
@@ -7044,14 +7044,14 @@ that names no right-hand buttons at all, and it does not move to the left when
 the layout puts it there. Firefox draws a close button in the corner of a
 tabs-in-title-bar window regardless of what GTK is told.
 
-That is enough to stop the plan in §19.8's last paragraph as stated. Real
+That is enough to stop the plan in §22.8's last paragraph as stated. Real
 caption buttons drawn in the extended frame would sit next to a client-drawn
 close button that cannot be removed, which is the two-title-bars bug again in
 miniature. Anything further here is a Gecko question — `browser.tabs.inTitlebar`
 is the switch that removes the whole bar, and it is the switch this stage
 already uses — rather than a GTK one.
 
-### 19.10 The gates
+### 22.10 The gates
 
 | Gate | Result |
 |---|---|
@@ -7073,32 +7073,32 @@ because the default changed. `weston-terminal`, against the Linux compositor wit
 and §15.6 established, unchanged. It never binds the KDE decoration manager: the
 interface appears in its trace once, in the registry burst, and is not taken up.
 It draws its own frame either way, which is what a toolkit that predates the
-protocol does. The three requests §19.7 wires had smithay's empty default before
+protocol does. The three requests §22.7 wires had smithay's empty default before
 and are only sent by a client that decorates itself, so they can only add
 behaviour. `wc-firefox.sh`'s own older blocks *were* re-run, because they are the
-ones that would have noticed (§19.2's last paragraph).
+ones that would have noticed (§22.2's last paragraph).
 
 The stage adds no unit test, and that is a statement rather than an omission:
 everything it changed is a value sent on a global's bind and three requests
 handed to Win32, and neither is reachable from a test that does not run a client.
 The `titlebar` block is the test, it runs the real Firefox against the real
-compositor, and it carries a control leg (§19.3) so that it fails if the second
+compositor, and it carries a control leg (§22.3) so that it fails if the second
 lever stops being needed as well as if it stops working.
 
-### 19.11 What is not proven
+### 22.11 What is not proven
 
-1. **Nothing has been dragged.** §19.7's three requests compile, log and are
+1. **Nothing has been dragged.** §22.7's three requests compile, log and are
    posted, and no run has clicked Firefox's tab strip and watched the window
    follow the pointer. The Linux harness cannot: there is no window manager
    under the headless platform, so a `move_request` there has nowhere to go and
    the headless arm says so rather than pretending. Doing it needs
    `wc-desk.exe drag`'s trick pointed at a client-decorated window on the guest's
-   desktop, which is one run and is item 1 of §19.12.
+   desktop, which is one run and is item 1 of §22.12.
 2. **`FrameStyle::extend_top` is still zero.** `WM_NCCALCSIZE` and
    `DwmExtendFrameIntoClientArea` are not written. The goal clause's second half
-   — tabs *in* the caption rather than under it — is untouched, and §19.8 and
-   §19.9 are the two things anybody starting it should read first.
-3. **The environment variable is unenforced.** §19.3's box. Nothing checks that
+   — tabs *in* the caption rather than under it — is untouched, and §22.8 and
+   §22.9 are the two things anybody starting it should read first.
+3. **The environment variable is unenforced.** §22.3's box. Nothing checks that
    the client was started with it; a deployment that forgets gets two title bars
    and no diagnostic. The compositor *could* notice — a client that asks for
    `Client` when the default is `Server` is exactly that case, and it is already
@@ -7106,24 +7106,24 @@ lever stops being needed as well as if it stops working.
    nobody has made.
 4. **One client, one version.** Firefox 151.0.2. GTK 4 does not implement the
    KDE protocol at all and would need `xdg-decoration`, which this compositor
-   answers consistently (§19.2) and which no client here has ever bound
+   answers consistently (§22.2) and which no client here has ever bound
    (§15.7). §16.11 item 2 has been asking for a GTK 4 client since stage 11 and
    still is.
 
-### 19.12 What to do next
+### 22.12 What to do next
 
-1. **Drag a client-decorated window on the guest's desktop.** §19.11 item 1. It
-   closes the only untested half of §19.7 and it is the run that says whether
+1. **Drag a client-decorated window on the guest's desktop.** §22.11 item 1. It
+   closes the only untested half of §22.7 and it is the run that says whether
    `ReleaseCapture` was the whole story.
 2. **`WM_NCCALCSIZE` and `DwmExtendFrameIntoClientArea`**, which is §15.15 item
-   1 and is now the only part of the goal clause left. Read §19.8 first: the
+   1 and is now the only part of the goal clause left. Read §22.8 first: the
    frame can be extended and the client's pixels can be blitted over it, and the
    corner cannot be given real caption buttons while Firefox insists on drawing a
-   close button there (§19.9). What that leaves is tabs in the caption with the
+   close button there (§22.9). What that leaves is tabs in the caption with the
    window's own buttons in the *extended* strip beside Firefox's close button, or
    `--decorations server` and one native bar. The second is what ships today.
-3. **Warn when the two levers disagree.** §19.11 item 3, and it is four lines.
-4. **The stale-stamp problem.** §19.6's box is the first time the guest-RAM
+3. **Warn when the two levers disagree.** §22.11 item 3, and it is four lines.
+4. **The stale-stamp problem.** §22.6's box is the first time the guest-RAM
    locate has failed repeatedly rather than once, and it failed *because the
    guest had been used*. `wc-arena-host` sweeps for a magic and a run id and
    reports how many pages carried the magic under a different id; that number is

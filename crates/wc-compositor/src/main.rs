@@ -159,7 +159,7 @@ struct Args {
     click: Option<platform::Click>,
     /// Which decoration mode to advertise, as `server` or `client`.
     ///
-    /// ADDED FOR STAGE 14. See [`Decorations`] for why it defaults to `server`
+    /// ADDED FOR STAGE 17. See [`Decorations`] for why it defaults to `server`
     /// and what a run that asks for `client` is for.
     decorations: Decorations,
 }
@@ -333,7 +333,7 @@ fn parse_args() -> Result<Args, u8> {
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
             }
-            // ADDED FOR STAGE 14, and it is the flag §19.2 is about.
+            // ADDED FOR STAGE 17, and it is the flag §22.2 is about.
             "--decorations" => {
                 let Some(v) = it.next() else {
                     eprintln!("wc-compositor: --decorations needs server or client");
