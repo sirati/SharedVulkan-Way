@@ -3091,16 +3091,25 @@ source reading of `impl Icd for SharedVulkan` done without sight of it. Both say
 
 #### 2. The result
 
-| | zink (239 carried) | full (509 carried) |
+| | zink | full |
 |---|---|---|
-| commands with a generated `Icd` method | 224 | 494 |
-| **untouched generated default — forwards** | **188** | **458** |
+| commands with a generated `Icd` method | 229 | 494 |
+| **untouched generated default — forwards** | **193** | **458** |
 | overridden by `sv-icd` | 36 | 36 |
 
 **The local set does not grow with the profile.** Widening from 239 to 509
 carried commands added 270 that forward untouched and not one new hand-written
 answer — so the hand-written surface is a fixed 36, and §0.19's coverage work
 did not quietly enlarge the thing this section is auditing.
+
+**Nor does it grow when refusals are fixed**, which is the other half of the same
+observation and it was measured by accident. Between the first run of this audit
+and merging master, `cts-close` landed the three buffer-device-address entry
+points: `NOT_IMPLEMENTED` went 12 → 9, the zink figures went 224 → 229 and
+188 → 193, and the locally-answered 36 did not move at all. Three commands went
+from *refused* straight to *forwarding*, with no stop at "answered here". That is
+the shape a healthy fix has, and the audit test is what showed it — a
+classification-only check would have reported nothing.
 
 The 36, classified for the **connected** case, which is the one that matters:
 
@@ -3150,9 +3159,9 @@ output back" to "return success anyway". A partial writeback is not something th
 generator can express.
 
 So the population of genuinely undiagnosable commands is **zero**, and the
-population of honestly-refused ones is the 12 in `NOT_IMPLEMENTED` —
-`vkGetDeviceQueue2`, the three buffer-device-address queries, the two debug-utils
-messenger commands, and six device-group/present-rectangle queries. Their
+population of honestly-refused ones is the 9 in `NOT_IMPLEMENTED` —
+`vkGetDeviceQueue2`, the three debug-utils messenger commands, and five
+device-group / present-rectangle / `vkAcquireNextImage2KHR` queries. Their
 extensions are kept out of the advertised list by `INCOMPLETE_EXTENSIONS`, so a
 conforming application never reaches them.
 
@@ -3182,6 +3191,26 @@ forward:
   this audit found it while looking for the opposite thing. A helper whose name
   announces a convention, with no callers, is evidence that refusals are marked
   when they are not. Deleted rather than wired up.
+
+And one that was not this section's to find. **Master was red when this branch
+merged it**, and the cause is worth recording because it is this section's own
+subject arriving in the test written to prevent it.
+`no_extension_is_advertised_with_a_stubbed_entry_point` asserted, by name, that
+`VK_KHR_buffer_device_address` and `VK_EXT_buffer_device_address` are in
+`INCOMPLETE_EXTENSIONS` — and said so in its comment: *"named rather than
+derived, because this is the case that motivated the table"*. Then `cts-close`
+implemented those entry points, which is the outcome everyone wanted, the
+extensions correctly left the list, and the assertion failed for having recorded
+a fact where it meant to state a property. Two branches, each correct, colliding
+on a hard-coded name.
+
+The fix is the one this whole workstream keeps arriving at: assert the property,
+not the instance. What the table *contains* is derived by `emit_tables` from the
+registry and re-asserting a derivation against itself tests nothing; what is
+load-bearing and uncheckable by a compiler is that every entry is a well-formed
+extension name, because `ask_device_extensions` subtracts the list by
+`binary_search` and a malformed entry subtracts nothing **silently**. That is now
+what the test says.
 
 **Not fixed: nothing was converted from local to forwarding**, because the audit
 found nothing that should be. That is the result, not an omission — the one

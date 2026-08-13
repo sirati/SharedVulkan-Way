@@ -1157,17 +1157,35 @@ mod tests {
                 "an empty name in NOT_IMPLEMENTED would silently match nothing"
             );
         }
-        // Under the default profile the three buffer-device-address entry points
-        // are refused, so their extensions must be out. Named rather than
-        // derived, because this is the case that motivated the table and a
-        // regression here is exactly the bug that was fixed.
-        if env!("SV_ICD_ENTRY_PROFILE") == "zink" {
-            for ext in ["VK_KHR_buffer_device_address", "VK_EXT_buffer_device_address"] {
-                assert!(
-                    INCOMPLETE_EXTENSIONS.contains(&ext),
-                    "{ext} introduces a stubbed entry point and must not be advertised"
-                );
-            }
+        // **This assertion used to name `VK_KHR_buffer_device_address` and
+        // `VK_EXT_buffer_device_address` and require them to be in the list.**
+        // It said, in its own comment, "named rather than derived, because this
+        // is the case that motivated the table" — and then `cts-close`
+        // implemented the three buffer-device-address entry points, which is the
+        // outcome everybody wanted, and the test failed for having recorded a
+        // fact instead of a property. Two branches landing a week apart, each
+        // correct, and the collision was a hard-coded name.
+        //
+        // That is precisely the defect design.md §0.19 and §0.20 are about,
+        // arriving in the test written to prevent it. So the property is stated
+        // instead, and it is the one that is actually load-bearing: **the table
+        // is a table of extension names**, and `sv_icd::ask_device_extensions`
+        // subtracts it from what the GPU side reports. A malformed entry there
+        // silently subtracts nothing, which is the failure mode that matters and
+        // the one no compiler catches.
+        //
+        // What the table *contains* is not restated here, because the generator
+        // derives it from the registry ("any command this extension introduces
+        // is refused") and re-asserting a derivation against itself tests
+        // nothing. `sv-codegen`'s `emit_tables` is where that logic lives and
+        // where it belongs.
+        for ext in INCOMPLETE_EXTENSIONS {
+            assert!(
+                ext.starts_with("VK_") && ext.len() > 3,
+                "{ext:?} is not an extension name; sv-icd looks these up by \
+                 binary_search against what the GPU side reports, so a malformed \
+                 entry subtracts nothing and does it silently"
+            );
         }
     }
 

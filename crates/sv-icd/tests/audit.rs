@@ -1,5 +1,5 @@
 //! **Carried is not implemented**: which commands reach a driver, and which
-//! answer here (design.md §0.19).
+//! answer here (design.md §0.20).
 //!
 //! The user's objection is the reason this file exists:
 //!
@@ -214,7 +214,7 @@ fn the_classification_is_well_formed() {
     }
 }
 
-/// The numbers design.md §0.19 quotes, so the prose cannot drift from the code.
+/// The numbers design.md §0.20 quotes, so the prose cannot drift from the code.
 #[test]
 fn the_headline_numbers_are_what_the_document_says() {
     let probed = probe_local();
@@ -228,8 +228,14 @@ fn the_headline_numbers_are_what_the_document_says() {
         return;
     }
 
-    assert_eq!(AUDIT_PROBES.len(), 224, "commands with a generated Icd method");
-    assert_eq!(forwards, 188, "untouched generated defaults, which forward");
+    // These moved once already, and the move is the reason to keep asserting
+    // them: `cts-close` implemented the three buffer-device-address entry points
+    // and two more besides, so 224 became 229, 188 became 193 and
+    // NOT_IMPLEMENTED went 12 -> 9 — while the locally-answered 36 did not
+    // change at all. A test that only checked the classification would have said
+    // nothing about any of that.
+    assert_eq!(AUDIT_PROBES.len(), 229, "commands with a generated Icd method");
+    assert_eq!(forwards, 193, "untouched generated defaults, which forward");
     assert_eq!(probed.len(), 36, "overridden, and answered here in the standalone case");
     assert_eq!(count(Where::ForwardsWhenConnected), 27);
     assert_eq!(count(Where::ClientSide), 7);
@@ -239,7 +245,7 @@ fn the_headline_numbers_are_what_the_document_says() {
 
     // The refused set is the other half of the honest answer: an entry point
     // that exists and fails by name. It must never grow silently.
-    assert_eq!(sv_icd_entry::NOT_IMPLEMENTED.len(), 12);
+    assert_eq!(sv_icd_entry::NOT_IMPLEMENTED.len(), 9);
     assert_eq!(
         sv_icd_entry::IMPLEMENTED_COUNT + sv_icd_entry::NOT_IMPLEMENTED.len(),
         sv_icd_entry::COMMAND_COUNT
