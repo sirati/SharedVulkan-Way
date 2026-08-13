@@ -15370,28 +15370,67 @@ Three, and the test for each is the same: can a run reach it *silently*.
    that maps early is asserting about one of them. Per-window assertion needs
    the compositor to key the line by window id, which it already does; nothing
    consumes it that way yet.
-5. **A test merged with master `4b49ae8` does not run anywhere, and this is not
-   §41's to fix.** Found while checking that the merge's tests had actually
-   executed rather than assuming the count. `b516f1c` (§0.19) makes
-   `sv-codegen`'s ICD-entry emitter write `INCOMPLETE_EXTENSIONS` and a
-   `#[test] fn no_extension_is_advertised_with_a_stubbed_entry_point` into the
-   *generated* crate — and none of the four `sv_icd_entry.rs` outputs under
-   `target/debug/build/sv-icd-entry-*/out/` contains either symbol. The workspace
-   run before and after the merge is identical, 82 binaries and 1318 passed, so
-   the one net new `#[test]` in seven commits executes zero times. Whether the
-   emit is behind an inactive profile or the codegen output is stale, the
-   symptom is §35's subject exactly: a check that cannot fail is not a check,
-   and a *count* that does not move when a test is added is the cheapest
-   available detector for it. Recorded here rather than fixed because it is the
-   full-API work's to own.
-6. **`wc-proxy`'s refusal has not been re-read as carefully as the
+5. **A claim this section made and then had to withdraw, left in because the
+   withdrawal is the useful part.** After merging master `4b49ae8` this section
+   reported that "a test merged with master does not run anywhere": `b516f1c`
+   (§0.19) emits `INCOMPLETE_EXTENSIONS` and
+   `no_extension_is_advertised_with_a_stubbed_entry_point` into the *generated*
+   ICD entry crate, no `sv_icd_entry.rs` under `target/debug/build/` contained
+   either symbol, and the workspace count had not moved.
+
+   **That was an artefact of the measurement, not a fact about the tree.** The
+   diff was taken against `master` at the moment of reading — by which time
+   master had already advanced to `074b05b` — while `HEAD` had only `4b49ae8`
+   merged. `b516f1c` was in the *unmerged* range. The "test that never runs" was
+   a test from a commit this branch did not yet contain. After merging
+   `074b05b` it runs and passes, the symbol is in the generated output, and the
+   count moves to 1319.
+
+   The lesson is not the false alarm, it is what produced it: **`master` is a
+   moving reference and `git diff A...master` is not reproducible five minutes
+   later.** Diffing against a named commit is; `git diff 4b49ae8...HEAD` would
+   have said the true thing. This is §35.10 in the small — a claim asserted
+   against something that was allowed to change underneath it. The detector
+   itself stands and earned its keep twice in this section: **a workspace test
+   count that does not move when a test is added is worth a minute of
+   suspicion**, and the minute it bought here was spent on a false alarm and,
+   immediately after, on item 6, which was real.
+6. **A genuinely broken shared gate, found by the same habit and fixed.** With
+   `074b05b` merged, `cargo test --workspace --no-fail-fast` failed —
+   `sv-transport`'s `vdoorbell::tests::a_byte_on_the_port_wakes_a_waiter_that_no_futex_could_reach`,
+   on `the doorman delivered no wakes at all`. It passed 5 runs out of 5 alone
+   and failed both full-workspace runs, which is the signature worth reading
+   rather than re-rolling.
+
+   It is a race in the *assertion*, not in the doorbell, and the two assertions
+   before it prove that: the outcome was `Woken` and the wait took under 500 ms,
+   so the wake plainly happened — only the count had not landed. `serve_port`
+   read
+
+   ```rust
+   bell.ring_local();                      // makes the wake observable
+   woken.fetch_add(1, Ordering::Relaxed);  // counted afterwards
+   ```
+
+   and `ring_local` releases a waiter that may be scheduled, return from `park`
+   and read `Doorman::woken()` before this thread reaches the next statement.
+   Parallel load widens that window, which is why only the whole-workspace run
+   showed it. Swapping the two lines fixes it and is accurate: the thread has
+   committed to the wake and nothing between them can fail.
+
+   Fixed here rather than reported, against the usual rule about staying in
+   one's own files, because it made the verification command **every** agent in
+   this tree is told to run red for everyone — and a shared gate that is red for
+   a reason unrelated to your change is how "re-run until green" becomes the
+   habit §35.1 names as worse than failing.
+7. **`wc-proxy`'s refusal has not been re-read as carefully as the
    compositor's.** The compositor's covered one of its two flags (§41.4 item
    1a); `wc-proxy`'s covers the `arena` transport branch, which is the only
    place `--arena-path` is consumed, and was verified by running the binary both
    ways. But it is still a check inside `run` rather than a tested function, so
    it has the property that let the compositor's rot. Giving it the same
    `file_arena_verdict` treatment is one commit and was not done here.
-7. **`wc-taskbar.sh`'s `local` block is untouched and did not need to be.** It
+8. **`wc-taskbar.sh`'s `local` block is untouched and did not need to be.** It
    runs two of our own clients on the guest itself with no proxy and no arena,
    so it has no substrate to declare. Worth stating because "every block of
    every harness" is the kind of claim that is easy to make and wrong.
