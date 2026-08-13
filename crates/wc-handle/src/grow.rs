@@ -313,6 +313,132 @@ impl Reply {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The two ends
+// ---------------------------------------------------------------------------
+
+use sv_transport::control::{Control, RingKind};
+use sv_transport::ring::{Lane, RingConsumer, RingProducer};
+
+fn other(e: sv_transport::Error) -> io::Error {
+    io::Error::other(format!("growth ring: {e}"))
+}
+
+/// The host's end: ask, and wait for the answer.
+///
+/// # Why this blocks, and what it blocks
+///
+/// It is called from `Arena::grow`, which is called from a pool allocation that
+/// cannot be satisfied — so the client whose pool this is, is already stopped.
+/// Blocking here does not add a stall, it *is* the stall, and shortening it is
+/// what the frame list is for.
+///
+/// The deadline is mandatory and there is no spelling without one: a growth
+/// that waited for ever on a compositor that had died would hang the client's
+/// thread inside an allocation, which is the shape of hang nobody can diagnose
+/// from the outside. On expiry the caller gets an error, the allocator counts a
+/// refusal, and the client survives it — §20 made a refusal survivable and this
+/// is one more of them.
+pub struct HostEnd {
+    to_guest: RingProducer,
+    from_guest: RingConsumer,
+}
+
+impl HostEnd {
+    /// Attach to the channel the compositor created, and claim the growth ring.
+    ///
+    /// The *peer* claims, which is `sv-transport`'s own arrangement — its test
+    /// has the peer call `claim_ring` and the owner read the directory back.
+    /// With [`geometry`]'s two slots and slot 0 reserved as the reverse ring,
+    /// the claim is deterministic and returns [`GROW_RING`]; it is called rather
+    /// than assumed because claiming is what *initialises the directory entry*
+    /// the producer and consumer resolve their offsets from.
+    pub fn attach(control: &Control) -> io::Result<HostEnd> {
+        let slot = control.claim_ring(RingKind::Instance, 0, None).map_err(other)?;
+        if slot != GROW_RING {
+            return Err(io::Error::other(format!(
+                "growth ring: claimed slot {slot} and both sides agree on {GROW_RING}"
+            )));
+        }
+        Ok(HostEnd {
+            to_guest: RingProducer::open(control, slot, Lane::Command).map_err(other)?,
+            from_guest: RingConsumer::open(control, slot, Lane::Reply).map_err(other)?,
+        })
+    }
+
+    /// Ask for a region and wait for the answer.
+    pub fn request(&mut self, req: Request, deadline: std::time::Duration) -> io::Result<Reply> {
+        self.to_guest.push_bytes(&req.encode()).map_err(other)?;
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            if let Some(packet) = self.from_guest.next().map_err(other)? {
+                let reply = Reply::decode(packet.payload)?;
+                self.from_guest.advance().map_err(other)?;
+                return Ok(reply);
+            }
+            if std::time::Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the compositor did not answer a request for {} bytes within {:?}: \
+                         it is wedged, gone, or its poll loop is not servicing the ring",
+                        req.bytes, deadline
+                    ),
+                ));
+            }
+            // Polling, and `park.rs` explains why a doorbell would not help:
+            // a futex wake does not cross a hypervisor. 200 µs rather than the
+            // parker's 20 ms slice because this one caller is *already*
+            // stopped and its latency is the whole cost being measured.
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+}
+
+/// The guest's end: answer, if anything has been asked.
+///
+/// Non-blocking by construction, because it is called from the compositor's
+/// poll loop and that loop also drives every client's input. A growth that
+/// blocked the loop would freeze the desktop to allocate memory for it.
+pub struct GuestEnd {
+    from_host: RingConsumer,
+    to_host: RingProducer,
+}
+
+impl GuestEnd {
+    /// Open the ring the host claimed. `Ok(None)` while the host has not
+    /// claimed one yet, which is every session until the first growth.
+    pub fn open(control: &Control) -> io::Result<Option<GuestEnd>> {
+        if !matches!(control.ring_state(GROW_RING), Ok(sv_transport::control::RingState::Live)) {
+            return Ok(None);
+        }
+        Ok(Some(GuestEnd {
+            from_host: RingConsumer::open(control, GROW_RING, Lane::Command).map_err(other)?,
+            to_host: RingProducer::open(control, GROW_RING, Lane::Reply).map_err(other)?,
+        }))
+    }
+
+    /// Take one request if there is one and answer it with `handler`.
+    ///
+    /// One per turn rather than draining: a request commits and pins guest RAM
+    /// and queries the page-frame database, which is tens of milliseconds, and
+    /// doing several in one turn of a 5 ms poll loop would be a visible stall
+    /// to pay for memory nobody had asked for twice.
+    pub fn service(
+        &mut self,
+        handler: &mut dyn FnMut(Request) -> Reply,
+    ) -> io::Result<Option<(Request, Reply)>> {
+        let Some(packet) = self.from_host.next().map_err(other)? else {
+            return Ok(None);
+        };
+        let req = Request::decode(packet.payload)?;
+        self.from_host.advance().map_err(other)?;
+        let reply = handler(req);
+        self.to_host.push_bytes(&reply.encode()).map_err(other)?;
+        Ok(Some((req, reply)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +527,102 @@ mod tests {
             "a {pages}-page frame list is {} bytes and the ring holds {max_payload}",
             worst.encode().len()
         );
+    }
+
+    /// THE TEST THIS MODULE EXISTS FOR: a request crosses the channel and an
+    /// answer comes back, over a real `Control` with a real ring.
+    ///
+    /// A heap region rather than guest RAM, which is `sv-transport`'s own way of
+    /// testing this and is honest about what it does and does not prove. It
+    /// exercises every line of the framing, the claim, the two lanes and the
+    /// poll — the parts that are ours. It cannot exercise the cross-VM race,
+    /// which is outside the language anyway (`region.rs` I4), and it cannot
+    /// prove the guest commits memory, which is `attach_guest_ram`'s own tests'
+    /// job.
+    ///
+    /// What it does prove is the thing that was wrong twice while writing it:
+    /// that the payloads satisfy the ring's internal length cross-check. A
+    /// message whose declared length disagrees with its framed length is never
+    /// delivered, and the symptom is this test hanging rather than failing —
+    /// which is why the deadline is short and the assertion is on the reply.
+    #[test]
+    fn a_request_crosses_the_ring_and_an_answer_comes_back() {
+        use std::sync::Arc;
+        use sv_transport::region::SharedRegion;
+
+        let g = geometry();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        // The compositor creates; the proxy attaches. Same order as the
+        // deployment, and the order matters: `Control::create` zeroes the
+        // region, so an attach that raced it would read a half-written header —
+        // which is what the READY flag and the last-written magic are for.
+        let guest = Control::create(Arc::clone(&region), g, protocol_ids(), 1).unwrap();
+        let host = Control::attach(Arc::clone(&region), protocol_ids()).unwrap();
+
+        // Before the host claims, the guest has no ring to service. That is the
+        // normal state of a session that never grows, and it must not be an
+        // error.
+        assert!(GuestEnd::open(&guest).unwrap().is_none(), "no ring before the host claims one");
+
+        let mut host_end = HostEnd::attach(&host).unwrap();
+        let mut guest_end = GuestEnd::open(&guest).unwrap().expect("the claim made it Live");
+
+        // The host asks. Nothing answers yet, so this is done in two steps
+        // rather than on two threads: the point is the bytes, not the timing.
+        host_end.to_guest.push_bytes(&Request { region: 4, bytes: 16 << 20 }.encode()).unwrap();
+
+        let mut seen = None;
+        let served = guest_end
+            .service(&mut |req| {
+                seen = Some(req);
+                Reply {
+                    status: 0,
+                    run_id: 0xfeed_face,
+                    len: req.bytes,
+                    pages: (req.bytes / 4096) as u32,
+                    locked: true,
+                    frames: vec![7, 8, 9],
+                    query_ms: 331,
+                    message: String::new(),
+                }
+            })
+            .unwrap();
+        assert!(served.is_some(), "the guest saw the request");
+        assert_eq!(seen, Some(Request { region: 4, bytes: 16 << 20 }));
+
+        // And the host reads the answer off the reply lane.
+        let reply = host_end.from_guest.next().unwrap().expect("an answer is waiting");
+        let reply = Reply::decode(reply.payload).unwrap();
+        assert_eq!(reply.run_id, 0xfeed_face);
+        assert_eq!(reply.pages, 4096);
+        assert_eq!(reply.frames, vec![7, 8, 9]);
+        assert!(reply.locked);
+
+        // A second turn with nothing asked is not an error and not a reply.
+        assert!(guest_end.service(&mut |_| unreachable!()).unwrap().is_none());
+    }
+
+    /// A compositor that never answers must not hang the client's thread inside
+    /// an allocation. The deadline is mandatory and this is what it buys: an
+    /// error the allocator counts as a refusal, which §20 made survivable.
+    #[test]
+    fn a_silent_compositor_times_out_rather_than_hanging() {
+        use std::sync::Arc;
+        use sv_transport::region::SharedRegion;
+
+        let g = geometry();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let _guest = Control::create(Arc::clone(&region), g, protocol_ids(), 1).unwrap();
+        let host = Control::attach(Arc::clone(&region), protocol_ids()).unwrap();
+        let mut host_end = HostEnd::attach(&host).unwrap();
+
+        let t = std::time::Instant::now();
+        let e = host_end
+            .request(Request { region: 1, bytes: 4096 }, std::time::Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("did not answer"), "{e}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "it gave up promptly");
     }
 
     /// The control region has to fit in the window it is carved from, with
