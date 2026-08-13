@@ -1,7 +1,8 @@
 # One binary per side: the Wayland compositor inside the Vulkan program
 
-**Status: merged. One workspace, `sv-guest` builds in all three feature
-configurations, 1125 tests green. Written 2026-08-13.**
+**Status: merged, and current with waycompose master b8f0209. One workspace,
+`sv-guest` builds in all three feature
+configurations, 1138 tests green. Written 2026-08-13.**
 
 The brief, in the user's words, twice:
 
@@ -69,7 +70,7 @@ they are separate commits.
 ### After you rebase, run this rather than only `cargo test`
 
 ```
-cargo test --workspace                    # 1125 at the time of writing
+cargo test --workspace                    # 1138 at the time of writing
 bash scripts/wc-proxy.sh                  # 37/0 — the regression gate that matters
 ```
 
@@ -149,7 +150,7 @@ is deleted; and `sv-guest` is one binary that is the Vulkan GPU server and the
 Wayland compositor, in all three feature configurations —
 `default`, `--features gpu` alone (exactly the old `sv-gpu-server`), and
 `--features wayland` alone (exactly the old `wc-compositor.exe`).
-**1125 tests, 0 failed; clippy clean.** Two pieces of the arena unification are
+**1138 tests, 0 failed; clippy clean.** Two pieces of the arena unification are
 built: `sv_arena::handle`, `firefox-accel.md` §7's shared handle as a type that
 cannot represent a descriptor, and `sv_arena::shared`, one allocator serving
 several consumers with disjoint reserved windows. Three definitions of `4096`
@@ -427,15 +428,33 @@ not cosmetic.
   to smithay's `SealedFile::with_data`, and `state.rs` catches it: the seat comes
   up **without a keyboard**, logging `seat0 has no keyboard: …`. Degraded, alive,
   and it says why.
-- The pool allocator's exhaustion **closes the connection**. The user hit exactly
-  this today: Firefox died instantly on a YouTube video.
+- The pool allocator's exhaustion killed the client. The user hit exactly this:
+  Firefox died instantly on a YouTube video.
 
-**The unified allocator must have the outbound side's manners.** `Error::OutOfArena`
-already carries `{ requested, largest_free }` — §5.2 calls it "a normal condition
-rather than a fault" — so the type is right and what must not regress is the
-*caller* discipline: arena exhaustion is a thing a compositor survives in a
-degraded state, not a thing that kills a client. A client that dies on a full
-arena turns a capacity problem into a crash report about Firefox.
+> **[CORRECTED — waycompose-design.md §20.2]**
+> *This section previously said the pool allocator's exhaustion "closes the
+> connection", and named that as the defect. That is the symptom and not the
+> cause, and the difference decides what the fix is.*
+>
+> **The allocation failure was survivable; forwarding past it was not.** An
+> unannounced pool is an object the compositor does not have, and the client's
+> next `create_buffer` was forwarded to it anyway — **a request on an unknown
+> object is a protocol error**, and that is what closed the connection. So the
+> fix is not "allocate harder", and an allocator that never refuses would only
+> have hidden it: requests naming a pool with no upstream object are now
+> absorbed and replayed from the client's own bytes, and an `attach` that cannot
+> be backed is held on the surface and retried at each commit.
+>
+> Worth stating because it is the second time in this document that a capacity
+> number turned out to be standing in for a correctness bug behind it.
+
+**The unified allocator must still have the outbound side's manners.**
+`Error::OutOfArena` already carries `{ requested, largest_free }` — §5.2 calls it
+"a normal condition rather than a fault" — so the type is right, and what must
+not regress is the *caller* discipline: a refusal is a thing the proxy absorbs,
+never a thing it forwards. `Policy::BestFitSegregated` (0 refusals where first
+fit refuses 62) reduces how often that path is taken; it does not make the path
+optional.
 
 **Not yet done:** the reconciliation of `wc_proxy::pool::Alloc` onto
 [`SharedArena`] itself. Only the *constant* is unified so far (§1.1); the free
