@@ -232,6 +232,13 @@ scripts/
                      with the resolver and once with `--no-icons`, and
                      photographs the taskbar both times. `WC_CLIENT_CMD` drives
                      Firefox instead. Everything it produces is in docs/stage11/
+  wc-arena-pressure.sh   the stage-16 acceptance test — a real Firefox against a
+                     deliberately **starved** arena. It is the only place the
+                     compositor's own verdict on this stage's messages can be
+                     had: a request naming a pool that has no memory behind it
+                     is a protocol error and a dead client, and no unit test can
+                     produce a real server's answer to one. WC_ARENA_MIB sets how
+                     starved; `both` compares against another proxy binary
   wc-desktop.sh      the stage-8 acceptance test — the compositor on the guest's
                      **interactive desktop** rather than in an ssh session, and
                      photographs of what it puts on screen; `fps` is the
