@@ -754,8 +754,24 @@ do_window() {
   fi
   note "our compositor is pid $CPID (socket $sock)"
 
+  # **The relay must outlive the compositor, not the setup.** It was `--timeout
+  # 120`, and it is started *here* — before the arena locate, which sweeps 13
+  # GiB of guest RAM through `rootc` and QMP and on a contended guest takes
+  # minutes rather than the 2.4 s §12.5 measured on an idle one. So the relay
+  # would exit part-way through a run that had done nothing wrong, and what the
+  # harness reported was the *client*: "Failed to process Wayland connection:
+  # Broken pipe", with the proxy saying "the compositor closed the connection"
+  # and "2 client msgs, 0 server msgs". The compositor had closed nothing; its
+  # log ends at "listening" and never mentions a client. Measured on this guest
+  # tonight, twice.
+  #
+  # 330 is the compositor's own `--timeout`, which is the honest coupling: the
+  # relay is the compositor's socket seen from the other side of the
+  # hypervisor, and there is no run in which one should outlive the other. The
+  # sibling call in `do_fps` already derives its timeout instead of naming a
+  # constant; this one was the last magic number.
   ssh "${SSHOPT[@]}" "$GUEST" \
-    "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 120" \
+    "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 330" \
     >"$RUNDIR/relay.log" 2>&1 &
   local relay=$!
   sleep 3
@@ -1233,6 +1249,17 @@ chmod +x s8.sh" >/dev/null
       | sed 's/^/        /' | head -20
   fi
   sed -n '/S8-PROXY-BEGIN/,/S8-CLIENT-END/p' "$RUNDIR/s8.log" | sed 's/^/        /' | head -40
+  # **The relay, but only when the client did not get a display.** It is the one
+  # process in this topology that nothing has ever printed, and it sits exactly
+  # where a failure is most easily misattributed: a relay that has exited looks
+  # to the proxy like a compositor that closed the connection, and looks to the
+  # harness like a client that could not connect. Both readings blame the wrong
+  # end. Printed conditionally rather than always, because on a good run it is
+  # four uninteresting lines.
+  if grep -q "failed to create display\|Broken pipe" "$RUNDIR/s8.log" 2>/dev/null; then
+    echo "        --- the relay, which is the half nothing else prints:"
+    sed 's/^/        /' "$RUNDIR/relay.log" 2>/dev/null | head -10
+  fi
   kill_ours "$sock" >/dev/null 2>&1
   # And the task definitions, which `kill_ours` does not touch: it ends
   # *processes* and `int_bg`'s task outlives its process by design. Without this
