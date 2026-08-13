@@ -652,6 +652,11 @@ impl RingTransport {
         // A failure to attach is a warning, never an error: a session without a
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
+        // Unix only: the host end of the chardev is a Unix socket, which is what
+        // the cross-VM topology has. A Windows *app* side is the same-machine
+        // topology, where the peer is on this kernel and the ordinary futex wake
+        // already reaches it — there is no hypervisor to carry anything across.
+        #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             Ok(path) => match sv_transport::vdoorbell::PortHandle::host_socket(&path)
@@ -670,6 +675,9 @@ impl RingTransport {
                 }
             },
         };
+
+        #[cfg(not(unix))]
+        let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {

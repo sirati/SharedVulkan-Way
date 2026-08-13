@@ -14593,11 +14593,13 @@ would be worse than the TCP path it replaces, so:
 1. ~~No Windows `open_virtio_port`.~~ **Done** — `winpipe::open_virtio_port`
    opens `\\.\Global\<name>` with the same `CreateFileW(OPEN_EXISTING)` as
    `Pipe::connect`, minus the `WaitNamedPipeW` retry, which on a port that is
-   not a named pipe fails with `ERROR_INVALID_NAME` rather than waiting. It is
-   compiled but **not exercised**: no Windows guest has opened one, because that
-   needs the QMP hot-add on testhost. `PortWake` and `serve_port` are written
-   against `Read`/`Write`, which is why filling this gap changed nothing in
-   `vdoorbell` — the port type was the only platform-specific thing in it.
+   not a named pipe fails with `ERROR_INVALID_NAME` rather than waiting, and
+   falls back to `\\.\<name>`. **Written, run, and it does not work yet** —
+   `ERROR_ACCESS_DENIED` on the deployment guest from an Administrator session,
+   with the device present. §36.13 has the elimination and the next step.
+   `PortWake` and `serve_port` are written against `Read`/`Write`, which is why
+   this changed nothing in `vdoorbell` — the port type was the only
+   platform-specific thing in it.
 2. **No QMP hot-add.** Nobody has written `chardev-add`/`device_add`, and it
    needs root on the machine QEMU lives on. The development guest did not need
    it — its ports are declared in `nix/guest.nix` and it can be rebooted freely
@@ -14627,14 +14629,13 @@ would be worse than the TCP path it replaces, so:
    That measurement is on `testhost`, which is somebody's working machine, and
    it waits for a window when nobody is using it rather than for a gap in the
    schedule.
-7. **No Wayland client has driven a *guest* window through a ring.** One has
-   driven a compositor through a ring (§36.11), on one machine. What is left
-   between the two is deployment rather than design: the compositor's control
-   region has to be the guest's pinned RAM published over the cold path rather
-   than a file it creates, which is `win_guest`'s existing `Hello`/`Accept` with
-   a different owner — and the compositor is a second guest *process*, which
-   §1.6 of `one-binary.md` argues is the thing to fix rather than to work
-   around.
+7. ~~No Wayland client has driven a *guest* window through a ring.~~ **Done, on a
+   Linux guest** — §36.12, across a real hypervisor. What is left is the Windows
+   substrate: `RingLink` maps with `map_fd` and Windows wants `map_section`, and
+   the guest-RAM provider there is `awe_probe`. The compositor also remains a
+   second guest *process*, which `one-binary.md` §1.6 argues is the thing to fix
+   rather than to work around — and which is now a doorbell constraint as well
+   as a copy one.
 
 **`scripts/probe-relay.c` therefore stays, and is still the only thing that
 works end to end.** It is retired when a Wayland client drives a guest window
@@ -14793,3 +14794,163 @@ WiFi round trip. Removing it means teaching the vendored `wayland-backend` to
 take a `Read + Write` client rather than a socket, which is a change to vendored
 code and a `wepoll` problem, and is not worth doing before a client has driven a
 *guest* window through a ring.
+
+### 36.12 Across a real hypervisor: a client here, a compositor in another kernel
+
+§36.11 ran both halves on one machine, and said so. This is the same thing with
+a hypervisor in the middle — `scripts/wc-ring-vm.sh`, on the development guest:
+
+```
+wc-compositor: 80 MiB of guest RAM for the ring region, run 0x3b6c4736baf9a7d3, 20480 pages stamped
+wc-compositor: the host located the ring region, generation 1
+wc-compositor: client 1 accepted on ring slot 1 (no socket crossed the VM boundary)
+
+sv-hostd: the guest offers run 0x3b6c4736baf9a7d3, 4096 control pages + 16384 arena pages, locator Scan
+sv-hostd: located 20480/20480 pages in 193.29ms over 2047 MiB of guest RAM; 3408 run(s), 0 outside RAM
+sv-hostd: stitched 80 MiB with 3408 mmap call(s); all 20480 pages carry their own index
+
+[proxy] upstream is the guest's own RAM via .../wl.sock (3408 run(s), 16 ring slots, generation 1)
+[proxy] client 1 connected, upstream ring slot 1 (no socket, no TCP, no ssh)
+[proxy] client 1 ... 0 fds in, 0 out; 8 client msgs, 31 server msgs
+
+cross-VM ring: PASS — a Wayland client drove a compositor in another kernel, over memory
+```
+
+`wayland-info` on the host enumerated 16 interfaces from a compositor inside a
+VM. The bytes went into pages the guest committed out of its own RAM and the
+host found by sweeping QEMU's memory backend for a stamp — **3,408 runs**, which
+is what a guest's fragmentation actually looks like and is exactly why the run
+list exists rather than an offset.
+
+**This is the thing the section was written for.** The chain it replaces was
+`wc-proxy → ssh -L → TCP over WiFi → probe-relay.exe → afunix.sys`. What is
+there now is a `Control::claim_ring` and a memcpy.
+
+#### 36.12.1 What it took, and it was almost nothing
+
+The compositor gained `--wayland-cold <port>` and the proxy gained
+`--upstream-ring-attach <socket>`. Both are the *existing* handshake:
+
+- the compositor's publish is `win_guest`'s bring-up with the arena unused —
+  commit, stamp, `Hello`, wait for `Accept`, **then** `Control::create`, in that
+  order because `Control::create` zeroes the region and would erase the stamps
+  the host is about to sweep for (the comment in `sv-gpu-server` is the one to
+  read; it was found by measurement, "located 8192 of 12288 pages");
+- the proxy's attach is `AttachRequest` / `Attach` / `Runs` / stitch — the ICD's
+  three messages, unchanged, because the Wayland half and the Vulkan half attach
+  to a guest region by exactly one mechanism. That is §36's whole thesis, and it
+  is the reason this step was small.
+
+`sv-hostd qemu-serve` was not modified at all. It located a Wayland compositor's
+control region believing it was serving an ICD, because at that layer there is
+no difference and there was never supposed to be one.
+
+**One wart, recorded rather than hidden.** `commit_and_stamp(control_size, 0)`
+is refused — "an extent with no arena" — so the compositor commits the smallest
+legal arena, stamps it with everything else, and never touches it. 64 MiB of
+guest RAM the host maps and nobody writes to. The alternative is a second shape
+of extent meaning "control only", which puts a special case in the locator to
+save 64 MiB in a fixture; that trade is not worth making until something other
+than a fixture asks for it.
+
+#### 36.12.2 What is still not proven
+
+The guest here is **Linux**. The deployment guest is Windows, and two things
+differ there and are not yet exercised: `RingLink` is `#[cfg(unix)]` because it
+maps its region with `map_fd` and Windows wants `map_section`, and the guest-RAM
+provider is the Linux one rather than `awe_probe`'s `VirtualAlloc` window. The
+protocol path — claim, accept, chunk, reassemble, EOF, and the cold-path publish
+— is now proven across a real hypervisor; the Windows *substrate* under it is
+not.
+
+`scripts/probe-relay.c` therefore still stays. It is the only thing that carries
+Wayland to the **Windows** guest, and §36 retires it when a ring does.
+
+### 36.13 The Windows guest will not open the port yet, and the reason is not privilege
+
+`winpipe::open_virtio_port` was written in §36.7, compiled, and marked "not
+exercised". It has now been exercised, on `testhost`'s Windows guest, and it
+**fails** — recorded here because a compiled-and-plausible function that nobody
+has run is exactly the kind of thing that gets believed.
+
+`sv-bell-probe.exe guest --port org.sirati.display.0`:
+
+```
+[bell-probe] cannot open org.sirati.display.0: CreateFileW (virtio-serial port) failed: errno 5
+```
+
+Five is `ERROR_ACCESS_DENIED`, and the obvious explanations are all eliminated:
+
+- **Not privilege.** The ssh session reports
+  `[Security.Principal.WindowsPrincipal]::IsInRole(Administrator) = True`.
+- **Not a missing device.** `Get-PnpDevice` shows `VirtIO Serial Driver` OK and
+  **three ports, `vport0p1`, `vport0p2`, `vport0p3`, all `OK`** — which is
+  exactly the three the host configures (`org.qemu.guest_agent.0`,
+  `org.sirati.wifi.0`, `org.sirati.display.0`). The port is there.
+- **Not the namespace.** Both `\\.\Global\<name>` and `\\.\<name>` were tried;
+  both return 5. (The fallback was added because of this measurement and is
+  worth keeping regardless — the security descriptor on the `Global\` alias is
+  not the one on the device.)
+- **Not the one-opener rule.** A second opener is `ERROR_SHARING_VIOLATION` (32),
+  not 5.
+
+So the remaining candidate is that **`vioser.sys` on this guest does not publish
+a symbolic link under the `name=` string at all**, and the openable path is the
+`vport0pN` device rather than the port's name. That is a spelling question with
+a cheap answer and it was **not** guessed at, deliberately: `vport0p2` is
+almost certainly `org.sirati.wifi.0`, which the user's WiFi tray tool owns, and
+opening a virtio-serial port that something else is using is exactly the
+one-opener collision this section has been careful about. Guessing to save a
+diagnostic would risk taking out a live tool on somebody's working machine.
+
+**The right next step** is to read the port name from the registry — the
+`vioser` enumeration records each port's `name=` against its `vport0pN` instance
+— and open the instance that matches, rather than assuming the name is directly
+openable. Until that is done, the Windows guest half of the doorbell is
+**unproven**, and §36.6.3's ~9 µs remains a Linux-guest measurement.
+
+**What this does not change**: the doorbell mechanism, which is
+platform-independent above the port, and which is measured across a real
+hypervisor on the Linux guest. What it changes is the claim about *where* it
+runs. The Windows guest is where the 216.9 ms was measured, and the doorbell
+has not yet been shown to reach it.
+
+#### 36.13.1 And there is no read-only way to map a port name to its instance
+
+Before guessing, two read-only sources were checked from the guest. Neither
+carries the name:
+
+- **`HKLM\SYSTEM\CurrentControlSet\Enum\VIOSERIAL`** — does not exist on this
+  guest. There is no per-port enumeration key to read a `name=` out of.
+- **`HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses\{6fde7521-…}`** — has
+  exactly three interfaces, and they are distinguished only by an **ordinal**:
+
+  ```
+  ##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&01#{6fde7521-…}
+  ##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&02#{6fde7521-…}
+  ##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&03#{6fde7521-…}
+  ```
+
+  Three interfaces for three ports, which corroborates §36.13's device count and
+  adds nothing about *which is which*. `Get-PnpDevice`'s friendly names —
+  `vport0p1`, `vport0p2`, `vport0p3` — are the same ordinals in another dress.
+
+So the mapping is not available read-only, and **this is where it stops.** The
+ordinals almost certainly follow the order the ports appear on the QEMU command
+line, which would make `&0&02` the WiFi port — and "almost certainly" is exactly
+the standard that must not be applied here, because a virtio-serial port takes
+one opener and being wrong means taking the WiFi tray tool off the user's live
+desktop to save a diagnostic. A slower doorbell is a much better outcome than
+that.
+
+What would settle it, and needs a writer rather than a reader: `vioser.sys`
+answers `IOCTL_VIOSERIAL_GET_PORT_NAME` (or the guest agent's own port-name
+query) on an *opened* handle — which is circular here, since opening is the
+thing that fails. The non-circular route is to add a **fourth** port whose
+ordinal is then known by construction, which is the QMP `device_add` of §36.7
+and is a change to a running VM rather than a read.
+
+**None of this is on the critical path.** §36.6.3's ~9 µs across a real
+hypervisor is the latency evidence and stands; §36.12's cross-VM Wayland client
+is the milestone and stands. The Windows guest's port is what would let the
+*deployment* guest use the doorbell, and it is a nice-to-have behind both.
