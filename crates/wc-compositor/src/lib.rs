@@ -729,6 +729,29 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // And the ones this process provides as a file. See `--arena-provide`: this
     // is `--arena` opened read-write, which is what makes an outbound window
     // possible on a machine with no hypervisor in it.
+    //
+    // THE FILE ARENA IS NOT A TARGET — guest RAM is (design.md §1a), and
+    // `--arena-guest-ram` is how this process provides one. The file path is a
+    // Wine-only fixture, kept because it is the only way to run the arena code
+    // without a hypervisor, and refused because a run that quietly lands here
+    // is measuring a substrate §10.3 measured incoherent for live mappings:
+    // 65280 of 65536 bytes wrong, both directions, which reached a user's
+    // screen as a torn window that passed every other check.
+    if !args.provide_arenas.is_empty() && std::env::var_os("SV_ALLOW_FILE_ARENA").is_none() {
+        eprintln!(
+            "wc-compositor: the FILE arena is not a target. `--arena-provide` and \
+             `--arena` open files, which is a Wine-only fixture for a machine with no \
+             hypervisor. Use `--arena-guest-ram <id>:<bytes>`. Set SV_ALLOW_FILE_ARENA=1 \
+             for a fixture run — never to make a guest run pass."
+        );
+        return std::process::ExitCode::from(2);
+    }
+    if !args.provide_arenas.is_empty() {
+        eprintln!(
+            "wc-compositor: WARNING: FILE arena in use (SV_ALLOW_FILE_ARENA is set). This \
+             is a fixture, not a target; guest RAM is the only real substrate."
+        );
+    }
     for (id, size, path) in &args.provide_arenas {
         match wc_handle::arena::provide_file(*id, path, *size) {
             Ok(()) => println!(
