@@ -5554,6 +5554,33 @@ guess is wrong and the harness was written against the guess: it is
 §13.9 said an image name is not an identity on this guest. Stage 11 found two
 more ways for that to be true and two ways to photograph the wrong instant.
 
+> **The rule, because this is the third time and it will not be the last.**
+>
+> There is one Windows guest, one `/srv/winshare`, one taskbar, and as many
+> experiments as there are worktrees. Everything below is a special case of two
+> sentences, and the next person should meet them here rather than derive them
+> again:
+>
+> 1. **An identity is a process id or a full path. Never an image name, never a
+>    window class, never a glob.** Every experiment deploys its own copy into
+>    its own directory, so the path is unique and the image name is not;
+>    `WaycomposeToplevel` is registered by every compositor in the tree; and
+>    `rm -f …/wg-*` matches somebody else's live sockets as happily as your dead
+>    ones.
+> 2. **A "polite" close is still a kill.** `taskkill /IM foo.exe` without `/F`
+>    does not terminate anything — it sends `WM_CLOSE` to every window of every
+>    matching process, which for a compositor means `xdg_toplevel.close`, a
+>    client that exits correctly, and a window that is simply not there any
+>    more. Nothing in either log says "somebody killed me"; the compositor's
+>    side reads `close requested`, which is what a user clicking the X looks
+>    like. Kills-by-name are not made safe by being gentle.
+>
+> The three instances so far: §12.8's image-name kill, which stage 8 narrowed to
+> an image *path* (§13.9); this stage's `WM_CLOSE` (below); and stage 12's
+> `clean` step running an unscoped `rm -f …/wg-*` over eight live sockets
+> belonging to this stage's runs. Each was diagnosed as flakiness first, and
+> each cost more than the fix.
+
 * **`taskkill /IM wc-compositor.exe` without `/F` sends `WM_CLOSE`.** Another
   worktree running an older `wc-guest.sh` reaps nothing of ours — our process
   survives — but our *window* closes, the compositor correctly sends
@@ -5584,6 +5611,28 @@ A fifth, smaller: registering two scheduled tasks with the same name in one run
 leaves `Start-ScheduledTask` with nothing to start and no error, which printed
 as "the compositor did not start" for the second pass only — with the
 compositor's own log on the guest proving that it had.
+
+**And the other half of the rule, which is about what a run leaves behind.**
+While this stage was running, the guest was found to be holding **six abandoned
+`wc-compositor.exe` processes started between 06:55 and 07:28**, still alive
+seven hours later, each with a window on the desktop — after a stage had
+reported that nothing of its own was running. That is the second time a cleanup
+claim has turned out to be false rather than the first; §13.9's fourth lesson is
+the same shape, where a compositor left over from an interrupted run kept
+writing frames into a directory the next run had just emptied.
+
+The mechanism is not mysterious: a scheduled task's process does not die with
+the ssh session that started it (§13.3), so *every* path out of a harness that
+is not an explicit kill leaves one behind — an interrupted run, a timeout, a
+failed assertion that returns early, a `set -e` on a line before the teardown.
+
+So the check has to be **"count the processes"** rather than **"the script
+reached its cleanup block"**. The two are not the same statement, they differ in
+exactly the cases anybody cares about, and only one of them is a measurement.
+A harness that means to say the guest is clean should enumerate
+`Win32_Process` and say how many it found — which is one line of the PowerShell
+each of these scripts already ships — rather than infer it from having run some
+code.
 
 ### 16.9 The evidence
 
@@ -5635,6 +5684,7 @@ one). Two things about that run are worth keeping:
 | `scripts/wc-icon.sh deploy` | builds and copies |
 | `scripts/wc-icon.sh taskbar` (`weston-terminal`, the guest's desktop) | 12 passed, 0 failed |
 | `scripts/wc-icon.sh taskbar` (Firefox, `--transport shared-file`) | 7 passed, 0 failed, 1 skipped |
+| `scripts/wc-icon.sh` teardown check — `Win32_Process` count on the guest | 0 left behind |
 
 The skip is the caption comparison in the Firefox run, which wants a 16x16
 reference file to search for and is looking in the Firefox package's own theme;

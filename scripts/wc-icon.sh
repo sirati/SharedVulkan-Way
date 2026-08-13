@@ -608,6 +608,30 @@ do_taskbar() {
       ;;
   esac
   do_compare
+  do_leftovers
+}
+
+# Did this run actually leave the guest as it found it?
+#
+# **Counted, not assumed.** A scheduled task's process does not die with the ssh
+# session that started it (§13.3), so every path out of a harness that is not an
+# explicit kill leaves a compositor behind — and a run that reaches its cleanup
+# block has not thereby established that the cleanup worked. Twice now a stage
+# has reported a clean guest that was not one; the second time it was holding six
+# abandoned compositors seven hours old, each with a window on the desktop
+# (§16.8). The difference between the two claims is one `Get-CimInstance`.
+do_leftovers() {
+  echo
+  echo "== what is left on the guest =="
+  local n
+  n=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+        -File '$DESKDIR_WIN\\killours.ps1' -Match '$GUESTNAME' -PidOnly" 2>/dev/null \
+      | tr -d '\r' | grep -c '[0-9]')
+  if [ "${n:-0}" -eq 0 ]; then
+    ok "no $COMP_EXE from $GUESTNAME is still running"
+  else
+    bad "$n $COMP_EXE process(es) from $GUESTNAME left behind; kill them by pid"
+  fi
 }
 
 case "$MODE" in
