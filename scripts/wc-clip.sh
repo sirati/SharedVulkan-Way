@@ -66,6 +66,56 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# check_counters <what> <line> <expected-fds> <expected-clipboard>
+#
+# The descriptor counts and the transfer count from one `wc-proxy` session
+# summary, against the values docs/waycompose-design.md §29.4 derives. See the
+# call sites for the derivation; this is only the comparison.
+#
+# The byte count is checked separately and only for being non-zero: it is the
+# length of whatever was copied, but a transfer counted and empty is the case
+# every other check in this file would pass.
+check_counters() {
+  local what=$1 line=$2 fds=$3 clip=$4 bytes
+  case "$line" in
+    *"$fds"*) ;;
+    *) bad "$what: expected \"$fds\" (§29.4); the session says $(echo "$line" | grep -o '[0-9]* fds in, [0-9]* out')"
+       return ;;
+  esac
+  case "$line" in
+    *"$clip ("*) ;;
+    *) bad "$what: the session does not report \"$clip\""; return ;;
+  esac
+  bytes=$(echo "$line" | grep -o "$clip ([0-9]* bytes)" | grep -o "[0-9]*" | tail -1)
+  if [ "${bytes:-0}" -lt 1 ]; then
+    bad "$what: the transfer was counted and carried ${bytes:-0} bytes"
+    return
+  fi
+  ok "$what: $fds and $bytes bytes moved -- §29.4's counts, unchanged"
+}
+
+# **Refuse to measure binaries older than the tree.** See the same function in
+# `scripts/wc-proxy.sh`, which was written after a stale `target/debug/wc-proxy`
+# made a clean tree report a regression it did not have. Every other harness in
+# this directory still checks only that its binaries *exist*, which is a
+# different claim.
+fresh() {
+  local bin=$1 how=$2 newer
+  if [ ! -f "$bin" ]; then
+    bad "no $bin -- $how"
+    return 1
+  fi
+  newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
+            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+            -newer "$bin" -print -quit 2>/dev/null)
+  if [ -n "$newer" ]; then
+    bad "$(basename "$bin") is older than ${newer#"$ROOT"/} -- $how, or this run measures the previous tree"
+    return 1
+  fi
+  ok "$(basename "$bin") is newer than every source file in the tree"
+  return 0
+}
+
 RUNDIR=$(mktemp -d /tmp/wc-clip-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -188,8 +238,8 @@ block_wine() {
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH"; return; }
   command -v wl-copy >/dev/null || { bad "wl-copy not on PATH -- see flake.nix"; return; }
-  [ -x "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe"; return; }
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build --workspace --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || return
 
   x86_64-w64-mingw32-gcc -O1 -o "$RUNDIR/probe-clip.exe" "$ROOT/scripts/probe-clip.c" \
     2>"$RUNDIR/probe-build.log" \
@@ -206,9 +256,14 @@ block_wine() {
   fi
   ok "wc-compositor.exe is listening, wc-proxy is in front of it"
 
+  # §32: the failing arm was a `note`, so this could not fail -- and without the
+  # listener the whole Windows-to-Linux direction is dead, which is half of what
+  # this file is for. If `AddClipboardFormatListener` really does fail under
+  # Wine that is a finding about Wine and belongs in the scoreboard, not in a
+  # line a reader has to notice.
   grep -q "watching the system clipboard" "$DIR/srv.log" 2>/dev/null \
     && ok "the compositor registered a WM_CLIPBOARDUPDATE listener" \
-    || note "no clipboard listener line (AddClipboardFormatListener may have failed under Wine)"
+    || bad "no clipboard listener line -- AddClipboardFormatListener failed, and nothing Windows copies can reach a Linux client"
 
   # -- direction A: a Linux client copies, a Windows application pastes -------
   #
@@ -302,11 +357,48 @@ block_wine() {
   # One line from a connection that copied and one from a connection that
   # pasted, because the two have different fd counts and §29.4 is an argument
   # about exactly those numbers.
+  #
+  # **§32: those numbers are now compared, and this is the sharpest case in the
+  # sweep.** The comment above says outright that §29.4 is an argument about
+  # exactly these counts, and the code under it printed them in a `note` and had
+  # no opinion. Worse than that: `[ -n "$line" ] && note …` means a run in which
+  # the proxy never logged a copy, or never logged a paste, printed **nothing at
+  # all** and passed. The absence of the evidence was silent.
+  #
+  # §29.4 states the values and derives them, so they are assertable rather than
+  # merely recordable:
+  #
+  #  * **a copy is `1 fds in, 2 out`.** In is `wl-copy`'s `wl_shm` pool (it opens
+  #    a 1x1 surface to obtain focus). Out is the keymap `memfd` §14.7 accounts
+  #    for, plus one `pipe2` write end per mime type pulled — manufactured here
+  #    and not retained, which is what makes the EOF mean "the client has
+  #    finished writing" rather than "nobody has written yet".
+  #  * **a paste is `2 fds in, 1 out`.** The second `in` is the client's own pipe,
+  #    arriving by `SCM_RIGHTS` on `wl_data_offer.receive` and consumed here.
+  #
+  # A drift in either direction is a change in what the proxy does with
+  # descriptors, which is the one thing this project's rule is about. Measured
+  # on this machine: exactly those, with 41 and 54 bytes.
+  #
+  # The byte counts are asserted as non-zero rather than as values, because they
+  # are the length of whatever the test happened to copy — but zero with the
+  # counter incremented is the case that matters: a transfer that was accounted
+  # for and moved nothing, which every check above would still pass.
   local line
   line=$(grep "clipboard: 1 copied" "$DIR/proxy.log" | head -1)
-  [ -n "$line" ] && note "a copy: ${line#*] }"
+  if [ -z "$line" ]; then
+    bad "the proxy never logged a connection that copied; §29.4's copy counts cannot be checked"
+  else
+    note "a copy: ${line#*] }"
+    check_counters copy "$line" "1 fds in, 2 out" "1 copied"
+  fi
   line=$(grep "clipboard: 0 copied .*1 pasted" "$DIR/proxy.log" | head -1)
-  [ -n "$line" ] && note "a paste: ${line#*] }"
+  if [ -z "$line" ]; then
+    bad "the proxy never logged a connection that pasted; §29.4's paste counts cannot be checked"
+  else
+    note "a paste: ${line#*] }"
+    check_counters paste "$line" "2 fds in, 1 out" "1 pasted"
+  fi
 
   mkdir -p "$OUT"
   cp "$DIR/srv.log" "$OUT/compositor.log" 2>/dev/null

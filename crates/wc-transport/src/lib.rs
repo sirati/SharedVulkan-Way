@@ -13,7 +13,7 @@
 //! has "no `SO_PEERCRED` equivalent".
 //!
 //! **Both halves of that argument are wrong, and the conclusion inverts.** See
-//! `docs/design.md` §2.2 for the full reasoning; in summary:
+//! `docs/waycompose-design.md` §2.2 for the full reasoning; in summary:
 //!
 //! 1. `SIO_AF_UNIX_GETPEERPID` exists. It is a documented `WSAIoctl` on Windows
 //!    AF_UNIX sockets, declared in Microsoft's `afunix.h` and carried in

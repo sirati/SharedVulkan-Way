@@ -486,7 +486,7 @@ pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
     let path_w = wide(path);
     // Read-only throughout: `GENERIC_READ`, `PAGE_READONLY`, `FILE_MAP_READ`.
     // A compositor's view of a client's buffer is read-only by design
-    // (docs/design.md §7.4), and asking for write access here would also make
+    // (docs/waycompose-design.md §7.4), and asking for write access here would also make
     // the open fail against a genuinely read-only mount.
     // SAFETY: a live NUL-terminated UTF-16 path for the duration of the call.
     let file = unsafe {

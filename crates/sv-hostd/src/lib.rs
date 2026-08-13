@@ -493,10 +493,37 @@ pub const PAGE_BYTES: usize = PAGE;
 mod tests {
     use super::*;
 
+    /// A run id no other test in this process, and no other run of this test
+    /// binary, can be using.
+    ///
+    /// # This is a truncated `cargo test --workspace`, not a tidiness fix
+    ///
+    /// `Hostd::local` names its object `/dev/shm/sv.arena.{run_id:016x}` and
+    /// creates it `O_CREAT|O_EXCL`, deliberately: the name carries the run id so
+    /// two daemons cannot collide and a leftover from a crash is identifiable.
+    /// Two tests here passed the **same** `run_id` of 1, and the harness runs
+    /// tests in parallel threads of one process, so whichever lost the race got
+    /// `EEXIST` — `open(shm, O_CREAT|O_EXCL), errno: 17`.
+    ///
+    /// It failed *sometimes*, which is what made it expensive. A failing test
+    /// binary stops `cargo test --workspace` where it stands, so the run
+    /// reported **169 tests of 1253** on the merge this was found in, and the
+    /// same tree on another attempt reported the true total. A number that is
+    /// either 169 or 1253 depending on thread scheduling is not a baseline, and
+    /// it is the same defect §32.2 fixed in `sv-icd` arriving from a second
+    /// direction.
+    ///
+    /// The process id is in the name as well as a per-test constant, so a run
+    /// that panicked before `Drop` could unlink cannot poison every future run
+    /// of the same test — which `O_EXCL` on a fixed name otherwise guarantees.
+    fn unique_run_id(test: u64) -> u64 {
+        (u64::from(std::process::id()) << 16) | test
+    }
+
     #[test]
     fn a_local_daemon_describes_one_contiguous_extent() {
         let g = demo_geometry();
-        let h = Hostd::local(g, 0xabc, 1).unwrap();
+        let h = Hostd::local(g, unique_run_id(1), 1).unwrap();
         assert_eq!(h.runs.len(), 1);
         assert_eq!(h.runs.bytes(), h.total_len());
         let a = h.attachment();
@@ -513,7 +540,7 @@ mod tests {
     fn the_two_views_are_independent_mappings_of_one_file() {
         use std::os::fd::AsFd;
         let g = demo_geometry();
-        let h = Hostd::local(g, 1, 1).unwrap();
+        let h = Hostd::local(g, unique_run_id(2), 1).unwrap();
         let (control, arena) = map_views(h.fd.as_fd(), &h.attachment()).unwrap();
         assert_eq!(control.len() as u64, g.control_size);
         assert_eq!(arena.len() as u64, g.arena_size);
@@ -538,7 +565,7 @@ mod tests {
     #[test]
     fn a_client_reaches_the_same_pages_from_the_name_alone() {
         let g = demo_geometry();
-        let h = Hostd::local(g, 0x5eed, 1).unwrap();
+        let h = Hostd::local(g, unique_run_id(3), 1).unwrap();
         let at = h.attachment();
 
         // Everything a client is given, as text.
@@ -568,7 +595,7 @@ mod tests {
     fn the_owner_publishes_and_a_second_view_attaches() {
         use std::os::fd::AsFd;
         let g = demo_geometry();
-        let h = Hostd::local(g, 1, 3).unwrap();
+        let h = Hostd::local(g, unique_run_id(4), 3).unwrap();
         let (control, _arena) = map_views(h.fd.as_fd(), &h.attachment()).unwrap();
         let owner = become_owner(Arc::clone(&control), g, demo_ids(), 3).unwrap();
         assert_eq!(owner.generation(), 3);

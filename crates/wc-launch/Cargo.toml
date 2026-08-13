@@ -20,7 +20,7 @@ windows-sys = { workspace = true, features = [
   # `CreateMutexW` takes a pointer to SECURITY_ATTRIBUTES, so its binding is
   # behind this feature even though the pointer passed is always null.
   "Win32_Security",
-  # CreateMutexW / OpenMutexW: the liveness test. docs/design.md §19.4 --
+  # CreateMutexW / OpenMutexW: the liveness test. docs/waycompose-design.md §19.4 --
   # a process that holds a named mutex is alive by construction, which an image
   # name is not (§16.8) and which a probe of the compositor's own socket must
   # not be (§17.4: the first client releases the held keymap).

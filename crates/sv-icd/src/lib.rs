@@ -116,7 +116,20 @@ fn instance() -> Option<&'static state::SharedVulkan> {
                 Ok(icd) => {
                     let leaked: &'static state::SharedVulkan = Box::leak(Box::new(icd));
                     sv_icd_entry::set_icd(leaked);
-                    eprintln!("sv-icd: connected to the GPU side at {sock}");
+                    // The hash goes on the line that always prints, not behind
+                    // `SV_DEBUG`. `Control::attach` already refuses a mismatch
+                    // loudly and by name (`ProtocolHashMismatch { ours,
+                    // theirs }`), so the failure is never silent — but it is
+                    // read as a *transport* fault, and it never is one: it means
+                    // one of the two binaries is older than the other. Printing
+                    // ours beside the socket puts the number in every run's log,
+                    // so the first question after a handshake failure is "are
+                    // these the same build" rather than "is the ring broken".
+                    // This project has lost time to a stale binary twice.
+                    eprintln!(
+                        "sv-icd: connected to the GPU side at {sock} (protocol {:#018x})",
+                        sv_proto::PROTOCOL_HASH
+                    );
                     Some(leaked)
                 }
                 Err(e) => {
@@ -252,6 +265,19 @@ pub unsafe extern "system" fn vkGetInstanceProcAddr(
 /// The path of the manifest this build wrote, for tests and for a person who
 /// wants to set `VK_DRIVER_FILES`.
 pub const MANIFEST_PATH: &str = env!("SV_ICD_MANIFEST");
+
+/// The absolute path of the `cdylib` [`MANIFEST_PATH`]'s manifest names.
+///
+/// A manifest is written by the build script and so always exists; the library
+/// it points at exists only once the `cdylib` target has been *built*, which
+/// `cargo test` alone does not do. Anything that hands the manifest to the real
+/// loader has to check this first, because the loader's response to a
+/// `library_path` that does not exist is to skip the driver without a word.
+pub const LIBRARY_PATH: &str = env!("SV_ICD_LIBRARY_PATH");
+
+/// The cargo profile this build belongs to (`debug` or `release`), so a test
+/// that needs to build [`LIBRARY_PATH`] can ask for the same one.
+pub const PROFILE: &str = env!("SV_ICD_PROFILE");
 
 /// Keep `c_void` referenced in a way that survives a `--release` build without
 /// the import being flagged unused on every platform.

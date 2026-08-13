@@ -3,7 +3,7 @@
 //! These are the tests that matter most in this crate, because they exercise
 //! the exact path a `wl_shm` frame takes and they do it without Wine, without a
 //! window and without a Windows binary. Stage 3's evidence had to be split in
-//! two halves for want of a client that could reach both (docs/design.md §8.5);
+//! two halves for want of a client that could reach both (docs/waycompose-design.md §8.5);
 //! this half needs neither.
 
 use std::collections::VecDeque;
@@ -104,7 +104,7 @@ impl Harness {
     /// Every message the compositor would have received, re-walked from the
     /// concatenated stream. Walking it rather than remembering it is the point:
     /// it proves the bytes really do form a well-framed stream in *our*
-    /// dialect, which is the failure mode docs/design.md §2.4 warns about.
+    /// dialect, which is the failure mode docs/waycompose-design.md §2.4 warns about.
     fn upstream_messages(&self) -> Vec<(u32, u16, Vec<u8>)> {
         let mut out = Vec::new();
         let mut at = 0;
@@ -298,7 +298,7 @@ fn an_arena_slice_carries_the_clients_pixels() {
 
 /// All three copy scopes must produce identical pixels for a client that
 /// damages honestly. They differ in cost, never in result — which is exactly
-/// what makes the cost measurement in docs/design.md §9 a choice rather than a
+/// what makes the cost measurement in docs/waycompose-design.md §9 a choice rather than a
 /// trade-off.
 #[test]
 fn every_copy_scope_produces_the_same_image() {
@@ -788,7 +788,7 @@ fn a_resize_after_publication_is_bounded_by_the_headroom_and_says_so() {
 /// the region on `destroy` unlinked the file the compositor was about to open.
 /// Measured, against `wc-compositor.exe`: `could not map SharedFile { … }: File
 /// not found`, reported to the client as a `wl_shm` protocol error, zero frames
-/// presented. This is docs/design.md §2.5 exactly.
+/// presented. This is docs/waycompose-design.md §2.5 exactly.
 #[test]
 fn a_destroyed_pool_stays_open_until_the_compositor_acknowledges_it() {
     let d = tmpdir("zombie");
@@ -981,7 +981,7 @@ fn a_keymap_cut_from_the_arena_reaches_the_client_with_no_shared_filesystem() {
 /// ends.
 ///
 /// This is the failure `wl_keyboard.keymap` had all along and that nothing
-/// exercised — docs/design.md §9.10 item 5's "implemented, unexercised". A
+/// exercised — docs/waycompose-design.md §9.10 item 5's "implemented, unexercised". A
 /// compositor that has not been told where to publish objects creates
 /// `Local\wc-…`, which is a name only the NT object manager understands. The
 /// old code noted it and forwarded the event *without* the descriptor, so the
@@ -1236,7 +1236,7 @@ impl Drop for Pressure {
     }
 }
 
-/// **The bug, and the fix.** docs/design.md §20.2.
+/// **The bug, and the fix.** docs/waycompose-design.md §20.2.
 ///
 /// An arena with no room for a pool used to kill the client, and the log line
 /// said so in three steps: `could not publish 2340864 bytes`, then
@@ -1294,7 +1294,7 @@ fn a_full_arena_degrades_one_surface_and_never_the_connection() {
     //
     // The client finishes with the first pool: buffer, then pool, then the
     // compositor's acknowledgement, which is the only point at which the bytes
-    // are safe to reuse (docs/design.md §2.5).
+    // are safe to reuse (docs/waycompose-design.md §2.5).
     p.h.send_words(big_buf, 0, &[]); // wl_buffer.destroy
     p.h.send_words(surface, 1, &[0, 0, 0]); // attach nil, so nothing holds it
     p.h.send_words(surface, 6, &[]);
@@ -1335,7 +1335,7 @@ fn a_full_arena_degrades_one_surface_and_never_the_connection() {
     );
 }
 
-/// **Reclamation.** docs/design.md §20.5, and the answer to §17.10 item 1.
+/// **Reclamation.** docs/waycompose-design.md §20.5, and the answer to §17.10 item 1.
 ///
 /// Firefox destroys one buffer in three and no pools at all, so a policy that
 /// waits to be asked gets nothing back. This one is not asked: it destroys the
@@ -1648,7 +1648,7 @@ fn string_body(s: &str) -> Vec<u8> {
 }
 
 /// A session with a `wl_data_device_manager` and a `wl_data_device` bound, which
-/// is what every GTK client does before it has a seat at all (docs/design.md
+/// is what every GTK client does before it has a seat at all (docs/waycompose-design.md
 /// §15.4).
 fn clipboard_harness() -> (Harness, u32, u32) {
     let d = tmpdir("clip");

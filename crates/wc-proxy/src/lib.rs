@@ -4,7 +4,7 @@
 //!
 //! # The problem this exists to solve, stated exactly
 //!
-//! docs/design.md §2.3 made `h` arguments in-band on Windows, because Windows
+//! docs/waycompose-design.md §2.3 made `h` arguments in-band on Windows, because Windows
 //! AF_UNIX carries no ancillary data and `DuplicateHandle` would mean a
 //! compositor holding `PROCESS_DUP_HANDLE` over every client. That decision is
 //! right and it has one consequence, measured twice independently (§7.5, §7.8,
@@ -52,7 +52,7 @@
 //! | [`proxy`] | the sockets and the pump | nothing |
 //!
 //! Everything above `proxy` is free of I/O, which is deliberate and is the same
-//! structure stage 3 gave `wc-shmclient` for the same reason (docs/design.md
+//! structure stage 3 gave `wc-shmclient` for the same reason (docs/waycompose-design.md
 //! §8.9): the encoding is the part most likely to be quietly wrong, and a bug
 //! in it presents as §2.4's silent desynchronisation rather than as an error.
 

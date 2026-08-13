@@ -41,6 +41,53 @@
 # the pixels there by passing something would fail these even though the picture
 # would look identical.
 #
+# EVERY NUMBER THIS HARNESS PRINTS IS EITHER ASSERTED OR SAID TO BE INFORMATIONAL
+#
+# §31. This harness reported **37 passed, 0 failed** through a 51x copy-cost
+# regression, because the cost table was printed for a human to read and the
+# harness had no opinion about it. A number a harness prints and does not check
+# is a number nobody is watching, and the only honest states for one are
+# "asserted", "bounded", or "informational, and here is why".
+#
+# The audit, in full, so that the next number added here has somewhere to go:
+#
+#   ASSERTED   frames presented (per client floor), map counts by kind,
+#              descriptors in and out, dumped-frame geometry and colour count,
+#              light rows top against bottom, primaries found, wedge span,
+#              screenshot colour count, commits, copies per commit, KiB per
+#              copy against the client's own buffer extent, MiB per commit
+#              across the scope hierarchy, and the number of rows in the table.
+#   BOUNDED    screenshot difference, but only for the client that animates;
+#              for a static client there is no live-ness claim to make.
+#   INFORMATIONAL
+#              microseconds per copy. It is a *rate* on a machine running Xvfb,
+#              Wine, a compositor and a client at once; the same tree measured
+#              37 us and 103 us for the same 244 KiB copy in one run of this
+#              file. Asserting on it would be asserting on the load. What the
+#              cost gate gets instead is bytes, which are a property of the code.
+#
+# TIMING, AND WHY THIS FILE WAITS FOR THINGS RATHER THAN SLEEPING ON THEM
+#
+# The other half of §31. This harness once failed 6 and then passed 39/0 twice
+# on the same tree, and a red that is not reliably a regression is worse than no
+# red at all: it teaches everyone to re-run until green. A scoreboard whose
+# noise floor is one test cannot report a one-test regression.
+#
+# Every fixed `sleep` that guarded a *state* is now a bounded wait for that
+# state, and every wait prints when it had to wait — a retry that leaves no
+# trace turns a slow run into a fast-looking one. `sleep` survives in exactly
+# two places, both of which wait for time rather than for a state: the gap
+# before `wine explorer` (§8.9's wineserver shutdown, which nothing observable
+# reports) and the interval between the two screenshots (which *is* the
+# measurement).
+#
+# The sharpest instance was not in this file at all. `find_socket` waits for the
+# compositor's socket *node*, and `bind` creates the node while `listen` is what
+# makes it accept; `wc-proxy` connected upstream once and reported "cannot reach
+# the compositor" if it landed in between. That is the same defect `wc-wlcs`'s
+# `connect_client` was fixed for, and it is now fixed in the proxy itself, with
+# the retry counted and printed — see `wc_proxy::proxy::connect_upstream`.
+#
 # WHAT WINE DOES AND DOES NOT PROVE. Unchanged from stages 1-3 and still the
 # most important sentence: Wine is not Windows. A pass says our code paths are
 # self-consistent and structurally possible. Wine has been wrong four times on
@@ -85,6 +132,60 @@ start_x() {
   return 1
 }
 
+# fresh <binary> <what-to-run>
+#
+# **Refuse to measure a binary older than the tree it is supposed to be built
+# from.** This check exists because writing this file walked straight into what
+# it is guarding: the §27 fix was reverted to reproduce the 51x regression, the
+# source was put back, `cargo test --workspace` was run — which builds test
+# binaries and does *not* relink `target/debug/wc-proxy` — and the next harness
+# run reported the regression against a clean tree. Twelve failures, and every
+# one of them a fact about a stale executable.
+#
+# That is the same defect this whole section is about, one level down: the
+# harness had an opinion about the numbers and no opinion about *what produced
+# them*. `[ -x "$LINUX_BIN/wc-proxy" ]` is a check that the file exists, which
+# is not the same claim at all. §18.8 says the neighbouring thing about clippy
+# — it builds metadata, not an executable — and this is its other half.
+fresh() {
+  local bin=$1 how=$2 newer
+  if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
+    bad "no $bin -- $how"
+    return 1
+  fi
+  newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
+            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+            -newer "$bin" -print -quit 2>/dev/null)
+  if [ -n "$newer" ]; then
+    bad "$(basename "$bin") is older than ${newer#$ROOT/} -- $how, or this run measures the previous tree"
+    return 1
+  fi
+  ok "$(basename "$bin") is newer than every source file in the tree"
+  return 0
+}
+
+# wait_for <file> <extended-regex> <seconds> <what>
+#
+# Wait for a state to be *reported* rather than sleeping long enough that it
+# probably happened. Bounded, and **the wait is printed whenever it was not
+# instant**, which is the difference between a harness that is load-independent
+# and one that merely looks it: a run that needed 4 of its 20 seconds says so,
+# so a machine drifting towards the cliff is visible before it goes over.
+wait_for() {
+  local f=$1 re=$2 secs=$3 what=$4
+  local i=0 n=$((secs * 20))
+  while [ "$i" -lt "$n" ]; do
+    if [ -f "$f" ] && grep -qE "$re" "$f" 2>/dev/null; then
+      [ "$i" -gt 10 ] && note "waited $(awk -v i="$i" 'BEGIN{printf "%.1f", i/20}')s for $what"
+      return 0
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  note "gave up after ${secs}s waiting for $what"
+  return 1
+}
+
 # Find the compositor's AF_UNIX node inside the prefix. Under Wine that node is
 # a *real host socket*, which is the only reason a native Linux proxy can reach
 # a mingw `.exe` at all (docs/design.md §4.2). On the real guest `afunix.sys`
@@ -99,13 +200,20 @@ find_socket() {
   return 1
 }
 
-# run_one <tag> <client> <transport> <copy-scope> <seconds>
+# run_one <tag> <client> <transport> <copy-scope> <seconds> [min-screenshot-diff]
 #
 # Starts the Windows compositor inside a Wine virtual desktop, the proxy beside
 # it, and the client against the proxy; photographs the X root twice while the
 # client is still drawing; leaves everything in $RUNDIR/<tag>.
+#
+# `min-screenshot-diff` is how many pixels the two shots must differ by for the
+# pair to carry a live-ness claim. 0 (the default) means the client is static
+# and the difference is informational. A non-zero value gets a **bounded,
+# printed retry**: a client that animates can still be photographed twice inside
+# one frame on a loaded machine, and that is a property of the load rather than
+# of the code.
 run_one() {
-  local tag=$1 client=$2 transport=$3 scope=$4 secs=$5
+  local tag=$1 client=$2 transport=$3 scope=$4 secs=$5 mindiff=${6:-0} shots=${7:-1}
   local dir="$RUNDIR/$tag"
   mkdir -p "$dir/rt" "$dir/frames"
   chmod 700 "$dir/rt"
@@ -177,19 +285,58 @@ run_one() {
     --copy "$scope" "${proxy_extra[@]}" \
     --accept-timeout 20 --timeout "$secs" >"$dir/proxy.log" 2>&1 &
   local proxy=$!
-  sleep 0.8
+  # WAS `sleep 0.8`, and the sleep was the bug. `Listener::bind` binds and
+  # listens in one call and then prints this line, so the line *is* the state
+  # the client needs; 0.8 s was a guess that happened to be long enough on an
+  # idle machine.
+  wait_for "$dir/proxy.log" '^\[proxy\] listening on' 20 "$tag: the proxy to listen"
 
   XDG_RUNTIME_DIR="$dir/rt" WAYLAND_DISPLAY=wl-proxy \
     timeout $((secs + 8)) "$client" >"$dir/cli.log" 2>&1 &
   local cli=$!
 
+  # WAS `sleep 5`. The thing worth photographing is a window, and the compositor
+  # says when it has made one; on a loaded machine five seconds was sometimes
+  # before that and the screenshot assertions then measured the load. Bounded by
+  # the client's own run length, so a client that never makes a window costs
+  # nothing extra and fails in `check_common` where the diagnosis lives.
+  #
+  # Only for the legs that photograph. The cost legs never look at a screenshot
+  # — `check_common` is not called for them — so waiting for a window there
+  # bought nothing and cost 16 s six times over, with a "gave up" line each
+  # time that trains a reader to ignore the notes. A wait nobody needs is
+  # noise, and noise is how a real one gets missed.
+  if [ "$shots" = 1 ]; then
+  wait_for "$dir/srv.log" 'window .* created \(HWND' $((secs + 10)) "$tag: the window to be created" || true
+  # A beat for the client to paint into the window that now exists. This one
+  # stays a `sleep` on purpose and it is a different kind of thing from the five
+  # seconds it replaced: startup was the load-dependent part and is now waited
+  # for explicitly, so all this covers is one client's paint. Nothing asserted
+  # on the shots needs it to be long enough — the colour-count floor clears by
+  # 7x either way — it is here so the photograph is of a settled window rather
+  # than of one appearing.
+  sleep 2
+
   # Two shots, while the client is still drawing. One shot cannot tell a live
   # window from a window showing one frozen frame, which is the failure stage 3
-  # designed this pair to catch.
-  sleep 5
-  xwd -root -silent -out "$dir/s1.xwd" 2>/dev/null && magick "$dir/s1.xwd" "$dir/s1.png" 2>/dev/null
-  sleep 1.5
-  xwd -root -silent -out "$dir/s2.xwd" 2>/dev/null && magick "$dir/s2.xwd" "$dir/s2.png" 2>/dev/null
+  # designed this pair to catch. The 1.5 s between them is a real sleep and
+  # stays one: it is the measurement's own interval, not a wait for a state.
+  local attempt=0 differ=0
+  while :; do
+    xwd -root -silent -out "$dir/s1.xwd" 2>/dev/null && magick "$dir/s1.xwd" "$dir/s1.png" 2>/dev/null
+    sleep 1.5
+    xwd -root -silent -out "$dir/s2.xwd" 2>/dev/null && magick "$dir/s2.xwd" "$dir/s2.png" 2>/dev/null
+    differ=$(magick compare -metric AE "$dir/s1.png" "$dir/s2.png" null: 2>&1 | grep -o "^[0-9]*")
+    differ=${differ:-0}
+    [ "$mindiff" -eq 0 ] && break
+    [ "$differ" -ge "$mindiff" ] && break
+    attempt=$((attempt + 1))
+    [ "$attempt" -ge 3 ] && break
+    note "$tag: the two shots differ by $differ, under the $mindiff this client owes; retrying the pair ($attempt/3)"
+  done
+  echo "$differ" >"$dir/differ"
+  echo "$mindiff" >"$dir/mindiff"
+  fi
 
   wait "$cli" 2>/dev/null
   echo $? >"$dir/cli.rc"
@@ -211,8 +358,15 @@ bbox() {
 # window: the milestone
 # ---------------------------------------------------------------------------
 
+# check_common <tag> <transport> [min-frames-presented]
+#
+# `min-frames-presented` is the client's own floor, not one number for both
+# clients. It used to be 2 for everything, which is `weston-terminal`'s
+# *structural* count — it draws once at map and once on the configure — and is
+# therefore no bound at all on `weston-presentation-shm`, which presented 784.
+# A window frozen after two frames passed the old check happily.
 check_common() {
-  local tag=$1 transport=$2 dir="$RUNDIR/$1"
+  local tag=$1 transport=$2 minframes=${3:-2} dir="$RUNDIR/$1"
   local srv="$dir/srv.log" px="$dir/proxy.log"
 
   if [ -f "$dir/why" ]; then
@@ -233,10 +387,10 @@ check_common() {
   local presents
   presents=$(grep -o "([0-9]* frames presented)" "$srv" | grep -o "[0-9]*" | tail -1)
   presents=${presents:-0}
-  if [ "$presents" -ge 2 ]; then
-    ok "$tag: $presents frames of the client's pixels reached the window"
+  if [ "$presents" -ge "$minframes" ]; then
+    ok "$tag: $presents frames of the client's pixels reached the window (owed $minframes)"
   else
-    bad "$tag: only $presents frame(s) presented"
+    bad "$tag: only $presents frame(s) presented, against the $minframes this client owes"
   fi
 
   # *What crossed*, from the compositor's own count of what it opened. This is
@@ -278,12 +432,39 @@ check_common() {
   # So what is asserted now is that every descriptor handed to the client was
   # manufactured rather than relayed — which is exactly what a failure to open
   # the name would report, and is checked by its absence.
-  local fds
+  #
+  # **CHANGED IN §31.** The check above was `case "$fds" in "") bad;; *) ok;;`,
+  # which is to say: the two numbers were printed and the only thing asserted
+  # was that the line existed. Both of them mean something.
+  #
+  #  * `in` is descriptors the *client* sent over `SCM_RIGHTS`. It must be at
+  #    least one, because a `wl_shm` client cannot make a pool without sending
+  #    the memfd — and if it were zero the whole premise of this harness, that a
+  #    stock libwayland client's ancillary data is being handled, would be
+  #    untested while the run still passed. Measured: 2 for `weston-terminal`
+  #    (two pools) and 1 for `weston-presentation-shm`.
+  #  * `out` is descriptors this side *manufactured* by opening a name the
+  #    compositor sent — one `wl_keyboard.keymap` per seat bind. Measured: 1 for
+  #    `weston-terminal`, 0 for `weston-presentation-shm`, which binds no seat.
+  #    What matters is that it does not scale with anything: 784 frames
+  #    presented against 0 fds out is the shape of "manufactured, not relayed".
+  #    The bound is 4 rather than 1 so that a second seat or a keymap reload is
+  #    not a failure, and it is 4 rather than unbounded so that a per-commit
+  #    descriptor would be.
+  local fds fds_in fds_out
   fds=$(grep -o "[0-9]* fds in, [0-9]* out" "$px" | tail -1)
-  case "$fds" in
-    "") bad "$tag: the proxy reported no descriptor counts" ;;
-    *)  ok "$tag: descriptors in from the client, out only ones made here from a name ($fds)" ;;
-  esac
+  fds_in=$(echo "$fds" | grep -o "^[0-9]*")
+  fds_out=$(echo "$fds" | grep -o "[0-9]* out$" | grep -o "^[0-9]*")
+  if [ -z "$fds" ]; then
+    bad "$tag: the proxy reported no descriptor counts"
+  else
+    [ "${fds_in:-0}" -ge 1 ] \
+      && ok "$tag: the client sent $fds_in descriptor(s) over SCM_RIGHTS, so the ancillary path really ran" \
+      || bad "$tag: the client sent no descriptors at all, so this run proves nothing about ancillary data"
+    [ "${fds_out:-0}" -le 4 ] \
+      && ok "$tag: $fds_out descriptor(s) out, each made here from a name -- not proportional to $presents frames" \
+      || bad "$tag: $fds_out descriptors handed to the client; that is too many to be keymaps and looks relayed"
+  fi
   if grep -q "cannot open" "$px"; then
     bad "$tag: the compositor named something this side could not open"
     grep "cannot open" "$px" | sed 's/^/        /' | head -3
@@ -292,25 +473,54 @@ check_common() {
   fi
 
   # Two shots of a live window. `weston-terminal` is static by design and
-  # `weston-presentation-shm` animates, so only the second can carry this — the
-  # same asymmetry docs/design.md §8.9 records for the Linux harness.
-  local differ=""
+  # `weston-presentation-shm` animates, so only the second can carry a live-ness
+  # claim — the same asymmetry docs/design.md §8.9 records for the Linux
+  # harness.
+  #
+  # **CHANGED IN §31, twice over.**
+  #
+  # The old line was `ok "two screenshots ... differing by $differ pixels"`,
+  # fired unconditionally. It passed at 0 pixels and it would have passed at any
+  # other number: the screenshot pair was a picture taken for a human, in a
+  # harness that runs headless. Two things are asserted in its place.
+  #
+  #  * **The screenshot has a window in it.** An Xvfb root with nothing on it is
+  #    one colour; these are 336 (`weston-terminal`) and 120
+  #    (`weston-presentation-shm`) distinct colours. A run where Wine drew
+  #    nothing, or where the desktop came up empty, produced a screenshot the
+  #    old check accepted and this one does not. Nothing else here looked at the
+  #    *screen* — the frame dumps are the compositor's own view, from inside.
+  #  * **The difference between the two, but only where there is a claim to
+  #    make.** For a client that animates it is a bound with a bounded retry
+  #    behind it (see `run_one`); for a static client it is informational and
+  #    labelled as such, because "0 pixels changed" is the correct answer for
+  #    `weston-terminal` and asserting on it either way would be inventing a
+  #    claim to have one.
+  local differ mindiff colours
+  differ=$(cat "$dir/differ" 2>/dev/null || echo 0)
+  mindiff=$(cat "$dir/mindiff" 2>/dev/null || echo 0)
   if [ -f "$dir/s1.png" ] && [ -f "$dir/s2.png" ]; then
-    differ=$(magick compare -metric AE "$dir/s1.png" "$dir/s2.png" null: 2>&1 | grep -o "^[0-9]*")
-    ok "$tag: two screenshots 1.5 s apart, differing by ${differ:-0} pixels"
+    colours=$(magick identify -format "%k" "$dir/s1.png" 2>/dev/null)
+    [ "${colours:-0}" -ge 16 ] \
+      && ok "$tag: the screenshot has a window in it -- ${colours} distinct colours, against 1 for a bare root" \
+      || bad "$tag: the screenshot has only ${colours:-0} distinct colours; the desktop looks empty"
+    if [ "$mindiff" -gt 0 ]; then
+      [ "$differ" -ge "$mindiff" ] \
+        && ok "$tag: the window is live -- $differ pixels changed between the two shots (owed $mindiff)" \
+        || bad "$tag: only $differ pixels changed across three tries; the window may be showing one frozen frame"
+    else
+      note "$tag: two screenshots 1.5 s apart differ by $differ pixels (informational: this client is static)"
+    fi
   else
     bad "$tag: no screenshot was captured"
   fi
-  echo "${differ:-0}" >"$dir/differ"
   return 0
 }
 
 run_window() {
   echo "== the milestone: an unmodified third-party client, in a Windows window =="
-  for exe in wc-compositor.exe; do
-    [ -f "$WIN_BIN/$exe" ] || { bad "no $WIN_BIN/$exe -- cargo build --target x86_64-pc-windows-gnu first"; return; }
-  done
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy -- cargo build first"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build --workspace --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH -- required, see the header"; return; }
   command -v magick >/dev/null || { bad "imagemagick not on PATH -- required"; return; }
@@ -324,8 +534,13 @@ run_window() {
   # shaped the whole deferral design (see `Session::flush_deferred`).
   if command -v weston-terminal >/dev/null; then
     echo "  -- weston-terminal / shared-file --"
+    # 2 frames: `weston-terminal` paints when it is mapped and when it is
+    # configured, and then stops. Measured at 2, 2 and 5 across runs, so 2 is
+    # its floor rather than its value — a count, not a rate, which is why it
+    # survives a loaded machine, and why it is no bound at all for the client
+    # below.
     run_one term weston-terminal shared-file damage 8
-    if check_common term shared-file; then
+    if check_common term shared-file 2; then
       local srv="$RUNDIR/term/srv.log"
       grep -q 'title -> "Wayland Terminal"' "$srv" \
         && ok "term: the client's own title reached the Windows caption" \
@@ -409,9 +624,27 @@ run_window() {
       else
         bad "term: no frame was dumped"
       fi
-      [ "$(cat "$RUNDIR/term/cli.rc")" = 0 ] \
-        && ok "term: the client exited 0" \
-        || note "term: the client exited $(cat "$RUNDIR/term/cli.rc") (124 = killed by timeout)"
+      # **§32, and this one was found by the merge rather than by the audit.**
+      #
+      # This was `ok` on 0 and `note` on anything else, so it could not fail —
+      # and on the merged tree it took the `note` arm (124, the timeout) and the
+      # scoreboard went from 54 to 53 with nothing reported. A check whose
+      # failing arm is informational does not merely fail to catch things; it
+      # *moves the total silently*, which is worse, because the total is what a
+      # person compares between runs.
+      #
+      # 0 and 124 are both correct. `weston-terminal` runs until something stops
+      # it, so `timeout` killing it is the ordinary ending, and which of the two
+      # happens depends on whether the compositor's own `--timeout` closed the
+      # connection first. Anything else — a segfault at 139, a protocol error at
+      # 1 — is the client dying on us, which is exactly what this line was
+      # supposed to notice and could not.
+      local rc
+      rc=$(cat "$RUNDIR/term/cli.rc")
+      case "$rc" in
+        0|124) ok "term: the client exited $rc (0 = clean, 124 = outlived the harness's timeout)" ;;
+        *)     bad "term: the client exited $rc -- neither a clean exit nor the timeout; it died" ;;
+      esac
     fi
   else
     note "SKIP weston-terminal (not installed)"
@@ -425,14 +658,14 @@ run_window() {
   # deployment uses and it must carry the same client.
   if command -v weston-presentation-shm >/dev/null; then
     echo "  -- weston-presentation-shm / arena --"
-    run_one pres weston-presentation-shm arena damage 8
-    if check_common pres arena; then
-      local differ
-      differ=$(cat "$RUNDIR/pres/differ")
-      [ "${differ:-0}" -ge 500 ] \
-        && ok "pres: the window is live -- $differ pixels changed between the two shots" \
-        || bad "pres: only $differ pixels changed; the window may be showing one frozen frame"
-
+    # 30 frames, and 500 pixels of screenshot difference. Measured: 784 frames
+    # and 24,864 pixels in an 8-second run, so both floors are more than an
+    # order of magnitude clear of the truth and more than an order of magnitude
+    # above the frozen case. The live-ness bound moved into `check_common` with
+    # `run_one`'s bounded retry behind it: two shots can land inside one frame
+    # on a loaded machine, and that is the load, not the code.
+    run_one pres weston-presentation-shm arena damage 8 500
+    if check_common pres arena 30; then
       # Stage 3's kind of measurement, on a client that is not ours.
       #
       # Pure red, green and blue must all be on the captured screen: the wheel
@@ -502,7 +735,7 @@ run_window() {
   if command -v weston-terminal >/dev/null; then
     echo "  -- weston-terminal / arena (the cross-check) --"
     run_one term-arena weston-terminal arena damage 8
-    check_common term-arena arena
+    check_common term-arena arena 2
   fi
 
   stop=0
@@ -514,31 +747,99 @@ run_window() {
 
 run_cost() {
   echo "== what a commit costs, per copy scope and per transport =="
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  # The cost table is the number this harness is trusted for, so it is the last
+  # place that may be computed from a binary older than the tree. See `fresh`.
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || return
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build --workspace --target x86_64-pc-windows-gnu" || return
   command -v weston-presentation-shm >/dev/null \
     || { note "SKIP (weston-presentation-shm not installed)"; return; }
   start_x 94 || { bad "could not start Xvfb"; return; }
 
-  printf "  %-12s %-6s %8s %10s %12s %10s\n" transport scope commits copies "MiB copied" "us/copy"
+  # The client's own buffer, in KiB: `weston-presentation-shm` draws a 250x250
+  # wheel at 4 bytes a pixel, which is 244.14 KiB and is asserted to be 250x250
+  # by the window leg above. **No copy scope may ever move more than one extent
+  # per copy**, because every scope is defined as copying a *subset* of a
+  # buffer — except `pool`, whose subset is the whole pool and whose ceiling is
+  # therefore the pool size, checked as the top of the hierarchy below instead.
+  #
+  # This is the number the 51x regression violated by 55x: 13 MiB per copy of a
+  # 244 KiB buffer. It is an absolute, so unlike a comparison between two runs
+  # it cannot be defeated by the two runs seeing different amounts of load.
+  local extent_kib=244 extent_ceiling=250
+
+  printf "  %-12s %-6s %8s %10s %12s %10s %10s\n" \
+    transport scope commits copies "MiB copied" "KiB/copy" "us/copy"
   for transport in shared-file arena; do
     for scope in pool buffer damage; do
       local tag="cost-$transport-$scope"
-      run_one "$tag" weston-presentation-shm "$transport" "$scope" 6 || continue
+      run_one "$tag" weston-presentation-shm "$transport" "$scope" 6 0 0 || continue
       local line
       line=$(grep -o "[0-9]* commits, [0-9]* copies, [0-9.]* MiB in [0-9.]* ms" "$RUNDIR/$tag/proxy.log" | tail -1)
-      local us
+      local us kib
       us=$(grep -o "[0-9]* us per copy" "$RUNDIR/$tag/proxy.log" | tail -1 | grep -o "^[0-9]*")
+      kib=$(grep -o "[0-9.]* KiB and" "$RUNDIR/$tag/proxy.log" | tail -1 | grep -o "^[0-9.]*")
       set -- $line
-      printf "  %-12s %-6s %8s %10s %12s %10s\n" "$transport" "$scope" "$1" "$3" "$5" "${us:-n/a}"
-      echo "$transport $scope $line ${us:-0}us" >>"$RUNDIR/cost.txt"
+      printf "  %-12s %-6s %8s %10s %12s %10s %10s\n" \
+        "$transport" "$scope" "$1" "$3" "$5" "${kib:-n/a}" "${us:-n/a}"
+      echo "$transport $scope $line ${us:-0}us ${kib:-0}kib" >>"$RUNDIR/cost.txt"
     done
   done
-  stop_x_note=1
-  if [ -s "$RUNDIR/cost.txt" ]; then
-    ok "six configurations measured; the table is above"
+
+  # **The row count, not "is the file non-empty".** The old check said "six
+  # configurations measured" whenever `cost.txt` had a single byte in it, so a
+  # run where five of the six legs died printed the word "six" and passed. A
+  # message that states a number the check does not verify is the same defect as
+  # a number nobody asserts on, one level up.
+  local rows
+  rows=$(wc -l <"$RUNDIR/cost.txt" 2>/dev/null || echo 0)
+  if [ "$rows" -eq 6 ]; then
+    ok "all six configurations produced a measurement"
   else
-    bad "no configuration produced a measurement"
+    bad "$rows of 6 configurations produced a measurement; the table above is incomplete"
   fi
+
+  # Per row: the shape of the run, and the cost of a copy.
+  #
+  # `commits >= 50` is a floor on *meaningfulness* rather than on speed — 620 to
+  # 736 were measured for a 6-second run, so 50 is more than ten times clear of
+  # the truth, and its job is only to stop a ratio being computed over three
+  # commits of noise.
+  #
+  # `copies <= 2 x commits` is the 51x regression stated as what it actually
+  # was: a buffer copied 55 times where it should have been copied once. Every
+  # scope copies at most once per commit by construction, and 698/699, 725/726,
+  # 735/736 were measured — one copy per commit, less the commit that attaches
+  # nothing. Twice that is 27x below the regression and cannot be reached by any
+  # amount of load.
+  # `<transport> <scope> <N> commits, <M> copies, <X> MiB in <Y> ms <U>us <K>kib`
+  local t s commits copies kibper
+  while read -r t s commits _ copies _ _ _ _ _ _ _ kibper; do
+    kibper=${kibper%kib}
+    local why=""
+    [ "$commits" -lt 50 ] && why="only $commits commits in 6 s -- too few to measure over"
+    if [ -z "$why" ] && [ "$copies" -gt $((commits * 2)) ]; then
+      why="$copies copies for $commits commits -- a buffer is being copied more than once per commit"
+    fi
+    if [ -z "$why" ] && [ "$s" != pool ] \
+       && awk -v k="$kibper" -v c="$extent_ceiling" 'BEGIN { exit !(k > c) }'; then
+      why="$kibper KiB per copy of a ${extent_kib} KiB buffer -- a scope that copies part of a buffer moved more than all of it"
+    fi
+    if [ -z "$why" ]; then
+      ok "$t/$s: $commits commits, $copies copies, $kibper KiB per copy -- once per commit, never more than the extent"
+    else
+      bad "$t/$s: $why"
+    fi
+  done <"$RUNDIR/cost.txt"
+
+  # Microseconds per copy is the one number here that is **informational, and
+  # deliberately so**. It is a rate measured on a machine running Xvfb, Wine, a
+  # Windows compositor, a client and this script at once; the same tree produced
+  # 37 us and 103 us for the same 244 KiB copy in a single run of this file. A
+  # bound loose enough to survive that would not catch anything, and a tight one
+  # would fail on load. Bytes are a property of the code and are what the gate
+  # above is built on; time is a property of the machine and is printed for a
+  # person looking at a specific run.
+  note "us/copy above is informational: it is a rate on a loaded machine, and the assertions are on bytes"
 
   # **The table is now checked and not only printed**, and that is §27's
   # doing. `--copy damage` is the scope the guest runs; `--copy buffer` copies
@@ -553,25 +854,52 @@ run_cost() {
   # A measurement nothing asserts on is a measurement that has stopped being a
   # test, which is the same lesson §14.9 drew about comments.
   #
-  # 1.5x rather than 1.0x: the two scopes copy the same pixels here but not the
-  # same *bytes* — `copy_damage` skips the padding between rows when a rectangle
-  # is not full-width, and the commit counts differ run to run because the
-  # client is timed rather than counted. The bound is loose enough never to be
-  # noise and tight enough that the regression above fails it by 34x.
-  local per_scope
+  # **CHANGED AGAIN IN §31: per commit, and the whole hierarchy.**
+  #
+  # The §27 check compared the two runs' raw MiB totals. That is a ratio between
+  # two separately-timed runs, and the client is timed rather than counted — so
+  # the divisor was itself load-dependent, and the 1.5x ceiling had to be loose
+  # enough to absorb that. Dividing by each run's own commit count cancels the
+  # load out: 175.24/736 against 172.85/726 is 1.0002x where the raw totals gave
+  # 1.01x, and the ceiling can come down to 1.25x without becoming noise. A gate
+  # that is load-independent can afford to be tight, which is the whole reason
+  # to make it load-independent.
+  #
+  # Not 1.0x: the two scopes copy the same pixels here but not the same *bytes*
+  # — `copy_damage` skips the padding between rows when a rectangle is not
+  # full-width.
+  #
+  # And the rest of the hierarchy, which nothing checked: `pool` copies the
+  # entire pool every commit and is therefore the ceiling for every other scope
+  # by definition. Measured at 14.3 MiB a commit against 0.238 for the other
+  # two, a 60x gap — so the assertion has enormous margin, and its job is to
+  # catch a `pool` scope that has quietly stopped copying the pool, which would
+  # otherwise look like an improvement.
+  per_commit() {
+    awk -v t="$1" -v s="$2" '$1==t && $2==s { printf "%.6f", $7 / ($3 > 0 ? $3 : 1) }' "$RUNDIR/cost.txt"
+  }
+  local ratio
   for transport in shared-file arena; do
-    local mib_buffer mib_damage
-    mib_buffer=$(awk -v t="$transport" '$1==t && $2=="buffer" {print $7}' "$RUNDIR/cost.txt")
-    mib_damage=$(awk -v t="$transport" '$1==t && $2=="damage" {print $7}' "$RUNDIR/cost.txt")
-    if [ -z "$mib_buffer" ] || [ -z "$mib_damage" ]; then
-      note "$transport: no buffer/damage pair to compare"
+    local pc_pool pc_buffer pc_damage
+    pc_pool=$(per_commit "$transport" pool)
+    pc_buffer=$(per_commit "$transport" buffer)
+    pc_damage=$(per_commit "$transport" damage)
+    if [ -z "$pc_buffer" ] || [ -z "$pc_damage" ]; then
+      bad "$transport: no buffer/damage pair to compare -- the cost gate did not run for this transport"
       continue
     fi
-    per_scope=$(awk -v d="$mib_damage" -v b="$mib_buffer" 'BEGIN { printf "%.2f", (b > 0 ? d / b : 999) }')
-    if awk -v r="$per_scope" 'BEGIN { exit !(r <= 1.5) }'; then
-      ok "$transport: damage copied ${mib_damage} MiB against buffer's ${mib_buffer} (${per_scope}x) -- the subset is not more expensive than the whole"
+    ratio=$(awk -v d="$pc_damage" -v b="$pc_buffer" 'BEGIN { printf "%.3f", (b > 0 ? d / b : 999) }')
+    if awk -v r="$ratio" 'BEGIN { exit !(r <= 1.25) }'; then
+      ok "$transport: damage costs ${ratio}x buffer per commit -- the subset is not more expensive than the whole"
     else
-      bad "$transport: damage copied ${mib_damage} MiB against buffer's ${mib_buffer} (${per_scope}x); a scope that copies part of a buffer must not cost more than copying all of it"
+      bad "$transport: damage costs ${ratio}x buffer per commit ($pc_damage vs $pc_buffer MiB); a scope that copies part of a buffer must not cost more than copying all of it"
+    fi
+    if [ -z "$pc_pool" ]; then
+      bad "$transport: no pool measurement, so the top of the scope hierarchy is unchecked"
+    elif awk -v p="$pc_pool" -v b="$pc_buffer" 'BEGIN { exit !(p >= b) }'; then
+      ok "$transport: pool costs $pc_pool MiB a commit against buffer's $pc_buffer -- the whole pool is still the ceiling"
+    else
+      bad "$transport: pool costs $pc_pool MiB a commit, less than buffer's $pc_buffer; pool has stopped copying the pool"
     fi
   done
 }

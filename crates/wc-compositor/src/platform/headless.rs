@@ -2,7 +2,7 @@
 //!
 //! # Why this exists at all, when the point of the project is Windows
 //!
-//! Because of docs/design.md §7.5, which is the most expensive fact stage 2
+//! Because of docs/waycompose-design.md §7.5, which is the most expensive fact stage 2
 //! established: **a stock libwayland client cannot send a buffer to the Windows
 //! build.** An `h` argument travels out-of-band by `SCM_RIGHTS` on Unix and
 //! in-band as a descriptor on Windows (§2.3), Wine's AF_UNIX carries no
@@ -192,7 +192,7 @@ pub(crate) struct PumpInner {
     /// window, which in a browser is the middle of a web page and opens
     /// nothing. There is no window manager on this platform and no `SendInput`,
     /// so without a way to say *where*, the popup path can only be exercised
-    /// under Wine — and Wine is a hypothesis (docs/design.md §4.4).
+    /// under Wine — and Wine is a hypothesis (docs/waycompose-design.md §4.4).
     ///
     /// Deliberately a single click rather than a scripting language: the
     /// question is whether one press at a known point produces an `xdg_popup`
@@ -217,6 +217,10 @@ pub struct Click {
 struct Headless {
     title: String,
     app_id: String,
+    /// The taskbar identity this window would be given on Windows. ADDED FOR
+    /// STAGE 32; kept so that a second `AppId` for the same one is not
+    /// announced twice.
+    aumid: String,
     shadow: Arc<Mutex<Shadow>>,
     mapped: bool,
     /// Surface size, as reported at `Map`. The *client area* size is this run
@@ -347,6 +351,7 @@ impl PumpInner {
                 id,
                 title,
                 app_id,
+                aumid,
                 shadow,
                 kind,
             } => {
@@ -362,11 +367,17 @@ impl PumpInner {
                          parent={parent} at {x},{y}"
                     ),
                 }
+                // ADDED FOR STAGE 32. There is no taskbar here either, so the
+                // identity is *said* — which is enough for a Linux-side test to
+                // assert that two clients got two of them and that two windows
+                // of one client did not.
+                println!("wc-compositor: window {id} taskbar identity -> {aumid:?}");
                 windows.insert(
                     id,
                     Headless {
                         title,
                         app_id,
+                        aumid,
                         shadow,
                         mapped: false,
                         surface: (0, 0),
@@ -390,9 +401,15 @@ impl PumpInner {
                     w.title = title;
                 }
             }
-            ToUi::AppId { id, app_id } => {
+            ToUi::AppId { id, app_id, aumid } => {
                 if let Some(w) = windows.get_mut(&id) {
                     println!("wc-compositor: window {id} app_id -> {app_id:?}");
+                    if w.aumid != aumid {
+                        println!(
+                            "wc-compositor: window {id} taskbar identity -> {aumid:?}"
+                        );
+                        w.aumid = aumid;
+                    }
                     w.app_id = app_id;
                 }
             }
@@ -752,7 +769,7 @@ impl PumpInner {
     ///
     /// # Why this is worth having when the whole point is Win32
     ///
-    /// Because of docs/design.md §8.5's split, which stage 6 inherits in a
+    /// Because of docs/waycompose-design.md §8.5's split, which stage 6 inherits in a
     /// sharper form than stage 3 had it. On Windows the only clients that can
     /// reach the compositor are ours or come through the proxy; on Linux any
     /// Weston client connects directly. `weston-eventdemo` **prints every input

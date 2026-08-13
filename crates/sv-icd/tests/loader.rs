@@ -16,7 +16,11 @@
 //!   debug-only.
 //!
 //! The loader is `dlopen`ed rather than linked, so the test skips cleanly on a
-//! machine that has no `libvulkan.so.1` instead of failing to build.
+//! machine that has no `libvulkan.so.1` instead of failing to build. It also
+//! builds the `cdylib` it drives if `cargo test` has not — see
+//! [`ensure_driver_artefact`], which is the difference between this file
+//! reporting a defect and reporting the order cargo happened to build things
+//! in.
 //!
 //! Everything below uses `sv_icd_entry`'s C ABI types, which is a second thing
 //! this test checks by construction: if those layouts were wrong, the loader
@@ -38,6 +42,80 @@ use core::ffi::{c_char, c_void};
 use sv_icd_entry::*;
 
 // ---------------------------------------------------------------------------
+// the driver artefact, which `cargo test` does not build on its own
+// ---------------------------------------------------------------------------
+
+/// Make sure the `cdylib` the manifest names actually exists, building it if it
+/// does not, and say why if it still does not.
+///
+/// # The gate this replaces reported the wrong thing
+///
+/// `sv-icd` is `crate-type = ["cdylib", "rlib"]`. An integration test links the
+/// `rlib`, so `cargo test` builds *only* the `rlib`: nothing in the test's
+/// dependency graph needs the `cdylib`, and cargo builds what is needed. On a
+/// freshly cloned tree the manifest therefore names a `libsv_icd.so` that has
+/// never been produced, the loader skips a driver whose `library_path` does not
+/// resolve without logging anything, and `vkCreateInstance` returns
+/// `VK_ERROR_INCOMPATIBLE_DRIVER` (-9).
+///
+/// That is a fact about build ordering, not about the code — and it was worse
+/// than a false red, because a test binary that *fails* stops `cargo test
+/// --workspace` where it stands. The run reported 166 tests instead of 1207,
+/// and twice an agent nearly published the truncated number as a baseline.
+/// Cargo has no stable way to say "this test depends on that `cdylib`"
+/// (artifact dependencies are still unstable), so the test arranges it itself.
+///
+/// `env!("CARGO")` is the cargo that compiled this file, so the nested build
+/// uses the same toolchain rather than whatever is first on `PATH`. If it
+/// cannot be run — no cargo, a read-only target directory, a custom profile
+/// whose artefacts land somewhere this file cannot predict — the test *skips*
+/// with the reason printed. Set `SV_ICD_REQUIRE_LOADER=1` to turn that skip
+/// into a failure, which is what a release gate should do: a check that can
+/// only ever skip is not a check.
+fn ensure_driver_artefact() -> Result<(), String> {
+    let lib = std::path::Path::new(sv_icd::LIBRARY_PATH);
+    if lib.exists() {
+        return Ok(());
+    }
+
+    let mut cmd = std::process::Command::new(env!("CARGO"));
+    cmd.arg("build")
+        .arg("--offline")
+        .arg("--lib")
+        .arg("--manifest-path")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    if sv_icd::PROFILE == "release" {
+        cmd.arg("--release");
+    }
+    let attempt = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return Err(format!("could not run {}: {e}", env!("CARGO"))),
+    };
+    if lib.exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} does not exist and `cargo build --lib` did not produce it{}\n{}",
+        sv_icd::LIBRARY_PATH,
+        if attempt.status.success() { " either" } else { "; the build failed" },
+        String::from_utf8_lossy(&attempt.stderr).trim_end(),
+    ))
+}
+
+/// Report a reason this test cannot run, and decide whether that is fatal.
+///
+/// Skipping is the default because the two reasons — no `libvulkan.so.1`, no
+/// buildable `cdylib` — are both properties of the machine rather than of the
+/// code. `SV_ICD_REQUIRE_LOADER=1` makes them fatal for anyone who wants to
+/// know that this gate actually ran.
+fn skip(reason: &str) {
+    if std::env::var_os("SV_ICD_REQUIRE_LOADER").is_some_and(|v| v != "0") {
+        panic!("SV_ICD_REQUIRE_LOADER is set and the loader test cannot run: {reason}");
+    }
+    eprintln!("SKIP: the real-loader test cannot run: {reason}");
+}
+
+// ---------------------------------------------------------------------------
 // the loader, opened by hand
 // ---------------------------------------------------------------------------
 
@@ -49,6 +127,14 @@ struct Loader {
 
 impl Loader {
     fn open() -> Option<Loader> {
+        // Before anything else: the driver the manifest names has to exist. A
+        // missing `cdylib` and a broken one both come back from the loader as
+        // `VK_ERROR_INCOMPATIBLE_DRIVER`, and only one of them is a defect.
+        if let Err(why) = ensure_driver_artefact() {
+            skip(&why);
+            return None;
+        }
+
         // The manifest must be visible before the loader scans for drivers, and
         // the loader scans once per `vkCreateInstance`, so setting it here is in
         // time. `VK_DRIVER_FILES` rather than the deprecated
@@ -83,6 +169,7 @@ impl Loader {
                 get_instance_proc_addr: unsafe { std::mem::transmute(sym) },
             });
         }
+        skip("no libvulkan.so.1 on this machine");
         None
     }
 
@@ -116,10 +203,7 @@ fn check(r: VkResult, what: &str) {
 
 #[test]
 fn a_trivial_application_gets_through_the_real_loader() {
-    let Some(loader) = Loader::open() else {
-        eprintln!("no libvulkan.so.1 on this machine — skipping the loader test");
-        return;
-    };
+    let Some(loader) = Loader::open() else { return };
 
     // -- vkCreateInstance ---------------------------------------------------
     type PfnCreateInstance = unsafe extern "system" fn(

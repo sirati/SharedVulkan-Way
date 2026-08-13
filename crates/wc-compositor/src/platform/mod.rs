@@ -6,7 +6,7 @@
 //! created it, and the pump is a blocking `GetMessage` loop. The Wayland side
 //! is a `poll`-shaped dispatch loop that on Windows cannot be nested inside
 //! `calloop`, because `Backend::poll_fd()` returns a wepoll handle and a wepoll
-//! handle is not a socket (docs/design.md §3.3). Two blocking loops, neither of
+//! handle is not a socket (docs/waycompose-design.md §3.3). Two blocking loops, neither of
 //! which can host the other, is two threads; that was settled in stage 1 and
 //! this stage is where it has to be built.
 //!
@@ -172,7 +172,7 @@ pub enum Edge {
 ///
 /// Stage 11 is where something started sending it: `xdg-toplevel-icon-v1` from
 /// a client that implements it, or `wc_icon_manager_v1` from a resolver on the
-/// Linux side for one that does not (docs/design.md §15).
+/// Linux side for one that does not (docs/waycompose-design.md §15).
 #[derive(Clone, Debug)]
 pub struct IconImage {
     pub width: i32,
@@ -183,7 +183,7 @@ pub struct IconImage {
 
 /// What the pointer should look like.
 ///
-/// ADDED FOR STAGE 12 (docs/design.md §23). One message for both halves of the
+/// ADDED FOR STAGE 12 (docs/waycompose-design.md §23). One message for both halves of the
 /// protocol, because Win32 has one mechanism: `wl_pointer.set_cursor` sends a
 /// surface and `wp_cursor_shape_v1.set_shape` sends a name, and both end as a
 /// single `SetCursor` with a single `HCURSOR`.
@@ -247,16 +247,36 @@ pub enum ToUi {
         id: WindowId,
         title: String,
         app_id: String,
+        /// Which taskbar button this window belongs on. ADDED FOR STAGE 32;
+        /// see [`ToUi::AppId`] and `crate::taskbar`.
+        aumid: String,
         shadow: Arc<Mutex<Shadow>>,
         kind: WindowKind,
     },
     /// `xdg_toplevel.set_title`.
     Title { id: WindowId, title: String },
-    /// `xdg_toplevel.set_app_id`. Not used for anything on the platform side;
-    /// recorded so the window knows what it is, and so the Wayland side can
-    /// match it against an icon somebody published for that app id
-    /// (`crate::icon`).
-    AppId { id: WindowId, app_id: String },
+    /// `xdg_toplevel.set_app_id`, and what the platform is to do about it.
+    ///
+    /// The app id itself is recorded so the window knows what it is; the
+    /// **`aumid`** is `crate::taskbar::identity` of it, and it is what the
+    /// Windows shell groups taskbar buttons by. ADDED FOR STAGE 32, which is
+    /// where this message stopped being informational: before it, every window
+    /// this process made shared one button, because a window with no identity
+    /// of its own inherits the *process*'s.
+    ///
+    /// The two are carried together rather than one being derived from the
+    /// other at this end, because the derivation needs something the platform
+    /// does not have — which connection a nameless client arrived on.
+    ///
+    /// **Ordering matters.** The shell reads the property when the button is
+    /// created, which is at `ShowWindow`, so this has to reach a window before
+    /// [`ToUi::Map`] does. `set_app_id` may arrive later than that anyway, and
+    /// then the button already exists; see `win32::set_taskbar_identity`.
+    AppId {
+        id: WindowId,
+        app_id: String,
+        aumid: String,
+    },
     /// Set the window and taskbar icon.
     ///
     /// **A set of sizes, not an image.** Windows asks for two — `ICON_SMALL`

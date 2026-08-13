@@ -1,7 +1,7 @@
 //! The host half of a guest-RAM arena: take the plan `wc-arena-host` produced
 //! and turn it into one contiguous, writable view of the guest's memory.
 //!
-//! STAGE 7. docs/design.md §10.13 item 1 in one module, and it is deliberately
+//! STAGE 7. docs/waycompose-design.md §10.13 item 1 in one module, and it is deliberately
 //! the *small* half.
 //!
 //! # What this module is not allowed to contain, and why

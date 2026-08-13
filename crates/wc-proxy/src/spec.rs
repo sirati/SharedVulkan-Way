@@ -3,7 +3,7 @@
 //!
 //! # Why a table at all
 //!
-//! docs/design.md §2.3 records the one thing we escaped that waypipe could not:
+//! docs/waycompose-design.md §2.3 records the one thing we escaped that waypipe could not:
 //!
 //! > "the type is on the wire. This is the cost waypipe could not avoid — it
 //! > needed a full protocol parser because one cannot determine which passed
@@ -75,7 +75,7 @@ pub enum ArgKind {
     NewIdUntyped,
     /// A file descriptor. **Zero bytes of body on Unix**, which is the whole
     /// reason this table has to exist, and an `Array`-shaped descriptor on the
-    /// Windows side of the boundary (docs/design.md §2.3).
+    /// Windows side of the boundary (docs/waycompose-design.md §2.3).
     Fd,
 }
 
@@ -155,7 +155,7 @@ impl Spec {
         // would cost: copy a file, add a line.
         //
         // Both decoration protocols, because the compositor advertises both to
-        // find out which one Firefox uses (docs/design.md §13.7) and a global
+        // find out which one Firefox uses (docs/waycompose-design.md §13.7) and a global
         // that is advertised can be bound. The failure without them is not
         // subtle and is not silent — the proxy refuses the connection with
         // `org_kde_kwin_server_decoration_manager has no message 0` — which is
@@ -183,7 +183,7 @@ impl Spec {
         spec.load(include_str!("../protocols/idle-inhibit-unstable-v1.xml"))?;
         spec.load(include_str!("../protocols/xdg-activation-v1.xml"))?;
         spec.load(include_str!("../protocols/keyboard-shortcuts-inhibit-unstable-v1.xml"))?;
-        // ADDED FOR STAGE 12 (docs/design.md §23). `wp_cursor_shape_v1`, so a
+        // ADDED FOR STAGE 12 (docs/waycompose-design.md §23). `wp_cursor_shape_v1`, so a
         // client can say "I-beam" instead of shipping cursor pixels.
         //
         // It is a **staging** protocol and the copy is taken from the same

@@ -3,7 +3,7 @@
 //! # Why this is a trait and not a call to `wl_shm`
 //!
 //! Stage 3 has exactly one source of pixels — `wl_shm`, which on Windows means
-//! a named section object (docs/design.md §2.2) — and a compositor that only
+//! a named section object (docs/waycompose-design.md §2.2) — and a compositor that only
 //! ever wanted that could call `smithay::wayland::shm::with_buffer_contents`
 //! straight from its `commit` handler in four lines.
 //!
@@ -74,7 +74,7 @@ impl Rect {
 /// whether the fourth byte means anything, and stage 3 ignores it either way —
 /// GDI's `BitBlt` and `SetDIBitsToDevice` treat a 32-bit `BI_RGB` DIB as
 /// opaque. Honouring alpha needs a layered window or `AlphaBlend`, which is a
-/// later stage's problem and is recorded as such in docs/design.md §8.7.
+/// later stage's problem and is recorded as such in docs/waycompose-design.md §8.7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     /// Alpha is meaningful (premultiplied, per the `wl_shm` spec).
@@ -318,7 +318,7 @@ impl Shadow {
     /// channel per pixel and the surfaces that need it are the ones where a
     /// client has told us, through `wl_surface.set_opaque_region`, that it does
     /// not. Firefox's own tree is a transparent GTK shadow surface with one
-    /// opaque rectangular subsurface on top of it (docs/design.md §13.5), for
+    /// opaque rectangular subsurface on top of it (docs/waycompose-design.md §13.5), for
     /// which copy and blend give identical pixels. When something arrives whose
     /// subsurfaces really are translucent — a rounded corner over a background
     /// this compositor drew — the difference will show as a hard edge, and that
@@ -355,7 +355,7 @@ impl Shadow {
 /// # Why this is here rather than in one platform
 ///
 /// It was in `platform/headless.rs` until stage 4, and being there was the
-/// reason docs/design.md §8.5's evidence had to be split: the Linux runs could
+/// reason docs/waycompose-design.md §8.5's evidence had to be split: the Linux runs could
 /// read their pixels back with `identify` and the Wine runs could not, so the
 /// half that produced an `HWND` was also the half whose pixels nobody outside
 /// the process ever measured. A `Shadow` is platform-neutral — it is packed
@@ -416,7 +416,7 @@ pub trait PixelSource {
 /// Pixels in a `wl_shm` pool.
 ///
 /// On Unix that is a `memfd`; on Windows it is a named section opened by name
-/// (docs/design.md §2.2). **Neither fact appears below**, and that is the
+/// (docs/waycompose-design.md §2.2). **Neither fact appears below**, and that is the
 /// point: smithay's `shm` module already hides the difference behind
 /// `with_buffer_contents`, and the port in `vendor/smithay/src/wayland/shm/`
 /// is where the platform lives.

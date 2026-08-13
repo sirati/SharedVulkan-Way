@@ -12,7 +12,7 @@
 //! the opener is a Linux process. [`Handle::create_section`] is exactly wrong
 //! for that: it mints `Local\wc-…`, a name only the NT object manager
 //! understands, which a Linux process can neither open nor spell. That is
-//! docs/design.md §9.10 item 5 — "`wl_keyboard.keymap`: implemented,
+//! docs/waycompose-design.md §9.10 item 5 — "`wl_keyboard.keymap`: implemented,
 //! unexercised" — and the reason it was unexercised is that exercising it would
 //! have failed.
 //!
@@ -27,7 +27,7 @@
 //! through smithay's `SealedFile`, its `KeymapFile`, its `KeyboardHandle`, its
 //! `Seat` and its `SeatState` — a parameter carried through five layers so that
 //! one leaf can spell a path. Every one of those is upstream code we intend to
-//! send patches back to (docs/design.md §5.3), and a five-layer parameter is
+//! send patches back to (docs/waycompose-design.md §5.3), and a five-layer parameter is
 //! not a patch anybody merges.
 //!
 //! It is also honest: like an arena, this is not a per-message fact. It is
