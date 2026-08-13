@@ -54,6 +54,12 @@ struct Args {
     trace: bool,
     accept_timeout: Duration,
     idle_timeout: Duration,
+    /// STAGE 11. Resolve `xdg_toplevel.set_app_id` to icon pixels here, where
+    /// the icon theme is, and publish them to the compositor on a second
+    /// connection (`crate::iconlink`).
+    icons: bool,
+    /// Which icon theme to try before `hicolor`.
+    icon_theme: String,
 }
 
 fn usage() -> &'static str {
@@ -84,6 +90,11 @@ usage: wc-proxy --upstream <path> [options]
   --copy pool|buffer|damage   how much to copy per commit (default damage)
   --trace                log every message in both directions\n  --pool-headroom N      over-allocate each region N-fold so resize fits
                          (default 1)
+
+  --icon-theme NAME      the icon theme to search before hicolor
+                         (default $WC_ICON_THEME, else hicolor)
+  --no-icons             do not resolve app ids to icons at all: no second
+                         connection to the compositor, no directory walk
   --accept-timeout SEC   how long to wait for a client (default 20)
   --timeout SEC          exit after this long with no traffic (default 20)
 "
@@ -109,6 +120,8 @@ fn parse_args() -> Result<Args, String> {
         trace: false,
         accept_timeout: Duration::from_secs(20),
         idle_timeout: Duration::from_secs(20),
+        icons: true,
+        icon_theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -135,6 +148,8 @@ fn parse_args() -> Result<Args, String> {
                 a.scope = CopyScope::parse(&v).ok_or_else(|| format!("--copy {v}?"))?;
             }
             "--trace" => a.trace = true,
+            "--no-icons" => a.icons = false,
+            "--icon-theme" => a.icon_theme = next()?,
             "--pool-headroom" => {
                 a.headroom = next()?.parse().map_err(|e| format!("--pool-headroom: {e}"))?
             }
@@ -291,13 +306,55 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let client = listener.accept_one(args.accept_timeout)?;
     println!("[proxy] client connected");
 
+    // STAGE 11. A second connection, for icons, opened only if it is wanted.
+    // A failure here is logged and shrugged off: this whole feature is
+    // cosmetic, and a compositor that is too old to have the global, or a
+    // socket that will not take a second client, must cost a picture rather
+    // than a window.
+    let mut icons = if args.icons {
+        let search = wc_proxy::icons::Search {
+            data_dirs: wc_proxy::icons::default_data_dirs(),
+            theme: args.icon_theme.clone(),
+        };
+        println!(
+            "[proxy] icons: theme {:?}, data dirs {}",
+            search.theme,
+            search
+                .data_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        );
+        match wc_proxy::iconlink::IconLink::connect(&args.upstream, &spec, search) {
+            Ok(link) => Some(link),
+            Err(e) => {
+                eprintln!("[proxy] icons: no icon feed ({e}); windows will get generic icons");
+                None
+            }
+        }
+    } else {
+        println!("[proxy] icons: --no-icons, so app ids are forwarded and not resolved");
+        None
+    };
+
     let mut session = Session::new(spec, transport, args.scope, args.headroom);
     session.set_trace(args.trace);
     let mut log = |s: &str| println!("[proxy] {s}");
-    let why = proxy::pump(&mut session, client, upstream, args.idle_timeout, &mut log)?;
+    let why = proxy::pump(
+        &mut session,
+        client,
+        upstream,
+        icons.as_mut(),
+        args.idle_timeout,
+        &mut log,
+    )?;
 
     println!("[proxy] stopped: {why}");
     println!("[proxy] transport {}", session.transport_name());
     println!("[proxy] {}", session.stats.summary());
+    if let Some(link) = &icons {
+        println!("[proxy] {}", link.summary());
+    }
     Ok(())
 }

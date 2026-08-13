@@ -133,6 +133,7 @@ pub fn pump(
     session: &mut Session,
     client: UnixStream,
     upstream: UnixStream,
+    icons: Option<&mut crate::iconlink::IconLink>,
     idle_timeout: std::time::Duration,
     log: &mut dyn FnMut(&str),
 ) -> io::Result<&'static str> {
@@ -146,11 +147,20 @@ pub fn pump(
     let mut to_client = Vec::<u8>::new();
     let mut to_client_fds = Vec::<OwnedFd>::new();
     let mut last_traffic = std::time::Instant::now();
+    let mut icons = icons;
 
     loop {
+        // Three descriptors at most, and the third is this program's *own*
+        // connection to the compositor rather than anything a client gave it —
+        // see `iconlink` for why the icon feed cannot ride the first one.
         let mut pollfds = [
             libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: upstream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: icons.as_ref().map_or(-1, |l| l.fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         if !to_server.is_empty() {
             pollfds[1].events |= libc::POLLOUT;
@@ -158,9 +168,14 @@ pub fn pump(
         if !to_client.is_empty() {
             pollfds[0].events |= libc::POLLOUT;
         }
-        // SAFETY: a live array of two `pollfd`s whose length is passed
+        if icons.as_ref().is_some_and(|l| l.wants_write()) {
+            pollfds[2].events |= libc::POLLOUT;
+        }
+        // A negative fd in a `pollfd` is ignored by `poll`, which is how the
+        // no-icons case costs nothing and needs no second loop.
+        // SAFETY: a live array of three `pollfd`s whose length is passed
         // truthfully.
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 20) };
+        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 3, 20) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -187,6 +202,14 @@ pub fn pump(
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("client: {e}")))?;
             for note in session.take_notes() {
                 log(&note);
+            }
+            // The app ids this batch carried, resolved to pixels and published
+            // on the other connection. After the forward, always: an icon is
+            // never worth delaying a client's message by a directory walk.
+            if let Some(link) = icons.as_deref_mut() {
+                for app_id in session.take_app_ids() {
+                    link.note_app_id(&app_id, log);
+                }
             }
         }
 
@@ -248,6 +271,20 @@ pub fn pump(
                     return Ok("the client stopped reading");
                 }
                 Err(e) => return Err(e),
+            }
+        }
+
+        // --- the icon feed ---------------------------------------------------
+        //
+        // Deliberately last, and deliberately not counted as traffic: a run
+        // whose client has gone quiet should still time out, and the icon
+        // connection is chatty exactly once, at the start.
+        if let Some(link) = icons.as_deref_mut() {
+            if pollfds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                link.on_readable(log)?;
+            }
+            if link.wants_write() {
+                link.on_writable()?;
             }
         }
 

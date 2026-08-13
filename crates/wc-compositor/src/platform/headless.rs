@@ -301,15 +301,35 @@ impl PumpInner {
                     w.app_id = app_id;
                 }
             }
-            ToUi::Icon { id, icon } => match icon {
-                Some(i) => println!(
-                    "wc-compositor: window {id} icon -> {}x{} hash={:016x}",
-                    i.width,
-                    i.height,
-                    fnv1a(&i.pixels)
-                ),
-                None => println!("wc-compositor: window {id} icon cleared"),
-            },
+            // There is no taskbar here, so the icon is reported rather than
+            // shown — and the hash is the point: it is how a Linux-side test of
+            // the resolver can assert that the *pixels* that arrived are the
+            // ones the theme holds, without a Windows machine in the loop.
+            ToUi::Icon { id, icons } => {
+                if icons.is_empty() {
+                    println!("wc-compositor: window {id} icon cleared");
+                }
+                for i in &icons {
+                    println!(
+                        "wc-compositor: window {id} icon -> {}x{} hash={:016x}",
+                        i.width,
+                        i.height,
+                        fnv1a(&i.pixels)
+                    );
+                }
+                // Which image each Win32 slot *would* get. The selection is the
+                // one part of the icon path that is arithmetic rather than
+                // Win32, so running it here means the choice is exercised on
+                // the machine that runs the tests rather than only on the guest.
+                for (slot, want) in [("small", 16), ("big", 32)] {
+                    if let Some(i) = crate::icon::best_match(&icons, want) {
+                        println!(
+                            "wc-compositor: window {id} icon {slot} ({want}px) would use {}x{}",
+                            i.width, i.height
+                        );
+                    }
+                }
+            }
             ToUi::Map { id, width, height } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;
