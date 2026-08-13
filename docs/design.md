@@ -7061,7 +7061,8 @@ already uses — rather than a GTK one.
 | `scripts/wc-firefox.sh titlebar` (new) | **9 passed, 0 failed** |
 | `scripts/wc-firefox.sh enumerate` | 13 passed, 0 failed — unchanged |
 | `scripts/wc-firefox.sh window` | 7 passed, 0 failed — unchanged |
-| **`scripts/wc-titlebar.sh both` (new, the guest's interactive desktop)** | **14 passed, 0 failed** — both legs, from this checkout, after both merges |
+| **`scripts/wc-titlebar.sh both` (new, the guest's interactive desktop)** | **14 passed, 0 failed** — both legs, one run, after both merges |
+| the three above, re-run from **master's checkout after the merge** | 160 tests, clippy clean on both targets, `titlebar` 9/9 |
 | `cargo clippy --manifest-path crates/wc-arena-host/Cargo.toml --all-targets` | clean |
 | `scripts/wc-proxy.sh`, `wc-input.sh`, `wc-guest.sh`, `wc-desktop.sh`, `wc-icon.sh` | **not re-run — the guest was contended and none of them touches a decoration** |
 
