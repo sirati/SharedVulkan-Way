@@ -485,6 +485,29 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
 /// 73017 bytes of `de` layout is ten pages of stamps, and ten is exactly what
 /// the sweep was short.
 ///
+/// # What a dedicated outbound region changed, and what it did not
+///
+/// DYNAMIC ARENA. The window now lives in a region of its own rather than on
+/// the tail of the data region, and that **scopes this race without removing
+/// it**. Gifts can only ever overwrite the *outbound* region's stamps, so every
+/// data region is safe by construction — a class of race gone, not merely made
+/// less likely. What is left is one 256 KiB region whose stamps a keymap will
+/// eat, and it still has to be located before that happens.
+///
+/// The deferral is not cheaper for being scoped, because the sweep's cost is a
+/// function of the *host's* RAM and not the region's: §12.5 measured 2.37-2.42 s
+/// against a 13312 MiB backing object whatever was being looked for. A 256 KiB
+/// region takes just as long to find by content as a 768 MiB one.
+///
+/// **What removes the deferral outright is the PFN locator**, which re-locates a
+/// region whose contents have already been overwritten — §0.14 item 4 measured
+/// it returning the same 16384 frames where the content sweep found 0 pages.
+/// With `Locator::Pfns` in use there is no ordering constraint left to defer
+/// against: a gift may land before the locate, because the locate no longer
+/// reads the bytes the gift overwrote. This code stays because the scan is
+/// still the R28 cross-check at attach and still the only locator on a guest
+/// that cannot run the query; it is dead weight on a guest that can.
+///
 /// # Why deferring is the fix rather than re-ordering something
 ///
 /// Every page of a guest-RAM arena has to carry its stamp when the host sweeps,
