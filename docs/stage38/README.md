@@ -9,7 +9,7 @@ of them from the guest's real interactive desktop — a 1280x800 screen with a
 | | file | menu rectangle, in screen coordinates | inside the work area |
 |---|---|---|---|
 | before | `stage38-screen-before.png` | 214x236 at 1213, 688 | no |
-| after | `stage38-screen-after.png` | 214x236 at 1047, 454 | yes |
+| after | `stage38-screen-after.png` | 214x236 at 1024, 474 | yes |
 
 Firefox's context menu, opened by a real right-click 40 pixels in from the
 bottom right corner of the work area. Before, only the first few pixels of
@@ -27,14 +27,14 @@ this was clicked in.
 | | file | Firefox's window | inside the work area |
 |---|---|---|---|
 | before | `stage38-window-before.png`, `spawn-before.txt` | 1296x820 at 26, 26 | no |
-| after | `stage38-window-after.png`, `spawn-after.txt` | 960x543 at 104, 104 | yes |
+| after | `stage38-window-after.png`, `spawn-after.txt` | 1220x752 at 0, 0 | yes |
 
 `PrintWindow` on the window's own `HWND`, so this is the real frame at the real
 DPI. The before window is wider than the screen it is on — its caption buttons
 are cut off at the right edge of the capture — because the compositor was
-advertising a 1920x1080 `wl_output` on a 1280x800 machine. The after window is
-smaller because **Firefox chose that size itself** against an output that is
-now the true work area; nothing clamped it.
+advertising a 1920x1080 `wl_output` on a 1280x800 machine. After, Firefox asks
+for 1220x767 against an output that is now the true work area, and the map-time
+clamp takes off the last 15 pixels; `comp-after.log` has both steps.
 
 ## Reproducing
 

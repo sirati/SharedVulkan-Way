@@ -14451,20 +14451,21 @@ about the stand-in rather than about the compositor.
 
 | | before | after |
 |---|---:|---:|
-| passed | 231 | **278** |
-| failed | 235 | **188** |
+| passed | 232 | **279** |
+| failed | 234 | **187** |
 | skipped | 759 | 759 |
 
 1,225 verdicts joined by test name: **47 moved, every one of them FAIL to
-PASS, and nothing regressed.** The before column is `4a5dfb4`'s, measured by
+PASS, and nothing regressed.** The before column is `a7210e8`'s, measured by
 checking master's `crates/wc-compositor` out over this branch's and building
-again, so the two runs differ in nothing but this change; it is one verdict off
-§26.6's recorded baseline of 230/236, which four merges have moved by exactly
-one test since.
+again, so the two runs differ in nothing but this change; it is two verdicts off
+§26.6's recorded baseline of 230/236, which five merges have moved since.
 
-The same measurement was taken twice more, at `7da9a58` (230 -> 277) and at
-`e3409ba` (231 -> 278), with the same 47 tests moving each time. Three trees,
-one number: this is not sensitive to what else has landed.
+The same measurement was taken three times more, at `7da9a58` (230 -> 277), at
+`e3409ba` (231 -> 278) and at `4a5dfb4` (231 -> 278), with the same 47 tests
+moving each time. Four trees, one number: it is not sensitive to what else has
+landed — including §37, which changed how every pointer coordinate is computed
+and moved none of these.
 
 | suite | failures before | after |
 |---|---:|---:|
@@ -14528,21 +14529,20 @@ taskbar.
 | | menu rectangle, in screen coordinates | inside the work area |
 |---|---|---|
 | before | 214x236 at 1213, 688 | **no** — 147 px past the right edge, 172 px below the work area |
-| after | 214x236 at 1047, 454 | **yes** |
-
-Both were taken while the guest's desktop was unlocked and unattended, and
-`docs/stage38/README.md` records the rule that goes with that: this mode moves
-a window and clicks on a desktop somebody may be using, so a screen capture
-before and after — compared, not glanced at — is what says whether the machine
-was free. The window measurements in §38.10 were taken later against a *locked*
-screen, which is possible precisely because they need no input.
+| after | 214x236 at 1024, 474 | **yes** |
 
 `docs/stage38/stage38-screen-before.png` is the user's report, photographed:
 Firefox's context menu with only the first few pixels of "Save Page As…" and
 "Select All" visible at the edge of the screen and the rest of the menu
 nowhere. `docs/stage38/stage38-screen-after.png` is the same click on the same
 machine with this stage's binary: the whole menu, flipped up and to the left,
-sitting above the taskbar.
+sitting above the taskbar — **and the window it belongs to fits the screen
+too**, which is §38.10 and is in the same photograph.
+
+This mode moves a window and clicks on a desktop somebody may be using, so it
+wants a machine that is free; the window measurements in §38.10 need no input
+at all and were taken against a *locked* screen, where a click would reach
+Winlogon's secure desktop rather than ours.
 
 **And the negative check, which is the same bug wearing different clothes.** A
 constraint that fires when it should not is not better than one that never
@@ -14580,7 +14580,7 @@ all and therefore runs against a locked screen:
 | | Firefox's window | inside the work area |
 |---|---|---|
 | before | 1296x820 at 26, 26 | **no** — 42 px past the right edge, 94 px below the work area |
-| after | 960x543 at 104, 104 | **yes**, caption and all |
+| after | 1220x752 at 0, 0 | **yes**, caption and all |
 
 `docs/stage38/stage38-window-before.png` and `-after.png` are those two
 windows, captured with `PrintWindow` on their own `HWND`s; `spawn-before.txt`
@@ -14591,12 +14591,23 @@ but *where* it lands is `CW_USEDEFAULT`'s cascade and moves from run to run: at
 `docs/stage38/stage38-screen-before.png` was taken during, with its title bar
 above the top of the screen. Either way it does not fit.
 
-**The "after" size is the interesting number, because nothing clamped it.**
-960x543 is Firefox's *own* choice against a `wl_output` that is now
-1280x752 — the real work area — rather than the fictitious 1920x1080 it used to
-be told. The clamp never fired. That is the right way round: a window that is
-resized after it has laid itself out reflows visibly, and a window that was
-told the truth first does not have to be.
+**Both halves are in the "after" number, and they can be told apart in the
+log.** Told that the output is 1280x752, Firefox now asks for a window of
+1220x767 rather than 1296x820 — most of the fix, and the client's own doing.
+That is still 15 pixels too tall for the work area, because 752 is the
+*window's* budget and Firefox sized its *content* against the output, so the
+clamp fires and takes it to 1220x752 at 0, 0:
+
+```
+window 1 asked for 1220x767 at -8,-8 and the work area is 1280x752 at 0,0
+                              -> 1220x752 at 0,0
+```
+
+An honest output alone would have left the window 15 px into the taskbar; the
+clamp alone would have shrunk a 1296x820 window by 68 px after it had laid
+itself out. Neither is redundant, and the order matters — the client is told
+the truth first and corrected second, because a browser reflowing after a
+correction is visible and a browser that was told the truth does not have to.
 
 **The `wl_output` is now the work area.** Until this stage the one output was
 `--output WxH` and nothing else, with a default of 1920x1080 that was true of
