@@ -65,6 +65,26 @@ pub struct Run {
 /// which is the first thing anyone will want after a frozen window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
+    /// Which region of the arena family this is — the number that travels in
+    /// `Descriptor::ArenaSlice { arena, .. }` and names the mapping a slice
+    /// lives in.
+    ///
+    /// DYNAMIC ARENA. A plan used to describe exactly one region because an
+    /// arena was committed once and never grew (design.md §5.7 D22: "the arena
+    /// is committed at `sv-gpu-server` startup and does not grow, on either
+    /// path"). Growth makes a plan a description of *n* regions, and each one
+    /// needs a name, because the two are separate `VirtualAlloc`s in the guest
+    /// located at unrelated ranges of QEMU's backing object and mapped at
+    /// unrelated host addresses. There is no offset arithmetic that reaches
+    /// from one into the other, which is exactly why the region id is part of
+    /// every descriptor rather than a thing the host infers.
+    ///
+    /// **It is an integer, and that is load-bearing.** design.md §1a: no
+    /// descriptor crosses. A region id names a mapping the way an arena id
+    /// always did (waycompose §17.2: "an arena id names a region, not a
+    /// client"); making growth work by handing over a second *object* would be
+    /// the one thing this design may not do.
+    pub id: u32,
     /// The object to open, normally `/proc/<qemu-pid>/fd/<n>`.
     pub object: PathBuf,
     /// The arena's length. Must equal the sum of the runs' lengths.
@@ -89,18 +109,84 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Parse the plan. Whitespace-separated words, one record per line, `#` for
-    /// a comment — the format is dull on purpose, because the interesting
-    /// failure is a plan from a *previous* VM boot rather than a plan that is
-    /// hard to parse.
+    /// Parse a plan that describes exactly one region.
+    ///
+    /// The pre-growth spelling, kept because it is what every existing caller
+    /// and every existing harness writes. A plan naming more than one region is
+    /// refused here rather than silently truncated to its first: a caller that
+    /// asked for one region and was handed the first of four would map a
+    /// quarter of the arena and allocate confidently into memory the guest
+    /// believes is somewhere else.
     pub fn read(path: &Path) -> io::Result<Plan> {
+        let mut all = Plan::read_all(path)?;
+        if all.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: describes {} regions and this caller can hold one; \
+                     use Plan::read_all",
+                    path.display(),
+                    all.len()
+                ),
+            ));
+        }
+        Ok(all.remove(0))
+    }
+
+    /// Parse a plan describing one **or more** regions.
+    ///
+    /// Whitespace-separated words, one record per line, `#` for a comment — the
+    /// format is dull on purpose, because the interesting failure is a plan
+    /// from a *previous* VM boot rather than a plan that is hard to parse.
+    ///
+    /// # The grammar, and why growth did not need a new file
+    ///
+    /// A `region <id>` line opens a new region record; every `object`, `len`,
+    /// `run`, `outbound` and `r` line after it belongs to that region. A file
+    /// with no `region` line at all is one region with id 0, which is exactly
+    /// the pre-growth format — so every plan ever written by `wc-arena-host`
+    /// still reads, and reads to the same thing.
+    ///
+    /// Appending rather than replacing is the point. The host locates a new
+    /// region while the old ones are live and full of pixels; rewriting the
+    /// file from scratch would mean re-locating regions whose stamps the first
+    /// pool overwrote (§12.10), which is the thing the content sweep
+    /// structurally cannot do. A plan is therefore a log of regions, and the
+    /// proxy re-reads it to find the ones it has not mapped yet.
+    pub fn read_all(path: &Path) -> io::Result<Vec<Plan>> {
         let text = std::fs::read_to_string(path)?;
         let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let mut object = PathBuf::new();
-        let mut len = 0u64;
-        let mut run_id = 0u64;
-        let mut outbound = None;
-        let mut runs = Vec::new();
+
+        // One partially built region. `None` for `id` marks "no `region` line
+        // has been seen", which is what makes the old format the new format's
+        // one-element case rather than a second parser.
+        struct Partial {
+            id: Option<u32>,
+            object: PathBuf,
+            len: u64,
+            run_id: u64,
+            outbound: Option<(u64, u64)>,
+            runs: Vec<Run>,
+        }
+        impl Partial {
+            fn new(id: Option<u32>) -> Partial {
+                Partial {
+                    id,
+                    object: PathBuf::new(),
+                    len: 0,
+                    run_id: 0,
+                    outbound: None,
+                    runs: Vec::new(),
+                }
+            }
+            fn is_empty(&self) -> bool {
+                self.object.as_os_str().is_empty() && self.len == 0 && self.runs.is_empty()
+            }
+        }
+
+        let mut cur = Partial::new(None);
+        let mut done: Vec<Partial> = Vec::new();
+
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -118,11 +204,21 @@ impl Plan {
                 .map_err(|e| bad(format!("{}:{}: {s:?}: {e}", path.display(), n + 1)))
             };
             match f.as_slice() {
-                ["object", v] => object = PathBuf::from(v),
-                ["len", v] => len = num(v)?,
-                ["run", v] => run_id = num(v)?,
-                ["outbound", o, l] => outbound = Some((num(o)?, num(l)?)),
-                ["r", a, o, l] => runs.push(Run {
+                ["region", v] => {
+                    let id = u32::try_from(num(v)?).map_err(|_| {
+                        bad(format!("{}:{}: region id {v:?} is not a u32", path.display(), n + 1))
+                    })?;
+                    if !cur.is_empty() {
+                        done.push(std::mem::replace(&mut cur, Partial::new(Some(id))));
+                    } else {
+                        cur.id = Some(id);
+                    }
+                }
+                ["object", v] => cur.object = PathBuf::from(v),
+                ["len", v] => cur.len = num(v)?,
+                ["run", v] => cur.run_id = num(v)?,
+                ["outbound", o, l] => cur.outbound = Some((num(o)?, num(l)?)),
+                ["r", a, o, l] => cur.runs.push(Run {
                     arena_offset: num(a)?,
                     file_offset: num(o)?,
                     len: num(l)?,
@@ -130,40 +226,66 @@ impl Plan {
                 _ => return Err(bad(format!("{}:{}: cannot read {line:?}", path.display(), n + 1))),
             }
         }
-        if object.as_os_str().is_empty() || len == 0 || runs.is_empty() {
+        if !cur.is_empty() {
+            done.push(cur);
+        }
+        if done.is_empty() {
             return Err(bad(format!("{}: no object, no length or no runs", path.display())));
         }
-        // The one consistency check worth making here, because the alternative
-        // is an arena with a hole in it that reads as zeroes: a pool allocated
-        // into the hole would be silently invisible to the compositor, which is
-        // §10.7's symptom arriving by a different road.
-        let covered: u64 = runs.iter().map(|r| r.len).sum();
-        if covered != len {
-            return Err(bad(format!(
-                "{}: the runs cover {covered} bytes of a {len}-byte arena",
-                path.display()
-            )));
-        }
-        // The window has to be inside the arena, and it has to be the tail —
-        // which is what `reserve_outbound` produces and what this side's
-        // allocator can express by simply being shorter. A window in the middle
-        // would need a hole in the free list, and refusing here is better than
-        // silently allocating around only part of one.
-        if let Some((off, wlen)) = outbound {
-            if off.checked_add(wlen) != Some(len) {
+
+        let mut out = Vec::with_capacity(done.len());
+        for (i, p) in done.into_iter().enumerate() {
+            let id = p.id.unwrap_or(0);
+            let (len, runs, outbound) = (p.len, p.runs, p.outbound);
+            let where_ = format!("{} region {id}", path.display());
+            if p.object.as_os_str().is_empty() || len == 0 || runs.is_empty() {
+                return Err(bad(format!("{where_}: no object, no length or no runs")));
+            }
+            // The one consistency check worth making here, because the
+            // alternative is an arena with a hole in it that reads as zeroes: a
+            // pool allocated into the hole would be silently invisible to the
+            // compositor, which is §10.7's symptom arriving by a different road.
+            let covered: u64 = runs.iter().map(|r| r.len).sum();
+            if covered != len {
                 return Err(bad(format!(
-                    "{}: an outbound window at {off}+{wlen} is not the tail of a {len}-byte arena",
+                    "{where_}: the runs cover {covered} bytes of a {len}-byte arena"
+                )));
+            }
+            // The window has to be inside the region, and it has to be the tail
+            // — which is what `reserve_outbound` produces and what this side's
+            // allocator can express by simply being shorter. A window in the
+            // middle would need a hole in the free list, and refusing here is
+            // better than silently allocating around only part of one.
+            if let Some((off, wlen)) = outbound {
+                if off.checked_add(wlen) != Some(len) {
+                    return Err(bad(format!(
+                        "{where_}: an outbound window at {off}+{wlen} is not the tail \
+                         of a {len}-byte arena"
+                    )));
+                }
+                if wlen >= len {
+                    return Err(bad(format!(
+                        "{where_}: an outbound window of {wlen} bytes leaves nothing \
+                         of a {len}-byte arena"
+                    )));
+                }
+            }
+            // Two regions with one id would be two mappings a descriptor cannot
+            // tell apart, and a slice naming that id would land in whichever the
+            // proxy happened to map second. Refused where it is cheap, for the
+            // same reason `sv-hostd` refuses a duplicate page index rather than
+            // choosing between two claimants.
+            if out.iter().any(|q: &Plan| q.id == id) {
+                return Err(bad(format!(
+                    "{}: region {id} is named twice; a region id names a mapping and \
+                     two mappings cannot share one",
                     path.display()
                 )));
             }
-            if wlen >= len {
-                return Err(bad(format!(
-                    "{}: an outbound window of {wlen} bytes leaves nothing of a {len}-byte arena",
-                    path.display()
-                )));
-            }
+            debug_assert_eq!(i, out.len());
+            out.push(Plan { id, object: p.object, len, run_id: p.run_id, outbound, runs });
         }
-        Ok(Plan { object, len, run_id, outbound, runs })
+        Ok(out)
     }
 }
 
@@ -404,6 +526,79 @@ mod tests {
         assert!(Plan::read(&p).is_err());
     }
 
+    /// DYNAMIC ARENA. Every plan `wc-arena-host` has ever written has no
+    /// `region` line, and must go on meaning what it meant. The old format is
+    /// the new format's one-element case rather than a second parser, and this
+    /// is the test that says so.
+    #[test]
+    fn a_plan_without_a_region_line_is_one_region_numbered_zero() {
+        let (_d, p) = write_plan(
+            "object /proc/1/fd/9\nlen 8192\nrun 0xdeadbeef\nr 0 0x1000 4096\nr 4096 0x9000 4096\n",
+        );
+        let all = Plan::read_all(&p).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, 0);
+        assert_eq!(all[0].len, 8192);
+        // And the single-region reader still answers, byte for byte.
+        assert_eq!(Plan::read(&p).unwrap(), all[0]);
+    }
+
+    /// The growth format. Two regions, each with its own object, length, run id
+    /// and run list — because they are two separate `VirtualAlloc`s in the
+    /// guest, located at two unrelated ranges of QEMU's backing object, and
+    /// nothing about the second is derivable from the first.
+    #[test]
+    fn a_plan_may_describe_several_regions_each_with_its_own_runs() {
+        let (_d, p) = write_plan(
+            "# grown twice\n\
+             region 0\nobject /proc/1/fd/9\nlen 8192\nrun 0xaaa\nr 0 0x1000 8192\n\
+             region 1\nobject /proc/1/fd/9\nlen 4096\nrun 0xbbb\nr 0 0x40000 4096\n\
+             region 7\nobject /proc/1/fd/11\nlen 4096\nrun 0xccc\nr 0 0x0 4096\n",
+        );
+        let all = Plan::read_all(&p).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all.iter().map(|r| r.id).collect::<Vec<_>>(), vec![0, 1, 7]);
+        assert_eq!(all[1].run_id, 0xbbb);
+        assert_eq!(all[2].object, PathBuf::from("/proc/1/fd/11"));
+        // Ids need not be dense: a released region's id is not reused, because
+        // a client may still name it in a request already in flight.
+        assert_eq!(all[2].len, 4096);
+
+        // And the single-region reader refuses it rather than quietly taking
+        // the first of three.
+        let e = Plan::read(&p).unwrap_err();
+        assert!(e.to_string().contains("describes 3 regions"), "{e}");
+    }
+
+    /// Two regions with one id would be two mappings a descriptor cannot tell
+    /// apart. `Descriptor::ArenaSlice { arena, offset, len }` names the region
+    /// by that number and nothing else, so a duplicate would put a slice in
+    /// whichever mapping the proxy happened to attach second — the silent wrong
+    /// answer this project spends most of its checks avoiding.
+    #[test]
+    fn two_regions_may_not_share_an_id() {
+        let (_d, p) = write_plan(
+            "region 3\nobject /proc/1/fd/9\nlen 4096\nrun 0x1\nr 0 0x0 4096\n\
+             region 3\nobject /proc/1/fd/9\nlen 4096\nrun 0x2\nr 0 0x1000 4096\n",
+        );
+        let e = Plan::read_all(&p).unwrap_err();
+        assert!(e.to_string().contains("region 3 is named twice"), "{e}");
+    }
+
+    /// Each region carries its own outbound window and its own hole check, and
+    /// the message says which region was wrong. A plan with four regions whose
+    /// error message did not name one would be a plan a human cannot fix.
+    #[test]
+    fn a_hole_is_refused_per_region_and_the_message_names_it() {
+        let (_d, p) = write_plan(
+            "region 0\nobject /proc/1/fd/9\nlen 4096\nrun 0x1\nr 0 0x0 4096\n\
+             region 5\nobject /proc/1/fd/9\nlen 8192\nrun 0x2\nr 0 0x1000 4096\n",
+        );
+        let e = Plan::read_all(&p).unwrap_err();
+        assert!(e.to_string().contains("region 5"), "{e}");
+        assert!(e.to_string().contains("cover 4096 bytes of a 8192-byte arena"), "{e}");
+    }
+
     /// The guest's own memory is a perfectly good stand-in for the guest's
     /// memory *as QEMU sees it*, for the one property this type owns: that a
     /// scattered run list becomes one contiguous view in the right order. Two
@@ -421,6 +616,7 @@ mod tests {
         })
         .unwrap();
         let plan = Plan {
+            id: 0,
             object: backing,
             len: 8192,
             run_id: 1,

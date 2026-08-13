@@ -165,6 +165,8 @@ pub fn run() {
              arena-host scan --fd <path> --run <hex> [--out <file>]\n  \
              arena-host translate --fd <path> --run <hex> --gpas <guest-status.txt> \
              --regions <gpa:size:off,...> [--out <file>]\n  \
+             arena-host locate --fd <path> --run <hex> [--locator scan|pfns|both] \
+             [--gpas <guest-status.txt>] [--out <file>]\n  \
              arena-host write1 --fd <path> --map <file> --stamp <hex>\n  \
              arena-host verify --fd <path> --map <file> [--stamp <hex>] [--vkstamp <hex>]\n  \
              arena-host write2 --fd <path> --map <file> --stamp <hex>\n\
@@ -196,6 +198,74 @@ pub fn run() {
         "scan" => {
             let run = hexarg(&args, "--run").expect("--run");
             let found = scan(&file, size, run);
+            report_map(&found, &regions, arg(&args, "--out"));
+        }
+        // design.md §0.14: the same extent, located by either mechanism or by
+        // both. `--locator scan` is `scan` under another name and is the default
+        // so that nothing acquires the undocumented dependency by accident;
+        // `both` is R28's cross-check and is the mode that proves the frame path
+        // works, because it locates the same memory twice by two mechanisms with
+        // nothing in common and refuses if they differ about any page.
+        "locate" => {
+            let run = hexarg(&args, "--run").expect("--run");
+            let which = arg(&args, "--locator").unwrap_or_else(|| "scan".into());
+            assert!(
+                matches!(which.as_str(), "scan" | "pfns" | "both"),
+                "--locator wants scan|pfns|both, not {which:?}"
+            );
+            let frames = (which != "scan").then(|| {
+                let path = arg(&args, "--gpas")
+                    .expect("--locator pfns|both needs --gpas <guest-status.txt>");
+                let f = read_frames(&path);
+                println!("read {} frame(s) from {path}; first 0x{:x}", f.len(), f[0]);
+                f
+            });
+
+            let scanned = (which != "pfns").then(|| {
+                let t = Instant::now();
+                let m = scan(&file, size, run);
+                println!("scan: {} pages in {:.3?}", m.len(), t.elapsed());
+                m
+            });
+            let translated = frames.as_ref().map(|f| {
+                let t = Instant::now();
+                let m = translate_frames(&regions, f);
+                println!("frame list: {} pages in {:.3?}", m.len(), t.elapsed());
+                m
+            });
+
+            // R28, and the reason the scan is not deleted: the frame list is
+            // believed *because* this agreed, on the one occasion the stamps
+            // still exist to check it against.
+            if let (Some(s), Some(p)) = (&scanned, &translated) {
+                let d = compare_maps(s, p);
+                println!(
+                    "R28 cross-check: {} of {} pages agree, {} disagree",
+                    d.agreed, d.pages, d.disagreed
+                );
+                if let Some((i, a, b)) = d.first {
+                    println!(
+                        "  first disagreement at page {i}: scan {}, frame list {}",
+                        a.map_or("not found".into(), |o| format!("0x{o:010x}")),
+                        b.map_or("not found".into(), |o| format!("0x{o:010x}"))
+                    );
+                }
+                if d.disagreed > 0 {
+                    // Fatal, and loud. A confident frame list that names the
+                    // wrong memory is the failure R28 exists for, and carrying
+                    // on with either answer is choosing one at random.
+                    eprintln!(
+                        "FATAL: the two locators disagree — the frame list cannot be trusted"
+                    );
+                    std::process::exit(1);
+                }
+                println!("the frame list is corroborated by the scan; it may now be trusted");
+            }
+
+            // The frame list's map is what is reported when both ran: they are
+            // equal — that is what was just checked — and it is the one the
+            // session would re-locate with afterwards.
+            let found = translated.or(scanned).expect("one locator always runs");
             report_map(&found, &regions, arg(&args, "--out"));
         }
         "udmabuf" => {
@@ -666,6 +736,105 @@ fn report_map(found: &[(u32, u64)], regions: &[Region], out: Option<String>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the frame-list locator, and R28's cross-check (design.md §0.14)
+// ---------------------------------------------------------------------------
+
+/// Read the frame list out of the guest's `guest-status.txt`.
+///
+/// The **frame** column is authoritative and the `gpa` column is ignored. They
+/// are the same number shifted by twelve, and the guest computes both — so
+/// reading the second would be believing the guest's arithmetic about the
+/// host's address space rather than doing the translation here, against the
+/// region table read off `info mtree -f`. That substitution is R21 exactly.
+fn read_frames(path: &str) -> Vec<u64> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut frames = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.first() != Some(&"pfn") {
+            continue;
+        }
+        assert!(f.len() >= 3, "malformed frame line: {line:?}");
+        let index: usize = f[1].parse().unwrap_or_else(|_| panic!("bad index in {line:?}"));
+        let frame = u64::from_str_radix(f[2], 16)
+            .unwrap_or_else(|_| panic!("bad frame number in {line:?}"));
+        assert_eq!(index, frames.len(), "the frame list has a hole at page {index}");
+        frames.push(frame);
+    }
+    assert!(!frames.is_empty(), "{path} carries no `pfn` lines");
+    frames
+}
+
+/// Translate a frame list into memfd offsets, in page order.
+///
+/// This is the whole of the host's work on the frame path: 0.064 s against the
+/// scan's 2.308 s on the same 64 MiB window, because it is arithmetic over a
+/// table rather than a read of thirteen gigabytes. A frame that is in no RAM
+/// region is reported and dropped rather than translated to something that
+/// happens to parse — the pages then come back short, which is loud, instead of
+/// pointing at the PCI hole, which is not.
+fn translate_frames(regions: &[Region], frames: &[u64]) -> Vec<(u32, u64)> {
+    let mut out = Vec::with_capacity(frames.len());
+    for (i, frame) in frames.iter().enumerate() {
+        let gpa = frame << 12;
+        match gpa_to_off(regions, gpa) {
+            Some(off) => out.push((i as u32, off)),
+            None => println!("page {i}: frame 0x{frame:x} (gpa 0x{gpa:x}) is in no RAM region"),
+        }
+    }
+    out
+}
+
+/// What the two locators made of the same extent. `security-model.md` R28.
+#[derive(Debug, PartialEq, Eq)]
+struct Disagreement {
+    pages: usize,
+    agreed: usize,
+    disagreed: usize,
+    /// The first page they differed about, with the scan's offset and the frame
+    /// list's — `None` on either side meaning that locator did not find the page
+    /// at all. One example beats a count: a uniform shift means the undocumented
+    /// interface moved, one wrong page means a frame did, and the two are told
+    /// apart by looking at the numbers.
+    first: Option<(u32, Option<u64>, Option<u64>)>,
+}
+
+/// Compare two page maps index by index.
+///
+/// Keyed by page index rather than zipped by position, because the two locators
+/// can disagree about *which* pages they found as well as about where they are,
+/// and zipping two lists of different lengths reports the first as if it were
+/// the second — the whole map shifted by one, every page "wrong".
+fn compare_maps(scan: &[(u32, u64)], pfns: &[(u32, u64)]) -> Disagreement {
+    let by_index = |m: &[(u32, u64)]| -> std::collections::BTreeMap<u32, u64> {
+        m.iter().copied().collect()
+    };
+    let (a, b) = (by_index(scan), by_index(pfns));
+    let mut indices: Vec<u32> = a.keys().chain(b.keys()).copied().collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut d = Disagreement {
+        pages: indices.len(),
+        agreed: 0,
+        disagreed: 0,
+        first: None,
+    };
+    for i in indices {
+        let (x, y) = (a.get(&i).copied(), b.get(&i).copied());
+        if x.is_some() && x == y {
+            d.agreed += 1;
+        } else {
+            d.disagreed += 1;
+            if d.first.is_none() {
+                d.first = Some((i, x, y));
+            }
+        }
+    }
+    d
+}
+
 fn read_map(path: &str) -> Vec<(u32, u64)> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     text.lines()
@@ -726,6 +895,87 @@ mod tests {
         // And the naive reading lands on a page that exists, which is why it
         // fails quietly rather than out of bounds.
         assert!(off_to_gpa(&r, off).is_some());
+    }
+
+    // ---- the frame-list locator and R28 -------------------------------------
+
+    /// The frame path's arithmetic, on the mapping this machine actually has:
+    /// a frame number becomes a GPA by a shift and a GPA becomes an offset by
+    /// the region table. Above 4 GiB those are different numbers, which is the
+    /// whole reason the second step is a table lookup and not a shift as well.
+    #[test]
+    fn a_frame_list_translates_through_the_same_table_the_scan_reports_against() {
+        let r = parse_regions(TESTHOST);
+        // Two frames below the hole, one above it.
+        let map = translate_frames(&r, &[0x10f, 0x110, 0x2b6a6d]);
+        assert_eq!(map, vec![(0, 0x10f000), (1, 0x110000), (2, 0x2_76a6_d000)]);
+        // …and the offsets translate back to the GPAs the frames named, so the
+        // two directions of the table agree about the frame path too.
+        for (i, off) in &map {
+            let frame = [0x10fu64, 0x110, 0x2b6a6d][*i as usize];
+            assert_eq!(off_to_gpa(&r, *off), Some(frame << 12));
+        }
+    }
+
+    /// A frame in the PCI hole is dropped and reported rather than translated,
+    /// so the answer comes back *short* — which is loud — instead of pointing at
+    /// memory the guest cannot see, which is not.
+    #[test]
+    fn a_frame_outside_ram_is_dropped_rather_than_translated() {
+        let r = parse_regions(TESTHOST);
+        // 0xc0000 << 12 is the first byte of the hole; 0x400000 is past the end.
+        let map = translate_frames(&r, &[0x10f, 0xc_0000, 0x40_0000, 0x110]);
+        assert_eq!(map.len(), 2, "two of the four frames are not RAM");
+        assert_eq!(map, vec![(0, 0x10f000), (3, 0x110000)]);
+        // The page indices are preserved, so "page 3" is still page 3 and the
+        // shortfall cannot be mistaken for a shift.
+        assert!(map.iter().all(|(i, _)| *i != 1 && *i != 2));
+    }
+
+    /// R28 as the comparison it actually is: two locators, the same extent, and
+    /// the answer is per page rather than per list.
+    #[test]
+    fn two_locators_that_agree_page_for_page_are_the_r28_cross_check_passing() {
+        let scanned = vec![(0u32, 0x1000u64), (1, 0x2000), (2, 0x9000)];
+        let translated = scanned.clone();
+        let d = compare_maps(&scanned, &translated);
+        assert_eq!(d.agreed, 3);
+        assert_eq!(d.disagreed, 0);
+        assert_eq!(d.first, None);
+    }
+
+    /// The failure R28 exists for: a frame list that is confident,
+    /// self-consistent, translates cleanly and names the wrong page. Nothing but
+    /// the scan can tell, and what it has to say is *which* page — because one
+    /// wrong page and a whole map shifted are different diagnoses.
+    #[test]
+    fn a_frame_list_that_names_the_wrong_page_is_caught_with_the_page_number() {
+        let scanned = vec![(0u32, 0x1000u64), (1, 0x2000), (2, 0x9000)];
+        let translated = vec![(0u32, 0x1000u64), (1, 0x2000), (2, 0xa000)];
+        let d = compare_maps(&scanned, &translated);
+        assert_eq!(d.agreed, 2);
+        assert_eq!(d.disagreed, 1);
+        assert_eq!(d.first, Some((2, Some(0x9000), Some(0xa000))));
+    }
+
+    /// The two locators can disagree about *which* pages they found as well as
+    /// where they are — a scan of an overwritten window finds none at all, which
+    /// is the measured case. Comparing by position would then report every page
+    /// as wrong; comparing by index reports the pages that are missing as
+    /// missing.
+    #[test]
+    fn a_locator_that_found_a_page_the_other_did_not_is_a_disagreement_about_that_page() {
+        let scanned = vec![(0u32, 0x1000u64), (2, 0x9000)];
+        let translated = vec![(0u32, 0x1000u64), (1, 0x2000), (2, 0x9000)];
+        let d = compare_maps(&scanned, &translated);
+        assert_eq!(d.pages, 3, "the union of the two, not the shorter of them");
+        assert_eq!(d.agreed, 2);
+        assert_eq!(d.first, Some((1, None, Some(0x2000))));
+
+        // The measured case in full: the window was overwritten, so the scan
+        // located zero pages and the query located all of them.
+        let d = compare_maps(&[], &translated);
+        assert_eq!((d.pages, d.agreed, d.disagreed), (3, 0, 3));
     }
 
     // ---- the GPU-workload phase --------------------------------------------

@@ -883,6 +883,62 @@ pub fn attached() -> Vec<(u32, usize, String)> {
     out
 }
 
+/// Where a region the peer grew into can be found, on the file fixture.
+///
+/// DYNAMIC ARENA, and the narrowness is the point. A growing arena means the
+/// peer can name a region this process has never been told about, and the two
+/// substrates answer that completely differently:
+///
+/// * **Guest RAM, the deployment.** It cannot arise. The regions *are* this
+///   process's own memory — `attach_guest_ram` commits, pins and stamps them
+///   here — so a region the host can name is one this process made, and it was
+///   in the registry before the host could locate it. Growth on that path needs
+///   nothing from this function.
+/// * **A file, the Wine and same-machine fixture.** The regions are objects the
+///   other side created, and nothing announces them. `--arena` names one at
+///   startup and there is no request in the protocol for a second.
+///
+/// So this is a fixture affordance and is off unless asked for. It is not a
+/// fallback in design.md §5.1's sense — it cannot make a file stand in for
+/// guest RAM, because on the guest-RAM path the lookup never misses.
+fn grow_dir() -> &'static RwLock<Option<std::path::PathBuf>> {
+    static DIR: OnceLock<RwLock<Option<std::path::PathBuf>>> = OnceLock::new();
+    DIR.get_or_init(|| RwLock::new(None))
+}
+
+/// Look for regions the peer grew into under `dir`, named `region-<id>`.
+///
+/// The name is a convention shared with `wc_proxy::pool::FileGrowth`, which is
+/// the only thing that creates them. A convention rather than a message
+/// because the fixture has no channel to carry one and inventing a protocol
+/// request for the substrate that is explicitly not the deployment would be
+/// paying for the wrong thing.
+pub fn set_grow_dir(dir: &std::path::Path) -> io::Result<()> {
+    *grow_dir().write().map_err(|_| io::Error::other("arena grow dir poisoned"))? =
+        Some(dir.to_path_buf());
+    Ok(())
+}
+
+/// Attach `region-<id>` from the growth directory, if one was configured.
+///
+/// Read-only, like [`attach`]: these are the peer's bytes and this process is
+/// the reader of them. The length is the object's own, because the peer sized
+/// it and a second opinion here could only ever disagree.
+fn attach_grown(arena: u32) -> io::Result<()> {
+    let dir = {
+        let g = grow_dir().read().map_err(|_| io::Error::other("arena grow dir poisoned"))?;
+        match g.as_ref() {
+            Some(d) => d.clone(),
+            // Not configured: the caller's "not attached" error is the right
+            // one and is more informative than anything invented here.
+            None => return Ok(()),
+        }
+    };
+    let path = dir.join(format!("region-{arena}"));
+    let len = std::fs::metadata(&path)?.len();
+    attach(arena, &path.to_string_lossy(), len)
+}
+
 /// Resolve `(arena, offset, len)` to a read-only view.
 ///
 /// Every arithmetic step is checked. An offset or length that runs off the end
@@ -890,6 +946,19 @@ pub fn attached() -> Vec<(u32, usize, String)> {
 /// the compositor a short buffer that `BufferSpec::required_len` would then
 /// reject somewhere much further away, and the message would be about a stride.
 pub(crate) fn window(arena: u32, offset: u64, len: u64) -> io::Result<Mapping> {
+    // DYNAMIC ARENA. A grown arena names a region this process may not have
+    // heard of. On the deployment that cannot happen: the region is guest RAM
+    // and *this* process is the side that committed it, so it was attached
+    // before the host could possibly locate it. It happens only on the file
+    // fixture, where the regions are objects somebody else made, and
+    // `grow_dir` is the opt-in that says where to look. See [`set_grow_dir`].
+    if !registry()
+        .read()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?
+        .contains_key(&arena)
+    {
+        attach_grown(arena)?;
+    }
     let guard = registry()
         .read()
         .map_err(|_| io::Error::other("arena registry poisoned"))?;
