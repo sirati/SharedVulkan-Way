@@ -40,6 +40,7 @@
  */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -94,6 +95,7 @@ static const struct wl_interface *(*real_get_interface)(struct wl_proxy *);
 
 static int shim_on;      /* WC_POOLSHIM=1 arms the redirection */
 static int shim_verbose;
+static int shim_diag;    /* WC_POOLSHIM_DIAG=1 answers §30.10, observing only */
 static const char *backing_dir;
 
 /* Counters the harness asserts on. Printed at exit. */
@@ -125,6 +127,14 @@ struct poolrec {
     unsigned long long last_sum;
     unsigned long checks, changes;
     int retired; /* fd number given back, stats kept for the report */
+    /* WHAT THE POOL ACTUALLY IS. §30.10 measured that Firefox maps its pool
+     * through a *different descriptor* than the one it passes to
+     * `create_pool` — the object is `mozilla-ipc` shared memory, whose fd is
+     * duplicated and passed around, so the number the shim watched was never
+     * the number the mapping was made from. Identity has to be the object, and
+     * `(st_dev, st_ino)` is what names an object. */
+    dev_t obj_dev;
+    ino_t obj_ino;
 };
 static struct poolrec pools[MAXPOOL];
 
@@ -139,6 +149,149 @@ static struct poolrec *pool_by_addr(void *a) {
     for (int i = 0; i < MAXPOOL; i++)
         if (pools[i].used && pools[i].addr == a) return &pools[i];
     return NULL;
+}
+
+/* §30.10: WHICH OF THE TWO CAUSES IS IT.
+ *
+ * §30.6 measured that Firefox paints through `wl_shm` and not into the objects
+ * this shim substitutes, and left two candidates it could not separate:
+ *
+ *   (a) the drawing does not happen in the process that owns the Wayland
+ *       connection, so the memory was allocated and written somewhere this
+ *       shim's `create_pool` hook can never reach; or
+ *   (b) the client holds more than one mapping of the same object, and the
+ *       shim replaced one while the writes go through another.
+ *
+ * Both are questions about who maps the pool object, and the kernel already
+ * knows the answer. Take the object's inode from the descriptor, then walk
+ * every `/proc/<pid>/maps` we can read and count the mappings of that inode.
+ *
+ *   two or more mappings in this process   -> (b)
+ *   mappings only in some *other* process  -> (a)
+ *   no mapping anywhere at create_pool     -> the pool is mapped later, by
+ *                                             whoever paints, and the pid of
+ *                                             that mapping decides it
+ *
+ * Observation only: it runs with the redirection disarmed, so what it measures
+ * is what Firefox does rather than what the shim did to it. */
+/* Inodes seen at `create_pool`, so the same question can be asked again once
+ * frames are actually flowing. Asking only at `create_pool` is what left §30.6
+ * ambiguous: a pool with no mapping anywhere at that instant has not told you
+ * whether it will be mapped here later or somewhere else. */
+#define MAXINO 32
+static unsigned long long diag_inos[MAXINO];
+static int diag_sizes[MAXINO];
+static int n_diag_ino;
+
+static int scan_maps_for_ino(unsigned long long want, const char *tag) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+    struct dirent *ent;
+    int total = 0;
+    while ((ent = readdir(proc))) {
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+        char path[256];
+        snprintf(path, sizeof path, "/proc/%s/maps", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long long a1, a2, off, ino;
+            char perms[8], dev[16];
+            int n = 0;
+            if (sscanf(line, "%llx-%llx %7s %llx %15s %llu%n", &a1, &a2, perms,
+                       &off, dev, &ino, &n) == 6 &&
+                ino == want) {
+                const char *name = line + n;
+                while (*name == ' ') name++;
+                char *nl = strchr((char *)name, '\n');
+                if (nl) *nl = 0;
+                /* Name the process rather than leaving the pid to be guessed:
+                 * "the other mapper must be the compositor" is exactly the kind
+                 * of inference this section exists to avoid. */
+                char cpath[256], comm[128] = "?";
+                snprintf(cpath, sizeof cpath, "/proc/%s/comm", ent->d_name);
+                FILE *cf = fopen(cpath, "r");
+                if (cf) {
+                    if (fgets(comm, sizeof comm, cf)) {
+                        char *c = strchr(comm, '\n');
+                        if (c) *c = 0;
+                    }
+                    fclose(cf);
+                }
+                fprintf(stderr,
+                        "wc-poolshim: DIAG %s ino=%llu mapped by pid=%s (%s)%s "
+                        "len=%llu perms=%s %s\n",
+                        tag, want, ent->d_name, comm,
+                        atoi(ent->d_name) == (int)getpid() ? " [SELF]" : "",
+                        a2 - a1, perms, name);
+                total++;
+            }
+        }
+        fclose(f);
+    }
+    closedir(proc);
+    return total;
+}
+
+/* Called once frames are flowing. This is the measurement that separates (a)
+ * from (b): if the mapping now exists in a *different* pid, the painting is not
+ * done by the process that owns the Wayland connection. */
+static void diagnose_again(const char *tag) {
+    for (int i = 0; i < n_diag_ino; i++) {
+        int t = scan_maps_for_ino(diag_inos[i], tag);
+        fprintf(stderr,
+                "wc-poolshim: DIAG %s ino=%llu size=%d total mappings: %d\n",
+                tag, diag_inos[i], diag_sizes[i], t);
+    }
+}
+
+static void diagnose_pool(int client_fd, int size) {
+    struct stat st;
+    if (fstat(client_fd, &st) != 0) return;
+    fprintf(stderr,
+            "wc-poolshim: DIAG create_pool pid=%d fd=%d size=%d ino=%llu\n",
+            (int)getpid(), client_fd, size, (unsigned long long)st.st_ino);
+    if (n_diag_ino < MAXINO) {
+        diag_inos[n_diag_ino] = (unsigned long long)st.st_ino;
+        diag_sizes[n_diag_ino] = size;
+        n_diag_ino++;
+    }
+
+    DIR *proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent *ent;
+    int total = 0;
+    while ((ent = readdir(proc))) {
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+        char path[256];
+        snprintf(path, sizeof path, "/proc/%s/maps", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long long a1, a2, off, ino;
+            char perms[8], dev[16];
+            int n = 0;
+            if (sscanf(line, "%llx-%llx %7s %llx %15s %llu%n", &a1, &a2, perms,
+                       &off, dev, &ino, &n) == 6 &&
+                ino == (unsigned long long)st.st_ino) {
+                const char *name = line + n;
+                while (*name == ' ') name++;
+                char *nl = strchr((char *)name, '\n');
+                if (nl) *nl = 0;
+                fprintf(stderr,
+                        "wc-poolshim: DIAG   mapped by pid=%s len=%llu perms=%s "
+                        "off=%llu %s\n",
+                        ent->d_name, a2 - a1, perms, off, name);
+                total++;
+            }
+        }
+        fclose(f);
+    }
+    closedir(proc);
+    fprintf(stderr, "wc-poolshim: DIAG   total mappings of ino=%llu: %d\n",
+            (unsigned long long)st.st_ino, total);
 }
 
 /* FNV-1a over a sample of the pool. Sampled rather than complete because this
@@ -180,6 +333,8 @@ static void init(void) {
     const char *vb = getenv("WC_POOLSHIM_VERBOSE");
     shim_on = on ? atoi(on) : 0;
     shim_verbose = vb ? atoi(vb) : 0;
+    const char *dg = getenv("WC_POOLSHIM_DIAG");
+    shim_diag = dg ? atoi(dg) : 0;
     backing_dir = getenv("WC_POOLSHIM_DIR");
     if (!backing_dir) backing_dir = "/tmp";
 }
@@ -209,9 +364,29 @@ static struct maprec *find_map(int fd) {
  * into its own memfd again while the compositor still reads the substituted
  * object, and the picture goes stale without a single error anywhere. So the
  * substitution has to be reasserted on every `mmap` of a pool fd. */
+/* Match a descriptor to a pool by the *object* it refers to, not by its number.
+ * This is the §30.10 fix, and it happens to retire hazard §30.6d as well: a
+ * recycled descriptor number now names a different object and simply does not
+ * match, so there is nothing left for the `close` handler to protect against. */
+static struct poolrec *pool_by_object(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return NULL;
+    for (int i = 0; i < MAXPOOL; i++)
+        if (pools[i].used && !pools[i].retired && pools[i].obj_ino == st.st_ino &&
+            pools[i].obj_dev == st.st_dev)
+            return &pools[i];
+    return NULL;
+}
+
+/* NO DESCRIPTOR-NUMBER FALLBACK. Keeping `pool_by_client_fd` as a second chance
+ * here re-arms §30.6d in its worst form: with retirement now gone, a recycled
+ * number matches a live pool forever and re-points unrelated objects. Measured
+ * — that combination killed Firefox in one run. The object is the identity or
+ * there is no identity. */
 static int substitute_fd(int fd) {
-    struct poolrec *p = pool_by_client_fd(fd);
-    return (p && shim_on) ? p->our_fd : fd;
+    if (!shim_on) return fd;
+    struct poolrec *p = pool_by_object(fd);
+    return p ? p->our_fd : fd;
 }
 
 /* WHY `close` HAS TO BE WATCHED, AND WHAT IT COSTS TO SKIP IT.
@@ -243,13 +418,17 @@ int close(int fd) {
         init();
         if (!real_close) return -1;
     }
-    struct poolrec *p = pool_by_client_fd(fd);
-    if (p) {
-        real_close(p->our_fd);
-        p->retired = 1;
-        n_retired++;
-        log_line("close: pool fd=%d retired, witness kept on the object", fd);
-    }
+    /* Once pools are keyed on the object (§30.10), closing the client's
+     * descriptor is not the end of the pool: Firefox closes the number it
+     * passed to `create_pool` and then maps the same object through another
+     * one. Retiring here would throw away the record just before it is needed,
+     * which is the §30.6 failure with a different cause. The recycling hazard
+     * that made retirement necessary is gone for the same reason — a reused
+     * number names a different object and no longer matches. Keep our
+     * descriptor open; the pool ends at `wl_shm_pool.destroy`. */
+    /* Nothing to do for pools here any more, and that is the point: the pool is
+     * named by its object, so a descriptor going away neither ends it nor
+     * endangers anything. */
     for (int i = 0; i < MAXMAP; i++)
         if (maps[i].used && maps[i].fd == fd) maps[i].used = 0;
     return real_close(fd);
@@ -281,7 +460,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     if (use != fd) {
         log_line("mmap of pool fd=%d re-pointed at our fd=%d (len=%zu)", fd, use,
                  len);
-        struct poolrec *p = pool_by_client_fd(fd);
+        struct poolrec *p = pool_by_object(fd);
         void *r2 = real_mmap(addr, len, prot, flags, use, off);
         if (r2 != MAP_FAILED && p) {
             if (p->witness) real_munmap(p->witness, p->len);
@@ -319,7 +498,7 @@ void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
  * interposed rather than one. */
 int ftruncate(int fd, off_t len) {
     init();
-    struct poolrec *p = pool_by_client_fd(fd);
+    struct poolrec *p = shim_on ? pool_by_object(fd) : NULL;
     if (p && shim_on) {
         if (real_ftruncate(p->our_fd, len) != 0) return -1;
         log_line("ftruncate: grew our fd=%d to %lld alongside client fd=%d",
@@ -339,7 +518,7 @@ int ftruncate64(int fd, off_t len) { return ftruncate(fd, len); }
  * later. Measured: 9 resizes went past an `ftruncate`-only shim untouched. */
 int posix_fallocate(int fd, off_t off, off_t len) {
     init();
-    struct poolrec *p = pool_by_client_fd(fd);
+    struct poolrec *p = shim_on ? pool_by_object(fd) : NULL;
     if (p && shim_on) {
         int r = real_posix_fallocate ? real_posix_fallocate(p->our_fd, off, len)
                                      : real_ftruncate(p->our_fd, off + len);
@@ -463,6 +642,11 @@ static int redirect_pool(int client_fd, int32_t size) {
             pools[i].len = size;
             pools[i].last_sum = 0;
             pools[i].checks = pools[i].changes = 0;
+            struct stat cst;
+            if (fstat(client_fd, &cst) == 0) {
+                pools[i].obj_dev = cst.st_dev;
+                pools[i].obj_ino = cst.st_ino;
+            }
             void *w = real_mmap(NULL, size, PROT_READ, MAP_SHARED, ourfd, 0);
             pools[i].witness = (w == MAP_FAILED) ? NULL : (unsigned char *)w;
             break;
@@ -510,6 +694,7 @@ struct wl_proxy *wl_proxy_marshal_array_flags(struct wl_proxy *proxy,
                 n_create_pool++;
                 log_line("saw wl_shm.create_pool fd=%d size=%d", args[1].h,
                          args[2].i);
+                if (shim_diag) diagnose_pool(args[1].h, args[2].i);
                 if (shim_on) {
                     int ourfd = redirect_pool(args[1].h, args[2].i);
                     if (ourfd >= 0) args[1].h = ourfd;
@@ -524,6 +709,9 @@ struct wl_proxy *wl_proxy_marshal_array_flags(struct wl_proxy *proxy,
                  * independent view of the object the compositor was handed, so
                  * a commit whose pixels changed must change it too. */
                 n_commit++;
+                if (shim_diag && (n_commit == 200 || n_commit == 2000))
+                    diagnose_again(n_commit == 200 ? "at-200-commits"
+                                                   : "at-2000-commits");
                 if (n_commit % 5 == 0)
                     fprintf(stderr, "wc-poolshim: commits=%lu pools=%lu\n",
                             n_commit, n_redirected);

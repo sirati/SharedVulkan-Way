@@ -10462,13 +10462,19 @@ already write into the memory the compositor reads. The only reason a copy
 happens is that Firefox's pool is a *different object*. If the pool's pages were
 arena pages, a commit would cost nothing.
 
-The result of this stage is: **the mechanism exists, nothing forbids it, and at
-the obvious interception point it carries none of Firefox's pixels while looking
-entirely healthy.** The copy stays. What follows is what was measured, because
-the hazards found are worth more than the conclusion — and because the last of
-them is the shim producing a clean, crash-free, protocol-error-free session with
-the wrong memory in it, which is this project's most expensive failure mode
-arriving exactly where it was predicted.
+The result of this stage is: **the mechanism exists, nothing forbids it, and it
+works — an unmodified Firefox paints its frames straight into memory this side
+chose — but only once a pool is identified by the object it *is* rather than by
+the descriptor number it arrived on.** Keyed the obvious way instead, on that
+number, the whole thing is accepted by Firefox and carries none of its pixels
+while looking entirely healthy: no crash, no protocol error, thousands of
+buffers attached, and a blank window.
+
+The copy still stays, for the reasons in §30.11, none of which is any longer
+about whether the mechanism works. What follows is what was measured, because
+the hazards are worth more than the conclusion — three of the five are the same
+mistake wearing different clothes, and the one distinction that dissolves all
+three is the only thing in this section anyone needs to remember.
 
 ### 30.1 One correction to the module header, and it is narrow
 
@@ -10585,7 +10591,7 @@ through an address whose backing object had been replaced underneath it, across
 nine pool growths, and the bytes it drew appeared in the object the compositor
 had been handed. For this class of client the mechanism is not in doubt.
 
-### 30.6 What is proven for Firefox, and what is not
+### 30.6 What is proven for Firefox, and the identity that decided it
 
 Firefox 151.0.1, unmodified, on the same rig, rendering an animated page for
 70 seconds:
@@ -10599,7 +10605,8 @@ Firefox 151.0.1, unmodified, on the same rig, rendering an animated page for
 | `wl_surface.attach` / `damage_buffer` | 2284 / 2281 |
 | `wl_shm_pool.create_buffer` | 4 (reused across every attach) |
 | `zwp_linux_dmabuf` used | no — this is genuinely the `wl_shm` path |
-| **witness saw Firefox draw into our object** | **no: 1 change in 7683 commits** |
+| witness, keyed on the *descriptor* | no: 1 change in 7683 commits |
+| **witness, keyed on the *object*** | **yes: 2334 and 949 changes in ~7130 commits** |
 
 The first row is the one that mattered most going in, and it is the answer to
 "does GTK's shm path go through an interposable symbol": **it does**. Firefox's
@@ -10646,24 +10653,70 @@ answer the project fears most**, and it produced it here. A screenshot would
 have shown a blank or stale window and nothing anywhere would have logged an
 error.
 
-Two candidate causes remain, and the experiment does not separate them:
+Two candidate causes were proposed at that point: that the drawing does not
+happen in the process owning the Wayland connection, or that the client holds a
+second mapping of the same descriptor. **Both are wrong**, and the way to find
+that out was to stop reasoning about it and ask the kernel who maps the object.
+Take the pool's inode from the descriptor with `fstat`, walk every readable
+`/proc/<pid>/maps`, and count. Observation only, with the redirection disarmed,
+so it measures what Firefox does rather than what the shim did to it:
 
-* **The drawing may not happen in the process that owns the Wayland
-  connection.** Only one process ever calls `create_pool`, and that process
-  never `mmap`s two of the four pools at all (`no_mapping=2`, and `re-pointed=0`
-  — no `mmap` of a pool descriptor happened after `create_pool` either). A
-  buffer allocated and painted in a content process and handed to the parent as
-  a descriptor would look exactly like this, and would mean an `LD_PRELOAD` shim
-  has to act where the memory is *allocated*, not where the pool is announced.
-* **A client may hold more than one mapping of the same descriptor.** The shim
-  replaces the first mapping it recorded; if Firefox mapped the object twice,
-  the other mapping still names the client's own memfd and every write goes
-  there.
+```
+DIAG create_pool pid=3948252 fd=20 size=36864   ino=231537   -> 0 mappings
+DIAG create_pool pid=3948252 fd=88 size=4608000 ino=212570   -> 0 mappings
+... once frames are flowing, the same inodes:
+DIAG ino=212570 mapped by pid=3778952 (weston)              /memfd:mozilla-ipc
+DIAG ino=212570 mapped by pid=3948252 (.firefox-wrappe) [SELF] /memfd:mozilla-ipc
+DIAG ino=212570 total mappings: 2
+```
 
-Both are testable and neither is tested. Until one of them is, the honest
-statement is the one in §30.10: **no frame of Firefox's rendering has been shown
-to travel through a redirected pool, and the measurement now says positively
-that none did.**
+Two mappings, and both are accounted for: the compositor, which maps every pool
+it is given, and **the very process that called `create_pool`**. There is no
+third process, so the painting is not happening elsewhere; and there is one
+mapping per process, so there is no second mapping to have missed. The name is
+the tell — `/memfd:mozilla-ipc`, which is `mozilla::ipc::SharedMemory`, whose
+descriptor is duplicated and passed around Firefox freely.
+
+So the cause is a third one, and it is the caveat §30.6d already flagged as
+"necessary but not obviously sufficient" arriving as the thing that actually
+breaks it:
+
+**(e) The client maps the pool through a *different descriptor* than the one it
+passes to `create_pool`.** Same object, different number. A shim keyed on the
+descriptor number is watching a number the mapping is never made from, so it
+sees no `mmap` to intercept (`re-pointed=0`) and substitutes an object nobody
+writes to. Everything else about the mechanism was already right.
+
+**The fix is a distinction, and it is the same shape as the one that unblinded
+the witness: identity is the object, not the number.** `(st_dev, st_ino)` names
+an object; `fstat` the descriptor on every `mmap` and match on that. With that
+one change, against unmodified Firefox on the same rig:
+
+| | descriptor-keyed | **object-keyed** |
+|---|---|---|
+| pool `mmap`s intercepted | 0 | **2** |
+| witness changes, 4.6 MB pool #1 | 1 | **2334** in 7137 commits |
+| witness changes, 4.6 MB pool #2 | 1 | **949** in 7126 commits |
+| crashes | 0 | 0 |
+
+**Firefox's frames travel through the redirected pools.** The two pools that
+change are exactly the two 4.6 MB `mozilla-ipc` rendering pools; the two that
+still change once are `wayland-cursor` and `gdk-wayland`, which is correct,
+because a cursor and a decoration pool have no reason to repaint.
+
+The distinction pays a second time, and this is the part worth keeping. Keying
+on the object **retires hazard §30.6d entirely**: a recycled descriptor number
+now names a different object and simply fails to match, so there is nothing left
+for the `close` handler to defend against — and since the `close` handler was
+what blinded the witness in the first place, removing the need for it removes
+that failure too. One correct notion of identity dissolved three bugs: the IPC
+corruption, the instrument blindness, and this.
+
+It also produced one more measurement of the cost of getting identity wrong.
+An intermediate build kept the descriptor-number lookup as a *fallback* after
+the object lookup, while retirement had already been removed — so a recycled
+number matched a live pool forever. That killed Firefox in one run. There is no
+safe fallback: the object is the identity or there is no identity.
 
 Four hazards were found on the way, each of which produced a wrong answer before
 it was understood. They are recorded because every one of them fails silently or
@@ -10833,15 +10886,19 @@ Requirements 1, 2 and 4 are the ones that need to exist in the interface; 3 and
 
 ### 30.10 What is not proven
 
-* **That a Firefox frame can reach the compositor through a redirected pool.**
-  This is no longer merely unproven — it was measured and it did **not** happen
-  (§30.6). Interception, rewriting and survival are all proven; the pixel path
-  is refuted for this interception point. What is not known is whether that is
-  fatal to the route or only to the *placement* of the interception, and the two
-  candidate causes in §30.6 are the fork in that road. Deciding between them is
-  the next thing to do and it is cheap: log every `mmap` of every descriptor
-  Firefox later passes to `create_pool`, in every process, and see whether the
-  writing mapping is in another process or merely a second mapping in this one.
+* ~~That a Firefox frame can reach the compositor through a redirected pool.~~
+  **Closed, and affirmatively** (§30.6). The interception point was right and
+  needed one more hook: identity by object rather than by descriptor number.
+  2334 and 949 witness changes across ~7130 commits, in the two `mozilla-ipc`
+  rendering pools, with no crash. What remains unproven about it is narrower and
+  is listed below.
+* **That object identity is safe against inode reuse.** `(st_dev, st_ino)` is a
+  far better key than a descriptor number, but it is not eternal either: once a
+  memfd is fully released its inode can be reissued, and a pool record outliving
+  its object would then match a stranger — §30.6d one level up. The pool record
+  must end at `wl_shm_pool.destroy`, which is the protocol's own statement that
+  the object is finished; the experiment leaks the record instead, which is fine
+  for four pools and not fine for a session.
 * **That it is faster.** No end-to-end timing was taken, because the arena path
   was not built. The claim "126 µs per copy becomes 0 µs" is arithmetic on a
   copy that no longer happens, not a measurement, and it ignores whatever the
@@ -10869,27 +10926,38 @@ caches something that defeats the substitution — were both checked and neither
 holds. Firefox's pools are interposable by name, rewritable in place, and the
 client survives having its memory moved underneath it.
 
-But it does not work yet, and the failure is the dangerous kind. Redirecting at
-`create_pool` in the process that owns the Wayland connection is *accepted* by
-Firefox and carries none of its pixels (§30.6). Everything observable short of
-the pixels themselves says success: no crash, no protocol error, buffers created
-from the substituted pools and attached 2284 times. Only the witness says
-otherwise. Anyone building this without §30.7's verifier in place first would
-have shipped a blank window and gone looking for the bug in the compositor.
+**And it works**: with pools keyed on the object rather than the descriptor,
+unmodified Firefox paints its frames directly into memory this shim chose, and
+the witness counts 2334 and 949 changes across ~7130 commits to prove it (§30.6).
+That is the requirement — "it should normally be directly written" — reached for
+a real client on a plain-file stand-in for the arena.
 
-It is also not cheap. Four silent-failure hazards surfaced in a day of building
-the simplest possible version against a plain file, three of which produce
-either a frozen picture or a dead content process with no error anywhere near
-the cause — and the fifth, the one above, is the shim producing a perfectly
-healthy-looking session with the wrong memory in it. The arena version has to
-add scattered-run composition and a pinning contract on top of that.
+What that costs to get wrong is the reason this section is long. Keyed on the
+descriptor instead, the same mechanism is *accepted* by Firefox and carries none
+of its pixels: no crash, no protocol error, buffers created from the substituted
+pools and attached 2284 times, and a blank window. Only the witness dissented.
+Anyone building this without §30.7's verifier in place first would have shipped
+that and gone looking for the bug in the compositor.
 
-So: **leave the copy in place.** It is correct, it is measured, and §27 made it
-2.05× cheaper. Take the arena-backed pool when the region lifecycle has settled
-and the pinning contract of §30.9 exists, and take it with the verifier of
-§30.7 built first — with a firm memory of what the module header says, which
-remains the best short statement of why this is hard, and which this section
-narrows in exactly one place (§30.1) and contradicts nowhere.
+It is also not cheap. Five silent-failure hazards surfaced in building the
+simplest possible version against a plain file, and every one of them either
+freezes the picture, kills a content process, or hands the compositor the wrong
+memory with nothing anywhere reporting an error. Three of the five were the same
+mistake — taking a descriptor number for an identity — and were dissolved by one
+distinction rather than three fixes, which is the most useful thing this section
+learned. The arena version still has to add scattered-run composition and a
+pinning contract on top.
+
+So: **leave the copy in place, for now, and for reasons that are no longer about
+whether this works.** It works. But it works against a plain file, in a rig
+whose compositor is weston rather than `wc-compositor`; the arena version has
+§30.8's scattering to solve and §30.9's pinning contract to be given; the
+region lifecycle is still settling; and §30.7's verifier does not exist in
+`wc-proxy` yet, which §30.6 is the argument for building before rather than
+after. None of those is a reason to doubt the mechanism and all of them are
+reasons not to switch to it this week — with a firm memory of what the module
+header says, which remains the best short statement of why this is hard, and
+which this section narrows in exactly one place (§30.1) and contradicts nowhere.
 
 And keep the ordering straight. The accelerated path — WebRender rendering
 through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all
