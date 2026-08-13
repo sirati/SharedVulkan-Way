@@ -80,6 +80,18 @@ pub struct Driver {
     /// `VK_EXT_debug_utils`, for the one command whose handle argument the
     /// generated passes cannot see (`server::set_debug_utils_object_name_ext`).
     pub debug_utils: Option<ash::ext::debug_utils::Device>,
+    /// Whether `VkPhysicalDeviceVulkan12Features::bufferDeviceAddress` came back
+    /// true and was therefore enabled on this device.
+    ///
+    /// Read by [`crate::arena`], and this is the whole reason it is a field. A
+    /// buffer whose address a shader may take must be bound to memory allocated
+    /// with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`
+    /// (`VUID-VkMemoryAllocateInfo-flags-03331` in the other direction:
+    /// `VUID-VkBufferDeviceAddressInfo-buffer-02601`), and **the arena is one
+    /// allocation made before any application connects**, so the decision has to
+    /// be taken here or not at all. Setting the bit unconditionally is invalid
+    /// usage on a driver without the feature, so it is conditional on this.
+    pub buffer_device_address: bool,
 }
 
 impl Driver {
@@ -160,7 +172,7 @@ impl Driver {
     fn open_on(entry: ash::Entry, instance: ash::Instance, index: usize) -> Result<Driver> {
         let r = Driver::open_inner(&entry, &instance, index);
         match r {
-            Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host)) => {
+            Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host, buffer_device_address)) => {
                 let props = unsafe { instance.get_physical_device_properties(pd) };
                 let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
                     .to_string_lossy()
@@ -184,6 +196,7 @@ impl Driver {
                     has_dma_buf,
                     external_host,
                     debug_utils,
+                    buffer_device_address,
                 })
             }
             Err(e) => {
@@ -206,6 +219,7 @@ impl Driver {
         Option<ash::khr::external_memory_fd::Device>,
         bool,
         Option<ash::ext::external_memory_host::Device>,
+        bool,
     )> {
         let _ = entry;
         let pds =
@@ -296,6 +310,20 @@ impl Driver {
         let mut nscm = vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT::default();
         let mut pgq = vk::PhysicalDevicePrimitivesGeneratedQueryFeaturesEXT::default();
         let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
+        // The six extensions design.md §0.17 added to the profile that carry a
+        // feature struct. Without the struct chained the feature comes back
+        // false and is *enabled* false, so an application that asks for
+        // `VK_EXT_graphics_pipeline_library` finds the extension present and the
+        // feature off — which is a worse answer than not advertising it, because
+        // it fails at `vkCreateGraphicsPipelines` instead of at
+        // `vkCreateDevice`. Adding the extension string and forgetting this is
+        // the shape of mistake `chain_if!` exists to make cheap to avoid.
+        let mut fsr = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+        let mut gpl = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
+        let mut sucf = vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default();
+        let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+        let mut ai64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
+        let mut dbc = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
         let enabled = |name: &CStr| owned.iter().any(|o| o.as_c_str() == name);
         let mut f2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f11)
@@ -330,6 +358,12 @@ impl Driver {
         chain_if!(c"VK_EXT_non_seamless_cube_map", nscm);
         chain_if!(c"VK_EXT_primitives_generated_query", pgq);
         chain_if!(c"VK_KHR_maintenance5", m5);
+        chain_if!(c"VK_KHR_fragment_shading_rate", fsr);
+        chain_if!(c"VK_EXT_graphics_pipeline_library", gpl);
+        chain_if!(c"VK_KHR_shader_subgroup_uniform_control_flow", sucf);
+        chain_if!(c"VK_KHR_fragment_shader_barycentric", bary);
+        chain_if!(c"VK_EXT_shader_image_atomic_int64", ai64);
+        chain_if!(c"VK_EXT_depth_bias_control", dbc);
         unsafe { instance.get_physical_device_features2(pd, &mut f2) };
 
         let dci = vk::DeviceCreateInfo::default()
@@ -339,12 +373,25 @@ impl Driver {
         let device =
             unsafe { instance.create_device(pd, &dci, None) }.map_err(vkerr("vkCreateDevice"))?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        // Read out of the *answer* `vkCreateDevice` was just given, so the two
+        // cannot disagree: §0.4 item 9 hands the physical device's own features
+        // straight back as the enabled set, which is what makes "reported" and
+        // "enabled" the same word here. Recording it is what lets `crate::arena`
+        // allocate memory a shader may take the address of, and what turns
+        // design.md §0.16 item 3's "advertised and not implemented" into
+        // implemented rather than into a retraction.
+        //
+        // After `vkCreateDevice` rather than before it, because `f12` is
+        // mutably borrowed by the chain until then, and the borrow checker is
+        // right: reading a `pNext` link while the chain it is in is still lent
+        // out is exactly the aliasing this project forbids everywhere else.
+        let bda = f12.buffer_device_address != 0;
 
         let external_fd =
             has_fd.then(|| ash::khr::external_memory_fd::Device::new(instance, &device));
         let external_host =
             has_host.then(|| ash::ext::external_memory_host::Device::new(instance, &device));
-        Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host))
+        Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host, bda))
     }
 
     /// The driver's own name, as `sv_arena::import::path_for_driver` spells it.

@@ -945,6 +945,13 @@ fn emit_forward_command(
     let mut reply_fields = Vec::new();
     if wire.returns_result {
         reply_fields.push(quote!(result: sv_proto::VkResult(__r.0),));
+    } else if wire.returns_value {
+        // The driver's own answer, widened to the wire's `u64`. This is the GPU
+        // side of design.md §0.3 item 5: `vkGetBufferDeviceAddress` returns a
+        // real device address on a real device, and §11's caveat holds it
+        // together — we never relocate, so the number stays true for as long as
+        // the buffer does.
+        reply_fields.push(quote!(ret: __r as u64,));
     }
     for (f, kind) in &outs {
         let id = naming::ident(&f.rust_name);

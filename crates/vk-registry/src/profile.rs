@@ -525,6 +525,91 @@ pub mod profiles {
                 "VK_KHR_xlib_surface".into(),
                 "VK_KHR_xcb_surface".into(),
                 "VK_KHR_wayland_surface".into(),
+                // ---------------------------------------------------------
+                // What the conformance suite asked for, in its own words
+                // ---------------------------------------------------------
+                //
+                // design.md §0.17. Everything above this line is here because
+                // Zink, DXVK or the WSI needs it; everything below is here
+                // because `scripts/sv-cts.sh` counted a test that **passes on
+                // the control** and skips forwarded, and printed deqp's own
+                // reason. That is the difference between widening the profile
+                // and guessing at it: each of these has a number of tests
+                // beside it, measured on RADV RAPHAEL_MENDOCINO at 1-in-19997,
+                // and none of them is speculative.
+                //
+                // Nine extensions, 21 of the 50 skips in that sample, and
+                // **five commands between them** — the cheap half of the gap
+                // is almost entirely features and structures rather than entry
+                // points, which is not what "501 commands not carried"
+                // suggests from the registry side alone.
+                //
+                // 7 tests, no commands at all: a pipeline built in libraries
+                // and linked, which is a `pNext` on the create-info and a
+                // feature bit.
+                "VK_KHR_pipeline_library".into(),
+                "VK_EXT_graphics_pipeline_library".into(),
+                // 5 tests, two commands.
+                "VK_KHR_fragment_shading_rate".into(),
+                // 2 tests, no commands: a SPIR-V execution-mode capability.
+                "VK_KHR_shader_subgroup_uniform_control_flow".into(),
+                // One test each, and between them one command.
+                "VK_EXT_sample_locations".into(),
+                "VK_EXT_depth_range_unrestricted".into(),
+                "VK_EXT_depth_bias_control".into(),
+                "VK_KHR_fragment_shader_barycentric".into(),
+                "VK_EXT_shader_image_atomic_int64".into(),
+                // ---------------------------------------------------------
+                // Asked for and deliberately still out, each with its reason
+                // ---------------------------------------------------------
+                //
+                // - **`VK_EXT_shader_object`** (14 tests, the largest single
+                //   line in the skip list). Five commands of its own and a
+                //   second, parallel model of the whole pipeline: without
+                //   `VK_EXT_extended_dynamic_state3`'s 31 setters an
+                //   application that binds shaders has no way to set the state
+                //   a pipeline would have carried, so the real cost is 36
+                //   commands and a validity model this generator has never
+                //   walked. It is a stage, not a line, and it is the next one.
+                // - **`VK_EXT_descriptor_buffer`** (1 test, 11 commands).
+                //   design.md §9.2 excludes it by name: it puts raw device
+                //   addresses in *application-visible* data, which is a
+                //   different thing from `vkGetBufferDeviceAddress` returning
+                //   one — the application writes descriptors by address into
+                //   memory we own, and the boundary has no way to know which
+                //   words are addresses.
+                // - **`VK_KHR_acceleration_structure` and
+                //   `VK_KHR_ray_tracing_pipeline`** (3 tests, 23 commands).
+                //   Same address problem, an order of magnitude more surface.
+                // - **`VK_KHR_external_semaphore_fd`** (1 test). Refused on
+                //   principle rather than on cost: its entire purpose is to
+                //   move a **file descriptor** between processes, and
+                //   design.md §1a says no descriptor ever crosses. A profile
+                //   that carried it would be advertising a promise this
+                //   project exists not to keep.
+                // - **`VK_KHR_push_descriptor`** (2 tests). **Added, measured,
+                //   and taken back out** — the one entry here that is a
+                //   measurement rather than a judgement, and worth the space it
+                //   takes because of *how* it failed. Its `vkCmdPushDescriptor-
+                //   SetWithTemplate` carries a `const void* pData` whose layout
+                //   lives in the template object, exactly like
+                //   `vkUpdateDescriptorSetWithTemplate`; and
+                //   `exceptions::void_policy` already declares
+                //   `VoidPolicy::ArenaOffset` for it. **A policy is not an
+                //   implementation.** `vkUpdateDescriptorSetWithTemplate` is
+                //   expanded app-side into `vkUpdateDescriptorSets` (§0.4 item
+                //   10) and the push variants have no such expansion, so the
+                //   application's own pointer was lowered as though it were an
+                //   arena offset. Measured: two `DeviceLost`, one ring fatal
+                //   (`no VkDescriptorUpdateTemplate with id 20`) and **a
+                //   segmentation fault in `sv-gpu-server` itself** — the driver
+                //   walking a descriptor layout at an offset that never meant
+                //   anything. That is worse than an unimplemented command, and
+                //   it is what an extension costs when only half of it is
+                //   declared. The work is the mirror of §0.4 item 10:
+                //   `vkCmdPushDescriptorSetWithTemplate` expanded app-side into
+                //   `vkCmdPushDescriptorSet`, which needs the template's
+                //   `pipelineBindPoint` kept alongside its entries.
             ],
             extra_commands: vec![],
             excluded_commands: excluded_commands(),

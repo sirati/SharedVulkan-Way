@@ -483,6 +483,36 @@ pub trait IcdLocal {
         None
     }
 
+    /// design.md §5.3's `(memory, offset)` rewrite, **app-side half** — pass 6
+    /// of §7.2, on the side that owns the allocator.
+    ///
+    /// An app-side `VkDeviceMemory` is an id this process minted for a sub-range
+    /// of an arena slab; the GPU side has never heard of it and, by §6.4, must
+    /// not have to. What crosses is `(ARENA_MEMORY_ID, arena_offset + offset)`,
+    /// a well-known id and a number this side already owns, and
+    /// `sv_gpu_server::table::resolve_memory` finishes the translation. Heap-0
+    /// memory is a real GPU-side allocation under the app's own id and crosses
+    /// unchanged.
+    ///
+    /// **The default is the identity**, which is right for an ICD with no arena
+    /// — `NullIcd`, the test doubles, and any build where every allocation is
+    /// the GPU side's.
+    ///
+    /// # Why this is on the trait rather than in one command
+    ///
+    /// It was a single hand-written line in `sv-icd`'s `vkBindBufferMemory` for
+    /// four stages, and the other six commands that carry a memory id across —
+    /// `vkBindImageMemory`, `vkBindBufferMemory2`, `vkBindImageMemory2`,
+    /// `vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges`,
+    /// `vkQueueBindSparse` — sent the app-side id raw. The GPU side then said
+    /// `no VkDeviceMemory with id 8` and took the ring fatal, and every CTS test
+    /// that binds an image to host-visible memory lost the device
+    /// (design.md §0.17). Generating the pass is what makes the set closed: it
+    /// is the same fold the GPU side already runs, applied one boundary earlier.
+    fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
+        Ok((memory, offset))
+    }
+
     /// `vkGetInstanceProcAddr`, which cannot be forwarded because its answer is
     /// a pointer (design.md §6.1's exclusion list).
     ///
@@ -762,6 +792,32 @@ pub fn icd() -> &'static dyn Icd {
     }
 }
 
+/// [`sv_proto::MemoryTransform`] over the registered ICD: the adapter the
+/// generated forwarders hand to pass 6's struct walkers.
+///
+/// It is the app-side twin of `sv_gpu_server`'s `Mapping`, and it exists for the
+/// same reason: the generated walk speaks to a trait object, and one side's
+/// state has to be lent to it. The state here is reached through [`icd`] rather
+/// than passed in, because a `forward::*` function's whole signature is
+/// `(&dyn Transport, args)` — it is below the `Icd` trait, not above it.
+///
+/// An id the ICD does not know is [`sv_wire::WireError::NoSuchMemory`] and the
+/// call fails on this side of the boundary. That is the point: the alternative
+/// is a ring fatal on the far side naming an id nobody can look up.
+pub struct MemoryRewrite;
+
+impl sv_proto::MemoryTransform for MemoryRewrite {
+    fn rewrite(&mut self, memory: u64, offset: u64) -> sv_wire::Result<(u64, u64)> {
+        // `VK_NULL_HANDLE` is legal in a `VkSparseMemoryBind`, where it means
+        // "unbind this range", so it passes through rather than being looked up.
+        if memory == 0 {
+            return Ok((0, offset));
+        }
+        IcdLocal::rewrite_memory(icd(), memory, offset)
+            .map_err(|_| sv_wire::WireError::NoSuchMemory { id: memory })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // small helpers the generated code calls
 // ---------------------------------------------------------------------------
@@ -993,13 +1049,17 @@ mod tests {
             // set and has not been written.
             "vkEnumeratePhysicalDeviceGroups",
             "vkGetDeviceQueue2",
-            // design.md §0.3 finding 5: a command returning a value that is
-            // neither `void` nor `VkResult` has no reply to carry it. Latent —
-            // §9.2 does not advertise `bufferDeviceAddress` — and a hole in the
-            // protocol rather than in this crate.
-            "vkGetBufferDeviceAddress",
-            "vkGetBufferOpaqueCaptureAddress",
-            "vkGetDeviceMemoryOpaqueCaptureAddress",
+            // **`vkGetBufferDeviceAddress` and its two friends left this list**
+            // (design.md §0.17). §0.3 finding 5 put them here — a command
+            // returning a value that is neither `void` nor `VkResult` had no
+            // reply to carry it — and called the hole latent because "§9.2 does
+            // not advertise `bufferDeviceAddress`, so a conforming application
+            // never calls them". Both halves of that were wrong: the feature is
+            // mirrored from the physical device and `vulkaninfo` printed it
+            // true, and CTS called all three. `plan.rs` now generates a reply
+            // whenever a command returns anything at all, the reply carries a
+            // `ret`, and the arena is allocated with
+            // `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` so the address is real.
         ];
         let mut got: Vec<&str> = NOT_IMPLEMENTED.to_vec();
         got.sort_unstable();

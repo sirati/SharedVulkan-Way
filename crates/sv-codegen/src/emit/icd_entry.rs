@@ -1451,6 +1451,14 @@ fn stub_body(
     // one of the results the specification allows an implementation to invent.
     let on_err = if c.returns_void {
         quote!({ crate::report_failure(__e); return; })
+    } else if wire.returns_value {
+        // There is no `VkResult` to fail with and the specification gives these
+        // three no error path at all — `vkGetBufferDeviceAddress` "returns the
+        // address" and that is the whole contract. Zero is the one value that
+        // cannot be a valid device address, so it is the failure, and it is
+        // *reported* as well so that a run under `SV_DEBUG` says why rather than
+        // leaving an application to dereference a null address in a shader.
+        quote!({ crate::report_failure(__e); return 0 as _; })
     } else {
         quote!(return crate::lower_failed(__e))
     };
@@ -1458,10 +1466,18 @@ fn stub_body(
     // --- call and write back ---------------------------------------------
     let call = if wire.generates_reply {
         let store = emit_writeback(store_cx, c, wire, &abi_by_name)?;
-        let result = if c.returns_result {
-            quote!(__r)
+        // A value that is neither `void` nor `VkResult` rides the reply's `ret`
+        // field (design.md §0.3 item 5, closed). It is read out *before* the
+        // writeback, because the writeback consumes the reply, and cast back to
+        // whatever the C header spells the return type — `VkDeviceAddress` here,
+        // a bare `uint64_t` for the two opaque-capture-address commands.
+        let (take_ret, result) = if c.returns_result {
+            (quote!(), quote!(__r))
         } else if c.returns_void {
-            quote!()
+            (quote!(), quote!())
+        } else if wire.returns_value {
+            let cret = c_type(lower_cx, &c.return_type);
+            (quote!(let __ret = __reply.ret as #cret;), quote!(__ret))
         } else {
             return Err(format!(
                 "{} returns {:?}, which is neither void nor VkResult",
@@ -1473,6 +1489,7 @@ fn stub_body(
                 Ok(r) => r,
                 Err(__e) => #on_err,
             };
+            #take_ret
             let __r = #store;
             #result
         }
@@ -1746,6 +1763,100 @@ fn ring_class(c: &crate::plan::CommandPlan) -> TokenStream {
 /// rather than methods on a trait so that nothing here has to be object-safe and
 /// so that `sv-icd` can call one directly when it wants to forward a command it
 /// otherwise answers locally.
+/// Pass 6, app-side half: the `(memory, offset)` rewrite of design.md §5.3,
+/// applied to one command's inputs just before they are encoded.
+///
+/// # Why here and not in the C stub
+///
+/// The stub lowers the application's arguments and then calls the [`Icd`] trait,
+/// whose method the app side is entitled to *answer itself*: `vkAllocateMemory`,
+/// `vkMapMemory` and `vkFreeMemory` are answered out of the app-side allocator
+/// and never cross at all. Rewriting in the stub would hand those overrides
+/// arena coordinates in place of the ids their own tables are keyed by. This
+/// module is the narrower seam — everything that reaches it is about to become
+/// bytes on a ring — so "every memory id that crosses is rewritten" is stated
+/// exactly where it is true, and nothing that does not cross is touched.
+///
+/// It is the same fold `gpu_entry` runs on the way in, sharing
+/// [`super::passes::transform_walk_pub`] and
+/// [`crate::exceptions::memory_offset_sibling`] so that the two sides cannot
+/// disagree about what a pair is.
+fn memory_rewrite_pre(cx: &Ctx<'_>, c: &crate::plan::CommandPlan) -> TokenStream {
+    // A `(memory, offset)` pair at the top level of a parameter list, which no
+    // struct walker can see: `vkBindImageMemory(device, image, memory,
+    // memoryOffset)` is exactly this shape.
+    let param_names: Vec<String> = c.inputs.iter().map(|f| f.name.clone()).collect();
+    let mut pairs = Vec::new();
+    for f in &c.inputs {
+        if !matches!(&f.shape, Shape::Scalar(Scalar::Handle(h)) if h == "VkDeviceMemory") {
+            continue;
+        }
+        let mem = naming::ident(&f.rust_name);
+        match crate::exceptions::memory_offset_sibling(&param_names, &f.name) {
+            Some(off) => {
+                let off_id = naming::ident(&naming::snake_case(&off));
+                pairs.push(quote! {
+                    let (__mm, __oo) = sv_proto::MemoryTransform::rewrite(
+                        &mut crate::MemoryRewrite, args.#mem.0, args.#off_id,
+                    ).map_err(crate::wire_failed)?;
+                    args.#mem.0 = __mm;
+                    args.#off_id = __oo;
+                });
+            }
+            None => pairs.push(quote! {
+                let (__mm, _) = sv_proto::MemoryTransform::rewrite(
+                    &mut crate::MemoryRewrite, args.#mem.0, 0,
+                ).map_err(crate::wire_failed)?;
+                args.#mem.0 = __mm;
+            }),
+        }
+    }
+
+    // And every pair reachable through a struct, an array of structs or a
+    // `pNext` link: `VkBindImageMemoryInfo`, `VkMappedMemoryRange`,
+    // `VkSparseMemoryBind`.
+    let mut walks = Vec::new();
+    for f in &c.inputs {
+        let id = naming::ident(&f.rust_name);
+        if let Some(stmt) = super::passes::transform_walk_pub(cx.wire, &f.shape, &quote!(args.#id)) {
+            walks.push(stmt);
+        }
+    }
+    if pairs.is_empty() && walks.is_empty() {
+        return quote!();
+    }
+    // `__t` is deliberately shadowed inside the block: the walkers were written
+    // to be emitted next to a `&mut dyn MemoryTransform` of that name, and the
+    // enclosing function's `__t` is the transport. Nothing inside the block
+    // wants the transport, and the shadow ends with it.
+    // The walkers speak `sv_wire::Result` and this function returns
+    // `IcdResult`, and `sv_icd_entry` deliberately has no `From<WireError>` —
+    // its own words: "`?` on a `WireError` inside a generated body would then
+    // convert silently, and this crate's rule is that a generated block does
+    // nothing the generator did not write out". So the conversion is written
+    // out, once, around the whole walk.
+    let walks = if walks.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            {
+                let mut __ad = crate::MemoryRewrite;
+                let __t: &mut dyn sv_proto::MemoryTransform = &mut __ad;
+                let mut __walk = || -> sv_wire::Result<()> {
+                    #(#walks)*
+                    Ok(())
+                };
+                __walk().map_err(crate::wire_failed)?;
+            }
+        }
+    };
+    quote! {
+        let mut args = args;
+        #(#pairs)*
+        #walks
+    }
+}
+
 fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
     let fns = cx.wire.commands.iter().map(|c| {
         let m = naming::command_method(&c.name);
@@ -1756,10 +1867,12 @@ fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
         let opcode = c.opcode;
         let ring = ring_class(c);
         let doc = format!("Forward `{}` to the GPU side.", c.name);
+        let mem_pre = memory_rewrite_pre(cx, c);
 
         // The command bytes are identical in both directions; only the flag and
         // what happens afterwards differ.
         let encode = quote! {
+            #mem_pre
             let mut __cmd = vec![0u8; sv_proto::#size_cmd(&args)];
             {
                 let mut __enc = sv_wire::Encoder::new(&mut __cmd);
