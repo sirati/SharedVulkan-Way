@@ -354,6 +354,15 @@ pub struct State {
     /// [`FromUi::KeyboardFocus`]. See [`Self::sync_locked_modifiers`].
     locks: (bool, bool),
 
+    /// The connection, for the two smithay entry points that take one and are
+    /// called from outside a handler: `set_data_device_focus` when Windows
+    /// moves the focus, and `set_data_device_selection` when the Win32
+    /// clipboard changes. Both are events that originate on the UI thread, so
+    /// there is no `&DisplayHandle` in scope to borrow.
+    display: DisplayHandle,
+    /// The one seat, for the same two calls. `SeatState` owns it and this is an
+    /// `Arc` handle to it, so holding one here does not duplicate anything.
+    seat: Seat<Self>,
 
     ui: Ui,
     events: Receiver<FromUi>,
@@ -409,6 +418,25 @@ pub struct State {
     /// never arrived".
     pub icons_applied: usize,
     pub icons_missing: usize,
+
+    /// Kept alive so `wc_clipboard_manager_v1` stays advertised.
+    _clipboard_manager: smithay::reexports::wayland_server::backend::GlobalId,
+    /// Fetches in flight: the token the UI thread will answer with, and who to
+    /// answer.
+    ///
+    /// Keyed by a token this compositor mints rather than by the one the client
+    /// sent, because two proxies are two clients and their tokens are allowed
+    /// to collide. The client's own number is carried alongside and echoed
+    /// back.
+    clip_fetches: HashMap<u64, (crate::clipboard::proto::wc_clipboard_manager_v1::WcClipboardManagerV1, u32)>,
+    next_clip_token: u64,
+    /// Who to tell when the system drag ends. One at a time, because there is
+    /// one mouse.
+    clip_drag_source: Option<crate::clipboard::proto::wc_clipboard_manager_v1::WcClipboardManagerV1>,
+    pub clip_published: usize,
+    pub clip_fetched: usize,
+    pub clip_offered: usize,
+    pub clip_drags: usize,
 
     pub clients_seen: usize,
     pub toplevels: usize,
@@ -497,9 +525,11 @@ impl State {
         decorations: Decorations,
     ) -> Self {
         let mut seat_state = SeatState::new();
-        // The local is dropped at the end of this function and that is safe:
-        // `SeatState` keeps every seat it makes, and `Seat` is an `Arc` handle
-        // rather than the seat itself.
+        // `SeatState` keeps every seat it makes and `Seat` is an `Arc` handle
+        // rather than the seat itself, so this local used to be dropped here.
+        // The clipboard work keeps it: `set_data_device_focus` and
+        // `set_data_device_selection` both take one and are called from the UI
+        // event pump, where there is no seat in scope.
         let mut seat: Seat<State> = seat_state.new_wl_seat(dh, "seat0");
 
         // **Capabilities are advertised by adding them, and only then.**
@@ -611,6 +641,14 @@ impl State {
                 1,
                 (),
             );
+        // §29. The clipboard's side door, for the one thing
+        // `wl_data_device` cannot express across this boundary: the bytes
+        // themselves. See `protocols/wc-clipboard-v1.xml` and `crate::clipboard`.
+        let clipboard_manager = dh
+            .create_global::<State, crate::clipboard::proto::wc_clipboard_manager_v1::WcClipboardManagerV1, _>(
+                1,
+                (),
+            );
         let mut toplevel_icon =
             smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<State>(dh);
         // The sizes Windows will ask for, told to the client at bind time:
@@ -687,6 +725,8 @@ impl State {
             cursor_surface: None,
             popup_grab: None,
             locks: (false, false),
+            display: dh.clone(),
+            seat,
             ui,
             events,
             sources: vec![Box::new(ShmSource)],
@@ -709,6 +749,14 @@ impl State {
             shortcuts_inhibit: KeyboardShortcutsInhibitState::new::<State>(dh),
             icons_applied: 0,
             icons_missing: 0,
+            _clipboard_manager: clipboard_manager,
+            clip_fetches: HashMap::new(),
+            next_clip_token: 1,
+            clip_drag_source: None,
+            clip_published: 0,
+            clip_fetched: 0,
+            clip_offered: 0,
+            clip_drags: 0,
             clients_seen: 0,
             toplevels: 0,
             popups: 0,
@@ -896,6 +944,14 @@ impl State {
                     self.pointer_axis(id, horizontal, vertical, v120_h, v120_v, time)
                 }
                 FromUi::Layout { name } => self.set_layout(name),
+                FromUi::ClipboardChanged { mimes } => self.on_clipboard_changed(mimes),
+                FromUi::ClipboardData { token, data } => self.on_clipboard_data(token, data),
+                FromUi::DragFinished { action } => {
+                    println!("wc-compositor: the drag ended with action {action:#x}");
+                    if let Some(source) = self.clip_drag_source.take() {
+                        source.drag_finished(action);
+                    }
+                }
                 FromUi::TouchDown { id, slot, x, y, shape, time } => {
                     self.touch_down(id, slot, x, y, shape, time)
                 }
@@ -917,6 +973,71 @@ impl State {
                         touch.cancel(self);
                     }
                 }
+            }
+        }
+    }
+
+    /// The Win32 clipboard changed: offer it to Wayland.
+    ///
+    /// This is the *whole* of the announcement, and it goes out over ordinary
+    /// `wl_data_device` rather than over `wc_clipboard_v1`. That is deliberate
+    /// and it is what keeps the side interface small: smithay already knows how
+    /// to mint a `wl_data_offer`, list its mime types on it, and send
+    /// `selection` to whichever client has the focus — and wc-proxy forwards
+    /// every one of those messages verbatim, because none of them carries a
+    /// descriptor. The only message in the family that does is
+    /// `wl_data_offer.receive`, and that one never reaches this compositor.
+    fn on_clipboard_changed(&mut self, mimes: Vec<String>) {
+        if mimes.is_empty() {
+            println!("wc-compositor: the system clipboard is empty; clearing the selection");
+            smithay::wayland::selection::data_device::clear_data_device_selection(
+                &self.display,
+                &self.seat.clone(),
+            );
+            return;
+        }
+        self.clip_offered += 1;
+        println!(
+            "wc-compositor: the system clipboard changed; offering {} mime type(s): {}",
+            mimes.len(),
+            mimes.join(", ")
+        );
+        smithay::wayland::selection::data_device::set_data_device_selection(
+            &self.display,
+            &self.seat.clone(),
+            mimes,
+            (),
+        );
+    }
+
+    /// The UI thread has read the clipboard. Send it back to whoever asked.
+    ///
+    /// Chunked at [`crate::clipboard::CHUNK`] for the reason §16.5 gives about
+    /// icons and which is not specific to icons: `wayland-backend`'s buffers
+    /// are 4096 bytes, and a message that does not fit in one cannot be sent at
+    /// all. A clipboard payload is routinely larger than an icon.
+    fn on_clipboard_data(&mut self, token: u64, data: Option<Vec<u8>>) {
+        let Some((manager, client_token)) = self.clip_fetches.remove(&token) else {
+            // The publisher went away while the UI thread was reading. Not an
+            // error: a proxy whose client exited mid-paste is the ordinary
+            // case, and there is nobody left to tell.
+            return;
+        };
+        match data {
+            Some(bytes) => {
+                self.clip_fetched += 1;
+                println!(
+                    "wc-compositor: clipboard fetch {client_token} answered with {} bytes",
+                    bytes.len()
+                );
+                for part in bytes.chunks(crate::clipboard::CHUNK) {
+                    manager.chunk(client_token, part.to_vec());
+                }
+                manager.done(client_token);
+            }
+            None => {
+                println!("wc-compositor: clipboard fetch {client_token} has no such format");
+                manager.fail(client_token, "the clipboard holds nothing of that type".into());
             }
         }
     }
@@ -990,6 +1111,15 @@ impl State {
             let Some(surface) = self.surface_of(id) else { return };
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
+            // **The clipboard follows the keyboard, and until §29 nothing
+            // said so.** `wl_data_device`'s selection is offered to the client
+            // with *data device focus*, which smithay keeps separately and
+            // which nothing here had ever set — so a compositor-provided
+            // selection would have been announced to nobody, and a client's
+            // `wl_data_device` would have sat silent forever. It is one call,
+            // it is the same rule every compositor uses, and its absence is
+            // invisible until something actually has a selection to offer.
+            self.set_clipboard_focus(Some(&surface));
             keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
             // STAGE 13. The locks are Windows', and they are the half of the
             // modifier state that key events cannot carry.
@@ -1046,6 +1176,7 @@ impl State {
             for keycode in keyboard.pressed_keys() {
                 keyboard.input_intercept::<(), _>(self, keycode, KeyState::Released, |_, _, _| ());
             }
+            self.set_clipboard_focus(None);
             keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
     }
@@ -1071,6 +1202,16 @@ impl State {
         mods.caps_lock = caps;
         mods.num_lock = num;
         keyboard.set_modifier_state(mods);
+    }
+
+    /// Who may see the selection. See the call site in [`Self::set_keyboard_focus`].
+    fn set_clipboard_focus(&mut self, surface: Option<&WlSurface>) {
+        let client = surface.and_then(|s| self.display.get_client(s.id()).ok());
+        smithay::wayland::selection::data_device::set_data_device_focus(
+            &self.display,
+            &self.seat.clone(),
+            client,
+        );
     }
 
     /// One key, in evdev numbering, to whatever has focus.
@@ -2866,6 +3007,138 @@ impl Dispatch<WcIconManagerV1, PublisherState> for State {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The clipboard: the side door for the bytes
+// ---------------------------------------------------------------------------
+
+use crate::clipboard::proto::wc_clipboard_manager_v1::{self, WcClipboardManagerV1};
+
+/// Per-publisher staging, on the resource rather than on the compositor, so two
+/// proxies building selections at once cannot interleave into each other.
+#[derive(Debug, Default)]
+pub struct ClipboardState(std::sync::Mutex<crate::clipboard::Staging>);
+
+impl GlobalDispatch<WcClipboardManagerV1, ()> for State {
+    fn bind(
+        _state: &mut State,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WcClipboardManagerV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        println!(
+            "wc-compositor: a client bound wc_clipboard_manager_v1 \
+             (the clipboard's byte path)"
+        );
+        data_init.init(resource, ClipboardState::default());
+    }
+}
+
+impl Dispatch<WcClipboardManagerV1, ClipboardState> for State {
+    fn request(
+        state: &mut State,
+        _client: &Client,
+        resource: &WcClipboardManagerV1,
+        request: wc_clipboard_manager_v1::Request,
+        data: &ClipboardState,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State>,
+    ) {
+        use crate::clipboard::StageError;
+        use wc_clipboard_manager_v1::{Error, Request};
+
+        // Every failure here ends the *publisher's* connection, which in this
+        // topology is wc-proxy's third socket and not the application's. A
+        // proxy that miscounts its bytes costs a paste, not a window — the same
+        // property the icon feed has and for the same reason.
+        let fail = |e: StageError| match e {
+            StageError::TooBig => (Error::TooBig, "more staged bytes than the compositor holds"),
+            StageError::TooMany => (Error::TooMany, "more mime types than a clipboard holds"),
+        };
+
+        match request {
+            Request::Chunk { data: bytes } => {
+                if let Err(e) = data.0.lock().unwrap().chunk(&bytes) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Data { mime_type } => {
+                if let Err(e) = data.0.lock().unwrap().data(mime_type) {
+                    let (code, why) = fail(e);
+                    resource.post_error(code, why);
+                }
+            }
+            Request::Publish => {
+                let payloads = data.0.lock().unwrap().take();
+                let system = crate::clipboard::to_system(&payloads);
+                state.clip_published += 1;
+                println!(
+                    "wc-compositor: a client published a selection: {} mime type(s) -> {} \
+                     system format(s) [{}]",
+                    payloads.len(),
+                    system.len(),
+                    system
+                        .iter()
+                        .map(|(f, b)| format!("{} {} bytes", f.name(), b.len()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // The *payloads*, not the converted formats, cross to the UI
+                // thread: the conversion belongs to `crate::clipboard` and the
+                // headless platform has no `CF_UNICODETEXT` to convert to.
+                // `win32.rs` calls `to_system` itself.
+                state.ui.send(ToUi::SetClipboard { payloads });
+            }
+            Request::Fetch { token, source, mime_type } => {
+                let internal = state.next_clip_token;
+                state.next_clip_token += 1;
+                state.clip_fetches.insert(internal, (resource.clone(), token));
+                state.ui.send(ToUi::FetchClipboard {
+                    token: internal,
+                    // The `source` enum's `drag` entry. Compared as a number
+                    // rather than through the generated type because the arg
+                    // is a plain `uint` in the XML: an `enum=` attribute would
+                    // make the generated signature a `WEnum`, which buys
+                    // nothing for a two-value flag and costs a match arm for a
+                    // value that cannot occur.
+                    from_drag: source == 1,
+                    mime: mime_type,
+                });
+            }
+            // Drag and drop, from a Wayland client outward. §29 stages the
+            // payload through exactly the same `chunk`/`data` path a publish
+            // uses (see the XML) and hands it to the platform; a platform with
+            // no OLE drag source answers `none` at once.
+            //
+            // **Answered unconditionally, on every path.** A `start_drag` that
+            // produced no `drag_finished` would leave the client's
+            // `wl_data_source` waiting forever, which is the half-implemented
+            // drag this stage exists not to build.
+            Request::StartDrag { actions } => {
+                let payloads = data.0.lock().unwrap().take();
+                state.clip_drags += 1;
+                println!(
+                    "wc-compositor: a client started a drag with {} mime type(s), \
+                     actions {actions:#x}",
+                    payloads.len()
+                );
+                state.clip_drag_source = Some(resource.clone());
+                state.ui.send(ToUi::StartDrag { payloads, actions });
+            }
+            Request::CancelDrag => {
+                state.ui.send(ToUi::CancelDrag);
+            }
+            Request::Destroy => {
+                // Fetches this resource was waiting on are abandoned rather
+                // than answered into a dead object, which the XML says.
+                state.clip_fetches.retain(|_, (r, _)| r != resource);
+            }
+        }
+    }
+}
+
 // ADDED FOR STAGE 9 -----------------------------------------------------------
 //
 // `OutputHandler` has no required methods: smithay's output global does all its
@@ -2873,25 +3146,53 @@ impl Dispatch<WcIconManagerV1, PublisherState> for State {
 // client binds one. Nothing here needs to know.
 impl OutputHandler for State {}
 
-/// The clipboard, implemented as far as **refusing honestly**.
+/// The clipboard, from `wl_data_device`'s side.
 ///
-/// Every method here is smithay's default, which is to say the selection is
-/// tracked between clients on this compositor and nothing is offered from
-/// outside it. That is not the finished feature and it is not a stub either:
-/// two Wayland clients on this compositor can already copy and paste through
-/// it, because smithay's `wl_data_device` implementation does that work itself.
+/// # What §29 changed, and what it deliberately did not
 ///
-/// **What cannot work here, and will not until something is built for it, is a
-/// clipboard shared with Windows.** The two halves of that are
-/// `SelectionHandler::send_selection` — hand the compositor an fd and have it
-/// write the Win32 clipboard's bytes into it — and the reverse. On the guest
-/// that fd is a `wc_handle::Handle` (the fork makes `OwnedFd` mean that), and a
-/// `Handle` written by the compositor is exactly the object docs/design.md
-/// §12.13 item 7 says has no route to a client on the other side of the
-/// hypervisor. So this is not laziness deferred; it is the same missing
-/// allocator, arriving from a third direction.
+/// This used to be smithay's defaults with a paragraph saying a Windows
+/// clipboard could not be built on them, because `send_selection` hands the
+/// compositor **a file descriptor to write into** and on the guest an `OwnedFd`
+/// is a `wc_handle::Handle` — an object docs/design.md §12.13 item 7 says has
+/// no route to a client across the hypervisor. That paragraph was right about
+/// the descriptor and wrong about the feature.
+///
+/// The way out is that the descriptor never has to exist here. `wc-proxy` runs
+/// on the client's own machine, where the client's pipe is a real Linux pipe;
+/// it terminates the transfer there and carries the **bytes** over
+/// `wc_clipboard_v1`. So this compositor's part of the clipboard is: announce
+/// what Windows holds (`on_clipboard_changed`, over ordinary `wl_data_device`),
+/// and answer for the bytes (the `Dispatch` above). Neither needs an fd.
+///
+/// `send_selection` is therefore **unreachable in this topology** and is still
+/// implemented, because "unreachable" is a claim about the proxy and this trait
+/// is reachable by anything that connects directly. It refuses by closing the
+/// descriptor, which the client reads as an empty selection — a failed paste,
+/// which is recoverable, rather than a protocol error, which is not.
 impl SelectionHandler for State {
     type SelectionUserData = ();
+
+    fn send_selection(
+        &mut self,
+        _ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: smithay::utils::os::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        // Dropped, not written. On Windows this "fd" is a `wc_handle::Handle`
+        // the client named, and there is no writer for one here; on Linux it is
+        // a pipe from a client that bypassed the proxy. Both get an empty
+        // paste and a line saying why.
+        drop(fd);
+        println!(
+            "wc-compositor: a client asked for the selection as {mime_type:?} through \
+             wl_data_offer.receive. That request carries a file descriptor and this \
+             compositor has no way to write into one across the boundary; the bytes go \
+             through wc_clipboard_v1 instead, which wc-proxy binds. Closing the \
+             descriptor: the paste comes back empty rather than killing the client."
+        );
+    }
 }
 
 impl DataDeviceHandler for State {
@@ -2904,6 +3205,15 @@ impl DataDeviceHandler for State {
 // and nothing is done with them. A drag *within* one client works because
 // smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
 // is not started here.
+//
+// §29 left this alone on purpose. Drag and drop is the same interface
+// family as the clipboard and it is **not implemented**, which is a decision
+// and not an oversight: a half-built DnD is a drag that starts, offers a
+// format, and then hangs on the drop, and that failure — a client waiting
+// forever on a transfer nobody will finish — is precisely what this stage
+// exists to remove. wc-proxy answers `wl_data_device.start_drag` with an
+// immediate `wl_data_source.cancelled`, so a client that tries gets a drag that
+// does not begin instead of one that does not end. docs/waycompose-design.md §29.8.
 impl ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 

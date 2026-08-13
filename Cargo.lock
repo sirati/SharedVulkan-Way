@@ -1263,9 +1263,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-arena-host"
+version = "0.1.0"
+dependencies = [
+ "arena-record",
+ "sv-arena",
+ "sv-hostd",
+ "sv-transport",
+ "wc-handle",
+]
+
+[[package]]
 name = "wc-compositor"
 version = "0.1.0"
 dependencies = [
+ "awe-probe",
  "libc",
  "smithay",
  "wayland-backend",
@@ -1289,6 +1301,14 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sv-arena",
+ "sv-transport",
+ "windows-sys",
+]
+
+[[package]]
+name = "wc-launch"
+version = "0.1.0"
+dependencies = [
  "windows-sys",
 ]
 

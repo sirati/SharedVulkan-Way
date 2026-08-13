@@ -336,6 +336,16 @@ pub struct OutboundWindow {
     pub offset: u64,
     /// Its length. Always a whole number of [`REGION_PAGE`]s.
     pub len: u64,
+    /// DYNAMIC ARENA. The run id of the region this window is the whole of,
+    /// when `reserve_outbound` had to commit one. `None` when the window is a
+    /// tail of a region somebody else already committed and reported.
+    ///
+    /// It is here because the host cannot locate a region it has not been told
+    /// the run id of, and a dedicated outbound region is committed *inside*
+    /// `reserve_outbound` where the caller would otherwise never see it. A
+    /// region nobody can locate is a region the compositor writes keymaps into
+    /// and no client ever reads.
+    pub run_id: Option<u64>,
 }
 
 /// The window, plus the free list that is the whole of the allocator's state.
@@ -423,6 +433,44 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         ));
     }
     let len = len.div_ceil(GIFT_GRANULARITY) * GIFT_GRANULARITY;
+    // DYNAMIC ARENA. An id this process has not committed means "commit a
+    // region for the window", and the window is then the whole of it.
+    //
+    // This is the split the floor depends on. While the window was a tail of
+    // the data region, the region carrying live keymaps was also the region the
+    // data allocator started in, so pinning the one pinned the other and
+    // whatever the session started at became permanent — an `sv-guest` holding
+    // 817 MB with no client connected. Giving the window its own region makes
+    // the floor the size of the thing that actually has to stay.
+    //
+    // The id carries the meaning rather than a new flag, because the two cases
+    // want to be told apart by *which region*, which is exactly what an id is
+    // for. `--arena-outbound 0:M` against a committed arena 0 is the pre-split
+    // spelling and still does what it always did.
+    if !registry()
+        .read()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?
+        .contains_key(&arena)
+    {
+        // Its own commit, its own stamps, its own run id: the host locates it
+        // exactly as it locates a data region, and `defer_gifts` still covers
+        // the ordering (see that function for what a dedicated region did and
+        // did not change about the stamp race).
+        let region = attach_guest_ram(arena, len)?;
+        let mut guard = outbound_slot()
+            .lock()
+            .map_err(|_| io::Error::other("outbound window poisoned"))?;
+        if let Some(w) = guard.as_ref() {
+            return Err(io::Error::other(format!(
+                "this process already has an outbound window, in arena {}: a second \
+                 would be a second allocator over objects clients already hold",
+                w.arena
+            )));
+        }
+        let w = Window { arena, base: 0, len, free: vec![(0, len)], given: 0, pending: None };
+        *guard = Some(w);
+        return Ok(OutboundWindow { arena, offset: 0, len, run_id: Some(region.run_id) });
+    }
     let arena_len = {
         let guard = registry()
             .read()
@@ -462,7 +510,7 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
     }
     let base = arena_len - len;
     *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None });
-    Ok(OutboundWindow { arena, offset: base, len })
+    Ok(OutboundWindow { arena, offset: base, len, run_id: None })
 }
 
 /// Hold every gift's bytes in memory until [`release_gifts`] is called.
@@ -484,6 +532,29 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
 /// so the keymap is minted before the socket is bound, let alone bound to.
 /// 73017 bytes of `de` layout is ten pages of stamps, and ten is exactly what
 /// the sweep was short.
+///
+/// # What a dedicated outbound region changed, and what it did not
+///
+/// DYNAMIC ARENA. The window now lives in a region of its own rather than on
+/// the tail of the data region, and that **scopes this race without removing
+/// it**. Gifts can only ever overwrite the *outbound* region's stamps, so every
+/// data region is safe by construction — a class of race gone, not merely made
+/// less likely. What is left is one 256 KiB region whose stamps a keymap will
+/// eat, and it still has to be located before that happens.
+///
+/// The deferral is not cheaper for being scoped, because the sweep's cost is a
+/// function of the *host's* RAM and not the region's: §12.5 measured 2.37-2.42 s
+/// against a 13312 MiB backing object whatever was being looked for. A 256 KiB
+/// region takes just as long to find by content as a 768 MiB one.
+///
+/// **What removes the deferral outright is the PFN locator**, which re-locates a
+/// region whose contents have already been overwritten — §0.14 item 4 measured
+/// it returning the same 16384 frames where the content sweep found 0 pages.
+/// With `Locator::Pfns` in use there is no ordering constraint left to defer
+/// against: a gift may land before the locate, because the locate no longer
+/// reads the bytes the gift overwrote. This code stays because the scan is
+/// still the R28 cross-check at attach and still the only locator on a guest
+/// that cannot run the query; it is dead weight on a guest that can.
 ///
 /// # Why deferring is the fix rather than re-ordering something
 ///
@@ -566,7 +637,7 @@ pub fn outbound() -> Option<OutboundWindow> {
     let guard = outbound_slot().lock().ok()?;
     guard
         .as_ref()
-        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len })
+        .map(|w| OutboundWindow { arena: w.arena, offset: w.base, len: w.len, run_id: None })
 }
 
 /// Bytes given out and bytes still free in the outbound window, for the one log
@@ -881,6 +952,44 @@ pub fn attached() -> Vec<(u32, usize, String)> {
         .collect();
     out.sort_by_key(|(id, _, _)| *id);
     out
+}
+
+/// Where a region this process **provided** starts in this process's address
+/// space, for the one caller that needs an address rather than bytes.
+///
+/// # Why a raw address is exported at all, when nothing else here is
+///
+/// Every other accessor in this module hands out bytes, because the whole point
+/// of an arena id is that neither side has to know where the other put
+/// anything. This one exists for `SuperfetchPfnQuery`, which is a *reverse*
+/// lookup: it enumerates the machine's page frames and keeps the ones whose
+/// recorded virtual address falls inside a window (`awe_probe::superfetch`).
+/// The window has to be named by its address because that is the only name the
+/// PFN database knows it by — there is no id to give it.
+///
+/// It is `provided` only, and that is the same rule [`guest_write`] and
+/// [`release_guest_ram`] are under: a region this process merely *opened* is
+/// somebody else's memory, its frames belong to whoever committed them, and
+/// asking Windows which frames back a foreign mapping would produce an answer
+/// about a different process's pages.
+///
+/// # What this makes possible, and it is the whole of §0.14 item 4
+///
+/// The content sweep can only find a region whose pages still carry their
+/// stamps, and the first pool allocated into a region overwrites them
+/// ([`attach_guest_ram`]'s own note says so: "this region cannot be re-found
+/// later"). The frame list does not care what is in the pages — measured, on a
+/// window whose every byte had been overwritten, as the *same* frame list where
+/// the sweep found zero pages. So this is not an optimisation of locating; it
+/// is what makes locating a region twice possible, and growth is the first
+/// thing that needs it.
+pub fn region_base(arena: u32) -> Option<usize> {
+    let guard = registry().read().ok()?;
+    let a = guard.get(&arena)?;
+    if !a.provided {
+        return None;
+    }
+    Some(a.view.ptr() as usize)
 }
 
 /// Give a guest-RAM region back to the operating system.

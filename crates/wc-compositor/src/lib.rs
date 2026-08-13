@@ -42,12 +42,14 @@
 //! honest about being one; it is not a throughput limit, because a single turn
 //! drains every pending message.
 
+mod clipboard;
 /// The socket a conformance suite drives this compositor through, standing
 /// where Windows stands. Linux only, because WLCS is. See its header, and
 /// docs/waycompose-design.md §26.
 #[cfg(unix)]
 mod control;
 mod cursor;
+pub mod grow;
 mod icon;
 mod input;
 mod platform;
@@ -604,12 +606,38 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // line is what the peer's allocator has to be told to stay out of.
     if let Some((id, bytes)) = args.outbound {
         match wc_handle::arena::reserve_outbound(id, bytes) {
-            Ok(w) => println!(
-                "wc-compositor: arena {id} outbound window: offset {}, {} bytes \
-                 (objects made for clients are arena slices; wc-proxy needs \
-                 --arena-outbound {} to leave them alone)",
-                w.offset, w.len, w.len
-            ),
+            Ok(w) => {
+                // DYNAMIC ARENA. A run id here means `reserve_outbound` had to
+                // commit a region of its own for the window, because `id` named
+                // an arena this process had not provided. The run id goes out on
+                // its own line and in the same shape as the data regions',
+                // because the host's locator cannot find a region it has not
+                // been told the run id of — and a region nobody can locate is
+                // one the compositor writes keymaps into that no client ever
+                // reads.
+                if let Some(run) = w.run_id {
+                    println!(
+                        "wc-compositor: arena {id} provided from guest RAM: \
+                         run 0x{run:016x}, {} bytes, {} pages, locked=true \
+                         (the outbound window's own region)",
+                        w.len,
+                        w.len / wc_handle::arena::GIFT_GRANULARITY,
+                    );
+                }
+                println!(
+                    "wc-compositor: arena {id} outbound window: offset {}, {} bytes{} \
+                     (objects made for clients are arena slices; wc-proxy needs \
+                     --arena-outbound {} to leave them alone)",
+                    w.offset,
+                    w.len,
+                    if w.run_id.is_some() {
+                        ", the whole of its own region, so every data region can be reclaimed"
+                    } else {
+                        ", a tail of the data region, which therefore cannot be reclaimed"
+                    },
+                    w.len
+                );
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not reserve an outbound window in arena {id}: {e}");
                 return std::process::ExitCode::from(2);
