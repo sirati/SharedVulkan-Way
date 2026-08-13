@@ -351,6 +351,21 @@ pub struct State {
     /// they happen wherever the last motion was — so the compositor has to
     /// remember.
     pointer_at: (f64, f64),
+    /// Which surface each live touch contact landed on.
+    ///
+    /// ADDED FOR §40, to answer one question smithay will not: **when a
+    /// surface is destroyed with a finger still on it, which contacts have to
+    /// be ended?** `TouchHandle` keeps the per-slot focus privately and does
+    /// not release it when the focused surface dies, so without this the
+    /// client is left holding a contact that can never come up — there is no
+    /// `wl_touch.leave` to rescue it, and the next `down` on the same slot
+    /// arrives with the previous one still notionally held.
+    ///
+    /// Keyed by the *surface* rather than by the window, because the surface
+    /// is what gets destroyed: a `wl_subsurface` can go away while its window
+    /// lives on, and WLCS's `sends_touch_up_on_surface_destroy` runs that case
+    /// against both subsurface builders.
+    touch_contacts: Vec<(i32, WlSurface)>,
     /// `wp_cursor_shape_v1`, held only so the global outlives the display.
     ///
     /// ADDED FOR STAGE 12. Named with a leading underscore for the same reason
@@ -771,6 +786,7 @@ impl State {
             keyboard_focus: None,
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
+            touch_contacts: Vec::new(),
             // ADDED FOR STAGE 12. Version 2 of the protocol, which is what
             // smithay's global advertises and what adds `dnd_ask` and
             // `all_resize` to the shape enum.
@@ -1105,17 +1121,77 @@ impl State {
         self.by_id(id).map(|w| w.role.surface().clone())
     }
 
-    /// A window's surface **and where that surface's origin is**, which is what
-    /// every input event needs and what none of them had until §37.
+    /// **Which surface of window `id` is under the point `(x, y)`**, and where
+    /// that surface's origin sits — the pair every input event needs.
     ///
-    /// Returned together on purpose. The two are read from the same `Window` in
-    /// the same borrow, so there is no call site that can pick up the surface
-    /// and forget the origin — which is precisely the bug §37 fixes, committed
-    /// once in `pointer_motion` and copied from there into `touch_down` and
-    /// `touch_motion` with the comment "`(0, 0)` for the same reason".
-    fn surface_and_origin(&self, id: WindowId) -> Option<(WindowId, WlSurface, (f64, f64))> {
-        self.by_id(id)
-            .map(|w| (id, w.role.surface().clone(), surface_origin(w.content_offset)))
+    /// # What this replaces, and why it is the compositor's job on both legs
+    ///
+    /// Until §40 this was `surface_and_origin`: the window's *root* surface and
+    /// nothing else. §37 fixed the origin half — the second element stopped
+    /// being a hard-coded `(0, 0)` and became the window-geometry inset — but
+    /// the first half was still a placeholder, and it is the single largest
+    /// source of WLCS failures in the suite. A subsurface never received a
+    /// pointer event, and `wl_surface.set_input_region` was parsed by smithay
+    /// and read by nobody.
+    ///
+    /// **This is not harness-only code, and the architecture note in
+    /// `control.rs` is easy to misread as saying it is.** Windows routes a
+    /// `WM_MOUSEMOVE` to an `HWND`, and there is one `HWND` per *window*. A
+    /// `wl_subsurface` has no `HWND` — the whole surface tree is composed into
+    /// one window's pixels by `compose_tree` — so the routing *within* a window
+    /// is something Win32 has already declined to do and cannot do. Windows
+    /// answers "which window"; only this function can answer "which surface".
+    /// It runs on the real platform path exactly as it runs under `--control`.
+    ///
+    /// # The coordinate spaces, because there are three
+    ///
+    /// `(x, y)` arrives in **window-content pixels**: the platform has already
+    /// subtracted the frame, so `(0, 0)` is the top-left of the client area.
+    /// `placed_tree` reports each surface in **root-buffer** coordinates. The
+    /// blit puts root-buffer point `(gx, gy)` at window pixel `(0, 0)`, where
+    /// `(gx, gy)` is [`Window::content_offset`] — so the two spaces differ by
+    /// exactly that offset, and a surface placed at `loc` has its origin at
+    /// window pixel `loc - g`. That subtraction is done once, here, and the
+    /// result is handed to smithay in the form it wants: smithay computes
+    /// `location - origin`, so the client is sent `(x, y) - (loc - g)`, which
+    /// is the same arithmetic `compose_tree` did to the pixels.
+    ///
+    /// For a window whose tree is one surface this returns exactly what
+    /// `surface_and_origin` did — `loc` is `(0, 0)` and the origin is
+    /// `(-gx, -gy)`, which is [`surface_origin`]'s value. The old function is
+    /// the new one's single-surface case, so §37's fix is preserved rather than
+    /// re-derived.
+    ///
+    /// # Topmost wins, and `None` is a real answer
+    ///
+    /// `placed_tree` is in paint order, so the reverse is top-to-bottom and the
+    /// first surface that accepts the point is the one the client would see
+    /// drawn there. If nothing accepts it — every surface's input region
+    /// excludes it, or the window has no buffer yet — the answer is `None`, and
+    /// the caller sends a `leave` rather than delivering to the root anyway.
+    /// That is the case `set_input_region` exists to create and the one the
+    /// placeholder got wrong in the direction that matters: silently claiming
+    /// input a client asked not to receive.
+    fn surface_under(&self, id: WindowId, x: f64, y: f64) -> Option<(WlSurface, (f64, f64))> {
+        let window = self.by_id(id)?;
+        // §37's sign, reused rather than re-derived: this is the root surface's
+        // origin, and every other surface of the tree is that plus its own
+        // placement. A second copy of the negation is a second chance to get it
+        // backwards, and the whole of `surface_origin`'s doc comment is about
+        // how easy that is.
+        let (rx, ry) = surface_origin(window.content_offset);
+        let root = window.role.surface().clone();
+        placed_tree(&root).into_iter().rev().find_map(|(surface, loc)| {
+            // The surface's origin in window-content pixels.
+            let origin = (rx + f64::from(loc.0), ry + f64::from(loc.1));
+            let local = (x - origin.0, y - origin.1);
+            let size = self.staging.get(&surface).map(|s| (s.width(), s.height()))?;
+            let accepted = compositor::with_states(&surface, |states| {
+                let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+                accepts_input_at(size, attrs.current().input_region.as_ref(), local)
+            });
+            accepted.then_some((surface, origin))
+        })
     }
 
     /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
@@ -1337,24 +1413,30 @@ impl State {
     /// something this file could get subtly wrong.
     fn pointer_motion(&mut self, id: Option<WindowId>, x: f64, y: f64, time: u32) {
         let pointer = self.pointer.clone();
-        let focus = id.and_then(|id| self.surface_and_origin(id));
-        match &focus {
-            Some((id, _, _)) => {
-                self.pointer_focus = Some(*id);
+        // **The scene lookup, and the window bookkeeping, are deliberately
+        // separate.** `pointer_focus` answers "which window is the pointer
+        // over", which is Windows' answer and is true whether or not any
+        // surface in that window accepts input there; `pointer_button` relies
+        // on it to re-place the pointer under a `SetCapture` drag, and
+        // `pointer_axis` on it to say where a wheel went. The hit test answers
+        // "which surface", and its `None` — a point inside the window but
+        // outside every input region — must not be allowed to read as "the
+        // pointer left the window".
+        match id {
+            Some(id) => {
+                self.pointer_focus = Some(id);
                 self.pointer_at = (x, y);
             }
             None => self.pointer_focus = None,
         }
+        let focus = id.and_then(|id| self.surface_under(id, x, y));
         pointer.motion(
             self,
-            // The second element is the surface's origin in compositor space,
-            // and smithay subtracts it from `location` to get the surface-local
-            // point the client is sent. Compositor space here is the window's
-            // client area in pixels — one `HWND` per window, the platform has
-            // already subtracted the frame — so the only thing left in it is
-            // the client's own window-geometry inset, and that is
-            // [`Window::content_offset`] negated. See `surface_and_origin`.
-            focus.map(|(_, s, origin)| (s, origin.into())),
+            // The second element is the surface's origin in window-content
+            // pixels, and smithay subtracts it from `location` to get the
+            // surface-local point the client is sent. See `surface_under` for
+            // the three coordinate spaces and which one this is.
+            focus.map(|(s, origin)| (s, origin.into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial: SERIAL_COUNTER.next_serial(),
@@ -1518,7 +1600,14 @@ impl State {
         time: u32,
     ) {
         let Some(touch) = self.touch.clone() else { return };
-        let Some((_, surface, origin)) = self.surface_and_origin(id) else { return };
+        // §24 said touch reuses the pointer's conversion rather than doing its
+        // own arithmetic, and §40 keeps that promise through the scene lookup
+        // as well: a contact lands on whichever surface of the tree is under
+        // it, honouring input regions, exactly as a click does. A contact on a
+        // point no surface accepts is dropped rather than delivered to the
+        // root — `wl_touch` has no "leave without down", so there is nothing to
+        // send and the `down` simply does not happen.
+        let Some((surface, origin)) = self.surface_under(id, x, y) else { return };
         // Logged, unlike pointer motion, because a contact is rare — a few per
         // gesture rather than one per pixel — and because "touch does nothing"
         // is otherwise indistinguishable from "no touch message ever arrived",
@@ -1537,6 +1626,8 @@ impl State {
                 None => "no contact geometry reported".to_owned(),
             }
         );
+        self.touch_contacts.retain(|(s, _)| *s != slot);
+        self.touch_contacts.push((slot, surface.clone()));
         touch.down(
             self,
             // The surface origin in compositor space, found the same way it is
@@ -1571,7 +1662,7 @@ impl State {
         // contact. Which is why a motion for a window that has gone away is
         // still worth delivering — the contact's focus is the surface it landed
         // on, not this one.
-        let focus = self.surface_and_origin(id).map(|(_, s, origin)| (s, origin.into()));
+        let focus = self.surface_under(id, x, y).map(|(s, origin)| (s, origin.into()));
         touch.motion(
             self,
             focus,
@@ -1582,6 +1673,7 @@ impl State {
 
     fn touch_up(&mut self, id: WindowId, slot: i32, time: u32) {
         let Some(touch) = self.touch.clone() else { return };
+        self.touch_contacts.retain(|(s, _)| *s != slot);
         println!("wc-compositor: window {id} touch up contact {slot}");
         touch.up(
             self,
@@ -2210,37 +2302,13 @@ impl State {
         committed: &WlSurface,
         committed_damage: &[Rect],
     ) -> (Vec<Rect>, i32, i32) {
-        use smithay::wayland::compositor::{
-            SubsurfaceCachedState, TraversalAction, SUBSURFACE_ROLE,
-        };
         use smithay::wayland::shell::xdg::SurfaceCachedState;
 
         // Where each surface of the tree sits, relative to the root surface's
         // own origin. Collected first because composing needs `&mut` on the
         // window's shadow while `staging` is read, and because the traversal
         // closure cannot borrow `self`.
-        let mut placed: Vec<(WlSurface, (i32, i32))> = Vec::new();
-        compositor::with_surface_tree_upward(
-            root,
-            (0i32, 0i32),
-            |_, states, loc| {
-                let mut loc = *loc;
-                if states.role == Some(SUBSURFACE_ROLE) {
-                    let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
-                    loc = (loc.0 + p.x, loc.1 + p.y);
-                }
-                TraversalAction::DoChildren(loc)
-            },
-            |surface, states, loc| {
-                let mut loc = *loc;
-                if states.role == Some(SUBSURFACE_ROLE) {
-                    let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
-                    loc = (loc.0 + p.x, loc.1 + p.y);
-                }
-                placed.push((surface.clone(), loc));
-            },
-            |_, _, _| true,
-        );
+        let placed = placed_tree(root);
 
         // The window geometry rectangle, in root-surface coordinates. Absent
         // means "the whole buffer", which is what the protocol says and what
@@ -2248,14 +2316,48 @@ impl State {
         let geometry = compositor::with_states(root, |states| {
             states.cached_state.get::<SurfaceCachedState>().current().geometry
         });
-        let root_size = self
-            .staging
-            .get(root)
-            .map(|s| (s.width(), s.height()))
-            .unwrap_or((0, 0));
+        // **"The full bounds of the surface, *including any subsurfaces*."**
+        //
+        // That is `xdg_surface.set_window_geometry`'s wording for what the
+        // geometry is when a client never sets one, and until §40 the last
+        // three words were missing here: the fallback was the root buffer's
+        // size, so a `wl_subsurface` hanging over its parent's edge was
+        // clipped away — not drawn, and therefore not clickable either, since
+        // the window is the canvas and `surface_under` hit-tests what the
+        // window contains.
+        //
+        // WLCS builds exactly that shape on purpose (`SubsurfaceBuilder` in
+        // `surface_builder.cpp` puts a 215x108 subsurface on an 80x50 parent),
+        // and it is not a contrived one: a video player whose overlay controls
+        // extend past the video, or any client that positions a subsurface at
+        // a negative offset, has it.
+        //
+        // **This changes nothing for a client without subsurfaces**, which is
+        // the case every earlier stage measured: the union of a one-surface
+        // tree is that surface's own rectangle at `(0, 0)`, which is the
+        // `root_size` this replaces. And it changes nothing for a client that
+        // *does* set a geometry — Firefox, `weston-terminal`, every GTK
+        // application — because that is still the branch above.
+        let bounds = placed
+            .iter()
+            .filter_map(|(surface, (x, y))| {
+                let s = self.staging.get(surface)?;
+                (s.width() > 0 && s.height() > 0)
+                    .then(|| (*x, *y, x + s.width(), y + s.height()))
+            })
+            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
         let (gx, gy, gw, gh) = match geometry {
             Some(r) if r.size.w > 0 && r.size.h > 0 => (r.loc.x, r.loc.y, r.size.w, r.size.h),
-            _ => (0, 0, root_size.0, root_size.1),
+            // The origin is part of the answer, not assumed to be `(0, 0)`: a
+            // subsurface may sit at a negative offset, and then the tree's
+            // top-left is above and to the left of the root's. That flows into
+            // `content_offset` and out through `surface_origin`, whose sign
+            // convention already handles a negative inset and is unit-tested
+            // for it.
+            _ => match bounds {
+                Some((x0, y0, x1, y1)) => (x0, y0, x1 - x0, y1 - y0),
+                None => (0, 0, 0, 0),
+            },
         };
         let format = self
             .staging
@@ -2293,6 +2395,98 @@ impl State {
             })
             .collect();
         (damage, gw, gh)
+    }
+}
+
+/// Every surface of `root`'s subsurface tree, with its position relative to
+/// `root`'s own origin, **in paint order**: parent before child, and siblings
+/// in the order `wl_subsurface.place_above`/`place_below` put them.
+///
+/// ADDED FOR §40, by lifting the walk out of `compose_tree` unchanged. It is a
+/// free function with one caller-visible promise — the order — because it now
+/// has two callers that must not disagree: the blit, which paints the list
+/// front to back, and [`State::surface_under`], which hit-tests it back to
+/// front. Hit-testing is the exact inverse of painting, and the only way to
+/// keep that true as the tree grows a case is to derive both from one list.
+///
+/// `with_surface_tree_upward` is what promises the order, and the two closures
+/// add the subsurface offset in the same way for the same reason: the pre-order
+/// closure passes the accumulated position down to the children, and the
+/// post-order one records it.
+fn placed_tree(root: &WlSurface) -> Vec<(WlSurface, (i32, i32))> {
+    use smithay::wayland::compositor::{
+        SubsurfaceCachedState, TraversalAction, SUBSURFACE_ROLE,
+    };
+    let mut placed: Vec<(WlSurface, (i32, i32))> = Vec::new();
+    compositor::with_surface_tree_upward(
+        root,
+        (0i32, 0i32),
+        |_, states, loc| {
+            let mut loc = *loc;
+            if states.role == Some(SUBSURFACE_ROLE) {
+                let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+                loc = (loc.0 + p.x, loc.1 + p.y);
+            }
+            TraversalAction::DoChildren(loc)
+        },
+        |surface, states, loc| {
+            let mut loc = *loc;
+            if states.role == Some(SUBSURFACE_ROLE) {
+                let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+                loc = (loc.0 + p.x, loc.1 + p.y);
+            }
+            placed.push((surface.clone(), loc));
+        },
+        |_, _, _| true,
+    );
+    placed
+}
+
+/// Whether `surface` accepts input at `point`, in its own surface-local
+/// coordinates.
+///
+/// ADDED FOR §40. Two rules, in this order, and the order is the protocol's:
+///
+/// 1. **The point must be on the surface.** `wl_surface.set_input_region` says
+///    the region "is clipped to the surface size", so a region larger than the
+///    buffer does not extend it — which is what WLCS's `ClippedLargerRegion`
+///    parameterisation exists to check, and which is why the buffer bound is
+///    tested even when a region was set.
+/// 2. **An absent region means the whole surface**, not an empty one. That is
+///    the protocol's initial value ("infinite"), and reading `None` as "no
+///    input" would silently make every ordinary client unclickable.
+///
+/// 3. **A surface with no size takes no input**, whatever its region says.
+///    That is the state a `wl_subsurface` sits in between `get_subsurface` and
+///    its first commit, and smithay's own `contains_point` answers the same
+///    way.
+///
+/// The size comes from the staging shadow rather than from a stored field for
+/// the same reason `mapped_windows` reads it there: the shadow is reset to the
+/// buffer's dimensions on every commit, so it cannot disagree with what the
+/// client last drew.
+///
+/// **The region is an argument rather than something read from the surface,
+/// and that is what makes the rules testable.** A `WlSurface` needs a live
+/// display and a connected client to exist, so a function that took one could
+/// only ever be exercised through the whole conformance suite — the same
+/// hundred-second feedback loop that let the placeholder this replaces survive
+/// as long as it did. The protocol lookup is one line in the caller.
+fn accepts_input_at(
+    size: (i32, i32),
+    region: Option<&compositor::RegionAttributes>,
+    point: (f64, f64),
+) -> bool {
+    if size.0 <= 0 || size.1 <= 0 {
+        return false;
+    }
+    if point.0 < 0.0 || point.1 < 0.0 || point.0 >= f64::from(size.0) || point.1 >= f64::from(size.1)
+    {
+        return false;
+    }
+    match region {
+        None => true,
+        Some(region) => region.contains((point.0.round() as i32, point.1.round() as i32)),
     }
 }
 
@@ -2395,6 +2589,56 @@ impl CompositorHandler for State {
         println!("wc-compositor: wl_surface created");
     }
 
+    /// A `wl_surface` went away.
+    ///
+    /// ADDED FOR §40, for one reason: **a contact still down on it has to come
+    /// up.** `wl_touch` has no `leave` — `down` binds a contact to a surface
+    /// and only `up` or `cancel` releases it — so a client whose surface is
+    /// destroyed mid-gesture is otherwise left holding a finger it can never
+    /// put down, and the slot cannot be reused. WLCS asks this as
+    /// `TouchTest.sends_touch_up_on_surface_destroy`, against every surface
+    /// type including both subsurface shapes.
+    ///
+    /// `up` rather than `cancel`, deliberately. `wl_touch.cancel` means "the
+    /// compositor took the gesture away and you should undo what it did" — an
+    /// edge swipe, a system gesture — and it ends *every* live contact on the
+    /// seat at once. A surface being destroyed is neither: the other contacts,
+    /// on other surfaces, are unaffected and must not be cancelled, and the
+    /// client has no reason to roll anything back. The contact simply ended.
+    ///
+    /// The staging entry goes too. `commit` already drops it for a null
+    /// buffer; this is the other way a surface's pixels stop existing, and
+    /// leaving them behind would keep the surface's size answerable to
+    /// `surface_under` after the surface itself was gone.
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.staging.remove(surface);
+        let ended: Vec<i32> = self
+            .touch_contacts
+            .iter()
+            .filter(|(_, s)| s == surface)
+            .map(|(slot, _)| *slot)
+            .collect();
+        if ended.is_empty() {
+            return;
+        }
+        let Some(touch) = self.touch.clone() else { return };
+        self.touch_contacts.retain(|(_, s)| s != surface);
+        let time = self.now_ms();
+        for slot in ended {
+            println!("wc-compositor: touch contact {slot} ended: its surface was destroyed");
+            touch.up(
+                self,
+                &UpEvent {
+                    slot: Some(slot as u32).into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+        }
+        // One frame for the group, as for every other batch of touch events.
+        touch.frame(self);
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         println!("wc-compositor: wl_surface commit");
 
@@ -2477,6 +2721,18 @@ impl CompositorHandler for State {
                 self.present(surface, &buffer, rects)
             }
             Some(BufferAssignment::Removed) => {
+                // **The staging entry goes with the buffer, and until §40 it
+                // did not.** A null buffer unmaps the surface — it has no
+                // content and, the protocol is explicit, no input either. But
+                // the pixels stayed in `staging`, so the surface kept its size
+                // for anything that asked; `surface_under` takes its size from
+                // there, so an unmapped subsurface went on swallowing every
+                // click that landed on where it used to be, invisibly and
+                // forever. That is WLCS's
+                // `input_not_seen_in_region_after_null_buffer_committed`, and
+                // it is the same leak `cursor_surface` above already guards
+                // against by hand.
+                self.staging.remove(surface);
                 if let Some(window) = self.windows.get_mut(surface) {
                     // A null buffer unmaps the surface. The toplevel still
                     // exists, so the window is not destroyed — it has nothing
@@ -2489,6 +2745,21 @@ impl CompositorHandler for State {
                         maximized: None,
                         minimized: Some(true),
                     });
+                } else {
+                    // A subsurface went away. The window it belongs to is still
+                    // mapped and is still showing the pixels this surface put
+                    // there, so the tree has to be recomposed — otherwise the
+                    // input answer changes immediately (correct) and the
+                    // picture does not (wrong), which is the more confusing
+                    // half of the bug rather than the lesser one.
+                    let root = root_of(surface);
+                    if self.windows.contains_key(&root) {
+                        let (damage, w, h) = self.compose_tree(&root, surface, &[]);
+                        if w > 0 && h > 0 {
+                            let id = self.windows[&root].id;
+                            self.ui.send(ToUi::Present { id, damage });
+                        }
+                    }
                 }
             }
             // A commit with no new buffer: state-only, or an ack. Damage
@@ -2498,6 +2769,40 @@ impl CompositorHandler for State {
 
         if icon_dirty {
             self.take_client_icon(surface);
+        }
+
+        // **The scene can move under a stationary pointer, and until §40
+        // nothing re-asked who was under it.**
+        //
+        // Every hit test before this ran on a pointer *event* — the pointer
+        // moved, so the compositor worked out what it had moved onto. But the
+        // other half of the same question is a commit: a `wl_subsurface` that
+        // is repositioned, raised with `place_above`, given a new input region
+        // or unmapped changes what is under a pointer that has not moved at
+        // all. The client is entitled to a `leave` and an `enter` for that, and
+        // it was getting neither — the last motion event stayed true forever.
+        //
+        // WLCS asks this directly and by name:
+        // `subsurface_moves_under_input_device_once`, `..._twice`,
+        // `subsurface_moves_out_from_under_input_device`,
+        // `subsurface_extends_parent_input_region`, `place_above_simple`.
+        //
+        // Re-delivered at the *same* coordinates rather than as a synthesised
+        // move, so this cannot invent motion the user did not make: the
+        // position is `pointer_at`, which is where the platform last said the
+        // pointer was. If the answer is unchanged, smithay coalesces it to a
+        // `motion` at the point the client already knows about; if it changed,
+        // the enter/leave pair it owes the client comes out of the same call
+        // that would have sent it had the pointer moved instead.
+        //
+        // Gated on the committing tree being the one under the pointer, so an
+        // application animating in the background does not re-run a hit test
+        // for a window nobody is pointing at.
+        if let Some(over) = self.pointer_focus
+            && self.by_id(over).map(|w| w.role.surface().clone()) == Some(root_of(surface))
+        {
+            let (x, y) = self.pointer_at;
+            self.pointer_motion(Some(over), x, y, self.now_ms());
         }
     }
 }
@@ -3729,5 +4034,123 @@ mod tests {
     #[test]
     fn a_negative_inset_shifts_the_other_way() {
         assert_eq!(delivered((-5, -7), (100.0, 100.0)), (95.0, 93.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // §40: the input region, which was parsed and ignored
+    // -----------------------------------------------------------------------
+
+    mod input_region {
+        use crate::state::accepts_input_at;
+        use smithay::utils::Rectangle;
+        use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
+
+        fn region(rects: &[(RectangleKind, i32, i32, i32, i32)]) -> RegionAttributes {
+            RegionAttributes {
+                rects: rects
+                    .iter()
+                    .map(|&(kind, x, y, w, h)| {
+                        (kind, Rectangle::new((x, y).into(), (w, h).into()))
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The default, and the one that matters most: no region means the
+        /// whole surface. `None` is the protocol's initial value and it means
+        /// *infinite* — reading it as an empty region would make every
+        /// ordinary client, which never calls `set_input_region` at all,
+        /// silently unclickable.
+        #[test]
+        fn an_absent_region_accepts_the_whole_surface() {
+            assert!(accepts_input_at((100, 100), None, (0.0, 0.0)));
+            assert!(accepts_input_at((100, 100), None, (99.0, 99.0)));
+        }
+
+        /// The buffer is a bound even with no region: past the last pixel is
+        /// off the surface. Half-open, so `(100, 100)` on a 100x100 surface is
+        /// outside — the same convention `Rect::clip` and the blit use.
+        #[test]
+        fn the_buffer_bounds_the_surface_from_below_and_above() {
+            assert!(!accepts_input_at((100, 100), None, (100.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), None, (50.0, 100.0)));
+            assert!(!accepts_input_at((100, 100), None, (-1.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), None, (50.0, -1.0)));
+        }
+
+        /// A surface with no buffer takes no input. This is the state a
+        /// `wl_subsurface` is in between `get_subsurface` and its first
+        /// commit, and hit-testing it would put the pointer on a surface with
+        /// nothing drawn on it.
+        #[test]
+        fn a_surface_with_no_buffer_takes_no_input() {
+            assert!(!accepts_input_at((0, 0), None, (0.0, 0.0)));
+            let r = region(&[(RectangleKind::Add, 0, 0, 100, 100)]);
+            assert!(!accepts_input_at((0, 0), Some(&r), (0.0, 0.0)));
+        }
+
+        /// A region smaller than the surface: inside accepts, the gap between
+        /// the region and the buffer edge does not. WLCS's `SmallerRegion`.
+        #[test]
+        fn a_smaller_region_leaves_the_rest_of_the_surface_inert() {
+            let r = region(&[(RectangleKind::Add, 20, 20, 60, 60)]);
+            assert!(accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+            assert!(accepts_input_at((100, 100), Some(&r), (20.0, 20.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (19.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (80.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (5.0, 5.0)));
+        }
+
+        /// **A region larger than the surface does not extend it.** The
+        /// protocol says the input region "is clipped to the surface size", so
+        /// the buffer bound is checked whether or not a region was set — which
+        /// is the whole point of WLCS's `ClippedLargerRegion` parameterisation,
+        /// and the case an implementation that checked the region *instead of*
+        /// the bounds would get wrong.
+        #[test]
+        fn a_larger_region_is_clipped_to_the_surface() {
+            let r = region(&[(RectangleKind::Add, -50, -50, 200, 200)]);
+            assert!(accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (-10.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (120.0, 50.0)));
+        }
+
+        /// An empty region is the opposite of an absent one: it accepts
+        /// nothing. A client that calls `set_input_region` with a fresh
+        /// `wl_region` is asking to be transparent to input, and that is a
+        /// thing clients deliberately do.
+        #[test]
+        fn an_empty_region_accepts_nothing() {
+            let r = region(&[]);
+            assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+        }
+
+        /// `wl_region.subtract` is not a suggestion. A region built as one
+        /// rectangle minus a hole has a hole, and the rectangles are applied
+        /// in order — which is why `contains` scans the whole list rather than
+        /// stopping at the first hit.
+        #[test]
+        fn a_subtracted_rectangle_is_a_hole() {
+            let r = region(&[
+                (RectangleKind::Add, 0, 0, 100, 100),
+                (RectangleKind::Subtract, 40, 40, 20, 20),
+            ]);
+            assert!(accepts_input_at((100, 100), Some(&r), (10.0, 10.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+            assert!(accepts_input_at((100, 100), Some(&r), (65.0, 50.0)));
+        }
+
+        /// Several disjoint rectangles, which is WLCS's `MultiRectCorners`:
+        /// the corners accept and the middle does not.
+        #[test]
+        fn disjoint_rectangles_each_accept_their_own_area() {
+            let r = region(&[
+                (RectangleKind::Add, 0, 0, 20, 20),
+                (RectangleKind::Add, 80, 80, 20, 20),
+            ]);
+            assert!(accepts_input_at((100, 100), Some(&r), (5.0, 5.0)));
+            assert!(accepts_input_at((100, 100), Some(&r), (85.0, 85.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+        }
     }
 }
