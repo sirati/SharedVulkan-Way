@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use wc_proxy::pool::{Arena, CopyScope, PoolTransport, SharedFile};
+use wc_proxy::pool::{Arena, CopyScope, Policy, PoolTransport, SharedFile};
 use wc_proxy::proxy::{self, Listener};
 use wc_proxy::session::Session;
 use wc_proxy::spec::Spec;
@@ -49,6 +49,10 @@ struct Args {
     /// between them, and two allocators over the same bytes is the one failure
     /// this flag exists to prevent.
     arena_outbound: u64,
+    /// STAGE 16. Which run of free arena bytes a pool takes. The default is the
+    /// one this stage measured; `first-fit` is stage 12's, kept so that a live
+    /// run can be compared against a synthetic one without a rebuild.
+    arena_policy: Policy,
     scope: CopyScope,
     headroom: u64,
     trace: bool,
@@ -99,6 +103,11 @@ usage: wc-proxy --upstream <path> [options]
                          first -- out of them. Must match the compositor's
                          --arena-outbound. With --arena-plan the plan carries it
                          and this is refused rather than believed.
+  --arena-policy KIND    arena: first-fit | best-fit    (default best-fit)
+                         which run of free bytes a pool takes. best-fit is
+                         stage 16's, measured in docs/design.md 20.4; first-fit
+                         is stage 12's, kept so a live run can be compared
+                         against the synthetic one without a rebuild.
 
   --copy pool|buffer|damage   how much to copy per commit (default damage)
   --trace                log every message in both directions
@@ -135,6 +144,7 @@ fn parse_args() -> Result<Args, String> {
         arena_path: PathBuf::new(),
         arena_plan: PathBuf::new(),
         arena_outbound: 0,
+        arena_policy: Policy::default(),
         scope: CopyScope::Damage,
         headroom: 1,
         trace: false,
@@ -161,6 +171,11 @@ fn parse_args() -> Result<Args, String> {
             "--arena-outbound" => {
                 a.arena_outbound =
                     next()?.parse().map_err(|e| format!("--arena-outbound: {e}"))?
+            }
+            "--arena-policy" => {
+                let v = next()?;
+                a.arena_policy = Policy::parse(&v)
+                    .ok_or_else(|| format!("--arena-policy {v}? try first-fit or best-fit"))?;
             }
             "--arena-size" => {
                 a.arena_size = next()?.parse().map_err(|e| format!("--arena-size: {e}"))?
@@ -241,6 +256,11 @@ fn announce_outbound(t: &Arena) {
             t.id()
         ),
     }
+    // STAGE 16. Which allocator ran is exactly the §8.4 question: two policies
+    // that differ only in which free run they take produce byte-identical
+    // pixels, so a run that did not say which one it used could not be compared
+    // with one that used the other.
+    println!("[proxy] arena {}: allocation policy {}", t.id(), t.policy().as_str());
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -280,7 +300,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // nothing for it to open. What it was started with is
             // `--arena-guest-ram <id>:<size>`, and what it printed is the run id
             // this plan was made from.
-            let t = Arena::from_plan(args.arena_id, &args.arena_plan)?;
+            let mut t = Arena::from_plan(args.arena_id, &args.arena_plan)?;
+            t.set_policy(args.arena_policy)?;
             println!(
                 "[proxy] transport arena {}: {} bytes of {} \
                  (nothing is opened per pool, and the compositor opened nothing at all)",
@@ -293,6 +314,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         "arena" => {
             let mut t = Arena::open_or_create(args.arena_id, &args.arena_path, args.arena_size)?;
+            t.set_policy(args.arena_policy)?;
             if args.arena_outbound != 0 {
                 t.reserve_outbound(args.arena_outbound)?;
             }
