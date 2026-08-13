@@ -6340,3 +6340,353 @@ Wine question, it is a substrate question.
    can see. `scripts/wc-desktop.sh` plus this stage's `--arena-guest-ram` flags
    is one run, and it is the only thing left that would put a photograph behind
    the sentence "Firefox, over the guest's own RAM, in a window".
+
+## 25. Stage 21: four protocols, one of which was a trap
+
+### 25.1 Status in one paragraph
+
+Written 2026-08-13, branched from master at `08f66b8`. Four items, grouped
+because they are small and share files, and the first of them is not a feature
+at all — it is a live foot-gun that has been in the tree since stage 11.
+`xdg-toplevel-icon-v1` is genuinely complete in the compositor: `set_icon`, the
+commit-time read of the double-buffered state, buffers through the
+[`PixelSource`] list so an arena buffer works like any other, the `icon_name`
+fallback, the size list announced at bind (§16.4). It was **not** in
+`crates/wc-proxy/protocols/` and not in `Spec::builtin`. A guest client that
+binds that global gets `Error::UnknownOpcode` on its first request and the proxy
+ends the connection. The other three items are new globals:
+`zwp_idle_inhibit_manager_v1`, `xdg_activation_v1` and
+`zwp_keyboard_shortcuts_inhibit_v1`. All four now pass
+`scripts/wc-inhibit.sh` in both modes — against the Linux compositor directly,
+and against `wc-compositor.exe` through `wc-proxy`, which is the real topology.
+
+### 25.2 The trap, and why nothing had tripped it
+
+`Session::client_message` does this, in this order:
+
+```rust
+let interface = self.objects.interface(header.object).ok_or(...)?;
+let msg = self.spec.request(&interface, header.opcode).ok_or_else(...)?;
+let spans = wire::walk(body, &msg.args, FdEncoding::OutOfBand)...;
+```
+
+The opcode is resolved against the vendored XML **before** anything is walked.
+So an interface the table does not know is fatal on the first message on that
+object, whatever the message is. There is no fd involved and no walk attempted;
+there is nothing to walk *with*.
+
+The note the proxy wrote when it saw the bind said otherwise:
+
+> client bound {iface}, which is not in the vendored protocols; messages on it
+> cannot be walked and the connection will fail **if it ever carries an `h`**
+
+That sentence is wrong and it is wrong in the most expensive direction: it tells
+a reader that an fd-free protocol is safe to leave out, which is exactly the
+conclusion that produced this bug. Four of the eight interfaces stage 21 adds
+carry no fd anywhere and all four would have killed a connection. The note now
+says "its first request cannot be walked and will end the connection".
+
+Why nothing noticed for two stages is the part worth keeping. **A bind always
+succeeds.** `wl_registry.bind` is a message on `wl_registry`, which is in the
+table; the interface name is a string argument the proxy copies through, and the
+new object is recorded under a name the proxy does not recognise without
+anything going wrong yet. The failure is one message later, in the client. So
+the shape of the bug is:
+
+* the compositor advertises the global — correct, and it really is implemented;
+* the client binds it and feature-detection *succeeds*;
+* the client sends its first request and the connection dies.
+
+That is strictly worse than not advertising it. §14.9 already names two
+independent cases of "implemented" meaning "compiled"; this is a third kind —
+"implemented" meaning "implemented in one of the two processes it takes". The
+compositor's implementation was never the problem and reviewing the compositor
+would never have found it.
+
+The two halves cannot depend on each other: `wc-compositor` is a Windows binary
+and `wc-proxy` is a Linux one, and they are only ever in one process during a
+Wine smoke test. So there is no type that can enforce the agreement. What there
+is now is `spec::tests::every_global_the_compositor_advertises_can_be_walked`,
+which lists the compositor's globals by hand and asserts each has a request 0 in
+the proxy's table. Duplication, deliberately, because the alternative is nothing.
+
+### 25.3 What reproduced it
+
+`scripts/wc-inhibit.sh wine`, off a stale `target/debug/wc-proxy` that predated
+the fix — the binary had not been rebuilt after the XML was added. The run
+printed, in the proxy's own words:
+
+```
+client bound xdg_toplevel_icon_manager_v1, which is not in the vendored
+  protocols; messages on it cannot be walked and the connection will fail if
+  it ever carries an h
+```
+
+four times, once per new interface, and every assertion in the gate failed. The
+accident is a better demonstration than anything written on purpose: it is the
+pre-fix behaviour, on the real topology, with the message that misdescribes it.
+It also cost ten minutes to diagnose, which is the same ten minutes the
+"build before you deploy" rule exists to prevent — `cargo clippy` had been green
+against a `wc-proxy` that was never built.
+
+### 25.4 `zwp_idle_inhibit`: the call is one line, the bookkeeping is not
+
+The Windows side is `SetThreadExecutionState(ES_CONTINUOUS |
+ES_DISPLAY_REQUIRED)` to inhibit and `SetThreadExecutionState(ES_CONTINUOUS)` to
+release. Three things about it are decisions rather than transcription.
+
+**It is per *thread*.** The state belongs to the calling thread and the system
+takes the union across threads; it is released when that thread exits. So the
+call is made from the UI thread, which is `main`'s and outlives everything, and
+the Wayland side does the arithmetic and sends a `ToUi::IdleInhibit { on }` only
+when the answer changes. Had it been called from the Wayland thread it would
+work today and stop working silently the day that work moved.
+
+**`ES_SYSTEM_REQUIRED` is deliberately not asked for.** The protocol asks the
+compositor not to blank, lock or screensave. It says nothing about whether the
+machine may suspend, and adding it would be this compositor setting a power
+policy no client requested, on a guest whose host can suspend it regardless.
+
+**`ES_DISPLAY_REQUIRED` does not stop the screen saver.** It resets the
+*display* idle timer. The screen saver runs on the *input* idle timer, and a
+client holding an idle inhibitor is usually playing a video — which is precisely
+the case with no input. So `toplevel_proc` also refuses `WM_SYSCOMMAND` with
+`SC_SCREENSAVE` or `SC_MONITORPOWER` while an inhibitor is held, which is the
+documented way for a foreground application to veto it, and only while one is
+held.
+
+The bookkeeping is the part that is not a transcription of anything. smithay's
+`IdleInhibitHandler::uninhibit` is called from exactly one place —
+`zwp_idle_inhibitor_v1.destroy`, the client's explicit request. There is no
+`destroyed` hook on that object. So a client that **crashes, is killed, or just
+closes its connection** with an inhibitor alive leaves behind one that nothing
+will ever revoke, and an idle inhibitor that cannot be revoked is a display that
+never sleeps again for the life of the compositor.
+
+That cannot be handled by being careful inside the handlers, because the event
+never arrives. What does arrive is that the `WlSurface` stops being alive.
+`State::tick_idle_inhibit` runs once per turn of the dispatch loop, sweeps
+inhibitors whose surface is dead, and recomputes. It costs one
+`HashMap::is_empty` in the ordinary case, because the ordinary case is that
+nobody ever created one.
+
+It also decides what "visible" means, which the protocol leaves to the
+compositor: the window has committed a buffer and is not minimised. Minimising
+the window playing the video is about as clear a statement as a user can make.
+That is why `Window` gained a `minimized` field this stage — `FromUi::Minimized`
+already arrived and nothing had kept it.
+
+The gate creates an inhibitor, destroys it, then creates a second one and
+**disconnects without destroying it**. Two on transitions and two off
+transitions are asserted. One of each would pass a compositor that had the sweep
+missing entirely.
+
+### 25.5 `xdg_activation`: Windows decides, and the common case is the permitted one
+
+`SetForegroundWindow` is not a command. Windows refuses it from a process that
+is not entitled to steal the foreground; the entitlement is roughly that the
+calling process already owns the foreground window, or received the last input
+event, or there is no foreground window, or the foreground lock timeout has
+expired.
+
+**Every toplevel in this compositor is an `HWND` owned by one process**, however
+many Wayland clients are behind them, and that turns out to matter here. "The
+user clicks a link in one client's window and another client's window raises" is
+a foreground request made by the process that already owns the foreground
+window. Windows allows it. Two clients on two machines, one Win32 process, one
+set of foreground rights — this is the topology paying a dividend rather than a
+tax, which is rare enough to write down.
+
+The case Windows refuses is a client asking unprompted while the user is in some
+other application. It is right to refuse: that is the behaviour the rule exists
+to stop, and a Linux compositor would apply a policy of its own for the same
+reason. What the user gets instead is the flashing taskbar button —
+`FlashWindowEx` with `FLASHW_TRAY | FLASHW_TIMERNOFG`, requested explicitly
+rather than relying on the system's implicit flash, so the outcome does not
+depend on an undocumented courtesy. `TIMERNOFG` means it stops when the window
+reaches the foreground, so there is nothing to cancel.
+
+`AllowSetForegroundWindow` is **not** called, and this is the one place the
+brief and the code disagree. It grants foreground rights to a *different
+process*, by pid. There is no different process. It becomes relevant the day the
+compositor launches a Windows application on a client's behalf, and not before.
+
+Token policy: single-use, and thirty seconds rather than the ten in smithay's
+own example. The token is minted by the application the user clicked in and
+spent by the application that is then *started*; a cold Firefox on this guest
+takes longer than ten seconds to reach a surface. A limit that expires during
+the ordinary case is not a security measure, it is a feature that works on a
+warm cache. The pool is swept whenever a token is minted, so it is bounded by
+the rate tokens are asked for — GTK requests one for every launch it
+contemplates and spends only some.
+
+**The client cannot be told.** `xdg_activation_v1` version 1 has no failure
+event; `activate` is a request with no reply. So a client has no way to learn
+that Windows said no, and the compositor's log is the only place the answer
+exists. It says which of the two happened rather than that something was tried.
+
+### 25.6 `zwp_keyboard_shortcuts_inhibit`: honestly complete, for nothing
+
+Every inhibitor is granted the moment it is created. That reads like a cop-out
+and is not one, and the distinction is the whole reason this item is in the
+stage.
+
+The inhibitor means "stop applying your own keyboard shortcuts and give the
+client every key". `State::key` already hands every key to the focused client
+with `FilterResult::Forward`, and the comment there predates this stage:
+
+> No compositor-level bindings. Every key goes to the client, which is the right
+> default for a compositor whose window manager is somebody else: Windows has
+> already taken the combinations it reserves (Alt-Tab, the Windows key) before
+> the message loop sees them, and intercepting more here would silently steal
+> keys the application expects.
+
+So there is no shortcut to suppress. Granting is not a stub standing in for
+work; it is a true statement about what this compositor does with a key. This is
+the rare case where advertising a protocol costs nothing and claims nothing
+false, and it is worth naming as such because the same three lines in a
+compositor that *did* have bindings would be a lie.
+
+Two things would make it one, and both are things a later stage could do without
+opening this file: adding a compositor-level key binding, and intercepting a key
+in `win32::toplevel_proc` before it becomes a `FromUi::Key`. Either has to
+consult `Seat::keyboard_shortcuts_inhibited` — smithay keeps the answer already;
+this compositor simply has no question to ask it yet.
+
+What it cannot deliver, and no compositor on Windows can, is the combinations
+the *system* takes first: Ctrl-Alt-Del is the secure attention sequence and
+Win-L is the shell's, and neither reaches a window procedure. A Linux compositor
+grabbing the keyboard has the same hole for the same kind of key, so this is not
+a Windows tax — but a client asking to inhibit shortcuts is often asking for
+exactly those, so it is stated rather than left to be discovered.
+
+### 25.7 The gate
+
+`scripts/wc-inhibit.sh`, and it is a C client rather than a Rust test on
+purpose. A unit test in `wc-proxy` proves the wire table; `wayland-info` proves
+the globals are advertised. Neither proves that a client which binds one and
+then *uses* it gets what the protocol promises — and "binds, then misbehaves" is
+the failure this stage is about, because it is the one a client cannot
+feature-detect its way around.
+
+`scripts/probe-inhibit.c` is libwayland-client, built from the XML in
+`crates/wc-proxy/protocols` — our vendored copies, so the probe's idea of an
+opcode is the same file the compositor was generated from rather than whatever
+`wayland-protocols` the machine has. It maps a real window, because an inhibitor
+on an unmapped surface is one the compositor is supposed to ignore and a probe
+that never mapped would pass against a compositor that ignored all of them.
+
+What each protocol can prove differs, and the script says which is which:
+
+| protocol | observable from the client? |
+| --- | --- |
+| `zwp_keyboard_shortcuts_inhibit` | **yes** — the grant is an `active` event |
+| `xdg_toplevel_icon` | partly — `icon_size` events arrive; the pixels are the compositor's log |
+| `xdg_activation` | partly — the token dance; the raise has no reply either way |
+| `zwp_idle_inhibit` | **no** — the protocol has no events at all |
+
+Two modes. `linux` runs the Linux build directly. `wine` runs
+`wc-compositor.exe` with `wc-proxy` in between, and the proxy is not optional
+there: the first attempt pointed the probe straight at the Wine socket the way
+`scripts/wc-xdg.sh wine` does, and it stopped at `wl_surface commit`. That is
+§2.4 arriving on schedule — the probe attaches a `wl_shm` buffer,
+`wl_shm.create_pool` carries an `h`, a stock libwayland client sends it out of
+band by `SCM_RIGHTS`, and Wine's AF_UNIX carries no ancillary data, so the
+descriptor is absent and the parser desynchronises at that request. **A client
+that maps a window cannot reach a Windows compositor without the proxy, by
+construction.** Which makes the `wine` mode the better test anyway: it is the
+only local run that proves §25.1's first item end to end.
+
+Both modes pass, ten assertions each.
+
+### 25.8 What Wine says, and what it cannot
+
+The `wine` run reaches the Win32 calls and they return:
+
+```
+wc-compositor: window 1 activated (SetForegroundWindow)
+wc-compositor: idle inhibit on  (SetThreadExecutionState 0x80000002, was 0x7)
+wc-compositor: idle inhibit off (SetThreadExecutionState 0x80000000, was 0x80000002)
+```
+
+That is worth exactly what it is worth: a wrong argument width, a missing
+import, a call made from the wrong thread would show up here. It says nothing
+about whether a display stays on. Wine has no display to keep awake, and its
+`SetForegroundWindow` answers about an X11 window on an Xvfb nobody is looking
+at — it succeeded here, which on the real guest it may not. §13.6 counts four
+occasions where Wine's answer and the guest's differed, and `SetThreadExecutionState`
+and `SetForegroundWindow` are exactly the class of API it stubs.
+
+Note the `was 0x7` in the first line: Wine reports a previous state of
+`ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_USER_PRESENT`, which is its
+stub's idea of a starting value and is not what a real thread returns. The code
+only tests for the documented failure (a return of 0), so this is a curiosity
+rather than a dependency — but it is a concrete example of Wine answering
+plausibly and differently.
+
+**What needs a real-guest re-check, in order of how much it would cost to be
+wrong about:**
+
+1. **`SetThreadExecutionState` actually keeps the display on.** Play a video in
+   Firefox on the guest with the power plan's display timeout set low, and watch.
+   The log line says what was asked for; only the guest says what happened.
+2. **The `WM_SYSCOMMAND` veto reaches us.** `SC_SCREENSAVE` goes to the
+   foreground window. If the guest's foreground window is not one of ours at the
+   moment the timer fires, we never see it — the execution state still applies,
+   the veto does not, and the difference only shows on a machine with a screen
+   saver configured.
+3. **`SetForegroundWindow` succeeds in the case that matters.** The claim in
+   §25.5 is that clicking a link in one client's window raises another client's
+   window because both are one process. That is an argument from the Windows
+   rules, and it is the sort of argument that is right until the guest has a
+   foreground lock timeout set differently. The test is two clients on the guest
+   and a real click.
+4. **`FlashWindowEx` when refused.** Only reachable by deliberately arranging for
+   the compositor not to own the foreground — click into Notepad, then have a
+   client activate. Worth one run, because the fallback is the entire user-visible
+   behaviour in the refused case.
+
+### 25.9 What was left out, and why
+
+Nothing among the four. Each is either whole or not advertised. What was
+considered during the stage and deliberately not built:
+
+1. **`ext-idle-notify-v1` / `zwp_idle_notifier_v1`**, the reverse of
+   idle-inhibit: the compositor tells clients when the *user* has gone idle.
+   Not built, and not because it is large. Windows' answer is
+   `GetLastInputInfo`, which is a poll — there is no notification — so a correct
+   implementation is a timer on the UI thread whose period is the shortest
+   timeout any client has requested. That is a real design with a real cost
+   (a wakeup on an otherwise idle machine, on a guest, forever), and the
+   protocol has clients that would then rely on it. It is a stage, not a
+   footnote, and advertising a global that fired late or not at all would be
+   §25.2's bug wearing a different hat.
+2. **`ES_SYSTEM_REQUIRED`** — §25.4.
+3. **`AllowSetForegroundWindow`** — §25.5.
+4. **Validating an activation token's serial and seat.** `XdgActivationTokenData`
+   carries the `(Serial, WlSeat)` the requesting client attached, and a stricter
+   compositor refuses tokens without a recent input serial. Not done, because
+   the serials that would be checked are ones this compositor minted from
+   `SERIAL_COUNTER` in response to Win32 input, and it has no record of which of
+   them was a click. Checking a serial for existence rather than for recency
+   would be a validation that always passes, which is worse than none. The age
+   check in §25.5 is the real limit today.
+5. **Icon sizes from the guest rather than from a constant.** `[16, 32, 48]` is
+   still hard-coded (§16.4); `GetSystemMetrics(SM_CXSMICON)` and `SM_CXICON` are
+   the true answers and change with DPI. Unrelated to this stage, noticed while
+   reading the code it touches, and left where it was.
+
+### 25.10 What to do next
+
+1. **Re-run `scripts/wc-inhibit.sh wine` after any protocol is added by anyone.**
+   Three tests in `wc-proxy` assert exact counts and all three move on every
+   addition: `spec::the_builtin_protocols_parse` (now 40 interfaces),
+   `wire::every_message_in_every_protocol_round_trips` (now 426 messages) and
+   `spec::the_reverse_direction_has_fds_too` (unchanged, because none of these
+   four carries an fd — which is the fact worth having asserted).
+2. **The four guest re-checks in §25.8.** None needs a long session; all four
+   are one interactive run with Firefox already open.
+3. **Decide whether `ext-idle-notify` is a stage.** §25.9 item 1 has the design
+   sketched; what it needs is somebody to say whether a periodic
+   `GetLastInputInfo` on the guest is acceptable, which is a question about the
+   deployment and not about the code.
