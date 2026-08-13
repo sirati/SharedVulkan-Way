@@ -322,6 +322,7 @@ impl RingCtrl {
         Ok(crate::park::Bell {
             wake: self.region.atomic_u32(self.base + wake_off)?,
             parked: self.region.atomic_u32(self.base + parked_off)?,
+            token: crate::park::lane_token(self.id.0, lane),
         })
     }
 }
