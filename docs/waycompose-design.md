@@ -11061,12 +11061,13 @@ but the shape is unchanged — **126 µs per 4.5 MiB copy, 262 copies and 1158 M
 in one Firefox session** — and none of that is what "directly written" means.
 
 **Read those numbers next to the one that arrived while this section was being
-written, because it changes what they are worth.** The WSI work decomposed
-Firefox's first-frame stall and found a cross-VM present costs **216.9 ms**
-against 1.7–2.1 ms for the same present locally, essentially all of it because
+written, because it changes what they are worth.** §34 decomposed Firefox's
+first-frame stall and found a cross-VM present costs **216.9 ms** median against
+1.7–2.1 ms for the same present locally, essentially all of it because
 `sv_transport::park`'s futex doorbell cannot cross a hypervisor: every waiter
-runs out a 20 ms scheduler slice instead of being woken, about **eleven waits per
-present**. Set the copy against that. One copy is 126 µs, so it is 0.06% of one
+runs out a 20 ms scheduler slice instead of being woken, and 216.9 / 20 = 10.8 —
+about **eleven waits per present**, each one missing its doorbell and paying the
+slice. Set the copy against that. One copy is 126 µs, so it is 0.06% of one
 present; and the *entire* session's copying — all 262 of them, all 1158 MiB — is
 33 ms, which is **about a seventh of a single present**. A day spent removing
 every copy in this document would be invisible next to one doorbell that wakes.
@@ -11593,7 +11594,7 @@ header says, which remains the best short statement of why this is hard, and
 which this section narrows in exactly one place (§30.1) and contradicts nowhere.
 
 **A second argument arrives at the same place from a completely different
-direction, and it is the stronger one.** The 216.9 ms doorbell above is not a
+direction, and it is the stronger one.** §34's 216.9 ms doorbell is not a
 reason to build this carefully; it is a reason not to build it *yet*. Every
 hazard in §30.6 is a way to lose a frame silently, and the whole prize for
 running that risk is 126 µs against a 217 ms present. Taking a silent-corruption
@@ -11616,3 +11617,269 @@ through `shared_vulkan` into arena memory, where no `wl_shm` pool exists at all
 — remains the better answer, because it removes the pool rather than relocating
 it. This section's mechanism is what serves the clients that will never take
 that path, which is most of them.
+
+## 34. Growth on guest RAM: the two absences, and the direction that was the hard part
+
+Stage 20 built arena growth and §28.12 recorded that it did not work. The
+mechanism was right — a multi-region allocator, `RegionSource`, `PlanGrowth`, a
+plan format with `region <id>` in it, the outbound window in a region of its own
+— and over the file fixture it grew. Over guest RAM it was inert, and inert in
+the only mode that matters: the file-backed arena is a Wine-only test scaffold
+(§28.2), so growth that worked there and nowhere else was growth that had not
+been built.
+
+The diagnosis was already written down and it was correct. Over guest RAM
+`PlanGrowth` obtains a region by **re-reading the plan**, and two things that
+would put one there did not exist:
+
+1. nothing made the guest commit a second region. `attach_guest_ram` was called
+   once per `--arena-guest-ram` at start-up and from nowhere else; the
+   compositor's only growth flag was `--arena-grow-dir`, the fixture's.
+2. nothing appended to the plan. `wc-arena-host` wrote one for a run id and a
+   page count and truncated the file next time.
+
+### 34.1 A plan is a log, because a region can only be located once
+
+`--append` and `--region N`, and the reason it has to be an append rather than a
+rewrite is §12.10: **the first pool allocated into a region writes pixels over
+the stamps the sweep locates it by**. A locator that rebuilt the file from
+scratch would have to re-locate regions whose stamps are gone, and for a region
+in use there is nothing left to find — the sweep would report `located 0 of 4096
+pages` for memory that is working perfectly. So each region is written exactly
+once, at the one moment it is findable.
+
+The region id is on the command line rather than counted from the file, and that
+is not a detail. The id is **decided by the host's allocator** — `Arena::grow`
+passes its `next_id` to `RegionSource::provide` — because that number is what
+every `Descriptor::ArenaSlice { arena, .. }` into the new region will carry. A
+locator that numbered regions itself would write a plan naming a region the
+compositor had never heard of.
+
+The pre-growth spelling is byte-for-byte unchanged, and `Plan::read_all` still
+reads a file with no `region` line as one region numbered zero.
+
+### 34.2 The sweep costs what the guest costs, which is why growth needed the PFN locator
+
+This is the number that decides whether growth is a feature:
+
+| locator | cost | can it re-locate an overwritten region? |
+|---|---|---|
+| content sweep | **2832–3101 ms**, across a 24× range of arena sizes | no |
+| `SuperfetchPfnQuery` | **~330 ms** guest-side, **0.064 s** host-side | yes |
+
+The sweep's cost is flat in the *arena* and linear in the *guest*, because it is
+a content search across the whole 13 GiB backing object. Paid per growth, that is
+a three-second stall in the middle of whatever the user was doing. It is not a
+tuning problem; it is the reason stage 16 rejected growth outright.
+
+So `wc-arena-host --frames PATH` takes a frame list and locates by translating
+it — a table lookup per page against `info mtree -f`, which is
+`sv_hostd::LocatorChoice::Pfns`, already written and cross-checked in this tree
+since §0.14 and **never once executed on a guest**. Growth is the thing that
+makes it necessary rather than nice.
+
+There is deliberately **no flag that prefers a locator**. The guest sends a frame
+list or it does not; a fallback that can be selected by configuration is one that
+gets selected by accident, which is design.md §5.1's objection to fallbacks
+generally. When there is no frame list the sweep runs, and it *works* — a freshly
+committed region still carries its stamps — it merely costs three seconds, and
+the guest's reason for not having one travels with the answer so that the three
+seconds has its cause next to it in the log.
+
+`--verify` is left on for both, and over a frame list it is worth more than it
+costs: it is `security-model.md` R28's cross-check without R28's price, because a
+region is located at the one moment nothing has been allocated into it, so the
+stamps are still there to check the *trusting* locator against, and the read is
+one pass over the region rather than over all of guest RAM.
+
+### 34.3 The direction, and the two wrong answers before the right one
+
+Growth needs a signal that travels **host to guest**. That is the direction
+nothing in this project had: the arena handshake is the guest saying a 64-bit run
+id and the host going to find the memory, and the launcher's ssh channel has the
+*guest* as the client with the host's key behind a forced command.
+
+Two candidates were proposed and both were wrong, in instructive ways.
+
+**A request on the Wayland connection the proxy holds to the compositor.** It is
+host→guest by construction and invents no transport, and it is the same family
+as `wc_icon_manager_v1` (§16) and the clipboard's side channel (§28). It is also
+carried over a TCP relay through an `ssh -L` tunnel — so it is a control path
+over the network, on a guest whose networking is proxy-ARPed over WiFi and has
+been fragile. This project's premise is shared memory across the VM boundary. A
+control channel over ssh is the wrong architecture however convenient the socket.
+
+**A new control ring in shared memory.** Right substrate, wrong instinct: there
+already is one. shared_vulkan's control region and rings carry `deqp-vk` and
+Firefox's GL across this exact boundary today. Waycompose is an addition to
+shared_vulkan, not a second system beside it, so a growth request is **a message
+on that channel** and not a mechanism of its own.
+
+### 34.4 What using the existing channel actually required, which was nothing
+
+This was the thing worth checking rather than assuming, and it came back better
+than expected. `sv_transport::region::SharedRegion::from_raw(base, len)` already
+exists, and its own doc comment already names this case:
+
+> The one caller is the guest-side arena provider, which commits **one** pinned
+> window covering both regions … Slicing that window into a control region and an
+> arena is what this constructor is for.
+
+So both sides build a `SharedRegion` over a sub-range of memory they already
+hold, one calls `Control::create` and the other `Control::attach`, and that is
+the bring-up. No new constructor, no protocol change, no extension of
+`sv-transport` at all.
+
+**The control region is the first 272 KiB of the compositor's outbound window.**
+Four properties made that the only candidate needing nothing new:
+
+* **Already located.** The window is a sub-range of a region the host swept at
+  start-up, so the channel costs no second run id and no second ~3 s sweep.
+* **Already the compositor's to write** (§12.11 item 3).
+* **Already excluded from the host's pool allocator**, by the `outbound` line the
+  plan has carried since stage 10. A control region anywhere else in the arena
+  would need a hole in a free list that is deliberately a sorted run list with no
+  holes in it.
+* **Never reclaimed.** §20's release returns data regions and exempts the one
+  holding the window, so the channel cannot be unmapped under a request in
+  flight.
+
+It costs the gift allocator 272 KiB of its 1 MiB and does not move the floor: the
+window is a tail of the startup region either way. Neither side is *told* where
+the control region is — both derive it from the plan's `outbound` line and one
+shared constant, for the same reason the outbound window itself has one origin
+(§14.7): a number typed into two command lines is a number that can differ, and
+the symptom here would be two `Control`s at two addresses each waiting for a peer
+writing somewhere else.
+
+### 34.5 Two things about that channel that are not ours to choose
+
+**`Control::create` zeroes the control region, and those bytes are stamp pages.**
+This is not hypothetical; `sv-gpu-server`'s own bring-up records the run it cost:
+*"located 8192 of 12288 pages — the 8192 arena pages present and all 4096 control
+pages missing. Nothing said why; the count was simply short."* So the compositor
+may not create the channel until the host's locate has finished — and it needs no
+new signal for that, because §12.10 already built one for exactly this hazard.
+`release_gifts` is called when the first client is accepted, and a client can only
+have arrived through a proxy started from a plan, and the plan exists only if the
+sweep succeeded. Same event, same argument.
+
+**The ring cross-checks a length declared inside the payload.** Its consumer
+compares each packet's framed length against a `u32` at byte 8 on the command
+lane and byte 4 on the reply lane, and refuses the packet if they disagree — so
+both messages carry `sv-wire`'s `CommandHeader`/`ReplyHeader` rather than a
+private framing. A constraint discovered rather than chosen, and a good one: a
+growth request is now a well-formed command on the same ring as everything else.
+
+The geometry is the smallest that works with one exception, and the exception is
+measured. `ring_data_bytes` is 64 KiB because the reply carries the new region's
+**frame list**, and a test holds the *worst* case — one run per page of a 16 MiB
+region — to fitting in one packet. Measured fragmentation of `VirtualLock`ed
+4 KiB pages is 1471 runs per 64 MiB, about a quarter of that. `ring_slot_count`
+is 2 rather than 1 because slot 0 is pre-claimed as the reverse ring by
+`Control`'s own directory writer. `arena_size` and `timeline_count` are 0 and
+honestly so: the arena here is `wc_proxy::pool`'s, and there is no `vkQueueSubmit`
+on this side of the tree.
+
+**The doorbell does not ring across a hypervisor, and that is the most expensive
+sentence in this document.** `sv_transport::park` says it itself: the guest's
+kernel and the host's each hash the shared word into their own table, so a rung
+doorbell reaches nobody and the waiter runs out its `slice` instead. `slice` is
+`Duration::from_millis(20)`.
+
+This section first recorded that as *"a doorbell that reaches nobody costs
+latency and not correctness"*, cited D9's decision to ship polling, and moved on.
+**The observation was right and the conclusion was too mild**, and it was too
+mild for a reason worth naming: growth is a rare operation, so the number was
+judged against the only caller in front of it. One 20 ms wait per region is
+genuinely nothing next to a locate. That made the slice look like a cost this
+stage had accepted, when it was a cost the *project* was paying everywhere.
+
+An hour later the WSI work decomposed Firefox's ~15 s first-frame stall and
+priced it (`docs/firefox-accel.md` §3, "Candidate 1, the cross-VM present: all of
+it, and it is 20 ms at a time"):
+
+| `vkQueuePresentKHR` | ms/frame |
+|---|---|
+| same machine | 1.7–2.1 |
+| across the VM boundary | **216.9 median**, min 213.9, max 228.7, over 480 frames |
+
+A 7% spread over 480 frames is what rules out a contended guest: contention is
+bursty and this is a constant. And **216.9 / 20 = 10.8** — a present on that path
+is `vkResetFences`, `vkQueueSubmit` and `vkWaitForFences`, each a forwarded round
+trip with a wait at both ends, plus kopper's per-frame surface query and the
+acquire. About eleven waits, every one missing its doorbell and paying the slice
+in full. The arithmetic closes exactly.
+
+So the honest statement is: **it is not a correctness-of-protocol problem and it
+is a correctness-of-product one.** Nothing is ever wrong, no message is ever
+lost, and the transport is doing precisely what D9 specified — and the result is
+that GPU rendering across this boundary is unusable, by two orders of magnitude,
+for this one reason. "Bounded latency" is true and is the wrong frame: a bound of
+20 ms multiplied by every wait in a frame is not a bound anybody can ship behind.
+
+What it needs is what `park.rs`'s own comment named before any of this was
+measured — *"a doorbell the hypervisor carries — a virtio-serial byte or an
+ivshmem interrupt — behind this same trait"*. Behind the trait, so no caller
+changes. That fix belongs to whoever owns the plumbing and not to this section;
+what §34 owes it is the measurement and the corrected reading, because the
+milder version of this paragraph is exactly the kind of sentence that lets a
+20 ms constant sit unexamined for a month.
+
+**For growth specifically the slice is still nothing, and that distinction is the
+point rather than an excuse.** A growth is one round trip per region — three or
+four in a session — against a locate of 0.064 s and a commit of tens of
+milliseconds. 20 ms of doorbell latency is under 3% of a growth even in the best
+case, and it does not scale with anything: growth pays the slice once where a
+frame pays it eleven times. So this channel can ship on the polling parker today
+and the GPU path cannot, and when the doorbell lands growth gets the improvement
+for free without a line changing on either side of it.
+
+The compositor pays nothing extra to service the ring either way: its poll loop
+already turns every 5 ms for the UI (§13.8), and a turn is one atomic load.
+
+### 34.6 What is built, and what is not
+
+Built, tested, and building for both targets:
+
+* `wc-arena-host --append`, `--region N`, `--frames PATH` — the host half of a
+  plan that grows, and the PFN locator reached from waycompose for the first
+  time. Tested: a second region appended leaves the first record byte-for-byte
+  intact.
+* `wc_compositor::grow::commit` — the guest committing a region **on demand**
+  under an id the host chose, and answering with the page frames behind it.
+  `wc_handle::arena::region_base` is what it needed, and it is the only raw
+  address this codebase exports: the PFN query is a reverse lookup keyed by the
+  window's virtual address, which is the only name the frame database knows it
+  by.
+* `wc_handle::grow` — the request and the reply, on shared_vulkan's rings, with
+  the framing the ring will check and the geometry the frame list needs.
+
+**Not built: the two ends of the ring, and the `RegionSource` that drives them.**
+The compositor does not yet call `Control::create` at `release_gifts` and does not
+yet service the ring in its poll loop; `wc-proxy` does not yet have a
+`GuestGrowth` that attaches, sends a `Request`, waits for the `Reply`, writes the
+frame list out and spawns `wc-arena-host --append --frames`. Every piece each of
+those needs now exists and the call sequences are §34.4's; what is missing is the
+wiring, and until it lands `--arena-grow` over guest RAM still refuses. **The
+launcher is therefore still at 64 MiB and must stay there**: dropping it to 16
+before the wiring exists would produce exactly §28.12's ten refusals and its
+2144–2777 ms clicks, which is worse than 48 MiB of RAM.
+
+Nothing here has run on a guest. The numbers quoted above are all from earlier
+measurements in this tree — the sweep's 2832–3101 ms, the query's ~330 ms and
+0.064 s, the 1471 runs per 64 MiB — and none of them was taken on a growth. In
+particular **the PFN locator has still never executed on a guest**, and the first
+thing the wiring will produce is the measurement that says whether a growth costs
+what §34.2's table predicts. Peak resident arena bytes on a 16 MiB start, against
+the 64 MiB the launcher reserves, is the number this stage exists to produce and
+it has not been produced.
+
+### 34.7 The launcher's own channel is still ssh, and it is a different problem
+
+`wc-session` is a forced command over ssh, guest→host, and it is how the run id,
+the page count and the outbound size reach the locator. That is a *bootstrap* —
+it happens before any shared memory has been located, so it cannot itself ride
+shared memory without something else establishing the first region — and it has a
+different shape from this one. It should stop being ssh, and it is not this
+section's to fix.
