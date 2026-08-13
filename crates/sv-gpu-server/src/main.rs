@@ -86,7 +86,7 @@ fn win_run() -> Result<(), Box<dyn std::error::Error>> {
         driver.name, driver.queue_family
     );
 
-    let geometry = sv_transport::control::Geometry::for_arena(arena_size);
+    let geometry = geometry_for(arena_size);
 
     // Two sections, not one with two views. Windows view offsets must be
     // multiples of the 64 KiB allocation granularity, so "the arena starts after

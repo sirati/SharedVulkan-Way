@@ -1300,3 +1300,109 @@ the one to plan against. What the local rig is good for is that the *locate* is
 sixteen times faster, because the sweep is linear in guest RAM and this guest has
 a sixth as much — so an iteration is seconds rather than a round trip over
 somebody's WiFi.
+
+---
+
+# The Windows platform layer, running on the Intel driver
+
+Run 2026-08-13 with `scripts/sv-windows-e2e.sh`: two processes **inside the
+guest**, no VM boundary, the real Intel iGPU at the far end. This is the
+analogue of `sv-end-to-end.sh`, and what differs is only the platform layer —
+named section objects instead of a memfd, a named pipe instead of a Unix socket,
+and **no handle passed at all**.
+
+```
+[gpu] Intel(R) UHD Graphics (intel), queue family 0, provider AppMemfd (named section)
+[gpu] arena 64 MiB imported as a host pointer, memory type 1
+[gpu] waiting for the app side on \\.\pipe\shared_vulkan.e2e-…
+[gpu] app side attached (two named sections, no handle passed)
+[gpu] serving rings [1, 2, 3] on Intel(R) UHD Graphics (intel)
+app : sv-icd: connected to the GPU side at e2e-…
+app : === device 0: Intel(R) UHD Graphics  type=INTEGRATED_GPU api=1.4.323  (148 extensions)
+app : === device 1: Intel(R) UHD Graphics  type=INTEGRATED_GPU api=1.3.0    (25 extensions)
+```
+
+**The verdict is a count, not a name.** On Linux the app side has no GPU, so
+"reports the GPU side's driver" is proof. Here both processes are on the machine
+that owns the GPU, the loader enumerates the Intel ICD *and* ours, and both say
+`Intel(R) UHD Graphics`. What proves it is that there are **two of them on a
+machine with one GPU**: a second entry with the same driver version can only be
+ours forwarding to the first. `api=1.3.0` against `1.4.323` and 25 extensions
+against 148 are the corroboration — 1.3.0 is our manifest's cap and 25 is the
+profile we advertise. Device 1's heap 1 is 56 MiB, host-visible: that is the
+arena, seen through §9.1's memory table.
+
+`CreateFileMapping` + `MapViewOfFile` + `VK_EXT_external_memory_host` therefore
+work together on the real Intel driver, and `DuplicateHandle` is not needed for
+any of it.
+
+## Four things in the way, none of them in our code
+
+**1. The Vulkan loader ignores `VK_DRIVER_FILES` in an elevated process.**
+
+```
+[Vulkan Loader] INFO: Loader is running with elevated permissions.
+                      Environment variable VK_DRIVER_FILES will be ignored
+```
+
+Windows OpenSSH hands this account an elevated, high-integrity token, so every
+command run over ssh is elevated. This is a deliberate loader security measure —
+an elevated process must not be talked into loading an attacker-named DLL — and
+it applies to `VK_ADD_DRIVER_FILES` and the layer variables too.
+
+**The symptom is a perfect-looking success.** `vulkaninfo` runs, exits 0, and
+reports `Intel(R) UHD Graphics` with `driverID =
+DRIVER_ID_INTEL_PROPRIETARY_WINDOWS` — the real driver reached directly, which
+is exactly what a working forwarder would also print. Only the loader log says
+otherwise. `runas /trustlevel:0x20000` does not help; the loader still sees the
+process as elevated.
+
+The way through is the registry, which is the documented mechanism and what
+`scripts/win-register-icd.ps1` already existed for. The harness registers,
+runs, and **unregisters on every exit path** including interrupt; the exposure
+is a few seconds in which another application would enumerate one extra device.
+
+**2. A `.ps1` with no BOM is read in the machine's ANSI code page.** Windows
+PowerShell 5.1 does this, and `win-register-icd.ps1`'s comments contained em
+dashes and section signs. On the German guest they decoded to characters that
+closed a string early, and PowerShell reported a syntax error *on a different
+line* than the one it could not read. The file is ASCII-only now; a BOM would
+also work, but ASCII asks nothing of whoever copies the file, and this file is
+built on Linux, pushed over scp, crossed virtio-fs and read on German Windows.
+
+**3. Backslashes do not survive the shell layers**, even with
+`MSYS_NO_PATHCONV=1`. `C:\\sv\\win-register-icd.ps1` arrived as
+`C:svwin-register-icd.ps1`. Forward slashes work everywhere Windows accepts a
+path, which `gpu-workload-run.sh` had already learned for `Z:/probe`.
+
+**4. `vulkaninfo` cannot be the app side on Windows.** There is always a Win32
+surface, so it calls `vkGetPhysicalDeviceSurfaceSupportKHR` and dies with
+`ERROR_EXTENSION_NOT_PRESENT` before printing a single device. On Linux it skips
+surface queries because `DISPLAY` is unset, which is why this never came up.
+`VK_KHR_win32_surface` is simply not implemented — presentation is app-side and
+X11/Wayland today. That is a WSI gap, not a platform-layer one, and `vk-probe`
+is the right app for this test because it needs no surface.
+
+## Two smaller notes
+
+**The GPU side's own loader enumerates our ICD once it is registered**, and our
+ICD then refuses to load, six times, with
+
+```
+sv-icd: cannot create the arena (the app-side arena mapping is implemented for
+Linux only …); the driver will not load
+```
+
+That is correct behaviour rather than a bug: `SV_SOCKET` is unset in the GPU
+side's environment, so `sv-icd` takes its standalone path, that path needs an
+arena it cannot make on Windows, and it **refuses rather than answering from a
+table**. Only `Mapping::create` is Linux-only; `Mapping::attach`, which is what
+the connected path uses, is portable, which is why the app side works. Worth
+knowing that registering the ICD system-wide makes the GPU side load its own
+client DLL, and worth keeping the refusal loud.
+
+**The named pipe is single-instance and does not re-listen.** A second
+application against a live GPU side gets `CreateFileW … errno 231`
+(`ERROR_PIPE_BUSY`) after the connect timeout. One session, one client is the
+current design; serving several would need the `ConnectNamedPipe` loop the Linux
+`--clients N` path already has.

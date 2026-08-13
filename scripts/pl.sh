@@ -10,20 +10,37 @@
 #   pl.sh pull <remote> <local> scp a file back from the host
 set -uo pipefail
 
-AGENT_DIR=~/.ssh/agent
+# **The local 1Password agent, not a forwarded one.**
+#
+# `~/.ssh/agent/s.*` are sockets forwarded from the user's own SSH
+# sessions into this machine. There are dozens of them, they go stale whenever
+# that session reconnects, and a stale one does not say so: `ssh-add -l` may
+# still list keys while a signing request returns `agent refused operation` or
+# simply hangs.
+#
+# That cost a whole session. Picking "the first socket that lists keys" found a
+# stale one, every socket in the directory was backed by the same dead
+# forwarding, and the uniform `agent refused operation` was read as "the
+# 1Password vault has locked" — a diagnosis that also appears in
+# `measured-gpu-side.md` for an earlier run, for what was very likely the same
+# reason. The vault was never locked.
+#
+# The local agent has none of that: one socket, no forwarding, no staleness.
+# `SV_AGENT` overrides it for the case where somebody really does want a
+# forwarded one.
+AGENT_SOCK=~/.1password/agent.sock
 KEY=/tmp/sv-k1.pub
 
-live_agent() {
-  for s in "$AGENT_DIR"/s.*; do
-    n=$(SSH_AUTH_SOCK=$s timeout 4 ssh-add -l 2>/dev/null | wc -l)
-    if [ "$n" -gt 0 ]; then echo "$s"; return 0; fi
-  done
-  return 1
-}
-
-AG=${SV_AGENT:-$(live_agent)}
-[ -n "$AG" ] || { echo "no live ssh agent socket" >&2; exit 1; }
+AG=${SV_AGENT:-$AGENT_SOCK}
+[ -S "$AG" ] || { echo "no ssh agent socket at $AG" >&2; exit 1; }
 export SSH_AUTH_SOCK="$AG"
+# Prove it can *sign*, not merely that it can list. Listing works against a
+# stale forwarded agent and signing is what actually fails, so a helper that
+# checks the cheap thing reports success and then hands the caller a hang.
+if ! timeout 10 ssh-add -l >/dev/null 2>&1; then
+  echo "the agent at $AG is not answering — is 1Password running?" >&2
+  exit 1
+fi
 
 HOST_OPTS=(-o IdentityAgent="$AG" -o HostKeyAlias=testhost.lan
            -o HostKeyAlgorithms=rsa-sha2-512,rsa-sha2-256 -o BatchMode=yes

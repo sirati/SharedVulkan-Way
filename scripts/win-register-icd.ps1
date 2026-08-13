@@ -1,7 +1,22 @@
 # Register (or unregister) the shared_vulkan ICD with the Windows Vulkan loader.
 #
-# The Windows half of design.md §8. It matters only when the *app side* is
-# Windows — not on testhost, where the app side is the Linux host — but the
+# ASCII ONLY, DELIBERATELY. Windows PowerShell 5.1 reads a .ps1 with no
+# byte-order mark using the machine's ANSI code page, not UTF-8. This file used
+# to contain em dashes and section signs in its comments; on the German guest
+# they decoded to different characters, one of which closed a string early, and
+# PowerShell reported a *syntax error on a different line* than the one it could
+# not read:
+#
+#   Unerwartetes Token "build" in Ausdruck oder Anweisung.
+#   Die Zeichenfolge hat kein Abschlusszeichen: ".
+#
+# A BOM would also fix it. ASCII is better: it needs nothing of whoever copies
+# the file, and copying is exactly what happens to it -- it is built on Linux,
+# pushed over scp, crosses virtio-fs, and is read by a shell on a German
+# Windows. Keep it typeable on a US keyboard.
+#
+# The Windows half of design.md section 8. It matters only when the *app side* is
+# Windows -- not on testhost, where the app side is the Linux host -- but the
 # brief requires either side to be either OS, so the path exists and is written
 # down rather than described.
 #
@@ -20,8 +35,8 @@
 # R6's "no permanent test-signing" constraint costs this project nothing.
 #
 # The `WOW6432Node` mirror is for 32-bit applications on a 64-bit system. A
-# 64-bit driver must NOT be registered there — a 32-bit loader would try to load
-# a 64-bit DLL — so this script writes it only when given a 32-bit manifest.
+# 64-bit driver must NOT be registered there -- a 32-bit loader would try to load
+# a 64-bit DLL -- so this script writes it only when given a 32-bit manifest.
 #
 # The development-loop alternative, which needs no administrator at all, is the
 # environment variable:
@@ -78,7 +93,7 @@ if ($Remove) {
 }
 
 if (-not (Test-Path $full)) {
-  throw "no manifest at $full — build sv-icd first; its build script writes one next to the DLL"
+  throw "no manifest at $full -- build sv-icd first; its build script writes one next to the DLL"
 }
 
 # Fail early and clearly rather than after a half-written registry change.
@@ -87,7 +102,7 @@ if (-not $json.ICD.library_path) {
   throw "$full does not look like an ICD manifest (no ICD.library_path)"
 }
 if ($json.ICD.api_version -notmatch '^1\.[1-9]') {
-  # design.md §8: below 1.1 the loader demotes the driver to Vulkan 1.0 *and
+  # design.md section 8: below 1.1 the loader demotes the driver to Vulkan 1.0 *and
   # rewrites every application's requested apiVersion*, with no diagnostic.
   throw "manifest api_version is $($json.ICD.api_version); below 1.1 the loader silently demotes the driver"
 }
