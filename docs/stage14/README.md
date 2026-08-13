@@ -11,7 +11,7 @@ to start looks like — so the pair is the evidence.
 
 | file | what it is |
 |---|---|
-| `stage14-client.png` | the guest's real desktop, `--decorations client`: Windows' caption with its three buttons, and in the tab strip **below** it Firefox's own close button. Two title bars, one on top of the other, both able to close the window. This is what every stage from 9 to 13 shipped. |
+| `stage14-client.png` | the guest's real desktop, `--decorations client`: Windows' caption with its three buttons, and in the tab strip **below** it Firefox's own close button. Two title bars, one on top of the other, both able to close the window. This is what every stage from 9 to 13 shipped. The page it happens to be showing is `about:support`, which is not staged and is a useful accident — the build id, the binary path and the profile directory in it are this run's provenance. |
 | `stage14-server.png` | the same, `--decorations server` plus the environment variable. One caption, Windows', with the client's own icon and title in it; Firefox's tabs directly beneath with nothing in the corner but the tab-list chevron. |
 | `compositor-server.log` | the `server` leg's compositor log, from inside the VM. `decorations: manager default is Server`, `kde-decoration: client asked for Value(Server)`, `mapped: 0 section, 0 shared-file, N arena-slice`. |
 | `compositor-client.log` | the `client` leg's, for the same lines with the other answers. |
