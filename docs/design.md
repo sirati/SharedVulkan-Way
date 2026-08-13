@@ -2866,6 +2866,36 @@ Four things were needed and all four are §0.3 item 5's own prescription:
   `vkGetPhysicalDeviceFeatures2`, so `vulkaninfo` printed it true throughout; the
   guard could never have fired.
 
+  **"Do we support buffer device address" has two answers, and they are both
+  deliberate.** Asked as *the core 1.2 feature* — `bufferDeviceAddress` in
+  `VkPhysicalDeviceVulkan12Features`, queried through
+  `vkGetPhysicalDeviceFeatures2`, used through `vkGetBufferDeviceAddress` — the
+  answer is **yes**, and this section is what makes it true. Asked as *the
+  extension* — `VK_KHR_buffer_device_address` or `VK_EXT_buffer_device_address`
+  in `vkEnumerateDeviceExtensionProperties` — the answer is **no**: neither is in
+  `profiles::zink()`, so `PROFILE_DEVICE_EXTENSIONS` does not carry them,
+  `driver::forwardable_device_extensions` intersects them away, and the ICD never
+  advertises them. Their `…KHR`-suffixed entry points are therefore absent from
+  the proc tables, which is correct and not a hole: an application may only call
+  `vkGetBufferDeviceAddressKHR` after enabling an extension it cannot see. The
+  two answers are consistent because the extension is unreachable, not because
+  they agree.
+
+  This is what §0.19's `no_extension_is_advertised_with_a_stubbed_entry_point`
+  caught, from the wrong end. That guard is right and its derivation resolves a
+  promoted extension through its alias to the core command — but it also **named
+  `VK_KHR_buffer_device_address` by hand** as the case that motivated it, and
+  when the three entry points here stopped being stubs the assertion was left
+  demanding that a fixed bug still be present. It failed on master for exactly
+  that reason. The fix is not an exclusion: the generator now emits
+  `INCOMPLETE_EXTENSION_REASONS`, pairing every excluded extension with the
+  refused entry point that excluded it, and the test asserts *that* pairing. It
+  is strictly stronger — it would have caught the original bug, it catches an
+  extension excluded for no reason, and it cannot expire when a stub becomes an
+  implementation. **A hand-named case inside a test about an invariant is a fact
+  with an expiry date**, and this one expired against a fix, which is the best
+  way for it to have happened and still a gate that went red for everyone.
+
 **3. The profile was widened by what CTS asked for, and the cheap half of the
 gap is not commands.** `sv-codegen gap` reports the registry's side — 740
 commands defined, 239 carried — and check 4 reports the suite's side, in deqp's
@@ -2900,6 +2930,14 @@ that badly misdescribes the work: much of the reachable gap is feature bits,
 segmentation fault.** `VK_KHR_push_descriptor` was added, measured, and taken
 back out — the one entry in that list that is a measurement rather than a
 judgement, and the most useful finding in it.
+
+  **It is excluded because it is unimplemented, not because it is unwanted**,
+  and the distinction is load-bearing: `VK_EXT_descriptor_buffer`, the
+  ray-tracing pair and `VK_KHR_external_semaphore_fd` are excluded on *policy*
+  and must stay out; this one is excluded on *state* and should come back in the
+  moment somebody writes the expansion below. Ten of the wider run's 198 skips
+  are waiting on it. A mechanical widening that restores it without the
+  expansion restores the segmentation fault with it.
 
   `exceptions::void_policy` already declared
   `VoidPolicy::ArenaOffset` for `vkCmdPushDescriptorSetWithTemplate`'s `pData`,

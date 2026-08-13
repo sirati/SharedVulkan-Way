@@ -523,7 +523,7 @@ pub trait IcdLocal {
     /// `vkQueueBindSparse` — sent the app-side id raw. The GPU side then said
     /// `no VkDeviceMemory with id 8` and took the ring fatal, and every CTS test
     /// that binds an image to host-visible memory lost the device
-    /// (design.md §0.17). Generating the pass is what makes the set closed: it
+    /// (design.md §0.20). Generating the pass is what makes the set closed: it
     /// is the same fold the GPU side already runs, applied one boundary earlier.
     fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
         Ok((memory, offset))
@@ -1074,7 +1074,7 @@ mod tests {
             "vkEnumeratePhysicalDeviceGroups",
             "vkGetDeviceQueue2",
             // **`vkGetBufferDeviceAddress` and its two friends left this list**
-            // (design.md §0.17). §0.3 finding 5 put them here — a command
+            // (design.md §0.20). §0.3 finding 5 put them here — a command
             // returning a value that is neither `void` nor `VkResult` had no
             // reply to carry it — and called the hole latent because "§9.2 does
             // not advertise `bufferDeviceAddress`, so a conforming application
@@ -1105,6 +1105,24 @@ mod tests {
     /// belongs to an extension puts that extension out of the advertised set,
     /// and `sv_icd::SharedVulkan::ask_device_extensions` subtracts it. It holds
     /// under every profile, which is the point.
+    ///
+    /// # It named its motivating case, and the name expired
+    ///
+    /// As first written this test asserted, under the `zink` profile, that
+    /// `VK_KHR_buffer_device_address` and `VK_EXT_buffer_device_address` **must**
+    /// be in [`INCOMPLETE_EXTENSIONS`] — true when written, because
+    /// `vkGetBufferDeviceAddress` was a stub returning a silent zero. design.md
+    /// §0.20 implemented all three entry points, the derivation correctly stopped
+    /// listing the extensions, and the assertion failed **demanding that a fixed
+    /// bug still be present**. A hand-named case in a test about an invariant is
+    /// a fact with an expiry date, and this one expired against a fix.
+    ///
+    /// So the pairing is derived now: the generator emits
+    /// [`INCOMPLETE_EXTENSION_REASONS`], and what is checked is that every
+    /// entry is there *because of* an entry point that is genuinely refused.
+    /// That is strictly stronger than the named case — it would have caught the
+    /// original bug, it catches an extension listed for no reason, and it cannot
+    /// go stale when a stub becomes an implementation.
     #[test]
     fn no_extension_is_advertised_with_a_stubbed_entry_point() {
         assert!(
@@ -1122,15 +1140,55 @@ mod tests {
                 "an empty name in NOT_IMPLEMENTED would silently match nothing"
             );
         }
-        // Under the default profile the three buffer-device-address entry points
-        // are refused, so their extensions must be out. Named rather than
-        // derived, because this is the case that motivated the table and a
-        // regression here is exactly the bug that was fixed.
+
+        // The two tables describe the same set, in the same order.
+        let named: Vec<&str> = INCOMPLETE_EXTENSION_REASONS.iter().map(|(e, _)| *e).collect();
+        assert_eq!(
+            named, INCOMPLETE_EXTENSIONS,
+            "INCOMPLETE_EXTENSION_REASONS and INCOMPLETE_EXTENSIONS are emitted from one \
+             set and must not disagree"
+        );
+
+        // **The invariant.** Every excluded extension is excluded because a
+        // named entry point of its own refuses. An extension listed without one
+        // is a promise withdrawn for no reason, which costs an application a
+        // feature the device has; an extension *not* listed while one of its
+        // entry points refuses is §9.2's promise broken, which costs it a silent
+        // wrong answer. This checks the first directly and the second by
+        // construction, since the generator builds both tables from `refused`.
+        for (ext, why) in INCOMPLETE_EXTENSION_REASONS {
+            assert!(
+                NOT_IMPLEMENTED.contains(why),
+                "{ext} is excluded because of {why}, which is not in NOT_IMPLEMENTED — \
+                 either the reason is stale or the exclusion is"
+            );
+        }
+
+        // And the direction that has no derivation behind it: if nothing is
+        // refused, nothing may be excluded.
+        if NOT_IMPLEMENTED.is_empty() {
+            assert!(
+                INCOMPLETE_EXTENSIONS.is_empty(),
+                "no entry point refuses, so no extension can be incomplete"
+            );
+        }
+
+        // The buffer-device-address case, kept and inverted rather than deleted,
+        // because it is the case the table was built for and the direction it
+        // points in is now the interesting one. design.md §0.20 implemented
+        // `vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress` and
+        // `vkGetDeviceMemoryOpaqueCaptureAddress`, so none of the three may
+        // appear here — and a merge that reintroduced a stub for any of them
+        // would fail on the loop above with the command's own name.
         if env!("SV_ICD_ENTRY_PROFILE") == "zink" {
-            for ext in ["VK_KHR_buffer_device_address", "VK_EXT_buffer_device_address"] {
+            for cmd in [
+                "vkGetBufferDeviceAddress",
+                "vkGetBufferOpaqueCaptureAddress",
+                "vkGetDeviceMemoryOpaqueCaptureAddress",
+            ] {
                 assert!(
-                    INCOMPLETE_EXTENSIONS.contains(&ext),
-                    "{ext} introduces a stubbed entry point and must not be advertised"
+                    !NOT_IMPLEMENTED.contains(&cmd),
+                    "{cmd} is implemented as of design.md §0.20 and must not be a stub again"
                 );
             }
         }

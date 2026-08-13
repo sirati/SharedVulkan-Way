@@ -445,7 +445,7 @@ fn sent(r: &Recorder) -> Vec<u8> {
 /// `vkBindBufferMemory` had the rewrite and `vkBindImageMemory` did not, so an
 /// image bound to host-visible memory sent an app-side id the GPU side has never
 /// heard of; it answered `no VkDeviceMemory with id 8`, took the ring fatal, and
-/// the device was lost (design.md §0.17). The two commands are asserted
+/// the device was lost (design.md §0.20). The two commands are asserted
 /// together here precisely because their being different was the bug.
 #[test]
 fn every_forwarded_memory_pair_is_rewritten() {

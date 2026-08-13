@@ -2174,7 +2174,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     // un-advertised — the version number is what advertises it — so it stays a
     // `NOT_IMPLEMENTED` entry and nothing else. That is the honest split, and
     // the API version is `sv-worktrees/vers`'s question, not this table's.
-    let mut incomplete: BTreeSet<&str> = BTreeSet::new();
+    let mut incomplete: BTreeSet<(&str, String)> = BTreeSet::new();
     for e in &cx.model.extensions {
         if !e.supported_for_vulkan {
             continue;
@@ -2185,17 +2185,48 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         // it is the core name the generator refuses. Comparing names alone let
         // the extension through, which is the exact bug this table exists to
         // stop, one indirection down.
-        let breaks = e.requires.iter().flat_map(|b| b.items.iter()).any(|it| match it {
+        // **The refused command is kept, not just the fact that there was one.**
+        // Without it the only thing a test can check about this table is that it
+        // is sorted, and the interesting property — that every entry is here
+        // *because of* a named stub — has to be asserted by writing the answer
+        // down. It was, and it went stale the moment the stub it named became a
+        // real implementation: `no_extension_is_advertised_with_a_stubbed_entry_-
+        // point` hard-coded `VK_KHR_buffer_device_address`, and when
+        // §0.20 implemented `vkGetBufferDeviceAddress` the assertion was left
+        // demanding that a fixed bug still be present. Carrying the reason makes
+        // the pairing derivable on both sides, so the test checks the invariant
+        // instead of remembering an example.
+        let because = e.requires.iter().flat_map(|b| b.items.iter()).find_map(|it| match it {
             vk_registry::InterfaceRef::Command(c) => {
-                refused.contains(c) || refused.contains(&cx.model.canonical_command(c))
+                // Through the alias, not just the name.
+                // `VK_KHR_buffer_device_address` requires
+                // `vkGetBufferDeviceAddressKHR`, which is an *alias* of the core
+                // `vkGetBufferDeviceAddress` — one entry point under two names,
+                // and it is the core name the generator refuses. Comparing names
+                // alone let the extension through, which is the exact bug this
+                // table exists to stop, one indirection down. The name reported
+                // is the one that is actually in `NOT_IMPLEMENTED`, so a reader
+                // can find it and a test can look it up.
+                if refused.contains(c) {
+                    return Some(c.clone());
+                }
+                let canon = cx.model.canonical_command(c);
+                refused.contains(&canon).then(|| canon.to_string())
             }
-            _ => false,
+            _ => None,
         });
-        if breaks {
-            incomplete.insert(e.name.as_str());
+        if let Some(cmd) = because {
+            incomplete.insert((e.name.as_str(), cmd));
         }
     }
-    let incomplete: Vec<&str> = incomplete.into_iter().collect();
+    let incomplete_reasons: Vec<TokenStream> = incomplete
+        .iter()
+        .map(|(e, c)| {
+            let c = c.as_str();
+            quote!((#e, #c))
+        })
+        .collect();
+    let incomplete: Vec<&str> = incomplete.iter().map(|(e, _)| *e).collect();
 
     let n_impl = cx.abi.commands.len() - refused.len();
     let total = cx.abi.commands.len();
@@ -2232,6 +2263,24 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         ///
         /// Sorted, so `binary_search` is the lookup.
         pub static INCOMPLETE_EXTENSIONS: &[&str] = &[#(#incomplete,)*];
+
+        /// Why each entry of [`INCOMPLETE_EXTENSIONS`] is there: the extension
+        /// paired with one entry point of its own that is in
+        /// [`NOT_IMPLEMENTED`].
+        ///
+        /// The name is the one the *generator refused*, which for a promoted
+        /// extension is the core spelling rather than the suffixed alias —
+        /// `VK_KHR_buffer_device_address` would appear here against
+        /// `vkGetBufferDeviceAddress`, not against `vkGetBufferDeviceAddressKHR`
+        /// — so it can be found in `NOT_IMPLEMENTED` and looked up by a test.
+        ///
+        /// This exists because the alternative was a test that named one
+        /// extension by hand, and a hand-named case is a fact with an expiry
+        /// date: it asserted `VK_KHR_buffer_device_address` must be excluded,
+        /// design.md §0.20 implemented the three entry points, and the assertion
+        /// then failed for the best possible reason — demanding that a fixed bug
+        /// still be present.
+        pub static INCOMPLETE_EXTENSION_REASONS: &[(&str, &str)] = &[#(#incomplete_reasons,)*];
 
         /// Entry points `sv-icd-entry` writes by hand — see the generator's
         /// `HAND_WRITTEN` for why each one cannot be a fold over a wire reply.
