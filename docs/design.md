@@ -2981,10 +2981,10 @@ exactly once across the two projects. A pool over the real region costs
 **0.4–0.7 µs to reach and 5.4–7.1 µs to touch**, against 1.9–3.2 µs and
 1.9–2.6 ms for the same code over a file on the export.
 
-Four runs of the frame check, all after the substrate change: 555/60/10,
-577/60/10, 606/60/11, 626/60/11. The 60 is the client's own repertoire of
-images and is the control's number exactly; the frame total varies with how much
-of the 20-second window the run actually got.
+Five runs of the frame check, all after the substrate change: 555/60/10,
+577/60/10, 592/60/10, 606/60/11, 626/60/11. The 60 is the client's own
+repertoire of images and is the control's number exactly, in every run; the
+frame total varies with how much of the 20-second window the run actually got.
 
 ### 12.2 What was built, in the order the bytes move
 
@@ -3170,9 +3170,9 @@ and it is the only check in the file that ever caught the freeze.
 | §10.7, guest, file arena on the export | 645 | 18 | **462** |
 | §10.7, guest, `SharedFile` on the export | 642 | 18 | 459 |
 | §10.7, Wine on the workstation, coherent fs (the control) | 780 | 60 | 13 |
-| **stage 7, guest, guest-RAM arena** | **555–626** | **60** | **10–11** |
+| **stage 7, guest, guest-RAM arena** (five runs) | **555–626** | **60** | **10–11** |
 
-The guest run is now indistinguishable from the control, across four runs: the
+The guest run is now indistinguishable from the control, across five runs: the
 same 60 distinct images every time — which is the client's own repertoire, not
 ours — and a commonest of 10 or 11 against the control's 13. The check is
 unchanged. It was not relaxed, re-scoped, or moved to a note; it asserts what it
@@ -3371,7 +3371,16 @@ not one function's worth of code.
 | Gate | Result |
 |---|---|
 All of these are from **master's checkout after the merge**, not from the branch
-before it.
+before it. Every one was re-run there rather than carried over.
+
+One thing about running them worth knowing, because it cost a confusing minute:
+the workstation lost its LAN route to the guest mid-session — `ssh: connect to
+host <guest-ip>: No route to host`, 18 checks failing at once, and green
+again on retry with nothing changed. Blocks 7–10 were unaffected throughout,
+because they reach the guest from the VM host over the host-only link at
+<guest-nat-ip>. **All-of-block-1 failing is a network symptom, not a code one**; a
+real regression does not take out `SIO_AF_UNIX_GETPEERPID` and the xkb probe
+together.
 
 | Gate | Result |
 |---|---|
