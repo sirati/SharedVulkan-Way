@@ -647,6 +647,51 @@ fn an_event_carrying_a_descriptor_becomes_a_real_fd_for_the_client() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A keymap in a **Windows section** is refused, loudly, and the connection
+/// ends.
+///
+/// This is the failure `wl_keyboard.keymap` had all along and that nothing
+/// exercised — docs/design.md §9.10 item 5's "implemented, unexercised". A
+/// compositor that has not been told where to publish objects creates
+/// `Local\wc-…`, which is a name only the NT object manager understands. The
+/// old code noted it and forwarded the event *without* the descriptor, so the
+/// client received a well-formed `keymap` and `mmap`ed a descriptor it never
+/// got.
+///
+/// The assertion is on the message rather than only on the error, because the
+/// whole value of failing here is that somebody reading the log learns what to
+/// do about it.
+#[test]
+fn a_keymap_in_a_windows_section_is_a_diagnosis_rather_than_a_broken_client() {
+    let d = tmpdir("ntsection");
+    let t = SharedFile::new(&d, "Z:\\").unwrap();
+    let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let seat = h.bind(registry, 3, "wl_seat", 7);
+    let kbd = h.id();
+    h.send_words(seat, 1, &[kbd]);
+
+    let descriptor = wc_handle::Descriptor::Section {
+        name: "Local\\wc-0123456789abcdef0123456789abcdef".into(),
+        size: 4096,
+    };
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u32.to_ne_bytes());
+    wire::push_bytes(&mut body, &descriptor.encode());
+    body.extend_from_slice(&4096u32.to_ne_bytes());
+
+    let err = h
+        .session
+        .server_message(Header { object: kbd, opcode: 0, size: 8 + body.len() }, &body)
+        .expect_err("a section the client cannot open must not be forwarded");
+    let text = format!("{err}");
+    assert!(text.contains("wl_keyboard.keymap"), "{text}");
+    assert!(text.contains("--shared-dir"), "the message must say what to do: {text}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// Messages the proxy has never heard of go through byte for byte. This is the
 /// property that makes the proxy worth building — `docs/goal-firefox.md` needs
 /// protocols nobody has written code for here.

@@ -94,6 +94,8 @@ struct Step {
 struct Simulation {
     enabled: bool,
     activate: Step,
+    /// Pointer and keyboard, as one step. See [`PumpInner::simulate_input`].
+    input: Step,
     resize: Step,
     close: Step,
 }
@@ -102,16 +104,68 @@ impl Simulation {
     const OFF: Simulation = Simulation {
         enabled: false,
         activate: Step { frames: u64::MAX, after: Duration::MAX },
+        input: Step { frames: u64::MAX, after: Duration::MAX },
         resize: Step { frames: u64::MAX, after: Duration::MAX },
         close: Step { frames: u64::MAX, after: Duration::MAX },
     };
     const ON: Simulation = Simulation {
         enabled: true,
         activate: Step { frames: 1, after: Duration::from_millis(500) },
+        // After the activation and before the resize, so the client is focused
+        // when the keys arrive and has not been asked to reallocate while it is
+        // being typed at. The order is the one a user produces.
+        input: Step { frames: 2, after: Duration::from_millis(900) },
         resize: Step { frames: 4, after: Duration::from_millis(1500) },
         close: Step { frames: 12, after: Duration::from_millis(3500) },
     };
 }
+
+/// What the simulated keyboard types: `hello` in evdev keycodes, then Return.
+///
+/// A word rather than one key, and a word whose letters are spread across the
+/// board rather than adjacent, because the failure this is here to catch is an
+/// off-by-one in the keycode table — and an off-by-one is invisible if every
+/// key tested is next to the one before it. `h e l l o` is scan codes 0x23,
+/// 0x12, 0x26, 0x26, 0x18, which are not consecutive in either scheme.
+///
+/// The doubled `l` is deliberate too: a compositor that dropped repeated
+/// keycodes, or that tracked "pressed" state wrongly, would deliver one.
+const TYPED: &[(u16, char)] = &[
+    (35, 'h'),
+    (18, 'e'),
+    (38, 'l'),
+    (38, 'l'),
+    (24, 'o'),
+    (28, '\n'), // KEY_ENTER
+];
+
+/// `KEY_LEFTSHIFT`, used as a modifier rather than as a character.
+///
+/// The shifted key is typed as four events — shift down, key down, key up,
+/// shift up — because that is what a keyboard sends and what a compositor has
+/// to turn into `wl_keyboard.modifiers` around a `key`. It is the only part of
+/// the keyboard path where the compositor's *own* xkb state is load-bearing:
+/// the client is told which modifiers are latched, and it computes the
+/// character. Sending an upper-case character instead would be making the
+/// decision the keymap exists to make.
+const SHIFT: u16 = 42;
+
+/// `KEY_Z`, which must come out as `Z` while shift is held.
+const SHIFTED: (u16, char) = (44, 'Z');
+
+/// The key pressed once before the layout change and once after.
+///
+/// `KEY_Y` is 21, and it is the *position* of `Y` on an American board and of
+/// `Z` on a German one. So the same evdev keycode must produce `y` under the
+/// `us` keymap and `z` under `de` — which is a statement about the client's own
+/// libxkbcommon having recompiled a keymap that arrived over the wire, and is
+/// the only way to prove from outside that the second `wl_keyboard.keymap`
+/// carried a different keymap rather than being re-sent or ignored.
+///
+/// It is also the exact pair that a compositor translating virtual-key codes
+/// instead of scan codes would get wrong (see `crate::input`), which makes one
+/// key carry two claims.
+const LAYOUT_PROBE: u16 = 21;
 
 impl Step {
     /// Has this step come due, by either route?
@@ -141,8 +195,19 @@ struct Headless {
     frames: u64,
     mapped_at: Option<Instant>,
     activated: bool,
+    input: bool,
     resized: bool,
     closed: bool,
+}
+
+/// Which layout the keyboard compiles when nobody says.
+///
+/// There is no Windows here to ask, and asking the *Linux* machine's layout
+/// would be answering a different question — the layout that matters is the one
+/// the user is typing on, which on this platform is nobody. So it is the
+/// fallback, and the harness passes `--layout` when it wants a specific one.
+pub fn current_layout() -> &'static str {
+    crate::input::FALLBACK
 }
 
 pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
@@ -214,6 +279,7 @@ impl PumpInner {
                         frames: 0,
                         mapped_at: None,
                         activated: false,
+                        input: false,
                         resized: false,
                         closed: false,
                     },
@@ -336,6 +402,10 @@ impl PumpInner {
             println!("wc-compositor: [simulate-wm] window {id} activated");
             let _ = self.events.send(FromUi::Activated { id, on: true });
         }
+        if !w.input && self.simulate.input.due(w.frames, w.mapped_at) {
+            w.input = true;
+            self.simulate_input(id, w);
+        }
         if !w.resized && self.simulate.resize.due(w.frames, w.mapped_at) {
             w.resized = true;
             // A resize arrives from the platform as a *client area* size, which
@@ -361,6 +431,116 @@ impl PumpInner {
             );
             let _ = self.events.send(FromUi::CloseRequested { id });
         }
+    }
+
+    /// Drive the seat, in the units and the order a real one produces.
+    ///
+    /// # Why this is worth having when the whole point is Win32
+    ///
+    /// Because of docs/design.md §8.5's split, which stage 6 inherits in a
+    /// sharper form than stage 3 had it. On Windows the only clients that can
+    /// reach the compositor are ours or come through the proxy; on Linux any
+    /// Weston client connects directly. `weston-eventdemo` **prints every input
+    /// event it receives, including the Unicode character its own libxkbcommon
+    /// produced from the keycode and the keymap we sent it** — which is the
+    /// strongest available statement that the seat is right, and it is made by
+    /// a program that has never heard of this project.
+    ///
+    /// What this leg cannot say anything about is the translation: there is no
+    /// `WM_KEYDOWN` here, so the keycodes are written down rather than
+    /// converted, and `crate::input`'s table is tested by unit tests and by the
+    /// Wine leg instead. Saying which half each leg carries matters more than
+    /// the code, and it is the same division §8.5 drew for pixels.
+    ///
+    /// The sequence is deliberately a *user's* sequence and not a list of every
+    /// event type: enter, move, click, release, type a word, scroll, leave. An
+    /// event delivered out of that order — a button before an enter, a key
+    /// before a focus — is a protocol error the client is entitled to treat as
+    /// fatal, and a harness that produced them in a convenient order would not
+    /// be testing that this one is correct.
+    fn simulate_input(&self, id: WindowId, w: &Headless) {
+        let t = || {
+            w.mapped_at
+                .map(|m| m.elapsed().as_millis() as u32)
+                .unwrap_or(0)
+        };
+        let (cx, cy) = (f64::from(w.surface.0) / 2.0, f64::from(w.surface.1) / 2.0);
+        let send = |e: FromUi| {
+            let _ = self.events.send(e);
+        };
+
+        println!("wc-compositor: [simulate-wm] window {id} keyboard focus");
+        send(FromUi::KeyboardFocus { id, on: true });
+
+        println!("wc-compositor: [simulate-wm] window {id} pointer enter at {cx},{cy}");
+        send(FromUi::PointerEnter { id, x: cx, y: cy, time: t() });
+        send(FromUi::PointerMotion { id, x: cx + 8.0, y: cy + 4.0, time: t() });
+        send(FromUi::PointerButton {
+            id,
+            button: crate::input::evdev::BTN_LEFT,
+            pressed: true,
+            time: t(),
+        });
+        send(FromUi::PointerButton {
+            id,
+            button: crate::input::evdev::BTN_LEFT,
+            pressed: false,
+            time: t(),
+        });
+
+        let typed: String = TYPED.iter().map(|(_, c)| *c).collect();
+        println!(
+            "wc-compositor: [simulate-wm] window {id} typing {:?} as evdev {:?}",
+            typed.trim_end(),
+            TYPED.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+        );
+        for (keycode, _) in TYPED {
+            send(FromUi::Key { id, keycode: *keycode, pressed: true, time: t() });
+            send(FromUi::Key { id, keycode: *keycode, pressed: false, time: t() });
+        }
+
+        println!(
+            "wc-compositor: [simulate-wm] window {id} shift + evdev {} -> {:?}",
+            SHIFTED.0, SHIFTED.1
+        );
+        send(FromUi::Key { id, keycode: SHIFT, pressed: true, time: t() });
+        send(FromUi::Key { id, keycode: SHIFTED.0, pressed: true, time: t() });
+        send(FromUi::Key { id, keycode: SHIFTED.0, pressed: false, time: t() });
+        send(FromUi::Key { id, keycode: SHIFT, pressed: false, time: t() });
+
+        // The layout change, which on Windows is `WM_INPUTLANGCHANGE`, with the
+        // same key pressed either side of it. See [`LAYOUT_PROBE`] for why that
+        // is the only client-observable proof that the second keymap crossed.
+        println!("wc-compositor: [simulate-wm] window {id} probe key before the layout change");
+        send(FromUi::Key { id, keycode: LAYOUT_PROBE, pressed: true, time: t() });
+        send(FromUi::Key { id, keycode: LAYOUT_PROBE, pressed: false, time: t() });
+        println!("wc-compositor: [simulate-wm] window {id} layout change -> de");
+        send(FromUi::Layout { name: "de" });
+        println!("wc-compositor: [simulate-wm] window {id} probe key after the layout change");
+        send(FromUi::Key { id, keycode: LAYOUT_PROBE, pressed: true, time: t() });
+        send(FromUi::Key { id, keycode: LAYOUT_PROBE, pressed: false, time: t() });
+
+        // **One notch away from the user**, which is what a wheel does when it
+        // is rolled forward and what Windows reports as `+WHEEL_DELTA`.
+        //
+        // Wayland's vertical axis is positive *downwards*, in the same
+        // coordinate space as motion — and rolling the wheel away scrolls the
+        // content up, so the value is **negative**. The numbers here are
+        // therefore exactly the ones `win32.rs` produces for the same physical
+        // gesture, which is the point: the two platforms feed the harness the
+        // same assertion, and a sign error on either side fails it.
+        println!("wc-compositor: [simulate-wm] window {id} scroll one notch away from the user");
+        send(FromUi::PointerAxis {
+            id,
+            horizontal: 0.0,
+            vertical: -10.0,
+            v120_h: 0,
+            v120_v: -120,
+            time: t(),
+        });
+
+        println!("wc-compositor: [simulate-wm] window {id} pointer leave");
+        send(FromUi::PointerLeave { id, time: t() });
     }
 }
 

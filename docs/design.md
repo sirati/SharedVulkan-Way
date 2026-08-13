@@ -2055,3 +2055,468 @@ Ahead of §8.11's list, because the stage-4 path reaches the guest differently.
    `mapped: N section, N shared-file, N arena-slice` line, which is the only
    thing standing between "the pixels arrived" and "the pixels arrived the way we
    think they did".
+
+---
+
+## 10. Stage 6: a seat, and a client you can type into
+
+Written 2026-08-13, on top of stage 4's proxy. Stages 1-4 built something you
+could look at. This is the stage where it becomes something you can use.
+
+### 10.1 Status in one paragraph
+
+**`weston-eventdemo` and `weston-terminal`, unmodified, receive keystrokes that
+began as `WM_KEYDOWN` in a Win32 message queue.** `wc-compositor.exe` advertises
+a `wl_seat` with pointer and keyboard capabilities, compiles a keymap resolved
+on Linux at build time, and publishes it as a file **both sides can name** —
+which is `wl_keyboard.keymap`'s `h` argument travelling in the direction stage 4
+implemented and §9.10 item 5 admitted had never been exercised. Win32 scan codes
+become Linux evdev keycodes, `WM_SETFOCUS` becomes `wl_keyboard.enter`,
+`TrackMouseEvent` makes `WM_MOUSELEAVE` exist so `wl_pointer.leave` can, and
+`SetCapture` keeps a drag alive off the window. The milestone is
+`docs/stage6-typing.png`: `weston-terminal` in a window with Windows' own
+caption, with `echo waycompose types` in it, typed by `SendInput`. It is
+measured rather than admired — the window changed by **0** pixels in two idle
+seconds and by **337** after the keys, and the client committed **21** new
+frames. `scripts/wc-input.sh` is 22 checks on Linux, 24 under Wine and 6 for the
+terminal, 0 failures.
+
+### 10.2 The keymap is an `h` in the other direction, and that is the whole
+trap
+
+§9.3's table has four messages carrying an `h`, and stage 4 moved one of them:
+`wl_shm.create_pool`, which the **client** creates and the compositor opens. The
+proxy therefore owned every transport decision, because the proxy was the
+creator.
+
+`wl_keyboard.keymap` runs the other way. The **compositor** creates the object
+and the client opens it — and `Handle::create_section`, which is what
+`SealedFile` called, mints `Local\wc-…`. That is a name only the NT object
+manager understands. A Linux process cannot open one and cannot spell one.
+
+So §9.10 item 5's "implemented, unexercised" was not a coverage gap. **It was a
+path that would have failed the moment anything used it**, and the reason
+nothing had used it was that the compositor advertised no keyboard.
+
+The fix is the same shape as the arena's and the reasoning is §9.4's, restated:
+
+> "An arena is not a per-message fact and cannot be one. It is attached out of
+> band, before any protocol traffic… `wc_handle::arena` is a process-global
+> registry for that reason. Threading it through `Handle::map()` instead would
+> mean a diff through smithay's `ShmState`, its `Client` data and its `wl_shm`
+> dispatch."
+
+`wc_handle::publish` is that registry for the outbound direction: a directory
+this process writes into and the prefix a peer prepends to reach the same bytes,
+set once from `--shared-dir` / `--shared-peer-prefix`. `Handle::create_shared`
+asks it, and falls back to a section when nobody said — which is correct for two
+Windows processes and is what a same-machine deployment wants.
+
+**smithay's diff for all of this is one word**: `create_section` becomes
+`create_shared` in `utils/sealed_file.rs`. Threading a destination through
+`SealedFile` → `KeymapFile` → `KeyboardHandle` → `Seat` → `SeatState` would have
+been a parameter carried through five layers of upstream code so that one leaf
+could spell a path, and it is not a patch anybody merges.
+
+**The failure is now a diagnosis rather than a mystery, and that changed too.**
+`wc-proxy` used to *note* a descriptor it could not materialise and forward the
+message without it. For a keymap that is §2.4's silent desynchronisation in its
+purest form: the client receives a well-formed `wl_keyboard.keymap`, calls
+`mmap` on a descriptor it never received, and libwayland aborts it — with a
+correct-looking keymap event as the last thing in its log. It is now fatal, with
+the descriptor's kind and the flag to pass in the message.
+
+**And stage 6 broke stage 4's harness, which is the best evidence that the two
+directions are different problems.** `scripts/wc-proxy.sh` passed no
+`--shared-dir`, because until now the compositor never created an object for a
+client. The moment it had a keyboard, `weston-terminal` — which binds `wl_seat`
+— started failing at connect, while `weston-presentation-shm` — which does not —
+kept passing. One flag fixed it. Nothing about the pixel path changed.
+
+One stage-4 assertion had to change with it, and it was measuring the wrong
+thing. The harness demanded the proxy send **0** descriptors to the client, and
+that passed because there were none to send. It now sends one per keymap. That
+is not a violation: those fds are on the host side of the boundary, manufactured
+here by opening a path the compositor named, and §9.4's rule is about the
+boundary. What enforces the rule is that `wc-proxy`'s **upstream writer has no
+fd path at all** — by construction, not by a counter — and the harness now
+checks the thing that can actually go wrong: whether every name the compositor
+sent was openable here.
+
+### 10.3 Scan codes, not virtual keys, and why that is not a preference
+
+`WM_KEYDOWN` carries two descriptions of one keypress: a virtual-key code in
+`wParam` and a scan code in `lParam` bits 16-23 with an `E0` flag at bit 24.
+Only one of them can be translated correctly.
+
+**A virtual-key code has a layout baked into it.** On a German layout the key in
+the position of the American `Z` reports `VK_Y`; every `VK_OEM_*` names a
+different physical key on a different layout. **A scan code is positional** and
+says nothing about what is printed on the key.
+
+Wayland is positional too. `wl_keyboard.key` carries a keycode and the client
+runs *our keymap* over it — which is the entire reason a keymap is sent at all.
+So a compositor translating VK codes applies the layout twice: once in Windows
+to obtain the VK, and once in the client's xkb, over a keycode that already had
+one applied. **On `us` the two layouts agree and the bug is invisible. On `de`
+the `Z` and `Y` keys swap and it is not.**
+
+`WM_CHAR` is unused for the same reason one layer on: it is the result of
+Windows' own composition, and a Wayland client does its own with its own dead
+keys. `TranslateMessage` still runs — other parts of Win32 expect it to — and
+its `WM_CHAR` is simply not handled.
+
+**The table is mostly an identity, and that is history rather than luck.** Linux
+numbered its evdev keycodes from the IBM PC/XT scan codes, so for the whole base
+set — `0x01` Escape through `0x58` F12, 88 codes — **the scan code and the evdev
+keycode are the same number**. `KEY_A` is 30 and `A` is `0x1E`; `KEY_SPACE` is
+57 and space is `0x39`; `KEY_F11` is 87 and F11 is `0x57`. Asserted at eleven
+points spread across the range rather than claimed once, because "obviously an
+identity" is the kind of statement that is wrong at one end.
+
+What is not an identity is the 40 `E0`-prefixed codes — the arrow cluster, the
+right-hand modifiers, the keypad's Enter and slash, the Windows and media keys —
+because those were added to both schemes later and in different orders. That
+half is Linux's own `atkbd` table, copied. Seven unprefixed Japanese codes are
+likewise a table.
+
+**Three keys are genuinely ambiguous on Windows and are settled by the VK**,
+which is unambiguous for them precisely because no layout relabels them:
+
+| key | why | resolution |
+|---|---|---|
+| Pause | claims scan `0x45`, the `E1` prefix is swallowed before the message loop | `VK_PAUSE` → `KEY_PAUSE` |
+| NumLock | also claims `0x45`, with the extended bit going either way per driver | `VK_NUMLOCK` → `KEY_NUMLOCK` |
+| PrintScreen | sends `E0 2A E0 37` — a **phantom shift** first | `VK_SNAPSHOT` → `KEY_SYSRQ`, and `E0 2A`/`E0 36` are dropped |
+
+The phantom shift has its own test, because forwarding it is silent: the
+client believes Shift is held, every following key produces the shifted
+character, and all the keycodes look right.
+
+An untranslatable scan code produces **nothing**, and says so with the code in
+the log. Inventing a keycode would make the client's xkb produce a keysym for a
+key that does not exist.
+
+### 10.4 Layouts: what works, and exactly what does not
+
+The set is fixed at build time and cannot be otherwise. §7.2 established that
+`xkb_keymap_new_from_names` resolves against the xkeyboard-config tree, that the
+tree does not exist on Windows, and that `nix/libxkbcommon-mingw.nix` compiles
+in a config root nobody creates so that a `new_from_names` which silently
+started working would be a visible bug. Only `new_from_string` works there.
+
+So `scripts/gen-keymap.sh --all` resolves **us, gb, de, fr** on Linux and the
+compiled text is checked in at `crates/wc-compositor/keymaps/*.xkb` and
+`include_str!`ed. Checked in rather than generated by a `build.rs`, for two
+reasons: a build script calling `xkbcli` would make the build depend on
+xkeyboard-config, defeating the point of resolving elsewhere; and a keymap
+generated at build time is a keymap nobody has read, and these files are where a
+user's characters come from.
+
+Selection is `GetKeyboardLayout(0)`'s low word, a `LANGID`, matched whole and
+then on its primary language — FreeRDP's `xkb_layout_ids.c` cut down to the
+layouts that actually shipped, because a table naming a hundred layouts none of
+which are present is a table that lies. `WM_INPUTLANGCHANGE` re-runs it and
+`set_keymap_from_string` re-sends the keymap.
+
+**Measured, and it was not the expected answer.** Under Wine,
+`GetKeyboardLayout` returns `0x0809` — English (United Kingdom) — so the
+compositor selects `gb` unless told otherwise. That is the mechanism working; it
+is also why `scripts/wc-input.sh` passes `--layout us` rather than trusting the
+machine.
+
+**What this gets right for a non-US layout, stated precisely.** Because the
+mapping is positional and the keymap is the user's, a German user pressing the
+key labelled `Z` sends `KEY_Y` and the `de` keymap turns it into `z`. That is
+correct, and it is correct *because* the VK was not used. The same holds for
+every key on any of the four.
+
+**What it gets wrong**, in order of how likely it is to matter:
+
+1. **A layout that is not one of the four gets `us` characters.** Positions stay
+   right; letters do not. A Spanish or Polish user's keyboard produces American
+   letters, with no error anywhere. Fixing it is a line in
+   `gen-keymap.sh`'s list, a line in `LAYOUTS` and a row in `layout_for_langid`
+   — which is cheap, and is why the limit is a list rather than a design.
+2. **AltGr is forwarded as Ctrl+AltGr.** Windows synthesises a left-Ctrl press
+   before the right-Alt of an AltGr, and both are forwarded, so a client sees
+   both. On `us` there is no AltGr level and it never shows; on `de` the third
+   level is exactly where the interesting characters live. Untested and expected
+   to be wrong.
+3. **Dead keys and IME do not exist.** Composition on Windows happens in
+   `WM_IME_*` and in `WM_CHAR`, neither of which is used, and the Wayland answer
+   is `text-input-v3`, which is not implemented. So the four layouts' dead keys
+   work only insofar as the *client's* xkb composes them, which for a keyboard
+   with real dead keys is not the same thing. **No CJK input is possible at
+   all.**
+4. **Key repeat is Windows' rate only by coincidence.** `repeat_info` says 30/s
+   after 500 ms, which are Windows' defaults written down rather than read with
+   `SystemParametersInfo`. A user who changed theirs is not obeyed. Windows'
+   own repeats — `WM_KEYDOWN` with `lParam` bit 30 set — are dropped, which is
+   right: the protocol has the client run the timer, and forwarding both would
+   give it two repeat streams at different rates.
+
+### 10.5 The Win32 side, and the three omissions that are silent
+
+Each of these produces a compositor that looks like it works.
+
+* **`TrackMouseEvent`, or there is no `WM_MOUSELEAVE`.** Win32 sends
+  `WM_MOUSEMOVE` for free and sends *nothing at all* when the pointer leaves
+  unless the window has asked — once, per departure, because the request is
+  consumed when it fires. Without it a client believes the pointer is inside
+  forever: hover highlights that never turn off, a cursor that never changes
+  back. It is armed on the first move after an entry rather than on every move,
+  which would be a syscall per pixel of travel. `wl_pointer.leave` is checked on
+  the wire by the harness for this reason and not inferred.
+
+* **`SetCapture` on the first press, `ReleaseCapture` on the last release.**
+  Win32 delivers mouse messages to the window under the pointer, so a drag that
+  leaves the window loses its `WM_LBUTTONUP` — it goes to whatever was dragged
+  onto, or nowhere — and the client is left holding a button forever. Every
+  text selection and every scrollbar drag depends on this. Counted rather than a
+  flag, because two buttons can be down and releasing on the first would
+  reintroduce the bug for the second.
+
+* **`WM_SYSKEYDOWN` as well as `WM_KEYDOWN`.** Windows routes Alt, F10 and every
+  Alt-combination through the `SYS` pair. A compositor handling only
+  `WM_KEYDOWN` delivers **no Alt at all** — so no Alt-shortcut in any client —
+  while every other key works perfectly. The `SYS` cases return 0 rather than
+  falling through to `DefWindowProc`, which would open the window menu on Alt
+  and swallow the next key.
+
+Three smaller decisions, each an answer to a way of being wrong:
+
+* **`GetMessageTime`, not a clock read.** Clients use the differences between
+  input timestamps for double-click detection and gesture timing. Reading a
+  clock in the window procedure timestamps events with *when the compositor got
+  round to them*, which on a 5 ms poll loop is not when they happened.
+* **`lParam` halves are signed.** A pointer position during a drag off the left
+  edge is negative, and `lparam & 0xffff` reads -1 as 65535 — a plausible number
+  no clamp catches.
+* **`WM_MOUSEWHEEL`'s sign is inverted and `WM_MOUSEHWHEEL`'s is not.** Windows
+  counts a notch rolled away from the user as `+WHEEL_DELTA`; Wayland's vertical
+  axis is positive *downwards* and rolling away scrolls the content up. Both
+  are positive to the right horizontally. `WHEEL_DELTA` is 120 and
+  `wl_pointer.axis_value120` counts in hundred-and-twentieths, which is not a
+  coincidence — the protocol added v120 because Windows already spoke it — so
+  the raw delta *is* the v120 value once the sign is fixed. The harness asserts
+  the sign on both platforms, because a backwards mouse wheel is the most
+  reported and least diagnosable input bug there is.
+
+**Focus is `WM_SETFOCUS`, not `WM_ACTIVATE`.** They arrive together for a
+top-level window and they are different facts: activation says which window is
+frontmost and becomes `xdg_toplevel`'s `activated` state; focus says where a
+keystroke goes and becomes `wl_keyboard.enter`. The brief's item 4 is this pair,
+because **the user's window manager is Windows** and a compositor deciding its
+own keyboard focus would be fighting it. A `WM_KILLFOCUS` is honoured only if
+the window is still the focused one, because the two messages can arrive in
+either order and clearing on a stale kill would take focus from a window that
+had just been given it.
+
+### 10.6 The evidence, in three legs, and what each is worth
+
+§8.5 split the pixel evidence in two and had to apologise for it. The same split
+exists here for the same structural reason, and it is worth being explicit about
+which half each leg carries.
+
+**Leg 1 — Linux, direct.** `weston-eventdemo`, a Weston demo client, prints
+every input event it receives **including the Unicode codepoint its own
+libxkbcommon produced** by running our keymap over our keycode. That is a
+strictly stronger statement than "an event was sent": a wrong keycode, a wrong
+keymap, a wrong evdev/xkb offset or a keymap that failed to cross all produce a
+different letter, and none of them produce an error. `WAYLAND_DEBUG=1` runs
+beside it so libwayland decodes the same bytes independently. What this leg
+cannot say anything about is the translation, because there is no `WM_KEYDOWN`.
+
+**Leg 2 — Wine, through the proxy.** `wc-compositor.exe` in a virtual desktop,
+`wc-proxy` beside it, `weston-eventdemo` against the proxy, and
+`probe-input.exe` injecting with `SendInput` — so a keystroke starts as a scan
+code in the desktop's input queue and ends as a character in a Linux client.
+This leg carries `crates/wc-compositor/src/input.rs`, the focus messages,
+`TrackMouseEvent` and `SetCapture`, and it is held to **exactly** the assertions
+leg 1 is: `check_client_events` is one function called by both, so a weaker
+check cannot creep into the harder case.
+
+**Leg 3 — the terminal.** `weston-terminal` through the proxy, typed at with
+`SendInput`, photographed by `xwd` from outside every process involved. A
+terminal is the demonstration because §8.7 measured that it redraws **only** when
+its content changes, which is what makes "the picture changed" a statement about
+the keys. The harness takes two screenshots while it is idle *before* typing —
+without that, a blinking cursor would satisfy the check, and every terminal has
+one.
+
+| measurement | value |
+|---|---|
+| pixels changed in 2 idle seconds | **0** |
+| pixels changed by `echo waycompose types` | **337** |
+| frames the client committed after the keys | **21** (3 → 24) |
+| keymap the client received, `us` | 35,572 bytes |
+| keymap after the layout change, `de` | 37,532 bytes |
+| descriptors, proxy | 3 in from the client, 1 out to it |
+
+Three checks are worth naming because each catches something nothing else does.
+
+**`y` then `z` from the same keycode.** The layout change sends a second
+`wl_keyboard.keymap`, and evdev `KEY_Y` — the position of `Y` on an American
+board and of `Z` on a German one — is pressed either side of it. A second keymap
+*event* would not do: a compositor re-sending the same keymap produces one, and
+so does a client that ignores it. Only the character changing says a different
+keymap crossed the boundary, was opened from its name, and was compiled by the
+client's own library.
+
+**Shift + `KEY_Z` decoding as `Z`.** The one place the compositor's own xkb state
+is load-bearing — it tracks which modifiers are down and tells the client with
+`wl_keyboard.modifiers`. A compositor that forwarded keycodes and never sent a
+`modifiers` event produces a lower-case `z`, and every other assertion in the
+file still passes.
+
+**The scroll sign.** Both legs produce the same physical gesture — one notch away
+from the user — and both must yield `-10` and `axis_discrete -1`.
+
+### 10.7 What Wine got wrong on the way, and it was three things
+
+None of them were the compositor, and all three looked exactly like the
+compositor.
+
+1. **`FindWindowW` enumerates one desktop.** `wine explorer /desktop=wc-input`
+   creates a second one; a probe launched on the default desktop finds no window
+   of class `WaycomposeToplevel`, injects into the wrong input queue, and reports
+   a compositor that ignores input. The probe now runs inside the same desktop.
+2. **A console subsystem binary takes the foreground.** Launched inside the
+   desktop, the probe got a `WineConsoleClass` window, and *that* became the
+   foreground window — so `SetForegroundWindow(compositor)` was refused and every
+   keystroke went to the console. The probe reported
+   `foreground=… class 'WineConsoleClass'`, which is the only reason this was
+   half an hour rather than a day. Building it `-mwindows` means no console
+   exists to steal it, and is why `probe-input.c` writes to `--log`.
+   `AttachThreadInput` is needed as well: `SetForegroundWindow` is refused for a
+   process that is not already foreground, and `SetFocus`/`GetFocus` address the
+   *calling thread's* input queue.
+3. **A killed client does not flush stdio.** `weston-eventdemo`'s own output is
+   fully buffered to a file, so a run stopped with a signal contained every
+   `WAYLAND_DEBUG` line (stderr, unbuffered) and **none** of the decoded
+   characters — every wire assertion passing and every "what did the client make
+   of it" assertion failing, for no reason in the compositor. Fixed twice over:
+   `stdbuf -oL`, and stopping the compositor first so the client leaves through
+   `exit()`.
+
+### 10.8 The bug a client found and a test could not
+
+The first version handed smithay an evdev keycode. smithay's `Keycode` is an
+**XKB** keycode, which carries X11's eight-key offset, and it subtracts the
+eight on the way out — so every key reached the client eight too small.
+
+What that looks like from outside is the point. Nothing errored. Every key
+produced *a* character. `weston-eventdemo` printed `key 27, unicode 93` — a
+right square bracket — for a keypress the compositor believed was `h`, and the
+run typed `]9aaqt` for `hello`.
+
+**A unit test over `crates/wc-compositor/src/input.rs` could not have caught
+it**, because the table it checks was correct. The bug was one addition at the
+boundary between our numbering and smithay's, and only a client running the
+keymap could see it. That is the argument for §10.6's leg 1 in one paragraph,
+and it is why the harness asserts on decoded characters rather than on keycodes.
+
+### 10.9 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo clippy --workspace --all-targets` (Linux) | clean, no warnings |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` | clean, no warnings |
+| `cargo test --workspace` | **125 tests**, 0 failures (was 116) |
+| `scripts/wc-xkb.sh` (stage 2) | 5 passed, 0 failed |
+| `scripts/wc-xdg.sh all` (stage 2) | 10 passed, 0 failed |
+| `scripts/wc-window.sh all` (stage 3) | 37 passed, 0 failed |
+| `scripts/wc-proxy.sh window` (stage 4) | 36 passed, 0 failed |
+| `scripts/wc-input.sh linux` | **22 passed, 0 failed** |
+| `scripts/wc-input.sh wine` | **24 passed, 0 failed** |
+| `scripts/wc-input.sh term` | **6 passed, 0 failed** |
+
+The new tests are in `crates/wc-compositor/src/input.rs`, and the one worth
+naming is `each_embedded_keymap_compiles_and_maps_the_key_it_should`: it
+compiles all four checked-in keymaps with the same libxkbcommon the Windows
+binary links and asserts what `KEY_A` and `KEY_Z` produce in each. A truncated
+file, a keymap generated for the wrong layout, or one embedded under the wrong
+name all produce a compositor that starts, sends a keymap, and gives the user
+the wrong characters with no error anywhere. The `fr` row carries the test — if
+`de` were silently a copy of `us`, only azerty would notice.
+
+`crates/wc-compositor/src/input.rs` carries `#![allow(dead_code)]` and the
+reason is stated there: the scan-code half is called only from `win32.rs`, so a
+Linux build sees it as dead. It is not — it is what the tests exercise, and **a
+table that only compiles on the platform that cannot run the tests is a table
+nobody checks.**
+
+### 10.10 What is not proven
+
+1. **Nothing here has run on the real guest**, and for input that is a sharper
+   caveat than for pixels. §9.11 item 3 still stands: `wc-proxy` cannot reach a
+   guest compositor's `AF_UNIX` node at all without `probe-relay.c` over an
+   `ssh -L`, so leg 2 has never been assembled anywhere but Wine.
+2. **`SendInput` under Wine is not `SendInput` on Windows**, and it is a worse
+   case than most of what Wine has been asked to stand in for. Real Windows
+   applies UIPI and a set of `SetForegroundWindow` restrictions that Wine does
+   not, and §10.7 shows the foreground rules already differ enough to change the
+   harness. A guest run may need the probe elevated, or may need
+   `PostMessage` — `probe-input.c` keeps `--post` for exactly that, and if the
+   two modes ever disagree the difference is Wine's rather than the
+   compositor's.
+3. **`WM_INPUTLANGCHANGE` has never fired.** The layout-switch path is proven by
+   the headless simulation calling the same code, and by `GetKeyboardLayout`
+   selecting `gb` under Wine at startup — but no run has changed the layout of a
+   live Windows keyboard and watched the keymap follow.
+4. **AltGr, dead keys and IME.** §10.4 items 2 and 3. AltGr is expected to be
+   wrong; IME is absent, so CJK input is impossible and needs `text-input-v3`.
+5. **Client cursors are not drawn.** `wl_pointer.set_cursor` arrives — the log
+   line proves it, `weston-terminal` sets one — and the system arrow is shown
+   instead. The conversion is the same shape as `set_icon`, which exists; what is
+   missing is the policy for hiding the system cursor while the client's is up.
+   A text field will have the wrong pointer shape.
+6. **One seat, one pointer, no touch and no tablet.** `wl_touch` is a capability
+   the seat could carry and nothing produces the events;
+   `WM_POINTER*`/`WM_TOUCH` are not handled at all.
+7. **Popups still are not shown** (§9's `new_popup` is unchanged), so no menu
+   can be clicked even though the click that would open it now arrives. This is
+   the next thing a usable client needs and it is a scene-graph problem rather
+   than an input one.
+8. **No compositor-level key bindings, deliberately.** Every key goes to the
+   client. That is right when the window manager is Windows — it has already
+   taken Alt-Tab and the Windows key before the message loop sees them — but it
+   means there is no way to reach the compositor itself, and nothing has decided
+   whether there should be.
+9. **Timestamps come from two clocks that do not agree.** Input carries
+   `GetMessageTime`'s tick count and frame callbacks carry §7.7 item 5's
+   process-start clock. Wayland requires only that each is comparable with
+   itself, which holds; a client correlating an input event with a frame
+   callback would be comparing epochs. Nothing does yet.
+10. **A second client's keymap costs a second file.** Every `KeymapFile` creates
+    its own object and there is one per seat, so this is bounded — but the
+    published directory now accumulates files whose lifetime is the compositor's,
+    and nothing sweeps it if the process is killed rather than exiting.
+
+### 10.11 What to re-check on the guest
+
+Ahead of §9.11, because input reaches the guest differently again.
+
+1. **Whether injected input reaches the compositor's window at all**, with the
+   real `SendInput` and the real foreground rules. This is the item most likely
+   to differ, and §10.7 is why. `probe-input.exe --post` is the fallback and its
+   *agreement* with `SendInput` is itself the measurement.
+2. **What `GetKeyboardLayout` returns on the real machine**, and whether it is
+   one of the four shipped. Wine says `0x0809`; the guest is a different
+   installation with different regional settings, and a user whose layout is not
+   in the list gets American letters silently.
+3. **Whether the published directory is coherent across the boundary.** This is
+   §9.11 item 1 again with a different consumer: the keymap is a `SharedFile`,
+   and virtio-fs without DAX would give each side its own copy. A keymap is
+   written once and read once, so it is the *easiest* case for a filesystem to
+   get right — which makes it a good first measurement and a bad proof that
+   pixels will work.
+4. **Whether `WM_MOUSELEAVE` behaves.** `TrackMouseEvent` is a `comctl32`-era
+   API and Wine's implementation is its own; a guest run that never produces
+   `wl_pointer.leave` would mean the arm is not sticking.
+5. **The three ambiguous keys.** Pause, NumLock and PrintScreen are resolved by
+   VK precisely because their scan codes differ between drivers, and Wine is one
+   driver. The resolution should be driver-independent; that is a claim, and it
+   has been tested against one.

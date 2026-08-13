@@ -305,6 +305,14 @@ pub enum Error {
     /// The message carries an `h` this proxy has no transport for. Clipboard
     /// and drag-and-drop pipes, which are stage 5.
     UnsupportedFd { interface: String, message: String },
+    /// The compositor named an object this side cannot open. ADDED FOR
+    /// STAGE 6; see the note in `server_message` for why it is fatal.
+    Materialise {
+        interface: String,
+        message: String,
+        descriptor: String,
+        source: io::Error,
+    },
     Io(io::Error),
 }
 
@@ -325,6 +333,10 @@ impl std::fmt::Display for Error {
                 f,
                 "{interface}.{message} carries a descriptor this proxy cannot yet republish \
                  (clipboard and drag-and-drop pipes are stage 5)"
+            ),
+            Error::Materialise { interface, message, descriptor, source } => write!(
+                f,
+                "{interface}.{message} names {descriptor}, which this side cannot open: {source}"
             ),
             Error::Io(e) => write!(f, "{e}"),
         }
@@ -710,25 +722,33 @@ impl Session {
 
         // Materialise a real descriptor from the *name* the compositor sent.
         // See this module's header for why that is not the forbidden direction.
+        //
+        // **A failure here is fatal, and that changed in stage 6.** It used to
+        // be a note: the descriptor bytes were removed from the body and the
+        // message was forwarded without its fd. That is the §2.4
+        // desynchronisation in the direction nobody had exercised — the client
+        // receives a perfectly well-formed `wl_keyboard.keymap` and calls
+        // `mmap` on a descriptor it never received. libwayland aborts the
+        // client, and the last thing in its log is a keymap event that looks
+        // correct. Killing the connection with the descriptor's kind in the
+        // message is the diagnosis; forwarding was the mystery.
         let mut fds = Vec::new();
         if msg.has_fd() {
             for span in spans.iter().filter(|s| s.kind == ArgKind::Fd) {
-                let Some(bytes) = wire::bytes_at(body, span) else {
-                    continue;
-                };
-                match Descriptor::decode(bytes) {
-                    Ok(d) => match materialise(&d) {
-                        Ok(fd) => {
-                            self.stats.fds_materialised += 1;
-                            fds.push(fd);
-                        }
-                        Err(e) => self.note(format!(
-                            "{interface}.{}: could not materialise {d:?}: {e}",
-                            msg.name
-                        )),
-                    },
-                    Err(e) => self.note(format!("{interface}.{}: {e}", msg.name)),
-                }
+                let bytes = wire::bytes_at(body, span).ok_or_else(|| Error::MissingFd {
+                    interface: interface.clone(),
+                    message: msg.name.clone(),
+                })?;
+                let d = Descriptor::decode(bytes)
+                    .map_err(|e| Error::Walk(format!("{interface}.{}: {e}", msg.name)))?;
+                let fd = materialise(&d).map_err(|e| Error::Materialise {
+                    interface: interface.clone(),
+                    message: msg.name.clone(),
+                    descriptor: format!("{d:?}"),
+                    source: e,
+                })?;
+                self.stats.fds_materialised += 1;
+                fds.push(fd);
             }
         }
 
@@ -974,8 +994,33 @@ fn copy_damage(
 fn materialise(d: &Descriptor) -> io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
     match d {
-        Descriptor::SharedFile { path, .. } | Descriptor::Section { name: path, .. } => {
+        Descriptor::SharedFile { path, .. } => {
             let f = std::fs::File::open(path)?;
+            Ok(OwnedFd::from(f))
+        }
+        // `Section` is a *filesystem path* when the peer is a Unix process and
+        // an *NT object name* when it is a Windows one, and only this side can
+        // tell which it is looking at. A `Local\wc-…` opened as a path fails
+        // with "No such file or directory", which is true and unhelpful; the
+        // real answer is that the compositor was never told where to put
+        // objects a client has to open.
+        //
+        // Detected by the prefix rather than by a flag, because the prefix is
+        // what `wc_handle::platform::random_section_name` puts there on Windows
+        // and it is the only thing in the descriptor that distinguishes the two
+        // cases. See docs/design.md §10.
+        Descriptor::Section { name, .. } if name.starts_with("Local\\") || name.starts_with("Global\\") => {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{name} is a Windows kernel object name, which a Linux process cannot open. \
+                     Start wc-compositor.exe with --shared-dir and --shared-peer-prefix so that \
+                     objects it creates for clients land somewhere both sides can reach."
+                ),
+            ))
+        }
+        Descriptor::Section { name, .. } => {
+            let f = std::fs::File::open(name)?;
             Ok(OwnedFd::from(f))
         }
         Descriptor::ArenaSlice { .. } => {

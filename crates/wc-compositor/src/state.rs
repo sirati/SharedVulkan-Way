@@ -9,12 +9,25 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
+};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
+// smithay's own input vocabulary rather than `wayland_server`'s protocol enums.
+// They have the same names and are different types: the protocol ones are the
+// wire encoding of one interface's argument, and these are what the input
+// handles take, because a `KeyState` also has to describe a key from a
+// libinput device that never touched the protocol. Naming the wrong one
+// compiles nowhere, which is the good case — but the compiler's message says
+// only "similar names", so the reason they are two types is worth recording.
+use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::reexports::wayland_server::protocol::{
     wl_buffer, wl_output, wl_seat, wl_surface::WlSurface,
 };
+use smithay::utils::SERIAL_COUNTER;
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -56,7 +69,30 @@ pub struct State {
     compositor: CompositorState,
     shm: ShmState,
     xdg_shell: XdgShellState,
+    /// Owns the seat: `SeatState` keeps every `Seat` it makes, so there is no
+    /// separate field for the one seat and dropping the local from `new` does
+    /// not destroy the global.
     seat_state: SeatState<Self>,
+    /// `None` only if the keymap failed to compile, which is a hard startup
+    /// error everywhere it can be one — but *not* here, because a compositor
+    /// that refuses to run because a keymap is bad is worse than one that runs
+    /// without a keyboard and says so.
+    keyboard: Option<KeyboardHandle<Self>>,
+    pointer: PointerHandle<Self>,
+    /// Which window the platform says has keyboard focus, and which one the
+    /// pointer is over. Kept as ids rather than surfaces because that is what
+    /// arrives from the UI thread, and resolved to a surface at the moment of
+    /// use so a message about a window that has since been destroyed is
+    /// ignorable rather than a dangling reference.
+    keyboard_focus: Option<WindowId>,
+    pointer_focus: Option<WindowId>,
+    /// Where the pointer is, in surface coordinates of [`Self::pointer_focus`].
+    /// `wl_pointer.button` and `.axis` carry no coordinates — the protocol says
+    /// they happen wherever the last motion was — so the compositor has to
+    /// remember.
+    pointer_at: (f64, f64),
+    /// Said once, the first time a client sets a cursor. See [`SeatHandler`].
+    cursor_noted: bool,
 
     ui: Ui,
     events: Receiver<FromUi>,
@@ -93,13 +129,110 @@ impl ClientData for ClientState {
     }
 }
 
+/// How fast a held key repeats, and how long before it starts.
+///
+/// **The compositor does not repeat anything.** `wl_keyboard.repeat_info` is
+/// advertised and the *client* runs the timer, which is how the protocol is
+/// specified and is why a Wayland client's key repeat keeps working while the
+/// compositor is busy. Windows repeats too — a held key produces a stream of
+/// `WM_KEYDOWN` with the "previous state" bit set — and forwarding those as
+/// well would give a client two repeat streams at different rates. So they are
+/// dropped, in `win32.rs`, and this is the only rate anyone sees.
+///
+/// The numbers are Windows' own defaults expressed the way Wayland wants them:
+/// `SPI_GETKEYBOARDDELAY` 1 is 500 ms, `SPI_GETKEYBOARDSPEED` is around 30/s at
+/// its default. Reading the real values is a `SystemParametersInfo` call and is
+/// noted in the design as not done, rather than guessed at silently.
+const REPEAT_DELAY_MS: i32 = 500;
+const REPEAT_RATE_HZ: i32 = 30;
+
 impl State {
-    pub fn new(dh: &DisplayHandle, ui: Ui, events: Receiver<FromUi>, debug_icon: bool) -> Self {
-        let mut state = State {
+    pub fn new(
+        dh: &DisplayHandle,
+        ui: Ui,
+        events: Receiver<FromUi>,
+        debug_icon: bool,
+        layout: &str,
+    ) -> Self {
+        let mut seat_state = SeatState::new();
+        // The local is dropped at the end of this function and that is safe:
+        // `SeatState` keeps every seat it makes, and `Seat` is an `Arc` handle
+        // rather than the seat itself.
+        let mut seat: Seat<State> = seat_state.new_wl_seat(dh, "seat0");
+
+        // **Capabilities are advertised by adding them, and only then.**
+        // smithay recomputes `wl_seat.capabilities` from what the seat has and
+        // sends it to every bound `wl_seat`, so the ordering requirement — a
+        // capability must not be announced before the thing it names exists —
+        // is met by construction rather than by getting a sequence right. A
+        // client that binds later gets the current set in its `bind`.
+        let pointer = seat.add_pointer();
+
+        // The keyboard is the one that can fail, because it compiles a keymap.
+        // On Windows this is the *only* way it can succeed: `XkbConfig`'s RMLVO
+        // fields go through `xkb_keymap_new_from_names`, which resolves against
+        // an xkeyboard-config tree that does not exist there (design §7.2). The
+        // `keymap` field is this project's patch to smithay and is what makes
+        // the build-time-resolved string reachable from `add_keyboard`.
+        let chosen = crate::input::layout(layout).or_else(|| {
+            eprintln!(
+                "wc-compositor: no keymap for layout {layout:?}; falling back to {}",
+                crate::input::FALLBACK
+            );
+            crate::input::layout(crate::input::FALLBACK)
+        });
+        let keyboard = chosen.and_then(|l| {
+            match seat.add_keyboard(
+                XkbConfig { keymap: Some(l.keymap), ..XkbConfig::default() },
+                REPEAT_DELAY_MS,
+                REPEAT_RATE_HZ,
+            ) {
+                Ok(k) => {
+                    println!(
+                        "wc-compositor: seat0 keyboard: layout {} ({} bytes of keymap), \
+                         repeat {REPEAT_RATE_HZ}/s after {REPEAT_DELAY_MS} ms",
+                        l.name,
+                        l.keymap.len()
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    // Not fatal, and the line says which capability is missing
+                    // rather than leaving a client to discover it.
+                    eprintln!("wc-compositor: seat0 has no keyboard: {e}");
+                    None
+                }
+            }
+        });
+        println!("wc-compositor: seat0 capabilities: pointer{}", if keyboard.is_some() { ", keyboard" } else { "" });
+
+        // Said at startup, on the side that created the object, because the
+        // failure it predicts happens later and somewhere else. A keyboard on
+        // Windows with no published directory means the keymap will be a
+        // `Local\wc-…` section; that is right for a Windows client and
+        // unopenable by anything across the boundary, and the first a proxy
+        // knows about it is when it has to end a connection. One line here
+        // turns "the client died on connect" into "we were told this at
+        // startup".
+        if cfg!(windows) && keyboard.is_some() && wc_handle::publish::get().is_none() {
+            println!(
+                "wc-compositor: no --shared-dir, so the keymap will be a Windows section. \
+                 That is correct for a client on this machine and unopenable by one across \
+                 the boundary."
+            );
+        }
+
+        State {
             compositor: CompositorState::new::<State>(dh),
             shm: ShmState::new::<State>(dh, Vec::new()),
             xdg_shell: XdgShellState::new::<State>(dh),
-            seat_state: SeatState::new(),
+            seat_state,
+            keyboard,
+            pointer,
+            keyboard_focus: None,
+            pointer_focus: None,
+            pointer_at: (0.0, 0.0),
+            cursor_noted: false,
             ui,
             events,
             sources: vec![Box::new(ShmSource)],
@@ -112,14 +245,7 @@ impl State {
             toplevels: 0,
             presents: 0,
             stopped: false,
-        };
-        // A seat is not needed to map a window, but a client that finds no
-        // `wl_seat` may decline to draw at all. Input is stage 4 — and note
-        // that `KeyboardHandle::new` still cannot succeed on Windows, because
-        // `XkbConfig::compile_keymap` goes through `xkb_keymap_new_from_names`
-        // (docs/design.md §7.2). Nothing here calls it.
-        let _seat: Seat<State> = state.seat_state.new_wl_seat(dh, "seat0");
-        state
+        }
     }
 
     /// Milliseconds since the compositor started, which is what a frame
@@ -185,12 +311,219 @@ impl State {
                 FromUi::Activated { id, on } => {
                     self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
                 }
+                FromUi::KeyboardFocus { id, on } => self.set_keyboard_focus(id, on),
+                FromUi::Key { id, keycode, pressed, time } => {
+                    self.key(id, keycode, pressed, time)
+                }
+                FromUi::PointerEnter { id, x, y, time } => self.pointer_motion(Some(id), x, y, time),
+                FromUi::PointerMotion { id, x, y, time } => self.pointer_motion(Some(id), x, y, time),
+                FromUi::PointerLeave { id, time } => {
+                    if self.pointer_focus == Some(id) {
+                        self.pointer_motion(None, 0.0, 0.0, time);
+                    }
+                }
+                FromUi::PointerButton { id, button, pressed, time } => {
+                    self.pointer_button(id, button, pressed, time)
+                }
+                FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, time } => {
+                    self.pointer_axis(id, horizontal, vertical, v120_h, v120_v, time)
+                }
+                FromUi::Layout { name } => self.set_layout(name),
             }
         }
     }
 
     fn by_id(&self, id: WindowId) -> Option<&Window> {
         self.windows.values().find(|w| w.id == id)
+    }
+
+    fn surface_of(&self, id: WindowId) -> Option<WlSurface> {
+        self.by_id(id).map(|w| w.toplevel.wl_surface().clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Input
+    // -----------------------------------------------------------------------
+
+    /// Keyboard focus follows the **foreground window**, because the user's
+    /// window manager is Windows.
+    ///
+    /// A Wayland compositor normally decides this itself — click-to-focus,
+    /// follow-mouse, a keyboard shortcut — and here it has no business
+    /// deciding. There is one focus on the desktop, Windows owns it, and the
+    /// only correct answer is to mirror it. `WM_SETFOCUS`/`WM_KILLFOCUS` is the
+    /// message pair that carries it, and it is deliberately not `WM_ACTIVATE`:
+    /// activation is about which top-level window is frontmost and focus is
+    /// about where a keystroke goes, and `xdg_toplevel`'s `activated` state
+    /// wants the first while `wl_keyboard.enter` wants the second.
+    fn set_keyboard_focus(&mut self, id: WindowId, on: bool) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        if on {
+            let Some(surface) = self.surface_of(id) else { return };
+            self.keyboard_focus = Some(id);
+            println!("wc-compositor: window {id} has keyboard focus");
+            keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+        } else {
+            // Only if it is *still* ours. A focus change is two messages, and
+            // they can arrive in either order: Windows sends `WM_KILLFOCUS` to
+            // the old window and `WM_SETFOCUS` to the new one, and clearing on
+            // a stale kill would take the focus away from a window that had
+            // just been given it.
+            if self.keyboard_focus != Some(id) {
+                return;
+            }
+            self.keyboard_focus = None;
+            println!("wc-compositor: window {id} lost keyboard focus");
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// One key, in evdev numbering, to whatever has focus.
+    ///
+    /// `id` is not used to route: `wl_keyboard` events go to the focused
+    /// surface and to nothing else, and smithay's `KeyboardHandle` owns that
+    /// focus. It is checked instead — a key from a window that does not have
+    /// focus is a bug in the platform layer and is worth not delivering
+    /// silently to whoever does.
+    fn key(&mut self, id: WindowId, keycode: u16, pressed: bool, time: u32) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        if self.keyboard_focus != Some(id) {
+            return;
+        }
+        let state = if pressed { KeyState::Pressed } else { KeyState::Released };
+        keyboard.input::<(), _>(
+            self,
+            // **Plus eight, and this is the one number in the stage that was
+            // wrong and was caught by a client rather than by a test.**
+            //
+            // smithay's `Keycode` is an *XKB* keycode, which carries X11's
+            // eight-key offset; `wl_keyboard.key` carries an *evdev* keycode,
+            // which does not. smithay subtracts the eight on the way out
+            // (`wayland/seat/keyboard.rs`), so a caller that hands it an evdev
+            // number is handing it one that is eight too small, and every key
+            // reaches the client eight too small.
+            //
+            // What that looks like from outside is the reason it is worth
+            // recording: nothing errors, every key produces *a* character, and
+            // the characters are wrong. `weston-eventdemo` printed
+            // `key 27, unicode 93` — a right square bracket — for a keypress
+            // this compositor believed was `h`. A unit test over
+            // `crate::input` could not have caught it, because the table it
+            // checks was correct; only a client running the keymap could.
+            (u32::from(keycode) + 8).into(),
+            state,
+            SERIAL_COUNTER.next_serial(),
+            time,
+            // No compositor-level bindings. Every key goes to the client, which
+            // is the right default for a compositor whose window manager is
+            // somebody else: Windows has already taken the combinations it
+            // reserves (Alt-Tab, the Windows key) before the message loop sees
+            // them, and intercepting more here would silently steal keys the
+            // application expects.
+            |_, _, _| FilterResult::Forward,
+        );
+    }
+
+    /// Move the pointer, which is also how it enters and leaves.
+    ///
+    /// `PointerHandle::motion` with `Some(surface)` sends `enter` when the
+    /// surface changes and `motion` when it does not; with `None` it sends
+    /// `leave`. So there is one function here rather than three, and the
+    /// enter/leave bookkeeping the protocol requires is smithay's rather than
+    /// something this file could get subtly wrong.
+    fn pointer_motion(&mut self, id: Option<WindowId>, x: f64, y: f64, time: u32) {
+        let pointer = self.pointer.clone();
+        let focus = id.and_then(|id| self.surface_of(id).map(|s| (id, s)));
+        match &focus {
+            Some((id, _)) => {
+                self.pointer_focus = Some(*id);
+                self.pointer_at = (x, y);
+            }
+            None => self.pointer_focus = None,
+        }
+        pointer.motion(
+            self,
+            // The second element is the surface's origin in compositor space.
+            // Every window here is its own `HWND` with its own coordinate
+            // system and the platform has already subtracted the frame, so the
+            // surface origin *is* the compositor origin and this is `(0, 0)`.
+            // It is written out rather than assumed because the moment a scene
+            // graph exists — subsurfaces, popups — it stops being true, and a
+            // hard-coded zero somewhere else would be found by a popup landing
+            // in the wrong place.
+            focus.map(|(_, s)| (s, (0.0, 0.0).into())),
+            &MotionEvent {
+                location: (x, y).into(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        // Every logical group of pointer events ends in a `frame`. `wl_pointer`
+        // version 5 made it required, clients batch on it, and omitting it
+        // leaves a client holding a half-delivered event until the next one
+        // arrives — which for a mouse that has stopped moving is forever.
+        pointer.frame(self);
+    }
+
+    fn pointer_button(&mut self, id: WindowId, button: u32, pressed: bool, time: u32) {
+        let pointer = self.pointer.clone();
+        if self.pointer_focus != Some(id) {
+            // A button from a window the pointer is not over. Reachable on
+            // Win32 during a drag, where `SetCapture` keeps sending us the
+            // release after the pointer has left; the release still has to be
+            // delivered, so the pointer is put back over the window first.
+            let (x, y) = self.pointer_at;
+            self.pointer_motion(Some(id), x, y, time);
+        }
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+                button,
+                state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn pointer_axis(
+        &mut self,
+        id: WindowId,
+        horizontal: f64,
+        vertical: f64,
+        v120_h: i32,
+        v120_v: i32,
+        time: u32,
+    ) {
+        let pointer = self.pointer.clone();
+        if self.pointer_focus != Some(id) {
+            return;
+        }
+        let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+        if v120_v != 0 || vertical != 0.0 {
+            frame = frame.value(Axis::Vertical, vertical).v120(Axis::Vertical, v120_v);
+        }
+        if v120_h != 0 || horizontal != 0.0 {
+            frame = frame.value(Axis::Horizontal, horizontal).v120(Axis::Horizontal, v120_h);
+        }
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
+    /// The user changed their Windows keyboard layout under a running client.
+    ///
+    /// `set_keymap_from_string` re-sends `wl_keyboard.keymap` to every bound
+    /// keyboard, which is the protocol's own answer to this and is why the
+    /// keymap is an event rather than a one-off — clients are required to
+    /// handle it arriving again.
+    fn set_layout(&mut self, name: &'static str) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        let Some(l) = crate::input::layout(name) else { return };
+        match keyboard.set_keymap_from_string(self, l.keymap.to_owned()) {
+            Ok(()) => println!("wc-compositor: keyboard layout -> {}", l.name),
+            Err(e) => eprintln!("wc-compositor: could not switch to layout {}: {e}", l.name),
+        }
     }
 
     /// Tell the platform to stop pumping. Sending this rather than dropping the
@@ -482,12 +815,42 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // smithay's own view of the focus, after the `enter`/`leave` pair has
+        // been sent. Logged rather than acted on: the decision was made in
+        // `set_keyboard_focus` from a Win32 message, and doing anything here
+        // would be a second source of truth for the same fact.
+        println!(
+            "wc-compositor: keyboard focus -> {}",
+            if focused.is_some() { "a surface" } else { "nothing" }
+        );
+    }
+
+    /// The client wants to draw the cursor itself.
+    ///
+    /// **Not implemented, and the reason is worth stating rather than leaving
+    /// as an empty body.** `wl_pointer.set_cursor` hands over a surface whose
+    /// buffer is the cursor image, and turning that into something Win32 shows
+    /// means `CreateIconIndirect` per frame plus a `SetCursor` from the window
+    /// procedure's `WM_SETCURSOR` — the same shape as `set_icon` in
+    /// `win32.rs`, which already exists. What is missing is not the conversion
+    /// but the *policy*: hiding the system arrow while the client's cursor is
+    /// up, and putting it back on leave, is state that belongs to the window
+    /// and there is nothing to test it against until a client that sets one is
+    /// in the harness.
+    ///
+    /// The visible consequence is that the arrow the user sees is Windows',
+    /// which for a terminal is the same arrow the client would have drawn, and
+    /// for a text field is the wrong shape. Said once so it is in the log of
+    /// any run where it matters.
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        if !self.cursor_noted {
+            self.cursor_noted = true;
+            println!(
+                "wc-compositor: a client set a cursor ({image:?}); \
+                 client cursors are not drawn yet, the system arrow is shown instead"
+            );
+        }
     }
 }
 
@@ -612,6 +975,22 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Drop the focus **before** the window goes, and unconditionally.
+        // smithay holds the focused `WlSurface` in the keyboard handle, and a
+        // handle still pointing at a destroyed surface sends `leave` to a dead
+        // object on the next focus change. Doing it here rather than waiting
+        // for a `WM_KILLFOCUS` matters because a client that destroys its
+        // surface without the window being defocused first — which is what
+        // happens when a client exits — never produces one.
+        if let Some(window) = self.windows.get(surface.wl_surface()) {
+            let id = window.id;
+            if self.keyboard_focus == Some(id) {
+                self.set_keyboard_focus(id, false);
+            }
+            if self.pointer_focus == Some(id) {
+                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+            }
+        }
         if let Some(window) = self.windows.remove(surface.wl_surface()) {
             println!(
                 "wc-compositor: xdg_toplevel destroyed -> window {} ({} frames presented)",

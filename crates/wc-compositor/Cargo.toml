@@ -47,5 +47,10 @@ windows-sys = { workspace = true, features = [
   "Win32_Graphics_Gdi",
   "Win32_System_Console",
   "Win32_System_LibraryLoader",
+  # ADDED FOR STAGE 6: `TrackMouseEvent` (without which there is no
+  # `WM_MOUSELEAVE` at all), `SetCapture`/`ReleaseCapture` (without which a
+  # drag off the window loses its release), and `GetKeyboardLayout` (which
+  # chooses the keymap).
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
