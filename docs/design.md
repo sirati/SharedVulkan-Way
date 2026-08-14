@@ -3963,35 +3963,76 @@ The alternative — deferring destruction GPU-side — would additionally have h
 to stop the driver call (§0.23.3), which means every destroy in the project.
 Measuring first turned a codegen-wide change into a change in one function.
 
-#### 0.23.6 Status, and one thing found on the way
+#### 0.23.6 Measured: 144 → 0, and what that says about the order of work
 
-Fixed: the diagnostic, which was 0-for-3 and had misled three investigations.
+`sv_icd::transport::RingTransport::publish_recorded_first`, called from `call`
+and `send` and deliberately **not** from `record`. Same reproducer, same
+selection, same box:
 
-Diagnosed and specified, not implemented: the flush-before-destroy above. It is
-one function, and it wants its own before/after on the reproducer — 144 fatals
-to zero — rather than being asserted at the end of a long session.
+| | ring fatals | `no VkPipelineLayout` | of the control's passes, lost | verdict |
+|---|---|---|---|---|
+| before | 2 | **144** | 100.0% | `sv-cts: FAIL` |
+| after | **0** | **0** | **0.0%** | `sv-cts: PASS` |
 
-**And a trap in `note()` that cost time here and will cost it again.**
-`GpuServer::note` returns `WireError::UnknownCommand { opcode: 0 }` for *every*
-table failure, so the fatal reads:
+It is written as *program order between recorded and non-recorded commands*
+rather than as "flush before destroys", because a transport that knew which
+opcodes are destroys would be a transport with a reason to be regenerated (§6.5,
+`Transport`). Destroys are where it was found; `vkUpdateDescriptorSets` and
+every other unrecorded command had the same hole.
 
-```
+**The order of work is the lesson, and it is worth stating plainly.** §0.23.3
+concluded that the fix was a GPU-side deferral — a hook on every destroy
+command, plus an object table holding destroyed objects alive — and that
+conclusion was *reasonable*: it follows from §5.5 item 2, which specifies
+exactly that, and from the observation that `unbind` runs after the driver call.
+It was also wrong, and nothing on paper was going to show it.
+
+The cheap fix was invisible until the expensive one had been disproved. What
+disproved it was one instrument — `SV_SEND_TRACE`, the app side's own send
+order — and the reason it was needed is general: **an instrument that can only
+see one side of a boundary cannot answer a question about ordering across it.**
+The GPU side's trace prints execution order, and execution order is equally
+consistent with "the app sent the destroy first" and "the app published the blob
+late". Those have different fixes, one of them project-wide.
+
+So: a change to every destroy command in the codebase became a change to one
+function, because the reproducer was run before the fix was written. That is the
+whole argument for measuring first, and this is the clearest instance of it in
+the project.
+
+#### 0.23.7 Two diagnostics that cost time, both now fixed
+
+**`GpuServer::note` fabricated its headline.** Every table failure returned
+`WireError::UnknownCommand { opcode: 0 }`, so the fatal read:
+
+```text
 in a command blob: unknown command opcode 0 (no VkPipelineLayout with id 44 …)
 ```
 
-The headline is fabricated. The opcode was fine and nothing was unknown; the
-real error is the parenthetical. Reading the headline first sends you looking
-for a decoder that has lost alignment — which is where this investigation went
-for a while, and it is a plausible enough bug to waste an afternoon on. The
-detail is the truth and the headline contradicts it. `note()` should return an
-error that says a lookup failed; it is not fixed here only because it is one
-more thing in the same file as the diagnostic and wants the same before/after.
+The opcode was fine and nothing was unknown; the truth was the parenthetical.
+Reading the headline first sends you looking for a decoder that has lost
+alignment — a plausible bug, in a different subsystem, and this investigation
+spent time there. It is `TableError::Unknown`'s `RingBarrier` guess one layer
+out, and the same rule: **an error must not assert something it does not know.**
 
-Also found: **`sv-cts.sh --fraction 1` selects zero tests.** The sampler is
+It is now `WireError::Table`, which says *"an object-table lookup failed"* and
+nothing more. It carries no detail because `WireError` is `Copy` and appears in
+the return of every generated read — the specifics are in `last_error`, which
+the ring already prints beside it. The headline is now true and the detail is
+unchanged.
+
+**`sv-cts.sh --fraction 1` selected zero tests.** The sampler was
 `awk 'NR % n == 1'`, and `NR % 1` is always 0, so the documented meaning — "run
-1 test in every N", i.e. all of them at N=1 — silently selects nothing and the
-run fails with `the selection is empty`. Cost two runs here. `--fraction 2` is
-the smallest working value.
+1 test in every N", i.e. all of them at N=1 — silently selected nothing and the
+run died with `the selection is empty`. It is now `(NR - 1) % n == 0`, which is
+identical for every N ≥ 2 and correct at 1.
+
+This is a gate that cannot fire, in the harness that produces this project's
+headline Vulkan numbers, and the documentation is what made it dangerous: a
+reader asking for the whole suite got an error about their *selection* rather
+than about the sampler. **No recorded result used it** — checked across `docs/`
+and `scripts/`, the only mentions are this section and an unrelated comment
+about 1-in-2000 — so nothing in the tree needs re-measuring.
 
 
 ---
@@ -5923,6 +5964,28 @@ lifetime is the read-pending word of §5.5 plus retirement by timeline value.
 
 `vkResetCommandPool` / `vkResetCommandBuffer` return blobs to the arena
 allocator through the same deferred path.
+
+**Buffering `vkCmd*` reorders them against everything that is not a `vkCmd*`,
+and that has to be paid for.** This is the consequence of the paragraph above
+and it went unstated for four stages. Recorded commands are published on a
+schedule of their own — at `vkEndCommandBuffer`, or when a block fills — while
+`vkCreate*`, `vkDestroy*` and every other forwarded call goes immediately. Both
+travel the device ring, so each class is ordered *with itself*; program order
+**between** the classes is not preserved, and the wire can carry
+`[destroy] [recorded…]` for an application that wrote `[recorded…] [destroy]`.
+
+`VK_KHR_maintenance4` makes that application correct — a pipeline layout's
+lifetime ends when the command buffer leaves the recording state — so it is a
+real defect and not a licence to blame the caller. It reproduced as
+`no VkPipelineLayout with id 44`, 144 times across 48 CTS cases, and §0.23 is
+the whole story.
+
+The repair is `sv_icd::transport::RingTransport::publish_recorded_first`:
+publish what is recorded before sending anything that is not. **It does not cost
+the 105 µs against 130 µs this section's pipelining bought**, because that
+number is `vkCmd*` against `vkCmd*` and `Transport::record` still buffers; what
+is forced is a publish before an *unrecorded* command, which is not a per-draw
+operation.
 
 ### 6.6 Licences, stated once
 
