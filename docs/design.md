@@ -3657,7 +3657,151 @@ The first is right. It is written here rather than done here because it belongs
 with the private session, and doing it separately would leave a gate with
 nothing behind it.
 
-#### 0.21.7 What would demonstrate it
+#### 0.21.8 Is it reachable without patching Firefox? No — and the smallest patch is one symbol
+
+The question that decides whether "Firefox must use GPU accel for video decoding"
+is a transport job or a browser-integration job. Read from Firefox and ffmpeg
+source on 2026-08-14, not inferred.
+
+**The verdict is no**, and the reason is narrower and more fixable than §0.8 item
+7 suggested.
+
+`FFmpegVulkanVideoDecoder`'s two output paths both end in `vkGetMemoryFdKHR`;
+that was already established (§5b of `docs/video-decode.md`). What is new here is
+the *third* possibility everyone assumes exists — reading the decoded frame back
+into ordinary shared memory and letting it take Firefox's software surface — and
+whether it is reachable:
+
+* **ffmpeg can do it.** `hwcontext_vulkan.c:4994` implements
+  `vulkan_transfer_data_from`; a Vulkan hardware frame can be transferred to a
+  software `AVFrame` by `av_hwframe_transfer_data`. This is upstream, shipped,
+  and not specific to anything here.
+* **Firefox never calls it.** `av_hwframe_transfer_data` appears **zero** times
+  in `FFmpegVideoDecoder.cpp`, `FFmpegVulkanVideoDecoder.cpp` and
+  `FFmpegLibWrapper.h`.
+* **Firefox does not even load the symbol.** `FFmpegLibWrapper.h:197–212` loads
+  `av_hwframe_ctx_alloc`, `av_hwframe_ctx_init`, `av_hwframe_map`,
+  `av_hwdevice_get_hwframe_constraints`, `av_hwframe_constraints_free` and
+  `av_hwframe_transfer_get_formats` — the call that asks *which formats a
+  transfer would support* — but **not the call that performs one**.
+
+That last line is the finding. The readback capability is present in the library
+Firefox already has open, and Firefox loads the function that describes it and
+not the function that does it.
+
+**There are three independent locks, and each is sufficient on its own.** The
+missing symbol is only the second:
+
+1. Both Vulkan output paths converge on an `AVDRMFrameDescriptor` at
+   `FFmpegVideoDecoder.cpp:2344`, and everything below `GetVideoFrameSurface` is
+   dma-buf typed.
+2. `av_hwframe_transfer_data` is not in `FFmpegLibWrapper` at all — and
+   `GetVideoBuffer` refuses hardware frames outright, in as many words
+   (`FFmpegVideoDecoder.cpp:1260–1265`): *"Pre-allocation is only for sw
+   decoding … it would cause a need to read CPU data from GPU, which is slow."*
+   There is no readback-to-host-memory code anywhere to reach.
+3. The IPC type that would have to carry a foreign frame,
+   `RemoteDecoderVideoSubDescriptor` (`gfx/layers/ipc/LayersSurfaces.ipdlh:152`),
+   has **no member capable of naming one on Linux** — its only non-null Linux
+   arm is `SurfaceDescriptorDMABuf`, which is file handles. Decode runs in the
+   RDD process, so every frame crosses this union.
+
+**The smallest patch, then, is a third branch rather than a redirection of
+either existing one:** in `FFmpegVideoDecoder<LIBAV_VER>::CreateImageVulkan`
+(`FFmpegVideoDecoder.cpp:2218`), taken *before* the `directExport`/copy split at
+`:2296`, producing a `PlanarYCbCrImage` through `VideoData::CreateAndCopyData`
+(`:2084`) — the call software decode already falls back to, three hundred lines
+above in the same file.
+
+It is smallest because it is the only candidate that touches neither
+`FFmpegVideoFramePool`, nor `DMABufSurface`, nor
+`RemoteDecoderVideoSubDescriptor`, nor WebRender. It also clears lock 3 for
+free: the RDD boundary's shmem fallback (`dom/media/ipc/RemoteVideoDecoder.cpp:286–307`)
+hard-requires `AsPlanarYCbCrImage()`, and a `PlanarYCbCrImage` is exactly what
+it wants.
+
+**And on our side it needs `vkCmdCopyImageToBuffer` rather than
+`av_hwframe_transfer_data`** — which is a correction to the obvious reading of
+the missing symbol. Adding the ffmpeg call would work, and would allocate its
+own destination buffer; §0.21.3's readback wants the destination to be **arena**
+memory, so that the host reads the frame out of a mapping it already holds
+instead of out of a buffer ffmpeg chose. Recording the copy ourselves is both
+fewer moving parts and the only version that keeps the one copy landing
+somewhere the host does not have to copy it again.
+
+So the readback path, designed in §0.21.3 as the *canvas* path, turns out to be
+the path that makes decode work at all — but it is reached by a branch we write,
+not by a symbol Firefox forgot to load.
+
+#### 0.21.9 Two tiers, and only one of them is small
+
+| | what Firefox needs | what we need | frame crosses? |
+|---|---|---|---|
+| **Tier 1** — it works | one new branch in `CreateImageVulkan`, reusing `CreateAndCopyData` | §0.21.3's readback into arena memory | **every frame** |
+| **Tier 2** — it is fast | a new `Image` subclass, a new `RemoteDecoderVideoSubDescriptor` member, a new `RenderTextureHost` | private video session, §0.21.2's image id | never |
+
+Tier 2's row is the one to read twice. §0.21.5 describes it as "strictly less
+machinery than either path Firefox has now", which is true of the *Vulkan* work
+— no export, no `sync_fd` — and false of the *Firefox* work, and the second is
+what decides the effort. It also fails `RemoteVideoDecoder.cpp:288`'s
+`AsPlanarYCbCrImage()` check, so it cannot borrow the shmem fallback the way
+tier 1 does. The nearest existing analogue to §0.21.2's image id is
+`SurfaceDescriptorRemoteTexture { RemoteTextureId; RemoteTextureOwnerId }`
+(`LayersSurfaces.ipdlh:220`) — two integers naming a texture the receiver does
+not own, which is exactly the right shape — but it is in the top-level
+`SurfaceDescriptor` union and **not** in the video one, and its `RemoteTextureMap`
+resolves inside Firefox's own compositor rather than to a foreign GPU server. So
+it is a precedent for the shape, not a seam to reuse.
+
+Tier 1 is small enough to be worth proposing upstream on its own merits: a
+Vulkan decoder that cannot export should degrade rather than fail, and today it
+fails fatally. That is arguably a bug in Firefox independent of this project —
+any Vulkan device without `VK_EXT_external_memory_dma_buf` hits it.
+
+The fatality is worth stating exactly, because it is finer than §0.8 item 7 put
+it and the conclusion survives the refinement. **Init-time failures do fall
+back**: `InitHWDecoderIfAllowed` (`FFmpegVideoDecoder.cpp:999`) tests only
+`NS_SUCCEEDED` and discards the code, so a `FATAL_ERR` from `InitVulkanDecoder`
+merely moves on to VA-API and then software. And *some* first-frame failures are
+`NS_ERROR_DOM_MEDIA_DECODE_ERR`, which does recover — there is even a Linux
+"decode error, disable HW acceleration" path at `MediaFormatReader.cpp:2645`, and
+a speed-triggered `HW decoding is slow, switching back to SW decode` at
+`FFmpegVideoDecoder.cpp:1657`.
+
+But **the two failures a forwarded device actually hits are the fatal ones**:
+`"Failed to create NV12 image"` (`FFmpegVulkanVideoDecoder.cpp:933`, creating an
+image with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` on a device that never
+enabled the extension) and `"Failed to export NV12 FD"` (`:1040`,
+`vkGetMemoryFdKHR`). Both are `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which
+`MediaFormatReader.h:574` classifies as fatal, so the recovery guarded at
+`MediaFormatReader.cpp:2611` never runs. The slowness fallback cannot save it
+either — it fires on being slow, not on failing to export.
+
+One thing that makes §0.21.6's hazard less bad than it reads, and it should be
+recorded rather than left for someone to discover with relief:
+`media.hardware-video-decoding-vulkan.enabled` defaults to **false**
+(`StaticPrefList.yaml:13061`, `mirror: once`). So the broken-playback path needs
+a user to turn a pref on *and* restart. It is a trap rather than a live
+regression — which is why it belongs on a list rather than in a hotfix, and why
+it should still be closed before someone finds it.
+
+Tier 2 is §0.21.5's third output path and is not small.
+
+**The honest caveat on tier 1, and it is the one that needs a guest.** Tier 1
+decodes on the guest GPU and then copies every decoded frame across the
+boundary — 3.1 MB a frame at 1080p, 186 MB/s at 60 fps. Whether that beats
+plain software decode *on the host*, where no frame crosses at all, is not
+obvious and cannot be settled by reading: it is guest decode plus a copy against
+host CPU decode plus nothing. It is entirely possible that tier 1 is slower than
+doing nothing, in which case the only version of this feature worth having is
+tier 2.
+
+So the answer to "transport job or Firefox-integration job" is: **Firefox
+integration, at both tiers**, with our side ready for tier 1 as specified and
+tier 2 blocked behind the private session. And the first thing to measure, when
+there is a guest, is whether tier 1 is worth building at all.
+
+#### 0.21.10 What would demonstrate it
 
 Nothing here has run. The measurement that would settle it needs a guest, and a
 format the host iGPU can decode:
