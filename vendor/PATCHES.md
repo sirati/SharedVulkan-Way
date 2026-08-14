@@ -56,6 +56,14 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
   it; on Windows they were always distinct types and nothing had to say so.
   `docs/waycompose-design.md` §76 for the measurement, §72.3 for what the
   separation is for.
+* `WireFd` — the type `ProtoFd` is going to become: an `h` argument that is
+  **either** a name the peer can open (`Named`, a `wc_handle::Handle`) **or** a
+  descriptor that is already open (`Open`, Unix only — `SCM_RIGHTS` has no
+  Windows equivalent, so that arm would be uninhabited there). The unnamed form
+  is deliberately *not* a sixth `wc_handle::Descriptor` variant: `Descriptor` is
+  a wire format meaning "a name a peer can open", and an `SCM_RIGHTS` fd has no
+  name. Tested but not yet constructed — `rs/wire.rs` still chooses by `cfg`.
+  `docs/waycompose-design.md` §77.
 * `WlStream` — the socket type, `wc_transport::Stream` on both platforms.
 * `PollHandle` — an `OwnedFd` (epoll/kqueue) on Unix, a `polling::Poller`
   (wepoll) on Windows.
@@ -77,7 +85,7 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | `rustix` and `wayland-sys` moved behind `[target.'cfg(unix)']`. `wc-transport` added unconditionally, `wc-handle` and `polling` for Windows. `libwayland_*` features re-declared as inert. `rs_sys_impls` test target removed. |
+| `Cargo.toml` | `rustix` and `wayland-sys` moved behind `[target.'cfg(unix)']`. `wc-transport` and `wc-handle` added unconditionally (the latter moved out of `cfg(windows)` by `docs/waycompose-design.md` §77, because `os::WireFd::Named` names a `wc_handle::Handle` on Unix too), `polling` for Windows. `libwayland_*` features re-declared as inert. `rs_sys_impls` test target removed. |
 | `src/lib.rs` | `mod sys` gated on `unix` **and** on the system features rather than on `test`; `mod test` likewise. `pub use rs::client/server` made unconditional on Windows. |
 | `src/protocol.rs` | `Fd: AsRawFd` → `Fd: FdRepr` (5 bounds); the two bodies that called `as_raw_fd()`; `wayland_sys::common` → `crate::os::c_abi`. |
 | `src/debug.rs` | same bound substitution. |
