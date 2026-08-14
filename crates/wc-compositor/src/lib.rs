@@ -1137,7 +1137,7 @@ fn wayland_thread(
         Ok(d) => d,
         Err(e) => {
             eprintln!("wc-compositor: could not create display: {e}");
-            ui.send(platform::ToUi::Quit);
+            ui.send(platform::ToUi::Quit { clients: 0 });
             return 2;
         }
     };
@@ -1152,7 +1152,7 @@ fn wayland_thread(
         Ok(l) => l,
         Err(e) => {
             eprintln!("wc-compositor: could not bind socket: {e}");
-            state.quit();
+            state.quit(0);
             return 2;
         }
     };
@@ -1172,6 +1172,10 @@ fn wayland_thread(
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
     let mut code = 1u8;
+    // STAGE 54. How many clients were still connected on the last turn, so the
+    // window-leak report can tell "a window with nobody behind it" from "a
+    // compositor that timed out while somebody was still using it".
+    let mut live_at_exit = 0u32;
 
     // One per thread, reused every turn. See `tick.rs`: on Windows a
     // `thread::sleep(5ms)` is a 15.9 ms sleep, and 15.9 ms against
@@ -1228,7 +1232,7 @@ fn wayland_thread(
             }
             Some(Err(e)) => {
                 eprintln!("wc-compositor: could not obtain the ring region: {e}");
-                state.quit();
+                state.quit(0);
                 return 2;
             }
         }
@@ -1391,6 +1395,9 @@ fn wayland_thread(
             .handle()
             .backend_handle()
             .with_all_clients(|_| live += 1);
+        // STAGE 54. Carried out of the loop so the exit report can say whether
+        // the windows still standing have clients behind them.
+        live_at_exit = live;
 
         if once && state.clients_seen > 0 && live == 0 {
             println!(
@@ -1436,6 +1443,6 @@ fn wayland_thread(
         }
     );
     let _ = std::io::stdout().flush();
-    state.quit();
+    state.quit(live_at_exit);
     code
 }

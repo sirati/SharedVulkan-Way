@@ -310,6 +310,13 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
 impl PumpInner {
     pub(crate) fn run(self) {
         let mut windows: HashMap<WindowId, Headless> = HashMap::new();
+        // STAGE 54. What this platform can say about window lifetime. There are no
+        // real handles here, so `live` is the map itself -- the honest answer for
+        // a platform whose windows *are* the map, and the reason the win32 arm
+        // reports both numbers while this one reports the same number twice.
+        let mut made = 0u64;
+        let mut gone = 0u64;
+        let mut clients_at_exit = 0u32;
         // The system clipboard, on a system that has none.
         //
         // In-process rather than a file or an X selection, and that is the
@@ -336,11 +343,35 @@ impl PumpInner {
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             };
-            if matches!(cmd, ToUi::Quit) {
+            if let ToUi::Quit { clients } = cmd {
+                clients_at_exit = clients;
                 break;
+            }
+            // STAGE 54. Counted here rather than inside `handle` so that the
+            // signature of a function eight other commands share does not grow
+            // two arguments for the benefit of two of them. The `contains_key`
+            // matters: a `Destroy` for an id that is not in the map destroys
+            // nothing, and counting it would let a double-destroy balance a
+            // leak.
+            match &cmd {
+                ToUi::Create { .. } => made += 1,
+                ToUi::Destroy { id } if windows.contains_key(id) => gone += 1,
+                _ => {}
             }
             self.handle(&mut windows, &mut clipboard, cmd);
         }
+
+        // STAGE 54, in the same words the win32 arm uses, so one grep and one
+        // assertion serve both platforms. `still held` and `still alive` are the
+        // same number here because on a platform with no window manager the map
+        // *is* the window list; on Win32 they are two independent answers and
+        // the interesting case is when they differ.
+        println!(
+            "wc-compositor: windows at exit: {made} created, {gone} destroyed, \
+             {} still held, {} still alive, {clients_at_exit} client(s) still connected",
+            windows.len(),
+            windows.len()
+        );
 
         let _ = self.events.send(FromUi::Stopped);
     }
@@ -706,7 +737,7 @@ impl PumpInner {
                 );
                 let _ = self.events.send(FromUi::ClipboardData { token, data });
             }
-            ToUi::Quit => {}
+            ToUi::Quit { .. } => {}
         }
     }
 

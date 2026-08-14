@@ -20113,3 +20113,181 @@ leg (`weston-eventdemo` decoding `helloZyz` through our keymap), and both Wine
 legs, 29/0 and 31/0. What the guest run adds is that chain on the guest's own
 desktop, which is the venue the user's report came from and the only one that
 can close it.
+## 56. The same category, from inside, so it travels to the guest
+
+### 56.1 Status in one paragraph
+
+**§53 got here first, and this is the second half of the same category rather
+than a rival to it.** That section built the stronger witness: `probe-life.c` is
+a *separate process* that never speaks to the compositor and asks the window
+manager instead, launched into the compositor's own virtual desktop because
+`EnumWindows` only sees the calling thread's. Nothing a compositor can do makes
+that witness lie. It is Wine-only, it runs a churn loop, and its answer was that
+the compositor is clean.
+
+What it cannot do is travel. It needs its own process deployed into the same
+desktop, which on the cross-VM guest means shipping a binary into a session that
+is presently locked, and it has no Linux leg at all. So this section adds the
+cheap half: **the compositor reports its own window accounting on the way out,
+on every platform, on every run**, including the number `EnumWindows` gives for
+its own process. `wc-guest.sh` and `wc-damage.sh` get it in logs they already
+capture, with nothing deployed and no extra process.
+
+The two are not interchangeable and the ordering between them is the honest one:
+§53's witness is authoritative and this one is ubiquitous. Where they disagree,
+believe §53.
+
+**This was duplicated effort and the cause is worth recording.** The assignment
+said §53 was claimed by something else, and I took that at face value instead of
+reading master before starting — which is the same mistake as §51.5's rebuild
+ritual, performed after it stopped being necessary. Two agents built the same
+category on the same night. What survives here is only what §53 does not cover.
+
+### 56.2 One thing §53's argument does not cover: §21's contrast
+
+§53.2 makes the case for the category and it is not repeated here. One point
+belongs to this half rather than that one, because it is about *why the number
+has to be everywhere* rather than why it has to come from outside.
+
+§21 is the precedent. smithay calls `IdleInhibitHandler::uninhibit` from exactly
+one place — the client's explicit `destroy` request — so a client that crashes
+leaves an inhibitor nothing will ever revoke. That was found, and the reason it
+was found is that its symptom is **visible**: a display that never sleeps again,
+which on a guest VM is a real bill.
+
+A leaked `HWND` has no symptom at all. The process holds a handle until it
+exits. A defect with no symptom is not found by somebody noticing; it is found
+by a number being printed somewhere a run already looks — which is the argument
+for carrying it in the compositor's own exit line rather than only in a harness
+somebody has to remember to run.
+### 56.3 Five numbers, and the fourth is the one that matters
+
+```
+wc-compositor: windows at exit: 3 created, 3 destroyed, 0 still held,
+               0 still alive, 0 client(s) still connected
+```
+
+| | |
+|---|---|
+| created / destroyed | what the compositor believes it did |
+| still held | entries left in its own map |
+| **still alive** | **what Windows says**, `EnumWindows` filtered to this process and `WaycomposeToplevel` |
+| clients connected | whether anybody was still there — the qualifier |
+
+The first three are the compositor's own account of its own behaviour, and a
+bug in the teardown path is exactly the circumstance in which that account is
+wrong. `DestroyWindow` returning false, a window owned by the wrong thread, a
+handle already replaced — each leaves the arithmetic balanced, the map empty,
+and a window on the desktop.
+
+**Measured, not reasoned.** Deleting the `DestroyWindow` call and running
+`scripts/wc-teardown.sh wine`:
+
+```
+FAIL  wine: WINDOW LEAK: 1 created, 1 destroyed, 0 still held, 1 still alive
+```
+
+Created equals destroyed. The map is empty. Every self-reported number is
+perfect and the window is still there. A check built only on the compositor's
+own bookkeeping would have passed that build, which is the entire argument for
+asking somebody else.
+
+The enumeration is filtered by **process id** as well as class, because
+`wc-proxy.sh` and `wc-guest.sh` run several compositors at once on a shared
+machine and §16.8's rule is that identity on a shared box is never a class of
+thing. A count that swept up another run's windows would fail a harness for
+somebody else's leak.
+
+### 56.4 The fifth number exists because the first run was a false positive
+
+The first real run of this assertion reported `1 created, 0 destroyed, 1 still
+held, 1 still alive` and would have failed. There was no bug. The compositor had
+reached its idle timeout while `weston-terminal` was **still connected**, and a
+window whose client is alive is not a leak — the compositor is entitled to still
+have it.
+
+So `ToUi::Quit` now carries how many clients were still connected, and the
+assertion returns early when that is non-zero. Without it the check would have
+fired on every harness in this tree that stops a compositor with `--timeout`
+rather than `--once`, which is nearly all of them, and would have been switched
+off within a day as noise.
+
+It is carried on the quit message rather than printed as a second line
+deliberately: the number it qualifies is only knowable on the UI thread, and two
+lines that must be read together are two lines that can be read apart.
+
+### 56.5 The answer is that teardown works
+
+A client killed with `SIGTERM` — no `destroy` request, no clean disconnect —
+still produces, in order:
+
+```
+wc-compositor: window 1 destroyed
+wc-compositor: client InnerClientId { id: 0, serial: 1 } disconnected: ConnectionClosed
+```
+
+on both platforms, and the exit line reads `1 created, 1 destroyed, 0 still
+held, 0 still alive`. smithay's `toplevel_destroyed` does fire from the
+resource destructor on an abrupt disconnect, which is the thing §21's inhibitor
+did not have.
+
+Reporting that plainly is the point. This stage found no bug; it found that
+nothing would have found one.
+
+### 56.6 Why this is a harness of its own
+
+The report is printed on the way out, from the thread that owns the windows. A
+compositor killed with a signal prints nothing — and prints nothing about
+teardown for the good reason that it did none.
+
+**Every other harness in this tree stops its compositor with `kill`.**
+`wc-window.sh`, `wc-proxy.sh`, `wc-damage.sh`, `wc-firefox.sh` all do, because
+until now nothing depended on the compositor being allowed to finish. So none of
+them can carry this assertion without being restructured, and `wc-teardown.sh`
+lets the compositor reach its idle timeout instead: the client is given a
+shorter life than the compositor's timeout, so the client is always the one that
+goes first. That ordering *is* the design of the timings, and getting it
+backwards is what §56.4 was.
+
+**Its Wine leg overlaps `wc-life.sh` and its Linux leg does not.** §53 churns
+windows open and closed and asks an outside process; this one runs a single
+window to a clean exit and reads the compositor's own line. They test different
+mechanisms — the witness against the accounting — and the Wine leg here exists
+because that is the only platform where the accounting has a second opinion to
+be checked against. If a future tidy-up wants one harness rather than two, the
+thing to keep is §53's witness and the thing to fold into it is this exit line;
+the reverse would lose the stronger check.
+
+### 56.7 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace`, both targets | clean |
+| `cargo test --workspace --no-fail-fast` | **2592 tests**, 0 failures — unchanged; this stage adds no test, the harness is the test |
+| **`scripts/wc-teardown.sh all`** (new) | **11 passed, 0 failed** |
+| ... `linux` leg | `1 created, 1 destroyed, 0 still held, 0 still alive` |
+| ... `wine` leg | the same, and Windows agrees none survives |
+| **the same, against a build with `DestroyWindow` removed** | **1 failed** — `1 created, 1 destroyed, 0 still held, 1 still alive` |
+| `wc_assert_no_window_leaks`, all five states | clean passes; leaked-handle, lost-track, and missing-line all fail; live-client returns a note |
+
+The negative-capability row is the one worth reading. The assertion was proved
+able to fail on the real mechanism, on the platform where the mechanism matters,
+by breaking the code it watches — not by feeding it a synthetic log.
+
+### 56.8 What is not proven
+
+1. **Popups are counted, but nothing exercises their teardown.** `WindowKind`
+   distinguishes toplevels from popups and both go through the same `Destroy`;
+   `wc-teardown.sh` only ever opens a toplevel. A menu-opening leg would be the
+   sharper test and `wc-popup.sh` is where it belongs.
+2. **The enumeration is `WaycomposeToplevel` only.** `WaycomposeController` is
+   one window for the life of the process and is deliberately not counted, but
+   that means a leak of *it* is invisible to this check. It cannot leak per
+   client, which is why it is out of scope rather than an omission.
+3. **No cross-VM leg.** The report is printed by whichever compositor runs, so
+   `wc-guest.sh` would get it for free — but nothing has asserted on it there,
+   and a guest run has not been made.
+4. **This checks windows, not everything that can outlive its client.** Pools
+   are already counted (`pools_created`/`pools_released`); surfaces, subsurfaces
+   and seat objects are not. The category is now open rather than closed, and
+   the shape of the next one is the same: ask somebody outside the process.

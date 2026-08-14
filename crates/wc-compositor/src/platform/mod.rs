@@ -569,7 +569,19 @@ pub enum ToUi {
     },
 
     /// End the pump.
-    Quit,
+    ///
+    /// `clients` is how many Wayland clients were still connected when the
+    /// compositor decided to stop. STAGE 54: it rides on this message rather
+    /// than being printed separately because the number it qualifies -- how
+    /// many windows are still alive -- is only knowable on the UI thread, and
+    /// two lines that have to be read together are two lines that can be read
+    /// apart. **A window whose client is still connected is not a leak**; a
+    /// compositor that exits on an idle timeout with a client still up is
+    /// entitled to still have its window, and the first run of this stage's
+    /// own assertion failed exactly that way.
+    Quit {
+        clients: u32,
+    },
 }
 
 /// `wl_data_device_manager.dnd_action`, which both sides of the boundary speak.
