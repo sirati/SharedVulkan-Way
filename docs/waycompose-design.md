@@ -19510,3 +19510,190 @@ box, which is the whole of §27.6's lesson.
 | `scripts/wc-guest.sh damage` on a box with no `WC_HOST` | declines with its reason |
 | `wc_topology_declare` / `wc_latency_claim`, all three states | undeclared refuses, `same-box` refuses, `cross-vm` without `WC_HOST` is refused at declaration |
 | **`scripts/wc-guest.sh damage` against a real guest** | **NOT RUN — testhost is down** |
+
+## 52. Nothing asserted that a window stopped existing
+
+*(§35's continuation, on the other side of the same rule.)*
+
+### 52.1 Status in one paragraph
+
+**Every window gate in this tree asserts that something appeared, and until now
+none asserted that anything went away.** `wc-window.sh` waits for a toplevel,
+`wc-taskbar.sh` counts buttons, `wc-icon.sh` reads an icon back,
+`wc-titlebar.sh` measures a caption; the three harnesses that mention
+destruction all do it by grepping the compositor's own log for
+`xdg_toplevel destroyed -> window N`, which is the code under test reporting its
+own success. A compositor that dropped its map entry, printed that line and
+never called `DestroyWindow` would keep the entire suite green while leaking an
+`HWND`, its icons and its `IDropTarget` registration once per client, for a
+whole session — on a compositor whose windows come and go with a client's menus.
+`scripts/probe-life.c` and `scripts/wc-life.sh` are the missing *category*: a
+separate process that never speaks to the compositor asks the window manager
+instead, and the answer is now **11 passed, 0 failed, 1 skipped**. The
+compositor is clean — six windows created, six destroyed, zero left, and its own
+claim of six agrees with the window manager's count. **Three of the four things
+that went wrong on the way there were the harness lying to itself**, which is
+recorded in 52.4 because each was indistinguishable from the defect being looked
+for.
+
+### 52.2 Why this is a category and not a missing assertion
+
+§35 is the section about gates that report success while something is wrong, and
+its examples are all one gate measuring one wrong thing. This is the same rule
+seen from a distance: not a gate that is wrong, but a **question nobody asked**.
+
+Everything in a compositor's window path is naturally shaped to answer "did it
+appear". A test creates a client, waits for a window, and looks at it; if the
+window is not there the test cannot proceed and fails loudly. Disappearance has
+no such shape. There is nothing to wait for, nothing to look at, and the
+absence of a thing is exactly what a test that has already finished looks like.
+So the assertion has to be constructed deliberately, against an instrument that
+can tell "gone" from "was never there" — and if it is not constructed, its
+absence is silent for as long as the project lasts.
+
+The cost of not asking is not hypothetical. `ToUi::Destroy` does four things —
+`release_icons`, `drag::revoke`, `DestroyWindow`, and removing the map entry —
+and **the map entry is the only one any existing gate could notice**, because it
+is the one the compositor's own log line is downstream of. The other three could
+each be deleted without a single red result.
+
+### 52.3 What the outside witness can and cannot see here
+
+```
+probe-life.exe pidof   --title <substr>   the PID owning a visible toplevel
+probe-life.exe count   --pid <n>          user=, gdi=, toplevels=, all=, counter=
+probe-life.exe alive   --hwnd <h>         IsWindow
+probe-life.exe windows --pid <n>          one line per window it still owns
+```
+
+**The obvious instrument does not work on the only platform available, and that
+was measured rather than assumed.** `GetGuiResources` is the kernel's own
+per-process USER and GDI handle count and is precisely the right question;
+**Wine returns 0 for it**, checked against a `notepad` that plainly owned three
+windows. A harness that asserted `user == baseline` here would compare zero to
+zero and pass for ever — the exact defect this section is about, reintroduced by
+the tool meant to detect it.
+
+So `probe-life.exe` reports a fifth field, `counter=stub|live|denied`, and
+derives it from a contradiction rather than from a platform check: a process
+that owns windows owns USER objects, so `toplevels > 0` with `user == 0` means
+the counter is not implemented, whoever is underneath. `wc-life.sh` reads that
+word and **skips the handle assertion by name**, which is one `SKIP` in the
+output and a sentence in the log rather than a green tick that means nothing.
+
+What does work is `EnumWindows` over the compositor's PID, and it is the
+assertion that matters anyway: a leaked `HWND` is still enumerable.
+
+### 52.4 Four things that went wrong, three of which were the harness
+
+Each of these presented as the defect being hunted. That is the point of
+recording them: on this subject a broken instrument and a broken compositor
+produce the same output.
+
+**1. A client that closed itself.** `weston-terminal` was the obvious churn
+client and is the wrong one — it runs a shell in a pty, and on a
+non-interactive launch that shell exits at once and takes the terminal with it.
+The compositor's log showed the entire life of window 1, created through
+destroyed, inside five seconds, and the harness reported that no window existed
+to measure. Giving it a `--shell` script that blocks did not help; the terminal
+still went and left the blocked script behind as an orphan.
+`weston-clickdot` has no pty and no child. **A window whose lifetime the harness
+does not control is not a window the harness can ask lifetime questions about**,
+which on this subject is not a detail but the experiment backwards.
+
+**2. A probe whose answer went nowhere.** `EnumWindows` enumerates the *calling
+thread's* desktop, so the probe must be launched into the compositor's virtual
+desktop with `wine explorer /desktop=…` — and `wine explorer` starts the program
+without connecting its stdout to the caller. The probe found the right windows
+and reported nothing, and the harness said `no window titled 'ClickDot'` about a
+client that was running happily with its window mapped. It answers into a file
+now, as `probe-drag.exe` already did for the same reason.
+
+**3. A kill that killed the wrong process.** `wl` is a shell function, so
+`wl "$CLIENT" &` backgrounds a *subshell* and `$!` is the subshell's pid; the
+client is its child and survives `kill "$CLIENT"`. The first churn run therefore
+produced this, which is worth reading as though it were a bug report:
+
+```text
+FAIL  cycle 1: window 655528 still exists after its client went away
+FAIL  cycle 2: window 5636270 still exists after its client went away
+…
+FAIL  the compositor owns 8 windows after 5 cycles, up from 3 -- an HWND per client is leaking
+----  the compositor's own log claims 0 destruction(s)
+```
+
+That is a perfect description of a compositor that never destroys anything, and
+it was produced by a harness that never closed a client. **The assertion was
+right and its subject was wrong.** The tell is in the output and was missed
+twice: `claims 0 destruction(s)` — a compositor leaking windows would still have
+*seen* the clients go.
+
+**4. An instrument that intermittently said nothing.** One `wine explorer`
+invocation in twelve failed to start the program, returning an empty string. Had
+that reached the comparison it would have been read as "not gone", which is the
+right answer today and a wrong one the moment the empty string lands on the
+other branch. `life()` retries and returns non-zero rather than an empty string
+that reads like a verdict.
+
+### 52.5 The assertions, and why none of them can pass vacuously
+
+The baseline is **zero**: the compositor's own controller window is message-only
+and `EnumWindows` does not enumerate those, so with no client mapped it owns
+nothing enumerable. "Zero windows after five cycles, the same as before" is
+therefore a comparison of zero to zero, and would be worthless on its own.
+Three assertions exist to stop it being worthless, and each is the same
+discipline — *show the instrument giving the other answer*:
+
+| assertion | what stops it passing vacuously |
+|---|---|
+| every window was `alive` while its client ran | the same call on the same handle answers `gone` later, so the instrument is not stuck |
+| the count **rose** above baseline on every cycle | a counter that never moves cannot show a leak; this shows it moving |
+| every window was `gone` after its client went | paired with the row above, on the same handle |
+| the count returned to baseline | meaningful only because the two rows above proved it left it |
+| the compositor's claim equals the number of windows | six claimed for six created — the internal and external accounts are compared rather than one being trusted |
+
+The last row is the whole point of the harness. The compositor's log has always
+said it destroyed things; this is the first run in which anything checked.
+
+### 52.6 What is not proven
+
+1. **`RevokeDragDrop` is not observed.** `ToUi::Destroy` revokes the drop-target
+   registration before `DestroyWindow` (§43.7's ordering), and nothing here can
+   see whether it happened: OLE's registration table is not enumerable from
+   another process. A leak there would show as a `RegisterDragDrop` failure on a
+   later window that reused the `HWND`, which no run has provoked. §50's harness
+   is the one positioned to check it.
+2. **Icons are not observed.** `release_icons` runs on the same path and its
+   effect is an `HICON` count — a GDI object, which is exactly what
+   `GetGuiResources` would answer and Wine will not.
+3. **This is Wine, and the handle counter is the part Windows would answer.**
+   The single most valuable re-run of this harness is on the guest, where
+   `counter=live` and the `SKIP` becomes an assertion. §50.3 is what that needs.
+4. **Popups are not churned.** A menu is the highest-frequency window in a real
+   session and §43.7 deliberately does not register popups as drop targets, so
+   their create/destroy path differs from a toplevel's. This churns toplevels
+   only.
+5. **Five cycles is not a soak.** It shows the count returning to baseline, not
+   that it does so ten thousand times.
+6. **Nothing here asserts the `HWND` is not merely hidden.** `EnumWindows`
+   enumerates hidden windows too — which is why the count uses `all=` rather
+   than `toplevels=` — but a window destroyed on one desktop and re-parented to
+   another would not be noticed.
+
+### 52.7 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-life.sh wine`** (new) | **11 passed, 0 failed, 1 skipped** |
+| `cargo test --workspace --no-fail-fast` | unchanged — this section adds no Rust |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-xref.sh` | 0 broken, 0 ambiguous |
+
+`wc-life.sh` declares `wine-fixture` and `same-box`, and makes no latency claim.
+The compositor's log from a run is in `docs/life/compositor.log`.
+
+**No Rust changed, and that is the result rather than an omission.** The
+compositor was already correct on this path: six windows created, six destroyed,
+none left, its own count agreeing with the window manager's. What did not exist
+was any way to know that — and the difference between "correct" and "known to be
+correct" is the whole of what this section adds.
