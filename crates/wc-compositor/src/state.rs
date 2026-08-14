@@ -2547,7 +2547,6 @@ impl State {
         committed: &WlSurface,
         committed_damage: &[Rect],
     ) -> (Vec<Rect>, i32, i32) {
-        use smithay::wayland::shell::xdg::SurfaceCachedState;
 
         // Where each surface of the tree sits, relative to the root surface's
         // own origin. Collected first because composing needs `&mut` on the
@@ -2558,9 +2557,7 @@ impl State {
         // The window geometry rectangle, in root-surface coordinates. Absent
         // means "the whole buffer", which is what the protocol says and what
         // every non-GTK client relies on.
-        let geometry = compositor::with_states(root, |states| {
-            states.cached_state.get::<SurfaceCachedState>().current().geometry
-        });
+        let geometry = declared_geometry(root);
         // **"The full bounds of the surface, *including any subsurfaces*."**
         //
         // That is `xdg_surface.set_window_geometry`'s wording for what the
@@ -2651,6 +2648,29 @@ impl State {
 /// placed the way every menu was placed before this stage.
 fn popup_bounds_of(window: &Window) -> Option<Rect> {
     *window.popup_bounds.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The window geometry rectangle a client has **declared**, if it has declared
+/// one.
+///
+/// ADDED FOR §45, as one function because it now has two readers and they must
+/// not drift: `compose_tree` turns it into the window's crop and size, and the
+/// state-only commit path in `CompositorHandler::commit` compares it against
+/// what the window already has to decide whether that work is needed at all.
+///
+/// `None` is a real answer and is not the same as `Some` of the buffer's
+/// rectangle. It means the client has never called
+/// `xdg_surface.set_window_geometry`, and the protocol then defines the
+/// geometry as the bounds of the tree — which is a *derived* value that changes
+/// whenever a subsurface moves, and therefore cannot be compared against a
+/// stored one to detect a client's intent. Keeping the two cases distinct here
+/// is what stops the caller confusing "the client changed its mind" with "a
+/// subsurface moved".
+fn declared_geometry(root: &WlSurface) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
+    use smithay::wayland::shell::xdg::SurfaceCachedState;
+    compositor::with_states(root, |states| {
+        states.cached_state.get::<SurfaceCachedState>().current().geometry
+    })
 }
 
 /// Every surface of `root`'s subsurface tree, with its position relative to
@@ -3018,8 +3038,87 @@ impl CompositorHandler for State {
                 }
             }
             // A commit with no new buffer: state-only, or an ack. Damage
-            // without a buffer means nothing.
-            None => {}
+            // without a buffer means nothing — but the *geometry* can mean a
+            // great deal.
+            //
+            // **`xdg_surface.set_window_geometry` is double-buffered, and until
+            // §45 it was only ever read on the buffer path.** `compose_tree` is
+            // the one place that turns a geometry rectangle into
+            // `Window::content_offset` and into the window's size, and
+            // `present` is the only caller — so a client that set a geometry
+            // and committed *without attaching a new buffer* had it applied to
+            // nothing. The crop stayed where it was, the window kept its old
+            // size, and every input event kept arriving at the old offset.
+            //
+            // That is not a corner case invented by the suite. It is what a
+            // client does whenever its window outline changes but its pixels do
+            // not: leaving a maximised state, a GTK client adjusting its shadow
+            // margin, anything that acks a configure and re-declares its
+            // geometry before it has drawn. WLCS asks it as
+            // `XdgToplevelStableTest.pointer_respects_window_geom_offset` and
+            // its touch twin, and both failed with the pointer arriving at the
+            // raw window coordinate — the exact symptom §37 fixed for the
+            // buffer path, surviving on the path §37 did not look at.
+            //
+            // **Only a *declared* geometry, and only when it has changed**, and
+            // both halves were learned by breaking something.
+            //
+            // The first attempt recomposed on every state-only commit of a
+            // window root. That is two tests worse, not better, and the reason
+            // is instructive: when a client has declared *no* geometry the
+            // protocol defines it as the bounds of the tree, so recomposing
+            // re-derives `content_offset` from wherever the subsurfaces
+            // currently are — and a parent's commit is exactly the moment
+            // smithay is applying pending subsurface state, so the walk can
+            // read positions that are about to change. The compositor then
+            // caches a crop computed from a half-applied tree, and the pointer
+            // arithmetic that §40 fixed is wrong again by that difference.
+            // `place_above_simple` and `subsurface_moves_under_input_device`
+            // are the two that noticed.
+            //
+            // So the trigger is a client's *stated* intent — a rectangle it
+            // called `set_window_geometry` with — compared against the one the
+            // window is already using. A derived geometry is left to the buffer
+            // path, where the tree is settled, and to §40's hit test, which
+            // reads subsurface positions live and never caches them.
+            None => {
+                let declared = declared_geometry(surface)
+                    .filter(|r| r.size.w > 0 && r.size.h > 0);
+                if let (true, Some(r)) = (self.windows.contains_key(surface), declared) {
+                    let before = self.windows[surface].content_offset;
+                    let before_size = self.windows[surface]
+                        .shadow
+                        .lock()
+                        .map(|s| (s.width(), s.height()))
+                        .unwrap_or((0, 0));
+                    // Not an early `return`: the pointer re-evaluation at the
+                    // end of this function is §40's, it applies to every
+                    // commit, and skipping it here would trade one bug for
+                    // another.
+                    let changed = before != (r.loc.x, r.loc.y)
+                        || before_size != (r.size.w, r.size.h);
+                    let (_, w, h) = if changed {
+                        self.compose_tree(surface, surface, &[])
+                    } else {
+                        (Vec::new(), 0, 0)
+                    };
+                    let after = self.windows[surface].content_offset;
+                    if w > 0 && h > 0 && (before != after || before_size != (w, h)) {
+                        let id = self.windows[surface].id;
+                        println!(
+                            "wc-compositor: window {id} geometry committed without a buffer: \
+                             crop {before:?} -> {after:?}, {}x{} -> {w}x{h}",
+                            before_size.0, before_size.1
+                        );
+                        // The whole window, because the crop moved: every pixel
+                        // of it now shows a different part of the buffer.
+                        self.ui.send(ToUi::Present {
+                            id,
+                            damage: vec![Rect::new(0, 0, w, h)],
+                        });
+                    }
+                }
+            }
         }
 
         if icon_dirty {
@@ -3374,9 +3473,10 @@ impl XdgShellHandler for State {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(window) = self.windows.get(surface.wl_surface()) {
+        let id = self.windows.get(surface.wl_surface()).map(|w| w.id);
+        if let Some(id) = id {
             self.ui.send(ToUi::SetWindowState {
-                id: window.id,
+                id,
                 maximized: Some(true),
                 minimized: None,
             });
@@ -3385,18 +3485,48 @@ impl XdgShellHandler for State {
         // the compositor declines. The real state arrives a moment later from
         // `WM_SIZE`; this meets the protocol obligation on time rather than
         // making it conditional on a round trip through Win32.
-        surface.send_configure();
+        //
+        // **§45: the configure has to carry the state, not merely exist.** It
+        // used to be a bare `send_configure()`, on the reasoning that the state
+        // was Windows' to report and would follow from `WM_SIZE`. Both halves
+        // of that are true and the conclusion still did not hold: a client that
+        // asks to be maximised and receives a configure *without* the maximized
+        // state has been told, in the protocol's own terms, that its request
+        // was declined. It then gets a second configure a moment later saying
+        // the opposite. Nothing in xdg-shell licenses that sequence, and a
+        // client is entitled to act on the first one — WLCS's
+        // `window_can_maximize_itself` does exactly that, waiting for one
+        // configure and reading the state off it.
+        //
+        // So the state is adopted here, at the moment the request is honoured
+        // and forwarded, rather than borrowed from the echo. **If Windows
+        // refuses, the echo corrects it** — `FromUi::Maximized { on: false }`
+        // runs through the same `set_state` and sends another configure — so
+        // the optimism is bounded by the same round trip that used to be waited
+        // for, and the disagreement is now the exceptional case rather than the
+        // ordinary one.
+        match id {
+            Some(id) => self.set_state(id, |s| toggle(s, xdg_state::Maximized, true)),
+            None => { surface.send_configure(); }
+        }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(window) = self.windows.get(surface.wl_surface()) {
+        // The mirror of `maximize_request`, and it carries the state for the
+        // same reason: a configure that does not clear `maximized` says the
+        // request was declined.
+        let id = self.windows.get(surface.wl_surface()).map(|w| w.id);
+        if let Some(id) = id {
             self.ui.send(ToUi::SetWindowState {
-                id: window.id,
+                id,
                 maximized: Some(false),
                 minimized: None,
             });
         }
-        surface.send_configure();
+        match id {
+            Some(id) => self.set_state(id, |s| toggle(s, xdg_state::Maximized, false)),
+            None => { surface.send_configure(); }
+        }
     }
 
     fn minimize_request(&mut self, surface: ToplevelSurface) {

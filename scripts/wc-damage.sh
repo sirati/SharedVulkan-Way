@@ -301,7 +301,7 @@ check_run() {
   # of the blind spot is the discrepancy. That is a bound on coverage that
   # cannot be defeated by load, by the client, or by how long the run lasted.
   #
-  # **The third term is §45's, and it was added because this assertion
+  # **The third term is §46's, and it was added because this assertion
   # failed.** The identity was originally written with two terms, on the premise
   # that `commit` increments one of them every time. It does not: it returns
   # early for a surface that has never had a buffer attached, for a buffer or
