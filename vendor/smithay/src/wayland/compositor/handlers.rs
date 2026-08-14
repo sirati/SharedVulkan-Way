@@ -558,12 +558,39 @@ impl Cacheable for SubsurfaceCachedState {
 
 pub(crate) struct SubsurfaceState {
     pub(crate) sync: AtomicBool,
+    /// The position `wl_subsurface.set_position` last asked for, **not yet
+    /// applied**.
+    ///
+    /// # Why this is not in `SubsurfaceCachedState`
+    ///
+    /// waycompose §68. The protocol is explicit and it is the one sentence this
+    /// whole field exists for:
+    ///
+    /// > "Position is double-buffered state **on the parent surface**, see
+    /// > wl_subsurface and wl_surface.commit for more information."
+    ///
+    /// A `Cacheable` in `cached_state` is double-buffered on the surface that
+    /// *owns* it, which for a subsurface is the child. That is the same thing
+    /// only while the child is synchronized — a sync child's cache is applied
+    /// when the parent commits anyway. In **desync** mode the child's own commit
+    /// applies its cache immediately, and the position then moves with no parent
+    /// commit at all, which WLCS's
+    /// `subsurface_does_not_move_when_parent_not_committed` measures directly:
+    /// it sets desync, sets position (20, 20), commits *only* the subsurface,
+    /// and requires the pointer to still be at (30, 30) rather than (10, 10).
+    ///
+    /// So the pending value lives here, outside the child's cache, and
+    /// [`super::tree::PrivateSurfaceData::commit`] promotes it into
+    /// `SubsurfaceCachedState::current` when the **parent** commits. Readers are
+    /// unaffected: `current().location` is still where the applied position is.
+    pub(crate) pending_location: Mutex<Point<i32, Logical>>,
 }
 
 impl SubsurfaceState {
     fn new() -> SubsurfaceState {
         SubsurfaceState {
             sync: AtomicBool::new(true),
+            pending_location: Mutex::new((0, 0).into()),
         }
     }
 }
@@ -604,16 +631,19 @@ where
     ) {
         match request {
             wl_subsurface::Request::SetPosition { x, y } => {
+                // waycompose §68: staged on the **parent's** behalf, not in this
+                // surface's own cache. See `SubsurfaceState::pending_location`
+                // for the protocol sentence that requires it and for what the
+                // old placement measured wrong.
                 let client_scale = state.client_compositor_state(client).client_scale();
+                let location = Point::<i32, Client>::from((x, y))
+                    .to_f64()
+                    .to_logical(client_scale)
+                    .to_i32_round();
                 PrivateSurfaceData::with_states(&data.surface, |state| {
-                    state
-                        .cached_state
-                        .get::<SubsurfaceCachedState>()
-                        .pending()
-                        .location = Point::<i32, Client>::from((x, y))
-                        .to_f64()
-                        .to_logical(client_scale)
-                        .to_i32_round();
+                    if let Some(sub) = state.data_map.get::<SubsurfaceState>() {
+                        *sub.pending_location.lock().unwrap() = location;
+                    }
                 })
             }
             wl_subsurface::Request::PlaceAbove { sibling } => {

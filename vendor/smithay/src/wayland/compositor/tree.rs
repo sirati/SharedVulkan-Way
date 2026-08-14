@@ -41,6 +41,26 @@ type DestructionHook = dyn Fn(&mut dyn Any, &WlSurface) + Send + Sync;
 pub struct PrivateSurfaceData {
     parent: Option<WlSurface>,
     children: Vec<WlSurface>,
+    /// The sibling order `place_above`/`place_below` last asked for, **not yet
+    /// applied**. `None` when nothing has been restacked since the last commit.
+    ///
+    /// waycompose §68, and the protocol sentence is the twin of the one behind
+    /// `SubsurfaceState::pending_location`:
+    ///
+    /// > "Z-order is double-buffered state **on the parent surface**, see
+    /// > wl_subsurface and wl_surface.commit for more information."
+    ///
+    /// `reorder` used to permute `children` in place, on the bare request, with
+    /// the parent's commit not involved at all — so a client that restacked and
+    /// did not commit its parent saw the new stacking immediately, and one that
+    /// restacked twice before committing saw the intermediate state.
+    ///
+    /// Kept as a separate list rather than by deferring the permutation,
+    /// because `children` also changes for reasons that are *not* double
+    /// buffered — a subsurface being created or destroyed — and those must keep
+    /// working between a restack and the commit that applies it. Promotion
+    /// therefore reconciles rather than assigns: see `apply_child_state`.
+    pending_children: Option<Vec<WlSurface>>,
     public_data: SurfaceData,
     pending_transaction: PendingTransaction,
     current_txid: Serial,
@@ -102,6 +122,7 @@ impl PrivateSurfaceData {
         Mutex::new(PrivateSurfaceData {
             parent: None,
             children: vec![],
+            pending_children: None,
             public_data: SurfaceData {
                 role: Default::default(),
                 data_map: Default::default(),
@@ -255,11 +276,70 @@ impl PrivateSurfaceData {
         }
     }
 
+    /// Apply the positions `wl_subsurface.set_position` staged for `surface`'s
+    /// **direct children**.
+    ///
+    /// waycompose §68. *"Position is double-buffered state on the parent
+    /// surface"* — so this is the parent's commit doing the applying, and it is
+    /// the only place a subsurface's location becomes current. See
+    /// `handlers::SubsurfaceState::pending_location` for why the value cannot
+    /// live in the child's own `cached_state`.
+    ///
+    /// Called from **both** commit paths. `commit` handles a surface committing
+    /// on its own; `commit_sync_surface_tree` handles the synchronized subtree a
+    /// desync ancestor drags along with it, where each level is somebody's
+    /// parent and owes its children the same service.
+    fn apply_child_positions(surface: &WlSurface, dh: &DisplayHandle) {
+        let _ = dh;
+        // §68: the stacking order first, and in its own lock scope — the loop
+        // below takes each child's lock, and holding the parent's across that
+        // is how a tree walk deadlocks.
+        Self::apply_pending_order(surface);
+        for child in Self::get_children(surface) {
+            // A surface is in its own children list (see the field's comment),
+            // so the parent would otherwise apply its own pending position and
+            // move itself.
+            if child.id() == surface.id() {
+                continue;
+            }
+            Self::with_states(&child, |states| {
+                let Some(sub) = states
+                    .data_map
+                    .get::<super::handlers::SubsurfaceState>()
+                else {
+                    return;
+                };
+                let pending = *sub.pending_location.lock().unwrap();
+                // **Both halves, and the pending one is not redundant.**
+                //
+                // `SubsurfaceCachedState` is still a `Cacheable`, so the child's
+                // own commit will promote its pending value over whatever is
+                // current. With `set_position` no longer writing that pending
+                // value it stays at its default, so writing only `current` here
+                // is undone by the child's very next commit — measured, and it
+                // cost nine passing tests in `XdgShellStableSubsurfaces`
+                // (17 passed/7 failed became 8/16) before this line existed.
+                //
+                // Keeping the two equal makes the cache's promotion a no-op and
+                // leaves `current().location` — which is what every reader uses,
+                // `placed_tree` included — the single applied value.
+                let mut cached = states
+                    .cached_state
+                    .get::<super::handlers::SubsurfaceCachedState>();
+                cached.pending().location = pending;
+                cached.current().location = pending;
+            });
+        }
+    }
+
     fn commit_sync_surface_tree(
         surface: &WlSurface,
         parent_transaction: &PendingTransaction,
         dh: &DisplayHandle,
     ) {
+        // §68: this surface is the parent of the next level down, and its state
+        // is being applied now, so its children's positions are applied now too.
+        Self::apply_child_positions(surface, dh);
         let children = PrivateSurfaceData::get_children(surface);
         let mut my_data = Self::lock_user_data(surface);
 
@@ -280,6 +360,24 @@ impl PrivateSurfaceData {
 
     pub fn commit<C: CompositorHandler + 'static>(surface: &WlSurface, dh: &DisplayHandle, state: &mut C) {
         let is_sync = is_effectively_sync(surface);
+        // §68. A commit on *this* surface makes its children's staged positions
+        // current — **but only if this commit is itself taking effect.**
+        //
+        // `is_sync` is the whole of that condition and leaving it out is a real
+        // bug, measured: an effectively-synchronized surface's commit applies
+        // nothing until its own parent commits, so applying its children's
+        // positions here moves a grandchild one commit early. It cost three
+        // `SubsurfaceMultilevelTest` cases —
+        // `subsurface_with_sync_parent_does_not_move_when_only_parent_committed`
+        // and the two `..._is_sync` ones — which is the suite doing exactly the
+        // job it exists for.
+        //
+        // The synchronized case is not skipped, only deferred: when a desync
+        // ancestor eventually commits, `commit_sync_surface_tree` walks this
+        // subtree and applies each level's children there.
+        if !is_sync {
+            Self::apply_child_positions(surface, dh);
+        }
         let children = PrivateSurfaceData::get_children(surface);
         let mut my_data = Self::lock_user_data(surface);
         // commit our state
@@ -429,12 +527,30 @@ impl PrivateSurfaceData {
         }
 
         let mut parent_guard = Self::lock_user_data(&parent);
-        let my_index = index_of(surface, &parent_guard.children).unwrap();
-        let mut other_index = match index_of(relative_to, &parent_guard.children) {
+        // §68: staged, not applied. The permutation is computed against the
+        // pending order so that two restacks before one commit compose, which
+        // is what "double-buffered" means and what permuting `children` twice
+        // in place could not express.
+        let mut order = parent_guard
+            .pending_children
+            .take()
+            .unwrap_or_else(|| parent_guard.children.clone());
+
+        let my_index = match index_of(surface, &order) {
             Some(idx) => idx,
-            None => return Err(()),
+            None => {
+                parent_guard.pending_children = Some(order);
+                return Err(());
+            }
         };
-        let me = parent_guard.children.remove(my_index);
+        let mut other_index = match index_of(relative_to, &order) {
+            Some(idx) => idx,
+            None => {
+                parent_guard.pending_children = Some(order);
+                return Err(());
+            }
+        };
+        let me = order.remove(my_index);
         if my_index < other_index {
             other_index -= 1;
         }
@@ -442,9 +558,38 @@ impl PrivateSurfaceData {
             Location::Before => other_index,
             Location::After => other_index + 1,
         };
-        parent_guard.children.insert(new_index, me);
+        order.insert(new_index, me);
+        parent_guard.pending_children = Some(order);
 
         Ok(())
+    }
+
+    /// Promote the staged sibling order, if there is one.
+    ///
+    /// §68. **Reconciles rather than assigns**, because `children` also changes
+    /// for reasons that are not double-buffered: a subsurface can be created or
+    /// destroyed between a `place_above` and the commit that applies it, and the
+    /// staged list is a snapshot from before that happened. So the applied order
+    /// is the staged one filtered to children that still exist, followed by any
+    /// child the snapshot never saw — which lands a newly created subsurface on
+    /// top, exactly as *"a new sub-surface is initially added as the top-most in
+    /// the stack of its siblings and parent"* requires and as `add_child`'s
+    /// `push` already did.
+    fn apply_pending_order(surface: &WlSurface) {
+        let mut data = Self::lock_user_data(surface);
+        let Some(staged) = data.pending_children.take() else {
+            return;
+        };
+        let mut applied: Vec<WlSurface> = staged
+            .into_iter()
+            .filter(|s| data.children.iter().any(|c| c.id() == s.id()))
+            .collect();
+        for child in &data.children {
+            if !applied.iter().any(|s| s.id() == child.id()) {
+                applied.push(child.clone());
+            }
+        }
+        data.children = applied;
     }
 }
 

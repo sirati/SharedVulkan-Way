@@ -23269,3 +23269,121 @@ the screen beat asking what is in the process list**, both times.
    should therefore compare against a *baseline of itself*, which is what §53's
    harness already does for the enumerated count, rather than treating the
    number as a window count.
+
+---
+---
+
+## 74. §68 fixed: subsurface position and z-order now apply on the parent's commit
+
+### 74.1 Status in one paragraph
+
+§68 diagnosed the deviation and stopped, calling the fix "a session with its own
+measurements". The user's answer was that a known-wrong state machine is not a
+documentation item, and that is right. Both halves are now fixed in
+`vendor/smithay`: **position** is staged outside the child's cache and promoted
+when the parent commits, and **z-order** is staged as a pending sibling list and
+promoted the same way. WLCS headless goes **413 passed / 53 failed to 415 / 51**,
+the subsurface suite **17 / 7 to 19 / 5**, and `cargo test --workspace` is
+unchanged at 2629 — which is the §40 guard doing its job, because the blit and
+the hit test read the very list this changed.
+
+### 74.2 Position, and the two mistakes the suite caught
+
+`SubsurfaceState::pending_location` holds what `set_position` asked for;
+`PrivateSurfaceData::commit` promotes it into `SubsurfaceCachedState::current`
+when the **parent** commits. Readers are untouched: `current().location` is still
+the applied value, which is what `placed_tree` reads.
+
+Neither of the two errors on the way was predictable from the diagnosis, and both
+are recorded at the line that fixes them:
+
+1. **Writing only `current` is undone by the child's next commit.**
+   `SubsurfaceCachedState` is still a `Cacheable`, so the child's commit promotes
+   its pending value over whatever is current — and with `set_position` no longer
+   writing that pending value, it stays at the default and the position snapped
+   back to (0, 0). **17 passed / 7 failed became 8 / 16.** Both halves are written
+   now, which makes the cache's promotion a no-op.
+2. **Applying on every commit is wrong for a synchronized surface**, whose commit
+   takes effect only when *its* parent commits. Applying there moves a grandchild
+   one commit early and cost three `SubsurfaceMultilevelTest` cases —
+   `subsurface_with_sync_parent_does_not_move_when_only_parent_committed` and the
+   two `..._is_sync` ones. Guarded on `!is_sync`; the synchronized case is
+   deferred rather than skipped, and `commit_sync_surface_tree` applies it when a
+   desync ancestor commits.
+
+The first of those took the suite from better-than-baseline to far worse in one
+step, which is the argument for running it after every edit rather than at the
+end of the session.
+
+### 74.3 Z-order, and why it reconciles rather than assigns
+
+`reorder` now permutes `PrivateSurfaceData::pending_children` — initialised from
+`children` on the first restack after a commit — so two restacks before one
+commit **compose**, which is what double-buffering means and what permuting the
+live list twice could not express.
+
+Promotion is not an assignment. `children` also changes for reasons that are
+*not* double-buffered — a subsurface created or destroyed between the restack and
+the commit — and the staged list is a snapshot from before that happened. So
+`apply_pending_order` filters the snapshot to children that still exist and
+appends any the snapshot never saw, which lands a newly created subsurface on top:
+exactly what *"a new sub-surface is initially added as the top-most in the stack
+of its siblings and parent"* requires, and what `add_child`'s `push` already did.
+
+It is applied in `apply_child_positions`, before the loop and in its own lock
+scope — the loop takes each child's lock, and holding the parent's across that is
+how a tree walk deadlocks.
+
+### 74.4 §66.4's hypothesis is now answered on evidence
+
+§66.4 read `place_above_simple` and `place_below_simple` as unsatisfiable — each
+asserts the moved subsurface is not focused *and* that the fixture's is not, when
+after the restack one of them must be — and refused to conclude the suite was
+wrong without a reference run. §68.4 then said the reading could not be trusted
+anyway, because with z-order applied on the bare request the stack those tests
+assert about was not the stack we built.
+
+It is now. And in the full run:
+
+```
+grep -c "wrong surface/subsurface on top"   ->  2
+grep -c "did not have an effect"            ->  0
+```
+
+**Both tests now pass their first assertion and fail only their second.** The
+restacking has an effect, measured; what remains is the pair asserting that
+neither subsurface is on top. That is the evidence §66.4 asked for, arrived at by
+fixing the deviation rather than by running a reference compositor — and it means
+the two are almost certainly not ours. They are still counted as ours, because
+"almost certainly" is not a reference run, and the run is still one command.
+
+### 74.5 The score
+
+| | before | after |
+|---|---|---|
+| WLCS headless | 413 passed, 53 failed | **415 passed, 51 failed** |
+| of those, expected on this leg | 30 | 30 |
+| debts (§65's number) | 23 | **21** |
+| `XdgShellStableSubsurfaces` | 17 passed, 7 failed | **19 passed, 5 failed** |
+| `cargo test --workspace --no-fail-fast` | 2629 | 2629 |
+
+The cargo number not moving is the point of quoting it: `placed_tree` feeds both
+the blit and the hit test, §40 built the tests that hold them as each other's
+inverse, and a state-machine change underneath them left every one of those
+passing.
+
+### 74.6 What is still open, and it is three things
+
+1. **`subsurface_with_sync_parent_does_not_move_when_only_grandparent_committed`**
+   and **`subsurface_does_not_move_when_grandparent_commit_is_before_sync_parent_commit`**.
+   Both are three-level orderings, both still fail, and neither is explained by
+   what is now in place. The `!is_sync` guard and `commit_sync_surface_tree`
+   between them decide when a grandchild's position lands, and these two say that
+   decision is still not right for a sync middle level.
+2. **`place_above_simple` / `place_below_simple`** — §74.4. One reference run
+   against Weston or Mir closes them either way.
+3. **`subsurface_extends_parent_input_region`**, which throws `bad optional
+   access` rather than failing an assertion — the pointer entered nothing at all.
+   Untouched by any of this and still unexplained.
+
+The popup group of six remains unstarted.
