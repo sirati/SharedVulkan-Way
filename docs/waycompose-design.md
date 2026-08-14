@@ -24564,9 +24564,11 @@ platforms, and which one a connection speaks is a field on its `BufferedSocket`
 set by whoever accepted it — §72.3's "the transport picks", built. A Linux
 `wc-compositor` can now parse an in-band `wl_shm.create_pool` and map the named
 object it names, which is the half of §72.3's defect that lived in this tree.
-**The acceptance test has not been run**, and the proxy still spells its upstream
-dialect as a constant, so the tripwire stays; 79.7 is precise about the line
-between what is proven and what is merely compiled.
+**The acceptance test passes**: `scripts/wc-pool.sh` runs `wc-pooltest` through
+`wc-proxy` to a Linux compositor and the four pools cross, where the identical
+topology with one flag removed still hangs exactly as §72.3 describes. The
+tripwire is deleted (79.9). What is **not** fixed is the reverse direction for a
+keymap, and 79.7 draws that line precisely.
 
 ### 79.2 The prediction held to the line
 
@@ -24708,18 +24710,58 @@ and silently accepting would reproduce §72.3's desync one layer down.
    same applies to the clipboard and drag pipes.
 
 So the pool path — the one §72.3 names — is built end to end and the keymap path
-is not. That is the honest split, and 3 is why `wayland-info` over the relay is
+is not. That is the honest split, and 2 is why `wayland-info` over the relay is
 still expected to fail where `wc-pooltest` is not.
+
+### 79.9 The acceptance test, both legs
+
+`scripts/wc-pool.sh` runs `scripts/wc-pooltest.c` through `wc-proxy` to a
+**Linux** `wc-compositor`, on one host, and it is in the tree because §72.3 asked
+for exactly this: "that is the regression test, and it has to go from failing to
+passing".
+
+| leg | what it is | client exit | pools the proxy published |
+|---|---|---|---|
+| **fixed** | compositor told its socket peer is a proxy (`--in-band`) | **0** | **4** |
+| **control** | identical, without telling it | **124 (timeout)** | **1** |
+
+**The control leg is half the test.** The fixed leg alone would pass just as well
+if the compositor had quietly started ignoring `h` arguments; the control leg
+asserts that removing one flag brings back **exactly** the failure §72.3
+describes — the client publishes one pool, its next round trip never returns, and
+neither log says anything. Not an error, not a disconnect: a hang. That is what
+makes "it works now" mean "the dialect is chosen" rather than "something
+changed".
+
+**`the_upstream_dialect_is_still_assumed_rather_than_chosen` is deleted, and it
+is worth saying why the obvious objection does not hold.** Its assertion — that
+`session.rs` spells both dialects as constants — is *still literally true*, since
+`wc-proxy` is untouched. But that grep was never the point; it was a stand-in for
+the defect, and its own doc comment names the condition for removal. Its opening
+sentence, "on Unix the vendored backend's `Argument::Fd` is a raw descriptor with
+nowhere to put a `wc_handle::Descriptor`, so a rewritten `wl_shm.create_pool`
+handed to a **Linux** `wc-compositor` desynchronises its reader", is now false in
+every clause. Keeping a test whose premise is dead because its assertion still
+parses is the failure §35.10 warns about — a claim that outlives its truth — and
+it is replaced by the harness above, which asserts the defect's absence against
+the thing itself rather than against a proxy for it.
+
+The proxy's upstream dialect being a constant is no longer a *defect*; it is a
+limitation with a name: `wc-proxy` can only speak to a compositor that expects in
+band. That is every compositor this project ships. A stock third-party compositor
+behind `wc-proxy` was never supported and is not what §72.3 was about.
 
 ### 79.8 The gates
 
 | gate | result |
 |---|---|
-| `nix develop --command cargo test --workspace --no-fail-fast` | **89 binaries, 2645 passed, 0 failed** |
+| `nix develop --command cargo test --workspace --no-fail-fast` | **89 binaries, 2644 passed, 0 failed** |
 | master `c2330a4` before this | 89 binaries, 2642 passed |
+| `scripts/wc-pool.sh` | both legs pass — 79.9 |
 | `cargo clippy --workspace --all-targets` | exit 0 |
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0, and it found 79.4 |
 | `the_upstream_dialect_is_still_assumed_rather_than_chosen` | passes, and stays — see 79.7 |
 
-The three new tests are the three in 79.7. No test moved binaries and none was
-deleted.
+2644 is 2642 plus three minus one. The three are the wire tests in 79.7; the one
+is `the_upstream_dialect_is_still_assumed_rather_than_chosen`, deleted for the
+reason 79.9 gives. No test moved binaries.
