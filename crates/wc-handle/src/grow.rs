@@ -104,14 +104,19 @@ pub const CONTROL_BYTES: u64 = 272 * 1024;
 /// reverse ring by `Control`'s own directory writer, so a geometry with one
 /// slot has no slot to claim. Growth uses slot 1.
 ///
-/// `ring_data_bytes: 65536` is the one number chosen by a measurement rather
-/// than by a minimum, and the measurement is the **frame list**. A grown region
-/// answers with the page frame behind every one of its pages, run-length
-/// encoded at 16 bytes a run; `VirtualLock`ed 4 KiB pages measured 1471 runs
-/// per 64 MiB, so a 16 MiB region is ~368 runs and ~6 KiB. 64 KiB is that with
-/// two orders of magnitude of headroom, and a reply that still does not fit is
-/// answered without a frame list — the host then sweeps, which costs three
-/// seconds and is correct.
+/// `ring_data_bytes: 65536` is sized by the **frame list**, and the arithmetic
+/// is simpler and harsher than it first looked. `Reply::encode` writes one
+/// `u64` per **page** — not a run-length encoded pair — so fragmentation does
+/// not enter into it. A packet holds 65,504 bytes, 48 of them fixed, which is
+/// **8,182 pages ~= 31.96 MiB**.
+///
+/// So every region of 32 MiB or more overflows, always, and `GROW_STEP`'s
+/// 16/32/64 series reaches that on its **second** growth in every session.
+/// That is not an edge to be sized around: it is the normal case, and
+/// `GuestEnd::service` answers it by keeping the region and dropping the frame
+/// list, which costs the host a sweep. See waycompose §61.4a for why the lane
+/// is not simply made bigger — it is carved out of the outbound window, which
+/// is the one region release may never reclaim.
 ///
 /// `arena_size: 0` because this control region describes **no arena**. The
 /// arena is `wc-proxy`'s, allocated by `wc_proxy::pool`, and the slab directory
@@ -497,10 +502,20 @@ impl GuestEnd {
         let max = self.to_host.max_payload() as usize;
         if reply.encode().len() > max && !reply.frames.is_empty() {
             let pages = reply.frames.len();
+            let need = reply.encode().len();
             reply.frames.clear();
+            // Says what was *lost* and what it *costs*, not that something was
+            // dropped. This is not a rare edge — a reply carries one `u64` per
+            // page, so the ring holds about 8182 pages and every region of
+            // 32 MiB or more overflows it, which the 16/32/64 growth series
+            // reaches on its second growth. An operator will see this line on
+            // most sessions that grow twice, so it has to be a sentence that
+            // explains itself rather than a warning that invites a bug report.
             let why = format!(
-                "the frame list for {pages} page(s) does not fit in a {max}-byte ring \
-                 packet; the host will sweep for the stamps instead"
+                "no frame list: {pages} pages need {need} bytes and a ring packet holds \
+                 {max}, so this region is located by sweeping guest RAM for its stamps \
+                 instead of by translating frames — correct, and seconds rather than \
+                 milliseconds"
             );
             reply.message = if reply.message.is_empty() {
                 why
@@ -576,11 +591,15 @@ mod tests {
         assert!(back.frames.is_empty());
     }
 
-    /// A frame list for a 16 MiB region has to fit in one ring packet, or the
-    /// host sweeps for three seconds instead of translating for 0.064 s. This
-    /// is the arithmetic that says it does, at the *worst* case — one run per
-    /// page, which is what `VirtualLock`ed 4 KiB pages approach and what the
-    /// measured 1471 runs per 64 MiB is a quarter of.
+    /// A 16 MiB region -- the first growth, and `GROW_STEP` -- fits in one ring
+    /// packet, so the common case is translated rather than swept.
+    ///
+    /// This is the *lower* half of the boundary, not a worst case: the reply is
+    /// one `u64` per page, so 4096 pages is 32,816 bytes against a 65,504-byte
+    /// limit. The upper half is
+    /// `a_frame_list_too_big_for_the_ring_is_dropped_and_the_region_still_answered`,
+    /// which is where the 16/32/64 series actually lands on its second growth.
+    /// Both are needed: this one would keep passing if the encoding doubled.
     #[test]
     fn a_sixteen_mib_region_s_frame_list_fits_in_one_packet() {
         let pages = (16 << 20) / 4096;
@@ -749,7 +768,16 @@ mod tests {
         assert_eq!(reply.pages, pages);
         assert_eq!(reply.run_id, 0xabc);
         assert!(reply.frames.is_empty(), "the frame list is what gives way");
-        assert!(reply.message.contains("does not fit"), "and it says why: {}", reply.message);
+        // On the substance rather than a phrase: the message has to name what
+        // was lost and what it costs, because at one line per second growth an
+        // operator reads this routinely rather than once.
+        assert!(reply.message.contains("no frame list"), "names what was lost: {}", reply.message);
+        assert!(reply.message.contains("sweeping"), "names the cost: {}", reply.message);
+        assert!(
+            reply.message.contains(&pages.to_string()),
+            "and the size that caused it: {}",
+            reply.message
+        );
     }
 
     /// A compositor that never answers must not hang the client's thread inside
