@@ -880,6 +880,23 @@ pub mod profiles {
             // raw device addresses in application memory, which is the one thing
             // this design says it will not put there.
             "VK_EXT_descriptor_buffer",
+            // Reached only once `VK_KHR_ray_tracing_pipeline` came back, and out
+            // for the *same* reason as the entry above rather than a new one:
+            // `VkAccelerationStructureMotionInstanceDataNV` has
+            // `VkAccelerationStructureInstanceKHR` in an arm, and that struct is
+            // the bitfields docs/design.md §7.4 names as the one type the registry
+            // genuinely cannot describe. `sv_codegen::abi::surface_profile`
+            // already excludes it as a tripwire; this is the profile agreeing so
+            // the tripwire is never reached.
+            "VK_NV_ray_tracing_motion_blur",
+            // The other half of the push-descriptor mitigation above. The two
+            // commands are excluded by name because core 1.4 also requires them;
+            // the *extension* is excluded as well so that its name never reaches
+            // an application, because an extension advertised with its two
+            // template entry points missing is the over-promise §9.2 forbids.
+            //
+            // Out again when the app-side expansion lands.
+            "VK_KHR_push_descriptor",
             // The same shape, without the §9.2 argument: `pParams` is an array
             // of pointers to CUDA kernel arguments whose count and element sizes
             // live in the CUDA module, which the registry cannot see and this
@@ -913,22 +930,17 @@ pub mod profiles {
             // promise nothing keeps. `sv_codegen::exceptions` already marks the
             // field `NotSerialisable`; this is the profile agreeing.
             "VK_EXT_map_memory_placed",
-            // The **capture-replay class**, and it is one class rather than two
-            // coincidences. `pShaderGroupCaptureReplayHandle` and
-            // `opaqueCaptureDescriptorData` are both optional `void*` whose
-            // extent is a *device property* (`shaderGroupHandleCaptureReplaySize`,
-            // `…CaptureReplayDescriptorDataSize`) rather than a `len=`, and both
-            // are written only by a capture tool replaying a trace.
-            //
-            // The right answer is not an exclusion — it is a fourth
-            // `sv_codegen::exceptions::VoidPolicy` that encodes "we do not
-            // advertise the capture-replay feature, so this member is null on
-            // the wire and a non-null one is a usage error we refuse by name".
-            // That is a generator change with a test, not a profile line, and it
-            // is the next thing worth doing here: it is what stands between this
-            // profile and `VK_KHR_ray_tracing_pipeline` (7 commands) plus
-            // `VK_EXT_descriptor_buffer` (11).
-            "VK_KHR_ray_tracing_pipeline",
+            // **The capture-replay class used to be excluded here, and it is
+            // gone.** `pShaderGroupCaptureReplayHandle` and
+            // `opaqueCaptureDescriptorData` are optional `void*` whose extent is
+            // a device property rather than a `len=`, and the previous note here
+            // predicted the answer would be a fourth
+            // `sv_codegen::exceptions::VoidPolicy` rather than a profile line.
+            // It was: `VoidPolicy::CaptureReplayUnsupported` encodes them as null
+            // on the wire and refuses a non-null one by name, which is what the
+            // specification already requires of a device that does not advertise
+            // `…CaptureReplay` — and this one does not. `VK_KHR_ray_tracing_pipeline`
+            // and `VK_EXT_descriptor_buffer` are carried now; docs/design.md §0.24.
             // **The union-of-handles class used to be excluded here, and it is
             // gone** — `VK_KHR_acceleration_structure`,
             // `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap`,
@@ -968,6 +980,41 @@ pub mod profiles {
     /// Commands excluded from every profile, with the reason each is out.
     fn excluded_commands() -> Vec<String> {
         [
+            // **The push-descriptor template family: a wild pointer, and the
+            // reason it came back.**
+            //
+            // `pData` points at application memory laid out by the
+            // `VkDescriptorUpdateTemplate` the call also names, and
+            // `sv_codegen::exceptions` gives it `VoidPolicy::ArenaOffset` — the
+            // generated lowering therefore emits `(p_data) as usize as u64`,
+            // handing the *application's own pointer* to the GPU side as an
+            // arena offset. That is only safe when something app-side expands
+            // the data first. For `vkUpdateDescriptorSetWithTemplate` something
+            // does: `sv_icd::icd` overrides the generated method and turns it
+            // into `VkWriteDescriptorSet`s before anything crosses (§0.4 item
+            // 10). For the *push* variants nothing does, so the raw pointer
+            // crosses and the GPU side dereferences it against its own arena
+            // mapping. The CTS agent measured that as a segfault in
+            // `sv-gpu-server`.
+            //
+            // §0.20 item 4 excluded `VK_KHR_push_descriptor` from `zink` for
+            // exactly this and wrote down that a mechanical widening would
+            // restore it. The widening was §0.19's, it became the default in the
+            // same commit, and the prediction came true — with Firefox crashing
+            // instantly as the symptom.
+            //
+            // **Excluded by command and not only by extension**, because
+            // `vkCmdPushDescriptorSetWithTemplate` is required by *two* things:
+            // `VK_KHR_push_descriptor` and core 1.4. Dropping the extension
+            // alone leaves the core command carried and the pointer still wild.
+            //
+            // This comes out when the expansion exists — `sv-worktrees/cts2`
+            // owns writing it, as a mirror of the update path. Until then the
+            // guard that would have caught this automatically is
+            // `LOWERING_INCOMPLETE` (§0.24 item 6); this list is the mitigation,
+            // not the mechanism.
+            "vkCmdPushDescriptorSetWithTemplate",
+            "vkCmdPushDescriptorSetWithTemplate2",
             // docs/design.md §10: presentation is outside the protocol. The ICD
             // implements the swapchain; it is never forwarded.
             "vkCreateSwapchainKHR",

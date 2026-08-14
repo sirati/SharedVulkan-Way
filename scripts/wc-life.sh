@@ -150,7 +150,14 @@ start_chain() {
   mkdir -p "$DIR/rt" "$DIR/pools" "$DIR/keymaps"
   chmod 700 "$DIR/rt"
   SOCK="wl-$TAG"
-  wined "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout 600 \
+  # The idle timeout has to outlast the longest stretch of this run with **no
+  # client connected**, and that is not the gap between cycles: the "is it gone
+  # yet" poll spends up to forty seconds asking, each `life` call being a fresh
+  # `wine explorer`. Set to 30 s it fired mid-churn, the compositor exited, and
+  # the next three cycles reported windows that never appeared and a
+  # registration "stranded in OLE's table" -- a clean bill of blame for the
+  # compositor, produced by a harness that had shut it down.
+  wined "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout "${WC_LIFE_IDLE:-120}" \
     --shared-dir "$(winepath -w "$DIR/keymaps")" --shared-peer-prefix "$DIR/keymaps/" \
     --log "$(winepath -w "$DIR/srv.log")" >"$DIR/loader.log" 2>&1 &
   SRV=$!
@@ -348,6 +355,51 @@ run_wine() {
     ok "the compositor claimed $claimed destructions for $((CYCLES + 1)) windows and the window manager agrees none are left"
   else
     bad "the compositor claimed $claimed destruction(s) and $now windows remain against a baseline of $BASE"
+  fi
+
+  # ------------------------------------------- the other per-window resource ---
+  #
+  # docs/waycompose-design.md §62. A window is not the only thing `ToUi::Destroy` gives back: it also
+  # revokes the window's OLE drop-target registration, and **that one has no
+  # external witness at all**. OLE's registration table is not enumerable from
+  # another process, and a stranded entry has no symptom until an `HWND` value
+  # is reused — which docs/waycompose-design.md §62.3 measures as not happening within a run, so the
+  # trick that would have caught it is unavailable here.
+  #
+  # What is available is the compositor's own count, printed at exit, made
+  # falsifiable by `revoke` now reading the `HRESULT` it used to discard. This
+  # asserts the pair balances *and* that it is not a pair of zeros.
+  echo "--- waiting for the compositor to reach its idle timeout and report ---"
+  local _ exitline dtline
+  for _ in $(seq 1 $(( ${WC_LIFE_IDLE:-120} + 40 ))); do
+    grep -q "drop targets at exit" "$DIR/srv.log" 2>/dev/null && break
+    sleep 1
+  done
+  exitline=$(grep -o 'windows at exit:.*' "$DIR/srv.log" | tail -1)
+  dtline=$(grep -o 'drop targets at exit:.*' "$DIR/srv.log" | tail -1)
+  if [ -z "$dtline" ]; then
+    bad "the compositor never printed its drop-target accounting"
+  else
+    note "$exitline"
+    note "$dtline"
+    local reg rev bad_rev
+    reg=$(echo "$dtline" | grep -oE 'claims [0-9]+' | grep -oE '[0-9]+')
+    rev=$(echo "$dtline" | grep -oE '[0-9]+ revoked' | grep -oE '[0-9]+')
+    bad_rev=$(echo "$dtline" | grep -oE '[0-9]+ revoke\(s\) failed' | grep -oE '[0-9]+')
+    # Non-vacuity first, for the reason the whole harness exists: 0 == 0 is not
+    # a result. The churn above proved windows were made; each of them
+    # registered, so this number has to be the same one.
+    if [ "${reg:-0}" -eq 0 ]; then
+      bad "no window was ever registered as a drop target, so the balance below is 0 == 0"
+    else
+      ok "$reg window(s) were registered as drop targets, so there was something to give back"
+      [ "$reg" = "$rev" ] \
+        && ok "and all $rev were revoked before their windows were destroyed (§43.7's ordering, counted)" \
+        || bad "$reg registered but only $rev revoked -- a registration is stranded in OLE's table"
+      [ "${bad_rev:-0}" = 0 ] \
+        && ok "no RevokeDragDrop failed" \
+        || bad "$bad_rev RevokeDragDrop call(s) failed"
+    fi
   fi
 
   wc_assert_topology "$DIR/srv.log" "wc-life"

@@ -20184,6 +20184,24 @@ version about causes nobody checks. The rule that would have caught both: when a
 run refuses, the reason it refused is a *measurement to take*, not a story to
 supply from what happens to be on the screen.
 
+> **§60 adds the third instance, and it is the one that shows this rule's own
+> failure mode.** The correction to the paragraph above — *"the session is
+> locked, `SendInput` returns 0"* — was not a story. It was a correct
+> measurement, and §57 is a real defect found by taking it. It was simply about
+> a code path the launcher does not travel: ssh lands in session 0, the
+> launcher's clicks go through a scheduled task into session 1, and a window
+> there is visible and mappable while the session is locked. The run was
+> available the whole time.
+>
+> So the rule needs a second clause: **a measurement can be real and still be
+> about the wrong path.** Taking one is not sufficient — establishing which path
+> the failing thing actually travels is itself the first measurement.
+>
+> And it is the harder clause to follow, because a real number stops the search
+> sooner than a guess does. An inference from a window listing is cheap to
+> doubt; a measured `SendInput -> 0, ERROR_ACCESS_DENIED` is not, and it held
+> for a day. §60.3 is the full sequence.
+
 > **And it happened twice, to two people, from the same evidence, within an
 > hour — which is what turns this from an anecdote into a rule worth stating.**
 >
@@ -20747,7 +20765,572 @@ build, for these capabilities.
    rectangle; that is a claim about Win32 being checked here by a Linux run.
 ---
 
-## 60. Wine becomes first class, and four of the six known quirks were not Wine
+## 61. Growth ran on a guest, and the first thing it produced was the reason it never had
+
+§34 built arena growth over guest RAM, ended with "**Nothing here has run on a
+guest**", and predicted that the first run would produce the cost of a growth
+against the table in `docs/waycompose-design.md` §34.2. This is that run. It
+produced the cost — and before it, two defects that had made growth impossible
+on every guest session this project has ever started, neither of which any test
+in the tree could have found.
+
+Venue: `sv-guest.exe` on the Windows guest, `wc-proxy` and `wc-arena-host` on
+testhost where QEMU runs, Firefox on testhost as the client. Driven through
+`scripts/wc-launch.sh`, which is the product's own path — `wc-launch.exe` starts
+the compositor, opens its own tunnel and asks the VM host for the application,
+and the clock is inside the launcher. The workstation only builds, clicks and
+reads numbers back.
+
+### 61.1 The declaration this harness never made
+
+`scripts/wc-launch.sh` had neither `wc_substrate_declare` nor
+`wc_topology_declare`, four stages after `docs/waycompose-design.md` §51 made
+them structural. The reason is worth recording because it is a hole in the
+structure rather than an oversight in the script: every *other* guest harness
+gets its declaration for free, because it calls `wc_locate_arena` to find the
+arena and that function lives in `wc-substrate.sh`. This one locates nothing —
+`wc-session` runs `wc-arena-host` on the far side of an ssh channel — so there
+was no function it had to call, and therefore nothing that made the omission
+visible. **A gate you reach for by accident is not a gate.**
+
+It declares both now, and `wcl_assert_located` proves them from the one line the
+launcher already prints, which carries the page count *and* which locator
+produced them. Sample output, from the run below:
+
+```
+  ----  topology: CROSS-VM -- a hypervisor is in the path. sv-guest.exe on
+        <guest-user>@<guest-ip>, wc-proxy on <host-user>@<host-ip>, arena in the guest's own RAM
+  PASS  the arena is guest RAM: 3072 pages located by frames on <host-user>@<host-ip>
+  PASS  launch: TOPOLOGY cross-vm: proven by 3072 pages of guest RAM located by frames
+```
+
+### 61.2 The first defect: the keymap had already taken the channel's address
+
+`docs/waycompose-design.md` §34.5 reasoned carefully about *when*
+`Control::create` may run — it zeroes the control region, and on guest RAM those
+bytes are the stamps the host locates by, so it must wait until the first client
+proves the locate finished. That reasoning is correct and it is why
+`grow::Service::start()` was called at `release_gifts`.
+
+It is also only half the constraint, and the other half points the opposite way.
+`reserve_growth_channel` may only run **while the outbound window is untouched**,
+because the channel is the front of that window and the free list has no way to
+express a hole. Smithay seals the seat's keymap in `Seat::add_keyboard`, which
+`docs/waycompose-design.md` §14.12's own correction already records as happening
+"a full minute before any client exists" — and although
+`docs/waycompose-design.md` §12.10's `defer_gifts` postpones the keymap's
+*write*, it does not postpone its *allocation*: `w.given` is charged when the
+slice is taken. So by the time a client arrived, the front of the window was
+spoken for and the reservation was refused, every time.
+
+What that looked like from the two ends, on the guest at a 12 MiB floor:
+
+```
+wc-compositor: seat0 keyboard: layout de (73017 bytes of keymap)
+wc-compositor: no growth channel (the growth channel must be reserved before anything is
+  given out of the outbound window: it is the front of that window, and the free list has
+  no way to express a hole); this session cannot be asked for more memory and will refuse
+  under pressure instead
+```
+
+```
+[proxy] client 28: pool 25: could not publish 960000 bytes: arena 0 cannot serve 962560
+  bytes and cannot grow: growth channel: magic is 0x6d79656b5f626b78, which is not ours
+  (a byte-swapped magic means a big-endian peer)
+```
+
+`0x6d79656b5f626b78` is `xkb_keym` in ASCII. The proxy attached at the front of
+the outbound window — which is where both sides derive the channel's address
+from, correctly — and read the keymap's own header as a control-region magic.
+**The diagnosis it printed named a big-endian peer**, which is as far from an
+offset collision as a message can get, and it is the shape of failure worth
+remembering: two components agreeing about an address, one of which had lost a
+race for it years of design-time reasoning never considered.
+
+The measurement that session produced is `docs/waycompose-design.md` §28.12's,
+verbatim and on the deployment for the first time: **0 growths, 97 refusals**, and
+`the pool is held back and every request naming it is absorbed, so this surface
+stops updating until there is room`.
+
+The fix is the same split `defer_gifts`/`release_gifts` already is: **reserve
+early, create late.** `reserve_growth_channel` is bookkeeping and touches no
+bytes, so it runs where the outbound window is set up, before the keymap;
+`Control::create`, which writes, still runs at the first client. `Window::channel`
+carries the range between the two moments.
+
+### 61.3 Growth, measured
+
+With the channel actually up:
+
+```
+wc-compositor: arena 0 growth channel reserved at 11534336+278528, before any object is
+  given out of the outbound window
+wc-compositor: growth channel up; the host may ask for another region when its pools do not fit
+```
+
+and, under a real Firefox on a 12 MiB floor:
+
+| | |
+|---|---|
+| `[proxy] region 1` | **16777216 bytes of guest RAM — 746 ms in the guest, 46 ms locating (frame list)** |
+| host-side translation | `located 4096 of 4096 pages in 8.70ms by frame list (swept 0 MiB; 388 frame run(s) became 388 file run(s))` |
+| plan | `region 1 (388 run(s), object /proc/1773734/fd/35) [appended]` — region 0's record byte-for-byte intact |
+| refusals | **0**, across all 14 client reports |
+| arena | `peak resident 28.0 MiB in 2 region(s); floor 12.0 MiB (the startup region, never returned); grew 1` |
+
+Against `docs/waycompose-design.md` §34.2's table: the locate is **46 ms**, of
+which 8.70 ms is the translation, against the 2832–3101 ms a content sweep costs
+and the 0.064 s that section predicted for the query. The prediction was
+pessimistic by a comfortable margin. The guest's 746 ms is the `VirtualAlloc`
+plus a `VirtualLock` of every page plus the stamp plus `SuperfetchPfnQuery`, and
+it is the dominant term — growth is a guest-side cost, not a locate cost, which
+inverts the assumption that made stage 16 reject growth outright.
+
+**The PFN locator executed on a guest, on the growth path, and it is the arm
+that ran.** `docs/waycompose-design.md` §34.6's "the PFN locator has still never
+executed on a guest" is closed. No `frames=none` was seen on any leg of any run
+in this session; the startup locates took the same arm (`3072 of 3072 pages in
+6.45ms`, and at the 64 MiB baseline `16384 of 16384 pages in 7.90ms`).
+
+Click-to-window, same clicks through the same scheduler path, cold:
+
+| floor | click-to-window |
+|---|---|
+| 64 MiB, no growth needed | 4720 ms |
+| 12 MiB, one growth | 3991 ms, 4930 ms |
+
+The 12 MiB run is not slower, and there is no held-back pool in it. That is what
+`Floor::GrowsUnderPressure` asks for and it is now shown — with the caveat in
+§61.5 about which comparison is honest.
+
+### 61.4 The second defect: the reply does not fit the ring it was sized for
+
+Later growths in the same session failed:
+
+```
+wc-compositor: growth channel: growth ring: a 65600-byte packet cannot fit a 65536-byte ring;
+  the payload belongs in the arena
+```
+
+`docs/waycompose-design.md` §34.5 sized `ring_data_bytes` at 64 KiB because "the
+reply carries the new region's frame list, and a test holds the *worst* case —
+one run per page of a 16 MiB region — to fitting in one packet". A 16 MiB region
+is 4096 pages; at 16 bytes a frame that is 65536 bytes, which is the ring
+exactly — and the packet is the payload **plus `sv-wire`'s `ReplyHeader`**. The
+test held the payload and the ring holds the packet, so the worst case overflows
+by the header and by nothing else. Measured fragmentation made this rare rather
+than constant: the growth that succeeded needed 388 runs, well inside the ring;
+the ones that failed had hit the fully-fragmented case.
+
+Not fixed here. The section's own words already name the answer — "the payload
+belongs in the arena" — and choosing between a larger ring and an out-of-band
+payload is a protocol decision, not a number to nudge.
+
+### 61.5 Release still has not fired, and now there are two reasons
+
+**This is the measurement the user asked for and it is the one this run does not
+have.** `sv-guest.exe`'s working set, from the guest's own process view, across
+the run at a 12 MiB floor with one growth:
+
+| | `sv-guest.exe` working set |
+|---|---|
+| before — no process at all | **0** (16 samples with no `sv-guest.exe`) |
+| at peak, clients up | **112,427,008 B (107.2 MiB)** |
+| after every Firefox exited | **90,206,208 B (86.0 MiB)** |
+
+It fell by 21 MiB and **it did not give back the 16 MiB region**: the proxy's own
+accounting says `now 28.0 MiB in 2 region(s) … grew 1, released 0 region(s) /
+0.0 MiB` after the last client was gone. Two independent causes were observed,
+and either alone is sufficient:
+
+1. **The reclaim clock only turns while a client is drawing.** `Arena::frame()`
+   is what advances the tick and is the only caller of `reclaim_regions`, and its
+   one call site is `Session::commit` — a client's surface commit. With every
+   client exited there are no commits, so a region that has just become idle can
+   never accumulate the `--arena-grow-idle 120` frames that would return it. The
+   policy is written in frames and the situation it most needs to handle is the
+   one that has no frames in it.
+
+2. **The region never became empty.** After every Firefox was killed the arena
+   still reported `21880832 of 29360128 bytes out`, so `slot.is_empty()` was
+   false regardless of the clock. Whatever holds those pools outlives the
+   connection that made them, and that is a second bug behind the first.
+
+So the honest statement is: **release is wired, its opcode is right, its
+asymmetry argument is right, and it has still never run.** The user's
+observation — "sv-guest.exe is hogging 890 MB even though no wayland or vulkan
+clients are up" — is not explained by the startup floor alone. The floor is the
+part that was designed never to come back; this is the part that was designed to
+come back and does not.
+
+What the run *does* settle about the user's complaint is the 890 MB itself: the
+working set tracks the arena almost exactly. At a 64 MiB floor `sv-guest.exe`
+peaked at 116,162,560 B; at 12 MiB it peaked at 112,427,008 B with a 16 MiB
+region bought on top. The arena is the dominant term, so a 768 MiB floor is a
+768 MiB process, which is what reached a user.
+
+### 61.6 What is proven and what is not
+
+| | |
+|---|---|
+| growth over guest RAM, end to end, on a guest | **shown** — `region 1`, 16 MiB, 746 ms guest / 46 ms locate |
+| `0 refusals` at a floor below the peak | **shown** — 14 client reports, all `0 refusals` |
+| the plan appends without disturbing region 0 | **shown** — `[appended]`, region 0's record unchanged |
+| the PFN locator on a guest, on the growth path | **shown** — `by frame list`, 388 runs, 8.70 ms |
+| `frames=none` degradation | **not seen** — the frame-list arm ran on every leg, so the sweep arm is still unexercised on this deployment |
+| release returning guest RAM | **NOT SHOWN — and it is not merely unrun.** Two causes observed, §61.5 |
+| a second growth in one session | **NOT SHOWN** — refused by the ring size, §61.4 |
+| `Floor::CURRENT` moved to `GrowsUnderPressure` | **no.** Growth is shown; release is not, and a floor that grows without giving back is the user's complaint with extra steps |
+
+`Floor::CURRENT` stays `MustStandAlone` and
+`growth_has_not_been_demonstrated_on_a_guest_yet` stays asserted. The arm's own
+text asks for growth "showing the arena growing rather than refusing", which this
+run gives it — but the module header's argument is about memory that is *"gone
+from Windows entirely, for anything, for as long as the session lasts"*, and
+until §61.5's two causes are fixed a lower floor buys regions it cannot return.
+The next run to flip that line is the one that puts a number in the "after"
+row of §61.5's table that is smaller than the "peak" row by the size of the
+regions it grew.
+
+### 36.20 The deployment guest answers: 13.6 µs, and there is no floor
+
+§36.19 predicted that `WaitOnAddress`'s whole-millisecond argument floors a
+*missed* wake and not a *delivered* one, from a 136 µs measurement on the
+Windows binary under Wine. That was evidence, not proof, and it stayed a
+prediction because Wine implements `WaitOnAddress` over futexes.
+
+Measured on `testhost`'s Windows guest — the machine where the 216.9 ms
+present was measured, running Microsoft's `WaitOnAddress` and virtio-win's
+`vioser.sys`. `scripts/sv-bell-guest.sh`, 2,000 samples, µs:
+
+| | min | median | p99 | max |
+|---|---|---|---|---|
+| same kernel (socketpair on the VM host) | 5.6 | 8.2 | 12.3 | 75.2 |
+| **across the boundary (virtio-serial)** | **22.3** | **27.1** | **43.6** | **130.0** |
+
+> **A doorbell reaches the Windows guest in 13.6 µs**, one way.
+
+Against the alternatives, per wait: the fixed 20 ms slice is **1,474×** that,
+and the ladder's 1 ms floor is **74×** it. Eleven waits — one present — is
+**0.15 ms of doorbell latency against 220 ms of slice**.
+
+**The prediction holds and the floor does not exist for a delivered wake.** If
+`WaitOnAddress`'s millisecond granularity applied to delivery, nothing here
+could have come in under 1,000 µs; the *slowest sample of two thousand* was 130.
+§36.18's worry — that the 64-of-95 sub-100 µs mass was exactly what a floor
+would destroy — is answered: it survives, on the real guest, with room.
+
+Against the Linux development guest's 8.8–9.4 µs one way, Windows costs about
+50% more. Same order, no cliff. Whatever `vioser.sys` and `afunix`-free
+virtio-serial cost over `/dev/virtio-ports`, it is tens of microseconds and not
+a millisecond.
+
+#### 36.20.1 Two guards that fired, and were right to
+
+**The one-opener rule caught a real leak.** A previous run's probe was still
+holding the port — `Id 21432, C:\Users\<guest-user>\sv-bell-probe.exe, StartTime
+10:22:23` — and the second attempt got `ERROR_ACCESS_DENIED`. That is the same
+errno §36.13 saw on `org.sirati.display.0`, which strengthens that section's
+hypothesis considerably: **5 is what this driver returns for a port that is
+present but unavailable**, whether because nothing backs it or because someone
+else has it. It was found by asking for pid and path rather than by killing an
+image name.
+
+**And the handshake-before-latency check did its job on the first try.** The run
+that hit the held port refused to measure and said so, instead of timing a
+transport that was not there. It was written for the locked-session worry, which
+turned out not to be the risk at all — the risk was a stale process of my own —
+and it caught the thing it was not written for. That is the argument for the
+shape rather than for the specific fear.
+
+**One self-inflicted delay worth recording**: the guard that refuses to share
+the QMP socket used `pgrep -f qemu-serve`, and the ssh command carrying the
+check *contains that string*, so it matched its own shell and refused a socket
+that was free. It is `pgrep -x sv-hostd` now, by executable name. This is the
+same self-match that once made a `pkill -f` take down the wrong process on this
+machine, in a script written after that lesson.
+
+**The port was hot-added and remains transient** — it dies with the QEMU
+process, and `testhost/default.nix` was not touched. Making it permanent is
+one line there, needs a `nixos-rebuild switch` that restarts the VM, and is the
+user's to time.
+## 62. The other thing a window holds, and the return value nobody read
+
+*(§53's continuation. The window handle had a witness; this does not.)*
+
+### 62.1 Status in one paragraph
+
+§53.6 item 1 said `RevokeDragDrop` was not observed, and it was worse than
+unobserved: **`drag::revoke` discarded the `HRESULT`.** The whole of §43.7's
+ordering argument — revoke *before* `DestroyWindow`, because OLE keys the
+registration on the `HWND` and a destroyed handle cannot be revoked — rests on
+that call succeeding, and a compositor that got the ordering wrong produced
+exactly the same output as one that got it right: none. It is read now, counted,
+and printed at exit beside §56's window accounting, so it travels to the guest
+on every run with nothing deployed. A new test on the Windows target makes the
+count falsifiable rather than decorative. `scripts/wc-life.sh` asserts the pair
+balances and is not a pair of zeros: **14 passed, 0 failed, 1 skipped**, with
+6 registered and 6 revoked. **The idea that would have made this externally
+checkable does not work, and 57.3 is the measurement rather than the argument.**
+
+### 62.2 Why this resource has no outside witness
+
+§53's strength was that its witness could not be talked out of it: another
+process asks the window manager, and nothing the compositor does makes
+`EnumWindows` lie. That does not transfer here, for a structural reason rather
+than a missing tool. **OLE's drop-target registration table is not enumerable
+from another process.** There is no `EnumDragDropTargets`; the only documented
+way to observe a registration is to be refused when adding a second one for the
+same `HWND`, and that requires holding the `HWND` in question.
+
+So the asymmetry is real and is stated rather than papered over: the window
+count in §53 is authoritative, and the drop-target count here is the
+compositor's own account of its own behaviour — which §56.3 is right to label
+`claims`, because a bug in the teardown path is exactly the circumstance in
+which such an account is wrong.
+
+### 62.3 The trick that would have fixed that, and the measurement that killed it
+
+A stranded registration *does* have one observable consequence: OLE refuses a
+`RegisterDragDrop` on an `HWND` that already has one, with
+`DRAGDROP_E_ALREADYREGISTERED`. The compositor already logs that refusal. So if
+a destroyed window's `HWND` value were ever handed out again, a leaked
+registration would announce itself on the *next* window, from outside, with no
+new instrumentation at all.
+
+That only works if handle values are reused. **They are not, at this scale.**
+Six windows through one compositor process, from `docs/life/compositor.log`:
+
+```text
+window 1 created (HWND 0x1007a)
+window 2 created (HWND 0x700ac)
+window 3 created (HWND 0x1100ac)
+window 4 created (HWND 0x1b00ac)
+window 5 created (HWND 0x2500ac)
+window 6 created (HWND 0x800be)
+```
+
+Six windows, six distinct handles. The low half repeats — `0x00ac` four times —
+and the high half does not, which is the generation counter doing its job: a
+handle value is not reused until the table wraps, and the table is 16 bits wide.
+Provoking a collision would take of the order of 65,536 create/destroy cycles.
+
+**This is recorded as a negative result rather than quietly dropped**, because
+the idea is a good one and the next person will have it. It is not wrong; it is
+untestable at any cycle count this project will run, and a harness built on it
+would be a gate that cannot fail — which is the thing §53 exists to avoid,
+reintroduced by the mechanism meant to strengthen it.
+
+### 62.4 What makes a counter worth printing
+
+A count of successes is worth nothing unless the thing counted can come out the
+other way, so that is now a test on the Windows target
+(`revoking_a_window_that_was_never_a_drop_target_is_not_a_success`, in the
+`drag::` suite, **11 tests**):
+
+* `RevokeDragDrop` on a window that was never registered does **not** return
+  `S_OK` — so the `hr == S_OK` arm in `revoke` is a real branch;
+* and on one that *was* registered it does — so the arm is reachable.
+
+Deliberately not asserting the exact failure code beyond "not success": what
+matters is that OLE distinguishes the two cases, and pinning the constant would
+fail on a platform that returned a different-but-still-failing one for the same
+correct reason.
+
+The pair then rides out on the exit line, next to §56's:
+
+```text
+wc-compositor: windows at exit: 6 created, 6 destroyed, 0 still held, 0 still alive, 0 client(s) still connected
+wc-compositor: drop targets at exit: claims 6 registered, 6 revoked, 0 revoke(s) failed
+```
+
+`wc-life.sh` asserts three things about the second line, and the first of them is
+the one that stops the other two being decoration: that `registered` is **not
+zero**. The churn proved six windows were made; each registered; so the number
+has to be six, and a balance of `0 == 0` is a failure rather than a pass.
+
+### 62.5 What is not proven
+
+1. **The count is the compositor's own.** §62.2 is why there is no alternative,
+   not an excuse for not having one. If OLE ever grows an enumeration, this
+   should be replaced rather than supplemented.
+2. **`release_icons` is still unobserved**, for §53.6 item 2's reason: its
+   effect is an `HICON` count, `GetGuiResources` is what would answer, and Wine
+   returns 0. That is the one remaining per-window resource with neither an
+   external witness nor an internal count, and giving it an internal count is
+   the obvious next step.
+3. **The guest run is still the valuable one** and is still queued: on Windows
+   `counter=live` turns §53's `SKIP` into an assertion and would cover both the
+   icons and the handle totals at once.
+4. **Nothing here provokes a failure in a live compositor.** The test proves the
+   branch exists; no run has made the compositor's own revoke fail, because
+   nothing in the tree currently can.
+5. **Popups are still not churned** (§53.6 item 4), and they are the case where
+   this matters most: §43.7 does not register popups as drop targets at all, so
+   a menu-heavy session exercises the create/destroy path without the
+   registration path, and the two counts would legitimately diverge. Nothing
+   asserts what that divergence should look like.
+
+### 62.6 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-life.sh wine`** | **14 passed, 0 failed, 1 skipped** (11 in §53) |
+| `wine …/wc_compositor-*.exe drag::` | **11 tests, 0 failures** (10 in §50) |
+| `cargo test --workspace --no-fail-fast` | see below |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-xref.sh` | 0 broken, 0 ambiguous |
+
+The compositor's idle timeout in `wc-life.sh` had to change, and that is
+load-bearing rather than tidying: the exit accounting is printed **on the way
+out**, so a harness that kills the compositor never sees it. §56's harness
+reaches the same conclusion by the same route.
+
+**The first number chosen for it was wrong, and the way it was wrong is the
+lesson.** 600 s went to 30 s, and 30 s fired *mid-churn* — because the stretch
+that matters is not the gap between cycles but the "is it gone yet" poll, which
+spends up to forty seconds with no client connected, each `life` call being a
+fresh `wine explorer`. The compositor exited, the next three cycles reported
+windows that never appeared, and the run printed:
+
+```text
+FAIL  cycle 4: the client's window never appeared
+FAIL  only 2 of 5 windows were ever seen alive -- the negative results below are worthless
+FAIL  4 registered but only 3 revoked -- a registration is stranded in OLE's table
+----  windows at exit: 4 created, 3 destroyed, 1 still held, 1 still alive, 2 client(s) still connected
+```
+
+That last line is a compositor leaking a window and stranding an OLE
+registration. It is also a harness that shut the compositor down while two
+clients were still connected. **This is the third time in two sections that a
+harness bug has produced a perfectly plausible bug report about the
+compositor** — §53.4's three were the same shape — and the reason is worth
+naming: on this subject the *evidence for a leak is an absence*, and everything
+that goes wrong with a harness also produces an absence. The defence is the one
+§53.5 already built, and it worked here: the "was it ever alive" and "did the
+count rise" rows failed first, and a run whose positive halves fail is a run
+whose negative halves prove nothing. The gate said so in those words rather than
+reporting the leak.
+
+The timeout is now 120 s, and the rule is written where the number is: it must
+outlast the longest stretch of the run with no client connected.
+
+
+---
+---
+
+## 63. The run happened: one title bar and a typed word, in the same photograph
+
+### 63.1 Status in one paragraph
+
+`docs/stage8/stage57-typed.png` is `weston-terminal` on the guest's interactive
+desktop with **one** title bar and the word `wazcomposetzpes` on its prompt.
+That is the original brief's deliverable — *"a photograph of `weston-terminal`
+on the guest desktop with one title bar, and a photograph of typed text
+appearing in it"* — and it is one picture rather than two because the two bugs
+were never as separate as the report made them look. 13 assertions, 0 failures,
+first attempt, on a run where nothing named `--decorations` at all.
+
+### 63.2 The two pictures
+
+`stage57-typed.png` — §33's block 5b. `probe-input.exe` on `WinSta0` types
+`waycomposetypes` with `SendInput`, having first checked it owns the
+foreground:
+
+```
+PASS  probe-input found our window: target HWND 0000000000170cb6
+----  foreground=...170cb6 (class 'WaycomposeToplevel') focus=...170cb6 target=...170cb6
+PASS  the window after waycomposetypes was typed into it
+```
+
+The prompt reads `wazcomposetzpes`, and that is **correct**: the guest's layout
+is German (`0x0407` -> `de`), the probe injects positional scan codes, and scan
+`0x15` is `Z` on a German board and `Y` on an American one. §49.9 measured the
+same substitution and it is the cheapest possible proof that the client compiled
+*our* keymap rather than guessing.
+
+`stage57-clicked-then-typed.png` — §37's block 5c, and the question §37.8 left
+open. A click 40 px down the client area, then typing:
+
+```
+PASS  §37: a click 40 px down the client area started no window move, so it landed
+      below the bar the client drew
+PASS  §37: the terminal repainted 22 times after being clicked in and typed at
+----  §37: every scan code of the typed word translated
+```
+
+The prompt shows the first word with `echowazcomposetzpes` appended, so the
+keyboard survived the click that used to be delivered 32 px too high and read as
+a title-bar drag. The assertion is the **repaint count**, not the picture, for
+§37.7's reason: with the bug present the "picture changed" check was green
+because the *window had moved*.
+
+And the window is **838x435**, which is §49's folded caption on a run that named
+no decoration flag at all — so `--decorations auto` is the shipped default doing
+its job on the real desktop, not a leg configured to succeed.
+
+### 63.3 Three causes, and none of them was the one that mattered
+
+This run was blocked for a day, and the sequence of explanations is the useful
+part of the section.
+
+| who | cause given | how it was arrived at |
+|---|---|---|
+| this author | "a person is at the machine" | inferred from a `wc-desk windows` listing showing Firefox on a news article |
+| the coordinator | "the session is locked; `SendInput` returns 0" | **measured**, and §57 is the real defect it found |
+| the growth agent | ssh lands in **session 0**; the launcher's clicks go through a scheduled task into **session 1** | measured, on the path the launcher actually uses |
+
+The third is the one that made the run possible: a probe window in session 1
+reported `session=1 handle=985882 visible=True` **while the session was
+locked**. Windows map on a locked session. The run was available the whole time.
+
+§55.3 said *the reason a run refuses is a measurement to take, not a story
+supplied from what happens to be on the screen*, and the middle row is why that
+rule needs a second clause. **The coordinator's cause was not a story.** It was
+a correct measurement — `SendInput` really does return 0 on a locked session,
+and §57 is a genuine defect found by taking it. It was simply about a code path
+the launcher does not travel.
+
+So:
+
+> **A measurement can be real and still be about the wrong path.** Taking one is
+> not sufficient; establishing which path the failing thing actually travels is
+> itself the first measurement, and it is the one all three of us skipped.
+
+That is a sharper rule than the one §55.3 states, and it is a *harder* one to
+follow, because a real number is far more convincing than a guess and stops the
+search sooner. My inference was cheap to doubt. A measured
+`SendInput -> 0, ERROR_ACCESS_DENIED` is not, and it held for a day.
+
+The three instances also line up with §55.3's mechanism — *a workaround that
+works removes the pressure that would have found the real cause* — in its
+third form. Here nobody wrote a workaround; the **explanation itself** was the
+workaround. It accounted for the symptom, so the question stopped being asked.
+
+### 63.4 What is now closed, and what is not
+
+Closed, both of the user's reports from `docs/waycompose-design.md`'s task list:
+
+* *"wayland terminal renders also a double titlebar"* — §49's `--decorations
+  auto`, photographed here under the shipped default. One bar, the client's,
+  with Windows' own caption buttons in it.
+* *"typing in wayland terminal does not seem to work"* — three causes across
+  three sections, and this is the venue the report came from. §33 guessed a
+  missing keymap; §37 found the pointer offset that made a click read as a
+  drag; §49.8 found a spurious configure at map from my own frame code. All
+  three are fixed and this run exercises all three at once.
+
+Not closed:
+
+1. **A client that starts maximised and decorates itself** still gets two bars
+   (§49.7 item 1). Neither weston client does.
+2. **The 35 unexplained WLCS failures** (§59.5) are untouched, and they are what
+   "implemented fully rather than partially" actually names.
+3. **`GetGuiResources` is still a skip under Wine**, which is one of the two
+   runs queued behind this one.
+---
+
+## 64. Wine becomes first class, and four of the six known quirks were not Wine
 
 The Wayland server runs on Windows. It also has to run under Wine, because a
 Wine box is the venue that is *always* available and a Windows guest is the one
@@ -20779,7 +21362,7 @@ two branches that do exist were both found while checking something else, which
 is the honest way round: the quirks somebody remembers are not the ones still
 biting.
 
-### 60.1 What was built
+### 64.1 What was built
 
 `crates/wc-compositor/src/wine.rs`. A `OnceLock<Win32>` with three values —
 `Windows`, `Wine { version, host }`, and `None` for the Linux build — decided
@@ -20788,7 +21371,7 @@ once and never re-asked.
 The probe is the one Wine documents: `GetModuleHandleW("ntdll.dll")` and then
 `GetProcAddress` for `wine_get_version`, whose presence is the whole answer.
 `wine_get_host_version` gives the kernel underneath, and both are kept rather
-than reduced to a boolean, because every claim in §60.4 is a claim about a
+than reduced to a boolean, because every claim in §64.4 is a claim about a
 *particular* Wine and the first question asked of a quirk that stops
 reproducing is which one it was measured on. Measured here:
 
@@ -20816,7 +21399,7 @@ It is printed from `run_from` immediately after `--log` has been redirected and
 **before `platform::start`**. That ordering is load-bearing rather than tidy:
 what platform a run is on must not depend on the platform having come up, or
 the one run that most needs attributing — the one that failed to start — is
-exactly the one that cannot be. It is also why the guest leg in §60.6 works at
+exactly the one that cannot be. It is also why the guest leg in §64.6 works at
 all on a VM with no X.
 
 `None` is a variant rather than an absence for the same reason. A harness that
@@ -20824,14 +21407,14 @@ meant to run the `.exe` and got the Linux build has measured nothing about
 Windows, and §35 is a whole section about gates that reported success while
 something was wrong.
 
-### 60.2 The override, and why a stale assumption has to be falsifiable
+### 64.2 The override, and why a stale assumption has to be falsifiable
 
 `WC_WIN32=windows|wine` replaces the probe's answer, in the compositor and in
 `scripts/probe-cursor.c` alike. Two uses, both of which were needed within
 hours of it existing:
 
 * **Force the Windows path under Wine**, to check that a branch is still
-  earning its place. Every entry in §60.4 is a claim about wine-11.14; this is
+  earning its place. Every entry in §64.4 is a claim about wine-11.14; this is
   how the next person tests whether it has been fixed upstream without booting
   anything.
 * **Force the Wine path on Windows**, so a workaround is not code that has only
@@ -20841,11 +21424,11 @@ An unrecognised value is a **startup failure**, not a warning — the same
 treatment `--decorations` gets. A typo that quietly falls back to the probe is a
 run that was told to exercise one path, measured the other, and passed.
 
-`WC_WIN32=windows` is what settled §60.5, and it settled it in one run. That is
+`WC_WIN32=windows` is what settled §64.5, and it settled it in one run. That is
 the argument for the flag in a sentence: the tool built to falsify a Wine claim
 falsified three of them the first afternoon it existed.
 
-### 60.3 Harnesses can no longer be wrong about which platform they measured
+### 64.3 Harnesses can no longer be wrong about which platform they measured
 
 `scripts/wc-cursor.sh` gained `win32_of()`, which reads the line out of a
 compositor log, and both legs now **assert** on it: the `wine` leg fails if the
@@ -20855,10 +21438,10 @@ This is cheap and it is the half of "first class" that pays for itself. §33
 records a photograph of "this compositor ignoring input" that was another
 worktree's `weston-terminal`, written into `docs/` as evidence before anybody
 noticed. A leg that cannot say what it ran on can be wrong in that direction
-silently, and this stage's own §60.5 is a second example of the same failure
+silently, and this stage's own §64.5 is a second example of the same failure
 wearing different clothes.
 
-### 60.4 The Wine paths, and there are two
+### 64.4 The Wine paths, and there are two
 
 **Neither changes a pixel.** Both correct a claim that was false under Wine.
 
@@ -20912,13 +21495,13 @@ while Windows keeps the assertion by name, where the name means something:
 
 ```
 PASS  the border's cursor is not the client's (handle=…100b0 vs handle=…20090);
-      Wine cannot say which system cursor it is (§60.4)
+      Wine cannot say which system cursor it is (§64.4)
 ```
 
 Weaker, and stated as weaker. It proves the compositor did not claim the resize
 border; it says nothing about which system cursor is there.
 
-### 60.5 The six that were refused, and two of them were this project's own bug
+### 64.5 The six that were refused, and two of them were this project's own bug
 
 This is the more useful half of the stage.
 
@@ -20950,6 +21533,31 @@ never a stable "Wine limitation" being tolerated; it was a flaky harness whose
 *good* outcome was three notes and whose bad outcome was three failures, and
 both were being read as facts about Wine. A reproducible wrong diagnosis is more
 durable than an intermittent one, and this one was both by turns.
+
+**§63.3's rule is this finding seen from the other side, and the pair is worth
+stating together.** §63.3 settles on:
+
+> A measurement can be real and still be about the wrong path. Taking one is not
+> sufficient; establishing which path the failing thing actually travels is
+> itself the first measurement.
+
+There, a *correct* measurement — `SendInput` returns 0 on a locked session —
+attributed a blockage to a path the launcher does not travel, and held a run up
+for a day. Here, a *correct* observation — `GetCursorInfo` dies with
+`BadWindow (X_QueryPointer)`, three runs out of three — was attributed to Wine
+when it belonged to the harness. Both are the same error: the evidence was
+sound and the *subject* of the sentence was wrong. Neither would have been
+caught by repeating the measurement, which is the instinct both cases invite;
+both needed the control that varies the suspected cause and holds the rest
+still — an isolated `SendInput`-then-`GetCursorInfo` binary here, a session-1
+probe window there.
+
+The asymmetry that makes §63.3's version harder is worth keeping in view: its
+wrong attribution came with a real number attached, and a real number stops the
+search. Mine came with a 3-of-3 reproduction, which is the same thing wearing
+different clothes. **Reproducibility is evidence that a phenomenon is real, and
+no evidence at all about what causes it** — and this section spent its first
+afternoon writing a Wine path on the strength of exactly that confusion.
 
 **Cross-process `SendMessageW(WM_SETCURSOR)` is not delivered (§23.7 item 2) —
 not Wine.** Same cause, and it falls out of the same fix. §23.7 recorded `0` for
@@ -20996,7 +21604,7 @@ Two more were checked and left alone:
   both points it visited and accepts either, which costs nothing on Windows and
   asserts an order neither platform guarantees. Left as it is; tightening it to
   "the click came from the last move" on Windows only is a real option and is
-  §60.8's list, not this one.
+  §64.8's list, not this one.
 
 **And the ones §13.6 and §26.5 already settled, which stay settled.**
 `SetProcessDpiAwarenessContext` was a session-0 window station with no display
@@ -21011,7 +21619,7 @@ which was withdrawn. This stage removes two more from the folklore — §23.7's
 pair were never Wine — and adds one that is: `dwmapi` reporting success it
 cannot deliver. Cite the document, not a number somebody remembers.
 
-### 60.6 A VM running only Wine
+### 64.6 A VM running only Wine
 
 `scripts/wc-wine-guest.sh`, and it is the venue the requirement asked for.
 
@@ -21051,7 +21659,7 @@ a `cross-vm` claim that cannot back itself:
   somebody else configured and are refused when there is none; this one **is**
   the VM host — it starts QEMU itself a few lines later — so the two facts the
   guard checks are facts it establishes. That is stating the arrangement, not
-  evading the guard, and §60.6's two kernels are the run's own proof of it.
+  evading the guard, and §64.6's two kernels are the run's own proof of it.
 * **No substrate is declared, and that is the answer rather than an omission.**
   `wc_substrate_declare` offers `guest-ram` and `wine-fixture` and this leg uses
   neither: with no client there is no `wl_shm` pool and no arena, so nothing
@@ -21071,9 +21679,9 @@ about needing Xvfb implies for this particular use, and that note is about
 
 **What it does not do**, said plainly: no client, so no toplevel, no window and
 no pixel. A rendering leg in the guest needs an X server and a client in there
-too. §60.8.
+too. §64.8.
 
-### 60.7 The gates
+### 64.7 The gates
 
 | Gate | Result |
 |---|---|
@@ -21081,11 +21689,12 @@ too. §60.8.
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
 | `cargo clippy -p wc-compositor --all-targets` (Linux) | no warnings from this branch |
 | `cargo clippy -p wc-compositor --all-targets --target x86_64-pc-windows-gnu` | no warnings from this branch |
-| `scripts/wc-xref.sh` (behind `cargo test` since §54, tightened by §55) | 953 resolve, **0 missing, 0 unqualified**; the 103 ambiguities are `docs/design.md`'s own duplicate numbers, none from this branch |
-| `cargo test --workspace --no-fail-fast` | **86 binaries, 2603 tests**, 0 failures; seven of them are this branch's `wine::tests` |
+| `design_citations` (the §54 gate, tightened by §55) | `every_design_document_citation_resolves` passes; every citation this branch added names its document |
+| `cargo test --workspace --no-fail-fast` | **86 binaries, 2627 tests**, 0 failures (2620 on master `988d359`; 7 new) |
 | `scripts/wc-cursor.sh linux` | **8 passed, 0 failed** |
 | `scripts/wc-cursor.sh wine` | **17 passed, 0 failed** (master: 10, and see below) |
-| `scripts/wc-wine-guest.sh` (new) | **3 passed, 0 failed** — measured pre-merge, see below |
+| `scripts/wc-cursor.sh all` | **25 passed, 0 failed** |
+| `scripts/wc-wine-guest.sh` (new) | **3 passed, 0 failed** — measured on `e5e5963`, not re-run; see below |
 
 The seven new tests are `wine::tests`, and they are over `decide()` — the pure
 function that applies `WC_WIN32` to the probe — which is why they run on the
@@ -21102,7 +21711,7 @@ failing binary and under-reports the total.
 **On the wine leg's `+7`, and the run that measured master to check it.** Master's
 own `wc-cursor.sh wine` was run three times on this tree, unmodified, with only
 the compositor changed: **10 passed / 0 failed, 10 passed / 0 failed, and 5
-passed / 3 failed.** The third is §60.5's race caught in the act — "the
+passed / 3 failed.** The third is §64.5's race caught in the act — "the
 compositor never turned a cursor surface into pixels", "no reading of the
 compositor's queue: missing", and the three notes — and it is roughly one run in
 three. So the honest comparison is not 10 against 17 but *an intermittently
@@ -21125,9 +21734,9 @@ the compositor's cursor and passed. The probe now counts refusals, prints
 `moves-refused N of M` whether or not any were, and exits 3 when all were; the
 harness asserts the count is zero and reads `refused 0 of 4`.
 
-Worth naming as a pattern rather than a fix: §57 and §60.5 are the same failure
+Worth naming as a pattern rather than a fix: §57 and §64.5 are the same failure
 one level apart — a probe that cannot tell "I measured this" from "I measured
-whatever was already there". §60.5's version was the harness outliving the
+whatever was already there". §64.5's version was the harness outliving the
 probe; §57's is the window server refusing the probe. Both produce readings that
 look exactly like measurements.
 
@@ -21151,21 +21760,28 @@ that had moved. The underlying point is unaffected and still worth keeping:
 catch a link failure and is not a substitute for `cargo build --target`.
 
 **The guest leg's three assertions were measured on `e5e5963`, not on the merge.**
-The development guest is in use by another run and its QMP chardev takes exactly
-one client, so re-running it needs a slot rather than a retry. Nothing in the
-merge touches what it measures — the platform line and `wine_get_host_version` —
-but the number in that row is older than the others and is labelled so.
+The workstation is in use — the user asked for no testing on it until they are
+done — and the guest's QMP chardev takes exactly one client besides, so
+re-running this needs a slot rather than a retry. Every other row in the table
+above has been re-measured across four merges; this one has not, and it is
+labelled with the commit it was taken on rather than left to look current.
 
-### 60.8 What is not done
+Nothing in those merges touches what it measures: the platform line, which is
+printed before `platform::start`, and `wine_get_host_version`. But "nothing
+should have changed it" is an argument and not a measurement, which is the
+distinction this whole section is about, so the row stays dated until it is run
+again.
+
+### 64.8 What is not done
 
 1. **No real Windows guest ran this.** Everything above is Wine, on this
    workstation and in the VM. The `windows` branch of every assertion in
    `wc-cursor.sh` has been exercised only by `WC_WIN32=windows` under Wine,
-   which tests the *branch* and not the platform. The `dwmapi` entry in §60.4
+   which tests the *branch* and not the platform. The `dwmapi` entry in §64.4
    in particular predicts that a real guest logs
    `DwmExtendFrameIntoClientArea ok` with no Wine caveat, and §31.7 says it
    does — but that was a different run on a different day.
-2. **A rendering leg in the guest.** §60.6 has no client. An X server and a
+2. **A rendering leg in the guest.** §64.6 has no client. An X server and a
    `weston-eventdemo` inside the VM would make `wc-cursor.sh wine` runnable
    there, which is the first Wine cursor run that would not share a wineserver,
    an X server and a machine with ten other worktrees.
@@ -21173,7 +21789,7 @@ but the number in that row is older than the others and is labelled so.
    does; `wc-input.sh`, `wc-clip.sh`, `wc-damage.sh`, `wc-inhibit.sh` and
    `wc-wlcs-wine.sh` all read a compositor log and none of them check who wrote
    it. `win32_of()` is six lines and should be shared rather than copied.
-4. **`wc-damage.sh`'s wait, everywhere else.** §60.5's cause — the harness
+4. **`wc-damage.sh`'s wait, everywhere else.** §64.5's cause — the harness
    outliving the thing it was measuring — is a shape, not an incident.
    `wc-cursor.sh` has the fix now and `wc-damage.sh` had it already; the others
    should be read with it in mind, because the symptom is a *missing* reading

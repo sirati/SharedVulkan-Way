@@ -364,6 +364,25 @@ struct Window {
     /// guest RAM the window's pages carry the stamps the host locates the arena
     /// by, and a gift written before the sweep takes them with it.
     pending: Option<HashMap<u64, Vec<u8>>>,
+    /// STAGE 53. The growth channel's range, taken out of the front of this
+    /// window by [`reserve_growth_channel`] and remembered here so that the
+    /// *reservation* and the `Control::create` that writes into it can happen
+    /// at two different moments.
+    ///
+    /// They have to, and §34.5 saw only one of the two constraints. The
+    /// reservation may only run while the window is untouched — the channel is
+    /// its front and the free list has no way to express a hole — and smithay
+    /// takes the seat's keymap slice in `Seat::add_keyboard`, a full minute
+    /// before any client exists. The write may only run *after* the host's
+    /// locate, because `Control::create` zeroes the region and on guest RAM
+    /// those bytes are the stamps the locate reads.
+    ///
+    /// One call cannot satisfy both, and doing the whole thing at the later
+    /// moment — which is what `Service::start` did — is why growth had never
+    /// once worked on a guest: `reserve_growth_channel` refused every time,
+    /// because by then the keymap already held the front of the window.
+    /// [`defer_gifts`]/[`release_gifts`] is the same split for the same reason.
+    channel: Option<(u64, u64)>,
 }
 
 fn outbound_slot() -> &'static Mutex<Option<Window>> {
@@ -467,7 +486,7 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
                 w.arena
             )));
         }
-        let w = Window { arena, base: 0, len, free: vec![(0, len)], given: 0, pending: None };
+        let w = Window { arena, base: 0, len, free: vec![(0, len)], given: 0, pending: None, channel: None };
         *guard = Some(w);
         return Ok(OutboundWindow { arena, offset: 0, len, run_id: Some(region.run_id) });
     }
@@ -509,7 +528,7 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         ));
     }
     let base = arena_len - len;
-    *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None });
+    *guard = Some(Window { arena, base, len, free: vec![(base, len)], given: 0, pending: None, channel: None });
     Ok(OutboundWindow { arena, offset: base, len, run_id: None })
 }
 
@@ -1021,7 +1040,24 @@ pub fn reserve_growth_channel(arena: u32) -> io::Result<(u64, u64)> {
         ));
     }
     w.free = vec![(w.base + control, w.len - control)];
+    w.channel = Some((w.base, control));
     Ok((w.base, control))
+}
+
+/// The range [`reserve_growth_channel`] took, for the caller that comes back
+/// later to write into it.
+///
+/// `None` means no reservation was made — no outbound window, one too small, or
+/// a build that never asked. It is deliberately not an error: a session that
+/// cannot grow is a session that refuses under pressure, which is a fact to
+/// report rather than a failure to start.
+pub fn growth_channel(arena: u32) -> Option<(u64, u64)> {
+    let guard = outbound_slot().lock().ok()?;
+    let w = guard.as_ref()?;
+    if w.arena != arena {
+        return None;
+    }
+    w.channel
 }
 
 /// Where a region this process **provided** starts in this process's address
@@ -1432,7 +1468,7 @@ mod tests {
 
     #[test]
     fn the_outbound_window_is_the_compositors_and_nothing_else_can_write_it() {
-        let pages = 16u64;
+        let pages = 256u64;
         let region = attach_guest_ram(OUT, pages * REGION_PAGE as u64).unwrap();
         assert!(outbound().is_none(), "nothing may be outbound before it is reserved");
 
@@ -1455,9 +1491,9 @@ mod tests {
         );
 
         // The tail, and exactly the tail.
-        let w = reserve_outbound(OUT, 4 * REGION_PAGE as u64).unwrap();
+        let w = reserve_outbound(OUT, 96 * REGION_PAGE as u64).unwrap();
         assert_eq!(w.arena, OUT);
-        assert_eq!(w.len, 4 * REGION_PAGE as u64);
+        assert_eq!(w.len, 96 * REGION_PAGE as u64);
         assert_eq!(w.offset, region.len as u64 - w.len);
         assert_eq!(outbound(), Some(w));
         // One per process.
@@ -1471,6 +1507,29 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
 
+        // STAGE 53: the growth channel is taken **before any gift**, and that
+        // ordering is the whole of why growth had never worked on a guest.
+        //
+        // The window is untouched at this point and that is the only moment the
+        // reservation is possible: the channel is the front of the window and
+        // the free list has no way to express a hole. `grow::Service::start`
+        // used to reserve at the *first client* instead — correct for
+        // `Control::create`, which writes and must wait for the host's locate,
+        // and far too late for this, which does not write at all. On a guest the
+        // keymap had taken the front an hour earlier and every session logged
+        // `no growth channel … will refuse under pressure instead`. See
+        // `docs/waycompose-design.md` §53.2.
+        assert_eq!(growth_channel(OUT), None, "nothing is reserved before it is asked for");
+        let (coff, clen) = reserve_growth_channel(OUT).expect("an untouched window may be carved");
+        assert_eq!(coff, w.offset, "the channel is the front of the window, by construction");
+        assert_eq!(clen, crate::grow::CONTROL_BYTES);
+        assert_eq!(
+            growth_channel(OUT),
+            Some((coff, clen)),
+            "the range has to survive to the later caller that writes into it"
+        );
+        assert_eq!(growth_channel(OUT + 1), None, "and it answers for one arena only");
+
         // STAGE 12: deferral, and the property it exists for.
         //
         // **The region must still read as the guest stamped it** until somebody
@@ -1483,10 +1542,14 @@ mod tests {
         let held = Handle::create_shared(64).unwrap();
         held.write_at(0, b"KEYMAP").unwrap();
         let held_at = match held.descriptor() {
-            Descriptor::ArenaSlice { offset, .. } => *offset,
+            crate::Descriptor::ArenaSlice { offset, .. } => *offset,
             other => panic!("{other:?}"),
         };
-        assert_eq!(held_at, w.offset, "the first gift is the start of the window, which is a page");
+        // STAGE 53: the front of the window is the growth channel's now, so the
+        // first gift starts where the channel ends. That the keymap is *second*
+        // is the whole fix — see the reservation above and
+        // `docs/waycompose-design.md` §53.2.
+        assert_eq!(held_at, w.offset + crate::grow::CONTROL_BYTES, "the first gift follows the channel");
         let look = |off: u64, len: u64| {
             Handle::from_descriptor(Descriptor::ArenaSlice { arena: OUT, offset: off, len })
                 .map()
@@ -1546,7 +1609,11 @@ mod tests {
         let (bo, _) = span(&b);
         assert!(ao + al <= bo || bo + 4096 <= ao, "gifts {ao} and {bo} overlap");
         let (given, free) = outbound_usage().unwrap();
-        assert_eq!(given + free, w.len);
+        // STAGE 53. The growth channel is out of the allocator's arithmetic
+        // entirely — not given, not free — because it was taken out of the free
+        // list before the first gift and is never returned to it. §34.4 budgeted
+        // exactly this: "it costs the gift allocator 272 KiB of its 1 MiB".
+        assert_eq!(given + free + crate::grow::CONTROL_BYTES, w.len);
         drop(b);
         let (given2, _) = outbound_usage().unwrap();
         assert_eq!(given2, given - 4096, "a dropped gift did not return its bytes");
@@ -1644,4 +1711,5 @@ mod release_tests {
         let e = release_guest_ram(9_413).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
     }
+
 }

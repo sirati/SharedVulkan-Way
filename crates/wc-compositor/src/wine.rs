@@ -1,29 +1,30 @@
 //! **Which implementation of Win32 this process is talking to**, decided once
 //! at startup and never asked again.
 //!
-//! docs/waycompose-design.md §60.
+//! docs/waycompose-design.md §64.
 //!
 //! # Why this exists
 //!
 //! Every Windows-side run in this project has had two possible venues: a real
 //! Windows kernel on the guest, and Wine on a Linux box. The second is the one
 //! that is always available, so it is the one nearly every gate in `scripts/`
-//! actually uses — and it is *not* Windows. §13.6 settles the tally at **four
-//! recorded discrepancies**, one of which (`SetProcessDpiAwarenessContext`,
-//! §10.8) was withdrawn when the cause turned out to be a session-0 window
-//! station rather than Wine. §26.5 adds the correction that matters more than
-//! the number: most of what this document called "Wine lied" was really "there
-//! was no hypervisor in the test", which is a fact about the *topology* and not
-//! about Wine.
+//! actually uses — and it is *not* Windows. docs/waycompose-design.md §13.6
+//! settles the tally at **four recorded discrepancies**, one of which
+//! (`SetProcessDpiAwarenessContext`, docs/waycompose-design.md §10.8) was
+//! withdrawn when the cause turned out to be a session-0 window station rather
+//! than Wine. docs/waycompose-design.md §26.5 adds the correction that matters
+//! more than the number: most of what this document called "Wine lied" was
+//! really "there was no hypervisor in the test", which is a fact about the
+//! *topology* and not about Wine.
 //!
 //! So the point of this module is emphatically **not** to route around Wine. It
 //! is two much smaller things:
 //!
 //! 1. **Say which venue a run measured**, once, in a line a harness can assert
 //!    on — so that a run cannot silently be evidence about the wrong platform.
-//!    That failure has happened here: §33's photograph of "this compositor
-//!    ignoring input" was another worktree's `weston-terminal`, and it reached
-//!    `docs/` before anybody noticed.
+//!    That failure has happened here: docs/waycompose-design.md §33's
+//!    photograph of "this compositor ignoring input" was another worktree's
+//!    `weston-terminal`, and it reached `docs/` before anybody noticed.
 //! 2. **Give the small number of genuine Wine defects one decision point**, so
 //!    that a workaround is a named branch with a measurement attached rather
 //!    than an unconditional allowance that quietly weakens the Windows run too.
@@ -34,22 +35,23 @@
 //! merely different.** The whole value of the Wine legs is that they are a
 //! stand-in for Windows: every `if under_wine()` is one more thing the Wine run
 //! stops testing about the Windows run, so the set has to stay small enough to
-//! list. It is listed in §60.4, and today it is two entries, neither of which
-//! changes a pixel:
+//! list. It is listed in docs/waycompose-design.md §64.4, and today it is two
+//! entries, neither of which changes a pixel:
 //!
 //! * `platform::win32::apply_frame` — Wine's `dwmapi` answers `S_OK` to
 //!   `DwmExtendFrameIntoClientArea` and `DwmIsCompositionEnabled` while
 //!   implementing neither, so the compositor's own log claimed a compositing
-//!   arrangement that did not exist. §31.7 predicted exactly this ("a run that
-//!   extends the frame and finds `dwmapi` stubbed would look exactly like
-//!   `noglass.png` and would report success ... the one failure mode of this
-//!   arrangement with no diagnostic") and this is the diagnostic.
+//!   arrangement that did not exist. docs/waycompose-design.md §31.7 predicted
+//!   exactly this ("a run that extends the frame and finds `dwmapi` stubbed
+//!   would look exactly like `noglass.png` and would report success ... the one
+//!   failure mode of this arrangement with no diagnostic") and this is the
+//!   diagnostic.
 //! * `scripts/probe-cursor.c` — `GetCursorInfo` is *fatal* under Wine's X11
 //!   driver, which is not a Rust call site but is the same decision made the
 //!   same way, from the same probe.
 //!
 //! Three things that look like candidates and are deliberately **not** here are
-//! in §60.5, with the reason each was refused.
+//! in docs/waycompose-design.md §64.5, with the reason each was refused.
 //!
 //! # The override, and why a stale assumption must be falsifiable
 //!
@@ -74,7 +76,7 @@ pub enum Win32 {
     Windows,
     /// Wine, with what `ntdll!wine_get_version` and `wine_get_host_version`
     /// said. The version is kept rather than discarded because every entry in
-    /// §60.4 is a claim about a *particular* Wine, and the first question asked
+    /// §64.4 is a claim about a *particular* Wine, and the first question asked
     /// of a quirk that stops reproducing is "which one was it measured on".
     Wine { version: String, host: String },
     /// Not a Windows binary at all: the Linux build, which is what `cargo test`
@@ -82,8 +84,8 @@ pub enum Win32 {
     ///
     /// A variant rather than an absence so that the startup line says it out
     /// loud. A harness that meant to run the `.exe` and got this one has
-    /// measured nothing about Windows, and §35 is a section about gates that
-    /// reported success while something was wrong.
+    /// measured nothing about Windows, and docs/waycompose-design.md §35 is a
+    /// section about gates that reported success while something was wrong.
     None,
 }
 
@@ -337,7 +339,7 @@ mod tests {
         let (w, how) = decide(wine(), None);
         assert_eq!(how, How::Probe);
         assert_eq!(w.tag(), "wine");
-        // The version survives the trip, because §60.4's entries are claims
+        // The version survives the trip, because §64.4's entries are claims
         // about a particular Wine and a log that dropped the number would make
         // the next person re-measure to find out which.
         assert_eq!(w, Win32::Wine { version: "11.14".into(), host: "Linux 6.18.33".into() });

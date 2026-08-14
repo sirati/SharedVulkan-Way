@@ -761,6 +761,11 @@ thread_local! {
     /// move in it: OLE calls `DragOver` several times a second for as long as
     /// the gesture lasts.
     static OVER_RUN: Cell<(DROPEFFECT, u32)> = const { Cell::new((DROPEFFECT_NONE, 0)) };
+    /// Drop-target registrations OLE accepted, gave back, and refused to give
+    /// back. ADDED FOR docs/waycompose-design.md §62; see `drop_target_counts`.
+    static REGISTERED: Cell<u32> = const { Cell::new(0) };
+    static REVOKED: Cell<u32> = const { Cell::new(0) };
+    static REVOKE_FAILED: Cell<u32> = const { Cell::new(0) };
     /// `now_ms()` at the `DragEnter` of the gesture in progress, so the gap
     /// until the client's first answer is a number rather than an estimate.
     static ENTERED_AT: Cell<u32> = const { Cell::new(0) };
@@ -1366,6 +1371,7 @@ pub(crate) fn register(hwnd: HWND, window: u64) {
     // this module allocated. OLE takes its own reference.
     let hr = unsafe { RegisterDragDrop(hwnd, target.cast()) };
     if hr == S_OK {
+        REGISTERED.with(|c| c.set(c.get() + 1));
         println!("wc-compositor: window {window} accepts drops from Windows applications");
     } else {
         // Not fatal, and said out loud rather than swallowed: a compositor
@@ -1391,7 +1397,42 @@ pub(crate) fn revoke(hwnd: HWND) {
         return;
     }
     // SAFETY: a live window handle on the thread that owns it.
-    unsafe { RevokeDragDrop(hwnd) };
+    let hr = unsafe { RevokeDragDrop(hwnd) };
+    // ADDED FOR docs/waycompose-design.md §62. **The result used to be
+    // discarded**, and the whole of §43.7's ordering argument — revoke before
+    // `DestroyWindow`, because OLE keys the registration on the `HWND` and a
+    // destroyed handle cannot be revoked — rests on this call succeeding. A
+    // compositor that got the ordering wrong, or that revoked a window it had
+    // never registered, produced exactly the same output as one that got it
+    // right: none.
+    //
+    // Counted rather than only logged, because one line per window is noise and
+    // a pair of totals at exit is a gate (see `REGISTERED` / `REVOKED`).
+    if hr == S_OK {
+        REVOKED.with(|c| c.set(c.get() + 1));
+    } else {
+        REVOKE_FAILED.with(|c| c.set(c.get() + 1));
+        println!("wc-compositor: RevokeDragDrop failed with {hr:#010x}; the registration is stranded");
+    }
+}
+
+/// How many windows OLE accepted as drop targets, and how many were given back.
+///
+/// ADDED FOR docs/waycompose-design.md §62. These are the compositor's own
+/// account of its own behaviour and are labelled as such wherever they are
+/// printed — §56's distinction. What makes them worth having anyway is that the
+/// *external* check is impossible here: OLE's registration table is not
+/// enumerable from another process, and a stranded entry has no symptom until
+/// an `HWND` value is reused, which §60.3 measures as not happening within a
+/// run. A number the compositor prints is the only observation available, so it
+/// is at least made falsifiable — `RevokeDragDrop` on a window that was never
+/// registered returns `DRAGDROP_E_INVALIDHWND`, and the test asserts that.
+pub(crate) fn drop_target_counts() -> (u32, u32, u32) {
+    (
+        REGISTERED.with(|c| c.get()),
+        REVOKED.with(|c| c.get()),
+        REVOKE_FAILED.with(|c| c.get()),
+    )
 }
 
 
@@ -1444,6 +1485,70 @@ pub(crate) fn from_dropeffect(effect: DROPEFFECT) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RevokeDragDrop` tells a window it never registered apart from one it
+    /// did, so counting its successes is a measurement rather than a formality.
+    ///
+    /// ADDED FOR docs/waycompose-design.md §62. `revoke` used to discard the
+    /// `HRESULT`; it now counts, and a counter is only worth having if the
+    /// thing it counts can come out the other way. This is the other way: OLE
+    /// answers `DRAGDROP_E_INVALIDHWND` for a window that was never a drop
+    /// target, so the `hr == S_OK` arm in `revoke` is a real branch and the
+    /// "registered == revoked" gate in `scripts/wc-life.sh` is a real gate.
+    ///
+    /// Deliberately not asserting the exact code beyond "not success": the
+    /// contract that matters is that OLE distinguishes the two cases at all,
+    /// and pinning the constant would fail on a platform that returned a
+    /// different-but-still-failing one for the same correct reason.
+    #[test]
+    fn revoking_a_window_that_was_never_a_drop_target_is_not_a_success() {
+        let hr = unsafe { OleInitialize(std::ptr::null()) };
+        assert!(hr == S_OK || hr == 1, "OleInitialize -> {hr:#010x}");
+
+        // A window this test owns and never registered. `HWND_MESSAGE` keeps it
+        // off any desktop, so this runs the same with or without one.
+        let class = windows_sys::w!("wc_revoke_probe");
+        let mut wc: windows_sys::Win32::UI::WindowsAndMessaging::WNDCLASSEXW =
+            unsafe { std::mem::zeroed() };
+        wc.cbSize = size_of_val(&wc) as u32;
+        wc.lpfnWndProc = Some(windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW);
+        wc.lpszClassName = class;
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::RegisterClassExW(&wc) };
+        let hwnd = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+                0,
+                class,
+                windows_sys::w!(""),
+                0,
+                0,
+                0,
+                0,
+                0,
+                windows_sys::Win32::UI::WindowsAndMessaging::HWND_MESSAGE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!hwnd.is_null(), "CreateWindowExW failed");
+
+        let unregistered = unsafe { RevokeDragDrop(hwnd) };
+        assert_ne!(
+            unregistered, S_OK,
+            "revoking a window that was never registered must not report success"
+        );
+
+        // And the success case, so the assertion above is not merely "this
+        // always fails": register, then revoke, and get S_OK.
+        register(hwnd, 0);
+        let registered = unsafe { RevokeDragDrop(hwnd) };
+        assert_eq!(
+            registered, S_OK,
+            "revoking a window that *was* registered must report success"
+        );
+
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd) };
+    }
 
     #[test]
     fn the_two_drag_vocabularies_do_not_share_a_numbering() {

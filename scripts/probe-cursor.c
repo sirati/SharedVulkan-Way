@@ -60,7 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* WHICH WIN32 IS THIS -- docs/waycompose-design.md §60.
+/* WHICH WIN32 IS THIS -- docs/waycompose-design.md §64.
  *
  * The same probe `crates/wc-compositor/src/wine.rs` makes, made here because
  * this is a separate process and the compositor's answer does not cross to it:
@@ -94,7 +94,7 @@ static int under_wine(void)
 	return cached;
 }
 
-/* THE ONE THING THIS PROBE CANNOT DO UNDER WINE (docs/waycompose-design.md §60.4)
+/* THE ONE THING THIS PROBE CANNOT DO UNDER WINE (docs/waycompose-design.md §64.4)
  *
  * `stock_name` below rests on a documented Windows property, and the header of
  * this file states it as the reason the reading is proof rather than
@@ -119,7 +119,7 @@ static void announce_stock_identity(void)
 	if (under_wine())
 		printf("probe-cursor: stock-identity=unavailable "
 		       "(Wine's stock HCURSORs are per-process, so a handle from "
-		       "another process cannot be named; docs/waycompose-design.md §60.4)\n");
+		       "another process cannot be named; docs/waycompose-design.md §64.4)\n");
 	else
 		printf("probe-cursor: stock-identity=available\n");
 	fflush(stdout);
@@ -186,17 +186,28 @@ static void move_to(int x, int y)
 	in.mi.dy = (LONG)((double)y * 65535.0 / (double)(h - 1));
 	in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
 	/* **The return value is checked, and docs/waycompose-design.md §57 is why.**
-	 * A locked Windows session puts the input desktop on `Winlogon`; a process
-	 * on `Default` cannot inject into it, and `SendInput` returns 0 with
-	 * `ERROR_ACCESS_DENIED` without blocking, throwing or logging. §57 found
-	 * `probe-scroll.c` discarding exactly this and measuring a browser nobody
-	 * had scrolled.
+	 * `SendInput` can return 0 with `ERROR_ACCESS_DENIED` without blocking,
+	 * throwing or logging. §57 found `probe-scroll.c` discarding exactly this
+	 * and measuring a browser nobody had scrolled.
 	 *
 	 * The same hole was here. Every reading after a `move_to` -- the client
 	 * area, the dwell, and both frame points -- is a claim about where the
 	 * pointer *is*, so a refused move does not make them fail, it makes them
 	 * describe wherever the pointer happened to be already. On this Xvfb they
 	 * would still have read the compositor's cursor and passed.
+	 *
+	 * **What this deliberately does NOT say is why**, and
+	 * docs/waycompose-design.md §63.3 is the reason. An earlier version of this
+	 * line asked "is the session locked?", which is a real cause -- a locked
+	 * session puts the input desktop on `Winlogon` and a process on `Default`
+	 * cannot inject into it -- and it is the cause that held up a run for a day
+	 * while being about a path the launcher does not travel: ssh lands in
+	 * session 0, the launcher's clicks go through a scheduled task into session
+	 * 1, and a window there is visible and mappable while locked. §63.3's rule
+	 * is that *a measurement can be real and still be about the wrong path*, so
+	 * this prints the refusal and the error code and stops. Which session and
+	 * which desktop this process is on is the next measurement, not a guess to
+	 * put in the log where somebody will read it as the answer.
 	 *
 	 * Counted rather than fatal: the caller decides, and `wc-cursor.sh` asserts
 	 * the count is zero. A probe that stopped here would lose the readings that
@@ -205,7 +216,8 @@ static void move_to(int x, int y)
 	if (SendInput(1, &in, sizeof in) != 1) {
 		moves_refused++;
 		printf("probe-cursor: SendInput REFUSED for %d,%d (err %lu) -- "
-		       "is the session locked? (docs/waycompose-design.md §57)\n",
+		       "the window server would not take it; which session and desktop "
+		       "is this process on? (docs/waycompose-design.md §63.3)\n",
 		       x, y, (unsigned long)GetLastError());
 		fflush(stdout);
 	}
@@ -297,13 +309,13 @@ static void ask_window(const char *tag, HWND w, int hittest)
 /* Report the cursor at the current pointer position, prefixed with `tag` so a
  * shell script can grep for one probe point among several.
  *
- * A NOTE ON WHAT USED TO BE HERE (docs/waycompose-design.md §60.5)
+ * A NOTE ON WHAT USED TO BE HERE (docs/waycompose-design.md §64.5)
  *
  * §23.7 item 1 recorded `GetCursorInfo` as *fatal* under Wine -- a run of this
  * probe dying at exactly this call with
  * `X Error of failed request: BadWindow (invalid Window parameter), Major
  * opcode 38 (X_QueryPointer)` -- and it reproduced on this branch, three times
- * out of three, before anything was changed. §60 was about to give it a Wine
+ * out of three, before anything was changed. §64 was about to give it a Wine
  * path. It does not have one, because the cause is not Wine:
  * `scripts/wc-cursor.sh` was tearing the compositor down while this probe was
  * still running, so the window whose pointer was being queried had just been

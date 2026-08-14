@@ -4,17 +4,17 @@
 #
 #   scripts/wc-wine-guest.sh [--keep]
 #
-# docs/waycompose-design.md §60.6.
+# docs/waycompose-design.md §64.6.
 #
 # WHY THIS EXISTS
 #
-# The requirement §60 answers is "we also need to be able to test against a vm
-# running only wine". Every Wine run in this document before §26 was one
-# machine with no VM boundary at all, and §26.5 is blunt about what that cost:
-# several consequences of *having no hypervisor* were written up as "Wine
-# lied". So a Wine leg that is a genuine second venue — its own kernel, its own
-# wineserver, its own X-less session — is worth more than another local one,
-# and this is the cheapest honest form of it.
+# The requirement docs/waycompose-design.md §64 answers is "we also need to be
+# able to test against a vm running only wine". Every Wine run in this document
+# before §26 was one machine with no VM boundary at all, and §26.5 is blunt
+# about what that cost: several consequences of *having no hypervisor* were
+# written up as "Wine lied". So a Wine leg that is a genuine second venue — its
+# own kernel, its own wineserver, its own X-less session — is worth more than
+# another local one, and this is the cheapest honest form of it.
 #
 # `nix build .#svGuest` boots a NixOS VM on this workstation with a
 # `memory-backend-memfd` and a QMP socket. It has no Wine of its own and does
@@ -41,13 +41,14 @@
 # everything short of a real `HWND` with pixels in it, which is more than
 # `flake.nix`'s note about needing Xvfb implies for this particular use.
 #
-# The identity line is printed *before* `platform::start` regardless (§60.3),
-# and that ordering is the load-bearing part: what platform a run is on must
-# not depend on the platform having come up, or the one run that most needs
-# attributing — the one that failed to start — is the one that cannot be.
+# The identity line is printed *before* `platform::start` regardless
+# (docs/waycompose-design.md §64.3), and that ordering is the load-bearing
+# part: what platform a run is on must not depend on the platform having come
+# up, or the one run that most needs attributing — the one that failed to
+# start — is the one that cannot be.
 #
 # A leg that renders in the guest needs an X server and a client in there too.
-# docs/waycompose-design.md §60.8 names it as work rather than pretending this covers it.
+# docs/waycompose-design.md §64.8 names it as work rather than pretending this covers it.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -67,14 +68,15 @@ bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 
-# §51/§52. Whether a hypervisor is in the path, declared rather than assumed.
+# docs/waycompose-design.md §51 and §52. Whether a hypervisor is in the path,
+# declared rather than assumed.
 #
 # **This one is genuinely `cross-vm`, and it is the only Wine leg in the tree
 # that is.** Every other Wine harness here declares `same-box` and is right to:
 # §26.5's correction is that every Wine run in this document before it was one
 # machine with no boundary at all. This script boots the VM itself and runs the
 # compositor inside it, so the boundary is real and the declaration is checkable
-# against the run's own output — §60.6's two kernels are that check.
+# against the run's own output — docs/waycompose-design.md §64.6's two kernels are that check.
 #
 # `WC_HOST` and `WC_GUEST_CONFIGURED` are set here rather than expected from the
 # environment, and the difference matters: the other cross-VM harnesses *reach*
@@ -194,7 +196,7 @@ sed 's/^/        /' "$RUNDIR/comp.log"
 GUEST_LINE=$(grep -o 'wc-compositor: win32 is .*' "$RUNDIR/comp.log" | head -1 | tr -d '\r')
 case "$GUEST_LINE" in
   *"win32 is wine"*) ok "inside the VM the compositor says: ${GUEST_LINE#wc-compositor: }" ;;
-  "")                bad "the compositor never said which Win32 it was on (docs/waycompose-design.md §60)" ;;
+  "")                bad "the compositor never said which Win32 it was on (docs/waycompose-design.md §64)" ;;
   *)                 bad "inside the VM the compositor says: ${GUEST_LINE#wc-compositor: }" ;;
 esac
 

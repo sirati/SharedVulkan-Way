@@ -222,6 +222,16 @@ pub enum LowerError {
     ChainTooLong,
     /// The transport is not connected.
     NotConnected,
+    /// A capture-replay member was not null on a device that does not advertise
+    /// capture-replay (docs/design.md §0.24).
+    ///
+    /// `pShaderGroupCaptureReplayHandle` and `opaqueCaptureDescriptorData` are
+    /// only written by a tool replaying a trace, and doing so requires the
+    /// matching `…CaptureReplay` feature — which `sv_icd::advertise` does not
+    /// advertise. So a non-null value here is a usage error, and refusing it by
+    /// name is what makes "we do not support capture-replay" different from "we
+    /// ignored your replay token and gave you a different address".
+    CaptureReplayUnsupported,
     OutOfHostMemory,
     OutOfDeviceMemory,
     DeviceLost,
