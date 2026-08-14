@@ -104,6 +104,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SPI_GETKEYBOARDSPEED, WM_SETCURSOR,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
+    // ADDED FOR STAGE 54: asking Windows what still exists, rather than asking
+    // this process what it believes. See `live_toplevels`.
+    EnumWindows, GetClassNameW, GetWindowThreadProcessId,
     AdjustWindowRectEx, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyWindow, DispatchMessageW, GetClientRect, GetMessageTime, GetMessageW, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, PostQuitMessage,
@@ -997,6 +1000,23 @@ pub(crate) struct Ui {
     /// messages rather than pumping them — but "should not be possible" is not
     /// a thing to find out about from a corrupted window list.
     draining: Cell<bool>,
+    /// How many windows this process has ever made, and how many it has
+    /// destroyed. §54.
+    ///
+    /// Every gate in this tree asserts that something **appeared**. Nothing
+    /// asserted that anything stopped existing, so a leaked `HWND` per client
+    /// survived a whole session with every check green — the same shape of hole
+    /// the WLCS side found on protocol errors, in the platform layer.
+    ///
+    /// Counted here rather than derived from `windows.len()` because the map is
+    /// the thing under suspicion: a `Destroy` that removed the entry and failed
+    /// to destroy the window would leave the map empty and the `HWND` alive,
+    /// which is exactly the leak worth catching and exactly the one a
+    /// map-length check cannot see. These two numbers are the *claim*;
+    /// `live_toplevels` below is the platform's own answer, and the pair
+    /// disagreeing is the finding.
+    made: Cell<u64>,
+    gone: Cell<u64>,
     pub(crate) controller: Cell<isize>,
     /// Whether a client currently holds an idle inhibitor.
     ///
@@ -2124,7 +2144,13 @@ fn drain(ui: &Rc<Ui>) {
         return;
     }
     while let Ok(cmd) = ui.commands.try_recv() {
-        if matches!(cmd, ToUi::Quit) {
+        if let ToUi::Quit { clients } = cmd {
+            // STAGE 54, and **before** `PostQuitMessage`: the enumeration has to
+            // happen while this thread still owns its windows. After the quit
+            // message the pump unwinds and the process tears down, at which
+            // point every window goes away for a reason that has nothing to do
+            // with whether the compositor destroyed it.
+            report_window_leaks(ui, clients);
             // SAFETY: ends this thread's `GetMessage` loop.
             unsafe { PostQuitMessage(0) };
             break;
@@ -2132,6 +2158,69 @@ fn drain(ui: &Rc<Ui>) {
         handle(ui, cmd);
     }
     ui.draining.set(false);
+}
+
+/// How many `WaycomposeToplevel` windows **this process** still owns, asked of
+/// Windows rather than of our own bookkeeping. STAGE 54.
+///
+/// This is the half that makes the leak report evidence instead of an
+/// assertion. `made` and `gone` are what the compositor believes; this is what
+/// the window manager will tell anybody who asks. A `Destroy` that removed the
+/// map entry and then failed to destroy the window — `DestroyWindow` returning
+/// false, a window owned by the wrong thread, a handle already replaced —
+/// leaves those two numbers balanced and this one non-zero, and that gap is the
+/// entire bug this stage exists to make visible.
+///
+/// Filtered by process id, not just by class: `wc-proxy.sh` and `wc-guest.sh`
+/// run several compositors at once on a shared machine, and §16.8's rule is
+/// that identity on a shared box is never a class of thing. A count that swept
+/// up another run's windows would fail a harness for somebody else's leak.
+fn live_toplevels() -> u32 {
+    struct Count {
+        pid: u32,
+        n: u32,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> i32 {
+        // SAFETY: `lparam` is the `&mut Count` handed to `EnumWindows` below,
+        // which outlives the enumeration.
+        let c = unsafe { &mut *(lparam as *mut Count) };
+        let mut pid: u32 = 0;
+        // SAFETY: a live handle from the enumerator and a valid out-pointer.
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid != c.pid {
+            return 1;
+        }
+        let mut buf = [0u16; 64];
+        // SAFETY: a live handle and a buffer with its own length.
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == CLASS_TOPLEVEL {
+            c.n += 1;
+        }
+        1
+    }
+    let mut c = Count {
+        // SAFETY: no arguments, no failure mode.
+        pid: unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() },
+        n: 0,
+    };
+    // SAFETY: a real callback and a pointer that outlives the call.
+    unsafe { EnumWindows(Some(visit), &mut c as *mut Count as LPARAM) };
+    c.n
+}
+
+/// The line every harness asserts on. STAGE 54.
+///
+/// Printed on the way out, from the UI thread, because that is the thread that
+/// owns the windows and the only one entitled to enumerate them.
+fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
+    let made = ui.made.get();
+    let gone = ui.gone.get();
+    let held = ui.windows.borrow().len();
+    let live = live_toplevels();
+    println!(
+        "wc-compositor: windows at exit: {made} created, {gone} destroyed, \
+         {held} still held, {live} still alive, {clients} client(s) still connected"
+    );
 }
 
 /// Look a window up without holding the map borrow across anything that can
@@ -2215,6 +2304,32 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                     "wc-compositor: window {id} repositioned to {},{} {width}x{height}",
                     origin.x, origin.y
                 );
+            }
+        }
+        // §45.11. The corner moved; the size did not (a size change arrives on
+        // the ordinary present path) and neither did the z-order or the focus.
+        ToUi::ShiftOrigin { id, dx, dy } => {
+            if let Some(w) = window(ui, id) {
+                let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: a live handle, and `GetWindowRect` only writes the
+                // rectangle it is given.
+                unsafe {
+                    if GetWindowRect(w.hwnd(), &mut r) != 0 {
+                        SetWindowPos(
+                            w.hwnd(),
+                            std::ptr::null_mut(),
+                            r.left + dx,
+                            r.top + dy,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        println!(
+                            "wc-compositor: window {id} origin shifted by {dx},{dy} \
+                             (its content did not move)"
+                        );
+                    }
+                }
             }
         }
         ToUi::Present { id, damage } => {
@@ -2335,10 +2450,11 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                         DestroyWindow(hwnd);
                     }
                 }
+                ui.gone.set(ui.gone.get() + 1);
                 println!("wc-compositor: window {id} destroyed");
             }
         }
-        ToUi::Quit => unreachable!("handled in drain"),
+        ToUi::Quit { .. } => unreachable!("handled in drain"),
     }
 }
 
@@ -2634,6 +2750,7 @@ fn create_window(
         super::drag::register(hwnd, id);
     }
     ui.windows.borrow_mut().insert(id, state.clone());
+    ui.made.set(ui.made.get() + 1);
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");
     // ADDED FOR STAGE 32, and *here* rather than at map for one reason: the
@@ -3081,7 +3198,7 @@ fn frame_glass(w: &WindowState) -> bool {
         "wc-compositor: window {} folds {inset} px of caption into its client area{}",
         w.id,
         match dwm {
-            // docs/waycompose-design.md §55.4, and the one Wine branch in this file. §31.7 named this
+            // docs/waycompose-design.md §58.4, and the one Wine branch in this file. §31.7 named this
             // exact hole — "a run that extends the frame and finds `dwmapi`
             // stubbed would look exactly like `noglass.png` and would report
             // success ... the one failure mode of this arrangement with no
@@ -3107,7 +3224,7 @@ fn frame_glass(w: &WindowState) -> bool {
             Some(0) if crate::wine::under_wine() =>
                 ", DwmExtendFrameIntoClientArea returned ok -- but this dwmapi is Wine's stub \
                  (DwmGetWindowAttribute is E_NOTIMPL) and nothing is composited behind the \
-                 frame; see docs/waycompose-design.md §55.4",
+                 frame; see docs/waycompose-design.md §58.4",
             Some(0) => ", DwmExtendFrameIntoClientArea ok",
             Some(_) => ", DwmExtendFrameIntoClientArea FAILED",
             None if w.frame.get().dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",
@@ -4742,6 +4859,8 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         events: config.events,
         frame: config.frame,
         draining: Cell::new(false),
+        made: Cell::new(0),
+        gone: Cell::new(0),
         controller: Cell::new(controller as isize),
         idle_inhibited: Cell::new(false),
         html_format: Cell::new(0),

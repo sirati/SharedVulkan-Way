@@ -4,11 +4,12 @@
 #   scripts/wc-firefox.sh enumerate   what Firefox binds, and what it does without
 #   scripts/wc-firefox.sh window      the browser's own pixels, measured from outside
 #   scripts/wc-firefox.sh titlebar    the two levers that leave exactly one title bar
+#   scripts/wc-firefox.sh auto        Firefox under the compiled-in default, vs server
 #   scripts/wc-firefox.sh tabs        the client half of --decorations tabs
 #   scripts/wc-firefox.sh menu        a click, an xdg_popup, and a second window
 #   scripts/wc-firefox.sh wine        the same client into a real HWND, through the proxy
 #   scripts/wc-firefox.sh wine-arena  the same run with the pixels in an arena
-#   scripts/wc-firefox.sh all         all seven
+#   scripts/wc-firefox.sh all         all eight
 #
 # Run from inside `nix develop`.
 #
@@ -120,6 +121,16 @@ have() { command -v "$1" >/dev/null 2>&1; }
 #              names it explicitly now, because the compiled-in default changed
 #              in this stage (§22.2) and a block that relied on it would be
 #              measuring the flag rather than the client.
+#
+#              **`FX_DECOR=none` passes no `--decorations` at all**, added by
+#              §53 for the one block that has to measure the compiled-in
+#              default rather than a named value. That is the exact opposite of
+#              every other block's requirement and it is why it needs a
+#              sentinel: §49 changed the default to `auto` and argued it is
+#              indistinguishable from `server` for a client that negotiates,
+#              and *every* block here names `FX_DECOR`, so no run had ever
+#              exercised the argument. §49.9 listed it as unmeasured; this is
+#              the block that measures it.
 #   FX_ENV     extra `VAR=value` words put in front of Firefox. This is where
 #              `MOZ_GTK_TITLEBAR_DECORATION` goes, and it is an *array* because
 #              the alternative — a string that the shell re-splits — puts a
@@ -129,9 +140,14 @@ run_firefox() {
   mkdir -p "$dir/rt" "$dir/profile" "$dir/frames"
   chmod 700 "$dir/rt"
 
+  # `none` means "name nothing", so the compositor uses its compiled-in
+  # default. See the FX_DECOR paragraph above.
+  local decor=()
+  [ "${FX_DECOR:-client}" = none ] || decor=(--decorations "${FX_DECOR:-client}")
+
   XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-compositor" \
     --socket "$sock" --timeout $((secs + 30)) --output "$OUTPUT" \
-    --decorations "${FX_DECOR:-client}" \
+    "${decor[@]}" \
     --dump-frames "$dir/frames" "$@" >"$dir/srv.log" 2>&1 &
   local srv=$!
   for _ in $(seq 1 100); do
@@ -483,6 +499,87 @@ block_titlebar() {
 # 23 px below the top of the caption it is supposed to be inside. That is what
 # this block asserts, and it is a check rather than an assumption because the
 # brief for the tabs-in-title-bar stage said in as many words not to assume it.
+# --------------------------------------------------------------------- auto --
+# STAGE 53. Firefox under the compiled-in default, which nothing had ever run.
+#
+# §49 made `--decorations auto` the default and argued it is *byte-for-byte*
+# `server` for a client that negotiates: `Decorations::kde()` answers
+# `KdeDefaultMode::Server` for `Auto` and `Server` alike, `xdg()` answers
+# `ServerSide` for both, and `fold_caption` never folds a `Negotiated` window.
+# Firefox binds KDE's manager, so it is `Negotiated` on every run.
+#
+# That argument was unmeasured, and §49.9 said so. It could not be measured by
+# accident either: every block in this file names `FX_DECOR`, deliberately, for
+# the reason the settings block gives — so the compiled-in default is the one
+# thing this harness was constructed never to exercise.
+#
+# The claim is an *equivalence*, so the block is a pair. `auto` and `server` are
+# run minutes apart with the same environment, and the assertions are on the
+# things Firefox can see: what it was told, what it asked for, and where it put
+# its window geometry. Asserting only "auto looks right" would pass a compositor
+# that had quietly made `server` wrong too.
+block_auto() {
+  echo "== auto: Firefox under the compiled-in default, and against server"
+  have "$FIREFOX" || { non "no firefox on PATH"; return; }
+
+  local a="$RUNDIR/auto" s="$RUNDIR/autoref"
+
+  # Leg 1: name nothing. This is what a deployment that sets no flag gets.
+  FX_DECOR=none; FX_ENV=(MOZ_GTK_TITLEBAR_DECORATION=none)
+  WC_WAYLAND_DEBUG=1 run_firefox "$a" wc-auto 25 \
+    || { bad "the compositor never bound its socket (auto)"; return; }
+
+  grep -q 'decorations: manager default is Auto' "$a/srv.log" \
+    && ok "auto: no --decorations was passed and the compositor ran Auto" \
+    || { bad "auto: the compositor did not report Auto as its default"; \
+         grep -o 'manager default is .*' "$a/srv.log" | sed 's/^/        /'; }
+
+  # The whole of §49.4, from the client's side: Auto is Server on the wire.
+  grep -q 'default_mode(2)' "$a/fx.txt" \
+    && ok "auto: Firefox received default_mode(2) — Auto advertises Server" \
+    || bad "auto: Firefox never logged default_mode(2)"
+
+  # And the whole of §49.3: a client that negotiates is never folded.
+  grep -q 'negotiated its decorations' "$a/srv.log" \
+    && ok "auto: the compositor classified Firefox as Negotiated, so it is never folded" \
+    || { bad "auto: Firefox was not classified as Negotiated"; \
+         grep -oE 'window [0-9]+ \(.*' "$a/srv.log" | head -2 | sed 's/^/        /'; }
+  grep -q 'folding the caption' "$a/srv.log" \
+    && bad "auto: a Firefox window had its caption folded — auto is not server for it" \
+    || ok "auto: no window's caption was folded, which is what server would have done"
+
+  # Leg 2: the same run with `server` named, so the equivalence is measured
+  # rather than argued. Everything Firefox can observe must match.
+  FX_DECOR=server; FX_ENV=(MOZ_GTK_TITLEBAR_DECORATION=none)
+  WC_WAYLAND_DEBUG=1 run_firefox "$s" wc-autoref 25 \
+    || { bad "the compositor never bound its socket (server)"; return; }
+
+  # `fx_facts` is what a client could tell the two runs apart by: the mode it
+  # was told, the modes it asked for, and its toplevel geometry origin.
+  fx_facts() {
+    local t=$1
+    printf 'told=%s asked=%s origin=%s' \
+      "$(grep -o 'default_mode([0-9]*)' "$t" | sort -u | tr '\n' ',')" \
+      "$(grep -o 'request_mode([0-9]*)' "$t" | sort -u | tr '\n' ',')" \
+      "$(grep -o 'set_window_geometry([0-9-]*, [0-9-]*, [0-9-]*, [0-9-]*)' "$t" \
+         | tr -d 'a-z_()' | tr -d ' ' | awk -F, '$3 >= 640 { print $1 "," $2 }' | sort -u | tr '\n' ',')"
+  }
+  local fa fs
+  fa=$(fx_facts "$a/fx.txt")
+  fs=$(fx_facts "$s/fx.txt")
+  note "auto:   $fa"
+  note "server: $fs"
+  if [ "$fa" = "$fs" ]; then
+    ok "auto and server are indistinguishable to Firefox — §49.4's argument, measured"
+  else
+    bad "auto and server differ where Firefox can see it"
+  fi
+  case "$fa" in
+    *origin=0,0,*) ok "auto: the toplevel geometry origin is 0,0 — server-side decorations, no shadow inset" ;;
+    *)             bad "auto: the toplevel geometry origin is not 0,0" ;;
+  esac
+}
+
 block_tabs() {
   echo "== tabs: the client half of --decorations tabs, on Linux"
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
@@ -855,13 +952,14 @@ case "${1:-all}" in
   enumerate)  block_enumerate ;;
   window)     block_window ;;
   titlebar)   block_titlebar ;;
+  auto)       block_auto ;;
   tabs)       block_tabs ;;
   menu)       block_menu ;;
   wine)       block_wine shared-file ;;
   wine-arena) block_wine arena ;;
-  all)        block_enumerate; block_window; block_titlebar; block_tabs; block_menu
+  all)        block_enumerate; block_window; block_titlebar; block_auto; block_tabs; block_menu
               block_wine shared-file; block_wine arena ;;
-  *) echo "usage: $0 [enumerate|window|titlebar|tabs|menu|wine|wine-arena|all]"; exit 2 ;;
+  *) echo "usage: $0 [enumerate|window|titlebar|auto|tabs|menu|wine|wine-arena|all]"; exit 2 ;;
 esac
 
 echo

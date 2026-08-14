@@ -416,6 +416,26 @@ pub enum ToUi {
     },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },
+    /// The window's top-left corner moved by this much, without the surface
+    /// under it moving at all.
+    ///
+    /// ADDED FOR §45.11. `xdg_surface.set_window_geometry` — or, when a client
+    /// never declares one, the bounding box of the surface tree — says which
+    /// part of the buffer is "the window". When that rectangle's origin moves,
+    /// the pixels have not: a `wl_subsurface` appearing 100 px off the left
+    /// edge makes the window 100 px wider *and* starts it 100 px further left,
+    /// while everything already on screen stays exactly where the user last saw
+    /// it. Without this message the window stayed put and its contents slid
+    /// inside it.
+    ///
+    /// **A delta rather than a position, deliberately.** This compositor does
+    /// not know where its windows are — Windows owns that, which is the whole
+    /// argument in `control.rs`'s header — so the only thing it can truthfully
+    /// say is how much the corner moved relative to wherever the window
+    /// currently is. On Win32 that is a `SetWindowPos` with `SWP_NOSIZE`
+    /// against the current `GetWindowRect`; the size change, if any, rides on
+    /// the ordinary present path.
+    ShiftOrigin { id: WindowId, dx: i32, dy: i32 },
     /// The surface has committed its first buffer and may now be shown, at
     /// this surface size.
     ///
@@ -569,7 +589,19 @@ pub enum ToUi {
     },
 
     /// End the pump.
-    Quit,
+    ///
+    /// `clients` is how many Wayland clients were still connected when the
+    /// compositor decided to stop. STAGE 54: it rides on this message rather
+    /// than being printed separately because the number it qualifies -- how
+    /// many windows are still alive -- is only knowable on the UI thread, and
+    /// two lines that have to be read together are two lines that can be read
+    /// apart. **A window whose client is still connected is not a leak**; a
+    /// compositor that exits on an idle timeout with a client still up is
+    /// entitled to still have its window, and the first run of this stage's
+    /// own assertion failed exactly that way.
+    Quit {
+        clients: u32,
+    },
 }
 
 /// `wl_data_device_manager.dnd_action`, which both sides of the boundary speak.
