@@ -22202,11 +22202,20 @@ is unchanged by any of this: all three arrangements above are Linux and Wine.
 The user asked for three, and they are the three combinations of *which side is
 Wine* that exist while the Windows laptop is unavailable:
 
-| | arrangement | harness | result |
+| | arrangement | harness | result *as first run* |
 |---|---|---|---:|
-| 1 | linux → linux vm | `scripts/wc-vm-client.sh linux` | **9 passed, 0 failed** |
-| 2 | linux → wine linux vm | `scripts/wc-wine-guest.sh` | **3 passed, 0 failed** |
-| 3 | wine linux → linux vm | `scripts/wc-vm-client.sh wine` | **10 passed, 0 failed** |
+| 1 | linux → linux vm | `wc-vm-client.sh linux` | 9 passed, 0 failed |
+| 2 | linux → wine linux vm | `wc-wine-guest.sh` | **3 passed, 0 failed** |
+| 3 | wine linux → linux vm | `wc-vm-client.sh wine` | 10 passed, 0 failed |
+
+> **Read §67.10 before this table.** Two of these three rows have since been
+> withdrawn as transport results and one of them no longer passes. The legs
+> carry the wire on a channel the user's rule forbids, so they are demoted to
+> venue evidence; and their assertions stopped before the session broke, so the
+> zeros in rows 1 and 3 were measuring less than they appear to. The leg names
+> are now `linux-relay` and `wine-relay`, and `ring` is the leg that asks the
+> transport question properly. Row 2 is unaffected — it moves no Wayland traffic
+> across the boundary at all.
 
 Arrangement 3 is the one §26.5 specified as "leg 3" and nobody had run: *"Wine
 plays the Windows side, and a Linux VM guest runs the client."* Arrangement 1 is
@@ -22306,6 +22315,165 @@ arrangement most likely to be wrong.
 ---
 ---
 
+
+### 67.10 The relay is withdrawn, the ring is blocked, and the file pool cannot cross 9p
+
+§67.9's two `*-relay` legs carried the Wayland wire over
+`/dev/virtio-ports/org.sirati.svcold.0` through two `socat`s. The user's rule:
+
+> all communication is to go through the ring. alternative channels are
+> permitted only for wakeup from idle
+
+**That forbids them.** The doorbell is the sanctioned use of virtio-serial
+(§36.6) because ringing a bell to wake a parked consumer *is* wakeup; a byte
+relay carrying `wl_shm`, `wl_surface` and every commit is the conversation. §70.5
+withdrew `--upstream-cold` for exactly this and observed that withdrawing only
+the flag would leave this harness standing, "because what the rule forbids is
+the channel, not the flag that names it". That is correct and this section
+accepts it.
+
+The legs are **kept and demoted**, not deleted. What they establish is about the
+*venue* and none of it is a transport claim: the guest has no network, a Unix
+socket node exported over 9p is a host kernel object a guest `connect()` cannot
+reach, and both halves really are in different kernels — which the kernel
+assertion proves in both directions. Each leg now prints a banner saying it is
+not a sanctioned transport before it prints anything else.
+
+#### The ring, attempted, and two measured refusals
+
+`scripts/wc-vm-client.sh ring` is the leg that tries to obey the rule. For this
+arrangement — compositor on the host, client in the guest — the control region
+has to be memory *both kernels can map*, which on this rig means the guest's RAM
+through the memfd backend. The compositor offers a control region two ways and
+neither reaches that:
+
+```text
+--wayland-cold  →  exit 2: "publishes a control region out of guest RAM, which
+                   needs the Linux guest-RAM provider (sv_arena::guestram) …
+                   no compositor has been taught to do it yet"
+--wayland-ring  →  accepted: "accepting Wayland rings in Local\wc-vm-ring"
+```
+
+The second *works*, and being a **named section** is exactly why it does not
+help: a section is a same-machine object, and the compositor's own startup says
+so about the neighbouring keymap in the very next line — *"unopenable by one
+across the boundary"*. The ring section is the same kind of object.
+
+So there is no combination that puts a **Windows-build** compositor's control
+region into a form the far side of a hypervisor can map, and the missing piece
+is one function. `RingLink::publish` is `#[cfg(target_os = "linux")]`; the
+compositor already commits and stamps guest RAM on Windows for an *arena*
+(`--arena-guest-ram`, through `awe-probe`), and ringlink has simply never been
+wired to it. Both refusals are measured here rather than read out of the source,
+because a blocker asserted from reading is what §67.5 is about.
+
+#### The harness passed over a session that had already died
+
+§70.5's run reported **9 passed / 0 failed** while the session broke immediately
+after the window appeared, because every assertion stopped at
+`window … created`. **This harness had the same defect and it is worth being
+plain about that**: its assertions stopped at the registry walk, and
+`wayland-info` disconnects cleanly, so a leg could pass with the interesting
+part untouched.
+
+`assert_session_survived` is the fix, and it is three sources because each
+failure was visible in only one of them:
+
+* the **client's** own log — a `wl_display` protocol error ends the session, and
+  libwayland prints it and carries on;
+* the **proxy's** log — a failed client, a refused pool, a keymap the far side
+  cannot open;
+* the **compositor's** log, so this is not one end agreeing with itself.
+
+The third is not decoration. Run with `WC_VM_POOLTEST=1`, which swaps the
+registry walk for `wc-pooltest` — the smallest client that sends an `h` —
+**both legs break, and `wc-pooltest` prints `4 pools created and destroyed` and
+exits 0 anyway**:
+
+```text
+FAIL  the client hit a protocol error, so the session died:
+      wl_display#1: error 0: Invalid new_id: 6.
+FAIL  the proxy reports the session did not survive:
+      pool 3: could not publish 1228800 bytes: Invalid argument (os error 22)
+....  the h-sending client: wc-pooltest: 4 pools created and destroyed
+....  and its own exit status was 0
+```
+
+A client's exit status is not a session check. That is a sharper form of §70.5's
+lesson: there the *harness* stopped at the first good news, here the **client
+itself** reported success over a dead connection, and a harness that trusted its
+exit code would have agreed with it.
+
+#### Two failures, and the control separates them cleanly
+
+The two legs differ in exactly one thing — whether the compositor is the Linux
+build or the Windows one under Wine — which is the pairing the dialect question
+turns on (§70.2, §72). That is what leg 1 was built to be, and with the session
+check in place it pays for itself immediately: **one of the two failures moves
+when the dialect moves and the other does not.**
+
+| symptom | linux leg | wine leg | so it is |
+|---|---|---|---|
+| `pool 3: could not publish 1228800 bytes: EINVAL` | yes | yes | **not** the dialect |
+| `wl_keyboard.keymap (event): argument 1 claims 35572 bytes, 0 available` | yes | no | **the dialect** |
+
+The second is the interesting one and it arrives on the *plain* run, with
+`wayland-info` and no pool in sight. It is `wc-proxy` reading the compositor's
+**server-to-client** `wl_keyboard.keymap`: against the Windows build the
+descriptor is in band (§2.3) and the proxy finds it; against a Linux compositor
+the fd came as `SCM_RIGHTS` and the in-band read finds `0 available`. §72 reports
+the same mismatch in the client-to-server direction on `create_pool`; this is the
+other direction of the same fact, and between them the dialect is wrong both
+ways round rather than only on the path a pool takes.
+
+It also means §67.9's original claim — that the legs "walked the registry only,
+so the in-band path is advertised and not exercised" — was too generous to
+itself. The registry walk *does* reach the dialect, through the keymap the seat
+sends unprompted. The old harness did not notice because nothing was looking.
+
+#### The `EINVAL` is 9p, and it is not the dialect
+
+Measured directly, in the guest, with a five-line probe:
+
+```text
+/sv mount: 9p rw,relatime,access=client,msize=16384,trans=virtio
+  mmap MAP_SHARED  on /sv    → FAILED, Invalid argument (errno 22)
+  mmap MAP_PRIVATE on /sv    → ok
+  mmap MAP_SHARED  on /tmp   → ok            (tmpfs, the control)
+```
+
+`SharedFile::create` ends in `Handle::map_mut`, an `mmap(MAP_SHARED)` on the
+pool file, and the share is mounted with **no cache mode**, where 9p refuses
+shared mappings. So `could not publish … os error 22` is the mount, not Wine,
+not the compositor and not the translator. It also explains §70.5's six
+identical refusals, which were on the same share.
+
+**The consequence is larger than one harness.** The file pool transport is not
+merely "a fixture rather than the deployment" across this boundary — it is
+**non-functional** across it. Nothing can publish a pool into a 9p share this
+way. The only substrate that crosses is the arena in guest RAM, which is the
+deployment's answer and the ring's, and §71 is the section building it. A
+`cache=loose` mount would probably make the fixture work and is deliberately
+**not** proposed here: it would restore a path the rule says should not carry
+this traffic anyway.
+
+One thing is left unattributed on purpose: `Invalid new_id: 6` arrives on both
+legs alongside the refusals, and whether it is downstream of the held-back pool
+or independent has not been established. Naming a cause for it here would be
+§63.3's error with a fresh coat of paint.
+
+#### Where this leaves §67.9
+
+| leg | what it is now |
+|---|---|
+| `ring` | the transport question, answered: blocked, with both refusals measured |
+| `linux-relay`, `wine-relay` | venue evidence only, banner-labelled, **not** a transport result |
+| `wc-wine-guest.sh` | unaffected — it runs one process under Wine in the guest and moves no Wayland traffic across the boundary at all |
+
+The arrangement is viable — §70.5 got a mapped `HWND` out of it and this section
+got a registry walk — and the thing that makes it *shippable* is not a channel
+but the two pieces named above: a guest-RAM publish for the Windows build, and
+the negotiated format §72 is for. Neither belongs to this section.
 ## 68. Subsurface state that belongs to the parent's commit is applied on the child's
 
 ### 68.1 Status in one paragraph
