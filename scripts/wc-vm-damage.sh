@@ -32,6 +32,34 @@
 # cross-vm` is therefore *available* here and refused there, which is the first
 # real exercise of §51's gate against a leg that can actually pass it.
 #
+# ═══════════════════════════════════════════════════════════════════════════
+# THE TRANSPORT HERE IS A FIXTURE AND THE RULE FORBIDS IT AS A RESULT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The user's standing rule:
+#
+#   > all communication is to go through the ring. alternative channels are
+#   > permitted only for wakeup from idle
+#
+# This file carries the **Wayland wire itself** over a virtio-serial port
+# through two `socat`s. That is the protocol stream on an alternative channel,
+# and it is exactly what `wc-vm-client.sh` labels forbidden. **No result from
+# this file is a statement about how the deployment moves bytes.**
+#
+# It is kept for the half that is not about the transport: the **arena locate**
+# -- `--arena-guest-ram` in the guest, `wc-arena-host` reading QEMU's monitor
+# from outside, and `wc-proxy` mapping the result. That is the path `wc-guest.sh`
+# uses on testhost and the one §51.6's block 12 depends on, and nothing else
+# on this workstation exercises it. Legs 1 and 3 in `wc-vm-client.sh` and leg 2
+# in `wc-wine-guest.sh` cover the three arrangements the user asked for; this
+# file is not a fourth and does not claim to be.
+#
+# **And the wire does not work here.** Three runs reported `2 client msgs,
+# 0 server msgs`: the client reaches the proxy, the compositor answers, and the
+# answers do not come back. Moving the socket off 9p and attaching the host end
+# of the port first both changed nothing. That is not diagnosed further, because
+# fixing it would be building a forbidden channel properly.
+#
 # HOW THE PROTOCOL CROSSES, AND WHY NOT SSH
 #
 # `nix/guest.nix` gives the guest no sshd and no networking on purpose — "no X,
@@ -183,6 +211,17 @@ block_linux() {
   # The compositor, inside the guest. Copied into the shared directory for the
   # reason `sv-guest-e2e.sh` gives: the guest sees `/nix/store` and `/sv`, and
   # this binary is in neither until it is put there.
+  # **The host end of the port, attached BEFORE the guest opens it.** A
+  # virtio-serial port tells the guest whether a host is connected, and a guest
+  # that opens it first writes into a port with nobody on the other end. The
+  # first two runs of this leg reported "2 client msgs, 0 server msgs" -- the
+  # client reached the proxy, the compositor answered, and the answers went
+  # nowhere. Starting this side first costs nothing and removes the race.
+  socat "UNIX-LISTEN:$RUNDIR/upstream.sock,fork" "UNIX-CONNECT:$RUNDIR/wl.sock" \\
+    >"$RUNDIR/relay-host.log" 2>&1 &
+  RELAY_HOST=$!
+  sleep 1
+
   cp "$BIN/wc-compositor" "$RUNDIR/wc-compositor"
 
   # `guest-cmd.sh` is the rendezvous `nix/guest.nix`'s `sv-payload` unit waits
@@ -192,15 +231,20 @@ block_linux() {
   # the proxy on *this* side, so what the guest does with the pixels afterwards
   # is not what is being measured.
   cat >"$RUNDIR/guest-cmd.sh" <<GUESTEOF
-export XDG_RUNTIME_DIR=/sv/rt
-mkdir -p /sv/rt && chmod 700 /sv/rt
+# **Guest-local, not the 9p share.** The compositor binds an AF_UNIX socket
+# here and 9p cannot represent one: bound under /sv it appears on the host as a
+# plain file, and the guest-side socat has nothing to connect to. The first run
+# of this leg got "2 client msgs, 0 server msgs" from that -- the client reached
+# the proxy and the compositor never answered. Only the logs belong on /sv.
+export XDG_RUNTIME_DIR=/run/wcrt
+mkdir -p /run/wcrt && chmod 700 /run/wcrt
 uname -sr > /sv/guest-kernel.txt
 /sv/wc-compositor --socket wl-vm --timeout $SECS \\
   --arena-guest-ram "0:$ARENA_SIZE" --arena-outbound "0:$ARENA_OUT" \\
   --arena-frames /sv/arena.frames \\
   > /sv/comp.log 2>&1 &
-for i in \$(seq 1 100); do [ -S /sv/rt/wl-vm ] && break; sleep 0.2; done
-$SOCAT UNIX-CONNECT:/sv/rt/wl-vm /dev/virtio-ports/$WLPORT >/sv/socat.log 2>&1
+for i in \$(seq 1 100); do [ -S /run/wcrt/wl-vm ] && break; sleep 0.2; done
+$SOCAT UNIX-CONNECT:/run/wcrt/wl-vm /dev/virtio-ports/$WLPORT >/sv/socat.log 2>&1
 GUESTEOF
   chmod +x "$RUNDIR/guest-cmd.sh"
 
@@ -293,12 +337,9 @@ GUESTEOF
   WC_SUBSTRATE_LOCATED=$pages
   WC_SUBSTRATE_LOCATOR="wc-arena-host over QMP"
 
-  # The host end of the port, as a Unix socket the proxy can treat as upstream.
+  # The proxy's runtime dir. The relay itself was started before the guest
+  # opened its end -- see above.
   mkdir -p "$RUNDIR/rt"; chmod 700 "$RUNDIR/rt"
-  socat "UNIX-LISTEN:$RUNDIR/upstream.sock,fork" "UNIX-CONNECT:$RUNDIR/wl.sock" \
-    >"$RUNDIR/relay-host.log" 2>&1 &
-  RELAY_HOST=$!
-  sleep 1
 
   XDG_RUNTIME_DIR="$RUNDIR/rt" "$BIN/wc-proxy" \
     --upstream "$RUNDIR/upstream.sock" --socket wl-proxy --runtime-dir "$RUNDIR/rt" \
