@@ -163,6 +163,28 @@ pub trait Resource: Clone + std::fmt::Debug + Sized {
         Client::from_id(&dh, client_id).ok()
     }
 
+    /// WAYCOMPOSE FORK (`docs/waycompose-design.md` §80): which `h` dialect the
+    /// client owning this object speaks.
+    ///
+    /// What a **sender** consults before building an `h`. A keymap or a clipboard
+    /// pipe going to an in-band peer has to be a *named* object, and only the
+    /// sender can make one — `rs/wire.rs` refuses rather than inventing a name
+    /// for a descriptor it was handed (`MessageWriteError::WrongDialect`).
+    ///
+    /// Defaults to [`FdEncoding::OutOfBand`][wayland_backend::os::FdEncoding] on
+    /// Unix when the object is no longer alive, which is the same answer an
+    /// unannounced peer gets: a dead object has no client to ask, and guessing
+    /// *in band* would turn a harmless no-op into a wrong-format write.
+    fn fd_encoding(&self) -> wayland_backend::os::FdEncoding {
+        self.handle()
+            .upgrade()
+            .and_then(|h| {
+                let client = h.get_client(self.id()).ok()?;
+                Some(h.client_fd_encoding(client))
+            })
+            .unwrap_or_default()
+    }
+
     /// The version of this object
     fn version(&self) -> u32;
 

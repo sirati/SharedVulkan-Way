@@ -68,6 +68,7 @@ pub use wayland_backend::os::{AsFd, BorrowedFd, Mapping, OwnedFd, RawFd};
 /// See `docs/waycompose-design.md` §76.
 #[cfg(feature = "wayland_frontend")]
 pub use wayland_backend::os::{
+    Handle,
     BorrowedProtoFd, BorrowedWireFd, FdEncoding, ProtoFd, RawProtoFd, WireFd,
 };
 

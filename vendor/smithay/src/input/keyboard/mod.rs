@@ -746,7 +746,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
                 continue;
             };
 
-            let res = keymap_file.with_fd(kbd.version() >= 7, |fd, size| {
+            let res = keymap_file.with_fd(kbd.fd_encoding(), kbd.version() >= 7, |fd, size| {
                 kbd.keymap(KeymapFormat::XkbV1, fd, size as u32)
             });
             if let Err(e) = res {

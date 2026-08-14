@@ -20,6 +20,20 @@ use crate::utils::os::{AsFd, BorrowedFd};
 pub struct SealedFile {
     file: File,
     size: usize,
+    /// §80: the **named** twin, minted only if an in-band peer ever asks for one.
+    ///
+    /// A `memfd` is a descriptor and nothing else; a peer reached through
+    /// `wc-proxy` is handed a *name* and opens it itself. Those are different
+    /// objects, so serving both means having both — and the second one is worth
+    /// a file on disk only for the peers that need it, which is why this is
+    /// lazy rather than made alongside the `memfd`. A compositor serving only
+    /// stock clients never creates one.
+    ///
+    /// `Mutex` rather than `OnceLock` because minting can fail and a failure
+    /// must be retryable: `publish::mint()` depends on `--shared-dir`, and a
+    /// compositor started without one should not have the first keymap poison
+    /// every later attempt.
+    named: std::sync::Mutex<Option<crate::utils::os::Handle>>,
 }
 
 /// See the Unix definition above.
@@ -65,6 +79,7 @@ impl SealedFile {
         Ok(Self {
             file,
             size: data.len(),
+            named: std::sync::Mutex::new(None),
         })
     }
 
@@ -113,6 +128,7 @@ impl SealedFile {
         Ok(Self {
             file: file_rdonly,
             size: data.len(),
+            named: std::sync::Mutex::new(None),
         })
     }
 
@@ -199,28 +215,78 @@ impl AsFd for SealedFile {
 }
 
 impl SealedFile {
-    /// The `h` argument a `wl_keyboard.keymap` should carry for this file.
+    /// Run `f` with the `h` argument a `wl_keyboard.keymap` should carry for this
+    /// file, in the dialect `encoding` names.
     ///
-    /// §79. The one place that knows which arm a keymap is, and it replaced the
-    /// `cfg` at four call sites: the descriptor a Windows peer needs and the
-    /// descriptor a Unix peer needs are different *kinds*, not different
-    /// spellings, and only the object itself can say which it has.
+    /// §80 replaced a `proto_fd()` that could only ever answer with the open form
+    /// on Unix, and it is a closure rather than a getter for one reason: the
+    /// named arm borrows a handle that has to stay alive for the call, and
+    /// returning `BorrowedWireFd::Named(&handle)` out of a function would return
+    /// a reference into a local.
     ///
-    /// **On Unix this is always the open form**, and a client that speaks the
-    /// in-band dialect will therefore be refused by `rs/wire.rs` with
-    /// `WrongDialect` rather than silently desynchronised. Making a keymap
-    /// nameable on Unix means backing `SealedFile` with a
-    /// `wc_handle::Handle::create_shared_file` instead of a `memfd`, which is
-    /// real work and is the next step rather than this one.
-    pub fn proto_fd(&self) -> crate::utils::os::BorrowedProtoFd<'_> {
-        #[cfg(unix)]
-        {
-            use crate::utils::os::AsFd as _;
-            crate::utils::os::BorrowedProtoFd::Open(self.file.as_fd())
+    /// **The named object is minted here, not at construction.** See the `named`
+    /// field: a compositor serving only stock clients never creates one.
+    pub fn with_proto_fd<F, T>(
+        &self,
+        encoding: crate::utils::os::FdEncoding,
+        f: F,
+    ) -> Result<T, std::io::Error>
+    where
+        F: FnOnce(crate::utils::os::BorrowedProtoFd<'_>) -> T,
+    {
+        match encoding {
+            crate::utils::os::FdEncoding::InBand => {
+                let handle = self.named()?;
+                Ok(f(crate::utils::os::BorrowedProtoFd::Named(&handle)))
+            }
+            #[cfg(unix)]
+            crate::utils::os::FdEncoding::OutOfBand => {
+                use crate::utils::os::AsFd as _;
+                Ok(f(crate::utils::os::BorrowedProtoFd::Open(self.file.as_fd())))
+            }
+            #[cfg(windows)]
+            crate::utils::os::FdEncoding::OutOfBand => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "there is no out-of-band descriptor on this platform",
+            )),
         }
+    }
+
+    /// The named form of this file, minted on first use.
+    ///
+    /// On Windows the object **is** the named form and there is nothing to mint.
+    /// On Unix the sealed file is a `memfd`, which is a descriptor and has no
+    /// name a peer could open, so a second object is created holding the same
+    /// bytes — `wc_handle::Handle::create_shared`, which is the same call the
+    /// Windows arm has always made and lands in `--shared-dir` where the peer
+    /// can reach it.
+    ///
+    /// The two objects are **not** kept in sync and do not need to be: a
+    /// `SealedFile` is immutable by construction, which is what "sealed" means.
+    fn named(&self) -> Result<crate::utils::os::Handle, std::io::Error> {
         #[cfg(windows)]
         {
-            crate::utils::os::BorrowedProtoFd::Named(&self.handle)
+            Ok(self.handle.clone())
+        }
+        #[cfg(unix)]
+        {
+            use std::io::{Read, Seek};
+            let mut slot = self.named.lock().unwrap();
+            if let Some(handle) = slot.as_ref() {
+                return Ok(handle.clone());
+            }
+            // Read the bytes back out of the sealed file rather than keeping a
+            // second copy alive for the lifetime of every keymap: this runs once
+            // per keymap per compositor, and a keymap is tens of kilobytes.
+            let mut file = &self.file;
+            let mut bytes = Vec::with_capacity(self.size);
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.read_to_end(&mut bytes)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let handle = crate::utils::os::Handle::create_shared(bytes.len() as u64)?;
+            handle.write_at(0, &bytes)?;
+            *slot = Some(handle.clone());
+            Ok(handle)
         }
     }
 }

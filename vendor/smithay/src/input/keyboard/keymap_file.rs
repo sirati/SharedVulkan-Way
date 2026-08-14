@@ -64,34 +64,40 @@ impl KeymapFile {
 
     #[cfg(feature = "wayland_frontend")]
     /// Run a closure with the file descriptor to ensure safety
-    pub fn with_fd<F>(&self, supports_sealed: bool, cb: F) -> Result<(), std::io::Error>
+    pub fn with_fd<F>(
+        &self,
+        encoding: crate::utils::os::FdEncoding,
+        supports_sealed: bool,
+        cb: F,
+    ) -> Result<(), std::io::Error>
     where
         F: FnOnce(crate::utils::os::BorrowedProtoFd<'_>, usize),
     {
-        // On Windows the "unsealed" fallback below does not exist and cannot:
-        // it hands the client a `tempfile` descriptor, and a Windows `h`
-        // argument is a named kernel object, not a descriptor. A section is the
-        // only thing there is to send, so `supports_sealed` has nothing to
-        // select between. A client on version < 7 of `wl_keyboard` gets the
-        // section anyway; that is more permissive than the protocol requires
+        // The "unsealed" fallback below hands the client a plain `tempfile`
+        // descriptor, so it exists only for the out-of-band dialect — an in-band
+        // peer is handed a *name* and there is nothing to select between. A
+        // client on version < 7 of `wl_keyboard` behind a proxy gets the sealed
+        // object anyway; that is more permissive than the protocol requires
         // rather than less, since `keymap` says nothing about sealing.
-        #[cfg(windows)]
-        {
-            let _ = supports_sealed;
-            let file = self.sealed.as_ref().ok_or_else(|| {
-                std::io::Error::other("no keymap section: creating it failed earlier")
-            })?;
-            cb(file.proto_fd(), file.size());
-            return Ok(());
+        //
+        // §80 turned this from a `cfg` into a test of the connection. It used to
+        // be Windows-that-has-no-tempfile-path versus Unix-that-does; it is now
+        // in-band-peer versus out-of-band-peer, and Windows is simply a platform
+        // on which every peer is the former.
+        let sealed = self.sealed.as_ref();
+        let unsealed_ok = supports_sealed || encoding == crate::utils::os::FdEncoding::InBand;
+        if let Some(file) = unsealed_ok.then_some(sealed).flatten() {
+            return file.with_proto_fd(encoding, |fd| cb(fd, file.size()));
+        }
+        if encoding == crate::utils::os::FdEncoding::InBand {
+            return Err(std::io::Error::other(
+                "no keymap object to name for an in-band peer: creating it failed earlier",
+            ));
         }
 
         #[cfg(unix)]
         {
-        use std::{io::Write, path::PathBuf};
-
-        if let Some(file) = supports_sealed.then_some(self.sealed.as_ref()).flatten() {
-            cb(file.proto_fd(), file.size());
-        } else {
+            use std::{io::Write, path::PathBuf};
             let dir = std::env::var_os("XDG_RUNTIME_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
@@ -100,12 +106,18 @@ impl KeymapFile {
             file.write_all(self.keymap.as_bytes())?;
             file.flush()?;
 
-            // The unsealed fallback is a plain `tempfile`, so it can only ever
-            // be the open form. §79: a peer that speaks in band will be refused
-            // by `rs/wire.rs` rather than desynchronised.
-            cb(crate::utils::os::BorrowedProtoFd::Open(file.as_fd()), self.keymap.len());
+            cb(
+                crate::utils::os::BorrowedProtoFd::Open(file.as_fd()),
+                self.keymap.len(),
+            );
+            Ok(())
         }
-        Ok(())
+        #[cfg(windows)]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "there is no out-of-band descriptor on this platform",
+            ))
         }
     }
 
@@ -116,7 +128,7 @@ impl KeymapFile {
     ) -> Result<(), std::io::Error> {
         use wayland_server::{protocol::wl_keyboard::KeymapFormat, Resource};
 
-        self.with_fd(keyboard.version() >= 7, |fd, size| {
+        self.with_fd(keyboard.fd_encoding(), keyboard.version() >= 7, |fd, size| {
             keyboard.keymap(KeymapFormat::XkbV1, fd, size as u32);
         })
     }

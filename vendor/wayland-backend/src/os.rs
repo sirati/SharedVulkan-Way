@@ -491,6 +491,13 @@ impl<T: AsFd + ?Sized> AsFd for &T {
 /// [`WireFd::Named`] and maps it exactly the same way.
 pub use wc_handle::Mapping;
 
+/// The named kernel object a [`WireFd::Named`] carries.
+///
+/// Re-exported so that a consumer building one — smithay's `SealedFile`, which
+/// has to mint a keymap an in-band peer can open — can name the type without
+/// depending on `wc-handle` directly. §80.
+pub use wc_handle::Handle;
+
 /// The socket type the transport is built on.
 pub use wc_transport::Stream as WlStream;
 

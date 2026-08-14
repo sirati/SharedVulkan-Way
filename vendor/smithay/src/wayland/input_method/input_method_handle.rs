@@ -294,7 +294,7 @@ where
                 let guard = data.keyboard_handle.arc.internal.lock().unwrap();
                 instance.repeat_info(guard.repeat_rate, guard.repeat_delay);
                 let keymap_file = data.keyboard_handle.arc.keymap.lock().unwrap();
-                let res = keymap_file.with_fd(false, |fd, size| {
+                let res = keymap_file.with_fd(instance.fd_encoding(), false, |fd, size| {
                     instance.keymap(KeymapFormat::XkbV1, fd, size as u32);
                 });
 

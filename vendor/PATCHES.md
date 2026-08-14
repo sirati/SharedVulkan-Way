@@ -56,6 +56,9 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
   it; on Windows they were always distinct types and nothing had to say so.
   `docs/waycompose-design.md` §76 for the measurement, §72.3 for what the
   separation is for.
+* `Handle` — `wc_handle::Handle`, re-exported so that a consumer minting a named
+  object (smithay's `SealedFile`, §80) can name the type without depending on
+  `wc-handle` directly.
 * `WireFd` — what `ProtoFd` **is**: an `h` argument that is **either** a name the
   peer can open (`Named`, a `wc_handle::Handle`) **or** a descriptor that is
   already open (`Open`, Unix only — `SCM_RIGHTS` has no Windows equivalent, so
@@ -166,6 +169,7 @@ obligation the `unsafe` block around `Poller::add_with_mode` relies on.
 | `src/display.rs` | stream type; `AsFd` impl gated to Unix, with an inherent `poll_handle()` on Windows. |
 | `src/lib.rs`, `src/dispatch.rs`, `src/global.rs` | fd types from `wayland_backend::os`; `backend::os` re-exported, because `ProtoFd` and `FdEncoding` appear in every generated request and event (§79). |
 | `src/display.rs` | `DisplayHandle::set_client_fd_encoding`, the per-connection dialect (§79). |
+| `src/lib.rs` | `Resource::fd_encoding()`, so a **sender** can ask which dialect the owning client speaks before building an `h` (§80). |
 
 ### The lockfile, where Windows is *better*
 

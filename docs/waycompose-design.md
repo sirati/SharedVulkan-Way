@@ -24765,3 +24765,142 @@ behind `wc-proxy` was never supported and is not what §72.3 was about.
 2644 is 2642 plus three minus one. The three are the wire tests in 79.7; the one
 is `the_upstream_dialect_is_still_assumed_rather_than_chosen`, deleted for the
 reason 79.9 gives. No test moved binaries.
+
+## 80. The keymap crosses the other way, and §79's loud refusal was the right shape
+
+### 80.1 Status in one paragraph
+
+§79 built the direction a compositor **reads** an `h` and said plainly that the
+direction it **writes** one was not done: `SealedFile` is a `memfd`, so a keymap
+to an in-band peer was refused by `rs/wire.rs` with `WrongDialect`. It is done.
+`SealedFile` now mints a named twin on first in-band use, `KeymapFile::with_fd`
+takes the peer's dialect instead of a `cfg`, and `scripts/wc-keymap.sh` runs
+**`wayland-info`** — a client that is not ours — through `wc-proxy` to a Linux
+`wc-compositor` and gets its keyboard. Both directions of §72.3 are now closed.
+
+### 80.2 The refusal was load-bearing, which is the argument for building it that way
+
+§79 chose to make the unsupported case fail loudly rather than skip it, and this
+section is what that bought. The control leg's log line is:
+
+```
+[proxy] client 1 failed: compositor: wl_keyboard.keymap (event):
+        argument 1 claims 35572 bytes, 0 available
+```
+
+The proxy reads its upstream in band, so it takes the length word of an
+out-of-band `h` — which occupies **no body bytes at all** — and finds nothing
+behind it. That is §72.3's defect seen from the end that happens to have a length
+check in front of it, and it named the failing message, the argument index and
+the exact byte count. Compare the pool direction, where the same class of error
+produced a hang and two silent logs. **A defect that reports itself is a
+morning's work; one that hangs is a section of this document.**
+
+### 80.3 `SealedFile` grows a named twin, lazily
+
+A sealed `memfd` is a descriptor and nothing else: it has no name a peer could
+open. A peer reached through `wc-proxy` is handed a *name*. Those are different
+objects, so serving both means having both.
+
+```rust
+named: std::sync::Mutex<Option<Handle>>,
+```
+
+Three decisions worth recording:
+
+* **Lazy.** A compositor serving only stock clients never creates one. The cost
+  of the named form is a file in `--shared-dir`, and it is paid per keymap per
+  compositor by the peers that need it.
+* **`Mutex`, not `OnceLock`.** Minting can fail — `publish::mint()` depends on
+  `--shared-dir` — and a failure has to be retryable. A `OnceLock` would let the
+  first keymap, sent before the compositor was configured, poison every later
+  attempt.
+* **The two objects are never synchronised, and do not need to be.** A
+  `SealedFile` is immutable by construction; that is what "sealed" means. The
+  bytes are read back out of the `memfd` at mint time rather than kept in a
+  second buffer for the lifetime of every keymap.
+
+The Windows arm is unchanged and is now simply the case where the named form
+already exists: `named()` hands back the `Handle` the file has always held.
+
+### 80.4 `with_fd`'s `cfg` became a question about the peer
+
+`KeymapFile::with_fd` used to branch on the platform: Windows had no
+`tempfile` fallback and Unix did. It now branches on the connection.
+
+The unsealed fallback exists **only for the out-of-band dialect** — it hands the
+client a plain `tempfile` descriptor, and an in-band peer is handed a name, so
+there is nothing to select between. A client on version < 7 of `wl_keyboard`
+behind a proxy therefore gets the sealed object anyway, which is *more*
+permissive than the protocol requires rather than less: `keymap` says nothing
+about sealing. Windows is now simply the platform on which every peer is in band,
+which is what the `cfg` was really encoding all along.
+
+The dialect reaches the call site through `Resource::fd_encoding()`, a default
+method on the trait every generated protocol object implements. It reconstructs
+the client from the object exactly as `Resource::client()` already does, so no
+call site had to start carrying a `DisplayHandle` it did not have. It returns
+`OutOfBand` for a dead object, deliberately: a dead object has no client to ask,
+and guessing *in band* would turn a harmless no-op into a wrong-format write.
+
+### 80.5 The evidence, and why the client is `wayland-info`
+
+`scripts/wc-keymap.sh`, the mirror of `scripts/wc-pool.sh`:
+
+| leg | `wayland-info` exit | `repeat_info` lines | keymap objects minted |
+|---|---|---|---|
+| **fixed** — compositor told its peer is a proxy | 0 | **1** | **1** |
+| **control** — identical, without telling it | 0 | **0** | **0** |
+
+**The client is not ours**, which is the point: `wayland-info` is in the dev
+shell already and binds `wl_seat` and creates a `wl_keyboard`, which is what
+makes a compositor send a keymap at all. `wc-pooltest.c` binds nothing but
+`wl_shm`, so §79's passing pool leg was never evidence about this direction —
+stated because it would have been easy to assume otherwise.
+
+**The assertion is deliberately not the exit code.** `wayland-info` exits 0 in
+both legs: it prints the globals it was told about and stops. What differs is
+whether the *keyboard* answered — `wl_keyboard.repeat_info` follows
+`wl_keyboard.keymap`, so a keymap that desynchronised the stream takes the repeat
+lines with it, in a run whose exit status says everything was fine. Asserting on
+the exit code would have called the control leg a pass. This is §71.1's rule
+again: a client's exit status is not a session check.
+
+`scripts/wc-pool.sh` still passes both legs, unchanged.
+
+### 80.6 The clipboard and the drag pipes needed no change, and that is a claim
+
+They were named alongside the keymap as "the same shape". They are not, and it is
+worth saying why rather than leaving the absence of a diff to be read as an
+oversight.
+
+1. **Forwarding already works within a dialect.** `SelectionSourceProvider::send`
+   takes a `ProtoFd` and passes `fd.borrow()`, so a pipe arriving on one
+   connection goes out on another as whichever arm it arrived as. §79 built
+   `WireFd::borrow()` for exactly this.
+2. **Cross-dialect forwarding is not implementable today and not because of
+   this code.** Naming a pipe means a `Descriptor::Pipe`, and `wc-handle` has no
+   pipe support on *either* platform — the variant exists and nothing constructs
+   or opens one. That is a `wc-handle` gap, not a wire one.
+3. **This compositor sends no clipboard `h` at all.** `wc-compositor`'s
+   `send_selection` and `ServerDndGrabHandler::send` drop the descriptor and say
+   so in a printed line; the bytes go through `wc_clipboard_v1`, which `wc-proxy`
+   binds instead (§29.6). So there is no site here that would need the change.
+
+If a clipboard `h` ever is sent to a peer of the wrong dialect, `rs/wire.rs`
+raises `WrongDialect` and names it, which is 80.2's property and is why leaving
+this alone is safe rather than merely untested.
+
+### 80.7 The gates
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **89 binaries, 2644 passed, 0 failed** — unchanged from §79 |
+| `scripts/wc-keymap.sh` | both legs pass |
+| `scripts/wc-pool.sh` | both legs pass, unchanged |
+| `cargo clippy --workspace --all-targets` | exit 0 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+
+No unit test was added, and that is the honest description: what changed is
+reachable only with three processes and a real client, so the evidence is two
+harnesses rather than a number in the suite.
