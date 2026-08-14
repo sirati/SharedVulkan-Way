@@ -8939,10 +8939,11 @@ taken, so this one has only the number it was given.)*
 
 **The user's clause is three symptoms and they are not one bug.** "Screen must
 not tear or stop rendering of scrolling no blank slides (e.g. in about:support)"
-— the tearing was §18's incoherent virtio-fs export and is fixed; the stopping
-did not reproduce and there is a number saying so; the blank regions were a
-real, separate defect in `wc-proxy`, present in every guest run since stage 4,
-and invisible to every harness this project has. `wl_surface.damage` is defined
+— the tearing was §18's incoherent virtio-fs export and is fixed; **the stopping
+was the cross-VM present, and this section's original claim to have ruled it out
+is withdrawn in §27.6**; the blank regions were a real, separate defect in
+`wc-proxy`, present in every guest run since stage 4, and invisible to every
+harness this project has. `wl_surface.damage` is defined
 against the **surface** — what changed on screen since the last commit — and
 `wc-proxy` was spending it against a **buffer**, of which a scrolling Firefox
 has three. Everything the surface changed while some other buffer was on screen
@@ -9126,16 +9127,53 @@ what `stale_rows` counts, and 1628 consecutive commits at zero says the copy
 path is not tearing. That says nothing about the coherency of a guest-RAM arena
 across the real VM boundary, which is §18's subject and is fixed there.
 
-**Rendering did not stop.** The compositor presented 1626 of the 1628
-buffer-carrying commits it received, and the ratio holds across every run of
-this stage: 1355/1360, 1506/1509, 1033/1035, 18/20. That is §13.8's 1464/1465
-again, in a harness that is actively scrolling rather than idling, and it means
-frames are not being dropped between the client and the window. If a user still
-sees a scroll stutter, the cause is not in the commit-to-present path and this
-number is the reason to look elsewhere.
+**"Rendering did not stop" — WITHDRAWN.** This section originally read:
 
-**The blank regions were real**, are the subject of §27.2 and §27.3, and are
-fixed.
+> The compositor presented 1626 of the 1628 buffer-carrying commits it
+> received … If a user still sees a scroll stutter, the cause is not in the
+> commit-to-present path and this number is the reason to look elsewhere.
+
+The measurement is correct and the conclusion does not follow. **A
+presented-over-committed ratio counts drops, not latency**, and those are
+independent: if a present takes 216.9 ms, the compositor still presents every
+commit it is given — the client is throttled by its own frame callbacks and
+simply commits less often — so the ratio sits at 0.999 while the screen crawls.
+Every number in the withdrawn paragraph is compatible with the worst stutter
+this project has measured.
+
+Worse, and this is the part that should have been obvious while writing it:
+**this harness has no VM boundary in it at all.** `scripts/wc-damage.sh` runs
+Firefox, `wc-proxy` and `wc-compositor.exe` under Wine on one Linux box. The
+cross-VM present is not slow there; it does not exist there. The quantity that
+turned out to matter was structurally absent from the experiment, and the
+section drew a conclusion about it anyway — the precise failure §13.8 was
+written to stop, arriving one level up: not an instrument inside the loop, but a
+loop with the subject outside it.
+
+What the number does establish, unchanged and worth keeping: **no frames are
+dropped between commit and present.** That is a narrow claim about the
+compositor's own bookkeeping and it is what the ratio can carry.
+
+The cause was the cross-VM present, and it has since been measured and moved:
+
+| condition | mean per ring wait |
+|---|---|
+| fixed 20 ms slice | 18.96 ms |
+| slice ladder | 4.38 ms |
+| ladder + doorbell | **1.06 ms** |
+
+95 ring waits per condition on an identical workload, and a present is about 11
+waits. 17.9x, which is a different order of thing from anything in this section.
+Symptom 2 was theirs, not damage tracking's, and this section should never have
+claimed it.
+
+**The blank regions were real, and that finding is independent of the above.**
+The verifier compares the region's bytes against the client's own bytes for the
+same buffer at the moment of commit; it caught 3 commits in 1509 where the
+entire 900-row client area disagreed. Latency cannot produce that. A slow
+present does not put two-frames-ago content into a buffer's copy — no amount of
+waiting turns a byte that was never copied into the right byte. §27.2 and §27.3
+stand on their own evidence, and they are fixed.
 
 ### 27.7 Why no harness could have caught it
 
@@ -9347,11 +9385,13 @@ stage 14 is §19, the Windows desktop shortcut.
    1708 of 3343 attach no buffer. They cannot change what is on screen, so the
    coverage gap is believed harmless, but it is a gap and it is stated rather
    than netted out of the denominator.
-4. **This ran under Wine, against the shared-file transport.** Wine is not
-   Windows and has been wrong four times (§13.6). The insulation is unusually
-   good here — `--verify-damage` compares two mappings inside a Linux process
-   and Wine is only an upstream that consumes the stream — but the guest-RAM
-   arena leg has not been run with the verifier on.
+4. **This ran under Wine.** Wine is not Windows and has been wrong four times
+   (§13.6). The insulation is unusually good here — `--verify-damage` compares
+   two mappings inside a Linux process and Wine is only an upstream that
+   consumes the stream. **Both transports are now covered** (§45); what is
+   still missing is a run against real guest RAM, which needs a QEMU guest this
+   box does not have, and which `wc_substrate_declare` correctly refuses to let
+   this harness fake.
 5. **The reproduction rate on Firefox is low.** 3 in 1509. The defect is
    certain, the unit test is deterministic, and the worst case is the entire
    client area; but a run of `scripts/wc-damage.sh scroll` against broken code
@@ -17479,3 +17519,235 @@ none of them was being run until each had already cost a revert.
    seed fix protects them all now, but nothing in them would catch a manifest
    made wrong some other way.
 
+## 45. §27 continued: the arena leg, and an identity with a hole in it
+
+*(§27's continuation, appended here because this file is in append order. No
+stage number, for the reason §27 gives.)*
+
+### 45.1 Status in one paragraph
+
+Three things, none of them a new defect in the copy path. §27's central claim —
+the region holds what the client drew — now holds **over the arena as well as
+over shared files**, which it had never been measured on despite the arena being
+the transport the deployment uses. The substrate is declared and asserted rather
+than assumed. And an identity assertion another agent added to
+`scripts/wc-damage.sh` failed on the first arena run, correctly, because the
+identity had an unnamed remainder; the remainder is now named. §27.6's claim to
+have ruled out the user's second symptom is **withdrawn** — that belonged to the
+cross-VM present, not to damage tracking.
+
+### 45.2 The arena leg, and why "believed transport-agnostic" was not enough
+
+Every number in §27 was taken over `--transport shared-file`. That is one file
+per pool, each mapped at offset 0, created and destroyed with the pool. The
+arena is a different object: **one region for every pool**, behind an allocator
+that assigns offsets, reclaims cold pools when it runs short (§16) and now hands
+regions back per frame. The arrears bookkeeping is keyed on `(surface, buffer)`
+and never looks at a transport, so it *should* be indifferent to all of that.
+
+"Should" is the word this project does not accept, and the reason is specific
+rather than ritual: the arrears are a claim about **what the region already
+contains**, and an allocator that moves a pool's offset or reclaims and re-hands
+its bytes is precisely a mechanism for making that claim false without any
+damage message being involved. If reclamation ever returned a region whose new
+occupant inherited a buffer's arrears, the symptom would be §27.3's — a buffer
+believed current, copied partially, showing somebody else's pixels.
+
+Measured, `scripts/wc-damage.sh arena`, Firefox scrolling `about:support`:
+
+| | commits checked | stale | substrate asserted |
+|---|---|---|---|
+| `shared-file` (§27) | 1616 | 0 | not asserted at the time |
+| **`arena`** | **1797** | **0** | `0 section, 0 shared-file, 3 arena-slice` |
+
+The substrate line is the compositor's own counter, asserted by
+`wc_assert_substrate` rather than printed — which matters here more than
+usual, because the two legs of this harness differ *only* in which memory the
+pixels cross, so a leg that silently fell back to the other would compare a
+thing with itself and pass.
+
+Both legs are declared `wine-fixture`: there is no QEMU on this box, so there is
+no guest RAM to locate, and `wc_substrate_declare` hands out
+`SV_ALLOW_FILE_ARENA` for exactly that reason and refuses to on a machine that
+has a guest. **A run against real guest RAM is still outstanding** and is
+§27.12 item 4; what has changed is that the arena *code path* is now exercised
+rather than only the shared-file one.
+
+### 45.3 An identity is not an identity if the remainder has no name
+
+`wc-damage.sh` gained an assertion from another agent while this branch was
+away, and it is a better assertion than the one it sits next to:
+
+> every commit is verified or classified state-only, so the two must add up to
+> the commit count. If they do not, commits are passing through the instrument
+> without being classified either way — the check has a blind spot, and the
+> size of the blind spot is the discrepancy.
+
+That is exactly the right shape: a bound on coverage that no amount of load or
+client behaviour can defeat. **It failed on the first arena run** — 3704 of
+3711 — and it was right to.
+
+The premise was wrong, not the arithmetic. `Session::commit` returns early in
+five places before it reaches the copy: no such surface, a surface that has
+never had a buffer attached, a buffer already destroyed, a pool already gone,
+and a pool the compositor does not have. All five are legitimate and none was
+counted, so seven commits a run existed outside the classification.
+
+The tempting fix is a tolerance — "within ten of the commit count" — and it is
+the wrong one, because it converts a statement about coverage into a number
+somebody chose on a machine. The remainder is named instead:
+
+```rust
+pub verify_unreached: u64,
+```
+
+incremented at each of the five returns, printed in the summary line, and added
+as the third term. Seven commits do not matter. An identity with an unnamed
+remainder does, because it is the difference between "the check saw everything"
+and "the check saw everything it happened to see".
+
+### 45.4 The stale-binary guard fired on the author of the run it protected
+
+`scripts/wc-binaries.sh` landed while this branch was away and
+`scripts/wc-damage.sh` was wired into it by somebody else. Editing `session.rs`,
+rebuilding `wc-proxy` and re-running the arena leg produced, immediately:
+
+```
+FAIL  wc-compositor.exe is older than crates/wc-proxy/src/session.rs
+      -- or this run measures the previous tree
+```
+
+which is correct: `cargo build -p wc-proxy` does not rebuild the Windows half,
+and the run would have measured a compositor from before the change. Recorded
+because §35.4's finding is easy to read as being about other people's
+carelessness, and it is not — the guard caught the person who had just spent a
+stage arguing that measurements need to be able to fail. `cargo clippy --target`
+would not have caught it either, for §18.8's reason: it builds metadata, not an
+executable.
+
+**And then it fired again after a full `cargo build --workspace --target
+x86_64-pc-windows-gnu`, which is the interesting half.** The build was not
+wrong and neither was the guard: the change was confined to `crates/wc-proxy`,
+`wc-compositor` does not depend on `wc-proxy`, so cargo correctly relinked
+nothing and the `.exe` kept an mtime older than `session.rs`. `fresh` compares a
+binary against **every** `.rs` in `crates/` and `vendor/`, not against the
+sources that binary is built from, so a change to any crate ages every binary in
+the tree.
+
+That is the right default — a guard that under-reports staleness is worthless,
+and dependency-aware freshness means parsing `cargo metadata` — but it has a
+consequence worth writing down now that eighteen harnesses depend on it: **on a
+tree this size a false positive is the common case, and the only honest way to
+clear it is to force a relink** (`touch` the binary's own source and rebuild),
+never to `touch` the binary. The first produces a binary genuinely built from
+the current tree; the second manufactures exactly the condition §35.4 found a
+build pipeline manufacturing.
+
+**And forcing the relink one binary at a time does not converge.** Touching
+`wc-compositor/src/main.rs` to clear the `.exe` made that file newer than the
+Linux `wc-proxy`, and the next run failed the other way round — same guard,
+opposite binary, three legs each time. Then `git stash pop` during a merge gave
+`session.rs` a fresh mtime and it happened a third time, which is what turned an
+annoyance into a written-down procedure. The fixed point exists and has an
+order:
+
+```
+touch crates/wc-compositor/src/main.rs crates/wc-proxy/src/main.rs
+cargo build --workspace --target x86_64-pc-windows-gnu
+cargo build --workspace
+```
+
+**Both** crates' own sources, and that is the part that took three attempts to
+get right. Touching only the compositor's cleared the `.exe` and immediately
+aged `wc-proxy`, because `wc-proxy` does not depend on `wc-compositor` either —
+the two binaries have disjoint dependency graphs, so no single touch and no
+number of `cargo build`s can make both of them newer than a file only one of
+them was rebuilt for. Touching both, then linking both, puts every binary after
+every source in one pass.
+
+Any source edit invalidates the fixed point and the three lines have to be run
+again — including an edit that changes no bytes at all, which is what `git stash
+pop` does to mtimes during a merge, and which is how this was rediscovered a
+third time. That is the practical rule the guard implies rather than a criticism
+of it, and every gate below was run after exactly that sequence.
+
+Whoever owns `wc-binaries.sh` may want a per-crate variant; this section did not
+add one, because guessing a dependency graph in `bash` is how a guard starts
+lying.
+
+### 45.5 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace` | clean, **before** every run below and after every edit |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean — a real gate, and `clippy --target` does not substitute for it |
+| `cargo test --workspace --no-fail-fast` | **2431 tests**, 0 failures — master's count, unchanged: this section adds a counter and a harness leg, not a test |
+| **`scripts/wc-damage.sh all`** | **27 passed, 0 failed** — all three legs, and the §45.6 retry fired once and is visible in the log |
+| ... `damage` over **shared-file** | 3410 commits, all accounted (1630 checked, 1773 no buffer, 7 unreached), **0 stale**, `0 section, 3 shared-file, 0 arena-slice` |
+| ... `damage` over **arena** (new leg) | 3497 commits, all accounted (1651 checked, 1839 no buffer, 7 unreached), **0 stale**, `0 section, 0 shared-file, 3 arena-slice` |
+| ... `buffer` over shared-file (control) | 3274 commits, all accounted (1555 checked, 1712 no buffer, 7 unreached), **0 stale** |
+| `cargo clippy --workspace --all-targets` | clean of anything this section touched |
+
+The **7 unreached is the same 7 in every leg**, and the control run is what makes
+that conclusive rather than suggestive. A remainder that tracked the length of
+the run would mean commits were escaping classification under load; this one was
+7 in a 3410-commit run, 7 in a 3497-commit run over a different transport, and 7
+in a 51-commit run on an earlier attempt — two orders of magnitude apart. That is
+a fixed set of surfaces committing before they ever attach, which is what a
+cursor and Firefox's subsurfaces do while being configured, and it cannot be a
+leak because a leak does not hold constant while the denominator moves 60x.
+§45.3's counter turned an unexplained discrepancy into a number with a cause.
+
+An earlier attempt's control leg came in at 20 checked, exactly on its floor, and that is
+the §27.10 variance again rather than anything new — the same run has produced
+1035 and 1658 on other nights. It is the reason that floor is 20 and the
+`damage` legs' is 200.
+
+### 45.6 The floor stayed; the run got another go
+
+That variance then failed the gate outright: a verification run after the last
+merge gave `damage`/shared-file **23 checked commits against a floor of 200**,
+with the arena leg at 1638 and the control at 1633 in the same invocation. Zero
+stale in all three — Firefox simply barely drew.
+
+There are two wrong answers here and the tempting one is to lower the floor. It
+is wrong because the floor is not a performance threshold, it is the assertion
+that **the run produced enough work to mean anything**; a floor of 20 would let
+this harness pass on a leg that scrolled nothing, which is the vacuous pass it
+exists to prevent. The other wrong answer is to leave it flaking, which blocks
+whoever runs the gate next for a reason that has nothing to do with the code.
+
+So the run is repeated, at most once, and **the floor does not move**. A retry
+changes how many chances the workload gets; it does not change what counts as a
+result, and a leg that comes up short twice still fails. The distinction is the
+whole of the justification: this is not a tolerance, it is a second sample of a
+quantity known to vary by two orders of magnitude on a contended box.
+
+It fired on the very next run, which is the demonstration rather than a claim:
+
+```
+....  damage-arena: only 17 commits checked, below the floor of 200 --
+      the client barely drew. Re-running once.
+PASS  damage-arena: every one of 3480 commits is accounted for --
+      1643 checked, 1830 attached no buffer, 7 never reached the copy
+PASS  damage-arena (damage): the region matched the client on every one of 1643
+```
+
+17 and then 1643, on the same leg, in the same invocation, minutes apart. That
+is the variance, and it is why the second sample is worth taking rather than the
+floor worth lowering. The retry announces itself with `....` rather than `PASS`,
+so a run that needed one says so in its own output and nobody reading the log
+later has to wonder whether the number came first or second time.
+
+### 45.7 What is not proven
+
+1. **Still no run against real guest RAM.** Both legs are Wine fixtures and say
+   so in their own output. This is §27.12 item 4 and it needs a guest, not a
+   flag.
+2. **The reclaim-versus-arrears interaction is exercised, not targeted.** The
+   arena leg runs the allocator that reclaims and re-hands regions, and nothing
+   went stale — but Firefox on a 64 MiB arena never came close to exhausting it,
+   so the reclaim path was mostly idle. A run under deliberate arena pressure
+   would be the sharper test, and `scripts/wc-arena-pressure.sh` exists.
+3. **§27.6's withdrawal is a retraction, not a new measurement.** The 17.9x
+   present-latency result is somebody else's and is quoted, not reproduced here.

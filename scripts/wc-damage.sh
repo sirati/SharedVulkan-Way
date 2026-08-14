@@ -2,8 +2,9 @@
 # Does the region hold what the client drew, while the client is **scrolling**?
 #
 #   scripts/wc-damage.sh scroll     Firefox scrolling about:support, at --copy damage
+#   scripts/wc-damage.sh arena      the same, over the arena -- the deployment's transport
 #   scripts/wc-damage.sh control    the same run at --copy buffer, which cannot fail
-#   scripts/wc-damage.sh all        both
+#   scripts/wc-damage.sh all        all three
 #
 # Run from inside `nix develop`.
 #
@@ -72,6 +73,10 @@ note(){ echo "  ....  $*"; }
 
 # STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
 . "$(dirname "$0")/wc-binaries.sh"
+# And which memory the pixels cross, declared and then asserted rather than
+# assumed. §27 measured its whole result over `shared-file` and said nothing
+# about it, which is exactly the omission `wc_assert_substrate` exists for.
+. "$(dirname "$0")/wc-substrate.sh"
 
 RUNDIR=$(mktemp -d /tmp/wc-damage-XXXXXX)
 KEEP=${WC_KEEP:-}
@@ -108,12 +113,45 @@ PAGE=${WC_PAGE:-about:support}
 # Returns non-zero only when the run could not be *made*; a run that produced
 # numbers returns 0 and the assertions are the caller's.
 scroll_run() {
-  local tag=$1 scope=$2
+  local tag=$1 scope=$2 transport=${3:-shared-file}
   local dir="$RUNDIR/$tag"
   mkdir -p "$dir/rt" "$dir/pools" "$dir/keymaps" "$dir/profile"
   chmod 700 "$dir/rt"
 
   winp() { local p=$1; echo "Z:${p//\//\\}"; }
+
+  # **Which memory, declared before anything starts.** Both legs are fixtures on
+  # this box for the same reason — a Wine run has no QEMU, so there is no guest
+  # RAM to locate — and `wc_substrate_declare` refuses to say so if `WC_HOST` or
+  # a configured guest is in the environment, which is what stops this harness
+  # measuring a file on a machine that has the real thing.
+  local arena_size=$((64 * 1024 * 1024)) arena_out=$((1024 * 1024))
+  local comp_extra=() proxy_extra=()
+  case "$transport" in
+    shared-file)
+      wc_substrate_declare wine-fixture \
+        "no QEMU on this box: a Wine run has no guest RAM to locate" || return 1
+      comp_extra=(--shared-dir "$(winp "$dir/keymaps")" --shared-peer-prefix "$dir/keymaps/")
+      proxy_extra=(--transport shared-file --pool-dir "$dir/pools"
+                   --peer-prefix "$(winp "$dir/pools")\\") ;;
+    arena)
+      # The transport the **deployment** uses, which is the reason this leg was
+      # added rather than the substrate rule being satisfied on paper. The arena
+      # packs every pool into one region behind an allocator that moves offsets,
+      # reclaims cold pools (§16) and hands regions back per frame (dynamic
+      # arena); `shared-file` gives each pool its own file at offset 0 and never
+      # does any of that. The arrears bookkeeping is keyed on buffer id and is
+      # believed transport-agnostic — believed is the operative word, and this
+      # branch is what turns it into measured.
+      wc_substrate_declare wine-fixture \
+        "no QEMU on this box: a Wine run has no guest RAM to locate" || return 1
+      : >"$dir/arena"; truncate -s $arena_size "$dir/arena"
+      comp_extra=(--arena-provide "0:$arena_size:$(winp "$dir/arena")"
+                  --arena-outbound "0:$arena_out")
+      proxy_extra=(--transport arena --arena-path "$dir/arena" --arena-id 0
+                   --arena-size $arena_size --arena-outbound $arena_out) ;;
+    *) bad "$tag: unknown transport $transport"; return 1 ;;
+  esac
 
   Xvfb ":$WC_X_DISPLAY" -screen 0 1600x1100x24 -nolisten tcp >"$dir/xvfb.log" 2>&1 &
   XPID=$!
@@ -133,7 +171,7 @@ scroll_run() {
 
   wine explorer "/desktop=$desk,1600x1050" \
     "$WIN_BIN/wc-compositor.exe" --socket "$sock" --timeout 200 --output "$OUTPUT" \
-    --shared-dir "$(winp "$dir/keymaps")" --shared-peer-prefix "$dir/keymaps/" \
+    "${comp_extra[@]}" \
     --log "$(winp "$dir/srv.log")" >"$dir/loader.log" 2>&1 &
   local srv=$!
 
@@ -153,8 +191,7 @@ scroll_run() {
   XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-proxy" \
     --upstream "$node" --socket wl-proxy --runtime-dir "$dir/rt" \
     --copy "$scope" --verify-damage \
-    --transport shared-file --pool-dir "$dir/pools" \
-    --peer-prefix "$(winp "$dir/pools")\\" \
+    "${proxy_extra[@]}" \
     --accept-timeout 40 --timeout 200 >"$dir/proxy.log" 2>&1 &
   local proxy=$!
   sleep 1
@@ -220,6 +257,12 @@ check_run() {
          sed 's/^/        /' "$dir/proxy.log" 2>/dev/null | tail -8
          return 1; }
 
+  # Which memory actually served the pixels, from the compositor's own counters
+  # rather than from what this harness asked for. A run whose region turned out
+  # to be something other than the declared substrate is a run whose stale-row
+  # count is about the wrong thing.
+  wc_assert_substrate "$dir/srv.log" "$tag"
+
   local notches
   notches=$(grep -m1 'notches towards the user' "$dir/scroll.log" 2>/dev/null)
   if [ "$(cat "$dir/scroll.rc" 2>/dev/null || echo 1)" = 0 ] && [ -n "$notches" ]; then
@@ -239,8 +282,9 @@ check_run() {
   worst=$(grep -o 'worst [0-9]* rows' "$dir/proxy.log" | grep -o '[0-9]*' | sort -n | tail -1)
   worst=${worst:-0}
 
-  local skipped commits
-  skipped=$(grep -o '([0-9]* state-only, unverifiable)' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  local skipped commits unreached
+  skipped=$(grep -o '([0-9]* state-only, unverifiable' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  unreached=$(grep -o '[0-9]* never reached the copy' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
   # **§31: `skipped` is now part of an equation instead of part of a sentence.**
   #
   # It was interpolated into the pass message and compared with nothing, which
@@ -250,19 +294,28 @@ check_run() {
   # traffic.
   #
   # What is asserted is an identity rather than a threshold, because an identity
-  # needs no number chosen on a machine: `Session::flush_deferred` increments
-  # exactly one of `verified` and `verify_skipped` on every commit it sees, so
-  # the two must add up to the commit count. If they do not, commits are passing
-  # through the instrument without being classified either way — the check has
-  # a blind spot, and the size of the blind spot is the discrepancy. That is a
-  # bound on coverage that cannot be defeated by load, by the client, or by how
-  # long the run happened to last.
+  # needs no number chosen on a machine: every commit is verified, classified
+  # state-only, or never reached the copy at all, so the three must add up to
+  # the commit count. If they do not, commits are passing through the instrument
+  # without being classified any way — the check has a blind spot, and the size
+  # of the blind spot is the discrepancy. That is a bound on coverage that
+  # cannot be defeated by load, by the client, or by how long the run lasted.
+  #
+  # **The third term is §45's, and it was added because this assertion
+  # failed.** The identity was originally written with two terms, on the premise
+  # that `commit` increments one of them every time. It does not: it returns
+  # early for a surface that has never had a buffer attached, for a buffer or
+  # pool already gone, and for a pool the compositor does not have — all
+  # legitimate, none of them counted. The first arena run came out 7 short of
+  # 3711 and this line failed, correctly. Seven commits do not matter; an
+  # identity with an unnamed remainder is not an identity, so the remainder was
+  # named in `Stats::verify_unreached` rather than tolerated with a threshold.
   commits=$(grep -o '[0-9]* commits,' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-  local classified=$(( ${verified:-0} + ${skipped:-0} ))
+  local classified=$(( ${verified:-0} + ${skipped:-0} + ${unreached:-0} ))
   if [ "$classified" -ne "${commits:-0}" ]; then
-    bad "$tag: $classified of $commits commits were classified as verified or unverifiable; $(( ${commits:-0} - classified )) went through the check unaccounted for"
+    bad "$tag: $classified of $commits commits were classified; $(( ${commits:-0} - classified )) went through the check unaccounted for"
   else
-    ok "$tag: every one of $commits commits is accounted for -- $verified checked, $skipped attached no buffer"
+    ok "$tag: every one of $commits commits is accounted for -- $verified checked, $skipped attached no buffer, $unreached never reached the copy"
   fi
   if [ "${verified:-0}" -ge "$floor" ]; then
     ok "$tag: $verified commits were checked against the client's own bytes (${skipped:-0} more attached no buffer, so there was nothing to check)"
@@ -301,9 +354,9 @@ check_run() {
 # rather than gates and a flaky FAIL in a corroboration is worse than a weak
 # floor.
 block_scroll() {
-  local scope=${1:-damage} floor=${2:-200} tag
-  tag=$(echo "$scope" | tr -d ' ')
-  echo "== $scope: Firefox scrolling $PAGE, checked against the client's own bytes"
+  local scope=${1:-damage} floor=${2:-200} transport=${3:-shared-file} tag
+  tag="$scope-$transport"
+  echo "== $scope over $transport: Firefox scrolling $PAGE, checked against the client's own bytes"
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
   have wine || { non "no wine"; return; }
   have Xvfb || { non "no Xvfb"; return; }
@@ -335,16 +388,49 @@ block_scroll() {
     bad "could not link probe-scroll.exe"; sed 's/^/        /' "$RUNDIR/$tag/cc.log"; return
   fi
 
-  scroll_run "$tag" "$scope" || return
+  # **A short run is re-run, not excused.** The floor exists to say "this run
+  # produced enough work to mean something", and Firefox under Xvfb and Wine on
+  # a box ten agents share sometimes produces almost none: 23 checked commits
+  # where the same leg gives 1600 on either side of it. §27.10 item 3 already
+  # records that the counts span 20 to 4106.
+  #
+  # There are two wrong answers and one right one. Lowering the floor to 20
+  # would make the gate pass on a run that scrolled nothing, which is the
+  # vacuous-pass failure this harness was written to avoid. Leaving it to flake
+  # blocks whoever runs the gate next, for a reason that is not about the code.
+  # So the run is repeated, up to twice, and the *floor stays where it is* — a
+  # retry changes how many chances the workload gets, not what counts as a
+  # result. A leg that comes up short twice fails, and that is a real signal.
+  local attempt
+  for attempt in 1 2; do
+    scroll_run "$tag" "$scope" "$transport" || return
+    local got
+    got=$(grep -o 'verified [0-9]* commits' "$RUNDIR/$tag/proxy.log" 2>/dev/null \
+          | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+    [ "${got:-0}" -ge "$floor" ] && break
+    if [ "$attempt" = 1 ]; then
+      note "$tag: only ${got:-0} commits checked, below the floor of $floor -- the client barely drew. Re-running once."
+      # A clean directory, so the second run's logs cannot be read as the
+      # first's, and the probe relinked into it because it lived there.
+      rm -rf "${RUNDIR:?}/$tag"
+      mkdir -p "$RUNDIR/$tag"
+      x86_64-w64-mingw32-gcc -O1 -mwindows -o "$RUNDIR/$tag/probe-scroll.exe" \
+        "$ROOT/scripts/probe-scroll.c" >"$RUNDIR/$tag/cc.log" 2>&1 \
+        || { bad "$tag: could not relink probe-scroll.exe for the retry"; return; }
+    fi
+  done
   check_run "$tag" "$scope" "$floor"
   [ -n "$KEEP" ] && note "run kept in $RUNDIR/$tag"
 }
 
 case "${1:-all}" in
-  scroll)  block_scroll damage 200 ;;
-  control) block_scroll buffer 20 ;;
-  all)     block_scroll damage 200; block_scroll buffer 20 ;;
-  *) echo "usage: $0 [scroll|control|all]"; exit 2 ;;
+  scroll)  block_scroll damage 200 shared-file ;;
+  arena)   block_scroll damage 200 arena ;;
+  control) block_scroll buffer 20 shared-file ;;
+  all)     block_scroll damage 200 shared-file
+           block_scroll damage 200 arena
+           block_scroll buffer 20 shared-file ;;
+  *) echo "usage: $0 [scroll|arena|control|all]"; exit 2 ;;
 esac
 
 echo

@@ -493,6 +493,19 @@ pub struct Stats {
     /// much of the traffic the check has nothing to say about, and a check
     /// whose coverage is unstated is a check nobody can size.
     pub verify_skipped: u64,
+    /// Commits that never reached the copy at all, and so were neither verified
+    /// nor classified as state-only: no such surface, a surface that has never
+    /// had a buffer attached, a buffer or pool already gone, or a pool the
+    /// compositor does not have.
+    ///
+    /// This exists because `wc-damage.sh` asserts an **identity** — every
+    /// commit is verified, skipped, or unreached — and an identity with an
+    /// unnamed remainder is not one. The remainder was 7 of 3711 on the first
+    /// arena run, and the harness was right to fail: not because seven commits
+    /// matter, but because a coverage claim with a hole in it cannot be sized.
+    /// Every one of these is a legitimate early return; what was missing was
+    /// the arithmetic saying so.
+    pub verify_unreached: u64,
 }
 
 impl Stats {
@@ -529,8 +542,13 @@ impl Stats {
         // indistinguishable from a check that never ran.
         let verify = if self.verified > 0 || self.verify_skipped > 0 {
             format!(
-                "; verified {} commits ({} state-only, unverifiable), {} stale (worst {} rows)",
-                self.verified, self.verify_skipped, self.stale_commits, self.stale_rows_worst
+                "; verified {} commits ({} state-only, unverifiable, {} never reached the copy), \
+                 {} stale (worst {} rows)",
+                self.verified,
+                self.verify_skipped,
+                self.verify_unreached,
+                self.stale_commits,
+                self.stale_rows_worst
             )
         } else {
             String::new()
@@ -2394,6 +2412,7 @@ impl Session {
             self.note(format!("arena region {id} returned: {bytes} bytes of {origin}"));
         }
         let Some(surface) = self.surfaces.get_mut(&surface_id) else {
+            self.stats.verify_unreached += 1;
             return;
         };
         let attached_now = surface.pending_attached;
@@ -2407,12 +2426,15 @@ impl Session {
         let full = surface.needs_full_copy;
         let Some(buffer_id) = surface.current else {
             surface.damage.clear();
+            self.stats.verify_unreached += 1;
             return;
         };
         let Some(info) = self.buffers.get(&buffer_id).cloned() else {
+            self.stats.verify_unreached += 1;
             return;
         };
         let Some(pool) = self.pools.get_mut(&info.pool) else {
+            self.stats.verify_unreached += 1;
             return;
         };
 
@@ -2421,6 +2443,7 @@ impl Session {
             // want of room, or mid-teardown. Already noted, and the surface
             // keeps whatever it last showed. The damage list is deliberately
             // **not** consumed on the way out — see `needs_full_copy`.
+            self.stats.verify_unreached += 1;
             return;
         };
         pool.last_used = Instant::now();
@@ -2438,6 +2461,7 @@ impl Session {
         let pool = self.pools.get_mut(&info.pool).expect("just read");
         let src = pool.client.as_slice();
         let Some(dst) = self.transport.bytes_mut(&region) else {
+            self.stats.verify_unreached += 1;
             return;
         };
         let usable = src.len().min(dst.len()).min(pool.size);
