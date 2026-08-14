@@ -236,19 +236,29 @@ do_deploy() {
   # the product's own verb, which kills by the pid in its own state file.
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --stop" >/dev/null 2>&1
 
+  # STAGE 44. **Three builds whose success was never established.** Each is a
+  # bare pipeline in a script with no `set -e`, so its status was simply not
+  # looked at — and looking at it would not have helped, which is the part worth
+  # knowing: with `pipefail` (set on line 49) `cargo … | grep '^error' | head`
+  # returns 1 when the build *succeeds*, because grep matching nothing is a 1.
+  # Success and failure are both `rc=1`; only `${PIPESTATUS[0]}` tells them
+  # apart, and it has to be read on the very next line.
+  #
+  # §42.3 got the mechanism wrong here and §44.2 says so. It claimed the
+  # pipeline "gives grep's exit status" — true without `pipefail`, and no
+  # harness in this tree is without it.
   echo "  building the Windows half"
   cargo build --target x86_64-pc-windows-gnu \
         -p wc-launch -p wc-desk 2>&1 | grep -E "^error" | head -5
+  built_ok "${PIPESTATUS[0]}" "wc-launch and wc-desk for Windows" || exit 1
   cargo build --target x86_64-pc-windows-gnu -p sv-guest --no-default-features -F wayland 2>&1 | grep -E '^error|warning: unused' | head -5
-  # STAGE 42. **Existence is not freshness, and here the build above is exactly
-  # why.** `cargo build … | grep -E "^error" | head -5` gives the pipeline
-  # *grep's* exit status, so cargo's is discarded: a build that fails leaves the
-  # previous binary in place and `[ -f ]` is perfectly happy with it. This
-  # harness therefore had the failure mode §35.4 measured *and* a build step
-  # that hides it. `fresh` compares against the tree instead.
+  built_ok "${PIPESTATUS[0]}" "sv-guest for Windows" || exit 1
+  # And freshness on top, because a build that succeeded without recompiling
+  # anything is also possible: `cargo` is content when the tree has not changed,
+  # and this check is about the tree rather than about cargo. §35.4.
   local e
   for e in wc-launch.exe sv-guest.exe wc-desk.exe; do
-    fresh "$WIN_BIN/$e" "cargo build --target x86_64-pc-windows-gnu (it may have failed above -- its exit status is swallowed by the grep)" || exit 1
+    fresh "$WIN_BIN/$e" "cargo build --target x86_64-pc-windows-gnu" || exit 1
   done
 
   echo "  building the Linux half"
@@ -257,9 +267,8 @@ do_deploy() {
   # path dependency that kept it excluded no longer exists (one-binary.md §1.3). The
   # merge deleted it outright; stage 14 put it back, because nothing replaced it.
   cargo build -p wc-proxy -p wc-arena-host 2>&1 | grep -E '^error' | head -5
+  built_ok "${PIPESTATUS[0]}" "wc-proxy and wc-arena-host" || exit 1
   local locator="$LINUX_BIN/wc-arena-host"
-  # STAGE 42, and for the same reason as the Windows half: the grep above eats
-  # cargo's exit status.
   fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
   fresh "$locator"            "cargo build -p wc-arena-host" || exit 1
   for b in "$LINUX_BIN/wc-proxy" "$locator"; do

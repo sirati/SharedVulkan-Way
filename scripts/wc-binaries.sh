@@ -174,6 +174,99 @@ deployed_is() {
   return 0
 }
 
+# ------------------------------------------------------------- built_ok -----
+# Did the *build* succeed, given a status captured from `${PIPESTATUS[0]}`?
+#
+#   cargo build … 2>&1 | grep -E '^error' | head -5
+#   built_ok "${PIPESTATUS[0]}" "the Windows half" || exit 1
+#
+# **Why this needs a helper at all, and why `$?` will not do.** The harnesses
+# filter build output through a pipeline so that a wall of cargo noise becomes
+# five lines. With `set -o pipefail` — which every harness here sets — that
+# pipeline's status is the last non-zero of any stage, and `grep` **exits 1 when
+# it matches nothing**. Finding no errors is the success case. So:
+#
+#   cargo succeeds, grep finds nothing   PIPESTATUS=(0 1 0)   pipeline rc=1
+#   cargo FAILS,    grep finds nothing   PIPESTATUS=(1 1 0)   pipeline rc=1
+#
+# The pipeline returns 1 either way. A harness that tested `$?` would learn
+# nothing, and one that tested it *naively* would treat every successful build
+# as a failure. `${PIPESTATUS[0]}` is the only thing that separates them, and it
+# must be read on the very next line because any command in between replaces it.
+#
+# §42.3 stated this wrongly — it said the pipeline "gives grep's exit status, so
+# cargo's is discarded", which is what happens *without* `pipefail`. Every
+# harness in this tree has `pipefail`, so the real mechanism is the one above:
+# the status is not discarded, it is **indistinguishable**. The conclusion was
+# right and the reason was not; §44.2 records the correction.
+built_ok() {
+  local st=$1 what=$2
+  if [ "${st:-1}" -ne 0 ]; then
+    bad "the build of $what failed (cargo exited $st) -- the previous binaries are still on disk"
+    note "Nothing below this point is a measurement of the current tree. The five"
+    note "lines above are cargo's own first errors."
+    return 1
+  fi
+  return 0
+}
+
+# --------------------------------------------------------- manifest_is_ours -
+# Does this ICD manifest point at a driver in *this* worktree?
+#
+#   manifest_is_ours <path-to-sv_icd.json> <what-to-do-about-it>
+#
+# **THE WORST INSTANCE OF THIS WHOLE CLASS, AND IT IS BUILT INTO THE WORKFLOW.**
+# §44. `scripts/sv-worktree.sh` seeds a new worktree by reflinking the base
+# tree's `target/`, which is deliberate and good — a cold rebuild of the
+# generated protocol crate is enormous. But `target/debug/sv_icd.json` is a
+# *generated file containing an absolute path*, and the reflinked copy says:
+#
+#   "library_path": "/mnt/datasets/builds/shared-vulkan-base/target/debug/libsv_icd.so"
+#
+# That file exists. So in a fresh worktree, before anything is rebuilt, the
+# Vulkan loader is pointed at **the base tree's driver** and every one of
+# `sv-cts.sh`, `sv-bench.sh` and `sv-present.sh` measures a different checkout
+# than the one it is running in — silently, with `[ -f "$MANIFEST" ]` perfectly
+# satisfied, because the file really is there.
+#
+# This is strictly worse than the stale-binary case §35.4 measured: that is the
+# *previous* state of this tree, which at least shares its history. This is
+# another tree entirely, whose contents no one in this run has any claim about.
+# And it is the default state of every worktree on its first run, which is
+# exactly when an agent is most likely to run the suite to get a baseline.
+#
+# `fresh` cannot catch it: the manifest's mtime is the reflink's, which is
+# usually newer than the sources. The assertable fact is the path itself.
+manifest_is_ours() {
+  local manifest=$1 how=$2 lib
+  if [ ! -f "$manifest" ]; then
+    bad "no ICD manifest at $manifest -- $how"
+    return 1
+  fi
+  lib=$(grep -o '"library_path"[[:space:]]*:[[:space:]]*"[^"]*"' "$manifest" \
+        | sed 's/.*"\([^"]*\)"$/\1/')
+  if [ -z "$lib" ]; then
+    bad "the ICD manifest $manifest names no library_path -- $how"
+    return 1
+  fi
+  case "$lib" in
+    "$ROOT"/*)
+      if [ ! -f "$lib" ]; then
+        bad "the ICD manifest points into this tree at $lib, but nothing is there -- $how"
+        return 1
+      fi
+      ok "the ICD manifest points at this tree's own driver (${lib#"$ROOT"/})"
+      return 0 ;;
+    *)
+      bad "the ICD manifest points OUTSIDE this worktree: $lib"
+      note "This run would load another checkout's driver and report the result as"
+      note "this tree's. It is the reflink seed from scripts/sv-worktree.sh: the"
+      note "manifest is generated and holds an absolute path, so a fresh worktree"
+      note "inherits the base tree's. $how"
+      return 1 ;;
+  esac
+}
+
 # ------------------------------------------------------------- picture_is ---
 # Is this capture a picture of the thing it claims to be?
 #

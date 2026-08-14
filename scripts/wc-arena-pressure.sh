@@ -33,7 +33,13 @@
 # there the largest pool is bigger than the whole arena, so the client's main
 # surface can never be given memory at all and no policy can save it. That case
 # is worth running and is not worth asserting on -- see §20.7.
-set -u
+# STAGE 44. `pipefail` added: these were the only two harnesses without it, and
+# uniformity is the point rather than a live bug — neither currently has a
+# pipeline whose head is the thing under test, so this closes a latent hazard
+# rather than an open one. Without it a failing `cargo`/`ssh` at the head of a
+# pipeline is invisible; with it the status is at least *available*, which is
+# what `built_ok` and `${PIPESTATUS[0]}` then make usable.
+set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LINUX_BIN="$here/target/debug"

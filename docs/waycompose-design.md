@@ -16956,3 +16956,163 @@ The test count does not move: the new tests are `cfg(windows)` and the cross
 target's test binary is a `.exe`, which `cargo test --target` cannot execute
 without a `binfmt_misc` registration — §29.10's second row, for the same reason
 and with five more tests in it.
+
+## 44. The pipeline that could not report failure, and the manifest that pointed at another checkout
+
+### 44.1 Status in one paragraph
+
+Two continuations of §42, and the second found something worse than what it was
+sent for. The pipeline sweep is mostly a **clean negative**: the combination that
+would be actively misleading — `set -e` without `set -o pipefail` — does not
+occur anywhere in this tree, and only three pipelines in 53 harnesses discard a
+status that matters. But §42.3 explained one of them wrongly, and the correct
+explanation is sharper than the wrong one. The freshness job then turned up the
+real prize: **`scripts/sv-worktree.sh` gives every new worktree an ICD manifest
+pointing at the base tree's driver**, so the three harnesses that produce the
+numbers this project quotes most would silently measure a different checkout,
+with their preflight satisfied.
+
+### 44.2 The correction: `pipefail` is set, so the status is not discarded — it is indistinguishable
+
+§42.3 said of `wc-launch.sh`:
+
+> `cargo build … | grep -E "^error" | head -5` gives the pipeline *grep's* exit
+> status, so cargo's is discarded.
+
+**That is what happens without `pipefail`, and every harness in this tree sets
+it** — `wc-launch.sh` on its line 49. The conclusion (a failed build leaves the
+old binary and `[ -f ]` is satisfied) was right; the mechanism was not. Measured
+rather than reasoned about this time:
+
+```
+cargo succeeds, grep finds nothing   PIPESTATUS=(0 1 0)   pipeline rc=1
+cargo FAILS,    grep finds nothing   PIPESTATUS=(1 1 0)   pipeline rc=1
+```
+
+With `pipefail` the pipeline's status is the last non-zero of any stage, and
+**`grep` exits 1 when it matches nothing** — which is the success case here,
+since the grep is looking for `^error`. So the pipeline returns 1 whether the
+build succeeded or failed. A harness testing `$?` would learn nothing; one
+testing it naively would call every successful build a failure. `${PIPESTATUS[0]}`
+is the only thing that separates them, and it must be read on the very next line
+because any intervening command replaces it.
+
+`built_ok "${PIPESTATUS[0]}" "<what>"` is in `wc-binaries.sh` and is used at all
+three sites. Both arms verified: a succeeding build passes, a failing one fails
+with cargo's status quoted.
+
+**This is the same error I have now documented three times and committed
+twice**: a claim written from how the code reads rather than from running it.
+§35.10's rule says cite the measurement; the sentence in §42.3 cited nothing,
+and was wrong in the one direction nobody would check, because its conclusion
+was correct.
+
+### 44.3 The sweep, reported as found rather than as fixed
+
+53 harnesses.
+
+| what | found | note |
+|---|---|---|
+| `set -e` without `pipefail` | **0** | both `set -euo pipefail` files have it; the misleading combination does not exist here |
+| no `pipefail` at all | **2** harnesses | `wc-arena-pressure.sh`, `wc-inhibit.sh`, both `set -u`. Neither had a pipeline whose head was under test, so latent rather than live. Fixed anyway: 50 of 52 already had it, and uniformity is worth more than the diff |
+| no `set` line at all | **6** | 4 `probe-*.sh` helpers, which have **0** pipelines with a tested head; and 2 sourced libraries, `wc-binaries.sh` and `wc-substrate.sh`, which correctly set nothing and inherit the caller's options |
+| unchecked pipeline, head under test | **3** | all in `wc-launch.sh`, all `cargo build … \| grep \| head`. Fixed with `built_ok` |
+| pipeline whose *artifact* is checked instead | **1** | `wc-guest.sh`'s `ssh-add -L \| head -1 > "$KEY"`, followed immediately by `[ -s "$KEY" ]`. **Not a defect** — checking the artifact is stronger than checking the status, and it is left alone |
+
+The honest summary is that this sweep was worth doing and mostly found nothing,
+which is a result. The tree had already adopted `pipefail` almost everywhere;
+what it had not adopted was *reading* the status where a pipeline's shape makes
+the aggregate status meaningless.
+
+### 44.4 A manifest that points at another checkout, and why `[ -f ]` was happy
+
+§42.5 item 4 left `sv-cts.sh`, `sv-bench.sh` and `sv-present.sh` without a
+freshness guard. Adding one found something freshness cannot catch.
+
+`target/debug/sv_icd.json` is **generated, and contains an absolute path**:
+
+```json
+"library_path": "/mnt/datasets/builds/shared-vulkan-base/target/debug/libsv_icd.so"
+```
+
+`scripts/sv-worktree.sh` seeds a new worktree by reflinking the base tree's
+`target/` — deliberately, and it should, because a cold rebuild of the generated
+protocol crate is enormous. But the reflinked manifest still names the **base
+tree's** driver, and that file exists. So in a fresh worktree, before anything is
+rebuilt:
+
+* `[ -f "$MANIFEST" ]` passes — the file is really there;
+* the Vulkan loader loads `shared-vulkan-base`'s `libsv_icd.so`;
+* the CTS, the benchmark and the present suite measure **a different checkout**
+  and report the numbers as this tree's.
+
+This is worse than §35.4's stale binary. A stale binary is this tree's own
+previous state, which at least shares its history; this is another tree entirely,
+whose contents nobody in the run has any claim about. And it is **the default
+state of every worktree on its first run** — precisely when an agent runs the
+suite to get a baseline before changing anything.
+
+`fresh` cannot catch it: the manifest's mtime is the reflink's, newer than the
+sources. The assertable fact is the path. `manifest_is_ours` checks that the
+`library_path` lies inside `$ROOT` and that the file is actually there, and it
+is wired into all three harnesses ahead of their other preflight.
+
+Verified end to end on the real harness, both arms, in the worktree this section
+was written in:
+
+```
+$ ./scripts/sv-cts.sh                       # before building anything here
+  FAIL  the ICD manifest points OUTSIDE this worktree:
+        /mnt/datasets/builds/shared-vulkan-base/target/debug/libsv_icd.so
+
+$ cargo build -p sv-icd -p sv-gpu-server
+$ ./scripts/sv-cts.sh
+  PASS  the ICD manifest points at this tree's own driver (target/debug/libsv_icd.so)
+  PASS  libsv_icd.so is newer than every source file in the tree
+  PASS  sv-gpu-server is newer than every source file in the tree
+  === 0. the suite, the driver, and the caselist ===
+```
+
+That first run is not hypothetical: it is what this worktree did, and what every
+worktree has done since `sv-worktree.sh` was written.
+
+### 44.5 The executable bit, and why a `mv` lost it
+
+§42's merge arrived with eight harnesses at `100644`. Not umask — mine is `0022`
+— but the rewrite idiom:
+
+```sh
+awk '…' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+```
+
+`mv` replaces the original with a **new file** created at the default mode, so
+the executable bit goes with the old inode. Exactly the eight files that loop
+touched lost it; every file edited with `sed -i`, which rewrites in place, kept
+it. The lesson is small and the failure mode is not: `git merge` reports
+`mode change 100755 => 100644` once and nothing mentions it again, so it is
+invisible in any review that looks at content.
+
+`wc-binaries.sh` and `wc-substrate.sh` are `100644` **on purpose** — both say
+"sourced, never run" on line 1, and that is the distinction that made the other
+eight wrong.
+
+### 44.6 What is not done
+
+1. **`wc-popup.sh`'s negative control still asserts something no run has
+   produced**, unchanged from §42.5 item 2 and repeated here because it is now a
+   section older. If the first real run reports `inside-work-area=True`, the
+   assertion is the suspect and not the compositor. An untried assertion is a
+   hypothesis.
+2. **`manifest_is_ours` is not wired into anything but the three suites.**
+   `sv-end-to-end.sh`, `sv-windows-e2e.sh`, `sv-zink-gl.sh` and the other
+   `sv-*.sh` runners also load the ICD by manifest and have the same exposure.
+   They were not audited for it here; the three fixed are the three §42.5 item 4
+   named.
+3. **Nothing re-ran the CTS to completion.** The preflight was exercised in both
+   directions and the suite was allowed to start; its actual results are §26's
+   subject and are not re-measured here.
+4. **`sv-worktree.sh` still seeds the stale manifest.** The check now refuses it,
+   which is the safe half. Making the seed *correct* — rewriting `library_path`
+   into the new worktree, or excluding the generated manifest from the reflink —
+   would remove the failure rather than report it, and belongs to whoever owns
+   that script.

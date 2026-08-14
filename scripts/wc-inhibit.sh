@@ -38,7 +38,13 @@
 # (6) is the one that would be missing if this had been written the obvious
 # way. smithay calls `uninhibit` only for an explicit `destroy` request, so a
 # client that dies holding an inhibitor leaves it behind for ever.
-set -u
+# STAGE 44. `pipefail` added: these were the only two harnesses without it, and
+# uniformity is the point rather than a live bug — neither currently has a
+# pipeline whose head is the thing under test, so this closes a latent hazard
+# rather than an open one. Without it a failing `cargo`/`ssh` at the head of a
+# pipeline is invisible; with it the status is at least *available*, which is
+# what `built_ok` and `${PIPESTATUS[0]}` then make usable.
+set -uo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)

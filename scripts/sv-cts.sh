@@ -110,8 +110,19 @@ done
 
 command -v deqp-vk >/dev/null || { echo "deqp-vk is missing; enter 'nix develop'" >&2; exit 1; }
 MANIFEST="$BIN/sv_icd.json"
-[ -f "$MANIFEST" ]          || { echo "build first: cargo build -p sv-icd" >&2; exit 1; }
-[ -x "$BIN/sv-gpu-server" ] || { echo "build first: cargo build -p sv-gpu-server" >&2; exit 1; }
+# STAGE 44. §35.6 item 6 listed this harness as having no freshness guard, and
+# §42.5 item 4 left it as the unfinished half. Both are closed here, and the
+# preflight is stronger than a freshness check alone because of what the manifest
+# is: a *generated file holding an absolute path*. `scripts/sv-worktree.sh` seeds
+# a worktree by reflinking `target/`, so a fresh worktree's `sv_icd.json` names
+# the **base tree's** `libsv_icd.so` — which exists, so `[ -f "$MANIFEST" ]` was
+# satisfied and the loader would hand this suite another checkout's driver. That
+# is the state of every worktree on its first run, which is exactly when the CTS
+# is run to get a baseline. See `manifest_is_ours`.
+. "$(dirname "${BASH_SOURCE[0]}")/wc-binaries.sh"
+manifest_is_ours "$MANIFEST" "cargo build -p sv-icd, in this worktree" || exit 1
+fresh "$BIN/libsv_icd.so"  "cargo build -p sv-icd" || exit 1
+fresh "$BIN/sv-gpu-server" "cargo build -p sv-gpu-server" || exit 1
 [ -f "$ICDDIR/$ICD" ]       || { echo "no such ICD manifest: $ICDDIR/$ICD" >&2; exit 1; }
 
 RUNDIR="$(mktemp -d /tmp/sv-cts.XXXXXX)"
