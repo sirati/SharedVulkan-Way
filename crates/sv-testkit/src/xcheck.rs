@@ -721,14 +721,14 @@ fn compare_struct(
         report.counts.members += 1;
 
         if let Some(bits) = h.bitfield {
-            // design.md §7.4: bitfields the registry cannot describe are out of
+            // docs/design.md §7.4: bitfields the registry cannot describe are out of
             // scope, and `plan::build` refuses them outright, so reaching one
             // here would mean the profile let one through.
             report.note(
                 Category::Member,
                 &subject,
                 format!(
-                    "vulkan_core.h declares it as a :{bits} bitfield, which design.md §7.4 \
+                    "vulkan_core.h declares it as a :{bits} bitfield, which docs/design.md §7.4 \
                      puts out of scope — it should not be in the plan at all"
                 ),
             );
@@ -909,7 +909,7 @@ pub fn check_signatures(model: &Model, plan: &Plan, header: &HeaderModel, report
         }
 
         // Nothing may be dropped silently. The two strips that *are* deliberate
-        // are named in design.md §7.4 and in the exception table, and both are
+        // are named in docs/design.md §7.4 and in the exception table, and both are
         // listed here so that a third one cannot appear without this failing.
         let plan_params: BTreeSet<&str> = c
             .inputs
@@ -922,7 +922,7 @@ pub fn check_signatures(model: &Model, plan: &Plan, header: &HeaderModel, report
                 continue;
             }
             if p.ty.base_name() == Some("VkAllocationCallbacks") {
-                report.counts.skip("pAllocator, stripped above the protocol (design.md §7.4)");
+                report.counts.skip("pAllocator, stripped above the protocol (docs/design.md §7.4)");
                 continue;
             }
             if sv_codegen::exceptions::void_policy(&c.name, &p.name).is_some() {
@@ -964,7 +964,7 @@ fn ctype_decl(ty: &CType) -> (String, usize) {
 
 /// Dispatchable versus non-dispatchable, against the header's two macros.
 ///
-/// It matters beyond bookkeeping: design.md §6.4 makes a dispatchable handle a
+/// It matters beyond bookkeeping: docs/design.md §6.4 makes a dispatchable handle a
 /// pointer to a `#[repr(C)]` struct whose first word the loader overwrites, and
 /// a non-dispatchable one a plain id. Getting the flag wrong is a loader crash
 /// at the ICD boundary, not a wire-format bug — but it is derived from the same

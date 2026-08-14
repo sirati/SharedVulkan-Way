@@ -1,7 +1,7 @@
 //! Rings: SPSC, per queue, plus the reply and reverse directions, plus the
 //! `RingBarrier` that puts the application's happens-before back together.
 //!
-//! design.md §4.4, taken from Venus's `vn_ring` and gfxstream's ASG, which
+//! docs/design.md §4.4, taken from Venus's `vn_ring` and gfxstream's ASG, which
 //! converged independently: a single-producer/single-consumer circular buffer,
 //! `head` and `tail` on separate cache lines with explicit acquire/release
 //! ordering, and a consumer that spins while work arrives and parks only after
@@ -24,7 +24,7 @@
 //! > implicit in the type, and the spec says plainly that an unrecognised
 //! > command cannot be skipped. That is R13 and it is the worst failure mode
 //! > this project has: two builds do not fail to connect, they desynchronise and
-//! > misinterpret everything downstream. — design.md §6.2
+//! > misinterpret everything downstream. — docs/design.md §6.2
 //!
 //! `sv-wire`'s [`sv_wire::CommandHeader`] carries that `cmd_size`. This module
 //! carries a *second*, independent length in the ring's own packet header, and
@@ -151,7 +151,7 @@ impl RingId {
     }
 }
 
-/// Cross-ring ordering. design.md §4.4:
+/// Cross-ring ordering. docs/design.md §4.4:
 ///
 /// > Because rings are independent, an object created on the device ring may not
 /// > yet exist on the GPU side when a queue ring references it. The app's own
@@ -258,7 +258,7 @@ impl RingCtrl {
         Ok(())
     }
 
-    /// Count a notification. design.md §4.4: "the producer checks `IDLE` before
+    /// Count a notification. docs/design.md §4.4: "the producer checks `IDLE` before
     /// paying for a notification", and this is how one measures whether that
     /// check is earning its keep.
     pub fn note_notify(&self) -> Result<u64> {
@@ -343,7 +343,7 @@ impl RingCtrl {
 /// caller encodes into [`RingProducer::staging`], a private buffer that is
 /// reused, and [`RingProducer::commit`] copies it in.
 ///
-/// The cost is one `memcpy` of a *descriptor* — design.md §4.4 is explicit that
+/// The cost is one `memcpy` of a *descriptor* — docs/design.md §4.4 is explicit that
 /// the rings carry descriptors and the arena carries the data, and §6.5 puts
 /// recorded `vkCmd*` streams in arena blobs precisely so they never pass through
 /// here. If a measurement ever shows this copy on a profile, the fix is a
@@ -376,7 +376,7 @@ impl RingProducer {
     }
 
     /// The largest payload this ring can carry. Anything larger belongs in an
-    /// arena blob (design.md §6.5) and the error says so.
+    /// arena blob (docs/design.md §6.5) and the error says so.
     pub fn max_payload(&self) -> u64 {
         self.lanes.capacity - PACKET_HEADER_SIZE - BARRIER_SIZE
     }
@@ -572,7 +572,7 @@ impl RingProducer {
         // consumer that acquire-loads the new tail sees a complete record — and
         // a producer that dies before reaching this line has published nothing.
         self.region.atomic_u64(self.lanes.tail_off)?.store(tail + total, Ordering::Release);
-        // design.md §4.4: "the producer checks `IDLE` before paying for a
+        // docs/design.md §4.4: "the producer checks `IDLE` before paying for a
         // notification". `Bell::ring` is that check — an acquire load, and the
         // syscall only when somebody is actually asleep. It has to be *after*
         // the store above or a woken consumer could find nothing.
@@ -598,7 +598,7 @@ impl RingProducer {
 
 /// One packet, copied out of the ring into the consumer's private buffer.
 ///
-/// The payload is a snapshot: design.md §5.5's distinction between a value read
+/// The payload is a snapshot: docs/design.md §5.5's distinction between a value read
 /// *out* of shared memory, which the act of reading pins, and one the peer can
 /// still change under you.
 #[derive(Debug)]
@@ -793,7 +793,7 @@ impl RingConsumer {
             // seqno and a reply answers one, so a packet holding three commands
             // could be neither ordered against nor replied to individually.
             // Commands that genuinely want batching go into an arena blob and
-            // travel as one `svExecuteCommandBlob` descriptor (design.md §6.5).
+            // travel as one `svExecuteCommandBlob` descriptor (docs/design.md §6.5).
             //
             // **THE SIZE IS AT A DIFFERENT OFFSET ON THE TWO LANES**, and
             // reading it from the command position on a reply lane was a live
@@ -872,7 +872,7 @@ impl RingConsumer {
 
 /// Has the barrier been satisfied?
 ///
-/// One acquire load in the common case, which is design.md §4.4's claim and is
+/// One acquire load in the common case, which is docs/design.md §4.4's claim and is
 /// worth keeping true: this function must not grow an allocation or a lock.
 pub fn barrier_satisfied(control: &Control, b: RingBarrier) -> Result<bool> {
     let ctrl = control.ring_ctrl_offset(b.ring)?;
@@ -903,7 +903,7 @@ pub fn barrier_satisfied(control: &Control, b: RingBarrier) -> Result<bool> {
 /// load on the GPU side, already satisfied in the common case.
 ///
 /// One tracker per queue ring. The ring it orders against is the queue's
-/// `depends_ring` from the directory (design.md §4.2, §4.4), which is why that
+/// `depends_ring` from the directory (docs/design.md §4.2, §4.4), which is why that
 /// field exists.
 #[derive(Debug, Clone)]
 pub struct BarrierTracker {
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn the_reverse_ring_needs_no_special_case() {
-        // design.md §4.6 budgets ~200 lines for it. It is the same ring with the
+        // docs/design.md §4.6 budgets ~200 lines for it. It is the same ring with the
         // producer on the other side, so this test is the whole of it.
         let f = fixture();
         let slot = crate::control::REVERSE_RING_SLOT;

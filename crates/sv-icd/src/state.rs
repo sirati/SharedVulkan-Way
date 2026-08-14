@@ -2,14 +2,14 @@
 //!
 //! # What is here and what is not
 //!
-//! This is the ICD as of design.md §13 **step 5** — "manifest, `VK_DRIVER_FILES`,
+//! This is the ICD as of docs/design.md §13 **step 5** — "manifest, `VK_DRIVER_FILES`,
 //! dispatchable-handle magic, interface negotiation, `vulkaninfo` producing a
 //! sane report" — and no further. Step 4, the end-to-end round trip against a
 //! GPU side on lavapipe, needs `sv-transport` and `sv-gpu-server`, neither of
 //! which is on master. So:
 //!
 //! - **Object ids are minted here and nothing crosses.** That is exactly what
-//!   design.md §6.4 specifies for the app side ("`vkCreateBuffer` encodes the id
+//!   docs/design.md §6.4 specifies for the app side ("`vkCreateBuffer` encodes the id
 //!   it chose and returns immediately — object creation costs no round trip"),
 //!   so the ids are real and the encoding is real; what is missing is the ring
 //!   that would carry them.
@@ -26,7 +26,7 @@
 //! `sv-gpu-server` exist, [`crate::transport::RingTransport`] implements the
 //! seam, and when `SV_SOCKET` names a live GPU side every one of the ~239
 //! forwarded commands crosses instead of being answered here. What is still
-//! answered locally is exactly the set design.md §8, §9 and §10 name — the
+//! answered locally is exactly the set docs/design.md §8, §9 and §10 name — the
 //! memory table, the extension lists, the WSI family, and `vkMapMemory` — plus,
 //! when there is *no* GPU side, everything, so that `vulkaninfo` against a
 //! standalone driver still produces a report.
@@ -51,7 +51,7 @@ use sv_icd_entry::{IcdResult, LowerError};
 /// It is a ceiling and not an answer. What an application is told is
 /// [`negotiate`]'s output — `min(what the driver behind us reports, this)` — so
 /// that a 1.1 device is advertised as 1.1 and a 1.4 device is advertised as 1.3
-/// *and said so at startup*. See design.md §0.18, and [`crate::icd`]'s
+/// *and said so at startup*. See docs/design.md §0.18, and [`crate::icd`]'s
 /// `clamp_api_version` for the two GL versions that claiming more than this
 /// cost the last time it was claimed.
 ///
@@ -125,7 +125,7 @@ pub fn negotiate(driver: u32, ceiling: u32) -> (u32, Negotiated) {
 /// agreement is checked by `the_two_sides_agree_about_the_arena_id`.
 pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 
-/// The default arena size when nothing else says (design.md §4.2's table).
+/// The default arena size when nothing else says (docs/design.md §4.2's table).
 pub const DEFAULT_ARENA_LEN: u64 = 256 << 20;
 
 #[derive(Debug)]
@@ -145,16 +145,38 @@ pub struct Device {
 pub struct Memory {
     pub memory_type_index: u32,
     /// `None` for a heap-0 allocation, which is never arena-backed and never
-    /// mappable (design.md §9.1: "impossible by construction rather than by
+    /// mappable (docs/design.md §9.1: "impossible by construction rather than by
     /// check").
     pub allocation: Option<Allocation>,
     pub size: u64,
     pub mapped: bool,
 }
 
+/// A `VkDescriptorUpdateTemplate` as the app side has to remember it.
+///
+/// # Why the bind point is here and was not
+///
+/// `vkUpdateDescriptorSetWithTemplate` needs only the entries: the descriptor
+/// set it writes into is a parameter of the call. The **push** form is not like
+/// that — `vkCmdPushDescriptorSetWithTemplate` names no set, because there is
+/// none; the descriptors go straight into the command buffer, and the pipeline
+/// bind point they belong to was fixed when the *template* was created
+/// (`VkDescriptorUpdateTemplateCreateInfo::pipelineBindPoint`, meaningful
+/// exactly when `templateType` is `PUSH_DESCRIPTORS`).
+///
+/// So expanding a push template into `vkCmdPushDescriptorSet` needs a value the
+/// call does not carry, and the only place it exists is the template object.
+/// docs/design.md §0.22.
+#[derive(Debug, Clone)]
+pub struct Template {
+    pub entries: Vec<sv_proto::VkDescriptorUpdateTemplateEntry>,
+    /// `pipelineBindPoint`, as the create-info gave it.
+    pub bind_point: sv_proto::VkPipelineBindPoint,
+}
+
 /// Everything the app side knows.
 pub struct State {
-    /// design.md §6.4 allocates ids from a per-device counter. One counter for
+    /// docs/design.md §6.4 allocates ids from a per-device counter. One counter for
     /// the process is a superset of that — every id is still unique on the wire
     /// — and it removes the question of which counter a cross-device object
     /// belongs to. Starts at 1 so that 0 stays `VK_NULL_HANDLE`.
@@ -169,14 +191,15 @@ pub struct State {
     /// Buffer id → its memory requirements, so `vkGetBufferMemoryRequirements`
     /// can answer without a GPU.
     pub buffers: HashMap<u64, u64>,
-    /// `VkDescriptorUpdateTemplate` id → the entries it was created with.
+    /// `VkDescriptorUpdateTemplate` id → what the app side has to remember
+    /// about it.
     ///
     /// Kept because `vkUpdateDescriptorSetWithTemplate`'s `pData` has no
     /// describable shape without them — see
     /// [`sv_icd_entry::local::expand_descriptor_template`]. This is the only object
     /// whose *contents* the app side has to remember; everything else it only
     /// has to name.
-    pub templates: HashMap<u64, Vec<sv_proto::VkDescriptorUpdateTemplateEntry>>,
+    pub templates: HashMap<u64, Template>,
     pub allocator: Box<dyn Backing>,
 }
 
@@ -228,7 +251,7 @@ pub struct SharedVulkan {
     /// returns, and what `vkCreateDevice` will accept.
     ///
     /// **Asked of the GPU side once, at connect**, rather than being the
-    /// constant `advertise::DEVICE_EXTENSIONS` used to be. design.md §9.2 says
+    /// constant `advertise::DEVICE_EXTENSIONS` used to be. docs/design.md §9.2 says
     /// an extension in this list is a promise its entry points work, and the
     /// only side that can keep that promise is the one holding the driver: it
     /// answers the intersection of the profile with what its driver has
@@ -240,7 +263,7 @@ pub struct SharedVulkan {
     /// loader `dlopen`s it once — and the alternative is a lifetime on the
     /// generated `Icd` trait for a `Vec` that is never freed anyway.
     device_extensions: Vec<(&'static str, u32)>,
-    /// Live swapchains, by id (design.md §10, [`crate::wsi`]).
+    /// Live swapchains, by id (docs/design.md §10, [`crate::wsi`]).
     ///
     /// **A second lock rather than a field of [`State`]**, and the lock order is
     /// swapchain-then-state, never the reverse. Every step of
@@ -251,7 +274,7 @@ pub struct SharedVulkan {
     swapchains: Mutex<HashMap<u64, crate::wsi::Swapchain>>,
     /// Live surfaces, by id.
     ///
-    /// **The ICD owns these**, which design.md §8 says it does not: see
+    /// **The ICD owns these**, which docs/design.md §8 says it does not: see
     /// `sv_codegen::emit::icd_entry::EXTRA_LOCAL`. A `VkSurfaceKHR` that reaches
     /// any entry point of this driver is a key of this map, and one that is not
     /// is a surface some other ICD created.
@@ -262,7 +285,7 @@ impl SharedVulkan {
     /// A standalone driver: its own memfd, no GPU side.
     ///
     /// Not a fallback to be removed. `vulkaninfo` against this configuration is
-    /// what design.md §13 step 5 tests, the loader test in `tests/loader.rs`
+    /// what docs/design.md §13 step 5 tests, the loader test in `tests/loader.rs`
     /// drives it, and a machine with no GPU side running has to enumerate rather
     /// than fail to load.
     pub fn new(arena_len: u64) -> Result<SharedVulkan, std::io::Error> {
@@ -322,7 +345,7 @@ impl SharedVulkan {
         let (driver_instance, driver_device) =
             attached.transport.driver_versions().unwrap_or((0, 0));
         // **The instance number is bounded by the device's**, and that is a
-        // consequence of design.md §8 rather than of Vulkan: an ICD may in
+        // consequence of docs/design.md §8 rather than of Vulkan: an ICD may in
         // general offer more instance-level version than any of its devices
         // supports, but this one has exactly one physical device, so an
         // application told "instance 1.3" and then handed a 1.1 device learns
@@ -406,7 +429,7 @@ impl SharedVulkan {
             })
             .collect();
         // **`VK_KHR_swapchain` is added here rather than intersected**, and that
-        // is a correction to design.md §0.4 item 8 rather than an exception to
+        // is a correction to docs/design.md §0.4 item 8 rather than an exception to
         // it. §0.4's rule — the list is "the profile's extensions intersected
         // with what the driver actually has, and only the side holding the
         // driver knows the second half" — is right for every extension whose
@@ -431,7 +454,7 @@ impl SharedVulkan {
         // whose reply it cannot shape, and the refusal lands in
         // `sv_icd_entry::NOT_IMPLEMENTED` rather than in the profile. So the
         // answer arriving over the wire is "the device supports it", not "it
-        // works", and design.md §9.2 asks for the second.
+        // works", and docs/design.md §9.2 asks for the second.
         //
         // Concretely: this is what stops `VK_KHR_buffer_device_address` being
         // advertised while `vkGetBufferDeviceAddress` returns a silent zero.
@@ -471,7 +494,7 @@ impl SharedVulkan {
         });
 
         // **`VK_KHR_swapchain` is added here rather than intersected**, and that
-        // is a correction to design.md §0.4 item 8 rather than an exception to
+        // is a correction to docs/design.md §0.4 item 8 rather than an exception to
         // it. §0.4's rule — the list is "the profile's extensions intersected
         // with what the driver actually has, and only the side holding the
         // driver knows the second half" — is right for every extension whose
@@ -572,7 +595,7 @@ impl SharedVulkan {
         &self.device_extensions
     }
 
-    /// The swapchain table (design.md §10).
+    /// The swapchain table (docs/design.md §10).
     pub fn swapchains(&self) -> std::sync::MutexGuard<'_, HashMap<u64, crate::wsi::Swapchain>> {
         self.swapchains.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -599,7 +622,7 @@ impl SharedVulkan {
         self.transport.as_ref()
     }
 
-    /// design.md §5.3's rewrite, app-side half: allocation coordinates become
+    /// docs/design.md §5.3's rewrite, app-side half: allocation coordinates become
     /// arena coordinates.
     ///
     /// Returns `(memory id, offset)` ready to cross. For an arena-backed
@@ -674,7 +697,7 @@ fn announce(how: Negotiated, advertised: u32, driver_device: u32) {
              advertising {adv}.\n\
              sv-icd: applications will not attempt anything above {adv} through this driver. \
              Raising the ceiling means adding the missing core version to the wire profile — \
-             see design.md §0.18 for what that costs.",
+             see docs/design.md §0.18 for what that costs.",
             version_string(driver),
             version_string(PROTOCOL_API_VERSION),
             sv_proto::PROTOCOL_PROFILE,

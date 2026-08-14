@@ -57,7 +57,73 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* WHICH WIN32 IS THIS -- docs/waycompose-design.md §67.
+ *
+ * The same probe `crates/wc-compositor/src/wine.rs` makes, made here because
+ * this is a separate process and the compositor's answer does not cross to it:
+ * `ntdll!wine_get_version` exists under Wine and nowhere else. Cached in a
+ * static for the same reason the compositor uses a `OnceLock` -- a value two
+ * call sites can re-read is a value they can disagree about.
+ *
+ * `WC_WIN32=windows|wine` overrides it, exactly as it does for the compositor,
+ * so the fatal call below can be re-tried on a Wine that may have fixed it
+ * without anyone having to edit this file. */
+static int under_wine(void)
+{
+	static int cached = -1;
+	if (cached >= 0)
+		return cached;
+
+	const char *forced = getenv("WC_WIN32");
+	if (forced && !strcmp(forced, "wine"))  { cached = 1; return cached; }
+	if (forced && !strcmp(forced, "windows")) { cached = 0; return cached; }
+
+	HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+	const char *(CDECL *ver)(void) = nt
+		? (const char *(CDECL *)(void))(void *)GetProcAddress(nt, "wine_get_version")
+		: NULL;
+	cached = ver != NULL;
+	if (cached)
+		printf("probe-cursor: win32 is wine %s\n", ver());
+	else
+		printf("probe-cursor: win32 is windows\n");
+	fflush(stdout);
+	return cached;
+}
+
+/* THE ONE THING THIS PROBE CANNOT DO UNDER WINE (docs/waycompose-design.md §67.4)
+ *
+ * `stock_name` below rests on a documented Windows property, and the header of
+ * this file states it as the reason the reading is proof rather than
+ * resemblance: "Stock cursors are shared per-session handles, so an exact match
+ * is proof of identity". Under Wine they are **per process**.
+ *
+ * Measured, wine-11.14 staging under Xvfb, 2026-08-13. In a single process the
+ * sixteen `LoadCursorW(NULL, IDC_*)` handles are stable across calls -- and
+ * they are 0x1004e, 0x10050 ... 0x1006c, a dense run from a per-process base.
+ * A second Wine process allocates from the same base, so a handle read off the
+ * *compositor's* input queue and a handle loaded here are two numbers from two
+ * namespaces, and comparing them is meaningless in both directions: it can
+ * miss a stock cursor, and it can collide with an unrelated one.
+ *
+ * So under Wine every reading comes back `cursor=custom` whatever it really
+ * is, and this line is what stops that being read as a measurement.
+ * `wc-cursor.sh` substitutes the weaker test the guard is actually about --
+ * the frame's handle must merely *differ* from the client area's -- and keeps
+ * the assertion by name for Windows, where it means something. */
+static void announce_stock_identity(void)
+{
+	if (under_wine())
+		printf("probe-cursor: stock-identity=unavailable "
+		       "(Wine's stock HCURSORs are per-process, so a handle from "
+		       "another process cannot be named; docs/waycompose-design.md §67.4)\n");
+	else
+		printf("probe-cursor: stock-identity=available\n");
+	fflush(stdout);
+}
 
 /* The stock cursors, by ordinal. Written out rather than using the `IDC_*`
  * macros so that the numbers in this file and the numbers in
@@ -99,6 +165,10 @@ static const char *stock_name(HCURSOR h)
 	return NULL;
 }
 
+/* How many `SendInput` calls the window server refused. See `move_to`. */
+static int moves_refused;
+static int moves_tried;
+
 /* Absolute mouse coordinates are normalised over the whole virtual screen in
  * units of 1/65535 — not pixels, and the divisor is the *virtual* screen. The
  * same note probe-input.c carries, because it is the same trap. */
@@ -115,7 +185,42 @@ static void move_to(int x, int y)
 	in.mi.dx = (LONG)((double)x * 65535.0 / (double)(w - 1));
 	in.mi.dy = (LONG)((double)y * 65535.0 / (double)(h - 1));
 	in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-	SendInput(1, &in, sizeof in);
+	/* **The return value is checked, and docs/waycompose-design.md §57 is why.**
+	 * `SendInput` can return 0 with `ERROR_ACCESS_DENIED` without blocking,
+	 * throwing or logging. §57 found `probe-scroll.c` discarding exactly this
+	 * and measuring a browser nobody had scrolled.
+	 *
+	 * The same hole was here. Every reading after a `move_to` -- the client
+	 * area, the dwell, and both frame points -- is a claim about where the
+	 * pointer *is*, so a refused move does not make them fail, it makes them
+	 * describe wherever the pointer happened to be already. On this Xvfb they
+	 * would still have read the compositor's cursor and passed.
+	 *
+	 * **What this deliberately does NOT say is why**, and
+	 * docs/waycompose-design.md §63.3 is the reason. An earlier version of this
+	 * line asked "is the session locked?", which is a real cause -- a locked
+	 * session puts the input desktop on `Winlogon` and a process on `Default`
+	 * cannot inject into it -- and it is the cause that held up a run for a day
+	 * while being about a path the launcher does not travel: ssh lands in
+	 * session 0, the launcher's clicks go through a scheduled task into session
+	 * 1, and a window there is visible and mappable while locked. §63.3's rule
+	 * is that *a measurement can be real and still be about the wrong path*, so
+	 * this prints the refusal and the error code and stops. Which session and
+	 * which desktop this process is on is the next measurement, not a guess to
+	 * put in the log where somebody will read it as the answer.
+	 *
+	 * Counted rather than fatal: the caller decides, and `wc-cursor.sh` asserts
+	 * the count is zero. A probe that stopped here would lose the readings that
+	 * do not depend on the pointer. */
+	moves_tried++;
+	if (SendInput(1, &in, sizeof in) != 1) {
+		moves_refused++;
+		printf("probe-cursor: SendInput REFUSED for %d,%d (err %lu) -- "
+		       "the window server would not take it; which session and desktop "
+		       "is this process on? (docs/waycompose-design.md §63.3)\n",
+		       x, y, (unsigned long)GetLastError());
+		fflush(stdout);
+	}
 	Sleep(40);
 }
 
@@ -202,7 +307,24 @@ static void ask_window(const char *tag, HWND w, int hittest)
 }
 
 /* Report the cursor at the current pointer position, prefixed with `tag` so a
- * shell script can grep for one probe point among several. */
+ * shell script can grep for one probe point among several.
+ *
+ * A NOTE ON WHAT USED TO BE HERE (docs/waycompose-design.md §67.5)
+ *
+ * §23.7 item 1 recorded `GetCursorInfo` as *fatal* under Wine -- a run of this
+ * probe dying at exactly this call with
+ * `X Error of failed request: BadWindow (invalid Window parameter), Major
+ * opcode 38 (X_QueryPointer)` -- and it reproduced on this branch, three times
+ * out of three, before anything was changed. §66 was about to give it a Wine
+ * path. It does not have one, because the cause is not Wine:
+ * `scripts/wc-cursor.sh` was tearing the compositor down while this probe was
+ * still running, so the window whose pointer was being queried had just been
+ * destroyed. With the harness waiting for `probe-cursor: done` -- the fix
+ * `wc-damage.sh` already documents for the same `wine explorer /desktop=`
+ * trap -- the call is clean and returns every reading.
+ *
+ * It stays `GetCursorInfo` on both platforms, therefore, and this comment is
+ * here so the next person to see that X error looks at the harness first. */
 static void report(const char *tag)
 {
 	CURSORINFO ci;
@@ -266,6 +388,13 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+
+	/* Before anything is measured, and after `--log` has been reopened, so
+	 * that the first line of the probe's own log says which Win32 every
+	 * line below it is about. `wc-cursor.sh` reads it and refuses to run
+	 * the Windows-only assertions against a Wine reading. */
+	(void)under_wine();
+	announce_stock_identity();
 
 	HWND w = find_target(cls, wait);
 	if (!w) {
@@ -366,7 +495,15 @@ int main(int argc, char **argv)
 		report("frame-caption");
 	}
 
+	/* Printed always, including the zero, so the harness asserts on a number
+	 * this probe stated rather than on the absence of a warning. §57's shape:
+	 * a run that measured nothing must say so in the same line a run that
+	 * measured everything says it. */
+	printf("probe-cursor: moves-refused %d of %d\n", moves_refused, moves_tried);
 	printf("probe-cursor: done\n");
 	fflush(stdout);
-	return 0;
+	/* 3, matching probe-scroll.c, when the window server refused *every* move:
+	 * there is then no pointer-dependent reading in this log worth having. A
+	 * partial refusal is left to the harness, which asserts on zero. */
+	return moves_tried > 0 && moves_refused == moves_tried ? 3 : 0;
 }

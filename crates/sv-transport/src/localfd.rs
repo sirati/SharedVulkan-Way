@@ -1,10 +1,10 @@
 //! The quarantined descriptor handoff: `SCM_RIGHTS`, and the one provider that
 //! still needs it.
 //!
-//! # This module violates design.md §1a and exists anyway
+//! # This module violates docs/design.md §1a and exists anyway
 //!
 //! > **No file descriptor or handle ever crosses between the app side and the
-//! > GPU side.** — design.md §1a
+//! > GPU side.** — docs/design.md §1a
 //!
 //! Everything in this crate obeys that except what is in this file. It is here,
 //! separate, named after what it is and excluded from the cold path proper, so
@@ -18,7 +18,7 @@
 //! from the driver and exports it as a dma-buf. A dma-buf has **no name**, so
 //! the only way to give one to another process is a descriptor, and there is no
 //! variant of this path that a VM boundary could carry. It is therefore a
-//! same-machine-only mechanism, and design.md §1a says a same-machine-only
+//! same-machine-only mechanism, and docs/design.md §1a says a same-machine-only
 //! mechanism must not be part of the design.
 //!
 //! It survives for exactly one reason, and it is a hardware fact rather than a
@@ -36,7 +36,7 @@
 //! reached by path — the cross-VM topology — and **cannot** work when the object
 //! is a named one, because no named object on Linux is sealable. So there is no
 //! legal route to RADV on one machine, and deleting this module would take five
-//! passing harnesses with it. design.md §0.7 records that as a finding rather
+//! passing harnesses with it. docs/design.md §0.7 records that as a finding rather
 //! than as a decision.
 //!
 //! # `unsafe`

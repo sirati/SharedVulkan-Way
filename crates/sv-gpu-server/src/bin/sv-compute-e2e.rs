@@ -20,7 +20,7 @@
 //! layout, pipeline, command pool, command buffer, fence — is an id this process
 //! minted, encoded, and sent; every `vkCmd*` is a ring packet; the submit
 //! carries a `RingBarrier` past everything the device ring produced. The one
-//! thing that does **not** cross is the data, which is design.md §1's invariant:
+//! thing that does **not** cross is the data, which is docs/design.md §1's invariant:
 //!
 //! > `vkMapMemory` on the app side returns `arena_base + slab_base +
 //! > alloc_offset + offset`. A real pointer into real shared pages. It involves
@@ -110,7 +110,7 @@ fn work(
         req.size, req.alignment, req.memory_type_bits
     );
 
-    // Pick a HOST_VISIBLE type from *our* table (design.md §9.1: types 1..3 are
+    // Pick a HOST_VISIBLE type from *our* table (docs/design.md §9.1: types 1..3 are
     // the arena, type 0 is device-local and unmappable).
     let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
     let ti = (0..mem_props.memory_type_count)
@@ -277,7 +277,7 @@ fn work(
         d.cmd_dispatch(cmd, 64, 1, 1);
         d.end_command_buffer(cmd).map_err(|e| format!("vkEndCommandBuffer: {e:?}"))?;
     }
-    println!("[app] recorded {} commands, all of them in one arena blob (design.md §6.5)", 5);
+    println!("[app] recorded {} commands, all of them in one arena blob (docs/design.md §6.5)", 5);
 
     let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }
         .map_err(|e| format!("vkCreateFence: {e:?}"))?;

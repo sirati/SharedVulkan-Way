@@ -320,7 +320,7 @@ mod host {
         // nothing and the sweep is what is left. There is no flag that makes
         // this program *prefer* one — a fallback that could be selected by
         // configuration is a fallback that gets selected by accident, which is
-        // design.md §5.1's objection to fallbacks generally.
+        // docs/waycompose-design.md §5.1's objection to fallbacks generally.
         let frames = match &args.frames {
             None => None,
             Some(path) => {

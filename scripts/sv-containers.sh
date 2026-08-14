@@ -6,7 +6,7 @@
 #
 # This is the Linux-host / Linux-guest topology, not a simulation of it. The two
 # sides share two things and no more: a Unix socket, over which `sv-hostd` sends
-# the *name* of the arena object (design.md §1a — no descriptor crosses), and the
+# the *name* of the arena object (docs/design.md §1a — no descriptor crosses), and the
 # `/dev/shm` namespace that name is resolved in. Everything else — PID namespace,
 # IPC namespace, UTS namespace, /tmp — is separate, so a side that reached for
 # anything it was not given would fail here rather than in a VM three stages

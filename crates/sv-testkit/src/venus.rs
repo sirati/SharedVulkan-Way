@@ -11,7 +11,7 @@
 //!
 //! Every round-trip test in `sv-proto` is symmetric and therefore proves nothing
 //! about that. What proves something is comparing against an *independent*
-//! implementation of the same wire format, which design.md §6.2 and §7.3 name:
+//! implementation of the same wire format, which docs/design.md §6.2 and §7.3 name:
 //! Venus's MIT-licensed generated C.
 //!
 //! # What is compared, and what is not

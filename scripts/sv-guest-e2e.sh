@@ -28,7 +28,7 @@
 # BOTH SIDES MUST COME FROM ONE BUILD. The GPU side here is a binary *copied*
 # into the guest, so rebuilding on the host changes only the host's half.
 #
-# `WIRE_VERSION` went 1 -> 2 in design.md §0.18 (`svDriverVersions`, which is
+# `WIRE_VERSION` went 1 -> 2 in docs/design.md §0.18 (`svDriverVersions`, which is
 # hand-written in `sv_proto::sv` and so outside the protocol hash). A guest
 # binary from before that commit is refused at handshake — correctly, and by
 # design. The ICD names the cause and the fix in the refusal message; the
@@ -132,7 +132,12 @@ for _ in $(seq 1 300); do
   sleep 1
 done
 
-say "vulkaninfo through the real loader, our ICD, and a GPU side in the VM${BELL:+, with a doorbell}"
+# The application. `vulkaninfo --summary` by default: it enumerates, which is
+# what the handshake needed proving against. `SV_E2E_APP` swaps in something that
+# *presents*, which is a different and harder question -- §36.15 measured the
+# cost of a **wait**, and the 216.9 ms that started all this was a **present**.
+APP=${SV_E2E_APP:-vulkaninfo --summary}
+say "$APP through the real loader, our ICD, and a GPU side in the VM${BELL:+, with a doorbell}"
 # Timed, because §36.6 is a latency claim and this is the only place in the tree
 # where a real application's commands cross a real hypervisor. Every one of them
 # is a round trip the app side parks for, so the wall clock here *is* the sum of
@@ -140,7 +145,7 @@ say "vulkaninfo through the real loader, our ICD, and a GPU side in the VM${BELL
 APP_T0=$(date +%s.%N)
 env VK_DRIVER_FILES="$ROOT/target/debug/sv_icd.json" SV_SOCKET="$RUNDIR/icd.sock" \
   ${BELL:+SV_BELL="$RUNDIR/bell.sock"} ${SV_PARK_FIRST_SLICE_US:+SV_PARK_FIRST_SLICE_US="$SV_PARK_FIRST_SLICE_US"} \
-  vulkaninfo --summary > "$RUNDIR/app.log" 2>&1
+  $APP > "$RUNDIR/app.log" 2>&1
 APP_RC=$?
 APP_MS=$(awk "BEGIN{printf \"%.0f\", ($(date +%s.%N) - $APP_T0) * 1000}")
 wait $HOSTD_PID

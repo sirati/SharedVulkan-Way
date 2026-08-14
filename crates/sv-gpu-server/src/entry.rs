@@ -1,7 +1,7 @@
 //! ```text
 //! sv-gpu-server serve   --socket <path> [--device N] [--arena BYTES] [--clients N]
 //!                       --clients N = accept up to N *sessions*, each served as
-//!                       it arrives, each with its own arena (design.md §0.12)
+//!                       it arrives, each with its own arena (docs/design.md §0.12)
 //! sv-gpu-server attach  --socket <path> [--device N]
 //! ```
 //!
@@ -146,7 +146,7 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // Both sides derive these from the session string
                     // ([`winshm::section_name`]), so they are stated here for
                     // the record rather than for the peer's benefit — the
-                    // Windows axis has obeyed design.md §1a since it was written
+                    // Windows axis has obeyed docs/design.md §1a since it was written
                     // and is the pattern the Linux axis was generalised from.
                     object: winshm::section_name(&format!("{session_name}.ctl")),
                     arena_object: winshm::section_name(&format!("{session_name}.arena")),
@@ -548,7 +548,7 @@ fn serve(
     // is a question nobody has measured and which this design does not need to
     // ask.
     //
-    // Naming it is what reduces this path's violation of design.md §1a to
+    // Naming it is what reduces this path's violation of docs/design.md §1a to
     // exactly one object: the exported dma-buf, which has no name to give.
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
@@ -566,7 +566,7 @@ fn serve(
     // `eglinfo`, `glxgears` and `video-probe`, all of which are one process, and
     // it was the whole of what stopped a real application: Firefox forks
     // `glxtest` before the browser exists, that child took the session, the
-    // browser was never served, and Firefox exited (design.md §0.11,
+    // browser was never served, and Firefox exited (docs/design.md §0.11,
     // `docs/firefox-accel.md`). Two ordinary GL programs run one after another
     // gave one attach, not two.
     //
@@ -629,7 +629,7 @@ fn serve(
         let attachment = Attachment {
             // The control region has a name; the arena does not, and that is
             // what an empty `object` means on this path. It is the one sender in
-            // the project that leaves it empty, and design.md §0.7 says why.
+            // the project that leaves it empty, and docs/design.md §0.7 says why.
             object: control_name.clone(),
             arena_object: String::new(),
             control_offset: 0,
@@ -670,7 +670,7 @@ fn serve(
                 }
                 eprintln!(
                     "[gpu] session {i} attached (control region by name, arena as a dma-buf \
-                     descriptor — design.md §1a's one exception)"
+                     descriptor — docs/design.md §1a's one exception)"
                 );
             }
             Ok(other) => {
@@ -765,11 +765,11 @@ fn attach(
     };
     if at.object.is_empty() {
         return Err("the daemon sent no object name; this build cannot take a descriptor \
-                    across the boundary (design.md §1a)"
+                    across the boundary (docs/design.md §1a)"
             .into());
     }
     // **The GPU side opens the object itself, by name.** This is the whole of
-    // design.md §1a on this path: what arrived over the socket was text, and it
+    // docs/design.md §1a on this path: what arrived over the socket was text, and it
     // would have arrived identically down a virtio-serial port from a daemon on
     // the other side of a hypervisor.
     let fd = open_named(&at.object)?;
@@ -791,7 +791,7 @@ fn attach(
     )?;
     control.stamp_epoch()?;
 
-    // design.md §5.2: "Slabs are **imported** lazily." Nothing is asked of the
+    // docs/design.md §5.2: "Slabs are **imported** lazily." Nothing is asked of the
     // driver here; the app side sends `svImportArenaSlab` for each slab it
     // allocates in, and each import costs about 4.4 ms of the ~70 ms per GiB
     // this would otherwise all pay at startup (`arena::import_slab`).
@@ -907,7 +907,7 @@ fn guest(
     // **The control region is initialised after the host has located the
     // extent, not before, and this ordering is load-bearing.**
     //
-    // design.md §4.3 has the owner "allocate both regions, zero them, write
+    // docs/design.md §4.3 has the owner "allocate both regions, zero them, write
     // every header field, then store `magic`" as step 1, and offer the extent
     // over the cold path as step 2. §5.1 has the guest stamp every page and the
     // host find them by content. On one machine those two are compatible

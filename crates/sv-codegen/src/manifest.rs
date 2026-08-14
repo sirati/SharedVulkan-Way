@@ -1,6 +1,6 @@
 //! The protocol manifest and its hash.
 //!
-//! design.md §4.3 and §6.2 deviation 2:
+//! docs/design.md §4.3 and §6.2 deviation 2:
 //!
 //! > `protocol_hash` is the answer to R13. … The hash is computed by the
 //! > generator over the full command and struct table it emitted — **not** over
@@ -94,7 +94,7 @@ fn render_bitmask(s: &mut String, b: &BitmaskPlan) {
 /// sides' accessors do, and a build whose generator laid the bits out
 /// differently would produce a struct the peer's driver reads wrongly with no
 /// symptom at the transport. Putting the offsets in the manifest makes that a
-/// handshake refusal instead (design.md §4.3).
+/// handshake refusal instead (docs/design.md §4.3).
 fn render_flag_word(s: &mut String, f: &crate::plan::FlagWordPlan) {
     let _ = writeln!(s, "flag-word {} width={}", f.name, f.bit_width);
     for b in &f.fields {

@@ -1,13 +1,13 @@
 //! The scan locator and the stitching attacher: `Mode::Qemu`'s two halves.
 //!
-//! design.md §5.1, D21: the attaching side finds the pages **by content**, not
+//! docs/design.md §5.1, D21: the attaching side finds the pages **by content**, not
 //! by being told where they are, because outside AWE "Windows does not report
 //! frame numbers to user mode at all". The guest stamps every 4 KiB page of the
 //! extent with `{magic, run_id, page_index}` before publishing it, and this
 //! module sweeps the backing object for the magic.
 //!
 //! **That premise was narrowed on 2026-08-13 and this module's role with it**
-//! (design.md §0.14, §5.1; `measured-gpu-side.md`, "Asking Windows where the
+//! (docs/design.md §0.14, §5.1; `measured-gpu-side.md`, "Asking Windows where the
 //! pages are"). Windows reports no frames through `QueryWorkingSetEx`, which is
 //! what was measured — but it does through
 //! `NtQuerySystemInformation(SystemSuperfetchInformation)` /
@@ -36,7 +36,7 @@
 //! > more. … It is also the only locator that **verifies rather than trusts**:
 //! > it finds pages by their contents, so it cannot produce R21's silent wrong
 //! > answer the way a translated frame list or a computed formula can.
-//! > — design.md §5.1
+//! > — docs/design.md §5.1
 //!
 //! Measured: 1.8 s at 64 MiB, 2.02 s at 1 GiB, 2.32 s at 2 GiB.
 //!
@@ -286,7 +286,7 @@ pub fn scan(
 }
 
 // ---------------------------------------------------------------------------
-// the frame-list locator (design.md §5.1's `PfnLocator` / `SuperfetchPfnLocator`)
+// the frame-list locator (docs/design.md §5.1's `PfnLocator` / `SuperfetchPfnLocator`)
 // ---------------------------------------------------------------------------
 
 /// Bits between a frame number and a guest-physical address. The PFN database
@@ -456,7 +456,7 @@ pub fn cross_check(scan: &PageMap, pfns: &PageMap) -> Result<CrossCheck, LocateE
 /// > `sv-hostd` … reserves one `PROT_NONE` range per region and
 /// > `mmap(MAP_FIXED)`s each run into it. The result is virtually contiguous
 /// > with identical internal offsets — the §1 invariant — and nothing above the
-/// > attacher ever learns that it was stitched. — design.md §4.3
+/// > attacher ever learns that it was stitched. — docs/design.md §4.3
 ///
 /// The reservation is one `mmap` of the whole extent; each run then replaces its
 /// slice of it. Reserving first matters: mapping the runs one at a time and

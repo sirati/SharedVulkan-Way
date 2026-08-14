@@ -1,5 +1,5 @@
 //! **Carried is not implemented**: which commands reach a driver, and which
-//! answer here (design.md §0.20).
+//! answer here (docs/design.md §0.20).
 //!
 //! The user's objection is the reason this file exists:
 //!
@@ -30,7 +30,7 @@
 //! `Err(NotImplemented(<its own command name>))`, which no hand-written body
 //! does. So calling all of them on a driver with no GPU side sorts the profile
 //! in two without reading a line of source. Nothing here is a maintained list of
-//! names — that was the mistake design.md §0.18 removed from the API version and
+//! names — that was the mistake docs/design.md §0.18 removed from the API version and
 //! it would be the same mistake here.
 //!
 //! What is **judged** is the classification below, because "should this have
@@ -55,7 +55,7 @@ use sv_icd_entry::AUDIT_PROBES;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Where {
     /// The override forwards; its local arm exists only for the standalone
-    /// driver, which is a supported configuration (design.md §13 step 5) and not
+    /// driver, which is a supported configuration (docs/design.md §13 step 5) and not
     /// a fallback. Not a noop.
     ForwardsWhenConnected,
     /// Answered here and a round trip would be **wrong**: it is a fact about the
@@ -135,6 +135,15 @@ const CLASSIFIED: &[(&str, Where, &str)] = &[
     ("vkDestroyDescriptorUpdateTemplate", Where::ForwardsWhenConnected, "forwards"),
     ("vkUpdateDescriptorSetWithTemplate", Where::ForwardsWhenConnected,
      "forwards, expanded into vkUpdateDescriptorSets from the kept entries"),
+    ("vkCmdPushDescriptorSetWithTemplate", Where::ForwardsWhenConnected,
+     "forwards, expanded into vkCmdPushDescriptorSet from the kept entries plus \
+      the template's pipelineBindPoint, which this call does not carry. Before \
+      §0.22 it was neither forwarded nor expanded: pData crossed as an arena \
+      offset it never was, and the GPU side segfaulted reading a descriptor \
+      layout from wherever that number landed"),
+    ("vkCmdPushDescriptorSetWithTemplate2", Where::ForwardsWhenConnected,
+     "as vkCmdPushDescriptorSetWithTemplate; unwraps the info struct and \
+      delegates, so there is one expansion and not two"),
 
     // -- fences and idles: ordinary forwards
     ("vkGetFenceStatus", Where::ForwardsWhenConnected, "forwards"),
@@ -214,7 +223,7 @@ fn the_classification_is_well_formed() {
     }
 }
 
-/// The numbers design.md §0.20 quotes, so the prose cannot drift from the code.
+/// The numbers docs/design.md §0.20 quotes, so the prose cannot drift from the code.
 #[test]
 fn the_headline_numbers_are_what_the_document_says() {
     let probed = probe_local();

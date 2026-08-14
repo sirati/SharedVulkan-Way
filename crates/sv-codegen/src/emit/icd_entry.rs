@@ -1,9 +1,9 @@
 //! Pass 10: `sv-icd-entry` — the C ABI, the `extern "system"` stubs and the
-//! proc-address tables (design.md §7.2, §7.3, §8).
+//! proc-address tables (docs/design.md §7.2, §7.3, §8).
 //!
 //! # Why this pass exists at all
 //!
-//! design.md §7.3 puts it plainly: "The unavoidable `unsafe` is the ICD boundary
+//! docs/design.md §7.3 puts it plainly: "The unavoidable `unsafe` is the ICD boundary
 //! itself — `extern "system"` functions taking raw pointers from the
 //! application. Those live in a separate generated crate, `sv-icd-entry`, and
 //! every stub has the identical mechanical shape 'null-check, dereference, call
@@ -37,7 +37,7 @@
 //! 2. **Every array read is bounded by the count the registry names**, resolved
 //!    at generation time to a concrete sibling field ([`crate::abi::ArrayLen`]).
 //!    A `len=` this generator cannot resolve is a generator error, not a guess.
-//!    Note that this is *stronger* than the wire needs: design.md §7.4 observes
+//!    Note that this is *stronger* than the wire needs: docs/design.md §7.4 observes
 //!    that our wire's explicit counts demote `len=` to a cross-check, and that
 //!    observation stops at this boundary — here `len=` bounds a read of the
 //!    application's memory.
@@ -51,7 +51,7 @@
 //! The commands the profile excludes from the wire — `vkGetInstanceProcAddr`,
 //! `vkGetDeviceProcAddr`, the swapchain family, the surface queries — have no
 //! `Args` type to lower into, because they are answered on the app side and
-//! never cross (design.md §8, §10). They get an entry in the proc tables and a
+//! never cross (docs/design.md §8, §10). They get an entry in the proc tables and a
 //! stub that routes to a hand-written method on [`Icd`], or, where `sv-icd` does
 //! not implement them yet, a stub that fails cleanly and is listed in
 //! `NOT_IMPLEMENTED`.
@@ -83,7 +83,7 @@ pub struct Ctx<'a> {
     /// its scalar members and writes zeros, because on the way **out** the
     /// storage behind `pProperties` is the application's uninitialised memory
     /// and reading it is undefined behaviour plus a small information leak
-    /// (design.md §6.1's three-state validity, applied at the C boundary).
+    /// (docs/design.md §6.1's three-state validity, applied at the C boundary).
     ///
     /// The GPU side lowers the identical struct in the identical direction —
     /// C to wire — and for it those members are **the driver's answer**. Reusing
@@ -93,7 +93,7 @@ pub struct Ctx<'a> {
     ///
     /// So "which direction" does not determine the conversion: **the validity
     /// state does**, and it differs between the two sides for the same struct in
-    /// the same direction. design.md §7.2's two-by-two is really a two-by-two-by
+    /// the same direction. docs/design.md §7.2's two-by-two is really a two-by-two-by
     /// -two, and that third axis is what this flag selects.
     lower_full: bool,
 }
@@ -345,7 +345,7 @@ fn emit_handle(name: &str, dispatchable: bool) -> TokenStream {
             "`{name}`, a **dispatchable** handle.\n\n\
              At the ABI it is a pointer, and the loader requires the first \
              pointer-sized word of what it points at to be its own dispatch table \
-             pointer (design.md §6.4, R17). Everything `sv-icd` returns through \
+             pointer (docs/design.md §6.4, R17). Everything `sv-icd` returns through \
              one of these is a [`crate::DispatchableHeader`] followed by the \
              object's own state; the loader's assertion is debug-only, so getting \
              this wrong is a fault inside the loader rather than an error."
@@ -363,7 +363,7 @@ fn emit_handle(name: &str, dispatchable: bool) -> TokenStream {
     } else {
         let doc = format!(
             "`{name}`, a non-dispatchable handle: a bare 64-bit value, and in this \
-             implementation it *is* the wire object id (design.md §6.4, R3). \
+             implementation it *is* the wire object id (docs/design.md §6.4, R3). \
              Nothing dereferences it on either side."
         );
         quote! {
@@ -799,6 +799,21 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
         Scalar::F32 | Scalar::F64 => quote!(#access),
         Scalar::Size => quote!((#access) as u64),
         Scalar::Bool32 => quote!((#access) != 0),
+        // A capture-replay member is **refused by name if it is not null**,
+        // rather than carried. docs/design.md §0.24: we do not advertise
+        // `…CaptureReplay` in any feature struct, so the specification requires
+        // the application to leave these null, and a non-null one is a usage
+        // error rather than data we lost. Refusing it loudly is the difference
+        // between "we do not support capture-replay" and "we silently ignored
+        // your replay token and gave you a different address".
+        Scalar::OpaqueU64(crate::exceptions::VoidPolicy::CaptureReplayUnsupported) => {
+            quote!({
+                if !(#access).is_null() {
+                    return Err(crate::LowerError::CaptureReplayUnsupported);
+                }
+                0u64
+            })
+        }
         Scalar::OpaqueU64(_) => quote!((#access) as usize as u64),
         Scalar::Enum(n) | Scalar::Bitmask(n) | Scalar::Bitmask64(n) => {
             let t = naming::type_ident(n);
@@ -847,7 +862,7 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
                     "{n} is a union carrying a handle or a (memory, offset) pair, so which arm \
                      is live decides what crosses — and it is being lowered somewhere with no \
                      `selector=` sibling in scope. gfxstream's member-[0] rule is not safe here \
-                     (design.md §0.21)"
+                     (docs/design.md §0.21)"
                 ));
             }
             let f = cx.lower_fn(n);
@@ -868,7 +883,7 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
 /// *translate*: an object id that the handle-map pass must turn into a driver
 /// handle, or a `(memory, offset)` pair the transform pass must rebase. Reading
 /// the wrong arm then does not mis-name the bytes, it hands the driver a
-/// descriptor built from a number that was never a handle — design.md §0.16
+/// descriptor built from a number that was never a handle — docs/design.md §0.16
 /// item 2's hazard, which cost this project a GPU hang the first time it was met
 /// one level in.
 fn union_needs_selector(cx: &Ctx<'_>, name: &str) -> bool {
@@ -928,7 +943,7 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
                 return Err(format!(
                     "{name}.{}: a union arm carrying a handle or memory pair with no \
                      `selection=` in the registry — there is nothing to select it by, and \
-                     guessing is what design.md §0.21 exists to stop",
+                     guessing is what docs/design.md §0.21 exists to stop",
                     field.name
                 ));
             }
@@ -965,7 +980,7 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
              The discriminator is a parameter rather than something read out of \
              an enclosing pointer, so a caller that has not found the sibling \
              cannot compile. An unrecognised value refuses the call by name \
-             instead of falling back to a member (design.md §0.21)."
+             instead of falling back to a member (docs/design.md §0.21)."
         );
         return Ok(quote! {
             #[doc = #doc]
@@ -985,7 +1000,7 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
     }
 
     if s.is_union {
-        // design.md §7.4: a C union carries no tag and only ten `selector=`
+        // docs/design.md §7.4: a C union carries no tag and only ten `selector=`
         // annotations exist in the whole registry. gfxstream always marshals
         // member [0]; Venus hardcodes three discriminators and refuses the rest.
         // We take gfxstream's rule *and* check the thing that makes it safe: the
@@ -1010,7 +1025,7 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         let doc = format!(
             "Lower a C `{name}`.\n\n\
              A C union has no tag, so member `{}` is read — gfxstream's rule \
-             (design.md §7.4). Every member of this union occupies the same \
+             (docs/design.md §7.4). Every member of this union occupies the same \
              storage and the encoding is bit-preserving, so what the peer \
              reconstructs is the bytes the application wrote; what is lost is \
              only the *name* the application used for them.",
@@ -1036,7 +1051,7 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         // memory held. Venus's three-state validity, applied at the C boundary
         // where it matters most: reading those bytes would be reading
         // uninitialised memory, which is undefined behaviour and a small
-        // information leak besides (design.md §6.1).
+        // information leak besides (docs/design.md §6.1).
         // `returnedonly` means "the *implementation* fills this in". On the app
         // side we are the caller, so those members are uninitialised on the way
         // out and must not be read. On the GPU side we are the implementation's
@@ -1216,7 +1231,7 @@ fn stub_ident(name: &str) -> proc_macro2::Ident {
 /// All but the last two are here for one reason, and it is a structural one
 /// rather than a shortcut: **a dispatchable handle cannot be generated.** What
 /// the application gets back from `vkCreateInstance` is a pointer to an
-/// allocation whose first word the loader owns (design.md §6.4), and no fold
+/// allocation whose first word the loader owns (docs/design.md §6.4), and no fold
 /// over a wire reply can mint one — the reply carries a `u64` id, and turning an
 /// id into a live object is the ICD's own bookkeeping. Every command that
 /// *returns* a dispatchable object, or destroys one, is therefore hand-written,
@@ -1255,7 +1270,7 @@ pub const HAND_WRITTEN: &[&str] = &[
     // side answers. See `crate::local::sv_vk_map_memory2`.
     "vkMapMemory2",
     "vkUnmapMemory2",
-    // design.md §10. Presentation is the ICD's, entirely: a swapchain image is
+    // docs/design.md §10. Presentation is the ICD's, entirely: a swapchain image is
     // a GPU-side `VkImage` the app side created out of ordinary forwarded
     // commands, and `vkQueuePresentKHR` is a copy into the arena followed by
     // whatever the app side's display target does with the pixels. None of
@@ -1289,7 +1304,7 @@ fn emit_command(
     let cx = lower_cx;
     let stub = stub_ident(&c.name);
     // A parameter the wire command does not name is one the protocol strips —
-    // `pAllocator`, always (design.md §7.4). It is still in the C signature and
+    // `pAllocator`, always (docs/design.md §7.4). It is still in the C signature and
     // must still occupy its argument slot; it is simply never read.
     let used: BTreeSet<&str> = lower_cx
         .wire
@@ -1379,7 +1394,7 @@ fn stub_body(
     let cx = lower_cx;
     if !c.forwarded {
         return Err(format!(
-            "`{}` is answered on the app side rather than forwarded (design.md §8, \
+            "`{}` is answered on the app side rather than forwarded (docs/design.md §8, \
              §10), and `sv-icd` does not implement it yet",
             c.name
         ));
@@ -1464,7 +1479,7 @@ fn stub_body(
             // directly, as the specification entirely permits, would have got
             // silent nonsense.
             //
-            // It is design.md §0.4 item 5's mistake in the other direction:
+            // It is docs/design.md §0.4 item 5's mistake in the other direction:
             // there the *count* was derived from the array's length on the way
             // back, here the array's length is dropped on the way out.
             (Shape::Blob { .. }, _) if field.is_output => {
@@ -1517,7 +1532,7 @@ fn stub_body(
             }
             // An output array: send the caller's capacity as the element count,
             // with no values. Venus's `_partial` array, and it is what lets the
-            // peer clamp its reply against our buffer (design.md §6.1).
+            // peer clamp its reply against our buffer (docs/design.md §6.1).
             (Shape::Array { elem, .. }, _) if field.is_output => {
                 let ty = wire_type(elem);
                 let d = wire_default(elem);
@@ -1621,7 +1636,7 @@ fn stub_body(
     let call = if wire.generates_reply {
         let store = emit_writeback(store_cx, c, wire, &abi_by_name)?;
         // A value that is neither `void` nor `VkResult` rides the reply's `ret`
-        // field (design.md §0.3 item 5, closed). It is read out *before* the
+        // field (docs/design.md §0.3 item 5, closed). It is read out *before* the
         // writeback, because the writeback consumes the reply, and cast back to
         // whatever the C header spells the return type — `VkDeviceAddress` here,
         // a bare `uint64_t` for the two opaque-capture-address commands.
@@ -1771,7 +1786,7 @@ fn emit_writeback(
                 match capacity(cx, c, wire, abi_by_name, field)? {
                     // The count-then-fill idiom: the caller's capacity arrives in
                     // `*pCount` and the answer is written back to it. Venus's
-                    // clamp (design.md §6.1) — an unclamped write here is a
+                    // clamp (docs/design.md §6.1) — an unclamped write here is a
                     // buffer overflow in *our* code the moment either side has a
                     // bug, and the clamp is one comparison.
                     Capacity::OutPointer(count_ptr) => {
@@ -1886,7 +1901,7 @@ fn emit_writeback(
 // the trait, the tables and the whole crate
 // ---------------------------------------------------------------------------
 
-/// Which ring a command's packet belongs on (design.md §4.4).
+/// Which ring a command's packet belongs on (docs/design.md §4.4).
 ///
 /// Derived from the command's first parameter, which is the only thing that
 /// decides it: a `VkQueue` command is a queue-ring command, anything naming a
@@ -1917,7 +1932,7 @@ fn ring_class(c: &crate::plan::CommandPlan) -> TokenStream {
 /// rather than methods on a trait so that nothing here has to be object-safe and
 /// so that `sv-icd` can call one directly when it wants to forward a command it
 /// otherwise answers locally.
-/// Pass 6, app-side half: the `(memory, offset)` rewrite of design.md §5.3,
+/// Pass 6, app-side half: the `(memory, offset)` rewrite of docs/design.md §5.3,
 /// applied to one command's inputs just before they are encoded.
 ///
 /// # Why here and not in the C stub
@@ -2053,7 +2068,7 @@ fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
                 }
             }
         } else if c.is_recorded {
-            // design.md §6.5: "`vkCmd*` calls are **not** sent individually.
+            // docs/design.md §6.5: "`vkCmd*` calls are **not** sent individually.
             // Each `VkCommandBuffer` owns an arena block; recording encodes
             // straight into it."
             //
@@ -2119,7 +2134,7 @@ fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
 ///
 /// # Why this has to be generated, and cannot be a plain forward
 ///
-/// design.md §6.4: "the app side allocates ids from a per-device 64-bit counter,
+/// docs/design.md §6.4: "the app side allocates ids from a per-device 64-bit counter,
 /// so `vkCreateBuffer` encodes the id it chose and returns immediately". The id
 /// is therefore an **input** to the command even though C calls it an output
 /// parameter — and the lowering pass, faithfully, fills it from the
@@ -2184,7 +2199,7 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
              returns a connected transport this encodes the command, sends it to \
              the GPU side and decodes the reply; with no transport it refuses by \
              name. An implementation overrides this method only for the commands \
-             design.md §8 and §10 say are answered app-side.",
+             docs/design.md §8 and §10 say are answered app-side.",
             c.name
         );
         if HAND_WRITTEN.contains(&c.name.as_str()) {
@@ -2221,7 +2236,7 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
         /// Every method takes decoded, owned arguments and returns a decoded
         /// reply. Nothing on this trait is `unsafe` and nothing on it is a raw
         /// pointer — the lowering above has already happened. That is the whole
-        /// point of design.md §7.3's "the unsafe block is one line and reviewable
+        /// point of docs/design.md §7.3's "the unsafe block is one line and reviewable
         /// by pattern": this trait is the line it calls.
         ///
         /// It is the app-side dual of `sv_proto::Server`, and the two are
@@ -2379,7 +2394,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     // Extensions this build must not advertise, worked out here rather than
     // guessed at runtime.
     //
-    // design.md §9.2 says an extension in the advertised list is a promise its
+    // docs/design.md §9.2 says an extension in the advertised list is a promise its
     // entry points work. Until now that promise was kept by *intersecting* the
     // profile with what the GPU side's driver reports, which answers "does the
     // hardware have it" and leaves "did we generate a working stub for it"
@@ -2447,8 +2462,92 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
             quote!((#e, #c))
         })
         .collect();
-    let incomplete: Vec<&str> = incomplete.iter().map(|(e, _)| *e).collect();
+    // The two classes share one output list: an extension is withheld whether
 
+    // Commands whose app-side lowering would hand the application's own pointer
+    // to the GPU side as an arena offset (docs/design.md §0.24 item 6).
+    //
+    // The third class of over-promise, and the one neither `NOT_IMPLEMENTED` nor
+    // the queue check can see: the entry point exists, marshals and dispatches,
+    // and the *value it marshals is wrong*. `INCOMPLETE_EXTENSIONS` asks "did
+    // the generator emit a working stub"; here it did, and the stub writes a
+    // wild pointer onto the wire.
+    let mut lowering_incomplete: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut core_wild: Vec<String> = Vec::new();
+    for c in &cx.wire.commands {
+        let needs_expansion = cx.model.commands.get(&c.name).is_some_and(|cmd| {
+            cmd.params.iter().any(|p| {
+                p.ty.base().is_void()
+                    && crate::exceptions::void_policy(&c.name, &p.name)
+                        == Some(crate::exceptions::VoidPolicy::ArenaOffset)
+            })
+        });
+        if !needs_expansion
+            || crate::exceptions::ICD_EXPANDS_ARENA_POINTER.contains(&c.name.as_str())
+        {
+            continue;
+        }
+        let requires_it = |f: &vk_registry::FeatureSet| {
+            f.requires.iter().flat_map(|b| b.items.iter()).any(|it| {
+                matches!(it, vk_registry::InterfaceRef::Command(x)
+                    if *x == c.name || cx.model.canonical_command(x) == c.name)
+            })
+        };
+
+        // **Core first, and this ordering is the whole correctness of the
+        // check.** A command can be required by an extension *and* by a core
+        // version — `vkCmdPushDescriptorSetWithTemplate` is required by
+        // `VK_KHR_push_descriptor` and by Vulkan 1.4 — and finding the extension
+        // first makes the answer "withdraw the extension", which does nothing:
+        // the core command is still carried and a 1.4 application still calls
+        // it. The first run of this check did exactly that, and the wild pointer
+        // it was written to stop survived it.
+        //
+        // There is nothing to withdraw for a core command, so it is a build
+        // failure. That is the point of the check: it converts a mechanical
+        // widening from a segfault into something that will not compile.
+        if cx.model.features.iter().any(|f| f.supported_for_vulkan && requires_it(f)) {
+            core_wild.push(c.name.clone());
+            continue;
+        }
+        match cx.model.extensions.iter().filter(|e| e.supported_for_vulkan).find(|e| requires_it(e))
+        {
+            Some(e) => {
+                lowering_incomplete.insert((e.name.as_str(), c.name.as_str()));
+            }
+            None => core_wild.push(c.name.clone()),
+        }
+    }
+    let core_wild = if core_wild.is_empty() {
+        quote!()
+    } else {
+        let msg = format!(
+            "these commands lower a `void*` as an arena offset but nothing app-side \
+             expands it, so the application's own pointer would cross as an offset — \
+             and they are core, so there is no extension to stop advertising. Either \
+             implement the expansion and add them to \
+             `sv_codegen::exceptions::ICD_EXPANDS_ARENA_POINTER`, or exclude them in \
+             the profile: {}",
+            core_wild.join(", ")
+        );
+        quote!(compile_error!(#msg);)
+    };
+    let lowering_incomplete_pairs: Vec<TokenStream> = lowering_incomplete
+        .iter()
+        .map(|(e, c)| quote!((#e, #c)))
+        .collect();
+    let lowering_incomplete_exts: BTreeSet<&str> =
+        lowering_incomplete.iter().map(|(e, _)| *e).collect();
+
+    // its entry point is missing or its lowering is wrong, because from an
+    // application's side those are the same broken promise.
+    let incomplete: Vec<&str> = incomplete
+        .iter()
+        .map(|(e, _)| *e)
+        .chain(lowering_incomplete_exts.iter().copied())
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect();
     // What queue an extension's commands have to be recorded on, from `queues=`.
     //
     // # The defect this exists for, and why the other table could not catch it
@@ -2620,7 +2719,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// `vkGetDeviceProcAddr`.
         pub static INSTANCE_COMMANDS: &[crate::ProcEntry] = &[#(#instance)*];
         /// The set `vk_icdGetPhysicalDeviceProcAddr` answers for: commands whose
-        /// first parameter is a `VkPhysicalDevice` (design.md §8).
+        /// first parameter is a `VkPhysicalDevice` (docs/design.md §8).
         pub static PHYSICAL_DEVICE_COMMANDS: &[crate::ProcEntry] = &[#(#phys)*];
         /// Commands answerable by `vkGetDeviceProcAddr`.
         pub static DEVICE_COMMANDS: &[crate::ProcEntry] = &[#(#device)*];
@@ -2664,6 +2763,18 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// Sorted by extension name, so `binary_search_by_key` is the lookup.
         pub static EXTENSION_QUEUE_REQUIREMENTS: &[(&str, &[u32])] = &[#(#queue_reqs,)*];
 
+        #core_wild
+
+        /// Extensions withheld because a command's app-side *lowering* is
+        /// incomplete — the entry point exists and marshals, and the value it
+        /// marshals would be the application's own pointer sent as an arena
+        /// offset (docs/design.md §0.24 item 6).
+        ///
+        /// Folded into [`INCOMPLETE_EXTENSIONS`]; kept separately with the
+        /// offending command so a reader can tell this class from a stubbed
+        /// entry point, which needs a different fix.
+        pub static LOWERING_INCOMPLETE: &[(&str, &str)] = &[#(#lowering_incomplete_pairs,)*];
+
         /// Whether an extension's `depends=` is satisfied by `__have`.
         ///
         /// The registry's expression, compiled: `,` became `||`, `+` became
@@ -2694,7 +2805,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// This exists because the alternative was a test that named one
         /// extension by hand, and a hand-named case is a fact with an expiry
         /// date: it asserted `VK_KHR_buffer_device_address` must be excluded,
-        /// design.md §0.20 implemented the three entry points, and the assertion
+        /// docs/design.md §0.20 implemented the three entry points, and the assertion
         /// then failed for the best possible reason — demanding that a fixed bug
         /// still be present.
         pub static INCOMPLETE_EXTENSION_REASONS: &[(&str, &str)] = &[#(#incomplete_reasons,)*];
@@ -2745,7 +2856,7 @@ fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
         ///
         /// `allowed` is the generated per-parent membership predicate. A link
         /// whose `sType` the parent does not accept, or that this build does not
-        /// know, is **dropped and the walk continues** — design.md §6.1's
+        /// know, is **dropped and the walk continues** — docs/design.md §6.1's
         /// asymmetry: "the app side silently drops unknown links and continues
         /// down `pNext`; the GPU side treats one as fatal".
         ///
@@ -2844,7 +2955,7 @@ const NOT_NEEDED: &str = "not needed in this direction";
 /// unlowerable too. Iterating to a fixpoint is what makes it impossible for the
 /// emitted code to call a function that was never emitted — the alternative is a
 /// generated crate that does not compile, which is the failure mode
-/// design.md §7.3 spends `syn::parse2` on avoiding one layer up.
+/// docs/design.md §7.3 spends `syn::parse2` on avoiding one layer up.
 fn close<'a, F, W>(cx: &Ctx<'a>, wanted: W, emit: F) -> (BTreeMap<String, String>, Ctx<'a>)
 where
     F: Fn(&Ctx<'_>, &StructPlan) -> Result<TokenStream, String>,
@@ -2880,7 +2991,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
 
     let (lower_refused, lower_cx) = close(cx, |_| true, emit_lower_struct);
     // Only structs the implementation can fill in need a writeback. That set is
-    // exactly `needs_partial`: design.md §6.1's three-state validity marks a
+    // exactly `needs_partial`: docs/design.md §6.1's three-state validity marks a
     // struct partial when it is `returnedonly` or reachable from a command
     // output, which is the same question as "could this ever come back". Without
     // the filter the refusal list is 82 entries long and every one of them is a

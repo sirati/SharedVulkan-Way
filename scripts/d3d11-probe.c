@@ -2,7 +2,7 @@
  *
  * WHY IT HAS NO WINDOW
  *
- * Not because presentation is missing — design.md §10 stage 2 is built and this
+ * Not because presentation is missing — docs/design.md §10 stage 2 is built and this
  * ICD has a `VK_KHR_swapchain` — but because a `IDXGISwapChain` would put Wine's
  * window management between the test and the thing being tested. What this
  * program measures is the *forwarder*, and a window adds an `HWND`, a
@@ -185,7 +185,7 @@ int main(void) {
      * Swapping the first two vertices makes it clockwise and therefore front-
      * facing. This is a bug in this program that the previous stage could not
      * have found: DXVK never reached a draw, because it refused the device over
-     * `VK_KHR_swapchain` (design.md §0.5). */
+     * `VK_KHR_swapchain` (docs/design.md §0.5). */
     static const struct V verts[3] = {
         {0.8f, -0.7f, 0.f, 1.f, 0.1f, 1.f, 0.2f, 1.f},
         {-0.8f, -0.7f, 0.f, 1.f, 1.f, 0.15f, 0.1f, 1.f},

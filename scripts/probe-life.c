@@ -121,6 +121,64 @@ int main(int argc, char **argv)
 			g_out = fopen(argv[++i], "w");
 	}
 
+	/* Does this platform's `GetGuiResources` answer at all?
+	 *
+	 * ADDED FOR docs/waycompose-design.md §69. §53.3 measured it returning 0
+	 * under Wine on the workstation and skipped the USER/GDI assertion for
+	 * that reason. That left a question the skip could not settle: **is the
+	 * zero a fact about Wine, or a fact about the venue?** If Wine stubs it
+	 * everywhere then no arrangement of virtual machines will make that
+	 * assertion possible and the guest run should not be spent on it; if it
+	 * answers somewhere, the skip has somewhere to go.
+	 *
+	 * Self-contained on purpose. The other modes need a second process with
+	 * windows to point at, and shipping two programs and a compositor into a
+	 * VM to ask one question is how a cheap measurement becomes a project.
+	 * This makes its own windows, asks about its own process, and prints
+	 * both numbers with the count of windows they are supposed to describe —
+	 * so `user=0 windows=4` is legible as a stub rather than as an absence.
+	 */
+	if (!strcmp(cmd, "selftest")) {
+		WNDCLASSEXW wc;
+		HWND made[4];
+		DWORD before_u, before_g, after_u, after_g;
+		HANDLE self = GetCurrentProcess();
+		int k;
+
+		memset(&wc, 0, sizeof wc);
+		wc.cbSize = sizeof wc;
+		wc.lpfnWndProc = DefWindowProcW;
+		wc.hInstance = GetModuleHandleW(NULL);
+		wc.lpszClassName = L"probe_life_selftest";
+		RegisterClassExW(&wc);
+
+		before_u = GetGuiResources(self, GR_USEROBJECTS);
+		before_g = GetGuiResources(self, GR_GDIOBJECTS);
+		for (k = 0; k < 4; k++)
+			made[k] = CreateWindowExW(0, L"probe_life_selftest", L"probe-life selftest",
+						  WS_OVERLAPPEDWINDOW, 0, 0, 120, 90,
+						  NULL, NULL, wc.hInstance, NULL);
+		after_u = GetGuiResources(self, GR_USEROBJECTS);
+		after_g = GetGuiResources(self, GR_GDIOBJECTS);
+
+		n_all = 0;
+		g_pid = GetCurrentProcessId();
+		EnumWindows(by_pid, 0);
+
+		fprintf(g_out ? g_out : stdout,
+			"before user=%lu gdi=%lu\nafter  user=%lu gdi=%lu\nwindows=%d\ncounter=%s\n",
+			(unsigned long)before_u, (unsigned long)before_g,
+			(unsigned long)after_u, (unsigned long)after_g, n_all,
+			/* The same contradiction the `count` mode uses: a process that
+			 * owns windows owns USER objects. Four were just made. */
+			(after_u == 0) ? "stub"
+				       : (after_u > before_u ? "live" : "flat"));
+		for (k = 0; k < 4; k++)
+			if (made[k]) DestroyWindow(made[k]);
+		if (g_out) fclose(g_out);
+		return 0;
+	}
+
 	if (!strcmp(cmd, "pidof")) {
 		if (!g_title) { fprintf(stderr, "probe-life: pidof needs --title\n"); return 2; }
 		EnumWindows(by_title, 0);

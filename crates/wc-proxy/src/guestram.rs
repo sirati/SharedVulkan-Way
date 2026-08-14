@@ -29,7 +29,7 @@
 //!
 //! Because the rule is the rule (see the crate docs). The name here is
 //! `/proc/<qemu-pid>/fd/<n>` — a same-machine name, and `shared_vulkan`'s
-//! design.md §1a says exactly what that costs and that it may only ever be
+//! docs/waycompose-design.md §1a says exactly what that costs and that it may only ever be
 //! given to the host side, which is where every reader of it is. Nothing about
 //! this crosses into the guest: the guest allocated the memory, stamped it, and
 //! said a 64-bit number.
@@ -70,7 +70,7 @@ pub struct Plan {
     /// lives in.
     ///
     /// DYNAMIC ARENA. A plan used to describe exactly one region because an
-    /// arena was committed once and never grew (design.md §5.7 D22: "the arena
+    /// arena was committed once and never grew (docs/design.md §5.7 D22: "the arena
     /// is committed at `sv-gpu-server` startup and does not grow, on either
     /// path"). Growth makes a plan a description of *n* regions, and each one
     /// needs a name, because the two are separate `VirtualAlloc`s in the guest
@@ -79,7 +79,7 @@ pub struct Plan {
     /// from one into the other, which is exactly why the region id is part of
     /// every descriptor rather than a thing the host infers.
     ///
-    /// **It is an integer, and that is load-bearing.** design.md §1a: no
+    /// **It is an integer, and that is load-bearing.** docs/waycompose-design.md §1a: no
     /// descriptor crosses. A region id names a mapping the way an arena id
     /// always did (waycompose §17.2: "an arena id names a region, not a
     /// client"); making growth work by handing over a second *object* would be

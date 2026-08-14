@@ -3,7 +3,7 @@
 //! Every method here takes owned wire values and returns owned wire values.
 //! There is no `unsafe` in this file and there are no raw pointers in any
 //! signature — that is what `sv-icd-entry`'s generated lowering bought, and it
-//! is what design.md §7.3 means by "the unsafe block is one line and reviewable
+//! is what docs/design.md §7.3 means by "the unsafe block is one line and reviewable
 //! by pattern".
 //!
 //! # Reading this file
@@ -12,9 +12,9 @@
 //!
 //! - **Answered from what we advertise** (`crate::advertise`). These are correct
 //!   as far as this stage goes and stay correct once a GPU side exists, because
-//!   design.md §9 says we advertise a curated table rather than the peer's.
+//!   docs/design.md §9 says we advertise a curated table rather than the peer's.
 //! - **Answered from app-side state.** Object ids, arena allocations, mapping.
-//!   These are the real implementation, not a placeholder: design.md §6.4 and
+//!   These are the real implementation, not a placeholder: docs/design.md §6.4 and
 //!   §5.3 put exactly this work on the app side.
 //! - **Accepted and dropped.** Anything that would need a GPU, in the standalone
 //!   configuration where there is no GPU to ask. These return a success the
@@ -35,7 +35,7 @@
 //! generated default refuses by its own name and no hand-written body does, so
 //! the two are distinguishable without reading anything. It then requires a
 //! classification for each local answer and fails if one is missing. That list
-//! cannot go stale the way a comment can, and design.md §0.20 is what it found.
+//! cannot go stale the way a comment can, and docs/design.md §0.20 is what it found.
 
 use crate::advertise;
 use crate::state::{Memory, PROTOCOL_API_VERSION, SharedVulkan};
@@ -47,7 +47,7 @@ use sv_proto as p;
 /// Every physical-device query below has this shape, and writing it out
 /// thirteen times buried the one thing that differs. The two arms are both
 /// correct answers to different questions: with a GPU side the honest answer is
-/// the driver's, and without one it is the curated table of design.md §9 —
+/// the driver's, and without one it is the curated table of docs/design.md §9 —
 /// which is what makes `vulkaninfo` against a standalone driver a meaningful
 /// test rather than a crash.
 macro_rules! forwarded {
@@ -59,7 +59,7 @@ macro_rules! forwarded {
     };
 }
 
-/// Encode one command straight into a command buffer's blob (design.md §6.5).
+/// Encode one command straight into a command buffer's blob (docs/design.md §6.5).
 ///
 /// The generated forwarders do this for every `vkCmd*`; this is for the two
 /// framing commands, which the generator emits as replying calls because that is
@@ -82,7 +82,7 @@ fn record_into_blob(
 
 impl IcdLocal for SharedVulkan {
     /// `vkEnumerateInstanceVersion`, and it is the negotiated number rather than
-    /// a constant (design.md §0.18).
+    /// a constant (docs/design.md §0.18).
     fn api_version(&self) -> u32 {
         self.advertised_api_version()
     }
@@ -92,12 +92,12 @@ impl IcdLocal for SharedVulkan {
     }
 
     /// One id space for the process, so that `State`'s tables and the wire agree
-    /// about what an id means (design.md §6.4).
+    /// about what an id means (docs/design.md §6.4).
     fn mint_id(&self) -> u64 {
         self.state().mint()
     }
 
-    /// design.md §5.3's rewrite, app-side half. The generated forwarders call
+    /// docs/design.md §5.3's rewrite, app-side half. The generated forwarders call
     /// this for every `(memory, offset)` pair that crosses; the arena allocator
     /// that answers it lives here.
     fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
@@ -148,7 +148,7 @@ impl IcdLocal for SharedVulkan {
     }
 
     /// The ids are minted here whether or not there is a GPU side, which is
-    /// design.md §6.4 exactly: "the app side allocates ids from a counter, so
+    /// docs/design.md §6.4 exactly: "the app side allocates ids from a counter, so
     /// `vkCreateBuffer` encodes the id it chose and returns immediately". What
     /// the round trip adds is not the id — it is the GPU side *learning* the id,
     /// so that everything referencing this instance afterwards resolves.
@@ -156,7 +156,7 @@ impl IcdLocal for SharedVulkan {
         let (id, phys) = {
             let mut s = self.state();
             let id = s.mint();
-            // One physical device, minted with the instance. design.md §8: we do
+            // One physical device, minted with the instance. docs/design.md §8: we do
             // not export `vk_icdEnumerateAdapterPhysicalDevices`, because we
             // have no PnP adapter LUID and its only benefit — the loader sorting
             // physical devices for drivers at interface ≥ 6 — is meaningless
@@ -232,7 +232,7 @@ impl IcdLocal for SharedVulkan {
         // An extension the application asks for that we do not advertise is
         // `VK_ERROR_EXTENSION_NOT_PRESENT`, which is the spec's answer and is
         // what makes a curated extension list honest rather than a filter that
-        // silently drops things (design.md §9.2, R16).
+        // silently drops things (docs/design.md §9.2, R16).
         for want in &info.pp_enabled_extension_names {
             let want = String::from_utf8_lossy(want).to_string();
             if !self.device_extensions().iter().any(|(n, _)| *n == want) {
@@ -341,7 +341,7 @@ impl IcdLocal for SharedVulkan {
             if !s.devices.contains_key(&device) {
                 return Err(LowerError::Shape("vkAllocateCommandBuffers: unknown device"));
             }
-            // design.md §6.5 gives each `VkCommandBuffer` an arena block that
+            // docs/design.md §6.5 gives each `VkCommandBuffer` an arena block that
             // recording encodes straight into, and `vkQueueSubmit` then sends
             // `svExecuteCommandBlob` descriptors. **That is not built** — see
             // the note in `sv_gpu_server::server` — so no block is reserved and
@@ -386,7 +386,7 @@ impl IcdLocal for SharedVulkan {
         }
     }
 
-    /// design.md §5.3, and the whole point of the project.
+    /// docs/design.md §5.3, and the whole point of the project.
     fn map_memory(
         &self,
         _device: u64,
@@ -428,14 +428,14 @@ impl IcdLocal for SharedVulkan {
 
     fn unmap_memory(&self, _device: u64, memory: u64) {
         // Pure bookkeeping: the arena is mapped for the process's lifetime, so
-        // there is nothing to unmap (design.md §5.3).
+        // there is nothing to unmap (docs/design.md §5.3).
         let mut s = self.state();
         if let Some(m) = s.memories.get_mut(&memory) {
             m.mapped = false;
         }
     }
 
-    // -- presentation (design.md §10) ---------------------------------------
+    // -- presentation (docs/design.md §10) ---------------------------------------
     //
     // Delegations only. The implementation is [`crate::wsi`], which is long
     // enough to want its own file and is the one place in this crate that
@@ -513,7 +513,7 @@ impl Icd for SharedVulkan {
 
     /// **The acceptance criterion of this stage.** With a GPU side this reports
     /// the *driver's* properties — its `deviceName`, its limits — rather than
-    /// design.md §9's synthesised table, which is how `vulkaninfo` tells the two
+    /// docs/design.md §9's synthesised table, which is how `vulkaninfo` tells the two
     /// configurations apart from the outside.
     ///
     /// Every field but one is the driver's answer. `apiVersion` is **ours**, for
@@ -648,12 +648,12 @@ impl Icd for SharedVulkan {
     /// commands on this surface where the *driver's* honest answer is our
     /// dishonest one. RADV can export a `VkBuffer` as a dma-buf; we cannot pass
     /// a dma-buf to the application, because the application is on the other
-    /// side of a wire that design.md §6.1 puts external handles explicitly
+    /// side of a wire that docs/design.md §6.1 puts external handles explicitly
     /// outside of ("WSI handles and external handles are **not
     /// serialisable**"). Forwarding the reply would advertise an export path
     /// that fails at the first `vkGetMemoryFdKHR`.
     ///
-    /// design.md §9.2 already says we "do not advertise external
+    /// docs/design.md §9.2 already says we "do not advertise external
     /// memory/semaphore/fence handle types we cannot honour"; before these
     /// overrides that sentence was true only because the *extensions* were not
     /// advertised, which is not the same thing — the queries are core 1.1 and an
@@ -721,7 +721,7 @@ impl Icd for SharedVulkan {
         }
 
         // Arena-backed memory is allocated **entirely on the app side** and does
-        // not cross: design.md §5.2 puts the allocator here ("it is the side
+        // not cross: docs/design.md §5.2 puts the allocator here ("it is the side
         // that receives the allocation requests, and keeping the free lists in
         // private memory means the GPU side cannot be corrupted by an allocator
         // bug"), and §5.3 makes the resulting `VkDeviceMemory` a sub-range of a
@@ -753,7 +753,7 @@ impl Icd for SharedVulkan {
         );
         drop(s);
 
-        // design.md §5.2: "When the app side needs a slab it picks a free region
+        // docs/design.md §5.2: "When the app side needs a slab it picks a free region
         // of the arena, writes a slab-directory entry, and sends
         // `svImportArenaSlab`. The GPU side imports it and replies. A failed
         // import is a hard error surfaced as `VK_ERROR_OUT_OF_DEVICE_MEMORY`
@@ -802,7 +802,7 @@ impl Icd for SharedVulkan {
             match s.memories.remove(&args.memory.0) {
                 Some(m) => match m.allocation {
                     Some(a) => {
-                        // design.md §5.5 defers this until the timelines an
+                        // docs/design.md §5.5 defers this until the timelines an
                         // allocation could be referenced by have passed. The
                         // timeline mirror is not wired to submissions yet, so
                         // this is still immediate — the honest gap, and the one
@@ -830,7 +830,7 @@ impl Icd for SharedVulkan {
     ) -> IcdResult<p::VkGetBufferMemoryRequirementsReply> {
         // Forwarded for the *numbers* and patched for the *mask*. The driver
         // knows the real size and alignment for this buffer and we do not; it
-        // also numbers memory types its own way, and design.md §9.1 says we
+        // also numbers memory types its own way, and docs/design.md §9.1 says we
         // advertise ours. Passing its `memoryTypeBits` through would have an
         // application select a type from our four-entry table by an index that
         // means something else.
@@ -848,7 +848,7 @@ impl Icd for SharedVulkan {
         let mut r = p::VkMemoryRequirements::default();
         // Rounded to the allocator's granularity and reported honestly, because
         // `VUID-VkMemoryAllocateInfo-allocationSize-01745` requires the size to
-        // be a multiple of the alignment too (design.md §5.2).
+        // be a multiple of the alignment too (docs/design.md §5.2).
         r.size = crate::arena::round_up(size.max(1));
         r.alignment = crate::arena::GRANULARITY;
         r.memory_type_bits = advertise::ARENA_MEMORY_TYPE_BITS;
@@ -906,7 +906,7 @@ impl Icd for SharedVulkan {
     /// being here was the bug: §5.3's app-side half was one hand-written line in
     /// this one command, so the six other commands that carry a memory id across
     /// — `vkBindImageMemory` first among them — sent the app-side id raw and the
-    /// GPU side took a ring fatal on it (design.md §0.20). It is now generated
+    /// GPU side took a ring fatal on it (docs/design.md §0.20). It is now generated
     /// for every forwarded command, in `sv_icd_entry::forward`, and this
     /// override is left only for the property the generated default does not
     /// have: with no GPU side there is nothing to bind to, and saying so is
@@ -946,11 +946,21 @@ impl Icd for SharedVulkan {
         let mut args = args;
         args.p_descriptor_update_template =
             Some(p::VkDescriptorUpdateTemplate(sv_icd_entry::IcdLocal::mint_id(self)));
-        let entries = args
-            .p_create_info
-            .as_ref()
-            .map(|c| c.p_descriptor_update_entries.clone())
-            .unwrap_or_default();
+        let template = crate::state::Template {
+            entries: args
+                .p_create_info
+                .as_ref()
+                .map(|c| c.p_descriptor_update_entries.clone())
+                .unwrap_or_default(),
+            // Meaningful only for a `PUSH_DESCRIPTORS` template, and harmless
+            // to keep for the others: it is the one thing
+            // `vkCmdPushDescriptorSetWithTemplate` needs and does not carry.
+            bind_point: args
+                .p_create_info
+                .as_ref()
+                .map(|c| c.pipeline_bind_point)
+                .unwrap_or(p::VkPipelineBindPoint(0)),
+        };
         let id = args.p_descriptor_update_template.map(|t| t.0);
         let reply = match self.wire() {
             Some(t) => forward::create_descriptor_update_template(t, args)?,
@@ -962,7 +972,7 @@ impl Icd for SharedVulkan {
         if reply.result.0 == 0
             && let Some(id) = id
         {
-            self.state().templates.insert(id, entries);
+            self.state().templates.insert(id, template);
         }
         Ok(reply)
     }
@@ -994,7 +1004,7 @@ impl Icd for SharedVulkan {
         let entries = {
             let s = self.state();
             match s.templates.get(&args.descriptor_update_template.0) {
-                Some(e) => e.clone(),
+                Some(t) => t.entries.clone(),
                 // A template we never saw created. Refusing is right: silently
                 // doing nothing would leave the descriptor set holding whatever
                 // it held, which is a wrong picture rather than a failed call.
@@ -1030,6 +1040,82 @@ impl Icd for SharedVulkan {
         )
     }
 
+    /// The push form, rewritten into `vkCmdPushDescriptorSet`.
+    ///
+    /// # The defect this closes, which was predicted and then landed anyway
+    ///
+    /// `exceptions::void_policy` declares `VoidPolicy::ArenaOffset` for this
+    /// command's `pData`, with a paragraph on why it is the hardest `void*` in
+    /// the registry — **and nothing implemented it.** A policy is a statement
+    /// about what the bytes *are*; it does not move them. So the generated
+    /// lowering took the application's own `pData` pointer and put it on the
+    /// wire as though it were an offset into our arena, and the GPU side read a
+    /// descriptor layout from wherever in the arena that number happened to
+    /// land. Measured: two device losses, a ring fatal, and **a segmentation
+    /// fault inside `sv-gpu-server`** — a wrong pointer lowered as an offset is
+    /// the worst blast radius this design has.
+    ///
+    /// docs/design.md §0.20 item 4 found it, excluded `VK_KHR_push_descriptor` from
+    /// `zink` for exactly this, and wrote that *"a mechanical widening that
+    /// restores it without the expansion restores the segmentation fault with
+    /// it."* Making `full` the default did precisely that. The warning was
+    /// right, the exclusion was right, and neither survived a profile generated
+    /// from a rule — which is the argument for exclusions carrying their reasons
+    /// rather than only their names.
+    ///
+    /// # Why it is a rewrite and not a forward
+    ///
+    /// The same reason `vkUpdateDescriptorSetWithTemplate` is (§0.4 item 10):
+    /// `pData`'s *layout* lives in the template object and its *bytes* live in
+    /// the application's memory, so it cannot cross and does not have to.
+    /// Expanding it here produces the identical descriptor writes in a shape the
+    /// registry describes. The one thing this form needs and the call does not
+    /// carry is `pipelineBindPoint`, which is why [`crate::state::Template`]
+    /// keeps it.
+    ///
+    /// `dstSet` is zero because a push descriptor writes into no set — the
+    /// specification requires the member to be ignored, and sending anything
+    /// else would be inventing a handle.
+    fn cmd_push_descriptor_set_with_template(
+        &self,
+        args: p::VkCmdPushDescriptorSetWithTemplateArgs,
+    ) -> IcdResult<()> {
+        let Some(t) = self.wire() else { return Ok(()) };
+        self.push_with_template(
+            t,
+            args.command_buffer,
+            args.descriptor_update_template,
+            args.layout,
+            args.set,
+            args.p_data,
+        )
+    }
+
+    /// The `2` form, which is the same call with its parameters in a struct.
+    ///
+    /// `VkPushDescriptorSetWithTemplateInfo` carries the template, layout, set
+    /// and `pData`; there is nothing in it the form above does not handle, so
+    /// both unwrap onto one helper rather than expanding twice.
+    fn cmd_push_descriptor_set_with_template2(
+        &self,
+        args: p::VkCmdPushDescriptorSetWithTemplate2Args,
+    ) -> IcdResult<()> {
+        let Some(t) = self.wire() else { return Ok(()) };
+        let Some(info) = args.p_push_descriptor_set_with_template_info else {
+            return Err(LowerError::Shape(
+                "vkCmdPushDescriptorSetWithTemplate2: no VkPushDescriptorSetWithTemplateInfo",
+            ));
+        };
+        self.push_with_template(
+            t,
+            args.command_buffer,
+            info.descriptor_update_template,
+            info.layout,
+            info.set,
+            info.p_data,
+        )
+    }
+
     // -- accepted and dropped ------------------------------------------------
 
     // -- forwarded, with a standalone answer behind them ---------------------
@@ -1038,7 +1124,7 @@ impl Icd for SharedVulkan {
     // now round trips whenever there is a GPU side; the local answer stays
     // because a driver with no GPU side still has to let `vulkaninfo` and the
     // loader test walk create-instance → create-device → submit → allocate →
-    // map without failing, which is design.md §13 step 5.
+    // map without failing, which is docs/design.md §13 step 5.
     //
     // The object id is minted here in every case (§6.4), so the *only*
     // difference between the two arms is whether anything learns of it.
@@ -1064,7 +1150,7 @@ impl Icd for SharedVulkan {
         forwarded!(self, destroy_command_pool, args, { Ok(()) })
     }
 
-    /// design.md §6.5, and the correction to it that the blob forced.
+    /// docs/design.md §6.5, and the correction to it that the blob forced.
     ///
     /// §6.5 leaves `vkBeginCommandBuffer` as an ordinary forwarded command and
     /// only `vkCmd*` in the blob. That cannot work: the GPU side replays a blob
@@ -1301,7 +1387,7 @@ impl Icd for SharedVulkan {
 /// version its own ICD does not implement.
 ///
 /// **The bound is [`PROTOCOL_API_VERSION`] and it is derived, not written
-/// down** (design.md §0.18). What changed when §0.18 was done is not this
+/// down** (docs/design.md §0.18). What changed when §0.18 was done is not this
 /// function — clamping *is* the right thing and the paragraphs below are why —
 /// but three facts around it: the bound now comes from the wire profile so it
 /// cannot disagree with the command table; the driver's number is learned over
@@ -1367,7 +1453,7 @@ fn device_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceProperties {
 fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits {
     // The struct has 110 members and every one is a scalar or a small array, so
     // a byte-for-byte reinterpretation would work and is exactly what this
-    // project does not do (design.md §7.3: "never transmute"). The fields that
+    // project does not do (docs/design.md §7.3: "never transmute"). The fields that
     // matter to an application checking whether it can run are set; the rest
     // keep the zero the wire type's `Default` gives them.
     let mut w = p::VkPhysicalDeviceLimits::default();
@@ -1431,6 +1517,60 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
     w.optimal_buffer_copy_offset_alignment = c.optimal_buffer_copy_offset_alignment;
     w.optimal_buffer_copy_row_pitch_alignment = c.optimal_buffer_copy_row_pitch_alignment;
     w
+}
+
+impl SharedVulkan {
+    /// The shared body of the two `vkCmdPushDescriptorSetWithTemplate` forms.
+    ///
+    /// One expansion, reached from two trait methods, so the `2` form cannot
+    /// drift from the form it is a restatement of. See
+    /// `Icd::cmd_push_descriptor_set_with_template` for what this is closing and
+    /// why it is a rewrite rather than a forward (docs/design.md §0.22).
+    #[allow(clippy::too_many_arguments)]
+    fn push_with_template(
+        &self,
+        t: &dyn sv_icd_entry::Transport,
+        command_buffer: p::VkCommandBuffer,
+        template: p::VkDescriptorUpdateTemplate,
+        layout: p::VkPipelineLayout,
+        set: u32,
+        p_data: u64,
+    ) -> IcdResult<()> {
+        let (entries, bind_point) = {
+            let s = self.state();
+            match s.templates.get(&template.0) {
+                Some(t) => (t.entries.clone(), t.bind_point),
+                // As in the update form: a template we never saw created is
+                // refused rather than dropped, because dropping it leaves the
+                // command buffer holding a wrong picture instead of a failed
+                // call.
+                None => {
+                    return Err(LowerError::Shape(
+                        "vkCmdPushDescriptorSetWithTemplate: unknown template",
+                    ));
+                }
+            }
+        };
+        // SAFETY: `p_data` is the application's own `pData` for this call, read
+        // in the application's process, with the entries it created the template
+        // with. The specification's contract, exactly as for the update form.
+        let writes =
+            unsafe { sv_icd_entry::local::expand_descriptor_template(p_data, 0, &entries) };
+        if writes.is_empty() {
+            return Ok(());
+        }
+        forward::cmd_push_descriptor_set(
+            t,
+            p::VkCmdPushDescriptorSetArgs {
+                command_buffer,
+                pipeline_bind_point: bind_point,
+                layout,
+                set,
+                descriptor_write_count: writes.len() as u32,
+                p_descriptor_writes: writes,
+            },
+        )
+    }
 }
 
 fn memory_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceMemoryProperties {

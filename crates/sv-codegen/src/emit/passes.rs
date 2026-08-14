@@ -1,4 +1,4 @@
-//! Passes 5 and 6: `handle_map` and `transform` (design.md §7.2).
+//! Passes 5 and 6: `handle_map` and `transform` (docs/design.md §7.2).
 //!
 //! Both are struct-graph walks over an already-decoded value, and both exist for
 //! the same reason: an id or an offset that means one thing on the app side
@@ -7,7 +7,7 @@
 //!
 //! > "A generated pass that walks whole struct graphs is the only tractable way
 //! > to catch all of them; hand-listing the sites is how this goes wrong."
-//! > — design.md §5.3
+//! > — docs/design.md §5.3
 //!
 //! Only types that can actually contain something to rewrite get a walker. The
 //! reachability fixpoint in [`crate::plan`] includes `pNext` extenders, because a
@@ -42,7 +42,7 @@ pub fn emit(plan: &Plan) -> TokenStream {
     // a `transform_*` function that was never generated, which is a compile
     // error in the *generated* crate with no explanation attached to it. The
     // handle side of this pair spent four extensions' worth of API behind a
-    // `compile_error!` for the same reason (design.md §0.21).
+    // `compile_error!` for the same reason (docs/design.md §0.21).
     let transform_unions = plan
         .structs
         .iter()
@@ -76,7 +76,7 @@ fn emit_traits(plan: &Plan) -> TokenStream {
         ///
         /// Passed to the mapper so the GPU side's table can be typed: an id is a
         /// `SlotMap` key and looking one up in the wrong table is the kind of
-        /// mistake a tag turns into an error (design.md §6.4).
+        /// mistake a tag turns into an error (docs/design.md §6.4).
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum HandleType {
             #(#handle_variants)*
@@ -90,14 +90,14 @@ fn emit_traits(plan: &Plan) -> TokenStream {
 
         /// App-side id → GPU-side driver handle.
         ///
-        /// design.md §6.4: what crosses is always a table index, never a
+        /// docs/design.md §6.4: what crosses is always a table index, never a
         /// pointer. The table lives on the GPU side and this is the interface
         /// the generated walkers use to consult it.
         pub trait HandleMapper {
             fn map(&mut self, ty: HandleType, id: u64) -> sv_wire::Result<u64>;
         }
 
-        /// The `(memory, offset)` rewrite of design.md §5.3.
+        /// The `(memory, offset)` rewrite of docs/design.md §5.3.
         ///
         /// An app-side `VkDeviceMemory` is a sub-range of a slab; the GPU side
         /// holds one real `VkDeviceMemory` per slab. Every pair that crosses is
@@ -139,7 +139,7 @@ fn emit_handle_map(plan: &Plan, s: &StructPlan) -> TokenStream {
 /// # This used to be a `compile_error!`, and the refusal outlived its reason
 ///
 /// It read: *"a union containing handles reached the handle_map pass; the
-/// selector rules of design.md §7.4 must be applied before this can be
+/// selector rules of docs/design.md §7.4 must be applied before this can be
 /// generated"*, and it kept `VK_KHR_acceleration_structure`,
 /// `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap` — 53 commands,
 /// the largest single block of uncarried API — out of every profile.
@@ -199,7 +199,7 @@ fn emit_transform_union(plan: &Plan, s: &StructPlan) -> TokenStream {
     });
     let doc = format!(
         "Rewrite every `(memory, offset)` pair inside a `{}` from app-side \
-         allocation coordinates to GPU-side slab coordinates (design.md §5.3), \
+         allocation coordinates to GPU-side slab coordinates (docs/design.md §5.3), \
          in the live arm only.",
         s.name
     );
@@ -250,7 +250,7 @@ fn handle_walk(plan: &Plan, shape: &Shape, access: &TokenStream) -> Option<Token
     match shape {
         // **`VkDeviceMemory` belongs to the transform pass, not to this one**,
         // and the two must partition the handle space rather than both claiming
-        // it. design.md §7.2 lists passes 5 and 6 side by side without saying
+        // it. docs/design.md §7.2 lists passes 5 and 6 side by side without saying
         // so, and the failure when both run is specific and confusing: an
         // app-side memory id is not a table entry at all — it is either
         // `ARENA_MEMORY_ID`, a sentinel with no driver handle behind it, or an
@@ -327,7 +327,7 @@ fn emit_transform(plan: &Plan, s: &StructPlan) -> TokenStream {
 
     let doc = format!(
         "Rewrite every `(memory, offset)` pair inside a `{}` from app-side \
-         allocation coordinates to GPU-side slab coordinates (design.md §5.3).",
+         allocation coordinates to GPU-side slab coordinates (docs/design.md §5.3).",
         s.name
     );
     quote! {

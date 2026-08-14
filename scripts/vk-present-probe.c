@@ -1,6 +1,6 @@
 /* vk-present-probe — a Vulkan program that presents, and the frame is checked.
  *
- * design.md §10 stage 2's acceptance criterion, written as a program: put a
+ * docs/design.md §10 stage 2's acceptance criterion, written as a program: put a
  * known image into a swapchain image on the GPU side, present it, and see the
  * same bytes come out on the app side.
  *
@@ -55,7 +55,7 @@
 #include <dlfcn.h>
 
 /* Overridable so that the same program is both the correctness check (small,
- * three frames, compared byte for byte) and the cost measurement design.md §10
+ * three frames, compared byte for byte) and the cost measurement docs/design.md §10
  * asks for (1080p, many frames, timed). `SV_PRESENT_DUMP` should be unset for
  * the second. */
 #define MAX_FRAMES 512
@@ -480,7 +480,7 @@ int main(void) {
         if (FRAMES <= 8)
             printf("frame %u presented from image %u\n", frame, index);
     }
-    /* design.md §10's "measure what the blit costs". `vkQueuePresentKHR` here is
+    /* docs/design.md §10's "measure what the blit costs". `vkQueuePresentKHR` here is
      * the whole of it: one `vkQueueSubmit` round trip carrying a pre-recorded
      * `vkCmdCopyImageToBuffer`, a `vkWaitForFences`, and the app side reading
      * the arena. Everything else in a frame belongs to the application. */

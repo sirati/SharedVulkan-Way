@@ -106,7 +106,11 @@ type note >/dev/null 2>&1 || note() { echo "  ----  $*"; }
 # sources is exactly the class of mistake this file exists to stop.
 _fresh_deps() {
   local bin=$1 dep
-  dep="${bin%.exe}.d"
+  # Cargo names the depfile after the *crate*, so a binary's platform suffix is
+  # not part of it: `wc-proxy.exe` -> `wc-proxy.d`, `libsv_icd.so` -> `libsv_icd.d`.
+  # Stripping only `.exe` sent every `.so` down the whole-tree fallback, where it
+  # was blamed on the first unrelated file the walk happened to reach.
+  dep="${bin%.exe}"; dep="${dep%.so}"; dep="${dep%.dylib}.d"
   [ -f "$dep" ] || return 1
   # A Makefile rule: "target: dep dep dep", possibly over several lines.
   sed -e 's/\\$//' -e 's/^[^:]*://' "$dep" 2>/dev/null \
@@ -442,4 +446,50 @@ deployed_all() {
     deployed_is "$ldir/$l" "$rdir/$r" "$runner" "$how" || rc=1
   done
   return $rc
+}
+
+# ----------------------------------------------------------- proc_running ---
+# Is a process of this name running -- **excluding the command that is asking**?
+#
+#   proc_running <exact-executable-name>
+#     0  yes, something else is running it
+#     1  no
+#
+# WHY THIS EXISTS, AND IT IS NOW THREE TIMES
+#
+# `pgrep -f` and `pkill -f` match against the **whole command line**, and the
+# command line doing the asking contains the pattern it is asking about. So a
+# guard written as
+#
+#     ssh host 'pgrep -f qemu-serve >/dev/null && refuse'
+#
+# matches its own shell, every time, and refuses unconditionally. On this
+# project that has now happened three times:
+#
+#   1. a `pkill -f` intended for one process took down the shell issuing it;
+#   2. a QMP guard refused a socket that was free for an hour, because the ssh
+#      command carrying the check contained `qemu-serve` -- and it was written
+#      *after* lesson 1;
+#   3. a `ps | grep` looking for stray pollers found only its own `grep`.
+#
+# The third is the harmless one and the most instructive: the check was for
+# exactly this defect and exhibited it.
+#
+# THE FIX THAT GENERALISES is to match on something the invoking command cannot
+# contain. In order of preference:
+#
+#   - a **pidfile** the process itself wrote. Unambiguous, and survives a rename.
+#   - **`pgrep -x <name>`**, which matches the executable name rather than the
+#     command line. A shell running `pgrep -x sv-hostd` is named `bash`, so it
+#     cannot match. This is what the function below does.
+#   - failing both, `pgrep -f <pat>` with **`$$` and its ancestors excluded** --
+#     which is fiddly, easy to get wrong under `ssh`, and the reason the other
+#     two are preferred.
+#
+# A guard that cannot distinguish itself from what it guards against is not a
+# guard; it is a coin that always lands the same way.
+proc_running() {
+  local name=$1 pids
+  pids=$(pgrep -x "$name" 2>/dev/null) || return 1
+  [ -n "$pids" ]
 }

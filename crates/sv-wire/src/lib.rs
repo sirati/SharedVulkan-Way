@@ -7,7 +7,7 @@
 //!
 //! # The format
 //!
-//! design.md §6.1 takes Venus's `VK_EXT_command_serialization` encoding rules;
+//! docs/design.md §6.1 takes Venus's `VK_EXT_command_serialization` encoding rules;
 //! §6.2 names three deliberate deviations. Both are implemented here, and both
 //! are stated as executable facts rather than prose, because the failure mode of
 //! getting them subtly wrong is silent corruption on both sides at once (R8).
@@ -31,7 +31,7 @@
 //! The stream is 4-byte granular and **not** 8-byte aligned: a `u64` routinely
 //! lands on a 4-byte boundary. That is Venus's format and it costs us nothing,
 //! because nothing here reads through a reference — every field is assembled
-//! from bytes (design.md §7.3, "never transmute a struct out of shared memory").
+//! from bytes (docs/design.md §7.3, "never transmute a struct out of shared memory").
 //!
 //! ## Where we differ from Venus, and why
 //!
@@ -44,13 +44,13 @@
 //!    byte-comparison test. We zero them. The layout is identical; only the
 //!    value of bytes nobody is allowed to read differs.
 //!
-//! 2. **A `u32` byte length in every command header** (design.md §6.2, R13).
+//! 2. **A `u32` byte length in every command header** (docs/design.md §6.2, R13).
 //!    The header is `{ cmd_type: u32, cmd_flags: u32, cmd_size: u32 }`, the
 //!    first two fields being Venus's verbatim so a prefix comparison still
 //!    works.
 //!
 //! 3. **Replies are a length-prefixed stream**, not a fixed mailbox
-//!    (design.md §6.2, §4.4).
+//!    (docs/design.md §6.2, §4.4).
 //!
 //! `pNext` is the fourth difference and it does not live here: design.md D6
 //! takes *gfxstream's* length-prefixed links rather than Venus's per-parent
@@ -108,12 +108,12 @@ pub enum WireError {
     /// that the headline is *true*. Before this existed every table failure was
     /// reported as `UnknownCommand { opcode: 0 }` — a fabricated headline that
     /// sent readers hunting a desynchronised decoder when the decoder was fine.
-    /// design.md §0.23.6.
+    /// docs/design.md §0.23.6.
     Table,
     /// A reserved span was not exactly filled. This is a generator bug — the
     /// `size` pass and the `encode` pass disagreed — and it is worth catching
     /// loudly, because the two passes disagreeing is precisely how a stream
-    /// desynchronises (design.md §7.2).
+    /// desynchronises (docs/design.md §7.2).
     SizeMismatch { reserved: usize, written: usize },
     /// A count read from the wire cannot be satisfied by the bytes remaining.
     /// Cheap, and the realistic thing it catches is a wrong `len=`, not an
@@ -130,12 +130,12 @@ pub enum WireError {
     /// A `pNext` link whose declared length does not match its content.
     PNextLengthMismatch { declared: u32, consumed: usize },
     /// A `pNext` link the decoder does not know. Fatal on the GPU side, skipped
-    /// on the app side (design.md §6.1, gfxstream's asymmetric handling).
+    /// on the app side (docs/design.md §6.1, gfxstream's asymmetric handling).
     UnknownPNext { s_type: i32 },
     /// A union tag with no member.
     UnknownUnionTag { tag: u32 },
     /// An opcode the dispatcher does not implement, or one the restricted
-    /// sub-decoder is not allowed to accept (design.md §6.5).
+    /// sub-decoder is not allowed to accept (docs/design.md §6.5).
     UnknownCommand { opcode: u32 },
     /// A string that was not NUL-terminated where the format promises one.
     UnterminatedString,
@@ -150,7 +150,7 @@ pub enum WireError {
     LengthDisagreement { field: &'static str, declared: u64, actual: u64 },
     /// A `VkDeviceMemory` id the app side's allocator has never handed out, met
     /// while rewriting a `(memory, offset)` pair into arena coordinates
-    /// (design.md §5.3, §7.2 pass 6).
+    /// (docs/design.md §5.3, §7.2 pass 6).
     ///
     /// It is a *wire* error because the pass that raises it is the generated
     /// `MemoryTransform` walk, which speaks `sv_wire::Result` on both sides of
@@ -209,7 +209,7 @@ pub type Result<T> = core::result::Result<T, WireError>;
 
 /// A bump cursor over a span the caller has already reserved.
 ///
-/// design.md §7.2 keeps the `size` and `encode` passes separate precisely so a
+/// docs/design.md §7.2 keeps the `size` and `encode` passes separate precisely so a
 /// contiguous span can be reserved in the ring or the arena blob before any
 /// bytes are written, and encoding then never allocates and never copies. The
 /// encoder therefore borrows a slice it does not own and cannot grow.
@@ -336,7 +336,7 @@ impl<'a> Encoder<'a> {
     /// A one-or-zero presence flag for an optional pointer.
     ///
     /// Eight bytes, because that is what Venus writes (`vn_encode_simple_pointer`
-    /// is an `array_size` of 0 or 1). design.md §6.1 describes this as "a
+    /// is an `array_size` of 0 or 1). docs/design.md §6.1 describes this as "a
     /// one-word boolean … smaller [than] gfxstream's 8-byte … token"; it is the
     /// same eight bytes, and the real difference — the one that matters — is
     /// that it carries no address.
@@ -437,7 +437,7 @@ pub struct Patch {
 
 /// A bounds-checked cursor over bytes the peer wrote.
 ///
-/// Every accessor returns `Result`. design.md §7.3: "One comparison per field,
+/// Every accessor returns `Result`. docs/design.md §7.3: "One comparison per field,
 /// which is noise next to the work being done." The alternative — a decoder
 /// that reads first and checks later, or not at all — is how a wrong `len=`
 /// becomes memory corruption instead of an error.
@@ -457,7 +457,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// The app side's decoder: unknown `pNext` links are kept as raw bytes and
-    /// the chain walk continues (design.md §6.1).
+    /// the chain walk continues (docs/design.md §6.1).
     pub fn lenient(buf: &'a [u8]) -> Self {
         Decoder { buf, pos: 0, unknown_pnext: UnknownPNextPolicy::Skip }
     }
@@ -596,7 +596,7 @@ impl<'a> Decoder<'a> {
     /// packed arrays and conservative (never over-permissive) for arrays of
     /// variable-size structs, where an element is at least `elem_size` bytes.
     /// Count-then-check-then-loop, never slice-from-peer-length
-    /// (design.md §7.3).
+    /// (docs/design.md §7.3).
     pub fn array_size(&mut self, min_elem_size: usize) -> Result<usize> {
         let count = self.u64()?;
         let n = usize::try_from(count).map_err(|_| WireError::CountOverflow { count })?;
@@ -679,7 +679,7 @@ impl<'a> Decoder<'a> {
 // Headers
 // ---------------------------------------------------------------------------
 
-/// A command header. Venus's two dwords plus our length (design.md §6.2).
+/// A command header. Venus's two dwords plus our length (docs/design.md §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandHeader {
     pub cmd_type: u32,
@@ -742,7 +742,7 @@ impl PNextLinkHeader {
 
 /// How a side reacts to a `pNext` link it does not know.
 ///
-/// design.md §6.1: "the app side silently drops unknown links and continues
+/// docs/design.md §6.1: "the app side silently drops unknown links and continues
 /// down `pNext`; the GPU side treats one as fatal", because a fatal abort turns
 /// a silent protocol mismatch into a loud one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

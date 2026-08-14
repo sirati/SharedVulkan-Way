@@ -5,7 +5,7 @@
 #   scripts/wc-vm-damage.sh linux    client here, compositor in a Linux VM
 #   scripts/wc-vm-damage.sh boot     boot the guest and stop, for poking at
 #
-# docs/waycompose-design.md §58.
+# docs/waycompose-design.md §70.
 #
 # WHY THIS EXISTS
 #
@@ -272,7 +272,7 @@ GUESTEOF
   if [ ! -s "$RUNDIR/arena.plan" ]; then
     bad "wc-arena-host did not locate the guest's arena"
     sed 's/^/        /' "$RUNDIR/locate.log" | tail -6
-    # §58.5: if the shortfall is the outbound window, say so, because the number
+    # §70.4: if the shortfall is the outbound window, say so, because the number
     # on its own reads like sweep noise and it is not.
     local badpages
     badpages=$(grep -o "verify: [0-9]*/[0-9]* pages" "$RUNDIR/locate.log" | tail -1)
@@ -282,7 +282,7 @@ GUESTEOF
       note "else's data, which is a page that was dropped and re-faulted, not one that was"
       note "overwritten -- and a re-faulted page also has a new frame, which is why the"
       note "frame list is stale for exactly those pages and the sweep cannot find them"
-      note "either. §58.5 has the detail; this is not the content sweep being unreliable."
+      note "either. §70.4 has the detail; this is not the content sweep being unreliable."
     fi
     return| tail -14
     return

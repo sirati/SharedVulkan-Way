@@ -23,7 +23,7 @@
 //!
 //! # Why the published header, rather than `vulkan_object.py`
 //!
-//! design.md §7.1 names Khronos's `vulkan_object.py` / `reg.py` as the
+//! docs/design.md §7.1 names Khronos's `vulkan_object.py` / `reg.py` as the
 //! independent model, and states the objection to it in the same breath: a
 //! checked-in fixture makes the protocol a function of an artefact that can
 //! drift from `$VK_XML`.
@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 /// Derived from the registry path rather than from `$VULKAN_SDK`, because the
 /// whole argument for this cross-check is that the two artefacts describe the
 /// same release. A header from somewhere else would be a fixture that can drift,
-/// which is precisely what design.md §7.1 objects to.
+/// which is precisely what docs/design.md §7.1 objects to.
 pub fn header_path() -> Result<PathBuf> {
     let xml = vk_registry::registry_path()?;
     // …/share/vulkan/registry/vk.xml → …/include/vulkan/vulkan_core.h
@@ -120,7 +120,7 @@ pub fn header_paths() -> Result<Vec<PathBuf>> {
     // `vulkan_core.h` is not the whole of the published API. Anything behind a
     // `VK_USE_PLATFORM_*` guard lives in its own header, and a profile that
     // names such an extension would otherwise be reported as inventing it —
-    // which is what `VK_KHR_xcb_surface` did the first time design.md §10 stage
+    // which is what `VK_KHR_xcb_surface` did the first time docs/design.md §10 stage
     // 2 put it in the profile: "the profile lists it, but vulkan_core.h has no
     // block for it". The published header exists; it is just a different file.
     //
@@ -653,7 +653,7 @@ fn struct_head(line: &str) -> Option<(String, bool)> {
 /// One line only. The multi-line ones in the header are all *callback* typedefs
 /// (`PFN_vkAllocationFunction`, `PFN_vkDebugUtilsMessengerCallbackEXT`), which
 /// are function-pointer types rather than commands and are not serialisable
-/// anyway (design.md §6.1).
+/// anyway (docs/design.md §6.1).
 fn command_typedef(line: &str) -> Option<HeaderCommand> {
     let rest = line.strip_prefix("typedef ")?;
     if !line.ends_with(");") {

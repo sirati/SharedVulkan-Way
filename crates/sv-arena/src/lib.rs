@@ -1,6 +1,6 @@
 //! The passthrough arena: extents, slabs, the allocator, and the R26 canary.
 //!
-//! design.md §5. The arena is the reason this project exists — §1's second
+//! docs/design.md §5. The arena is the reason this project exists — §1's second
 //! invariant is that "the command stream carries offsets, never payloads" — so
 //! this crate's whole job is to turn a request for `n` bytes into an offset that
 //! means the same thing on both sides.
@@ -51,7 +51,7 @@ use core::fmt;
 
 /// The allocator's granularity, and the alignment of every offset it returns.
 ///
-/// design.md §5.2: "dictated by the measured `minImportedHostPointerAlignment`
+/// docs/design.md §5.2: "dictated by the measured `minImportedHostPointerAlignment`
 /// and by the page granularity of the shared mapping".
 pub const GRANULARITY: u64 = 4096;
 

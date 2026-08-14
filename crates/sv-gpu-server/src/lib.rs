@@ -1,6 +1,6 @@
 //! `sv-gpu-server` — the GPU side.
 //!
-//! design.md §3's right-hand box: it attaches to the control region, consumes
+//! docs/design.md §3's right-hand box: it attaches to the control region, consumes
 //! command rings, decodes with the generated protocol, calls a real Vulkan
 //! driver and writes replies.
 //!
@@ -30,7 +30,7 @@ pub mod workload;
 
 /// The reserved object id for "the arena's own `VkDeviceMemory`".
 ///
-/// design.md §5.3 makes an app-side `VkDeviceMemory` a sub-range of a slab and
+/// docs/design.md §5.3 makes an app-side `VkDeviceMemory` a sub-range of a slab and
 /// has the app side rewrite every `(memory, offset)` pair to "(slab handle,
 /// `slab_offset + app_offset`)". The app side cannot name a *driver* handle —
 /// see the note on [`table::resolve_memory`] — so what it names is this
@@ -47,7 +47,7 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 /// not already catch. In practice `sv_proto::PROTOCOL_HASH` is the real check
 /// (§4.3, R13) and this is the coarse one in front of it.
 ///
-/// **2** since design.md §0.18: `svDriverVersions` is a hand-written command in
+/// **2** since docs/design.md §0.18: `svDriverVersions` is a hand-written command in
 /// `sv_proto::sv`, so it is outside the generated table the hash is computed
 /// over and the hash cannot see it. An app side that asks a GPU side built
 /// before it gets "unknown protocol command", which is fatal to that ring — the

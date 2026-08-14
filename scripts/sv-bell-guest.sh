@@ -64,7 +64,11 @@ guest_ports() {
 }
 
 say "refusing to share the QMP socket"
-if vmhost 'export PATH=/run/current-system/sw/bin; pgrep -f qemu-serve >/dev/null' 2>/dev/null; then
+# By executable name, never by command line. See `proc_running` in
+# wc-binaries.sh for why: the ssh command carrying this check contains the
+# string it searches for, so a `pgrep -f` matched its own shell and refused a
+# socket that was free.
+if vmhost 'export PATH=/run/current-system/sw/bin; pgrep -x sv-hostd >/dev/null' 2>/dev/null; then
   echo "FAIL: an sv-hostd holds QMP. The chardev serves one client and a second"
   echo "      opener hangs silently. Wait for that run to finish."
   exit 1

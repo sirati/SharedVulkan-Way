@@ -1,6 +1,6 @@
 //! The GPU side's C boundary: **wire → C**, and the driver call across it.
 //!
-//! design.md §7.2's pass taxonomy has three of the four corners of "which side"
+//! docs/design.md §7.2's pass taxonomy has three of the four corners of "which side"
 //! × "which direction" and is missing this one. The previous stage wrote it by
 //! hand for about forty commands and recorded that it would not scale to 239;
 //! this crate is that finding acted on. The generator is
@@ -8,7 +8,7 @@
 //!
 //! # What is hand-written here
 //!
-//! [`Raise`], and nothing else. It is design.md §7.2's **pass 4**, which that
+//! [`Raise`], and nothing else. It is docs/design.md §7.2's **pass 4**, which that
 //! section strikes out with the note that owned Rust values make it a no-op.
 //! That is true of *decoding* and false of *raising*: a C
 //! `VkGraphicsPipelineCreateInfo` holds eight pointers to sub-structures that
@@ -74,7 +74,7 @@ use core::ffi::{c_char, c_void};
 // from the wrong offset with no diagnostic whatsoever.
 pub use sv_icd_entry::*;
 
-/// The pool a raised value's pointers point into: design.md §7.2's pass 4.
+/// The pool a raised value's pointers point into: docs/design.md §7.2's pass 4.
 ///
 /// # `Vec<Box<T>>` is the obvious design and it is unsound. Miri said so.
 ///
@@ -99,7 +99,7 @@ pub use sv_icd_entry::*;
 /// `Box` left to move, the allocation is owned by a raw pointer, and nothing
 /// retags anything until `Drop` reclaims it. The cost is that this module has
 /// `unsafe` in it, which the generated `raise_*` code still does not —
-/// design.md §7.3's "confined to modules with written invariants", and the
+/// docs/design.md §7.3's "confined to modules with written invariants", and the
 /// invariant is stated on [`Raise::one`].
 ///
 /// # Why not a bump allocator
@@ -152,7 +152,7 @@ impl Raise {
     /// A NUL-terminated copy of `bytes`.
     ///
     /// The wire never carries the terminator — it is a fact of the *format*, not
-    /// of the value (design.md §6.1) — so it is added here. An interior NUL is
+    /// of the value (docs/design.md §6.1) — so it is added here. An interior NUL is
     /// not rejected: it would truncate the string a driver sees, and a wire
     /// string containing one is a corrupt peer rather than a case to handle.
     pub fn cstring(&mut self, bytes: &[u8]) -> *mut c_char {
@@ -330,7 +330,7 @@ mod tests {
     /// The two things `raise_*` reconstructs that the wire does not carry.
     ///
     /// `sType` is not a field of a wire struct at all — dropping it is what
-    /// makes "a value with the wrong sType" unrepresentable (design.md §7.2) —
+    /// makes "a value with the wrong sType" unrepresentable (docs/design.md §7.2) —
     /// so raising has to put it back from the registry. And a `pNext` chain is a
     /// flat `Vec` on the wire and a linked list in C, built back to front
     /// because a link has to exist before the one in front of it can point at
@@ -375,7 +375,7 @@ mod tests {
 
     /// `lower_full_*` reads what `lower_*` deliberately does not.
     ///
-    /// This is the finding design.md §0.4 item 1 records, made checkable. Both
+    /// This is the finding docs/design.md §0.4 item 1 records, made checkable. Both
     /// functions convert a C `VkPhysicalDeviceProperties` into the same wire
     /// type in the same direction, and they must disagree: on the *app* side the
     /// struct is the caller's uninitialised memory on the way out and reading it

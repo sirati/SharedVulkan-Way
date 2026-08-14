@@ -7,11 +7,11 @@
 //! constness at each level and the array extents are left as a string for every
 //! downstream project to re-derive. A remoting layer cannot skip that step: how
 //! many stars a parameter has is precisely what decides whether it is a value, a
-//! pointer to one value, or a pointer to an array (design.md §7.1).
+//! pointer to one value, or a pointer to an array (docs/design.md §7.1).
 //!
 //! # Why this is hand-rolled rather than built on `nom`
 //!
-//! design.md §7.1 budgets "around 400–600 lines with `nom`". The grammar this
+//! docs/design.md §7.1 budgets "around 400–600 lines with `nom`". The grammar this
 //! has to accept turned out to be much smaller than that estimate assumed: it
 //! was measured against the whole pinned registry (see `shape_of` in
 //! `examples/dump_codes.rs`) and every member and parameter declaration in
@@ -30,7 +30,7 @@
 //!
 //! Function-pointer typedefs are *not* handled here. `vk-parse` already gives
 //! those structured (`TypeSpec::Funcpointer`), and they are not serialisable
-//! anyway (design.md §6.1, Venus's exclusion list), so parsing them would be
+//! anyway (docs/design.md §6.1, Venus's exclusion list), so parsing them would be
 //! work in service of nothing.
 
 use std::fmt;
@@ -89,7 +89,7 @@ pub struct Declarator {
     pub name: String,
     pub ty: CType,
     /// `uint32_t mask:8`. Present only in the ray-tracing and micromap structs,
-    /// which design.md §7.4 puts out of scope; recorded rather than dropped so
+    /// which docs/design.md §7.4 puts out of scope; recorded rather than dropped so
     /// the generator can reject them by name instead of silently mis-encoding
     /// them.
     pub bitfield_bits: Option<u32>,

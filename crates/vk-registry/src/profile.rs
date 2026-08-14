@@ -1,6 +1,6 @@
 //! Which part of the registry a given build generates for.
 //!
-//! design.md §11 scopes the project to Zink, and §13 step 3 starts smaller than
+//! docs/design.md §11 scopes the project to Zink, and §13 step 3 starts smaller than
 //! that. Neither is "the whole registry", so the generator needs an explicit,
 //! *declared* answer to "is `vkCmdDrawIndirectCount` in?" — declared, because a
 //! subset discovered by whatever the generator happened to reach is a subset
@@ -32,7 +32,7 @@ pub struct Profile {
     pub extra_commands: Vec<String>,
     /// Commands to exclude even though a listed feature provides them.
     ///
-    /// This is where "we do not forward presentation" (design.md §10) and "we
+    /// This is where "we do not forward presentation" (docs/design.md §10) and "we
     /// strip `pAllocator` above the protocol" (§7.4) become facts a reviewer can
     /// read, rather than behaviour buried in the generator.
     pub excluded_commands: Vec<String>,
@@ -40,7 +40,7 @@ pub struct Profile {
     /// features and extensions provide.
     ///
     /// An allowlist rather than a 400-entry exclusion list, so that
-    /// design.md §13 step 3's "deliberately tiny command set" can be written
+    /// docs/design.md §13 step 3's "deliberately tiny command set" can be written
     /// down as the sixteen names it is.
     pub only_commands: Option<Vec<String>>,
     /// Types to exclude, with the same reasoning.
@@ -123,7 +123,7 @@ impl Profile {
     /// `vkEnumerateInstanceVersion` is a promise that the entry points and
     /// structures of that version exist, and the only thing that can keep the
     /// promise is the wire profile. `sv-icd` calls this its *ceiling* and
-    /// advertises `min(what the driver supports, this)`; see design.md §0.18.
+    /// advertises `min(what the driver supports, this)`; see docs/design.md §0.18.
     ///
     /// A profile with no `VK_VERSION_*` feature carries no core Vulkan at all,
     /// which is the §13-step-3 tiny profile, and 1.0 is the honest answer for
@@ -491,11 +491,11 @@ fn collect_type_names(ty: &CType, queue: &mut VecDeque<String>) {
 /// that lists an extension the registry does not support must fail the *build*,
 /// and a checked-in Rust value is checked by the same compiler that builds the
 /// generator. Growing the subset is editing this function, which is exactly the
-/// "declared input" design.md §13 asks for.
+/// "declared input" docs/design.md §13 asks for.
 pub mod profiles {
     use super::Profile;
 
-    /// design.md §13 step 3: "a deliberately tiny command set".
+    /// docs/design.md §13 step 3: "a deliberately tiny command set".
     ///
     /// Its purpose is to be small enough to read the generated output of, by
     /// hand, in full. Everything the generator can get wrong it can get wrong
@@ -513,7 +513,7 @@ pub mod profiles {
         }
     }
 
-    /// The commands design.md §13 step 3 names, kept as the positive list the
+    /// The commands docs/design.md §13 step 3 names, kept as the positive list the
     /// exclusion above is derived from.
     pub const STEP3_COMMANDS: &[&str] = &[
         "vkCreateInstance",
@@ -534,10 +534,10 @@ pub mod profiles {
         "vkBindBufferMemory",
     ];
 
-    /// design.md §11: Zink's requirement set, which is the v1 scope.
+    /// docs/design.md §11: Zink's requirement set, which is the v1 scope.
     ///
     /// Core 1.0–1.3 plus the extensions zink's own `VP_ZINK_requirements.json`
-    /// profile names as required, plus the WSI family of design.md §10 stage 2.
+    /// profile names as required, plus the WSI family of docs/design.md §10 stage 2.
     ///
     /// **`VK_KHR_swapchain` is in this list and none of its commands are on the
     /// wire.** That is not a contradiction: an extension appears here so that
@@ -577,7 +577,7 @@ pub mod profiles {
                 "VK_VERSION_1_4".into(),
             ],
             extensions: vec![
-                // Zink's five hard requirements (design.md §11).
+                // Zink's five hard requirements (docs/design.md §11).
                 "VK_KHR_maintenance1".into(),
                 // Advertised for its *name*, not for anything it adds. Every
                 // type and command it defines is core since 1.1 and so already
@@ -599,7 +599,7 @@ pub mod profiles {
                 "VK_KHR_timeline_semaphore".into(),
                 // The ladder to GL 4.6 that VP_ZINK_gl21_baseline and its
                 // successors add, restricted to things that do not put raw
-                // device addresses in application data (design.md §9.2).
+                // device addresses in application data (docs/design.md §9.2).
                 "VK_EXT_transform_feedback".into(),
                 "VK_EXT_conditional_rendering".into(),
                 "VK_EXT_provoking_vertex".into(),
@@ -628,9 +628,9 @@ pub mod profiles {
                 "VK_KHR_draw_indirect_count".into(),
                 "VK_EXT_robustness2".into(),
                 // The reverse ring forwards validation-layer output to the app
-                // side, which needs the messenger types (design.md §4.6).
+                // side, which needs the messenger types (docs/design.md §4.6).
                 "VK_EXT_debug_utils".into(),
-                // Headless first (design.md §10 stage 1).
+                // Headless first (docs/design.md §10 stage 1).
                 "VK_EXT_headless_surface".into(),
                 "VK_KHR_surface".into(),
                 // §10 stage 2. The ICD implements every command of this
@@ -663,7 +663,7 @@ pub mod profiles {
                 // What the conformance suite asked for, in its own words
                 // ---------------------------------------------------------
                 //
-                // design.md §0.20. Everything above this line is here because
+                // docs/design.md §0.20. Everything above this line is here because
                 // Zink, DXVK or the WSI needs it; everything below is here
                 // because `scripts/sv-cts.sh` counted a test that **passes on
                 // the control** and skips forwarded, and printed deqp's own
@@ -706,7 +706,7 @@ pub mod profiles {
                 //   commands and a validity model this generator has never
                 //   walked. It is a stage, not a line, and it is the next one.
                 // - **`VK_EXT_descriptor_buffer`** (1 test, 11 commands).
-                //   design.md §9.2 excludes it by name: it puts raw device
+                //   docs/design.md §9.2 excludes it by name: it puts raw device
                 //   addresses in *application-visible* data, which is a
                 //   different thing from `vkGetBufferDeviceAddress` returning
                 //   one — the application writes descriptors by address into
@@ -718,7 +718,7 @@ pub mod profiles {
                 // - **`VK_KHR_external_semaphore_fd`** (1 test). Refused on
                 //   principle rather than on cost: its entire purpose is to
                 //   move a **file descriptor** between processes, and
-                //   design.md §1a says no descriptor ever crosses. A profile
+                //   docs/design.md §1a says no descriptor ever crosses. A profile
                 //   that carried it would be advertising a promise this
                 //   project exists not to keep.
                 // - **`VK_KHR_push_descriptor`** (2 tests). **Added, measured,
@@ -827,7 +827,7 @@ pub mod profiles {
     ///
     /// [`Profile::excluded_extensions`] then names what is genuinely unreachable,
     /// with a reason each. Those reasons fall into two kinds and neither is a
-    /// scope decision — they are the boundary invariant (design.md §1a) and the
+    /// scope decision — they are the boundary invariant (docs/design.md §1a) and the
     /// serialisability rule (§6.1) refusing, which is the generator working.
     pub fn full() -> Profile {
         let mut p = zink();
@@ -850,14 +850,14 @@ pub mod profiles {
     fn excluded_extensions() -> Vec<String> {
         [
             // A callback is a function pointer into the application's address
-            // space. design.md §6.1 takes Venus's exclusion list verbatim in
+            // space. docs/design.md §6.1 takes Venus's exclusion list verbatim in
             // spirit and function pointers are the first entry on it; §1a is the
             // sharper version — the pointer is meaningless on the other side of
             // the VM boundary and there is no encoding that makes it meaningful.
             //
             // `VK_EXT_debug_utils` is in the profile and this is not a
             // contradiction: its messenger is created *app-side* and its output
-            // reaches the application over the reverse ring (design.md §4.6), so
+            // reaches the application over the reverse ring (docs/design.md §4.6), so
             // no function pointer ever crosses. `VK_EXT_debug_report` has no such
             // treatment and `VK_EXT_device_memory_report` puts its callback in a
             // `VkDeviceCreateInfo` `pNext` chain, which does cross.
@@ -867,7 +867,7 @@ pub mod profiles {
             // same objection, and the extension exists to let a loader skip the
             // ICD's manifest — which is the one thing this ICD is.
             "VK_LUNARG_direct_driver_loading",
-            // Bitfields mixed with ordinary members. design.md §7.4 already
+            // Bitfields mixed with ordinary members. docs/design.md §7.4 already
             // refuses `VkAccelerationStructureInstanceKHR` for this and the
             // reason is the same one: C does not state where a 9-bit field sits
             // inside a word, the registry does not either, and a generator that
@@ -876,10 +876,19 @@ pub mod profiles {
             // A `void*` whose extent is a device property rather than a `len=`,
             // and no policy in `sv_codegen::exceptions` fits: the bytes are a
             // capture-replay token that only a capture tool produces.
-            // design.md §9.2 is the sharper objection — a descriptor buffer *is*
+            // docs/design.md §9.2 is the sharper objection — a descriptor buffer *is*
             // raw device addresses in application memory, which is the one thing
             // this design says it will not put there.
             "VK_EXT_descriptor_buffer",
+            // Reached only once `VK_KHR_ray_tracing_pipeline` came back, and out
+            // for the *same* reason as the entry above rather than a new one:
+            // `VkAccelerationStructureMotionInstanceDataNV` has
+            // `VkAccelerationStructureInstanceKHR` in an arm, and that struct is
+            // the bitfields docs/design.md §7.4 names as the one type the registry
+            // genuinely cannot describe. `sv_codegen::abi::surface_profile`
+            // already excludes it as a tripwire; this is the profile agreeing so
+            // the tripwire is never reached.
+            "VK_NV_ray_tracing_motion_blur",
             // The same shape, without the §9.2 argument: `pParams` is an array
             // of pointers to CUDA kernel arguments whose count and element sizes
             // live in the CUDA module, which the registry cannot see and this
@@ -887,7 +896,7 @@ pub mod profiles {
             "VK_NVX_binary_import",
             // `ppData` hands the application a pointer into the driver's own
             // descriptor set allocation. That pointer is in the GPU side's
-            // address space and design.md §1a says it cannot cross; there is no
+            // address space and docs/design.md §1a says it cannot cross; there is no
             // encoding that makes it mean anything here.
             "VK_VALVE_descriptor_set_host_mapping",
             // More `void*` with no `len=`. Each one is a vendor blob whose
@@ -908,32 +917,27 @@ pub mod profiles {
             // `pPlacedAddress` asks the driver to map at an address the
             // application chose. In this design the ICD, not the driver, decides
             // where mapped memory lands — it is arena memory and the address is
-            // `arena_base + offset` (design.md §5.3) — so honouring the request
+            // `arena_base + offset` (docs/design.md §5.3) — so honouring the request
             // is not the GPU side's to honour, and forwarding it would be a
             // promise nothing keeps. `sv_codegen::exceptions` already marks the
             // field `NotSerialisable`; this is the profile agreeing.
             "VK_EXT_map_memory_placed",
-            // The **capture-replay class**, and it is one class rather than two
-            // coincidences. `pShaderGroupCaptureReplayHandle` and
-            // `opaqueCaptureDescriptorData` are both optional `void*` whose
-            // extent is a *device property* (`shaderGroupHandleCaptureReplaySize`,
-            // `…CaptureReplayDescriptorDataSize`) rather than a `len=`, and both
-            // are written only by a capture tool replaying a trace.
-            //
-            // The right answer is not an exclusion — it is a fourth
-            // `sv_codegen::exceptions::VoidPolicy` that encodes "we do not
-            // advertise the capture-replay feature, so this member is null on
-            // the wire and a non-null one is a usage error we refuse by name".
-            // That is a generator change with a test, not a profile line, and it
-            // is the next thing worth doing here: it is what stands between this
-            // profile and `VK_KHR_ray_tracing_pipeline` (7 commands) plus
-            // `VK_EXT_descriptor_buffer` (11).
-            "VK_KHR_ray_tracing_pipeline",
+            // **The capture-replay class used to be excluded here, and it is
+            // gone.** `pShaderGroupCaptureReplayHandle` and
+            // `opaqueCaptureDescriptorData` are optional `void*` whose extent is
+            // a device property rather than a `len=`, and the previous note here
+            // predicted the answer would be a fourth
+            // `sv_codegen::exceptions::VoidPolicy` rather than a profile line.
+            // It was: `VoidPolicy::CaptureReplayUnsupported` encodes them as null
+            // on the wire and refuses a non-null one by name, which is what the
+            // specification already requires of a device that does not advertise
+            // `…CaptureReplay` — and this one does not. `VK_KHR_ray_tracing_pipeline`
+            // and `VK_EXT_descriptor_buffer` are carried now; docs/design.md §0.24.
             // **The union-of-handles class used to be excluded here, and it is
             // gone** — `VK_KHR_acceleration_structure`,
             // `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap`,
             // 52 commands with everything they drag in through `depends=`, which
-            // was the single largest block of uncarried API (design.md §0.21).
+            // was the single largest block of uncarried API (docs/design.md §0.21).
             //
             // What it said, and what was wrong with it: that
             // `VkAccelerationStructureGeometryDataKHR` and its three siblings
@@ -968,7 +972,49 @@ pub mod profiles {
     /// Commands excluded from every profile, with the reason each is out.
     fn excluded_commands() -> Vec<String> {
         [
-            // design.md §10: presentation is outside the protocol. The ICD
+            // **The push-descriptor template family: a wild pointer, and the
+            // reason it came back.**
+            //
+            // `pData` points at application memory laid out by the
+            // `VkDescriptorUpdateTemplate` the call also names, and
+            // `sv_codegen::exceptions` gives it `VoidPolicy::ArenaOffset` — the
+            // generated lowering therefore emits `(p_data) as usize as u64`,
+            // handing the *application's own pointer* to the GPU side as an
+            // arena offset. That is only safe when something app-side expands
+            // the data first. For `vkUpdateDescriptorSetWithTemplate` something
+            // does: `sv_icd::icd` overrides the generated method and turns it
+            // into `VkWriteDescriptorSet`s before anything crosses (§0.4 item
+            // 10). For the *push* variants nothing does, so the raw pointer
+            // crosses and the GPU side dereferences it against its own arena
+            // mapping. The CTS agent measured that as a segfault in
+            // `sv-gpu-server`.
+            //
+            // §0.20 item 4 excluded `VK_KHR_push_descriptor` from `zink` for
+            // exactly this and wrote down that a mechanical widening would
+            // restore it. The widening was §0.19's, it became the default in the
+            // same commit, and the prediction came true — with Firefox crashing
+            // instantly as the symptom.
+            //
+            // **Excluded by command and not only by extension**, because
+            // `vkCmdPushDescriptorSetWithTemplate` is required by *two* things:
+            // `VK_KHR_push_descriptor` and core 1.4. Dropping the extension
+            // alone leaves the core command carried and the pointer still wild.
+            //
+            // **The mitigation is gone as of §0.22: the expansion exists.**
+            // `sv_icd::icd::cmd_push_descriptor_set_with_template` reads `pData`
+            // through the template and emits `VkWriteDescriptorSet`s into
+            // `vkCmdPushDescriptorSet`, exactly as the update path does; the
+            // pointer never crosses. Both commands and the extension are carried
+            // again, and the three names are in
+            // `sv_codegen::exceptions::ICD_EXPANDS_ARENA_POINTER` so that
+            // `LOWERING_INCOMPLETE` knows why it is not complaining — which is a
+            // different thing from it having nothing to find.
+            //
+            // The paragraph above is left standing because the sequence it
+            // records is the argument for the guard: a prediction written down
+            // in §0.20 item 4, a mechanical widening that ignored it, and a
+            // segfault. The list was the mitigation; the guard is the mechanism.
+            // docs/design.md §10: presentation is outside the protocol. The ICD
             // implements the swapchain; it is never forwarded.
             "vkCreateSwapchainKHR",
             "vkDestroySwapchainKHR",
@@ -1000,7 +1046,7 @@ pub mod profiles {
             "vkGetPhysicalDeviceSurfaceFormatsKHR",
             "vkGetPhysicalDeviceSurfacePresentModesKHR",
             // Surface creation, likewise. **The ICD implements these rather
-            // than declining them**, which is a change from design.md §8's "we
+            // than declining them**, which is a change from docs/design.md §8's "we
             // opt out of interface-3 surface creation by not exposing
             // `vkCreateXXXSurfaceKHR`": an ICD that does not export
             // `vkGetPhysicalDeviceXcbPresentationSupportKHR` makes the loader
@@ -1034,7 +1080,7 @@ pub mod profiles {
             "vkGetPhysicalDeviceXcbPresentationSupportKHR",
             "vkGetPhysicalDeviceWaylandPresentationSupportKHR",
             // The debug-utils messenger lives on the app side; its GPU-side
-            // half is the reverse ring, which is hand-written (design.md §4.6,
+            // half is the reverse ring, which is hand-written (docs/design.md §4.6,
             // §6.3), not a forwarded command.
             "vkCreateDebugUtilsMessengerEXT",
             "vkDestroyDebugUtilsMessengerEXT",
@@ -1053,23 +1099,23 @@ pub mod profiles {
     /// Types excluded from every profile, with the reason each is out.
     fn excluded_types() -> Vec<String> {
         [
-            // design.md §7.4: not serialisable. Stripped above the protocol, as
+            // docs/design.md §7.4: not serialisable. Stripped above the protocol, as
             // Mesa's own Venus driver does.
             "VkAllocationCallbacks",
             // Ray tracing is out of scope, and this struct is bitfields the
-            // registry cannot describe (design.md §7.4).
+            // registry cannot describe (docs/design.md §7.4).
             "VkAccelerationStructureInstanceKHR",
             // Carries `PFN_vkDebugUtilsMessengerCallbackEXT`, a function
             // pointer, which cannot cross an address-space boundary. The app
             // side registers the messenger locally and the GPU side forwards
-            // messages over the reverse ring instead (design.md §4.6). Excluded
+            // messages over the reverse ring instead (docs/design.md §4.6). Excluded
             // here rather than left to fail in the generator so that the reason
             // is next to the decision.
             "VkDebugUtilsMessengerCreateInfoEXT",
             // The two X11 surface-creation structs. Each holds a pointer into a
             // library this project does not link — `xcb_connection_t*`,
             // `Display*` — so they are not serialisable in exactly the sense
-            // design.md §6.1 means, and they are not on the C surface either,
+            // docs/design.md §6.1 means, and they are not on the C surface either,
             // because the two commands that take them are the ones §8 declines
             // to export. What the ICD is handed instead is the loader's
             // `VkIcdSurfaceXcb`/`VkIcdSurfaceXlib`, a `vk_icd.h` struct with the
@@ -1081,7 +1127,7 @@ pub mod profiles {
             // `libwayland-client`, which this project also does not link — and
             // unlike the X11 pair, these two pointers are **used**: `sv_icd`'s
             // Wayland target attaches a `wl_shm` buffer to that very surface on
-            // that very connection (design.md §10, `sv_icd::present::wayland`).
+            // that very connection (docs/design.md §10, `sv_icd::present::wayland`).
             // Used through `dlopen`, though, so the crate still links nothing;
             // what the struct has to be here is the loader's
             // `VkIcdSurfaceWayland`, which has the same two fields.
