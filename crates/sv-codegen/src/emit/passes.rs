@@ -30,12 +30,24 @@ pub fn emit(plan: &Plan) -> TokenStream {
         .structs
         .iter()
         .filter(|s| s.has_handles && s.is_union)
-        .map(emit_handle_map_union);
+        .map(|s| emit_handle_map_union(plan, s));
     let transform_walkers = plan
         .structs
         .iter()
         .filter(|s| s.has_device_memory && !s.is_union)
         .map(|s| emit_transform(plan, s));
+    // The same fold for a union carrying a `(memory, offset)` pair. Nothing in
+    // any profile reaches one today, and that is exactly why it is emitted: the
+    // filter above used to be the only thing standing between here and a call to
+    // a `transform_*` function that was never generated, which is a compile
+    // error in the *generated* crate with no explanation attached to it. The
+    // handle side of this pair spent four extensions' worth of API behind a
+    // `compile_error!` for the same reason (design.md §0.21).
+    let transform_unions = plan
+        .structs
+        .iter()
+        .filter(|s| s.has_device_memory && s.is_union)
+        .map(|s| emit_transform_union(plan, s));
     let chain = emit_chain_walkers(plan);
 
     quote! {
@@ -43,6 +55,7 @@ pub fn emit(plan: &Plan) -> TokenStream {
         #(#handle_walkers)*
         #(#handle_unions)*
         #(#transform_walkers)*
+        #(#transform_unions)*
         #chain
     }
 }
@@ -121,21 +134,81 @@ fn emit_handle_map(plan: &Plan, s: &StructPlan) -> TokenStream {
     }
 }
 
-fn emit_handle_map_union(s: &StructPlan) -> TokenStream {
-    // A union whose members contain handles is not a shape the profiles reach;
-    // emitting a walker that silently did nothing would be worse than an
-    // explicit refusal, so this is a compile error in the generated crate if it
-    // ever becomes reachable.
+/// The handle walk for a union, over the tag the wire already carries.
+///
+/// # This used to be a `compile_error!`, and the refusal outlived its reason
+///
+/// It read: *"a union containing handles reached the handle_map pass; the
+/// selector rules of design.md §7.4 must be applied before this can be
+/// generated"*, and it kept `VK_KHR_acceleration_structure`,
+/// `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap` — 53 commands,
+/// the largest single block of uncarried API — out of every profile.
+///
+/// **The selector rules are not needed here.** They are needed one boundary
+/// away, in `sv-icd-entry`'s C → wire lowering, where a C union genuinely
+/// carries no tag and something has to decide which member is live. By the time
+/// a value reaches *this* pass it is already a Rust `enum`, and
+/// `exceptions`'s own header says why that settles it: "A Rust `enum` *is* the
+/// tag, so an encoded union always knows which member it holds and no default is
+/// ever guessed." The walk is a `match`.
+///
+/// So the refusal was correct about the *project* and wrong about *this
+/// function*: it named a real gap and then placed the barrier at the wrong pass,
+/// where it blocked three extensions that had nothing else missing. The barrier
+/// belongs where the ambiguity is, and it is now there —
+/// [`super::icd_entry`]'s lowering refuses a union it cannot select, by name.
+fn emit_handle_map_union(plan: &Plan, s: &StructPlan) -> TokenStream {
     let ty = naming::type_ident(&s.name);
     let id = handle_map_fn(&s.name);
+    let arms = s.fields.iter().map(|f| {
+        let v = naming::union_variant(&f.name);
+        match handle_walk(plan, &f.shape, &quote!((*inner))) {
+            // An arm with no handle in it still needs a match arm, and binding
+            // nothing is what says "this one is bytes".
+            None => quote!(#ty::#v(_) => {}),
+            Some(stmt) => quote!(#ty::#v(inner) => { #stmt }),
+        }
+    });
+    let doc = format!(
+        "Replace every object id inside a `{}` with its driver handle.\n\n\
+         Only the live arm is walked, because the wire form of a union is a \
+         member index followed by that member — so unlike the C type, this value \
+         knows which arm it is.",
+        s.name
+    );
     quote! {
-        #[allow(unused)]
-        pub fn #id(_v: &mut #ty, _m: &mut dyn HandleMapper) -> sv_wire::Result<()> {
-            compile_error!(
-                "a union containing handles reached the handle_map pass; the \
-                 selector rules of design.md §7.4 must be applied before this \
-                 can be generated"
-            );
+        #[doc = #doc]
+        pub fn #id(v: &mut #ty, m: &mut dyn HandleMapper) -> sv_wire::Result<()> {
+            match v { #(#arms)* }
+            let _ = (&v, &m);
+            Ok(())
+        }
+    }
+}
+
+/// [`emit_handle_map_union`], for the `(memory, offset)` rewrite.
+fn emit_transform_union(plan: &Plan, s: &StructPlan) -> TokenStream {
+    let ty = naming::type_ident(&s.name);
+    let id = transform_fn(&s.name);
+    let arms = s.fields.iter().map(|f| {
+        let v = naming::union_variant(&f.name);
+        match transform_walk(plan, &f.shape, &quote!((*inner))) {
+            None => quote!(#ty::#v(_) => {}),
+            Some(stmt) => quote!(#ty::#v(inner) => { #stmt }),
+        }
+    });
+    let doc = format!(
+        "Rewrite every `(memory, offset)` pair inside a `{}` from app-side \
+         allocation coordinates to GPU-side slab coordinates (design.md §5.3), \
+         in the live arm only.",
+        s.name
+    );
+    quote! {
+        #[doc = #doc]
+        pub fn #id(v: &mut #ty, m: &mut dyn MemoryTransform) -> sv_wire::Result<()> {
+            match v { #(#arms)* }
+            let _ = (&v, &m);
+            Ok(())
         }
     }
 }

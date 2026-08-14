@@ -673,6 +673,11 @@ fn count_expr(len: &ArrayLen, member_access: &dyn Fn(&str) -> TokenStream) -> Op
             let a = member_access(sibling);
             quote!((((#a) as usize) + (#add as usize)) / (#divisor as usize))
         }
+        // The bound is arithmetic the generator already did: nothing to read.
+        ArrayLen::Constant(n) => {
+            let n = *n as usize;
+            quote!(#n)
+        }
         // A path length (`pAllocateInfo->commandBufferCount`) is only ever a
         // command parameter, and the parameter accessor handles it.
         ArrayLen::Path { .. } | ArrayLen::Unresolved(_) => return None,
@@ -830,10 +835,46 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
             if !cx.shared.contains(n) {
                 return Err(format!("{n} has no wire counterpart"));
             }
+            // **A union whose arm changes what the bytes mean cannot be reached
+            // from here**, because here is the generic path and it has no
+            // sibling to read. `emit_lower_struct` handles the selector case, so
+            // arriving in this arm means the union is a member of something that
+            // does not annotate it — a registry gap — and the honest answer is
+            // to refuse the whole command by name rather than take member [0]
+            // and hope. See `union_needs_selector`.
+            if union_needs_selector(cx, n) {
+                return Err(format!(
+                    "{n} is a union carrying a handle or a (memory, offset) pair, so which arm \
+                     is live decides what crosses — and it is being lowered somewhere with no \
+                     `selector=` sibling in scope. gfxstream's member-[0] rule is not safe here \
+                     (design.md §0.21)"
+                ));
+            }
             let f = cx.lower_fn(n);
             quote!(#f(&(#access))?)
         }
     })
+}
+
+/// Whether reading the wrong arm of this union would be a *semantic* error
+/// rather than a renaming.
+///
+/// gfxstream's rule — always marshal member [0] — is safe exactly when every arm
+/// is plain bytes of the same extent, because the peer then reconstructs the
+/// bytes the application wrote and only the *name* is lost. `VkClearValue` and
+/// `VkPerformanceCounterResultKHR` are that shape and stay on the fast path.
+///
+/// It stops being safe the moment an arm holds something the boundary has to
+/// *translate*: an object id that the handle-map pass must turn into a driver
+/// handle, or a `(memory, offset)` pair the transform pass must rebase. Reading
+/// the wrong arm then does not mis-name the bytes, it hands the driver a
+/// descriptor built from a number that was never a handle — design.md §0.16
+/// item 2's hazard, which cost this project a GPU hang the first time it was met
+/// one level in.
+fn union_needs_selector(cx: &Ctx<'_>, name: &str) -> bool {
+    cx.wire
+        .struct_plan(name)
+        .is_some_and(|s| s.is_union && (s.has_handles || s.has_device_memory))
 }
 
 /// `lower_<Struct>(p: *const abi::Struct) -> Result<sv_proto::Struct>`.
@@ -862,6 +903,87 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         }),
     );
 
+    if s.is_union && union_needs_selector(cx, name) {
+        // **The selector-driven form, and it takes the discriminator as a
+        // parameter so that it cannot be called without one.**
+        //
+        // The registry states both halves of this and nothing read either: the
+        // enclosing struct's member carries `selector="geometryType"`, and each
+        // arm of the union carries `selection="VK_GEOMETRY_TYPE_TRIANGLES_KHR"`
+        // — ten annotations across the whole of `vk.xml`, parsed into
+        // `Member::selector` and `Member::selection` since the registry crate
+        // was written. `exceptions`' header concluded that unions needed no
+        // exception table because "a Rust `enum` *is* the tag", which is true of
+        // the wire and **stops at the C ABI**, where there is no tag and this
+        // function is the thing that has to invent one.
+        //
+        // Making the selector an argument rather than something read from an
+        // enclosing pointer is what makes the property structural: there is no
+        // way to emit a call to this function that has not gone and found the
+        // sibling. A caller that cannot is a compile error in the generator, not
+        // a wrong answer at run time.
+        let mut arms = Vec::new();
+        for field in &s.fields {
+            if field.selection.is_empty() {
+                return Err(format!(
+                    "{name}.{}: a union arm carrying a handle or memory pair with no \
+                     `selection=` in the registry — there is nothing to select it by, and \
+                     guessing is what design.md §0.21 exists to stop",
+                    field.name
+                ));
+            }
+            let variant = naming::union_variant(&field.name);
+            let abi = abi_members
+                .get(field.name.as_str())
+                .ok_or_else(|| format!("{name}.{}: no C member", field.name))?;
+            let access = member_access(&field.name);
+            let e = lower_expr(cx, &field.shape, abi, &access, &count_access, name)?;
+            // Resolved to numbers here rather than emitted as associated
+            // constants, because the C-layer enums are newtypes and a `match`
+            // pattern over an associated const depends on structural-equality
+            // rules the generator should not have an opinion about.
+            let mut pats = Vec::new();
+            for c in &field.selection {
+                let v = cx
+                    .wire
+                    .enums
+                    .iter()
+                    .find_map(|e| e.values.iter().find(|(n, _)| n == c).map(|(_, v)| *v))
+                    .ok_or_else(|| {
+                        format!("{name}.{}: selection={c} is not a value of any enum in this profile", field.name)
+                    })?;
+                let v = v as i32;
+                pats.push(quote!(#v));
+            }
+            arms.push(quote! {
+                #(#pats)|* => sv_proto::#ty::#variant(#e),
+            });
+        }
+        let cname = name.to_string();
+        let doc = format!(
+            "Lower a C `{name}`, choosing the arm its `selector=` sibling names.\n\n\
+             The discriminator is a parameter rather than something read out of \
+             an enclosing pointer, so a caller that has not found the sibling \
+             cannot compile. An unrecognised value refuses the call by name \
+             instead of falling back to a member (design.md §0.21)."
+        );
+        return Ok(quote! {
+            #[doc = #doc]
+            #[allow(unused_unsafe, unused_variables)]
+            pub unsafe fn #f(
+                p: *const #ty,
+                __sel: i32,
+            ) -> crate::LowerResult<sv_proto::#ty> {
+                unsafe {
+                    Ok(match __sel {
+                        #(#arms)*
+                        _ => return Err(crate::LowerError::Shape(#cname)),
+                    })
+                }
+            }
+        });
+    }
+
     if s.is_union {
         // design.md §7.4: a C union carries no tag and only ten `selector=`
         // annotations exist in the whole registry. gfxstream always marshals
@@ -870,6 +992,11 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         // generator refuses a union whose member [0] is not the one every other
         // member fits inside, so the bytes an application wrote are never
         // truncated, only reinterpreted.
+        //
+        // **It is reached only for a union that is plain bytes**
+        // (`union_needs_selector` above): every arm the same storage, nothing
+        // the boundary has to translate, so reinterpreting loses the name and
+        // nothing else.
         let first = s
             .fields
             .first()
@@ -923,7 +1050,25 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         let access = member_access(&field.name);
         let e = match validity {
             PartialValidity::Skip => wire_default(&field.shape),
-            _ => lower_expr(cx, &field.shape, abi, &access, &count_access, name)?,
+            // **The `selector=` call site.** This is the only place in the
+            // generator that has both the union and the sibling that decides
+            // it, so it is the only place that can call the selector-driven
+            // lowering — which is why that function takes the discriminator as
+            // an argument rather than reaching for it.
+            _ => match (&field.selector, &field.shape) {
+                (Some(sel), Shape::Scalar(Scalar::Union(u))) if union_needs_selector(cx, u) => {
+                    if !s.fields.iter().any(|f| &f.name == sel) {
+                        return Err(format!(
+                            "{name}.{}: selector={sel} names no sibling of this struct",
+                            field.name
+                        ));
+                    }
+                    let f = cx.lower_fn(u);
+                    let sib = member_access(sel);
+                    quote!(#f(&(#access), (#sib).0 as i32)?)
+                }
+                _ => lower_expr(cx, &field.shape, abi, &access, &count_access, name)?,
+            },
         };
         inits.push(quote!(#id: #e,));
     }
