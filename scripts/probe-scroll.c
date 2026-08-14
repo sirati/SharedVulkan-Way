@@ -28,12 +28,55 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Why this enumerates instead of calling FindWindowW.
+ *
+ * `FindWindowW(cls, NULL)` returns the FIRST window of the class in Z-order,
+ * and the compositor owns more than one: a toplevel it shows, and hidden
+ * helper/owner windows of the same class. The probe took the first, found it
+ * hidden, and waited out its whole timeout reporting "exists but never became
+ * visible" while the real toplevel was up with 50 frames blitted into it. That
+ * sent one run chasing a Windows session boundary that was never the problem.
+ *
+ * So: walk every top-level window, match the class, and take the first that is
+ * actually VISIBLE and has a non-empty client rect. `found_any` is kept so the
+ * failure can still distinguish "no window of this class at all" from "they are
+ * all hidden", which is the distinction that made this diagnosable. */
+struct find_ctx {
+	const wchar_t *cls;
+	HWND hit;
+	int found_any;
+};
+
+static BOOL CALLBACK find_cb(HWND h, LPARAM lp)
+{
+	struct find_ctx *c = (struct find_ctx *)lp;
+	wchar_t buf[128];
+
+	if (!GetClassNameW(h, buf, 128) || wcscmp(buf, c->cls) != 0)
+		return TRUE;
+	c->found_any = 1;
+	if (IsWindowVisible(h)) {
+		RECT r;
+		if (GetClientRect(h, &r) && r.right > 1 && r.bottom > 1) {
+			c->hit = h;
+			return FALSE;	/* stop: this is the one */
+		}
+	}
+	return TRUE;
+}
+
+static int g_found_hidden;	/* the class exists here; every one was hidden */
+
 static HWND find_target(const wchar_t *cls, int seconds)
 {
+	g_found_hidden = 0;
 	for (int i = 0; i < seconds * 10; i++) {
-		HWND h = FindWindowW(cls, NULL);
-		if (h && IsWindowVisible(h))
-			return h;
+		struct find_ctx c = { cls, NULL, 0 };
+		EnumWindows(find_cb, (LPARAM)&c);
+		if (c.hit)
+			return c.hit;
+		if (c.found_any)
+			g_found_hidden = 1;
 		Sleep(100);
 	}
 	return NULL;
@@ -123,8 +166,10 @@ int main(int argc, char **argv)
 
 	HWND target = find_target(cls, wait);
 	if (!target) {
-		printf("probe-scroll: no visible window of class '%ls' after %d s\n",
-		       cls, wait);
+		if (g_found_hidden)
+			printf("probe-scroll: a window of class '%ls' EXISTS in this desktop but never became visible after %d s -- the compositor made it and did not show it, or it is on a station with no visible desktop\n", cls, wait);
+		else
+			printf("probe-scroll: NO window of class '%ls' exists in this desktop at all after %d s -- wrong session/window station, or the compositor never created one\n", cls, wait);
 		return 1;
 	}
 	RECT rc;
