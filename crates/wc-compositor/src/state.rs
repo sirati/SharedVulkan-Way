@@ -2040,8 +2040,8 @@ impl State {
     /// Tell the platform to stop pumping. Sending this rather than dropping the
     /// channel is what makes shutdown ordered: the UI thread destroys its own
     /// windows, from the thread that owns them, before it returns.
-    pub fn quit(&self) {
-        self.ui.send(ToUi::Quit);
+    pub fn quit(&self, clients: u32) {
+        self.ui.send(ToUi::Quit { clients });
     }
 
     fn on_resized(&mut self, id: WindowId, width: i32, height: i32) {
