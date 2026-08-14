@@ -1,4 +1,4 @@
-use wayland_backend::os::OwnedFd; // WAYCOMPOSE FORK
+use wayland_backend::os::ProtoFd; // WAYCOMPOSE FORK
 use std::sync::Arc;
 
 use wayland_backend::server::{
@@ -73,7 +73,7 @@ impl<D> ObjectData<D> for ProtocolErrorData {
         _handle: &Handle,
         _data: &mut D,
         _client_id: ClientId,
-        _msg: wayland_backend::protocol::Message<ObjectId, OwnedFd>,
+        _msg: wayland_backend::protocol::Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         None
     }

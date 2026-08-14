@@ -4,7 +4,16 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Result as IoResult};
 
 // WAYCOMPOSE FORK: the fd types and the stream type now come from `crate::os`.
-use crate::os::{errors, OwnedFd, RawFd, WlStream};
+//
+// `OwnedFd`/`RawFd` here are this file's own business — the `SCM_RIGHTS` queues
+// and the `AsRawFd`/`AsFd` impls on `Socket` and `BufferedSocket`. `ProtoFd` and
+// `RawProtoFd` appear only in the `Message` signatures this file forwards to
+// `wire.rs`, and are the protocol's business. See `crate::os`.
+//
+// `RawFd` is in the Unix group below rather than here, and the reason is the
+// separation itself: once the `Message` signatures stopped saying `RawFd`, its
+// only remaining readers were the two `AsRawFd` impls, which are Unix-only.
+use crate::os::{errors, OwnedFd, ProtoFd, RawProtoFd, WlStream};
 
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
@@ -13,7 +22,7 @@ use std::mem::MaybeUninit;
 #[cfg(unix)]
 use std::slice;
 #[cfg(unix)]
-use crate::os::{AsFd, AsRawFd, BorrowedFd};
+use crate::os::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
 #[cfg(unix)]
 use rustix::io::retry_on_intr;
@@ -311,7 +320,7 @@ impl BufferedSocket {
     //
     // if false is returned, it means there is not enough space
     // in the buffer
-    fn attempt_write_message(&mut self, msg: &Message<u32, RawFd>) -> IoResult<bool> {
+    fn attempt_write_message(&mut self, msg: &Message<u32, RawProtoFd>) -> IoResult<bool> {
         let fds_len = self.out_fds.len();
         loop {
             match write_to_buffers(msg, self.out_data.get_writable_storage(), &mut self.out_fds) {
@@ -339,7 +348,7 @@ impl BufferedSocket {
     ///
     /// If the message is too big to fit in the buffer, the error `Error::Sys(E2BIG)`
     /// will be returned.
-    pub fn write_message(&mut self, msg: &Message<u32, RawFd>) -> IoResult<()> {
+    pub fn write_message(&mut self, msg: &Message<u32, RawProtoFd>) -> IoResult<()> {
         if !self.attempt_write_message(msg)? {
             // the attempt failed, there is not enough space in the buffer
             // we need to flush it
@@ -384,7 +393,7 @@ impl BufferedSocket {
     pub fn read_one_message<F>(
         &mut self,
         mut signature: F,
-    ) -> Result<Message<u32, OwnedFd>, MessageParseError>
+    ) -> Result<Message<u32, ProtoFd>, MessageParseError>
     where
         F: FnMut(u32, u16) -> Option<&'static [ArgumentType]>,
     {

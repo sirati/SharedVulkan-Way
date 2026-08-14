@@ -54,7 +54,9 @@ fn generate_objects_for(interface: &Interface) -> TokenStream {
         pub mod #mod_name {
             use std::sync::Arc;
             // WAYCOMPOSE FORK: was `std::os::unix::io::OwnedFd`. See vendor/PATCHES.md.
-            use wayland_backend::os::OwnedFd;
+            // Renamed to `ProtoFd` because an `h` argument is the protocol's fd
+            // rather than the socket's; docs/waycompose-design.md §76.
+            use wayland_backend::os::ProtoFd;
 
             use super::wayland_client::{
                 backend::{
@@ -165,11 +167,11 @@ fn generate_objects_for(interface: &Interface) -> TokenStream {
                     #iface_name { id: ObjectId::null(), data: None, version: 0, backend }
                 }
 
-                fn parse_event(conn: &Connection, msg: Message<ObjectId, OwnedFd>) -> Result<(Self, Self::Event), DispatchError> {
+                fn parse_event(conn: &Connection, msg: Message<ObjectId, ProtoFd>) -> Result<(Self, Self::Event), DispatchError> {
                     #parse_body
                 }
 
-                fn write_request<'a>(&self, conn: &Connection, msg: Self::Request<'a>) -> Result<(Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, Option<(&'static Interface, u32)>), InvalidId> {
+                fn write_request<'a>(&self, conn: &Connection, msg: Self::Request<'a>) -> Result<(Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, Option<(&'static Interface, u32)>), InvalidId> {
                     #write_body
                 }
             }
@@ -213,7 +215,7 @@ fn gen_methods(interface: &Interface) -> TokenStream {
                     Type::Fixed => quote! { f64 },
                     Type::String => if arg.allow_null { quote!{ Option<String> } } else { quote!{ String } },
                     Type::Array => if arg.allow_null { quote!{ Option<Vec<u8>> } } else { quote!{ Vec<u8> } },
-                    Type::Fd => quote! { ::wayland_backend::os::BorrowedFd<'_> },
+                    Type::Fd => quote! { ::wayland_backend::os::BorrowedProtoFd<'_> },
                     Type::Object => {
                         let iface = arg.interface.as_ref().unwrap();
                         let iface_mod = Ident::new(iface, Span::call_site());

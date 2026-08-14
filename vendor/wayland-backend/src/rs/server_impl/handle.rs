@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd, stream and poll-handle types now come from `crate::os`.
-use crate::os::{PollHandle, RawFd, WlStream as UnixStream};
+use crate::os::{PollHandle, RawProtoFd, WlStream as UnixStream};
 
 use std::{
     ffi::CString,
@@ -217,7 +217,7 @@ impl InnerHandle {
         }
     }
 
-    pub fn send_event(&self, msg: Message<ObjectId, RawFd>) -> Result<(), InvalidId> {
+    pub fn send_event(&self, msg: Message<ObjectId, RawProtoFd>) -> Result<(), InvalidId> {
         self.state.lock().unwrap().send_event(msg)
     }
 
@@ -354,7 +354,7 @@ pub(crate) trait ErasedState: downcast_rs::Downcast {
         &self,
         id: InnerObjectId,
     ) -> Result<Arc<dyn std::any::Any + Send + Sync>, InvalidId>;
-    fn send_event(&mut self, msg: Message<ObjectId, RawFd>) -> Result<(), InvalidId>;
+    fn send_event(&mut self, msg: Message<ObjectId, RawProtoFd>) -> Result<(), InvalidId>;
     fn post_error(&mut self, object_id: InnerObjectId, error_code: u32, message: CString);
     fn kill_client(&mut self, client_id: InnerClientId, reason: DisconnectReason);
     fn global_info(&self, id: InnerGlobalId) -> Result<GlobalInfo, InvalidId>;
@@ -510,7 +510,7 @@ impl<D> ErasedState for State<D> {
             .map(|arc| arc.into_any_arc())
     }
 
-    fn send_event(&mut self, msg: Message<ObjectId, RawFd>) -> Result<(), InvalidId> {
+    fn send_event(&mut self, msg: Message<ObjectId, RawProtoFd>) -> Result<(), InvalidId> {
         self.clients
             .get_client_mut(msg.sender_id.id.client_id.clone())?
             .send_event(msg, Some(&mut self.pending_destructors))

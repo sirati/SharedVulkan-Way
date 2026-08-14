@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd and stream types now come from `crate::os`.
-use crate::os::{OwnedFd, RawFd, WlStream as UnixStream};
+use crate::os::{ProtoFd, RawProtoFd, WlStream as UnixStream};
 #[cfg(unix)]
 use crate::os::BorrowedFd;
 
@@ -29,7 +29,7 @@ pub trait ObjectData: downcast_rs::DowncastSync {
     fn event(
         self: Arc<Self>,
         backend: &Backend,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData>>;
 
     /// Notification that the object has been destroyed and is no longer active
@@ -248,7 +248,7 @@ impl Backend {
     ///   is `wl_registry.bind`), the `child_spec` must be provided.
     pub fn send_request(
         &self,
-        msg: Message<ObjectId, RawFd>,
+        msg: Message<ObjectId, RawProtoFd>,
         data: Option<Arc<dyn ObjectData>>,
         child_spec: Option<(&'static Interface, u32)>,
     ) -> Result<ObjectId, InvalidId> {
@@ -367,7 +367,7 @@ impl ObjectData for DumbObjectData {
     fn event(
         self: Arc<Self>,
         _handle: &Backend,
-        _msg: Message<ObjectId, OwnedFd>,
+        _msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData>> {
         unreachable!()
     }
@@ -385,7 +385,7 @@ impl ObjectData for UninitObjectData {
     fn event(
         self: Arc<Self>,
         _handle: &Backend,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData>> {
         panic!("Received a message on an uninitialized object: {msg:?}");
     }

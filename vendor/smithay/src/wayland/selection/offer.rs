@@ -1,4 +1,4 @@
-use crate::utils::os::OwnedFd;
+use crate::utils::os::ProtoFd;
 use std::sync::Arc;
 
 use tracing::debug;
@@ -128,11 +128,11 @@ where
         dh: &Handle,
         handle: &mut D,
         _: ClientId,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dh = DisplayHandle::from(dh.clone());
 
-        // NOTE: we can't parse message more than once, since it expects the `OwnedFd` which
+        // NOTE: we can't parse message more than once, since it expects the `ProtoFd` which
         // we can't clone. To achieve that, we use RTTI passed along the selection data, to
         // make the parsing work only once.
         let (mime_type, fd, object_name) = match self.device_kind {

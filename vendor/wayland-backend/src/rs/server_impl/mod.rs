@@ -1,6 +1,6 @@
 //! Server-side rust implementation of a Wayland protocol backend
 
-use crate::os::OwnedFd; // WAYCOMPOSE FORK
+use crate::os::ProtoFd; // WAYCOMPOSE FORK
 use std::{fmt, sync::Arc};
 
 use crate::protocol::{same_interface, Interface, Message};
@@ -121,7 +121,7 @@ impl<D> ObjectData<D> for UninitObjectData {
         _: &Handle,
         _: &mut D,
         _: ClientId,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         panic!("Received a message on an uninitialized object: {msg:?}");
     }

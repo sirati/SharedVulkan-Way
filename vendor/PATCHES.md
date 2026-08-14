@@ -48,6 +48,22 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
   raw/owned distinction collapses on Windows because a `Handle` is refcounted
   and already carries its own lifetime; upstream's `try_clone_to_owned()`
   becomes `.clone()`, which is the honest analogue of `dup()`.
+* `ProtoFd`, `RawProtoFd`, `BorrowedProtoFd<'a>` — the same three types again,
+  under the names the **protocol** uses. Unconditional aliases of the three
+  above, and today that is all they are. They exist because on Unix the socket
+  layer and an `h` argument were both `OwnedFd`, so the payload of an
+  `Argument`/`Message` could not be changed without dragging `SCM_RIGHTS` with
+  it; on Windows they were always distinct types and nothing had to say so.
+  `docs/waycompose-design.md` §76 for the measurement, §72.3 for what the
+  separation is for.
+* `WireFd` — the type `ProtoFd` is going to become: an `h` argument that is
+  **either** a name the peer can open (`Named`, a `wc_handle::Handle`) **or** a
+  descriptor that is already open (`Open`, Unix only — `SCM_RIGHTS` has no
+  Windows equivalent, so that arm would be uninhabited there). The unnamed form
+  is deliberately *not* a sixth `wc_handle::Descriptor` variant: `Descriptor` is
+  a wire format meaning "a name a peer can open", and an `SCM_RIGHTS` fd has no
+  name. Tested but not yet constructed — `rs/wire.rs` still chooses by `cfg`.
+  `docs/waycompose-design.md` §77.
 * `WlStream` — the socket type, `wc_transport::Stream` on both platforms.
 * `PollHandle` — an `OwnedFd` (epoll/kqueue) on Unix, a `polling::Poller`
   (wepoll) on Windows.
@@ -69,7 +85,7 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | `rustix` and `wayland-sys` moved behind `[target.'cfg(unix)']`. `wc-transport` added unconditionally, `wc-handle` and `polling` for Windows. `libwayland_*` features re-declared as inert. `rs_sys_impls` test target removed. |
+| `Cargo.toml` | `rustix` and `wayland-sys` moved behind `[target.'cfg(unix)']`. `wc-transport` and `wc-handle` added unconditionally (the latter moved out of `cfg(windows)` by `docs/waycompose-design.md` §77, because `os::WireFd::Named` names a `wc_handle::Handle` on Unix too), `polling` for Windows. `libwayland_*` features re-declared as inert. `rs_sys_impls` test target removed. |
 | `src/lib.rs` | `mod sys` gated on `unix` **and** on the system features rather than on `test`; `mod test` likewise. `pub use rs::client/server` made unconditional on Windows. |
 | `src/protocol.rs` | `Fd: AsRawFd` → `Fd: FdRepr` (5 bounds); the two bodies that called `as_raw_fd()`; `wayland_sys::common` → `crate::os::c_abi`. |
 | `src/debug.rs` | same bound substitution. |
@@ -191,7 +207,8 @@ only its *output* matters. Five emission sites named `std::os::unix::io`:
 * `src/server_gen.rs` — the same three, for `write_event`.
 * `src/common.rs` — the borrowed-fd field type.
 
-All now emit `wayland_backend::os::{OwnedFd, BorrowedFd}`. The scanner already
+All now emit `wayland_backend::os::{ProtoFd, BorrowedProtoFd}` — the protocol's
+fd rather than the socket's, `docs/waycompose-design.md` §76. The scanner already
 emitted `wayland_backend::protocol::*` paths, so requiring `wayland-backend` in
 scope is a pre-existing constraint and not a new one.
 
@@ -378,7 +395,10 @@ Not "does not port yet" — cannot exist elsewhere:
 
 `utils/os.rs` (new, 72 lines, 12 of them code). On Unix it re-exports `std`; on
 Windows it re-exports `wayland_backend::os`, where `OwnedFd` is a
-`wc_handle::Handle` — a *named* kernel object.
+`wc_handle::Handle` — a *named* kernel object. It also re-exports `ProtoFd` on
+both platforms, for the three `ObjectData::request` signatures in
+`wayland/selection/` whose `Message<ObjectId, _>` is the backend's to name
+(`docs/waycompose-design.md` §76).
 
 `docs/design.md` §5.3 predicted this would be the piece upstream will not take,
 and that is still the assessment: it presupposes this project's transport

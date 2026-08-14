@@ -11987,11 +11987,26 @@ both messages carry `sv-wire`'s `CommandHeader`/`ReplyHeader` rather than a
 private framing. A constraint discovered rather than chosen, and a good one: a
 growth request is now a well-formed command on the same ring as everything else.
 
-The geometry is the smallest that works with one exception, and the exception is
-measured. `ring_data_bytes` is 64 KiB because the reply carries the new region's
-**frame list**, and a test holds the *worst* case — one run per page of a 16 MiB
-region — to fitting in one packet. Measured fragmentation of `VirtualLock`ed
-4 KiB pages is 1471 runs per 64 MiB, about a quarter of that. `ring_slot_count`
+The geometry is the smallest that works with one exception: `ring_data_bytes` is
+64 KiB because the reply carries the new region's **frame list**.
+
+> **[CORRECTED — §61.4.]** This paragraph used to justify the 64 KiB by a
+> *worst* case of "one run per page of a 16 MiB region", and reassure with
+> "measured fragmentation … is 1471 runs per 64 MiB, about a quarter of that".
+> **Both halves were wrong and the reassurance was the worse of them.**
+> `Reply::encode` writes one `u64` per **page**, not a run-length encoded pair,
+> so fragmentation does not enter into it at all — the 1471-runs figure is the
+> *locator's* coalesced file runs, a different number in a different program.
+> The reply's size is a function of the region's page count alone: a packet
+> holds 65,504 bytes, 48 of them fixed, so **8,182 pages ≈ 31.96 MiB**. Every
+> region of 32 MiB or more overflows, always. `GROW_STEP` is 16 MiB and the
+> series is 16, 32, 64 — so **the second growth of any session overflows, every
+> time**, which is exactly what §61.4 observed and misattributed to bad luck.
+> The behaviour is fixed (§61.4a: the region is kept, the frame list is
+> dropped); what is corrected here is the arithmetic that made a certainty look
+> like an edge.
+
+`ring_slot_count`
 is 2 rather than 1 because slot 0 is pre-claimed as the reverse ring by
 `Control`'s own directory writer. `arena_size` and `timeline_count` are 0 and
 honestly so: the arena here is `wc_proxy::pool`'s, and there is no `vkQueueSubmit`
@@ -20928,19 +20943,73 @@ wc-compositor: growth channel: growth ring: a 65600-byte packet cannot fit a 655
   the payload belongs in the arena
 ```
 
-`docs/waycompose-design.md` §34.5 sized `ring_data_bytes` at 64 KiB because "the
-reply carries the new region's frame list, and a test holds the *worst* case —
-one run per page of a 16 MiB region — to fitting in one packet". A 16 MiB region
-is 4096 pages; at 16 bytes a frame that is 65536 bytes, which is the ring
-exactly — and the packet is the payload **plus `sv-wire`'s `ReplyHeader`**. The
-test held the payload and the ring holds the packet, so the worst case overflows
-by the header and by nothing else. Measured fragmentation made this rare rather
-than constant: the growth that succeeded needed 388 runs, well inside the ring;
-the ones that failed had hit the fully-fragmented case.
+**Fixed.** The region is kept and the frame list is dropped; see §61.4a for the
+decision and §34.5 for the corrected sizing. What this section first said about
+*why* it happened was wrong twice over, and both corrections make it worse
+rather than rarer.
 
-Not fixed here. The section's own words already name the answer — "the payload
-belongs in the arena" — and choosing between a larger ring and an out-of-band
-payload is a protocol decision, not a number to nudge.
+**It is not 16 bytes a frame, it is 8.** `Reply::encode` writes one `u64` per
+**page** — `put_u64` per entry of `frames` — not a run-length encoded pair. The
+original note reasoned from RLE runs at 16 bytes and concluded that a 16 MiB
+region was "the ring exactly"; it is 4096 pages at 8 bytes, which is 32,768
+bytes, comfortably half the lane.
+
+**So fragmentation has nothing to do with it.** The claim that "measured
+fragmentation made this rare rather than constant", and the 388-run figure
+offered as evidence, were about the *locator's* coalesced file runs — a
+different number in a different program. The reply's size depends on the
+region's **page count alone**. A packet holds `max_payload` = 65,504 bytes, of
+which 48 are the fixed header, so the ring carries **8,182 pages ≈ 31.96 MiB**.
+
+**Which makes it deterministic, not rare.** Every region of 32 MiB or more
+overflows, always, on any guest. `GROW_STEP` is 16 MiB and the series is
+geometric to a 64 MiB cap — 16, 32, 64 — so **the second growth in any session
+overflows, every time.** "Later growths in the same session failed" was not a
+coincidence of fragmentation; it was the series arriving at 32 MiB.
+
+A Linux guest reaches it with certainty for a second reason: `/proc/self/pagemap`
+names every page, so the frame list is always fully populated. A Windows guest
+depends on `SuperfetchPfnQuery` answering for the whole window, which it did.
+
+#### 61.4a The decision, and why the region is what survives
+
+The section said the choice between a larger ring and an out-of-band payload was
+"a protocol decision, not a number to nudge". That was right about it being a
+decision and wrong about leaving it: a decision is a thing to make. It is made,
+and it is neither of those two.
+
+**The frame list is dropped and the region is answered for.** The asymmetry
+decides it. Pushing an oversized packet fails the push, and it is the **reply**
+that is lost — the host sits out its 20-second deadline and reports a compositor
+that never answered, for a growth that in fact *succeeded* and whose region is
+committed, `VirtualLock`ed and now unreachable. That is a leak with a
+misdiagnosis attached. Losing the frame list instead costs a sweep and says so.
+
+It invents no new failure mode. "No frame list" is exactly the degradation
+`docs/design.md` §0.21 and §34.2 already specify and the host already
+implements: the locator sweeps, which is *correct* on a freshly committed region
+because nothing has overwritten its stamps, and costs seconds instead of
+milliseconds.
+
+**A larger ring was rejected on a cost this document already carries.** The lane
+is sized inside `CONTROL_BYTES`, which is carved out of the compositor's
+outbound window — the window that holds keymaps and clipboard offers and is the
+one region release may never reclaim. Sizing it for 64 MiB of frame list would
+take a quarter of that window permanently, raising the floor this stage exists
+to lower. Chunking across packets is the other alternative, is real protocol
+work, and buys the same thing.
+
+**And "out of band" cannot mean a side channel here**, which the original
+wording invited: all communication goes through the ring, and alternative
+channels exist only to wake a peer from idle. Putting the payload in the arena
+would be within that rule only if the ring still framed it — which is chunking
+by another name.
+
+The check lives in `GuestEnd::service`, the one place every reply passes
+through, because the limit is the ring's and that is what the type owns. Its
+message now says what was lost and what it costs, because at one line per second
+growth it is a thing operators will read routinely rather than once.
+
 
 ### 61.5 Release still has not fired, and now there are two reasons
 
@@ -22375,6 +22444,24 @@ help: a section is a same-machine object, and the compositor's own startup says
 so about the neighbouring keymap in the very next line — *"unopenable by one
 across the boundary"*. The ring section is the same kind of object.
 
+**And the obvious fallback does not exist either, which is the third
+measurement.** If a section cannot cross, the next idea is a *file*-backed
+control region on the one filesystem both sides can see: `--wayland-ring
+$RUNDIR/ring` on the host, `--upstream-ring /sv/ring` in the guest. The Linux
+compositor creates it happily. The guest's proxy then says:
+
+```text
+wc-proxy: mmap failed: errno 22
+```
+
+`SharedRegion::map_fd` is an `mmap(MAP_SHARED)`, and that is the same EINVAL the
+pool publish gets, for the same reason, on the same mount. So **one measurement
+rules out both fallbacks at once** — the file pool *and* the file control
+region — and the only substrate that crosses this boundary is guest RAM through
+the memfd backend. Which is the deployment's answer, and the ring's, and the
+thing `--wayland-cold` does for Linux only. The circle closes on the missing
+function rather than on a missing idea.
+
 So there is no combination that puts a **Windows-build** compositor's control
 region into a form the far side of a hypervisor can map, and the missing piece
 is one function. `RingLink::publish` is `#[cfg(target_os = "linux")]`; the
@@ -22478,13 +22565,55 @@ legs alongside the refusals, and whether it is downstream of the held-back pool
 or independent has not been established. Naming a cause for it here would be
 §63.3's error with a fresh coat of paint.
 
+#### The ring probe made §63.3's mistake twice before it worked
+
+Worth recording because the section is about exactly this and the instances are
+mine, in one function, minutes apart:
+
+1. The leg used `$RUNDIR/ring` as its scratch **directory** and then passed the
+   same path to `--wayland-ring`. The compositor could not create a region at a
+   path that was already a directory, and the harness reported *"the Linux
+   compositor did not create a file-backed ring"* — true, and about the wrong
+   step.
+2. Fixed, the proxy then exited on argument validation (`--peer-prefix is
+   required for --transport shared-file`) before it had touched the region at
+   all, and the check — which matched *any* error — read that as the mapping
+   being refused. It would have recorded a correct conclusion supported by
+   evidence for something else entirely.
+
+Both were caught only by reading the log rather than the verdict. The check now
+keys on what the log says **about the region**, and the inconclusive case is a
+third outcome rather than being folded into either of the other two. A probe
+that cannot say "I did not get far enough to tell you" will eventually tell you
+something else instead.
+
 #### Where this leaves §67.9
 
-| leg | what it is now |
-|---|---|
-| `ring` | the transport question, answered: blocked, with both refusals measured |
-| `linux-relay`, `wine-relay` | venue evidence only, banner-labelled, **not** a transport result |
-| `wc-wine-guest.sh` | unaffected — it runs one process under Wine in the guest and moves no Wayland traffic across the boundary at all |
+| leg | what it is now | result |
+|---|---|---:|
+| `ring` | the transport question, answered: blocked, with all three refusals measured | 3 passed, 0 failed |
+| `linux-relay`, `wine-relay` | venue evidence only, banner-labelled, **not** a transport result | see above |
+| `wc-wine-guest.sh` | unaffected — it runs one process under Wine in the guest and moves no Wayland traffic across the boundary at all | 3 passed, 0 failed |
+
+**And the leg is written so that it starts working rather than needing to be
+written again.** Two things have to land before this arrangement can carry the
+wire, and neither is in this section:
+
+* **A guest-RAM publish for the Windows build.** `RingLink::publish` is
+  `#[cfg(target_os = "linux")]`; the compositor already commits and stamps guest
+  RAM on Windows for an *arena* through `awe-probe`. When ringlink is wired to
+  it, `--wayland-cold` stops exiting 2 and the first assertion in `run_ring`
+  inverts — which is the shape a blocked leg should have, because the day it
+  unblocks is the day the harness says so instead of somebody remembering to
+  check.
+* **The dialect.** `wc-proxy` writes the in-band form upstream unconditionally,
+  which is why the `linux-relay` leg's keymap fails and why §72's `create_pool`
+  desynchronises. `ProtoFd` step 1 is on master; when the per-connection flag
+  follows, the `linux-relay` leg's session check should go green without the
+  harness changing, and that will be evidence rather than an expectation.
+
+Until then the honest summary is short: the arrangement is viable, the venue is
+real and measured, and **no sanctioned transport reaches it yet**.
 
 The arrangement is viable — §70.5 got a mapped `HWND` out of it and this section
 got a registry walk — and the thing that makes it *shippable* is not a channel
@@ -23725,3 +23854,703 @@ passing.
    Untouched by any of this and still unexplained.
 
 The popup group of six remains unstarted.
+
+## 75. The leak assertion §53 could not make, made
+
+*(§53's and §73's continuation. Twenty minutes on the deployment guest.)*
+
+### 75.1 Status in one paragraph
+
+§53 built an outside witness for window destruction and had to **skip** its
+sharpest assertion, because `GetGuiResources` — the kernel's own per-process
+handle count — returns 0 under Wine. §69 showed that zero is a fact about Wine
+and not about the venue, so no local virtualisation could rescue it; §73 showed
+the counter answers on a real Windows kernel and moves both ways. This is the
+run that uses it. Three create/destroy cycles against the compositor's own
+process on the guest:
+
+```text
+BASE (no client)         user=1  all=0
+client up   (x2 samples) user=3  all=1     CLIENT-RUNNING=yes at both
+client gone              user=2  all=0
+                         ... identical for cycles 2 and 3
+windows at exit:      3 created, 3 destroyed, 0 still held, 0 still alive
+drop targets at exit: claims 3 registered, 3 revoked, 0 revoke(s) failed
+```
+
+**The count moves both ways and returns to a constant baseline.** Two, not
+three-four-five: nothing accumulates. §53's `SKIP` is an assertion now, and it
+passes.
+
+### 75.2 What the `1 → 2` step is, and why it is not the leak
+
+The baseline before any window is `user=1`; after the first window is created
+and destroyed it is `user=2`, and it stays 2 for ever. A permanent increase on
+the first window is exactly what a per-window leak would look like on cycle one,
+so it has to be accounted for rather than waved past.
+
+It is the **window class**. `RegisterClassExW` runs once per process, a class is
+a USER object, and it is not freed while the process lives. The distinguishing
+property is not the +1 but its *repetition*: a leak of an `HWND` would add one
+per window and the count would climb 2, 3, 4, 5 across the cycles. It does not
+move again. **The evidence for "no leak" is the second and third cycles, not the
+first**, which is why a one-cycle version of this run would have been
+unreadable.
+
+`EnumWindows` agrees independently — `all=1` while the client is up and `all=0`
+after — so the two instruments §53 built for different reasons corroborate each
+other on the venue where both work.
+
+`gdi=0` throughout, and it is probably correct rather than stubbed: these
+windows own no device context. §73.5 item 2 still stands.
+
+### 75.3 Two false passes, and the second is the one worth keeping
+
+Both are the shape that has now caught several harnesses in this document: a run
+that reports success because the thing it was watching never happened.
+
+**`wc-probe.exe` does not map a toplevel.** It was the obvious client — it is
+already on the guest and `wc-guest.sh` uses it — and it connects, binds globals
+and exits. The first run of this experiment reported `counter=live`, the
+compositor alive at every cycle, and a clean exit accounting:
+`0 created, 0 destroyed`. Every number was consistent and every one of them was
+about nothing. `wc-shmclient.exe` makes a real window.
+
+**Then the counter did not move, and that read as a clean result.** Three cycles
+of `UP == DOWN == 2` is exactly what a leak-free compositor looks like from a
+distance. It was the sampling: `--frames 90` meant the client had finished and
+gone before the `UP` sample was taken, so both samples were of an idle
+compositor. The fix is not a longer sleep — it is that **the harness now prints
+whether the client was still running at the moment of each sample**:
+
+```text
+CLIENT-RUNNING-AT-UP1=yes
+UP1=user=3 …
+```
+
+That line is the difference between a measurement and a coincidence, and it is
+cheap. The general form is worth stating because this document keeps paying for
+it: *when an assertion compares two samples, record the condition each sample
+was supposed to be taken under, next to the sample.* A number without its
+premise cannot be checked, and the failure mode is not a wrong answer — it is a
+right-looking answer to a question nobody asked.
+
+### 75.4 §64's icon count is still zero, and this run says why
+
+```text
+icon objects at exit: claims 0 created, 0 icon(s) and 0 cursor(s) destroyed
+icons: 0 window(s) got one, 3 had none to get; no resolver published anything
+```
+
+Both halves are **structurally absent from this arrangement** rather than
+untested by accident:
+
+* no client published an icon, so `release_icons` had nothing to release —
+  `wc-icon.sh` is the harness that publishes one;
+* the run is in **session 0** and has no pointer, so no `HCURSOR` is ever built
+  — and §64.3 already established that the cursor half only moves in a harness
+  that moves a mouse.
+
+So §64.5 item 1 is unchanged and its remedy is now precise: an icon-publishing
+client for one half, injected pointer motion for the other. Neither is the
+`grep` this was hoped to be; both are runs. The machine was handed back rather
+than held for them, with two agents queued.
+
+### 75.5 What is not proven
+
+1. **Three cycles.** The count returns to baseline three times; it is not a
+   soak, and a leak that appears on the hundredth window would not be seen.
+2. **One client shape.** `wc-shmclient.exe` makes one plain toplevel. Popups,
+   subsurfaces and a client with several windows are untested here, and §53.6
+   item 4 already names popups as the highest-churn case.
+3. **The `+1` is attributed, not proven.** The window class is the only
+   plausible one-time USER object on that path and the number never moves again,
+   but nothing enumerated it.
+4. **`gdi=0` is still inferred.** §73.5 item 2.
+5. **This says nothing about the drag or icon resources beyond their counters
+   balancing** — 3 registered / 3 revoked is the compositor's own account
+   (§62.2), and on this venue there is still no outside witness for OLE's table.
+
+
+## 76. The protocol's file descriptor gets a name of its own
+
+### 76.1 Status in one paragraph
+
+§72.3 settled what the fix for the pool path is — **both encodings, selected by
+transport rather than by platform** — and listed the sites. A first attempt at
+it found a prerequisite the section had not scoped, and reverted rather than
+leave `vendor/` half-refactored. This section is that prerequisite, landed on
+its own: `wayland_backend::os::ProtoFd` and its two companions now name **the
+`Fd` payload of an `Argument`/`Message`**, distinctly from the `OwnedFd` the
+socket layer uses for real kernel descriptors. **Nothing behaves differently.**
+The aliases are unconditional and resolve to exactly the types that were there
+before, on both platforms; the tripwire
+`the_upstream_dialect_is_still_assumed_rather_than_chosen` still passes because
+it still describes the truth. What changed is that the definition §72.3 has to
+edit is now **one line that the socket layer does not read**.
+
+### 76.2 The prerequisite, and it is a Unix-only accident
+
+On Windows the two roles were never confusable and nothing had to say so: a
+socket is a `wc_transport::Stream`, and an `h` argument is a
+`wc_handle::Handle`. Two types, two jobs, no overlap. That is why the fork got
+this far without naming the distinction.
+
+On **Unix** both are `std::os::unix::io::OwnedFd`. `crate::os` re-exported one
+name for both jobs, and the crate had **two unrelated readers** of it:
+
+* the **socket layer** — `rs/socket.rs`'s `in_fds`/`out_fds` queues, `send_msg`
+  and `rcv_msg`, the `SCM_RIGHTS` control message, `rustix`'s `AncillaryIter`,
+  the `dup()` in `write_to_buffers`, and the `AsFd`/`AsRawFd` impls on `Socket`,
+  `BufferedSocket` and `Client<D>`. Every one of those is a real descriptor and
+  can never be anything else;
+* the **protocol layer** — the `Fd` parameter of `Argument<Id, Fd>` and
+  `Message<Id, Fd>`, which is only ever compared (`FdRepr::fd_eq`), printed
+  (`FdRepr::fd_fmt`), and handed to whatever `rs/wire.rs` has decided an `h`
+  looks like on the wire.
+
+§72.3's fix changes the second. With one name, it could not be changed without
+the first coming with it — which is what the first attempt hit, and why the
+sensible move is to give the protocol role its own spelling first and change
+nothing else.
+
+### 76.3 Three names, not one, and why
+
+`Argument`/`Message` are instantiated at three different fd types, and the
+separation is only useful if it covers all three:
+
+| new name | was | where it appears |
+|---|---|---|
+| `os::ProtoFd` | `os::OwnedFd` | a message **parsed off the wire**: `parse_message`, `read_one_message`, every `ObjectData::event`/`request` signature, every generated `Event` field |
+| `os::RawProtoFd` | `os::RawFd` | a message **about to be written**: `send_request`, `send_event`, `write_message`, `write_to_buffers` |
+| `os::BorrowedProtoFd<'a>` | `os::BorrowedFd<'a>` | what `wayland-scanner` emits: `write_request`/`write_event`, and the `h` field of every generated `Request<'a>` |
+
+The send side is unowned on Unix — the caller keeps the descriptor and
+`write_to_buffers` `dup()`s it — which is why the protocol needs two of these
+rather than one, and the borrowed form has a lifetime the other two do not
+because that is the shape `wayland-scanner` generates into every protocol crate
+in the ecosystem.
+
+All three are declared **without a `cfg`**, as aliases of the names that were
+already there. That is deliberate and it is the whole safety argument: an
+unconditional alias to an existing type cannot change behaviour on either
+platform, so this commit is a rename and can be reviewed as one.
+
+### 76.4 The real site count: 88, not 71
+
+§72.3's estimate was 71 instantiation sites across 30 files. **The file count was
+exactly right and the site count was 24% low.** The measured surface, after the
+change:
+
+| | sites |
+|---|---|
+| `Message<…>` / `Argument<…>` / `ArgSmallVec<…>` instantiations | **88**, across **30** files |
+| of which in the two checked-in `wayland-scanner` assets | 26 |
+| `use` lines that exist only to spell one of the three | 34 |
+| files touched in total | 33 |
+
+The gap is not a miscount of anything visible; it is that `vendor/wayland-scanner`
+is three surfaces rather than one — the `quote!` blocks that emit the type, the
+two checked-in `scanner_assets/*.rs` that a test compares the emission against
+byte-for-byte, and the generated `Request`/`Event` **field** types, which are not
+`Message<…>` instantiations but must move with them or the tuple stops
+type-checking. Changing the scanner is not optional: `wayland-protocols`,
+`wayland-protocols-wlr` and `wayland-protocols-misc` come from crates.io and are
+generated by this fork's scanner through the `[patch.crates-io]` table, so the
+generated code is where most of the protocol's `h` arguments actually live.
+
+`vendor/smithay` contributes three sites here — the `ObjectData::request` impls
+in `selection/offer.rs` and the two dnd grabs — and `crate::utils::os` gained a
+`ProtoFd` re-export so they can be spelled without reaching past it. These are
+**not** §72.3's "sixteen occurrences across six files"; those are the
+`#[cfg(windows)]` coupling sites in `wayland/shm/pool.rs` and friends, and they
+are untouched.
+
+### 76.5 The separation, measured rather than asserted
+
+The claim this commit makes is falsifiable in one command, so it was falsified
+rather than argued. Temporarily replacing the three aliases with distinct
+newtypes and running `cargo check -p wayland-backend --all-targets`:
+
+| | errors |
+|---|---|
+| the library | **8** — `rs/wire.rs` ×2, `rs/client_impl/mod.rs` ×4, `rs/server_impl/client.rs` ×2 |
+| plus the unit tests | 23 total, the extra 15 in the `mod tests` of `socket.rs` and `wire.rs` |
+| naming `rustix`, `AncillaryIter`, `borrow_raw`, or an `AsFd` impl on `Socket`/`Client<D>`/`Stream` | **0** |
+
+The non-test body of `rs/socket.rs` produces **no errors at all**, which is the
+result that matters: the file that owns `SCM_RIGHTS` does not move when the
+protocol's fd type does. Of the eight, two are `FdRepr` bounds — a trait
+`crate::os` already owns and a real change would simply implement — and the other
+two in `wire.rs` are lines 157 and 332, the write arm and the parse arm of
+`Argument::Fd`. **Those two are precisely the sites §72.3 says have to become a
+runtime choice.** The refactor's blast radius and the fix's work list are the
+same two lines.
+
+Compare the first attempt's reading, which is now confirmed: it saw 24 errors
+splitting into a socket-layer group and nothing in the protocol layer, because it
+changed the shared name. Changing the protocol-only name inverts that exactly.
+
+### 76.6 What was deliberately not done
+
+* **The enum is not here.** `ProtoFd` is an alias, not a sum type. The variant
+  for "an fd that arrived with no name" belongs in `vendor/wayland-backend/src/os.rs`
+  — `Descriptor` means "a name a peer can open" and an `SCM_RIGHTS` fd has none,
+  so it does not go in `wc-handle` — and it is the next commit, not this one.
+* **`wc-handle` is still Windows-only.** `vendor/wayland-backend/Cargo.toml:73`
+  declares it under `[target.'cfg(windows)'.dependencies]`. The crate itself is
+  portable — its own `cfg(windows)` block holds only `windows-sys` — so making
+  the dependency unconditional is a two-line change, but it belongs with the
+  enum that needs it.
+* **`wire.rs`'s two arms are still `#[cfg]`, not a choice**, and the
+  per-connection flag does not exist. §72.3 is not fixed by this section and does
+  not claim to be.
+* **The tripwire is still there and still passes.** It asserts that
+  `wc-proxy`'s `session.rs` spells both dialects as constants with no transport
+  consulted, and that is still true — this commit did not touch `wc-proxy` at
+  all. Deleting it is the job of whoever makes the encoding a runtime choice.
+
+### 76.7 The gates
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **87 binaries, 2632 passed, 0 failed** |
+| the same, on `7abc743` before any of this | 86 binaries, 2631 passed, 0 failed |
+| §75's own commit, `5b39633`, reports | 87 binaries, 2632 tests, 0 failures |
+| `cargo clippy --workspace --all-targets` | clean; no warning in any `vendor/wayland-*` crate |
+| `wayland-scanner`'s two asset tests | pass; the checked-in `test-client-code.rs` and `test-server-code.rs` were updated and match the emission byte-for-byte |
+| `scripts/wc-xref.sh` | exit 0 |
+| `the_upstream_dialect_is_still_assumed_rather_than_chosen` | passes, unchanged |
+
+**The first two counts differ and the difference is not this section's.** The
+branch was rebased mid-flight onto `5b39633`, which adds a
+`crates/vk-registry/tests/attributes.rs` holding one test; that commit's own
+message reports the post-rebase number, and this section's run reproduces it
+exactly. Independently of that, comparing the `7abc743` and post-change runs
+*per binary* rather than in aggregate, **the only line that differs is that new
+binary** — every other binary reports an identical pass count. That is the check
+worth running for a rename: an aggregate that happens to match can hide a test
+moving from one binary to another, and a per-binary diff cannot.
+
+### 76.8 Is step 2 now ordinary
+
+Yes, on the evidence in §76.5. The remaining work has a work list of two arms in
+`wire.rs`, one dependency line, an enum with two variants, and smithay's sixteen
+`cfg` sites — and the measurement says that nothing in the socket layer is on
+that list. That was the open question the first attempt could not answer, because
+with one name for two jobs there was no way to ask it.
+
+## 59. The kill that took the machine's keys
+
+### 59.1 Status in one paragraph
+
+An over-broad `pkill -9 -f weston`, meant for one harness's leftovers, matched
+the desktop session hosting 1Password and killed it — taking with it the SSH
+agent holding the keys for `testhost` and the guest, and the key that signs
+commits. Two machines unreachable and signing broken, from a cleanup line in an
+unrelated run. This is the **fourth** instance in one session of a process-name
+match catching more than it meant to, and the first to cost anything outside its
+own run. `scripts/wc-binaries.sh` grew `proc_kill` and `proc_kill_pidfile`:
+they take a pid or a pidfile and **refuse a name or a pattern**, and three tests
+behind `cargo test --workspace` keep the refusal honest.
+
+### 59.2 The argument that was only half written
+
+`proc_running` already matched an exact executable name, and the comment above
+it gives the reason: a `pgrep -f sv-hostd` guard matches *the shell running it*,
+because that shell's command line contains the string. The fix generalised as an
+order of preference — pidfile, then `pgrep -x`, then `pgrep -f` with the shell's
+ancestors excluded — and ended with a line that reads differently today:
+
+> A guard that cannot distinguish itself from what it guards against is not a
+> guard; it is a coin that always lands the same way.
+
+**That was written about guards, and the kill side of it was never written.**
+The three earlier instances were self-inflicted: a script matching its own
+shell, which is embarrassing and contained. This one matched another agent's
+process, and the blast radius was the machine's credentials.
+
+**A pattern is the wrong instrument for stopping a process you started.** You
+already know its pid — you started it. The pattern is a way of *rediscovering* a
+pid you already had, and it rediscovers other people's too. So:
+
+* started in this shell → you have `$!`;
+* outlives the shell → have it write a pidfile;
+* neither → you are not stopping *your* process, you are stopping whatever
+  matches, and you cannot know what that is.
+
+`proc_kill` refuses anything that is not digits, which covers the two shapes
+that actually occur: a bare program name, and the **empty string** — `kill ""`
+is an error, but `kill $(pgrep something-absent)` with no match is a request to
+signal the whole process group, which is the same outage by a different route.
+pid 1 is refused explicitly. An already-dead pid is success, because the caller
+wanted it gone and it is gone.
+
+`proc_kill_pidfile` removes the pidfile only when the pid in it was ours to
+stop, and refuses a file whose body is not a number — a truncated or
+half-written pidfile is a pattern one indirection along.
+
+### 59.3 What is *not* refused, and why
+
+`pkill -f` anchored on an absolute path into **this run's own directory** stays,
+and several harnesses use it:
+
+```sh
+h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true"
+```
+
+That is a pattern no other agent's command line can contain, because the
+directory is unique to the run. The distinction is not "patterns are bad" — it
+is that a pattern must name something only this run could have produced. A bare
+program name names something the whole machine shares, and `weston` is on every
+desktop here.
+
+The sweep found thirteen substring kills in `scripts/`; eleven are already
+path-anchored in exactly this way. The two that are not — a port-scoped
+`http.server 8931` and a `$RUNDIR`-scoped `qemu-system` — are scoped to
+something this run owns, and are left.
+
+### 59.4 What is not done
+
+1. **Nothing forces a harness to use `proc_kill`.** The tests assert that the
+   refusal works, not that anybody calls it — the same gap §54 had before the
+   citation checker went behind `cargo test`, and the same shape as a lint that
+   exists but is not run. A grep-based gate refusing new bare `pkill -f <name>`
+   in `scripts/` is the obvious next step and is one more instance of the
+   pattern this section is about.
+2. **The three earlier instances are fixed where they were found, not
+   systematically.** They were guards rather than kills, so `proc_running`
+   covers the shape; nothing proves there is not a fifth.
+3. **This section's commit is unsigned**, because the signing key went with the
+   session that was killed. Recorded here rather than repaired later: rewriting
+   history to re-sign would make the commit that documents the outage the one
+   piece of evidence that it happened.
+## 77. `WireFd`: the type an `h` argument becomes, and the dependency that had to move first
+
+### 77.1 Status in one paragraph
+
+§76 gave the protocol's file descriptor a name of its own. This gives it a
+**type**: `wayland_backend::os::WireFd`, an `h` argument that is **either a name
+the peer can open or a descriptor that is already open**. It is the thing
+§72.3's fix turns a `cfg` into a runtime choice *between*. Nothing constructs one
+yet — `rs/wire.rs` still decides by platform — so this changes no behaviour
+either, and the tripwire
+`the_upstream_dialect_is_still_assumed_rather_than_chosen` still passes. What is
+now true that was not: the type exists, it is **tested**, and one of those tests
+is the claim that §72.3's remaining work is a substitution rather than a
+redesign.
+
+### 77.2 Steps 2 and 3 are one commit, and that is a correction to the plan
+
+The plan had "the enum" and "`wc-handle` unconditional" as separate steps. They
+cannot be. `WireFd::Named` carries a `wc_handle::Handle`, and
+`vendor/wayland-backend/Cargo.toml` declared `wc-handle` under
+`[target.'cfg(windows)'.dependencies]` — so on Unix, the platform the whole fix
+is *for*, the enum could not name its own variant. Landing the enum first would
+have meant either a Windows-only type, which is the split being deleted, or a
+placeholder, which is a comment nothing asserts.
+
+### 77.3 The dependency move, and it is a move rather than a port
+
+`wc-handle` was already portable: `crates/wc-handle/src/lib.rs` contains **no
+`cfg` at all**, and `src/platform/` has had a `unix.rs` beside its `windows.rs`
+since it was written. Its own manifest puts `windows-sys` behind
+`cfg(windows)` and `libc` behind `cfg(unix)`, and its `sv-arena` dependency is
+already deliberately unconditional with a note saying why. So the change is two
+lines moving between tables, and there is a precedent directly above them in the
+same file: `wc-transport` is unconditional for exactly this reason — "so that the
+port has one socket abstraction rather than a `cfg` at every use site". This is
+the same sentence one level up, about descriptors rather than sockets.
+
+No dependency cycle: `wc-handle` reaches `sv-arena` and `sv-transport`, and
+neither of those names any wayland crate.
+
+### 77.4 The shape, and the two questions it has to answer
+
+```rust
+pub enum WireFd {
+    Named(wc_handle::Handle),
+    #[cfg(unix)]
+    Open(OwnedFd),
+}
+```
+
+**Why the second arm is not a sixth `wc_handle::Descriptor` variant.** Because
+`Descriptor` means *"a name a peer can open"*, and an fd that arrived over
+`SCM_RIGHTS` has no name — it was never created under one and nothing can
+re-open it. `Descriptor` has an `encode()`/`decode()` pair; it *is* a wire
+format. An unnamed arm would put something in that format that cannot be written
+down, and every reader of the type would have to learn that one variant is a lie.
+`Descriptor::NtHandle` is the precedent for the *shape* — an escape hatch for an
+object that cannot be named — and not for reuse: that one is Windows's, and this
+is Unix's. So the disjunction lives in `os.rs`, the module that already decides
+what a file descriptor is.
+
+**Why there is no `Open` arm on Windows.** Not an omission and not a `cfg` left
+in by accident. `SCM_RIGHTS` has no Windows equivalent — there is no ancillary
+channel on the socket at all — so an already-open unnamed fd cannot arrive there,
+and a variant for it would be uninhabited by construction. §72.3's "both
+encodings exist on both platforms" is a claim about the **in-band** form existing
+on Unix, which is the half that was missing. It does not claim Windows grows an
+out-of-band one, and reading it that way would produce a variant that could only
+ever be dead.
+
+**Why `Named` carries a `Handle` rather than a `Descriptor`.** Sending a name
+transfers nothing — unlike `SCM_RIGHTS`, the kernel takes no reference — so the
+sender must keep the object alive until the peer opens it. `Handle` is what
+carries that keepalive; a bare `Descriptor` would be a name for an object that
+may already be gone. `rs/wire.rs`'s existing Windows arm records this rule at
+length and it is unchanged by any of this.
+
+### 77.5 The test that is the point
+
+`os::tests::wire_fd_is_already_a_legal_message_payload` builds a
+`Message<u32, WireFd>`, compares two of them, and prints one. That is the whole
+of what the protocol layer asks of an `Fd`, and **§72.3's claim that the rest is
+"a cfg becoming a runtime choice rather than a redesign" is only true if that
+compiles.** If `WireFd` needed a bound the protocol layer could not supply, this
+is where it would be found — before the wire format depends on it rather than
+halfway through changing it.
+
+One thing that could have forced a restructure did not. `os.rs` carries a blanket
+`impl<T: AsRawFd> FdRepr for T` on Unix, and `WireFd` needs its own `FdRepr`
+because half its inhabitants have no raw fd to return. Those two impls coexist:
+`WireFd` is a local type with no `AsRawFd`, so coherence accepts both. Had it
+not, the blanket impl would have had to become three concrete ones first.
+
+Six more tests hold the behaviour rather than describing it, and the sharpest
+pair is the asymmetry: two `Named` handles to one section are **equal** (they
+compare descriptors), and two `dup()`s of one file are **not** (they compare raw
+fd numbers). That difference already existed between the platforms and this
+module's `FdRepr` docs already recorded it; it is now visible inside a single
+type, on one platform, where it can be asserted. A named thing and an open thing
+are never equal — they might name the same bytes, and nothing here can know that.
+
+### 77.6 A warning §76 introduced, fixed here rather than by amending it
+
+The Windows cross check reported `unused import: RawFd` in `rs/socket.rs`. It is
+§76's: once the `Message` signatures in that file stopped saying `RawFd`, its only
+remaining readers were the two `AsRawFd` impls, which are Unix-only. The Linux
+workspace clippy gate could not see it, because on Linux those impls compile. The
+import moved into the `cfg(unix)` group.
+
+Recorded rather than quietly fixed for the reason §35.10 gives: it is the *shape*
+of the mistake that generalises. A rename that is green on one platform can still
+strand an import on the other, and `cargo clippy --workspace --all-targets` is
+not that check — `cargo check --workspace --target x86_64-pc-windows-gnu` is.
+
+### 77.7 The gates
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **87 binaries, 2637 passed, 0 failed** |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0; `wayland-backend` warning-free |
+| `cargo check -p wayland-backend --all-targets` (Linux) | warning-free |
+| `cargo clippy --workspace --all-targets` | clean |
+| `scripts/wc-xref.sh` | exit 0 |
+| `the_upstream_dialect_is_still_assumed_rather_than_chosen` | passes, unchanged |
+
+**2637 is 2632 plus seven minus two, and only the seven are this commit's.** §76
+ran at 2632. A per-binary diff against that run shows exactly two lines moving:
+`wayland_backend` from 5 to 12, which is the seven `os::tests::*` above, and
+`sv_proto` from 1820 to 1818, which is `6cb8db3` adding seventeen lines to
+`crates/vk-registry/src/profile.rs` — `sv-proto` is generated from that profile,
+so its test count moves when the profile does. Nothing in this commit is
+reachable from `sv-proto`. This is the second time in three sections that the
+aggregate would have been read wrong and the per-binary diff read right.
+
+The Windows cross gate also reports five `never used` warnings in
+`crates/wc-launch/src/floor.rs`. They are **not** this commit's — that file is
+untouched here, and they are Windows-only dead code that predates it. Named
+rather than left for the next person to wonder about, which is the same rule
+77.6 is an instance of.
+
+### 77.8 What is still missing, and it is steps 4 and 5
+
+1. **`rs/wire.rs`'s two arms become a runtime choice.** Lines 157 and 332 — the
+   write arm and the parse arm of `Argument::Fd` — plus the `cfg(unix)` early
+   return in `parse_message` and the fd-count pre-check above it. §76.5 measured
+   that these are the only library sites that move.
+2. **`ProtoFd` aliases `WireFd`**, and `RawProtoFd`/`BorrowedProtoFd` grow their
+   send-side counterparts.
+3. **The per-connection flag**, which is what "the transport picks" means
+   concretely, and the smithay `cfg` sites that follow from it.
+
+The acceptance test for the sequence is unchanged and is not this: `wc-pooltest`
+through the proxy to a **Linux** compositor, and after that a client that maps a
+window and draws with the compositor across the hypervisor.
+
+---
+---
+
+## 78. The popup group is three groups, and a grab that ended too early
+
+### 78.1 Status in one paragraph
+
+Seven popup failures, and §66's lesson applied before anything else: read the
+messages, do not group by suite name. They are **three** groups — grab semantics
+(4), reactive positioning (2), and a protocol error on a zero-size anchor rect
+(1) — and only the first is one thing. One of the four is fixed: a popup grab was
+dismissed *before* the click that dismissed it was delivered. WLCS headless goes
+**415 to 416**, popups **5 / 7 to 6 / 6**, debts 21 to 20, `cargo test` unchanged
+at 2630.
+
+### 78.2 What the seven actually say
+
+| test | message | group |
+|---|---|---|
+| `does_not_get_popup_done_event_before_button_press` | "pointer button sent after popup done" | grab |
+| `grabbed_popup_gets_keyboard_focus` | "grabbed popup not given keyboard focus" | grab |
+| `grabbed_popup_gets_done_event_when_new_toplevel_created` | `popup_done()` never called | grab |
+| `grabbed_popups_get_done_events_in_correct_order` | `popup_done()` never called | grab |
+| `when_parent_surface_is_moved_a_reactive_popup_is_moved` | "reactive popup was not moved" | positioning |
+| `when_parent_surface_is_moved_a_nonreactive_popup_is_not_moved` | `surface_actually_at_location` false | positioning |
+| `zero_size_anchor_rect_stable` | "Wayland protocol error: 0 on interface \<UNKNOWN INTERFACE\>" | protocol error |
+
+Three different files' worth of work, which is exactly what §66 was about.
+
+### 78.3 The fix, and why the obvious version of it was not enough
+
+`dismiss_grab_if_outside` ran before `pointer.button`, so the press arrived after
+`popup_done`.
+
+Moving it after the button did **not** fix the test, and the reason is worth
+keeping. `left_click` is a press *and* a release, and the test's notification
+fires on every button event:
+
+```c
+manager->client->add_pointer_button_notification([&](auto, auto, auto) {
+    EXPECT_THAT(got_popup_done, IsFalse()) << "pointer button sent after popup done";
+```
+
+So dismissing on the press still puts `popup_done` between the two halves of one
+click, and the assertion fails on the release instead of the press — the same
+red with a different cause, which is the kind of thing that reads as "the fix did
+not work" and is not. The grab is dismissed when the click **ends**.
+
+That is also the better behaviour independently of the test. A menu dismissed
+mid-click leaves the client unable to distinguish a click that merely closed it
+from one that closed it and activated what was underneath; both halves now reach
+the surface below while the popup still exists, and the popup is told afterwards.
+
+**Measured after every edit**, which is §74's rule earning itself a third time:
+the intermediate state — dismiss after `button` but on the press — scored exactly
+what the broken state scored, 5 / 7, and only the log told the two apart.
+
+### 78.4 What is left, in the order I would take it
+
+1. **`grabbed_popup_gets_keyboard_focus`.** Keyboard focus follows the platform's
+   `WM_SETFOCUS` to the *toplevel* (§11), and a popup that takes an explicit
+   grab must have it instead. This is the one most on Firefox's path — a menu
+   that cannot take the keyboard cannot be driven by arrow keys.
+2. **The two `popup_done` cases**, which never fire at all: one when a new
+   toplevel appears, one for nested grabs, which must be dismissed innermost
+   first.
+3. **Reactive positioning**, `xdg_positioner.set_reactive`, unimplemented — the
+   popup must follow when its parent moves.
+4. **`zero_size_anchor_rect_stable`**, where we raise a protocol error on
+   something legal.
+
+### 78.5 Unchanged and still open from §72
+
+The two three-level grandparent orderings, `subsurface_extends_parent_input_region`,
+and the two restacking assertions that now fail only their second half. None of
+them is touched by this.
+
+*(Committed unsigned: 1Password holds the signing key and its session was killed
+by an over-broad `pkill -9 -f weston` elsewhere on the machine. Recorded rather
+than rewritten later.)*
+
+## 60. The rule that stops the kill, behind the gate that runs it
+
+### 60.1 Status in one paragraph
+
+§59 built `proc_kill`, and §59.4 item 1 named its gap in the same breath:
+nothing forced a harness to call it. `scripts/wc-killcheck.sh` is that rule, and
+`crates/sv-testkit/tests/kill_scoping.rs` puts it behind
+`cargo test --workspace`. The population it governs is the sweep's, unchanged:
+**10 kills scoped to something the run owns, 3 baselined with their reasons, 0
+naming something the machine shares.** The gate caught its own documentation on
+its first run, which is the third time that has happened here and is answered
+the same way each time.
+
+### 60.2 The rule, and why it is exactly the sweep's finding
+
+> **A pattern is allowed only when it names something only THIS RUN could have
+> produced.**
+
+Encoded as: the pattern interpolates a shell variable. That is not a proxy for
+the rule, it *is* the rule — a literal cannot be run-unique, because two
+concurrent runs of a harness share every literal in it. `^$HOST_DIR/wc-proxy`,
+`$DIR/sv-hostd`, `qemu-system.*$RUNDIR` all pass; `weston` does not.
+
+**New occurrences only.** Eleven of the thirteen kills were already right, and a
+gate that demanded they be rewritten would be a gate people turn off. The two
+that are not run-unique are the baseline, and each carries its argument in the
+script rather than being a bare exemption — an allowlist without reasons is
+where rules go to die.
+
+**The judgement call, asked for and answered.** `wc-launch.sh`'s
+`pkill -f 'wc-launch/firefox'` is a path *fragment*. It cannot match a user's
+ordinary Firefox — an ordinary Firefox has no such string in its command line —
+so it is nothing like the outage. But it is **harness-unique, not run-unique**:
+two concurrent `wc-launch.sh` runs would match each other. They would also
+collide on the shared profile directory that pattern points at, so the kill is
+not the first thing that breaks, and it is tolerated on that basis. It is
+recorded as the one baseline entry that would become correct on its own by
+giving each run its own profile directory — which is a real fix, not a
+re-classification.
+
+`http.server 8931` is a port. Only one process can hold a port, so there is
+never a second match to hit by accident: scoped to something the run owns, if
+not to the run itself.
+
+### 60.3 A refusal that names the alternative
+
+The message is not just "no". §59's helpers exist, so the gate points at them in
+order of preference — `proc_kill` (you started it, you have its pid),
+`proc_kill_pidfile` (it outlives the shell), `kill_exact` (matches the executable
+name, so it cannot match the shell running it) — and then states the escape
+hatch: if a pattern really is the only option, interpolate the run's own
+directory, socket or port.
+
+A refusal that does not name the alternative gets worked around, so the test
+asserts the message contains `proc_kill`. That is the same reasoning as asserting
+it names the offending file: an output nobody can act on is a failure that will
+be re-run rather than fixed.
+
+### 60.4 The gate flagged its own documentation, again
+
+`proc_kill`'s refusal message quotes the command that caused the outage, so the
+string appears in `wc-binaries.sh` inside a `note`. The gate saw it and refused.
+
+That is the third checker in this tree to catch its own prose — §48.3 (the
+citation checker on this document), §54.1 (its own negative fixture) — and the
+answer has been the same every time: **narrow the rule, do not exempt the file.**
+Here that means skipping comments and *reporter calls*, whose leading token is
+`note`/`bad`/`echo` and whose job is to print text at a person rather than run a
+command. Deliberately a rule about one line's first word rather than a path
+exemption, because `wc-binaries.sh` is precisely the file most likely to grow a
+real kill.
+
+The pattern is worth naming now that it has three instances: **a checker good
+enough to be worth writing is good enough to catch the writing about it.** That
+is not a flaw in the checker. It is the checker being right about a string that
+is genuinely indistinguishable, at its level of analysis, from the thing it
+hunts — and the fix is always to make the rule see one level further, never to
+carve out the file that happens to hurt.
+
+### 60.5 What is not done
+
+1. **The gate governs `scripts/` only.** A `pkill` in a Rust test, or typed
+   directly into a shell by an agent, is not covered — and the outage was the
+   latter. This cannot stop a person; it can only stop the tree from teaching
+   them the habit. That is a real limit and not a small one.
+2. **`kill_exact` is not itself gated.** It matches an executable name, which is
+   correct for a program only this project runs and wrong for one the machine
+   shares — `kill_exact weston` would have caused the same outage. Nothing
+   checks its argument, and the honest reason it is not gated is that the check
+   would need to know which names are ours, which is a list nobody maintains.
+3. **The three baseline entries are tolerated, not fixed.** The `wc-launch` one
+   has a stated route to correctness (a per-run profile directory) that nobody
+   has taken.

@@ -14,6 +14,12 @@ use std::{
     },
 };
 
+// WAYCOMPOSE FORK: the `h` payload of an `Argument`/`Message` is named apart
+// from the real descriptors this file builds with `from_raw_fd` and hands to
+// libwayland. They are the same type on Unix, which is the only platform this
+// backend has; see `crate::os` and `docs/waycompose-design.md` §76.
+use crate::os::{ProtoFd, RawProtoFd};
+
 use crate::protocol::{
     check_for_signature, same_interface, AllowNull, Argument, ArgumentType, Interface, Message,
     ObjectInfo, ANONYMOUS_INTERFACE,
@@ -594,7 +600,7 @@ impl InnerHandle {
         }
     }
 
-    pub fn send_event(&self, msg: Message<ObjectId, RawFd>) -> Result<(), InvalidId> {
+    pub fn send_event(&self, msg: Message<ObjectId, RawProtoFd>) -> Result<(), InvalidId> {
         self.state.lock().unwrap().send_event(msg)
     }
 
@@ -889,7 +895,7 @@ pub(crate) trait ErasedState: downcast_rs::Downcast {
         &self,
         id: InnerObjectId,
     ) -> Result<Arc<dyn std::any::Any + Send + Sync>, InvalidId>;
-    fn send_event(&mut self, msg: Message<ObjectId, RawFd>) -> Result<(), InvalidId>;
+    fn send_event(&mut self, msg: Message<ObjectId, RawProtoFd>) -> Result<(), InvalidId>;
     fn post_error(&mut self, object_id: InnerObjectId, error_code: u32, message: CString);
     fn kill_client(&mut self, client_id: InnerClientId, reason: DisconnectReason);
     fn global_info(&self, id: InnerGlobalId) -> Result<GlobalInfo, InvalidId>;
@@ -1093,7 +1099,7 @@ impl<D: 'static> ErasedState for State<D> {
 
     fn send_event(
         &mut self,
-        Message { sender_id: ObjectId { id }, opcode, args }: Message<ObjectId, RawFd>,
+        Message { sender_id: ObjectId { id }, opcode, args }: Message<ObjectId, RawProtoFd>,
     ) -> Result<(), InvalidId> {
         if !id.alive.load(Ordering::Acquire) || id.ptr.is_null() {
             return Err(InvalidId);
@@ -1547,7 +1553,7 @@ unsafe extern "C" fn resource_dispatcher<D: 'static>(
     };
 
     let mut parsed_args =
-        SmallVec::<[Argument<ObjectId, OwnedFd>; 4]>::with_capacity(message_desc.signature.len());
+        SmallVec::<[Argument<ObjectId, ProtoFd>; 4]>::with_capacity(message_desc.signature.len());
     let mut arg_interfaces = message_desc.arg_interfaces.iter().copied();
     let mut created = None;
     // Safety (args deference): the args array provided by libwayland is well-formed
@@ -1721,7 +1727,7 @@ impl<D> ObjectData<D> for UninitObjectData {
         _: &Handle,
         _: &mut D,
         _: ClientId,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         panic!("Received a message on an uninitialized object: {msg:?}");
     }

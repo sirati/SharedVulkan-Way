@@ -63,7 +63,9 @@ fn generate_objects_for(interface: &Interface) -> TokenStream {
         pub mod #mod_name {
             use std::sync::Arc;
             // WAYCOMPOSE FORK: was `std::os::unix::io::OwnedFd`. See vendor/PATCHES.md.
-            use wayland_backend::os::OwnedFd;
+            // Renamed to `ProtoFd` because an `h` argument is the protocol's fd
+            // rather than the socket's; docs/waycompose-design.md §76.
+            use wayland_backend::os::ProtoFd;
 
             use super::wayland_server::{
                 backend::{
@@ -165,11 +167,11 @@ fn generate_objects_for(interface: &Interface) -> TokenStream {
                     handle.send_event(self, evt)
                 }
 
-                fn parse_request(conn: &DisplayHandle, msg: Message<ObjectId, OwnedFd>) -> Result<(Self, Self::Request), DispatchError> {
+                fn parse_request(conn: &DisplayHandle, msg: Message<ObjectId, ProtoFd>) -> Result<(Self, Self::Request), DispatchError> {
                     #parse_body
                 }
 
-                fn write_event<'a>(&self, conn: &DisplayHandle, msg: Self::Event<'a>) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+                fn write_event<'a>(&self, conn: &DisplayHandle, msg: Self::Event<'a>) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
                     #write_body
                 }
 
@@ -223,7 +225,7 @@ fn gen_methods(interface: &Interface) -> TokenStream {
                                 quote! { Vec<u8> }
                             }
                         }
-                        Type::Fd => quote! { ::wayland_backend::os::BorrowedFd<'_> },
+                        Type::Fd => quote! { ::wayland_backend::os::BorrowedProtoFd<'_> },
                         Type::Object | Type::NewId => {
                             let iface = arg.interface.as_ref().unwrap();
                             let iface_mod = Ident::new(iface, Span::call_site());

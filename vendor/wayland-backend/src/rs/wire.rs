@@ -4,7 +4,14 @@ use std::collections::VecDeque;
 use std::ffi::CStr;
 
 // WAYCOMPOSE FORK: was `std::os::unix::io::{BorrowedFd, OwnedFd, RawFd}`.
-use crate::os::{OwnedFd, RawFd};
+//
+// This file is where the two jobs `crate::os` distinguishes actually sit next
+// to each other, so the import list is worth reading slowly. `ProtoFd` and
+// `RawProtoFd` are the `h` argument — the thing whose encoding
+// `docs/waycompose-design.md` §72.3 makes a per-transport choice. `OwnedFd` and
+// `BorrowedFd` here are the `SCM_RIGHTS` queues and the `dup()` that fills them:
+// real kernel descriptors, and nothing else on any platform.
+use crate::os::{OwnedFd, ProtoFd, RawProtoFd};
 #[cfg(unix)]
 use crate::os::BorrowedFd;
 
@@ -82,12 +89,12 @@ impl std::fmt::Display for MessageParseError {
 ///
 /// Any serialized Fd will be `dup()`-ed in the process
 pub fn write_to_buffers(
-    msg: &Message<u32, RawFd>,
+    msg: &Message<u32, RawProtoFd>,
     payload: &mut [u8],
     fds: &mut Vec<OwnedFd>,
 ) -> Result<usize, MessageWriteError> {
     let orig_payload_len = payload.len();
-    // Helper function to write a u32 or a RawFd to its buffer
+    // Helper function to write a u32 or a RawProtoFd to its buffer
     fn write_buf(u: u32, payload: &mut [u8]) -> Result<&mut [u8], MessageWriteError> {
         if payload.len() >= 4 {
             let (head, tail) = payload.split_at_mut(4);
@@ -203,7 +210,7 @@ pub fn parse_message<'a>(
     raw: &'a [u8],
     signature: &[ArgumentType],
     fds: &mut VecDeque<OwnedFd>,
-) -> Result<(Message<u32, OwnedFd>, &'a [u8]), MessageParseError> {
+) -> Result<(Message<u32, ProtoFd>, &'a [u8]), MessageParseError> {
     // helper function to read arrays
     fn read_array_from_payload(
         array_len: usize,

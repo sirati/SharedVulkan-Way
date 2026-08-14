@@ -7,7 +7,8 @@
 #   scripts/wc-vm-client.sh wine-relay    wc-compositor.exe under Wine here, ditto
 #   scripts/wc-vm-client.sh all
 #
-# docs/waycompose-design.md §67.9.
+# docs/waycompose-design.md §67.9 built it; §67.10 withdrew two of its three
+# legs as a transport result and added the `ring` leg. Read §67.10 first.
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # THE RULE, AND WHY TWO OF THESE THREE LEGS ARE NOT A TRANSPORT RESULT
@@ -33,7 +34,7 @@
 # banner each one prints says so rather than leaving it to this comment.
 #
 # `ring` is the leg that tries to obey the rule. It fails, and the failure is
-# the point — see §67.9 and `run_ring` below.
+# the point — see §67.10 and `run_ring` below.
 #
 # THE THREE ARRANGEMENTS, AND WHICH TWO THIS FILE IS
 #
@@ -217,7 +218,7 @@ $(grep -m1 -E "wl_display#[0-9]+: error|error [0-9]+: " "$cl" | tr -d '\r')"
     # systematic failure look like an incident.
     grep -cE "could not publish" "$pl" 2>/dev/null | grep -qv '^0$' \
       && note "pool publish refusals: $(grep -c 'could not publish' "$pl")"
-    # **And the cause, measured rather than guessed** (§67.9). `SharedFile::create`
+    # **And the cause, measured rather than guessed** (§67.10). `SharedFile::create`
     # ends in `Handle::map_mut`, an `mmap(MAP_SHARED)` on the pool file. `/sv` is
     # 9p mounted `rw,relatime,access=client,msize=16384,trans=virtio` -- no cache
     # mode -- and a shared mapping there returns EINVAL. Measured in the guest
@@ -229,7 +230,7 @@ $(grep -m1 -E "wl_display#[0-9]+: error|error [0-9]+: " "$cl" | tr -d '\r')"
     if grep -q "could not publish.*os error 22" "$pl" 2>/dev/null; then
       note "the EINVAL is 9p: mmap(MAP_SHARED) on /sv returns errno 22 (measured;"
       note "MAP_PRIVATE there and MAP_SHARED on tmpfs both succeed). The file pool"
-      note "transport cannot cross this share at all -- see §67.9."
+      note "transport cannot cross this share at all -- see §67.10."
     fi
   fi
 
@@ -255,7 +256,7 @@ run_leg() {
   note "alternative channel is only for wakeup from idle, so **this is not a"
   note "sanctioned transport and no result below is a statement about one.** What"
   note "it establishes is the venue: two kernels, no network, no shared socket."
-  note "See the 'ring' leg for the transport question and §67.9 for the blocker."
+  note "See the 'ring' leg for the transport question and §67.10 for the blocker."
 
   local sock=wg-vm cdir="$RUNDIR/$kind"
   mkdir -p "$cdir"
@@ -559,7 +560,11 @@ run_ring() {
   echo
   echo "== can the wire ride the ring in this arrangement? =="
 
-  local d="$RUNDIR/ring"; mkdir -p "$d"
+  # NOT `$RUNDIR/ring`: that is the path handed to --wayland-ring below, and using
+  # it as this leg's scratch directory made the compositor fail to create the
+  # region -- reported as "did not create a file-backed ring", which was true and
+  # about the wrong step.
+  local d="$RUNDIR/ringleg"; mkdir -p "$d"
   export WINEPREFIX="${WINEPREFIX:-/tmp/wc-wineprefix}" WINEDEBUG="${WINEDEBUG:--all}"
 
   # 1. the cross-VM publish, on the Windows build.
@@ -590,11 +595,90 @@ $(grep -o 'accepting Wayland rings in.*' "$d/ring.log" | head -1 | tr -d '\r')"
     sed 's/^/        /' "$d/ring.log" | head -8
   fi
 
+  # 3. The obvious fallback, and it does not exist either.
+  #
+  # If a Windows-build section cannot cross, the next idea is a **file**-backed
+  # control region on the one filesystem both sides can see: `--wayland-ring
+  # $RUNDIR/ring` on the host, `--upstream-ring /sv/ring` in the guest. It is
+  # worth measuring rather than reasoning about, because the reasoning goes
+  # through a fact established elsewhere and §67.5 is about exactly that habit.
+  #
+  # It fails for the reason the pool publish fails: `SharedRegion::map_fd` is an
+  # `mmap(MAP_SHARED)`, `/sv` is 9p with no cache mode, and a shared mapping
+  # there is EINVAL. So the same measurement rules out the file *pool* and the
+  # file *control region* together, and the only substrate that crosses this
+  # boundary is guest RAM through the memfd backend — which is the deployment's
+  # answer, the ring's, and the thing `--wayland-cold` does for Linux only.
+  local rd="$d/filering"; mkdir -p "$rd"
+  # `XDG_RUNTIME_DIR` is not optional here and its absence cost a run: without it
+  # the socket bind fails before the ring is ever created, and the leg reported
+  # "did not create a file-backed ring" — which is true, and about the wrong
+  # step. §63.3, in miniature, inside this file.
+  XDG_RUNTIME_DIR="$rd" "$LINUX_BIN/wc-compositor" --socket ring-c --wayland-ring "$RUNDIR/ring" \
+    --timeout 60 >"$rd/comp.log" 2>&1 &
+  local rcomp=$!
+  local ok_ring=0
+  for _ in $(seq 1 100); do
+    grep -q "accepting Wayland rings" "$rd/comp.log" 2>/dev/null && { ok_ring=1; break; }
+    sleep 0.2
+  done
+  if [ "$ok_ring" != 1 ]; then
+    note "the Linux compositor did not create a file-backed ring; skipping the 9p probe"
+    kill "$rcomp" 2>/dev/null
+  else
+    cat > "$RUNDIR/guest-cmd.sh" <<GUEST
+printf 'guest-%s: %s\n' kernel "\$(uname -sr)"
+mkdir -p /tmp/rt && chmod 700 /tmp/rt
+ls -l /sv/ring 2>&1 | head -1
+# The pool flags are here only to get past argument validation: --transport
+# shared-file demands a --peer-prefix whether or not a pool is ever created, and
+# without them the proxy exits before it touches the ring -- which the first run
+# of this probe reported as an attach, from a log that never mentioned one.
+mkdir -p /tmp/pools
+XDG_RUNTIME_DIR=/tmp/rt timeout 25 /sv/wc-proxy --upstream-ring /sv/ring \
+  --socket wl-proxy --runtime-dir /tmp/rt --accept-timeout 5 --timeout 8 \
+  --pool-dir /tmp/pools --peer-prefix /tmp/pools/ \
+  >/sv/ringproxy.log 2>&1
+printf 'ringproxy-%s %s\n' rc "\$?"
+printf 'WCVM-%s\n' DONE
+GUEST
+    rm -f "$RUNDIR/guest.log" "$RUNDIR/ringproxy.log" "$RUNDIR/nixos.qcow2"
+    say "booting the guest to try --upstream-ring on the 9p share"
+    ( cd "$RUNDIR" && "$VM/bin/run-nixos-vm" -nographic ) >"$rd/console.log" 2>&1 &
+    QEMU_PID=$!
+    for _ in $(seq 1 150); do
+      grep -q "^WCVM-DONE" "$RUNDIR/guest.log" 2>/dev/null && break
+      kill -0 "$QEMU_PID" 2>/dev/null || break
+      sleep 2
+    done
+    local rp; rp=$(head -3 "$RUNDIR/ringproxy.log" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+    # Three outcomes, and they are told apart on *what the log says about the
+    # ring* rather than on whether anything went wrong. The first version of
+    # this check matched any error at all, so a proxy that exited on argument
+    # validation -- before it had touched the region -- was read as a refusal of
+    # the mapping. That is the same mistake as the `$RUNDIR/ring` collision
+    # above, twice in one function, and it is why both are written down.
+    if grep -qiE "mmap failed|os error 22|errno 22|invalid argument" "$RUNDIR/ringproxy.log" 2>/dev/null; then
+      ok "a file-backed ring on the 9p share is refused too: \
+$(grep -iE 'mmap failed|errno 22|os error 22|invalid argument' "$RUNDIR/ringproxy.log" | head -1 | tr -d '\r')"
+      note "same cause as the pool: mmap(MAP_SHARED) on /sv is EINVAL (measured"
+      note "directly in the guest; MAP_PRIVATE there and MAP_SHARED on tmpfs both work)."
+    elif grep -qiE "claimed|attached|upstream ring" "$RUNDIR/ringproxy.log" 2>/dev/null; then
+      bad "unexpected: the guest attached to a file-backed ring over 9p: ${rp:0:130}"
+    else
+      note "the ring probe was inconclusive -- the proxy stopped before the region:"
+      note "  ${rp:0:130}"
+    fi
+    kill "$rcomp" 2>/dev/null
+    [ -n "$QEMU_PID" ] && { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; }
+    QEMU_PID=""
+  fi
+
   note "CONCLUSION: this arrangement cannot be made ring-compliant today, and the"
   note "missing piece is one function -- a guest-RAM publish for the Windows build."
   note "The compositor already commits and stamps guest RAM on Windows for an *arena*"
   note "(--arena-guest-ram, via awe-probe); ringlink's publish has never been wired"
-  note "to it. See docs/waycompose-design.md §67.9."
+  note "to it. See docs/waycompose-design.md §67.10."
 }
 
 SOCAT_ABS=$(readlink -f "$(command -v socat)")
