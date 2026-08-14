@@ -3573,11 +3573,25 @@ really has, intersected in `driver.rs`'s `forwardable_device_extensions` and
 passed through `state.rs`'s `INCOMPLETE_EXTENSIONS` filter, which no video
 extension is on either.
 
-Meanwhile the ICD advertises **one** queue family, `GRAPHICS|COMPUTE|TRANSFER`,
-and the GPU side opens the first compute-capable family — which on both RADV and
-the guest Intel is never the `VIDEO_DECODE`-only one. §6 of
-`docs/video-decode.md` measured the consequence: `no queue family with
-VIDEO_DECODE`.
+The chain, with its citations, so it can be checked rather than believed:
+
+| step | where |
+|---|---|
+| the default profile is `full` | `sv_codegen::DEFAULT_PROFILE`, `crates/sv-codegen/src/lib.rs:368` |
+| `full` excludes five extensions and no video one | `Profile::full` → `excluded_extensions()`, `crates/vk-registry/src/profile.rs:832,850` |
+| every video command is forwarded, so no video extension is *incomplete* | `docs/video-decode.md` §6: "the thirteen new commands … all of them forwarded by the generator with no hand-written line on either side"; the filter is `crates/sv-icd/src/state.rs:440` |
+| the device type an application sees is the **real GPU's**, forwarded | `crates/sv-icd/src/icd.rs:1358`, `crates/sv-gpu-server/src/convert.rs:49`. `advertise.rs:143`'s `VK_PHYSICAL_DEVICE_TYPE_OTHER` is only the pre-connection fallback |
+| but there is one queue family and it has no `VIDEO_DECODE` | `advertise.rs` (§0.4 item 7), `driver.rs` |
+
+The last row is where it breaks, and §6 of `docs/video-decode.md` has already
+measured the exact message: `no queue family with VIDEO_DECODE`.
+
+The device-type row is worth its line because it *removes* the escape. §0.8 item
+7 noted Firefox accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, which reads as
+though selection depended on our claiming something unusual. It does not: the
+type is forwarded from the guest's real GPU, so a guest with an Intel iGPU
+presents as `INTEGRATED_GPU` and there is no device-type check anywhere that
+Firefox could fail.
 
 **Those two facts together are exactly the trap §0.8 item 7 documented.**
 Firefox 153 selects a device on `VK_KHR_video_queue` + `VK_KHR_video_decode_queue`
