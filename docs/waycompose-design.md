@@ -22971,64 +22971,103 @@ other half of the lesson: `run-nixos-vm` is a wrapper, so the pid the shell
 knows is the wrapper's and killing it can leave the emulator behind. Cleanup now
 matches on the run directory too, which can only ever reach this run's guest.
 
-### 71.4 What is still in the way, stated precisely
+### 71.4 It was the growth channel, and the first guess was wrong
 
-The locate now finds every page and the **verify** fails:
+The verify failed on 68 pages beginning at index 16128, which was exactly the
+offset the compositor printed for its outbound window. the first write-up guessed the pages
+had been **dropped and re-faulted** — `MADV_DONTNEED` on shared memory returns a
+zero-filled page with a *new frame*, which would explain both the missing stamps
+and the stale frame list in one stroke. **That guess is withdrawn. Nothing was
+re-faulted and no frame changed.**
 
-```
-located 16384 of 16384 pages in 193.51ms by frame list
-verify: 16316/16384 pages of the stitched view carry their own arena index
-wc-arena-host: 68 page(s) are not where the arena says they are
-```
-
-16316 both ways, deterministically, across four runs — so this is not the sweep
-being flaky. Instrumenting the verify names the pages exactly: they begin at
-**page 16128**, which is byte 66060288, which is where the compositor said its
-outbound window starts. And their contents are the finding:
+The cause is arithmetic:
 
 ```
-DBG page 16128: first8=[00, 00, 31, 4b, 52, 56, 48, 53]
-DBG page 16130: first8=[00, 00, 00, 00, 00, 00, 00, 00]
-DBG page 16131: first8=[00, 00, 00, 00, 00, 00, 00, 00]
+grow::CONTROL_BYTES = 272 * 1024 = 278_528 bytes = 68 pages of 4096
 ```
 
-**Mostly zeroes, not somebody else's data.** A page overwritten by a gift would
-carry the gift; a page reading zero has been *dropped and re-faulted*. That
-single observation explains both symptoms at once: a re-faulted page is zero, so
-the sweep cannot find its stamp, and it has a **new physical frame**, so the
-frame list captured at allocation time points at the old one. Two locate methods
-failing on identically the same 68 pages is what a changed frame looks like from
-both sides.
+§53 reserves the growth channel from the **front of the outbound window**, and
+it must do so *before any gift* while the window is still untouched — that
+ordering is §53.2's whole finding, and `reserve_growth_channel` refuses once
+anything has been handed out. So on every run with both a guest-RAM arena and an
+outbound window, the first 68 pages of that window carry an initialised ring
+control region instead of stamps, before the host ever looks.
 
-This is §14.12 item 1's territory — stage 12 found the keymap sealed into the
-outbound window "a full minute before any client exists" and fixed it with
-`defer_gifts`, which is *active* here: the compositor logs `objects made for
-clients are held in memory until the first client connects`. So the deferral is
-working and something else is releasing those pages. On a Linux guest,
-`MADV_DONTNEED` on shared memory is exactly the call that drops a page and
-returns a zero-filled one with a different frame on the next touch.
+The evidence matches exactly and I had already collected it without reading it:
+the first two pages held the channel's header (`first8=[00,00,31,4b,52,56,48,53]`)
+and the rest read as zeroes. That is an initialised ring, not a re-faulted page.
+A page that had been dropped would have been *entirely* zero, header included.
 
-**Not fixed here**, deliberately. It is in the arena's gift and outbound
-handling, which §27's brief listed as somebody else's — and a blind change to
-page lifetime in the region every client's pixels live in is not a thing to make
-at the end of a long session on a hypothesis.
+**`defer_gifts` is not the fix and was never going to be**, which is why it was
+active and logging throughout. The growth channel is not a gift. §12's deferral
+covers objects made *for clients*; the channel is infrastructure the compositor
+takes for itself, deliberately ahead of them.
 
-### 71.5 The gates
+So the defect was in the **check**, not the compositor. `wc-arena-host --verify`
+walked all `--pages`, including a window whose stamps the compositor is designed
+to spend. It now stops at the outbound boundary and says so:
+
+```
+verify: skipping the last 256 page(s) -- the outbound window is where the
+        compositor writes, and its stamps are its own to spend
+verify: 16128/16128 pages of the stitched view carry their own arena index
+```
+
+The data region is still verified in full, and that is the half that matters: a
+mislocated *data* page is somebody's pixels landing in the wrong memory. The
+outbound window is located by frame translation like everything else — only its
+stamps are unreadable, and only because they have been spent.
+
+### 71.5 The wire did not cross, and the rule says not to fix it
+
+With the locate passing, the leg reaches the proxy: `wc-proxy` maps the guest's
+arena, `--verify-damage` is on, and a client connects to it. Then it stops.
+Three runs reported **`2 client msgs, 0 server msgs`** — the client reaches the
+proxy, the compositor answers, and the answers never arrive.
+
+Two causes were found and neither was it. The compositor's socket was on the 9p
+share, and **a Unix socket node exported over 9p is a host kernel object a guest
+`connect()` cannot reach** — which `wc-vm-client.sh` had already established and
+this section rediscovered the slow way, seeing `wl-vm` as a plain file on the
+host. Moving it to guest-local `/run` fixed that and changed nothing. Attaching
+the host end of the virtio port before the guest opens it changed nothing
+either.
+
+It was not pursued further, and the reason is the user's standing rule:
+
+> all communication is to go through the ring. alternative channels are
+> permitted only for wakeup from idle
+
+This leg carries the **whole Wayland conversation** over a virtio-serial port
+through two `socat`s. Making that work properly would be building a forbidden
+channel well. `wc-vm-client.sh` reached the same conclusion about the same
+transport and keeps its `*-relay` legs labelled rather than fixed; this file is
+now labelled the same way, and its banner says so rather than leaving it to a
+comment somebody has to find.
+
+**What the leg is for is the half that is not the transport**: the arena locate,
+which is the deployment's own path and which nothing else on this workstation
+exercises. That half now works end to end.
+
+### 71.6 The gates
 
 | Gate | Result |
 |---|---|
 | `cargo build --workspace`, both targets | clean |
-| `cargo test --workspace --no-fail-fast` | **2629 tests**, 0 failures — one test was rewritten rather than deleted, §71.2 |
-| **`scripts/wc-vm-damage.sh linux`** | **9 passed, 1 failed** — the failure is §71.4 |
+| `cargo test --workspace --no-fail-fast` | **2632 tests**, 0 failures — one test was rewritten rather than deleted, §71.2 |
+| **`scripts/wc-vm-damage.sh linux`** | **13 passed, 2 failed** |
 | ... the guest boots and QMP answers | pass |
 | ... `wc-compositor` listens **inside the guest** | pass |
 | ... **`Linux 6.18.44` inside vs `Linux 6.18.33` outside** | pass — the run cannot have measured the host |
 | ... the arena comes from the guest's own RAM | pass — 16384 pages, run id reported |
 | ... the guest publishes a frame list | pass — 16384 frames, §71.2's new path |
-| ... the host locates it | **fail** — 68 outbound pages, §71.4 |
-| topologies 2 and 3 | **NOT RUN** |
+| ... **the host locates it** | **pass** — `verify: 16128/16128 pages`, §71.4 |
+| ... `wc-proxy` maps the guest's arena with `--verify-damage` on | pass |
+| ... **`wc_assert_topology` proves the boundary** | pass — 16384 pages of guest RAM located over QMP; the first time §51's gate has been exercised by a leg that can pass it |
+| ... a commit is checked across the boundary | **fail** — §71.5, the wire, which the rule says not to fix |
+| the three arrangements | covered by `wc-vm-client.sh` and `wc-wine-guest.sh`; this file is not a fourth |
 
-### 71.6 What is not proven
+### 71.7 What is not proven
 
 1. **The user's second symptom is still unverified.** The leg stops one step
    before the proxy, so no commit has been checked across this boundary and no

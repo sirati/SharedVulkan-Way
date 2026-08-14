@@ -431,9 +431,41 @@ mod host {
         );
 
         if args.verify {
+            // **The outbound window is exempt, and by construction rather than
+            // by tolerance.** STAGE 71.
+            //
+            // Its stamps are the compositor's to overwrite: the window is where
+            // gifts are written, and since §53 its first `CONTROL_BYTES` are the
+            // growth channel, reserved and initialised *before any gift* while
+            // the window is still untouched. So on any run with both a guest-RAM
+            // arena and an outbound window, some leading pages of that window
+            // have lost their stamps before the host ever looks — which is the
+            // design working, not a fault.
+            //
+            // Measured rather than assumed. A Linux-guest run reported
+            // `verify: 16316/16384 pages` and refused to write a plan; the wrong
+            // pages began at index 16128, which was exactly the offset the
+            // compositor had printed for its outbound window, and there were
+            // **68** of them. `grow::CONTROL_BYTES` is 272 KiB, which is 68
+            // pages of 4096. The first two carried the channel's header and the
+            // rest read as zeroes, which is an initialised ring and not, as
+            // §70.4 guessed, a page that had been dropped and re-faulted. That
+            // guess is withdrawn: nothing was re-faulted and no frame changed.
+            //
+            // The data region is still verified in full, which is the half that
+            // matters — a mislocated *data* page is somebody's pixels landing in
+            // the wrong memory, and that check is unchanged.
+            let outbound_pages = args.outbound / PAGE;
+            let checked = args.pages.saturating_sub(outbound_pages);
+            if outbound_pages > 0 {
+                println!(
+                    "verify: skipping the last {outbound_pages} page(s) -- the outbound \
+                     window is where the compositor writes, and its stamps are its own to spend"
+                );
+            }
             let mut wrong = 0usize;
             let mut header = [0u8; 20];
-            for i in 0..args.pages {
+            for i in 0..checked {
                 view.read(i * PAGE, &mut header).ok_or("short read of the stitched view")?;
                 let magic_ok = header[0..8] == wc_handle::arena::STAMP_MAGIC;
                 let run_ok = u64::from_le_bytes(header[8..16].try_into().unwrap()) == args.run_id;
@@ -444,8 +476,8 @@ mod host {
             }
             println!(
                 "verify: {}/{} pages of the stitched view carry their own arena index",
-                args.pages as usize - wrong,
-                args.pages
+                checked as usize - wrong,
+                checked
             );
             if wrong > 0 {
                 return Err(format!("{wrong} page(s) are not where the arena says they are").into());
