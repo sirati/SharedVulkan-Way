@@ -393,6 +393,16 @@ OUT_EXTRA=()
 # --timeout already deal with that.
 ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/wg-s4-* 2>/dev/null; true" >/dev/null 2>&1
 
+# The export's own leftovers, and this one produced a wrong answer rather than a
+# missing one. The frame list is written into $SHARE by the guest and read back
+# here by name. Nothing truncated it between runs, so a run whose list was
+# SHORTER than its predecessor's read its own entries followed by the tail of
+# the previous run's -- 16397 frames for a 16384-page arena, jumping backwards
+# from page 16384 to 16373, and wc-arena-host rightly refused it as a list with
+# a hole. A stale scroll.log is worse still: it would report a scroll from the
+# run before this one as if it were this one's.
+rm -f "$SHARE/arena.frames" "$SHARE/scroll.log" "$SHARE/s4.log" 2>/dev/null || true
+
 # How long the compositor lives. Everything else in this script is timed from
 # it, and `guest-ram` needs the extra because the *locate* happens between the
 # compositor starting and the client running: a sweep of 13 GiB of guest RAM is
@@ -402,7 +412,20 @@ ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/wg-s4-
 COMP_SECS=$((SECS + 45))
 [ "$TRANSPORT" = guest-ram ] && COMP_SECS=$((SECS + 90))
 
-ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./wc-compositor.exe \
+# The scroll probe rides the compositor's OWN ssh, and that is the whole fix.
+# Windows OpenSSH gives every connection its own session and window station, and
+# window enumeration only ever sees the calling thread's desktop. A probe over a
+# second ssh therefore polled an empty desktop for its full timeout and reported
+#   probe-scroll: no visible window of class 'WaycomposeToplevel' after 150 s
+# while the compositor, in the other session, had a real HWND with 45 frames
+# blitted into it. Same ssh, same station, and FindWindowW can see it. This is
+# the third harness to meet the session boundary; see wc-input.sh.
+SCROLL_PRE=""
+if [ -n "$VERIFY" ]; then
+  SCROLL_PRE="(./probe-scroll.exe --class WaycomposeToplevel --wait $((SECS)) --notches ${WC_NOTCHES:-60} --gap ${WC_GAP:-150} --settle 6000 --log '$SHARE_WIN\\scroll.log' >scroll.out 2>&1 &) ; "
+  echo "S4-SCROLL: probe-scroll.exe rides the compositor's own session"
+fi
+ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && $SCROLL_PRE ./wc-compositor.exe \
   --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
   --arena-frames '$SHARE_WIN\\arena.frames' \
   --log '$SHARE_WIN\\s4.log' ${OUT_EXTRA[*]@Q} ${COMP_EXTRA[*]@Q} ${KEYMAP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
@@ -495,15 +518,9 @@ sleep 4
 # the window would show up as a run with no scroll in it, which the commit floor
 # catches. Blocking the harness on it would trade a detectable failure for a
 # hang.
+# Launched above, inside the compositor's ssh. Not a separate connection any
+# more, so there is no pid here to hold and nothing to wait on.
 SCROLL=0
-if [ -n "$VERIFY" ]; then
-  ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && \
-    ./probe-scroll.exe --class WaycomposeToplevel --wait $((SECS)) \
-    --notches ${WC_NOTCHES:-60} --gap ${WC_GAP:-150} --settle 6000 \
-    --log 'C:\\Users\\<guest-user>\\$GDIR\\scroll.log'" >"$RUN/scroll.out" 2>&1 &
-  SCROLL=$!
-  echo "S4-SCROLL: probe-scroll.exe launched on the guest"
-fi
 
 PROXY=0
 if [ ! -S "$RUN/up.sock" ]; then
@@ -608,7 +625,10 @@ echo "S4-RELAY-BEGIN";  cat "$RUN/relay.out"; echo "S4-RELAY-END"
 # Windows session makes SendInput return 0 while the probe exits happily.
 if [ -n "$VERIFY" ]; then
   echo "S4-SCROLLLOG-BEGIN"
-  ssh "${GK[@]}" "$G" "cat $GDIR/scroll.log" 2>/dev/null
+  # Read from the export, not over ssh: the probe now writes into $SHARE_WIN so
+  # the driver can read it locally, and one fewer connection is one fewer
+  # session to get confused about.
+  cat "$SHARE/scroll.log" 2>/dev/null
   echo "S4-SCROLLLOG-END"
 fi
 echo "S4-CLIENT-BEGIN"; head -20 "$RUN/cli.log"; echo "S4-CLIENT-END"
@@ -1128,6 +1148,12 @@ s4_run() {
          want=$(echo "$loc" | grep -o "/[0-9]* pages" | tr -dc 0-9)
          if [ "$got" = "$want" ] && [ "${got:-0}" -gt 0 ]; then
            ok "$tag: all $got pages of the guest's arena were found in QEMU's backend, each at its own index"
+           # §51. The evidence the assertions read. Without this the locate
+           # happened, printed its line into the driver log, and `wc_assert_substrate`
+           # still said UNPROVEN -- correctly, because it can only see variables.
+           # The gate was right and the wiring was missing.
+           WC_SUBSTRATE_LOCATED=$got
+           WC_SUBSTRATE_LOCATOR="wc-arena-host over QMP on $HOST"
          else
            bad "$tag: $loc"
          fi ;;
