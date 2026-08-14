@@ -1339,6 +1339,37 @@ impl State {
         self.by_id(id).map(|w| w.role.surface().clone())
     }
 
+    /// Whether every surface between `surface` and `root` still has a buffer.
+    ///
+    /// ADDED FOR §45.10 for the hit test, and made a function in §45.11 when it
+    /// turned out the *bounding box* needed the same answer — which is the
+    /// point §40 made about `placed_tree` and which this predicate had spent a
+    /// section quietly contradicting.
+    ///
+    /// "A sub-surface is mapped when the parent is mapped **and** the
+    /// sub-surface has a buffer." The staging entry is the buffer: it is
+    /// created on commit and dropped on a null buffer or a destroy, so asking
+    /// whether an ancestor has one is asking exactly the protocol's question.
+    ///
+    /// **The root is deliberately excluded.** "The root has no buffer" is the
+    /// window-level question, answered by `Window::mapped` and by the platform
+    /// ceasing to report the window; and a tree whose root has not drawn *yet*
+    /// is the normal transient state §9 documented, where Firefox commits the
+    /// subsurface holding the browser before the toplevel behind it.
+    fn ancestors_mapped(&self, surface: &WlSurface, root: &WlSurface) -> bool {
+        let mut ancestor = compositor::get_parent(surface);
+        while let Some(p) = ancestor {
+            if &p == root {
+                return true;
+            }
+            if !self.staging.contains_key(&p) {
+                return false;
+            }
+            ancestor = compositor::get_parent(&p);
+        }
+        true
+    }
+
     /// **Which surface of window `id` is under the point `(x, y)`**, and where
     /// that surface's origin sits — the pair every input event needs.
     ///
@@ -1426,15 +1457,8 @@ impl State {
             // the browser *before* the toplevel behind it, so a tree whose root
             // has not drawn yet is a normal transient state rather than an
             // unmapped window.
-            let mut ancestor = compositor::get_parent(&surface);
-            while let Some(p) = ancestor {
-                if p == root {
-                    break;
-                }
-                if !self.staging.contains_key(&p) {
-                    return None;
-                }
-                ancestor = compositor::get_parent(&p);
+            if !self.ancestors_mapped(&surface, &root) {
+                return None;
             }
             // The surface's origin in window-content pixels.
             let origin = (rx + f64::from(loc.0), ry + f64::from(loc.1));
@@ -1482,6 +1506,7 @@ impl State {
                     h: shadow.height(),
                     toplevel: w.role.toplevel().is_some(),
                     popup_at: w.popup_at,
+                    content: w.content_offset,
                 })
             })
             .collect();
@@ -2671,8 +2696,25 @@ impl State {
         // `root_size` this replaces. And it changes nothing for a client that
         // *does* set a geometry — Firefox, `weston-terminal`, every GTK
         // application — because that is still the branch above.
+        // **An unmapped subtree is not part of the bounds, and §45.11 is where
+        // that was learned rather than asserted.** §45.10 taught the hit test
+        // that a subsurface is mapped only while its parent is; the bounding
+        // box went on counting the children of an unmapped surface, so a window
+        // whose overhanging subsurface had been unmapped stayed the larger
+        // size. Nothing was drawn there — the unmapped surface has no staging
+        // entry and neither, usually, do its children — but the *window* still
+        // covered those pixels, and a window covers pixels whether or not it
+        // paints them. WLCS's `input_falls_through_subsurface_when_parent_unmapped`
+        // is precisely that: a lower window underneath the overhang, which
+        // must receive the click and could not while a larger empty window sat
+        // over it.
+        //
+        // This is §40's argument about `placed_tree` arriving where it was
+        // always going: painting and hit-testing must not disagree about which
+        // surfaces are in the tree, and for one section they did.
         let bounds = placed
             .iter()
+            .filter(|(surface, _)| self.ancestors_mapped(surface, root))
             .filter_map(|(surface, (x, y))| {
                 let s = self.staging.get(surface)?;
                 (s.width() > 0 && s.height() > 0)
@@ -2701,11 +2743,45 @@ impl State {
         let window = self.windows.get_mut(root).expect("caller checked");
         // The one place this number is decided, for the pixels *and* for the
         // pointer. See `Window::content_offset`.
+        let was = window.content_offset;
+        let mapped = window.mapped;
+        let wid = window.id;
         window.content_offset = (gx, gy);
+        // **And when it changes, the window has moved on screen.** §45.11.
+        //
+        // `content_offset` says where the window's top-left pixel sits inside
+        // the root surface's buffer. If it changes while the window is up — a
+        // subsurface appears off the left edge and the tree's bounds grow, or a
+        // client re-declares its geometry — then the buffer has not moved and
+        // the window's corner has, by exactly the difference. Nothing said so,
+        // so the window stayed where it was and its contents slid inside it.
+        //
+        // Sent as a **delta**, not a position, and that is the architecture
+        // rather than convenience: this compositor does not know where any of
+        // its windows are. Windows owns that (`control.rs`'s header), and the
+        // only thing this side can truthfully say is "whatever you have, it
+        // moved by this much".
+        if mapped && was != (gx, gy) {
+            self.ui.send(ToUi::ShiftOrigin {
+                id: wid,
+                dx: gx - was.0,
+                dy: gy - was.1,
+            });
+        }
         let shadow = window.shadow.clone();
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
         let reshaped = shadow.reset(gw, gh, format);
         for (surface, (x, y)) in &placed {
+            // The same rule as the bounds above and as the hit test: a
+            // subsurface of an unmapped surface is not mapped, so it is not
+            // drawn either. In practice such a surface usually has no staging
+            // entry of its own and this changes nothing — but "usually" is not
+            // a reason for the paint path to use a different predicate from
+            // the two that decide where the window is and what is under the
+            // pointer.
+            if !self.ancestors_mapped(surface, root) {
+                continue;
+            }
             if let Some(src) = self.staging.get(surface) {
                 shadow.compose(src, (x - gx, y - gy));
             }

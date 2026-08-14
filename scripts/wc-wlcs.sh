@@ -555,6 +555,21 @@ justified_failure_patterns() {
     printf 'SurfaceInputRegions/SurfaceInputCombinations.%s/6\t%s\n' "$t" "$why"
     printf 'SurfaceInputRegions/SurfaceInputCombinations.%s/7\t%s\n' "$t" "$why"
   done
+  # ADDED IN §45.11, and only once the evidence separated them. These four ran
+  # with four *more* — parameters 8 to 11 — which failed for a completely
+  # different reason: §40's union bounding box moved the window's size without
+  # moving its origin. §45.10 found that, declined to reclassify any of the
+  # eight while half of them were a live bug, and said so. The bug is fixed and
+  # 8 to 11 now pass; these four remain, and they remain for the reason above —
+  # every one of them puts a subsurface 100 px to the left of a toplevel that
+  # has *declared* a window geometry, so the subsurface is outside the HWND.
+  #
+  # The order matters and is the point: a failing test was not called expected
+  # until nothing else could explain it.
+  for t in 4 5 6 7; do
+    printf 'SurfaceInputRegions/SurfaceInputCombinations.input_seen_by_subsurface_after_parent_unmapped_and_remapped/%s\t%s\n' \
+      "$t" "$why"
+  done
 }
 
 justified_failures() {
