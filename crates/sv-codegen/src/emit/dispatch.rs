@@ -649,6 +649,18 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
                         consumed: sv_wire::COMMAND_HEADER_SIZE,
                     })?;
                 let mut body = dec.sub(body_len)?;
+                // **`SV_TRACE` reaches inside a blob**, which it did not, and
+                // that gap cost a diagnosis. `sv_gpu_server::session` traces the
+                // ring dispatcher, so a `vkCmd*` replayed from a blob was
+                // invisible: a driver crash during replay could be located no
+                // more precisely than "somewhere in this recording", which is
+                // where docs/design.md §0.23's open segfault sat for two
+                // sessions. Printed *before* the call, unlike the ring tracer
+                // which prints after, because the interesting command is the one
+                // that does not return.
+                if std::env::var_os("SV_TRACE").is_some() {
+                    eprintln!("[blob] {}", opcode.name());
+                }
                 match opcode {
                     #(#sub_arms)*
                     _ => return Err(sv_wire::WireError::UnknownCommand {
