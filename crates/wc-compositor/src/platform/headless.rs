@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    assemble, Commands, CursorSpec, FrameStyle, FromUi, PlatformConfig, Started, ToUi, TouchShape,
+    assemble, Commands, CursorSpec, FromUi, PlatformConfig, Started, ToUi, TouchShape,
     WindowId,
 };
 use crate::surface::{PixelFormat, Shadow};
@@ -181,7 +181,10 @@ pub(crate) struct PumpInner {
     commands: Commands,
     events: Sender<FromUi>,
     dump_frames: Option<PathBuf>,
-    frame: FrameStyle,
+    // §46 REMOVED THE RUN-WIDE `frame` HERE. It existed to answer "is the
+    // caption folded", and that question is now per window and arrives on
+    // `ToUi::Map`. A field kept "for symmetry with win32" would be a second
+    // answer to a question that has one, and the compiler said so.
     simulate: Simulation,
     /// ADDED FOR STAGE 9: one scripted click, into the first window that maps.
     ///
@@ -291,7 +294,6 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             commands: rx,
             events: config.events,
             dump_frames: config.dump_frames,
-            frame: config.frame,
             simulate: if config.simulate_wm {
                 Simulation::ON
             } else {
@@ -498,15 +500,21 @@ impl PumpInner {
                 "wc-compositor: window {id} repositioned to {x},{y} {width}x{height}"
             ),
 
-            ToUi::Map { id, width, height } => {
+            ToUi::Map { id, width, height, fold_caption } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;
                     w.surface = (width, height);
                     w.mapped_at = Some(Instant::now());
+                    // §46: `fold_caption` rather than `self.frame.extend_top`,
+                    // because the decision is now this window's rather than the
+                    // run's. There is no caption on this platform to fold, so
+                    // the line is the *only* thing the headless leg can assert
+                    // on — which makes it the instrument for every per-window
+                    // frame test that does not need a real Win32 window.
                     println!(
                         "wc-compositor: window {id} mapped surface {width}x{height} \
                          client {width}x{height}{}",
-                        if self.frame.extend_top {
+                        if fold_caption {
                             " (the system caption folded in)"
                         } else {
                             ""

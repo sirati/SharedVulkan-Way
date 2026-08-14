@@ -125,7 +125,8 @@ use crate::platform::{
     CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
 };
 use crate::surface::{
-    bars, decorator, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource,
+    bars, decorator, fold_caption, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow,
+    ShmSource,
 };
 
 /// Which decoration mode the compositor advertises, and answers with.
@@ -141,10 +142,30 @@ use crate::surface::{
 /// So the mode is a flag with `Server` as its default — Windows' caption is a
 /// real server-side decoration and claiming it is the honest answer — and
 /// `Client` is what the frame-extension work of §22.7 is developed against.
+///
+/// **§46 made `Auto` the default and `Server` a named leg.** `Server` was the
+/// right default for as long as the compositor had only two arrangements and
+/// had to promise one of them to every client; §31 built the third, and the
+/// user's `weston-terminal` bug is a client for which `Server` is a promise
+/// nobody can keep — it binds no decoration protocol, so it never hears the
+/// promise, and it draws a title bar under ours. `Auto` advertises exactly what
+/// `Server` advertises and differs only for a window that turns out to have
+/// decorated itself anyway. See [`crate::surface::fold_caption`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Decorations {
-    /// Windows draws the caption; the client draws none. **The default.**
+    /// Advertise `Server`, and fold the caption for a window that decorated
+    /// itself regardless. **The default since §46.**
+    ///
+    /// On the wire this is indistinguishable from [`Self::Server`]: same
+    /// `default_mode`, same `xdg-decoration` answer. The difference is one
+    /// `bool` per window, decided at map from the geometry inset, and it is
+    /// what gives a non-negotiating self-decorating client one title bar
+    /// instead of two.
     #[default]
+    Auto,
+    /// Windows draws the caption; the client draws none. **The default before
+    /// §46**, and still the leg to name when a run wants the old behaviour
+    /// — including the run that photographs the bug.
     Server,
     /// The client draws its own title bar, and Windows draws its caption above
     /// it. This is the two-title-bar arrangement every stage before 17 shipped,
@@ -167,6 +188,7 @@ impl Decorations {
     /// Parse the `--decorations` argument. `None` for anything else.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "auto" => Some(Self::Auto),
             "server" => Some(Self::Server),
             "client" => Some(Self::Client),
             "tabs" => Some(Self::Tabs),
@@ -174,9 +196,19 @@ impl Decorations {
         }
     }
 
-    /// Whether the Win32 side should fold the caption into the client area.
+    /// Whether **every** window in this run folds its caption, regardless of
+    /// what the client turns out to be. `Tabs` only.
+    ///
+    /// §46 renamed nothing here and changed nothing about what it answers; what
+    /// changed is that this is no longer the whole story, because `Auto` decides
+    /// per window. See [`Self::auto`] and [`crate::surface::fold_caption`].
     pub fn extends_frame(self) -> bool {
         matches!(self, Self::Tabs)
+    }
+
+    /// Whether the fold is decided per window from what the client did.
+    pub fn auto(self) -> bool {
+        matches!(self, Self::Auto)
     }
 
     /// The KDE protocol's spelling, which is the one that decides GTK's
@@ -185,7 +217,11 @@ impl Decorations {
     /// to any per-surface request.
     fn kde(self) -> KdeDefaultMode {
         match self {
-            Self::Server => KdeDefaultMode::Server,
+            // **`Auto` is `Server` on the wire, and that is the point.** A
+            // client that binds this manager gets told the system decorates,
+            // takes it, and draws no bar — which is already right and must not
+            // change. `Auto` only differs for a client that never asked.
+            Self::Auto | Self::Server => KdeDefaultMode::Server,
             // `Tabs` is `Client` here, and that is the whole reason it is not a
             // third value on the wire: the tab strip this arrangement puts in
             // the caption is drawn by the client, and it only exists at all
@@ -198,7 +234,7 @@ impl Decorations {
     /// project runs (§15.7), and answered consistently anyway.
     fn xdg(self) -> DecorationMode {
         match self {
-            Self::Server => DecorationMode::ServerSide,
+            Self::Auto | Self::Server => DecorationMode::ServerSide,
             Self::Client | Self::Tabs => DecorationMode::ClientSide,
         }
     }
@@ -2125,7 +2161,7 @@ impl State {
                 "wc-compositor: window {id} pixels served by {served_by} \
                  (mapped: {sections} section, {files} shared-file, {slices} arena-slice)"
             );
-            self.report_decorator(&root, id, &app_id);
+            let fold_caption = self.report_decorator(&root, id, &app_id);
             // ADDED FOR STAGE 9. `wl_surface.enter` is how a client learns
             // which output it is on, and therefore what scale to draw at and
             // what refresh rate to expect. It is sent at map because before a
@@ -2160,6 +2196,7 @@ impl State {
                 id,
                 width: w,
                 height: h,
+                fold_caption,
             });
             if !title.is_empty() {
                 self.ui.send(ToUi::Title { id, title });
@@ -2464,7 +2501,16 @@ impl State {
     /// draw anyway becomes the only one — and that is a per-window window
     /// style, on the Win32 side, which this branch does not have. The one thing
     /// that has to exist first is the ability to *tell*, and that is here.
-    fn report_decorator(&self, root: &WlSurface, id: WindowId, app_id: &str) {
+    /// Decide this window's frame, and say so. Returns whether its caption is
+    /// folded into its client area, which is what `ToUi::Map` carries.
+    ///
+    /// §33 wrote this as a report and said in as many words that it reported
+    /// and did not decide, because the arrangement to switch to did not exist
+    /// on that branch and because the inset is not a fact a live window style
+    /// should track. §31 built the arrangement and §46 takes the decision —
+    /// **once, here, at map** — which is what makes the second objection not
+    /// apply. See [`crate::surface::fold_caption`].
+    fn report_decorator(&self, root: &WlSurface, id: WindowId, app_id: &str) -> bool {
         use smithay::wayland::shell::xdg::SurfaceCachedState;
         let inset = compositor::with_states(root, |states| {
             states
@@ -2481,7 +2527,14 @@ impl State {
         // that named "two title bars" from `who` alone was right only while the
         // caption was never folded — which was true when §33 was written and
         // stopped being true when §31 merged.
-        let folded = self.decorations.extends_frame();
+        // §46: per window, not per run. `extends_frame()` is still the run-wide
+        // `tabs` switch and is still honoured; `auto` adds the arm that asks
+        // what this particular client turned out to be.
+        let folded = fold_caption(
+            self.decorations.extends_frame(),
+            self.decorations.auto(),
+            who,
+        );
         let app = if app_id.is_empty() { "<no app id>" } else { app_id };
         match bars(who, folded) {
             Bars::Agreed => println!(
@@ -2494,10 +2547,11 @@ impl State {
                  margin around its window; Windows' caption is the only title bar"
             ),
             Bars::OneClient => println!(
-                "wc-compositor: window {id} ({app}) draws its own title bar and this run folds \
-                 the caption into the client area ({:?}), so that bar is the window's -- \
-                 geometry inset {},{} (§31, §33.7)",
-                self.decorations, inset.0, inset.1
+                "wc-compositor: window {id} ({app}) bound no decoration protocol and reports a \
+                 {},{} margin around its window -- it is drawing its own title bar, so this \
+                 window's caption is folded into its client area ({:?}) and that bar is the \
+                 window's (§46)",
+                inset.0, inset.1, self.decorations
             ),
             // The two that are defect reports. Named as such, because the
             // compositor is telling the truth about a window the user is about
@@ -2517,6 +2571,7 @@ impl State {
                 self.decorations
             ),
         }
+        folded
     }
 
     /// Draw every surface of `root`'s tree into `root`'s window shadow, and say

@@ -223,11 +223,15 @@ struct Args {
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
     #[cfg(not(windows))]
     click: Option<platform::Click>,
-    /// Which decoration mode to advertise, as `server`, `client` or `tabs`.
+    /// Which decoration mode to advertise, as `auto`, `server`, `client` or
+    /// `tabs`.
     ///
-    /// ADDED FOR STAGE 17, and given a third value by TABS IN THE TITLE BAR. See
-    /// [`Decorations`] for why it defaults to `server`, what a run that asks
-    /// for `client` is for, and what `tabs` changes on the Win32 side.
+    /// ADDED FOR STAGE 17, given a third value by TABS IN THE TITLE BAR and a
+    /// fourth — the default — by §46. See [`Decorations`] for what each is for:
+    /// `auto` advertises what `server` advertises and folds the caption only
+    /// for a window whose client turned out to decorate itself, `server` is
+    /// that arrangement without the per-window arm, `client` is the deliberate
+    /// two-bar control leg, and `tabs` folds unconditionally.
     decorations: Decorations,
     /// Whether `--decorations tabs` also calls `DwmExtendFrameIntoClientArea`.
     ///
@@ -493,12 +497,12 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             // ADDED FOR STAGE 17, and it is the flag §22.2 is about.
             "--decorations" => {
                 let Some(v) = it.next() else {
-                    eprintln!("wc-compositor: --decorations needs server, client or tabs");
+                    eprintln!("wc-compositor: --decorations needs auto, server, client or tabs");
                     return Err(2);
                 };
                 let Some(d) = Decorations::parse(&v) else {
                     eprintln!(
-                        "wc-compositor: --decorations {v}: expected server, client or tabs"
+                        "wc-compositor: --decorations {v}: expected auto, server, client or tabs"
                     );
                     return Err(2);
                 };

@@ -418,7 +418,19 @@ pub enum ToUi {
     Present { id: WindowId, damage: Vec<Rect> },
     /// The surface has committed its first buffer and may now be shown, at
     /// this surface size.
-    Map { id: WindowId, width: i32, height: i32 },
+    ///
+    /// `fold_caption` is §46's per-window frame decision, and it rides on this
+    /// message rather than on [`ToUi::Create`] because it cannot be known any
+    /// earlier: it is derived from `xdg_surface.set_window_geometry`, and a
+    /// toplevel is created before it has committed anything. Applied before the
+    /// window is shown, so the first `WM_NCCALCSIZE` a window ever answers is
+    /// already the right one and no frame is recalculated under the user.
+    Map {
+        id: WindowId,
+        width: i32,
+        height: i32,
+        fold_caption: bool,
+    },
     /// The client asked to be maximised, unmaximised or minimised.
     SetWindowState {
         id: WindowId,
@@ -902,7 +914,19 @@ pub(crate) fn assemble(
 pub struct PlatformConfig {
     /// Where UI events are delivered.
     pub events: Sender<FromUi>,
-    /// How much frame the system owns.
+    /// How much frame the system owns, as the *run* was configured.
+    ///
+    /// Still the whole answer for `dwm_glass` and `caption_buttons`, which are
+    /// run-wide switches. `extend_top` is only this run's starting point since
+    /// §46: it is what `--decorations tabs` sets for every window, and every
+    /// window's own answer arrives later on [`ToUi::Map`].
+    ///
+    /// Unread on the headless platform, which has no caption to fold and now
+    /// takes the per-window flag straight off `Map`. Allowed rather than
+    /// `cfg`-ed away, because a field that exists on one platform's config and
+    /// not the other's is a second shape of `PlatformConfig` for two callers to
+    /// keep in step.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub frame: FrameStyle,
     /// Write every presented frame here as a PPM, for the harness to read back.
     /// `None` in normal operation.
