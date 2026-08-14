@@ -494,6 +494,86 @@ proc_running() {
   [ -n "$pids" ]
 }
 
+# ------------------------------------------------------------- proc_kill ----
+# Stop a process this run started, by **pid or pidfile — never a pattern**.
+#
+#   proc_kill <pid> <what-it-is>
+#   proc_kill_pidfile <path> <what-it-is>
+#
+# WHY THIS EXISTS, AND IT IS NOT HYPOTHETICAL
+#
+# `proc_running` above matches an exact executable name because a `pgrep -f`
+# guard matches the shell running it. **The kill side of that argument was never
+# written, and today it cost the machine.** An over-broad
+#
+#     pkill -9 -f weston
+#
+# — intended for one harness's leftovers — matched the desktop session hosting
+# 1Password, killed it, and took with it the SSH agent that carries the keys for
+# `testhost` and the guest, and the key that signs commits. Two machines
+# unreachable and signing broken, from a cleanup line in an unrelated run. It is
+# the fourth instance of this defect in one session; the first three were guards
+# matching their own shells, which is embarrassing but self-contained. This one
+# matched *another agent's process*, which is not.
+#
+# **A pattern is the wrong instrument for stopping a process you started.** You
+# know its pid — you started it. The pattern is a way of *rediscovering* a pid
+# you already had, and it rediscovers other people's too. The rule:
+#
+#   * If you started it in this shell, you have `$!`. Use it.
+#   * If it outlives the shell, have it write a pidfile, and use that.
+#   * If you have neither, you are not stopping *your* process — you are
+#     stopping whatever matches, and you cannot know what that is.
+#
+# `pkill -f` is still correct in one shape, which several harnesses here use:
+# anchored on an absolute path into **this run's own directory**
+# (`pkill -f '^$HOST_DIR/wc-proxy'`). That is a pattern no other agent's command
+# line can contain, because the directory is unique to this run. What is refused
+# below is a bare program name, which is what `weston` was.
+proc_kill() {
+  local pid=$1 what=${2:-a process} sig=${3:-TERM}
+
+  # A pid is digits. Anything else is a pattern by another name, and the whole
+  # point of this function is that it will not take one -- including the empty
+  # string, which `kill ""` turns into an error and `kill $(pgrep …)` with no
+  # match turns into "kill the whole process group".
+  case "$pid" in
+    ''|*[!0-9]*)
+      bad "proc_kill: refusing to kill '$pid' ($what): that is not a pid"
+      note "Pass a pid or use proc_kill_pidfile. A name or pattern matches processes"
+      note "this run did not start -- an over-broad 'pkill -f weston' took out the"
+      note "SSH agent and commit signing on this machine today."
+      return 1 ;;
+  esac
+
+  [ "$pid" -gt 1 ] 2>/dev/null || { bad "proc_kill: refusing pid $pid ($what)"; return 1; }
+  kill -s "$sig" "$pid" 2>/dev/null || return 0   # already gone is success
+  # Give it a moment to go, then insist. `kill -0` is the check, not `pgrep`.
+  local i=0
+  while [ "$i" -lt 40 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.05; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -s KILL "$pid" 2>/dev/null
+    note "$what (pid $pid) ignored SIG$sig and was killed"
+  fi
+  return 0
+}
+
+# The same, for a process that outlives the shell that started it.
+#
+# The pidfile is removed **only when the pid in it was ours to stop**: a stale
+# pidfile whose pid has been recycled by an unrelated process is the same defect
+# as a pattern, one indirection along. `proc_kill` refuses a non-numeric body,
+# which is the common form of a truncated or half-written pidfile.
+proc_kill_pidfile() {
+  local file=$1 what=${2:-a process} pid
+  [ -f "$file" ] || return 0
+  pid=$(tr -dc '0-9' < "$file" 2>/dev/null)
+  if [ -z "$pid" ]; then
+    note "$file holds no pid; leaving it rather than guessing what to stop"
+    return 1
+  fi
+  proc_kill "$pid" "$what" && rm -f "$file"
+}
 # `kill_exact <name>` — kill processes whose *executable* is `<name>`, and
 # nothing else.
 #

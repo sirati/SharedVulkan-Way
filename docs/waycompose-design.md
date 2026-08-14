@@ -24040,3 +24040,89 @@ Yes, on the evidence in §76.5. The remaining work has a work list of two arms i
 `cfg` sites — and the measurement says that nothing in the socket layer is on
 that list. That was the open question the first attempt could not answer, because
 with one name for two jobs there was no way to ask it.
+
+## 59. The kill that took the machine's keys
+
+### 59.1 Status in one paragraph
+
+An over-broad `pkill -9 -f weston`, meant for one harness's leftovers, matched
+the desktop session hosting 1Password and killed it — taking with it the SSH
+agent holding the keys for `testhost` and the guest, and the key that signs
+commits. Two machines unreachable and signing broken, from a cleanup line in an
+unrelated run. This is the **fourth** instance in one session of a process-name
+match catching more than it meant to, and the first to cost anything outside its
+own run. `scripts/wc-binaries.sh` grew `proc_kill` and `proc_kill_pidfile`:
+they take a pid or a pidfile and **refuse a name or a pattern**, and three tests
+behind `cargo test --workspace` keep the refusal honest.
+
+### 59.2 The argument that was only half written
+
+`proc_running` already matched an exact executable name, and the comment above
+it gives the reason: a `pgrep -f sv-hostd` guard matches *the shell running it*,
+because that shell's command line contains the string. The fix generalised as an
+order of preference — pidfile, then `pgrep -x`, then `pgrep -f` with the shell's
+ancestors excluded — and ended with a line that reads differently today:
+
+> A guard that cannot distinguish itself from what it guards against is not a
+> guard; it is a coin that always lands the same way.
+
+**That was written about guards, and the kill side of it was never written.**
+The three earlier instances were self-inflicted: a script matching its own
+shell, which is embarrassing and contained. This one matched another agent's
+process, and the blast radius was the machine's credentials.
+
+**A pattern is the wrong instrument for stopping a process you started.** You
+already know its pid — you started it. The pattern is a way of *rediscovering* a
+pid you already had, and it rediscovers other people's too. So:
+
+* started in this shell → you have `$!`;
+* outlives the shell → have it write a pidfile;
+* neither → you are not stopping *your* process, you are stopping whatever
+  matches, and you cannot know what that is.
+
+`proc_kill` refuses anything that is not digits, which covers the two shapes
+that actually occur: a bare program name, and the **empty string** — `kill ""`
+is an error, but `kill $(pgrep something-absent)` with no match is a request to
+signal the whole process group, which is the same outage by a different route.
+pid 1 is refused explicitly. An already-dead pid is success, because the caller
+wanted it gone and it is gone.
+
+`proc_kill_pidfile` removes the pidfile only when the pid in it was ours to
+stop, and refuses a file whose body is not a number — a truncated or
+half-written pidfile is a pattern one indirection along.
+
+### 59.3 What is *not* refused, and why
+
+`pkill -f` anchored on an absolute path into **this run's own directory** stays,
+and several harnesses use it:
+
+```sh
+h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true"
+```
+
+That is a pattern no other agent's command line can contain, because the
+directory is unique to the run. The distinction is not "patterns are bad" — it
+is that a pattern must name something only this run could have produced. A bare
+program name names something the whole machine shares, and `weston` is on every
+desktop here.
+
+The sweep found thirteen substring kills in `scripts/`; eleven are already
+path-anchored in exactly this way. The two that are not — a port-scoped
+`http.server 8931` and a `$RUNDIR`-scoped `qemu-system` — are scoped to
+something this run owns, and are left.
+
+### 59.4 What is not done
+
+1. **Nothing forces a harness to use `proc_kill`.** The tests assert that the
+   refusal works, not that anybody calls it — the same gap §54 had before the
+   citation checker went behind `cargo test`, and the same shape as a lint that
+   exists but is not run. A grep-based gate refusing new bare `pkill -f <name>`
+   in `scripts/` is the obvious next step and is one more instance of the
+   pattern this section is about.
+2. **The three earlier instances are fixed where they were found, not
+   systematically.** They were guards rather than kills, so `proc_running`
+   covers the shape; nothing proves there is not a fifth.
+3. **This section's commit is unsigned**, because the signing key went with the
+   session that was killed. Recorded here rather than repaired later: rewriting
+   history to re-sign would make the commit that documents the outage the one
+   piece of evidence that it happened.
