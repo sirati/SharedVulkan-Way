@@ -20872,7 +20872,36 @@ has to be six, and a balance of `0 == 0` is a failure rather than a pass.
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
 | `scripts/wc-xref.sh` | 0 broken, 0 ambiguous |
 
-The compositor's idle timeout in `wc-life.sh` dropped from 600 s to 30 s, and
-that is load-bearing rather than tidying: the exit accounting is printed **on
-the way out**, so a harness that kills the compositor never sees it. §56's
-harness reaches the same conclusion by the same route.
+The compositor's idle timeout in `wc-life.sh` had to change, and that is
+load-bearing rather than tidying: the exit accounting is printed **on the way
+out**, so a harness that kills the compositor never sees it. §56's harness
+reaches the same conclusion by the same route.
+
+**The first number chosen for it was wrong, and the way it was wrong is the
+lesson.** 600 s went to 30 s, and 30 s fired *mid-churn* — because the stretch
+that matters is not the gap between cycles but the "is it gone yet" poll, which
+spends up to forty seconds with no client connected, each `life` call being a
+fresh `wine explorer`. The compositor exited, the next three cycles reported
+windows that never appeared, and the run printed:
+
+```text
+FAIL  cycle 4: the client's window never appeared
+FAIL  only 2 of 5 windows were ever seen alive -- the negative results below are worthless
+FAIL  4 registered but only 3 revoked -- a registration is stranded in OLE's table
+----  windows at exit: 4 created, 3 destroyed, 1 still held, 1 still alive, 2 client(s) still connected
+```
+
+That last line is a compositor leaking a window and stranding an OLE
+registration. It is also a harness that shut the compositor down while two
+clients were still connected. **This is the third time in two sections that a
+harness bug has produced a perfectly plausible bug report about the
+compositor** — §53.4's three were the same shape — and the reason is worth
+naming: on this subject the *evidence for a leak is an absence*, and everything
+that goes wrong with a harness also produces an absence. The defence is the one
+§53.5 already built, and it worked here: the "was it ever alive" and "did the
+count rise" rows failed first, and a run whose positive halves fail is a run
+whose negative halves prove nothing. The gate said so in those words rather than
+reporting the leak.
+
+The timeout is now 120 s, and the rule is written where the number is: it must
+outlast the longest stretch of the run with no client connected.

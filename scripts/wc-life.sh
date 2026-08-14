@@ -150,7 +150,14 @@ start_chain() {
   mkdir -p "$DIR/rt" "$DIR/pools" "$DIR/keymaps"
   chmod 700 "$DIR/rt"
   SOCK="wl-$TAG"
-  wined "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout "${WC_LIFE_IDLE:-30}" \
+  # The idle timeout has to outlast the longest stretch of this run with **no
+  # client connected**, and that is not the gap between cycles: the "is it gone
+  # yet" poll spends up to forty seconds asking, each `life` call being a fresh
+  # `wine explorer`. Set to 30 s it fired mid-churn, the compositor exited, and
+  # the next three cycles reported windows that never appeared and a
+  # registration "stranded in OLE's table" -- a clean bill of blame for the
+  # compositor, produced by a harness that had shut it down.
+  wined "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout "${WC_LIFE_IDLE:-120}" \
     --shared-dir "$(winepath -w "$DIR/keymaps")" --shared-peer-prefix "$DIR/keymaps/" \
     --log "$(winepath -w "$DIR/srv.log")" >"$DIR/loader.log" 2>&1 &
   SRV=$!
@@ -364,7 +371,7 @@ run_wine() {
   # asserts the pair balances *and* that it is not a pair of zeros.
   echo "--- waiting for the compositor to reach its idle timeout and report ---"
   local _ exitline dtline
-  for _ in $(seq 1 $(( ${WC_LIFE_IDLE:-30} + 40 ))); do
+  for _ in $(seq 1 $(( ${WC_LIFE_IDLE:-120} + 40 ))); do
     grep -q "drop targets at exit" "$DIR/srv.log" 2>/dev/null && break
     sleep 1
   done
