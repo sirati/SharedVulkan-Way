@@ -15226,11 +15226,13 @@ Three things follow.
    spin phase.
 2. **The ladder is a real mitigation and really is not the fix.** 4.3× better and
    still 4 ms a wait, because it is a poll and the ladder's own ceiling bounds it.
-3. **The doorbell is the fix: 17.9× against the fixed slice**, and what is left —
-   about 1 ms — is the residue of the waits that the ladder is still climbing
-   before the byte arrives, plus scheduling. The doorbell itself crosses in ~9 µs
-   (§36.6.3), so there is more available here; the ladder and the doorbell are
-   currently additive rather than the doorbell simply winning.
+3. **The doorbell is the fix: 17.9× against the fixed slice**, and what is left
+   is about 1 ms. ~~That residue is the waits the ladder is still climbing before
+   the byte arrives, so the two are additive rather than the doorbell simply
+   winning.~~ **That explanation was wrong and §36.17 measured it.** Holding the
+   slice at 20 ms and adding only the doorbell gives 0.876 ms — so the ladder
+   contributes almost nothing once the bell is wired, and the residue is
+   somewhere else.
 
 **Caveats, in the order they matter.** The guest is Linux, so the Windows
 `WaitOnAddress` floor of 1 ms is not in this measurement and the deployment guest
@@ -16808,3 +16810,55 @@ off the network before the two halves could be brought up together. So the
 Windows guest's doorbell latency, and with it whether `WaitOnAddress`'s 1 ms
 floor swallows the win, remain open. §36.6.3's ~9 µs and §36.15's 1.06 ms per
 wait are both Linux-guest numbers and stay that way until this is run.
+
+### 36.17 The doorbell does not need the ladder, and the residue is not what I said
+
+§36.15 reported 1.06 ms per wait with ladder *and* doorbell, and explained the
+residue as "the ladder still climbing before the byte arrives — the two are
+additive rather than the doorbell simply winning". `SV_PARK_FIRST_SLICE_US`
+exists precisely so that kind of claim can be tested from one binary instead of
+argued, so it was tested.
+
+Two rounds, `sv-guest-e2e.sh`, **95 ring waits in every condition** as before:
+
+| condition | parked | **mean per wait** |
+|---|---|---|
+| fixed 20 ms slice, no doorbell | 1801.5 / 1697.5 / 1927.8 ms | 18.96 / 17.87 / **20.29 ms** |
+| **fixed 20 ms slice + doorbell** | 82.8 / 83.2 ms | **0.871 / 0.876 ms** |
+| ladder + doorbell | 74.2 / 75.3 ms | 0.781 / 0.792 ms |
+
+**The middle row is the result.** With the slice left at the value that shipped —
+no ladder at all — the doorbell alone takes 20.29 ms per wait down to 0.876 ms.
+That is **23×**, and the ladder adds a further 0.08 ms, about 10% of what is
+left.
+
+So the explanation in §36.15 was wrong in an instructive direction: it credited
+the mitigation for the fix's residue. What it should have said, and what this
+measures, is that **the doorbell does not need the ladder.** The ladder remains
+worth keeping — it costs nothing, it is what protects a session whose doorbell
+fails to attach, and §36.6.1's argument that it needs to know nothing about the
+topology still holds — but it is no longer load-bearing anywhere the doorbell
+works.
+
+**And the real residue is now a sharper question than before.** The port itself
+crosses in ~9 µs (§36.6.3) and a wait costs 0.88 ms, which is ninety times that.
+The gap is not the slice, because the slice is 20 ms in that row and moving it to
+25 µs recovers only 0.08 ms. Three candidates, none of them yet measured, and
+they are written down rather than picked between:
+
+1. **Two thread wakeups per wake.** The `Doorman` blocks in `read`, wakes, and
+   then `sys::wake`s the *waiter* — so every doorbell costs two scheduler
+   round trips where the raw ping-pong in §36.6.3 costs one.
+2. **The waits that never park.** `Bell::ring` only pokes when `parked != 0`,
+   so a wait satisfied during the spin or yield phase involves no doorbell at
+   all. Those are microseconds and pull the mean *down*, which means the waits
+   that do park are costing more than 0.88 ms, not less.
+3. **One `Doorman` for all rings.** Three rings share one reader thread and one
+   port; a wake for the queue ring waits behind one for the device ring.
+
+Distinguishing them needs a histogram rather than a mean, which is the next
+increment of the instrument and is the same lesson §36.10 taught about picking
+the measurement before arguing about the number.
+
+**Still Linux.** Every figure here is the development guest. `WaitOnAddress`'s
+1 ms floor is not in any of them.
