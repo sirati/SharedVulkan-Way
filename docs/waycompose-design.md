@@ -16730,3 +16730,81 @@ been a third way to get this wrong.
    `sv-present.sh` are on §35.6 item 6's list and run built binaries; their
    gates came back clean, so they have no vacuous checks, but they still have no
    freshness guard. That is the remaining half of item 6.
+
+### 36.16 The fourth port: the hot-add works, and a fresh port *does* open by name
+
+§36.13 stopped at "there is no read-only way to map a port name to its device
+instance", and named the non-circular route: **add a fourth port, whose ordinal
+is then known by construction.** That was done, on the running deployment guest,
+and it answers the question and two more.
+
+**The hot-add.** Three QMP commands on `/run/windows-vm/qmp.sock`, addition only
+— no removal, nothing existing modified, no restart:
+
+```
+{"execute":"qmp_capabilities"}                                  {"return": {}}
+{"execute":"chardev-add","arguments":{"id":"svbell",...}}       {"return": {}}
+{"execute":"device_add","arguments":{"driver":"virtserialport",
+   "bus":"vioserial.0","chardev":"svbell",
+   "name":"org.sirati.svbell.0","id":"svbellport"}}             {"return": {}}
+```
+
+`docs/hardware-constraints.md` said ports can be hot-added to a running guest and
+`scripts/sv-guest-host.sh` said adding one "means … restarting a VM other people
+are using". **The first is right and the second is out of date**, and this is the
+run that settles it: a Windows guest with a live desktop gained a virtio-serial
+port and noticed nothing.
+
+**The ordinal, known by construction.** `Control\DeviceClasses\{6fde7521-…}`
+listed three interfaces before and four after, and the difference is one line:
+
+```
+##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&04#{6fde7521-…}
+```
+
+No guess was needed, and none was made — which mattered, because `&0&02` is
+almost certainly the WiFi port and a virtio-serial port takes one opener.
+
+**And then the interesting part: the new port opens by *name*.**
+
+```
+[bell-probe] guest echoing on org.sirati.svbell.0 for 3s
+```
+
+That is `winpipe::open_virtio_port("org.sirati.svbell.0")` succeeding on the
+deployment guest — the same call that returns `ERROR_ACCESS_DENIED` for
+`org.sirati.display.0` on the same guest, in the same session, at the same
+privilege. So §36.13's conclusion needs correcting: **`vioser.sys` does publish a
+symbolic link under the `name=` string.** The problem is specific to
+`org.sirati.display.0`, not general to the driver.
+
+The most likely explanation, and it is consistent with everything measured: that
+port was added to the host's QEMU argv on 2026-08-12, *after* the running QEMU
+was started, so the guest enumerated a port the host never attached a chardev to
+— a device object with no backing, which denies. The three interfaces present
+before the hot-add are then qga, wifi, and a display port that exists in Windows
+and reaches nothing. **That is a hypothesis with a cheap test — hot-add a chardev
+for it — and it is recorded as a hypothesis.** What is *measured* is that a
+freshly and completely added port opens by name.
+
+**A bug this found, and it is the kind only running finds.** A virtio-serial port
+on Windows whose host end has nobody attached fails a *read* with
+`ERROR_NO_SYSTEM_RESOURCES` (1450) — a startling spelling of "not ready". The
+guest half necessarily opens before the host process connects, because a harness
+has to see "echoing" in the log before it is safe to measure, so the first run
+died with an error that reads like memory exhaustion. `winpipe` now maps it to
+`WouldBlock`, and both readers retry: the Linux side of the same situation reads
+EOF and has always been treated as "nothing yet", so this is the two platforms
+agreeing rather than a special case.
+
+**The port is transient**, and that is worth saying loudly: a hot-added device
+lives exactly as long as the QEMU process. It is not in `testhost`'s NixOS
+configuration and will not survive a VM restart. Making it permanent is one line
+in `virtualisation.windowsVm.virtioSerialPorts` — which does need a restart, and
+is the right trade only once the doorbell is shown to be worth it there.
+
+**Not yet measured: the round trip.** The host half never ran — the machine went
+off the network before the two halves could be brought up together. So the
+Windows guest's doorbell latency, and with it whether `WaitOnAddress`'s 1 ms
+floor swallows the win, remain open. §36.6.3's ~9 µs and §36.15's 1.06 ms per
+wait are both Linux-guest numbers and stay that way until this is run.

@@ -190,6 +190,13 @@ pub fn serve_port<R: Read>(
         let n = match port.read(&mut buf) {
             Ok(0) => return ServeEnd::Closed,
             Ok(n) => n,
+            // The Windows guest end of a virtio-serial port reports "host not
+            // attached" as `WouldBlock` (winpipe maps ERROR_NO_SYSTEM_RESOURCES).
+            // A doorbell whose peer has not connected yet must wait, not exit.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return ServeEnd::Failed,
         };
