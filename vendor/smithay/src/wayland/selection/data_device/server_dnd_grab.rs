@@ -1,4 +1,4 @@
-use crate::utils::os::OwnedFd;
+use crate::utils::os::ProtoFd;
 use std::{
     cell::RefCell,
     fmt,
@@ -496,7 +496,7 @@ where
         dh: &Handle,
         handler: &mut D,
         _client_id: ClientId,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dh = DisplayHandle::from(dh.clone());
         if let Ok((resource, request)) = WlDataOffer::parse_request(&dh, msg) {

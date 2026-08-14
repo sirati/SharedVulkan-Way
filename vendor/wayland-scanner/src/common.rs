@@ -201,9 +201,9 @@ pub(crate) fn gen_message_enum(
                         Type::Array => quote! { Vec<u8> },
                         Type::Fd => {
                             if receiver {
-                                quote! { OwnedFd }
+                                quote! { ProtoFd }
                             } else {
-                                quote! { wayland_backend::os::BorrowedFd<'a> }
+                                quote! { wayland_backend::os::BorrowedProtoFd<'a> }
                             }
                         }
                         Type::Object => {

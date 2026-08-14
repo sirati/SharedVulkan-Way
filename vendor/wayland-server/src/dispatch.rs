@@ -1,4 +1,4 @@
-use wayland_backend::os::OwnedFd; // WAYCOMPOSE FORK
+use wayland_backend::os::ProtoFd; // WAYCOMPOSE FORK
 use std::sync::Arc;
 
 use wayland_backend::{
@@ -227,7 +227,7 @@ impl<I: Resource + 'static, U: Send + Sync + 'static, D: Dispatch<I, U> + 'stati
         handle: &wayland_backend::server::Handle,
         data: &mut D,
         client_id: wayland_backend::server::ClientId,
-        msg: wayland_backend::protocol::Message<wayland_backend::server::ObjectId, OwnedFd>,
+        msg: wayland_backend::protocol::Message<wayland_backend::server::ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dhandle = DisplayHandle::from(handle.clone());
         let client = match Client::from_id(&dhandle, client_id) {

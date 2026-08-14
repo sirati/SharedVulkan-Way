@@ -7,7 +7,7 @@ pub mod wl_registry {
         },
         Dispatch, DispatchError, DisplayHandle, New, Resource, ResourceData, Weak,
     };
-    use wayland_backend::os::OwnedFd;
+    use wayland_backend::os::ProtoFd;
     use std::sync::Arc;
     #[doc = r" The minimal object version supporting this request"]
     pub const REQ_BIND_SINCE: u32 = 1u32;
@@ -150,7 +150,7 @@ pub mod wl_registry {
         }
         fn parse_request(
             conn: &DisplayHandle,
-            msg: Message<ObjectId, OwnedFd>,
+            msg: Message<ObjectId, ProtoFd>,
         ) -> Result<(Self, Self::Request), DispatchError> {
             unimplemented!("`wl_registry` is implemented internally in `wayland-server`")
         }
@@ -158,7 +158,7 @@ pub mod wl_registry {
             &self,
             conn: &DisplayHandle,
             msg: Self::Event<'a>,
-        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
             match msg {
                 Event::Global { name, interface, version } => Ok(Message {
                     sender_id: self.id.clone(),
@@ -215,7 +215,7 @@ pub mod wl_callback {
         Dispatch, DispatchError, DisplayHandle, New, Resource, ResourceData, Weak,
     };
     use std::sync::Arc;
-    use wayland_backend::os::OwnedFd;
+    use wayland_backend::os::ProtoFd;
     #[doc = r" The minimal object version supporting this event"]
     pub const EVT_DONE_SINCE: u32 = 1u32;
     #[doc = r" The wire opcode for this event"]
@@ -329,7 +329,7 @@ pub mod wl_callback {
         }
         fn parse_request(
             conn: &DisplayHandle,
-            msg: Message<ObjectId, OwnedFd>,
+            msg: Message<ObjectId, ProtoFd>,
         ) -> Result<(Self, Self::Request), DispatchError> {
             let me = Self::from_id(conn, msg.sender_id.clone()).unwrap();
             let mut arg_iter = msg.args.into_iter();
@@ -345,7 +345,7 @@ pub mod wl_callback {
             &self,
             conn: &DisplayHandle,
             msg: Self::Event<'a>,
-        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
             match msg {
                 Event::Done { callback_data } => Ok(Message {
                     sender_id: self.id.clone(),
@@ -383,7 +383,7 @@ pub mod test_global {
         Dispatch, DispatchError, DisplayHandle, New, Resource, ResourceData, Weak,
     };
     use std::sync::Arc;
-    use wayland_backend::os::OwnedFd;
+    use wayland_backend::os::ProtoFd;
     #[doc = r" The minimal object version supporting this request"]
     pub const REQ_MANY_ARGS_SINCE: u32 = 1u32;
     #[doc = r" The wire opcode for this request"]
@@ -440,7 +440,7 @@ pub mod test_global {
             #[doc = "some text"]
             some_text: String,
             #[doc = "a file descriptor"]
-            file_descriptor: OwnedFd,
+            file_descriptor: ProtoFd,
         },
         #[doc = "Only available since version 2 of the interface"]
         GetSecondary {
@@ -495,7 +495,7 @@ pub mod test_global {
             #[doc = "some text"]
             some_text: String,
             #[doc = "a file descriptor"]
-            file_descriptor: wayland_backend::os::BorrowedFd<'a>,
+            file_descriptor: wayland_backend::os::BorrowedProtoFd<'a>,
         },
         #[doc = "acking the creation of a secondary"]
         AckSecondary { sec: super::secondary::Secondary },
@@ -595,7 +595,7 @@ pub mod test_global {
         }
         fn parse_request(
             conn: &DisplayHandle,
-            msg: Message<ObjectId, OwnedFd>,
+            msg: Message<ObjectId, ProtoFd>,
         ) -> Result<(Self, Self::Request), DispatchError> {
             let me = Self::from_id(conn, msg.sender_id.clone()).unwrap();
             let mut arg_iter = msg.args.into_iter();
@@ -889,7 +889,7 @@ pub mod test_global {
             &self,
             conn: &DisplayHandle,
             msg: Self::Event<'a>,
-        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
             match msg {
                 Event::ManyArgsEvt {
                     unsigned_int,
@@ -953,7 +953,7 @@ pub mod test_global {
             fixed_point: f64,
             number_array: Vec<u8>,
             some_text: String,
-            file_descriptor: ::wayland_backend::os::BorrowedFd<'_>,
+            file_descriptor: ::wayland_backend::os::BorrowedProtoFd<'_>,
         ) {
             let _ = self.send_event(Event::ManyArgsEvt {
                 unsigned_int,
@@ -992,7 +992,7 @@ pub mod secondary {
         Dispatch, DispatchError, DisplayHandle, New, Resource, ResourceData, Weak,
     };
     use std::sync::Arc;
-    use wayland_backend::os::OwnedFd;
+    use wayland_backend::os::ProtoFd;
     #[doc = r" The minimal object version supporting this request"]
     pub const REQ_DESTROY_SINCE: u32 = 2u32;
     #[doc = r" The wire opcode for this request"]
@@ -1105,7 +1105,7 @@ pub mod secondary {
         }
         fn parse_request(
             conn: &DisplayHandle,
-            msg: Message<ObjectId, OwnedFd>,
+            msg: Message<ObjectId, ProtoFd>,
         ) -> Result<(Self, Self::Request), DispatchError> {
             let me = Self::from_id(conn, msg.sender_id.clone()).unwrap();
             let mut arg_iter = msg.args.into_iter();
@@ -1132,7 +1132,7 @@ pub mod secondary {
             &self,
             conn: &DisplayHandle,
             msg: Self::Event<'a>,
-        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
             match msg {
                 Event::__phantom_lifetime { never, .. } => match never {},
             }
@@ -1155,7 +1155,7 @@ pub mod tertiary {
         Dispatch, DispatchError, DisplayHandle, New, Resource, ResourceData, Weak,
     };
     use std::sync::Arc;
-    use wayland_backend::os::OwnedFd;
+    use wayland_backend::os::ProtoFd;
     #[doc = r" The minimal object version supporting this request"]
     pub const REQ_DESTROY_SINCE: u32 = 3u32;
     #[doc = r" The wire opcode for this request"]
@@ -1268,7 +1268,7 @@ pub mod tertiary {
         }
         fn parse_request(
             conn: &DisplayHandle,
-            msg: Message<ObjectId, OwnedFd>,
+            msg: Message<ObjectId, ProtoFd>,
         ) -> Result<(Self, Self::Request), DispatchError> {
             let me = Self::from_id(conn, msg.sender_id.clone()).unwrap();
             let mut arg_iter = msg.args.into_iter();
@@ -1295,7 +1295,7 @@ pub mod tertiary {
             &self,
             conn: &DisplayHandle,
             msg: Self::Event<'a>,
-        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
             match msg {
                 Event::__phantom_lifetime { never, .. } => match never {},
             }
@@ -1318,7 +1318,7 @@ pub mod quad {
         Dispatch, DispatchError, DisplayHandle, New, Resource, ResourceData, Weak,
     };
     use std::sync::Arc;
-    use wayland_backend::os::OwnedFd;
+    use wayland_backend::os::ProtoFd;
     #[doc = r" The minimal object version supporting this request"]
     pub const REQ_DESTROY_SINCE: u32 = 3u32;
     #[doc = r" The wire opcode for this request"]
@@ -1431,7 +1431,7 @@ pub mod quad {
         }
         fn parse_request(
             conn: &DisplayHandle,
-            msg: Message<ObjectId, OwnedFd>,
+            msg: Message<ObjectId, ProtoFd>,
         ) -> Result<(Self, Self::Request), DispatchError> {
             let me = Self::from_id(conn, msg.sender_id.clone()).unwrap();
             let mut arg_iter = msg.args.into_iter();
@@ -1458,7 +1458,7 @@ pub mod quad {
             &self,
             conn: &DisplayHandle,
             msg: Self::Event<'a>,
-        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId> {
+        ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId> {
             match msg {
                 Event::__phantom_lifetime { never, .. } => match never {},
             }

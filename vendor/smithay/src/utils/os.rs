@@ -57,6 +57,18 @@ compile_error!(
 #[cfg(windows)]
 pub use wayland_backend::os::{AsFd, BorrowedFd, Mapping, OwnedFd, RawFd};
 
+/// The payload of a protocol `h` argument, as the backend names it.
+///
+/// The distinction drawn in this module's second heading has a spelling on the
+/// backend side too, and this is that name imported rather than re-derived: it
+/// is what `Message<ObjectId, _>` carries in an `ObjectData::request`
+/// signature. On Unix it is the same type as [`OwnedFd`] today, which is
+/// exactly why it needs its own name before
+/// `docs/waycompose-design.md` §72.3 can change what an `h` is allowed to be.
+/// See `docs/waycompose-design.md` §76.
+#[cfg(feature = "wayland_frontend")]
+pub use wayland_backend::os::ProtoFd;
+
 /// The transport socket a client connection arrives on.
 ///
 /// This is the *other* kind of descriptor described above, and it deliberately

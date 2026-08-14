@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd and stream types now come from `crate::os`.
-use crate::os::{OwnedFd, RawFd, WlStream as UnixStream};
+use crate::os::{ProtoFd, RawProtoFd, WlStream as UnixStream};
 #[cfg(unix)]
 use crate::os::BorrowedFd;
 
@@ -27,7 +27,7 @@ pub trait ObjectData<D>: downcast_rs::DowncastSync {
         handle: &Handle,
         data: &mut D,
         client_id: ClientId,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>>;
     /// Notification that the object has been destroyed and is no longer active
     fn destroyed(
@@ -383,7 +383,7 @@ impl Handle {
     /// - the message opcode must be valid for the sender interface
     /// - the argument list must match the prototype for the message associated with this opcode
     #[inline]
-    pub fn send_event(&self, msg: Message<ObjectId, RawFd>) -> Result<(), InvalidId> {
+    pub fn send_event(&self, msg: Message<ObjectId, RawProtoFd>) -> Result<(), InvalidId> {
         self.handle.send_event(msg)
     }
 
@@ -643,7 +643,7 @@ impl<D> ObjectData<D> for DumbObjectData {
         _handle: &Handle,
         _data: &mut D,
         _client_id: ClientId,
-        _msg: Message<ObjectId, OwnedFd>,
+        _msg: Message<ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         unreachable!()
     }
