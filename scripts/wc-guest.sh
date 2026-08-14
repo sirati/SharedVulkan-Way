@@ -147,7 +147,12 @@ S4_FIREFOX=""; S4_OUTPUT=""; S4_VERIFY=""
 STAGE=$(mktemp -d /tmp/wc-guest-XXXXXX)
 RUNDIR=$(mktemp -d /tmp/wc-guest-run-XXXXXX)
 chmod 700 "$RUNDIR"
-trap 'rm -rf "$STAGE" "$RUNDIR"' EXIT
+# WC_KEEP honoured, which it was not. Two guest runs of block 12 failed and
+# neither could be diagnosed, because this trap removed $RUNDIR -- and with it
+# s4-dmg.log, the only place the driver's own S4-FAIL line is written -- before
+# anything could read it. A harness that discards its evidence on the way out
+# costs a run per question on a machine other agents are queued for.
+trap 'if [ -n "${WC_KEEP:-}" ]; then echo "  ....  kept: $RUNDIR"; else rm -rf "$STAGE" "$RUNDIR"; fi' EXIT
 
 pass=0; fail=0; skip=0
 ok()   { echo "  PASS  $*"; pass=$((pass + 1)); }
@@ -173,6 +178,12 @@ h()  { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
 
 # STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
 . "$(dirname "$0")/wc-binaries.sh"
+# §51/§27. `do_damage` declares its substrate and its topology and asserts both.
+# These were never sourced here: block 12 was written, reviewed and merged
+# without ever running, so the first real run died on `command not found`
+# before it reached anything it was built to measure. §14.9, once more.
+. "$(dirname "$0")/wc-substrate.sh"
+. "$(dirname "$0")/wc-topology.sh"
 
 # Kill every process running out of one directory on the guest, and nothing
 # else. See the call site in `do_deploy` for why an image name will not do.
@@ -725,6 +736,12 @@ do_deploy() {
   else
     echo "  FAILED to build wc-arena-host"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
   fi
+  # The crate was restored as an ORDINARY WORKSPACE MEMBER, so cargo now puts it
+  # in the workspace target dir. This line still named the crate-local tree it
+  # built into when it had one, and the deploy died on a path rather than on a
+  # build. Both layouts are tried, after the build, because an unbuilt binary is
+  # absent from either and resolving first would always take the fallback.
+  [ -x "$locator" ] || locator="$ROOT/target/debug/wc-arena-host"
   [ -x "$locator" ] || { echo "error: no $locator"; exit 1; }
 
   h "mkdir -p $HOST_DIR $SHARE" >/dev/null
@@ -1083,8 +1100,15 @@ do_stage4() {
 s4_run() {
   local tag=$1 transport=$2 client=$3 port=$4 secs=$5
   local log="$RUNDIR/s4-$tag.log"
+  # `$HOST_WESTON` is quoted, and that is not tidying. It is empty for any leg
+  # that runs Firefox rather than weston, and unquoted an empty value passes NO
+  # argument at all -- so every positional after it shifted left by one, PAGES
+  # received GDIR's "wctest", and the driver died on
+  # `ARENA_SIZE=$((PAGES * 4096))` with "wctest: unbound variable", because bash
+  # arithmetic reads a bare word as a variable name. Three guest runs of block 12
+  # failed on this before the run directory was kept long enough to read.
   echo "  -- $client / $transport --"
-  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" $HOST_WESTON $secs '$QMP' '$VM_HINT' \"$ROOTC\" $ARENA_PAGES $GUESTNAME $ARENA_OUTBOUND '$S4_FIREFOX' '$S4_OUTPUT' '$S4_VERIFY'" >"$log"
+  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" '$HOST_WESTON' $secs '$QMP' '$VM_HINT' \"$ROOTC\" $ARENA_PAGES $GUESTNAME $ARENA_OUTBOUND '$S4_FIREFOX' '$S4_OUTPUT' '$S4_VERIFY'" >"$log"
 
   if grep -q "S4-FAIL" "$log"; then
     bad "$tag: $(grep S4-FAIL "$log")"
