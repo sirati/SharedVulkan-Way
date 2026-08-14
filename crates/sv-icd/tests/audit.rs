@@ -135,15 +135,6 @@ const CLASSIFIED: &[(&str, Where, &str)] = &[
     ("vkDestroyDescriptorUpdateTemplate", Where::ForwardsWhenConnected, "forwards"),
     ("vkUpdateDescriptorSetWithTemplate", Where::ForwardsWhenConnected,
      "forwards, expanded into vkUpdateDescriptorSets from the kept entries"),
-    ("vkCmdPushDescriptorSetWithTemplate", Where::ForwardsWhenConnected,
-     "forwards, expanded into vkCmdPushDescriptorSet from the kept entries plus \
-      the template's pipelineBindPoint, which this call does not carry. Before \
-      §0.22 it was neither forwarded nor expanded: pData crossed as an arena \
-      offset it never was, and the GPU side segfaulted reading a descriptor \
-      layout from wherever that number landed"),
-    ("vkCmdPushDescriptorSetWithTemplate2", Where::ForwardsWhenConnected,
-     "as vkCmdPushDescriptorSetWithTemplate; unwraps the info struct and \
-      delegates, so there is one expansion and not two"),
 
     // -- fences and idles: ordinary forwards
     ("vkGetFenceStatus", Where::ForwardsWhenConnected, "forwards"),

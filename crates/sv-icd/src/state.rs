@@ -152,28 +152,6 @@ pub struct Memory {
     pub mapped: bool,
 }
 
-/// A `VkDescriptorUpdateTemplate` as the app side has to remember it.
-///
-/// # Why the bind point is here and was not
-///
-/// `vkUpdateDescriptorSetWithTemplate` needs only the entries: the descriptor
-/// set it writes into is a parameter of the call. The **push** form is not like
-/// that — `vkCmdPushDescriptorSetWithTemplate` names no set, because there is
-/// none; the descriptors go straight into the command buffer, and the pipeline
-/// bind point they belong to was fixed when the *template* was created
-/// (`VkDescriptorUpdateTemplateCreateInfo::pipelineBindPoint`, meaningful
-/// exactly when `templateType` is `PUSH_DESCRIPTORS`).
-///
-/// So expanding a push template into `vkCmdPushDescriptorSet` needs a value the
-/// call does not carry, and the only place it exists is the template object.
-/// design.md §0.22.
-#[derive(Debug, Clone)]
-pub struct Template {
-    pub entries: Vec<sv_proto::VkDescriptorUpdateTemplateEntry>,
-    /// `pipelineBindPoint`, as the create-info gave it.
-    pub bind_point: sv_proto::VkPipelineBindPoint,
-}
-
 /// Everything the app side knows.
 pub struct State {
     /// docs/design.md §6.4 allocates ids from a per-device counter. One counter for
@@ -191,15 +169,14 @@ pub struct State {
     /// Buffer id → its memory requirements, so `vkGetBufferMemoryRequirements`
     /// can answer without a GPU.
     pub buffers: HashMap<u64, u64>,
-    /// `VkDescriptorUpdateTemplate` id → what the app side has to remember
-    /// about it.
+    /// `VkDescriptorUpdateTemplate` id → the entries it was created with.
     ///
     /// Kept because `vkUpdateDescriptorSetWithTemplate`'s `pData` has no
     /// describable shape without them — see
     /// [`sv_icd_entry::local::expand_descriptor_template`]. This is the only object
     /// whose *contents* the app side has to remember; everything else it only
     /// has to name.
-    pub templates: HashMap<u64, Template>,
+    pub templates: HashMap<u64, Vec<sv_proto::VkDescriptorUpdateTemplateEntry>>,
     pub allocator: Box<dyn Backing>,
 }
 

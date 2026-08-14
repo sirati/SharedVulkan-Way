@@ -1029,55 +1029,6 @@ fn emit_forward_command(
                 });
                 reply_fields.push(quote!(#id: a.#id.clone(),));
             }
-            // **An output array of plain scalars**, which this arm used to
-            // refuse with "an output that is not a struct".
-            //
-            // Two commands in the registry are this shape and both belong to
-            // `VK_KHR_calibrated_timestamps`: `pTimeDomains` is an array of
-            // `VkTimeDomainKHR` and `pTimestamps` an array of `uint64_t`. The
-            // refusal meant the GPU side generated no forwarder for either, so
-            // `sv_proto::Server`'s default answered
-            // `VK_ERROR_INITIALIZATION_FAILED` — while the app side advertised
-            // the extension and forwarded the call perfectly happily.
-            //
-            // **That is what was killing Firefox** (design.md §0.22). Zink calls
-            // `vkGetPhysicalDeviceCalibrateableTimeDomainsKHR` while building
-            // its screen, takes the failure as fatal, and tears the device down
-            // before rendering a frame: `DRI2: failed to create screen`,
-            // `eglInitialize failed`, no GL at all. An array of numbers coming
-            // back is the same fold as the single-number `Out::Scalar` arm above
-            // with a loop around it, and it is emitted here rather than refused.
-            Out::Array { handle: None, count, .. } if output_struct(f).is_none() => {
-                let elem = match &f.shape {
-                    Shape::Array { elem, .. } | Shape::Optional(elem) => match &**elem {
-                        Shape::Scalar(s) => s.clone(),
-                        other => {
-                            return Err(format!(
-                                "{}: an output array of {other:?}, which is neither a struct \
-                                 nor a scalar",
-                                f.name
-                            ));
-                        }
-                    },
-                    other => {
-                        return Err(format!("{}: an output array shaped {other:?}", f.name));
-                    }
-                };
-                let n = match count {
-                    Some(s) => {
-                        let cid = naming::ident(&naming::snake_case(s));
-                        quote!((#cid as usize).min(#id.len()))
-                    }
-                    None => quote!(#id.len()),
-                };
-                let back = lower_scalar_back(&elem, &quote!(#id[__i]));
-                post.push(quote! {
-                    let mut __v = Vec::with_capacity(#n);
-                    for __i in 0..#n { __v.push(#back); }
-                    let #id = __v;
-                });
-                reply_fields.push(quote!(#id: #id,));
-            }
             Out::Array { handle: None, count, .. } => {
                 let sname = output_struct(f)
                     .ok_or_else(|| format!("{}: an output that is not a struct", f.name))?;
