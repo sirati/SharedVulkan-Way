@@ -788,7 +788,25 @@ fn emit_forward_command(
             .ok_or_else(|| format!("{}.{}: no C parameter", c.name, f.name))?;
         let id = naming::ident(&f.rust_name);
         let ty = c_param_type(cx, &abi.ty);
-        let e = raise_expr(cx, &f.shape, abi, &quote!(a.#id), &c.name)?;
+        // **A `stride=` parameter is rewritten, not forwarded.**
+        //
+        // The wire carries every array tightly packed, so the application's
+        // stride describes a layout that no longer exists by the time the driver
+        // sees it. Passing it through hands RADV a repacked array *and* the
+        // original spacing, and it strides straight off the end — the app side
+        // reads at the application's stride (`icd_entry`), this side tells the
+        // driver the only stride that is now true (docs/design.md §0.24).
+        //
+        // `size_of` the C element type rather than the wire one, because it is
+        // the C array the driver walks.
+        let strided_by = c.params.iter().find(|p| p.stride.as_deref() == Some(f.name.as_str()));
+        let e = match strided_by {
+            Some(arr) => {
+                let elem = pointee_c_type(cx, &arr.ty)?;
+                quote!(core::mem::size_of::<#elem>() as _)
+            }
+            None => raise_expr(cx, &f.shape, abi, &quote!(a.#id), &c.name)?,
+        };
         // An array *parameter* decays to a pointer and an array *member* does
         // not — docs/design.md §0.3's finding 4, met from the other side.
         // `vkCmdSetBlendConstants(const float blendConstants[4])` takes four

@@ -114,6 +114,9 @@ pub struct AbiMember {
     /// Non-const outermost pointer: the callee fills it in.
     pub is_output: bool,
     /// Some other member's `len=` names this one.
+    /// `stride=` — the sibling naming this array's byte spacing. `None` for
+    /// every array in the registry but the two multi-draw ones.
+    pub stride: Option<String>,
     pub is_a_length: bool,
     /// `null-terminated` at the outermost pointer level: a C string.
     pub is_c_string: bool,
@@ -511,6 +514,7 @@ fn member(
         inner_len: term(1).as_ref().and_then(|t| array_len(model, t)),
         optional: m.is_optional(0),
         is_output: m.is_output_pointer(),
+        stride: m.stride.clone(),
         is_a_length: lengths.contains(&m.name),
         name: m.name.clone(),
         ty: m.ty.clone(),

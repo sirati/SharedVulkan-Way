@@ -314,6 +314,15 @@ pub struct Member {
     /// `selection=` — for a member *of* a union, the discriminator values that
     /// choose it.
     pub selection: Vec<String>,
+    /// `stride=` — the array this member points at is spaced by the named
+    /// sibling's value in **bytes**, not by `size_of` its element type.
+    ///
+    /// Two parameters in the whole registry carry it, both multi-draw, and
+    /// until docs/design.md §0.24 nothing read it — so a strided array was
+    /// marshalled as though tightly packed, and the GPU side handed the driver a
+    /// repacked array together with the *application's* stride, which walks off
+    /// the end of it.
+    pub stride: Option<String>,
     /// `values=` — the fixed `sType` value.
     pub values: Vec<String>,
     /// `noautovalidity="true"`, which usually marks a member whose presence is
@@ -1102,6 +1111,9 @@ fn build_member_from_type_member(d: &vk_parse::TypeMemberDefinition) -> Result<M
         len: parse_len(d.len.as_deref(), d.altlen.as_deref()),
         optional: parse_optional(d.optional.as_deref()),
         externsync: d.externsync.clone(),
+        // `stride=` is a command-parameter attribute in this registry version;
+        // no struct member carries one, and both uses are multi-draw params.
+        stride: None,
         selector: d.selector.clone(),
         selection: split_list(d.selection.as_deref()),
         values: split_list(d.values.as_deref()),
@@ -1121,6 +1133,7 @@ fn build_member_from_command_param(p: &vk_parse::CommandParam) -> Result<Member>
         len: parse_len(p.len.as_deref(), p.altlen.as_deref()),
         optional: parse_optional(p.optional.as_deref()),
         externsync: p.externsync.clone(),
+        stride: p.stride.clone(),
         selector: None,
         selection: Vec::new(),
         values: Vec::new(),

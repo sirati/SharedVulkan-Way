@@ -724,8 +724,39 @@ fn lower_expr(
                 .ok_or_else(|| format!("{owner}.{}: an array with no resolvable len=", abi.name))?;
             let n = count_expr(len, member_access)
                 .ok_or_else(|| format!("{owner}.{}: len={len:?} is not a sibling", abi.name))?;
-            let inner =
-                lower_expr(cx, elem, abi, &quote!(*(#access).add(__i)), member_access, owner)?;
+            // **`stride=`: the application's array may not be tightly packed.**
+            //
+            // `(#access).add(__i)` strides by `size_of` the element, which is
+            // what a C array does and *not* what the registry says here: two
+            // parameters carry `stride=`, both multi-draw, and both let the
+            // application space its entries by any number of bytes it likes —
+            // `VkMultiDrawInfoEXT` interleaved into a larger struct of its own,
+            // for instance. Reading them at `size_of` spacing returns the wrong
+            // elements and walks off the end of a sparse array.
+            //
+            // Neither `vk-registry` nor this generator mentioned `stride`
+            // before docs/design.md §0.24, which makes it the third
+            // load-bearing registry attribute nobody read, after `selector=`
+            // (§0.21) and `noautovalidity=` (§0.16). It was latent only because
+            // Zink passes `size_of`.
+            //
+            // The wire form is always tightly packed, so the *stride does not
+            // cross*: `gpu_entry` substitutes `size_of` for the driver's copy of
+            // the parameter, which is the other half of this fix.
+            let step = match abi.stride.as_deref() {
+                Some(s) => {
+                    let a = member_access(s);
+                    Some(quote!((#a) as usize))
+                }
+                None => None,
+            };
+            let elem_access = match &step {
+                Some(step) => quote!(
+                    *((#access).cast::<u8>().add(__i * #step).cast::<_>())
+                ),
+                None => quote!(*(#access).add(__i)),
+            };
+            let inner = lower_expr(cx, elem, abi, &elem_access, member_access, owner)?;
             let ty = wire_type(elem);
             // A pointer that a *sibling* decides the validity of. Non-null is
             // not permission to read it — see `exceptions::SIBLING_SELECTED`,
