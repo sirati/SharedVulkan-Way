@@ -19362,11 +19362,11 @@ box, which is the whole of §27.6's lesson.
 | Gate | Result |
 |---|---|
 | `cargo build --workspace`, both targets | clean |
-| `cargo test --workspace --no-fail-fast` | unchanged — this section adds no Rust |
+| `cargo test --workspace --no-fail-fast` | **2589 tests**, 0 failures — unchanged by this section, which adds no Rust |
 | **`scripts/wc-damage.sh all`** | **33 passed, 0 failed** — all three legs declare and assert `same-box`, the latency gate refuses on each, and the refusal is asserted rather than assumed |
-| ... `damage` / shared-file | 1553 checked, **0 stale**, presented 1553 of 1553 |
-| ... `damage` / arena | 1189 checked, **0 stale**, presented 1189 of 1189 |
-| ... `buffer` / shared-file | 1039 checked, **0 stale** |
+| ... `damage` / shared-file | 1545 checked, **0 stale**, presented 1545 of 1545 |
+| ... `damage` / arena | 1628 checked, **0 stale**, presented 1628 of 1628 |
+| ... `buffer` / shared-file | 1556 checked, **0 stale** |
 | `scripts/wc-guest.sh damage` on a box with no `WC_HOST` | declines with its reason |
 | `wc_topology_declare` / `wc_latency_claim`, all three states | undeclared refuses, `same-box` refuses, `cross-vm` without `WC_HOST` is refused at declaration |
 | **`scripts/wc-guest.sh damage` against a real guest** | **NOT RUN — testhost is down** |
