@@ -18986,6 +18986,22 @@ input — works and is obeyed. It is the lock: Windows refuses synthetic input
 injection while the workstation is locked, and `SendInput` returns 0 having
 inserted nothing.
 
+> **CORRECTED BY §73.4. The fourth line was my bug, not the lock.** When the
+> same probe was run months later on the *unlocked* desktop it still returned
+> `SendInput_returned=0`, this time with `lasterror=87` —
+> `ERROR_INVALID_PARAMETER`, which is what `SendInput` answers when `cbSize`
+> does not match its `INPUT`. The struct carried two extra padding fields and
+> was 56 bytes where the ABI wants 40, so **that call had never worked, locked
+> or not**.
+>
+> The conclusion of this section survives on the other evidence and only on it:
+> `LockApp` was the foreground window and `WindowFromPoint` at the drag's origin
+> returned it, and the control below — a real drag between two Explorer windows
+> — did not move the file. Those are about the lock. The `SendInput` line was
+> never evidence of anything, and it is left in place above rather than quietly
+> edited because a diagnosis that was 80% right is more useful to the next
+> person than one that was retconned into being entirely right.
+
 The control makes it concrete rather than theoretical. Two Explorer windows
 were opened on a scratch directory containing two throwaway files created for
 the purpose, placed side by side, and a drag was injected from one to the
@@ -22983,3 +22999,105 @@ Where a refusal is still wanted, `finish_attach` is the place: it already
 carries `WIRE_VERSION` and a protocol hash and already refuses a skew while
 naming the cause, which is the failure mode this defect lacks — today it is a
 desynchronised reader with nothing logged and the connection still open.
+
+## 73. `counter=live`: the skip that only a Windows kernel could resolve
+
+*(§53's and §69's continuation. Six minutes on the deployment guest.)*
+
+### 73.1 Status in one paragraph
+
+§53.3 skipped the USER/GDI leak assertion because `GetGuiResources` returns 0
+under Wine, and §69 established — from inside a Linux VM, on the guest's own
+kernel — that the zero is a fact about **Wine** rather than about the venue, so
+**no arrangement of local virtualisation could ever turn that skip into an
+assertion**. This is the run that could. On the deployment guest, real Windows
+11, session 1: the counter answers, and it answers in both directions.
+
+```text
+       real Windows (guest)        the same binary, Wine on the workstation
+       before user=1               before user=0
+       after  user=6   (4 windows) after  user=0   (5 windows enumerated)
+       counter=live                counter=stub
+       destroyed user=1            destroyed user=0
+       fell=yes                    fell=no
+```
+
+§53's `SKIP` is now a real assertion waiting to be written, and §69's negative
+result is confirmed from the other side rather than merely not contradicted.
+
+### 73.2 Why the third sample is the one that matters
+
+The first version of this probe stopped at `after`, and it would have been
+enough to report `live`. It is not enough to report anything **useful**, and the
+reason is the same one §64.4 ran into from a different direction: the assertion
+§53 wants is *"the count came back"*, and a counter that only ever goes up
+cannot express it. On a stubbed counter `0 == 0` satisfies "came back" forever.
+
+So `selftest` now destroys its four windows and samples a third time. `fell=yes`
+is what separates an instrument from a decoration, and it is the difference
+between the two columns above: Wine's zero is *flat*, and flat is
+indistinguishable from perfect.
+
+`gdi=0` on both sides, and that is probably **correct rather than stubbed**: a
+plain `WS_OVERLAPPEDWINDOW` with no device context owns no GDI objects. The
+count §53 needs is the USER one — an `HWND` is a USER object — and that is the
+one that moved.
+
+### 73.3 What this unlocks, and what it does not
+
+**Unlocked.** The window-handle leak assertion of §53 can be made against the
+compositor's own process on the guest: churn clients, watch `GR_USEROBJECTS`
+return to its baseline. §64's icon account gets the same treatment — `HICON` is
+a USER object too, so the `0 icon(s) destroyed` that no local harness could turn
+into a number now has somewhere to be one.
+
+**Not done.** Neither of those runs happened. This visit was six minutes and
+there were two agents queued behind it, so it bought the *decisive* measurement
+and handed the machine back. Both are now one `grep` away rather than a
+rewrite, which is the state §53.6 item 3 and §64.5 item 3 asked for.
+
+### 73.4 A correction I owe §53, and the shape of the mistake
+
+§53.3 lists five lines as "the whole diagnosis" of the locked session, and one
+of them was wrong for a reason that had nothing to do with locking.
+
+Run again on the **unlocked** desktop, the same probe still reported
+`SendInput_returned=0` — this time with `lasterror=87`,
+`ERROR_INVALID_PARAMETER`. That is what `SendInput` answers when `cbSize` does
+not match the `INPUT` it is given, and the struct in that probe carried two
+extra padding fields: 56 bytes where the x64 ABI wants 40. **The call had never
+worked, locked or not.**
+
+The conclusion of §53.3 survives, on the other evidence and only on it:
+`LockApp` was the foreground window, `WindowFromPoint` at the drag's origin
+returned it, and the control — a real drag between two Explorer windows on a
+scratch directory — did not move the file. Those are about the lock. The
+`SendInput` line was never evidence of anything.
+
+**The shape is worth naming because it is the one this document keeps
+rediscovering.** A wrong instrument agreed with a correct conclusion, so nothing
+about the run looked wrong. §53.4 records three harness bugs found because they
+made the harness disagree with reality; this is the fourth and it was invisible
+precisely because it *agreed*. The only reason it surfaced at all is that the
+same probe was pointed at a machine whose state had changed, and it gave the
+same answer — an answer that was supposed to depend on that state.
+
+And the same misreading nearly recurred at the top of this run. `Get-Process
+LockApp` returned 1 on the unlocked desktop, because Windows 11 leaves `LockApp`
+resident and suspended after an unlock. Counting the process would have said
+"locked"; `WindowFromPoint` at the centre of the screen said `firefox` with a
+page title, which is what the desktop actually had on it. **Asking what is on
+the screen beat asking what is in the process list**, both times.
+
+### 73.5 What is not proven
+
+1. **No compositor was run on the guest in this visit.** §73.3.
+2. **`gdi=0` is inferred to be correct, not shown.** A window that owns a device
+   context would settle it and none was made.
+3. **One process, four windows.** That the counter tracks a compositor holding
+   dozens of windows across many clients is likely and untested.
+4. **The USER count includes more than windows** — the `+5` for four windows is
+   the windows plus something (a class, a message queue). A leak assertion
+   should therefore compare against a *baseline of itself*, which is what §53's
+   harness already does for the enumerated count, rather than treating the
+   number as a window count.
