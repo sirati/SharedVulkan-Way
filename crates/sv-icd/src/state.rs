@@ -174,6 +174,34 @@ pub struct Template {
     pub bind_point: sv_proto::VkPipelineBindPoint,
 }
 
+/// A `VkDescriptorSet`, as the app side has to remember it.
+///
+/// Two fields, and each is here for a reason the other cannot cover — see
+/// [`State::set_layouts`] for what the record is *for*.
+///
+/// # Why the answer and not the layout's id
+///
+/// The obvious record is the `VkDescriptorSetLayout` id, and it is wrong:
+/// **a descriptor set layout may be destroyed while descriptor sets allocated
+/// from it are still in use**, which the specification says in as many words.
+/// A set holding its layout's id would then look the answer up in a table the
+/// destroy has already emptied, conclude "unknown", and put the poison back on
+/// the wire — the original defect, restored by an entirely ordinary sequence.
+///
+/// So the *answer* is captured at allocate time and shared: one `Arc` per
+/// layout, however many sets are allocated from it, and the layout's own entry
+/// exists only long enough to be copied out of.
+#[derive(Debug, Clone)]
+pub struct DescriptorSet {
+    /// The bindings whose sampler comes from the layout. Shared with the layout
+    /// entry it was allocated from, and outlives it.
+    pub immutable: std::sync::Arc<std::collections::HashSet<u32>>,
+    /// The `VkDescriptorPool` it came out of. This is what makes the record
+    /// droppable: `vkResetDescriptorPool` and `vkDestroyDescriptorPool` free
+    /// every set of a pool without naming one of them.
+    pub pool: u64,
+}
+
 /// Everything the app side knows.
 pub struct State {
     /// docs/design.md §6.4 allocates ids from a per-device counter. One counter for
@@ -200,6 +228,39 @@ pub struct State {
     /// whose *contents* the app side has to remember; everything else it only
     /// has to name.
     pub templates: HashMap<u64, Template>,
+    /// `VkDescriptorSetLayout` id → the bindings of it that take their sampler
+    /// from the *layout*, not from the descriptor write.
+    ///
+    /// # Why the app side has to remember this
+    ///
+    /// `VkDescriptorImageInfo::sampler` is ignored — and the specification then
+    /// permits it to hold **anything at all** — for every `descriptorType`
+    /// except `SAMPLER` and `COMBINED_IMAGE_SAMPLER`, and for those two as well
+    /// when the binding being written was declared with `pImmutableSamplers`.
+    /// CTS writes `0xDEADBEEF` there on purpose. Forwarding that value makes it
+    /// an object id on the wire, the GPU side cannot resolve it, and the ring
+    /// goes fatal: `no VkSampler with id 3735928559`. docs/design.md §0.26.
+    ///
+    /// It is the same class as `sv_codegen::exceptions::SIBLING_SELECTED` — a
+    /// member the specification says is meaningless — one level deeper, and it
+    /// is here rather than in the codegen for a reason that decides the shape:
+    /// the selector is not a sibling member of the same struct. It is a property
+    /// of the *layout the destination set was allocated with*, two commands
+    /// away, and no rule expressible over `vk.xml` can reach it.
+    ///
+    /// Only the binding numbers are kept. Which sampler the layout names is the
+    /// GPU side's business — it holds the real `VkDescriptorSetLayout` — and the
+    /// only question asked here is whether the write's own sampler means
+    /// anything.
+    ///
+    /// Read by `vkAllocateDescriptorSets` and by nothing else: the answer moves
+    /// into the *set's* record there, because a layout may be destroyed while
+    /// its sets live on. See [`DescriptorSet`].
+    pub set_layouts: HashMap<u64, std::sync::Arc<std::collections::HashSet<u32>>>,
+    /// `VkDescriptorSet` id → whether a write to it carries a sampler that means
+    /// anything, and the pool that will take the record away. See
+    /// [`State::set_layouts`] and [`DescriptorSet`].
+    pub descriptor_sets: HashMap<u64, DescriptorSet>,
     pub allocator: Box<dyn Backing>,
 }
 
@@ -214,6 +275,8 @@ impl State {
             memories: HashMap::new(),
             buffers: HashMap::new(),
             templates: HashMap::new(),
+            set_layouts: HashMap::new(),
+            descriptor_sets: HashMap::new(),
             allocator,
         }
     }

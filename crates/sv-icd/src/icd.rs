@@ -1018,7 +1018,7 @@ impl Icd for SharedVulkan {
         // SAFETY: `p_data` is the application's own `pData` for this call, read
         // in the application's process, with the entries it created the template
         // with. The specification's contract; see the function's own note.
-        let writes = unsafe {
+        let mut writes = unsafe {
             sv_icd_entry::local::expand_descriptor_template(
                 args.p_data,
                 args.descriptor_set.0,
@@ -1028,6 +1028,11 @@ impl Icd for SharedVulkan {
         if writes.is_empty() {
             return Ok(());
         }
+        // The expanded writes are `vkUpdateDescriptorSets` writes and carry the
+        // same ignored member; a template entry says which `descriptorType` it
+        // is writing and nothing about the layout's immutable samplers, so this
+        // path needs the same pass. docs/design.md §0.26.
+        self.drop_ignored_samplers(&mut writes);
         forward::update_descriptor_sets(
             t,
             p::VkUpdateDescriptorSetsArgs {
@@ -1038,6 +1043,167 @@ impl Icd for SharedVulkan {
                 p_descriptor_copies: Vec::new(),
             },
         )
+    }
+
+    // -- descriptor sets: which writes carry a sampler that means anything ---
+    //
+    // docs/design.md §0.26. Seven commands, of which only the last changes a
+    // packet; the other six exist to keep the record it reads. Each keeps the
+    // generated default's refusal-by-name in its standalone arm, so the audit's
+    // derivation still sorts all seven as "forwards".
+
+    /// Remember which of this layout's bindings carry immutable samplers.
+    ///
+    /// That is the fact `update_descriptor_sets` cannot get any other way; see
+    /// [`crate::state::State::set_layouts`].
+    fn create_descriptor_set_layout(
+        &self,
+        mut args: p::VkCreateDescriptorSetLayoutArgs,
+    ) -> IcdResult<p::VkCreateDescriptorSetLayoutReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkCreateDescriptorSetLayout"));
+        };
+        // **Mint the id here.** `emit_mint_outputs` puts it in the *trait
+        // default*, so overriding a create-command opts out of it silently and
+        // every object of that type gets id 0 — see
+        // `create_descriptor_update_template` for the day that cost.
+        let id = IcdLocal::mint_id(self);
+        args.p_set_layout = Some(p::VkDescriptorSetLayout(id));
+        // Collected before the call, because `args` moves into it.
+        let immutable: std::sync::Arc<std::collections::HashSet<u32>> = std::sync::Arc::new(
+            args.p_create_info
+                .as_ref()
+                .map(|c| {
+                    c.p_bindings
+                        .iter()
+                        .filter(|b| !b.p_immutable_samplers.is_empty())
+                        .map(|b| b.binding)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        let reply = forward::create_descriptor_set_layout(t, args)?;
+        if reply.result.0 == 0 {
+            self.state().set_layouts.insert(id, immutable);
+        }
+        Ok(reply)
+    }
+
+    /// Drop the layout's entry — and *only* the layout's.
+    ///
+    /// A descriptor set layout may be destroyed while sets allocated from it are
+    /// still in use, so this must not take the answer away from those sets. It
+    /// does not: they took their own copy at allocate time
+    /// ([`crate::state::DescriptorSet`]).
+    fn destroy_descriptor_set_layout(
+        &self,
+        args: p::VkDestroyDescriptorSetLayoutArgs,
+    ) -> IcdResult<()> {
+        self.state().set_layouts.remove(&args.descriptor_set_layout.0);
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkDestroyDescriptorSetLayout"));
+        };
+        forward::destroy_descriptor_set_layout(t, args)
+    }
+
+    /// Take each set's copy of its layout's answer, before the layout can go.
+    fn allocate_descriptor_sets(
+        &self,
+        mut args: p::VkAllocateDescriptorSetsArgs,
+    ) -> IcdResult<p::VkAllocateDescriptorSetsReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkAllocateDescriptorSets"));
+        };
+        for slot in args.p_descriptor_sets.iter_mut() {
+            *slot = p::VkDescriptorSet(IcdLocal::mint_id(self));
+        }
+        let pool = args.p_allocate_info.as_ref().map(|a| a.descriptor_pool.0).unwrap_or(0);
+        // `pSetLayouts` is parallel to `pDescriptorSets`; a short one is an
+        // application error the driver will refuse, and zipping simply records
+        // nothing for the sets it does not describe. A layout this side never
+        // saw created records nothing, which leaves its sets unclassifiable and
+        // therefore untouched — the safe direction, as in `drop_ignored_samplers`.
+        let record: Vec<(u64, crate::state::DescriptorSet)> = {
+            let s = self.state();
+            args.p_allocate_info
+                .as_ref()
+                .map(|a| {
+                    args.p_descriptor_sets
+                        .iter()
+                        .zip(a.p_set_layouts.iter())
+                        .filter_map(|(set, l)| {
+                            let immutable = s.set_layouts.get(&l.0)?;
+                            let rec = crate::state::DescriptorSet {
+                                immutable: std::sync::Arc::clone(immutable),
+                                pool,
+                            };
+                            Some((set.0, rec))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let reply = forward::allocate_descriptor_sets(t, args)?;
+        if reply.result.0 == 0 {
+            let mut s = self.state();
+            for (set, rec) in record {
+                s.descriptor_sets.insert(set, rec);
+            }
+        }
+        Ok(reply)
+    }
+
+    fn free_descriptor_sets(
+        &self,
+        args: p::VkFreeDescriptorSetsArgs,
+    ) -> IcdResult<p::VkFreeDescriptorSetsReply> {
+        {
+            let mut s = self.state();
+            for set in &args.p_descriptor_sets {
+                s.descriptor_sets.remove(&set.0);
+            }
+        }
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkFreeDescriptorSets"));
+        };
+        forward::free_descriptor_sets(t, args)
+    }
+
+    /// A pool reset frees every set in it without naming one of them, which is
+    /// why [`crate::state::DescriptorSet`] carries the pool.
+    fn reset_descriptor_pool(
+        &self,
+        args: p::VkResetDescriptorPoolArgs,
+    ) -> IcdResult<p::VkResetDescriptorPoolReply> {
+        self.forget_pool(args.descriptor_pool.0);
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkResetDescriptorPool"));
+        };
+        forward::reset_descriptor_pool(t, args)
+    }
+
+    fn destroy_descriptor_pool(&self, args: p::VkDestroyDescriptorPoolArgs) -> IcdResult<()> {
+        self.forget_pool(args.descriptor_pool.0);
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkDestroyDescriptorPool"));
+        };
+        forward::destroy_descriptor_pool(t, args)
+    }
+
+    /// Drop every `VkDescriptorImageInfo::sampler` the specification ignores,
+    /// then forward.
+    ///
+    /// This is the whole of docs/design.md §0.26 on the wire. Everything above
+    /// exists so that this can answer "does this write's sampler mean
+    /// anything?" — and the answer has to be *no* by default for three of the
+    /// five descriptor types that select `pImageInfo`, and no for the other two
+    /// whenever the destination binding was declared with immutable samplers.
+    fn update_descriptor_sets(&self, mut args: p::VkUpdateDescriptorSetsArgs) -> IcdResult<()> {
+        self.drop_ignored_samplers(&mut args.p_descriptor_writes);
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkUpdateDescriptorSets"));
+        };
+        forward::update_descriptor_sets(t, args)
     }
 
     /// The push form, rewritten into `vkCmdPushDescriptorSet`.
@@ -1520,6 +1686,83 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
 }
 
 impl SharedVulkan {
+    /// Forget every descriptor set that came out of `pool`.
+    ///
+    /// `vkResetDescriptorPool` and `vkDestroyDescriptorPool` free all of a
+    /// pool's sets and name none of them, so this is a scan. It is the only
+    /// linear pass in the record and it runs on two commands an application
+    /// calls a handful of times, against a map that holds one small entry per
+    /// live descriptor set — which is also what keeps the record from growing
+    /// without bound, since most applications free sets exactly this way and
+    /// never call `vkFreeDescriptorSets` at all.
+    fn forget_pool(&self, pool: u64) {
+        self.state().descriptor_sets.retain(|_, s| s.pool != pool);
+    }
+
+    /// Zero every `VkDescriptorImageInfo::sampler` that the specification says
+    /// is ignored — docs/design.md §0.26.
+    ///
+    /// # The rule, transcribed
+    ///
+    /// `VkDescriptorImageInfo::sampler` is used only for descriptor types
+    /// `SAMPLER` (0) and `COMBINED_IMAGE_SAMPLER` (1), and for those two only
+    /// *"if the binding being updated does not use immutable samplers"*
+    /// (VUID-VkWriteDescriptorSet-descriptorType-00325). `SAMPLED_IMAGE` (2),
+    /// `STORAGE_IMAGE` (3) and `INPUT_ATTACHMENT` (10) also read `pImageInfo`
+    /// and never read its sampler. Ignored means ignored: the application is
+    /// entitled to leave anything there, and CTS leaves `0xDEADBEEF`.
+    ///
+    /// # Why zero rather than "leave it alone"
+    ///
+    /// On this wire a handle **is** an object id, so a value that means nothing
+    /// to the specification still gets looked up on the GPU side. The lucky
+    /// outcome is `no VkSampler with id 3735928559` and a fatal ring; the
+    /// unlucky one is an id that happens to name a live sampler, which resolves,
+    /// and the driver is handed a descriptor built from a value the application
+    /// never chose. `VK_NULL_HANDLE` is what the far side must be given here,
+    /// and [`sv_gpu_server::table::Objects::get`] already passes 0 through
+    /// unchanged.
+    ///
+    /// # What an unknown set means, and why it is left alone
+    ///
+    /// A `dstSet` this side never saw allocated cannot be classified, and the
+    /// two mistakes are not symmetric: keeping a sampler that is ignored costs
+    /// at worst the fatal that already happens and says so, while dropping one
+    /// that is *used* silently binds the wrong sampler and no diagnostic exists
+    /// anywhere. So an unknown set keeps its samplers.
+    fn drop_ignored_samplers(&self, writes: &mut [p::VkWriteDescriptorSet]) {
+        // `VkDescriptorType`, quoted from `vulkan_core.h`.
+        const SAMPLER: i64 = 0;
+        const COMBINED_IMAGE_SAMPLER: i64 = 1;
+        // Cheap out before taking the lock: most writes are buffers, whose
+        // `pImageInfo` the lowering has already left empty
+        // (`sv_codegen::exceptions::SIBLING_SELECTED`).
+        if !writes.iter().any(|w| !w.p_image_info.is_empty()) {
+            return;
+        }
+        let s = self.state();
+        for w in writes.iter_mut() {
+            if w.p_image_info.is_empty() {
+                continue;
+            }
+            let ty = i64::from(w.descriptor_type.0);
+            let used = if ty == SAMPLER || ty == COMBINED_IMAGE_SAMPLER {
+                match s.descriptor_sets.get(&w.dst_set.0) {
+                    Some(d) => !d.immutable.contains(&w.dst_binding),
+                    // Never saw the set allocated: see the note above.
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if !used {
+                for info in w.p_image_info.iter_mut() {
+                    info.sampler = p::VkSampler(0);
+                }
+            }
+        }
+    }
+
     /// The shared body of the two `vkCmdPushDescriptorSetWithTemplate` forms.
     ///
     /// One expansion, reached from two trait methods, so the `2` form cannot
@@ -1609,4 +1852,90 @@ fn queue_families() -> Vec<p::VkQueueFamilyProperties> {
             w
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::DescriptorSet;
+
+    /// One write of `count` image infos, each with the same sampler id.
+    fn write(set: u64, binding: u32, ty: i32, sampler: u64) -> p::VkWriteDescriptorSet {
+        let mut w = p::VkWriteDescriptorSet::default();
+        w.dst_set = p::VkDescriptorSet(set);
+        w.dst_binding = binding;
+        w.descriptor_count = 1;
+        w.descriptor_type = p::VkDescriptorType(ty);
+        let mut info = p::VkDescriptorImageInfo::default();
+        info.sampler = p::VkSampler(sampler);
+        info.image_view = p::VkImageView(12);
+        w.p_image_info = vec![info];
+        w
+    }
+
+    fn samplers(writes: &[p::VkWriteDescriptorSet]) -> Vec<u64> {
+        writes.iter().flat_map(|w| w.p_image_info.iter().map(|i| i.sampler.0)).collect()
+    }
+
+    /// docs/design.md §0.26, all four answers of the rule at once.
+    ///
+    /// `0xDEADBEEF` is the literal value CTS writes into the member it is
+    /// entitled to leave uninitialised, and it is the value that lost a device:
+    /// on this wire a handle *is* an object id, so an ignored one is still
+    /// looked up on the GPU side and the ring goes fatal on it.
+    #[test]
+    fn an_ignored_sampler_does_not_reach_the_wire() {
+        const POISON: u64 = 0xDEAD_BEEF;
+        const SAMPLER: i32 = 0;
+        const COMBINED: i32 = 1;
+        const SAMPLED_IMAGE: i32 = 2;
+
+        let icd = SharedVulkan::new(1 << 20).expect("a standalone driver");
+        {
+            let mut s = icd.state();
+            // Layout 100: binding 1 has immutable samplers, binding 2 does not.
+            // Set 10 is allocated from it and takes its own copy of the answer,
+            // which is what makes the layout's own entry disposable.
+            let immutable = std::sync::Arc::new([1u32].into_iter().collect());
+            s.set_layouts.insert(100, std::sync::Arc::clone(&immutable));
+            s.descriptor_sets.insert(10, DescriptorSet { immutable, pool: 7 });
+        }
+
+        // 1. Immutable binding: the write's sampler means nothing.
+        let mut w = vec![write(10, 1, COMBINED, POISON)];
+        icd.drop_ignored_samplers(&mut w);
+        assert_eq!(samplers(&w), vec![0], "an immutable binding's sampler must not cross");
+
+        // 2. Same layout, a binding it did not declare immutable: the sampler is
+        //    the application's and must survive untouched.
+        let mut w = vec![write(10, 2, COMBINED, 15)];
+        icd.drop_ignored_samplers(&mut w);
+        assert_eq!(samplers(&w), vec![15], "a used sampler must not be dropped");
+
+        // 3. A type that never reads the member, immutable or not.
+        let mut w = vec![write(10, 2, SAMPLED_IMAGE, POISON)];
+        icd.drop_ignored_samplers(&mut w);
+        assert_eq!(samplers(&w), vec![0], "SAMPLED_IMAGE never reads pImageInfo's sampler");
+
+        // 4. A set this side never saw allocated cannot be classified, and the
+        //    two mistakes are not symmetric: keeping is the safe direction.
+        let mut w = vec![write(999, 0, SAMPLER, 15)];
+        icd.drop_ignored_samplers(&mut w);
+        assert_eq!(samplers(&w), vec![15], "an unknown set keeps its samplers");
+
+        // 5. Destroying the layout must not disarm the sets allocated from it:
+        //    the specification permits exactly this order, and a set that lost
+        //    its answer here would put the poison back on the wire.
+        icd.state().set_layouts.remove(&100);
+        let mut w = vec![write(10, 1, COMBINED, POISON)];
+        icd.drop_ignored_samplers(&mut w);
+        assert_eq!(samplers(&w), vec![0], "a set outlives its layout with its answer");
+
+        // 6. A pool reset does forget its sets, so the same write is no longer
+        //    classifiable and the sampler is kept rather than silently dropped.
+        icd.forget_pool(7);
+        let mut w = vec![write(10, 1, COMBINED, POISON)];
+        icd.drop_ignored_samplers(&mut w);
+        assert_eq!(samplers(&w), vec![POISON], "a reset pool's sets are forgotten");
+    }
 }

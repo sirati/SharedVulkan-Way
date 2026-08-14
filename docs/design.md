@@ -4882,6 +4882,181 @@ answered app-side by design rather than missing.
 
 ---
 
+### 0.26 `0xDEADBEEF` is a `VkSampler` here: the ignored member, and why the selector is two commands away
+
+Measured 2026-08-14 on **devhost**, in `nix develop`, against the one device
+loss a fresh 823-test CTS run found on master:
+
+```
+dEQP-VK.ycbcr.format.g16_b16_r16_3plane_422_unorm.tess_control_linear_array_disjoint
+  -> DeviceLost 3/3 standalone, each with:  FATAL: no VkSampler with id 3735928559
+```
+
+#### 0.26.1 It was filed as §0.23's bug and it is not
+
+The parcel this was worked from named it the blob-lifetime defect: an object
+destroyed once its command buffer left the recording state, replayed against a
+table that no longer had it. That class is real, it is §0.23, and **it was
+already fixed** — `RingTransport::publish_recorded_first`, measured 144 → 0.
+Nothing about this fatal fits it, and one number said so before a line was
+written: **3735928559 is `0xDEADBEEF`**. Ids on this wire come from
+`State::mint`, a counter starting at 1 (§6.4), so a dense small integer is what a
+live *or* a destroyed object looks like. A poison value is neither. It was never
+an id at all.
+
+The send trace settles the rest in six lines:
+
+```
+[icd] ring Device seqno 11 opcode 305   vkCreateSampler              → id 15
+[icd] ring Device seqno 12 opcode 280   vkCreateDescriptorSetLayout  → pImmutableSamplers = [15]
+[icd] ring Device seqno 14 opcode   4   vkAllocateDescriptorSets
+[icd] ring Device seqno 15 opcode 557   vkUpdateDescriptorSets       ← sampler 0xDEADBEEF
+[gpu] ring 2 seqno 15 FATAL: … no VkSampler with id 3735928559
+[icd] ring Device seqno 21 opcode 344   vkDestroySampler             ← *after* the fatal
+```
+
+The sampler is alive, it is six packets from being destroyed, and no command
+blob is involved — this fatal happens before the first `vkCmd*`. §0.23's
+diagnostic rewrite is what made that readable: the message now lists *"a wrong id
+read out of application memory"* beside the lifetime case instead of asserting a
+missing `RingBarrier`, and the reader is told to check the last create/destroy of
+the id first. Doing exactly that took ten minutes and excluded the filed
+diagnosis.
+
+#### 0.26.2 The rule, and where the specification hides it
+
+`VkDescriptorImageInfo::sampler` is used for `descriptorType` `SAMPLER` and
+`COMBINED_IMAGE_SAMPLER` — **and for those two only *"if the binding being
+updated does not use immutable samplers"*** (VUID-VkWriteDescriptorSet-
+descriptorType-00325). The other three types that select `pImageInfo` —
+`SAMPLED_IMAGE`, `STORAGE_IMAGE`, `INPUT_ATTACHMENT` — never read it. Ignored
+means ignored: the application may leave anything there, and CTS leaves
+`0xDEADBEEF` **on purpose**, precisely to catch an implementation that reads it.
+
+Which is what this is. The ycbcr tests are the natural place for it to land,
+because a ycbcr sampler *must* be immutable in the layout — that is what the
+extension requires — so every one of these writes has an ignored sampler in it.
+
+This is `exceptions::SIBLING_SELECTED` (§0.16 item 2) one level deeper, and the
+level matters. That table handles *arrays* the registry marks `noautovalidity`
+whose selector is a sibling member of the same struct, and it says the rule
+plainly: **the wire should carry an empty array, because the callee must not look
+at it either.** Same principle, same struct family, and a shape the codegen
+cannot express — see the next item.
+
+#### 0.26.3 App side, and the reason is that the selector is not on the wire
+
+Both sides had a claim and one of them is disqualified by arithmetic.
+
+The selector for `pImageInfo` is `descriptorType`, a member of the same struct;
+a generated pass can read it. The selector for `sampler` is *"does the binding
+`dstBinding` of the layout that `dstSet` was allocated with declare
+`pImmutableSamplers`"* — which is **three objects and two commands away** from
+the call being lowered. There is nothing in `vk.xml` to derive it from and no
+sibling to read it out of, so it cannot be a codegen exception table however the
+table is shaped. It has to be state, and state means a hand-written body.
+
+Given that, the app side wins on the same argument §0.16 item 2 already made:
+
+* **A handle on this wire is an object id.** A value the specification says is
+  meaningless is still *looked up* by the far side. The fatal is the lucky
+  outcome — an ignored `0xDEADBEEF` that happened to collide with a live sampler
+  would resolve, and the driver would be handed a descriptor built from a number
+  the application never chose, with no diagnostic anywhere. That is §0.16 item
+  2's exact hazard, met a third time.
+* **The GPU side cannot refuse it cheaply.** Its resolution happens in generated
+  decode, before any command body runs, so a fix there means teaching the object
+  table to tolerate an unresolvable `VkSampler` — which is the one thing that
+  makes this class of defect *findable*, and it would be given up for every
+  other object at the same time.
+* **The GPU side would need the identical two maps anyway.** Layout → immutable
+  bindings, set → layout. Nothing is saved by keeping them on the far side, and
+  the garbage crosses the boundary first.
+
+So: `sv_icd::icd`, seven overrides and two helpers. `vkCreateDescriptorSetLayout`
+records the binding numbers declared with immutable samplers;
+`vkAllocateDescriptorSets` records set → (layout, pool); `vkFreeDescriptorSets`,
+`vkResetDescriptorPool` and `vkDestroyDescriptorPool` drop those records — the
+pool is carried precisely because the last two free every set of a pool and name
+none of them, which is also how most applications free sets at all;
+`vkUpdateDescriptorSets` zeroes each ignored sampler to `VK_NULL_HANDLE`, which
+`Objects::get` already passes through unchanged. Only the binding *numbers* are
+kept: which sampler the layout names is the GPU side's business, and the only
+question asked here is whether the write's own sampler means anything.
+
+`vkUpdateDescriptorSetWithTemplate` expands app-side into these same writes
+(§0.4 item 10) and forwards them directly, so it gets the same pass — otherwise
+the defect would survive on exactly the path Zink and DXVK use by default, which
+is how it stayed unseen until CTS ran (§0.16 item 2's own note, verbatim).
+
+**What the set records is the answer, not the layout's id**, and that is not a
+detail. A descriptor set layout may be destroyed while sets allocated from it are
+still in use — the specification says so in as many words — so a set holding its
+layout's *id* would look the answer up in a table the destroy has already
+emptied, conclude "unknown", and put the poison back on the wire. The answer is
+copied at allocate time and shared by `Arc`, one per layout however many sets
+come out of it, and the layout's own entry then exists only to be copied out of.
+
+**An unknown `dstSet` keeps its samplers**, and that asymmetry is deliberate:
+keeping an ignored sampler costs at worst the fatal that already exists and says
+so, while dropping a *used* one binds silently wrong and nothing anywhere would
+report it.
+
+**The residue, stated:** `vkCmdPushDescriptorSet` carries the same
+`VkWriteDescriptorSet` and writes no set at all — there is nothing to look up,
+because the binding it names belongs to a `VkPipelineLayout`'s *n*th set layout
+and this side keeps no pipeline-layout → set-layout map. It is untouched here and
+unmeasured: no test in this tree has produced the fatal from that command, and
+the pipeline-layout map is the thing to add if one does. §0.24 excludes the two
+`WithTemplate` push forms from the profile by name for an unrelated reason, which
+narrows the surface but does not close it.
+
+#### 0.26.4 Measured
+
+Standalone, own GPU side per run, killed by pid; the named test, on a machine
+under other agents' load (load average 60-75 throughout, so these are not quiet
+numbers and did not need to be — the defect is deterministic):
+
+| | runs | Pass | DeviceLost | ring fatals |
+|---|---|---|---|---|
+| before | 3 | 0 | **3** | 3 |
+| after | **17** | **17** | **0** | **0** |
+
+Seventeen across the fix's two shapes — eleven before the
+layout-outlives-its-sets correction above, and six on the code as committed, of
+which the last three are after the merge of `push-template` and the `void*`
+family (§0.25), which touch the lowering this rides on.
+
+And a wider slice, because a fix for one test is a fix for one test: 60 ycbcr
+cases (every 400th of the suite's 62333), one deqp-vk invocation, one GPU side,
+same binary both ways —
+
+| | Pass | NotSupported | DeviceLost | ring fatals | cases that ran |
+|---|---|---|---|---|---|
+| before | 0 | 1 | **1** | 1 | **2 of 60** |
+| after | **23** | 37 | **0** | **0** | **60 of 60** |
+
+The "cases that ran" column is the part worth reading. The device loss arrives on
+the *second* case and the shared GPU side takes the rest of the invocation with
+it (§0.15's contamination, the reason `sv-cts.sh` restarts a GPU side per round)
+— so one ignored member was costing 58 unrelated verdicts every time it fired.
+
+#### 0.26.5 What this says about a parcel that arrives diagnosed
+
+§0.23.6 drew the lesson that measuring first turned a codegen-wide change into a
+change in one function. This is its mirror image and the sharper half: the work
+arrived with a diagnosis, a mechanism, a cited section and an instruction not to
+re-diagnose — and the diagnosis was of a bug that had already been fixed. Had it
+been believed, the deferral it asked for would have been built, correctly, on
+both sides of a boundary, and the test would still lose the device.
+
+**The reproducer is cheaper than the argument for skipping it.** Running it cost
+four minutes and printed the answer in the first line of output. Not one part of
+the filed mechanism — maintenance4, blob replay, `completed_seqno` — was needed
+to find it, and every part of it would have been needed to build the wrong fix.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
