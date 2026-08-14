@@ -116,13 +116,39 @@ const fn ole_iid(data1: u32) -> GUID {
     }
 }
 
-/// SAFETY: both pointers must be readable `GUID`s.
+/// SAFETY: `a` must be null or point at 16 readable bytes.
+///
+/// **The read is unaligned, and that is a fix rather than a precaution.** §44's
+/// run is the first time `DoDragDrop` has been entered, and the first drag out
+/// of a Wayland window aborted the compositor here:
+///
+/// ```text
+/// thread 'main' panicked at platform/drag.rs:125:22:
+/// misaligned pointer dereference: address must be a multiple of 0x4 but is 0x6fffff1d3a86
+///   4: wc_compositor::platform::drag::guid_eq
+///   5: wc_compositor::platform::drag::do_query_interface
+///  17: OLEDD_DragTrackerWindowProc
+///  22: DoDragDrop
+/// ```
+///
+/// A `REFIID` is a pointer into **another module's** memory, and nothing about
+/// COM promises it satisfies Rust's alignment invariant for `&GUID`. OLE's
+/// standard marshaller — which is what runs the moment a drag crosses out of
+/// our own window and into another process's, so that our `IDataObject` can be
+/// marshalled to it — hands out interface identifiers that live inside packed
+/// marshalling buffers, at whatever byte offset the stream put them.
+///
+/// `&*a` asserts alignment in a debug build and aborts; in release the check is
+/// compiled out and the same code reads the same bytes and works. That is the
+/// worst shape a defect can have — it is invisible in the build that ships and
+/// fatal in the build every harness in this tree runs — and it is why this is
+/// `read_unaligned` and not a note.
 unsafe fn guid_eq(a: *const GUID, b: &GUID) -> bool {
     if a.is_null() {
         return false;
     }
-    // SAFETY: the caller guarantees `a` is readable.
-    let a = unsafe { &*a };
+    // SAFETY: the caller guarantees 16 readable bytes; alignment is not assumed.
+    let a = unsafe { a.read_unaligned() };
     a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
 }
 
@@ -722,6 +748,40 @@ thread_local! {
     /// The window a drag is currently over, so `Drop` and `DragLeave` can name
     /// it without OLE telling them — neither method carries an `HWND`.
     static OVER: Cell<u64> = const { Cell::new(0) };
+    /// The answer `DragOver` last gave, and how many times in a row it gave it.
+    ///
+    /// ADDED FOR §44, and it exists to make one specific claim measurable
+    /// rather than arguable. §43.4 decided that `DragOver` answers from the
+    /// last known accepted action and is therefore up to one round trip stale;
+    /// §43.9 item 2 then recorded that **nobody had seen it**. What a user sees
+    /// is not milliseconds, it is *how many frames of the gesture wear the
+    /// no-entry cursor before the client's `accept` arrives* — which is exactly
+    /// the length of the first run here. Logging on change rather than on every
+    /// call keeps that number in the log without putting one line per mouse
+    /// move in it: OLE calls `DragOver` several times a second for as long as
+    /// the gesture lasts.
+    static OVER_RUN: Cell<(DROPEFFECT, u32)> = const { Cell::new((DROPEFFECT_NONE, 0)) };
+    /// `now_ms()` at the `DragEnter` of the gesture in progress, so the gap
+    /// until the client's first answer is a number rather than an estimate.
+    static ENTERED_AT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Close off the current run of `DragOver` answers and print it.
+///
+/// Called at the two ends of a gesture — `Drop` and `DragLeave` — because the
+/// last run has no *next* answer to be flushed by, and a measurement that
+/// silently drops its final sample is worse than one that is missing.
+fn flush_over_run(window: u64) {
+    OVER_RUN.with(|o| {
+        let (last, n) = o.get();
+        if n > 0 {
+            println!(
+                "wc-compositor: DragOver on window {window} answered {last:#x} for the last \
+                 {n} call(s)"
+            );
+        }
+        o.set((DROPEFFECT_NONE, 0));
+    });
 }
 
 /// Stage a drag and ask the pump to run it.
@@ -999,6 +1059,8 @@ unsafe extern "system" fn dt_drag_enter(
     // Nothing has answered yet, so the first `DragOver` says no. See `FEEDBACK`.
     FEEDBACK.with(|f| f.set(DROPEFFECT_NONE));
     OVER.with(|o| o.set(window));
+    OVER_RUN.with(|o| o.set((DROPEFFECT_NONE, 0)));
+    ENTERED_AT.with(|t| t.set(super::win32::now_ms()));
     DROPPED.with(|d| d.borrow_mut().clear());
     // SAFETY: OLE passes a writable out-pointer.
     unsafe { write_effect(effect, DROPEFFECT_NONE) };
@@ -1010,6 +1072,19 @@ unsafe extern "system" fn dt_drag_enter(
         println!("wc-compositor: a Windows drag entered window {window} offering nothing we speak");
         return S_OK;
     }
+    // ADDED FOR §44. Until this line the *successful* path of `DragEnter` said
+    // nothing at all, and the only entry in the log was the one above for a
+    // drag we could not describe — so "a drag entered" was a claim no run could
+    // support from the compositor's own output. §43.9 item 1 is the sentence
+    // this line exists to let somebody stop writing.
+    println!(
+        "wc-compositor: a Windows drag entered window {window} at screen ({}, {}) offering {} \
+         mime(s): {}",
+        pt.x,
+        pt.y,
+        mimes.len(),
+        mimes.join(", ")
+    );
     if let Some(ui) = super::win32::ui() {
         let (x, y) = super::win32::screen_to_surface(&ui, window, pt.x, pt.y);
         let _ = ui.events.send(super::FromUi::DragEnter {
@@ -1037,8 +1112,29 @@ unsafe extern "system" fn dt_drag_over(
 ) -> HRESULT {
     // SAFETY: `this` is live for the call.
     let window = unsafe { &*this }.window;
+    let answer = FEEDBACK.with(|f| f.get());
     // SAFETY: OLE passes a writable out-pointer.
-    unsafe { write_effect(effect, FEEDBACK.with(|f| f.get())) };
+    unsafe { write_effect(effect, answer) };
+    // ADDED FOR §44; see `OVER_RUN`. One line per *change*, so the first run is
+    // the size of §43.4's staleness in the unit the user actually experiences.
+    OVER_RUN.with(|o| {
+        let (last, n) = o.get();
+        if last == answer && n > 0 {
+            o.set((answer, n + 1));
+        } else {
+            if n > 0 {
+                println!(
+                    "wc-compositor: DragOver on window {window} answered {last:#x} {n} time(s)"
+                );
+            }
+            println!(
+                "wc-compositor: DragOver on window {window} now answers {answer:#x} ({} ms after \
+                 the drag entered)",
+                super::win32::now_ms().wrapping_sub(ENTERED_AT.with(|t| t.get()))
+            );
+            o.set((answer, 1));
+        }
+    });
     if let Some(ui) = super::win32::ui() {
         let (x, y) = super::win32::screen_to_surface(&ui, window, pt.x, pt.y);
         let _ = ui.events.send(super::FromUi::DragMotion {
@@ -1054,6 +1150,8 @@ unsafe extern "system" fn dt_drag_over(
 unsafe extern "system" fn dt_drag_leave(this: *mut DropTarget) -> HRESULT {
     // SAFETY: `this` is live for the call.
     let window = unsafe { &*this }.window;
+    flush_over_run(window);
+    println!("wc-compositor: a Windows drag left window {window}");
     FEEDBACK.with(|f| f.set(DROPEFFECT_NONE));
     OVER.with(|o| o.set(0));
     if let Some(ui) = super::win32::ui() {
@@ -1085,6 +1183,7 @@ unsafe extern "system" fn dt_drop(
     // decide whether to delete its original on a move.
     unsafe { write_effect(effect, taken) };
     let bytes = unsafe { read_all(data) };
+    flush_over_run(window);
     println!(
         "wc-compositor: a Windows drag was dropped on window {window}: {} format(s) read, \
          effect {taken:#x}",
@@ -1649,5 +1748,14 @@ mod tests {
 /// answered after the client has been told about it.
 pub(crate) fn feedback(accepted: bool, action: u32) {
     let effect = if accepted { to_dropeffect(action) } else { DROPEFFECT_NONE };
+    // ADDED FOR §44. This is the *arrival* of the asynchronous half, and it is
+    // the other end of the interval `OVER_RUN` measures: between `DragEnter`
+    // and this line every `DragOver` answers `DROPEFFECT_NONE`, and the run
+    // length printed on the next change is how much of the gesture that was.
+    println!(
+        "wc-compositor: the client under the drag answered accepted={accepted} action={action} \
+         -> effect {effect:#x} ({} ms after the drag entered)",
+        super::win32::now_ms().wrapping_sub(ENTERED_AT.with(|t| t.get()))
+    );
     FEEDBACK.with(|f| f.set(effect));
 }
