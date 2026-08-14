@@ -22375,6 +22375,24 @@ help: a section is a same-machine object, and the compositor's own startup says
 so about the neighbouring keymap in the very next line — *"unopenable by one
 across the boundary"*. The ring section is the same kind of object.
 
+**And the obvious fallback does not exist either, which is the third
+measurement.** If a section cannot cross, the next idea is a *file*-backed
+control region on the one filesystem both sides can see: `--wayland-ring
+$RUNDIR/ring` on the host, `--upstream-ring /sv/ring` in the guest. The Linux
+compositor creates it happily. The guest's proxy then says:
+
+```text
+wc-proxy: mmap failed: errno 22
+```
+
+`SharedRegion::map_fd` is an `mmap(MAP_SHARED)`, and that is the same EINVAL the
+pool publish gets, for the same reason, on the same mount. So **one measurement
+rules out both fallbacks at once** — the file pool *and* the file control
+region — and the only substrate that crosses this boundary is guest RAM through
+the memfd backend. Which is the deployment's answer, and the ring's, and the
+thing `--wayland-cold` does for Linux only. The circle closes on the missing
+function rather than on a missing idea.
+
 So there is no combination that puts a **Windows-build** compositor's control
 region into a form the far side of a hypervisor can map, and the missing piece
 is one function. `RingLink::publish` is `#[cfg(target_os = "linux")]`; the
@@ -22478,13 +22496,55 @@ legs alongside the refusals, and whether it is downstream of the held-back pool
 or independent has not been established. Naming a cause for it here would be
 §63.3's error with a fresh coat of paint.
 
+#### The ring probe made §63.3's mistake twice before it worked
+
+Worth recording because the section is about exactly this and the instances are
+mine, in one function, minutes apart:
+
+1. The leg used `$RUNDIR/ring` as its scratch **directory** and then passed the
+   same path to `--wayland-ring`. The compositor could not create a region at a
+   path that was already a directory, and the harness reported *"the Linux
+   compositor did not create a file-backed ring"* — true, and about the wrong
+   step.
+2. Fixed, the proxy then exited on argument validation (`--peer-prefix is
+   required for --transport shared-file`) before it had touched the region at
+   all, and the check — which matched *any* error — read that as the mapping
+   being refused. It would have recorded a correct conclusion supported by
+   evidence for something else entirely.
+
+Both were caught only by reading the log rather than the verdict. The check now
+keys on what the log says **about the region**, and the inconclusive case is a
+third outcome rather than being folded into either of the other two. A probe
+that cannot say "I did not get far enough to tell you" will eventually tell you
+something else instead.
+
 #### Where this leaves §67.9
 
-| leg | what it is now |
-|---|---|
-| `ring` | the transport question, answered: blocked, with both refusals measured |
-| `linux-relay`, `wine-relay` | venue evidence only, banner-labelled, **not** a transport result |
-| `wc-wine-guest.sh` | unaffected — it runs one process under Wine in the guest and moves no Wayland traffic across the boundary at all |
+| leg | what it is now | result |
+|---|---|---:|
+| `ring` | the transport question, answered: blocked, with all three refusals measured | 3 passed, 0 failed |
+| `linux-relay`, `wine-relay` | venue evidence only, banner-labelled, **not** a transport result | see above |
+| `wc-wine-guest.sh` | unaffected — it runs one process under Wine in the guest and moves no Wayland traffic across the boundary at all | 3 passed, 0 failed |
+
+**And the leg is written so that it starts working rather than needing to be
+written again.** Two things have to land before this arrangement can carry the
+wire, and neither is in this section:
+
+* **A guest-RAM publish for the Windows build.** `RingLink::publish` is
+  `#[cfg(target_os = "linux")]`; the compositor already commits and stamps guest
+  RAM on Windows for an *arena* through `awe-probe`. When ringlink is wired to
+  it, `--wayland-cold` stops exiting 2 and the first assertion in `run_ring`
+  inverts — which is the shape a blocked leg should have, because the day it
+  unblocks is the day the harness says so instead of somebody remembering to
+  check.
+* **The dialect.** `wc-proxy` writes the in-band form upstream unconditionally,
+  which is why the `linux-relay` leg's keymap fails and why §72's `create_pool`
+  desynchronises. `ProtoFd` step 1 is on master; when the per-connection flag
+  follows, the `linux-relay` leg's session check should go green without the
+  harness changing, and that will be evidence rather than an expectation.
+
+Until then the honest summary is short: the arrangement is viable, the venue is
+real and measured, and **no sanctioned transport reaches it yet**.
 
 The arrangement is viable — §70.5 got a mapped `HWND` out of it and this section
 got a registry walk — and the thing that makes it *shippable* is not a channel
