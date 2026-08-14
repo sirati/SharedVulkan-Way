@@ -833,6 +833,24 @@ impl RingTransport {
             match ring.producer.push(command, barrier) {
                 Ok(seqno) => {
                     self.note_seqno(class, seqno);
+                    // §0.23.4's instrument. The GPU side's `SV_TRACE` prints
+                    // command *names* in the order it executes them, which
+                    // cannot distinguish "the app sent the destroy first" from
+                    // "the app published the blob late" — both look identical
+                    // from there. This prints the order the app *sent* things,
+                    // with the seqno the fatal names, which is the one fact
+                    // that separates the three candidates.
+                    if crate::transport::send_trace() {
+                        eprintln!(
+                            "[icd] ring {:?} seqno {seqno} opcode {} ({} bytes)",
+                            class,
+                            command
+                                .get(0..4)
+                                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                                .unwrap_or(u32::MAX),
+                            command.len()
+                        );
+                    }
                     return Ok(seqno);
                 }
                 Err(sv_transport::Error::RingFull { .. }) => {
@@ -1307,4 +1325,18 @@ pub(crate) fn arm_park_report() {
             unsafe { libc::atexit(park_time_atexit) };
         });
     }
+}
+
+/// `SV_SEND_TRACE=1`: print every packet this side pushes, with its ring and
+/// seqno.
+///
+/// §0.23.4. The GPU side's `SV_TRACE` prints commands in *execution* order,
+/// which is the order it drains rings — so a destroy that appears before a blob
+/// there is consistent with the app having sent it first *and* with the app
+/// having published the blob late, and those have different fixes. This is the
+/// send order, from the only side that knows it.
+pub fn send_trace() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SV_SEND_TRACE").is_some())
 }
