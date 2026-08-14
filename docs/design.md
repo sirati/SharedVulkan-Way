@@ -4745,6 +4745,143 @@ wants — the same shallow-versus-deep mistake item 2 records, one table over.
 
 ---
 
+### 0.25 The `void*` family, read one at a time, and 569 → 589
+
+Written 2026-08-14, against the `full` profile at 569 commands. `vk.xml`
+1.4.350.0. The counts are `sv-codegen --profile full gap`'s and the per-extension
+verdicts are `sv-codegen --profile full --audit`'s.
+
+Two classes were held out of every profile as one: "a `void*` with no `len=`",
+about forty-two commands, and "capture-replay", about seventeen. Neither turned
+out to be a class. Both are three or four different questions that look alike
+because the registry spells them all `void*`, and separating them is the whole
+of this section: **four of the groups have an answer, and the two that do not are
+refused for reasons that are now specific enough to act on.**
+
+**1. Capture-replay was half-built, and the half that was missing was the half
+that made it honest.** §0.24 added `VoidPolicy::CaptureReplayUnsupported` — null
+on the wire, a non-null one refused by name — resting on one sentence:
+
+> But they are only ever written by a tool *replaying a trace*, and doing that
+> requires the device to advertise the matching feature —
+> `rayTracingPipelineShaderGroupHandleCaptureReplay`,
+> `descriptorBufferCaptureReplay`. This driver advertises neither, and
+> `sv_icd::advertise` is where that is kept.
+
+`sv_icd::advertise` was not keeping it. Both bits arrive inside
+`VkPhysicalDeviceRayTracingPipelineFeaturesKHR` and
+`VkPhysicalDeviceDescriptorBufferFeaturesEXT`, which are forwarded whole from the
+physical device, and `withdraw_gated_features` cleared exactly one bit —
+`hostImageCopy`. On RADV or NVIDIA we advertised capture-replay and would have
+refused the first token an application legally passed. That is §0.16 item 3's
+shape precisely: a claim in a document, a test about a different structure, and
+`vulkaninfo` printing the opposite for weeks. The bits are cleared now, and the
+test that checks them names the policy it is protecting.
+
+`bufferDeviceAddressCaptureReplay` stays advertised, and the difference is the
+line this whole section is about: its token is a `uint64_t`
+(`VkBufferOpaqueCaptureAddressCreateInfo::opaqueCaptureAddress`), it crosses, and
+§0.20 implemented the query that produces it. What refuses is the `void*`, not
+the phrase "capture replay".
+
+**2. `VK_EXT_descriptor_buffer` was excluded by a sentence that had stopped being
+true.** The exclusion gave two reasons. The first — a capture-replay `void*` with
+no honest policy — was answered by §0.24 and the profile comment even said so
+while the exclusion stayed. The second was:
+
+> §9.2 is the sharper objection — a descriptor buffer *is* raw device addresses
+> in application memory, which is the one thing this design says it will not put
+> there.
+
+§9.2 said that while declining `bufferDeviceAddress`. §0.20 implemented the
+feature: `vkGetBufferDeviceAddress` is forwarded and returns the GPU side's real
+address. So the addresses an application writes into a descriptor buffer are the
+GPU-side driver's own values, produced there and consumed there, and the
+`transform` pass has nothing to miss. **A stale exclusion is indistinguishable
+from a live one from the outside**, which is why the sentence is quoted in the
+profile rather than deleted from it.
+
+Carrying it is **fifteen** commands: its own eleven, plus
+`vkCmdBindDescriptorBufferEmbeddedSamplers2EXT` and
+`vkCmdSetDescriptorBufferOffsets2EXT` from `VK_KHR_maintenance6` and the two
+`vkGetTensor…OpaqueCaptureDescriptorDataARM` from `VK_ARM_tensors`, whose
+`require` blocks `depends=` on it. What it does *not* buy is advertisement: seven
+of those commands are the `vkGet…OpaqueCaptureDescriptorData…` queries, whose
+`pData` must be non-null to mean anything, so they refuse and
+`INCOMPLETE_EXTENSIONS` withdraws both extensions. Carry everything, advertise
+what works (§0.19 item 3) — and with the feature bit of item 1 withdrawn, no
+conforming application calls one.
+
+**3. The `void*` with no `len=`, split by asking where the length actually is.**
+Reading all eleven refusals gives three groups, not one:
+
+- **No extent exists in any document.** `VkCuLaunchInfoNVX::pParams` has
+  `len="paramCount"`; it is the *element* that refuses, one `const void*` per
+  CUDA kernel argument whose size is stated only by the kernel's signature inside
+  the CUDA module — which the registry cannot see, this side does not parse, and
+  the application need not know. `VkQueryLowLatencySupportNV::pQueriedLowLatencyData`
+  is "NV internal use only" in the registry's own comment, with no size member,
+  no `len=` and no sentence anywhere. `vkGetDescriptorSetHostMappingVALVE::ppData`
+  is a pointer into the driver's own allocation (§1a). These are not gaps in the
+  generator, and they are now `NotSerialisable` entries with that argument beside
+  them rather than absences that read as oversights.
+- **The length is stated, in a place `len=` cannot name.**
+  `VkDataGraphPipelineConstantARM::pConstantData` — "The size and layout of the
+  data pointed to by `pConstantData` is specified by a specific structure in the
+  `pNext` chain", i.e. computed from `VkTensorDescriptionARM`'s `format`,
+  `dimensionCount`, `pDimensions` and `pStrides`.
+  `vkGetShaderInstrumentationValuesARM::pMetricValues` — `*pMetricBlockCount`
+  blocks of `sizeof(VkShaderInstrumentationMetricDataHeaderARM) + 8 ×
+  VkPhysicalDeviceShaderInstrumentationPropertiesARM::numMetrics` bytes.
+  `vkGetExternalComputeQueueDataNV::pData` — a device property,
+  `externalDataSize`. `VkDeviceFaultInfoEXT::pVendorBinaryData` —
+  `pFaultCounts->vendorBinarySize`, a member of a **different parameter's**
+  struct. All four want one thing and it is not four exceptions: a length the app
+  side computes and the wire carries explicitly, which is a fifth `VoidPolicy`
+  *plus* an emitter that can evaluate something other than a sibling name. That
+  is the next parcel, stated rather than half-built, because a policy without an
+  implementation is what §0.22 and §0.24 are both about. Twenty-four commands wait
+  behind it.
+  **`VK_EXT_device_fault` has a second defect of the same family that is not a
+  `void*` at all**: `pAddressInfos` and `pVendorInfos` have no `len=` whatever, so
+  the planner would carry them as pointers to exactly one element. Whoever takes
+  that parcel must answer both.
+- **The length is stated one member away and the registry simply omits the
+  attribute.** Exactly one: `VkOpticalFlowSessionCreatePrivateDataInfoNV`, whose
+  `size` is, verbatim, "the size of data in bytes which is passed at a memory
+  location specified in … `pPrivateData`". That is a `len="size"` the registry
+  did not write down, and `vk_registry::model::LEN_OMISSIONS` records it with the
+  sentence that states it — the same shape as `exceptions::PLATFORM_SCALARS`,
+  named source, closed list, and a test that retires the entry if a later
+  registry grows the attribute itself. **Five commands**, and no policy entry, no
+  special case, nothing downstream that knows this member is different.
+
+**4. What the class taught about `NotSerialisable`, which is the finding worth
+keeping.** The policy does two different things depending on where it lands. On a
+struct member it is a refusal: the build fails and a profile exclusion is where
+living without the extension gets written down. On a command *parameter* it is a
+**deletion** — the parameter is dropped and the command is carried as though it
+never had one.
+
+For `vkMapMemory` that is the design: `ppData` is computed app-side from
+`arena_base + offset` (§5.3) and nothing had to cross. For
+`vkGetDescriptorSetHostMappingVALVE` the identical entry would have carried a
+command that returns, never writes its one output, and tells nobody — §0.22's
+defect exactly, one policy over. So the claim is a list:
+`exceptions::PARAMETER_ANSWERED_APP_SIDE`, one line per command naming the
+function that produces the value, and `plan::build` refuses a dropped parameter
+that is not on it. Adding the VALVE entry with no list would have been silent;
+with the list it is a build failure that says why.
+
+**5. Where the numbers went.** 569 → **589** carried of 740: fifteen from
+`VK_EXT_descriptor_buffer` and its two dependants, five from `VK_NV_optical_flow`.
+Of the 151 still out, the honest arithmetic is 23 unreachable by any profile
+(platform headers, function pointers, WSI handles), 24 behind the fifth policy of
+item 3, and the rest — swapchain, the surface family, `vkGetInstanceProcAddr` —
+answered app-side by design rather than missing.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
