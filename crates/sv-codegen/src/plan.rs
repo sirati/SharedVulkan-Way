@@ -220,6 +220,19 @@ pub struct FieldPlan {
     /// Non-const outermost pointer: the callee fills it in and it comes back in
     /// the reply, not in the command.
     pub is_output: bool,
+    /// `selector=` — this member is a **union**, and the named sibling of the
+    /// same struct holds the discriminator that says which arm is live.
+    ///
+    /// Ten members in the whole registry carry it, and until design.md §0.21
+    /// nothing read it: `exceptions`' own header records that unions needed no
+    /// exception table because "a Rust `enum` *is* the tag", which is true of
+    /// the wire and stops at the C ABI — where a union has no tag and the app
+    /// side was reading member [0] regardless.
+    pub selector: Option<String>,
+    /// `selection=` — this member belongs to a union, and these are the
+    /// discriminator values that choose it. Comma-separated in the registry and
+    /// split here; several arms are chosen by more than one value.
+    pub selection: Vec<String>,
 }
 
 /// A struct or union.
@@ -665,6 +678,8 @@ fn field_plan(
         no_auto_validity: m.no_auto_validity,
         is_a_length: lengths.contains(&m.name),
         is_output: m.is_output_pointer(),
+        selector: m.selector.clone(),
+        selection: m.selection.clone(),
     })
 }
 

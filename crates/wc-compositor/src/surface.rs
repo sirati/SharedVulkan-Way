@@ -608,6 +608,59 @@ pub fn bars(who: Decorator, extends_frame: bool) -> Bars {
     }
 }
 
+/// **Should *this* window's caption be folded into its client area?**
+///
+/// ADDED FOR §46, and it is the join §33.7 said was missing and could not make:
+/// §31's arrangement is right for a client that decorates itself and wrong for
+/// one that does not, and `--decorations` is a **per-run** flag while which kind
+/// of client this is is a **per-window** fact. This function is the whole of the
+/// join, and every arm of it is a decision somebody has to be able to argue
+/// with:
+///
+/// * `Tabs` folds unconditionally, which is §31's behaviour unchanged. It is
+///   kept because it is the control leg every claim about the other arms is
+///   measured against, and because a run that wants to photograph one specific
+///   client's frame should not have to satisfy a heuristic to do it.
+/// * `Server` and `Client` never fold, which is stage 17's arrangement and,
+///   for `Client`, the deliberate two-bar control leg.
+/// * `Auto` folds for exactly [`Decorator::ProbablyItself`] — a client that
+///   bound no decoration protocol *and* reports a margin around its window.
+///
+/// # Why `Auto` is safe for the clients that are already right
+///
+/// A client that negotiated is never folded, whatever it drew. Firefox binds
+/// KDE's manager, reads `default_mode`, and is therefore `Negotiated` on every
+/// run — so `Auto` is byte-for-byte `Server` for it, which is the arrangement
+/// §22 measured and shipped. A client that draws no bar and has no margin is
+/// `ProbablySystem` and keeps Windows' caption. Only the third kind moves, and
+/// the third kind is the one with two title bars today.
+///
+/// # Why the height of the client's bar does not enter into it
+///
+/// It cannot make the count wrong. Folding puts the client's surface at the top
+/// of the window, so whatever the client draws there *is* the window's title
+/// bar, at whatever height the client chose. §31.9's 46-into-31 mismatch decides
+/// where Windows' buttons sit relative to the client's widgets; it does not
+/// decide how many bars there are.
+///
+/// # Why the decision is taken once, at map, and never revisited
+///
+/// §33.6 refused to hang a window style on the inset because *"a maximised
+/// `weston-terminal` sets its margin to zero: the tell vanishes and the symptom
+/// does not"* — a style that flipped on the live inset would unfold the caption
+/// when the user maximised the window and fold it back on restore. Deciding
+/// once, from the inset at first map, is what makes that objection not apply:
+/// the window is not maximised at map, the answer is taken then, and the frame
+/// does not change under the user afterwards. The cost is a client that starts
+/// maximised and decorates itself, which is diagnosed rather than handled — the
+/// map-time report says which way it went and §46.6 says what it costs.
+pub fn fold_caption(mode_folds: bool, mode_is_auto: bool, who: Decorator) -> bool {
+    if mode_folds {
+        return true;
+    }
+    mode_is_auto && who == Decorator::ProbablyItself
+}
+
 #[cfg(test)]
 mod decorator_tests {
     use super::*;
@@ -678,6 +731,54 @@ mod decorator_tests {
         let fx = decorator((26, 23), true);
         assert_eq!(bars(fx, false), Bars::Agreed);
         assert_eq!(bars(fx, true), Bars::Agreed);
+    }
+
+    // --- §46: the per-window join ------------------------------------------
+
+    /// `auto` folds for the client with two title bars and for nothing else.
+    /// This is the whole of the bug fix, as a table.
+    #[test]
+    fn auto_folds_only_for_the_client_that_decorates_itself() {
+        let terminal = decorator((32, 32), false); // ProbablyItself
+        let flower = decorator((0, 0), false); //     ProbablySystem
+        let firefox = decorator((26, 23), true); //   Negotiated
+
+        assert!(fold_caption(false, true, terminal));
+        assert!(!fold_caption(false, true, flower));
+        assert!(!fold_caption(false, true, firefox));
+    }
+
+    /// …and every window comes out with exactly one title bar, which is the
+    /// claim the fix is actually making. Asserted through `bars` rather than
+    /// restated, so that a change to either function has to keep them agreeing.
+    #[test]
+    fn under_auto_all_three_clients_get_one_bar() {
+        for (who, want) in [
+            (decorator((32, 32), false), Bars::OneClient),
+            (decorator((0, 0), false), Bars::OneSystem),
+            (decorator((26, 23), true), Bars::Agreed),
+        ] {
+            assert_eq!(bars(who, fold_caption(false, true, who)), want);
+        }
+    }
+
+    /// `tabs` still folds for everything, because it is the control leg — and
+    /// that is exactly why it is not the default: it is the run that gives
+    /// `weston-flower` no title bar at all.
+    #[test]
+    fn tabs_is_unconditional_and_that_is_why_it_is_not_the_default() {
+        let flower = decorator((0, 0), false);
+        assert!(fold_caption(true, false, flower));
+        assert_eq!(bars(flower, fold_caption(true, false, flower)), Bars::None);
+    }
+
+    /// `server` and `client` fold nothing, whoever the client is. `client` is
+    /// the deliberate two-bar leg and must stay one.
+    #[test]
+    fn the_named_arrangements_are_unchanged() {
+        let terminal = decorator((32, 32), false);
+        assert!(!fold_caption(false, false, terminal));
+        assert_eq!(bars(terminal, fold_caption(false, false, terminal)), Bars::Two);
     }
 }
 

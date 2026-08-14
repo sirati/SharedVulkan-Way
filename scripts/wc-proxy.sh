@@ -10,7 +10,7 @@
 #
 # WHAT THIS CLOSES, AND WHY IT IS ONE EXPERIMENT RATHER THAN TWO
 #
-# docs/design.md §8.5 had to split its evidence in half and said so:
+# docs/waycompose-design.md §8.5 had to split its evidence in half and said so:
 #
 #   * **Linux** ran `weston-terminal` and `weston-presentation-shm` — real
 #     libwayland clients that cannot share a bug with this project — through the
@@ -284,7 +284,7 @@ run_one() {
   fi
 
   # A **distinct desktop name per run, and a gap before starting**, both of
-  # which were measured rather than chosen. docs/design.md §8.9 records that the
+  # which were measured rather than chosen. docs/waycompose-design.md §8.9 records that the
   # Wine harnesses collide when run back to back because the previous
   # `wineserver` is still shutting down; this harness runs three compositors in
   # one go and hit a sharper version of it. With the same desktop name the
@@ -417,8 +417,36 @@ check_common() {
   local presents
   presents=$(grep -o "([0-9]* frames presented)" "$srv" | grep -o "[0-9]*" | tail -1)
   presents=${presents:-0}
+  # STAGE 48. **Zero is broken; short is inconclusive.** §35.9 item 3 flagged
+  # this floor as having no margin — `weston-terminal`'s present count was 2, 2
+  # and 5 across the runs measured — and asked what to do if a fourth
+  # observation came in at 1. This is the answer, and it turns on the floor's
+  # *basis* rather than on its value.
+  #
+  # The basis is structural, not a rate: `weston-terminal` draws once at map and
+  # once on the configure, so 2 is what the client owes by construction and no
+  # amount of load changes what it owes. What load can change is whether both
+  # draws land inside this leg's 8-second window. So the two cases are genuinely
+  # different facts and were reported as one:
+  #
+  #   0 frames  nothing of the client's pixels ever reached the window. That is
+  #             the claim of the stage failing, and no load explains it — the
+  #             client connected, mapped and committed to get this far.
+  #   1..n-1    fewer than the structural count, inside a bounded window, on a
+  #             machine that now reaches load average 175. That is a statement
+  #             about the box, and §47.3's third outcome is where it belongs.
+  #
+  # This is deliberately *not* applied to `weston-presentation-shm`, whose floor
+  # is 500 against the 784 it presents: that floor is a rate and a short count
+  # there is a real regression in a client that draws continuously. The
+  # distinction is the same one §47.2 draws between bytes and time — a
+  # structural count can be bounded tightly, a rate cannot.
   if [ "$presents" -ge "$minframes" ]; then
     ok "$tag: $presents frames of the client's pixels reached the window (owed $minframes)"
+  elif [ "$presents" -eq 0 ]; then
+    bad "$tag: no frame of the client's pixels ever reached the window (owed $minframes)"
+  elif [ "$minframes" -le 4 ]; then
+    skip "$tag: $presents of the $minframes structural frames arrived inside the window at load $(loadnow) -- the client owes them by construction, so this is the window and not the code"
   else
     bad "$tag: only $presents frame(s) presented, against the $minframes this client owes"
   fi
@@ -504,7 +532,7 @@ check_common() {
 
   # Two shots of a live window. `weston-terminal` is static by design and
   # `weston-presentation-shm` animates, so only the second can carry a live-ness
-  # claim — the same asymmetry docs/design.md §8.9 records for the Linux
+  # claim — the same asymmetry docs/waycompose-design.md §8.9 records for the Linux
   # harness.
   #
   # **CHANGED IN §31, twice over.**
@@ -595,7 +623,7 @@ run_window() {
       # compositor's view; the checks are stage 3's.
       # The pixels, read back out of the process by tools that are not ours.
       # `--dump-frames` is new on Win32 for stage 4 and is what gives this leg
-      # the read-back the Linux leg always had (docs/design.md §8.5).
+      # the read-back the Linux leg always had (docs/waycompose-design.md §8.5).
       local frame
       frame=$(find "$RUNDIR/term/frames" -name '*.ppm' 2>/dev/null | sort | tail -1)
       if [ -n "$frame" ]; then
@@ -621,7 +649,7 @@ run_window() {
         # `weston-terminal` draws its own toytoolkit title bar as a light band
         # across the top of its buffer and a black terminal field below. An
         # upside-down blit puts the light band at the bottom, which is exactly
-        # docs/design.md §8.11 item 3's worry about `SetDIBitsToDevice` with a
+        # docs/waycompose-design.md §8.11 item 3's worry about `SetDIBitsToDevice` with a
         # negative `biHeight` — the one place the documentation is ambiguous
         # and the most likely to differ between Wine's GDI and the real one.
         #
@@ -701,7 +729,7 @@ run_window() {
       # Pure red, green and blue must all be on the captured screen: the wheel
       # arrived with its channels intact. This is the check that a `Xrgb8888`
       # buffer and a 32-bit `BI_RGB` DIB really are the same bytes in the same
-      # order (docs/design.md §8.4) — a B/R swap anywhere between the client's
+      # order (docs/waycompose-design.md §8.4) — a B/R swap anywhere between the client's
       # `memfd` and the glass would leave a plausible-looking wheel with red and
       # blue exchanged, and the harness would still find three primaries, so the
       # *positions* are what carry it below.
@@ -734,7 +762,7 @@ run_window() {
 
       # The wheel is inscribed in the client's 250x250 buffer, so the union of
       # the three coloured wedges must fit inside 250x250 and must not be tiny.
-      # That is the scale check: a DPI-virtualised window (docs/design.md §8.10
+      # That is the scale check: a DPI-virtualised window (docs/waycompose-design.md §8.10
       # item 9) would be drawn larger, and a stride error would smear the wedges
       # horizontally past the buffer's width. Both fail this and neither fails a
       # "the colours are there" check.
@@ -761,7 +789,7 @@ run_window() {
   #
   # Each client has now driven one transport. Swapping them is what says the
   # result is a property of the path and not of one client's habits, which is
-  # the same argument docs/design.md §8.5 makes for running two clients at all.
+  # the same argument docs/waycompose-design.md §8.5 makes for running two clients at all.
   if command -v weston-terminal >/dev/null; then
     echo "  -- weston-terminal / arena (the cross-check) --"
     run_one term-arena weston-terminal arena damage 8

@@ -3,6 +3,7 @@
 # pixels in the guest's own RAM.
 #
 #   scripts/wc-titlebar.sh deploy   cross-compile and copy what this run needs
+#   scripts/wc-titlebar.sh local    §46, headless: two clients, one run, one flag
 #   scripts/wc-titlebar.sh server   one caption: default_mode(2) + the env var
 #   scripts/wc-titlebar.sh client   the arrangement before this stage, for the pair
 #   scripts/wc-titlebar.sh tabs     TABS IN THE TITLE BAR: the caption folded into the client
@@ -693,8 +694,68 @@ do_clean() {
   echo "  removed $GDIR and this run's leftovers"
 }
 
+# ---------------------------------------------------------------- local -----
+# STAGE 46. The half of the per-window claim that does not need a guest.
+#
+# Every other leg in this file photographs a window, which needs the interactive
+# desktop, the arena and the VM host. `auto` makes a claim a picture of one
+# window cannot carry and a headless run can: **two clients in one compositor
+# run come out differently.** No per-run flag can pass this leg whatever it is
+# set to, which is the point — it is the assertion that separates
+# `--decorations auto` from every arrangement before it, and it costs no guest.
+#
+# Deliberately not folded into `do_run`: that function is deploy, start on the
+# desktop, locate the arena, photograph. This shares none of it.
+do_local() {
+  echo "== auto: two clients, one run, one flag  (headless, no guest) =="
+  fresh "$LINUX_BIN/wc-compositor" "cargo build --workspace" || return
+  local c
+  for c in weston-terminal weston-flower; do
+    have "$c" || { miss "$c is not installed; the per-window claim needs both clients"; return; }
+  done
+
+  local d="$RUNDIR/local"; mkdir -p "$d/rt"; chmod 700 "$d/rt"
+  local sock="wl-tb46-$$"
+  # One compositor, both clients in sequence. `--once` would exit when the first
+  # client left, and running them at the same time would turn "which window
+  # folded" into a question about ordering. Sequential in one process is enough:
+  # the flag under test is the run's and does not change between the two.
+  XDG_RUNTIME_DIR="$d/rt" "$LINUX_BIN/wc-compositor" --socket "$sock" --timeout 30 \
+    --decorations auto >"$d/srv.log" 2>&1 &
+  local srv=$!
+  sleep 1
+  for c in weston-terminal weston-flower; do
+    ( cd "$d" && XDG_RUNTIME_DIR="$d/rt" WAYLAND_DISPLAY="$sock" timeout 8 "$c" ) >/dev/null 2>&1
+  done
+  kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
+
+  # By app id, so that neither claim can be satisfied by the other window's line.
+  local t f folds
+  t=$(grep "org.freedesktop.weston.wayland-terminal" "$d/srv.log" | head -1)
+  f=$(grep "org.freedesktop.weston.flower" "$d/srv.log" | head -1)
+  echo "$t" | grep -q "caption is folded into its client area" \
+    && ok "weston-terminal decorates itself, so its caption was folded: one bar, the client's" \
+    || { bad "weston-terminal's caption was not folded"; echo "        $t"; }
+  echo "$f" | grep -q "Windows' caption is the only title bar" \
+    && ok "weston-flower draws no bar, so its caption was kept: one bar, Windows'" \
+    || { bad "weston-flower's caption was folded away"; echo "        $f"; }
+
+  # And the pair, which is the sentence a per-run flag cannot make true.
+  folds=$(grep -c "the system caption folded in" "$d/srv.log")
+  [ "$folds" = 1 ] \
+    && ok "exactly one of the two windows folded its caption, in one run, under one flag" \
+    || bad "$folds of 2 windows folded; --decorations auto is not deciding per window"
+  if grep -q "THIS WINDOW HAS" "$d/srv.log"; then
+    bad "the compositor still reports a defect under auto"
+    grep "THIS WINDOW HAS" "$d/srv.log" | sed 's/^/        /'
+  else
+    ok "and neither window is reported as having two title bars or none"
+  fi
+}
+
 case "$MODE" in
   deploy)  do_deploy ;;
+  local)   do_local ;;
   server)  do_run server ;;
   client)  do_run client ;;
   tabs)    do_run tabs ;;
@@ -708,7 +769,7 @@ case "$MODE" in
   all)     do_deploy; do_run tabs; do_run noglass; do_run nobuttons
            do_run server; do_run client ;;
   clean)   do_clean ;;
-  *) echo "usage: $0 [deploy|server|client|tabs|noglass|nobuttons|both|pair|all|clean]"
+  *) echo "usage: $0 [deploy|local|server|client|tabs|noglass|nobuttons|both|pair|all|clean]"
      exit 2 ;;
 esac
 

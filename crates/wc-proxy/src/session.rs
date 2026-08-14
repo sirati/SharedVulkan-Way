@@ -801,6 +801,29 @@ struct Clip {
     /// `enter` and nothing says the old one is destroyed first; the ids are
     /// retired by `wl_display.delete_id` like every other object.
     drag_offers: std::collections::HashSet<u32>,
+    /// Of those, the ones a `wl_data_device.drop` has already been sent for.
+    ///
+    /// ADDED FOR §44, and it exists because of an ordering nobody had seen.
+    /// `wl_data_device.leave` used to forget every drag offer, which reads
+    /// correctly — the drag is over, nothing more will be received. It is
+    /// wrong, and the first drag that ever entered a client showed why: the
+    /// client's `wl_data_offer.receive` comes **after** the drop, and this
+    /// compositor sends `leave` in between. The proxy's own log, from that run:
+    ///
+    /// ```text
+    /// wl_data_device.enter: offer 4278190080 is a drag's
+    /// wl_data_device.drop
+    /// wl_data_device.leave: forgetting drag offers {4278190080}
+    /// receive on offer 4278190080 for "text/plain;charset=utf-8" -> Clipboard
+    /// paste 1 refused: the clipboard holds nothing of that type
+    /// ```
+    ///
+    /// A dropped offer stays valid until the client destroys it — that is what
+    /// `wl_data_offer.finish` is for — so `leave` may only forget the offers
+    /// that were *not* dropped. The direction this failed in loses the paste;
+    /// §29.8 names the direction it could fail in instead, where a `receive`
+    /// routed to the wrong selection hands somebody the last thing dragged.
+    dropped_offers: std::collections::HashSet<u32>,
     outgoing: Vec<Outgoing>,
     /// When the current pull started, for [`COPY_DEADLINE`].
     started: Option<Instant>,
@@ -1507,6 +1530,15 @@ impl Session {
         } else {
             Source::Clipboard
         };
+        // ADDED FOR §44. This decision had never been *observed* — the first
+        // real drag into a client made it wrongly and the only symptom was a
+        // paste that came back empty, four processes away. It is one line and
+        // it names both the answer and the evidence for it.
+        self.note(format!(
+            "receive on offer {offer} for {mime:?} -> {source:?} \
+             (offers announced by wl_data_device.enter: {:?})",
+            self.clip.drag_offers
+        ));
         self.clip.fetches.push((token, source, mime));
         self.clip.incoming.push(Incoming { token, fd, data: None, at: 0 });
     }
@@ -2044,12 +2076,38 @@ impl Session {
                         && id != 0
                     {
                         self.clip.drag_offers.insert(id);
+                        self.note(format!("wl_data_device.enter: offer {id} is a drag's"));
                     }
                 }
                 // The drag is over one way or the other. The ids stay valid
                 // until the client destroys them, but nothing more will be
                 // received from them.
-                "leave" => self.clip.drag_offers.clear(),
+                // The drag is over one way or the other. An offer that was
+                // *dropped* outlives this — see `dropped_offers`.
+                "leave" => {
+                    let forget: Vec<u32> = self
+                        .clip
+                        .drag_offers
+                        .iter()
+                        .copied()
+                        .filter(|id| !self.clip.dropped_offers.contains(id))
+                        .collect();
+                    if !forget.is_empty() {
+                        self.note(format!(
+                            "wl_data_device.leave: forgetting undropped drag offers {forget:?}"
+                        ));
+                    }
+                    for id in forget {
+                        self.clip.drag_offers.remove(&id);
+                    }
+                }
+                // The user let go over one of our surfaces. Every offer `enter`
+                // announced is now one the client may still `receive` from.
+                "drop" => {
+                    let dropped: Vec<u32> = self.clip.drag_offers.iter().copied().collect();
+                    self.note(format!("wl_data_device.drop on offers {dropped:?}"));
+                    self.clip.dropped_offers.extend(dropped);
+                }
                 _ => {}
             }
         }
@@ -2096,6 +2154,7 @@ impl Session {
             }
             self.objects.forget(id);
             self.clip.drag_offers.remove(&id);
+            self.clip.dropped_offers.remove(&id);
             // The compositor has finished with this object. For a pool that
             // means it has certainly opened the region by now, so one of the
             // three conditions on releasing it is met. See the note on

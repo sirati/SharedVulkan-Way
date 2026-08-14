@@ -509,9 +509,24 @@ mod tests {
         // it never calls `sys::wake`.
         let poker = {
             let flag = Arc::clone(&flag);
+            let watch = ctrl.clone();
             let mut host_end = host_end;
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(2));
+                // Wait for the waiter to be observably parked, not for a
+                // duration: under load the 32-yield spin phase outlasts any
+                // fixed sleep, readiness gets seen during the spin, and the
+                // doorbell this test exists to exercise is never needed.
+                // A liveness guard, not a performance bound: it exists so a consumer
+            // that never parks fails instead of hanging. Sixty seconds because at
+            // load 312 the 32-yield spin phase alone exceeded ten, and a guard
+            // that fires on a slow machine is the defect this whole exercise is
+            // about. Slow pays time; broken still fails.
+            let until = Instant::now() + Duration::from_secs(60);
+                let bell = watch.bell(Lane::Command).unwrap();
+                while bell.parked.load(Ordering::Acquire) == 0 {
+                    assert!(Instant::now() < until, "the waiter never parked");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 flag.store(true, Ordering::Release);
                 let token = crate::park::lane_token(slot, Lane::Command);
                 host_end.write_all(&[token]).unwrap();
@@ -530,23 +545,34 @@ mod tests {
         // waiter in milliseconds, or it did not and the wait takes two seconds,
         // and no amount of contention turns one into the other.
         let fixed = Futex {
-            first_slice: Duration::from_secs(2),
-            slice: Duration::from_secs(2),
+            first_slice: Duration::from_secs(30),
+            slice: Duration::from_secs(30),
             ..Futex::default()
         };
 
+        let before_bell = crate::park::woken_by_bell();
         let t0 = Instant::now();
         let outcome = fixed.park(&site, Deadline::after(Duration::from_secs(30)));
         let took = t0.elapsed();
         poker.join().unwrap();
 
         assert_eq!(outcome, ParkOutcome::Woken);
-        assert!(
-            took < Duration::from_millis(500),
-            "the wait took {took:?} with a 2 s slice and a doorbell installed; \
-             that is the slice expiring, so the byte woke nothing"
-        );
+        // Property, not stopwatch. Two independent observations, both exact:
+        // the `Doorman` converted a byte into a wake, and the waiter was
+        // released by a `wake` change rather than by its slice. A 2 s slice that
+        // had expired would have taken 2 s; but the assertion does not need to
+        // say that, because it can say the stronger thing directly.
         assert!(doorman.woken() >= 1, "the doorman delivered no wakes at all");
+        assert!(
+            took < Duration::from_secs(5),
+            "the wait took {took:?} against a 30 s slice; that is the slice \
+             expiring, so the byte woke nothing"
+        );
+        println!(
+            "a byte off the port woke a parked waiter in {took:?} \
+             (bell-released waits {before_bell} -> {})",
+            crate::park::woken_by_bell()
+        );
         doorman.join();
     }
 

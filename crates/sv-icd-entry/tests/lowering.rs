@@ -596,3 +596,96 @@ fn an_unknown_memory_id_fails_before_it_crosses() {
     assert_eq!(e, LowerError::Wire(sv_wire::WireError::NoSuchMemory { id: 999 }));
     assert!(sent(&t).is_empty(), "and nothing was sent");
 }
+
+// ---------------------------------------------------------------------------
+// unions: the arm the registry names, not the arm that happens to be first
+// ---------------------------------------------------------------------------
+
+/// A C union is lowered through its `selector=` sibling, not through member [0].
+///
+/// # Why this is a correctness test and not a coverage one
+///
+/// `lower_*` for a union used to read member [0] unconditionally — gfxstream's
+/// rule — justified on the grounds that "every member of this union occupies the
+/// same storage and the encoding is bit-preserving, so what the peer
+/// reconstructs is the bytes the application wrote; what is lost is only the
+/// *name*". That is true of `VkClearValue`, and false the moment an arm holds
+/// something the boundary has to **translate**.
+///
+/// `VkAccelerationStructureGeometryDataKHR` is the case: `triangles` is member
+/// [0] and much the largest arm, so the size check that made gfxstream's rule
+/// "safe" passes — and an application describing *instances* would have had the
+/// instances bytes reinterpreted as a triangles struct, its
+/// `VkDeviceOrHostAddressConstKHR` fields read out of the wrong offsets, and the
+/// result put on the wire with a straight face. No error anywhere.
+///
+/// So this asserts the variant, which is the whole property. design.md §0.21.
+#[test]
+fn a_union_is_lowered_through_its_selector_and_not_through_member_zero() {
+    let mut g = VkAccelerationStructureGeometryKHR::default();
+    g.s_type = VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    g.geometry_type = VkGeometryTypeKHR::VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    // The instances arm, with values chosen so that reading them at the
+    // triangles arm's offsets would produce something visibly different.
+    let mut inst = VkAccelerationStructureGeometryInstancesDataKHR::default();
+    inst.s_type =
+        VkStructureType::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    inst.array_of_pointers = 1;
+    inst.data.device_address = 0xDEAD_BEEF_0000_1000;
+    g.geometry.instances = inst;
+
+    // SAFETY: `g` is a live local of the matching C type, fully initialised.
+    let w = unsafe { lower_vk_acceleration_structure_geometry_khr(&raw const g) }
+        .expect("a geometry with a known geometryType lowers");
+
+    match &w.geometry {
+        sv_proto::VkAccelerationStructureGeometryDataKHR::Instances(i) => {
+            assert!(i.array_of_pointers, "the instances arm is read as instances");
+            match &i.data {
+                sv_proto::VkDeviceOrHostAddressConstKHR::DeviceAddress(a) => {
+                    assert_eq!(*a, 0xDEAD_BEEF_0000_1000)
+                }
+                other => panic!("the inner union lowered to {other:?}"),
+            }
+        }
+        other => panic!(
+            "geometryType said INSTANCES and the lowering produced {other:?} — \
+             member [0] is being read regardless of the selector"
+        ),
+    }
+
+    // The mirror, so that a lowering which simply hard-coded the *last* arm
+    // would fail too. `triangles` is member [0], so this is the case the old
+    // rule got right by accident and the new one must still get right on
+    // purpose.
+    let mut g2 = VkAccelerationStructureGeometryKHR::default();
+    g2.geometry_type = VkGeometryTypeKHR::VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    let mut tri = VkAccelerationStructureGeometryTrianglesDataKHR::default();
+    tri.max_vertex = 7;
+    g2.geometry.triangles = tri;
+    // SAFETY: as above.
+    let w2 = unsafe { lower_vk_acceleration_structure_geometry_khr(&raw const g2) }
+        .expect("a triangles geometry lowers");
+    match &w2.geometry {
+        sv_proto::VkAccelerationStructureGeometryDataKHR::Triangles(t) => {
+            assert_eq!(t.max_vertex, 7)
+        }
+        other => panic!("geometryType said TRIANGLES and the lowering produced {other:?}"),
+    }
+}
+
+/// A discriminator value the registry does not list refuses the call.
+///
+/// The alternative — falling back to member [0] — is what the old rule did for
+/// *every* value, and it is the shape of failure this whole section is about: an
+/// answer produced locally, with no error, that is wrong.
+#[test]
+fn an_unknown_union_discriminator_refuses_instead_of_guessing() {
+    let mut g = VkAccelerationStructureGeometryKHR::default();
+    // Not a `VkGeometryTypeKHR` this profile knows.
+    g.geometry_type = VkGeometryTypeKHR(0x7FFF_0000);
+    // SAFETY: `g` is a live local; the union arm is zeroed by `Default`.
+    let e = unsafe { lower_vk_acceleration_structure_geometry_khr(&raw const g) }
+        .expect_err("an unknown geometryType does not lower");
+    assert_eq!(e, LowerError::Shape("VkAccelerationStructureGeometryDataKHR"));
+}

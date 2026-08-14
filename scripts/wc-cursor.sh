@@ -14,7 +14,7 @@
 #
 # The same split every stage here draws, and the line is in a different place
 # than usual because the two halves of this feature are genuinely different
-# problems (docs/design.md §23):
+# problems (docs/waycompose-design.md §23):
 #
 #   * **linux.** `wp_cursor_shape_v1` is a *name* on the wire and nothing else,
 #     so what can go wrong with it is protocol-shaped: the global is not
@@ -51,7 +51,7 @@
 # cursor is the client's, so nothing else has to be.
 #
 # WHAT WINE DOES AND DOES NOT PROVE. Wine is not Windows and has been wrong
-# four times on this project (docs/design.md §13.6), and a cursor is exactly
+# four times on this project (docs/waycompose-design.md §13.6), and a cursor is exactly
 # the kind of thing it emulates rather than implements: `SetCursor`,
 # `CreateIconIndirect` with a 32-bit ARGB bitmap, and `GetCursorInfo` are all
 # Wine's own reimplementations. A pass here says the compositor installed the
@@ -396,7 +396,7 @@ $(grep -o 'cursor -> .*' "$dir/srv.log" | tail -1)"
       ok "and GetCursorInfo agrees: ${client_line#*cursor=}" ;;
     "")
       note "GetCursorInfo produced nothing -- see whether Wine's X11 driver died \
-(docs/design.md §23.7); the WM_SETCURSOR reading above does not depend on it" ;;
+(docs/waycompose-design.md §23.7); the WM_SETCURSOR reading above does not depend on it" ;;
     *)
       bad "over the client area Win32 is showing ${client_line#*cursor=}" ;;
   esac

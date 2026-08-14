@@ -3573,11 +3573,25 @@ really has, intersected in `driver.rs`'s `forwardable_device_extensions` and
 passed through `state.rs`'s `INCOMPLETE_EXTENSIONS` filter, which no video
 extension is on either.
 
-Meanwhile the ICD advertises **one** queue family, `GRAPHICS|COMPUTE|TRANSFER`,
-and the GPU side opens the first compute-capable family — which on both RADV and
-the guest Intel is never the `VIDEO_DECODE`-only one. §6 of
-`docs/video-decode.md` measured the consequence: `no queue family with
-VIDEO_DECODE`.
+The chain, with its citations, so it can be checked rather than believed:
+
+| step | where |
+|---|---|
+| the default profile is `full` | `sv_codegen::DEFAULT_PROFILE`, `crates/sv-codegen/src/lib.rs:368` |
+| `full` excludes five extensions and no video one | `Profile::full` → `excluded_extensions()`, `crates/vk-registry/src/profile.rs:832,850` |
+| every video command is forwarded, so no video extension is *incomplete* | `docs/video-decode.md` §6: "the thirteen new commands … all of them forwarded by the generator with no hand-written line on either side"; the filter is `crates/sv-icd/src/state.rs:440` |
+| the device type an application sees is the **real GPU's**, forwarded | `crates/sv-icd/src/icd.rs:1358`, `crates/sv-gpu-server/src/convert.rs:49`. `advertise.rs:143`'s `VK_PHYSICAL_DEVICE_TYPE_OTHER` is only the pre-connection fallback |
+| but there is one queue family and it has no `VIDEO_DECODE` | `advertise.rs` (§0.4 item 7), `driver.rs` |
+
+The last row is where it breaks, and §6 of `docs/video-decode.md` has already
+measured the exact message: `no queue family with VIDEO_DECODE`.
+
+The device-type row is worth its line because it *removes* the escape. §0.8 item
+7 noted Firefox accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, which reads as
+though selection depended on our claiming something unusual. It does not: the
+type is forwarded from the guest's real GPU, so a guest with an Intel iGPU
+presents as `INTEGRATED_GPU` and there is no device-type check anywhere that
+Firefox could fail.
 
 **Those two facts together are exactly the trap §0.8 item 7 documented.**
 Firefox 153 selects a device on `VK_KHR_video_queue` + `VK_KHR_video_decode_queue`
@@ -3590,6 +3604,38 @@ does not get software decode. Playback breaks.
 That was a documented future risk when the profile was `zink` and the extensions
 were not advertised. It became live when the default changed, and the two facts
 are in different files with nothing connecting them.
+
+**This is a different defect from a stale comment, and the difference is worth
+naming, because the tree has been finding both all week and only one of them has
+a fix.** A stale comment is a sentence that stopped being true because somebody
+edited the code beside it and not the prose — `arena_mib`'s "growth is armed and
+inert" outliving the branch that closed it, in the very file that set the number.
+The cure is proximity: put the reasoning where the value is decided, and a test
+that fails when they disagree.
+
+This is the other kind. **Nobody edited anything, and no sentence was ever
+wrong.** §0.8 item 7 was accurate the day it was written and is accurate now:
+*"Firefox 153 would select a forwarded device — it accepts
+`VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, and it requires only `VK_KHR_video_queue`
+and `VK_KHR_video_decode_queue` to do so."* It was a statement about what would
+happen **if** we advertised those extensions. Somebody then changed the default
+profile, for good reasons that had nothing to do with video, and the `if`
+quietly became true. The condition and its consequence were correct, in separate
+files, and the thing that changed was neither of them.
+
+Proximity cannot fix this one: the two facts have no natural place to sit
+together, because "which extensions does `full` advertise" and "what does
+Firefox do when it sees them" are genuinely different subjects. What would have
+caught it is an assertion rather than a sentence — *this profile does not
+advertise an extension whose queue family we do not serve* — which is a test the
+codegen could run and does not. That is worth building, and it belongs with
+whoever owns `advertise.rs` rather than here.
+
+The general shape, so it can be looked for elsewhere: **a documented conditional
+risk whose condition is a decision made in another file by another person for
+another reason.** Every "this is safe as long as X" in this document is one of
+these waiting to happen, and the ones that matter are those where X is somebody
+else's default.
 
 There is a second, quieter one underneath it: the generated GPU-side handler for
 `vkCmdDecodeVideoKHR` calls `note_missing(...)` and returns `Ok(())` when the
@@ -3611,7 +3657,151 @@ The first is right. It is written here rather than done here because it belongs
 with the private session, and doing it separately would leave a gate with
 nothing behind it.
 
-#### 0.21.7 What would demonstrate it
+#### 0.21.8 Is it reachable without patching Firefox? No — and the smallest patch is one symbol
+
+The question that decides whether "Firefox must use GPU accel for video decoding"
+is a transport job or a browser-integration job. Read from Firefox and ffmpeg
+source on 2026-08-14, not inferred.
+
+**The verdict is no**, and the reason is narrower and more fixable than §0.8 item
+7 suggested.
+
+`FFmpegVulkanVideoDecoder`'s two output paths both end in `vkGetMemoryFdKHR`;
+that was already established (§5b of `docs/video-decode.md`). What is new here is
+the *third* possibility everyone assumes exists — reading the decoded frame back
+into ordinary shared memory and letting it take Firefox's software surface — and
+whether it is reachable:
+
+* **ffmpeg can do it.** `hwcontext_vulkan.c:4994` implements
+  `vulkan_transfer_data_from`; a Vulkan hardware frame can be transferred to a
+  software `AVFrame` by `av_hwframe_transfer_data`. This is upstream, shipped,
+  and not specific to anything here.
+* **Firefox never calls it.** `av_hwframe_transfer_data` appears **zero** times
+  in `FFmpegVideoDecoder.cpp`, `FFmpegVulkanVideoDecoder.cpp` and
+  `FFmpegLibWrapper.h`.
+* **Firefox does not even load the symbol.** `FFmpegLibWrapper.h:197–212` loads
+  `av_hwframe_ctx_alloc`, `av_hwframe_ctx_init`, `av_hwframe_map`,
+  `av_hwdevice_get_hwframe_constraints`, `av_hwframe_constraints_free` and
+  `av_hwframe_transfer_get_formats` — the call that asks *which formats a
+  transfer would support* — but **not the call that performs one**.
+
+That last line is the finding. The readback capability is present in the library
+Firefox already has open, and Firefox loads the function that describes it and
+not the function that does it.
+
+**There are three independent locks, and each is sufficient on its own.** The
+missing symbol is only the second:
+
+1. Both Vulkan output paths converge on an `AVDRMFrameDescriptor` at
+   `FFmpegVideoDecoder.cpp:2344`, and everything below `GetVideoFrameSurface` is
+   dma-buf typed.
+2. `av_hwframe_transfer_data` is not in `FFmpegLibWrapper` at all — and
+   `GetVideoBuffer` refuses hardware frames outright, in as many words
+   (`FFmpegVideoDecoder.cpp:1260–1265`): *"Pre-allocation is only for sw
+   decoding … it would cause a need to read CPU data from GPU, which is slow."*
+   There is no readback-to-host-memory code anywhere to reach.
+3. The IPC type that would have to carry a foreign frame,
+   `RemoteDecoderVideoSubDescriptor` (`gfx/layers/ipc/LayersSurfaces.ipdlh:152`),
+   has **no member capable of naming one on Linux** — its only non-null Linux
+   arm is `SurfaceDescriptorDMABuf`, which is file handles. Decode runs in the
+   RDD process, so every frame crosses this union.
+
+**The smallest patch, then, is a third branch rather than a redirection of
+either existing one:** in `FFmpegVideoDecoder<LIBAV_VER>::CreateImageVulkan`
+(`FFmpegVideoDecoder.cpp:2218`), taken *before* the `directExport`/copy split at
+`:2296`, producing a `PlanarYCbCrImage` through `VideoData::CreateAndCopyData`
+(`:2084`) — the call software decode already falls back to, three hundred lines
+above in the same file.
+
+It is smallest because it is the only candidate that touches neither
+`FFmpegVideoFramePool`, nor `DMABufSurface`, nor
+`RemoteDecoderVideoSubDescriptor`, nor WebRender. It also clears lock 3 for
+free: the RDD boundary's shmem fallback (`dom/media/ipc/RemoteVideoDecoder.cpp:286–307`)
+hard-requires `AsPlanarYCbCrImage()`, and a `PlanarYCbCrImage` is exactly what
+it wants.
+
+**And on our side it needs `vkCmdCopyImageToBuffer` rather than
+`av_hwframe_transfer_data`** — which is a correction to the obvious reading of
+the missing symbol. Adding the ffmpeg call would work, and would allocate its
+own destination buffer; §0.21.3's readback wants the destination to be **arena**
+memory, so that the host reads the frame out of a mapping it already holds
+instead of out of a buffer ffmpeg chose. Recording the copy ourselves is both
+fewer moving parts and the only version that keeps the one copy landing
+somewhere the host does not have to copy it again.
+
+So the readback path, designed in §0.21.3 as the *canvas* path, turns out to be
+the path that makes decode work at all — but it is reached by a branch we write,
+not by a symbol Firefox forgot to load.
+
+#### 0.21.9 Two tiers, and only one of them is small
+
+| | what Firefox needs | what we need | frame crosses? |
+|---|---|---|---|
+| **Tier 1** — it works | one new branch in `CreateImageVulkan`, reusing `CreateAndCopyData` | §0.21.3's readback into arena memory | **every frame** |
+| **Tier 2** — it is fast | a new `Image` subclass, a new `RemoteDecoderVideoSubDescriptor` member, a new `RenderTextureHost` | private video session, §0.21.2's image id | never |
+
+Tier 2's row is the one to read twice. §0.21.5 describes it as "strictly less
+machinery than either path Firefox has now", which is true of the *Vulkan* work
+— no export, no `sync_fd` — and false of the *Firefox* work, and the second is
+what decides the effort. It also fails `RemoteVideoDecoder.cpp:288`'s
+`AsPlanarYCbCrImage()` check, so it cannot borrow the shmem fallback the way
+tier 1 does. The nearest existing analogue to §0.21.2's image id is
+`SurfaceDescriptorRemoteTexture { RemoteTextureId; RemoteTextureOwnerId }`
+(`LayersSurfaces.ipdlh:220`) — two integers naming a texture the receiver does
+not own, which is exactly the right shape — but it is in the top-level
+`SurfaceDescriptor` union and **not** in the video one, and its `RemoteTextureMap`
+resolves inside Firefox's own compositor rather than to a foreign GPU server. So
+it is a precedent for the shape, not a seam to reuse.
+
+Tier 1 is small enough to be worth proposing upstream on its own merits: a
+Vulkan decoder that cannot export should degrade rather than fail, and today it
+fails fatally. That is arguably a bug in Firefox independent of this project —
+any Vulkan device without `VK_EXT_external_memory_dma_buf` hits it.
+
+The fatality is worth stating exactly, because it is finer than §0.8 item 7 put
+it and the conclusion survives the refinement. **Init-time failures do fall
+back**: `InitHWDecoderIfAllowed` (`FFmpegVideoDecoder.cpp:999`) tests only
+`NS_SUCCEEDED` and discards the code, so a `FATAL_ERR` from `InitVulkanDecoder`
+merely moves on to VA-API and then software. And *some* first-frame failures are
+`NS_ERROR_DOM_MEDIA_DECODE_ERR`, which does recover — there is even a Linux
+"decode error, disable HW acceleration" path at `MediaFormatReader.cpp:2645`, and
+a speed-triggered `HW decoding is slow, switching back to SW decode` at
+`FFmpegVideoDecoder.cpp:1657`.
+
+But **the two failures a forwarded device actually hits are the fatal ones**:
+`"Failed to create NV12 image"` (`FFmpegVulkanVideoDecoder.cpp:933`, creating an
+image with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` on a device that never
+enabled the extension) and `"Failed to export NV12 FD"` (`:1040`,
+`vkGetMemoryFdKHR`). Both are `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which
+`MediaFormatReader.h:574` classifies as fatal, so the recovery guarded at
+`MediaFormatReader.cpp:2611` never runs. The slowness fallback cannot save it
+either — it fires on being slow, not on failing to export.
+
+One thing that makes §0.21.6's hazard less bad than it reads, and it should be
+recorded rather than left for someone to discover with relief:
+`media.hardware-video-decoding-vulkan.enabled` defaults to **false**
+(`StaticPrefList.yaml:13061`, `mirror: once`). So the broken-playback path needs
+a user to turn a pref on *and* restart. It is a trap rather than a live
+regression — which is why it belongs on a list rather than in a hotfix, and why
+it should still be closed before someone finds it.
+
+Tier 2 is §0.21.5's third output path and is not small.
+
+**The honest caveat on tier 1, and it is the one that needs a guest.** Tier 1
+decodes on the guest GPU and then copies every decoded frame across the
+boundary — 3.1 MB a frame at 1080p, 186 MB/s at 60 fps. Whether that beats
+plain software decode *on the host*, where no frame crosses at all, is not
+obvious and cannot be settled by reading: it is guest decode plus a copy against
+host CPU decode plus nothing. It is entirely possible that tier 1 is slower than
+doing nothing, in which case the only version of this feature worth having is
+tier 2.
+
+So the answer to "transport job or Firefox-integration job" is: **Firefox
+integration, at both tiers**, with our side ready for tier 1 as specified and
+tier 2 blocked behind the private session. And the first thing to measure, when
+there is a guest, is whether tier 1 is worth building at all.
+
+#### 0.21.10 What would demonstrate it
 
 Nothing here has run. The measurement that would settle it needs a guest, and a
 format the host iGPU can decode:
@@ -3626,6 +3816,195 @@ format the host iGPU can decode:
 
 Item 3 cannot pass until §0.21.5's Firefox gap is closed, and items 1 and 2 are
 what this project can demonstrate on its own once the private session is built.
+
+---
+
+### 0.21 The union that knew its own tag, and a barrier at the wrong pass
+
+Built 2026-08-14 on **devhost** in `nix develop`. §0.19's breakdown of the
+231 commands no profile carried named **53 of them "the union-of-handles class"**
+— the largest single block — and `profiles::full`'s own comment described the
+fix as *"four `SIBLING_SELECTED`-shaped entries taught to the union emitter"*.
+
+**No exception table was added.** The registry already states the whole rule, in
+two attributes this project has parsed since `vk-registry` was written and never
+read. `509 → 561` carried, `231 → 179` uncarried, and the four exception entries
+that were budgeted for do not exist.
+
+---
+
+**1. The barrier was at the wrong pass, and that is why it cost 52 commands.**
+`emit_handle_map_union` emitted a `compile_error!` reading *"a union containing
+handles reached the handle_map pass; the selector rules of design.md §7.4 must be
+applied before this can be generated"*. Every word of it is true about the
+project and none of it is true about that function.
+
+  The handle-map pass runs on a value that has **already crossed into the wire
+  representation**, where a union is a Rust `enum` — and `exceptions`' own header
+  says exactly what follows: *"A Rust `enum` is the tag, so an encoded union
+  always knows which member it holds and no default is ever guessed."* The walk
+  is a `match`. It needs no selector, no exception entry and no registry lookup;
+  it is fourteen lines and it was blocking `VK_KHR_acceleration_structure`,
+  `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap` together with
+  everything `depends=` drags behind them.
+
+  **The ambiguity is real, and it lives one boundary away** — in `sv-icd-entry`'s
+  C → wire lowering, where a C union genuinely has no tag. That code was reading
+  **member [0] unconditionally**, gfxstream's rule, with a comment justifying it:
+  *"every member of this union occupies the same storage and the encoding is
+  bit-preserving, so what the peer reconstructs is the bytes the application
+  wrote; what is lost is only the name."* True for `VkClearValue`. False the
+  moment an arm holds something the boundary must **translate** — an object id
+  the handle-map pass has to turn into a driver handle, or a `(memory, offset)`
+  pair the transform pass has to rebase. Reading the wrong arm then does not
+  mis-name bytes; it puts a number that was never a handle on the wire. That is
+  §0.16 item 2's hazard exactly, and it cost a GPU hang the first time it was met
+  one level in.
+
+  So a correct refusal was placed where there was nothing to refuse, and a silent
+  guess was left where the refusal belonged. **The barrier has moved**: the
+  handle-map and transform passes generate a `match`, and the *lowering* refuses
+  — by name, at generation time — any union it cannot select.
+
+**2. The registry states both halves, and nothing had read either.** `selector=`
+on the enclosing struct's member names the sibling holding the discriminator;
+`selection=` on each arm of the union names the values that choose it, comma-
+separated where an arm has several. Ten annotations in the whole of `vk.xml`,
+covering every union this class is about:
+
+```xml
+<member selector="geometryType">VkAccelerationStructureGeometryDataKHR geometry</member>
+…
+<member selection="VK_GEOMETRY_TYPE_INSTANCES_KHR">…InstancesDataKHR instances</member>
+```
+
+  `Member::selector` and `Member::selection` have been in the model all along.
+  §7.4 predicted this would need "a table of hardcoded discriminators" — Venus
+  carries `UNION_DEFAULT_TAGS` for it — and `exceptions`' header records the
+  conclusion that no such table was needed *because the enum is the tag*. That
+  conclusion was right about the wire and was quietly applied to the C ABI, where
+  it does not hold. **The correction is not a table either**; it is reading the
+  attribute. Ten unions rather than the four that were budgeted, and nothing to
+  keep in step by hand.
+
+**3. The discriminator is a parameter, so a caller that has not found it cannot
+compile.** The selector-driven lowering is emitted as
+
+```rust
+pub unsafe fn lower_vk_acceleration_structure_geometry_data_khr(
+    p: *const VkAccelerationStructureGeometryDataKHR,
+    __sel: i32,
+) -> crate::LowerResult<sv_proto::VkAccelerationStructureGeometryDataKHR>
+```
+
+  rather than as a function that reaches for the sibling itself. There is exactly
+  one place in the generator that holds both the union and the struct member that
+  decides it, and making the discriminator an argument means that place is the
+  only place a call can be emitted from. A union reached anywhere else — as a
+  bare array element, inside another union — hits `union_needs_selector` and
+  **fails the build with the type's name**, instead of taking member [0].
+
+  This is the property `noop-audit` established for writeback (`emit_writeback`
+  → `emit_command` → `Refusal` makes a silent partial writeback structurally
+  inexpressible) applied to the other direction: not "we remembered to check",
+  but "the wrong thing has no spelling". An unrecognised discriminator value at
+  run time refuses the call rather than falling back to an arm.
+
+**4. And behind the unions, a second gap that only a doubly indirect member could
+reach.** With the unions carried, `sv-gpu-entry` failed to compile on five sites
+of one shape: `let __v: *const T = raise_…()` against a function returning `T`.
+
+  `const VkAccelerationStructureGeometryKHR* const* ppGeometries` is
+  `Pointer(Pointer(T))`. `raise_expr`'s `Array` arm recursed into its element
+  with the **whole member's** C type, so the element's `Optional` arm peeled one
+  pointer level where two were needed. The `FixedArray` arm already had the fix
+  and a comment explaining it — `StdVideoH264ScalingLists`, `uint8_t
+  ScalingList4x4[6][16]`, "the first member in any profile that has two
+  [dimensions]" — written as a special case for two-dimensional *arrays* when it
+  is really the rule for **every level of indirection**. Nothing in any profile
+  was doubly indirect until the acceleration-structure family arrived, which is
+  how a pass that has marshalled half a million lines had never met it.
+
+  It is the same shape as §0.20 item 1's: a rule applied at the one site that
+  needed it, which then fails wherever the rule was needed *next*, with a symptom
+  that looks unrelated. Caught by the compiler here, and only because the
+  generated crate is Rust.
+
+**5. The extensions were carried and still not advertised, and the table from
+§0.20 is what said so.** Carrying 52 commands changed nothing an application
+could see, because `VK_KHR_acceleration_structure` was still in
+`INCOMPLETE_EXTENSIONS` — and `INCOMPLETE_EXTENSION_REASONS` named the entry
+point holding it there: `vkGetDeviceAccelerationStructureCompatibilityKHR`. Its
+`VkAccelerationStructureVersionInfoKHR` has `pVersionData` with
+`altlen="2*VK_UUID_SIZE"`, which `parse_len_expr` recorded as `Unresolved`, so
+the struct's *lowering* was refused, so the command was, so the extension was.
+`VK_EXT_opacity_micromap` was blocked by the identical shape through
+`vkGetDeviceMicromapCompatibilityEXT`.
+
+  `2*VK_UUID_SIZE` is **arithmetic over the registry's own constants with no
+  run-time input**, and `abi.rs`'s own comment had already listed it as one of
+  the four `altlen=` expressions in Vulkan while parsing only the other three.
+  `ArrayLen::Constant` evaluates it at generation time. One arithmetic case, two
+  extensions, and 23 refused entry points down to 21.
+
+  The general shape is worth more than the fix: **an extension is only as
+  advertised as its least-implemented entry point**, so a class of work can be
+  99% done and deliver nothing. Without the reasons table this would have looked
+  like the union work having no effect.
+
+**6. What it is worth, measured — 34 tests that could not run at all before.**
+`dEQP-VK.ray_query.*` at 1-in-400, 97 tests, on **devhost** in `nix develop`
+against RADV RAPHAEL_MENDOCINO:
+
+| | control | forwarded |
+|---|---|---|
+| Pass | 59 | **34** |
+| NotSupported | 38 | 59 |
+| DeviceLost | 0 | 4 |
+| ring fatals | — | **0** |
+| hard GPU recoveries | 0 | **0** |
+
+  Before this section every one of these was `NotSupported`, because the
+  extension was not advertised. **Thirty-four of them now build an acceleration
+  structure and trace rays through the forwarder** — 52 commands, four
+  selector-driven unions and a doubly indirect `ppGeometries` between the
+  application and the driver — with no ring fatal and no GPU reset.
+
+  Twenty-one of the remaining skips are `VK_KHR_ray_tracing_pipeline is not
+  supported`, which is the capture-replay class (§0.19) and untouched here; the
+  rest are `sparse_binding_structures`. **Four device losses are real and
+  undiagnosed**, and they are the honest cost of the section: a path that could
+  not execute at all now executes and is wrong four times in ninety-seven.
+
+  **Measured at load average 259**, on a machine an image-processing job was
+  saturating, which is the wrong conditions for a device-loss count and the right
+  conditions for nothing. The passes and the zero ring fatals are robust to that;
+  the four are an upper bound and want re-taking on a quiet machine.
+
+---
+
+**What is not settled.**
+
+- **Carried is not exercised.** These 52 commands now have a wire encoding, a
+  lowering, a handle map and a forwarder, and `sv-codegen`'s generated round-trip
+  tests cover the marshalling — but **no acceleration structure has been built
+  through this forwarder**. CTS's `ray_query` and `acceleration_structures`
+  groups are what would say, and they need `VK_KHR_ray_tracing_pipeline`, which
+  is still out on the capture-replay class (§0.19). The honest claim is *the
+  protocol carries them*, not *they work*.
+- **`VkDeviceOrHostAddressConstKHR` is a union this section did not have to
+  solve, and that is luck rather than design.** It has no `selector=`, and its
+  two arms are a `VkDeviceAddress` and a host pointer — so member [0] is taken,
+  which is right only because the acceleration-structure API is used with device
+  addresses and the host-address arm is a build-on-host feature nothing here
+  advertises. It is plain bytes by the letter of `union_needs_selector` and a
+  latent wrong answer by intent. Recorded rather than fixed, because fixing it
+  means deciding what a host address *means* across this boundary, which is
+  §5.3's question and not this section's.
+- **The nine remaining classes are unchanged.** 179 uncarried: platform-gated,
+  `void*` without `len=`, capture-replay, function pointers, app-side by design,
+  and 23 unreachable by any profile. §0.19's breakdown stands with the union row
+  struck out.
 
 ---
 

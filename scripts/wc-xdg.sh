@@ -29,12 +29,12 @@
 # its `wl_shm` pool during `display_create()` — before any surface exists. A
 # `wl_shm.create_pool` carries an `h` argument, and on Windows an `h` is encoded
 # in-band as a length-prefixed descriptor rather than passed out-of-band by
-# `SCM_RIGHTS` (docs/design.md §2.3). A stock libwayland client sends the fd out
+# `SCM_RIGHTS` (docs/waycompose-design.md §2.3). A stock libwayland client sends the fd out
 # of band; Wine's AF_UNIX carries no ancillary data; so the descriptor is simply
 # absent from the byte stream and the server's parser desynchronises at exactly
 # that request.
 #
-# That is docs/design.md §2.4 — "the Windows byte stream is not libwayland's
+# That is docs/waycompose-design.md §2.4 — "the Windows byte stream is not libwayland's
 # byte stream" — arriving on schedule. Measured: against the Windows binary,
 # `weston-flower` sends `create_surface`, `get_xdg_surface`, `get_toplevel` and
 # `commit`, and the server sees none of them, because they follow the

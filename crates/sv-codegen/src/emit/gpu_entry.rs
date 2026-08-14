@@ -161,9 +161,26 @@ fn raise_expr(
         // be `*const T` or `*mut T` depending on whether the struct is
         // `returnedonly`. `as _` reconciles the two; it is a constness cast and
         // nothing else, since the pointee type is derived from the same member.
+        // **These two peel the member's C type as they descend, for the reason
+        // `FixedArray` above gives about `StdVideoH264ScalingLists` — and they
+        // did not, which is a one-dimension-out bug that only a doubly indirect
+        // member can reach.** `const VkAccelerationStructureGeometryKHR* const*
+        // ppGeometries` is `Pointer(Pointer(T))`, so the `Array` arm handed its
+        // element the *whole* member and the element's `Optional` arm peeled one
+        // level to `*const T` where the value is a `T` — `let __v: *const T =
+        // raise_…()` against a function returning `T`.
+        //
+        // Nothing in any profile was doubly indirect until
+        // `VK_KHR_acceleration_structure` came in behind the union walkers
+        // (design.md §0.21), which is why a pass that has marshalled half a
+        // million lines had never met it. The fix is the same one line
+        // `FixedArray` already carries, and the lesson is that it was written as
+        // a special case for two-dimensional *arrays* when it is really the rule
+        // for every level of indirection.
         Shape::Optional(inner) => {
             let deref = quote!(*__x);
-            let e = raise_expr(cx, inner, abi, &deref, owner)?;
+            let inner_abi = AbiMember { ty: peel_array(&abi.ty)?, ..abi.clone() };
+            let e = raise_expr(cx, inner, &inner_abi, &deref, owner)?;
             let cty = pointee_c_type(cx, &abi.ty)?;
             // A pointer to one, allocated in the pool so it outlives the call.
             quote!(match &(#access) {
@@ -172,7 +189,8 @@ fn raise_expr(
             })
         }
         Shape::Array { elem, .. } => {
-            let inner = raise_expr(cx, elem, abi, &quote!(*__x), owner)?;
+            let inner_abi = AbiMember { ty: peel_array(&abi.ty)?, ..abi.clone() };
+            let inner = raise_expr(cx, elem, &inner_abi, &quote!(*__x), owner)?;
             let cty = pointee_c_type(cx, &abi.ty)?;
             // An empty array becomes a **null** pointer rather than a dangling
             // one. Vulkan permits null whenever the count is zero, and a driver

@@ -91,6 +91,9 @@ pub enum ArrayLen {
     /// `pSampleMask`, the only occurrence on this surface, and one the ICD does
     /// have to read correctly because the array is the application's.
     SiblingCeilDiv { sibling: String, add: u64, divisor: u64 },
+    /// `2*VK_UUID_SIZE`: a bound the registry states as arithmetic over its own
+    /// constants, with no run-time input at all. Evaluated at generation time.
+    Constant(u64),
     /// A `len=` this plan will not guess at. Any command or struct reaching one
     /// is refused rather than emitted with an invented bound.
     Unresolved(String),
@@ -500,8 +503,8 @@ fn member(
         rust_name: crate::naming::snake_case(&m.name),
         is_c_string: matches!(term(0), Some(LenTerm::NullTerminated))
             || (m.ty.indirection() == 1 && m.ty.base_name() == Some("char") && m.len.is_none()),
-        len: term(0).as_ref().and_then(array_len),
-        inner_len: term(1).as_ref().and_then(array_len),
+        len: term(0).as_ref().and_then(|t| array_len(model, t)),
+        inner_len: term(1).as_ref().and_then(|t| array_len(model, t)),
         optional: m.is_optional(0),
         is_output: m.is_output_pointer(),
         is_a_length: lengths.contains(&m.name),
@@ -510,13 +513,13 @@ fn member(
     })
 }
 
-fn array_len(term: &LenTerm) -> Option<ArrayLen> {
+fn array_len(model: &Model, term: &LenTerm) -> Option<ArrayLen> {
     match term {
         LenTerm::Sibling(s) => Some(ArrayLen::Sibling(s.clone())),
         LenTerm::Path { root, field } => {
             Some(ArrayLen::Path { root: root.clone(), field: field.clone() })
         }
-        LenTerm::Expr(e) => Some(parse_len_expr(e)),
+        LenTerm::Expr(e) => Some(parse_len_expr(model, e)),
         // A literal `1` is a pointer to one value, not an array; a
         // `null-terminated` is a string. Neither is a count.
         LenTerm::Literal(_) | LenTerm::NullTerminated => None,
@@ -529,7 +532,17 @@ fn array_len(term: &LenTerm) -> Option<ArrayLen> {
 /// there the count comes from the wire and `len=` is only a cross-check. Here
 /// the expression *is* the bound on a read of the application's memory, so the
 /// two ceiling-division forms are parsed rather than shrugged at.
-fn parse_len_expr(e: &str) -> ArrayLen {
+///
+/// **And so is the fourth, as of design.md §0.21.** `2*VK_UUID_SIZE` is a
+/// *constant*: no sibling, no run-time input, just registry arithmetic the
+/// generator can do at build time. Leaving it `Unresolved` refused
+/// `VkAccelerationStructureVersionInfoKHR`'s lowering, which took
+/// `vkGetDeviceAccelerationStructureCompatibilityKHR` with it, which put
+/// `VK_KHR_acceleration_structure` in `INCOMPLETE_EXTENSIONS` — so the 52
+/// commands the union work had just carried were **carried and not advertised**.
+/// `VK_EXT_opacity_micromap` was blocked by the identical shape through
+/// `vkGetDeviceMicromapCompatibilityEXT`. One arithmetic case, two extensions.
+fn parse_len_expr(model: &Model, e: &str) -> ArrayLen {
     let compact: String = e.chars().filter(|c| !c.is_whitespace()).collect();
     if let Some((lhs, rhs)) = compact.split_once('/')
         && let Ok(divisor) = rhs.parse::<u64>()
@@ -551,7 +564,33 @@ fn parse_len_expr(e: &str) -> ArrayLen {
             };
         }
     }
+    // A product of decimal literals and registry constants, evaluated here
+    // because there is nothing to evaluate it *from* at run time. Deliberately
+    // only `*`: every other operator in an `altlen=` so far involves a sibling,
+    // and §7.4's rule is that an expression the generator cannot resolve is a
+    // build failure rather than a guess. Widening this is a decision with a
+    // name on it, not a convenience.
+    if let Some(n) = const_product(model, &compact) {
+        return ArrayLen::Constant(n);
+    }
     ArrayLen::Unresolved(e.to_string())
+}
+
+/// `2*VK_UUID_SIZE` → 32. `None` for anything mentioning a name the registry
+/// does not define as a constant, which is what keeps a *sibling* out of here.
+fn const_product(model: &Model, compact: &str) -> Option<u64> {
+    let mut acc: u64 = 1;
+    for tok in compact.split('*') {
+        if tok.is_empty() {
+            return None;
+        }
+        let v = match tok.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => model.constants.get(tok).and_then(|k| k.value)?,
+        };
+        acc = acc.checked_mul(v)?;
+    }
+    Some(acc)
 }
 
 /// Record every named type a C type mentions, so the closure picks it up.
