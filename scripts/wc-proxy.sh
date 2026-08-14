@@ -605,7 +605,19 @@ run_window() {
     # its floor rather than its value — a count, not a rate, which is why it
     # survives a loaded machine, and why it is no bound at all for the client
     # below.
-    run_one term weston-terminal shared-file damage 8
+    # STAGE 49. The leg's duration, overridable — 8 seconds was a constant with
+    # no stated basis, which is the same shape as every other bound this line of
+    # work has been about. It is long enough for `weston-terminal` to map and
+    # take its configure with room to spare, and that is all it has to be.
+    #
+    # `WC_LEG_SECS` exists so the window can be made *deliberately* too short.
+    # §48.6 item 3 recorded that `minframes`'s inconclusive path had never fired
+    # on a real run, and the only variable that reaches it is this one: the
+    # client owes 2 frames by construction, so the only way to see 1 is to close
+    # the window before the second lands. Setting it to 1 does that on demand,
+    # which is how that path was finally exercised against a real client rather
+    # than a simulation (§49.2).
+    run_one term weston-terminal shared-file damage "${WC_LEG_SECS:-8}"
     if check_common term shared-file 2; then
       local srv="$RUNDIR/term/srv.log"
       grep -q 'title -> "Wayland Terminal"' "$srv" \
