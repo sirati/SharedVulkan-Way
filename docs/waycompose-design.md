@@ -17276,3 +17276,184 @@ none of them was being run until each had already cost a revert.
    seed fix protects them all now, but nothing in them would catch a manifest
    made wrong some other way.
 
+
+## 47. Slow is not broken, and two tasks that were already done
+
+### 47.1 Status in one paragraph
+
+Three items were handed over: `wc-proxy.sh` prints six cost numbers and asserts
+on none (#40), its timing assertions are tuned for an idle machine (#41), and
+`cargo test` is not self-contained on a clean checkout (#39). **Two of the three
+were already fixed and the measurement says so** — #40 by §27, §31 and §35.3,
+and #39 by §35.2, verified here on a genuinely cold checkout that passes 2431
+tests with no failures. What was left is real and is the interesting one: the
+harness had **no vocabulary for "the machine was too loaded to measure"**, so a
+load-induced short sample had to be reported either as a defect in the tree or
+not at all.
+
+### 47.2 #40, checked before being fixed
+
+The task says six cost numbers are printed and none asserted. That was true when
+it was written and is not true now:
+
+* §27 turned the buffer/damage comparison into an assertion after a
+  damage-tracking change copied 8583 MiB against 128 for the same 700 commits —
+  51x — and the harness reported *37 passed, 0 failed*.
+* §31 made it **load-independent** by dividing each run by its own commit count,
+  which cancels the machine out: 175.24/736 against 172.85/726 is 1.0002x where
+  the raw totals gave 1.01x. A gate that is load-independent can afford to be
+  tight, which is the whole reason to make it so.
+* §35.3 added the per-row gates — `copies <= 2 x commits`, KiB per copy against
+  the extent — and made µs/copy **explicitly informational**, with the reason
+  stated in the run's own output: *"us/copy above is informational: it is a rate
+  on a loaded machine, and the assertions are on bytes"*.
+
+That last one is the right answer to a load-sensitive number and was already
+here: bytes are a property of the code, time is a property of the machine, and
+the gate is built on the former. Measured on this tree, quiet box:
+
+```
+  transport    scope   commits     copies   MiB copied   KiB/copy    us/copy
+  shared-file  buffer      681        680       162.12      244.1         21
+  shared-file  damage      684        683       162.84      244.1         24
+  arena        damage      756        755       180.01      244.1         46
+  PASS  shared-file: damage costs 1.000x buffer per commit
+  PASS  arena: damage costs 1.000x buffer per commit
+== 13 passed, 0 failed ==
+```
+
+Note the µs/copy spread — 21 to 46 for identical 244.1 KiB copies **in one
+run**. That is the number a threshold would have had to bound.
+
+### 47.3 #41, which was real: a harness with no word for "inconclusive"
+
+One gate was still a threshold picked on a quiet box: `commits >= 50`, a floor on
+*meaningfulness* over a fixed 6-second window. Its reasoning was sound — 620 to
+736 commits were measured, so 50 is more than ten times clear — but it is a floor
+on a **rate**, and a full-profile workspace build now drives this 32-core machine
+past load average 100. At that point a 6-second window can genuinely miss 50
+commits, and the harness would print
+
+```
+FAIL  shared-file/damage: only 31 commits in 6 s -- too few to measure over
+```
+
+which announces a defect in the tree because the box was busy.
+
+**The deeper problem is that there was nowhere else to put it.** Every gate could
+end only in `bad` — the code is wrong — or `note`, which is counted by nobody.
+§35's rule is that a number nobody asserts on is unwatched; the corollary is that
+**an outcome the vocabulary cannot express gets misfiled**. So two changes:
+
+1. **The window grows instead of the verdict changing.** 6 s, then 18 s if the
+   sample was short. A slow machine pays time and still produces a measurement;
+   a broken one produces a short sample twice. This is what actually separates
+   slow from broken, rather than reclassifying one as the other. It is not
+   flakiness-papering, because the gates downstream are per-commit ratios that
+   are load-independent by construction (§31) — a longer window changes the
+   confidence, not the number.
+2. **A third outcome, counted.** `skip`/`inconclusive` appears in the summary
+   only when non-zero, quotes the load average, and **does not affect the exit
+   status**: "we could not measure it" is not a failure, and a harness that
+   exited non-zero for load would teach everyone to re-run until green, which
+   §35.1 names as worse than failing.
+
+**The skip cannot hide a defect, and that is the part worth checking.** A row
+that is thin *and* copying 55 times per commit is a failure, not an
+inconclusive — the load-independent gates run on whatever sample exists, because
+a thin sample cannot make a 55x regression look like 1x. Verified on four
+synthetic rows:
+
+```
+healthy 700/699/244        -> PASS
+thin 12/12/244             -> ???? inconclusive, load quoted
+thin 12/660/13000          -> FAIL  (the regression wins over the thin sample)
+fat  700/38500/13000       -> FAIL
+```
+
+and the retry logic on three:
+
+```
+700 first window           -> 1 attempt, no widening
+12 then 300                -> widened once, then measured  (slow)
+12 then 12                 -> widened once, then gave up   (inconclusive)
+```
+
+### 47.4 #39, which measurement closed rather than code
+
+`cargo test --workspace --no-fail-fast` **is** self-contained on a clean
+checkout. Established the only way it can be — a worktree created with no
+`target/` at all, cold-built from nothing:
+
+```
+exit=0    85 test binaries    2431 passed    0 failed
+```
+
+The suspicion was that it shared a cause with §44.4's manifest — a generated
+artefact a fresh tree lacks but an incremental one has. It does not, and the two
+places it could have are both already handled: `sv-icd/tests/loader.rs` runs a
+nested `cargo build --lib` (`ensure_driver_artefact`, §35.2) because nothing in
+the test's dependency graph needs the `cdylib`, and `sv-hostd/tests/
+two_processes.rs` uses `CARGO_BIN_EXE_*`, which cargo guarantees to build. The
+ICD manifest is written by `sv-icd`'s build script, so `cargo test` generates it
+in the tree it runs in — which is exactly why §44.4's bug needed a *reflinked*
+manifest to happen at all, and cannot occur on a clean checkout.
+
+**Two of three tasks closed by measuring instead of changing anything.** Worth
+saying plainly, because the cost of re-fixing something already fixed is not
+zero: it is a diff that has to be reviewed, and a chance to break a gate that
+was working.
+
+### 47.5 What is not done
+
+1. **The inconclusive path has not fired on a genuinely loaded machine.** Its
+   logic is verified on synthetic rows and its trigger is verified by
+   simulation, but reaching `commits < 50` needs roughly a 14x slowdown, and
+   generating that would have meant loading a box a dozen agents share. The
+   first run that goes inconclusive should be checked against this section: if
+   it happens at a load *below* about 100, the floor rather than the machine is
+   the suspect.
+2. **`minframes` still defaults to 2** and §35.9 item 3 already flagged that it
+   has no margin — `weston-terminal`'s present count was 2, 2 and 5 across the
+   runs measured. It is a count rather than a rate, so it survives load better
+   than the commits floor did, but it is the next candidate for the same
+   treatment and is untouched here.
+3. **Only `wc-proxy.sh` gained the third outcome.** Every other harness in
+   `scripts/` still has `ok`/`bad`/`note` and the same inability to say
+   "inconclusive"; several already use `miss`/`non` for *absence* of a
+   prerequisite, which is a different thing from a measurement that could not be
+   drawn. Making that vocabulary uniform is a sweep, not a patch.
+4. **The same defect is live in `sv-transport`'s own tests, and it is NOT fixed
+   here — deliberately.** Verifying this section's work turned up a red
+   workspace run:
+
+   ```
+   park::tests::a_rung_doorbell_wakes_the_consumer_rather_than_the_slice_expiring
+   panicked at crates/sv-transport/src/park.rs:1021
+   ```
+
+   at load average **175.54**. In isolation, on a box still at ~169, it failed
+   **2 runs out of 5**. This branch does not touch `sv-transport`.
+
+   The assertion is `latency < Duration::from_millis(5)`, and its message states
+   the real question: *"the 20 ms slice expiring instead means it was never
+   rung"*. So the property is **which mechanism woke the consumer** — the
+   doorbell or the slice timing out — and the 5 ms bound is a *proxy* for it.
+   That proxy is the §47.3 mistake in the code rather than the harness: under
+   load a genuine doorbell wake takes longer than 5 ms, so the test reports "the
+   doorbell was never rung" when the doorbell was rung and the scheduler was
+   busy. It is the same shape as the `commits >= 50` floor, one layer down.
+
+   **The fix is not a bigger number.** Raising the bound to 20 ms, or 50, moves
+   the failure rather than removing it, and at some point the bound crosses the
+   slice it is meant to be distinguishing from — at which case the test asserts
+   nothing at all, which is §42's other defect. The load-independent fix is to
+   make the wake *reason* observable: `ParkOutcome` already distinguishes
+   `Woken`/`TimedOut`/`Fatal`, and `wait_until`'s return is discarded by this
+   test in favour of `t0.elapsed()`. A test that asserted on the reason would be
+   both tighter and immune to load, which is §31's argument exactly.
+
+   That is an API change in a crate another agent is actively working in
+   (master's `wayland-bell-win`), so it is reported with its measurement rather
+   than patched from here. The precedent for *doing* it in §44 was a one-line
+   publish-before-store race with no API change; this is not that.
