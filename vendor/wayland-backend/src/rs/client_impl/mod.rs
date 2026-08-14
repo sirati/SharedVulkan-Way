@@ -1,6 +1,6 @@
 //! Client-side rust implementation of a Wayland protocol backend
 
-use crate::os::{OwnedFd, RawFd, WlStream as UnixStream};
+use crate::os::{ProtoFd, RawProtoFd, WlStream as UnixStream};
 #[cfg(unix)]
 use crate::os::{AsRawFd, BorrowedFd};
 use std::{
@@ -341,7 +341,7 @@ impl InnerBackend {
 
     pub fn send_request(
         &self,
-        Message { sender_id: ObjectId { id }, opcode, args }: Message<ObjectId, RawFd>,
+        Message { sender_id: ObjectId { id }, opcode, args }: Message<ObjectId, RawProtoFd>,
         data: Option<Arc<dyn ObjectData>>,
         child_spec: Option<(&'static Interface, u32)>,
     ) -> Result<ObjectId, InvalidId> {
@@ -602,7 +602,7 @@ impl ProtocolState {
         Ok(object)
     }
 
-    fn handle_display_event(&mut self, message: Message<u32, OwnedFd>) -> Result<(), WaylandError> {
+    fn handle_display_event(&mut self, message: Message<u32, ProtoFd>) -> Result<(), WaylandError> {
         if self.debug {
             debug::print_dispatched_message(
                 "wl_display",

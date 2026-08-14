@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd and stream types now come from `crate::os`.
-use crate::os::{errors, OwnedFd, RawFd, WlStream as UnixStream};
+use crate::os::{errors, ProtoFd, RawProtoFd, WlStream as UnixStream};
 #[cfg(unix)]
 use crate::os::{AsFd, BorrowedFd};
 
@@ -118,7 +118,7 @@ impl<D> Client<D> {
 
     pub(crate) fn send_event(
         &mut self,
-        Message { sender_id: object_id, opcode, args }: Message<ObjectId, RawFd>,
+        Message { sender_id: object_id, opcode, args }: Message<ObjectId, RawProtoFd>,
         pending_destructors: Option<&mut Vec<super::handle::PendingDestructor<D>>>,
     ) -> Result<(), InvalidId> {
         if self.killed {
@@ -348,7 +348,7 @@ impl<D> Client<D> {
     #[allow(clippy::type_complexity)]
     pub(crate) fn next_request(
         &mut self,
-    ) -> std::io::Result<(Message<u32, OwnedFd>, Object<Data<D>>)> {
+    ) -> std::io::Result<(Message<u32, ProtoFd>, Object<Data<D>>)> {
         if self.killed {
             return Err(errors::broken_pipe());
         }
@@ -426,7 +426,7 @@ impl<D> Client<D> {
 
     pub(crate) fn handle_display_request(
         &mut self,
-        message: Message<u32, OwnedFd>,
+        message: Message<u32, ProtoFd>,
         registry: &mut Registry<D>,
     ) {
         match message.opcode {
@@ -504,7 +504,7 @@ impl<D> Client<D> {
     #[allow(clippy::type_complexity)]
     pub(crate) fn handle_registry_request(
         &mut self,
-        message: Message<u32, OwnedFd>,
+        message: Message<u32, ProtoFd>,
         registry: &mut Registry<D>,
     ) -> Option<(InnerClientId, InnerGlobalId, InnerObjectId, Arc<dyn GlobalHandler<D>>)> {
         match message.opcode {
@@ -575,8 +575,8 @@ impl<D> Client<D> {
     pub(crate) fn process_request(
         &mut self,
         object: &Object<Data<D>>,
-        message: Message<u32, OwnedFd>,
-    ) -> Option<(ArgSmallVec<OwnedFd>, bool, Option<InnerObjectId>)> {
+        message: Message<u32, ProtoFd>,
+    ) -> Option<(ArgSmallVec<ProtoFd>, bool, Option<InnerObjectId>)> {
         let message_desc = object.interface.requests.get(message.opcode as usize).unwrap();
 
         if message_desc.since > object.version {

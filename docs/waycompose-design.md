@@ -23802,3 +23802,172 @@ than held for them, with two agents queued.
 5. **This says nothing about the drag or icon resources beyond their counters
    balancing** — 3 registered / 3 revoked is the compositor's own account
    (§62.2), and on this venue there is still no outside witness for OLE's table.
+
+
+## 76. The protocol's file descriptor gets a name of its own
+
+### 76.1 Status in one paragraph
+
+§72.3 settled what the fix for the pool path is — **both encodings, selected by
+transport rather than by platform** — and listed the sites. A first attempt at
+it found a prerequisite the section had not scoped, and reverted rather than
+leave `vendor/` half-refactored. This section is that prerequisite, landed on
+its own: `wayland_backend::os::ProtoFd` and its two companions now name **the
+`Fd` payload of an `Argument`/`Message`**, distinctly from the `OwnedFd` the
+socket layer uses for real kernel descriptors. **Nothing behaves differently.**
+The aliases are unconditional and resolve to exactly the types that were there
+before, on both platforms; the tripwire
+`the_upstream_dialect_is_still_assumed_rather_than_chosen` still passes because
+it still describes the truth. What changed is that the definition §72.3 has to
+edit is now **one line that the socket layer does not read**.
+
+### 76.2 The prerequisite, and it is a Unix-only accident
+
+On Windows the two roles were never confusable and nothing had to say so: a
+socket is a `wc_transport::Stream`, and an `h` argument is a
+`wc_handle::Handle`. Two types, two jobs, no overlap. That is why the fork got
+this far without naming the distinction.
+
+On **Unix** both are `std::os::unix::io::OwnedFd`. `crate::os` re-exported one
+name for both jobs, and the crate had **two unrelated readers** of it:
+
+* the **socket layer** — `rs/socket.rs`'s `in_fds`/`out_fds` queues, `send_msg`
+  and `rcv_msg`, the `SCM_RIGHTS` control message, `rustix`'s `AncillaryIter`,
+  the `dup()` in `write_to_buffers`, and the `AsFd`/`AsRawFd` impls on `Socket`,
+  `BufferedSocket` and `Client<D>`. Every one of those is a real descriptor and
+  can never be anything else;
+* the **protocol layer** — the `Fd` parameter of `Argument<Id, Fd>` and
+  `Message<Id, Fd>`, which is only ever compared (`FdRepr::fd_eq`), printed
+  (`FdRepr::fd_fmt`), and handed to whatever `rs/wire.rs` has decided an `h`
+  looks like on the wire.
+
+§72.3's fix changes the second. With one name, it could not be changed without
+the first coming with it — which is what the first attempt hit, and why the
+sensible move is to give the protocol role its own spelling first and change
+nothing else.
+
+### 76.3 Three names, not one, and why
+
+`Argument`/`Message` are instantiated at three different fd types, and the
+separation is only useful if it covers all three:
+
+| new name | was | where it appears |
+|---|---|---|
+| `os::ProtoFd` | `os::OwnedFd` | a message **parsed off the wire**: `parse_message`, `read_one_message`, every `ObjectData::event`/`request` signature, every generated `Event` field |
+| `os::RawProtoFd` | `os::RawFd` | a message **about to be written**: `send_request`, `send_event`, `write_message`, `write_to_buffers` |
+| `os::BorrowedProtoFd<'a>` | `os::BorrowedFd<'a>` | what `wayland-scanner` emits: `write_request`/`write_event`, and the `h` field of every generated `Request<'a>` |
+
+The send side is unowned on Unix — the caller keeps the descriptor and
+`write_to_buffers` `dup()`s it — which is why the protocol needs two of these
+rather than one, and the borrowed form has a lifetime the other two do not
+because that is the shape `wayland-scanner` generates into every protocol crate
+in the ecosystem.
+
+All three are declared **without a `cfg`**, as aliases of the names that were
+already there. That is deliberate and it is the whole safety argument: an
+unconditional alias to an existing type cannot change behaviour on either
+platform, so this commit is a rename and can be reviewed as one.
+
+### 76.4 The real site count: 88, not 71
+
+§72.3's estimate was 71 instantiation sites across 30 files. **The file count was
+exactly right and the site count was 24% low.** The measured surface, after the
+change:
+
+| | sites |
+|---|---|
+| `Message<…>` / `Argument<…>` / `ArgSmallVec<…>` instantiations | **88**, across **30** files |
+| of which in the two checked-in `wayland-scanner` assets | 26 |
+| `use` lines that exist only to spell one of the three | 34 |
+| files touched in total | 33 |
+
+The gap is not a miscount of anything visible; it is that `vendor/wayland-scanner`
+is three surfaces rather than one — the `quote!` blocks that emit the type, the
+two checked-in `scanner_assets/*.rs` that a test compares the emission against
+byte-for-byte, and the generated `Request`/`Event` **field** types, which are not
+`Message<…>` instantiations but must move with them or the tuple stops
+type-checking. Changing the scanner is not optional: `wayland-protocols`,
+`wayland-protocols-wlr` and `wayland-protocols-misc` come from crates.io and are
+generated by this fork's scanner through the `[patch.crates-io]` table, so the
+generated code is where most of the protocol's `h` arguments actually live.
+
+`vendor/smithay` contributes three sites here — the `ObjectData::request` impls
+in `selection/offer.rs` and the two dnd grabs — and `crate::utils::os` gained a
+`ProtoFd` re-export so they can be spelled without reaching past it. These are
+**not** §72.3's "sixteen occurrences across six files"; those are the
+`#[cfg(windows)]` coupling sites in `wayland/shm/pool.rs` and friends, and they
+are untouched.
+
+### 76.5 The separation, measured rather than asserted
+
+The claim this commit makes is falsifiable in one command, so it was falsified
+rather than argued. Temporarily replacing the three aliases with distinct
+newtypes and running `cargo check -p wayland-backend --all-targets`:
+
+| | errors |
+|---|---|
+| the library | **8** — `rs/wire.rs` ×2, `rs/client_impl/mod.rs` ×4, `rs/server_impl/client.rs` ×2 |
+| plus the unit tests | 23 total, the extra 15 in the `mod tests` of `socket.rs` and `wire.rs` |
+| naming `rustix`, `AncillaryIter`, `borrow_raw`, or an `AsFd` impl on `Socket`/`Client<D>`/`Stream` | **0** |
+
+The non-test body of `rs/socket.rs` produces **no errors at all**, which is the
+result that matters: the file that owns `SCM_RIGHTS` does not move when the
+protocol's fd type does. Of the eight, two are `FdRepr` bounds — a trait
+`crate::os` already owns and a real change would simply implement — and the other
+two in `wire.rs` are lines 157 and 332, the write arm and the parse arm of
+`Argument::Fd`. **Those two are precisely the sites §72.3 says have to become a
+runtime choice.** The refactor's blast radius and the fix's work list are the
+same two lines.
+
+Compare the first attempt's reading, which is now confirmed: it saw 24 errors
+splitting into a socket-layer group and nothing in the protocol layer, because it
+changed the shared name. Changing the protocol-only name inverts that exactly.
+
+### 76.6 What was deliberately not done
+
+* **The enum is not here.** `ProtoFd` is an alias, not a sum type. The variant
+  for "an fd that arrived with no name" belongs in `vendor/wayland-backend/src/os.rs`
+  — `Descriptor` means "a name a peer can open" and an `SCM_RIGHTS` fd has none,
+  so it does not go in `wc-handle` — and it is the next commit, not this one.
+* **`wc-handle` is still Windows-only.** `vendor/wayland-backend/Cargo.toml:73`
+  declares it under `[target.'cfg(windows)'.dependencies]`. The crate itself is
+  portable — its own `cfg(windows)` block holds only `windows-sys` — so making
+  the dependency unconditional is a two-line change, but it belongs with the
+  enum that needs it.
+* **`wire.rs`'s two arms are still `#[cfg]`, not a choice**, and the
+  per-connection flag does not exist. §72.3 is not fixed by this section and does
+  not claim to be.
+* **The tripwire is still there and still passes.** It asserts that
+  `wc-proxy`'s `session.rs` spells both dialects as constants with no transport
+  consulted, and that is still true — this commit did not touch `wc-proxy` at
+  all. Deleting it is the job of whoever makes the encoding a runtime choice.
+
+### 76.7 The gates
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **87 binaries, 2632 passed, 0 failed** |
+| the same, on `7abc743` before any of this | 86 binaries, 2631 passed, 0 failed |
+| §75's own commit, `5b39633`, reports | 87 binaries, 2632 tests, 0 failures |
+| `cargo clippy --workspace --all-targets` | clean; no warning in any `vendor/wayland-*` crate |
+| `wayland-scanner`'s two asset tests | pass; the checked-in `test-client-code.rs` and `test-server-code.rs` were updated and match the emission byte-for-byte |
+| `scripts/wc-xref.sh` | exit 0 |
+| `the_upstream_dialect_is_still_assumed_rather_than_chosen` | passes, unchanged |
+
+**The first two counts differ and the difference is not this section's.** The
+branch was rebased mid-flight onto `5b39633`, which adds a
+`crates/vk-registry/tests/attributes.rs` holding one test; that commit's own
+message reports the post-rebase number, and this section's run reproduces it
+exactly. Independently of that, comparing the `7abc743` and post-change runs
+*per binary* rather than in aggregate, **the only line that differs is that new
+binary** — every other binary reports an identical pass count. That is the check
+worth running for a rename: an aggregate that happens to match can hide a test
+moving from one binary to another, and a per-binary diff cannot.
+
+### 76.8 Is step 2 now ordinary
+
+Yes, on the evidence in §76.5. The remaining work has a work list of two arms in
+`wire.rs`, one dependency line, an enum with two variants, and smithay's sixteen
+`cfg` sites — and the measurement says that nothing in the socket layer is on
+that list. That was the open question the first attempt could not answer, because
+with one name for two jobs there was no way to ask it.

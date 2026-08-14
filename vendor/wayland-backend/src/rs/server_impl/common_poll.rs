@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd types from `crate::os`.
-use crate::os::OwnedFd;
+use crate::os::ProtoFd;
 #[cfg(unix)]
 use crate::os::{AsRawFd, BorrowedFd};
 
@@ -421,7 +421,7 @@ impl<D> InnerBackend<D> {
 }
 
 // WAYCOMPOSE FORK: clippy flags the size difference between the two variants on
-// Windows but not on Unix, because the two platforms' `Argument<_, OwnedFd>` are
+// Windows but not on Unix, because the two platforms' `Argument<_, ProtoFd>` are
 // different sizes — a Windows handle is an `Arc` plus a descriptor rather than a
 // bare `i32`. Boxing `Request` would add an allocation on the hot dispatch path
 // to satisfy a lint about a value that lives for one iteration of a loop, so the
@@ -432,7 +432,7 @@ enum DispatchAction<D: 'static> {
         object: Object<Data<D>>,
         object_id: InnerObjectId,
         opcode: u16,
-        arguments: SmallVec<[Argument<ObjectId, OwnedFd>; 4]>,
+        arguments: SmallVec<[Argument<ObjectId, ProtoFd>; 4]>,
         is_destructor: bool,
         created_id: Option<InnerObjectId>,
     },

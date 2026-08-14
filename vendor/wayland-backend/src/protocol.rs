@@ -35,9 +35,9 @@ pub enum ArgumentType {
     NewId,
     /// `Vec<u8>`
     Array,
-    /// A file descriptor argument. Represented by a [`RawFd`].
+    /// A file descriptor argument. Represented by a [`ProtoFd`].
     ///
-    /// [`RawFd`]: std::os::fd::RawFd
+    /// [`ProtoFd`]: crate::os::ProtoFd
     Fd,
 }
 
@@ -72,9 +72,9 @@ pub enum Argument<Id, Fd> {
     /// The value is boxed to reduce the stack size of Argument. The performance
     /// impact is negligible as `array` arguments are pretty rare in the protocol.
     Array(Box<Vec<u8>>),
-    /// A file descriptor argument. Represented by a [`RawFd`].
+    /// A file descriptor argument. Represented by a [`ProtoFd`].
     ///
-    /// [`RawFd`]: std::os::fd::RawFd
+    /// [`ProtoFd`]: crate::os::ProtoFd
     Fd(Fd),
 }
 

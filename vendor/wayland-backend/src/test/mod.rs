@@ -1,6 +1,7 @@
 #![allow(dead_code, non_snake_case)]
 
-use std::os::fd::OwnedFd;
+// WAYCOMPOSE FORK: the protocol payload, not a socket descriptor. `crate::os`.
+use crate::os::ProtoFd;
 use std::sync::Arc;
 
 use crate::protocol::{Argument, Message};
@@ -138,7 +139,7 @@ impl<D> server_rs::ObjectData<D> for DoNothingData {
         _: &server_rs::Handle,
         _: &mut D,
         _: server_rs::ClientId,
-        _: Message<server_rs::ObjectId, OwnedFd>,
+        _: Message<server_rs::ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn server_rs::ObjectData<D>>> {
         None
     }
@@ -159,7 +160,7 @@ impl<D> server_sys::ObjectData<D> for DoNothingData {
         _: &server_sys::Handle,
         _: &mut D,
         _: server_sys::ClientId,
-        _: Message<server_sys::ObjectId, OwnedFd>,
+        _: Message<server_sys::ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn server_sys::ObjectData<D>>> {
         None
     }
@@ -180,7 +181,7 @@ impl client_rs::ObjectData for DoNothingData {
     fn event(
         self: Arc<Self>,
         _: &client_rs::Backend,
-        _: Message<client_rs::ObjectId, OwnedFd>,
+        _: Message<client_rs::ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn client_rs::ObjectData>> {
         None
     }
@@ -192,7 +193,7 @@ impl client_sys::ObjectData for DoNothingData {
     fn event(
         self: Arc<Self>,
         _: &client_sys::Backend,
-        _: Message<client_sys::ObjectId, OwnedFd>,
+        _: Message<client_sys::ObjectId, ProtoFd>,
     ) -> Option<Arc<dyn client_sys::ObjectData>> {
         None
     }

@@ -77,7 +77,7 @@
 
 // WAYCOMPOSE FORK: fd types come from the backend's portability module rather
 // than from `std::os::unix::io`.
-use wayland_backend::os::OwnedFd;
+use wayland_backend::os::ProtoFd;
 
 use std::{
     fmt,
@@ -215,7 +215,7 @@ pub trait Resource: Clone + std::fmt::Debug + Sized {
     /// wayland-scanner.
     fn parse_request(
         dh: &DisplayHandle,
-        msg: Message<ObjectId, OwnedFd>,
+        msg: Message<ObjectId, ProtoFd>,
     ) -> Result<(Self, Self::Request), DispatchError>;
 
     /// Serialize an event for this object
@@ -226,7 +226,7 @@ pub trait Resource: Clone + std::fmt::Debug + Sized {
         &self,
         dh: &DisplayHandle,
         req: Self::Event<'a>,
-    ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedFd<'a>>, InvalidId>;
+    ) -> Result<Message<ObjectId, wayland_backend::os::BorrowedProtoFd<'a>>, InvalidId>;
 
     /// Creates a weak handle to this object
     ///

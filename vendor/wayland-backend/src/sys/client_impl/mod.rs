@@ -15,6 +15,12 @@ use std::{
     },
 };
 
+// WAYCOMPOSE FORK: the `h` payload of an `Argument`/`Message` is named apart
+// from the real descriptors this file builds with `from_raw_fd` and hands to
+// libwayland. They are the same type on Unix, which is the only platform this
+// backend has; see `crate::os` and `docs/waycompose-design.md` §76.
+use crate::os::{ProtoFd, RawProtoFd};
+
 use crate::{
     core_interfaces::WL_DISPLAY_INTERFACE,
     debug,
@@ -572,7 +578,7 @@ impl InnerBackend {
 
     pub fn send_request(
         &self,
-        Message { sender_id: ObjectId { id }, opcode, args }: Message<ObjectId, RawFd>,
+        Message { sender_id: ObjectId { id }, opcode, args }: Message<ObjectId, RawProtoFd>,
         data: Option<Arc<dyn ObjectData>>,
         child_spec: Option<(&'static Interface, u32)>,
     ) -> Result<ObjectId, InvalidId> {
@@ -917,7 +923,7 @@ unsafe extern "C" fn dispatcher_func(
     };
 
     let mut parsed_args =
-        SmallVec::<[Argument<ObjectId, OwnedFd>; 4]>::with_capacity(message_desc.signature.len());
+        SmallVec::<[Argument<ObjectId, ProtoFd>; 4]>::with_capacity(message_desc.signature.len());
     let mut arg_interfaces = message_desc.arg_interfaces.iter().copied();
     let mut created = None;
     // Safety (args deference): the args array provided by libwayland is well-formed
