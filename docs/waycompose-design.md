@@ -20263,7 +20263,8 @@ the reverse would lose the stronger check.
 | Gate | Result |
 |---|---|
 | `cargo build --workspace`, both targets | clean |
-| `cargo test --workspace --no-fail-fast` | **2592 tests**, 0 failures — unchanged; this stage adds no test, the harness is the test |
+| `cargo test --workspace --no-fail-fast` | **2594 tests**, 0 failures — unchanged by this section; the harness is the test |
+| **`scripts/wc-life.sh wine`** (§53's own gate, re-run) | **11 passed, 0 failed, 1 skipped** — the compositor claimed 9 destructions for 9 windows and the window manager agreed none were left |
 | **`scripts/wc-teardown.sh all`** (new) | **11 passed, 0 failed** |
 | ... `linux` leg | `1 created, 1 destroyed, 0 still held, 0 still alive` |
 | ... `wine` leg | the same, and Windows agrees none survives |
