@@ -623,3 +623,54 @@ the only real work — the fix itself is settled and measured.
 When the next one turns up it goes here, in the same shape: where, what, what
 the client sees, the fix, how it was found, why nobody hit it, and what is left
 for a human to decide.
+
+---
+
+## 3. `smithay`: protocol errors xdg-shell requires and upstream never raises
+
+**Added for waycompose §45.10.** Unlike everything above, this is not a
+portability change — it would apply unchanged on Linux, and it is the one entry
+here that is a straightforward missing-feature report rather than a fork.
+
+**Where.** `src/wayland/shell/xdg/handlers/wm_base.rs`, in
+`xdg_wm_base::Request::GetXdgSurface`, and `src/wayland/compositor/handlers.rs`
+in `wl_surface::Request::Attach`.
+
+**What.** Upstream creates the `xdg_surface` unconditionally. xdg-shell requires
+two refusals, and smithay makes neither:
+
+* `xdg_wm_base.role` when the `wl_surface` already has a role. Upstream checks
+  this on `get_toplevel` and `get_popup` but not on `get_xdg_surface`, so a
+  subsurface can be handed to `get_xdg_surface` and the error arrives later, or
+  not at all.
+* `xdg_wm_base.invalid_surface_state` when the `wl_surface` already has a
+  buffer. xdg-shell requires the first buffer to arrive after the role and
+  after the initial configure is acked, so a surface that has already drawn
+  cannot become an `xdg_surface`.
+
+**The part that is not obvious**, and the reason there is a second file: "does
+this surface have a buffer" cannot be answered from `SurfaceAttributes`. A
+compositor consumes the buffer when it commits — waycompose does
+`attrs.buffer.take()`, deliberately, so a frame's damage and callbacks are not
+replayed — and after that the surface has drawn and the state says it never did.
+Upstream has no record of the fact. So `BufferEverAttached` is a marker in the
+surface's `data_map`, set by `wl_surface.attach` and never cleared, including
+for a null buffer: the prohibition is about the surface's history rather than
+its present contents.
+
+**How it was found.** WLCS 1.8.1's `XdgSurfaceStableTest` — three tests, each
+failing with "Expected protocol error not received". Checking only `current()`
+and `pending()` fixed two of the three and left the committed-buffer case
+failing, which is what named the consumed-buffer problem.
+
+**Why nobody hit it before.** A compositor that never raises these errors is
+indistinguishable from a correct one until a client does something illegal, and
+well-behaved toolkits do not. The cost is that a buggy client gets undefined
+behaviour instead of a diagnostic.
+
+**What a human has to decide.** Whether `BufferEverAttached` is the shape
+upstream wants — a `data_map` marker is cheap and public, but upstream may
+prefer a private field on `PrivateSurfaceData`, or may prefer that the
+compositor not consume the buffer at all. The two `post_error` calls are
+uncontroversial on their own and could go upstream first, with the
+committed-buffer case following once the record's shape is agreed.

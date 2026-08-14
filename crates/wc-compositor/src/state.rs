@@ -1364,6 +1364,42 @@ impl State {
         let (rx, ry) = surface_origin(window.content_offset);
         let root = window.role.surface().clone();
         placed_tree(&root).into_iter().rev().find_map(|(surface, loc)| {
+            // **A subsurface is mapped only while its parent is.** The protocol
+            // says so directly — "a sub-surface is mapped when the parent is
+            // mapped and the sub-surface has a buffer" — and §40 implemented
+            // only the second half: a surface that lost its own buffer stopped
+            // taking input, and its children went on taking it as though
+            // nothing had happened.
+            //
+            // WLCS's `unmapping_parent_stops_subsurface_getting_input` builds
+            // exactly that: a subsurface, a subsurface of *it*, and a null
+            // buffer committed to the middle one. The child is still there,
+            // still has a buffer, and must not be clickable.
+            //
+            // Checked from the surface up to the root rather than by keeping a
+            // mapped flag per surface, because the buffer *is* the flag — the
+            // staging entry is created on commit and dropped on a null buffer
+            // or a destroy (§40), so asking whether an ancestor has one is
+            // asking the same question the child is asked.
+            //
+            // **The root is deliberately not part of this walk.** "The root has
+            // no buffer" is the window-level question, and it is answered
+            // already: `Window::mapped` gates it, and the platform stops
+            // reporting the window at all. Including it here would also break
+            // the case §9 documented — Firefox commits the subsurface holding
+            // the browser *before* the toplevel behind it, so a tree whose root
+            // has not drawn yet is a normal transient state rather than an
+            // unmapped window.
+            let mut ancestor = compositor::get_parent(&surface);
+            while let Some(p) = ancestor {
+                if p == root {
+                    break;
+                }
+                if !self.staging.contains_key(&p) {
+                    return None;
+                }
+                ancestor = compositor::get_parent(&p);
+            }
             // The surface's origin in window-content pixels.
             let origin = (rx + f64::from(loc.0), ry + f64::from(loc.1));
             let local = (x - origin.0, y - origin.1);

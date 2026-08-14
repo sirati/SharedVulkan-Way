@@ -282,6 +282,30 @@ pub enum RectangleKind {
 ///
 /// This struct contains an ordered `Vec` containing the rectangles defining
 /// a region. They should be added or subtracted in this order to compute the
+/// WAYCOMPOSE FORK (§45.10). Whether a `wl_surface` has **ever** had a buffer
+/// attached to it, which is not the same question as whether it has one now.
+///
+/// Lives in the surface's `data_map`, is set by `wl_surface.attach`, and is
+/// never cleared. `xdg_wm_base.get_xdg_surface` must refuse a surface that has
+/// already drawn, and a compositor that consumes the buffer on commit — which
+/// waycompose does, so that damage and frame callbacks are not replayed —
+/// destroys the evidence that it ever did.
+#[derive(Debug, Default)]
+pub struct BufferEverAttached(pub std::sync::atomic::AtomicBool);
+
+impl BufferEverAttached {
+    /// Whether `surface` has ever had a buffer attached.
+    pub fn is_set(surface: &wayland_server::protocol::wl_surface::WlSurface) -> bool {
+        with_states(surface, |states| {
+            states
+                .data_map
+                .get::<BufferEverAttached>()
+                .map(|s| s.0.load(std::sync::atomic::Ordering::Acquire))
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// actual contents of the region.
 #[derive(Clone, Debug, Default)]
 pub struct RegionAttributes {
