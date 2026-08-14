@@ -2221,6 +2221,23 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
         "wc-compositor: windows at exit: {made} created, {gone} destroyed, \
          {held} still held, {live} still alive, {clients} client(s) still connected"
     );
+    // ADDED FOR docs/waycompose-design.md §57. The same accounting for the
+    // *other* per-window resource, and it rides on this line's coat-tails for
+    // §56.2's reason: a stranded OLE registration has no symptom at all, so the
+    // only way it is ever noticed is a number printed where a run already
+    // looks.
+    //
+    // These three are the compositor's own account and are labelled `claims`
+    // for the same reason §56 labels its first three: a bug in the teardown
+    // path is exactly the circumstance in which the account is wrong. Unlike
+    // the window count there is no external witness available — OLE's table is
+    // not enumerable from another process — which §57.3 says out loud rather
+    // than leaving the asymmetry to be noticed.
+    let (registered, revoked, failed) = super::drag::drop_target_counts();
+    println!(
+        "wc-compositor: drop targets at exit: claims {registered} registered, \
+         {revoked} revoked, {failed} revoke(s) failed"
+    );
 }
 
 /// Look a window up without holding the map borrow across anything that can
