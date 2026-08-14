@@ -592,6 +592,14 @@ echo "S4-FRAMES: total=$tot distinct=$dis top=$top first=$geo"
 echo "S4-PROXY-BEGIN";  cat "$RUN/proxy.log"; echo "S4-PROXY-END"
 echo "S4-COMP-BEGIN";   cat "$SHARE/s4.log" 2>/dev/null; echo "S4-COMP-END"
 echo "S4-RELAY-BEGIN";  cat "$RUN/relay.out"; echo "S4-RELAY-END"
+# §57. The scroll probe's own log, fetched from the guest. Without this the
+# only evidence the wheel moved is that the probe did not crash, and a locked
+# Windows session makes SendInput return 0 while the probe exits happily.
+if [ -n "$VERIFY" ]; then
+  echo "S4-SCROLLLOG-BEGIN"
+  ssh "${GK[@]}" "$G" "cat $GDIR/scroll.log" 2>/dev/null
+  echo "S4-SCROLLLOG-END"
+fi
 echo "S4-CLIENT-BEGIN"; head -20 "$RUN/cli.log"; echo "S4-CLIENT-END"
 DRIVER
 }
@@ -1466,6 +1474,31 @@ do_damage() {
   grep -q "S4-SCROLL:" "$log" \
     && ok "probe-scroll.exe was launched on the guest, where the compositor's window is" \
     || bad "no scroll was injected; this leg measures an idle browser"
+
+  # **Launched is not injected**, and on this guest that distinction is the
+  # difference between a result and a fiction. §57: a *locked* Windows session
+  # puts the input desktop on `Winlogon`, and a process on `Default` cannot
+  # reach it -- `SendInput` returns 0, sets `ERROR_ACCESS_DENIED`, and the probe
+  # runs to completion having moved nothing. Every number downstream would then
+  # be a real measurement of an unscrolled browser, which is §27.6's shape
+  # exactly: an experiment that did not contain the thing it was about.
+  #
+  # The probe now counts refusals and exits 3 when everything was refused. This
+  # reads its accounting rather than trusting its exit, because the exit code
+  # travels through `ssh` and a backgrounded job and this line does not.
+  local scrolled
+  scrolled=$(sed -n '/S4-SCROLLLOG-BEGIN/,/S4-SCROLLLOG-END/p' "$log" \
+             | grep -o '[0-9]* of [0-9]* notches towards the user accepted' | tail -1)
+  if [ -z "$scrolled" ]; then
+    bad "dmg: the scroll probe never reported an accepted count; the wheel cannot be assumed to have moved"
+    sed -n '/S4-SCROLLLOG-BEGIN/,/S4-SCROLLLOG-END/p' "$log" | sed 's/^/        /' | head -8
+  elif grep -q "REFUSED by SendInput" "$log"; then
+    bad "dmg: SendInput refused notches -- $scrolled. If the guest session is LOCKED this is expected and the run is void: unlock it and re-run."
+    sed -n '/S4-SCROLLLOG-BEGIN/,/S4-SCROLLLOG-END/p' "$log" | grep -E "REFUSED|LOCKED|scrolled nothing" | sed 's/^/        /'
+    return
+  else
+    ok "dmg: the guest accepted the wheel -- $scrolled"
+  fi
 
   # The substrate and the topology, from the run's own evidence. `wc_locate_arena`
   # has set WC_SUBSTRATE_LOCATED by now if a locate ran, and `wc_assert_topology`

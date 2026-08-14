@@ -20292,3 +20292,107 @@ by breaking the code it watches — not by feeding it a synthetic log.
    are already counted (`pools_created`/`pools_released`); surfaces, subsurfaces
    and seat objects are not. The category is now open rather than closed, and
    the shape of the next one is the same: ask somebody outside the process.
+
+## 57. The injection that returns zero, and the run that would have believed it
+
+### 57.1 Status in one paragraph
+
+Block 12 — the cross-VM damage leg, §51.6 — is still unrun, and the blocker is
+that the guest's Windows session is **locked**. That would not have mattered if
+the leg simply failed. It does not: a locked session puts the input desktop on
+`Winlogon`, a process on `Default` cannot inject into it, and `SendInput`
+**returns 0** and sets `ERROR_ACCESS_DENIED` without blocking, throwing or
+logging. `probe-scroll.c` discarded that return value. It would have printed
+`60 notches towards the user`, the harness would have matched its completion
+line, and the run would have gone on to measure a browser **nobody scrolled** —
+producing real numbers about the wrong thing, which is §27.6's shape exactly.
+The probe now counts refusals, says which, and exits 3 when everything was
+refused; block 12 asserts on the count rather than on the probe's survival.
+
+### 57.2 Why this was worth doing while the guest was busy
+
+The leg cannot run: another agent's growth run holds the guest, and the session
+is locked besides. But the two facts are not the same kind of obstacle. "The
+guest is busy" is a queue. "`SendInput` returns 0 and nothing notices" is a
+**defect in the experiment**, and it was sitting in the leg waiting for the
+queue to clear.
+
+If the session had been unlocked between writing block 12 and running it,
+nothing would have been learned. If it had not, the run would have produced a
+full set of plausible damage numbers from an idle browser and — because the
+damage path is *correct* — reported zero stale rows and passed. A green run
+that scrolled nothing is worse than a red one, because it is evidence that will
+be cited.
+
+### 57.3 What changed, and the one thing that deliberately did not
+
+```c
+	if (SendInput(1, &in, sizeof in) != 1)
+		refused++;
+```
+
+and, at the end:
+
+```
+probe-scroll: 40 of 40 notches towards the user accepted, 150 ms apart
+```
+
+Counted rather than aborted on, because the distribution is the diagnosis:
+`0 of 60` is a locked session and `58 of 60` is contention with whatever else is
+on that desktop. Aborting on the first refusal would have collapsed those into
+one symptom.
+
+**The completion line still contains the exact phrase `notches towards the
+user`**, and that is deliberate rather than lucky. Two harnesses grep for it to
+tell a finished scroll from a probe that died — `wc-damage.sh` in two places,
+`wc-guest.sh` in one. A harness that only looks for the phrase keeps working;
+one that reads the numbers in front of it can now tell a scroll from a refusal.
+Changing the wording would have been a silent regression in three greps, which
+is the kind of thing §50.10's citation checker exists for and which no checker
+covers for harness greps.
+
+The pointer move is checked too but only warns: a refused `move_to` with
+accepted notches is a wheel going somewhere unintended, which is worth a line
+and is not the same failure.
+
+### 57.4 The log had to be fetched, which it was not
+
+Block 12 wrote the probe's log to `C:\Users\<guest-user>\wctest\scroll.log` on the
+guest and never brought it back, so the only evidence the wheel had moved was
+that the probe had not crashed. `wc-stage4` now emits it between
+`S4-SCROLLLOG-BEGIN`/`END` markers like every other log it returns, and
+`do_damage` asserts on the accepted count found there.
+
+It reads the accounting rather than the exit status on purpose: the exit code
+travels through `ssh`, a backgrounded job and a `wait` that the harness
+deliberately does not perform (§51.6 — a probe that failed to find the window
+must not hang the run), and a number in a log survives all three.
+
+### 57.5 The gates
+
+| Gate | Result |
+|---|---|
+| `x86_64-w64-mingw32-gcc -mwindows probe-scroll.c` | clean |
+| `bash -n` on both changed harnesses | clean |
+| `scripts/wc-damage.sh arena` | **11 passed, 0 failed** — `40 of 40 notches towards the user accepted`, 1030 commits checked, 0 stale |
+| the three existing greps for `notches towards the user` | still match the new wording |
+| **`scripts/wc-guest.sh damage` against the guest** | **STILL NOT RUN** — the guest is held and its session is locked |
+
+### 57.6 What is not proven
+
+1. **The refusal path has never been exercised.** The fix is reasoned from
+   Windows' documented behaviour and from the coordinator's measurement that
+   `SendInput` returns 0 while `SetCursorPos` is obeyed on that session; this
+   branch has only ever seen `40 of 40` accepted, because the box it can reach
+   is not locked. The first locked-session run is the test of it, and if it
+   reports anything other than `0 of N` with a `REFUSED` line, this section is
+   wrong about the mechanism rather than about the need for the check.
+2. **`SetCursorPos` being obeyed is not used.** It would be a way to confirm a
+   locked session positively rather than inferring it from a refusal count. Not
+   done, because a probe that reports what it *could* do is a smaller change
+   than one that diagnoses the session, and the diagnosis belongs to whoever
+   owns the guest.
+3. **Block 12 remains a hypothesis with a script attached** (§51.6), and the
+   user's second symptom — no tearing, no stalled scrolling, no blank frames in
+   `about:support` — remains unverified. What has changed is only that the leg
+   can no longer pass without having scrolled.
