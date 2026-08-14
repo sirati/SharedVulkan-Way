@@ -799,6 +799,21 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
         Scalar::F32 | Scalar::F64 => quote!(#access),
         Scalar::Size => quote!((#access) as u64),
         Scalar::Bool32 => quote!((#access) != 0),
+        // A capture-replay member is **refused by name if it is not null**,
+        // rather than carried. design.md §0.24: we do not advertise
+        // `…CaptureReplay` in any feature struct, so the specification requires
+        // the application to leave these null, and a non-null one is a usage
+        // error rather than data we lost. Refusing it loudly is the difference
+        // between "we do not support capture-replay" and "we silently ignored
+        // your replay token and gave you a different address".
+        Scalar::OpaqueU64(crate::exceptions::VoidPolicy::CaptureReplayUnsupported) => {
+            quote!({
+                if !(#access).is_null() {
+                    return Err(crate::LowerError::CaptureReplayUnsupported);
+                }
+                0u64
+            })
+        }
         Scalar::OpaqueU64(_) => quote!((#access) as usize as u64),
         Scalar::Enum(n) | Scalar::Bitmask(n) | Scalar::Bitmask64(n) => {
             let t = naming::type_ident(n);
@@ -2447,8 +2462,92 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
             quote!((#e, #c))
         })
         .collect();
-    let incomplete: Vec<&str> = incomplete.iter().map(|(e, _)| *e).collect();
+    // The two classes share one output list: an extension is withheld whether
 
+    // Commands whose app-side lowering would hand the application's own pointer
+    // to the GPU side as an arena offset (design.md §0.24 item 6).
+    //
+    // The third class of over-promise, and the one neither `NOT_IMPLEMENTED` nor
+    // the queue check can see: the entry point exists, marshals and dispatches,
+    // and the *value it marshals is wrong*. `INCOMPLETE_EXTENSIONS` asks "did
+    // the generator emit a working stub"; here it did, and the stub writes a
+    // wild pointer onto the wire.
+    let mut lowering_incomplete: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut core_wild: Vec<String> = Vec::new();
+    for c in &cx.wire.commands {
+        let needs_expansion = cx.model.commands.get(&c.name).is_some_and(|cmd| {
+            cmd.params.iter().any(|p| {
+                p.ty.base().is_void()
+                    && crate::exceptions::void_policy(&c.name, &p.name)
+                        == Some(crate::exceptions::VoidPolicy::ArenaOffset)
+            })
+        });
+        if !needs_expansion
+            || crate::exceptions::ICD_EXPANDS_ARENA_POINTER.contains(&c.name.as_str())
+        {
+            continue;
+        }
+        let requires_it = |f: &vk_registry::FeatureSet| {
+            f.requires.iter().flat_map(|b| b.items.iter()).any(|it| {
+                matches!(it, vk_registry::InterfaceRef::Command(x)
+                    if *x == c.name || cx.model.canonical_command(x) == c.name)
+            })
+        };
+
+        // **Core first, and this ordering is the whole correctness of the
+        // check.** A command can be required by an extension *and* by a core
+        // version — `vkCmdPushDescriptorSetWithTemplate` is required by
+        // `VK_KHR_push_descriptor` and by Vulkan 1.4 — and finding the extension
+        // first makes the answer "withdraw the extension", which does nothing:
+        // the core command is still carried and a 1.4 application still calls
+        // it. The first run of this check did exactly that, and the wild pointer
+        // it was written to stop survived it.
+        //
+        // There is nothing to withdraw for a core command, so it is a build
+        // failure. That is the point of the check: it converts a mechanical
+        // widening from a segfault into something that will not compile.
+        if cx.model.features.iter().any(|f| f.supported_for_vulkan && requires_it(f)) {
+            core_wild.push(c.name.clone());
+            continue;
+        }
+        match cx.model.extensions.iter().filter(|e| e.supported_for_vulkan).find(|e| requires_it(e))
+        {
+            Some(e) => {
+                lowering_incomplete.insert((e.name.as_str(), c.name.as_str()));
+            }
+            None => core_wild.push(c.name.clone()),
+        }
+    }
+    let core_wild = if core_wild.is_empty() {
+        quote!()
+    } else {
+        let msg = format!(
+            "these commands lower a `void*` as an arena offset but nothing app-side \
+             expands it, so the application's own pointer would cross as an offset — \
+             and they are core, so there is no extension to stop advertising. Either \
+             implement the expansion and add them to \
+             `sv_codegen::exceptions::ICD_EXPANDS_ARENA_POINTER`, or exclude them in \
+             the profile: {}",
+            core_wild.join(", ")
+        );
+        quote!(compile_error!(#msg);)
+    };
+    let lowering_incomplete_pairs: Vec<TokenStream> = lowering_incomplete
+        .iter()
+        .map(|(e, c)| quote!((#e, #c)))
+        .collect();
+    let lowering_incomplete_exts: BTreeSet<&str> =
+        lowering_incomplete.iter().map(|(e, _)| *e).collect();
+
+    // its entry point is missing or its lowering is wrong, because from an
+    // application's side those are the same broken promise.
+    let incomplete: Vec<&str> = incomplete
+        .iter()
+        .map(|(e, _)| *e)
+        .chain(lowering_incomplete_exts.iter().copied())
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect();
     // What queue an extension's commands have to be recorded on, from `queues=`.
     //
     // # The defect this exists for, and why the other table could not catch it
@@ -2663,6 +2762,18 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         ///
         /// Sorted by extension name, so `binary_search_by_key` is the lookup.
         pub static EXTENSION_QUEUE_REQUIREMENTS: &[(&str, &[u32])] = &[#(#queue_reqs,)*];
+
+        #core_wild
+
+        /// Extensions withheld because a command's app-side *lowering* is
+        /// incomplete — the entry point exists and marshals, and the value it
+        /// marshals would be the application's own pointer sent as an arena
+        /// offset (design.md §0.24 item 6).
+        ///
+        /// Folded into [`INCOMPLETE_EXTENSIONS`]; kept separately with the
+        /// offending command so a reader can tell this class from a stubbed
+        /// entry point, which needs a different fix.
+        pub static LOWERING_INCOMPLETE: &[(&str, &str)] = &[#(#lowering_incomplete_pairs,)*];
 
         /// Whether an extension's `depends=` is satisfied by `__have`.
         ///

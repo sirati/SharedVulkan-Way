@@ -1114,17 +1114,106 @@ fn emit_forward_command(
         quote!(Ok(()))
     };
 
+    // Recording is starting again, so whatever broke last time is forgiven.
+    let clears = crate::exceptions::CLEARS_COMMAND_BUFFER_POISON.contains(&cname);
+    let unpoison =
+        if clears { quote!(__h.unpoison_command_buffer(a.command_buffer.0);) } else { quote!() };
+
+    // Refuse a call that names a command buffer whose recording failed.
+    //
+    // # Where the set of command buffers comes from, and why not from here
+    //
+    // The first version of this walked the wire signature for `VkCommandBuffer`
+    // fields. It covered `vkCmdExecuteCommands` and `vkFreeCommandBuffers` and
+    // **missed `vkQueueSubmit`**, which is the only one that matters:
+    // `vkQueueSubmit` takes `VkSubmitInfo[]` and the buffers are a member of
+    // *that*, one level down, and `vkQueueSubmit2` puts them two levels down
+    // inside `VkCommandBufferSubmitInfo`. A shallow walk finds the commands that
+    // do not need checking and not the one that does.
+    //
+    // The right traversal already exists and runs immediately above: the
+    // **handle-mapping pass** visits every handle anywhere in the argument
+    // graph, nested or not, and calls `map_handle` with its `HandleType`. So the
+    // host notes command buffers as it maps them and this asks what it saw. No
+    // second walker, no depth limit, and a command added to the registry
+    // tomorrow with buffers three structs deep is covered by construction.
+    //
+    // # Which commands ask
+    //
+    // Not recorded ones: a `vkCmd*` recording into an already-poisoned buffer is
+    // harmless, the buffer is invalid either way, and refusing here would report
+    // the failure against whichever command happened to come next rather than
+    // against the submit.
+    //
+    // Not the ones that clear the mark — `vkBeginCommandBuffer` maps its target
+    // before `unpoison` runs, so it would refuse the very call that makes the
+    // buffer usable again.
+    //
+    // Not the ones that *destroy*, derived from the fact that they unbind
+    // handles: `vkFreeCommandBuffers` on an invalid buffer must free it, and a
+    // destructor that can be refused is a leak. This is why the check is keyed
+    // on `unbind.is_empty()` rather than on a list of names.
+    //
+    // What is left is `vkQueueSubmit`, `vkQueueSubmit2` and
+    // `vkEndCommandBuffer` — and `vkEndCommandBuffer` refusing is not a side
+    // effect but the specification: a command buffer whose recording failed
+    // returns an error from `vkEndCommandBuffer`.
+    let asks_about_poison = !wire.is_recorded && !clears && unbind.is_empty();
+    let poison_check = if asks_about_poison {
+        quote! {
+            if let Some(__why) = __h.take_poisoned_command_buffer() {
+                // Failing *this* call is the whole point: it is detectable, it
+                // names the command that broke recording, and it does not touch
+                // the ring.
+                __h.note_poisoned_submit(#cname, __why);
+                return #missing_answer;
+            }
+        }
+    } else {
+        // Still has to be drained, or a poisoned buffer seen by a recorded
+        // command would be reported against the next unrelated call that asks.
+        quote!(let _ = __h.take_poisoned_command_buffer();)
+    };
+
+    // A recorded command whose entry point the driver lacks poisons its target.
+    //
+    // `Ok(())` here was the silent-no-op §0.22 item 5 named and did not close:
+    // nothing is recorded, there is no reply to carry the fact, and a caller
+    // checking a return value cannot notice. Returning `Err` instead would take
+    // the ring fatal, which is far too blunt for a driver that merely lacks an
+    // optional extension — so neither answer was right, because the failure does
+    // not belong to *this* call. It belongs to the command buffer, and Vulkan
+    // already has a word for that: a command buffer whose recording failed is
+    // invalid, and submitting it must fail.
+    //
+    // The handle mapping above has already run, so `a.command_buffer.0` is the
+    // driver's handle rather than the wire id — which is also what
+    // `vkQueueSubmit` will be holding when it checks.
+    let missing_arm = if wire.is_recorded {
+        quote! {
+            __h.note_missing(#cname);
+            __h.poison_command_buffer(a.command_buffer.0, #cname);
+            return #missing_answer;
+        }
+    } else {
+        quote! {
+            __h.note_missing(#cname);
+            return #missing_answer;
+        }
+    };
+
     let mut_a = if has_pre { quote!(mut) } else { quote!() };
     Ok(quote! {
         let #mut_a a = a;
         let __h = &mut self.0;
         #unbind_block
         #pre
+        #unpoison
+        #poison_check
         let __maybe = __h.fns().#field;
         let __f = match __maybe {
             Some(__f) => __f,
             None => {
-                __h.note_missing(#cname);
                 // **Fail the call, not the session.** The profile is a superset
                 // of any one driver's extensions, so a missing entry point is a
                 // normal configuration and not a protocol error — and returning
@@ -1134,7 +1223,11 @@ fn emit_forward_command(
                 // (design.md §7.2's note on the trait), and the same argument
                 // applies one layer down: `vkSetDebugUtilsObjectNameEXT` on a
                 // driver without the extension must not lose the device.
-                return #missing_answer;
+                //
+                // For a *recorded* command there is a third answer, and it is
+                // the right one: poison the command buffer, so the submit that
+                // would have executed it fails instead. See `missing_arm`.
+                #missing_arm
             }
         };
         let mut __pool = crate::Raise::default();
@@ -1287,6 +1380,40 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// Record that the driver has no such entry point, for one clear
             /// diagnosis rather than a silent refusal.
             fn note_missing(&mut self, command: &'static str);
+            /// Mark a command buffer as having failed to record, naming the
+            /// command that could not be recorded.
+            ///
+            /// Vulkan already has the concept: a command buffer whose recording
+            /// failed is *invalid*, and submitting an invalid command buffer
+            /// must not succeed. That is the answer to the question §0.22 item 5
+            /// left open — a recorded `vkCmd*` whose driver entry point is
+            /// missing has no reply to fail and must not fail the ring, because
+            /// the failure is not this call's. It is the command buffer's.
+            ///
+            /// Called with the **driver's** handle, because the generated
+            /// dispatch maps handles before it looks the entry point up, and
+            /// because that is what `vkQueueSubmit` will be holding when it
+            /// checks.
+            fn poison_command_buffer(&mut self, command_buffer: u64, why: &'static str);
+            /// Clear a command buffer's poison: it is being recorded afresh.
+            ///
+            /// Without this a buffer reused after a failed recording stays
+            /// invalid forever, which turns one missing extension into a device
+            /// that never submits again.
+            fn unpoison_command_buffer(&mut self, command_buffer: u64);
+            /// Take the reason, if the handle-mapping pass just mapped a command
+            /// buffer whose recording had failed.
+            ///
+            /// The mapping pass is the traversal: it visits every handle
+            /// anywhere in the argument graph, so this needs no walker of its
+            /// own and cannot miss a `VkCommandBuffer` nested inside a
+            /// `VkSubmitInfo`. Taking rather than peeking, because the flag is
+            /// per-dispatch and a stale one would be reported against the next
+            /// command.
+            fn take_poisoned_command_buffer(&mut self) -> Option<&'static str>;
+            /// Report that a call was refused because it names a command buffer
+            /// whose recording failed.
+            fn note_poisoned_submit(&mut self, command: &'static str, why: &'static str);
             /// Hold the device's queue lock for the duration of one driver call
             /// the specification marks externally synchronised on a `VkQueue`.
             ///

@@ -113,11 +113,27 @@ pub struct GpuServer {
     /// The last table failure, so the ring can put a real diagnosis in
     /// `fatal_msg` instead of "unknown command 12".
     pub last_error: Option<String>,
+    /// Command buffers whose recording failed, and what broke each.
+    ///
+    /// Keyed on the **driver's** handle rather than the wire object id, because
+    /// the generated dispatch maps handles before it looks an entry point up,
+    /// so that is what both the poisoning site and `vkQueueSubmit` are holding.
+    ///
+    /// A map and not a set, so the refusal can name the command that broke
+    /// recording rather than only the fact that something did. Empty in every
+    /// run where the driver has every entry point the profile carries, which is
+    /// the common case — this costs one `is_empty` on the submit path.
+    poisoned: std::collections::HashMap<u64, &'static str>,
+    /// Set by the handle-mapping pass when the command currently being
+    /// dispatched named a poisoned command buffer; taken by the generated
+    /// dispatch just after. Per-dispatch, which is why it is taken rather than
+    /// read — a stale one would be reported against the next command.
+    dispatch_poison: Option<&'static str>,
 }
 
 impl GpuServer {
     pub fn new(shared: std::sync::Arc<Shared>) -> GpuServer {
-        GpuServer { shared, last_error: None }
+        GpuServer { shared, last_error: None, poisoned: Default::default(), dispatch_poison: None }
     }
 
     fn d(&self) -> &ash::Device {
@@ -196,7 +212,23 @@ impl GpuHost for GpuServer {
         // claim about the type — the type was already checked, by `ty`.
         let found = self.shared.objects().get::<vk::Buffer>(ty, id);
         match found {
-            Ok(h) => Ok(h.as_raw()),
+            Ok(h) => {
+                // **This pass is the command-buffer traversal** (design.md
+                // §0.24). It already visits every handle anywhere in the
+                // argument graph — nested inside `VkSubmitInfo`, inside
+                // `VkCommandBufferSubmitInfo`, at any depth — so noting the
+                // poisoned ones here means the check needs no walker of its own
+                // and cannot miss the one command that matters. A walker written
+                // against the wire signature did miss it: `vkQueueSubmit`'s
+                // buffers are a member of `VkSubmitInfo`, not a parameter.
+                if ty == HandleType::VkCommandBuffer
+                    && !self.poisoned.is_empty()
+                    && self.dispatch_poison.is_none()
+                {
+                    self.dispatch_poison = self.poisoned.get(&h.as_raw()).copied();
+                }
+                Ok(h.as_raw())
+            }
             Err(e) => Err(self.note(e)),
         }
     }
@@ -272,11 +304,53 @@ impl GpuHost for GpuServer {
         if first {
             eprintln!(
                 "sv-gpu-server: the driver has no {command}; the profile is wider \
-                 than this driver. Calls to it do nothing and cannot report it."
+                 than this driver."
             );
         }
         self.last_error =
             Some(format!("the driver has no {command}; the profile is wider than this driver"));
+    }
+
+    /// §0.24: a recorded command that could not be recorded invalidates its
+    /// command buffer, and the submit is where that becomes visible.
+    ///
+    /// This is the answer §0.22 item 5 left open. `Ok(())` was silent and `Err`
+    /// took the ring fatal, and neither was right because the failure is not the
+    /// `vkCmd*`'s to report — Vulkan says a command buffer whose recording
+    /// failed is invalid, and this is that state, kept where the only thing that
+    /// can act on it lives.
+    fn poison_command_buffer(&mut self, command_buffer: u64, why: &'static str) {
+        self.poisoned.insert(command_buffer, why);
+    }
+
+    fn unpoison_command_buffer(&mut self, command_buffer: u64) {
+        self.poisoned.remove(&command_buffer);
+    }
+
+    fn take_poisoned_command_buffer(&mut self) -> Option<&'static str> {
+        self.dispatch_poison.take()
+    }
+
+    fn note_poisoned_submit(&mut self, command: &'static str, why: &'static str) {
+        let msg = format!(
+            "{command} names a command buffer whose recording failed: the driver \
+             has no {why}"
+        );
+        // Always, and once per pair. A refused submit is the *good* outcome here
+        // — it is the failure being reported instead of swallowed — but a
+        // caller sees only an error code, and the code cannot say which command
+        // could not be recorded three hundred calls ago.
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SAID: Mutex<Option<HashSet<(&'static str, &'static str)>>> = Mutex::new(None);
+        let first = {
+            let mut g = SAID.lock().unwrap_or_else(|p| p.into_inner());
+            g.get_or_insert_with(HashSet::new).insert((command, why))
+        };
+        if first {
+            eprintln!("sv-gpu-server: {msg}");
+        }
+        self.last_error = Some(msg);
     }
 
     fn lock_queue(&self) -> sv_gpu_entry::QueueGuard<'_> {
