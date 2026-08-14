@@ -57,6 +57,14 @@ note() { echo "  ----  $*"; }
 . "$(dirname "$0")/wc-binaries.sh"
 . "$(dirname "$0")/wc-substrate.sh"
 
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "both ends of the drag are processes on this box" || exit 1
+
 RUNDIR=$(mktemp -d /tmp/wc-drag-XXXXXX)
 XPID=""; SRV=""; PROXY=""; CLIENT=""; CLIENT2=""; PROBEPID=""
 cleanup() {

@@ -66,6 +66,14 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "the whole clipboard chain runs under Wine on this box" || exit 1
+
 # check_counters <what> <line> <expected-fds> <expected-clipboard>
 #
 # The descriptor counts and the transfer count from one `wc-proxy` session

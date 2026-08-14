@@ -143,6 +143,7 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # STAGE 41. Sourced after `ok`/`bad`/`note`/`g`/`h` exist, because the library
 # uses all five.
 . "$(dirname "$0")/wc-substrate.sh"
+. "$(dirname "$0")/wc-topology.sh"
 # STAGE 42. `fresh` and `deployed_is`: is the binary newer than the tree, and is
 # the copy on the guest the one this tree built.
 . "$(dirname "$0")/wc-binaries.sh"
@@ -543,6 +544,10 @@ do_apps() {
   # `guest-ram` arm unsets `SV_ALLOW_FILE_ARENA`, so if anything below still
   # reaches for a file the binaries refuse it by name rather than serving it.
   wc_substrate_declare guest-ram || return
+  # §51. And that a hypervisor is in the path, which is what makes the arena
+  # above locatable at all -- `wc_assert_topology` proves the one from the other.
+  wc_topology_declare cross-vm \
+    "the compositor runs on the guest; this harness drives it from the VM host over an arena in the guest's own RAM" || return
 
   # And the export loses the three things this block used to put on it: the
   # arena, the keymap directory and the pool directory. Removed rather than left

@@ -19396,3 +19396,142 @@ box, which is the whole of §27.6's lesson.
 | `scripts/wc-guest.sh damage` on a box with no `WC_HOST` | declines with its reason |
 | `wc_topology_declare` / `wc_latency_claim`, all three states | undeclared refuses, `same-box` refuses, `cross-vm` without `WC_HOST` is refused at declaration |
 | **`scripts/wc-guest.sh damage` against a real guest** | **NOT RUN — testhost is down** |
+
+## 52. Declaring every harness, and the §27.6 that was not there
+
+*(§51's continuation. No stage number, for §27's reason.)*
+
+### 52.1 Status in one paragraph
+
+§51 built the gate; the tree had ~20 harnesses in the undeclared state, where a
+gate that refuses cannot refuse anything. All 57 scripts were surveyed, 40 of
+them are harnesses, and **21 now declare** — twelve `same-box`, seven
+`cross-vm`, and two that declare per-leg because they have legs of both kinds.
+The expectation going in was to find more than one §27.6. **There were none.**
+Only four scripts in the whole tree make a latency or throughput claim at all,
+and every one of them is either in the right venue or already marked
+informational by whoever wrote it. That is the finding, and it is a better one
+than a list of bugs would have been.
+
+### 52.2 The survey
+
+| | count |
+|---|---|
+| scripts | 57 |
+| harnesses (report a verdict) | 40 |
+| helpers and sourced libraries | 17 |
+| `cross-vm` | 13 |
+| `same-box` | 30 |
+| **both**, per leg | 2 — `wc-desktop.sh`, `wc-titlebar.sh` |
+| make a latency or throughput claim | **4** |
+
+**The topology is a property of the leg, not of the file**, which the two
+`both` entries are the proof of. `wc-titlebar.sh`'s `local` leg is headless
+Linux with two weston clients; its `server`, `client`, `tabs`, `noglass` and
+`nobuttons` legs drive a compositor on the guest. `wc-desktop.sh`'s `psgate` leg
+runs `pwsh` over PowerShell this repository generates and starts no client at
+all, while its `window` and `fps` legs are cross-VM. Declaring either file once
+at the top would have been convenient and wrong, so both declare inside the leg.
+
+### 52.3 The four claims, and why none of them is §27.6
+
+* **`wc-guest.sh` §8 — microseconds per pool open, export against NTFS, and
+  arena-slice against shared-file.** This is the one that is *genuinely* a
+  cross-VM latency claim: the export is virtio-fs, so "the same open costs
+  1046 us over the export and 24 on NTFS" is a statement about crossing the
+  boundary. It is sound because there is a hypervisor in that path — and the
+  identical sentence written in a Wine harness would be §27.6 again. The
+  declaration went in this block specifically, and its comment says so.
+* **`wc-desktop.sh` §4 — a 5 ms high-resolution timer wait against `Sleep(5)`.**
+  A cross-VM harness making a claim that is *not* about the boundary: both waits
+  happen inside the guest, and what is being compared is the guest's own
+  scheduler against itself. Correctly ungated, and now declared so a reader can
+  tell those two apart at a glance.
+* **`sv-bench.sh` — forwarded `glxgears` must beat `llvmpipe`.** A throughput
+  comparison on a same-box harness, and sound, because what it concludes is
+  **which device answered** rather than how long anything took to cross
+  anything. Mesa falls back to software silently and reports GL 4.6 while doing
+  it, so "a number came out" does not mean a GPU produced it; an order of
+  magnitude separates the two and no load crosses it. Its header already said
+  all of this. The declaration makes the distinction machine-checkable rather
+  than only argued.
+* **`wc-launch.sh` — the guest's reported click-to-window milliseconds.** Not a
+  performance bound at all: the assertion is that the guest's figure does not
+  exceed the wall time the harness itself waited, which is a **clock-sanity**
+  check. §35 had already rewritten it from an unconditional `ok` and marked the
+  millisecond figure "informational: it is a rate on a contended guest".
+
+### 52.4 The tree was already careful, and that is worth saying
+
+The instruction that prompted this sweep expected more than one §27.6. Finding
+none is a result, and reporting it as one matters more than finding something
+would have: a sweep that comes back empty and says so is evidence about the
+tree; a sweep that comes back with something marginal reclassified as a bug is
+evidence about the sweeper.
+
+What the survey actually found is a consistent, already-established habit of
+refusing to assert on rates — `wc-proxy.sh`'s "us/copy above is informational:
+it is a rate on a loaded machine, and the assertions are on bytes", `sv-cts.sh`
+printing its wall-time ratio with `echo` rather than `ok`, `sv-firefox-codec.sh`
+printing CPU seconds and dropped frames and asserting neither, `wc-launch.sh`'s
+two hedges. §27.6 was not the tree's habit. It was one section getting it wrong
+in a place where the habit did not reach, because the mistake was not "asserted
+on a rate" — it was "asserted on a rate *from a machine that did not contain the
+thing being measured*", and no amount of care about rates catches that.
+
+Which is the argument for the gate rather than against it. The habit is a
+convention, and a convention protects against the error people have already
+learned to look for.
+
+### 52.5 What the declarations cost, and one thing they caught
+
+Twelve `same-box` declarations were mechanical. The three that were not are
+worth recording:
+
+1. **`wc-clip.sh` has no `wc-binaries.sh` to anchor to**, so the insertion went
+   between `bad()` and `note()` and sourced `wc-topology.sh` before `note` was
+   defined. Harmless — the library's own fallback answered and the harness's
+   definition then won — but it is the sort of ordering that is harmless until
+   it is not, and it was moved.
+2. **`wc-desktop.sh`'s guard is an `if` block, not a `||` guard.** The
+   declaration landed *inside* the `WC_HOST`-unset branch, where it would have
+   tried to declare `cross-vm` on a machine with no host and failed a run that
+   should have skipped. Caught by reading the diff rather than by a test, which
+   is worth admitting: nothing in the gate would have caught it, because a
+   `cross-vm` declaration that correctly refuses looks identical to one that
+   should never have been attempted.
+3. **`HOST="${WC_HOST:-<host-user>@testhost}"`.** `wc-launch.sh` defaults its host,
+   so `WC_HOST` can be empty in the environment while the harness has a real
+   host. A `cross-vm` declaration that checks only `WC_HOST` would refuse it
+   wrongly. This is **not fixed** and is §52.7 item 1: the honest resolution is
+   for the declaration's guard to be advisory and `wc_assert_topology` — which
+   requires a proven guest-RAM locate and cannot be asserted into existence — to
+   remain the real check.
+
+### 52.6 The gates
+
+| Gate | Result |
+|---|---|
+| `bash -n` on all 57 scripts | clean |
+| every declaring harness invoked | 21 scripts declare; each prints its topology and its reason |
+| `scripts/wc-proxy.sh cost` | **13 passed, 0 failed** |
+| `scripts/wc-xkb.sh` | **5 passed, 0 failed** |
+| `scripts/wc-damage.sh` | unchanged from §51 |
+| `cargo test --workspace --no-fail-fast` | unchanged — this section adds no Rust |
+
+### 52.7 What is not proven
+
+1. **The `cross-vm` guard is stricter than the tree's conventions.** It requires
+   `WC_HOST` in the environment, and several harnesses default `HOST` from it.
+   No harness is broken by this today — the ones that default are declared where
+   `$HOST` is already known non-empty — but the next one will trip it. §52.5
+   item 3.
+2. **The sixteen "harness-lite" scripts are mostly undeclared.** The `sv-*`
+   family counts `fail=` and prints `PASS`/`FAIL` without the `ok`/`bad`
+   convention; only `sv-bench.sh` declares, because it is the only one making a
+   throughput claim. The rest are safe rather than informative, which is exactly
+   the state §51 built the gate to end, and finishing them is a follow-up.
+3. **Undeclared is still the default for anything new.** The gate refuses an
+   undeclared leg, so a new harness is safe; but nothing makes a new harness
+   declare, and there is no check that every harness has. A `wc-xref.sh`-style
+   gate over `scripts/` would close that and is not written here.

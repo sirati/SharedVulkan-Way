@@ -183,6 +183,7 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # the copy on the guest the one this tree built. Sourced after `ok`/`bad`/`note`
 # and `g`/`h`, which it uses.
 . "$(dirname "$0")/wc-binaries.sh"
+. "$(dirname "$0")/wc-topology.sh"
 
 # ------------------------------------------------------------ the arena ------
 # STAGE 13. Everything the guest-RAM transport needs, in one place, because
@@ -673,6 +674,13 @@ do_window() {
   fi
   [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || {
     miss "WC_HOST_WESTON and WC_HOST_FIREFOX both unset: no client to run"; return; }
+
+  # §51. A hypervisor is in this path. Block 4's timer comparison is a claim
+  # about the *guest's own* scheduler rather than about the boundary, so it is
+  # not gated -- the declaration is what lets a reader tell those two apart,
+  # and what would permit a real cross-VM claim here.
+  wc_topology_declare cross-vm \
+    "the compositor is on the guest, the client on the VM host, over guest RAM" || return
 
   local sock="wg-s8-$$"
   # Stale compositors go **first**, before the frame directory is emptied. An
@@ -1437,6 +1445,11 @@ chmod +x $HOST_DIR/s8fps.sh" >/dev/null 2>&1
 # comment in `reaptasks.ps1` warns about and is why that comment is there.
 do_psgate() {
   echo "== the generated PowerShell, checked on this machine =="
+  # §51. No guest at all: this leg parses the PowerShell the script generates.
+  # `wc-desktop.sh`'s other legs declare cross-vm -- the topology is a property
+  # of the leg, not of the file.
+  wc_topology_declare same-box \
+    "pwsh parses the generated PowerShell here; nothing is deployed and no client runs" || return
   if ! command -v pwsh >/dev/null; then
     miss "pwsh is not on PATH (\`nix-shell -p powershell\`); the generated PowerShell is unchecked"
     return
