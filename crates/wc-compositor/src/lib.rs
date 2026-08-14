@@ -945,6 +945,35 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             }
         }
 
+        // STAGE 53. Take the growth channel out of the front of the window
+        // **now**, before anything else is given out of it.
+        //
+        // This is bookkeeping and not a write: it edits the free list and
+        // nothing else, so it is safe here, before the host's locate, where
+        // `Control::create` would not be. The write happens at the first client,
+        // in `grow::Service::start`.
+        //
+        // It has to be here because the next thing that touches this window is
+        // smithay sealing the seat's keymap, and after that the reservation is
+        // refused — the channel is the front of the window and the free list has
+        // no way to express a hole. Every guest session before this one hit
+        // exactly that and logged `no growth channel … will refuse under
+        // pressure instead`, which is why §34.6's "wired end to end" had never
+        // grown a single region on a guest.
+        //
+        // Failure is reported and not fatal: a session that cannot grow still
+        // serves, it merely refuses when it runs out.
+        match wc_handle::arena::reserve_growth_channel(id) {
+            Ok((off, len)) => println!(
+                "wc-compositor: arena {id} growth channel reserved at {off}+{len}, \
+                 before any object is given out of the outbound window"
+            ),
+            Err(e) => eprintln!(
+                "wc-compositor: arena {id} has no growth channel ({e}); this session \
+                 cannot be asked for more memory and will refuse under pressure instead"
+            ),
+        }
+
         // STAGE 12, and it is a correction rather than a feature. The window's
         // pages carry the stamps the *host* locates this arena by, and a gift
         // written into them before the host has swept takes them with it — the
@@ -1273,33 +1302,45 @@ fn wayland_thread(
                 {
                     Ok(_) => {
                         state.clients_seen += 1;
-                        // STAGE 12. The first client is the earliest moment at
-                        // which anything could want an object this compositor
-                        // made, and — over guest RAM — the earliest moment at
-                        // which it is safe to write one: the client arrived
-                        // through a proxy that was started from a plan, and the
-                        // plan only exists if the host's sweep of the region
-                        // succeeded. See `wc_handle::arena::defer_gifts`.
-                        match wc_handle::arena::release_gifts() {
-                            Ok((0, _)) => {}
-                            Ok((n, bytes)) => println!(
-                                "wc-compositor: client {} released {n} held object(s), \
-                                 {bytes} bytes, into the arena",
-                                state.clients_seen
-                            ),
-                            Err(e) => {
-                                eprintln!("wc-compositor: could not release held objects: {e}")
-                            }
-                        }
-                        // GROWTH, and it is created *here* for exactly the
-                        // reason the gifts are released here. `Control::create`
-                        // zeroes the control region and on guest RAM those
-                        // bytes are stamp pages; doing it before the host's
-                        // locate would delete the stamps out from under it. A
-                        // client having arrived is the proof the locate
-                        // finished — it came through a proxy started from a
-                        // plan, and the plan exists only if the locate
-                        // succeeded. See `crate::grow::Service::start`.
+                        // GROWTH, and it is created here for exactly the reason
+                        // the gifts are released here. `Control::create` zeroes
+                        // the control region and on guest RAM those bytes are
+                        // stamp pages; doing it before the host's locate would
+                        // delete the stamps out from under it. A client having
+                        // arrived is the proof the locate finished — it came
+                        // through a proxy started from a plan, and the plan
+                        // exists only if the locate succeeded. See
+                        // `crate::grow::Service::start`.
+                        //
+                        // STAGE 53. **Before `release_gifts`, and that ordering
+                        // is the whole of why growth had never once worked on a
+                        // guest.** Both calls are gated on the same fact — a
+                        // client has arrived, so the locate is done — so §34.5
+                        // reasoned about the hazard they share and not about the
+                        // one they do not: they both want *the front of the
+                        // outbound window*.
+                        //
+                        // `reserve_growth_channel` may only run while the window
+                        // is untouched, because the channel is the front of it
+                        // and the free list has no way to express a hole. With
+                        // `release_gifts` first, smithay's deferred 73,017-byte
+                        // keymap lands there and the reservation is refused —
+                        // the compositor logged `no growth channel … will refuse
+                        // under pressure instead` once per client, the proxy
+                        // attached at the front of the window anyway and read
+                        // the keymap's own header as a control magic:
+                        //
+                        //   growth channel: magic is 0x6d79656b5f626b78, which
+                        //   is not ours (a byte-swapped magic means a big-endian
+                        //   peer)
+                        //
+                        // which is `xkb_keym` in ASCII, and a diagnosis pointing
+                        // at the wrong hemisphere entirely. Measured on the
+                        // guest at a 12 MiB floor: 0 growths, 97 refusals, and
+                        // §28.12's held-back pool back verbatim.
+                        //
+                        // Reserving first costs the gifts 272 KiB of a 1 MiB
+                        // window, which is what §34.4 already budgeted for.
                         if grow.is_none() {
                             match crate::grow::Service::start() {
                                 Ok(Some(s)) => {
@@ -1322,6 +1363,26 @@ fn wayland_thread(
                                      cannot be asked for more memory and will refuse under \
                                      pressure instead"
                                 ),
+                            }
+                        }
+                        // STAGE 12. The first client is the earliest moment at
+                        // which anything could want an object this compositor
+                        // made, and — over guest RAM — the earliest moment at
+                        // which it is safe to write one: the client arrived
+                        // through a proxy that was started from a plan, and the
+                        // plan only exists if the host's sweep of the region
+                        // succeeded. See `wc_handle::arena::defer_gifts`.
+                        //
+                        // Second, not first: see the growth block above.
+                        match wc_handle::arena::release_gifts() {
+                            Ok((0, _)) => {}
+                            Ok((n, bytes)) => println!(
+                                "wc-compositor: client {} released {n} held object(s), \
+                                 {bytes} bytes, into the arena",
+                                state.clients_seen
+                            ),
+                            Err(e) => {
+                                eprintln!("wc-compositor: could not release held objects: {e}")
                             }
                         }
                     }

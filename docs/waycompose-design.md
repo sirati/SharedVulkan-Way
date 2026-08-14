@@ -20745,3 +20745,231 @@ build, for these capabilities.
 4. **The 22 expected failures are argued, not proved.** §45.4 says input outside
    the window-geometry rectangle cannot be delivered because the HWND is that
    rectangle; that is a claim about Win32 being checked here by a Linux run.
+---
+
+## 61. Growth ran on a guest, and the first thing it produced was the reason it never had
+
+§34 built arena growth over guest RAM, ended with "**Nothing here has run on a
+guest**", and predicted that the first run would produce the cost of a growth
+against the table in `docs/waycompose-design.md` §34.2. This is that run. It
+produced the cost — and before it, two defects that had made growth impossible
+on every guest session this project has ever started, neither of which any test
+in the tree could have found.
+
+Venue: `sv-guest.exe` on the Windows guest, `wc-proxy` and `wc-arena-host` on
+testhost where QEMU runs, Firefox on testhost as the client. Driven through
+`scripts/wc-launch.sh`, which is the product's own path — `wc-launch.exe` starts
+the compositor, opens its own tunnel and asks the VM host for the application,
+and the clock is inside the launcher. The workstation only builds, clicks and
+reads numbers back.
+
+### 61.1 The declaration this harness never made
+
+`scripts/wc-launch.sh` had neither `wc_substrate_declare` nor
+`wc_topology_declare`, four stages after `docs/waycompose-design.md` §51 made
+them structural. The reason is worth recording because it is a hole in the
+structure rather than an oversight in the script: every *other* guest harness
+gets its declaration for free, because it calls `wc_locate_arena` to find the
+arena and that function lives in `wc-substrate.sh`. This one locates nothing —
+`wc-session` runs `wc-arena-host` on the far side of an ssh channel — so there
+was no function it had to call, and therefore nothing that made the omission
+visible. **A gate you reach for by accident is not a gate.**
+
+It declares both now, and `wcl_assert_located` proves them from the one line the
+launcher already prints, which carries the page count *and* which locator
+produced them. Sample output, from the run below:
+
+```
+  ----  topology: CROSS-VM -- a hypervisor is in the path. sv-guest.exe on
+        <guest-user>@<guest-ip>, wc-proxy on <host-user>@<host-ip>, arena in the guest's own RAM
+  PASS  the arena is guest RAM: 3072 pages located by frames on <host-user>@<host-ip>
+  PASS  launch: TOPOLOGY cross-vm: proven by 3072 pages of guest RAM located by frames
+```
+
+### 61.2 The first defect: the keymap had already taken the channel's address
+
+`docs/waycompose-design.md` §34.5 reasoned carefully about *when*
+`Control::create` may run — it zeroes the control region, and on guest RAM those
+bytes are the stamps the host locates by, so it must wait until the first client
+proves the locate finished. That reasoning is correct and it is why
+`grow::Service::start()` was called at `release_gifts`.
+
+It is also only half the constraint, and the other half points the opposite way.
+`reserve_growth_channel` may only run **while the outbound window is untouched**,
+because the channel is the front of that window and the free list has no way to
+express a hole. Smithay seals the seat's keymap in `Seat::add_keyboard`, which
+`docs/waycompose-design.md` §14.12's own correction already records as happening
+"a full minute before any client exists" — and although
+`docs/waycompose-design.md` §12.10's `defer_gifts` postpones the keymap's
+*write*, it does not postpone its *allocation*: `w.given` is charged when the
+slice is taken. So by the time a client arrived, the front of the window was
+spoken for and the reservation was refused, every time.
+
+What that looked like from the two ends, on the guest at a 12 MiB floor:
+
+```
+wc-compositor: seat0 keyboard: layout de (73017 bytes of keymap)
+wc-compositor: no growth channel (the growth channel must be reserved before anything is
+  given out of the outbound window: it is the front of that window, and the free list has
+  no way to express a hole); this session cannot be asked for more memory and will refuse
+  under pressure instead
+```
+
+```
+[proxy] client 28: pool 25: could not publish 960000 bytes: arena 0 cannot serve 962560
+  bytes and cannot grow: growth channel: magic is 0x6d79656b5f626b78, which is not ours
+  (a byte-swapped magic means a big-endian peer)
+```
+
+`0x6d79656b5f626b78` is `xkb_keym` in ASCII. The proxy attached at the front of
+the outbound window — which is where both sides derive the channel's address
+from, correctly — and read the keymap's own header as a control-region magic.
+**The diagnosis it printed named a big-endian peer**, which is as far from an
+offset collision as a message can get, and it is the shape of failure worth
+remembering: two components agreeing about an address, one of which had lost a
+race for it years of design-time reasoning never considered.
+
+The measurement that session produced is `docs/waycompose-design.md` §28.12's,
+verbatim and on the deployment for the first time: **0 growths, 97 refusals**, and
+`the pool is held back and every request naming it is absorbed, so this surface
+stops updating until there is room`.
+
+The fix is the same split `defer_gifts`/`release_gifts` already is: **reserve
+early, create late.** `reserve_growth_channel` is bookkeeping and touches no
+bytes, so it runs where the outbound window is set up, before the keymap;
+`Control::create`, which writes, still runs at the first client. `Window::channel`
+carries the range between the two moments.
+
+### 61.3 Growth, measured
+
+With the channel actually up:
+
+```
+wc-compositor: arena 0 growth channel reserved at 11534336+278528, before any object is
+  given out of the outbound window
+wc-compositor: growth channel up; the host may ask for another region when its pools do not fit
+```
+
+and, under a real Firefox on a 12 MiB floor:
+
+| | |
+|---|---|
+| `[proxy] region 1` | **16777216 bytes of guest RAM — 746 ms in the guest, 46 ms locating (frame list)** |
+| host-side translation | `located 4096 of 4096 pages in 8.70ms by frame list (swept 0 MiB; 388 frame run(s) became 388 file run(s))` |
+| plan | `region 1 (388 run(s), object /proc/1773734/fd/35) [appended]` — region 0's record byte-for-byte intact |
+| refusals | **0**, across all 14 client reports |
+| arena | `peak resident 28.0 MiB in 2 region(s); floor 12.0 MiB (the startup region, never returned); grew 1` |
+
+Against `docs/waycompose-design.md` §34.2's table: the locate is **46 ms**, of
+which 8.70 ms is the translation, against the 2832–3101 ms a content sweep costs
+and the 0.064 s that section predicted for the query. The prediction was
+pessimistic by a comfortable margin. The guest's 746 ms is the `VirtualAlloc`
+plus a `VirtualLock` of every page plus the stamp plus `SuperfetchPfnQuery`, and
+it is the dominant term — growth is a guest-side cost, not a locate cost, which
+inverts the assumption that made stage 16 reject growth outright.
+
+**The PFN locator executed on a guest, on the growth path, and it is the arm
+that ran.** `docs/waycompose-design.md` §34.6's "the PFN locator has still never
+executed on a guest" is closed. No `frames=none` was seen on any leg of any run
+in this session; the startup locates took the same arm (`3072 of 3072 pages in
+6.45ms`, and at the 64 MiB baseline `16384 of 16384 pages in 7.90ms`).
+
+Click-to-window, same clicks through the same scheduler path, cold:
+
+| floor | click-to-window |
+|---|---|
+| 64 MiB, no growth needed | 4720 ms |
+| 12 MiB, one growth | 3991 ms, 4930 ms |
+
+The 12 MiB run is not slower, and there is no held-back pool in it. That is what
+`Floor::GrowsUnderPressure` asks for and it is now shown — with the caveat in
+§61.5 about which comparison is honest.
+
+### 61.4 The second defect: the reply does not fit the ring it was sized for
+
+Later growths in the same session failed:
+
+```
+wc-compositor: growth channel: growth ring: a 65600-byte packet cannot fit a 65536-byte ring;
+  the payload belongs in the arena
+```
+
+`docs/waycompose-design.md` §34.5 sized `ring_data_bytes` at 64 KiB because "the
+reply carries the new region's frame list, and a test holds the *worst* case —
+one run per page of a 16 MiB region — to fitting in one packet". A 16 MiB region
+is 4096 pages; at 16 bytes a frame that is 65536 bytes, which is the ring
+exactly — and the packet is the payload **plus `sv-wire`'s `ReplyHeader`**. The
+test held the payload and the ring holds the packet, so the worst case overflows
+by the header and by nothing else. Measured fragmentation made this rare rather
+than constant: the growth that succeeded needed 388 runs, well inside the ring;
+the ones that failed had hit the fully-fragmented case.
+
+Not fixed here. The section's own words already name the answer — "the payload
+belongs in the arena" — and choosing between a larger ring and an out-of-band
+payload is a protocol decision, not a number to nudge.
+
+### 61.5 Release still has not fired, and now there are two reasons
+
+**This is the measurement the user asked for and it is the one this run does not
+have.** `sv-guest.exe`'s working set, from the guest's own process view, across
+the run at a 12 MiB floor with one growth:
+
+| | `sv-guest.exe` working set |
+|---|---|
+| before — no process at all | **0** (16 samples with no `sv-guest.exe`) |
+| at peak, clients up | **112,427,008 B (107.2 MiB)** |
+| after every Firefox exited | **90,206,208 B (86.0 MiB)** |
+
+It fell by 21 MiB and **it did not give back the 16 MiB region**: the proxy's own
+accounting says `now 28.0 MiB in 2 region(s) … grew 1, released 0 region(s) /
+0.0 MiB` after the last client was gone. Two independent causes were observed,
+and either alone is sufficient:
+
+1. **The reclaim clock only turns while a client is drawing.** `Arena::frame()`
+   is what advances the tick and is the only caller of `reclaim_regions`, and its
+   one call site is `Session::commit` — a client's surface commit. With every
+   client exited there are no commits, so a region that has just become idle can
+   never accumulate the `--arena-grow-idle 120` frames that would return it. The
+   policy is written in frames and the situation it most needs to handle is the
+   one that has no frames in it.
+
+2. **The region never became empty.** After every Firefox was killed the arena
+   still reported `21880832 of 29360128 bytes out`, so `slot.is_empty()` was
+   false regardless of the clock. Whatever holds those pools outlives the
+   connection that made them, and that is a second bug behind the first.
+
+So the honest statement is: **release is wired, its opcode is right, its
+asymmetry argument is right, and it has still never run.** The user's
+observation — "sv-guest.exe is hogging 890 MB even though no wayland or vulkan
+clients are up" — is not explained by the startup floor alone. The floor is the
+part that was designed never to come back; this is the part that was designed to
+come back and does not.
+
+What the run *does* settle about the user's complaint is the 890 MB itself: the
+working set tracks the arena almost exactly. At a 64 MiB floor `sv-guest.exe`
+peaked at 116,162,560 B; at 12 MiB it peaked at 112,427,008 B with a 16 MiB
+region bought on top. The arena is the dominant term, so a 768 MiB floor is a
+768 MiB process, which is what reached a user.
+
+### 61.6 What is proven and what is not
+
+| | |
+|---|---|
+| growth over guest RAM, end to end, on a guest | **shown** — `region 1`, 16 MiB, 746 ms guest / 46 ms locate |
+| `0 refusals` at a floor below the peak | **shown** — 14 client reports, all `0 refusals` |
+| the plan appends without disturbing region 0 | **shown** — `[appended]`, region 0's record unchanged |
+| the PFN locator on a guest, on the growth path | **shown** — `by frame list`, 388 runs, 8.70 ms |
+| `frames=none` degradation | **not seen** — the frame-list arm ran on every leg, so the sweep arm is still unexercised on this deployment |
+| release returning guest RAM | **NOT SHOWN — and it is not merely unrun.** Two causes observed, §61.5 |
+| a second growth in one session | **NOT SHOWN** — refused by the ring size, §61.4 |
+| `Floor::CURRENT` moved to `GrowsUnderPressure` | **no.** Growth is shown; release is not, and a floor that grows without giving back is the user's complaint with extra steps |
+
+`Floor::CURRENT` stays `MustStandAlone` and
+`growth_has_not_been_demonstrated_on_a_guest_yet` stays asserted. The arm's own
+text asks for growth "showing the arena growing rather than refusing", which this
+run gives it — but the module header's argument is about memory that is *"gone
+from Windows entirely, for anything, for as long as the session lasts"*, and
+until §61.5's two causes are fixed a lower floor buys regions it cannot return.
+The next run to flip that line is the one that puts a number in the "after"
+row of §61.5's table that is smaller than the "peak" row by the size of the
+regions it grew.
