@@ -430,12 +430,49 @@ pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
 /// what works. The three commands stay on the wire and in the proc tables — they
 /// are core 1.4 and cannot be made to disappear — and a conforming application
 /// that respects the feature bit never calls them.
+/// # Why the capture-replay bits, and what was asserting itself before
+///
+/// `sv_codegen::exceptions::VoidPolicy::CaptureReplayUnsupported` encodes
+/// `pShaderGroupCaptureReplayHandle` and `opaqueCaptureDescriptorData` as null
+/// on the wire and refuses a non-null one by name. That is honest **only
+/// because the specification requires those members to be null unless the
+/// device advertises the matching feature** — and the policy's own comment said
+/// so: "This driver advertises neither, and `sv_icd::advertise` is where that is
+/// kept."
+///
+/// It was not kept anywhere. These features arrive in
+/// `VkPhysicalDeviceRayTracingPipelineFeaturesKHR` and
+/// `VkPhysicalDeviceDescriptorBufferFeaturesEXT`, which are forwarded whole from
+/// the physical device, so on a driver that supports capture-replay — RADV and
+/// NVIDIA both do — we advertised it, an application could legally enable it,
+/// and the first replay token it passed would meet a refusal. Exactly the shape
+/// of docs/design.md §0.16 item 3, where §9.2's claim about `bufferDeviceAddress`
+/// rested on a test about a different structure and `vulkaninfo` printed the
+/// opposite all along.
+///
+/// So the claim is made here, where it is true by construction, and
+/// `sv_codegen`'s tests enumerate the class the claim is about
+/// (`the_capture_replay_class_is_what_the_naming_rule_matches`). docs/design.md
+/// §0.25.
+///
+/// **`bufferDeviceAddressCaptureReplay` is deliberately not withdrawn.** Its
+/// token is a `uint64_t` — `VkBufferOpaqueCaptureAddressCreateInfo::opaqueCaptureAddress`
+/// — not a `void*`, `vkGetBufferOpaqueCaptureAddress` is forwarded and returns
+/// the GPU side's real value (§0.20), and a `u64` crosses. The line between the
+/// two is the encoding, not the words "capture replay".
 pub fn withdraw_gated_features(chain: &mut [sv_proto::PNextLink]) {
     use sv_proto::PNextLink as L;
     for link in chain.iter_mut() {
         match link {
             L::VkPhysicalDeviceVulkan14Features(f) => f.host_image_copy = false,
             L::VkPhysicalDeviceHostImageCopyFeatures(f) => f.host_image_copy = false,
+            L::VkPhysicalDeviceRayTracingPipelineFeaturesKHR(f) => {
+                f.ray_tracing_pipeline_shader_group_handle_capture_replay = false;
+                f.ray_tracing_pipeline_shader_group_handle_capture_replay_mixed = false;
+            }
+            L::VkPhysicalDeviceDescriptorBufferFeaturesEXT(f) => {
+                f.descriptor_buffer_capture_replay = false;
+            }
             _ => {}
         }
     }
@@ -532,16 +569,6 @@ mod tests {
         assert_eq!(f.shader_int64, 0);
     }
 
-    /// A feature the driver has and we do not keep is withdrawn on *every* path
-    /// an application can ask through.
-    ///
-    /// The bug this guards is not "we forgot to clear it" — it is "we cleared it
-    /// in one of the three places". `hostImageCopy` is core 1.4's feature, the
-    /// promoted extension's feature and the `…EXT` alias's feature, and an
-    /// application that chains `VkPhysicalDeviceVulkan14Features` sees a
-    /// different answer from one that chains
-    /// `VkPhysicalDeviceHostImageCopyFeatures` unless both are handled.
-    #[test]
     /// We do not claim an extension whose commands need a queue family we do
     /// not open — stated as the invariant, not as a list of names.
     ///
@@ -597,6 +624,20 @@ mod tests {
         );
     }
 
+    /// A feature the driver has and we do not keep is withdrawn on *every* path
+    /// an application can ask through.
+    ///
+    /// The bug this guards is not "we forgot to clear it" — it is "we cleared it
+    /// in one of the three places". `hostImageCopy` is core 1.4's feature, the
+    /// promoted extension's feature and the `…EXT` alias's feature, and an
+    /// application that chains `VkPhysicalDeviceVulkan14Features` sees a
+    /// different answer from one that chains
+    /// `VkPhysicalDeviceHostImageCopyFeatures` unless both are handled.
+    ///
+    /// (This comment was two tests above its function, behind a stray `#[test]`
+    /// that made `rustc` warn about a duplicated attribute; moved rather than
+    /// left, because a doc comment on the wrong test is a claim about the wrong
+    /// assertion.)
     #[test]
     fn a_gated_feature_is_withdrawn_wherever_it_is_asked_for() {
         let mut chain = vec![
@@ -625,6 +666,67 @@ mod tests {
                 }
                 sv_proto::PNextLink::VkPhysicalDeviceHostImageCopyFeatures(f) => {
                     assert!(!f.host_image_copy, "the promoted extension's bit is still set");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// The feature that makes a `CaptureReplayUnsupported` `void*` legal to be
+    /// non-null is never advertised, on any of the paths it arrives by.
+    ///
+    /// This is the half of docs/design.md §0.24's argument that was written down
+    /// and not built. The policy is honest exactly while these bits are false,
+    /// so the bits are what the test is about — an application that respects
+    /// them never reaches the refusal, and one that does not gets a named error
+    /// instead of a wrong address (§0.25).
+    #[test]
+    fn no_capture_replay_feature_whose_token_is_a_void_pointer_is_advertised() {
+        let mut chain = vec![
+            sv_proto::PNextLink::VkPhysicalDeviceRayTracingPipelineFeaturesKHR(Box::new(
+                sv_proto::VkPhysicalDeviceRayTracingPipelineFeaturesKHR {
+                    ray_tracing_pipeline: true,
+                    ray_tracing_pipeline_shader_group_handle_capture_replay: true,
+                    ray_tracing_pipeline_shader_group_handle_capture_replay_mixed: true,
+                    ..Default::default()
+                },
+            )),
+            sv_proto::PNextLink::VkPhysicalDeviceDescriptorBufferFeaturesEXT(Box::new(
+                sv_proto::VkPhysicalDeviceDescriptorBufferFeaturesEXT {
+                    descriptor_buffer: true,
+                    descriptor_buffer_capture_replay: true,
+                    ..Default::default()
+                },
+            )),
+            // The one that stays: its token is a `uint64_t` and it works.
+            sv_proto::PNextLink::VkPhysicalDeviceBufferDeviceAddressFeatures(Box::new(
+                sv_proto::VkPhysicalDeviceBufferDeviceAddressFeatures {
+                    buffer_device_address: true,
+                    buffer_device_address_capture_replay: true,
+                    ..Default::default()
+                },
+            )),
+        ];
+        withdraw_gated_features(&mut chain);
+        for link in &chain {
+            match link {
+                sv_proto::PNextLink::VkPhysicalDeviceRayTracingPipelineFeaturesKHR(f) => {
+                    assert!(!f.ray_tracing_pipeline_shader_group_handle_capture_replay);
+                    assert!(!f.ray_tracing_pipeline_shader_group_handle_capture_replay_mixed);
+                    assert!(
+                        f.ray_tracing_pipeline,
+                        "ray tracing itself is carried; only replay is withdrawn"
+                    );
+                }
+                sv_proto::PNextLink::VkPhysicalDeviceDescriptorBufferFeaturesEXT(f) => {
+                    assert!(!f.descriptor_buffer_capture_replay);
+                    assert!(f.descriptor_buffer, "the extension's own feature survives");
+                }
+                sv_proto::PNextLink::VkPhysicalDeviceBufferDeviceAddressFeatures(f) => {
+                    assert!(
+                        f.buffer_device_address_capture_replay,
+                        "a u64 capture-replay token crosses and must not be withdrawn"
+                    );
                 }
                 _ => unreachable!(),
             }
