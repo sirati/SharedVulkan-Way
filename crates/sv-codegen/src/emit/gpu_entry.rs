@@ -958,6 +958,38 @@ fn emit_forward_command(
         call
     };
 
+    // # The command-pool lock, and why it is **not** taken per recorded command
+    //
+    // `VkCommandBuffer` and `VkCommandPool` are externally synchronised, and the
+    // pairing between the thread that recorded and the thread that executes is
+    // broken by construction here (docs/design.md §6.5, and
+    // `Command::externally_synchronizes_a_command_pool` for the argument).
+    //
+    // But a recording is a *sequence*, not a set of independent calls: two blobs
+    // for two command buffers of one pool must not interleave, and a lock taken
+    // and released around each `vkCmd*` permits exactly that interleaving while
+    // looking like synchronisation. So everything inside a blob — every
+    // `is_recorded` command and the two `BLOB_FRAMING` commands that bracket it
+    // — is deliberately **not** locked here; `sv_gpu_server::session` holds the
+    // lock across the whole replay instead, which is the granularity the
+    // obligation actually has.
+    //
+    // Taking it in both places would deadlock on the first `vkCmd*`, because the
+    // guard is a plain `Mutex` and Rust's is not reentrant. That is a good
+    // property rather than an inconvenience: it makes the double-lock a hang in
+    // the first test rather than a subtle scope error.
+    let in_blob =
+        wire.is_recorded || crate::exceptions::BLOB_FRAMING.contains(&c.name.as_str());
+    let call = if c.externsync_pool && !in_blob {
+        quote! {
+            let __pg = __h.lock_command_pool();
+            #call
+            drop(__pg);
+        }
+    } else {
+        call
+    };
+
     // -- 5. bind created objects, and lower the outputs back ----------------
     let mut post = Vec::new();
     let mut reply_fields = Vec::new();
@@ -1473,6 +1505,15 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// the obligation cannot be discharged by any one client behaving
             /// (docs/design.md §0.12 item 4).
             fn lock_queue(&self) -> crate::QueueGuard<'_>;
+            /// Hold the device's command-pool lock, for the commands
+            /// `vk_registry::model::Command::externally_synchronizes_a_command_pool`
+            /// selects and which are *not* replayed inside a blob.
+            ///
+            /// Everything inside a blob is covered once, by
+            /// `sv_gpu_server::session`, because a recording is a sequence and
+            /// per-command locking would let two recordings interleave while
+            /// looking synchronised (docs/design.md §0.23).
+            fn lock_command_pool(&self) -> crate::QueueGuard<'_>;
 
             #(#methods)*
         }
@@ -1553,6 +1594,39 @@ fn emit_server_impl(
 /// alternative is a hand-kept list beside `vk_registry::profiles::zink()` that
 /// silently stops matching it.
 fn emit_profile_extensions(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
+    fn lower_depends(e: &vk_registry::depends::Expr) -> TokenStream {
+        match e {
+            vk_registry::depends::Expr::Name(n) => quote!(__have(#n)),
+            vk_registry::depends::Expr::Any(v) => {
+                let parts = v.iter().map(lower_depends);
+                quote!((false #(|| #parts)*))
+            }
+            vk_registry::depends::Expr::All(v) => {
+                let parts = v.iter().map(lower_depends);
+                quote!((true #(&& #parts)*))
+            }
+        }
+    }
+    // An expression the parser cannot read reads as *unsatisfied*, which is the
+    // conservative direction and the rule `vk_registry::depends::satisfied`
+    // states.
+    let depends_arms: Vec<TokenStream> = cx
+        .model
+        .extensions
+        .iter()
+        .filter(|e| e.supported_for_vulkan)
+        .filter_map(|e| {
+            let expr = e.depends.as_deref()?;
+            let name = e.name.as_str();
+            match vk_registry::depends::compile(expr) {
+                Some(ast) => {
+                    let body = lower_depends(&ast);
+                    Some(quote!(#name => #body,))
+                }
+                None => Some(quote!(#name => false,)),
+            }
+        })
+        .collect();
     let names: Vec<&str> = wanted
         .iter()
         .filter(|n| {
@@ -1575,6 +1649,29 @@ fn emit_profile_extensions(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
         /// Neither may advertise anything else, because an advertised extension
         /// is a promise that its entry points cross (docs/design.md §9.2).
         pub const PROFILE_DEVICE_EXTENSIONS: [&str; #n] = [#(#names),*];
+
+        /// Whether an extension's `depends=` is satisfied by `__have`.
+        ///
+        /// The same compiled registry expression `sv_icd_entry` carries, emitted
+        /// here as well because the GPU side has the same obligation and a
+        /// *different* set to check it against: its own instance's extensions
+        /// and its own driver's device extensions.
+        ///
+        /// It was missing, and the validation layer said so:
+        /// `VUID-vkCreateDevice-ppEnabledExtensionNames-01387` —
+        /// `VK_EXT_display_control` enabled without `VK_EXT_display_surface_counter`,
+        /// `VK_EXT_present_timing` without `VK_KHR_get_surface_capabilities2`,
+        /// `VK_EXT_swapchain_maintenance1` without `VK_EXT_surface_maintenance1`.
+        /// **Every one of those dependencies is an *instance* extension**, which
+        /// is why enabling "every profile extension the driver has" looked
+        /// complete and was not: the device list can never satisfy them
+        /// (docs/design.md §0.23).
+        pub fn depends_satisfied(extension: &str, __have: &dyn Fn(&str) -> bool) -> bool {
+            match extension {
+                #(#depends_arms)*
+                _ => true,
+            }
+        }
     }
 }
 

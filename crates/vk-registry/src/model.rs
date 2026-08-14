@@ -445,6 +445,36 @@ impl Command {
         let implicit = self.implicit_externsync.iter().any(|p| p.contains("VkQueue"));
         explicit || implicit
     }
+
+    /// Whether the specification requires the caller to externally synchronise a
+    /// `VkCommandPool` or a `VkCommandBuffer` for this command.
+    ///
+    /// The same two spellings as [`Self::externally_synchronizes_a_queue`], and
+    /// the same argument for why the application's own synchronisation cannot
+    /// discharge the obligation on our behalf — one step further out.
+    ///
+    /// Vulkan lets an application record two command buffers at once provided it
+    /// synchronises each buffer and its pool. **A well-behaved application does
+    /// that on its own threads, and then this design replays its recordings on
+    /// *ours*** (docs/design.md §6.5: a `vkCmd*` is appended to a blob and the
+    /// blob is decoded by whichever ring thread receives it). The pairing
+    /// between "the thread that recorded" and "the thread that executes" is
+    /// broken by construction, so the obligation lands here.
+    ///
+    /// Measured before it was derived: `gl-probe` under Zink crashed roughly one
+    /// run in two inside `radv_amdgpu_cs_finalize`, reached from
+    /// `vkEndCommandBuffer` in a blob replay — and **not at all under the
+    /// validation layer**, whose own locking hid it. docs/design.md §0.23.
+    pub fn externally_synchronizes_a_command_pool(&self) -> bool {
+        let is_pool = |n: Option<&str>| matches!(n, Some("VkCommandPool" | "VkCommandBuffer"));
+        let explicit =
+            self.params.iter().any(|p| p.externsync.is_some() && is_pool(p.ty.base_name()));
+        let implicit = self
+            .implicit_externsync
+            .iter()
+            .any(|p| p.contains("VkCommandPool") || p.contains("VkCommandBuffer"));
+        explicit || implicit
+    }
 }
 
 // ---------------------------------------------------------------------------

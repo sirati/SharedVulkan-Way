@@ -265,12 +265,37 @@ fn protocol_command(
             blob.resize(d.len as usize, 0);
             arena.read_bytes(d.arena_offset, blob).map_err(err)?;
             let mut dec = sv_wire::Decoder::new(blob);
+            // **The command-pool lock, held across the whole replay** — not per
+            // command (docs/design.md §0.23).
+            //
+            // `VkCommandBuffer` and `VkCommandPool` are externally synchronised.
+            // An application records on its own threads and synchronises them
+            // correctly; this design then replays those recordings on *ring*
+            // threads, so the pairing the application established is gone and
+            // two blobs for two command buffers of one pool can be decoded at
+            // once. Zink does exactly that, and RADV crashed inside
+            // `radv_amdgpu_cs_finalize` from `vkEndCommandBuffer` on roughly one
+            // `gl-probe` run in two — and never under the validation layer,
+            // whose own locking hid it.
+            //
+            // A recording is a *sequence*, so the lock is taken once here rather
+            // than by each `vkCmd*`: per-command locking permits precisely the
+            // interleaving that corrupts the stream while looking like
+            // synchronisation. The generated dispatch therefore skips it for
+            // everything inside a blob, and a `Mutex` being non-reentrant is
+            // what would turn a mistake there into an immediate hang rather than
+            // a rare corruption.
+            // The `Arc` is cloned out first so the guard does not borrow `srv`,
+            // which `subdecode` needs mutably for the whole replay.
+            let __pool = Arc::clone(&srv.host().shared.pool_lock);
+            let __pool_guard = __pool.lock().unwrap_or_else(|e| e.into_inner());
             let n = sv_proto::subdecode(&mut dec, srv).map_err(|e| {
                 match srv.host().last_error.take() {
                     Some(detail) => format!("in a command blob: {e} ({detail})"),
                     None => format!("in a command blob: {e}"),
                 }
             })?;
+            drop(__pool_guard);
             Ok(n as u64)
         }
         Some(sv_proto::sv::SV_IMPORT_ARENA_SLAB) => {

@@ -195,6 +195,9 @@ pub struct AbiCommand {
     /// item 4). Nothing on the C ABI reads it: the app side's caller *is* the
     /// application, which Vulkan already obliges to synchronise itself.
     pub externsync_queue: bool,
+    /// The command externally synchronises a `VkCommandPool` or a
+    /// `VkCommandBuffer` (docs/design.md §0.23).
+    pub externsync_pool: bool,
 }
 
 impl AbiCommand {
@@ -335,6 +338,7 @@ pub fn build(model: &Model, profile: &Profile, forwarded: &BTreeSet<String>) -> 
             returns_result,
             returns_void,
             externsync_queue: cmd.externally_synchronizes_a_queue(),
+            externsync_pool: cmd.externally_synchronizes_a_command_pool(),
         });
     }
 
