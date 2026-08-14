@@ -735,3 +735,58 @@ pub fn working_set_bytes() -> Option<u64> {
         Some(c.WorkingSetSize as u64)
     }
 }
+
+// ---------------------------------------------------------------- pipes ---
+//
+// §81. The Unix side of this module implements `Descriptor::Pipe` with a FIFO.
+// This side does not, and the reason is a **property of the platform rather
+// than a gap in the port**, so it is stated here rather than left as an absent
+// function.
+//
+// A named pipe is what the Windows analogue would be, and the machinery is
+// already in this repository — `crates/sv-transport/src/winpipe.rs` has
+// `CreateNamedPipeW`/`CreateFileW` and a working `Pipe` type. Lifting it would
+// be an afternoon. It is not lifted because **nothing can reach it**:
+//
+// * `Descriptor::Pipe` is needed only to carry an `h` between two peers that
+//   speak *different* dialects, so that a name can stand in for a descriptor
+//   one side cannot receive (`docs/waycompose-design.md` §81.3).
+// * On Windows there is no ancillary channel, so no peer can speak the
+//   out-of-band dialect at all. `wayland_backend::os::FdEncoding::default()` is
+//   `InBand` there and `set_client_fd_encoding` refuses `OutOfBand` outright
+//   (§79.4, §81.2).
+// * Two in-band peers need no conversion: the descriptor is already a name and
+//   `WireFd::borrow()` forwards it unchanged.
+//
+// So a cross-dialect transfer is not a case that can occur on this platform,
+// and an implementation of it would be code with no caller and no test. If
+// Windows ever grows a second dialect, this comment is the pointer to the file
+// to lift.
+
+/// See the module note above: unreachable on this platform by construction.
+pub fn create_pipe(_path: &str) -> std::io::Result<OwnedPipe> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "every peer speaks the in-band dialect on Windows, so no named pipe is \
+         needed to convert between dialects; see platform/windows.rs",
+    ))
+}
+
+/// See [`create_pipe`].
+pub fn open_pipe(_path: &str, _for_write: bool) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "every peer speaks the in-band dialect on Windows; see platform/windows.rs",
+    ))
+}
+
+/// Uninhabited on this platform: [`create_pipe`] never returns one.
+#[derive(Debug)]
+pub enum OwnedPipe {}
+
+impl OwnedPipe {
+    /// Unreachable; exists so the two platforms present one API.
+    pub fn as_file(&self) -> &std::fs::File {
+        match *self {}
+    }
+}

@@ -3020,6 +3020,20 @@ fn materialise(
             }
             Ok(owned)
         }
+        // §81. A named stream becomes a real descriptor by being opened, which
+        // is the whole of the Named -> Open direction and needs no relay: the
+        // client is handed one end of the same FIFO the compositor created, and
+        // the bytes flow between them without this process touching one.
+        //
+        // The **other** direction still does not work, and it is not this arm's
+        // shape. Turning a client's anonymous pipe into a name means creating a
+        // FIFO and copying between the two, because nothing can give an existing
+        // pipe a name after the fact. That is a byte relay and a policy decision
+        // about who runs it; §81.5 says where it belongs.
+        Descriptor::Pipe { .. } => {
+            let file = wc_handle::Handle::from_descriptor(d.clone()).open_pipe()?;
+            Ok(OwnedFd::from(file))
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{other:?} cannot become a file descriptor on this side"),

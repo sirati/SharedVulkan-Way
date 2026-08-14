@@ -382,3 +382,86 @@ pub fn working_set_bytes() -> Option<u64> {
     let rss_pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
     Some(rss_pages * 4096)
 }
+
+// ---------------------------------------------------------------- pipes ---
+//
+// STAGE §81. The third pair in this module's contract, after "named section"
+// and "object at a path": a **byte stream a peer opens by name**.
+//
+// `Descriptor::Pipe` has existed since stage 1 and nothing constructed or
+// opened one, on either platform. It is what a clipboard or drag transfer needs
+// when the two ends speak different `h` dialects: an out-of-band client hands
+// the compositor a real pipe, an in-band source has to be handed a *name*, and
+// nothing could make the name.
+//
+// The Unix analogue is a FIFO. It is a filesystem object, so it has a name, and
+// it is a stream, so it has the semantics `wl_data_offer.receive` expects.
+
+/// A FIFO this process created, held open so that its name stays live.
+///
+/// Dropping it unlinks the path as well as closing the descriptor, exactly as
+/// [`OwnedObject`] does and for the same reason.
+#[derive(Debug)]
+pub struct OwnedPipe {
+    /// Held `O_RDWR`. See [`create_pipe`].
+    keepalive: File,
+    path: PathBuf,
+}
+
+impl OwnedPipe {
+    /// The end this process kept.
+    pub fn as_file(&self) -> &File {
+        &self.keepalive
+    }
+}
+
+impl Drop for OwnedPipe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Create a FIFO at `path` and hold it open.
+///
+/// # Why the keepalive is `O_RDWR`, which is the one subtle thing here
+///
+/// A FIFO with no writer gives its readers EOF, and a FIFO with no reader gives
+/// its writers `SIGPIPE`. Worse, an `open()` for reading **blocks until a writer
+/// arrives** and vice versa — which in a compositor's event loop is not a
+/// slow path, it is a deadlock.
+///
+/// Opening the creator's own end `O_RDWR` fixes all three at once: the FIFO
+/// always has at least one reader and one writer, so the peer's `open()` returns
+/// immediately, no end sees a spurious EOF, and nobody is killed by `SIGPIPE`
+/// because the other end went first. It costs one descriptor and it is the
+/// standard answer; it is written down here because a reader who has not hit
+/// this before will read `O_RDWR` on a unidirectional object as a mistake.
+pub fn create_pipe(path: &str) -> io::Result<OwnedPipe> {
+    let c_path = std::ffi::CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a pipe path"))?;
+    // Best-effort: a stale node from a crashed run must not make this fail.
+    let _ = std::fs::remove_file(path);
+    // SAFETY: a NUL-terminated path this function owns for the call.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let keepalive = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+    };
+    Ok(OwnedPipe { keepalive, path: PathBuf::from(path) })
+}
+
+/// Open a FIFO somebody else created, for reading or for writing.
+///
+/// `for_write` is the *opener's* direction, which is the inverse of
+/// `Descriptor::Pipe`'s `peer_reads` as seen from the creator. The caller
+/// resolves that; this function is told plainly which end it wants, because a
+/// boolean that means the opposite thing depending on who is asking is how a
+/// clipboard transfer ends up reading its own writes.
+pub fn open_pipe(path: &str, for_write: bool) -> io::Result<File> {
+    OpenOptions::new().read(!for_write).write(for_write).open(path)
+}

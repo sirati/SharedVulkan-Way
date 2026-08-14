@@ -25028,7 +25028,8 @@ oversight.
 2. **Cross-dialect forwarding is not implementable today and not because of
    this code.** Naming a pipe means a `Descriptor::Pipe`, and `wc-handle` has no
    pipe support on *either* platform — the variant exists and nothing constructs
-   or opens one. That is a `wc-handle` gap, not a wire one.
+   or opens one. That is a `wc-handle` gap, not a wire one. **§81 closed it**, in
+   the direction that needs no relay.
 3. **This compositor sends no clipboard `h` at all.** `wc-compositor`'s
    `send_selection` and `ServerDndGrabHandler::send` drop the descriptor and say
    so in a printed line; the bytes go through `wc_clipboard_v1`, which `wc-proxy`
@@ -25051,3 +25052,129 @@ this alone is safe rather than merely untested.
 No unit test was added, and that is the honest description: what changed is
 reachable only with three processes and a real client, so the evidence is two
 harnesses rather than a number in the suite.
+
+## 81. `Descriptor::Pipe` stops being a variant nothing constructs
+
+### 81.1 Status in one paragraph
+
+§80.6 named the last gap of this class and located it correctly: not a wire gap
+but a **`wc-handle` gap** — `Descriptor::Pipe` had existed since stage 1 and
+nothing on either platform constructed or opened one. It does now.
+`Handle::create_pipe`/`open_pipe`/`pipe_end` are real on Unix, backed by a FIFO,
+with **five unit tests that move actual bytes**; `wc-proxy`'s `materialise` grew
+the arm that turns an arriving pipe descriptor into a real fd. What is still not
+built is the *other* direction, and 81.5 is precise about why that is a relay
+rather than a descriptor.
+
+### 81.2 Windows needs none of it, and that is a proof rather than an excuse
+
+The obvious reading of a Unix-only implementation is "half done". It is not, and
+the argument is short enough to check:
+
+* `Descriptor::Pipe` is needed only to carry an `h` between two peers speaking
+  **different** dialects — a name has to stand in for a descriptor that one side
+  cannot receive.
+* On Windows there is no ancillary channel, so no peer can speak the out-of-band
+  dialect at all. §79.4 already made `FdEncoding::default()` `InBand` there, and
+  this section makes `set_client_fd_encoding` **refuse `OutOfBand` outright**
+  rather than leaving `rs/wire.rs` to discover it one message at a time.
+* Two in-band peers need no conversion: the `h` is already a name, and
+  `WireFd::borrow()` forwards it unchanged.
+
+So a cross-dialect transfer cannot arise on Windows, and an implementation there
+would be code with no caller and no test. `platform/windows.rs` says so in place
+of the functions, and names `crates/sv-transport/src/winpipe.rs` — which already
+has `CreateNamedPipeW` and a working `Pipe` — as the file to lift if that ever
+changes. A pointer to an afternoon's work beats an afternoon of untestable work.
+
+### 81.3 The one subtle thing is `O_RDWR`, and it is asserted rather than described
+
+A FIFO with no writer gives readers EOF; a FIFO with no reader gives writers
+`SIGPIPE`; and `open()` for reading **blocks until a writer arrives**, which in a
+compositor's event loop is not a slow path but a deadlock. Opening the creator's
+own end `O_RDWR` fixes all three at once, and it is the standard answer — written
+down because a reader who has not hit it before will read `O_RDWR` on a
+unidirectional object as a mistake.
+
+`opening_the_peer_end_does_not_block_on_the_other_end_appearing` is that hazard
+as a test. Note what it does *not* do: no thread, no timeout. If the keepalive
+were wrong the test would **hang rather than fail**, which is exactly the failure
+mode being excluded, and a timeout would only convert it into a flake.
+
+### 81.4 `peer_reads` is carried rather than inferred
+
+Wayland's pipe `h` arguments are unidirectional and **which way round they go is
+per request**: `wl_data_source.send` hands the source a descriptor to *write*,
+`wl_data_offer.receive` hands the requester one to *read*. A shim that assumed
+either would be wrong half the time, which is why the flag is in the descriptor
+and why `Handle::open_pipe` resolves it centrally. A boolean that means the
+opposite thing depending on who is asking is how a clipboard transfer ends up
+reading its own writes, and both directions have a test.
+
+### 81.5 What is built, and the one thing that is not
+
+**Named → Open is complete and needs no relay.** A pipe descriptor arriving at
+`wc-proxy` is opened, and the local client is handed one end of the same FIFO the
+compositor created. The bytes then flow between those two processes without the
+proxy touching one.
+
+**Open → Named is not built, and it is not an arm of the same shape.** Nothing
+can give an *existing* anonymous pipe a name after the fact. Converting one means
+creating a FIFO, handing over its name, and **copying between the two** — a byte
+relay, with a policy question attached about who runs it, how much it buffers and
+what happens when one end goes away. That is a different kind of change from
+anything in §79–§81, all of which moved descriptors rather than bytes.
+
+It also does not arise in this project yet, which is worth stating so the absence
+is not read as a blocker: `wc-compositor` sends no clipboard `h` at all — the
+bytes go through `wc_clipboard_v1`, which `wc-proxy` binds (§29.6). The case
+needs a *client* source behind the proxy and a *stock* client requesting, on one
+compositor, which is arrangement 3's shape and not one any harness runs today.
+
+### 81.6 The tests broke a sibling before they passed, and the fix is the rule they test
+
+Written first as a `mod pipe_tests` inside `lib.rs`, they cost **one failing test
+that was not theirs**: `publish::tests::a_published_directory_mints_two_spellings_of_one_name`
+opens with `assert!(mint().is_none(), "nothing may be minted before `set`")` — an
+assertion about the state of the **whole process** — and its own comment says the
+tests touching that registry must not run concurrently. A module in the same
+library shares the process and calls `set`, so it broke that sibling from another
+thread while every new test passed.
+
+Cargo gives each file under `tests/` its own process, which is why the four
+binaries beside `pipe.rs` already exist. Using the same escape hatch is the fix,
+and it is worth recording because it is the same rule as the object under test:
+**some things are global, and the way to have two of them is to have two
+processes.** A FIFO has a name in one filesystem; `publish` has one directory per
+process. Neither gets a second by being asked politely.
+
+It is also the argument for `--no-fail-fast` stated as an incident. The new tests
+all passed; the failure was somewhere else entirely, in a crate the change did
+not appear to touch. A run that stopped at the first failing binary would have
+reported the pipe work as green.
+
+### 81.7 The gates, and this time the count moves
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **91 binaries, 2704 passed, 0 failed** |
+| `cargo clippy --workspace --all-targets` | exit 0 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | both harnesses, both legs, unchanged |
+
+**The delta is attributed from the diff rather than by subtracting two runs**, and
+that is the more useful form here: master moved three times while this was being
+gated, so a subtraction would have been measuring someone else's commits as much
+as this one. The change adds **exactly one test file containing exactly five
+`#[test]`s and alters no test anywhere else** — `git diff` shows zero `#[test]`
+lines added or removed outside `crates/wc-handle/tests/pipe.rs`. That is checkable
+without re-running anything.
+
+**The five are the pipe tests, in the one new binary, and the contrast with §80 is
+the point.** §80's
+count did not move because what changed there was reachable only with three
+processes and a real client. A pipe is the one kind of `h` whose whole behaviour
+fits inside one process — create it, open it as the peer would, move bytes, check
+which side got them — so here the evidence *is* a number in the suite. Neither
+answer is better than the other; what would be wrong is reporting one shape of
+evidence as though it were the other.

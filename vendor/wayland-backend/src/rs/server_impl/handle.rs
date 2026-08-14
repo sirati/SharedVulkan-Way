@@ -112,11 +112,26 @@ impl<D> State<D> {
     }
 
     /// WAYCOMPOSE FORK (§79): declare which dialect this client speaks.
+    ///
+    /// §81 made the Windows refusal explicit rather than left to `rs/wire.rs` to
+    /// discover per message. There is no ancillary channel on that platform, so
+    /// **every peer there is in band** — and saying so here is what lets
+    /// §81.3 argue that a *cross-dialect* transfer cannot arise on Windows, which
+    /// is why the pipe support below is Unix-only and complete rather than
+    /// partial.
     fn set_client_fd_encoding(
         &mut self,
         client: InnerClientId,
         encoding: FdEncoding,
     ) -> std::io::Result<()> {
+        #[cfg(windows)]
+        if encoding == FdEncoding::OutOfBand {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "there is no out-of-band `h` on this platform: no ancillary channel \
+                 exists to carry one, so every peer speaks in band",
+            ));
+        }
         if let Ok(client) = self.clients.get_client_mut(client) {
             client.socket.set_fd_encoding(encoding);
         }

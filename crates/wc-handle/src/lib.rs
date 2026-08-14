@@ -433,6 +433,12 @@ pub struct Handle {
 /// window's free list for the other.
 enum Owned {
     Object(platform::OwnedObject),
+    /// A FIFO this process created for a peer to open. §81.
+    ///
+    /// Held for the same reason as `Object`: the name is only live while the
+    /// creator holds the object, and a peer that has not opened it by then
+    /// loses the race.
+    Pipe(platform::OwnedPipe),
     /// An allocation out of this process's outbound arena window. The only
     /// value in this crate that carries a write path into an arena, and not
     /// constructible from anything that arrived on the wire — see
@@ -565,6 +571,67 @@ impl Handle {
         match publish::mint() {
             Some((local, peer)) => Self::create_shared_file(&local, &peer, size),
             None => Self::create_section(size),
+        }
+    }
+
+    /// Create a **byte stream** a peer opens by name, and describe it as
+    /// [`Descriptor::Pipe`].
+    ///
+    /// §81. `Descriptor::Pipe` has existed since stage 1 and until now nothing
+    /// constructed one; this is what a clipboard or drag transfer needs when the
+    /// two ends speak different `h` dialects. An out-of-band client hands the
+    /// compositor a real pipe; an in-band source must be handed a *name*; and
+    /// only a named stream can be both.
+    ///
+    /// `peer_reads` is recorded in the descriptor rather than inferred, because
+    /// Wayland's pipe `h` arguments are unidirectional and **which way round
+    /// they go is per request**: `wl_data_source.send` hands the source a
+    /// descriptor to *write*, `wl_data_offer.receive` hands the requester one to
+    /// *read*. A shim that assumed either would be wrong half the time.
+    ///
+    /// The creator keeps the other end — [`Handle::pipe_end`] — and must hold
+    /// this `Handle` for as long as the transfer, exactly as for a section.
+    pub fn create_pipe(peer_reads: bool) -> io::Result<Self> {
+        let (local, peer) = publish::mint().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no directory for objects a peer must open: start the compositor with \
+                 --shared-dir and --shared-peer-prefix",
+            )
+        })?;
+        let pipe = platform::create_pipe(&local)?;
+        Ok(Self {
+            descriptor: Descriptor::Pipe { name: peer, peer_reads },
+            keepalive: Some(Arc::new(Owned::Pipe(pipe))),
+        })
+    }
+
+    /// The end of a [`Handle::create_pipe`] stream this process kept.
+    ///
+    /// `None` for any other kind of handle, and for a pipe descriptor that
+    /// merely *arrived* — the receiver opens it with [`Handle::open_pipe`]
+    /// instead, because it is the peer and not the creator.
+    pub fn pipe_end(&self) -> Option<&std::fs::File> {
+        match self.keepalive.as_deref() {
+            Some(Owned::Pipe(pipe)) => Some(pipe.as_file()),
+            _ => None,
+        }
+    }
+
+    /// Open a [`Descriptor::Pipe`] that arrived from a peer.
+    ///
+    /// The direction is taken from the descriptor: `peer_reads` is written by
+    /// the *creator* and is true when the side that receives the descriptor —
+    /// this side — is meant to read. Resolving it here rather than at each call
+    /// site is deliberate: a boolean meaning the opposite thing depending on who
+    /// is asking is how a clipboard transfer ends up reading its own writes.
+    pub fn open_pipe(&self) -> io::Result<std::fs::File> {
+        match &self.descriptor {
+            Descriptor::Pipe { name, peer_reads } => platform::open_pipe(name, !*peer_reads),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{other:?} is not a stream and cannot be opened as one"),
+            )),
         }
     }
 
@@ -735,6 +802,12 @@ impl Handle {
             ));
         };
         match &**owned {
+            // §81: a stream has no offsets. Writing "at" one is a category error
+            // rather than a bounds failure, and the caller wants `pipe_end()`.
+            Owned::Pipe(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this handle is a stream, not a mapping: write to `pipe_end()` instead",
+            )),
             Owned::Object(object) => {
                 let size = &self.owned_object_size()?;
                 let end = offset
@@ -1036,3 +1109,4 @@ mod tests {
         assert!(h.map().is_err());
     }
 }
+
