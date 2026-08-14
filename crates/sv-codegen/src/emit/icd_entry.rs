@@ -1294,6 +1294,23 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkGetSwapchainImagesKHR",
     "vkAcquireNextImageKHR",
     "vkQueuePresentKHR",
+    // **`VK_EXT_debug_utils`'s messenger, which the loader reaches whatever we
+    // advertise.** These three were generated refusals — the generator has
+    // nothing to forward them to, because a messenger is an app-side object
+    // holding an app-side function pointer, and a `PFN_` cannot cross a process
+    // boundary (docs/design.md §6.1's exclusion list). "Cannot be forwarded" was
+    // then treated as "cannot be implemented", which is a different claim: it is
+    // answered *here*, like the swapchain above it.
+    //
+    // Refusing cost the browser. Zink creates a messenger while building its
+    // screen and takes the failure as fatal, so `vkCreateDebugUtilsMessengerEXT`
+    // returning `VK_ERROR_INITIALIZATION_FAILED` meant no physical device, no
+    // screen, no GL, and Firefox exiting at once (docs/design.md §0.22).
+    // `crate::local` implements all three for real: the object is stored,
+    // destroyed on request, and `vkSubmitDebugUtilsMessageEXT` delivers to it.
+    "vkCreateDebugUtilsMessengerEXT",
+    "vkDestroyDebugUtilsMessengerEXT",
+    "vkSubmitDebugUtilsMessageEXT",
 ];
 
 fn emit_command(
@@ -1499,6 +1516,56 @@ fn stub_body(
                 quote!({
                     let __n = if #access.is_null() { 0usize } else { #n };
                     vec![0u8; __n]
+                })
+            }
+            // **An output array is never skipped, whatever its element is.**
+            //
+            // `Skip` means "do not read the caller's memory here", and for an
+            // output array that is right about the *contents* and wrong about
+            // the *capacity*: the count-then-fill idiom needs the peer to know
+            // how many elements it may write, and the wire carries that as the
+            // length of the array it is sent (docs/design.md §6.1). The arm
+            // below sends `__n` default elements, which reads nothing of the
+            // caller's and states the capacity exactly.
+            //
+            // Without this guard `partial_validity` decided by *element type*:
+            // an array of structs came back `Partial` and reached that arm, an
+            // array of plain scalars came back `Skip` and became `Vec::new()`.
+            // So `vkGetPhysicalDeviceCalibrateableTimeDomainsKHR` sent capacity
+            // zero however much the application had allocated, the GPU side
+            // dutifully asked the driver for nothing, and the reply came back
+            // `VK_INCOMPLETE` for ever. Zink asks for the time domains while
+            // building its screen and treats the failure as fatal — this is the
+            // second half of why Firefox never got a window (docs/design.md
+            // §0.22), and the same struct-shaped blind spot as the GPU-side
+            // `Out::Array` arm it mirrors.
+            (Shape::Array { .. }, PartialValidity::Skip) if field.is_output => {
+                let ty = wire_type(match &field.shape {
+                    Shape::Array { elem, .. } => elem,
+                    other => other,
+                });
+                let d = wire_default(match &field.shape {
+                    Shape::Array { elem, .. } => elem,
+                    other => other,
+                });
+                let len = abi.len.as_ref().ok_or_else(|| {
+                    format!("{}.{}: an output array with no len=", c.name, field.name)
+                })?;
+                let n = match len {
+                    ArrayLen::Path { root, field } => {
+                        let a = path_access(root, field);
+                        let r = naming::ident(&naming::snake_case(root));
+                        quote!(if #r.is_null() { 0usize } else { (#a) as usize })
+                    }
+                    other => count_expr(other, &count_access).ok_or_else(|| {
+                        format!("{}.{}: len={other:?} is not readable", c.name, field.name)
+                    })?,
+                };
+                quote!({
+                    let __n = if #access.is_null() { 0usize } else { #n };
+                    let mut __v: Vec<#ty> = Vec::with_capacity(__n);
+                    for _ in 0..__n { __v.push(#d); }
+                    __v
                 })
             }
             (_, PartialValidity::Skip) => wire_default(&field.shape),

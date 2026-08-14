@@ -1172,3 +1172,145 @@ pub unsafe fn lower_write_descriptor_set_for_test(
 ) -> crate::LowerResult<sv_proto::VkWriteDescriptorSet> {
     unsafe { crate::lower_vk_write_descriptor_set(p) }
 }
+
+// ---------------------------------------------------------------------------
+// `VK_EXT_debug_utils`: the messenger, which is a real object
+// ---------------------------------------------------------------------------
+
+/// One registered messenger.
+///
+/// The pointers are the application's: a callback it wrote and a `pUserData` it
+/// owns. They are stored, not dereferenced, until something has a message for
+/// them.
+#[derive(Clone, Copy)]
+struct Messenger {
+    severity: u32,
+    types: u32,
+    callback: PFN_vkDebugUtilsMessengerCallbackEXT,
+    user_data: usize,
+}
+
+// SAFETY: `user_data` is held as a `usize` and the callback is a plain function
+// pointer, so the struct is a bag of integers. Whether the *application's*
+// callback is thread-safe is the application's contract — the specification
+// requires it to be, because layers and the loader may call it from any thread.
+unsafe impl Send for Messenger {}
+
+fn messengers() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Messenger>> {
+    use std::sync::{Mutex, OnceLock};
+    static M: OnceLock<Mutex<std::collections::HashMap<u64, Messenger>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `vkCreateDebugUtilsMessengerEXT`.
+///
+/// # Why this is implemented rather than refused, and why that is not a stub
+///
+/// **The loader offers `VK_EXT_debug_utils` whether or not an ICD asks for it**,
+/// and calls into every ICD that exports the entry point. So this is reachable
+/// no matter what `advertise::INSTANCE_EXTENSIONS` says, and refusing it is not
+/// a way of declining the extension — it is a way of failing a call the
+/// application had every right to make. Mesa's Zink creates a messenger while
+/// building its screen, takes the failure as fatal, and never gets a physical
+/// device: `ZINK: vkCreateDebugUtilsMessengerEXT failed`, then
+/// `ZINK: failed to choose pdev`, then no GL at all. That was the whole of
+/// "Firefox crashes instantly" (docs/design.md §0.22).
+///
+/// **A messenger is a place to send messages, and accepting one is a complete
+/// implementation of that.** The object is real: it has an id, it is stored, it
+/// is destroyed on request, and `vkSubmitDebugUtilsMessageEXT` below actually
+/// delivers to it. What this ICD does *not* do is generate debug messages of its
+/// own — it has none to generate; the validation output this project cares about
+/// comes from the GPU side's own layers over the reverse ring (§4.6), which is a
+/// different mechanism with a different destination. Never calling a callback
+/// you have no messages for is silence, not a lie.
+///
+/// The deliberate choice, stated so a reader does not have to infer it: **accept
+/// and store, deliver on submit, never synthesise.** The alternative — refusing
+/// — is what shipped, and it cost the browser.
+pub unsafe extern "system" fn sv_vk_create_debug_utils_messenger_ext(
+    _instance: VkInstance,
+    p_create_info: *const VkDebugUtilsMessengerCreateInfoEXT,
+    _p_allocator: *const VkAllocationCallbacks,
+    p_messenger: *mut VkDebugUtilsMessengerEXT,
+) -> VkResult {
+    if p_create_info.is_null() || p_messenger.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: both pointers are the application's, non-null as checked, and
+    // valid for this call by the specification's contract.
+    unsafe {
+        let ci = &*p_create_info;
+        let id = crate::IcdLocal::mint_id(icd());
+        messengers().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            Messenger {
+                severity: ci.message_severity.0,
+                types: ci.message_type.0,
+                callback: ci.pfn_user_callback,
+                user_data: ci.p_user_data as usize,
+            },
+        );
+        *p_messenger = id;
+    }
+    VkResult::VK_SUCCESS
+}
+
+/// `vkDestroyDebugUtilsMessengerEXT`.
+pub unsafe extern "system" fn sv_vk_destroy_debug_utils_messenger_ext(
+    _instance: VkInstance,
+    messenger: VkDebugUtilsMessengerEXT,
+    _p_allocator: *const VkAllocationCallbacks,
+) {
+    if messenger != 0 {
+        messengers().lock().unwrap_or_else(|e| e.into_inner()).remove(&messenger);
+    }
+}
+
+/// `vkSubmitDebugUtilsMessageEXT`: deliver the application's message to the
+/// messengers that asked for it.
+///
+/// This one **must** do the work, and accepting-and-dropping would be the noop
+/// the rest of this file exists to avoid: the application is not registering an
+/// interest here, it is handing over a message and expecting its own callbacks
+/// to see it. Filtered by severity and type exactly as the specification
+/// describes, because a messenger that asked for errors and is handed verbose
+/// chatter has been misinformed rather than served.
+pub unsafe extern "system" fn sv_vk_submit_debug_utils_message_ext(
+    _instance: VkInstance,
+    message_severity: VkDebugUtilsMessageSeverityFlagBitsEXT,
+    message_types: VkDebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const VkDebugUtilsMessengerCallbackDataEXT,
+) {
+    if p_callback_data.is_null() {
+        return;
+    }
+    // Copied out under the lock and called outside it: an application callback
+    // is entitled to call back into the loader, and holding our own lock across
+    // it is how a driver deadlocks in somebody else's stack trace.
+    let targets: Vec<Messenger> = {
+        let m = messengers().lock().unwrap_or_else(|e| e.into_inner());
+        m.values()
+            .filter(|t| {
+                t.severity & message_severity.0 as u32 != 0
+                    && t.types & message_types.0 != 0
+            })
+            .copied()
+            .collect()
+    };
+    for t in targets {
+        if let Some(f) = t.callback {
+            // SAFETY: the callback and `pUserData` are the application's own,
+            // stored at create time and unchanged since; `p_callback_data` is
+            // the caller's and non-null as checked.
+            unsafe {
+                let _ = f(
+                    message_severity,
+                    message_types,
+                    p_callback_data,
+                    t.user_data as *mut c_void,
+                );
+            }
+        }
+    }
+}
