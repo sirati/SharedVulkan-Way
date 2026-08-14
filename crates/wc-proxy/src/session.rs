@@ -803,7 +803,7 @@ struct Clip {
     drag_offers: std::collections::HashSet<u32>,
     /// Of those, the ones a `wl_data_device.drop` has already been sent for.
     ///
-    /// ADDED FOR §44, and it exists because of an ordering nobody had seen.
+    /// ADDED FOR docs/waycompose-design.md §50, and it exists because of an ordering nobody had seen.
     /// `wl_data_device.leave` used to forget every drag offer, which reads
     /// correctly — the drag is over, nothing more will be received. It is
     /// wrong, and the first drag that ever entered a client showed why: the
@@ -1530,7 +1530,7 @@ impl Session {
         } else {
             Source::Clipboard
         };
-        // ADDED FOR §44. This decision had never been *observed* — the first
+        // ADDED FOR docs/waycompose-design.md §50. This decision had never been *observed* — the first
         // real drag into a client made it wrongly and the only symptom was a
         // paste that came back empty, four processes away. It is one line and
         // it names both the answer and the evidence for it.

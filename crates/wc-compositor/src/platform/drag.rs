@@ -118,7 +118,7 @@ const fn ole_iid(data1: u32) -> GUID {
 
 /// SAFETY: `a` must be null or point at 16 readable bytes.
 ///
-/// **The read is unaligned, and that is a fix rather than a precaution.** §44's
+/// **The read is unaligned, and that is a fix rather than a precaution.** docs/waycompose-design.md §50's
 /// run is the first time `DoDragDrop` has been entered, and the first drag out
 /// of a Wayland window aborted the compositor here:
 ///
@@ -750,7 +750,7 @@ thread_local! {
     static OVER: Cell<u64> = const { Cell::new(0) };
     /// The answer `DragOver` last gave, and how many times in a row it gave it.
     ///
-    /// ADDED FOR §44, and it exists to make one specific claim measurable
+    /// ADDED FOR docs/waycompose-design.md §50, and it exists to make one specific claim measurable
     /// rather than arguable. §43.4 decided that `DragOver` answers from the
     /// last known accepted action and is therefore up to one round trip stale;
     /// §43.9 item 2 then recorded that **nobody had seen it**. What a user sees
@@ -1072,7 +1072,7 @@ unsafe extern "system" fn dt_drag_enter(
         println!("wc-compositor: a Windows drag entered window {window} offering nothing we speak");
         return S_OK;
     }
-    // ADDED FOR §44. Until this line the *successful* path of `DragEnter` said
+    // ADDED FOR docs/waycompose-design.md §50. Until this line the *successful* path of `DragEnter` said
     // nothing at all, and the only entry in the log was the one above for a
     // drag we could not describe — so "a drag entered" was a claim no run could
     // support from the compositor's own output. §43.9 item 1 is the sentence
@@ -1115,7 +1115,7 @@ unsafe extern "system" fn dt_drag_over(
     let answer = FEEDBACK.with(|f| f.get());
     // SAFETY: OLE passes a writable out-pointer.
     unsafe { write_effect(effect, answer) };
-    // ADDED FOR §44; see `OVER_RUN`. One line per *change*, so the first run is
+    // ADDED FOR docs/waycompose-design.md §50; see `OVER_RUN`. One line per *change*, so the first run is
     // the size of §43.4's staleness in the unit the user actually experiences.
     OVER_RUN.with(|o| {
         let (last, n) = o.get();
@@ -1748,7 +1748,7 @@ mod tests {
 /// answered after the client has been told about it.
 pub(crate) fn feedback(accepted: bool, action: u32) {
     let effect = if accepted { to_dropeffect(action) } else { DROPEFFECT_NONE };
-    // ADDED FOR §44. This is the *arrival* of the asynchronous half, and it is
+    // ADDED FOR docs/waycompose-design.md §50. This is the *arrival* of the asynchronous half, and it is
     // the other end of the interval `OVER_RUN` measures: between `DragEnter`
     // and this line every `DragOver` answers `DROPEFFECT_NONE`, and the run
     // length printed on the next change is how much of the gesture that was.
