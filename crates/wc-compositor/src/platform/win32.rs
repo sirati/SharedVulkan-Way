@@ -2231,14 +2231,14 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
     // for the same reason §56 labels its first three: a bug in the teardown
     // path is exactly the circumstance in which the account is wrong. Unlike
     // the window count there is no external witness available — OLE's table is
-    // not enumerable from another process — which §60.3 says out loud rather
+    // not enumerable from another process — which §67.3 says out loud rather
     // than leaving the asymmetry to be noticed.
     let (registered, revoked, failed) = super::drag::drop_target_counts();
     println!(
         "wc-compositor: drop targets at exit: claims {registered} registered, \
          {revoked} revoked, {failed} revoke(s) failed"
     );
-    // ADDED FOR docs/waycompose-design.md §64, the third per-window resource.
+    // ADDED FOR docs/waycompose-design.md §67, the third per-window resource.
     //
     // `outstanding` is **not required to be zero** and saying so here is the
     // point: the cursor on screen is deliberately still alive, because
@@ -3232,6 +3232,33 @@ fn frame_glass(w: &WindowState) -> bool {
         "wc-compositor: window {} folds {inset} px of caption into its client area{}",
         w.id,
         match dwm {
+            // docs/waycompose-design.md §67.4, and the one Wine branch in this file. §31.7 named this
+            // exact hole — "a run that extends the frame and finds `dwmapi`
+            // stubbed would look exactly like `noglass.png` and would report
+            // success ... the one failure mode of this arrangement with no
+            // diagnostic" — and left it open because the `HRESULT` cannot
+            // close it.
+            //
+            // **Measured, wine-11.14 staging, 2026-08-13.** With a plain
+            // `WS_OVERLAPPEDWINDOW` and nothing else in the process:
+            // `DwmIsCompositionEnabled` returns `S_OK` with `enabled = 1`,
+            // `DwmExtendFrameIntoClientArea` returns `S_OK`, and
+            // `DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS)` returns
+            // `0x80004001` — `E_NOTIMPL` — leaving the `RECT` untouched. So two
+            // of the three answer success and the only one that has to return
+            // *data* admits it is a stub. There is no composition behind this
+            // frame and `S_OK` says there is.
+            //
+            // Nothing about the window changes here: the branch corrects the
+            // claim, not the behaviour, because `caption_button_rect` already
+            // returns `None` under Wine and the fallback that produces is the
+            // arrangement `--caption-buttons off` asks for on purpose. What was
+            // broken was the evidence, and §35 is a whole section about gates
+            // that reported success while something was wrong.
+            Some(0) if crate::wine::under_wine() =>
+                ", DwmExtendFrameIntoClientArea returned ok -- but this dwmapi is Wine's stub \
+                 (DwmGetWindowAttribute is E_NOTIMPL) and nothing is composited behind the \
+                 frame; see docs/waycompose-design.md §67.4",
             Some(0) => ", DwmExtendFrameIntoClientArea ok",
             Some(_) => ", DwmExtendFrameIntoClientArea FAILED",
             None if w.frame.get().dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",
@@ -4499,7 +4526,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
     if hicon.is_null() {
         None
     } else {
-        // ADDED FOR docs/waycompose-design.md §64. Counted here rather than at
+        // ADDED FOR docs/waycompose-design.md §67. Counted here rather than at
         // the two callers because this is the *only* `CreateIconIndirect` in
         // the compositor: window icons and mouse cursors are the same kind of
         // GDI object and are built by this one function. The two are freed by
@@ -4514,7 +4541,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
 
 thread_local! {
     /// Every `HICON`/`HCURSOR` this process has built, and every one it has
-    /// given back. ADDED FOR docs/waycompose-design.md §64.
+    /// given back. ADDED FOR docs/waycompose-design.md §67.
     ///
     /// §53 gave the window handle an outside witness and §60 gave the OLE
     /// drop-target registration an inside count. This is the third and last
