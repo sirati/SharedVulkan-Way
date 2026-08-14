@@ -1102,6 +1102,23 @@ pub mod profiles {
             // docs/design.md §7.4: not serialisable. Stripped above the protocol, as
             // Mesa's own Venus driver does.
             "VkAllocationCallbacks",
+            // **`VK_EXT_layer_settings` belongs to the layers, and walking into
+            // it is what crashed Firefox** (docs/design.md §0.24).
+            //
+            // The registry lists `VkLayerSettingsCreateInfoEXT` as an extender
+            // of `VkInstanceCreateInfo`, so the generic `pNext` walk lowered it
+            // like any other link — and faulted inside the chain hanging off it,
+            // reached from `lower_vk_instance_create_info` in the loader's
+            // `terminator_CreateInstance`. Firefox sets layer settings, so it
+            // met this on its first instance and died before a window existed.
+            //
+            // An ICD has no business reading it at all: the extension configures
+            // *layers*, which sit above the loader's terminator, and §6.1's own
+            // rule for the app side is that an unknown or unwanted link is
+            // dropped and the walk continues. Excluding the type is how that
+            // rule is stated for a link we do know and must not touch.
+            "VkLayerSettingsCreateInfoEXT",
+            "VkLayerSettingEXT",
             // Ray tracing is out of scope, and this struct is bitfields the
             // registry cannot describe (docs/design.md §7.4).
             "VkAccelerationStructureInstanceKHR",
