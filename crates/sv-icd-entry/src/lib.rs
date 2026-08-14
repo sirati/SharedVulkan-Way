@@ -223,7 +223,7 @@ pub enum LowerError {
     /// The transport is not connected.
     NotConnected,
     /// A capture-replay member was not null on a device that does not advertise
-    /// capture-replay (design.md §0.24).
+    /// capture-replay (docs/design.md §0.24).
     ///
     /// `pShaderGroupCaptureReplayHandle` and `opaqueCaptureDescriptorData` are
     /// only written by a tool replaying a trace, and doing so requires the

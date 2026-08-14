@@ -815,7 +815,7 @@ fn the_cross_check_is_deterministic() {
 /// is the same technique `the_video_profile_generates_all_three_passes` uses one
 /// test up.
 ///
-/// The four kinds, and why each is what it is (design.md §0.24):
+/// The four kinds, and why each is what it is (docs/design.md §0.24):
 ///
 /// - a recorded `vkCmd*` whose entry point the driver lacks **poisons** its
 ///   target, because the failure belongs to the command buffer and not to a call

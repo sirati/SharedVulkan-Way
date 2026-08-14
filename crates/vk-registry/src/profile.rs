@@ -884,7 +884,7 @@ pub mod profiles {
             // for the *same* reason as the entry above rather than a new one:
             // `VkAccelerationStructureMotionInstanceDataNV` has
             // `VkAccelerationStructureInstanceKHR` in an arm, and that struct is
-            // the bitfields design.md §7.4 names as the one type the registry
+            // the bitfields docs/design.md §7.4 names as the one type the registry
             // genuinely cannot describe. `sv_codegen::abi::surface_profile`
             // already excludes it as a tripwire; this is the profile agreeing so
             // the tripwire is never reached.
@@ -940,7 +940,7 @@ pub mod profiles {
             // on the wire and refuses a non-null one by name, which is what the
             // specification already requires of a device that does not advertise
             // `…CaptureReplay` — and this one does not. `VK_KHR_ray_tracing_pipeline`
-            // and `VK_EXT_descriptor_buffer` are carried now; design.md §0.24.
+            // and `VK_EXT_descriptor_buffer` are carried now; docs/design.md §0.24.
             // **The union-of-handles class used to be excluded here, and it is
             // gone** — `VK_KHR_acceleration_structure`,
             // `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap`,

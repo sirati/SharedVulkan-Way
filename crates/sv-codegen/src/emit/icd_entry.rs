@@ -800,7 +800,7 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
         Scalar::Size => quote!((#access) as u64),
         Scalar::Bool32 => quote!((#access) != 0),
         // A capture-replay member is **refused by name if it is not null**,
-        // rather than carried. design.md §0.24: we do not advertise
+        // rather than carried. docs/design.md §0.24: we do not advertise
         // `…CaptureReplay` in any feature struct, so the specification requires
         // the application to leave these null, and a non-null one is a usage
         // error rather than data we lost. Refusing it loudly is the difference
@@ -2465,7 +2465,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     // The two classes share one output list: an extension is withheld whether
 
     // Commands whose app-side lowering would hand the application's own pointer
-    // to the GPU side as an arena offset (design.md §0.24 item 6).
+    // to the GPU side as an arena offset (docs/design.md §0.24 item 6).
     //
     // The third class of over-promise, and the one neither `NOT_IMPLEMENTED` nor
     // the queue check can see: the entry point exists, marshals and dispatches,
@@ -2768,7 +2768,7 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// Extensions withheld because a command's app-side *lowering* is
         /// incomplete — the entry point exists and marshals, and the value it
         /// marshals would be the application's own pointer sent as an arena
-        /// offset (design.md §0.24 item 6).
+        /// offset (docs/design.md §0.24 item 6).
         ///
         /// Folded into [`INCOMPLETE_EXTENSIONS`]; kept separately with the
         /// offending command so a reader can tell this class from a stubbed

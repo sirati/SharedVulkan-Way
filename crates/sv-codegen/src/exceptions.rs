@@ -113,7 +113,7 @@ pub fn void_policy(owner: &str, field: &str) -> Option<VoidPolicy> {
 /// # The third class of over-promise, and the wild pointer that named it
 ///
 /// `ArenaOffset` means "this `void*` is `arena_base + offset`, and the GPU side
-/// resolves it against its own mapping of the same pages" (design.md §5.3). That
+/// resolves it against its own mapping of the same pages" (docs/design.md §5.3). That
 /// is true of `pHostPointer`, where the application's pointer really is arena
 /// memory. It is **not** true of a descriptor-template `pData`, which points at
 /// ordinary application memory laid out by the template — and for those the
@@ -148,7 +148,7 @@ pub const ICD_EXPANDS_ARENA_POINTER: &[&str] = &[
     // expands `pHostPointer` because nothing has to. `VK_EXT_external_memory_host`
     // is the extension whose entire contract is "this pointer is host memory the
     // driver will import", and in this design that memory is the arena
-    // (design.md §5.3) — so `arena_base + offset` is not an approximation of the
+    // (docs/design.md §5.3) — so `arena_base + offset` is not an approximation of the
     // pointer, it is what the pointer is.
     //
     // Listed rather than special-cased in the check, because "the policy is
@@ -229,7 +229,7 @@ const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
     ("vkCmdPushDescriptorSetWithTemplate2", "pData", VoidPolicy::ArenaOffset),
     ("VkPushDescriptorSetWithTemplateInfo", "pData", VoidPolicy::ArenaOffset),
     ("VkPushDescriptorSetWithTemplateInfoKHR", "pData", VoidPolicy::ArenaOffset),
-    // The capture-replay class (design.md §0.24). Both are optional, both have a
+    // The capture-replay class (docs/design.md §0.24). Both are optional, both have a
     // device property for a length where the registry has no `len=`, and both
     // are null unless a trace is being replayed against a device that advertises
     // the matching feature — which this one does not.
@@ -474,7 +474,7 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
 pub const BLOB_FRAMING: &[&str] = &["vkBeginCommandBuffer", "vkEndCommandBuffer"];
 
 /// The commands that return a command buffer to a recordable state, and so
-/// clear the "recording failed" mark of design.md §0.24.
+/// clear the "recording failed" mark of docs/design.md §0.24.
 ///
 /// # Why two names and not a rule
 ///
