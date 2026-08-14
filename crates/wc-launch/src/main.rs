@@ -27,6 +27,7 @@
 //! double-clicks cannot produce two compositors, which is the point of the
 //! mutex rather than a happy accident of it.
 
+mod floor;
 mod config;
 mod ico;
 mod plan;
@@ -571,6 +572,15 @@ mod win {
             &p.comp_log.to_string_lossy(),
             &p.comp_log.with_file_name("arena.frames").to_string_lossy(),
         );
+        // Which floor policy this session started under, and why. A run whose
+        // startup size cannot be explained from its own output is a run
+        // somebody will have to guess about later — and guessing about this
+        // number is how 768 MiB survived an afternoon.
+        log.say(&format!(
+            "arena floor: {} MiB — {}",
+            cfg.arena_mib,
+            crate::floor::Floor::CURRENT.why()
+        ));
         log.say(&format!("compositor: {} {}", cfg.compositor, argv.join(" ")));
         let comp = quiet(Command::new(&cfg.compositor).args(&argv))
             .spawn()

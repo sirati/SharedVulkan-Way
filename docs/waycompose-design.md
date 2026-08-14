@@ -17519,6 +17519,53 @@ none of them was being run until each had already cost a revert.
    seed fix protects them all now, but nothing in them would catch a manifest
    made wrong some other way.
 
+
+### 36.19 The `WaitOnAddress` millisecond floor does not apply to the doorbell
+
+The open question for the Windows guest was whether `WaitOnAddress`'s
+whole-millisecond argument would swallow the win. §36.18's histogram made that
+prediction sharp and pessimistic: 64 of 95 waits complete under 100 µs, and a
+1 ms floor is exactly what would destroy that mass, leaving the deployment guest
+near 1 ms with an empty fast bucket.
+
+**The prediction confuses two different numbers, and the confusion is worth
+naming because §36.6.1 invited it.** `sys::wait` clamps its *timeout* to a whole
+millisecond — how long the wait may block **if nothing wakes it**. A
+`WakeByAddressAll` returns the waiter as soon as it is scheduled; the timeout it
+was given has nothing to do with that. And `Bell::ring_local`, which the
+`Doorman` calls when a byte arrives off the port, is a `WakeByAddressAll` **on
+the guest's own kernel**. The hypervisor is not in that step at all.
+
+Measured rather than argued. `a_delivered_wake_is_not_floored_by_the_wait_timeout`
+parks a waiter with a **two second** slice on both rungs — so no timeout can end
+it in any plausible time — issues the wake after a known 5 ms delay, and reports
+the *excess* over that delay, which is the wake path's own cost:
+
+| binary | median excess | samples |
+|---|---|---|
+| Linux | **67 µs** | 60.8, 67.0, 67.5, 70.5, 72.9 µs |
+| **Windows** (under Wine) | **136 µs** | 109, 117, 136, 139, 161 µs |
+
+Two hundred times below the two-second timeout, and an order of magnitude below
+the millisecond floor. **The floor bounds a missed wake, not a delivered one.**
+
+So the honest expectation for the deployment guest is now the opposite of the
+pessimistic one: the doorbell should carry across largely intact, and the
+millisecond floor is the price of *polling* on Windows rather than a tax on the
+thing that replaces polling.
+
+**The caveat, and it is a real one.** This is Wine's `WaitOnAddress`, not
+Microsoft's, and Wine implements it over futexes — so the number is evidence and
+not proof. What makes it more than a Wine artefact is that the *argument* is not
+implementation-specific: the parameter is documented as a timeout, `WakeByAddressAll`
+is documented to wake waiters, and an implementation in which a delivered wake
+had to wait for the next millisecond tick would be a strange one. The
+15.6 ms system timer granularity that §13.8 measured for `Sleep` is likewise a
+property of timer expiry, not of thread wakes.
+
+It remains a prediction until it is run on the guest. But it is now a prediction
+with a measurement behind it and a mechanism to explain it, rather than a worry.
+
 ## 45. §27 continued: the arena leg, and an identity with a hole in it
 
 *(§27's continuation, appended here because this file is in append order. No

@@ -482,15 +482,21 @@ pub struct Futex {
     ///
     /// Linux honours it. **Windows does not**: `WaitOnAddress` takes whole
     /// milliseconds and `sys::wait` clamps to a floor of 1 ms, so on the guest
-    /// the first rung is 1 ms however small this is. That is deliberate and it
-    /// is stated here rather than tuned away, because the guest is where the
-    /// 216.9 ms was measured and 1 ms is the honest floor of this mechanism
-    /// there: ~11 waits at ~1 ms is ~11 ms a present, a factor of twenty, and
-    /// the remaining millisecond per wait is not recoverable with
-    /// `WaitOnAddress`. Going below it needs a different primitive — a
-    /// high-resolution waitable timer as `wc-compositor`'s `tick.rs` uses
-    /// (§13.8: `Sleep(1)` really costs 15.8 ms, the timer 5.1 ms), or the
-    /// hypervisor-carried doorbell this module has always said it wants.
+    /// the first rung is 1 ms however small this is. That bounds the *ladder*:
+    /// ~11 waits at ~1 ms is ~11 ms a present, a factor of twenty against the
+    /// old fixed slice, and no shorter rung can be asked for here.
+    ///
+    /// **It does not bound a doorbell, and conflating the two is easy enough
+    /// that §36.19 exists to stop it.** The clamp is on the *timeout* — how long
+    /// the wait may block **if nothing wakes it**. A `WakeByAddressAll`, which
+    /// is what [`Bell::ring_local`] issues on the guest's own kernel when the
+    /// `Doorman` reads a byte off the port, returns the waiter as soon as it is
+    /// scheduled and has nothing to do with the timeout it was given. Measured
+    /// on the Windows binary with a **two second** timeout, a delivered wake
+    /// cost a median of **136 µs** over the delay — not 1 ms, and not 2 s.
+    ///
+    /// So the millisecond floor is the price of *polling* on Windows, and the
+    /// doorbell is what stops that price being paid at all.
     pub first_slice: Duration,
 }
 
@@ -1363,4 +1369,101 @@ mod measure {
 fn bell_always() -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALWAYS.get_or_init(|| std::env::var("SV_BELL_ALWAYS").is_ok_and(|v| v != "0"))
+}
+
+/// Does `WaitOnAddress`'s whole-millisecond argument put a floor under a
+/// **delivered** wake, or only under a missed one?
+///
+/// This runs on every platform and is meant to be run on Windows, under Wine or
+/// on the guest: `wine target/x86_64-pc-windows-gnu/debug/deps/sv_transport-*.exe
+/// floor --nocapture`.
+#[cfg(test)]
+mod wake_floor {
+    use super::*;
+    use crate::control::{Geometry, ProtocolIds, RingKind};
+    use crate::region::SharedRegion;
+    use crate::ring::Lane;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// **The question the Windows guest measurement turns on.**
+    ///
+    /// `sys::wait` clamps its timeout to a whole millisecond because
+    /// `WaitOnAddress` takes a `DWORD` of them, and §36.6.1 recorded that as "on
+    /// the guest the first rung is 1 ms". The worry that follows — and the
+    /// natural prediction from §36.18's histogram, where 64 of 95 waits complete
+    /// under 100 µs — is that the floor destroys exactly that fast mass and the
+    /// Windows guest lands near 1 ms with an empty fast bucket.
+    ///
+    /// **That prediction confuses two different numbers.** The clamp is on the
+    /// *timeout*: how long the wait may block **if nothing wakes it**. A
+    /// `WakeByAddressAll` — which is what `Bell::ring_local` issues, on the
+    /// guest's own kernel, when the `Doorman` reads a byte off the port —
+    /// returns the waiter as soon as it is scheduled, and the timeout it was
+    /// given has nothing to do with it.
+    ///
+    /// So the floor should bound only a *missed* wake, and this measures the
+    /// difference directly: a waiter is parked with a **two second** slice, so
+    /// nothing but a delivered wake can end it in any reasonable time, and the
+    /// wake is issued after a known delay. What is reported is the *excess* over
+    /// that delay, which is the wake path's own cost — if the millisecond floor
+    /// applied to delivery, the excess could not be below a millisecond.
+    #[test]
+    fn a_delivered_wake_is_not_floored_by_the_wait_timeout() {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let ids = ProtocolIds::new(1, 1);
+        let owner = Control::create(Arc::clone(&region), g, ids, 1).unwrap();
+        let slot = owner.claim_ring(RingKind::Device, 1, None).unwrap();
+        let ctrl = Arc::new(RingCtrl::open(&owner, slot).unwrap());
+
+        // A two-second slice on both rungs: no timeout can end this wait early,
+        // so whatever ends it is the wake and nothing else.
+        let parker = Futex {
+            first_slice: Duration::from_secs(2),
+            slice: Duration::from_secs(2),
+            ..Futex::default()
+        };
+        const DELAY: Duration = Duration::from_millis(5);
+
+        let mut excesses = Vec::new();
+        for _ in 0..5 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let waker = {
+                let flag = Arc::clone(&flag);
+                let ctrl = Arc::clone(&ctrl);
+                std::thread::spawn(move || {
+                    std::thread::sleep(DELAY);
+                    flag.store(true, Ordering::Release);
+                    // Exactly what the Doorman does when a byte arrives.
+                    ctrl.bell(Lane::Command).unwrap().ring_local();
+                })
+            };
+            let ready = || flag.load(Ordering::Acquire);
+            let status = || ctrl.status();
+            let site = WaitSite::new(ctrl.id(), &ready, &status)
+                .with_bell(ctrl.bell(Lane::Command).unwrap());
+            let t0 = Instant::now();
+            let outcome = parker.park(&site, Deadline::after(Duration::from_secs(30)));
+            let took = t0.elapsed();
+            waker.join().unwrap();
+            assert_eq!(outcome, ParkOutcome::Woken);
+            excesses.push(took.saturating_sub(DELAY));
+        }
+        excesses.sort();
+        let median = excesses[excesses.len() / 2];
+        println!(
+            "delivered-wake excess over a {DELAY:?} delay, with a 2 s wait timeout: \
+             median {median:?}, all {excesses:?}"
+        );
+        // Generous: this runs under Wine and on shared machines. What it
+        // excludes is the timeout mattering at all — if delivery were floored by
+        // the 1 ms clamp this would still pass, but if it were floored by the
+        // *slice* it would be two seconds.
+        assert!(
+            median < Duration::from_millis(500),
+            "a delivered wake took {median:?} over the delay with a 2 s timeout; \
+             that is the timeout ending the wait, not the wake"
+        );
+    }
 }
