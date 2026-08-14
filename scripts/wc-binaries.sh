@@ -493,3 +493,27 @@ proc_running() {
   pids=$(pgrep -x "$name" 2>/dev/null) || return 1
   [ -n "$pids" ]
 }
+
+# `kill_exact <name>` — kill processes whose *executable* is `<name>`, and
+# nothing else.
+#
+# The companion to `proc_running`, and it exists because `pkill -f <substring>`
+# has now cost this project four times. The pattern matches a command *line*,
+# so it catches every shell that merely mentions the name — including the one
+# running the guard — and on a machine shared by a dozen agents it catches other
+# people's work. The last instance took down another session's weston, which
+# took 1Password with it, which took the SSH keys for the guest and the key git
+# signs commits with (docs/design.md §0.24).
+#
+# `pgrep -x` matches the executable name exactly and never the arguments, so a
+# harness that starts `weston --socket=svwl` cannot reach a `weston
+# --socket=weston-1p` belonging to somebody else. When two of *your own* differ
+# only by argument, that is what a pidfile is for — record the pid at spawn and
+# kill that, which is what `sv-cts.sh` does and why it has never done this.
+kill_exact() {
+  local name=$1 sig=${2:-TERM} pids
+  pids=$(pgrep -x "$name" 2>/dev/null) || return 0
+  [ -n "$pids" ] || return 0
+  # shellcheck disable=SC2086
+  kill -"$sig" $pids 2>/dev/null || true
+}

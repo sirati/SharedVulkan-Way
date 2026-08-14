@@ -1095,6 +1095,18 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         };
         let access = member_access(&field.name);
         let e = match validity {
+            // **An output chain gives up its tags and nothing else.** `Partial`
+            // on a `pNext` means "the links are there, their contents are the
+            // caller's uninitialised memory" — which the member-by-member rules
+            // above already say for every other field and the chain walk did
+            // not (docs/design.md §0.24).
+            PartialValidity::Partial if matches!(field.shape, Shape::PNext) => {
+                let allowed = crate::emit::pnext::allowed_fn_ident(name);
+                quote!(lower_pnext_tags(
+                    #access as *const core::ffi::c_void,
+                    sv_proto::#allowed,
+                )?)
+            }
             PartialValidity::Skip => wire_default(&field.shape),
             // **The `selector=` call site.** This is the only place in the
             // generator that has both the union and the sibling that decides
@@ -2949,7 +2961,68 @@ fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
         })
     });
 
+    // The tag-only arms: the same links, with no contents read.
+    let tag_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
+        if !lower_cx.shared.contains(name) {
+            return None;
+        }
+        let v = naming::pnext_variant(name);
+        let val = *value as i32;
+        Some(quote!(#val => sv_proto::PNextLink::#v(Box::new(Default::default())),))
+    });
+
     quote! {
+        /// Walk a `pNext` chain that is **output storage**, taking the tags and
+        /// nothing else.
+        ///
+        /// # Venus's three-state validity, applied to a chain
+        ///
+        /// docs/design.md §6.1 says a `returnedonly` structure's members are the
+        /// *caller's uninitialised memory* on the way out, so the app side sends
+        /// the partial form and does not read them. `emit_lower_struct` honours
+        /// that member by member — and then handed the whole `pNext` chain to
+        /// [`lower_pnext`], which lowers every link it recognises **in full**.
+        /// The tags are real; everything hanging off them is whatever was on the
+        /// caller's stack.
+        ///
+        /// That is docs/design.md §0.3 item 2's hazard for the third time, and
+        /// it is what crashed Firefox on `vkGetPhysicalDeviceProperties2`,
+        /// reached from the loader's `linux_read_sorted_physical_devices`
+        /// (§0.24). What the peer needs from an output chain is only *which
+        /// links are there*, so that it can fill them; the contents are its
+        /// answer, not the caller's question.
+        ///
+        /// # Safety
+        /// As [`lower_pnext`]: `head` is null or a chain of
+        /// `VkBaseInStructure`-prefixed structs living for the call. This
+        /// function reads strictly less than that contract allows — two fields
+        /// of each link and no further.
+        pub unsafe fn lower_pnext_tags(
+            head: *const core::ffi::c_void,
+            allowed: fn(i32) -> bool,
+        ) -> crate::LowerResult<Vec<sv_proto::PNextLink>> {
+            let mut out = Vec::new();
+            let mut __p = head;
+            let mut __guard = 0usize;
+            while !__p.is_null() {
+                __guard += 1;
+                if __guard > crate::MAX_PNEXT_LINKS {
+                    return Err(crate::LowerError::ChainTooLong);
+                }
+                let __base = __p as *const VkBaseInStructure;
+                let (__s_type, __next) = unsafe { ((*__base).s_type.0, (*__base).p_next) };
+                if allowed(__s_type) {
+                    let link = match __s_type {
+                        #(#tag_arms)*
+                        _ => { __p = __next as *const core::ffi::c_void; continue; }
+                    };
+                    out.push(link);
+                }
+                __p = __next as *const core::ffi::c_void;
+            }
+            Ok(out)
+        }
+
         /// Walk a C `pNext` chain into the wire's flat, length-prefixed form.
         ///
         /// `allowed` is the generated per-parent membership predicate. A link
