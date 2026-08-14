@@ -21546,3 +21546,74 @@ grab semantics second, five singletons after.
 3. **Eight of the twelve-test improvement is not mine.** 409/57 became 413/53
    across a master merge; only the four reclassifications are this section's,
    and the other eight were fixed by whoever moved the tree in between.
+
+### 36.21 A present, not a wake: the last link, on topology 1
+
+Everything before this measured a **wait**. §36.15 got 18.96 ms per wait against
+a 20 ms slice; §36.20 got a 13.6 µs wake to the Windows guest. But the figure
+that started all of it — 216.9 ms — was a **present**, and a present had never
+been measured across a boundary with the fix in place.
+
+**Venue, stated because §51 exists for this reason: topology 1, Linux host →
+Linux VM** (`nix build .#svGuest`, lavapipe in the guest). Not Wine, not
+testhost. The Windows numbers in §36.20 are a different venue and do not
+transfer to this table, nor this one to them.
+
+`scripts/sv-guest-e2e.sh` now takes `SV_E2E_APP`, so the application can be
+something that *presents* rather than something that enumerates.
+`vk-present-probe`, 60 frames at 256×256, 256 MiB arena:
+
+| condition | ring waits | parked | **mean per wait** | shape |
+|---|---|---|---|---|
+| fixed 20 ms slice | 281 | 5664.9 ms | **20.160 ms** | `<100ms=281` |
+| slice ladder | 281 | 631.1 ms | **2.246 ms** | `<10us=38 <100us=8 <1ms=137 <10ms=83 <100ms=15` |
+| **ladder + doorbell** | 281 | 116.4 ms | **0.414 ms** | `<10us=108 <100us=33 <1ms=121 <10ms=17 <100ms=2` |
+
+**281 ring waits in every condition**, as with the enumeration workload: the
+same presents, differing only in what a wait costs. **48.7× on the mean**, and
+the top row is again the whole story of the defect — every one of 281 waits in
+the 10–100 ms bucket, which is what "the number *was* the slice, once per wait"
+looks like for a present.
+
+And the probe's own per-frame timing, from the doorbell run:
+
+```
+timing 256x256 over 60 frames: 0.66 ms/frame total,
+  0.54 ms/frame in vkQueuePresentKHR,
+  0.009 ms/frame in vkAcquireNextImageKHR (0.2 MB/frame, 462 MB/s presented)
+PASS: 60 frames presented
+```
+
+> **A cross-VM present costs 0.54 ms in `vkQueuePresentKHR`.**
+
+That is the last link. 216.9 ms per present → diagnosed as a 20 ms slice once
+per wait → confirmed at 18.96 ms per wait → fixed by a hypervisor-carried wake
+→ **and now a present measured end to end at sub-millisecond across a real
+hypervisor.** Parking for the whole 60-frame run fell from 5.66 s to 116 ms.
+
+Two honest limits. The presents here are 256×256, not 1080p, so this is the
+*latency* of a present and not its bandwidth — `vk-present-probe`'s header asks
+for a 1080p run and that is still owed. And 281 waits over 60 frames is 4.7 per
+frame, which includes setup; the per-wait figure is the transferable one.
+
+#### 36.21.1 Two guards caught this run's mistakes, one of them mine
+
+The first attempt died with **R13's protocol-hash detector**: guest
+`0xc2ddabe30ce597a2` against host `0x3522313e5c823788`. That is the
+`sv_icd.json` trap `sv-present.sh` documents — a reflink-seeded worktree's
+manifest is a generated file holding an *absolute path*, and mine still named
+the base tree. The detector did exactly its job: refused to load rather than
+answering locally, and said which two hashes disagreed.
+
+The second was found by pointing §36's own freshness helper at the two halves,
+and it was **a bug in that helper**: `libsv_icd.so` reported stale and blamed
+`crates/wc-compositor/src/platform/drag.rs`, a file it cannot depend on. Cargo
+names the depfile after the *crate* — `libsv_icd.d`, not `libsv_icd.so.d` — and
+the helper stripped only `.exe`, so every `.so` fell down the whole-tree
+fallback and got blamed on whatever that walk reached first. Fixed to strip
+`.so` and `.dylib` too.
+
+Worth recording because it is the same defect the helper was written to remove,
+surviving in the helper: **a check whose scope is wrong reports a real-looking
+failure against an innocent file**, and the only reason it was caught is that
+the fallback path *says* it is the weaker check.
