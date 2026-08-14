@@ -24280,3 +24280,84 @@ rather than left for the next person to wonder about, which is the same rule
 The acceptance test for the sequence is unchanged and is not this: `wc-pooltest`
 through the proxy to a **Linux** compositor, and after that a client that maps a
 window and draws with the compositor across the hypervisor.
+
+---
+---
+
+## 78. The popup group is three groups, and a grab that ended too early
+
+### 78.1 Status in one paragraph
+
+Seven popup failures, and §66's lesson applied before anything else: read the
+messages, do not group by suite name. They are **three** groups — grab semantics
+(4), reactive positioning (2), and a protocol error on a zero-size anchor rect
+(1) — and only the first is one thing. One of the four is fixed: a popup grab was
+dismissed *before* the click that dismissed it was delivered. WLCS headless goes
+**415 to 416**, popups **5 / 7 to 6 / 6**, debts 21 to 20, `cargo test` unchanged
+at 2630.
+
+### 78.2 What the seven actually say
+
+| test | message | group |
+|---|---|---|
+| `does_not_get_popup_done_event_before_button_press` | "pointer button sent after popup done" | grab |
+| `grabbed_popup_gets_keyboard_focus` | "grabbed popup not given keyboard focus" | grab |
+| `grabbed_popup_gets_done_event_when_new_toplevel_created` | `popup_done()` never called | grab |
+| `grabbed_popups_get_done_events_in_correct_order` | `popup_done()` never called | grab |
+| `when_parent_surface_is_moved_a_reactive_popup_is_moved` | "reactive popup was not moved" | positioning |
+| `when_parent_surface_is_moved_a_nonreactive_popup_is_not_moved` | `surface_actually_at_location` false | positioning |
+| `zero_size_anchor_rect_stable` | "Wayland protocol error: 0 on interface \<UNKNOWN INTERFACE\>" | protocol error |
+
+Three different files' worth of work, which is exactly what §66 was about.
+
+### 78.3 The fix, and why the obvious version of it was not enough
+
+`dismiss_grab_if_outside` ran before `pointer.button`, so the press arrived after
+`popup_done`.
+
+Moving it after the button did **not** fix the test, and the reason is worth
+keeping. `left_click` is a press *and* a release, and the test's notification
+fires on every button event:
+
+```c
+manager->client->add_pointer_button_notification([&](auto, auto, auto) {
+    EXPECT_THAT(got_popup_done, IsFalse()) << "pointer button sent after popup done";
+```
+
+So dismissing on the press still puts `popup_done` between the two halves of one
+click, and the assertion fails on the release instead of the press — the same
+red with a different cause, which is the kind of thing that reads as "the fix did
+not work" and is not. The grab is dismissed when the click **ends**.
+
+That is also the better behaviour independently of the test. A menu dismissed
+mid-click leaves the client unable to distinguish a click that merely closed it
+from one that closed it and activated what was underneath; both halves now reach
+the surface below while the popup still exists, and the popup is told afterwards.
+
+**Measured after every edit**, which is §74's rule earning itself a third time:
+the intermediate state — dismiss after `button` but on the press — scored exactly
+what the broken state scored, 5 / 7, and only the log told the two apart.
+
+### 78.4 What is left, in the order I would take it
+
+1. **`grabbed_popup_gets_keyboard_focus`.** Keyboard focus follows the platform's
+   `WM_SETFOCUS` to the *toplevel* (§11), and a popup that takes an explicit
+   grab must have it instead. This is the one most on Firefox's path — a menu
+   that cannot take the keyboard cannot be driven by arrow keys.
+2. **The two `popup_done` cases**, which never fire at all: one when a new
+   toplevel appears, one for nested grabs, which must be dismissed innermost
+   first.
+3. **Reactive positioning**, `xdg_positioner.set_reactive`, unimplemented — the
+   popup must follow when its parent moves.
+4. **`zero_size_anchor_rect_stable`**, where we raise a protocol error on
+   something legal.
+
+### 78.5 Unchanged and still open from §72
+
+The two three-level grandparent orderings, `subsurface_extends_parent_input_region`,
+and the two restacking assertions that now fail only their second half. None of
+them is touched by this.
+
+*(Committed unsigned: 1Password holds the signing key and its session was killed
+by an over-broad `pkill -9 -f weston` elsewhere on the machine. Recorded rather
+than rewritten later.)*
