@@ -22017,7 +22017,9 @@ too. §67.8.
 | `scripts/wc-cursor.sh linux` | **8 passed, 0 failed** |
 | `scripts/wc-cursor.sh wine` | **17 passed, 0 failed** (master: 10, and see below) |
 | `scripts/wc-cursor.sh all` | **25 passed, 0 failed** |
-| `scripts/wc-wine-guest.sh` (new) | **3 passed, 0 failed** — measured on `e5e5963`, not re-run; see below |
+| `scripts/wc-wine-guest.sh` (new) — arrangement 2 | **3 passed, 0 failed**, re-measured on the merged tree |
+| `scripts/wc-vm-client.sh linux` (new) — arrangement 1 | **9 passed, 0 failed** |
+| `scripts/wc-vm-client.sh wine` (new) — arrangement 3 | **10 passed, 0 failed** |
 
 The seven new tests are `wine::tests`, and they are over `decide()` — the pure
 function that applies `WC_WIN32` to the probe — which is why they run on the
@@ -22083,17 +22085,18 @@ that had moved. The underlying point is unaffected and still worth keeping:
 catch a link failure and is not a substitute for `cargo build --target`.
 
 **The guest leg's three assertions were measured on `e5e5963`, not on the merge.**
-The workstation is in use — the user asked for no testing on it until they are
-done — and the guest's QMP chardev takes exactly one client besides, so
-re-running this needs a slot rather than a retry. Every other row in the table
-above has been re-measured across four merges; this one has not, and it is
-labelled with the commit it was taken on rather than left to look current.
+**The guest row was carried undated for four merges and is now measured.** For
+several revisions of this table it read *"measured on `e5e5963`, not re-run"*,
+because the development guest was held by another run. The argument for
+believing it in the meantime was that nothing in those merges touches what it
+measures — the platform line, printed before `platform::start`, and
+`wine_get_host_version`. That argument was correct and it was still an argument.
+It has now been run on the merged tree and reports the same two kernels, so the
+row is a measurement again; the point of having labelled it is that a reader
+could tell the difference while it was not.
 
-Nothing in those merges touches what it measures: the platform line, which is
-printed before `platform::start`, and `wine_get_host_version`. But "nothing
-should have changed it" is an argument and not a measurement, which is the
-distinction this whole section is about, so the row stays dated until it is run
-again.
+The Windows laptop remains unavailable, which is what §67.8 item 1 is about and
+is unchanged by any of this: all three arrangements above are Linux and Wine.
 
 ### 67.8 What is not done
 
@@ -22121,3 +22124,109 @@ again.
    Refused above for being a difference rather than a defect, which is the right
    call for a Wine branch and the wrong call for leaving the Windows leg
    untested.
+
+### 67.9 All three arrangements, and the client is in another kernel
+
+The user asked for three, and they are the three combinations of *which side is
+Wine* that exist while the Windows laptop is unavailable:
+
+| | arrangement | harness | result |
+|---|---|---|---:|
+| 1 | linux → linux vm | `scripts/wc-vm-client.sh linux` | **9 passed, 0 failed** |
+| 2 | linux → wine linux vm | `scripts/wc-wine-guest.sh` | **3 passed, 0 failed** |
+| 3 | wine linux → linux vm | `scripts/wc-vm-client.sh wine` | **10 passed, 0 failed** |
+
+Arrangement 3 is the one §26.5 specified as "leg 3" and nobody had run: *"Wine
+plays the Windows side, and a Linux VM guest runs the client."* Arrangement 1 is
+its control, which is why the two live in one file with one word between them —
+§13.8 is the record of comparing two numbers taken on two trees with two
+instruments and being wrong, and leg 1's whole value is that it differs from
+leg 3 in exactly one thing.
+
+**What is new here is not Wine, it is the boundary.** §26.5's correction is that
+every Wine run in this document before it was one machine with no VM in it, and
+several consequences of *having no hypervisor* were written up as "Wine lied".
+In arrangements 1 and 3 the client is in another kernel: it cannot see the
+host's filesystem except where 9p says so, it cannot open a host Unix socket,
+and its `SCM_RIGHTS` cannot cross. Those are the real deployment's constraints
+and the local Wine legs do not have them.
+
+#### How the bytes cross, and why it is not a socket
+
+The guest has no network at all — `nix/guest.nix` sets `networkingOptions = []`
+— and a Unix socket node exported over 9p is a host kernel object a guest
+`connect()` cannot reach. What the guest does have is the virtio-serial cold
+path, whose host end is a Unix socket QEMU listens on:
+
+```text
+  client ── wc-proxy ── /tmp/up.sock            (guest)
+                            │ socat
+             /dev/virtio-ports/org.sirati.svcold.0
+        ═════════════ the hypervisor boundary ═════════════
+                    $SV_RUNDIR/cold.sock          (host)
+                            │ socat
+              the compositor's AF_UNIX socket
+```
+
+Two `socat`s and one virtio-serial port, forwarding the byte stream unaltered —
+which is `probe-relay.c`'s argument for the same move on the real guest, and
+here it is *more* honest than the local legs, where the "boundary" was two
+processes on one kernel.
+
+`wl_shm` pools and the keymap are the two things not on the wire, and both use
+9p rather than the port: the client's pools are written into `/sv/pools` in the
+guest, which is `$SV_RUNDIR/pools` on the host, which the compositor opens by
+the path `--peer-prefix` gives it — a `winepath -w` of the host directory on
+leg 3, the host directory itself on leg 1. The keymap goes the other way.
+**That is a file transport and therefore a fixture, not the deployment**, whose
+answer is the arena in guest RAM (§12); the harness declares the absence
+explicitly rather than declaring a substrate it does not use.
+
+#### Two measurements the first run produced
+
+**`--no-icons`, and it is the port's arithmetic rather than a preference.**
+`wc-proxy` opens a *second* upstream connection to resolve app ids to icon
+pixels. A virtio-serial port is one stream, so two connections interleave into
+it; the compositor sees a corrupt second message flow and closes, and the first
+connection dies of a broken pipe. That is exactly what the first run printed —
+`icon: the compositor closed the icon connection` followed by
+`client 1 failed: Broken pipe (os error 32)`, with `2 client msgs` already
+across, so the relay itself was working. The icon feed is not what this leg
+tests and the honest fix is to not open the second connection rather than to
+multiplex a port that cannot carry it.
+
+**`cold.sock` does not exist until QEMU makes it.** The first version connected
+the host relay before booting the guest and got a `socat` that exited
+immediately, producing a leg that failed two steps away from where it went
+wrong. The relay now starts after the socket appears.
+
+#### The kernel check, in both directions
+
+§67.6's assertion has a mirror image here, and the pair is the part worth
+keeping:
+
+* `wc-wine-guest.sh` asserts the compositor's `wine_get_host_version` is the
+  **guest's** kernel, because there the compositor is inside the VM.
+* `wc-vm-client.sh wine` asserts it is the **host's**, and that it differs from
+  the kernel the payload reported from inside.
+
+```
+  arrangement 2:  compositor 'Linux 6.18.44'  (inside)   client on the host
+  arrangement 3:  compositor 'Linux 6.18.33'  (host)     client 'Linux 6.18.44'
+```
+
+Neither can be satisfied by a run that put both halves in the same place, which
+is the failure both are guarding against — and it is the failure this project
+actually has a history of: §26.5's whole correction is that runs believed to
+have a boundary did not. Between them the two assertions say *which side of the
+boundary each half was on* rather than asserting that there was one.
+
+#### What these legs do not do
+
+`wayland-info` is the client, so this is the registry and not a pixel. No
+window is mapped, nothing is committed, and the `wl_shm` path is advertised
+rather than exercised — the pool directory is configured and stays empty. A leg
+that maps a window needs a drawing client in the guest and is the obvious next
+step now that the transport underneath it is known to work. It is also the leg
+that would first exercise the 9p pool path in anger, which is the part of this
+arrangement most likely to be wrong.

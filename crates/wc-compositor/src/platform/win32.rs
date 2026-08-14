@@ -2231,14 +2231,14 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
     // for the same reason §56 labels its first three: a bug in the teardown
     // path is exactly the circumstance in which the account is wrong. Unlike
     // the window count there is no external witness available — OLE's table is
-    // not enumerable from another process — which §67.3 says out loud rather
+    // not enumerable from another process — which §60.3 says out loud rather
     // than leaving the asymmetry to be noticed.
     let (registered, revoked, failed) = super::drag::drop_target_counts();
     println!(
         "wc-compositor: drop targets at exit: claims {registered} registered, \
          {revoked} revoked, {failed} revoke(s) failed"
     );
-    // ADDED FOR docs/waycompose-design.md §67, the third per-window resource.
+    // ADDED FOR docs/waycompose-design.md §64, the third per-window resource.
     //
     // `outstanding` is **not required to be zero** and saying so here is the
     // point: the cursor on screen is deliberately still alive, because
@@ -4526,7 +4526,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
     if hicon.is_null() {
         None
     } else {
-        // ADDED FOR docs/waycompose-design.md §67. Counted here rather than at
+        // ADDED FOR docs/waycompose-design.md §64. Counted here rather than at
         // the two callers because this is the *only* `CreateIconIndirect` in
         // the compositor: window icons and mouse cursors are the same kind of
         // GDI object and are built by this one function. The two are freed by
@@ -4541,7 +4541,7 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
 
 thread_local! {
     /// Every `HICON`/`HCURSOR` this process has built, and every one it has
-    /// given back. ADDED FOR docs/waycompose-design.md §67.
+    /// given back. ADDED FOR docs/waycompose-design.md §64.
     ///
     /// §53 gave the window handle an outside witness and §60 gave the OLE
     /// drop-target registration an inside count. This is the third and last
