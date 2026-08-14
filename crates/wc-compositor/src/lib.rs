@@ -672,6 +672,99 @@ fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> Stri
     }
 }
 
+/// Everything the arena needs doing the moment a client — **any** client — is
+/// accepted, and nothing that depends on which door it came through.
+///
+/// # Why this is a function rather than two statements in the accept branch
+///
+/// Because it was two statements in *one* accept branch, and there are two.
+/// `--wayland-cold` (§36) accepts on a ring slot in guest RAM rather than on a
+/// socket, and that branch had neither call. §68 is the run that found it: a
+/// cross-VM session with a guest-RAM arena and no growth channel, so the arena
+/// could not grow, and — because `Op::Release` is a request on that same
+/// channel — could not give a region back either. Both halves were silent,
+/// because a path that is not taken says nothing.
+///
+/// # The ordering, which is the whole of why this is *here* and not earlier
+///
+/// GROWTH is created at the first client for exactly the reason the gifts are
+/// released at the first client. [`sv_transport::control::Control::create`]
+/// zeroes the control region, and on guest RAM those bytes are stamp pages;
+/// doing it before the host's locate would delete the stamps out from under it.
+/// A client having arrived is the proof the locate finished — it came through a
+/// proxy started from a plan, and the plan exists only if the locate succeeded.
+/// See [`crate::grow::Service::start`].
+///
+/// STAGE 53. **The growth channel first, and that ordering is the whole of why
+/// growth had never once worked on a guest.** Both calls are gated on the same
+/// fact — a client has arrived, so the locate is done — so §34.5 reasoned about
+/// the hazard they share and not about the one they do not: they both want *the
+/// front of the outbound window*.
+///
+/// `reserve_growth_channel` may only run while the window is untouched, because
+/// the channel is the front of it and the free list has no way to express a
+/// hole. With `release_gifts` first, smithay's deferred 73,017-byte keymap lands
+/// there and the reservation is refused — the compositor logged `no growth
+/// channel … will refuse under pressure instead` once per client, the proxy
+/// attached at the front of the window anyway and read the keymap's own header
+/// as a control magic:
+///
+/// ```text
+/// growth channel: magic is 0x6d79656b5f626b78, which is not ours
+/// (a byte-swapped magic means a big-endian peer)
+/// ```
+///
+/// which is `xkb_keym` in ASCII, and a diagnosis pointing at the wrong
+/// hemisphere entirely. Measured on the guest at a 12 MiB floor: 0 growths, 97
+/// refusals, and §28.12's held-back pool back verbatim.
+///
+/// Reserving first costs the gifts 272 KiB of a 1 MiB window, which is what
+/// §34.4 already budgeted for.
+///
+/// Idempotent in both halves — `grow.is_none()` guards one and `release_gifts`
+/// returns `(0, _)` once there is nothing held — so calling it on every accept
+/// is correct and is what makes it safe to call from more than one place.
+fn arm_arena_for_first_client(grow: &mut Option<crate::grow::Service>, clients_seen: usize) {
+    if grow.is_none() {
+        match crate::grow::Service::start() {
+            Ok(Some(s)) => {
+                println!(
+                    "wc-compositor: growth channel up; the host may ask for another region \
+                     when its pools do not fit"
+                );
+                *grow = Some(s);
+            }
+            // No outbound window, or none big enough. Said on every accept
+            // until there is a channel, which is once per client on a session
+            // that will never have one — noisy, and deliberately preferred to
+            // silence, because a session that cannot grow and does not say so
+            // is the failure stage 53 exists to remove.
+            Ok(None) => println!(
+                "wc-compositor: no outbound window, so no growth channel; this session \
+                 cannot be asked for more memory"
+            ),
+            Err(e) => eprintln!(
+                "wc-compositor: no growth channel ({e}); this session cannot be asked for \
+                 more memory and will refuse under pressure instead"
+            ),
+        }
+    }
+    // STAGE 12. The first client is the earliest moment at which anything could
+    // want an object this compositor made, and — over guest RAM — the earliest
+    // moment at which it is safe to write one. See
+    // `wc_handle::arena::defer_gifts`.
+    //
+    // Second, not first: see the growth block above.
+    match wc_handle::arena::release_gifts() {
+        Ok((0, _)) => {}
+        Ok((n, bytes)) => println!(
+            "wc-compositor: client {clients_seen} released {n} held object(s), {bytes} \
+             bytes, into the arena"
+        ),
+        Err(e) => eprintln!("wc-compositor: could not release held objects: {e}"),
+    }
+}
+
 /// What to do about the file arenas named on a command line.
 ///
 /// Split out of [`run_from`] so it can be *tested*, which is the whole reason
@@ -796,7 +889,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // §66, and first because everything below it is evidence *about a
+    // §68, and first because everything below it is evidence *about a
     // platform*: a log whose first line does not say which one is a log that
     // cannot be attributed. It is after `--log` for the same reason — a
     // harness that has to race the process for this line would sometimes lose.
@@ -1297,6 +1390,28 @@ fn wayland_thread(
                              (no socket crossed the VM boundary)"
                         );
                         let _ = std::io::stdout().flush();
+                        // §68. **The same two calls as the socket accept, and
+                        // their absence here is what the first real cross-VM
+                        // leg found.**
+                        //
+                        // A client arriving is the signal §12.10 built: it came
+                        // through a proxy, a proxy with an arena was started
+                        // from a plan, and the plan exists only if the host's
+                        // locate succeeded — so the stamps have been read and
+                        // `Control::create` may now zero those bytes. That
+                        // argument is about the *proxy having a plan*, not about
+                        // which door the client came through, so it holds
+                        // identically for a ring slot.
+                        //
+                        // Without this a `--wayland-cold` session had **no
+                        // growth channel at all**: the arena could not grow,
+                        // and — because `Op::Release` travels on that same
+                        // channel — could never give a region back either. It
+                        // also never released its deferred gifts, so the seat's
+                        // keymap stayed held for the life of the session.
+                        // Nothing said so on either side, because a path that
+                        // is simply not taken is silent.
+                        arm_arena_for_first_client(&mut grow, state.clients_seen);
                     }
                     Err(e) => eprintln!("wc-compositor: ring slot {slot} not inserted: {e}"),
                 }
@@ -1315,89 +1430,7 @@ fn wayland_thread(
                 {
                     Ok(_) => {
                         state.clients_seen += 1;
-                        // GROWTH, and it is created here for exactly the reason
-                        // the gifts are released here. `Control::create` zeroes
-                        // the control region and on guest RAM those bytes are
-                        // stamp pages; doing it before the host's locate would
-                        // delete the stamps out from under it. A client having
-                        // arrived is the proof the locate finished — it came
-                        // through a proxy started from a plan, and the plan
-                        // exists only if the locate succeeded. See
-                        // `crate::grow::Service::start`.
-                        //
-                        // STAGE 53. **Before `release_gifts`, and that ordering
-                        // is the whole of why growth had never once worked on a
-                        // guest.** Both calls are gated on the same fact — a
-                        // client has arrived, so the locate is done — so §34.5
-                        // reasoned about the hazard they share and not about the
-                        // one they do not: they both want *the front of the
-                        // outbound window*.
-                        //
-                        // `reserve_growth_channel` may only run while the window
-                        // is untouched, because the channel is the front of it
-                        // and the free list has no way to express a hole. With
-                        // `release_gifts` first, smithay's deferred 73,017-byte
-                        // keymap lands there and the reservation is refused —
-                        // the compositor logged `no growth channel … will refuse
-                        // under pressure instead` once per client, the proxy
-                        // attached at the front of the window anyway and read
-                        // the keymap's own header as a control magic:
-                        //
-                        //   growth channel: magic is 0x6d79656b5f626b78, which
-                        //   is not ours (a byte-swapped magic means a big-endian
-                        //   peer)
-                        //
-                        // which is `xkb_keym` in ASCII, and a diagnosis pointing
-                        // at the wrong hemisphere entirely. Measured on the
-                        // guest at a 12 MiB floor: 0 growths, 97 refusals, and
-                        // §28.12's held-back pool back verbatim.
-                        //
-                        // Reserving first costs the gifts 272 KiB of a 1 MiB
-                        // window, which is what §34.4 already budgeted for.
-                        if grow.is_none() {
-                            match crate::grow::Service::start() {
-                                Ok(Some(s)) => {
-                                    println!(
-                                        "wc-compositor: growth channel up; the host may ask \
-                                         for another region when its pools do not fit"
-                                    );
-                                    grow = Some(s);
-                                }
-                                // No outbound window, or none big enough. Said
-                                // once, because a session that silently cannot
-                                // grow is the failure this stage exists to
-                                // remove and it must not be silent.
-                                Ok(None) => println!(
-                                    "wc-compositor: no outbound window, so no growth channel; \
-                                     this session cannot be asked for more memory"
-                                ),
-                                Err(e) => eprintln!(
-                                    "wc-compositor: no growth channel ({e}); this session \
-                                     cannot be asked for more memory and will refuse under \
-                                     pressure instead"
-                                ),
-                            }
-                        }
-                        // STAGE 12. The first client is the earliest moment at
-                        // which anything could want an object this compositor
-                        // made, and — over guest RAM — the earliest moment at
-                        // which it is safe to write one: the client arrived
-                        // through a proxy that was started from a plan, and the
-                        // plan only exists if the host's sweep of the region
-                        // succeeded. See `wc_handle::arena::defer_gifts`.
-                        //
-                        // Second, not first: see the growth block above.
-                        match wc_handle::arena::release_gifts() {
-                            Ok((0, _)) => {}
-                            Ok((n, bytes)) => println!(
-                                "wc-compositor: client {} released {n} held object(s), \
-                                 {bytes} bytes, into the arena",
-                                state.clients_seen
-                            ),
-                            Err(e) => {
-                                eprintln!("wc-compositor: could not release held objects: {e}")
-                            }
-                        }
+                        arm_arena_for_first_client(&mut grow, state.clients_seen);
                     }
                     Err(e) => eprintln!("wc-compositor: could not insert client: {e}"),
                 }

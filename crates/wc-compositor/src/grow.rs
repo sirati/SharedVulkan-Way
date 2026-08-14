@@ -284,9 +284,14 @@ impl Service {
             if req.op == wc_handle::grow::Op::Release {
                 return match wc_handle::arena::release_guest_ram(req.region) {
                     Ok(bytes) => {
+                        // "the guest's operating system" and not "Windows",
+                        // because this line is printed by whichever build is in
+                        // the guest and §68 read it off a **Linux** one. A log
+                        // line that names the wrong operating system is a line
+                        // that will be quoted as evidence about it.
                         note = Some(format!(
-                            "wc-compositor: released arena {}: {bytes} bytes back to Windows \
-                             in {} ms",
+                            "wc-compositor: released arena {}: {bytes} bytes back to the \
+                             guest's operating system in {} ms",
                             req.region,
                             started.elapsed().as_millis()
                         ));

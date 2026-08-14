@@ -22121,3 +22121,220 @@ again.
    Refused above for being a difference rather than a defect, which is the right
    call for a Wine branch and the wrong call for leaving the Windows leg
    untested.
+
+## 68. Release ran on a guest: 113.9 MiB down to 97.9 MiB, and the guest's own kernel says so
+
+### 68.1 Status in one paragraph
+
+`docs/waycompose-design.md` §61.5 is the run that could not answer the user's
+question — *"its very important that the arena also releases unneeded memory
+again"* — and it named two causes. Both were fixed locally in the commit before
+this one and neither had been shown on a boundary. **They are shown now.** A
+client took 18 MiB of pools out of a guest's RAM, was killed rather than closed,
+and the guest gave a 16 MiB region back: `119382016 → 102604800` bytes of
+resident set, **read inside the virtual machine**, a fall of exactly the
+16,777,216 bytes the region was. Getting there cost two defects that only a real
+cross-VM leg could produce, and one of them means this topology cannot draw
+anything at all.
+
+Venue: `nix build .#svGuest` — NixOS in QEMU on this workstation, guest Linux
+6.18.44 against the host's 6.18.33, RAM in a `memory-backend-memfd` the host
+maps. `wc-compositor` in the guest with a 12 MiB guest-RAM arena; `wc-proxy` and
+the clients on the host; the Wayland stream over §36's rings in guest RAM.
+Harness: `scripts/wc-release-vm.sh`, **17 passed, 0 failed**.
+
+> **Topology: `cross-vm`, Linux host → Linux VM.** Every number below is from
+> that leg and from nowhere else. `testhost` was not touched.
+
+### 68.2 The three numbers, and why they are the guest's
+
+| | `wc-compositor`'s resident set, **in the guest** |
+|---|---|
+| before — compositor up, no pools out | **102,596,608 B (97.8 MiB)** |
+| at peak — 3 pools out, one region grown | **119,382,016 B (113.9 MiB)** |
+| after — client killed, region returned | **102,604,800 B (97.9 MiB)** |
+
+The rise is 16,785,408 bytes and the fall is 16,777,216 — the region, exactly,
+plus two pages of noise on the way up. §61.5's table has an "after" row larger
+than its "before" row by a region that never came back; this one closes.
+
+Run twice, on separate boots. The absolute numbers move by a few pages
+(`102,653,952 → 119,439,360 → 102,662,144` the second time) and **the two deltas
+are identical to the byte**: +16,785,408 and −16,777,216. So the quantity being
+reported is the region and not the weather.
+
+**It has to be the guest's number and there is no substitute.** The host
+unmapping its view of a region frees nothing at all: the pages are the guest's,
+they are `mlock`ed (`VirtualLock`ed on Windows) and therefore non-pageable, and
+they stay gone from the guest's operating system until the guest frees them.
+`wc_handle::arena::committed_bytes` was written for exactly this and had never
+been read by anything but a unit test; here it is `/proc/<pid>/statm` sampled by
+the guest's own payload script, which is the same accounting from outside the
+process.
+
+Note what does **not** move it: writing pixels into pages the guest already
+committed. The resident set is flat while pools are cut out of the startup
+region and only steps when a region is added or dropped. So "peak" here means
+"after the growth", and a run whose pools all fitted the floor would have shown
+nothing whatever the allocator did — which is worth saying because it is an easy
+way to build a release experiment that cannot fail.
+
+### 68.3 The first defect: the proxy cannot talk to a Linux compositor about a pool
+
+`scripts/wc-ring-vm.sh` has passed since §36 — a Wayland client on this kernel
+driving a compositor in another one, over memory. It drives it with
+`wayland-info`, which sends no `h` argument, and **that is the only reason it
+passes.**
+
+`wc-proxy` writes its upstream stream in the in-band-`h` dialect
+(`docs/waycompose-design.md` §2.3): `FdEncoding::OutOfBand` facing the client and
+`FdEncoding::InBand` facing the compositor, hard-coded, because the far side has
+always been the Windows build. On Unix the vendored backend's `Argument::Fd` is
+a raw descriptor — `vendor/wayland-backend/src/rs/wire.rs` has the decode and it
+is `#[cfg(windows)]`, and it must be, because there is nowhere in a `RawFd` to
+put a `wc_handle::Descriptor`. So a rewritten `wl_shm.create_pool` handed to a
+*Linux* `wc-compositor` desynchronises its reader.
+
+Measured, and the shape is worth recording because nothing anywhere says a word:
+
+* the client creates one pool and calls `wl_display_roundtrip`; the round trip
+  never returns;
+* the proxy logs the pool published, then two `wl_shm.format` events, then
+  nothing;
+* the compositor logs nothing at all and does not drop the connection;
+* the same client against the same compositor **with no proxy in between**
+  creates all three pools and is fine.
+
+`scripts/wc-pooltest.c` — this tree's own client, written for a different
+purpose — reproduces it identically. So the defect is not in the client that
+found it.
+
+**What this means for the venue.** Linux host → Linux VM cannot composite: the
+compositor in that topology never sees a pool as a Wayland object, so there is
+no surface, no window and no pixel. The only compositor binary that can read the
+proxy's dialect is the Windows one, which on a Linux guest means Wine inside the
+guest — the user's second topology, and not attempted here.
+
+**What it does not mean for this measurement.** The proxy's allocator takes the
+arena bytes when it *parses* `create_pool`, long before the compositor is
+involved: `[proxy] client 2: pool 3: 6291456 bytes from the client -> arena 0
+slice 0+6291456`, in a region located by `wc-arena-host` out of QEMU's memory
+backend. The pools really are cut out of guest RAM, the growth request really
+crosses the hypervisor, the region really is committed and pinned by the guest,
+and the guest really frees it. What is absent from this run is compositing, and
+nothing below depends on it. That is stated here rather than buried because
+`docs/waycompose-design.md` §27.6 is what happens when a run's absent quantity
+is not stated.
+
+### 68.4 The second defect: a ring accept armed nothing
+
+`grow::Service::start()` and `wc_handle::arena::release_gifts()` were two
+statements inside the **socket** accept branch, and §36 added a second accept
+branch — a ring slot in guest RAM — which had neither. On a `--wayland-cold`
+session that is:
+
+* **no growth channel at all.** The arena cannot grow, and because `Op::Release`
+  is a request on that same ring, it can never give a region back either. The
+  first run of this harness printed `growth channel reserved at 11534336+278528`
+  and then never `growth channel up`, and the proxy reported `grew 0` under
+  pressure that should have grown it twice.
+* **the gifts never released.** The seat's 71,249-byte keymap stays held for the
+  life of the session, so no client binding a `wl_keyboard` could be sent one.
+
+Both are silent on both sides, because a path that is simply not taken says
+nothing. `arm_arena_for_first_client` is now one function called from both
+branches, and the ordering argument transfers unchanged: a client arriving is
+the proof the locate finished, because it came through a proxy, and a proxy with
+an arena was started from a plan that exists only if the locate succeeded. That
+argument is about the proxy having a plan and not about which door the client
+came through.
+
+This is the second time a §36 accept path has been found to skip work the socket
+path does, and it is the cost of the same event having two implementations.
+
+### 68.5 The zero-client case, confirmed and then shown closing
+
+The previous commit stated a limitation rather than leaving it: with **zero**
+clients there is no pump, so no `poll` times out, so `tick_idle` never runs and
+the reclaim clock does not turn at all. The last session's `Drop` returns its
+pools and the now-empty region waits for a tick that will not come.
+
+Leg B is that case on purpose, and it behaved exactly as stated:
+
+* the lone client is killed; `session ended holding 3 pool(s), 18874368 bytes
+  returned to the arena` — the pools come back;
+* **15 seconds with nobody connected returns no region**;
+* one client reconnects, and `arena region 2 returned while idle: 33554432
+  bytes` follows within seconds.
+
+So the diagnosis is precisely the missing tick and not a missing release, which
+is the distinction that decides the fix: a tick from the accept loop, which owns
+the shared arena. Not written here.
+
+### 68.6 The gates, and one shim that is not a second locate
+
+`scripts/wc-release-vm.sh` declares to both structures and proves rather than
+asserts:
+
+```
+  PASS  the arena is guest RAM: all 3072 pages located by sweep through QEMU's flat view,
+        and there is no file
+  PASS  the compositor ran in another kernel: guest Linux 6.18.44, this workstation Linux 6.18.33
+  ----  topology: CROSS-VM -- a hypervisor is in the path.
+  PASS  release: TOPOLOGY cross-vm: proven by 3072 pages of guest RAM located by sweep --
+        QEMU's monitor cannot answer for a machine that is not running one
+```
+
+**`wc_locate_arena` is reused rather than reimplemented**, and that needed two
+shims: this rig has the guest, QEMU and the proxy all on one workstation, where
+that function expects ssh to a guest and ssh to a separate VM host. `g` and `h`
+are shells, and `g` rewrites `/sv` to the run directory because the guest's 9p
+mount and the host's directory are the same bytes under two names. Everything
+load-bearing stays that function's: the run id read out of the compositor's own
+line, `wc-arena-host` through QEMU's monitor, the `verify: 3072/3072` count and
+the refusal when a page is missing. A private copy that happened to agree with
+itself is the exact shape this project keeps finding gates in.
+
+**The kernel check earns its place.** A harness on one box that boots a guest can
+fail to reach it and measure the host instead, and every arena number would look
+plausible. `uname -r` inside the guest against `uname -r` here is a fact neither
+side can fake, and `wc_assert_topology` is the second, independent one.
+
+Two notes on the apparatus, which had never run against a real `cross-vm` leg
+before this:
+
+* **It behaved.** `wc_substrate_declare guest-ram` unset `SV_ALLOW_FILE_ARENA`,
+  `wc_topology_declare cross-vm` checked for a VM host and a guest, and
+  `wc_assert_topology` refused to accept the declaration on anything but the
+  locate. No gate had to be loosened.
+* **The locate took the sweep arm, and that is not a degradation.** There is no
+  page-frame database off Windows — `grow::frames` says so in the reply — so
+  every locate here is `frames=none` and the sweep runs: 3072 of 3072 pages in
+  187–208 ms over 2048 MiB. §61.4's "a 65600-byte packet cannot fit a 65536-byte
+  ring" therefore **cannot arise on this leg**, because the reply carries zero
+  frames. It is untouched and still open on Windows.
+
+### 68.7 What is proven and what is not
+
+| | |
+|---|---|
+| a killed client's pools returned to the arena | **shown** — `session ended holding 3 pool(s), 18874368 bytes returned`, twice |
+| an empty region returned to the guest | **shown** — `arena region 1 returned while idle: 16777216 bytes` |
+| the guest's operating system got the pages back | **shown** — resident set −16,777,216 B, from `/proc` inside the VM |
+| growth on demand across a hypervisor, Linux guest | **shown** — 16 MiB in 28 ms, then 32 MiB in 65 ms |
+| the reclaim clock turning while nothing draws | **shown** — every release here happened with no client drawing anything, ever |
+| the zero-client case | **still open, and confirmed** — §68.5 |
+| release on a **Windows** guest | **not shown.** This is a Linux guest; `VirtualFree`/`VirtualLock` were not the code that ran |
+| anything about compositing on this topology | **not in the experiment** — §68.3 |
+| `frames=none` degradation on the *growth* path | now **the only arm this leg has**; the frame-list arm is still Windows-only |
+| `Floor::CURRENT` moved to `GrowsUnderPressure` | **no** |
+
+`Floor::CURRENT` stays `MustStandAlone` and
+`growth_has_not_been_demonstrated_on_a_guest_yet` stays asserted. Release is now
+shown on a boundary, which was §61.6's stated blocker — but that arm asks for
+something this run does not contain and was not trying to: *"a guest session at
+this floor, with a real Firefox, showing the arena growing rather than
+refusing"*, with click latencies against the 64 MiB baseline. There is no
+Firefox here, no click and no window (§68.3). Moving that line is a separate,
+deliberate commit with a failing guard test in front of it, on a leg that has a
+browser in it.
