@@ -540,3 +540,72 @@ mod tests {
         assert_eq!(checked, 436, "the vendored protocols changed shape");
     }
 }
+
+/// What does the per-message dialect rewrite actually cost?
+///
+/// The user's rule is that efficiency decides between a negotiated,
+/// side-specialised ring format and one standard protocol translated at the
+/// boundary. Both readings are defensible from the armchair, so this measures
+/// the quantity they disagree about: **the per-message cost of `walk` +
+/// `splice_fds`**, which is the entire rewrite a standard protocol pays and a
+/// negotiated one avoids.
+///
+/// Ignored, because it is a stopwatch. Run it deliberately:
+/// `cargo test -p wc-proxy --lib rewrite -- --ignored --nocapture`
+#[cfg(test)]
+mod rewrite_cost {
+    use super::*;
+    use crate::spec::{Arg, ArgKind};
+
+    fn arg(kind: ArgKind) -> Arg {
+        Arg { kind, interface: None }
+    }
+
+    /// `wl_surface.attach(object, int, int)` — three words, no `h`. This is the
+    /// shape of nearly every message a session carries, so it is the one whose
+    /// cost multiplies.
+    fn attach() -> (Vec<u8>, Vec<Arg>) {
+        let mut b = Vec::new();
+        b.extend_from_slice(&7u32.to_ne_bytes());
+        b.extend_from_slice(&0u32.to_ne_bytes());
+        b.extend_from_slice(&0u32.to_ne_bytes());
+        (b, vec![arg(ArgKind::Object), arg(ArgKind::Word), arg(ArgKind::Word)])
+    }
+
+    /// `wl_shm.create_pool(new_id, h, int)` — the message the whole question is
+    /// about, in its out-of-band form.
+    fn create_pool() -> (Vec<u8>, Vec<Arg>) {
+        let mut b = Vec::new();
+        b.extend_from_slice(&9u32.to_ne_bytes());
+        b.extend_from_slice(&(4096u32).to_ne_bytes());
+        (b, vec![arg(ArgKind::NewId), arg(ArgKind::Fd), arg(ArgKind::Word)])
+    }
+
+    fn time(name: &str, body: &[u8], args: &[Arg], repl: &[Vec<u8>]) {
+        // Warm, then measure. The rewrite is `walk` to find the spans and
+        // `splice_fds` to rebuild the body — exactly what the boundary does per
+        // message today.
+        for _ in 0..1000 {
+            let s = walk(body, args, FdEncoding::OutOfBand).unwrap();
+            std::hint::black_box(splice_fds(body, &s, FdEncoding::OutOfBand, repl));
+        }
+        let n = 200_000;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let s = walk(body, args, FdEncoding::OutOfBand).unwrap();
+            std::hint::black_box(splice_fds(body, &s, FdEncoding::OutOfBand, repl));
+        }
+        let per = t0.elapsed().as_secs_f64() / n as f64;
+        println!("  {name:<14} {:>8.0} ns/message", per * 1e9);
+    }
+
+    #[test]
+    #[ignore = "a stopwatch: reports the per-message rewrite cost"]
+    fn what_the_dialect_rewrite_costs_per_message() {
+        println!("per-message cost of walk + splice_fds (the boundary rewrite):");
+        let (b, a) = attach();
+        time("attach", &b, &a, &[]);
+        let (b, a) = create_pool();
+        time("create_pool", &b, &a, &[vec![0u8; 8]]);
+    }
+}

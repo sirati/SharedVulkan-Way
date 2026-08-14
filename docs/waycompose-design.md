@@ -22787,3 +22787,123 @@ at the end of a long session on a hypothesis.
    beyond connecting.** The compositor bound its socket and the port carried
    bytes as far as the harness got, but no Wayland client has completed a
    handshake across it, so the transport is plausible rather than proven.
+
+### 36.22 The doorbell is a bell, and that is the whole of its licence
+
+The rule, as the user states it:
+
+> all communication is to go through the ring. alternative channels are
+> permitted only for wakeup from idle
+
+**The doorbell is the sanctioned exception and it is sanctioned narrowly.** A
+byte on a virtio-serial port that wakes a parked consumer is "wakeup from idle"
+exactly; it carries no payload, no sequencing and no state, and §36.6.3's
+framing argument is that it *cannot* — one byte, one wake, seven bits of
+slot-and-lane, and a lost or spurious byte costs a slice or a syscall
+respectively because there is nothing in it to lose.
+
+So the boundary, stated because the port exists and the temptation is
+structural: **nothing may ride that port except a wake.** Not a handshake, not a
+locator, not a small reply that would be convenient because the port is already
+open and a ring packet feels heavier. The moment it carries meaning, the ring
+stops being the channel and starts being one of two, and the reason the design
+survived contact with a hypervisor is that there is one.
+
+Two byte relays over virtio-serial were built for the Wayland wire and are
+withdrawn on this rule. If either returns, the answer is §36's ring — which is
+what carries a Wayland connection, and does so at 0.54 ms a present.
+
+The doorbell's own results are unaffected because a bell is all it ever was:
+13.6 µs across the boundary to the Windows guest, no floor for a delivered
+wake, and 48.7× on a real present in topology 1.
+
+### 36.23 `create_pool` against a Linux compositor: measured, and the rewrite is noise
+
+`wc-proxy` writes the in-band-`h` dialect upstream unconditionally, so against a
+*Linux* compositor `create_pool` desynchronises the reader with nothing logged.
+The user's rule for choosing the fix:
+
+> whatever is more efficient is the correct choice i.e. the ring data format can
+> be specialised for the other side instead of needing translation after the
+> fact if that is faster, however that requires that during client server
+> handshake this format is negotiated … on the other hand having a standard
+> protocol would make multi-client operations easier
+
+Efficiency decides, negotiation is the mechanism, and multi-client is the
+counterweight. Two questions had to be answered, and one of them is measurable.
+
+#### 36.23.1 Can the descriptor be resolved in the ring? It is resolved *before* it
+
+Not by the ring, and it does not need to be. §36.4's `PacketKind::Bytes` exists
+precisely because the ring carries opaque bytes — "nothing in this crate parses
+them or is allowed to" — and giving it a Wayland parser to find an `h` would
+make the transport protocol-aware, which is what §36 was built to avoid.
+
+It does not need to, because **the descriptor is already gone by then**. §14.7
+is exactly this: `wc-proxy`'s session turns the client's fd into an arena handle
+of integers before the bytes reach the boundary, which is *why* the fd count at
+the crossing hop is unrepresentable rather than zero. There is no descriptor at
+the ring. There is an integer that used to be one.
+
+And that settles the ring path on its own:
+
+> **`OutOfBand` is not merely wrong over a ring, it is impossible.** A ring
+> cannot carry a descriptor, by construction — that is §14.7's guarantee, not an
+> accident. A Linux compositor reached over a ring cannot be sent an
+> `SCM_RIGHTS` fd whatever the proxy is willing to do.
+
+So the in-band encoding is **not a Windows quirk**. It is the only encoding
+compatible with "all communication goes through the ring"; Windows merely got
+there first because `afunix.sys` forced it. **For the ring path there is nothing
+to negotiate** — the transport determines the encoding. Negotiation is only
+meaningful on the socket path, where both remain possible and where §14.7's
+argument for a local `SCM_RIGHTS` still holds.
+
+#### 36.23.2 Does specialisation buy anything? 300 ns against a 540,000 ns present
+
+The remaining case for a negotiated, side-specialised format is that it avoids a
+per-message rewrite at the boundary. That is a quantity, so it was measured
+rather than argued — `wire::rewrite_cost`, the full `walk` + `splice_fds` a
+message actually pays:
+
+| message | per-message rewrite |
+|---|---|
+| `wl_surface.attach` (three words — the shape nearly every message has) | **301 ns** |
+| `wl_shm.create_pool` (the message in question) | **304 ns** |
+
+Against §36.21's cross-VM present of **0.54 ms**, one rewrite is **0.056%** of a
+present — and that is a *debug* build, which is several times slower than
+anything shipped.
+
+**So specialisation buys nothing measurable, and the standard protocol wins on
+the multi-client argument the user raised themselves.** §41's two-client run
+over one arena makes multi-client real here rather than hypothetical, and a
+single dialect is what keeps a second client from being a second negotiation.
+
+The coordinator's reading was also right and is worth keeping: because
+negotiation is per connection, **the server must implement both encodings
+regardless** — so specialisation never removes a dialect, it only moves where
+the rewrite happens. Paying 300 ns at a boundary that already costs half a
+millisecond, in exchange for one protocol instead of two, is not a close call.
+
+#### 36.23.3 What should actually change
+
+Not the ring, and not a negotiation. The defect is narrower than either:
+
+- `wc-proxy`'s `FdEncoding` is **already a parameter, not a `cfg`** —
+  deliberately, "because this one process reads one dialect and writes the
+  other". The proxy is not the problem.
+- the vendored `wayland-backend`'s in-band `h` is **`#[cfg(windows)]`**. That is
+  the hard-coding, and it is on the compositor's side.
+
+The fix is to make that path conditional on **the transport rather than the
+platform**: a client arriving over a ring reads `h` in band on Linux exactly as
+on Windows, because there is no other way for the bytes to have arrived. A proxy
+that always writes in band over a ring is then *correct* rather than
+hard-coded — and the desynchronisation stops being possible instead of being
+detected.
+
+Where a refusal is still wanted, `finish_attach` is the place: it already
+carries `WIRE_VERSION` and a protocol hash and already refuses a skew while
+naming the cause, which is the failure mode this defect lacks — today it is a
+desynchronised reader with nothing logged and the connection still open.
