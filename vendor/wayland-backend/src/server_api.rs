@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd and stream types now come from `crate::os`.
-use crate::os::{ProtoFd, RawProtoFd, WlStream as UnixStream};
+use crate::os::{FdEncoding, ProtoFd, RawProtoFd, WlStream as UnixStream};
 #[cfg(unix)]
 use crate::os::BorrowedFd;
 
@@ -531,6 +531,41 @@ impl Handle {
     #[cfg(feature = "libwayland_server_1_23")]
     pub fn set_client_max_buffer_size(&self, client: ClientId, max_buffer_size: usize) {
         self.handle.set_client_max_buffer_size(client.id, max_buffer_size);
+    }
+
+    /// WAYCOMPOSE FORK (`docs/waycompose-design.md` §79): **declare which dialect
+    /// this client speaks its `h` arguments in.**
+    ///
+    /// A connection defaults to [`FdEncoding::OutOfBand`], which is what a stock
+    /// libwayland client is. A peer reached through `wc-proxy` speaks
+    /// [`FdEncoding::InBand`], and the compositor knows that from **which door
+    /// the connection arrived at** — §72.3’s "the transport picks" — not from
+    /// anything in the stream.
+    ///
+    /// **Call this immediately after `insert_client` and before the next
+    /// dispatch.** The two dialects disagree about how many body bytes an `h`
+    /// occupies, so a connection that has already read one message cannot change
+    /// its mind without desynchronising — which is the failure §72.3 describes.
+    /// Nothing is dispatched between the two calls, so there is no race to lose.
+    ///
+    /// Errors if the backend cannot speak the requested dialect: the
+    /// `libwayland` backend reads `SCM_RIGHTS` and nothing else.
+    pub fn set_client_fd_encoding(
+        &self,
+        client: ClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()> {
+        self.handle.set_client_fd_encoding(client.id, encoding)
+    }
+
+    /// WAYCOMPOSE FORK (§79): which dialect this client speaks.
+    ///
+    /// What a sender consults to know whether an `h` has to be a **name**. A
+    /// keymap or a clipboard pipe going to an in-band peer must be a named
+    /// object, and only the sender can make one — `rs/wire.rs` refuses rather
+    /// than inventing a name for an fd it was handed.
+    pub fn client_fd_encoding(&self, client: ClientId) -> FdEncoding {
+        self.handle.client_fd_encoding(client.id)
     }
 }
 

@@ -18,7 +18,7 @@ use std::{
 // from the real descriptors this file builds with `from_raw_fd` and hands to
 // libwayland. They are the same type on Unix, which is the only platform this
 // backend has; see `crate::os` and `docs/waycompose-design.md` §76.
-use crate::os::{ProtoFd, RawProtoFd};
+use crate::os::{FdEncoding, ProtoFd, RawProtoFd};
 
 use crate::protocol::{
     check_for_signature, same_interface, AllowNull, Argument, ArgumentType, Interface, Message,
@@ -864,6 +864,20 @@ impl InnerHandle {
         self.state.lock().unwrap().set_client_max_buffer_size(client, max_buffer_size)
     }
 
+    /// WAYCOMPOSE FORK (§79). See [`crate::server::Handle::set_client_fd_encoding`].
+    pub fn set_client_fd_encoding(
+        &self,
+        client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()> {
+        self.state.lock().unwrap().set_client_fd_encoding(client, encoding)
+    }
+
+    /// WAYCOMPOSE FORK (§79). See [`crate::server::Handle::client_fd_encoding`].
+    pub fn client_fd_encoding(&self, client: InnerClientId) -> FdEncoding {
+        self.state.lock().unwrap().client_fd_encoding(client)
+    }
+
     pub fn display_ptr(&self) -> *mut wl_display {
         self.state.lock().unwrap().display_ptr()
     }
@@ -905,6 +919,12 @@ pub(crate) trait ErasedState: downcast_rs::Downcast {
     fn flush(&mut self, client: Option<ClientId>) -> std::io::Result<()>;
     #[cfg(feature = "libwayland_server_1_23")]
     fn set_client_max_buffer_size(&mut self, client: InnerClientId, max_buffer_size: usize);
+    fn set_client_fd_encoding(
+        &mut self,
+        client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()>;
+    fn client_fd_encoding(&self, client: InnerClientId) -> FdEncoding;
     fn display_ptr(&self) -> *mut wl_display;
 }
 
@@ -1328,6 +1348,33 @@ impl<D: 'static> ErasedState for State<D> {
             };
         }
         Ok(())
+    }
+
+    /// WAYCOMPOSE FORK (§79). **`libwayland` speaks one dialect and it is not
+    /// this one.**
+    ///
+    /// The in-band form is a property of this fork’s own `rs` backend: it is
+    /// implemented in `rs/wire.rs`, and `libwayland` — which this backend is a
+    /// binding to — reads `SCM_RIGHTS` and nothing else. Refusing is the only
+    /// honest answer; silently accepting would produce exactly the desync
+    /// `docs/waycompose-design.md` §72.3 is about, one layer further down.
+    fn client_fd_encoding(&self, _client: InnerClientId) -> FdEncoding {
+        FdEncoding::OutOfBand
+    }
+
+    fn set_client_fd_encoding(
+        &mut self,
+        _client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()> {
+        match encoding {
+            FdEncoding::OutOfBand => Ok(()),
+            FdEncoding::InBand => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the libwayland backend cannot speak the in-band `h` dialect; \
+                 build the compositor against the rust backend",
+            )),
+        }
     }
 
     #[cfg(feature = "libwayland_server_1_23")]

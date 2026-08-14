@@ -11,7 +11,7 @@
 //! - The [`wlr_data_control`](wlr_data_control/index.html) module to hook data control into
 //!   clipboard and primary selection
 
-use crate::utils::os::OwnedFd;
+use crate::utils::os::ProtoFd;
 
 use crate::input::{Seat, SeatHandler};
 
@@ -45,7 +45,7 @@ pub trait SelectionHandler: Sized + SeatHandler {
         &mut self,
         ty: SelectionTarget,
         mime_type: String,
-        fd: OwnedFd,
+        fd: ProtoFd,
         seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {

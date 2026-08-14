@@ -1,5 +1,5 @@
 // WAYCOMPOSE FORK: fd, stream and poll-handle types now come from `crate::os`.
-use crate::os::{PollHandle, RawProtoFd, WlStream as UnixStream};
+use crate::os::{FdEncoding, PollHandle, RawProtoFd, WlStream as UnixStream};
 
 use std::{
     ffi::CString,
@@ -101,6 +101,26 @@ impl<D> State<D> {
         if let Ok(client) = self.clients.get_client_mut(client) {
             client.socket.set_max_buffer_size(Some(max_buffer_size));
         }
+    }
+
+    /// WAYCOMPOSE FORK (§79): which dialect this client speaks.
+    fn client_fd_encoding(&self, client: InnerClientId) -> FdEncoding {
+        self.clients
+            .get_client(client)
+            .map(|c| c.socket.fd_encoding())
+            .unwrap_or_default()
+    }
+
+    /// WAYCOMPOSE FORK (§79): declare which dialect this client speaks.
+    fn set_client_fd_encoding(
+        &mut self,
+        client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()> {
+        if let Ok(client) = self.clients.get_client_mut(client) {
+            client.socket.set_fd_encoding(encoding);
+        }
+        Ok(())
     }
 }
 
@@ -326,6 +346,20 @@ impl InnerHandle {
     pub fn set_client_max_buffer_size(&self, client: InnerClientId, max_buffer_size: usize) {
         self.state.lock().unwrap().set_client_max_buffer_size(client, max_buffer_size)
     }
+
+    /// WAYCOMPOSE FORK (§79). See [`crate::server::Handle::set_client_fd_encoding`].
+    pub fn set_client_fd_encoding(
+        &self,
+        client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()> {
+        self.state.lock().unwrap().set_client_fd_encoding(client, encoding)
+    }
+
+    /// WAYCOMPOSE FORK (§79). See [`crate::server::Handle::client_fd_encoding`].
+    pub fn client_fd_encoding(&self, client: InnerClientId) -> FdEncoding {
+        self.state.lock().unwrap().client_fd_encoding(client)
+    }
 }
 
 pub(crate) trait ErasedState: downcast_rs::Downcast {
@@ -362,6 +396,12 @@ pub(crate) trait ErasedState: downcast_rs::Downcast {
     fn flush(&mut self, client: Option<ClientId>) -> std::io::Result<()>;
     fn set_default_max_buffer_size(&mut self, max_buffer_size: usize);
     fn set_client_max_buffer_size(&mut self, client: InnerClientId, max_buffer_size: usize);
+    fn set_client_fd_encoding(
+        &mut self,
+        client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()>;
+    fn client_fd_encoding(&self, client: InnerClientId) -> FdEncoding;
 }
 
 downcast_rs::impl_downcast!(ErasedState);
@@ -556,5 +596,17 @@ impl<D> ErasedState for State<D> {
 
     fn set_client_max_buffer_size(&mut self, client: InnerClientId, max_buffer_size: usize) {
         self.set_client_max_buffer_size(client, max_buffer_size)
+    }
+
+    fn set_client_fd_encoding(
+        &mut self,
+        client: InnerClientId,
+        encoding: FdEncoding,
+    ) -> std::io::Result<()> {
+        self.set_client_fd_encoding(client, encoding)
+    }
+
+    fn client_fd_encoding(&self, client: InnerClientId) -> FdEncoding {
+        self.client_fd_encoding(client)
     }
 }

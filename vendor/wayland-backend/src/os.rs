@@ -11,6 +11,9 @@
 //!
 //! # What an `Fd` is on each platform
 //!
+//! (This table is about the **socket** role. For the protocol role see
+//! [`WireFd`], which is a disjunction rather than a platform choice.)
+//!
 //! | | `RawFd` | `OwnedFd` |
 //! |---|---|---|
 //! | Unix | `i32`, borrowed | `OwnedFd`, closes on drop |
@@ -48,10 +51,11 @@
 //! own name so that it can move on its own. See
 //! `docs/waycompose-design.md` §76.
 //!
-//! [`WireFd`] is what it is going to move **to**: an `h` that is either a name
-//! the peer can open or a descriptor that is already open, per connection rather
-//! than per platform. It exists and is tested; nothing constructs one yet,
-//! because `rs/wire.rs` still chooses by `cfg`. §77.
+//! [`WireFd`] is what it moved **to**, in §79: an `h` that is either a name the
+//! peer can open or a descriptor that is already open, chosen **per connection**
+//! by [`FdEncoding`] rather than per platform. §77 introduced the type; §79 made
+//! `rs/wire.rs` read and write both arms on both platforms, which is what
+//! `docs/waycompose-design.md` §72.3 called for.
 
 #[cfg(unix)]
 pub use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -59,35 +63,33 @@ pub use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 /// What a wayland `h` argument carries, owned: the `Fd` parameter of a
 /// [`Message`][crate::protocol::Message] that was **parsed** off the wire.
 ///
-/// Today this is the identity — see the module docs for the two jobs it
-/// separates, and note that the alias is deliberately unconditional, so that
-/// introducing it cannot change behaviour on either platform. It exists to be
-/// the one definition `docs/waycompose-design.md` §72.3 has to edit: an `h` that
-/// can carry either a descriptor **name** (in band, what a peer behind
-/// `wc-proxy` speaks) or an already-open fd (out of band, `SCM_RIGHTS`), chosen
-/// by transport rather than by platform. When that definition changes, the
-/// socket layer stays on [`OwnedFd`] and does not move.
+/// This is [`WireFd`]: an `h` that carries **either** a descriptor name (in
+/// band, what a peer behind `wc-proxy` speaks) **or** an already-open fd (out of
+/// band, `SCM_RIGHTS`), with `rs/wire.rs` choosing per connection rather than
+/// per platform. `docs/waycompose-design.md` §79.
 ///
-/// The type it will change **to** is [`WireFd`], which exists and is tested
-/// already; what is still missing is `rs/wire.rs` choosing between its two arms
-/// per connection instead of per platform.
-pub type ProtoFd = OwnedFd;
+/// The socket layer stayed on [`OwnedFd`] when this changed, which is what §76
+/// separated the two names for. Measured: swapping these three aliases for the
+/// enums produced **two** compile errors in the whole of `wayland-backend` and
+/// `wayland-server`, both in `rs/wire.rs`, and they were the write and parse
+/// arms of `Argument::Fd`.
+pub type ProtoFd = WireFd;
 
 /// What a wayland `h` argument carries when it is about to be **written**: the
 /// `Fd` parameter of the `Message` handed to `send_request` / `send_event`.
 ///
 /// The send side is unowned on Unix — the caller keeps the descriptor and
 /// `write_to_buffers` `dup()`s it — which is why the protocol has two of these
-/// rather than one. See [`ProtoFd`].
-pub type RawProtoFd = RawFd;
+/// rather than one. See [`RawWireFd`].
+pub type RawProtoFd = RawWireFd;
 
 /// What a wayland `h` argument carries in a generated request or event, borrowed
 /// for `'a`.
 ///
 /// This is the type `wayland-scanner` emits into `write_request` / `write_event`
 /// and into the `Fd` field of every generated `Request<'a>`, which is why it has
-/// a lifetime the other two do not. See [`ProtoFd`].
-pub type BorrowedProtoFd<'a> = BorrowedFd<'a>;
+/// a lifetime the other two do not. See [`BorrowedWireFd`].
+pub type BorrowedProtoFd<'a> = BorrowedWireFd<'a>;
 
 /// **What an `h` argument is once the dialect is a choice rather than a
 /// platform.** Either a *name* the peer can open, or a descriptor that is
@@ -154,6 +156,39 @@ impl WireFd {
         }
     }
 
+    /// Borrow this `h` in the form a request or event carries.
+    ///
+    /// The operation every sender that is **forwarding** an `h` needs: a
+    /// clipboard pipe arrives on one connection and goes out on another, and
+    /// neither end should have to know which arm it is.
+    pub fn borrow(&self) -> BorrowedWireFd<'_> {
+        match self {
+            Self::Named(handle) => BorrowedWireFd::Named(handle),
+            #[cfg(unix)]
+            Self::Open(fd) => BorrowedWireFd::Open(fd.as_fd()),
+        }
+    }
+
+    /// Take the open descriptor, or hand back the `h` unchanged if it is a name.
+    ///
+    /// For the callers that need a **real kernel descriptor** and cannot use a
+    /// name: a `UnixListener` to accept on, an fd to `mmap` a virtual keyboard's
+    /// keymap out of. `Err` is not a failure to convert, it is the statement
+    /// that this peer sent something that cannot do that job, and the caller
+    /// should raise a protocol error rather than guess.
+    ///
+    /// Unconditional, and on Windows it always returns `Err`: there is no
+    /// unnamed descriptor there, so every caller of this is a caller that cannot
+    /// be served on that platform. That is the same answer it has always given
+    /// — it is now given by the type rather than by a `cfg` at each site.
+    pub fn into_open(self) -> Result<OwnedFd, Self> {
+        match self {
+            #[cfg(unix)]
+            Self::Open(fd) => Ok(fd),
+            named => Err(named),
+        }
+    }
+
     /// The open descriptor, borrowed, if this is the out-of-band form.
     #[cfg(unix)]
     pub fn as_open(&self) -> Option<BorrowedFd<'_>> {
@@ -193,6 +228,137 @@ impl FdRepr for WireFd {
             Self::Named(handle) => write!(f, "{:?}", handle.descriptor()),
             #[cfg(unix)]
             Self::Open(fd) => write!(f, "{}", fd.as_raw_fd()),
+        }
+    }
+}
+
+/// The send-side counterpart of [`WireFd`]: what `send_request` / `send_event`
+/// carry.
+///
+/// Unowned in the `Open` arm, exactly as `RawFd` was — the caller keeps the
+/// descriptor and `write_to_buffers` `dup()`s it into the `SCM_RIGHTS` batch.
+/// The `Named` arm *is* owned, because a [`wc_handle::Handle`] is a refcounted
+/// clone rather than a number, and cloning it is the honest analogue of the
+/// `dup()` the other arm does later.
+#[derive(Debug, Clone)]
+pub enum RawWireFd {
+    /// See [`WireFd::Named`].
+    Named(wc_handle::Handle),
+    /// A raw descriptor the caller still owns. See [`WireFd::Open`].
+    #[cfg(unix)]
+    Open(RawFd),
+}
+
+impl FdRepr for RawWireFd {
+    fn fd_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Named(a), Self::Named(b)) => a == b,
+            #[cfg(unix)]
+            (Self::Open(a), Self::Open(b)) => a == b,
+            #[cfg(unix)]
+            _ => false,
+        }
+    }
+    fn fd_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Named(handle) => write!(f, "{:?}", handle.descriptor()),
+            #[cfg(unix)]
+            Self::Open(raw) => write!(f, "{raw}"),
+        }
+    }
+}
+
+/// The borrowed counterpart of [`WireFd`]: what `wayland-scanner` emits into
+/// every generated `Request<'a>` and `write_request`/`write_event` signature.
+///
+/// A caller with a real descriptor writes `BorrowedWireFd::Open(fd.as_fd())`; a
+/// caller with a named object writes `BorrowedWireFd::Named(&handle)`. Which one
+/// is correct is not the caller's guess — it is what the peer's dialect demands,
+/// and [`Client::fd_encoding`][crate::server::Client] is where that is recorded.
+#[derive(Debug, Clone)]
+pub enum BorrowedWireFd<'a> {
+    /// See [`WireFd::Named`].
+    Named(&'a wc_handle::Handle),
+    /// See [`WireFd::Open`].
+    #[cfg(unix)]
+    Open(BorrowedFd<'a>),
+}
+
+impl BorrowedWireFd<'_> {
+    /// Convert to the send-side form.
+    ///
+    /// Named `as_raw_fd` because that is what every generated `write_request`
+    /// calls, and the name is inherited rather than chosen. It is not a lie in
+    /// either arm: the `Open` arm really does produce the raw number, and the
+    /// `Named` arm produces the refcounted clone that stands in for one.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn as_raw_fd(&self) -> RawWireFd {
+        match self {
+            Self::Named(handle) => RawWireFd::Named((*handle).clone()),
+            #[cfg(unix)]
+            Self::Open(borrowed) => RawWireFd::Open(borrowed.as_raw_fd()),
+        }
+    }
+}
+
+impl FdRepr for BorrowedWireFd<'_> {
+    fn fd_eq(&self, other: &Self) -> bool {
+        self.as_raw_fd().fd_eq(&other.as_raw_fd())
+    }
+    fn fd_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_raw_fd().fd_fmt(f)
+    }
+}
+
+/// **How a connection spells an `h` argument.** The thing that used to be a
+/// `#[cfg]`.
+///
+/// Deliberately the same name and the same two variants as
+/// `wc_proxy::wire::FdEncoding`, which has been a runtime parameter on the proxy
+/// side since it was written — the proxy reads one dialect and writes the other
+/// on every message it touches, so it never had the option of a `cfg`. The two
+/// halves of this system now use one word for one concept.
+///
+/// `docs/waycompose-design.md` §72.3 for why the choice is by **transport**
+/// rather than by platform, and §79 for what makes it per connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdEncoding {
+    /// libwayland's: the descriptor rides a `SCM_RIGHTS` control message and the
+    /// `h` occupies **zero bytes** of the message body.
+    ///
+    /// The default **on Unix**, because it is what an unannounced peer is: a
+    /// stock client connecting to a stock socket. A peer that speaks the other
+    /// dialect has to have arrived somewhere that says so.
+    ///
+    /// **Cannot be spoken on Windows at all** — there is no ancillary channel —
+    /// which is why the default below is `cfg`-ed rather than derived.
+    OutOfBand,
+    /// The descriptor is encoded in the body exactly like an `array` — a `u32`
+    /// length, the bytes, padded to four — and there is no control message.
+    ///
+    /// What a peer reached through `wc-proxy` speaks, on either platform, and
+    /// the only dialect available on Windows because `SCM_RIGHTS` has no
+    /// equivalent there — which is what makes it the default there.
+    InBand,
+}
+
+impl Default for FdEncoding {
+    /// **What an unannounced peer on this platform is.**
+    ///
+    /// Not derived, because the honest answer differs: on Unix an unannounced
+    /// peer is a stock libwayland client and speaks `SCM_RIGHTS`; on Windows
+    /// there is no such thing as an out-of-band descriptor, so the only dialect
+    /// a connection can possibly be speaking is the in-band one. Deriving
+    /// `Default` on the first variant would have made every Windows connection
+    /// start out claiming a mechanism the platform does not have.
+    fn default() -> Self {
+        #[cfg(unix)]
+        {
+            Self::OutOfBand
+        }
+        #[cfg(windows)]
+        {
+            Self::InBand
         }
     }
 }
@@ -319,7 +485,10 @@ impl<T: AsFd + ?Sized> AsFd for &T {
 ///
 /// There is deliberately no writable counterpart; see `wc_handle::Handle::map`
 /// for why a compositor reading client buffers should not have one by default.
-#[cfg(windows)]
+///
+/// §79 made this unconditional. It was Windows-only while a named object was a
+/// Windows-only thing; a Linux compositor behind `wc-proxy` now receives
+/// [`WireFd::Named`] and maps it exactly the same way.
 pub use wc_handle::Mapping;
 
 /// The socket type the transport is built on.

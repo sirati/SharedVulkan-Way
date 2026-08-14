@@ -1,4 +1,4 @@
-use crate::utils::os::{AsFd, ProtoFd};
+use crate::utils::os::ProtoFd;
 use std::{
     cell::RefCell,
     fmt,
@@ -568,7 +568,7 @@ where
                 && source.alive()
                 && data.active;
             if valid {
-                source.send(mime_type, fd.as_fd());
+                source.send(mime_type, fd.borrow());
             }
         }
         Request::Destroy => {

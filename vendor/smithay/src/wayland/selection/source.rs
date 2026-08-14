@@ -1,4 +1,4 @@
-use crate::utils::os::{AsFd, OwnedFd};
+use crate::utils::os::ProtoFd;
 
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_source_v1::ExtDataControlSourceV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1 as PrimarySource;
@@ -48,8 +48,8 @@ impl SelectionSourceProvider {
     }
 
     /// Send the data with the specified `mime_type` using the given `fd`.
-    pub fn send(&self, mime_type: String, fd: OwnedFd) {
-        selection_dispatch!(self; Self(source) => source.send(mime_type, fd.as_fd()))
+    pub fn send(&self, mime_type: String, fd: ProtoFd) {
+        selection_dispatch!(self; Self(source) => source.send(mime_type, fd.borrow()))
     }
 
     /// Check whether the given selection source contains provided `mime_type`.

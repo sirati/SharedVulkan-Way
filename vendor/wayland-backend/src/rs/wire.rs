@@ -11,7 +11,7 @@ use std::ffi::CStr;
 // `docs/waycompose-design.md` §72.3 makes a per-transport choice. `OwnedFd` and
 // `BorrowedFd` here are the `SCM_RIGHTS` queues and the `dup()` that fills them:
 // real kernel descriptors, and nothing else on any platform.
-use crate::os::{OwnedFd, ProtoFd, RawProtoFd};
+use crate::os::{FdEncoding, OwnedFd, ProtoFd, RawProtoFd, RawWireFd, WireFd};
 #[cfg(unix)]
 use crate::os::BorrowedFd;
 
@@ -31,6 +31,19 @@ pub enum MessageWriteError {
     /// API and because the Unix path still raises it.
     #[cfg_attr(windows, allow(dead_code))]
     DupFdFailed(std::io::Error),
+    /// The `h` argument is the wrong kind for this connection's dialect.
+    ///
+    /// ADDED BY §79. An in-band peer needs a **name** and an out-of-band peer
+    /// needs an **open descriptor**, and neither can be produced from the other
+    /// down here: naming an arbitrary fd means creating a kernel object and
+    /// copying into it, which is a policy decision belonging to whoever owns the
+    /// bytes — `wc-proxy` for a relayed pool, smithay for a keymap. So this is
+    /// raised rather than papered over, and the caller that picked the wrong
+    /// arm is the one that has to be fixed.
+    WrongDialect {
+        /// What this connection speaks.
+        wanted: crate::os::FdEncoding,
+    },
 }
 
 impl std::error::Error for MessageWriteError {}
@@ -46,6 +59,13 @@ impl std::fmt::Display for MessageWriteError {
                 write!(
                     f,
                     "The message contains a file descriptor that could not be dup()-ed ({e})."
+                )
+            }
+            Self::WrongDialect { wanted } => {
+                write!(
+                    f,
+                    "The message contains an `h` argument of the wrong kind for a {wanted:?} \
+                     connection."
                 )
             }
         }
@@ -88,10 +108,14 @@ impl std::fmt::Display for MessageParseError {
 /// Returns the number of elements written in each buffer
 ///
 /// Any serialized Fd will be `dup()`-ed in the process
+///
+/// WAYCOMPOSE FORK: `encoding` is the parameter that used to be a `#[cfg]`. See
+/// `crate::os::FdEncoding` and `docs/waycompose-design.md` §79.
 pub fn write_to_buffers(
     msg: &Message<u32, RawProtoFd>,
     payload: &mut [u8],
     fds: &mut Vec<OwnedFd>,
+    encoding: FdEncoding,
 ) -> Result<usize, MessageWriteError> {
     let orig_payload_len = payload.len();
     // Helper function to write a u32 or a RawProtoFd to its buffer
@@ -145,36 +169,29 @@ pub fn write_to_buffers(
             Argument::Array(ref a) => write_array_to_payload(a, payload)?,
 
             // WAYCOMPOSE FORK: this arm is where an `h` argument leaves the
-            // process, and it is the one place the two platforms genuinely
-            // differ.
+            // process, and §79 made it a runtime choice. It was two `#[cfg]`
+            // arms; it is now two `match` arms, and both compile on both
+            // platforms.
             //
-            // On Unix the fd goes out-of-band: it is `dup()`-ed and queued for
+            // OUT OF BAND is libwayland's: the fd is `dup()`-ed and queued for
             // the `SCM_RIGHTS` control message that `Socket::send_msg` will
             // attach, and it occupies **zero** bytes of message body. Note
             // `payload` is returned unchanged.
-            #[cfg(unix)]
-            Argument::Fd(fd) => {
-                let dup_fd = unsafe { BorrowedFd::borrow_raw(fd) }
-                    .try_clone_to_owned()
-                    .map_err(MessageWriteError::DupFdFailed)?;
-                fds.push(dup_fd);
-                payload
-            }
-
-            // On Windows there is no out-of-band channel to put it in, so the
-            // typed descriptor goes in the body, encoded exactly like an
-            // `array`: a `u32` length followed by the bytes, padded to four.
-            // The message header's size field accounts for it automatically,
-            // and the parser on the other side reads it back positionally from
-            // the same signature, so nothing else in the protocol machinery
-            // notices.
             //
-            // **The lifetime rule this creates, stated plainly, because it is
-            // the one thing about the shim that a caller must know:** unlike
-            // `SCM_RIGHTS`, sending a descriptor transfers nothing. The kernel
-            // does not take a reference; the receiver holds only a *name* until
-            // it opens the object. So the process that created the object must
-            // keep its `Handle` alive for at least as long as the protocol
+            // IN BAND is what a peer reached through `wc-proxy` speaks, and on
+            // Windows it is the only thing there is: the typed descriptor goes
+            // in the body, encoded exactly like an `array` — a `u32` length
+            // followed by the bytes, padded to four. The message header's size
+            // field accounts for it automatically, and the parser on the other
+            // side reads it back positionally from the same signature, so
+            // nothing else in the protocol machinery notices.
+            //
+            // **The lifetime rule the in-band form creates, stated plainly,
+            // because it is the one thing about it that a caller must know:**
+            // unlike `SCM_RIGHTS`, sending a descriptor transfers nothing. The
+            // kernel does not take a reference; the receiver holds only a *name*
+            // until it opens the object. So the process that created the object
+            // must keep its `Handle` alive for at least as long as the protocol
             // object the handle backs — a `wl_shm_pool`, a keymap, a clipboard
             // pipe. Every real use site does this anyway, because it needs the
             // memory for the same period. A sender that drops its handle
@@ -183,11 +200,23 @@ pub fn write_to_buffers(
             // will fail at `map()` rather than silently reading somebody
             // else's memory, because section names carry 128 bits of entropy
             // and creation refuses to adopt an existing name.
-            #[cfg(windows)]
-            Argument::Fd(ref handle) => {
-                let _ = &fds; // no out-of-band channel on this platform
-                write_array_to_payload(&handle.descriptor().encode(), payload)?
-            }
+            Argument::Fd(ref fd) => match (encoding, fd) {
+                #[cfg(unix)]
+                (FdEncoding::OutOfBand, RawWireFd::Open(raw)) => {
+                    let dup_fd = unsafe { BorrowedFd::borrow_raw(*raw) }
+                        .try_clone_to_owned()
+                        .map_err(MessageWriteError::DupFdFailed)?;
+                    fds.push(dup_fd);
+                    payload
+                }
+                (FdEncoding::InBand, RawWireFd::Named(handle)) => {
+                    let _ = &fds; // no control message on this path
+                    write_array_to_payload(&handle.descriptor().encode(), payload)?
+                }
+                // The caller brought the wrong kind. Down here neither can be
+                // made from the other — see `MessageWriteError::WrongDialect`.
+                _ => return Err(MessageWriteError::WrongDialect { wanted: encoding }),
+            },
         };
     }
 
@@ -210,6 +239,7 @@ pub fn parse_message<'a>(
     raw: &'a [u8],
     signature: &[ArgumentType],
     fds: &mut VecDeque<OwnedFd>,
+    encoding: FdEncoding,
 ) -> Result<(Message<u32, ProtoFd>, &'a [u8]), MessageParseError> {
     // helper function to read arrays
     fn read_array_from_payload(
@@ -239,18 +269,19 @@ pub fn parse_message<'a>(
     }
 
     // WAYCOMPOSE FORK: this pre-check asks "have enough fds arrived
-    // out-of-band to satisfy this signature". On Windows nothing arrives
-    // out-of-band — the descriptors are in the body, and running out of them is
-    // detected as a short body like any other truncation.
-    #[cfg(windows)]
-    let _ = &fds;
+    // out-of-band to satisfy this signature". Nothing arrives out of band on an
+    // in-band connection — the descriptors are in the body, and running out of
+    // them is detected as a short body like any other truncation. §79 made this
+    // a test of the connection rather than of the platform.
     #[cfg(unix)]
-    {
+    if encoding == FdEncoding::OutOfBand {
         let fd_len = signature.iter().filter(|x| matches!(x, ArgumentType::Fd)).count();
         if fd_len > fds.len() {
             return Err(MessageParseError::MissingFD);
         }
     }
+    #[cfg(windows)]
+    let _ = (&fds, encoding);
 
     let (mut payload, rest) = raw.split_at(len);
     payload = &payload[2 * 4..];
@@ -258,15 +289,16 @@ pub fn parse_message<'a>(
     let arguments = signature
         .iter()
         .map(|argtype| {
-            // WAYCOMPOSE FORK: on Unix an `h` takes no body bytes and is popped
-            // from the out-of-band queue instead. On Windows it is an ordinary
-            // length-prefixed body argument and falls through to the match
-            // below, so this early return is Unix-only.
+            // WAYCOMPOSE FORK: on an out-of-band connection an `h` takes no body
+            // bytes and is popped from the control-message queue instead. On an
+            // in-band one it is an ordinary length-prefixed body argument and
+            // falls through to the match below, so this early return is taken
+            // per connection rather than per platform (§79).
             #[cfg(unix)]
-            if let ArgumentType::Fd = *argtype {
+            if encoding == FdEncoding::OutOfBand && matches!(*argtype, ArgumentType::Fd) {
                 // don't consume input but fd
                 return match fds.pop_front() {
-                    Some(front) => Ok(Argument::Fd(front)),
+                    Some(front) => Ok(Argument::Fd(WireFd::Open(front))),
                     None => Err(MessageParseError::MissingFD),
                 };
             }
@@ -298,20 +330,24 @@ pub fn parse_message<'a>(
                             Argument::Array(Box::new(v.into()))
                         })
                     }
-                    // WAYCOMPOSE FORK: unreachable on Unix, where the early
-                    // return above took it. On Windows this is the read side of
-                    // the shim — the descriptor comes back out of the body,
-                    // typed, so we know what kind of object it names without
-                    // having to infer it from which request it arrived in.
-                    // That inference is the cost waypipe could not avoid.
-                    #[cfg(unix)]
-                    ArgumentType::Fd => unreachable!(),
-                    #[cfg(windows)]
+                    // WAYCOMPOSE FORK: reached only on an in-band connection —
+                    // on an out-of-band one the early return above took it. This
+                    // is the read side of the in-band dialect: the descriptor
+                    // comes back out of the body, **typed**, so we know what kind
+                    // of object it names without having to infer it from which
+                    // request it arrived in. That inference is the cost waypipe
+                    // could not avoid.
+                    //
+                    // §79 made this reachable on Linux, which is the whole of
+                    // §72.3's defect: a Linux compositor behind `wc-proxy` now
+                    // reads the same bytes the Windows one always did.
                     ArgumentType::Fd => {
                         read_array_from_payload(front as usize, tail).and_then(|(v, rest)| {
                             tail = rest;
                             match wc_handle::Descriptor::decode(v) {
-                                Ok(d) => Ok(Argument::Fd(wc_handle::Handle::from_descriptor(d))),
+                                Ok(d) => {
+                                    Ok(Argument::Fd(WireFd::Named(wc_handle::Handle::from_descriptor(d))))
+                                }
                                 // A descriptor we cannot parse is a malformed
                                 // message, not a missing fd: the bytes were
                                 // there and they were wrong.
@@ -340,12 +376,12 @@ fn next_multiple_of(lhs: usize, rhs: usize) -> usize {
     }
 }
 
-#[cfg(all(test, unix))] // WAYCOMPOSE FORK: uses IntoRawFd
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::AllowNull;
     use smallvec::smallvec;
-    use std::{ffi::CString, os::unix::io::IntoRawFd};
+    use std::ffi::CString;
 
     #[test]
     fn into_from_raw_cycle() {
@@ -366,7 +402,8 @@ mod tests {
             ],
         };
         // write the message to the buffers
-        write_to_buffers(&msg, &mut bytes_buffer[..], &mut fd_buffer).unwrap();
+        write_to_buffers(&msg, &mut bytes_buffer[..], &mut fd_buffer, FdEncoding::OutOfBand)
+            .unwrap();
         // read them back
         let mut fd_buffer = VecDeque::from(fd_buffer);
         let (rebuilt, _) = parse_message(
@@ -381,8 +418,125 @@ mod tests {
                 ArgumentType::Int,
             ],
             &mut fd_buffer,
+            FdEncoding::OutOfBand,
         )
         .unwrap();
-        assert_eq!(rebuilt.map_fd(IntoRawFd::into_raw_fd), msg);
+        assert_eq!(rebuilt.map_fd(|_| unreachable!("no h in this signature")), msg);
+    }
+
+    /// A `wl_shm.create_pool` in the in-band dialect, written and read back
+    /// **on this platform**.
+    ///
+    /// This is §72.3’s defect as a unit test. Before §79 the in-band arms were
+    /// `#[cfg(windows)]`, so on Linux there was no code that could write these
+    /// bytes and none that could read them; a proxy that wrote them anyway left
+    /// the server’s reader one length-prefixed array out of step, with nothing
+    /// logged. The assertion that matters is the second one: the `h` costs body
+    /// bytes, which is exactly what the out-of-band reader would not have
+    /// consumed.
+    #[test]
+    fn an_in_band_h_round_trips_on_this_platform() {
+        let mut bytes_buffer = vec![0; 1024];
+        let mut fd_buffer = Vec::new();
+
+        let descriptor = wc_handle::Descriptor::Section {
+            name: "wc-pool-round-trip".into(),
+            size: 6291456,
+        };
+        let msg = Message {
+            sender_id: 3,
+            opcode: 0,
+            args: smallvec![
+                Argument::NewId(4),
+                Argument::Fd(RawWireFd::Named(wc_handle::Handle::from_descriptor(
+                    descriptor.clone()
+                ))),
+                Argument::Int(6291456),
+            ],
+        };
+
+        let written = write_to_buffers(
+            &msg,
+            &mut bytes_buffer[..],
+            &mut fd_buffer,
+            FdEncoding::InBand,
+        )
+        .unwrap();
+        assert!(fd_buffer.is_empty(), "the in-band dialect sends no control message");
+        assert!(
+            written > 2 * 4 + 2 * 4,
+            "the h must occupy body bytes: {written} is only the header and two words"
+        );
+
+        let mut fd_buffer = VecDeque::from(fd_buffer);
+        let (rebuilt, rest) = parse_message(
+            &bytes_buffer[..],
+            &[ArgumentType::NewId, ArgumentType::Fd, ArgumentType::Int],
+            &mut fd_buffer,
+            FdEncoding::InBand,
+        )
+        .unwrap();
+        assert_eq!(rest.len(), bytes_buffer.len() - written);
+        assert_eq!(rebuilt.sender_id, 3);
+        match &rebuilt.args[1] {
+            Argument::Fd(WireFd::Named(handle)) => assert_eq!(handle.descriptor(), &descriptor),
+            other => panic!("expected a named h, got {other:?}"),
+        }
+    }
+
+    /// The dialect is a property of the connection, and reading with the wrong
+    /// one is the defect §72.3 describes.
+    ///
+    /// An out-of-band reader handed in-band bytes does not fail loudly — it
+    /// takes the `h` from an empty queue and reports `MissingFD`, and in the
+    /// real socket path it would instead read the descriptor’s length word as
+    /// the *next* argument and stay silently out of step. Asserting the
+    /// mismatch is detectable at all is what stops it being invisible.
+    #[test]
+    fn reading_in_band_bytes_out_of_band_does_not_silently_succeed() {
+        let mut bytes_buffer = vec![0; 1024];
+        let mut fd_buffer = Vec::new();
+        let msg = Message {
+            sender_id: 3,
+            opcode: 0,
+            args: smallvec![Argument::Fd(RawWireFd::Named(
+                wc_handle::Handle::from_descriptor(wc_handle::Descriptor::Section {
+                    name: "wc-pool-mismatch".into(),
+                    size: 4096,
+                })
+            ))],
+        };
+        write_to_buffers(&msg, &mut bytes_buffer[..], &mut fd_buffer, FdEncoding::InBand).unwrap();
+
+        let mut fd_buffer = VecDeque::from(fd_buffer);
+        let parsed = parse_message(
+            &bytes_buffer[..],
+            &[ArgumentType::Fd],
+            &mut fd_buffer,
+            FdEncoding::OutOfBand,
+        );
+        assert!(matches!(parsed, Err(MessageParseError::MissingFD)), "got {parsed:?}");
+    }
+
+    /// The two dialects cannot be mixed within one connection, and the write
+    /// side says so rather than guessing.
+    #[test]
+    fn an_open_fd_cannot_be_written_in_band() {
+        let mut bytes_buffer = vec![0; 1024];
+        let mut fd_buffer = Vec::new();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let msg = Message {
+            sender_id: 3,
+            opcode: 0,
+            args: smallvec![Argument::Fd(RawWireFd::Open(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file)
+            ))],
+        };
+        let err = write_to_buffers(&msg, &mut bytes_buffer[..], &mut fd_buffer, FdEncoding::InBand)
+            .unwrap_err();
+        assert!(
+            matches!(err, MessageWriteError::WrongDialect { wanted: FdEncoding::InBand }),
+            "got {err:?}"
+        );
     }
 }

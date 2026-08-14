@@ -67,7 +67,14 @@ pub use wayland_backend::os::{AsFd, BorrowedFd, Mapping, OwnedFd, RawFd};
 /// `docs/waycompose-design.md` §72.3 can change what an `h` is allowed to be.
 /// See `docs/waycompose-design.md` §76.
 #[cfg(feature = "wayland_frontend")]
-pub use wayland_backend::os::ProtoFd;
+pub use wayland_backend::os::{
+    BorrowedProtoFd, BorrowedWireFd, FdEncoding, ProtoFd, RawProtoFd, WireFd,
+};
+
+/// See [`ProtoFd`]. A named `h` is mapped rather than `mmap`ed, and the view has
+/// to outlive the pointer, so whoever holds the pointer must be able to name it.
+#[cfg(unix)]
+pub use wayland_backend::os::Mapping;
 
 /// The transport socket a client connection arrives on.
 ///

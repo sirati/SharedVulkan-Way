@@ -136,6 +136,24 @@ where
                 listen_fd,
                 close_fd,
             } => {
+                // §79. Both of these have to be **real kernel descriptors**: one
+                // is accepted on, the other is polled for hangup. A name is not
+                // a thing either can be done to, and `wc_handle` has no listening
+                // socket to open by name — `vendor/PATCHES.md` already records
+                // that sandboxing this way is not portable and needs
+                // AppContainer rather than a shimmed fd. So an in-band peer is
+                // refused here, loudly, rather than further down.
+                let (listen_fd, close_fd) = match (listen_fd.into_open(), close_fd.into_open()) {
+                    (Ok(listen_fd), Ok(close_fd)) => (listen_fd, close_fd),
+                    _ => {
+                        _manager.post_error(
+                            wp_security_context_manager_v1::Error::InvalidListenFd as u32,
+                            "a security context needs real descriptors; this connection \
+                             sends names",
+                        );
+                        return;
+                    }
+                };
                 let data = SecurityContextUserData(Mutex::new(Some(SecurityContextBuilder {
                     listen_fd: UnixListener::from(listen_fd),
                     close_fd,

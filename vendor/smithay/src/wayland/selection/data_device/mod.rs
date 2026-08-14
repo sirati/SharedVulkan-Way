@@ -68,7 +68,7 @@
 //! // You're now ready to go!
 //! ```
 
-use crate::utils::os::OwnedFd;
+use crate::utils::os::ProtoFd;
 use std::cell::{Ref, RefCell};
 
 use tracing::instrument;
@@ -180,7 +180,7 @@ pub trait ServerDndGrabHandler: SeatHandler {
     /// * `mime_type` - The requested mime type
     /// * `fd` - The FD to write into
     /// * `seat` - The seat on which the DnD data is to be sent.
-    fn send(&mut self, mime_type: String, fd: OwnedFd, seat: Seat<Self>) {}
+    fn send(&mut self, mime_type: String, fd: ProtoFd, seat: Seat<Self>) {}
 
     /// The client has finished interacting with the resource
     ///
@@ -305,7 +305,7 @@ pub enum SelectionRequestError {
 pub fn request_data_device_client_selection<D>(
     seat: &Seat<D>,
     mime_type: String,
-    fd: OwnedFd,
+    fd: ProtoFd,
 ) -> Result<(), SelectionRequestError>
 where
     D: SeatHandler + DataDeviceHandler + 'static,

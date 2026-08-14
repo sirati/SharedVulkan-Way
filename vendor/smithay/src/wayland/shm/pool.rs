@@ -13,7 +13,9 @@ use std::{
 #[cfg(unix)]
 use std::{cell::Cell, mem, ptr, sync::OnceLock};
 
-use crate::utils::os::{AsFd, BorrowedFd, OwnedFd};
+use crate::utils::os::{Mapping, ProtoFd, WireFd};
+#[cfg(unix)]
+use crate::utils::os::AsFd;
 
 #[cfg(unix)]
 use rustix::mm;
@@ -78,7 +80,7 @@ pub struct Pool {
 #[derive(Debug)]
 struct InnerPool {
     map: RwLock<MemMap>,
-    fd: OwnedFd,
+    fd: ProtoFd,
 }
 
 // SAFETY: The memmap is owned by the pool and content is only accessible via a reference.
@@ -93,8 +95,8 @@ pub enum ResizeError {
 
 impl InnerPool {
     #[instrument(level = "trace", skip_all, name = "wayland_shm")]
-    pub fn new(fd: OwnedFd, size: NonZeroUsize) -> Result<InnerPool, OwnedFd> {
-        let memmap = match MemMap::new(fd.as_fd(), size) {
+    pub fn new(fd: ProtoFd, size: NonZeroUsize) -> Result<InnerPool, ProtoFd> {
+        let memmap = match MemMap::new(&fd, size) {
             Ok(memmap) => memmap,
             Err(_) => {
                 return Err(fd);
@@ -116,7 +118,7 @@ impl InnerPool {
         }
 
         trace!(fd = ?self.fd, oldsize = oldsize, newsize = ?newsize, "Resizing shm pool");
-        guard.remap(self.fd.as_fd(), newsize).map_err(|()| {
+        guard.remap(&self.fd, newsize).map_err(|()| {
             debug!(fd = ?self.fd, oldsize = oldsize, newsize = ?newsize, "SHM pool resize failed");
             ResizeError::MremapFailed
         })
@@ -223,7 +225,7 @@ fn guard_leave() -> bool {
 }
 
 impl Pool {
-    pub fn new(fd: OwnedFd, size: NonZeroUsize) -> Result<Self, OwnedFd> {
+    pub fn new(fd: ProtoFd, size: NonZeroUsize) -> Result<Self, ProtoFd> {
         InnerPool::new(fd, size).map(|p| Self { inner: Some(p) })
     }
 
@@ -252,88 +254,87 @@ impl Drop for Pool {
 
 /// A live mapping of a client's pool.
 ///
-/// The Windows arm carries the mapping object itself, not only a pointer, and
-/// the difference is load-bearing. On Unix `mmap` is an operation on the address
-/// space: once it returns, the pointer stands on its own and the fd could be
-/// closed. On Windows `MapViewOfFile` returns a view whose lifetime is the
-/// mapping's, so something has to hold it — and if nothing does, the pointer
-/// dangles the moment the temporary is dropped, which is a silent
-/// use-after-free rather than a compile error.
+/// The **named** arm carries the mapping object itself, not only a pointer, and
+/// the difference is load-bearing. `mmap` is an operation on the address space:
+/// once it returns, the pointer stands on its own and the fd could be closed.
+/// `wc_handle::Handle::map` returns a view whose lifetime is the mapping's, so
+/// something has to hold it — and if nothing does, the pointer dangles the moment
+/// the temporary is dropped, which is a silent use-after-free rather than a
+/// compile error.
+///
+/// §79 made `_view` unconditional. It was `#[cfg(windows)]` while a named object
+/// was a Windows-only thing; a Linux compositor behind `wc-proxy` now maps one
+/// too, and whether the view has to be held is a property of **which kind of `h`
+/// arrived**, not of which platform is running.
 #[derive(Debug)]
 struct MemMap {
     ptr: *mut u8,
     size: usize,
     /// Keeps the view alive for as long as `ptr` is used. Never read.
-    #[cfg(windows)]
-    _view: Option<crate::utils::os::Mapping>,
+    ///
+    /// `Some` exactly when the pool came from a [`WireFd::Named`], which is also
+    /// what tells `Drop` not to `munmap`: the view owns the unmapping.
+    _view: Option<Mapping>,
 }
 
 impl MemMap {
-    fn new(fd: BorrowedFd<'_>, size: NonZeroUsize) -> Result<MemMap, ()> {
-        #[cfg(unix)]
-        {
-            Ok(MemMap {
-                ptr: unsafe { map(fd, size) }?,
-                size: size.into(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            let (ptr, view) = map(fd, size)?;
-            Ok(MemMap {
-                ptr,
-                size: size.into(),
-                _view: Some(view),
-            })
-        }
+    fn new(fd: &ProtoFd, size: NonZeroUsize) -> Result<MemMap, ()> {
+        let (ptr, view) = map(fd, size)?;
+        Ok(MemMap { ptr, size: size.into(), _view: view })
     }
 
-    fn remap(&mut self, fd: BorrowedFd<'_>, newsize: NonZeroUsize) -> Result<(), ()> {
+    fn remap(&mut self, fd: &ProtoFd, newsize: NonZeroUsize) -> Result<(), ()> {
         if self.ptr.is_null() {
             return Err(());
         }
 
-        #[cfg(unix)]
-        {
-            // memunmap cannot fail, as we are unmapping a pre-existing map
-            let _ = unsafe { unmap(self.ptr, self.size) };
-            // remap the fd with the new size
-            match unsafe { map(fd, newsize) } {
-                Ok(ptr) => {
-                    // update the parameters
-                    self.ptr = ptr;
-                    self.size = usize::from(newsize);
-                    Ok(())
-                }
-                Err(()) => {
-                    // set ourselves in an empty state
-                    self.ptr = ptr::null_mut();
-                    self.size = 0;
-                    Err(())
+        // §79: the two arms below are chosen by **what kind of `h` this pool came
+        // from**, which used to be a platform question and is now a per-client
+        // one. The bodies are unchanged from the `cfg`s they replace.
+        match fd {
+            // An open descriptor can be re-`mmap`ed larger, so the old mapping
+            // goes first and a failure leaves the pool in the empty state
+            // upstream defined.
+            #[cfg(unix)]
+            WireFd::Open(_) => {
+                // memunmap cannot fail, as we are unmapping a pre-existing map
+                let _ = unsafe { unmap(self.ptr, self.size) };
+                match map(fd, newsize) {
+                    Ok((ptr, view)) => {
+                        self.ptr = ptr;
+                        self.size = usize::from(newsize);
+                        self._view = view;
+                        Ok(())
+                    }
+                    Err(()) => {
+                        self.ptr = ptr::null_mut();
+                        self.size = 0;
+                        Err(())
+                    }
                 }
             }
-        }
 
-        // A Windows section's size is fixed at `CreateFileMappingW` time, so
-        // there is no `mremap`. The old view is dropped only after the new one
-        // succeeds, so a failed grow leaves the pool exactly as it was rather
-        // than in the "empty state" the Unix arm falls back to — a pool that is
-        // still the old size is more useful to a client than a null one.
-        //
-        // `wl_shm_pool.resize` only ever grows, and a grow past the section's
-        // creation size cannot be satisfied here. `map()` reports that, and the
-        // caller turns it into `ResizeError::MremapFailed`, which is already the
-        // protocol-visible outcome for a failed resize. The real fix is
-        // `SEC_RESERVE` — reserve a large range at create time and commit as the
-        // pool grows — which is docs/design.md §6's "wl_shm properly" item and
-        // is a `wc-handle` change, not a smithay one.
-        #[cfg(windows)]
-        {
-            let (ptr, view) = map(fd, newsize)?;
-            self.ptr = ptr;
-            self.size = usize::from(newsize);
-            self._view = Some(view);
-            Ok(())
+            // A named object's size is fixed when it is created — a Windows
+            // section at `CreateFileMappingW` time — so there is no `mremap`. The
+            // old view is dropped only after the new one succeeds, so a failed
+            // grow leaves the pool exactly as it was rather than in the empty
+            // state the other arm falls back to: a pool that is still the old
+            // size is more useful to a client than a null one.
+            //
+            // `wl_shm_pool.resize` only ever grows, and a grow past the object's
+            // creation size cannot be satisfied here. `map()` reports that, and
+            // the caller turns it into `ResizeError::MremapFailed`, which is
+            // already the protocol-visible outcome for a failed resize. The real
+            // fix is `SEC_RESERVE` — reserve a large range at create time and
+            // commit as the pool grows — which is docs/design.md §6’s "wl_shm
+            // properly" item and is a `wc-handle` change, not a smithay one.
+            WireFd::Named(_) => {
+                let (ptr, view) = map(fd, newsize)?;
+                self.ptr = ptr;
+                self.size = usize::from(newsize);
+                self._view = view;
+                Ok(())
+            }
         }
     }
 
@@ -354,68 +355,85 @@ impl MemMap {
 
 impl Drop for MemMap {
     fn drop(&mut self) {
+        // §79: `_view` is `Some` exactly for a named mapping, and dropping it is
+        // what unmaps that one. `munmap` is for the other kind and would be
+        // wrong here — the address did not come from `mmap`.
         #[cfg(unix)]
-        if !self.ptr.is_null() {
+        if self._view.is_none() && !self.ptr.is_null() {
             let _ = unsafe { unmap(self.ptr, self.size) };
         }
-        // On Windows the view is unmapped by dropping `_view`.
     }
 }
 
-/// A simple wrapper with some default arguments for `nix::mman::mmap`.
-#[cfg(unix)]
-unsafe fn map(fd: BorrowedFd<'_>, size: NonZeroUsize) -> Result<*mut u8, ()> {
-    let ret = unsafe {
-        mm::mmap(
-            ptr::null_mut(),
-            size.into(),
-            mm::ProtFlags::READ | mm::ProtFlags::WRITE,
-            mm::MapFlags::SHARED,
-            fd,
-            0,
-        )
-    };
-    ret.map(|p| p as *mut u8).map_err(|_| ())
+/// Map a client's pool, whichever kind of `h` it arrived as.
+///
+/// §79 folded two `#[cfg]` functions into one `match`. The bodies are unchanged;
+/// what changed is that **both are reachable on both platforms**, because which
+/// one applies is now a property of the connection the pool came in on rather
+/// than of the kernel this is running under.
+///
+/// Returns the keepalive as `Option`: `mmap` needs none (the pointer stands on
+/// its own once it returns), and a named mapping needs one (the view owns the
+/// address range). That `Option` is also what `Drop` reads to decide whether to
+/// `munmap`.
+fn map(fd: &ProtoFd, size: NonZeroUsize) -> Result<(*mut u8, Option<Mapping>), ()> {
+    match fd {
+        // A simple wrapper with some default arguments for `nix::mman::mmap`.
+        #[cfg(unix)]
+        WireFd::Open(owned) => {
+            let ret = unsafe {
+                mm::mmap(
+                    ptr::null_mut(),
+                    size.into(),
+                    mm::ProtFlags::READ | mm::ProtFlags::WRITE,
+                    mm::MapFlags::SHARED,
+                    owned.as_fd(),
+                    0,
+                )
+            };
+            ret.map(|p| (p as *mut u8, None)).map_err(|_| ())
+        }
+
+        // Map a client's named object, read-only, and hand back both the pointer
+        // and the object that keeps it valid.
+        //
+        // Not `unsafe`, unlike the arm above: there is no raw address, length or
+        // flag combination for the caller to get wrong. `wc_handle` opens the
+        // named object by name and maps the whole of it, so the only failure
+        // modes are "the object is gone" and "it is not a section", both of
+        // which come back as `Err`.
+        //
+        // `size` is checked rather than requested. The pool's size is a protocol
+        // argument the client chose; the object's size is fixed at creation. A
+        // client asking for more than it created is a protocol error the caller
+        // turns into a failed map, which is the same outcome an over-large
+        // `mmap` offset gives on the other arm.
+        WireFd::Named(handle) => {
+            // `eprintln!` and not `debug!`, and that was learned rather than
+            // chosen. Failing to map a client's pool is protocol-fatal: the
+            // client is disconnected and told only "Failed to mmap fd", because
+            // the caller in `shm/handlers.rs` has the handle and not the error.
+            // This binary installs no `tracing` subscriber, so the one line that
+            // says *why* went nowhere, and stage 4 spent an hour guessing at a
+            // `MapViewOfFile` failure whose cause was already known here.
+            let mapping = handle.map().map_err(|err| {
+                eprintln!("wc-compositor: could not map {:?}: {err}", handle.descriptor());
+            })?;
+            if mapping.len() < usize::from(size) {
+                eprintln!(
+                    "wc-compositor: pool wants {} bytes, {:?} has {}",
+                    usize::from(size),
+                    handle.descriptor(),
+                    mapping.len()
+                );
+                return Err(());
+            }
+            let ptr = mapping.as_slice().as_ptr() as *mut u8;
+            Ok((ptr, Some(mapping)))
+        }
+    }
 }
 
-/// Map a client's section, read-only, and hand back both the pointer and the
-/// object that keeps it valid.
-///
-/// Not `unsafe`, unlike the Unix arm: there is no raw address, length or flag
-/// combination for the caller to get wrong. `wc_handle` opens the named object
-/// by name and maps the whole of it, so the only failure modes are "the object
-/// is gone" and "it is not a section", both of which come back as `Err`.
-///
-/// `size` is checked rather than requested. The pool's size is a protocol
-/// argument the client chose; the section's size is fixed at creation. A client
-/// asking for more than it created is a protocol error the caller turns into a
-/// failed map, which is the same outcome an over-large `mmap` offset gives on
-/// Unix.
-#[cfg(windows)]
-fn map(fd: BorrowedFd<'_>, size: NonZeroUsize) -> Result<(*mut u8, crate::utils::os::Mapping), ()> {
-    let handle = fd.as_raw_fd();
-    // `eprintln!` and not `debug!`, and that was learned rather than chosen.
-    // Failing to map a client's pool is protocol-fatal: the client is
-    // disconnected and told only "Failed to mmap fd", because the caller in
-    // `shm/handlers.rs` has the handle and not the error. This binary installs
-    // no `tracing` subscriber, so the one line that says *why* went nowhere,
-    // and stage 4 spent an hour guessing at a `MapViewOfFile` failure whose
-    // cause was already known here.
-    let mapping = handle.map().map_err(|err| {
-        eprintln!("wc-compositor: could not map {:?}: {err}", handle.descriptor());
-    })?;
-    if mapping.len() < usize::from(size) {
-        eprintln!(
-            "wc-compositor: pool wants {} bytes, {:?} has {}",
-            usize::from(size),
-            handle.descriptor(),
-            mapping.len()
-        );
-        return Err(());
-    }
-    let ptr = mapping.as_slice().as_ptr() as *mut u8;
-    Ok((ptr, mapping))
-}
 
 /// A simple wrapper for `nix::mman::munmap`.
 #[cfg(unix)]
