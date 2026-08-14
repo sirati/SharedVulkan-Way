@@ -22701,12 +22701,52 @@ by reading the log rather than the verdict.
 
 `SealedFile` — the keymap as a `memfd` rather than a file in `--shared-dir` — is
 the next piece of the dialect work, and `WC_VM_SEALED=1` drops `--shared-dir` so
-this leg can reach it. It passes, and **that is not evidence that the path
-works**: the proxy reports `0 fds in, 0 out`, so nothing crossed that would have
-exercised it. `wayland-info` reads the seat's capabilities without ever binding
-a `wl_keyboard`, so the run says nothing either way. The flag is in the harness
-for whoever takes `SealedFile` next, with a client that binds a keyboard; this
-section claims only that it did not break.
+this leg can reach it. It passed, and that was **not** evidence the path works:
+the proxy reported `0 fds in, 0 out`, so nothing appeared to have crossed.
+
+**That reasoning was wrong, and §80 is what corrected it.** Two mistakes, both
+mine, and both the same shape as everything else this section keeps finding:
+
+* *"`wayland-info` never binds a `wl_keyboard`"* — it does. §80 chose it for
+  exactly that property. What it does not do is print anything about the keymap,
+  so reading its output for the word was the wrong instrument.
+* *"`0 fds in, 0 out`, so nothing crossed"* — an in-band `h` **is not an fd**, so
+  that counter reads zero whether or not the keymap crossed and cannot separate
+  the two cases. A real number, about the wrong question. §63.3 again, in my own
+  log.
+
+§80's assertion is the right one and this harness now makes it:
+`wl_keyboard.repeat_info` follows the keymap immediately, so its absence is the
+symptom in a run whose exit code says everything is fine.
+
+#### And with a real assertion, the `SealedFile` path fails — differently than predicted
+
+| | keymap crosses? |
+|---|---|
+| `--shared-dir` (a file both sides can name) | **yes** — 1 `repeat_info` line |
+| `WC_VM_SEALED=1` (a `SealedFile` memfd) | **no** — no `repeat_info` |
+
+And the reason is not the dialect:
+
+```text
+[proxy] client 1 failed: compositor: wl_keyboard.keymap names
+  Section { name: "/tmp/nix-shell.U3jLqN/wc-270a9ffb…", size: 35572 },
+  which this side cannot open: No such file or directory (os error 2)
+```
+
+**The name is a path on the host, and the proxy is in the guest.** It is not a
+`WrongDialect` refusal — the dialect is agreed and the descriptor is read
+correctly — it is a named object whose name means nothing on the other side of
+the boundary. That is §11.2's problem arriving in the Linux-to-Linux-VM
+direction, the same shape §70.5 hit from the Windows side with a
+`Local\wc-…` section, and it is **invisible on one machine**, where the path
+resolves and the leg passes.
+
+This leg is the only one in the tree that can show it, because it is the only
+one with a hypervisor between the proxy and the compositor. Recorded here for
+whoever owns `SealedFile`: making the keymap a `memfd` is necessary and not
+sufficient; the *name* has to be one the far side can resolve, and a cross-VM
+leg is the only place that distinction is testable.
 
 `Invalid new_id: 6` still arrives beside the pool refusal and is still
 unattributed.
