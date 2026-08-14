@@ -125,7 +125,7 @@ HOST_WESTON="${WC_HOST_WESTON:-}"                    # dir holding weston-termin
 # root-only. That is a property of how testhost starts the VM and not of the
 # design: shared_vulkan's own boundary hands the same name to unprivileged ICD
 # processes, and it works there because QEMU runs as the developer. Recorded in
-# docs/design.md §12.9 rather than worked around, because the workaround would be
+# docs/waycompose-design.md §12.9 rather than worked around, because the workaround would be
 # passing a descriptor between the two processes and the rule says no.
 QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"            # QEMU's monitor, on WC_HOST
 VM_HINT="${WC_VM_HINT:-windows-vm}"                  # how to recognise its process
@@ -222,7 +222,7 @@ ARENA_OUTBOUND=${15:-1048576}
 FIREFOX=${16:-}
 # The size of the one `wl_output`. It matters for exactly one client and it
 # matters a lot: with no output at all GTK sizes Firefox's window against an
-# empty monitor list and produces 552x172 (docs/design.md §15.3), and with a
+# empty monitor list and produces 552x172 (docs/waycompose-design.md §15.3), and with a
 # different one the window size in the assertions moves. Fixed here so that the
 # guest's numbers and §15.6's workstation numbers are the same numbers.
 OUTPUT=${17:-}
@@ -623,7 +623,7 @@ do_deploy() {
   # the guest uses, so the blanket kill fired in precisely the case where two
   # runs collide. Stage 8 watched it happen from the other side — a compositor
   # in `wcdesk` photographed and driven into a resize loop by a run that
-  # believed it owned the machine (docs/design.md §13.9).
+  # believed it owned the machine (docs/waycompose-design.md §13.9).
   #
   # An image name is not an identity here; the image *path* is, because every
   # experiment deploys its own copy into its own directory. `taskkill` cannot
@@ -733,7 +733,7 @@ check_milestones() {
 
 do_run() {
   echo "== 1. the transport, on afunix.sys =="
-  # docs/design.md §7.8 items 1 and 2. Both roles are separate processes: a pid
+  # docs/waycompose-design.md §7.8 items 1 and 2. Both roles are separate processes: a pid
   # is only interesting when it is not our own.
   gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && rm -f acc-*.log && (./probe-accept.exe server '$GUESTDIR_WIN\\acc.sock' > acc-srv.log 2>&1 &) && sleep 2 && ./probe-accept.exe client '$GUESTDIR_WIN\\acc.sock' > acc-cli.log 2>&1; sleep 1; cat acc-srv.log acc-cli.log" >"$RUNDIR/acc.log"
   if grep -q "RESULT: GETPEERPID returned the client's real pid" "$RUNDIR/acc.log"; then
@@ -802,7 +802,7 @@ do_run() {
     relayed wc-compositor.exe wg-xdg $((PORT_BASE + 1)) weston-multi-resource
     check_milestones "$RUNDIR/wg-xdg.server.log" "weston-multi-resource"
 
-    # docs/design.md §7.8 item 3: three bytes at a time guarantees the server
+    # docs/waycompose-design.md §7.8 item 3: three bytes at a time guarantees the server
     # reads a partial message and has to wait for the rest.
     CHUNK=3 DELAY=15 relayed wc-compositor.exe wg-frag $((PORT_BASE + 2)) weston-multi-resource
     check_milestones "$RUNDIR/wg-frag.server.log" "fragmented (3-byte writes, 15 ms apart)"
@@ -829,7 +829,7 @@ do_run() {
   note "be shorter than the platform timer tick. Under Wine it is ~1 ms."
   gq "cd $GUESTDIR && for e in wc-server.exe wc-compositor.exe; do s=\$(date +%s%N); ./\$e --socket ld\$e --timeout 1 >/dev/null 2>&1; f=\$(date +%s%N); echo \"\$e: \$(( (f-s)/1000000 )) ms wall, of which 1000 ms is the idle timeout\"; done" >"$RUNDIR/load.log"
   sed 's/^/        /' "$RUNDIR/load.log"
-  note "docs/design.md §7.8 item 6: the 56 MB debug binary costs nothing measurable to load."
+  note "docs/waycompose-design.md §7.8 item 6: the 56 MB debug binary costs nothing measurable to load."
 
   do_coherency
   do_poolcost
@@ -838,7 +838,7 @@ do_run() {
 }
 
 # =============================================================================
-# Stage 4 on the real boundary. docs/design.md §9.11, all five items.
+# Stage 4 on the real boundary. docs/waycompose-design.md §9.11, all five items.
 # =============================================================================
 
 # ------------------------------------------------------------------ 7 --------
@@ -1097,7 +1097,7 @@ s4_run() {
   # was relayed. What enforces the rule is that the proxy's upstream writer has
   # no fd path at all -- construction, not a counter -- and what this asserts is
   # the part a counter can see: every descriptor going out was made here.
-  # docs/design.md §14.7 is the full argument: which two processes that
+  # docs/waycompose-design.md §14.7 is the full argument: which two processes that
   # descriptor exists between, why that pair is not the boundary, and what this
   # number would have to be for the rule to be broken.
   # STAGE 42. **The twenty lines above argue about which number would mean the
@@ -1213,7 +1213,7 @@ s4_run() {
       note "Nothing above catches this: the HWND, the frame count and the transport line are"
       note "all correct while it happens. Over a file on virtio-fs it is expected and is"
       note "block 7's result arriving as pixels -- the mount is not coherent while mapped, so"
-      note "the compositor reads its own cached copy (docs/design.md §10.3, §10.7). Over"
+      note "the compositor reads its own cached copy (docs/waycompose-design.md §10.3, §10.7). Over"
       note "guest-ram it is not expected and means one of two things: the host is writing"
       note "into memory that is not the compositor's (check block 10's COH- lines, and the"
       note "verify line above), or the guest's pages moved after they were located, which"

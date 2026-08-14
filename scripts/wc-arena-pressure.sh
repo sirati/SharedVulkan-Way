@@ -7,7 +7,7 @@
 #
 # # Why this exists, and why it is not `wc-firefox.sh` with a smaller number
 #
-# docs/design.md §20.2 is a correction to §17.8. §17.8 said that an arena with
+# docs/waycompose-design.md §20.2 is a correction to §17.8. §17.8 said that an arena with
 # no room for a pool would leave "the client's window stops updating" — a
 # compositor that looks frozen. It does not. The pool goes unannounced, the
 # client's next `wl_shm_pool.create_buffer` is forwarded to a compositor that

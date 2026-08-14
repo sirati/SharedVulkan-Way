@@ -192,7 +192,7 @@ block_enumerate() {
   done
 
   # The decoration question, measured rather than assumed. Both protocols are
-  # advertised; exactly one is used. docs/design.md §13.7.
+  # advertised; exactly one is used. docs/waycompose-design.md §13.7.
   if grep -q '^org_kde_kwin_server_decoration_manager ' "$b"; then
     ok "decorations: Firefox bound KDE's org_kde_kwin_server_decoration_manager"
   else
@@ -234,7 +234,7 @@ block_enumerate() {
     && ok "Firefox creates a wl_subsurface for its content" \
     || bad "Firefox created no subsurface"
 
-  # What a pool costs, which is the number docs/design.md §12.13 item 5 asks
+  # What a pool costs, which is the number docs/waycompose-design.md §12.13 item 5 asks
   # for. Reported rather than asserted: it is a property of the client and of
   # what it was doing, and a threshold here would be a threshold on Firefox's
   # mood.

@@ -3,7 +3,7 @@
 Every picture here was taken by `scripts/wc-icon.sh` on the guest's real
 interactive desktop (`WinSta0\Default`, session 1), by the route stage 8 built
 and for the same reason: an ssh session is not a desktop and cannot photograph
-one (docs/design.md §13.2). `docs/design.md` §16 is the argument; this is the
+one (docs/waycompose-design.md §13.2). `docs/design.md` §16 is the argument; this is the
 exhibit list.
 
 The window and taskbar captures are `PrintWindow(PW_RENDERFULLCONTENT)`, not

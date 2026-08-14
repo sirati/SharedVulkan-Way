@@ -35,7 +35,7 @@
  *
  *  - Ancillary data cannot cross a TCP hop. That would be fatal on Linux, where
  *    an `h` argument is an `SCM_RIGHTS` fd -- but on Windows an `h` is encoded
- *    *in band* as a length-prefixed descriptor (docs/design.md §2.3), so for
+ *    *in band* as a length-prefixed descriptor (docs/waycompose-design.md §2.3), so for
  *    this port there is nothing out of band to lose. It does mean the relay can
  *    only carry clients that reach the milestone under test before their first
  *    `h`, which is exactly why `weston-multi-resource` was chosen over
@@ -51,7 +51,7 @@
  * `--chunk` and `--delay` deliberately fragment the client-to-server direction.
  * A Wayland message is 8 bytes of header plus arguments, so forwarding 3 bytes
  * at a time guarantees the server reads a partial message and has to wait for
- * the rest -- which is docs/design.md §7.8 item 3, wepoll under a partial read,
+ * the rest -- which is docs/waycompose-design.md §7.8 item 3, wepoll under a partial read,
  * level-triggered. Nothing had produced one before.
  */
 #include <winsock2.h>

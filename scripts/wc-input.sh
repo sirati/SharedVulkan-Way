@@ -13,7 +13,7 @@
 #
 # WHY THE EVIDENCE IS IN TWO LEGS, AGAIN
 #
-# The same split docs/design.md §8.5 drew for pixels, for the same structural
+# The same split docs/waycompose-design.md §8.5 drew for pixels, for the same structural
 # reason and with a different line through it. Neither leg is sufficient and
 # saying which half each carries matters more than either one passing.
 #
@@ -561,7 +561,7 @@ run_wine() {
   # asks for a **4190208-byte** pool for its cursor theme, on top of its own
   # 800 KiB surface, and resizes it repeatedly; a 4 MiB arena ran out, the
   # proxy reported `no run of 4190208 bytes`, and the client exited before a
-  # single keystroke was injected. That is docs/design.md §12.13 item 5 —
+  # single keystroke was injected. That is docs/waycompose-design.md §12.13 item 5 —
   # "64 MiB is a guess" — arriving in the smallest possible client, and it is
   # worth knowing that the guess has to be generous.
   local arena_bytes=$((32 * 1024 * 1024)) out_bytes=$((1024 * 1024))
@@ -767,7 +767,7 @@ run_wine() {
   # between the two runs of this leg and is invisible from the client's side —
   # the characters are identical either way. The proxy counts the descriptors it
   # made from an arena slice separately from the ones it opened by name, for the
-  # reason docs/design.md §8.4 gives: a stage that added a second provider with
+  # reason docs/waycompose-design.md §8.4 gives: a stage that added a second provider with
   # no way to tell which one ran would not really have added it.
   if [ "$mode" = arena ]; then
     case "$fds" in
@@ -971,7 +971,7 @@ run_pointer() {
 #
 # `weston-eventdemo` proves the events are right; this proves they are *useful*.
 # A terminal is the demonstration because it redraws only when its content
-# changes — docs/design.md §8.7 measured that, and it is what makes "frames
+# changes — docs/waycompose-design.md §8.7 measured that, and it is what makes "frames
 # appeared after the keys were injected" a statement about the keys rather than
 # about an animation. Stage 4 established `weston-terminal` through the proxy;
 # stage 6 types into it.
