@@ -44,6 +44,18 @@
 #   the control; `zink` is the run. If Zink cannot reach a device it fails
 #   loudly (`eglInitialize failed`) rather than falling back, which is the one
 #   property that makes a green result mean anything.
+#
+# ---------------------------------------------------------------------------
+# BOTH SIDES MUST COME FROM ONE BUILD. The GPU side here is a binary *copied*
+# into the guest, so rebuilding on the host changes only the host's half.
+#
+# `WIRE_VERSION` went 1 -> 2 in design.md §0.18 (`svDriverVersions`, which is
+# hand-written in `sv_proto::sv` and so outside the protocol hash). A guest
+# binary from before that commit is refused at handshake — correctly, and by
+# design. The ICD names the cause and the fix in the refusal message; the
+# reason it is also written here is that this project has twice read a stale
+# deployed binary as a transport fault and lost an afternoon to it.
+# ---------------------------------------------------------------------------
 set -uo pipefail
 
 SESSIONS=${1:-4}

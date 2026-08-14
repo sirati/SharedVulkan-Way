@@ -486,7 +486,17 @@ impl Default for Futex {
             spins: 256,
             yields: 32,
             slice: Duration::from_millis(20),
-            first_slice: Duration::from_micros(25),
+            // `SV_PARK_FIRST_SLICE_US` overrides the first rung, and it exists
+            // so that fixed-slice, ladder and doorbell are three *conditions of
+            // one experiment* rather than three builds. §36.10 named that as
+            // what a real measurement needs: without it the only way to compare
+            // against the old behaviour is to check out an older revision,
+            // which changes more than the variable under test. Set it to 20000
+            // to reproduce exactly what shipped before the ladder.
+            first_slice: std::env::var("SV_PARK_FIRST_SLICE_US")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or(Duration::from_micros(25), Duration::from_micros),
         }
     }
 }
@@ -692,6 +702,67 @@ mod sys {
 /// and `None` for a wait that no producer rings a bell for — a barrier against
 /// another ring's `completed_seqno`, which is satisfied on the first load in the
 /// common case and spins in the rest.
+/// How much of this process's life has been spent waiting on a ring.
+///
+/// # Why this exists, and why wall clock was the wrong instrument
+///
+/// §36.10 tried to measure the cross-VM doorbell by timing `vulkaninfo` and
+/// could not: six runs each way gave medians of 157.5 ms and 191 ms with ranges
+/// 93–398 and 111–770. Three reasons, and all three are properties of the
+/// *instrument* rather than of the doorbell — `vulkaninfo --summary` is mostly
+/// setup rather than round trips, every sample included a VM boot, and the
+/// arena locate alone took 166.72 ms, which is larger than the quantity being
+/// measured and sits outside the timer.
+///
+/// The quantity the doorbell changes is not "how long the process took". It is
+/// **how long it was blocked in `park`**. That is what this counts, in the one
+/// place every ring wait goes through, so a run reports it directly instead of
+/// leaving it to be inferred from a wall clock that is mostly other things.
+///
+/// A relaxed add on a path that is about to make a syscall costs nothing worth
+/// measuring, and the alternative — sampling — would need the very thing being
+/// established.
+static PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PARKED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Accounts for one wait on drop, so every `return` path in `wait_until` —
+/// woken, timed out, fatal, peer gone — is counted without each having to
+/// remember. A wait that ends in an error is still a wait that cost time, and
+/// the first version of this missed exactly those.
+struct ParkAccount(Instant);
+
+impl Drop for ParkAccount {
+    fn drop(&mut self) {
+        PARKS.fetch_add(1, Ordering::Relaxed);
+        PARKED_NS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// `(parks, total time parked)` since the process started.
+pub fn park_stats() -> (u64, Duration) {
+    (
+        PARKS.load(Ordering::Relaxed),
+        Duration::from_nanos(PARKED_NS.load(Ordering::Relaxed)),
+    )
+}
+
+/// One line for a log, or `None` if this process never waited on a ring.
+///
+/// Printed at teardown by whoever owns the session. The mean is included
+/// because it is the number that moves: a doorbell does not change how many
+/// times a program waits, only how long each wait costs.
+pub fn park_summary() -> Option<String> {
+    let (n, total) = park_stats();
+    if n == 0 {
+        return None;
+    }
+    Some(format!(
+        "{n} ring waits, {:.1} ms parked, mean {:.3} ms",
+        total.as_secs_f64() * 1e3,
+        total.as_secs_f64() * 1e3 / n as f64
+    ))
+}
+
 pub fn wait_until(
     control: &Control,
     ctrl: &RingCtrl,
@@ -701,6 +772,8 @@ pub fn wait_until(
     overall: Deadline,
     liveness_interval: Duration,
 ) -> Result<()> {
+    let entered = Instant::now();
+    let _account = ParkAccount(entered);
     let status = || ctrl.status();
     let bell = lane.and_then(|l| ctrl.bell(l).ok());
     let mut site = WaitSite::new(ctrl.id(), ready, &status);

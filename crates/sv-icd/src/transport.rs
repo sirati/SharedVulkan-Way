@@ -287,6 +287,7 @@ pub struct RingTransport {
 impl Drop for RingTransport {
     fn drop(&mut self) {
         self.beating.store(false, std::sync::atomic::Ordering::Relaxed);
+        report_park_time();
     }
 }
 
@@ -601,6 +602,27 @@ impl RingTransport {
                          and diff it."
                     ));
                 }
+                // The coarse check in front of the hash, and the one that fires
+                // on a **stale deployed binary** rather than on a code change.
+                // This project has lost time to that twice, both times reading
+                // the symptom as a transport fault, so the next step is spelled
+                // out here rather than left to be inferred from two numbers.
+                //
+                // `WIRE_VERSION` went 1 → 2 for design.md §0.18's
+                // `svDriverVersions`, which is hand-written in `sv_proto::sv`
+                // and therefore outside the generated table the protocol hash
+                // covers. A GPU side copied to the guest before that commit
+                // cannot answer it, and the honest thing is to refuse here
+                // rather than to discover it on the first version query.
+                Err(e @ sv_transport::Error::WireVersionMismatch { .. }) => {
+                    return Err(format!(
+                        "{e}\nThis is a version skew between two builds, not a transport \
+                         fault. The usual cause is a stale binary: on the cross-VM \
+                         topology the GPU side is *copied* to the guest, so rebuilding \
+                         here changes only this side. Rebuild and re-deploy **both** \
+                         sides from the same tree."
+                    ));
+                }
                 Err(e) => return Err(e.to_string()),
             }
         };
@@ -652,6 +674,11 @@ impl RingTransport {
         // A failure to attach is a warning, never an error: a session without a
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
+        // Unix only: the host end of the chardev is a Unix socket, which is what
+        // the cross-VM topology has. A Windows *app* side is the same-machine
+        // topology, where the peer is on this kernel and the ordinary futex wake
+        // already reaches it — there is no hypervisor to carry anything across.
+        #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             Ok(path) => match sv_transport::vdoorbell::PortHandle::host_socket(&path)
@@ -670,6 +697,11 @@ impl RingTransport {
                 }
             },
         };
+
+        #[cfg(not(unix))]
+        let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
+
+        arm_park_report();
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -1187,6 +1219,26 @@ impl RingTransport {
         Ok(())
     }
 
+    /// Ask the GPU side which Vulkan version its driver actually is (§0.18).
+    ///
+    /// On the **instance** ring, because it is asked before any device exists —
+    /// `vkEnumerateInstanceVersion` is a global command and the loader may call
+    /// it before `vkCreateInstance`.
+    ///
+    /// `None` for any failure, and that is deliberate rather than lazy: a GPU
+    /// side built before this command existed answers "unknown protocol command"
+    /// and its ring is then fatal, so the *only* correct handling of a failure
+    /// here is to fall back to the ceiling. `WIRE_VERSION` is what actually
+    /// keeps such a peer away; this is the belt to that pair of braces.
+    pub fn driver_versions(&self) -> Option<(u32, u32)> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::DriverVersions.encode(&mut cmd).ok()?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Instance, sv_proto::sv::SV_DRIVER_VERSIONS, &cmd, &mut reply).ok()?;
+        let r = sv_proto::sv::DriverVersionsReply::decode(&reply).ok()?;
+        Some((r.instance_api_version, r.device_api_version))
+    }
+
     /// `vkFreeCommandBuffers`: give the block back to the reserve.
     ///
     /// Separate from [`Transport::discard_blob`] because the two mean different
@@ -1204,5 +1256,55 @@ impl RingTransport {
         if let Some(b) = blobs.open.remove(&command_buffer) {
             Self::release(&mut blobs, b);
         }
+    }
+}
+
+/// Print how long this process spent blocked on a ring, once.
+///
+/// §36.10's instrument. Wall clock could not resolve the doorbell — most of a
+/// run is setup, and one sample includes a VM boot — but **time spent parked**
+/// is exactly the quantity a doorbell changes, and the app side is the side that
+/// does the waiting.
+///
+/// # Why an `atexit` and not just `Drop`
+///
+/// `RingTransport` is reached through a process-lifetime singleton, so its
+/// `Drop` never runs: an application that exits without destroying its instance
+/// — which `vulkaninfo` does, and which is legal — takes the number with it. The
+/// first version of this printed nothing for exactly that reason and the log
+/// looked as though the ICD had never waited at all.
+///
+/// Registered once, on the first attach, so a process that never talks to a ring
+/// prints nothing.
+fn report_park_time() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(s) = sv_transport::park::park_summary() {
+            eprintln!("[icd] {s}");
+        }
+    });
+}
+
+#[cfg(unix)]
+extern "C" fn park_time_atexit() {
+    report_park_time();
+}
+
+/// Arrange for [`report_park_time`] to run however the process ends.
+///
+/// Unix only, and that is the measurement's venue rather than a limitation: in
+/// the cross-VM topology the app side — this side — runs on the **host**, which
+/// is Linux, and the guest is the GPU half. A Windows app side is the
+/// same-machine topology, where the peer is on this kernel, the ordinary futex
+/// wake already reaches it, and there is no hypervisor latency to account for.
+pub(crate) fn arm_park_report() {
+    #[cfg(unix)]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            // SAFETY: `park_time_atexit` is a plain `extern "C"` function with
+            // no arguments that touches only atomics and stderr.
+            unsafe { libc::atexit(park_time_atexit) };
+        });
     }
 }

@@ -492,7 +492,16 @@ fn the_transform_pass_rewrites_memory_and_offset_as_a_pair() {
 #[test]
 fn the_handshake_carries_a_hash_over_a_readable_manifest() {
     assert_ne!(sv_proto::PROTOCOL_HASH, 0);
-    assert_eq!(sv_proto::PROTOCOL_PROFILE, "zink");
+    // Which profile, not *the* profile. `SV_PROTO_PROFILE` selects it and
+    // `full` is a supported build (§0.19), so pinning the string to `zink` made
+    // this fail for a reason that has nothing to do with the handshake. What is
+    // worth asserting is that the manifest names the profile it was generated
+    // from — a hash with no readable explanation is the thing §4.3 is against.
+    assert!(
+        sv_codegen::PROFILE_NAMES.contains(&sv_proto::PROTOCOL_PROFILE),
+        "PROTOCOL_PROFILE {:?} is not a profile this generator knows",
+        sv_proto::PROTOCOL_PROFILE
+    );
     assert!(sv_proto::PROTOCOL_MANIFEST.contains("command vkCreateBuffer"));
     assert!(sv_proto::PROTOCOL_MANIFEST.contains("struct VkBufferCreateInfo"));
 }

@@ -16,16 +16,29 @@
 //! - **Answered from app-side state.** Object ids, arena allocations, mapping.
 //!   These are the real implementation, not a placeholder: design.md §6.4 and
 //!   §5.3 put exactly this work on the app side.
-//! - **Accepted and dropped.** Anything that would need a GPU. Every one of them
-//!   is marked `// NO GPU:` and returns a success the application can proceed
-//!   through, because the alternative — failing — makes it impossible to see how
-//!   far an application gets.
+//! - **Accepted and dropped.** Anything that would need a GPU, in the standalone
+//!   configuration where there is no GPU to ask. These return a success the
+//!   application can proceed through, because the alternative — failing — makes
+//!   it impossible to see how far an application gets.
 //!
-//! The third group is the honest gap in this stage and it is deliberately easy
-//! to grep for.
+//! # How to find the third group, which is **not** by grepping
+//!
+//! This paragraph used to say "every one of them is marked `// NO GPU:` … and it
+//! is deliberately easy to grep for". That claim had rotted to one marker
+//! against roughly twenty-six sites, so the grep returned 1/26 and looked
+//! authoritative doing it — a worse outcome than no convention at all, because a
+//! reader who finds one hit concludes there is one gap.
+//!
+//! The convention is replaced by a derivation. `crates/sv-icd/tests/audit.rs`
+//! runs every generated `Icd` method against a driver with no GPU side and sorts
+//! the profile into "forwards" and "answered here" **mechanically** — the
+//! generated default refuses by its own name and no hand-written body does, so
+//! the two are distinguishable without reading anything. It then requires a
+//! classification for each local answer and fails if one is missing. That list
+//! cannot go stale the way a comment can, and design.md §0.20 is what it found.
 
 use crate::advertise;
-use crate::state::{Memory, SharedVulkan, API_VERSION};
+use crate::state::{Memory, PROTOCOL_API_VERSION, SharedVulkan};
 use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError, forward};
 use sv_proto as p;
 
@@ -68,8 +81,10 @@ fn record_into_blob(
 }
 
 impl IcdLocal for SharedVulkan {
+    /// `vkEnumerateInstanceVersion`, and it is the negotiated number rather than
+    /// a constant (design.md §0.18).
     fn api_version(&self) -> u32 {
-        API_VERSION
+        self.advertised_api_version()
     }
 
     fn transport(&self) -> Option<&dyn sv_icd_entry::Transport> {
@@ -80,6 +95,13 @@ impl IcdLocal for SharedVulkan {
     /// about what an id means (design.md §6.4).
     fn mint_id(&self) -> u64 {
         self.state().mint()
+    }
+
+    /// design.md §5.3's rewrite, app-side half. The generated forwarders call
+    /// this for every `(memory, offset)` pair that crosses; the arena allocator
+    /// that answers it lives here.
+    fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
+        SharedVulkan::rewrite_memory(self, memory, offset)
     }
 
     fn instance_extensions(&self) -> &[(&'static str, u32)] {
@@ -143,7 +165,10 @@ impl IcdLocal for SharedVulkan {
             s.physical_devices.insert(phys, id);
             s.instances.insert(
                 id,
-                crate::state::Instance { api_version: API_VERSION, physical_devices: vec![phys] },
+                crate::state::Instance {
+                    api_version: self.advertised_api_version(),
+                    physical_devices: vec![phys],
+                },
             );
             (id, phys)
         };
@@ -500,12 +525,12 @@ impl Icd for SharedVulkan {
         if let Some(t) = self.wire() {
             let mut reply = forward::get_physical_device_properties(t, args)?;
             if let Some(p) = reply.p_properties.as_mut() {
-                clamp_api_version(&mut p.api_version);
+                clamp_api_version(self, &mut p.api_version);
             }
             return Ok(reply);
         }
         Ok(p::VkGetPhysicalDevicePropertiesReply {
-            p_properties: Some(Box::new(device_properties())),
+            p_properties: Some(Box::new(device_properties(self))),
         })
     }
 
@@ -516,12 +541,12 @@ impl Icd for SharedVulkan {
         if let Some(t) = self.wire() {
             let mut reply = forward::get_physical_device_properties2(t, args)?;
             if let Some(p) = reply.p_properties.as_mut() {
-                clamp_api_version(&mut p.properties.api_version);
+                clamp_api_version(self, &mut p.properties.api_version);
             }
             return Ok(reply);
         }
         let mut out = p::VkPhysicalDeviceProperties2::default();
-        out.properties = device_properties();
+        out.properties = device_properties(self);
         // The application's own chain links are left exactly as it left
         // them: answering a link we have no answer for would be inventing
         // data. See `store_pnext` in `sv-icd-entry` for the direction that
@@ -564,11 +589,15 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkGetPhysicalDeviceFeatures2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceFeatures2Reply> {
-        forwarded!(self, get_physical_device_features2, args, {
+        let mut reply = forwarded!(self, get_physical_device_features2, args, {
             Ok(p::VkGetPhysicalDeviceFeatures2Reply {
                 p_features: Some(Box::new(p::VkPhysicalDeviceFeatures2::default())),
             })
-        })
+        })?;
+        if let Some(f) = reply.p_features.as_mut() {
+            crate::advertise::withdraw_gated_features(&mut f.p_next);
+        }
+        Ok(reply)
     }
 
     fn get_physical_device_queue_family_properties(
@@ -871,14 +900,17 @@ impl Icd for SharedVulkan {
         Ok(())
     }
 
-    /// design.md §5.3's rewrite, app-side half.
+    /// Bind, or say nothing was bound.
     ///
-    /// The memory id becomes [`sv_gpu_server::ARENA_MEMORY_ID`]'s value and the
-    /// offset becomes the allocation's arena offset plus the application's. §5.3
-    /// says the id becomes "the slab's GPU-side handle"; it cannot — the app
-    /// side knows no driver handle and §6.4 depends on it not knowing one — so
-    /// what crosses is a well-known id and a number this side already owns, and
-    /// the GPU side finishes the translation. See `sv_gpu_server::table`.
+    /// **The `(memory, offset)` rewrite is no longer here.** It used to be, and
+    /// being here was the bug: §5.3's app-side half was one hand-written line in
+    /// this one command, so the six other commands that carry a memory id across
+    /// — `vkBindImageMemory` first among them — sent the app-side id raw and the
+    /// GPU side took a ring fatal on it (design.md §0.20). It is now generated
+    /// for every forwarded command, in `sv_icd_entry::forward`, and this
+    /// override is left only for the property the generated default does not
+    /// have: with no GPU side there is nothing to bind to, and saying so is
+    /// better than refusing by name.
     fn bind_buffer_memory(
         &self,
         args: p::VkBindBufferMemoryArgs,
@@ -887,16 +919,7 @@ impl Icd for SharedVulkan {
             // NO GPU: nothing to bind to.
             return Ok(p::VkBindBufferMemoryReply { result: p::VkResult(0) });
         };
-        let (memory, offset) = self.rewrite_memory(args.memory.0, args.memory_offset)?;
-        forward::bind_buffer_memory(
-            t,
-            p::VkBindBufferMemoryArgs {
-                device: args.device,
-                buffer: args.buffer,
-                memory: p::VkDeviceMemory(memory),
-                memory_offset: offset,
-            },
-        )
+        forward::bind_buffer_memory(t, args)
     }
 
     // -- descriptor update templates ----------------------------------------
@@ -1277,6 +1300,34 @@ impl Icd for SharedVulkan {
 /// says 1.3 — so a physical device reporting the driver's 1.4 was reporting a
 /// version its own ICD does not implement.
 ///
+/// **The bound is [`PROTOCOL_API_VERSION`] and it is derived, not written
+/// down** (design.md §0.18). What changed when §0.18 was done is not this
+/// function — clamping *is* the right thing and the paragraphs below are why —
+/// but three facts around it: the bound now comes from the wire profile so it
+/// cannot disagree with the command table; the driver's number is learned over
+/// `svDriverVersions` rather than assumed; and a clamp that actually fires is
+/// printed at startup by `sv_icd::state::announce`. A demotion that nobody can
+/// see is how this defect survived long enough to cost the two GL versions
+/// described below.
+///
+/// Note what this is *not*: it is not a floor. A driver reporting **less** than
+/// the bound passes through untouched and the application is told the driver's
+/// smaller number — which is the whole of "graceful fallback", and it needs no
+/// code here because `min` already does it.
+///
+/// **The bound is the negotiated device version, not the bare ceiling**, and the
+/// difference is not cosmetic. The two numbers are the same on every ordinary
+/// run — the negotiated one *is* `min(driver, ceiling)` and the forwarded reply
+/// carries that same driver — so the clamp is unchanged in practice. Where they
+/// part is where it matters: a driver that answered `svDriverVersions` with 1.1
+/// and this reply with 1.4 would otherwise produce an ICD whose
+/// `vkEnumerateInstanceVersion` says 1.1 and whose physical device says 1.3,
+/// which is a driver contradicting itself one call apart. Settling the number
+/// once at connect and bounding every later answer by it is what makes the
+/// driver's report a single consistent claim. It is also what makes
+/// `SV_DRIVER_VERSION_MAX` on the GPU side a faithful stand-in for an old
+/// device, and therefore what makes the fallback path testable at all.
+///
 /// It is not a cosmetic inconsistency, and the cost was two GL versions. Mesa's
 /// Zink takes `screen->vk_version` from exactly this field, and its device-info
 /// pass stops chaining an extension's feature struct into
@@ -1290,12 +1341,15 @@ impl Icd for SharedVulkan {
 /// `VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT` we *do* answer, and which
 /// says `true`, went unasked. Claiming a version above what you implement makes
 /// an honest answer unreachable rather than wrong.
-fn clamp_api_version(v: &mut u32) {
-    *v = (*v).min(API_VERSION);
+fn clamp_api_version(icd: &SharedVulkan, v: &mut u32) {
+    // `min` of the two rather than the negotiated number outright: if this
+    // driver ever reported *less* here than it did at connect, the smaller
+    // answer is still the honest one and raising it would be inventing support.
+    *v = (*v).min(icd.advertised_device_api_version()).min(PROTOCOL_API_VERSION);
 }
 
-fn device_properties() -> p::VkPhysicalDeviceProperties {
-    let c = advertise::device_properties(API_VERSION);
+fn device_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceProperties {
+    let c = advertise::device_properties(icd.advertised_device_api_version());
     let mut w = p::VkPhysicalDeviceProperties::default();
     w.api_version = c.api_version;
     w.driver_version = c.driver_version;

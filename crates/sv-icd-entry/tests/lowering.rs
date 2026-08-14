@@ -213,7 +213,20 @@ fn memory_properties_are_written_back_field_for_field() {
 
 struct TestIcd;
 
-impl IcdLocal for TestIcd {}
+/// A stand-in for `sv-icd`'s arena allocator: ids 100 and up are "arena-backed"
+/// and rewrite to `(ARENA, 0x1000 * id + offset)`; ids below 100 are heap-0 and
+/// cross unchanged; anything at or above 900 is unknown and must fail.
+const ARENA: u64 = 0xFFFF_FFFF_FFFF_FFFE;
+
+impl IcdLocal for TestIcd {
+    fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
+        match memory {
+            m if m >= 900 => Err(LowerError::Shape("no such VkDeviceMemory")),
+            m if m >= 100 => Ok((ARENA, 0x1000 * m + offset)),
+            m => Ok((m, offset)),
+        }
+    }
+}
 
 impl Icd for TestIcd {
     fn get_physical_device_memory_properties(
@@ -385,4 +398,201 @@ fn an_unselected_descriptor_arm_is_never_read() {
     assert_eq!(l2.p_buffer_info.len(), 1);
     assert_eq!(l2.p_buffer_info[0].buffer.0, POISON, "the *selected* arm is read verbatim");
     assert!(l2.p_image_info.is_empty(), "pImageInfo is not selected by STORAGE_BUFFER");
+}
+
+// ---------------------------------------------------------------------------
+// pass 6, app-side half: every memory id that crosses is rewritten
+// ---------------------------------------------------------------------------
+
+/// A transport that keeps the bytes instead of sending them.
+///
+/// The reply is this command's own opcode in a `ReplyHeader` followed by zeros:
+/// the header has to match or `decode_reply_*` refuses it as somebody else's
+/// answer, which is R13 doing its job. Zeros after it are `VK_SUCCESS` — enough
+/// for a forwarder to return, and this test is about what went *out*.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<u8>>);
+
+impl Transport for Recorder {
+    fn call(
+        &self,
+        _ring: RingClass,
+        opcode: u32,
+        command: &[u8],
+        reply: &mut Vec<u8>,
+    ) -> IcdResult<()> {
+        *self.0.lock().unwrap() = command.to_vec();
+        reply.resize(64, 0);
+        let mut enc = sv_wire::Encoder::new(&mut reply[..8]);
+        sv_wire::ReplyHeader { cmd_type: opcode, reply_size: 64 }
+            .encode(&mut enc)
+            .expect("a reply header fits in eight bytes");
+        Ok(())
+    }
+    fn send(&self, _ring: RingClass, _opcode: u32, command: &[u8]) -> IcdResult<()> {
+        *self.0.lock().unwrap() = command.to_vec();
+        Ok(())
+    }
+}
+
+fn sent(r: &Recorder) -> Vec<u8> {
+    r.0.lock().unwrap().clone()
+}
+
+/// design.md §5.3's rewrite happens for **every** command that carries a memory
+/// id, not for the one it was hand-written in.
+///
+/// `vkBindBufferMemory` had the rewrite and `vkBindImageMemory` did not, so an
+/// image bound to host-visible memory sent an app-side id the GPU side has never
+/// heard of; it answered `no VkDeviceMemory with id 8`, took the ring fatal, and
+/// the device was lost (design.md §0.20). The two commands are asserted
+/// together here precisely because their being different was the bug.
+#[test]
+fn every_forwarded_memory_pair_is_rewritten() {
+    set_icd(&TEST_ICD);
+    let t = Recorder::default();
+
+    // The shape that was broken.
+    forward::bind_image_memory(
+        &t,
+        sv_proto::VkBindImageMemoryArgs {
+            device: sv_proto::VkDevice(1),
+            image: sv_proto::VkImage(2),
+            memory: sv_proto::VkDeviceMemory(100),
+            memory_offset: 0x40,
+        },
+    )
+    .expect("a bind of arena-backed memory forwards");
+    let cmd = sent(&t);
+    let mut d = sv_wire::Decoder::new(&cmd);
+    sv_wire::CommandHeader::decode(&mut d).expect("a header");
+    let a = sv_proto::decode_cmd_vk_bind_image_memory(&mut d).expect("the command decodes");
+    assert_eq!(a.memory.0, ARENA, "the app-side id never reaches the wire");
+    assert_eq!(a.memory_offset, 0x1000 * 100 + 0x40, "the offset is arena-absolute");
+
+    // The shape that already worked, so that the two cannot drift apart again.
+    forward::bind_buffer_memory(
+        &t,
+        sv_proto::VkBindBufferMemoryArgs {
+            device: sv_proto::VkDevice(1),
+            buffer: sv_proto::VkBuffer(3),
+            memory: sv_proto::VkDeviceMemory(101),
+            memory_offset: 8,
+        },
+    )
+    .expect("a buffer bind forwards");
+    let cmd = sent(&t);
+    let mut d = sv_wire::Decoder::new(&cmd);
+    sv_wire::CommandHeader::decode(&mut d).expect("a header");
+    let a = sv_proto::decode_cmd_vk_bind_buffer_memory(&mut d).expect("the command decodes");
+    assert_eq!(a.memory.0, ARENA);
+    assert_eq!(a.memory_offset, 0x1000 * 101 + 8);
+
+    // Heap-0 memory is a real GPU-side allocation under the app's own id and
+    // must cross untouched — a rewrite that "helpfully" renamed it would break
+    // the one case that was never broken.
+    forward::bind_image_memory(
+        &t,
+        sv_proto::VkBindImageMemoryArgs {
+            device: sv_proto::VkDevice(1),
+            image: sv_proto::VkImage(2),
+            memory: sv_proto::VkDeviceMemory(7),
+            memory_offset: 0x40,
+        },
+    )
+    .expect("a bind of device-local memory forwards");
+    let cmd = sent(&t);
+    let mut d = sv_wire::Decoder::new(&cmd);
+    sv_wire::CommandHeader::decode(&mut d).expect("a header");
+    let a = sv_proto::decode_cmd_vk_bind_image_memory(&mut d).expect("the command decodes");
+    assert_eq!(a.memory.0, 7);
+    assert_eq!(a.memory_offset, 0x40);
+}
+
+/// The same pass, reached through a struct and through an array of them.
+///
+/// `vkBindImageMemory2` and `vkQueueBindSparse` carry the pair inside
+/// `VkBindImageMemoryInfo` and `VkSparseMemoryBind`, where no top-level rule can
+/// see it, and `VK_NULL_HANDLE` in a sparse bind means "unbind this range" and
+/// must survive the walk.
+#[test]
+fn a_memory_pair_inside_a_struct_is_rewritten_too() {
+    set_icd(&TEST_ICD);
+    let t = Recorder::default();
+
+    let mut info = sv_proto::VkBindImageMemoryInfo::default();
+    info.image = sv_proto::VkImage(2);
+    info.memory = sv_proto::VkDeviceMemory(102);
+    info.memory_offset = 0x20;
+    forward::bind_image_memory2(
+        &t,
+        sv_proto::VkBindImageMemory2Args {
+            device: sv_proto::VkDevice(1),
+            bind_info_count: 1,
+            p_bind_infos: vec![info],
+        },
+    )
+    .expect("a bind2 forwards");
+    let cmd = sent(&t);
+    let mut d = sv_wire::Decoder::new(&cmd);
+    sv_wire::CommandHeader::decode(&mut d).expect("a header");
+    let a = sv_proto::decode_cmd_vk_bind_image_memory2(&mut d).expect("the command decodes");
+    assert_eq!(a.p_bind_infos[0].memory.0, ARENA);
+    assert_eq!(a.p_bind_infos[0].memory_offset, 0x1000 * 102 + 0x20);
+
+    let mut null_bind = sv_proto::VkSparseMemoryBind::default();
+    null_bind.memory = sv_proto::VkDeviceMemory(0);
+    null_bind.memory_offset = 0;
+    let mut bound = sv_proto::VkSparseMemoryBind::default();
+    bound.memory = sv_proto::VkDeviceMemory(103);
+    bound.memory_offset = 0x10;
+    let mut buf = sv_proto::VkSparseBufferMemoryBindInfo::default();
+    buf.buffer = sv_proto::VkBuffer(4);
+    buf.bind_count = 2;
+    buf.p_binds = vec![null_bind, bound];
+    let mut bind = sv_proto::VkBindSparseInfo::default();
+    bind.buffer_bind_count = 1;
+    bind.p_buffer_binds = vec![buf];
+    forward::queue_bind_sparse(
+        &t,
+        sv_proto::VkQueueBindSparseArgs {
+            queue: sv_proto::VkQueue(1),
+            bind_info_count: 1,
+            p_bind_info: vec![bind],
+            fence: sv_proto::VkFence(0),
+        },
+    )
+    .expect("a sparse bind forwards");
+    let cmd = sent(&t);
+    let mut d = sv_wire::Decoder::new(&cmd);
+    sv_wire::CommandHeader::decode(&mut d).expect("a header");
+    let a = sv_proto::decode_cmd_vk_queue_bind_sparse(&mut d).expect("the command decodes");
+    let binds = &a.p_bind_info[0].p_buffer_binds[0].p_binds;
+    assert_eq!(binds[0].memory.0, 0, "VK_NULL_HANDLE means unbind, and is not looked up");
+    assert_eq!(binds[1].memory.0, ARENA);
+    assert_eq!(binds[1].memory_offset, 0x1000 * 103 + 0x10);
+}
+
+/// An id the app side never handed out fails **here**, with the id in the error.
+///
+/// The alternative is what this project measured: the raw id crosses, the GPU
+/// side cannot resolve it, the ring goes fatal and the application sees
+/// `VK_ERROR_DEVICE_LOST` from an unrelated `vkWaitForFences` several calls
+/// later.
+#[test]
+fn an_unknown_memory_id_fails_before_it_crosses() {
+    set_icd(&TEST_ICD);
+    let t = Recorder::default();
+    let e = forward::bind_image_memory(
+        &t,
+        sv_proto::VkBindImageMemoryArgs {
+            device: sv_proto::VkDevice(1),
+            image: sv_proto::VkImage(2),
+            memory: sv_proto::VkDeviceMemory(999),
+            memory_offset: 0,
+        },
+    )
+    .expect_err("an unknown memory id does not cross");
+    assert_eq!(e, LowerError::Wire(sv_wire::WireError::NoSuchMemory { id: 999 }));
+    assert!(sent(&t).is_empty(), "and nothing was sent");
 }

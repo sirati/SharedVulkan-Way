@@ -37,6 +37,29 @@ pub const SV_EXECUTE_COMMAND_BLOB: u32 = PROTOCOL_BASE;
 /// design.md §6.3: "Slab import, with the memory-type reply."
 pub const SV_IMPORT_ARENA_SLAB: u32 = PROTOCOL_BASE + 1;
 
+/// design.md §0.18: "which Vulkan version is behind you?", asked once at connect.
+///
+/// # Why this is a ring command and not a field of the cold-path `Attachment`
+///
+/// The obvious place for a fact the GPU side knows and the app side needs is the
+/// handshake message, and it was tried there first. It does not work, for two
+/// reasons that are both about *ordering* rather than about taste:
+///
+/// - On the cross-VM path the guest sends its `Hello` **before it opens the
+///   driver**, deliberately — "bound before the driver is opened so that a host
+///   waiting on the port sees it come up promptly" (`sv_gpu_server::entry`).
+///   At `Hello` time there is no `apiVersion` to report.
+/// - On the `sv-hostd` path the daemon that sends the `Attachment` is not the
+///   side holding the driver at all. In `Mode::Local` the GPU side is one of its
+///   *clients*, so the daemon has nothing to relay.
+///
+/// A ring command has neither problem: by the time any ring is served the GPU
+/// side has a `Driver`, and it is the same side that answers every other
+/// question about the device. It is the pattern
+/// `sv_icd::state::SharedVulkan::ask_device_extensions` already uses, for the
+/// same reason — the answer belongs to whoever holds the driver.
+pub const SV_DRIVER_VERSIONS: u32 = PROTOCOL_BASE + 2;
+
 /// Is this opcode ours?
 pub fn is_protocol(cmd_type: u32) -> bool {
     cmd_type >= PROTOCOL_BASE
@@ -103,12 +126,39 @@ pub struct ImportArenaSlabReply {
     pub memory_type: u32,
 }
 
+/// `svDriverVersions`: ask the GPU side what Vulkan its driver actually is.
+///
+/// No body. The GPU side has exactly one driver and one physical device
+/// (design.md §8), so there is nothing to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriverVersions;
+
+/// What the GPU side answers a [`DriverVersions`] with.
+///
+/// Both numbers are the driver's own, unclamped and un-negotiated: **this
+/// message reports, it does not decide**. Clamping them to what the wire can
+/// carry is the app side's job and happens in `sv_icd::state::negotiate`, which
+/// is where the decision can be printed once instead of being made silently in
+/// two places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriverVersionsReply {
+    /// `vkEnumerateInstanceVersion` on the GPU side's loader — what the driver
+    /// stack over there can offer an *instance*.
+    pub instance_api_version: u32,
+    /// `VkPhysicalDeviceProperties::apiVersion` of the physical device the GPU
+    /// side opened — the number `vulkaninfo` prints per device.
+    pub device_api_version: u32,
+}
+
 /// Header, the `u32` that follows it, and three `u64`s. The `u32` is not
 /// padding for its own sake: `COMMAND_HEADER_SIZE` is twelve, so without it
 /// every `u64` in every one of these bodies would be four-byte aligned.
 const BLOB_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 24;
 const IMPORT_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 24;
 const IMPORT_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8;
+/// Header and the `u32` that keeps the body four-byte aligned; there is no body.
+const VERSIONS_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4;
+const VERSIONS_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8;
 
 impl ExecuteCommandBlob {
     pub fn encoded_len() -> usize {
@@ -208,6 +258,66 @@ impl ImportArenaSlabReply {
     }
 }
 
+impl DriverVersions {
+    pub fn encoded_len() -> usize {
+        VERSIONS_SIZE
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        out.resize(VERSIONS_SIZE, 0);
+        let mut enc = Encoder::new(out);
+        CommandHeader {
+            cmd_type: SV_DRIVER_VERSIONS,
+            cmd_flags: sv_wire::CMD_FLAG_GENERATE_REPLY,
+            cmd_size: VERSIONS_SIZE as u32,
+        }
+        .encode(&mut enc)?;
+        enc.u32(0)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<DriverVersions> {
+        let mut dec = Decoder::new(payload);
+        let h = CommandHeader::decode(&mut dec)?;
+        if h.cmd_type != SV_DRIVER_VERSIONS {
+            return Err(WireError::UnknownCommand { opcode: h.cmd_type });
+        }
+        let _pad = dec.u32()?;
+        Ok(DriverVersions)
+    }
+}
+
+impl DriverVersionsReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        out.resize(VERSIONS_REPLY_SIZE, 0);
+        let mut enc = Encoder::new(out);
+        sv_wire::ReplyHeader {
+            cmd_type: SV_DRIVER_VERSIONS,
+            reply_size: VERSIONS_REPLY_SIZE as u32,
+        }
+        .encode(&mut enc)?;
+        enc.u32(self.instance_api_version)?;
+        enc.u32(self.device_api_version)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<DriverVersionsReply> {
+        let mut dec = Decoder::new(payload);
+        let h = sv_wire::ReplyHeader::decode(&mut dec)?;
+        if h.cmd_type != SV_DRIVER_VERSIONS {
+            return Err(WireError::UnknownCommand { opcode: h.cmd_type });
+        }
+        Ok(DriverVersionsReply {
+            instance_api_version: dec.u32()?,
+            device_api_version: dec.u32()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,12 +347,37 @@ mod tests {
         assert_eq!(ImportArenaSlabReply::decode(&buf).unwrap(), reply);
     }
 
+    #[test]
+    fn a_driver_version_question_and_its_answer_round_trip() {
+        let mut buf = Vec::new();
+        DriverVersions.encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), DriverVersions::encoded_len());
+        assert_eq!(DriverVersions::decode(&buf).unwrap(), DriverVersions);
+        // It must ask for a reply, or the app side waits for one that the GPU
+        // side's dispatcher never sends back.
+        let flags = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        assert_ne!(flags & sv_wire::CMD_FLAG_GENERATE_REPLY, 0);
+
+        // 1.4.323 is the testhost guest's Intel UHD (docs/video-decode.md) and
+        // the number this whole command exists to carry.
+        let reply = DriverVersionsReply {
+            instance_api_version: (1 << 22) | (4 << 12) | 323,
+            device_api_version: (1 << 22) | (4 << 12) | 323,
+        };
+        reply.encode(&mut buf).unwrap();
+        assert_eq!(DriverVersionsReply::decode(&buf).unwrap(), reply);
+        // The patch digits must survive: they are the only part of the number
+        // that distinguishes two drivers of the same minor version.
+        assert_eq!(DriverVersionsReply::decode(&buf).unwrap().device_api_version & 0xfff, 323);
+    }
+
     /// The one property that makes the two namespaces safe to share a `u32`.
     #[test]
     fn no_generated_opcode_reaches_the_protocol_range() {
         assert!((crate::Opcode::COUNT as u32) < PROTOCOL_BASE);
         assert!(crate::Opcode::from_u32(SV_EXECUTE_COMMAND_BLOB).is_none());
         assert!(crate::Opcode::from_u32(SV_IMPORT_ARENA_SLAB).is_none());
+        assert!(crate::Opcode::from_u32(SV_DRIVER_VERSIONS).is_none());
         assert!(!is_protocol(crate::Opcode::COUNT as u32 - 1));
         assert!(is_protocol(SV_EXECUTE_COMMAND_BLOB));
     }

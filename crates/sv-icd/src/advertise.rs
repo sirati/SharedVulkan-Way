@@ -345,6 +345,48 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
 /// driver's own extensions is not knowable here.
 pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
 
+/// Features the driver over there has and this side will not promise.
+///
+/// # Why this exists at all, given `INCOMPLETE_EXTENSIONS`
+///
+/// Extensions and features are not the same lever, and core 1.4 is where the
+/// difference stops being academic. `sv_icd_entry::INCOMPLETE_EXTENSIONS` can
+/// withdraw `VK_EXT_host_image_copy` — but the same capability is *also* core
+/// 1.4's `hostImageCopy`, reachable through `VkPhysicalDeviceVulkan14Features`
+/// with no extension string to decline. Withdrawing the extension and leaving
+/// the feature bit set advertises the same thing twice and denies it once.
+///
+/// So this walks the reply's `pNext` chain and clears the bit wherever it
+/// appears: in `VkPhysicalDeviceVulkan14Features`, in the promoted
+/// `VkPhysicalDeviceHostImageCopyFeatures`, and in the `…EXT` form. All three
+/// are the same bit and an application may ask through any of them.
+///
+/// # Why `hostImageCopy` in particular
+///
+/// The wire is right: `sv_codegen::exceptions` gives `pHostPointer` the
+/// `ArenaOffset` policy, which is what design.md §5.3 says a host pointer *is*
+/// here — `arena_base + offset`. What is not written is the case where the
+/// application's pointer is **not** arena memory. `vkCopyMemoryToImage` accepts
+/// a plain `malloc` buffer, and honouring that needs a bounce through an arena
+/// block whose extent must be computed from `imageExtent`, `imageSubresource`,
+/// `memoryRowLength` and the image's format. That is real work and it is not
+/// done, so the feature is withdrawn rather than half-kept.
+///
+/// This is the seam design.md §0.19 item 3 asks for: carry everything, advertise
+/// what works. The three commands stay on the wire and in the proc tables — they
+/// are core 1.4 and cannot be made to disappear — and a conforming application
+/// that respects the feature bit never calls them.
+pub fn withdraw_gated_features(chain: &mut [sv_proto::PNextLink]) {
+    use sv_proto::PNextLink as L;
+    for link in chain.iter_mut() {
+        match link {
+            L::VkPhysicalDeviceVulkan14Features(f) => f.host_image_copy = false,
+            L::VkPhysicalDeviceHostImageCopyFeatures(f) => f.host_image_copy = false,
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,15 +454,71 @@ mod tests {
         );
     }
 
+    /// The 1.0 feature set is the fallback with no GPU side, and it stays empty.
+    ///
+    /// **This test used to be called `we_do_not_advertise_buffer_device_address`
+    /// and it never checked that.** `bufferDeviceAddress` is not in
+    /// `VkPhysicalDeviceFeatures` at all — it arrives through
+    /// `VkPhysicalDeviceVulkan12Features`, which is forwarded whole from the
+    /// physical device — so the assertion below was true, the name was false,
+    /// and design.md §9.2's claim that we do not advertise the feature rested on
+    /// a test about a different structure. `vulkaninfo` printed
+    /// `bufferDeviceAddress = true` throughout (design.md §0.16 item 3).
+    ///
+    /// The name is corrected rather than the assertion, because the feature is
+    /// now **implemented** — all three of `vkGetBufferDeviceAddress`,
+    /// `vkGetBufferOpaqueCaptureAddress` and
+    /// `vkGetDeviceMemoryOpaqueCaptureAddress` forward and return the GPU side's
+    /// real address (§0.20) — so advertising it is honest and the check that
+    /// belongs here is the one the body actually makes.
     #[test]
-    fn we_do_not_advertise_buffer_device_address() {
-        // The feature is not in `VkPhysicalDeviceFeatures` at all — it arrives
-        // through `VkPhysicalDeviceVulkan12Features` — so what this checks is
-        // that the base feature set is empty and nothing has quietly turned
-        // something on.
+    fn the_ten_zero_feature_set_is_empty() {
         let f = features();
         assert_eq!(f.robust_buffer_access, 0);
         assert_eq!(f.shader_int64, 0);
+    }
+
+    /// A feature the driver has and we do not keep is withdrawn on *every* path
+    /// an application can ask through.
+    ///
+    /// The bug this guards is not "we forgot to clear it" — it is "we cleared it
+    /// in one of the three places". `hostImageCopy` is core 1.4's feature, the
+    /// promoted extension's feature and the `…EXT` alias's feature, and an
+    /// application that chains `VkPhysicalDeviceVulkan14Features` sees a
+    /// different answer from one that chains
+    /// `VkPhysicalDeviceHostImageCopyFeatures` unless both are handled.
+    #[test]
+    fn a_gated_feature_is_withdrawn_wherever_it_is_asked_for() {
+        let mut chain = vec![
+            sv_proto::PNextLink::VkPhysicalDeviceVulkan14Features(Box::new(
+                sv_proto::VkPhysicalDeviceVulkan14Features {
+                    host_image_copy: true,
+                    // A neighbour that must survive: the walk clears one bit,
+                    // not a struct.
+                    push_descriptor: true,
+                    ..Default::default()
+                },
+            )),
+            sv_proto::PNextLink::VkPhysicalDeviceHostImageCopyFeatures(Box::new(
+                sv_proto::VkPhysicalDeviceHostImageCopyFeatures {
+                    host_image_copy: true,
+                    ..Default::default()
+                },
+            )),
+        ];
+        withdraw_gated_features(&mut chain);
+        for link in &chain {
+            match link {
+                sv_proto::PNextLink::VkPhysicalDeviceVulkan14Features(f) => {
+                    assert!(!f.host_image_copy, "core 1.4's bit is still set");
+                    assert!(f.push_descriptor, "the walk cleared a bit it was not asked to");
+                }
+                sv_proto::PNextLink::VkPhysicalDeviceHostImageCopyFeatures(f) => {
+                    assert!(!f.host_image_copy, "the promoted extension's bit is still set");
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

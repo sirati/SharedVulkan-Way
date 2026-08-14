@@ -99,6 +99,31 @@ pub const PROTOCOL_HASH: u64 = {
 /// Which profile this build was generated for.
 pub const PROTOCOL_PROFILE: &str = env!("SV_PROTOCOL_PROFILE");
 
+/// The highest core Vulkan version this wire can carry — `sv-icd`'s **ceiling**.
+///
+/// `vk_registry::profile::Profile::core_api_version` over the profile the
+/// generator ran on, so it cannot drift from the command table: adding
+/// `VK_VERSION_1_4` to the profile raises this and brings the fourteen commands
+/// and forty-four types it names onto the wire in the same edit.
+///
+/// An ICD's `vkEnumerateInstanceVersion` is a *promise* that the entry points
+/// and structures of that version exist, and the side that has to keep it is the
+/// app side, whose whole vocabulary is this profile. So the app side advertises
+/// `min(what the driver reports, this)` — never a constant, and never the
+/// driver's number unclamped. design.md §0.18 has the measurement of what
+/// claiming more than this costs (two GL versions, through Zink).
+pub const CORE_API_VERSION: u32 = {
+    const S: &str = env!("SV_PROTOCOL_CORE_VERSION");
+    let bytes = S.as_bytes();
+    let mut acc: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        acc = acc * 10 + (bytes[i] - b'0') as u32;
+        i += 1;
+    }
+    acc
+};
+
 /// The canonical protocol manifest, for diagnosing a handshake refusal.
 ///
 /// When two sides disagree, the hash says *that* they disagree and this says

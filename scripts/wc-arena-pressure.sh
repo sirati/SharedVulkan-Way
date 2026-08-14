@@ -47,6 +47,16 @@ ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
 note(){ echo "  ....  $*" >&2; }
 
+# STAGE 41. No QEMU on this box, so no guest RAM to locate: this harness is the
+# Wine fixture. `wc_substrate_declare wine-fixture` is what hands it the
+# `SV_ALLOW_FILE_ARENA=1` that `wc-proxy` and `wc-compositor` now require, and
+# it refuses to hand that out to any harness that has a guest.
+. "$(dirname "$0")/wc-substrate.sh"
+# STAGE 42. `fresh`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+wc_substrate_declare wine-fixture \
+  "no QEMU on this box: a Wine run has no guest RAM to locate" || exit 2
+
 winp() { printf 'Z:%s\n' "$(echo "$1" | tr '/' '\\')"; }
 
 # One run: a Windows compositor, the named proxy, a starved arena, and Firefox.
@@ -139,7 +149,7 @@ verdict() {
   echo "$label|$closed|$died|$refusals|$frames|$reclaimed|$unknown"
 }
 main() {
-  [ -x "$WIN_BIN/wc-compositor.exe" ] || { echo "build wc-compositor.exe first"; exit 2; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || exit 2
   [ -n "$FIREFOX" ] || { echo "no firefox"; exit 2; }
   local root; root=$(mktemp -d /tmp/wc-press-XXXXXX)
   local which=${1:-this}

@@ -52,6 +52,9 @@ fail=0
 ok()   { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad()  { echo "  FAIL  $*"; fail=$((fail + 1)); }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 # A run directory of our own, so a stale socket from a previous run cannot be
 # mistaken for a live server and so nothing lands in the user's real
 # XDG_RUNTIME_DIR.
@@ -60,7 +63,7 @@ trap 'rm -rf "$RUNDIR"' EXIT
 
 run_linux() {
   echo "== linux: server and clients as Linux binaries =="
-  [ -x "$LINUX_BIN/wc-server" ] || { bad "no $LINUX_BIN/wc-server -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-server" "cargo build -p wc-server" || return
 
   # --- our own probe -------------------------------------------------------
   XDG_RUNTIME_DIR="$RUNDIR" "$LINUX_BIN/wc-server" --socket wayland-test --timeout 20 >"$RUNDIR/srv1.log" 2>&1 &
@@ -96,7 +99,7 @@ run_linux() {
 
 run_wine() {
   echo "== wine: server as a Windows binary =="
-  [ -f "$WIN_BIN/wc-server.exe" ] || { bad "no $WIN_BIN/wc-server.exe -- cargo build --target x86_64-pc-windows-gnu first"; return; }
+  fresh "$WIN_BIN/wc-server.exe" "cargo build -p wc-server --target x86_64-pc-windows-gnu" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
 
   # Windows AF_UNIX binds to a real filesystem path, and our `socket_dir()`

@@ -61,6 +61,9 @@ bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 nay() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 RUNDIR=$(mktemp -d /tmp/wc-wlcs-run-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -251,7 +254,7 @@ headless() {
   local filter=${1:-*}
   echo "== headless: the Linux build, --control standing in for Win32"
   [ -f "$SHIM" ] || { bad "$SHIM is not built (cargo build -p wc-wlcs)"; return; }
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "$LINUX_BIN/wc-compositor is not built"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "$LINUX_BIN/wc-compositor is not built" || return
   [ -f "$EXTFILE" ] || { bad "no $EXTFILE; run 'globals' first"; return; }
   export WC_WLCS_COMPOSITOR="$LINUX_BIN/wc-compositor"
   export WC_WLCS_RUNDIR="$RUNDIR"
@@ -277,7 +280,7 @@ wine_leg() {
     note "a clippy run builds metadata, not an executable"
     return
   fi
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "$LINUX_BIN/wc-proxy is not built"; return; }
+  fresh "$LINUX_BIN/wc-proxy" "$LINUX_BIN/wc-proxy is not built" || return
   [ -f "$EXTFILE" ] || { bad "no $EXTFILE; run 'globals' first"; return; }
   command -v wine >/dev/null || { bad "no wine in this shell"; return; }
   command -v Xvfb >/dev/null || { bad "no Xvfb in this shell"; return; }

@@ -49,6 +49,25 @@
 # directory, our own socket names, processes identified by pid, and never a
 # `taskkill /IM` (without `/F` it sends WM_CLOSE to *other people's* windows,
 # which is how §16 lost three runs).
+#
+# STAGE 41. WHICH MEMORY THE `apps` PHOTOGRAPHS WERE TAKEN ON
+#
+# `local` runs two of our own clients on the guest itself, with no proxy and no
+# arena, and is unaffected by any of this. `apps` is the block the requirement
+# is actually about, and until §41 it had **no guest-RAM path at all**: its
+# pools were `--transport shared-file` on the virtio-fs export and its
+# compositor was started with `--arena 0:N:Z:\wc32\arena`, a file on that same
+# export. So every taskbar-identity photograph in docs/stage32/ crossed the
+# substrate §10.3 measured incoherent for live mappings — 65280 of 65536 bytes
+# wrong, in both directions — on a harness that never said so.
+#
+# The identity result is not thereby wrong: two buttons come apart because of
+# `PKEY_AppUserModel_ID` and not because of what carried the pixels. But it was
+# taken on the fixture, and a run that cannot say which memory it used is a run
+# nobody can check. §41 gives `apps` the guest-RAM path, makes it the only one
+# reachable, and turns the substrate into an assertion. The old photographs are
+# **not** re-taken here — that is somebody else's measurement to make, and
+# §32.9 records what is on the fixture so the choice is an informed one.
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -58,6 +77,10 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage32"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# STAGE 41. This harness ssh's into a real Windows guest, which is the fact
+# `wc_substrate_declare` needs in order to refuse to hand this run the
+# file-arena escape hatch. Set before the library is sourced, because it reads it.
+WC_GUEST_CONFIGURED=1
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 GUESTNAME="${WC_GUESTNAME:-wctb32}"
 COMP_EXE="${WC_COMP_EXE:-wc-s32-compositor.exe}"
@@ -90,6 +113,18 @@ APP_B="${WC_APP_B:-weston-flower}"
 APP_B_ID="${WC_APP_B_ID:-org.freedesktop.weston.flower}"
 APP_B_ICON="${WC_APP_B_ICON:-}"
 
+# STAGE 41. The three settings the guest-RAM locate needs, spelled exactly as
+# `wc-guest.sh` and `wc-desktop.sh` spell them so that one export in a shell
+# configures every harness. `wc-arena-host` reads QEMU's QMP monitor and
+# `/proc/<qemu-pid>/fd`, and QEMU is a *system* service on this VM host, so both
+# are root-only — §12.9, which records that as a property of how testhost
+# starts the VM rather than of the design. No descriptor crosses the boundary in
+# either direction: what comes back is a plan, which is a list of offsets into
+# an object the host opens by name for itself.
+QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"
+VM_HINT="${WC_VM_HINT:-windows-vm}"
+ROOTC="${WC_ROOTC:-\$HOME/rootc}"
+
 SSHOPT=(-o IdentityAgent="$AGENT" -o BatchMode=yes -o LogLevel=ERROR
         -o StrictHostKeyChecking=accept-new)
 
@@ -104,6 +139,13 @@ miss() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
+
+# STAGE 41. Sourced after `ok`/`bad`/`note`/`g`/`h` exist, because the library
+# uses all five.
+. "$(dirname "$0")/wc-substrate.sh"
+# STAGE 42. `fresh` and `deployed_is`: is the binary newer than the tree, and is
+# the copy on the guest the one this tree built.
+. "$(dirname "$0")/wc-binaries.sh"
 
 # Run a command line on the interactive desktop and wait for it.
 int() {
@@ -199,7 +241,7 @@ PS1
 
 # Pull a BMP off the guest and convert it.
 fetch() {
-  local remote="$1" local_png="$2" caption="$3"
+  local remote="$1" local_png="$2" caption="$3" kind="${4:-window}"
   rm -f "$RUNDIR/$remote"
   scp "${SSHOPT[@]}" "$GUEST:$GUESTNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
@@ -212,20 +254,50 @@ fetch() {
     #
     # The bounds are deliberately weak and absolute rather than exact: this is a
     # screenshot of a Windows desktop whose size the harness does not fix, so
-    # what is excluded is a capture that cannot be of a desktop at all. 200x200
-    # against a 1280x1024 screen, and 16 colours against the 1 a blank surface
-    # gives -- the same floor and the same reasoning as §35.3's screenshot check.
+    # what is excluded is a capture that cannot be of the thing at all, and
+    # 16 colours against the 1 a blank surface gives -- the same floor and the
+    # same reasoning as §35.3's screenshot check.
+    #
+    # **BUT THE BOUND HAS TO MATCH THE SHAPE, AND FOR ONE CALLER IT NEVER DID.**
+    # §41.8. This check was `w < 200 || h < 200` -- "too small to be a desktop"
+    # -- for *both* callers, and one of them photographs `Shell_TrayWnd`, which
+    # on this guest's 1280x1024 screen is **1280x48**. Forty-eight is less than
+    # two hundred, so the taskbar photograph -- the one picture stage 32 exists
+    # to produce -- has been failing since §35 added the gate, on its geometry
+    # rather than on anything about the taskbar. Measured on the first guest-RAM
+    # run: `FAIL the taskbar, two applications: the capture is 1280x48, too
+    # small to be a desktop`, with the image itself correct and 1280x48 being
+    # exactly what `wc-icon.sh` photographs and calls a taskbar.
+    #
+    # That is §35's own shape turned around: a check that **cannot pass** is as
+    # useless as one that cannot fail, and it is worse than useless when it
+    # fails the stage's headline evidence for a reason unrelated to it. The
+    # right bound is per shape, so `kind` is now an argument:
+    #
+    #   tray    a strip across the screen: wide, short, and *bounded above* in
+    #           height, because a full-desktop capture arriving here would mean
+    #           `--class Shell_TrayWnd` selected the wrong window.
+    #   window  a client's window, which has no fixed size but is not a sliver.
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      local geo w hgt colours
+      local geo w hgt colours why=""
       geo=$(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null)
       colours=$(identify -format '%k' "$OUT/$local_png" 2>/dev/null)
       w=${geo%x*}; hgt=${geo#*x}
-      if [ "${w:-0}" -lt 200 ] || [ "${hgt:-0}" -lt 200 ]; then
-        bad "$caption: the capture is ${geo:-nothing}, too small to be a desktop"
+      case "$kind" in
+        tray)
+          [ "${w:-0}" -lt 400 ] && why="${geo:-nothing} is too narrow to be a taskbar spanning the screen"
+          [ -z "$why" ] && [ "${hgt:-0}" -lt 16 ] && why="${geo:-nothing} is too short to hold a button"
+          [ -z "$why" ] && [ "${hgt:-0}" -gt 200 ] && why="${geo:-nothing} is too tall to be Shell_TrayWnd -- the capture selected the wrong window" ;;
+        *)
+          [ "${w:-0}" -lt 100 ] || [ "${hgt:-0}" -lt 100 ] \
+            && why="${geo:-nothing} is too small to be a client's window" ;;
+      esac
+      if [ -n "$why" ]; then
+        bad "$caption: $why"
       elif [ "${colours:-0}" -lt 16 ]; then
         bad "$caption: the capture is $geo with only ${colours:-0} distinct colours -- a blank surface"
       else
-        ok "$caption -> docs/stage32/$local_png ($geo, $colours distinct colours)"
+        ok "$caption -> docs/stage32/$local_png ($geo, $colours distinct colours, checked as $kind)"
       fi
     else
       bad "could not convert $remote"
@@ -238,11 +310,16 @@ fetch() {
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
+  # STAGE 42. **Existence is not freshness.** What was here checked that each
+  # binary was a file, which a binary built before the change under test also
+  # is: §35.4 measured a harness reporting the *previous* tree's behaviour after
+  # `cargo test` declined to relink, and §35.6 item 6 named this harness as one
+  # of the seventeen with no guard at all.
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
   for e in wc-desk.exe wc-compositor.exe wc-shmclient.exe; do
-    [ -f "$WIN_BIN/$e" ] || {
-      echo "error: missing $WIN_BIN/$e — cargo build --workspace --target x86_64-pc-windows-gnu first"
-      exit 1; }
+    fresh "$WIN_BIN/$e" "$how_win" || exit 1
   done
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-tb-stage-XXXXXX)
   cp "$WIN_BIN/wc-desk.exe" "$stage/"
@@ -272,6 +349,28 @@ do_deploy() {
   sleep 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$GUESTNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
+
+  # STAGE 42. **And the copy is checked, because copying is the step that can
+  # silently not happen.** `scp` returning 0 says the transfer ran, not that the
+  # bytes on the guest are this tree's: a running `.exe` cannot be overwritten on
+  # Windows, so a compositor another agent left up makes `scp` succeed and leaves
+  # the old file in place. This harness already kills its own copies first for
+  # exactly that reason — which handles *its* leftovers and not anybody else's.
+  #
+  # The symptom of getting this wrong is a behaviour change, and on the GPU path
+  # a transport fault: `finish_attach` refuses a wire-version skew with "This is
+  # a version skew between two builds, not a transport fault." `WIRE_VERSION`
+  # went 1 -> 2 while this was being written, so it is current, not hypothetical.
+  #
+  # Byte identity rather than a version comparison, and that is not a compromise:
+  # `WIRE_VERSION` is a `pub const u32` the compiler inlines, no binary carries it
+  # as data and nothing prints it, so there is nothing to read. The hash catches
+  # a version skew, a protocol-hash skew and every other difference at once.
+  # The staging directory already holds the *renamed* copies (§13.9: an image
+  # name is not an identity on a guest a dozen agents share), so the local and
+  # remote basenames are the same here and no `local:remote` pair is needed.
+  deployed_all "$stage" "$DESKDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-desk.exe" "$COMP_EXE" "$CLIENT_EXE" || exit 1
   rm -rf "$stage"
   mkdir -p "$OUT"
 }
@@ -356,7 +455,7 @@ local_run() {
   sleep 12
 
   photograph "$tag" "$CPID"
-  fetch "tray-$tag.bmp" "stage32-taskbar-$tag.png" "the taskbar ($tag)"
+  fetch "tray-$tag.bmp" "stage32-taskbar-$tag.png" "the taskbar ($tag)" tray
   fetch "win-$tag.bmp"  "stage32-window-$tag.png"  "one of the windows ($tag)"
 
   g "cat $DESKDIR/cli-a-$tag.log" >"$RUNDIR/cli-a-$tag.log" 2>&1
@@ -440,11 +539,18 @@ do_apps() {
   g "rm -f $APPDATA_WIN/wg-s32-* 2>/dev/null; true" >/dev/null 2>&1
   sleep 2
 
-  local arena=$((64 * 1024 * 1024))
-  h "mkdir -p $HOST_DIR $SHARE $SHARE/keymaps $SHARE/pools;
-     chmod 777 $SHARE $SHARE/keymaps $SHARE/pools;
-     rm -f $SHARE/pools/*;
-     : >$SHARE/arena; truncate -s $arena $SHARE/arena; chmod 666 $SHARE/arena" >/dev/null
+  # STAGE 41. The substrate, declared before anything is measured on it. The
+  # `guest-ram` arm unsets `SV_ALLOW_FILE_ARENA`, so if anything below still
+  # reaches for a file the binaries refuse it by name rather than serving it.
+  wc_substrate_declare guest-ram || return
+
+  # And the export loses the three things this block used to put on it: the
+  # arena, the keymap directory and the pool directory. Removed rather than left
+  # and trusted not to be used — a leftover `arena` is openable, the right size,
+  # and completely silent to anything that was not looking. §18's
+  # `purge_arena_file`, which this generalises.
+  h "mkdir -p $HOST_DIR" >/dev/null
+  wc_purge_arena_file "$SHARE"
 
   # A desktop entry each, naming a DIFFERENT icon each, both of them real files
   # on the host. Weston ships no desktop entries (§16), so these are written —
@@ -464,18 +570,52 @@ Name=$APP_B
 Icon=$icon_b
 EOD" >/dev/null
 
-  # shared-file rather than the arena: the arena serves exactly one connection
-  # (§12.13 item 6) and this experiment is *about* having two.
-  local transport_args="--transport shared-file --pool-dir $SHARE/pools --peer-prefix $SHARE_WIN\\\\pools\\\\"
-  local keymap_extra="--shared-dir $SHARE_WIN\\keymaps --shared-peer-prefix $SHARE/keymaps/"
+  # STAGE 41. WHAT WAS HERE, AND WHY IT WAS WRONG FOR FOUR STAGES.
+  #
+  #   # shared-file rather than the arena: the arena serves exactly one
+  #   # connection (§12.13 item 6) and this experiment is *about* having two.
+  #   transport_args="--transport shared-file --pool-dir $SHARE/pools ..."
+  #   keymap_extra="--shared-dir $SHARE_WIN\keymaps ..."
+  #
+  # The premise expired in stage 12. `wc-proxy`'s `make_transport` calls
+  # `Arena::share()` per session and prints "client N: joins arena 0 (M
+  # connection(s) on it now)"; §15.14 is the stage that fixed it and §15.13
+  # measured four of Firefox's connections on one region and one allocator. So
+  # the one-connection limit was gone before this harness was written, and the
+  # sentence quoting it is what kept every taskbar-identity photograph on a file
+  # on the virtio-fs export — the substrate §10.3 measured incoherent for live
+  # mappings. Two applications on one guest-RAM arena is now the *stronger*
+  # version of this experiment, not a weaker one: the two buttons have to come
+  # apart while both clients' pixels are in the same region.
+  #
+  # No `--shared-dir` either, and its absence is the point: with a guest-RAM
+  # arena the keymap is cut from the compositor's own outbound window (§14), so
+  # nothing is published on any filesystem and the assertion at the bottom of
+  # this function can demand zero shared files rather than merely few.
+  #
+  # The frame list is the one file that still crosses and it is not the arena:
+  # it says *where the guest's pages are*, not what is in them. Written to the
+  # guest's own directory and fetched over ssh, so this block needs no export.
+  local gframes_win="$DESKDIR_WIN\\arena-$tag.frames"
+  local gframes="$DESKDIR/arena-$tag.frames"
+  g "rm -f $gframes" >/dev/null 2>&1
 
+  # `wc-proxy` and, new in §41, `wc-arena-host`. The locator is **not a
+  # workspace member** — it links shared_vulkan's `sv-hostd` — so it is built
+  # through its own manifest, exactly as `wc-desktop.sh` does it.
   h "pkill -f '^$HOST_DIR/wc-proxy' 2>/dev/null; sleep 1; true" >/dev/null 2>&1
-  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$HOST:$HOST_DIR/" >/dev/null || {
-    bad "could not copy wc-proxy to $HOST"; return; }
-  h "chmod +x $HOST_DIR/wc-proxy" >/dev/null
+  local locator="$LINUX_BIN/wc-arena-host"
+  [ -x "$locator" ] || locator="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
+  if ! cargo build --manifest-path "$ROOT/crates/wc-arena-host/Cargo.toml" \
+        >"$RUNDIR/loc-$tag.log" 2>&1; then
+    bad "could not build wc-arena-host"; tail -10 "$RUNDIR/loc-$tag.log" | sed 's/^/        /'; return
+  fi
+  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOST_DIR/" >/dev/null || {
+    bad "could not copy wc-proxy/wc-arena-host to $HOST -- something is still holding one"; return; }
+  h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
 
   local CPID
-  CPID=$(start_compositor "$sock" "$tag" "--arena 0:$arena:$SHARE_WIN\\arena $keymap_extra")
+  CPID=$(start_compositor "$sock" "$tag" "$(wc_arena_comp_args "$gframes_win")")
   if [ -z "$CPID" ]; then
     bad "the compositor did not start on the interactive desktop"
     sed 's/^/        /' "$RUNDIR/start-$tag.log" | head -6
@@ -489,30 +629,70 @@ EOD" >/dev/null
   local relay=$!
   sleep 3
 
+  # STAGE 41. THE LOCATE, and it has to be exactly here: after the compositor
+  # has committed and pinned the region inside the VM, and before the proxy that
+  # will map it starts. That ordering is the whole difference between this
+  # harness and the one it replaces, which had nothing to locate because its
+  # pixels were pool files on an export.
+  local plan="$HOST_DIR/$sock.plan"
+  if ! wc_locate_arena "$DESKDIR/comp-$tag.log" "$gframes" "$plan" "$RUNDIR"; then
+    kill $relay 2>/dev/null
+    kill_ours "$sock" >/dev/null 2>&1
+    return
+  fi
+
+  # STAGE 41: **the proxy and both clients are now root, in a transient unit.**
+  # The proxy has to open `/proc/<qemu-pid>/fd/<n>` to reach the guest's pages
+  # and QEMU is a system service on this host (§12.9), so the whole host side
+  # moves under `systemd-run --collect`. `wc-desktop.sh`'s arrangement, and its
+  # two lessons come with it: a root call that blocks for minutes often returns
+  # with no output at all, so completion is signalled by a *file* rather than by
+  # an exit code; and the `ssh -L` forward stays with the invoking user, outside
+  # the unit, because root has no `$HOME/.ssh/wc_guest` and can open a
+  # user-owned socket node anyway.
+  #
+  # `XDG_DATA_DIRS` moves inside the unit, because the icons these two buttons
+  # are being told apart by are resolved by the *proxy*, which is now root.
   h "cat > $HOST_DIR/s32.sh <<'EOS'
 #!/usr/bin/env bash
 set -uo pipefail
-RUN=\$(mktemp -d /tmp/wc-s32-XXXXXX); chmod 700 \"\$RUN\"
+RUN=\$(mktemp -d /tmp/wc-s32-XXXXXX); chmod 755 \"\$RUN\"
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
     -N -L \"\$RUN/up.sock:127.0.0.1:$PORT\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
 sleep 4
 if [ -S \"\$RUN/up.sock\" ]; then
-  XDG_RUNTIME_DIR=\"\$RUN\" XDG_DATA_DIRS=$HOST_DIR/data:$HOST_ICONS \
-    $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
-     --runtime-dir \"\$RUN\" $transport_args \
-     --copy damage --accept-timeout 40 --timeout 320 \
-     >\"\$RUN/proxy.log\" 2>&1 &
-  PROXY=\$!
-  sleep 2
-  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy $HOST_WESTON/$APP_A >\"\$RUN/cli-a.log\" 2>&1 &
-  A=\$!
-  sleep 6
-  XDG_RUNTIME_DIR=\"\$RUN\" WAYLAND_DISPLAY=wl-proxy $HOST_WESTON/$APP_B >\"\$RUN/cli-b.log\" 2>&1 &
-  B=\$!
+  cat > \"\$RUN/root.sh\" <<'INNER'
+#!/usr/bin/env bash
+export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+RUN=__RUN__
+export XDG_RUNTIME_DIR=\"\$RUN\"
+export XDG_DATA_DIRS=__DATA__
+$HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
+   --runtime-dir \"\$RUN\" --transport arena --arena-plan $plan --arena-id 0 \
+   --copy damage --accept-timeout 40 --timeout 320 \
+   >\"\$RUN/proxy.log\" 2>&1 &
+PROXY=\$!
+sleep 2
+WAYLAND_DISPLAY=wl-proxy $HOST_WESTON/$APP_A >\"\$RUN/cli-a.log\" 2>&1 &
+A=\$!
+sleep 6
+WAYLAND_DISPLAY=wl-proxy $HOST_WESTON/$APP_B >\"\$RUN/cli-b.log\" 2>&1 &
+B=\$!
+sleep 230
+kill \$A \$B \$PROXY 2>/dev/null; wait 2>/dev/null
+chmod -R a+rwX \"\$RUN\" 2>/dev/null
+touch \"\$RUN/done\"
+INNER
+  sed -i \"s#__RUN__#\$RUN#; s#__DATA__#$HOST_DIR/data:$HOST_ICONS#\" \"\$RUN/root.sh\"
+  chmod 755 \"\$RUN/root.sh\"
+  UNIT=wc-s32-\$\$
+  echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+systemd-run --unit=\$UNIT --collect /run/current-system/sw/bin/bash \$RUN/root.sh >/dev/null 2>&1
+echo started\" | eval $ROOTC >/dev/null 2>&1
   echo S32-CLIENTS-STARTED
-  sleep 230
-  kill \$A \$B \$PROXY 2>/dev/null
+  for _ in \$(seq 1 300); do [ -f \"\$RUN/done\" ] && break; sleep 1; done
+  [ -f \"\$RUN/done\" ] || echo \"S32-FAIL: the host-side unit never finished\"
 else
   echo S32-FAIL: no forward socket
 fi
@@ -534,7 +714,7 @@ chmod +x $HOST_DIR/s32.sh" >/dev/null
     [ "$(ours apps | wc -l)" -ge 2 ] && break
     note "attempt $attempt: fewer than two of our windows on the desktop yet"
   done
-  fetch "tray-$tag.bmp" "stage32-taskbar-two-applications.png" "the taskbar, two applications"
+  fetch "tray-$tag.bmp" "stage32-taskbar-two-applications.png" "the taskbar, two applications" tray
   fetch "win-$tag.bmp"  "stage32-window-apps.png"              "one of the two windows"
 
   wait $drv 2>/dev/null
@@ -548,6 +728,23 @@ chmod +x $HOST_DIR/s32.sh" >/dev/null
   grep -iE "icon: app id|client|stopped" "$OUT/proxy-apps.log" 2>/dev/null | sed 's/^/        /' | head -10
   echo "        --- the compositor's account:"
   grep -iE "taskbar identity|icon set:" "$RUNDIR/comp-$tag.log" | sed 's/^/        /' | head -12
+
+  # STAGE 41, AND BEFORE THE IDENTITY CLAIM, BECAUSE IT IS WHAT THAT CLAIM IS
+  # ABOUT. Two taskbar buttons come apart the same way whatever carried the
+  # pixels — which is exactly why a run has to say what carried them, or the
+  # photographs in docs/stage32/ turn out to have been taken on a file on the
+  # export and nobody notices for four stages. An assertion rather than the
+  # `note` this was: §35.
+  wc_assert_substrate "$RUNDIR/comp-$tag.log" "$tag"
+
+  # And the other half of the same claim, which only a guest-RAM run can make:
+  # two *connections* on one region and one allocator. §15.14 made that possible
+  # and nothing outside `wc-firefox.sh` had ever checked it on a real guest.
+  local joined
+  joined=$(grep -c 'joins arena 0' "$OUT/proxy-apps.log" 2>/dev/null)
+  [ "${joined:-0}" -ge 2 ] \
+    && ok "$tag: both clients share one guest-RAM arena and one allocator ($joined joined)" \
+    || bad "$tag: only ${joined:-0} connection(s) joined the arena; two applications need two"
 
   local n d
   n=$(ours apps | wc -l); d=$(ours apps | sort -u | wc -l)

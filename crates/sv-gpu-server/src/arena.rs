@@ -296,10 +296,14 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
         .ok_or(DriverError::Missing("a HOST_VISIBLE|HOST_COHERENT memory type"))?;
 
     let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(kind);
-    let ai = vk::MemoryAllocateInfo::default()
+    let mut flags = device_address_flags(driver);
+    let mut ai = vk::MemoryAllocateInfo::default()
         .allocation_size(len)
         .memory_type_index(type_index)
         .push_next(&mut export);
+    if let Some(f) = flags.as_mut() {
+        ai = ai.push_next(f);
+    }
     let memory = unsafe { driver.device.allocate_memory(&ai, None) }
         .map_err(|e| DriverError::Vk("vkAllocateMemory(export)", e))?;
 
@@ -410,10 +414,14 @@ pub fn import_slab(
     let mut imp = vk::ImportMemoryHostPointerInfoEXT::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
         .host_pointer(ptr);
-    let ai = vk::MemoryAllocateInfo::default()
+    let mut flags = device_address_flags(driver);
+    let mut ai = vk::MemoryAllocateInfo::default()
         .allocation_size(len)
         .memory_type_index(type_index)
         .push_next(&mut imp);
+    if let Some(f) = flags.as_mut() {
+        ai = ai.push_next(f);
+    }
     let memory = unsafe { driver.device.allocate_memory(&ai, None) }
         .map_err(|e| DriverError::Vk("vkAllocateMemory(import slab)", e))?;
     Ok((memory, type_index))
@@ -424,6 +432,31 @@ pub fn import_slab(
 /// Nothing is asked of the driver here, which is the point — this is the
 /// constructor whose whole content is the *absence* of the `vkAllocateMemory`
 /// that [`import_whole`] makes.
+/// `VkMemoryAllocateFlagsInfo` with `DEVICE_ADDRESS`, or `None`.
+///
+/// # Why every arena allocation carries it
+///
+/// `vkGetBufferDeviceAddress` is not a query the GPU side can answer after the
+/// fact: `VUID-VkBufferDeviceAddressInfo-buffer-02601` requires the buffer's
+/// *memory* to have been allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`,
+/// and the arena is **one allocation made at startup**, before any application
+/// exists to ask. So either every arena-backed buffer can have its address taken
+/// or none can, and the choice has to be made here.
+///
+/// It costs nothing measurable — the bit tells the driver to allocate the buffer
+/// out of an address-visible range, which on every driver in scope is where it
+/// was going anyway — and it is what makes design.md §11's "if we return the GPU
+/// side's true device address and never relocate" reachable rather than
+/// theoretical.
+///
+/// `None` when the driver did not report `bufferDeviceAddress`, because setting
+/// the bit without the feature is invalid usage and the allocation fails.
+fn device_address_flags(driver: &Driver) -> Option<vk::MemoryAllocateFlagsInfo<'static>> {
+    driver.buffer_device_address.then(|| {
+        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS)
+    })
+}
+
 pub fn map_lazy(region: Arc<SharedRegion>) -> Arena {
     let len = region.len() as u64;
     Arena {
@@ -475,10 +508,14 @@ pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena>
     let mut imp = vk::ImportMemoryHostPointerInfoEXT::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
         .host_pointer(ptr);
-    let ai = vk::MemoryAllocateInfo::default()
+    let mut flags = device_address_flags(driver);
+    let mut ai = vk::MemoryAllocateInfo::default()
         .allocation_size(len)
         .memory_type_index(type_index)
         .push_next(&mut imp);
+    if let Some(f) = flags.as_mut() {
+        ai = ai.push_next(f);
+    }
     let memory = unsafe { driver.device.allocate_memory(&ai, None) }
         .map_err(|e| DriverError::Vk("vkAllocateMemory(import host pointer)", e))?;
 

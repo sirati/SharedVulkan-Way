@@ -70,6 +70,9 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 RUNDIR=$(mktemp -d /tmp/wc-cursor-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -108,7 +111,7 @@ start_x() {
 
 run_linux() {
   echo "== wp_cursor_shape_v1, advertised and proxied =="
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "cargo build -p wc-compositor" || return
   command -v wayland-info >/dev/null || { note "SKIP (wayland-info not installed)"; return; }
 
   local dir="$RUNDIR/linux"
@@ -154,7 +157,7 @@ run_linux() {
   # never heard of is refused with a diagnosis rather than desynchronised
   # (docs/design.md §9.3) — so a run where `crates/wc-proxy/protocols/` was not
   # updated fails *here*, loudly, and not on the guest a week later.
-  [ -x "$LINUX_BIN/wc-proxy" ] || { note "SKIP the proxy leg (no wc-proxy built)"; return; }
+  fresh_or_skip "$LINUX_BIN/wc-proxy" "SKIP the proxy leg (no wc-proxy built)"; case $? in 2) note "SKIP the proxy leg (no wc-proxy built)"; return ;; 1) return ;; esac
   mkdir -p "$dir/prt" "$dir/pools" "$dir/keymaps"; chmod 700 "$dir/prt"
 
   # `--shared-dir`, and it is required rather than tidy. Without somewhere to
@@ -215,8 +218,8 @@ run_linux() {
 # with a hotspot that is not 0,0. Nothing in this project chose any of it.
 run_wine() {
   echo "== a client's cursor surface becomes a Win32 HCURSOR =="
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe"; return; }
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH"; return; }
   command -v weston-eventdemo >/dev/null || { note "SKIP (weston-eventdemo not installed)"; return; }

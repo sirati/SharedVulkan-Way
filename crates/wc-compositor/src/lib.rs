@@ -54,7 +54,6 @@ mod icon;
 mod input;
 mod platform;
 /// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
-#[cfg(unix)]
 mod ringlink;
 mod state;
 mod surface;
@@ -89,6 +88,9 @@ struct Args {
     /// slots in the control region it creates at this path — the `accept()` half
     /// of §36.2's table. The socket listener stays up alongside it.
     wayland_ring: Option<String>,
+    /// §36, cross-VM. Publish the ring region out of the guest's own RAM over
+    /// this cold path, instead of creating it as a file.
+    wayland_cold: Option<String>,
     idle_timeout: Duration,
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
@@ -203,10 +205,19 @@ struct Args {
     ///
     /// ADDED FOR STAGE 9. A flag rather than `GetSystemMetrics` because the
     /// harness has to be able to ask for a known desktop, and because the
-    /// headless platform has no desktop to ask. The Win32 platform ought to
-    /// override it with the real monitor and does not yet; that is named in
-    /// docs/waycompose-design.md §13.9 rather than left for someone to find.
+    /// headless platform has no desktop to ask.
+    ///
+    /// **STAGE 38 closed the debt this comment used to name.** It said "the
+    /// Win32 platform ought to override it with the real monitor and does not
+    /// yet"; it does now, with the primary monitor's *work area* rather than
+    /// its full size — see [`Started::work_area`] — and only when the flag was
+    /// not given. The default of 1920x1080 was true of no particular machine,
+    /// and a client that sizes itself to the output was opening a window
+    /// larger than a 1280x800 screen because of it.
     output: (i32, i32),
+    /// Whether `--output` was given. STAGE 38: a real monitor may replace the
+    /// default, and must never replace an answer the harness asked for.
+    output_explicit: bool,
     /// One scripted click, as `X,Y[,BUTTON][,MS]`. Headless only.
     ///
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
@@ -262,9 +273,10 @@ pub struct ControlHook;
 fn open_control(
     path: Option<&str>,
     events: std::sync::mpsc::Sender<platform::FromUi>,
+    output: (i32, i32),
 ) -> Result<ControlHook, u8> {
     let Some(path) = path else { return Ok(None) };
-    match control::Control::bind(path, events) {
+    match control::Control::bind(path, events, output) {
         Ok(c) => Ok(Some(c)),
         Err(e) => {
             eprintln!("wc-compositor: could not bind --control {path}: {e}");
@@ -280,6 +292,7 @@ fn open_control(
 fn open_control(
     path: Option<&str>,
     _events: std::sync::mpsc::Sender<platform::FromUi>,
+    _output: (i32, i32),
 ) -> Result<ControlHook, u8> {
     if path.is_some() {
         eprintln!("wc-compositor: --control is a Linux-only hook; there is no AF_UNIX listener here");
@@ -293,6 +306,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         once: false,
         socket: None,
         wayland_ring: None,
+        wayland_cold: None,
         idle_timeout: Duration::from_secs(30),
         dump_frames: None,
         debug_icon: false,
@@ -310,6 +324,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         shared_peer_prefix: String::new(),
         layout: None,
         output: (1920, 1080),
+        output_explicit: false,
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
@@ -328,6 +343,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--arena-frames" => args.arena_frames = it.next(),
             "--socket" => args.socket = it.next(),
             "--wayland-ring" => args.wayland_ring = it.next(),
+            "--wayland-cold" => args.wayland_cold = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -469,6 +485,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                     return Err(2);
                 }
                 args.output = (w, h);
+                args.output_explicit = true;
             }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -523,6 +540,16 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 return Err(2);
             }
         }
+    }
+    // A flag this build cannot honour fails **here**, where it was typed. It
+    // used to be dropped by a `#[cfg(unix)]` and reported only as an
+    // `unused variable` warning to whoever compiled the binary — which is never
+    // the person who needs to know. §36.14.
+    if let Err(e) =
+        ringlink::check_platform_flags(args.wayland_ring.as_deref(), args.wayland_cold.as_deref())
+    {
+        eprintln!("wc-compositor: {e}");
+        return Err(2);
     }
     Ok(args)
 }
@@ -636,6 +663,97 @@ fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> Stri
     }
 }
 
+/// What to do about the file arenas named on a command line.
+///
+/// Split out of [`run_from`] so it can be *tested*, which is the whole reason
+/// it exists as a function. The refusal it implements was added over
+/// `--arena-provide` alone while its own message named `--arena` too, and
+/// `--arena <id>:<size>:<path>` therefore attached a file in silence — on the
+/// two harnesses that used exactly that flag against the real guest, over the
+/// export §10.3 measured incoherent for live mappings. Nothing could have
+/// caught that: the check lived four statements into a function that starts a
+/// compositor, so no test could reach it, and the message asserted a coverage
+/// the condition did not have. §41.4.
+#[derive(Debug, PartialEq, Eq)]
+enum FileArenaVerdict {
+    /// No `--arena` and no `--arena-provide`: nothing to decide.
+    NoFileArena,
+    /// A file arena, and no `SV_ALLOW_FILE_ARENA`. The run stops.
+    Refuse(String),
+    /// A file arena a fixture asked for by name. The run continues and says so,
+    /// so that a fixture cannot be mistaken for a result in a log read later.
+    Warn(String),
+}
+
+fn file_arena_verdict(file_arenas: usize, allowed: bool) -> FileArenaVerdict {
+    if file_arenas == 0 {
+        return FileArenaVerdict::NoFileArena;
+    }
+    if !allowed {
+        return FileArenaVerdict::Refuse(
+            "wc-compositor: the FILE arena is not a target. `--arena` and \
+             `--arena-provide` open files, which is a Wine-only fixture for a machine \
+             with no hypervisor. Use `--arena-guest-ram <id>:<bytes>`. Set \
+             SV_ALLOW_FILE_ARENA=1 for a fixture run — never to make a guest run pass."
+                .to_owned(),
+        );
+    }
+    FileArenaVerdict::Warn(format!(
+        "wc-compositor: WARNING: FILE arena in use ({file_arenas} region(s), \
+         SV_ALLOW_FILE_ARENA is set). This is a fixture, not a target; guest RAM is \
+         the only real substrate."
+    ))
+}
+
+#[cfg(test)]
+mod file_arena_tests {
+    use super::*;
+
+    /// The regression that motivated splitting this out. `--arena` and
+    /// `--arena-provide` are counted together, so a run that names only the
+    /// first is refused exactly like a run that names only the second — which
+    /// was not true when the condition read `!args.provide_arenas.is_empty()`.
+    #[test]
+    fn either_file_arena_flag_is_refused_without_the_fixture_permission() {
+        for n in 1..=3 {
+            match file_arena_verdict(n, false) {
+                FileArenaVerdict::Refuse(m) => {
+                    assert!(m.contains("not a target"), "{m}");
+                    // The message names both flags, and now the condition
+                    // covers both. A message that claims more coverage than the
+                    // code has is how the hole survived review.
+                    assert!(m.contains("`--arena`"), "{m}");
+                    assert!(m.contains("`--arena-provide`"), "{m}");
+                    assert!(m.contains("--arena-guest-ram"), "the way out must be named: {m}");
+                }
+                other => panic!("{n} file arena(s) were not refused: {other:?}"),
+            }
+        }
+    }
+
+    /// Guest RAM is not a file arena and must never be touched by this check.
+    #[test]
+    fn a_run_with_no_file_arena_is_not_asked_for_permission() {
+        assert_eq!(file_arena_verdict(0, false), FileArenaVerdict::NoFileArena);
+        assert_eq!(file_arena_verdict(0, true), FileArenaVerdict::NoFileArena);
+    }
+
+    /// A fixture that asked for it by name runs, and **says so**: a fixture
+    /// that produced a silent green log is how a file result gets quoted later
+    /// as a result about the deployment.
+    #[test]
+    fn a_fixture_run_is_allowed_and_announces_itself() {
+        match file_arena_verdict(2, true) {
+            FileArenaVerdict::Warn(m) => {
+                assert!(m.contains("WARNING"), "{m}");
+                assert!(m.contains("not a target"), "{m}");
+                assert!(m.contains("2 region(s)"), "the count is in it: {m}");
+            }
+            other => panic!("a permitted fixture was not allowed to run: {other:?}"),
+        }
+    }
+}
+
 /// Run the compositor.
 ///
 /// This was `fn main` until the unification (one-binary.md §2.2). It is `pub`
@@ -655,7 +773,7 @@ pub fn run() -> std::process::ExitCode {
 /// each half re-reading a process-wide `env::args` that has one extra token in
 /// it. one-binary.md §2.2.
 pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
-    let args = match parse_args(&argv) {
+    let mut args = match parse_args(&argv) {
         Ok(a) => a,
         Err(code) => return std::process::ExitCode::from(code),
     };
@@ -675,6 +793,33 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // a filesystem open on the frame path exactly once in a way no measurement
     // would catch. Attaching here also means a wrong `--arena` is a startup
     // failure with a path in it rather than a pool that cannot be mapped.
+    //
+    // THE FILE ARENA IS NOT A TARGET, AND `--arena` IS ONE — which is the whole
+    // reason this check is *here* rather than only over `provide_arenas` below.
+    //
+    // The refusal added with `--arena-provide` names both flags in its message
+    // and tested only one of them, so `--arena <id>:<size>:<path>` attached a
+    // file in silence. That is not an academic gap: `--arena 0:N:Z:\wc11\arena`
+    // and `--arena 0:N:Z:\wc32\arena` are exactly what `wc-icon.sh` and
+    // `wc-taskbar.sh` passed on every run they ever made against the real
+    // guest, over the export §10.3 measured incoherent for live mappings. The
+    // escape hatch had a hole in the shape of the defect it was added to close.
+    //
+    // Both flags open a file; they differ only in whether it is opened
+    // read-write, which is what `--arena-provide` adds so that an outbound
+    // window is possible on a machine with no hypervisor. Neither is guest RAM,
+    // so neither is a target, and one condition covers both.
+    match file_arena_verdict(
+        args.arenas.len() + args.provide_arenas.len(),
+        std::env::var_os("SV_ALLOW_FILE_ARENA").is_some(),
+    ) {
+        FileArenaVerdict::Refuse(msg) => {
+            eprintln!("{msg}");
+            return std::process::ExitCode::from(2);
+        }
+        FileArenaVerdict::Warn(msg) => eprintln!("{msg}"),
+        FileArenaVerdict::NoFileArena => {}
+    }
     for (id, size, path) in &args.arenas {
         match wc_handle::arena::attach(*id, path, *size) {
             Ok(()) => println!("wc-compositor: arena {id} attached: {size} bytes at {path}"),
@@ -729,6 +874,12 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // And the ones this process provides as a file. See `--arena-provide`: this
     // is `--arena` opened read-write, which is what makes an outbound window
     // possible on a machine with no hypervisor in it.
+    //
+    // THE FILE ARENA IS NOT A TARGET — guest RAM is (design.md §1a), and
+    // `--arena-guest-ram` is how this process provides one. The refusal for
+    // both this flag and `--arena` is above, before either is opened: it was
+    // here and tested only `provide_arenas`, which let `--arena` through in
+    // silence. §41.4.
     for (id, size, path) in &args.provide_arenas {
         match wc_handle::arena::provide_file(*id, path, *size) {
             Ok(()) => println!(
@@ -857,7 +1008,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // Before the platform, because it takes the same sender: the control
     // socket is a *second* source of `FromUi`, sitting exactly where the
     // platform sits, which is the whole of what makes it honest.
-    let control = match open_control(args.control.as_deref(), event_tx.clone()) {
+    let control = match open_control(args.control.as_deref(), event_tx.clone(), args.output) {
         Ok(c) => c,
         Err(code) => return std::process::ExitCode::from(code),
     };
@@ -885,7 +1036,29 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let platform::Started { ui, pump } = started;
+    let platform::Started { ui, pump, work_area } = started;
+
+    // STAGE 38. The one `wl_output` describes the **work area** of the real
+    // monitor, unless the harness asked for a particular size.
+    //
+    // The output is what a client sizes itself against, so the honest number
+    // has to be the one it can actually use: the screen minus the taskbar. The
+    // alternative — letting the client open whatever it likes and resizing the
+    // window afterwards (`map_window`) — still happens, because a client may
+    // ask for anything, but it arrives after the client has laid out for a size
+    // it will not get, and a browser reflows visibly when that happens.
+    //
+    // `--output` wins. A conformance run asks for a known desktop and must not
+    // be given this machine's.
+    if let Some((w, h)) = work_area
+        && !args.output_explicit
+    {
+        println!(
+            "wc-compositor: wl_output is the monitor's work area, {w}x{h} \
+             (--output would override it)"
+        );
+        args.output = (w, h);
+    }
 
     // Which layout the keyboard compiles. `--layout` wins so a harness is not
     // at the mercy of the machine's regional settings; otherwise ask the
@@ -906,7 +1079,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let wayland = std::thread::Builder::new()
         .name("wayland".into())
         .spawn(move || {
-            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.idle_timeout, args.debug_icon,
+            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
@@ -935,6 +1108,7 @@ fn wayland_thread(
     once: bool,
     socket: Option<String>,
     wayland_ring: Option<String>,
+    wayland_cold: Option<String>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -1005,27 +1179,57 @@ fn wayland_thread(
     // §36. `accept()` on the ring directory, beside `accept()` on the socket.
     // Both produce a `wc_transport::Stream` for `insert_client`; only one of
     // them involves anything crossing the VM boundary.
-    #[cfg(unix)]
-    let mut ring_link = match wayland_ring.as_deref() {
-        None => None,
-        Some(path) => match ringlink::RingLink::create(path) {
-            Ok(rl) => {
-                println!("wc-compositor: accepting Wayland rings in {path}");
+    // **Not `#[cfg(unix)]`.** It was, and that was the bug: on Windows both
+    // flags were parsed, accepted and silently ignored, and the compositor fell
+    // through to the socket listener. So "the Wayland connection rides
+    // shared_vulkan's channel" was true on the fixture and false on the
+    // deployment, and the only thing that said so was an unused-variable
+    // warning. §36.14.
+    let mut ring_link = {
+        // Two ways to obtain the region and one directory to poll afterwards.
+        // `--wayland-cold` is the cross-VM one: the region is guest RAM the host
+        // locates. `--wayland-ring` is a named region, for one machine.
+        let made = match (wayland_cold.as_deref(), wayland_ring.as_deref()) {
+            (Some(port), _) => {
+                #[cfg(target_os = "linux")]
+                {
+                    Some(
+                        ringlink::RingLink::publish(port)
+                            .map(|rl| (rl, format!("guest RAM published on {port}"))),
+                    )
+                }
+                // Unreachable: `check_platform_flags` refuses this at parse.
+                // Kept so the arm exists on every platform and the reason lives
+                // in one place rather than being implied by a `cfg`.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = port;
+                    Some(Err(ringlink::COLD_NEEDS_LINUX.to_string()))
+                }
+            }
+            (None, Some(path)) => {
+                Some(ringlink::RingLink::create(path).map(|rl| (rl, path.to_string())))
+            }
+            (None, None) => None,
+        };
+        match made {
+            None => None,
+            Some(Ok((rl, what))) => {
+                println!("wc-compositor: accepting Wayland rings in {what}");
                 let _ = std::io::stdout().flush();
                 Some(rl)
             }
-            Err(e) => {
-                eprintln!("wc-compositor: could not create the ring region {path}: {e}");
+            Some(Err(e)) => {
+                eprintln!("wc-compositor: could not obtain the ring region: {e}");
                 state.quit();
                 return 2;
             }
-        },
+        }
     };
 
     loop {
         // The ring's accept, first, so a connection that arrived between turns
         // is dispatched in the same turn as one that arrived on the socket.
-        #[cfg(unix)]
         if let Some(rl) = ring_link.as_mut() {
             for (slot, stream) in rl.accept() {
                 let index = (state.clients_seen + 1) as u32;
@@ -1111,7 +1315,6 @@ fn wayland_thread(
         // the local socket *before* smithay reads it, or they wait a whole 5 ms
         // tick. `pump` also drains what smithay wrote last turn, which is why it
         // is one call and not two.
-        #[cfg(unix)]
         if let Some(rl) = ring_link.as_mut() {
             rl.pump();
         }

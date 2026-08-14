@@ -124,6 +124,10 @@ g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`,
+# which it uses; this harness deploys across *both* boundaries, so it uses both.
+. "$(dirname "$0")/wc-binaries.sh"
+
 # Run something on the interactive desktop, and wait for it.
 int() {
   g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
@@ -200,21 +204,23 @@ PS2
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
+  # STAGE 42. **Existence is not freshness**, and this harness already has the
+  # better half of the argument written down two comments below: looking in the
+  # wrong directory "is how a deploy silently ships the last run's copy". The
+  # same is true of looking in the *right* directory at a file that is simply
+  # old — §35.4's measurement, and §35.6 item 6 named this harness.
   local e
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
   for e in wc-compositor.exe wc-desk.exe; do
-    [ -f "$WIN_BIN/$e" ] || {
-      echo "error: no $WIN_BIN/$e -- cargo build --workspace --target x86_64-pc-windows-gnu"
-      exit 1; }
+    fresh "$WIN_BIN/$e" "$how_win" || exit 1
   done
   # `wc-arena-host` is its own workspace — it links shared_vulkan's crates and
   # deliberately inherits nothing from this one — so its binary is not in the
   # shared target directory and looking for it there is how a deploy silently
   # ships the last run's copy.
   local arena_host="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
-  [ -x "$LINUX_BIN/wc-proxy" ] && [ -x "$arena_host" ] || {
-    echo "error: no wc-proxy / wc-arena-host -- cargo build --workspace and"
-    echo "       cargo build --manifest-path crates/wc-arena-host/Cargo.toml"
-    exit 1; }
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || exit 1
+  fresh "$arena_host" "cargo build --manifest-path crates/wc-arena-host/Cargo.toml" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-tb-stage-XXXXXX)
   cp "$WIN_BIN/wc-compositor.exe" "$WIN_BIN/wc-desk.exe" "$stage/"
@@ -234,6 +240,11 @@ do_deploy() {
   g "mkdir -p $GDIR" || exit 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$TBNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$GDIR"
+  # STAGE 42. `scp` returning 0 says the transfer ran, not that the bytes over
+  # there are this tree's. See the comment above: a running `.exe` usually makes
+  # it *fail*, and the case this catches is the one where it does not.
+  deployed_all "$stage" "$GDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-compositor.exe" "wc-desk.exe" || exit 1
   rm -rf "$stage"
 
   [ -n "$HOST" ] || { echo "  WC_HOST unset: nothing copied to the VM host"; return; }
@@ -246,6 +257,12 @@ do_deploy() {
     >/dev/null || { echo "  could not copy to $HOST"; exit 1; }
   h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
   echo "  copied wc-proxy and wc-arena-host to $HOST:$HOST_DIR"
+  # STAGE 42, and the *other* boundary. `ETXTBSY` on a live Linux executable is
+  # the noisy failure the `pkill` above avoids; a copy that lands next to a
+  # binary another worktree is mid-run with is the quiet one. Same check, the
+  # caller's own `h` as the runner.
+  deployed_is "$LINUX_BIN/wc-proxy"  "$HOST_DIR/wc-proxy"      h "re-run $0 deploy" || exit 1
+  deployed_is "$arena_host"          "$HOST_DIR/wc-arena-host" h "re-run $0 deploy" || exit 1
   mkdir -p "$OUT"
 }
 
@@ -533,8 +550,12 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
 
   scp "${SSHOPT[@]}" "$GUEST:$TBNAME/tb-$leg.bmp" "$RUNDIR/tb-$leg.bmp" >/dev/null 2>&1
   mkdir -p "$outdir"
+  # STAGE 42. Same vacuous gate as the four `fetch` helpers, inlined here: the
+  # geometry went into the success string and was compared with nothing, so a
+  # 1x1 or an all-black capture read as a PASS. This is a window capture
+  # (`tb-$leg.bmp` is the toplevel with its frame), so `window` is the shape.
   if [ -s "$RUNDIR/tb-$leg.bmp" ] && magick "$RUNDIR/tb-$leg.bmp" "$picture" 2>/dev/null; then
-    ok "$leg: the window, frame and all -> ${picture#"$ROOT"/} ($(magick identify -format '%wx%h' "$picture"))"
+    picture_is "$picture" window "$leg: the window, frame and all -> ${picture#"$ROOT"/}"
   else
     bad "$leg: nothing came back from the capture"
   fi

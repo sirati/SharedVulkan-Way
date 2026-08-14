@@ -170,6 +170,9 @@ g()  { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 gq() { ssh "${SSHOPT[@]}" "$GUEST" "$@" 2>&1; }
 h()  { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
 
+# STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
+. "$(dirname "$0")/wc-binaries.sh"
+
 # Kill every process running out of one directory on the guest, and nothing
 # else. See the call site in `do_deploy` for why an image name will not do.
 #
@@ -272,6 +275,30 @@ case "$TRANSPORT" in
     # Provided out of band, before either side starts, which is what an arena
     # is. Truncated to zero first: a region left full of the previous run's
     # pixels is a way for a frozen frame to look like a live one.
+    #
+    # STAGE 41. **This is the file arena on a machine that has a guest, which is
+    # the one combination the rest of stage 41 exists to make impossible — and
+    # it is licensed here, by name, for the one reason that survives.** §18.2's
+    # second bullet: this branch is a *control*. It is how the export's
+    # incoherence is re-measured rather than assumed, and §12.6 is the section
+    # made of its output. A control that cannot be run is an assumption.
+    #
+    # What makes that legitimate rather than the defect §41 removed is that it
+    # is never silent. The transport is a positional argument of this driver —
+    # `s4_run term arena …`, `s4_run termg guest-ram …` — it is in the tag of
+    # every line the run prints, and `s4_run`'s `case "$transport:$counts"`
+    # asserts that the substrate named is the substrate that served the pixels.
+    # `SV_ALLOW_FILE_ARENA` is exported for this branch alone, so the two
+    # `guest-ram` legs below cannot inherit it and degrade to a file if their
+    # locate fails; they fail instead, which is the whole point.
+    #
+    # `wc-proxy` and `wc-compositor` each print their own warning on top of this
+    # one. Three lines saying "not a target" is the correct number for a
+    # substrate §10.3 measured 65280-of-65536 bytes wrong in both directions.
+    echo "S4-SUBSTRATE: FILE arena on the export -- a CONTROL for §12.6's incoherence"
+    echo "S4-SUBSTRATE: measurement, NOT a result about the deployment. Guest RAM is"
+    echo "S4-SUBSTRATE: the substrate; the guest-ram legs are the ones that measure it."
+    export SV_ALLOW_FILE_ARENA=1
     : >"$SHARE/arena"; truncate -s $ARENA_SIZE "$SHARE/arena"; chmod 666 "$SHARE/arena"
     COMP_EXTRA=(--arena "0:$ARENA_SIZE:$SHARE_WIN\\arena")
     PROXY_EXTRA=(--transport arena --arena-path "$SHARE/arena" --arena-id 0 --arena-size $ARENA_SIZE) ;;
@@ -285,6 +312,11 @@ case "$TRANSPORT" in
     # tell the compositor about, and PROXY_EXTRA cannot be filled in yet -- the
     # plan does not exist until the compositor has printed its run id.
     ARENA_SIZE=$((PAGES * 4096))
+    # STAGE 41. Actively removed rather than merely not set, so that a value
+    # inherited from the shell of somebody who ran the control an hour ago
+    # cannot license a file if this leg's locate fails. This leg has no file to
+    # fall back to and must not acquire one.
+    unset SV_ALLOW_FILE_ARENA
     COMP_EXTRA=(--arena-guest-ram "0:$ARENA_SIZE" --arena-outbound "0:$ARENA_OUTBOUND")
     # STAGE 10: no shared directory. The keymap comes out of the arena, so
     # there is nothing for the compositor to publish and nothing for this side
@@ -564,13 +596,20 @@ do_deploy() {
     echo "  FAILED to build probe-filemap.exe"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
   fi
 
-  local missing=0
+  # STAGE 42. **Existence is not freshness.** §35.4 measured a harness reporting
+  # the previous tree's behaviour after `cargo test` declined to relink, and
+  # §35.6 item 6 named this harness among the seventeen with no guard. Five
+  # binaries here, so `fresh_all` says it once when they are all fine and names
+  # each offender when they are not.
+  local how_win="cargo build --target x86_64-pc-windows-gnu"
+  local wins=() e
   for e in wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe; do
-    if [ -f "$WIN_BIN/$e" ]; then cp "$WIN_BIN/$e" "$STAGE/"; else
-      echo "  missing $WIN_BIN/$e"; missing=1
-    fi
+    wins+=("$WIN_BIN/$e")
   done
-  [ $missing -eq 0 ] || { echo "error: build first: cargo build --target x86_64-pc-windows-gnu"; exit 1; }
+  fresh_all "$how_win" "${wins[@]}" || exit 1
+  for e in wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe; do
+    cp "$WIN_BIN/$e" "$STAGE/"
+  done
 
   # A `.exe` still running holds its own file open, and `scp` over it fails as
   # `dest open ...: Failure` -- which reads as a permissions or disk problem and
@@ -594,6 +633,13 @@ do_deploy() {
   g "mkdir -p $GUESTDIR" || exit 1
   scp "${SSHOPT[@]}" "$STAGE"/*.exe "$STAGE/us.xkb" "$GUEST:$GUESTNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$STAGE" | grep -c . ) files to $GUEST:$GUESTDIR"
+  # STAGE 42. The long comment above is about `scp` *failing* on a running
+  # `.exe`; this is the case where it appears to succeed and the old bytes stay.
+  # `scp` returning 0 cannot tell them apart, and on the GPU path a stale copy
+  # presents as a transport fault — `finish_attach` refuses a wire-version skew
+  # with "This is a version skew between two builds, not a transport fault."
+  deployed_all "$STAGE" "$GUESTDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe || exit 1
 
   [ -n "$HOST" ] || { echo "  WC_HOST unset -- nothing deployed for stage 4"; return; }
 
@@ -607,7 +653,7 @@ do_deploy() {
   else
     echo "  FAILED to build probe-filemap-peer"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
   fi
-  [ -x "$LINUX_BIN/wc-proxy" ] || { echo "error: no $LINUX_BIN/wc-proxy -- cargo build first"; exit 1; }
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
   write_stage4_driver "$STAGE/wc-stage4"
 
   # `probe-filemap.c`'s pattern, generated here so that both the generator and
@@ -1054,12 +1100,42 @@ s4_run() {
   # docs/design.md §14.7 is the full argument: which two processes that
   # descriptor exists between, why that pair is not the boundary, and what this
   # number would have to be for the rule to be broken.
-  local fds
+  # STAGE 42. **The twenty lines above argue about which number would mean the
+  # rule was broken, and the code then asserted only that a number exists.** Any
+  # `"N fds in, M out"` passed, including one that showed descriptors being
+  # relayed — which is the single thing this project must never do and the whole
+  # subject of §14.7. A gate on the boundary claim of the stage that could not
+  # fail.
+  #
+  # What is asserted now is the number the comment names. The proxy prints, for
+  # example, `12 fds in, 2 out (2 from the arena)`, and the rule is that **every
+  # descriptor going out was made here**: over guest RAM they come from the
+  # arena, so `out` and `from the arena` must be equal. A descriptor that was
+  # relayed rather than manufactured shows up as `out` exceeding the number
+  # accounted for, which is exactly the shape §14.7 says to watch.
+  local fds out fromarena
   fds=$(grep -o "[0-9]* fds in, [0-9]* out[^;]*" "$log" | tail -1)
-  case "$fds" in
-    "") bad "$tag: the proxy reported no descriptor counts" ;;
-    *) ok "$tag: descriptors in from the client, out only ones made here from a name ($fds)" ;;
-  esac
+  if [ -z "$fds" ]; then
+    bad "$tag: the proxy reported no descriptor counts"
+  else
+    out=$(echo "$fds" | grep -o "[0-9]* out" | tr -dc 0-9)
+    fromarena=$(echo "$fds" | grep -o "([0-9]* from the arena)" | tr -dc 0-9)
+    if [ "$transport" = guest-ram ] && [ -n "$fromarena" ]; then
+      if [ "${out:-0}" -eq "${fromarena:-0}" ]; then
+        ok "$tag: all ${out:-0} descriptor(s) that went out were made here from the arena, none relayed ($fds)  <-- §14.7"
+      else
+        bad "$tag: ${out:-0} descriptor(s) went out but only ${fromarena:-0} came from the arena -- the rest were not accounted for ($fds)"
+      fi
+    elif [ "${out:-0}" -eq 0 ]; then
+      ok "$tag: no descriptor went out at all ($fds)  <-- §14.7"
+    else
+      # The shared-file and file-arena controls manufacture theirs from a name
+      # rather than from the arena, so there is no per-descriptor accounting
+      # line to compare against. Stated as informational rather than dressed up
+      # as a verdict this leg cannot reach.
+      note "$tag: ${out:-0} descriptor(s) out, made here from a name; this transport prints no arena accounting ($fds)"
+    fi
+  fi
 
   # STAGE 10, and it is the claim of the stage on the deployment that matters.
   # Over guest RAM the compositor was started with **no `--shared-dir`**, so a
