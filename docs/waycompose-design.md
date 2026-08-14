@@ -20488,3 +20488,156 @@ must not hang the run), and a number in a log survives all three.
    user's second symptom — no tearing, no stalled scrolling, no blank frames in
    `about:support` — remains unverified. What has changed is only that the leg
    can no longer pass without having scrolled.
+
+## 58. The boundary, brought here: a Linux guest, and three things in the way
+
+### 58.1 Status in one paragraph
+
+The instruction was to test across a real hypervisor without touching
+`testhost`, and to be precise about which of three topologies — this section
+runs **topology 1, Linux host to Linux VM**, and says so because a result from
+one is not a result from another. `scripts/wc-vm-damage.sh` boots the `svGuest`
+NixOS VM on this workstation, runs `wc-compositor` **inside it** with an arena
+cut from the guest's own RAM, and crosses the Wayland stream on a virtio-serial
+port added to the running guest over QMP. **The boundary is real and proved
+so**: `Linux 6.18.44` inside against `Linux 6.18.33` outside. Two things that
+were in the way are fixed and one is not. The leg reaches the arena locate and
+stops there, so **the user's second symptom is still unverified** — but it now
+fails for a precisely named reason rather than for want of a machine.
+
+### 58.2 There is a page-frame database off Windows, and the code said there was not
+
+```rust
+/// There is no page-frame database off Windows …
+#[cfg(not(windows))]
+pub fn frames(_arena: u32, _pages: u32) -> Result<(Vec<u64>, u128), String> {
+    Err("SuperfetchPfnQuery is a Windows interface and this is not Windows".into())
+}
+```
+
+True of the only guest this project had when it was written, and false the
+moment a Linux guest became a topology somebody wanted tested. Linux's
+equivalent is `/proc/self/pagemap`, documented in the kernel's
+`admin-guide/mm/pagemap.rst`: one 64-bit entry per virtual page, bit 63
+*present*, bits 0..54 the frame number.
+
+The consequence was not a missing feature but a failing run. With no frame list
+the host falls back to the content sweep, and §7 measured that sweep unreliable
+on a loaded machine. The first Linux-guest run reproduced it exactly:
+
+```
+located 16316 of 16384 pages after sweeping 2048 MiB
+```
+
+With the pagemap implementation, the same run:
+
+```
+located 16384 of 16384 pages in 193.51ms by frame list (swept 0 MiB;
+714 frame run(s) became 714 file run(s), first frame 0xe807)
+```
+
+**A zero is treated as a refusal, not an answer.** Since Linux 4.0 a process
+without `CAP_SYS_ADMIN` reads *zeroes* for the frame number rather than being
+refused: the entry is returned, the present bit is set, and only the number is
+blanked. That is deliberate hardening against Rowhammer, and it is the worst
+possible failure shape here — a list of zeroes is a perfectly well-formed frame
+list that would send the host looking for page 0 sixteen thousand times. So a
+zero frame behind a present page returns an error naming the privilege.
+
+### 58.3 `-name sv-guest` is a class of thing, and §16.8 says identity is not
+
+The second obstacle was §16.8 arriving where it bites hardest. `nix/guest.nix`
+bakes `-name sv-guest,process=sv-guest` into every guest it boots, and
+`find_qemu_pid` matches a substring of the command line. On a workstation where
+several agents each have a guest up, `--vm sv-guest` matches all of them:
+
+```
+wc-arena-host: io: 3 qemu-system processes match "sv-guest": [3402756, 3405077, 3414992] — narrow the hint
+```
+
+The locator is right to refuse — "two VMs matching one hint and the daemon
+guessing is how a client ends up mapping the wrong guest's RAM" — and the fix is
+not to make it guess. This harness passes **its own run directory** as the hint,
+which appears in its QEMU's command line twice and in nobody else's.
+
+Two of those three processes were this harness's own leaks, and that is the
+other half of the lesson: `run-nixos-vm` is a wrapper, so the pid the shell
+knows is the wrapper's and killing it can leave the emulator behind. Cleanup now
+matches on the run directory too, which can only ever reach this run's guest.
+
+### 58.4 What is still in the way, stated precisely
+
+The locate now finds every page and the **verify** fails:
+
+```
+located 16384 of 16384 pages in 193.51ms by frame list
+verify: 16316/16384 pages of the stitched view carry their own arena index
+wc-arena-host: 68 page(s) are not where the arena says they are
+```
+
+16316 both ways, deterministically, across four runs — so this is not the sweep
+being flaky. Instrumenting the verify names the pages exactly: they begin at
+**page 16128**, which is byte 66060288, which is where the compositor said its
+outbound window starts. And their contents are the finding:
+
+```
+DBG page 16128: first8=[00, 00, 31, 4b, 52, 56, 48, 53]
+DBG page 16130: first8=[00, 00, 00, 00, 00, 00, 00, 00]
+DBG page 16131: first8=[00, 00, 00, 00, 00, 00, 00, 00]
+```
+
+**Mostly zeroes, not somebody else's data.** A page overwritten by a gift would
+carry the gift; a page reading zero has been *dropped and re-faulted*. That
+single observation explains both symptoms at once: a re-faulted page is zero, so
+the sweep cannot find its stamp, and it has a **new physical frame**, so the
+frame list captured at allocation time points at the old one. Two locate methods
+failing on identically the same 68 pages is what a changed frame looks like from
+both sides.
+
+This is §14.12 item 1's territory — stage 12 found the keymap sealed into the
+outbound window "a full minute before any client exists" and fixed it with
+`defer_gifts`, which is *active* here: the compositor logs `objects made for
+clients are held in memory until the first client connects`. So the deferral is
+working and something else is releasing those pages. On a Linux guest,
+`MADV_DONTNEED` on shared memory is exactly the call that drops a page and
+returns a zero-filled one with a different frame on the next touch.
+
+**Not fixed here**, deliberately. It is in the arena's gift and outbound
+handling, which §27's brief listed as somebody else's — and a blind change to
+page lifetime in the region every client's pixels live in is not a thing to make
+at the end of a long session on a hypothesis.
+
+### 58.5 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace`, both targets | clean |
+| `cargo test --workspace --no-fail-fast` | **2596 tests**, 0 failures — one test was rewritten rather than deleted, §58.2 |
+| **`scripts/wc-vm-damage.sh linux`** | **9 passed, 1 failed** — the failure is §58.4 |
+| ... the guest boots and QMP answers | pass |
+| ... `wc-compositor` listens **inside the guest** | pass |
+| ... **`Linux 6.18.44` inside vs `Linux 6.18.33` outside** | pass — the run cannot have measured the host |
+| ... the arena comes from the guest's own RAM | pass — 16384 pages, run id reported |
+| ... the guest publishes a frame list | pass — 16384 frames, §58.2's new path |
+| ... the host locates it | **fail** — 68 outbound pages, §58.4 |
+| topologies 2 and 3 | **NOT RUN** |
+
+### 58.6 What is not proven
+
+1. **The user's second symptom is still unverified.** The leg stops one step
+   before the proxy, so no commit has been checked across this boundary and no
+   scroll has happened. §27.6's withdrawal stands and nothing here replaces it.
+2. **Only topology 1 was attempted.** Topology 2 (Linux → Wine in a Linux VM) is
+   closest to the deployment and is where `wc-wine-guest.sh` on the unmerged
+   `wine-first-class` branch already has the guest-side Wine working — its own
+   notes say a rendering leg needs a client in the guest, which is the piece
+   this file solves differently by keeping the client outside. Topology 3 is
+   untouched.
+3. **The `MADV_DONTNEED` explanation is a hypothesis with evidence, not a
+   diagnosis.** Zero pages and a stale frame are both consistent with it and
+   neither proves it; the call has not been traced. What is established is
+   *which* pages, that it is deterministic, and that it is the outbound window.
+4. **`socat` bridging a Unix socket to a virtio-serial port is unexercised
+   beyond connecting.** The compositor bound its socket and the port carried
+   bytes as far as the harness got, but no Wayland client has completed a
+   handshake across it, so the transport is plausible rather than proven.

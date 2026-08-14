@@ -147,12 +147,77 @@ pub fn frames(arena: u32, pages: u32) -> Result<(Vec<u64>, u128), String> {
     Ok((frames.into_iter().map(|f| f as u64).collect(), ms))
 }
 
-/// There is no page-frame database off Windows, and the Linux build of this
-/// compositor is the one `cargo test` runs. Degrading to the sweep is the
-/// honest answer and is what the caller already handles.
-#[cfg(not(windows))]
+/// Linux has a page-frame database too, and it is `/proc/self/pagemap`.
+///
+/// STAGE 58, and the comment this replaced was wrong rather than merely
+/// incomplete: it said "there is no page-frame database off Windows", which was
+/// true of the only guest this project had when it was written and stopped
+/// being true the moment a **Linux** guest became a topology somebody wanted
+/// tested. The consequence was not a missing feature but a *failing run*: with
+/// no frame list the host falls back to the content sweep, and §7 measured that
+/// sweep unreliable on a loaded machine — five consecutive runs giving
+/// "16377 of 16384 pages", "1 page index claimed twice", "28 claimed twice".
+/// The first Linux-guest run of `wc-vm-damage.sh` reproduced it exactly, at
+/// 16316 of 16384, and could not locate its own arena.
+///
+/// The format is documented in the kernel's `admin-guide/mm/pagemap.rst`: one
+/// 64-bit entry per virtual page, indexed by virtual page number, bit 63 is
+/// *present* and bits 0..54 are the frame number.
+///
+/// # The privilege, and why a zero is a refusal rather than an answer
+///
+/// Since Linux 4.0 a process without `CAP_SYS_ADMIN` reads **zeroes** for the
+/// frame number instead of being refused — the entry is still returned, the
+/// present bit is still set, and only the number is blanked. That is a
+/// deliberate hardening against Rowhammer-style attacks and it is also the
+/// worst possible failure shape for this caller, because a list of zeroes is a
+/// perfectly well-formed frame list that would send the host looking for page 0
+/// sixteen thousand times. So a zero frame behind a present page is treated as
+/// a refusal and reported as one.
+#[cfg(target_os = "linux")]
+pub fn frames(arena: u32, pages: u32) -> Result<(Vec<u64>, u128), String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let started = std::time::Instant::now();
+    let base = wc_handle::arena::region_base(arena)
+        .ok_or_else(|| format!("arena {arena} is not a region this process provided"))?;
+    let mut f = std::fs::File::open("/proc/self/pagemap")
+        .map_err(|e| format!("/proc/self/pagemap: {e}"))?;
+
+    let page = 4096usize;
+    let mut out = Vec::with_capacity(pages as usize);
+    for i in 0..pages as usize {
+        let vpn = (base + i * page) / page;
+        f.seek(SeekFrom::Start(vpn as u64 * 8))
+            .map_err(|e| format!("/proc/self/pagemap seek: {e}"))?;
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).map_err(|e| format!("/proc/self/pagemap read: {e}"))?;
+        let entry = u64::from_ne_bytes(buf);
+        if entry & (1 << 63) == 0 {
+            return Err(format!(
+                "page {i} of {pages} is not present in /proc/self/pagemap; the region \
+                 is not fully faulted in"
+            ));
+        }
+        let pfn = entry & ((1u64 << 55) - 1);
+        if pfn == 0 {
+            return Err(
+                "/proc/self/pagemap returned frame 0 for a present page, which is what \
+                 it does without CAP_SYS_ADMIN -- run the compositor as root in the \
+                 guest, or the host will locate by content sweep instead"
+                    .into(),
+            );
+        }
+        out.push(pfn);
+    }
+    Ok((out, started.elapsed().as_millis()))
+}
+
+/// Neither Windows nor Linux. Degrading to the sweep is the honest answer and
+/// is what the caller already handles.
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn frames(_arena: u32, _pages: u32) -> Result<(Vec<u64>, u128), String> {
-    Err("SuperfetchPfnQuery is a Windows interface and this is not Windows".into())
+    Err("no page-frame database on this platform".into())
 }
 
 /// The frame list in the format `wc-arena-host --frames` reads, which is
@@ -388,14 +453,30 @@ mod tests {
         assert_eq!(frame_list_text(&[]), "");
     }
 
-    /// Off Windows there is no page-frame database, and the answer has to be a
-    /// stated reason rather than an empty list — because an empty list and "the
-    /// query said this region has no pages" are the same value and very
-    /// different facts.
-    #[cfg(not(windows))]
+    /// A refusal has to be a **stated reason** rather than an empty list,
+    /// because an empty list and "the query said this region has no pages" are
+    /// the same value and very different facts.
+    ///
+    /// STAGE 58 rewrote this test rather than deleting it, and what it used to
+    /// assert is the interesting part: that the error mentions *Windows*,
+    /// because off Windows there was "no page-frame database". That was true of
+    /// the only guest this project had and false as soon as a Linux guest was
+    /// one — Linux has `/proc/self/pagemap`. The test was encoding the belief
+    /// rather than the invariant, so it failed the moment the belief was
+    /// corrected, which is exactly what a test defending a belief does.
+    ///
+    /// The invariant survives the correction: whatever this platform can or
+    /// cannot do, a caller that cannot be given frames is told why. Asking for
+    /// an arena nobody provided is the one refusal every platform shares.
     #[test]
-    fn without_a_page_frame_database_the_refusal_says_so() {
+    fn a_frame_query_that_cannot_be_answered_says_why() {
         let e = frames(0, 4).unwrap_err();
-        assert!(e.contains("Windows"), "{e}");
+        assert!(!e.is_empty(), "a refusal must carry a reason");
+        // `frames` is reached with an arena id that was never registered, so
+        // every platform's first check is the same one.
+        assert!(
+            e.contains("not a region this process provided") || e.contains("page-frame"),
+            "the reason should name the arena or the platform, got: {e}"
+        );
     }
 }
