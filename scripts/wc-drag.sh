@@ -225,7 +225,7 @@ start_chain() {
   chmod 700 "$dir/rt"
   SOCK="wl-$TAG"
 
-  RUST_BACKTRACE=1 wined "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout 300 \
+  RUST_BACKTRACE=1 wined "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout "${WC_DRAG_IDLE:-60}" \
     --shared-dir "$(winepath -w "$dir/keymaps" 2>/dev/null || echo "$dir/keymaps")" \
     --shared-peer-prefix "$dir/keymaps/" \
     --log "$(winepath -w "$dir/srv.log" 2>/dev/null || echo "$dir/srv.log")" \
@@ -555,6 +555,48 @@ CATCH
   cp "$DIR/proxy.log" "$ROOT/docs/drag/proxy.log"      2>/dev/null
   cp "$PROBELOG" "$ROOT/docs/drag/probe-drag.log" 2>/dev/null
   cp "$RUNDIR/after-out.png" "$ROOT/docs/drag/desktop.png" 2>/dev/null
+  # ------------------------------------------------------ the cursor objects ---
+  #
+  # docs/waycompose-design.md §61. This harness is the only one that moves a
+  # pointer, so it is the only one in which the compositor builds and frees
+  # `HCURSOR`s — seventeen of them in a run. `wc-life.sh` cannot assert this at
+  # all: it drives no input, so its count is zero and the assertion would be
+  # vacuous, which is the same trap as §53's `GetGuiResources`.
+  #
+  # The invariant is **not** "outstanding is zero". `set_cursor` frees the
+  # previous cursor only once the new one is installed, because destroying a
+  # cursor that is on screen leaves the pointer drawn from freed memory. So one
+  # object is legitimately still alive at exit, and the claim is that it is
+  # *one* rather than one per cursor change.
+  # The clients have to go first: the idle timeout does not run while one is
+  # connected, and the account is printed on the way out. §60.6 is the same
+  # constraint met from the other side, where the number was too *small*.
+  for p in $CLIENT $CLIENT2 $PROBEPID; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  CLIENT=""; CLIENT2=""; PROBEPID=""
+  echo "--- waiting for the compositor to report its icon-object account ---"
+  local _ iconline
+  for _ in $(seq 1 90); do
+    grep -q "icon objects at exit" "$DIR/srv.log" 2>/dev/null && break
+    sleep 1
+  done
+  iconline=$(grep -o 'icon objects at exit:.*' "$DIR/srv.log" | tail -1)
+  if [ -z "$iconline" ]; then
+    note "the compositor did not reach its idle timeout before this harness finished; no icon account"
+  else
+    note "$iconline"
+    local made outstanding
+    made=$(echo "$iconline" | grep -oE 'claims [0-9]+' | grep -oE '[0-9]+')
+    outstanding=$(echo "$iconline" | grep -oE '[0-9]+ outstanding' | grep -oE '[0-9]+')
+    if [ "${made:-0}" -lt 2 ]; then
+      bad "only ${made:-0} icon object(s) were ever built, so 'outstanding <= 1' is not a measurement"
+    else
+      ok "$made icon object(s) were built during the gesture, so the counter moved"
+      [ "${outstanding:-99}" -le 1 ] \
+        && ok "and $outstanding is outstanding at exit -- at most the cursor being shown, not one per change" \
+        || bad "$outstanding icon objects are outstanding after $made were built -- cursors are leaking"
+    fi
+  fi
+
   wc_assert_topology "$DIR/srv.log" "wc-drag"
   note "logs in $ROOT/docs/drag/, screenshots in $RUNDIR/{before,after-in,after-out}.png"
 }

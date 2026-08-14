@@ -20905,3 +20905,122 @@ reporting the leak.
 
 The timeout is now 120 s, and the rule is written where the number is: it must
 outlast the longest stretch of the run with no client connected.
+
+## 61. The third resource, and a number that is allowed to be one
+
+*(§53 and §60's continuation, and the end of the list.)*
+
+### 61.1 Status in one paragraph
+
+`ToUi::Destroy` gives back three things and the project has now looked at all
+three. §53 gave the **window handle** an outside witness — a separate process
+asking the window manager, which nothing the compositor does can talk out of it.
+§60 gave the **OLE drop-target registration** an inside count, because that
+resource has no outside witness and cannot be given one. This is the third:
+`release_icons`, which ran, destroyed what it found, and **said nothing at all**,
+so a window icon that was never released was invisible in exactly the way §60's
+stranded registration was. It is counted now and reported at exit beside the
+other two. The assertion lives in `scripts/wc-drag.sh` rather than in
+`wc-life.sh`, which is a finding rather than a filing decision — see 61.3 — and
+the number it asserts is **allowed to be one**, which is 61.4.
+
+### 61.2 One creation site, two destruction sites
+
+There is exactly one `CreateIconIndirect` in the compositor. Window icons and
+mouse cursors are the same kind of GDI object and are built by the same
+function, and they are freed by **different** calls: `DestroyIcon` from
+`release_icons` when a window goes, `DestroyCursor` from `set_cursor` when the
+pointer changes shape. So the account is one creation counter and two
+destruction counters — which is also the shape of the defect it would catch: a
+path that creates through the shared function and frees through neither.
+
+```text
+wc-compositor: icon objects at exit: claims 10 created, 0 icon(s) and 9 cursor(s) destroyed, 1 outstanding (the shown cursor is one)
+```
+
+Three lines now ride out together, one per resource, and only the first has an
+external witness:
+
+```text
+windows at exit:      6 created, 6 destroyed, 0 still held, 0 still alive, 0 client(s) still connected
+drop targets at exit: claims 6 registered, 6 revoked, 0 revoke(s) failed
+icon objects at exit: claims 10 created, 0 icon(s) and 9 cursor(s) destroyed, 1 outstanding
+```
+
+### 61.3 The harness that could assert it was not the one that was looking
+
+`wc-life.sh` is §53's harness, it churns windows, and it is the obvious home for
+a per-window resource count. **It cannot assert this one**, and finding that out
+is worth more than the assertion:
+
+* it drives **no pointer input**, so no cursor is ever built — `grep -c 'cursor ->'`
+  on its log is `0`;
+* its churn client is `weston-clickdot`, which publishes **no icon** — the
+  compositor's log says `has no published icon (the store holds 0)` — and the
+  proxy is run with `--no-icons` besides.
+
+So in `wc-life.sh` the count is zero created and zero destroyed, and an
+assertion that `created == destroyed` there would be `0 == 0`: the vacuous gate
+this whole run of sections exists to avoid, arrived at for the third time by a
+different route.
+
+`wc-drag.sh` is the only harness in the tree that moves a pointer. It builds
+**ten** icon objects in a run. That is where the assertion goes, and the
+general lesson is one this project keeps paying for: *the harness that owns the
+subject is not always the harness that can exercise it*. The window count and
+the icon count are both per-window resources and they need opposite harnesses.
+
+The window-icon half is still unasserted anywhere, for the reason §53.6 item 2
+gave: the harness that publishes an icon is `wc-icon.sh`, and it is a **guest**
+harness. That leg is queued behind the machine being in use, and it is now one
+`grep` away from being an assertion rather than a rewrite.
+
+### 61.4 A number that is allowed to be one, and why that is the gate
+
+The obvious assertion is `created == destroyed`. **It is wrong**, and asserting
+it would have been worse than not asserting anything, because it fails on every
+run that moves the mouse and would then be "fixed" by deleting it.
+
+`set_cursor` frees the previous cursor **only after the new one is installed**:
+
+> Destroying a cursor that is on screen is legal but leaves the pointer drawn
+> from freed memory until the next `SetCursor`, which is the classic way to get
+> a corrupted pointer that survives the process.
+
+So exactly one object is outstanding at any moment, by design. The invariant is
+therefore *outstanding ≤ 1*, and it is a real gate rather than a tautology
+because the harness first asserts the counter **moved**: ten objects built, so
+"one outstanding" distinguishes a compositor that frees each cursor as it goes
+from one that keeps all ten. A leak here grows with mouse movement,
+which is the most common thing a user does.
+
+### 61.5 What is not proven
+
+1. **The window-icon half is counted but not asserted.** Nothing local
+   publishes an icon; see 61.3. `wc-icon.sh` on the guest is the run that turns
+   `0 icon(s) destroyed` into a number that has to match.
+2. **These are the compositor's own counts**, like §60's and unlike §53's. The
+   external witness for GDI objects is `GetGuiResources`, which Wine stubs
+   (§53.3) — so on this platform the inside count is all there is, and on the
+   guest it would finally have something to be checked against.
+3. **No run has made the compositor leak one.** The counters distinguish the
+   states; nothing in the tree currently provokes the bad one.
+4. **`DeleteObject` on the two bitmaps is not counted.** `make_icon` deletes the
+   colour and mask bitmaps immediately after `CreateIconIndirect` copies them,
+   and that pair is on the same path but is not part of this account.
+
+### 61.6 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-drag.sh wine`** | **22 passed, 0 failed** (18 in §50.10; 2 new here) |
+| `scripts/wc-life.sh wine` | 14 passed, 0 failed, 1 skipped (unchanged) |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --workspace --no-fail-fast` | unchanged — no Linux code |
+| `scripts/wc-xref.sh` | 0 broken, 0 unqualified |
+
+`wc-drag.sh`'s compositor idle timeout came down to 60 s and its clients are now
+stopped before the wait, for §60.6's reason met from the other side: the account
+is printed **on the way out**, the idle timer does not run while a client is
+connected, and a harness that never lets the compositor exit never sees the line
+it is asserting on.
