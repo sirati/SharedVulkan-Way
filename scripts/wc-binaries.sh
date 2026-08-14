@@ -59,33 +59,115 @@ type bad  >/dev/null 2>&1 || bad()  { echo "  FAIL  $*"; }
 type note >/dev/null 2>&1 || note() { echo "  ----  $*"; }
 
 # ------------------------------------------------------------------ fresh ---
-# Is this binary newer than every source file that could have changed it?
+# Is this binary built from the sources it depends on, as they are now?
 #
 #   fresh <path> <what-to-do-about-it>
 #
-# Returns non-zero and says which file is newer. The message names the *first*
-# newer file rather than counting them, because one path is enough to act on and
-# a count is not.
+# WHY THIS IS NOT "NEWER THAN THE TREE" ANY MORE
 #
-# `-print -quit` stops at the first hit: this runs over a generated protocol
-# crate with tens of thousands of files in it, and the full walk is not free.
+# It was, and its normal state became a false positive -- which is worse than
+# no check, because a guard that cries wolf trains eighteen harnesses to ignore
+# it, and then the stale binary it exists to catch walks straight through.
+#
+# Two independent defects, both measured rather than reasoned about:
+#
+# 1. **The scope was the whole tree.** `wc-proxy` depends on 66 `.rs` files and
+#    `wc-compositor` on 272, out of 481 in `crates/` and `vendor/`. Their
+#    dependency graphs are *disjoint*, so touching a compositor source marked
+#    the proxy stale, rebuilding the proxy did not clear it, and rebuilding the
+#    compositor made the proxy stale again. One crate at a time never converges;
+#    the only sequence that worked was to touch both and build both, which is a
+#    ritual rather than a check.
+#
+# 2. **mtime is not content.** `git stash pop`, `git checkout` and the reflink
+#    seeding this project's worktrees use all rewrite mtimes on files whose
+#    bytes are unchanged. Every one of those invalidated every binary.
+#
+# So the scope comes from **cargo's own depfile** -- `<bin>.d`, the exact set
+# cargo compiled -- and the verdict is **content**, which is the same standard
+# `deployed_is` already holds the far side to. A hash of the dependency set is
+# recorded beside the binary when it is verified; if the hash still matches, the
+# sources are byte-for-byte what they were and the binary is current no matter
+# what happened to any mtime.
+#
+# mtime keeps one job, and it is the one it is good at: when the content *has*
+# changed, deciding whether the binary or the source moved last.
+#
+# A binary with no depfile falls back to the old whole-tree walk and says so.
+# That is the honest answer for a binary cargo did not build -- a copied `.exe`,
+# say -- rather than passing it on a check that was never run.
+
+# The sources cargo says this binary was built from, one per line, rebased onto
+# this worktree.
+#
+# The rebasing is not decoration: `sv-worktree.sh` seeds `target/` by reflink
+# from a base checkout, so a freshly seeded worktree's depfiles name *the base
+# tree's* paths. Comparing this worktree's binary against another worktree's
+# sources is exactly the class of mistake this file exists to stop.
+_fresh_deps() {
+  local bin=$1 dep
+  dep="${bin%.exe}.d"
+  [ -f "$dep" ] || return 1
+  # A Makefile rule: "target: dep dep dep", possibly over several lines.
+  sed -e 's/\\$//' -e 's/^[^:]*://' "$dep" 2>/dev/null \
+    | tr ' ' '\n' \
+    | sed '/^[[:space:]]*$/d' \
+    | awk -v root="$ROOT" '{ if (match($0, /\/(crates|vendor)\//)) print root substr($0, RSTART) }' \
+    | sort -u
+}
+
+# One hash over the *contents* of that set. The file list is sorted, so the
+# hash is stable across filesystem ordering; the paths go in as well as the
+# bytes, so adding an empty file is a change.
+_fresh_hash() {
+  local bin=$1 list
+  list=$(_fresh_deps "$bin") || return 1
+  [ -n "$list" ] || return 1
+  printf '%s\n' "$list" | xargs -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
 fresh() {
-  local bin=$1 how=$2 newer
+  local bin=$1 how=$2 newer want stamp
   if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
     bad "no $bin -- $how"
     return 1
   fi
-  newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
-            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-            -newer "$bin" -print -quit 2>/dev/null)
+
+  want=$(_fresh_hash "$bin")
+  if [ -z "$want" ]; then
+    # No depfile: cargo did not build this here. The whole-tree walk is the only
+    # thing left, and it is named as the weaker check it is.
+    newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
+              \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+              -newer "$bin" -print -quit 2>/dev/null)
+    if [ -n "$newer" ]; then
+      bad "$(basename "$bin") is older than ${newer#"$ROOT"/} -- $how, or this run measures the previous tree"
+      return 1
+    fi
+    note "$(basename "$bin") has no depfile; checked against the whole tree instead"
+    return 0
+  fi
+
+  stamp="${bin%.exe}.srcsha"
+  if [ -f "$stamp" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$want" ]; then
+    ok "$(basename "$bin") was built from these exact sources"
+    return 0
+  fi
+
+  # The content differs from the last verified state, so now ask which moved
+  # last -- over this binary's own dependencies and nothing else.
+  newer=$(_fresh_deps "$bin" | while read -r f; do
+            [ -n "$f" ] && [ "$f" -nt "$bin" ] && { printf '%s\n' "$f"; break; }
+            :
+          done)
   if [ -n "$newer" ]; then
     bad "$(basename "$bin") is older than ${newer#"$ROOT"/} -- $how, or this run measures the previous tree"
     return 1
   fi
-  ok "$(basename "$bin") is newer than every source file in the tree"
+  printf '%s\n' "$want" > "$stamp" 2>/dev/null
+  ok "$(basename "$bin") is newer than every source it depends on"
   return 0
 }
-
 # The same question, for a block that *skips* when the binary is not built
 # rather than failing.
 #
