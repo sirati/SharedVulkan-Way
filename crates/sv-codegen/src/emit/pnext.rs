@@ -166,13 +166,45 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
         };
         quote!(PNextLink::#v(inner) => #f(enc, inner)?,)
     });
-    let decode_arms = plan.pnext_links.iter().map(|(name, value)| {
+    // **One `#[inline(never)]` helper per link, and the reason is stack.**
+    //
+    // As `#val => PNextLink::V(Box::new(decode_x(&mut body)?)),` every arm
+    // materialises its struct as a temporary *in `decode_pnext`'s own frame*
+    // before the `Box` moves it to the heap. A debug build does not overlap the
+    // slots of mutually exclusive match arms, so the frame is the **sum** of a
+    // thousand link types rather than the largest — measured from a Firefox
+    // core at **180 KB in one frame** (docs/design.md §0.24).
+    //
+    // Firefox reaches this on a Mesa thread, under `kopper_init_screen`, with
+    // twenty frames already below it, and a worker thread's stack is a few
+    // hundred kilobytes. So the decoder overflowed the stack and Firefox took
+    // SIGSEGV in a crate that is `#![forbid(unsafe_code)]` — which is what said
+    // it could not be a wild pointer and had to be exhaustion.
+    //
+    // Moving each arm into its own function makes `decode_pnext`'s frame a
+    // handful of words and each link's temporary transient: the helper's frame
+    // is popped before the next link is read. `#[inline(never)]` is what keeps
+    // that true against an optimiser that would otherwise undo it.
+    let decode_helpers = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
         let f = super::wire::decode_self_fn(name);
-        let val = *value as i32;
-        quote!(#val => PNextLink::#v(Box::new(#f(&mut body)?)),)
+        let helper = format_ident!("decode_link_{}", naming::snake_case(name));
+        let doc = format!("One `{name}` link, decoded in its own frame.");
+        quote! {
+            #[doc = #doc]
+            #[inline(never)]
+            fn #helper(dec: &mut sv_wire::Decoder<'_>) -> sv_wire::Result<PNextLink> {
+                Ok(PNextLink::#v(Box::new(#f(dec)?)))
+            }
+        }
     });
-    let decode_partial_arms = plan.pnext_links.iter().map(|(name, value)| {
+    let decode_arms = plan.pnext_links.iter().map(|(name, value)| {
+        let helper = format_ident!("decode_link_{}", naming::snake_case(name));
+        let val = *value as i32;
+        quote!(#val => #helper(&mut body)?,)
+    });
+    // The partial walk has the same frame problem and the same fix.
+    let decode_partial_helpers = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
         let has_partial = plan.struct_plan(name).map(|s| s.needs_partial).unwrap_or(false);
         let f = if has_partial {
@@ -180,11 +212,24 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
         } else {
             super::wire::decode_self_fn(name)
         };
+        let helper = format_ident!("decode_link_partial_{}", naming::snake_case(name));
+        quote! {
+            #[inline(never)]
+            fn #helper(dec: &mut sv_wire::Decoder<'_>) -> sv_wire::Result<PNextLink> {
+                Ok(PNextLink::#v(Box::new(#f(dec)?)))
+            }
+        }
+    });
+    let decode_partial_arms = plan.pnext_links.iter().map(|(name, value)| {
+        let helper = format_ident!("decode_link_partial_{}", naming::snake_case(name));
         let val = *value as i32;
-        quote!(#val => PNextLink::#v(Box::new(#f(&mut body)?)),)
+        quote!(#val => #helper(&mut body)?,)
     });
 
     quote! {
+        #(#decode_helpers)*
+        #(#decode_partial_helpers)*
+
         /// Bytes a chain occupies, terminator included.
         pub fn size_pnext(links: &[PNextLink]) -> usize {
             let mut n = 4usize; // the terminator
