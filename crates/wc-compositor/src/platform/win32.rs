@@ -976,7 +976,7 @@ pub fn current_layout() -> &'static str {
 pub(crate) struct Ui {
     windows: RefCell<HashMap<WindowId, Rc<WindowState>>>,
     commands: Commands,
-    events: Sender<FromUi>,
+    pub(crate) events: Sender<FromUi>,
     frame: FrameStyle,
     /// Guards against `WM_WC_COMMAND` arriving while an earlier drain is still
     /// running. It should not be possible — the calls a drain makes send
@@ -1065,7 +1065,7 @@ thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
 }
 
-fn ui() -> Option<Rc<Ui>> {
+pub(crate) fn ui() -> Option<Rc<Ui>> {
     UI.with(|u| u.borrow().clone())
 }
 
@@ -1090,6 +1090,40 @@ fn ui() -> Option<Rc<Ui>> {
 fn message_time() -> u32 {
     // SAFETY: a pure query with no arguments.
     unsafe { GetMessageTime() as u32 }
+}
+
+/// The same clock, for the drop target.
+///
+/// ADDED FOR §42. `IDropTarget`'s methods are COM calls rather than window
+/// messages, so there is no message in the queue for `GetMessageTime` to
+/// describe — but OLE's modal loop is pumping messages the whole time, so the
+/// value is the time of whatever it last dispatched, which is within a mouse
+/// move of now and is on the same timeline as every other input event. That
+/// last part is what matters: a drag whose timestamps came from a different
+/// clock than the pointer's would give a client a gesture that appears to run
+/// backwards.
+pub(crate) fn now_ms() -> u32 {
+    message_time()
+}
+
+/// A screen point, in the surface coordinates of one of our windows.
+///
+/// ADDED FOR §42, and it goes through [`WindowState::to_surface`] — the
+/// conversion the pointer, the touch and §38's popup bounds all share. During
+/// an OLE drag there is no `WM_MOUSEMOVE`, so this is the *only* thing placing
+/// the drag inside the window, and a second conversion here would be a drop
+/// that lands somewhere the clicks do not.
+pub(crate) fn screen_to_surface(ui: &Rc<Ui>, id: WindowId, x: i32, y: i32) -> (f64, f64) {
+    let Some(w) = window(ui, id) else {
+        return (f64::from(x), f64::from(y));
+    };
+    let mut pt = POINT { x, y };
+    // SAFETY: a live window handle on its own thread; `ScreenToClient` converts
+    // in place.
+    unsafe {
+        ScreenToClient(w.hwnd(), &mut pt);
+    }
+    w.to_surface(pt.x, pt.y)
 }
 
 /// UTF-16, NUL-terminated. Every `*W` entry point wants one.
@@ -1829,7 +1863,7 @@ fn html_format(ui: &Rc<Ui>) -> u32 {
     id
 }
 
-fn format_id(ui: &Rc<Ui>, format: SystemFormat) -> u32 {
+pub(crate) fn format_id(ui: &Rc<Ui>, format: SystemFormat) -> u32 {
     match format {
         SystemFormat::UnicodeText => CF_UNICODETEXT,
         SystemFormat::Html => html_format(ui),
@@ -2258,6 +2292,10 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         }
         ToUi::StartDrag { payloads, actions } => start_drag(ui, payloads, actions),
         ToUi::CancelDrag => cancel_drag(ui),
+        // §42. The client under an incoming drag has answered; remember it, so
+        // that the next `IDropTarget::DragOver` — which must answer OLE
+        // synchronously and cannot wait for this — has something true to say.
+        ToUi::DragFeedback { accepted, action } => super::drag::feedback(accepted, action),
         ToUi::Destroy { id } => {
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
@@ -2269,6 +2307,12 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 release_icons(&w);
                 let hwnd = w.hwnd();
                 if !hwnd.is_null() {
+                    // §42: **before** `DestroyWindow`. OLE keys a drop-target
+                    // registration on the `HWND`, and a destroyed handle
+                    // cannot be revoked — the entry would stay in OLE's table
+                    // until the process exits, which on a compositor whose
+                    // windows come and go with a client's menus grows with use.
+                    super::drag::revoke(hwnd);
                     // SAFETY: the window was created on this thread, which is
                     // the only thread allowed to destroy it. This sends
                     // `WM_DESTROY`, which reclaims the `Rc` held in
@@ -2565,6 +2609,16 @@ fn create_window(
     // first would publish a rectangle measured against a frame the window is
     // about to stop having.
     state.publish_popup_bounds();
+    // §42: this window can be dropped onto, from now until it is destroyed.
+    //
+    // **Toplevels only.** A popup is a menu, not a destination — and
+    // registering one would mean revoking it on a window whose lifetime is a
+    // gesture, which is the revoke most likely to be missed. A drag that ends
+    // over a menu ends over the toplevel underneath it, which is what happens
+    // on the rest of the desktop too.
+    if matches!(kind, WindowKind::Toplevel) {
+        super::drag::register(hwnd, id);
+    }
     ui.windows.borrow_mut().insert(id, state.clone());
 
     println!("wc-compositor: window {id} created (HWND {hwnd:p}) title={title:?} app_id={app_id:?}");

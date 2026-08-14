@@ -1172,6 +1172,9 @@ fn wayland_thread(
     // One per thread, reused every turn. See `tick.rs`: on Windows a
     // `thread::sleep(5ms)` is a 15.9 ms sleep, and 15.9 ms against
     // `tick_frames`' 16 ms gate halves the frame rate of anything that animates.
+    // GROWTH. Built at the first client accept rather than here, because
+    // `Control::create` zeroes bytes the host is still locating by until then.
+    let mut grow: Option<crate::grow::Service> = None;
     let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
     println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
     let _ = std::io::stdout().flush();
@@ -1280,6 +1283,39 @@ fn wayland_thread(
                                 eprintln!("wc-compositor: could not release held objects: {e}")
                             }
                         }
+                        // GROWTH, and it is created *here* for exactly the
+                        // reason the gifts are released here. `Control::create`
+                        // zeroes the control region and on guest RAM those
+                        // bytes are stamp pages; doing it before the host's
+                        // locate would delete the stamps out from under it. A
+                        // client having arrived is the proof the locate
+                        // finished — it came through a proxy started from a
+                        // plan, and the plan exists only if the locate
+                        // succeeded. See `crate::grow::Service::start`.
+                        if grow.is_none() {
+                            match crate::grow::Service::start() {
+                                Ok(Some(s)) => {
+                                    println!(
+                                        "wc-compositor: growth channel up; the host may ask \
+                                         for another region when its pools do not fit"
+                                    );
+                                    grow = Some(s);
+                                }
+                                // No outbound window, or none big enough. Said
+                                // once, because a session that silently cannot
+                                // grow is the failure this stage exists to
+                                // remove and it must not be silent.
+                                Ok(None) => println!(
+                                    "wc-compositor: no outbound window, so no growth channel; \
+                                     this session cannot be asked for more memory"
+                                ),
+                                Err(e) => eprintln!(
+                                    "wc-compositor: no growth channel ({e}); this session \
+                                     cannot be asked for more memory and will refuse under \
+                                     pressure instead"
+                                ),
+                            }
+                        }
                     }
                     Err(e) => eprintln!("wc-compositor: could not insert client: {e}"),
                 }
@@ -1289,6 +1325,19 @@ fn wayland_thread(
                 eprintln!("wc-compositor: accept failed: {e}");
                 break;
             }
+        }
+
+        // GROWTH. Before the client work, so that a pool the host could not
+        // place is answered in the same turn the request arrived rather than
+        // one poll interval later — the client whose pool it is, is stopped
+        // until it is. One request per turn; `Service::service` never blocks,
+        // because this loop also drives every client's input and a growth that
+        // held it would freeze the desktop to allocate memory for it.
+        if let Some(g) = grow.as_mut()
+            && let Some(line) = g.service()
+        {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
         }
 
         // Order matters. UI events first, so a resize or a close reaches the

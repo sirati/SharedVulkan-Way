@@ -72,6 +72,12 @@
 /// Wayland client of the far end and only the host side has one.
 #[cfg(unix)]
 pub mod clip;
+/// GROWTH. Asking the compositor for another region, over the shared-memory
+/// channel, and then going and finding it. `cfg(unix)` for the same reason
+/// `guestram` is: it maps QEMU's backing object and forks the locator, neither
+/// of which is a thing on the other side of the boundary.
+#[cfg(unix)]
+pub mod guestgrow;
 #[cfg(unix)]
 pub mod guestram;
 #[cfg(unix)]

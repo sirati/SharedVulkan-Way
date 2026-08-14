@@ -173,6 +173,208 @@ pub fn frame_list_text(frames: &[u64]) -> String {
     s
 }
 
+/// The compositor's end of the growth channel, from creation to servicing.
+///
+/// # When this is created, and why it cannot be earlier
+///
+/// `Control::create` **zeroes** the control region, and on guest RAM those
+/// bytes are stamp pages — the ones the host locates the arena by. Creating the
+/// channel before the host's locate would delete the stamps out from under it,
+/// and `sv-gpu-server`'s own bring-up records what that looks like: *"located
+/// 8192 of 12288 pages — all 4096 control pages missing. Nothing said why; the
+/// count was simply short."*
+///
+/// So it is created at the first client accept, alongside
+/// [`wc_handle::arena::release_gifts`], which is the signal §12.10 already
+/// built for exactly this hazard: a client can only have arrived through a
+/// proxy that was started from a plan, and the plan exists only if the locate
+/// succeeded. Same event, same argument, and no new flag to get wrong.
+///
+/// # Why there is no flag
+///
+/// The channel is created whenever there is an outbound window big enough to
+/// hold it. A deployment that has one is a deployment where the host is the
+/// party allocating pools and can therefore run out; a harness with a 64 KiB
+/// window is testing a keymap and is told, once, that it is not getting a
+/// channel. Making it a flag would mean a launcher that forgot it produced a
+/// session which refuses under pressure for no visible reason — which is
+/// exactly the failure this whole stage exists to remove.
+pub struct Service {
+    /// Held because the ring's producer and consumer resolve their offsets
+    /// through the layout it published, and because dropping it would drop the
+    /// last `Arc` on the region view.
+    control: sv_transport::control::Control,
+    /// `None` until the host claims the ring, which is every session that never
+    /// grows. Not an error: most sessions never grow.
+    end: Option<wc_handle::grow::GuestEnd>,
+    pub served: u32,
+    pub refused: u32,
+}
+
+impl Service {
+    /// Take the front of the outbound window and publish a control region in
+    /// it. `Ok(None)` when there is no window, or none big enough — a stated
+    /// fact, not a failure.
+    pub fn start() -> Result<Option<Service>, String> {
+        let Some(w) = wc_handle::arena::outbound() else {
+            return Ok(None);
+        };
+        let (offset, len) = match wc_handle::arena::reserve_growth_channel(w.arena) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("{e}")),
+        };
+        let base = wc_handle::arena::region_base(w.arena)
+            .ok_or_else(|| format!("arena {} is not a region this process provided", w.arena))?;
+        // SAFETY: `region_base` answers only for a region this process
+        // committed and holds for the life of the process, `reserve_growth_channel`
+        // has just taken `[offset, +len)` of it out of every other allocator's
+        // reach, and `SharedRegion::from_raw`'s backing is `Borrowed` — its drop
+        // frees nothing and the memory outlives it.
+        let region = std::sync::Arc::new(unsafe {
+            sv_transport::region::SharedRegion::from_raw(
+                (base + offset as usize) as *mut u8,
+                len as usize,
+            )
+        });
+        let control = sv_transport::control::Control::create(
+            region,
+            wc_handle::grow::geometry(),
+            wc_handle::grow::protocol_ids(),
+            1,
+        )
+        .map_err(|e| format!("growth channel: {e}"))?;
+        Ok(Some(Service { control, end: None, served: 0, refused: 0 }))
+    }
+
+    /// One turn of the poll loop. Never blocks.
+    ///
+    /// Returns a line to log when something happened. One request per turn
+    /// rather than draining: answering one commits and pins guest RAM and
+    /// queries the page-frame database, which is tens of milliseconds, and
+    /// doing several in one turn of a 5 ms loop would be a visible stall to buy
+    /// memory nobody asked for twice.
+    pub fn service(&mut self) -> Option<String> {
+        if self.end.is_none() {
+            match wc_handle::grow::GuestEnd::open(&self.control) {
+                Ok(Some(e)) => self.end = Some(e),
+                Ok(None) => return None,
+                Err(e) => return Some(format!("growth channel: {e}")),
+            }
+        }
+        let end = self.end.as_mut()?;
+        let mut note = None;
+        let served = end.service(&mut |req| {
+            let started = std::time::Instant::now();
+            // RELEASE, and it is the half that actually returns memory. The
+            // host unmapping its view frees nothing: the pages are *this*
+            // process's, committed and `VirtualLock`ed, so they are non-pageable
+            // and gone from Windows entirely until `VirtualFree` runs here.
+            // `sv-guest.exe` holding hundreds of megabytes with no client
+            // connected is exactly what it looks like when the host thinks it
+            // released memory and this side was never told.
+            if req.op == wc_handle::grow::Op::Release {
+                return match wc_handle::arena::release_guest_ram(req.region) {
+                    Ok(bytes) => {
+                        note = Some(format!(
+                            "wc-compositor: released arena {}: {bytes} bytes back to Windows \
+                             in {} ms",
+                            req.region,
+                            started.elapsed().as_millis()
+                        ));
+                        wc_handle::grow::Reply {
+                            status: 0,
+                            run_id: 0,
+                            len: bytes,
+                            pages: 0,
+                            locked: false,
+                            frames: Vec::new(),
+                            query_ms: started.elapsed().as_millis() as u32,
+                            message: String::new(),
+                        }
+                    }
+                    Err(e) => {
+                        note = Some(format!(
+                            "wc-compositor: could not release arena {}: {e}",
+                            req.region
+                        ));
+                        wc_handle::grow::Reply {
+                            status: 1,
+                            run_id: 0,
+                            len: 0,
+                            pages: 0,
+                            locked: false,
+                            frames: Vec::new(),
+                            query_ms: 0,
+                            message: format!("{e}"),
+                        }
+                    }
+                };
+            }
+            match commit(req.region, req.bytes) {
+                Ok(g) => {
+                    note = Some(format!(
+                        "wc-compositor: grew arena {}: run 0x{:016x}, {} bytes, {} pages, \
+                         locked={}, {} frame(s) in {} ms, {} ms total{}",
+                        g.id,
+                        g.run_id,
+                        g.len,
+                        g.pages,
+                        g.locked,
+                        g.frames.len(),
+                        g.query_ms,
+                        started.elapsed().as_millis(),
+                        g.frames_unavailable
+                            .as_deref()
+                            .map(|r| format!(" (no frame list: {r})"))
+                            .unwrap_or_default(),
+                    ));
+                    wc_handle::grow::Reply {
+                        status: 0,
+                        run_id: g.run_id,
+                        len: g.len,
+                        pages: g.pages,
+                        locked: g.locked,
+                        frames: g.frames,
+                        query_ms: g.query_ms as u32,
+                        message: g.frames_unavailable.unwrap_or_default(),
+                    }
+                }
+                Err(e) => {
+                    // A refusal is an answer. The host counts it, the client
+                    // survives it (§20), and the reason travels rather than
+                    // being left in a log the host cannot read.
+                    note = Some(format!(
+                        "wc-compositor: refused to grow arena {} by {} bytes: {e}",
+                        req.region, req.bytes
+                    ));
+                    wc_handle::grow::Reply {
+                        status: 1,
+                        run_id: 0,
+                        len: 0,
+                        pages: 0,
+                        locked: false,
+                        frames: Vec::new(),
+                        query_ms: 0,
+                        message: format!("{e}"),
+                    }
+                }
+            }
+        });
+        match served {
+            Ok(Some((_, reply))) => {
+                if reply.status == 0 {
+                    self.served += 1;
+                } else {
+                    self.refused += 1;
+                }
+                note
+            }
+            Ok(None) => None,
+            Err(e) => Some(format!("wc-compositor: growth channel: {e}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

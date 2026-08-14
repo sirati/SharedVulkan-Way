@@ -152,9 +152,48 @@ pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
     sv_transport::control::ProtocolIds::new(1, 0x7743_4752_4f57_0001)
 }
 
+/// Which of the two things the host is asking for.
+///
+/// # Why release needs a message at all, when the host can just unmap
+///
+/// Because unmapping frees nothing. The pages are the **guest's** — committed
+/// and `VirtualLock`ed by the compositor — and the host's view of them is a
+/// second mapping of memory the guest is still charged for. Dropping it returns
+/// the host's address space and not one byte of the guest's RAM.
+///
+/// That asymmetry is the whole reason this exists as a message. `sv-guest.exe`
+/// holding hundreds of megabytes with no client connected is exactly what it
+/// looks like when the host thinks it has released memory and the guest has
+/// never been told: `VirtualLock`ed pages are non-pageable, so they are not
+/// merely reserved, they are gone from Windows entirely until somebody calls
+/// `VirtualFree`. Only the compositor can, and only if it is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Op {
+    /// Commit a region of at least `bytes` and register it as `region`.
+    Grow = 1,
+    /// `VirtualFree` the region registered as `region`. `bytes` is ignored.
+    ///
+    /// Sent after the host has already stopped listing the region and unmapped
+    /// its own view, so nothing can still be naming those bytes. The reply's
+    /// `len` is what actually came back.
+    Release = 2,
+}
+
+impl Op {
+    fn from_u32(v: u32) -> Option<Op> {
+        match v {
+            1 => Some(Op::Grow),
+            2 => Some(Op::Release),
+            _ => None,
+        }
+    }
+}
+
 /// What the host asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Request {
+    pub op: Op,
     /// The id the region must be registered under. Chosen by the host's
     /// allocator (`Arena::grow` passes its `next_id`), because that number is
     /// what every `Descriptor::ArenaSlice { arena, .. }` into the new region
@@ -196,8 +235,8 @@ pub struct Reply {
 // The wire, and the one thing about it that is not ours to choose
 // ---------------------------------------------------------------------------
 
-/// The command-lane opcode. One conversation, one opcode.
-const OP_GROW: u32 = 1;
+/// The command-lane opcode is [`Op`], which is a `#[repr(u32)]` enum so that
+/// the wire's `cmd_type` and the thing the handler matches on are one value.
 
 /// `sv_transport::ring`'s consumer cross-checks the packet's framed length
 /// against a length **declared inside the payload**, at a fixed offset that
@@ -233,7 +272,7 @@ fn get_u64(b: &[u8], at: usize) -> io::Result<u64> {
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(24);
-        put_u32(&mut v, OP_GROW); // cmd_type
+        put_u32(&mut v, self.op as u32); // cmd_type
         put_u32(&mut v, 0); // cmd_flags
         put_u32(&mut v, 24); // cmd_size — checked by the ring, see above
         put_u32(&mut v, self.region);
@@ -243,13 +282,14 @@ impl Request {
     }
 
     pub fn decode(b: &[u8]) -> io::Result<Request> {
-        if get_u32(b, 0)? != OP_GROW {
-            return Err(io::Error::new(
+        let raw = get_u32(b, 0)?;
+        let op = Op::from_u32(raw).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("growth ring: opcode {} is not a growth request", get_u32(b, 0)?),
-            ));
-        }
-        Ok(Request { region: get_u32(b, 12)?, bytes: get_u64(b, 16)? })
+                format!("growth ring: {raw} is not a request this compositor understands"),
+            )
+        })?;
+        Ok(Request { op, region: get_u32(b, 12)?, bytes: get_u64(b, 16)? })
     }
 }
 
@@ -270,7 +310,7 @@ impl Reply {
         let msg = self.message.as_bytes();
         let body = Reply::FIXED + msg.len() + self.frames.len() * 8;
         let mut v = Vec::with_capacity(body);
-        put_u32(&mut v, OP_GROW); // cmd_type
+        put_u32(&mut v, Op::Grow as u32); // cmd_type — a reply is always to a request
         put_u32(&mut v, body as u32); // reply_size — checked by the ring
         put_u32(&mut v, self.status);
         put_u32(&mut v, self.pages);
@@ -451,7 +491,7 @@ mod tests {
     /// growth that times out rather than one that fails.
     #[test]
     fn a_request_declares_its_own_length_where_the_ring_looks_for_it() {
-        let r = Request { region: 3, bytes: 16 << 20 };
+        let r = Request { op: Op::Grow, region: 3, bytes: 16 << 20 };
         let bytes = r.encode();
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
@@ -569,7 +609,7 @@ mod tests {
 
         // The host asks. Nothing answers yet, so this is done in two steps
         // rather than on two threads: the point is the bytes, not the timing.
-        host_end.to_guest.push_bytes(&Request { region: 4, bytes: 16 << 20 }.encode()).unwrap();
+        host_end.to_guest.push_bytes(&Request { op: Op::Grow, region: 4, bytes: 16 << 20 }.encode()).unwrap();
 
         let mut seen = None;
         let served = guest_end
@@ -588,7 +628,7 @@ mod tests {
             })
             .unwrap();
         assert!(served.is_some(), "the guest saw the request");
-        assert_eq!(seen, Some(Request { region: 4, bytes: 16 << 20 }));
+        assert_eq!(seen, Some(Request { op: Op::Grow, region: 4, bytes: 16 << 20 }));
 
         // And the host reads the answer off the reply lane.
         let reply = host_end.from_guest.next().unwrap().expect("an answer is waiting");
@@ -600,6 +640,28 @@ mod tests {
 
         // A second turn with nothing asked is not an error and not a reply.
         assert!(guest_end.service(&mut |_| unreachable!()).unwrap().is_none());
+    }
+
+    /// Release is a request like any other, and the opcode is what tells them
+    /// apart. It matters that this round-trips rather than being inferred from
+    /// `bytes == 0`: the host unmapping its view frees nothing, so a release
+    /// that the guest silently read as a grow-of-zero would leave the pages
+    /// `VirtualLock`ed and gone from Windows, which is the complaint this exists
+    /// to answer.
+    #[test]
+    fn release_is_its_own_opcode_and_survives_the_wire() {
+        let r = Request { op: Op::Release, region: 9, bytes: 0 };
+        let back = Request::decode(&r.encode()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.op, Op::Release);
+        // And the two are distinguishable at the first word, which is where the
+        // ring's own `cmd_type` lives.
+        let grow = Request { op: Op::Grow, region: 9, bytes: 0 }.encode();
+        assert_ne!(&grow[0..4], &r.encode()[0..4]);
+        // An opcode neither side knows is refused rather than guessed at.
+        let mut bad = r.encode();
+        bad[0..4].copy_from_slice(&99u32.to_le_bytes());
+        assert!(Request::decode(&bad).is_err());
     }
 
     /// A compositor that never answers must not hang the client's thread inside
@@ -618,7 +680,7 @@ mod tests {
 
         let t = std::time::Instant::now();
         let e = host_end
-            .request(Request { region: 1, bytes: 4096 }, std::time::Duration::from_millis(50))
+            .request(Request { op: Op::Grow, region: 1, bytes: 4096 }, std::time::Duration::from_millis(50))
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(e.to_string().contains("did not answer"), "{e}");

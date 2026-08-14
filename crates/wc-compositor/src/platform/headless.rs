@@ -664,6 +664,17 @@ impl PumpInner {
                 });
             }
             ToUi::CancelDrag => println!("wc-compositor: [headless] the drag was withdrawn"),
+            // The answer to a question only OLE asks. On Win32 this is what
+            // `IDropTarget::DragOver` returns to the modal loop, one round trip
+            // stale by construction (§42); here there is nobody to tell, and
+            // printing it is what lets a harness assert that the client's
+            // `accept` and `set_actions` came back at all — which is the half
+            // of the round trip that can be checked without a desktop.
+            ToUi::DragFeedback { accepted, action } => println!(
+                "wc-compositor: [headless] the client under the drag {} (action {})",
+                if accepted { "accepted" } else { "refused" },
+                crate::platform::dnd_action::describe(action)
+            ),
             ToUi::FetchClipboard { token, from_drag, mime } => {
                 if from_drag {
                     // Nothing can be dragged onto this platform, so there is
