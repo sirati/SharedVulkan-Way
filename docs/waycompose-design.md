@@ -11987,11 +11987,26 @@ both messages carry `sv-wire`'s `CommandHeader`/`ReplyHeader` rather than a
 private framing. A constraint discovered rather than chosen, and a good one: a
 growth request is now a well-formed command on the same ring as everything else.
 
-The geometry is the smallest that works with one exception, and the exception is
-measured. `ring_data_bytes` is 64 KiB because the reply carries the new region's
-**frame list**, and a test holds the *worst* case — one run per page of a 16 MiB
-region — to fitting in one packet. Measured fragmentation of `VirtualLock`ed
-4 KiB pages is 1471 runs per 64 MiB, about a quarter of that. `ring_slot_count`
+The geometry is the smallest that works with one exception: `ring_data_bytes` is
+64 KiB because the reply carries the new region's **frame list**.
+
+> **[CORRECTED — §61.4.]** This paragraph used to justify the 64 KiB by a
+> *worst* case of "one run per page of a 16 MiB region", and reassure with
+> "measured fragmentation … is 1471 runs per 64 MiB, about a quarter of that".
+> **Both halves were wrong and the reassurance was the worse of them.**
+> `Reply::encode` writes one `u64` per **page**, not a run-length encoded pair,
+> so fragmentation does not enter into it at all — the 1471-runs figure is the
+> *locator's* coalesced file runs, a different number in a different program.
+> The reply's size is a function of the region's page count alone: a packet
+> holds 65,504 bytes, 48 of them fixed, so **8,182 pages ≈ 31.96 MiB**. Every
+> region of 32 MiB or more overflows, always. `GROW_STEP` is 16 MiB and the
+> series is 16, 32, 64 — so **the second growth of any session overflows, every
+> time**, which is exactly what §61.4 observed and misattributed to bad luck.
+> The behaviour is fixed (§61.4a: the region is kept, the frame list is
+> dropped); what is corrected here is the arithmetic that made a certainty look
+> like an edge.
+
+`ring_slot_count`
 is 2 rather than 1 because slot 0 is pre-claimed as the reverse ring by
 `Control`'s own directory writer. `arena_size` and `timeline_count` are 0 and
 honestly so: the arena here is `wc_proxy::pool`'s, and there is no `vkQueueSubmit`
@@ -20928,19 +20943,73 @@ wc-compositor: growth channel: growth ring: a 65600-byte packet cannot fit a 655
   the payload belongs in the arena
 ```
 
-`docs/waycompose-design.md` §34.5 sized `ring_data_bytes` at 64 KiB because "the
-reply carries the new region's frame list, and a test holds the *worst* case —
-one run per page of a 16 MiB region — to fitting in one packet". A 16 MiB region
-is 4096 pages; at 16 bytes a frame that is 65536 bytes, which is the ring
-exactly — and the packet is the payload **plus `sv-wire`'s `ReplyHeader`**. The
-test held the payload and the ring holds the packet, so the worst case overflows
-by the header and by nothing else. Measured fragmentation made this rare rather
-than constant: the growth that succeeded needed 388 runs, well inside the ring;
-the ones that failed had hit the fully-fragmented case.
+**Fixed.** The region is kept and the frame list is dropped; see §61.4a for the
+decision and §34.5 for the corrected sizing. What this section first said about
+*why* it happened was wrong twice over, and both corrections make it worse
+rather than rarer.
 
-Not fixed here. The section's own words already name the answer — "the payload
-belongs in the arena" — and choosing between a larger ring and an out-of-band
-payload is a protocol decision, not a number to nudge.
+**It is not 16 bytes a frame, it is 8.** `Reply::encode` writes one `u64` per
+**page** — `put_u64` per entry of `frames` — not a run-length encoded pair. The
+original note reasoned from RLE runs at 16 bytes and concluded that a 16 MiB
+region was "the ring exactly"; it is 4096 pages at 8 bytes, which is 32,768
+bytes, comfortably half the lane.
+
+**So fragmentation has nothing to do with it.** The claim that "measured
+fragmentation made this rare rather than constant", and the 388-run figure
+offered as evidence, were about the *locator's* coalesced file runs — a
+different number in a different program. The reply's size depends on the
+region's **page count alone**. A packet holds `max_payload` = 65,504 bytes, of
+which 48 are the fixed header, so the ring carries **8,182 pages ≈ 31.96 MiB**.
+
+**Which makes it deterministic, not rare.** Every region of 32 MiB or more
+overflows, always, on any guest. `GROW_STEP` is 16 MiB and the series is
+geometric to a 64 MiB cap — 16, 32, 64 — so **the second growth in any session
+overflows, every time.** "Later growths in the same session failed" was not a
+coincidence of fragmentation; it was the series arriving at 32 MiB.
+
+A Linux guest reaches it with certainty for a second reason: `/proc/self/pagemap`
+names every page, so the frame list is always fully populated. A Windows guest
+depends on `SuperfetchPfnQuery` answering for the whole window, which it did.
+
+#### 61.4a The decision, and why the region is what survives
+
+The section said the choice between a larger ring and an out-of-band payload was
+"a protocol decision, not a number to nudge". That was right about it being a
+decision and wrong about leaving it: a decision is a thing to make. It is made,
+and it is neither of those two.
+
+**The frame list is dropped and the region is answered for.** The asymmetry
+decides it. Pushing an oversized packet fails the push, and it is the **reply**
+that is lost — the host sits out its 20-second deadline and reports a compositor
+that never answered, for a growth that in fact *succeeded* and whose region is
+committed, `VirtualLock`ed and now unreachable. That is a leak with a
+misdiagnosis attached. Losing the frame list instead costs a sweep and says so.
+
+It invents no new failure mode. "No frame list" is exactly the degradation
+`docs/design.md` §0.21 and §34.2 already specify and the host already
+implements: the locator sweeps, which is *correct* on a freshly committed region
+because nothing has overwritten its stamps, and costs seconds instead of
+milliseconds.
+
+**A larger ring was rejected on a cost this document already carries.** The lane
+is sized inside `CONTROL_BYTES`, which is carved out of the compositor's
+outbound window — the window that holds keymaps and clipboard offers and is the
+one region release may never reclaim. Sizing it for 64 MiB of frame list would
+take a quarter of that window permanently, raising the floor this stage exists
+to lower. Chunking across packets is the other alternative, is real protocol
+work, and buys the same thing.
+
+**And "out of band" cannot mean a side channel here**, which the original
+wording invited: all communication goes through the ring, and alternative
+channels exist only to wake a peer from idle. Putting the payload in the arena
+would be within that rule only if the ring still framed it — which is chunking
+by another name.
+
+The check lives in `GuestEnd::service`, the one place every reply passes
+through, because the limit is the ring's and that is what the type owns. Its
+message now says what was lost and what it costs, because at one line per second
+growth it is a thing operators will read routinely rather than once.
+
 
 ### 61.5 Release still has not fired, and now there are two reasons
 
