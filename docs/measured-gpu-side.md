@@ -1051,7 +1051,7 @@ comes out perfect.
 
 # `sv-hostd`'s QEMU mode, measured against the live guest
 
-Built and run 2026-08-12. This is design.md §13 step 7's host half: discover
+Built and run 2026-08-12. This is docs/design.md §13 step 7's host half: discover
 QEMU, read `info mtree -f` over QMP into a region table, locate the guest's
 extent by content, coalesce, and stitch it into one virtually contiguous view.
 
@@ -1203,7 +1203,7 @@ configuration existed.
 
 ## 1. §4.3's publish order destroys the stamps §5.1 depends on
 
-design.md §4.3 step 1 has the owner "allocate both regions, **zero them**, write
+docs/design.md §4.3 step 1 has the owner "allocate both regions, **zero them**, write
 every header field, then store `magic`", and step 2 offer the extent over the
 cold path. §5.1 has the guest stamp every page and the host find those pages by
 content. On one machine the two are compatible, because the host is handed a
@@ -1265,7 +1265,7 @@ address-space list contains `"memory"`.
 
 ## What the daemon→ICD boundary needs that the guest→host one does not
 
-design.md §5.7 is firm that "**the run list does not cross the wire, and it never
+docs/design.md §5.7 is firm that "**the run list does not cross the wire, and it never
 did have to**". That is about the **guest↔host** boundary, where the guest cannot
 know the runs — the entire reason `ScanLocator` exists.
 
@@ -1568,7 +1568,7 @@ node, and there is none to import it into.
 So the dma-buf measured above is real, and on this machine its consumers can
 only be CPU-side. That is not nothing — it is a `wl_shm`-shaped path with no
 copy — but it is not "Firefox can hardware-decode into it", and the difference
-matters. See design.md §0.10.
+matters. See docs/design.md §0.10.
 
 ## Re-running it
 

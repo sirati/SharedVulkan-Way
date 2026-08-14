@@ -2764,7 +2764,7 @@ here does not produce a bigger protocol; it produces a generator error:
 ```
 Error: planning profile "zink"
   VkImageToMemoryCopy.pHostPointer: a `void*` with no `len=` and no policy
-  entry. design.md §7.4 requires every one of these to be a data entry in
+  entry. docs/design.md §7.4 requires every one of these to be a data entry in
   crates/sv-codegen/src/exceptions.rs; add one, with the reason.
 ```
 
@@ -2911,7 +2911,7 @@ closed by scope**, which item 4 predicted in as many words.
 ---
 
 **1. `vkBindImageMemory` never had the app-side half of pass 6, and neither did
-five other commands.** design.md §5.3 splits the `(memory, offset)` rewrite in
+five other commands.** docs/design.md §5.3 splits the `(memory, offset)` rewrite in
 two: the app side turns *allocation* coordinates into *arena* coordinates, and
 the GPU side turns arena coordinates into a `VkDeviceMemory` plus an offset. §7.2
 lists the pass as GPU-side, which is half true, and the app-side half existed as
@@ -4117,7 +4117,7 @@ that were budgeted for do not exist.
 
 **1. The barrier was at the wrong pass, and that is why it cost 52 commands.**
 `emit_handle_map_union` emitted a `compile_error!` reading *"a union containing
-handles reached the handle_map pass; the selector rules of design.md §7.4 must be
+handles reached the handle_map pass; the selector rules of docs/design.md §7.4 must be
 applied before this can be generated"*. Every word of it is true about the
 project and none of it is true about that function.
 

@@ -77,7 +77,7 @@ an exclusion list with a reason per line: a rule rather than a 304-name list,
 because a list that long is not reviewable and goes stale the day the registry
 moves. `SV_PROTO_PROFILE=zink` gets the narrow Zink requirement set (design.md
 §11) back with no code change. The two now differ in extensions alone — both
-carry core 1.4. design.md §0.19.
+carry core 1.4. docs/design.md §0.19.
 
 **The remaining 231, grouped by why rather than by name**, because the group is
 what says what work would close it:
@@ -100,7 +100,7 @@ Both are one generator change, not a scope decision: a `void*` whose extent is a
 device property rather than a `len=` (capture-replay, 17), and a union with a
 handle in an arm whose live arm a sibling decides — the `noautovalidity` gap
 `sv_codegen::exceptions::SIBLING_SELECTED` already closes one level in
-(union-of-handles, 53). design.md §0.19 items 4 and 7a.
+(union-of-handles, 53). docs/design.md §0.19 items 4 and 7a.
 
 A third command answers "what does an *uncarried* command do?", which is not the
 same question and had a surprising answer — 501 are **absent**, which is what a
@@ -121,7 +121,7 @@ the forwarded device declined. At a 1-in-20000 sample the top of that list is
 eight `No matching queue found` and three `Exclusive compute queue not
 supported`), `VK_EXT_graphics_pipeline_library` (7) and the ray-tracing family
 (6). The second entry is not an extension and is not in the first table at all.
-design.md §0.15.
+docs/design.md §0.15.
 
 **Structs are the harder half.** Commands are a flat dispatch problem.
 Structs are not: they nest, they chain through `pNext`, they contain pointers

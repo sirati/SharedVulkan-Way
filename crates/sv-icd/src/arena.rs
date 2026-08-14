@@ -3,7 +3,7 @@
 //! # Scope, stated plainly
 //!
 //! This module is **the mapping and a placeholder allocator**, not the arena
-//! design. `sv-arena` (design.md §12) is being written separately and owns the
+//! design. `sv-arena` (docs/design.md §12) is being written separately and owns the
 //! slab directory, the segregated free lists, deferred free, the R26 canary and
 //! the provider/locator/attacher split. What is here is the smallest thing that
 //! lets `vkMapMemory` return a real pointer into real shared pages, which is the
@@ -21,7 +21,7 @@
 //!
 //! — so that swapping [`Placeholder`] for the real allocator is a change of one
 //! type name and not a change of shape. **Nothing above this module knows how
-//! many `mmap` calls produced the view** (design.md §5.3: "that must stay
+//! many `mmap` calls produced the view** (docs/design.md §5.3: "that must stay
 //! invisible"), so a stitched multi-run attachment can be substituted with no
 //! change above.
 //!
@@ -29,7 +29,7 @@
 //!
 //! On Linux the arena is a `memfd`, sized once and mapped `MAP_SHARED`. That is
 //! the same object `sv-hostd` hands out in the same-machine development loop
-//! (design.md §3: "in the same-machine development loop it degenerates to
+//! (docs/design.md §3: "in the same-machine development loop it degenerates to
 //! 'create a memfd, `ftruncate`, hand it out'"), so a GPU-side process can be
 //! given the descriptor and map the identical pages. Until `sv-transport` lands,
 //! this file creates the memfd itself rather than receiving it.
@@ -46,12 +46,12 @@ use std::io;
 /// shared mapping. Nothing has to be over-allocated to satisfy the driver.
 pub const GRANULARITY: u64 = 4096;
 
-/// The default slab size (design.md §5.2, D4).
+/// The default slab size (docs/design.md §5.2, D4).
 pub const DEFAULT_SLAB_SIZE: u64 = 64 << 20;
 
 /// An app-side `VkDeviceMemory` backed by the arena.
 ///
-/// design.md §5.3: "a triple `(slab_id, offset_in_slab, size)` — a sub-range of
+/// docs/design.md §5.3: "a triple `(slab_id, offset_in_slab, size)` — a sub-range of
 /// a slab, 4096-aligned, whose `offset_in_slab + size` never exceeds the slab".
 /// Field-for-field `sv_arena::Allocation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub trait Backing: Send {
     fn alloc(&mut self, size: u64) -> Result<Allocation>;
     fn arena_offset(&self, a: Allocation) -> Result<u64>;
     /// Freed immediately here. The real allocator defers until the timelines an
-    /// allocation could be referenced by have passed (design.md §5.5).
+    /// allocation could be referenced by have passed (docs/design.md §5.5).
     fn free_now(&mut self, a: Allocation) -> Result<()>;
     fn free_bytes(&self) -> u64;
 }
@@ -93,7 +93,7 @@ pub const fn round_up(size: u64) -> u64 {
 ///
 /// **Placeholder.** It is correct — allocations never overlap, every range is
 /// 4096-aligned, and a freed range is coalesced with its neighbours — and it is
-/// not the allocator design.md §5.2 specifies: no size classes, no slab
+/// not the allocator docs/design.md §5.2 specifies: no size classes, no slab
 /// directory, no deferred free, no canary. `sv_arena::ArenaAllocator` replaces
 /// it whole.
 #[derive(Debug)]
@@ -134,7 +134,7 @@ impl Backing for Placeholder {
         // An allocation never straddles a slab boundary: a slab is the unit of
         // GPU-side import, so a range that crossed one would need two imports
         // and could not be expressed as `(slab, offset_in_slab, size)`
-        // (design.md §5.2, §5.3).
+        // (docs/design.md §5.2, §5.3).
         for i in 0..self.free.len() {
             let (off, len) = self.free[i];
             let slab = off / self.slab_size;
@@ -219,7 +219,7 @@ impl Backing for Placeholder {
 /// adaptor is four forwarding methods and one field-for-field conversion.
 ///
 /// The conversion is written out rather than `transmute`d even though the two
-/// `Allocation` types have identical fields, for the reason design.md §7.3 gives
+/// `Allocation` types have identical fields, for the reason docs/design.md §7.3 gives
 /// about the generated code: two independently declared views of one layout
 /// agreeing is a coincidence maintained by nobody.
 impl Backing for sv_arena::alloc::ArenaAllocator {
@@ -263,14 +263,14 @@ impl Backing for sv_arena::alloc::ArenaAllocator {
 
 /// A shared mapping of the arena.
 ///
-/// One of the three modules design.md §7.3 permits hand-written `unsafe` in
+/// One of the three modules docs/design.md §7.3 permits hand-written `unsafe` in
 /// ("the mapping, the ring, and the arena allocator"), and the invariants are:
 ///
 /// - `base` is the result of one successful `mmap` of `len` bytes and is
 ///   unmapped exactly once, in `Drop`.
 /// - Nothing in this process ever constructs a Rust reference into the mapping.
 ///   The peer can write any byte of it at any moment, so a `&T` over it would
-///   violate the aliasing model no matter how careful we were (design.md §7.3).
+///   violate the aliasing model no matter how careful we were (docs/design.md §7.3).
 ///   The only thing that leaves this module is a raw pointer, which is what
 ///   `vkMapMemory` is specified to return.
 #[derive(Debug)]
@@ -311,11 +311,11 @@ unsafe impl Sync for Mapping {}
 impl Mapping {
     /// Create a `memfd` of `len` bytes and map it `MAP_SHARED`.
     ///
-    /// The **standalone** arena of design.md §3: this ICD with no GPU side, where
+    /// The **standalone** arena of docs/design.md §3: this ICD with no GPU side, where
     /// the memory is this process's own and is shared with nobody. The descriptor
     /// is kept only because it owns the pages.
     ///
-    /// It is deliberately *not* a handoff: design.md §1a forbids a descriptor
+    /// It is deliberately *not* a handoff: docs/design.md §1a forbids a descriptor
     /// crossing to the GPU side, and a connected ICD takes
     /// [`MappingBacking::Shared`] over a region `sv-transport` mapped from a name
     /// instead. A memfd is the right object here precisely because nobody else
@@ -358,7 +358,7 @@ impl Mapping {
     ///
     /// The pointer is the region's own base, so `vkMapMemory` returns an address
     /// inside the *same* mapping the transport reads and the GPU side's
-    /// `VkDeviceMemory` covers. That identity is design.md §1's invariant, and
+    /// `VkDeviceMemory` covers. That identity is docs/design.md §1's invariant, and
     /// making it a borrow rather than a second `mmap` is what guarantees it
     /// rather than arranging it.
     pub fn attach(

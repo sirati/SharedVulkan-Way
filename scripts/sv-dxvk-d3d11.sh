@@ -3,7 +3,7 @@
 #
 #   scripts/sv-dxvk-d3d11.sh [dxvk-version]     default: 2.6.2
 #
-# design.md §9.2 declines to advertise `bufferDeviceAddress` and predicts that
+# docs/design.md §9.2 declines to advertise `bufferDeviceAddress` and predicts that
 # DXVK and vkd3d-proton will therefore "fail device creation cleanly and
 # loudly". This script exists because that prediction turned out to be true of
 # one DXVK and false of another, and because the thing that actually stops
@@ -119,7 +119,7 @@ if grep -q "^PASS" "$RUNDIR/probe.log"; then
   exit 0
 fi
 if grep -q "Required Vulkan extension VK_KHR_swapchain not supported" "$RUNDIR/probe.log"; then
-  echo "Direct3D 11 over DXVK $VER: BLOCKED on VK_KHR_swapchain — which design.md §10"
+  echo "Direct3D 11 over DXVK $VER: BLOCKED on VK_KHR_swapchain — which docs/design.md §10"
   echo "stage 2 implements, so this is a regression in the WSI rather than a known gap."
   exit 1
 fi
@@ -127,5 +127,5 @@ echo "Direct3D 11 over DXVK $VER: refused, for the reason above."
 echo
 echo "A refusal is the **expected** answer for DXVK >= 2.7, which rewrote its"
 echo "requirement list and demands bufferDeviceAddress, descriptorIndexing and"
-echo "VK_KHR_pipeline_library (design.md §0.5, §9.2). For 2.6.x it is a failure."
+echo "VK_KHR_pipeline_library (docs/design.md §0.5, §9.2). For 2.6.x it is a failure."
 exit 1

@@ -1,4 +1,4 @@
-//! Generate pass 10 (design.md §7.2) into `OUT_DIR`.
+//! Generate pass 10 (docs/design.md §7.2) into `OUT_DIR`.
 //!
 //! The same rules as `sv-proto`'s build script and for the same reasons: the
 //! registry is the only input, it must be the pinned one, and the output is not

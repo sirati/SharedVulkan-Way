@@ -289,7 +289,7 @@ fn a_generated_stub_goes_all_the_way_round() {
     }
 }
 
-/// Venus's clamp (design.md §6.1), in the generated writeback.
+/// Venus's clamp (docs/design.md §6.1), in the generated writeback.
 ///
 /// "an unclamped write is a buffer overflow in our own code the moment either
 /// side has a bug, and the clamp is one comparison". This checks the comparison
@@ -350,7 +350,7 @@ fn the_count_then_fill_idiom_clamps_to_the_callers_buffer() {
 /// of `0xFFFFFFFF00000001` on the wire, and an id that fails to map is the
 /// *lucky* case — one that collides with a live object hands the driver a
 /// descriptor pointing at the wrong resource and hangs the GPU with no
-/// diagnostic anywhere (design.md §0.16).
+/// diagnostic anywhere (docs/design.md §0.16).
 ///
 /// This is the negative control. The two unselected pointers here address a
 /// single-element array while `descriptorCount` is 4, so a lowering that reads
@@ -439,13 +439,13 @@ fn sent(r: &Recorder) -> Vec<u8> {
     r.0.lock().unwrap().clone()
 }
 
-/// design.md §5.3's rewrite happens for **every** command that carries a memory
+/// docs/design.md §5.3's rewrite happens for **every** command that carries a memory
 /// id, not for the one it was hand-written in.
 ///
 /// `vkBindBufferMemory` had the rewrite and `vkBindImageMemory` did not, so an
 /// image bound to host-visible memory sent an app-side id the GPU side has never
 /// heard of; it answered `no VkDeviceMemory with id 8`, took the ring fatal, and
-/// the device was lost (design.md §0.20). The two commands are asserted
+/// the device was lost (docs/design.md §0.20). The two commands are asserted
 /// together here precisely because their being different was the bug.
 #[test]
 fn every_forwarded_memory_pair_is_rewritten() {
@@ -619,7 +619,7 @@ fn an_unknown_memory_id_fails_before_it_crosses() {
 /// `VkDeviceOrHostAddressConstKHR` fields read out of the wrong offsets, and the
 /// result put on the wire with a straight face. No error anywhere.
 ///
-/// So this asserts the variant, which is the whole property. design.md §0.21.
+/// So this asserts the variant, which is the whole property. docs/design.md §0.21.
 #[test]
 fn a_union_is_lowered_through_its_selector_and_not_through_member_zero() {
     let mut g = VkAccelerationStructureGeometryKHR::default();

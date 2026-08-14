@@ -3198,7 +3198,7 @@ fn frame_glass(w: &WindowState) -> bool {
         "wc-compositor: window {} folds {inset} px of caption into its client area{}",
         w.id,
         match dwm {
-            // docs/waycompose-design.md §58.4, and the one Wine branch in this file. §31.7 named this
+            // docs/waycompose-design.md §60.4, and the one Wine branch in this file. §31.7 named this
             // exact hole — "a run that extends the frame and finds `dwmapi`
             // stubbed would look exactly like `noglass.png` and would report
             // success ... the one failure mode of this arrangement with no
@@ -3224,7 +3224,7 @@ fn frame_glass(w: &WindowState) -> bool {
             Some(0) if crate::wine::under_wine() =>
                 ", DwmExtendFrameIntoClientArea returned ok -- but this dwmapi is Wine's stub \
                  (DwmGetWindowAttribute is E_NOTIMPL) and nothing is composited behind the \
-                 frame; see docs/waycompose-design.md §58.4",
+                 frame; see docs/waycompose-design.md §60.4",
             Some(0) => ", DwmExtendFrameIntoClientArea ok",
             Some(_) => ", DwmExtendFrameIntoClientArea FAILED",
             None if w.frame.get().dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",

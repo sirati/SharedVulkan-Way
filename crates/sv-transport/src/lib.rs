@@ -1,7 +1,7 @@
 //! The transport: the control region, the rings, the handshake, and the wait
 //! primitive.
 //!
-//! This is design.md §4 made executable. The shape of the crate follows the
+//! This is docs/design.md §4 made executable. The shape of the crate follows the
 //! shape of that section:
 //!
 //! | module | design.md |
@@ -105,7 +105,7 @@ pub enum Error {
     // -- liveness (R4) ------------------------------------------------------
     /// The peer restarted: the generation moved under us. Every handle, offset
     /// and timeline the other side holds is stale, and the app side turns this
-    /// into `VK_ERROR_DEVICE_LOST` (design.md §4.3).
+    /// into `VK_ERROR_DEVICE_LOST` (docs/design.md §4.3).
     PeerRestarted { expected: u32, found: u32 },
     /// A wait hit its deadline. Always carries which ring, because "something
     /// timed out" is not a diagnosis.
@@ -120,7 +120,7 @@ pub enum Error {
     /// it is an error to the caller that asked not to wait.
     RingFull { ring: u32, need: u64, free: u64 },
     /// A packet longer than the ring can ever hold. This is a caller bug: the
-    /// payload belongs in an arena blob (design.md §6.5).
+    /// payload belongs in an arena blob (docs/design.md §6.5).
     PacketTooLarge { need: u64, capacity: u64 },
     /// A framing length that cannot be right. A zero-length record would make
     /// the consumer read the same bytes for ever, so it is rejected by name

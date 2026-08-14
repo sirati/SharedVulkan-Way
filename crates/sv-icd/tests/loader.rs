@@ -1,7 +1,7 @@
 //! The honest end-to-end test: drive this ICD **through the real Vulkan
 //! loader**.
 //!
-//! design.md §13 step 5 asks for "manifest, `VK_DRIVER_FILES`,
+//! docs/design.md §13 step 5 asks for "manifest, `VK_DRIVER_FILES`,
 //! dispatchable-handle magic, interface negotiation, `vulkaninfo` producing a
 //! sane report". `vulkaninfo` is a person running a command; this is the same
 //! path as a test, and it is the only test in the workspace that exercises:
@@ -12,7 +12,7 @@
 //!   loader overwrites the first word of every handle we return with its own
 //!   dispatch table pointer and then dereferences it on the next call. Getting
 //!   that wrong is a fault inside the loader with our frame nowhere in the
-//!   backtrace (design.md §6.4, R17), and the loader's own assertion is
+//!   backtrace (docs/design.md §6.4, R17), and the loader's own assertion is
 //!   debug-only.
 //!
 //! The loader is `dlopen`ed rather than linked, so the test skips cleanly on a
@@ -139,7 +139,7 @@ impl Loader {
         // the loader scans once per `vkCreateInstance`, so setting it here is in
         // time. `VK_DRIVER_FILES` rather than the deprecated
         // `VK_ICD_FILENAMES`: the loader ignores the latter when both are set
-        // (design.md §8).
+        // (docs/design.md §8).
         //
         // SAFETY: single-threaded at this point; no other thread reads the
         // environment.
@@ -248,7 +248,7 @@ fn a_trivial_application_gets_through_the_real_loader() {
     // SAFETY: the count-then-fill idiom, with a null array on the first call.
     check(unsafe { enumerate(instance, &raw mut count, core::ptr::null_mut()) },
         "vkEnumeratePhysicalDevices (count)");
-    assert_eq!(count, 1, "design.md §8: one virtual device");
+    assert_eq!(count, 1, "docs/design.md §8: one virtual device");
 
     let mut devices = vec![core::ptr::null_mut::<VkPhysicalDevice_T>(); count as usize];
     // SAFETY: `devices` has `count` elements.
@@ -265,7 +265,7 @@ fn a_trivial_application_gets_through_the_real_loader() {
     check(unsafe { enumerate(instance, &raw mut count, again.as_mut_ptr()) }, "enumerate twice");
     assert_eq!(again[0], phys, "physical device handles must be stable");
 
-    // -- the memory table, which is the point of design.md §9.1 --------------
+    // -- the memory table, which is the point of docs/design.md §9.1 --------------
     type PfnMemProps =
         unsafe extern "system" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties);
     // SAFETY: the specification's signature.
@@ -406,7 +406,7 @@ fn a_trivial_application_gets_through_the_real_loader() {
     // rest of the allocation".
     check(unsafe { map_memory(device, memory, 0, u64::MAX, VkMemoryMapFlags(0), &raw mut p) },
         "vkMapMemory");
-    assert!(!p.is_null(), "design.md §5.3: vkMapMemory returns a real pointer into the arena");
+    assert!(!p.is_null(), "docs/design.md §5.3: vkMapMemory returns a real pointer into the arena");
 
     // Writing through the mapping writes the shared file. That is the property
     // the whole design rests on, and here it is only checked as far as this

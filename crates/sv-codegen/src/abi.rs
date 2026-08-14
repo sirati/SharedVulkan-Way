@@ -13,7 +13,7 @@
 //! | `pNext` | `Vec<PNextLink>` | a raw pointer to a linked list |
 //! | `VkAllocationCallbacks` | excluded, not serialisable | in every creation signature |
 //!
-//! The last row is the one that catches people out. design.md §7.4 strips
+//! The last row is the one that catches people out. docs/design.md §7.4 strips
 //! `pAllocator` *above the protocol*, which is a statement about the wire; the
 //! parameter is still in the C signature and an ICD that omits it corrupts its
 //! caller's stack. Likewise the profile's `excluded_commands` list
@@ -53,7 +53,7 @@ use vk_registry::{
 ///   including device-level commands (they come back as trampolines).
 /// - `vkGetDeviceProcAddr(device, name)` answers **only** for [`Level::Device`].
 /// - `vk_icdGetPhysicalDeviceProcAddr` answers only for
-///   [`Level::PhysicalDevice`] (design.md §8: required from interface 4).
+///   [`Level::PhysicalDevice`] (docs/design.md §8: required from interface 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     /// No dispatchable first parameter: `vkCreateInstance`,
@@ -182,7 +182,7 @@ pub struct AbiCommand {
     ///
     /// `false` for the ICD's own: `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`,
     /// the swapchain family and the surface queries. Those are implemented on
-    /// the app side and never cross (design.md §8, §10).
+    /// the app side and never cross (docs/design.md §8, §10).
     pub forwarded: bool,
     pub returns_result: bool,
     pub returns_void: bool,
@@ -191,7 +191,7 @@ pub struct AbiCommand {
     /// `vk_registry::model::Command::externally_synchronizes_a_queue`, because
     /// the emitters see an [`AbiCommand`] and never the registry's own.
     ///
-    /// Pass 12 turns it into a lock around the driver call (design.md §0.12
+    /// Pass 12 turns it into a lock around the driver call (docs/design.md §0.12
     /// item 4). Nothing on the C ABI reads it: the app side's caller *is* the
     /// application, which Vulkan already obliges to synchronise itself.
     pub externsync_queue: bool,
@@ -258,7 +258,7 @@ pub fn surface_profile(wire: &Profile) -> Profile {
 
 /// The commands that are not on the C surface either, and the only ones.
 ///
-/// design.md §8: "We opt *out* of interface-3 surface creation by not exposing
+/// docs/design.md §8: "We opt *out* of interface-3 surface creation by not exposing
 /// `vkCreateXXXSurfaceKHR`, so the loader hands us a `VkIcdSurfaceXXX` from
 /// `vk_icd.h` which we cast." That decision is what makes advertising
 /// `VK_KHR_xcb_surface` cost nothing in platform headers, and it is enforced
@@ -372,7 +372,7 @@ pub fn build(model: &Model, profile: &Profile, forwarded: &BTreeSet<String>) -> 
         if profile.excluded_types.contains(&name) {
             bail!(
                 "the ICD's C surface reaches {name}, which is excluded because the \
-                 registry cannot describe it (design.md §7.4). Either the profile \
+                 registry cannot describe it (docs/design.md §7.4). Either the profile \
                  gained an extension it should not have, or the exclusion is wrong."
             );
         }
@@ -476,7 +476,7 @@ fn member(
              Rust has no `#[repr(C)]` bitfield; a struct whose members are *all* \
              `uint32_t` bitfields is carried as the one word it occupies \
              (plan::FlagWordPlan), and a struct that mixes the two has no \
-             C-compatible Rust definition at all (design.md §7.4).",
+             C-compatible Rust definition at all (docs/design.md §7.4).",
             m.name
         );
     }
@@ -533,7 +533,7 @@ fn array_len(model: &Model, term: &LenTerm) -> Option<ArrayLen> {
 /// the expression *is* the bound on a read of the application's memory, so the
 /// two ceiling-division forms are parsed rather than shrugged at.
 ///
-/// **And so is the fourth, as of design.md §0.21.** `2*VK_UUID_SIZE` is a
+/// **And so is the fourth, as of docs/design.md §0.21.** `2*VK_UUID_SIZE` is a
 /// *constant*: no sibling, no run-time input, just registry arithmetic the
 /// generator can do at build time. Leaving it `Unresolved` refused
 /// `VkAccelerationStructureVersionInfoKHR`'s lowering, which took
@@ -836,7 +836,7 @@ mod tests {
             bad.is_empty(),
             "every `len=` on the C surface must resolve to a concrete count, because \
              here it bounds a read of the application's memory rather than being the \
-             cross-check design.md §7.4 demotes it to on the wire: {bad:#?}"
+             cross-check docs/design.md §7.4 demotes it to on the wire: {bad:#?}"
         );
     }
 }

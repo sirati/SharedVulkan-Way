@@ -1,6 +1,6 @@
 //! Write the ICD manifest the loader reads, with an absolute `library_path`.
 //!
-//! design.md §8: the packaged driver installs a manifest into
+//! docs/design.md §8: the packaged driver installs a manifest into
 //! `/usr/share/vulkan/icd.d/`, and the development loop points `VK_DRIVER_FILES`
 //! at one the build generated with an absolute path — Kazan's clean pattern.
 //!
@@ -14,14 +14,14 @@
 //! - **`api_version` demotion.** If the JSON says < 1.1 the loader demotes us to
 //!   a 1.0 driver *and rewrites every `VkApplicationInfo::apiVersion` we
 //!   receive* — so a 1.3 application silently becomes a 1.0 one and nothing says
-//!   why (design.md §8). The version here must match what
+//!   why (docs/design.md §8). The version here must match what
 //!   `vkEnumerateInstanceVersion` returns, and there is a test that they agree.
 //! - **`is_portability_driver`.** Setting it true makes us invisible to every
 //!   application that has not set
 //!   `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`, which is almost all of
 //!   them.
 //!
-//! # The constraint design.md §0.18 had to establish, from the loader's source
+//! # The constraint docs/design.md §0.18 had to establish, from the loader's source
 //!
 //! §0.18 makes the advertised Vulkan version **negotiated** — the app side
 //! reports `min(what the driver behind it supports, what the wire carries)`
@@ -90,7 +90,7 @@ use std::path::PathBuf;
 /// This used to be the literal `"1.3.0"` with a test holding it in step. The
 /// test is still there, because it also checks the ≥ 1.1 rule that the module
 /// docs above explain — but it can no longer *fail* on the profile moving, which
-/// is the point: design.md §0.18 removed every hand-maintained copy of this
+/// is the point: docs/design.md §0.18 removed every hand-maintained copy of this
 /// number and this was the last one.
 fn manifest_api_version() -> String {
     // Missing means the dependency's build script did not run, which cannot

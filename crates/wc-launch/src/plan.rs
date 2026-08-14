@@ -374,7 +374,7 @@ mod tests {
 
     /// The codec the host CPU can afford, stated by the deployment.
     ///
-    /// design.md §0.17: on a VM host with no GPU, YouTube's ABR offers AV1 and
+    /// docs/design.md §0.17: on a VM host with no GPU, YouTube's ABR offers AV1 and
     /// Firefox decodes it in software on two cores, at **1.25× the CPU of
     /// H.264 on the medians** of eight interleaved windows at 720p60 and
     /// 1080p60 — and far less predictably. These two preferences are what

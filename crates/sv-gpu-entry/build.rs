@@ -1,4 +1,4 @@
-//! Generate pass 12 (design.md §7.2, as corrected) into `OUT_DIR`.
+//! Generate pass 12 (docs/design.md §7.2, as corrected) into `OUT_DIR`.
 //!
 //! Same rules as `sv-icd-entry`'s build script: the pinned registry is the only
 //! input, the output is not checked in, and determinism is asserted rather than

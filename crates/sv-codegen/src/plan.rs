@@ -6,7 +6,7 @@
 //! walk a [`Shape`] and print Rust — which is what makes them reviewable.
 //!
 //! Keeping the plan separate is also what makes the differential test of
-//! design.md §6.2/§7.3 possible: Venus's generated C is a sequence of typed
+//! docs/design.md §6.2/§7.3 possible: Venus's generated C is a sequence of typed
 //! encode calls, and so is a [`Shape`] walk, so the two can be compared without
 //! either of them running.
 //!
@@ -223,7 +223,7 @@ pub struct FieldPlan {
     /// `selector=` — this member is a **union**, and the named sibling of the
     /// same struct holds the discriminator that says which arm is live.
     ///
-    /// Ten members in the whole registry carry it, and until design.md §0.21
+    /// Ten members in the whole registry carry it, and until docs/design.md §0.21
     /// nothing read it: `exceptions`' own header records that unions needed no
     /// exception table because "a Rust `enum` *is* the tag", which is true of
     /// the wire and stops at the C ABI — where a union has no tag and the app
@@ -251,15 +251,15 @@ pub struct StructPlan {
     pub s_type_value: Option<i64>,
     pub has_p_next: bool,
     /// `returnedonly="true"`: the implementation fills it in, so the app side
-    /// sends the *partial* form (design.md §6.1, Venus's three-state validity).
+    /// sends the *partial* form (docs/design.md §6.1, Venus's three-state validity).
     pub returned_only: bool,
     /// Whether a `_partial` encoding is generated for this struct.
     pub needs_partial: bool,
     /// Whether this type transitively contains a handle, and so needs a
-    /// `handle_map` walker (design.md §7.2 pass 5).
+    /// `handle_map` walker (docs/design.md §7.2 pass 5).
     pub has_handles: bool,
     /// Whether this type transitively contains a `VkDeviceMemory`, and so needs
-    /// a `transform` walker (design.md §7.2 pass 6, §5.3).
+    /// a `transform` walker (docs/design.md §7.2 pass 6, §5.3).
     pub has_device_memory: bool,
     /// The structs this one may carry in its `pNext`, restricted to the profile.
     pub extenders: Vec<String>,
@@ -285,10 +285,10 @@ pub struct CommandPlan {
     pub return_type: Option<String>,
     /// Whether a reply is generated at all. A command with no outputs and no
     /// result is fire-and-forget, which is most of the `vkCmd*` family
-    /// (design.md §4.4: "Most commands generate no reply at all").
+    /// (docs/design.md §4.4: "Most commands generate no reply at all").
     pub generates_reply: bool,
     /// Part of the recorded `vkCmd*` subset the restricted sub-decoder accepts
-    /// (design.md §6.5).
+    /// (docs/design.md §6.5).
     pub is_recorded: bool,
     pub origin: String,
 }
@@ -324,7 +324,7 @@ pub struct BitField {
 ///
 /// # Why this shape exists at all
 ///
-/// design.md §7.4 put bitfields out of scope and the planner refused them
+/// docs/design.md §7.4 put bitfields out of scope and the planner refused them
 /// outright, because `vk.xml`'s only bitfield struct is
 /// `VkAccelerationStructureInstanceKHR`, which is ray tracing and out of scope
 /// anyway. `video.xml` is nothing like that: **293 of its members are
@@ -462,7 +462,7 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
                              `uint32_t` bitfields summing to at most 32 bits, as one `u32` \
                              (see plan::FlagWordPlan); a struct that mixes bitfields with \
                              ordinary members has no layout the registry states and none this \
-                             generator will invent (design.md §7.4). Exclude the type in the \
+                             generator will invent (docs/design.md §7.4). Exclude the type in the \
                              profile if this is intentional.",
                             m.name
                         );
@@ -515,7 +515,7 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         for p in &cmd.params {
-            // design.md §7.4: `pAllocator` is stripped above the protocol.
+            // docs/design.md §7.4: `pAllocator` is stripped above the protocol.
             if p.ty.base_name() == Some("VkAllocationCallbacks") {
                 exceptions.note_unserialisable(
                     "VkAllocationCallbacks",
@@ -540,7 +540,7 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
         let return_type = cmd.return_type.base_name().map(str::to_string);
         let returns_result = return_type.as_deref() == Some("VkResult");
         // **A reply exists whenever the command returns anything at all**, which
-        // is design.md §0.3 item 5's correction to this line and the hole it
+        // is docs/design.md §0.3 item 5's correction to this line and the hole it
         // named. `vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress`
         // and `vkGetDeviceMemoryOpaqueCaptureAddress` return a
         // `VkDeviceAddress` with no output parameter and no `VkResult`, so the
@@ -554,7 +554,7 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
         // true, and CTS called all three on the first afternoon anyone asked.
         let returns_value = return_type.is_some() && !returns_result;
         // A `vkCmd*` recorded into a blob never generates a reply: its result is
-        // the state of the command buffer, and design.md §6.5 sends the whole
+        // the state of the command buffer, and docs/design.md §6.5 sends the whole
         // blob as one `svExecuteCommandBlob`.
         let is_recorded = cmd.is_command_buffer_recorded();
         let generates_reply =
@@ -724,7 +724,7 @@ fn shape_of(
                         let policy = exceptions::void_policy(owner, &m.name).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "{owner}.{}: a `void*` with no `len=` and no policy entry. \
-                                 design.md §7.4 requires every one of these to be a data entry \
+                                 docs/design.md §7.4 requires every one of these to be a data entry \
                                  in crates/sv-codegen/src/exceptions.rs; add one, with the \
                                  reason.",
                                 m.name
@@ -733,7 +733,7 @@ fn shape_of(
                         exceptions.note_void(owner, &m.name, policy);
                         if policy == VoidPolicy::NotSerialisable {
                             bail!(
-                                "{owner}.{}: {:?} is not serialisable (design.md §6.1 \
+                                "{owner}.{}: {:?} is not serialisable (docs/design.md §6.1 \
                                  exclusion list)",
                                 m.name,
                                 m.name
@@ -825,7 +825,7 @@ fn scalar_of(model: &Model, owner: &str, field: &str, name: &str) -> Result<Scal
                     }
                     None => bail!(
                         "{owner}.{field}: {n} is an opaque platform type and is not \
-                         serialisable (design.md §6.1)"
+                         serialisable (docs/design.md §6.1)"
                     ),
                 }
             }
@@ -861,12 +861,12 @@ fn scalar_of(model: &Model, owner: &str, field: &str, name: &str) -> Result<Scal
         }
         TypeDef::FuncPointer(f) => bail!(
             "{owner}.{field}: {} is a function pointer, which is not serialisable \
-             (design.md §6.1, Venus's exclusion list)",
+             (docs/design.md §6.1, Venus's exclusion list)",
             f.name
         ),
         TypeDef::External { name: n, .. } => bail!(
             "{owner}.{field}: {n} comes from a platform header and is not serialisable \
-             (design.md §6.1)"
+             (docs/design.md §6.1)"
         ),
     })
 }
@@ -956,7 +956,7 @@ fn annotate_pnext(model: &Model, profile: &ResolvedProfile, plan: &mut Plan) {
 ///
 /// A fixpoint rather than a single pass because struct graphs are deep and, with
 /// `pNext`, cyclic in the type graph if not in any value. Passes 5 and 6 of
-/// design.md §7.2 are emitted only for types that can actually contain
+/// docs/design.md §7.2 are emitted only for types that can actually contain
 /// something to rewrite, which is what keeps them from being two more full
 /// walks over 700 structs.
 fn annotate_reachability(plan: &mut Plan) {
@@ -985,7 +985,7 @@ fn annotate_reachability(plan: &mut Plan) {
             // A struct's chain can carry any extender, so a chain member
             // inherits every extender's properties. Missing that is how a
             // `(memory, offset)` pair hidden in a `pNext` extender escapes the
-            // transform pass — the exact failure design.md §5.3 warns about.
+            // transform pass — the exact failure docs/design.md §5.3 warns about.
             let reachable: Vec<&String> = names.iter().chain(s.extenders.iter()).collect();
             for n in reachable {
                 let Some(&j) = index.get(n.as_str()) else { continue };
@@ -1023,7 +1023,7 @@ fn shape_has_handle(shape: &Shape) -> bool {
 
 /// Decide which structs need a `_partial` encoding.
 ///
-/// Venus's rule, taken verbatim (design.md §6.1 adopts its three-state output
+/// Venus's rule, taken verbatim (docs/design.md §6.1 adopts its three-state output
 /// validity): a struct that is `returnedonly` and appears as an output is
 /// encoded partially on the way *to* the GPU side, because its contents are
 /// whatever the caller's uninitialised memory held. Any struct reachable from

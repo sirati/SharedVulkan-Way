@@ -17,7 +17,7 @@
 //!    is the `mmap` there the same pages?** An in-process `mmap` proves the
 //!    exporter implements `mmap`; it does not prove the object is shareable.
 //! 2. **Can a `VkBuffer` be bound to it and can the GPU read what the other
-//!    process wrote?** That is R15 — design.md §14's largest open item — for
+//!    process wrote?** That is R15 — docs/design.md §14's largest open item — for
 //!    this topology, and it is the difference between "the CPU can share memory"
 //!    and "the arena works".
 //! 3. **Can the other process see what the GPU wrote?** The direction that
@@ -132,7 +132,7 @@ fn gpu(socket: &str, device: usize, bytes: u64) -> Result<(), Box<dyn std::error
     ColdMessage::Attach(at).encode(&mut buf)?;
     let fd = a.exported_fd.as_ref().ok_or("no exported descriptor")?.as_fd();
     send_with_fds(&sock, &buf, &[fd])?;
-    println!("[gpu] dma-buf descriptor passed over SCM_RIGHTS — the quarantined path (design.md §1a)");
+    println!("[gpu] dma-buf descriptor passed over SCM_RIGHTS — the quarantined path (docs/design.md §1a)");
 
     // The app side says when it has written the input half.
     let msg = recv(&sock)?;

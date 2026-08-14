@@ -4,7 +4,7 @@
 //!
 //! `ash::vk::PhysicalDeviceLimits` and `sv_proto::VkPhysicalDeviceLimits`
 //! describe the same 106 numbers and are both `#[repr(C)]`-shaped, so a
-//! reinterpretation would work today. design.md §7.3 forbids exactly that —
+//! reinterpretation would work today. docs/design.md §7.3 forbids exactly that —
 //! "nothing is transmuted out of shared memory … every field is assembled from a
 //! cursor" — and the argument generalises: two independently generated views of
 //! one C struct agreeing about layout is a coincidence maintained by two

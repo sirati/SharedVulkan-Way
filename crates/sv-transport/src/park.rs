@@ -1,6 +1,6 @@
 //! The wait primitive, behind a trait, with a deadline on every wait.
 //!
-//! design.md §4.5 and D9:
+//! docs/design.md §4.5 and D9:
 //!
 //! > Ship polling. sharedgl proves polling works and demonstrates nothing
 //! > whatsoever about interrupts, since it never uses `ivshmem-doorbell` and
@@ -53,7 +53,7 @@ impl Deadline {
     }
 }
 
-/// Why a park stopped. design.md §4.5's `Woken | TimedOut | Fatal`.
+/// Why a park stopped. docs/design.md §4.5's `Woken | TimedOut | Fatal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkOutcome {
     Woken,
@@ -80,7 +80,7 @@ pub struct WaitSite<'a> {
     /// `None` for the waits that are not: a barrier waits on another ring's
     /// `completed_seqno` and nobody rings a bell for it, so those fall back to
     /// spinning — which is right, because a barrier is satisfied on the first
-    /// load in the common case (design.md §4.4).
+    /// load in the common case (docs/design.md §4.4).
     pub bell: Option<Bell<'a>>,
     /// Say "still here" while spinning and yielding.
     ///
@@ -321,7 +321,7 @@ impl Doorbell for NoDoorbell {
     fn ring(&self, _ring: RingId) {}
 }
 
-/// design.md §4.5 implementation 1: "bounded spin with `pause`, then `yield`,
+/// docs/design.md §4.5 implementation 1: "bounded spin with `pause`, then `yield`,
 /// then sleep with exponential backoff to a 200 µs ceiling. v1 on both sides."
 #[derive(Debug, Clone, Copy)]
 pub struct SpinYield {
@@ -407,7 +407,7 @@ impl Parker for SpinYield {
     }
 }
 
-/// design.md §4.5 implementation 2: "`Futex` — Linux-only, works across
+/// docs/design.md §4.5 implementation 2: "`Futex` — Linux-only, works across
 /// processes on shared memory. Used by the same-machine development loop, where
 /// it is strictly better than spinning and costs nothing."
 ///
@@ -437,7 +437,7 @@ impl Parker for SpinYield {
 /// # A shared futex is a same-kernel mechanism, and this degrades rather than
 /// breaks
 ///
-/// design.md §1a forbids a *descriptor* crossing the boundary; a futex is not
+/// docs/design.md §1a forbids a *descriptor* crossing the boundary; a futex is not
 /// one, but it is worth being explicit that the wake is co-location-dependent
 /// in the same spirit. Two processes on one kernel hash a `MAP_SHARED` word to
 /// the same futex key and `FUTEX_WAKE` reaches the peer. Across a hypervisor
@@ -768,7 +768,7 @@ mod sys {
 /// Wait for `ready`, and turn a timeout into a diagnosis rather than into a
 /// retry loop.
 ///
-/// This is the function callers should use. It is where design.md §4.5's last
+/// This is the function callers should use. It is where docs/design.md §4.5's last
 /// paragraph lives:
 ///
 /// > A wait that expires checks the peer heartbeat and the generation counter
@@ -1361,7 +1361,7 @@ mod tests {
 
     #[test]
     fn the_doorbell_is_only_paid_for_when_the_consumer_has_parked() {
-        // design.md §4.4: "the producer checks `IDLE` before paying for a
+        // docs/design.md §4.4: "the producer checks `IDLE` before paying for a
         // notification". The check is the producer's, so this test is about the
         // status word being usable for it — the mechanism, not a policy buried
         // in the producer.

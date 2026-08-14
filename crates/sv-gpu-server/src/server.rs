@@ -24,7 +24,7 @@
 //!   allocation, so `vkCreateInstance` and `vkCreateDevice` bind an id to
 //!   objects that already exist;
 //! - **the arena** — `vkAllocateMemory` is a sub-range of an imported slab and
-//!   never reaches a driver (design.md §5.2, §5.3);
+//!   never reaches a driver (docs/design.md §5.2, §5.3);
 //! - **two queries whose answer is ours** — the memory table of §9.1 is
 //!   renumbered, and the device-extension list is a promise about what *we*
 //!   forward rather than a report of what the driver has;
@@ -53,7 +53,7 @@ use sv_wire::{Result as WireResult, WireError};
 ///
 /// # What is per session and what is per device
 ///
-/// Since design.md §0.11 this process serves **several independent sessions**,
+/// Since docs/design.md §0.11 this process serves **several independent sessions**,
 /// one per connected client, each on its own threads. The split is by whether
 /// two clients could tread on each other:
 ///
@@ -73,7 +73,7 @@ pub struct Shared {
     pub arena: Arena,
     pub objects: Mutex<Objects>,
     /// The driver's entry points, resolved once by name from the same `vk.xml`
-    /// the wire format is generated from (design.md §7.2, pass 12).
+    /// the wire format is generated from (docs/design.md §7.2, pass 12).
     pub fns: Arc<DriverFns>,
     /// External synchronisation for the one `VkQueue` this device has.
     ///
@@ -405,7 +405,7 @@ impl GpuHost for GpuServer {
     /// **The only command on this surface the GPU side alters rather than
     /// reproduces**, and the alteration is about the arena rather than about
     /// buffers. The arena's `VkDeviceMemory` is external memory on every
-    /// provider of design.md §5.4 — exported as a dma-buf here, imported as a
+    /// provider of docs/design.md §5.4 — exported as a dma-buf here, imported as a
     /// host pointer on the Windows path — and a buffer bound into external
     /// memory must have been *created* naming at least one of the same handle
     /// types. Without it RADV renders correctly and the validation layer says
@@ -424,7 +424,7 @@ impl GpuHost for GpuServer {
     /// `memoryTypeBits`. `Driver::assert_arena_buffers_are_exportable` checks
     /// at startup that it does not narrow it past the arena.
     ///
-    /// **It cannot be done by the app side.** design.md §0.4 says "the app side
+    /// **It cannot be done by the app side.** docs/design.md §0.4 says "the app side
     /// cannot add that chain — it does not know the handle type", which is true
     /// and understates it: the handle type is chosen by whichever §5.4 provider
     /// this side used, and on the app-allocated path the `Attach` that carries
@@ -494,7 +494,7 @@ impl GpuHost for GpuServer {
         // `ppData` is on §6.1's exclusion list ("pointers to mapped memory
         // regions … are **not serialisable**"), so `VkMapMemoryReply` carries a
         // result and nothing else. The app side's `vkMapMemory` returns a
-        // pointer into its own mapping of the arena (design.md §5.3); this
+        // pointer into its own mapping of the arena (docs/design.md §5.3); this
         // exists so that an app side which asks anyway gets a success rather
         // than a refusal.
         let _ = a;
@@ -529,7 +529,7 @@ impl GpuHost for GpuServer {
         &mut self,
         _a: p::VkGetPhysicalDeviceMemoryPropertiesArgs,
     ) -> WireResult<p::VkGetPhysicalDeviceMemoryPropertiesReply> {
-        // Reported for diagnostics only: design.md §9.1 says the app side
+        // Reported for diagnostics only: docs/design.md §9.1 says the app side
         // advertises its own four-type table and does not mirror this one, and
         // `sv-icd` answers the command locally so this reply is never consulted.
         Ok(p::VkGetPhysicalDeviceMemoryPropertiesReply {
@@ -553,7 +553,7 @@ impl GpuHost for GpuServer {
     /// The one queue family this GPU side has, described from the queue it
     /// actually opened.
     ///
-    /// Not the driver's table. design.md §8 gives one physical device and
+    /// Not the driver's table. docs/design.md §8 gives one physical device and
     /// `crate::driver` opens one queue on one family; an application handed
     /// RADV's five families would ask for family 3 and be given family 0's
     /// queue with no diagnostic. The flags are the real ones for the family we

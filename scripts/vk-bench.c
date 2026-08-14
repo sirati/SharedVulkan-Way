@@ -1,6 +1,6 @@
 /* vk-bench — what a forwarded Vulkan costs, measured through the real loader.
  *
- * design.md §13 step 1 asks for "a throughput/latency benchmark" and there was
+ * docs/design.md §13 step 1 asks for "a throughput/latency benchmark" and there was
  * never one. This is it, written at the *application* level rather than at the
  * transport level, for the reason §0.6 item 7 gives about control runs: the only
  * number that means anything is the one an application can observe, and the same
@@ -299,7 +299,7 @@ int main(void) {
 
     /* ---- arena-write: what a host-visible mapping costs to dribble into ----
      *
-     * design.md §6.5 puts a command buffer's recording in *arena* memory, and
+     * docs/design.md §6.5 puts a command buffer's recording in *arena* memory, and
      * `measured-gpu-side.md` says the arena costs nothing — 34.08 GB/s imported
      * against 33.56 for a driver allocation. That was one large sequential copy.
      * Recording is the opposite shape: a few dozen bytes at a time, with an
@@ -372,7 +372,7 @@ int main(void) {
          * `spaced-arena` minus `spaced-plain` is therefore the real per-command
          * price of putting a command blob in *this* arena, and it is a property
          * of the memory type the provider chose. On the `testhost` topology
-         * the arena is ordinary guest RAM (design.md §5.6 makes it write-back)
+         * the arena is ordinary guest RAM (docs/design.md §5.6 makes it write-back)
          * and this difference should vanish; on the Linux GPU-export provider
          * the arena is the driver's, and it does not. */
         volatile unsigned sink = 0;

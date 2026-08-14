@@ -18,7 +18,7 @@
 # WHAT --containers DEMONSTRATES that two plain processes cannot: the app side
 # runs in a sandbox with **no /dev/dri and no /dev/nvidia at all**. It has no
 # GPU, cannot open one, and still ends up with a CPU pointer to memory the GPU
-# is computing into. That is design.md §1's invariant and the project's whole
+# is computing into. That is docs/design.md §1's invariant and the project's whole
 # premise, as a process boundary rather than an argument.
 set -uo pipefail
 

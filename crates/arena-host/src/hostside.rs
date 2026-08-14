@@ -200,7 +200,7 @@ pub fn run() {
             let found = scan(&file, size, run);
             report_map(&found, &regions, arg(&args, "--out"));
         }
-        // design.md §0.14: the same extent, located by either mechanism or by
+        // docs/design.md §0.14: the same extent, located by either mechanism or by
         // both. `--locator scan` is `scan` under another name and is the default
         // so that nothing acquires the undocumented dependency by accident;
         // `both` is R28's cross-check and is the mode that proves the frame path
@@ -737,7 +737,7 @@ fn report_map(found: &[(u32, u64)], regions: &[Region], out: Option<String>) {
 }
 
 // ---------------------------------------------------------------------------
-// the frame-list locator, and R28's cross-check (design.md §0.14)
+// the frame-list locator, and R28's cross-check (docs/design.md §0.14)
 // ---------------------------------------------------------------------------
 
 /// Read the frame list out of the guest's `guest-status.txt`.
@@ -1091,7 +1091,7 @@ mod tests {
 // udmabuf: can the located pages become a real Linux dma-buf?
 // ---------------------------------------------------------------------------
 //
-// design.md §0.7 recorded three closed routes for RADV and gave the third as
+// docs/design.md §0.7 recorded three closed routes for RADV and gave the third as
 // "`/dev/udmabuf`: `Permission denied` — `root:kvm` 0660, this account is not in
 // `kvm`". That was measured on **devhost**, where `sirati` is in
 // `users wheel lp networkmanager scanner libvirtd` and not in `kvm`. On
@@ -1261,7 +1261,7 @@ fn udmabuf_probe(file: &File, map: &[(u32, u64)], limit_mb: u64) {
 /// Wrap a raw fd as an owning `File`, so the dma-buf is closed when the
 /// borrow that maps it goes out of scope. The mapping outlives the descriptor,
 /// which is ordinary `mmap` behaviour and is also the point: **the fd is made
-/// on this side and never leaves it** (design.md §1a).
+/// on this side and never leaves it** (docs/design.md §1a).
 fn dev_file(fd: i32) -> File {
     use std::os::unix::io::FromRawFd;
     unsafe { File::from_raw_fd(fd) }

@@ -2,7 +2,7 @@
 //!
 //! Everything in this crate is emitted by `sv-codegen` from the registry
 //! `$VK_XML` names. Nothing here is hand-written except this file and [`sv`],
-//! which carries design.md §6.3's non-Vulkan commands — "hand-written, not
+//! which carries docs/design.md §6.3's non-Vulkan commands — "hand-written, not
 //! generated, and … the only place the protocol is ours rather than Vulkan's".
 //! They live here rather than in `sv-wire` because they are protocol and not
 //! primitives, and beside the generated protocol because both sides need them
@@ -11,7 +11,7 @@
 //!
 //! # `#![forbid(unsafe_code)]`
 //!
-//! design.md §7.3 makes this the crate's central claim, and it applies to all of
+//! docs/design.md §7.3 makes this the crate's central claim, and it applies to all of
 //! it — encode, decode, pnext, transform, handle map, sub-decoder:
 //!
 //! > The generated marshalling is the largest body of code in the project and
@@ -39,7 +39,7 @@
 //! It has no I/O, no transport, no Vulkan. It turns values into bytes and bytes
 //! into values, and it defines the [`Server`] trait that the GPU side
 //! implements. That is why it can be tested with no driver present, which is
-//! what design.md §13 steps 1–6 depend on.
+//! what docs/design.md §13 steps 1–6 depend on.
 
 #![forbid(unsafe_code)]
 // The generated code names Vulkan constants exactly as the registry spells
@@ -76,7 +76,7 @@ include!(concat!(env!("OUT_DIR"), "/sv_proto.rs"));
 
 pub mod sv;
 
-/// The `protocol_hash` this build carries into the handshake (design.md §4.3).
+/// The `protocol_hash` this build carries into the handshake (docs/design.md §4.3).
 ///
 /// Computed by the generator over the manifest it emitted — the full command and
 /// struct table, plus the exceptions it consulted — and *not* over `vk.xml`,
@@ -110,7 +110,7 @@ pub const PROTOCOL_PROFILE: &str = env!("SV_PROTOCOL_PROFILE");
 /// and structures of that version exist, and the side that has to keep it is the
 /// app side, whose whole vocabulary is this profile. So the app side advertises
 /// `min(what the driver reports, this)` — never a constant, and never the
-/// driver's number unclamped. design.md §0.18 has the measurement of what
+/// driver's number unclamped. docs/design.md §0.18 has the measurement of what
 /// claiming more than this costs (two GL versions, through Zink).
 pub const CORE_API_VERSION: u32 = {
     const S: &str = env!("SV_PROTOCOL_CORE_VERSION");

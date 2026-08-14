@@ -14,7 +14,7 @@
 //! else, in either direction, between a guest and its host.
 //!
 //! **That observation has since been promoted from "this module's reason to
-//! exist" to a rule for the whole project** — design.md §1a — and `cold.rs` has
+//! exist" to a rule for the whole project** — docs/design.md §1a — and `cold.rs` has
 //! no ancillary data in it any more. What is left of the distinction is only the
 //! *transport*: this module frames for a character device and `cold.rs` frames
 //! for a socket, and the messages are the same messages.

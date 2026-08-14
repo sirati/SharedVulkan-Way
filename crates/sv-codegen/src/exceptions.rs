@@ -1,7 +1,7 @@
 //! The exception table: everything `vk.xml` cannot express, budgeted rather
 //! than discovered.
 //!
-//! design.md §7.4 is the specification for this file, and its closing sentence
+//! docs/design.md §7.4 is the specification for this file, and its closing sentence
 //! is the rule it enforces: "Every exception is a data entry in one file, and an
 //! unlisted case is a build failure. That is the difference between a generator
 //! that is honest about its limits and one that emits plausible-looking wrong
@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 
 /// What to do with a `void*` that is not `pNext` and has no `len=`.
 ///
-/// design.md §7.4 counts 103 of these registry-wide. Those with a `len` are
+/// docs/design.md §7.4 counts 103 of these registry-wide. Those with a `len` are
 /// blobs and need no entry. The rest are listed here by `(owner, field)`, and an
 /// unlisted one is a generator error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub enum VoidPolicy {
     ///
     /// `pHostPointer` is the interesting one, exactly as §7.4 says: it is
     /// `VK_EXT_external_memory_host`, and in our design a host pointer *is* an
-    /// arena offset (design.md §5.3). It crosses as a `u64` offset, and the GPU
+    /// arena offset (docs/design.md §5.3). It crosses as a `u64` offset, and the GPU
     /// side resolves it against its own mapping of the same pages.
     ArenaOffset,
     /// An opaque token the app side owns and the GPU side never dereferences.
@@ -64,7 +64,7 @@ pub enum VoidPolicy {
     /// Not serialisable at all; a command or struct reaching one is a build
     /// failure.
     ///
-    /// Venus's exclusion list, taken verbatim in spirit (design.md §6.1):
+    /// Venus's exclusion list, taken verbatim in spirit (docs/design.md §6.1):
     /// function pointers, pointers to mapped memory, WSI handles and external
     /// handles are not serialisable.
     NotSerialisable,
@@ -83,13 +83,13 @@ pub fn void_policy(owner: &str, field: &str) -> Option<VoidPolicy> {
 }
 
 const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
-    // design.md §5.3: an app-side `vkMapMemory` pointer is arena_base + offset,
+    // docs/design.md §5.3: an app-side `vkMapMemory` pointer is arena_base + offset,
     // and the GPU side never maps arena memory through the driver at all. The
     // import path therefore carries an offset.
     ("VkImportMemoryHostPointerInfoEXT", "pHostPointer", VoidPolicy::ArenaOffset),
     ("vkGetMemoryHostPointerPropertiesEXT", "pHostPointer", VoidPolicy::ArenaOffset),
     // `vkMapMemory`'s out-parameter is a pointer into our own mapping. It is
-    // computed app-side and never crosses (design.md §5.3: "no round trip and
+    // computed app-side and never crosses (docs/design.md §5.3: "no round trip and
     // no copy"), so the command is forwarded without it.
     ("vkMapMemory", "ppData", VoidPolicy::NotSerialisable),
     // `vkMapMemory2` is core 1.4's promotion of `VK_KHR_map_memory2` and its
@@ -119,7 +119,7 @@ const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
     // of the same pages. No length needs to cross, and no copy happens.
     //
     // `VK_KHR_descriptor_update_template` is one of zink's five hard
-    // requirements (design.md §11), so this is not a case that can be excluded.
+    // requirements (docs/design.md §11), so this is not a case that can be excluded.
     ("vkUpdateDescriptorSetWithTemplate", "pData", VoidPolicy::ArenaOffset),
     ("vkUpdateDescriptorSetWithTemplateKHR", "pData", VoidPolicy::ArenaOffset),
     ("vkCmdPushDescriptorSetWithTemplate", "pData", VoidPolicy::ArenaOffset),
@@ -134,11 +134,11 @@ const BY_FIELD_NAME: &[(&str, VoidPolicy)] = &[
     ("pCheckpointMarker", VoidPolicy::OpaqueToken),
     ("pTag", VoidPolicy::OpaqueToken),
     // An external handle by any name. Venus excludes these and so do we
-    // (design.md §9.2: we do not advertise handle types we cannot honour).
+    // (docs/design.md §9.2: we do not advertise handle types we cannot honour).
     ("handle", VoidPolicy::NotSerialisable),
     ("hostAddress", VoidPolicy::ArenaOffset),
     // Every `pHostPointer` in the registry is the same thing: application memory
-    // the driver reads or writes directly. design.md §5.3 says what an app-side
+    // the driver reads or writes directly. docs/design.md §5.3 says what an app-side
     // pointer into mapped memory *is* in this design — `arena_base + offset` —
     // so the offset is what crosses, and the GPU side resolves it against its
     // own mapping of the same pages.
@@ -171,25 +171,25 @@ const UNSERIALISABLE: &[(&str, &str)] = &[
         "VkAllocationCallbacks",
         "host allocators are not supported: the callbacks are function pointers, \
          which do not cross an address-space boundary. Stripped above the \
-         protocol, as Mesa's Venus driver does (design.md §7.4)",
+         protocol, as Mesa's Venus driver does (docs/design.md §7.4)",
     ),
     (
         "VkAccelerationStructureInstanceKHR",
         "bitfields the registry cannot describe, and out of scope with ray \
-         tracing (design.md §7.4)",
+         tracing (docs/design.md §7.4)",
     ),
     (
         "VkAccelerationStructureMatrixMotionInstanceNV",
-        "bitfields the registry cannot describe (design.md §7.4)",
+        "bitfields the registry cannot describe (docs/design.md §7.4)",
     ),
     (
         "VkAccelerationStructureSRTMotionInstanceNV",
-        "bitfields the registry cannot describe (design.md §7.4)",
+        "bitfields the registry cannot describe (docs/design.md §7.4)",
     ),
     (
         "VkDebugUtilsMessengerCreateInfoEXT",
         "carries a function pointer; the reverse ring forwards messages instead \
-         (design.md §4.6)",
+         (docs/design.md §4.6)",
     ),
 ];
 
@@ -260,7 +260,7 @@ pub fn platform_scalar(type_name: &str) -> Option<&'static str> {
 /// "a sibling decides this and I cannot express how".
 ///
 /// A lowering that reads whichever pointers happen to be non-null is therefore
-/// making an out-of-bounds read of the *application's* memory — design.md §0.3
+/// making an out-of-bounds read of the *application's* memory — docs/design.md §0.3
 /// item 2's hazard exactly, met for the second time and this time live. What it
 /// produced was a `VkBuffer` id of `0xFFFFFFFF00000001` on the wire and
 /// `no VkBuffer with id …` on the GPU side; and that is the **lucky** outcome,
@@ -272,7 +272,7 @@ pub fn platform_scalar(type_name: &str) -> Option<&'static str> {
 /// # Why no harness had caught it
 ///
 /// Zink uses descriptor update *templates* unconditionally in its default mode
-/// (design.md §0.4 item 10), and this project expands those app-side into wire
+/// (docs/design.md §0.4 item 10), and this project expands those app-side into wire
 /// structs directly, never touching this lowering. DXVK leans on templates too.
 /// So the direct `vkUpdateDescriptorSets` path — the one every ordinary Vulkan
 /// application uses — had never been exercised by anything in this tree until
@@ -309,7 +309,7 @@ pub fn sibling_selected(owner: &str, member: &str) -> Option<(&'static str, &'st
 }
 
 /// Members whose value is a `(memory, offset)` pair the `transform` pass must
-/// rewrite (design.md §5.3).
+/// rewrite (docs/design.md §5.3).
 ///
 /// Derived, not listed: any `VkDeviceMemory`-typed member, paired with the
 /// sibling that holds its offset. The pairing rule is here rather than in the
@@ -317,7 +317,7 @@ pub fn sibling_selected(owner: &str, member: &str) -> Option<(&'static str, &'st
 ///
 /// > "A generated pass that walks whole struct graphs is the only tractable way
 /// > to catch all of them; hand-listing the sites is how this goes wrong."
-/// > — design.md §5.3
+/// > — docs/design.md §5.3
 pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<String> {
     // `memory` → `memoryOffset`; `memory` → `offset`; `pMemory` → `pOffset`.
     let base = memory_member.trim_start_matches('p');
@@ -337,7 +337,7 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
 
 /// The two commands that frame a blob and are therefore inside it.
 ///
-/// design.md §6.5 gives the sub-decoder "only the `vkCmd*` opcode subset". That
+/// docs/design.md §6.5 gives the sub-decoder "only the `vkCmd*` opcode subset". That
 /// is one command short at each end. The GPU side replays a blob when it
 /// *arrives*, not when the application recorded it, so a `vkBeginCommandBuffer`
 /// that crossed as an ordinary round trip would open the driver's command buffer
@@ -366,23 +366,23 @@ pub const BLOB_FRAMING: &[&str] = &["vkBeginCommandBuffer", "vkEndCommandBuffer"
 ///    than creating new ones, and `vkDestroyDevice` must not destroy the device
 ///    the arena lives in.
 /// 2. **The arena.** `vkAllocateMemory` is a sub-range of a slab the GPU side
-///    already imported (design.md §5.2, §5.3); it never reaches a driver.
+///    already imported (docs/design.md §5.2, §5.3); it never reaches a driver.
 /// 3. **Submission.** `vkQueueSubmit` carries `svExecuteCommandBlob`
-///    descriptors, not a driver call (design.md §6.5).
+///    descriptors, not a driver call (docs/design.md §6.5).
 /// 4. **Two queries whose answer is ours rather than the driver's**: the memory
-///    table of design.md §9.1, which is renumbered, and the extension list,
+///    table of docs/design.md §9.1, which is renumbered, and the extension list,
 ///    which is a promise about what *we* forward.
 pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     // --- 1. the session ---------------------------------------------------
     ("vkCreateInstance", "binds an id to the instance the GPU side already opened"),
     ("vkDestroyInstance", "the GPU side's instance outlives any one client"),
-    ("vkEnumeratePhysicalDevices", "design.md §8 advertises exactly one device"),
+    ("vkEnumeratePhysicalDevices", "docs/design.md §8 advertises exactly one device"),
     ("vkCreateDevice", "binds an id to the device the arena was allocated from"),
     ("vkDestroyDevice", "the arena lives in this device"),
     ("vkGetDeviceQueue", "the queue was chosen at startup, with the arena"),
     ("vkGetDeviceQueue2", "as vkGetDeviceQueue"),
     // --- 2. the arena -----------------------------------------------------
-    ("vkAllocateMemory", "a sub-range of an imported slab (design.md §5.2)"),
+    ("vkAllocateMemory", "a sub-range of an imported slab (docs/design.md §5.2)"),
     ("vkFreeMemory", "returns a sub-range to the allocator, and must not free the slab"),
     ("vkMapMemory", "the mapping is the app side's; nothing crosses"),
     ("vkUnmapMemory", "as vkMapMemory"),
@@ -392,7 +392,7 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     // than reproduce, and the reason is the arena rather than the command.
     //
     // The arena's `VkDeviceMemory` is external memory on every provider of
-    // design.md §5.4 — exported as a dma-buf on the GPU-allocated path,
+    // docs/design.md §5.4 — exported as a dma-buf on the GPU-allocated path,
     // imported as a host pointer on the app-allocated one — and Vulkan requires
     // that every buffer bound into such memory was *created* naming at least
     // one of the same handle types (`VUID-vkBindBufferMemory-memory-02726` and
@@ -410,7 +410,7 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     ("vkCreateBuffer", "the arena is external memory, so every buffer bound into it must say so"),
     // --- 3. answers that are ours -----------------------------------------
     //
-    // `vkQueueSubmit` is deliberately **not** here, although design.md §6.5
+    // `vkQueueSubmit` is deliberately **not** here, although docs/design.md §6.5
     // implies it must be. Its blob form (`svExecuteCommandBlob`) is a change to
     // what the *app side* sends, not to what the GPU side does with a
     // `VkSubmitInfo`, and until the app side records blobs the generic
@@ -418,7 +418,7 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     // it carries the `pNext` chain, so a timeline-semaphore submit works.
     (
         "vkGetPhysicalDeviceMemoryProperties",
-        "design.md §9.1's table is renumbered; the driver's would index ours wrongly",
+        "docs/design.md §9.1's table is renumbered; the driver's would index ours wrongly",
     ),
     ("vkGetPhysicalDeviceMemoryProperties2", "as vkGetPhysicalDeviceMemoryProperties"),
     (
@@ -471,7 +471,7 @@ fn lower_first(s: &str) -> String {
 /// Every exception the generator actually consulted, for the build log and for
 /// the manifest that the protocol hash is computed over.
 ///
-/// design.md §4.3: the hash is "computed by the generator over the full command
+/// docs/design.md §4.3: the hash is "computed by the generator over the full command
 /// and struct table it emitted — not over `vk.xml`, because … the generator
 /// version matters too". An exception table that changed without the registry
 /// changing is exactly the kind of generator-version change that must move the

@@ -1,6 +1,6 @@
 //! `VK_KHR_swapchain`, implemented entirely on the app side.
 //!
-//! design.md §10 stage 2, with one correction to it that runs through the whole
+//! docs/design.md §10 stage 2, with one correction to it that runs through the whole
 //! file and is worth stating first.
 //!
 //! # The correction: presentation needs no protocol
@@ -116,7 +116,7 @@ struct SwapImage {
     fence: u64,
     /// The arena address of the readback buffer, as a `usize` so that [`State`]
     /// stays `Send`. It is a pointer into the arena mapping, which outlives
-    /// every swapchain (design.md §5.3: the arena is mapped for the process's
+    /// every swapchain (docs/design.md §5.3: the arena is mapped for the process's
     /// lifetime), so it does not dangle when this struct moves.
     pixels: usize,
 }
@@ -408,7 +408,7 @@ fn create_readback(
     result_ok(b.result)?;
 
     // The whole point of the project, used by the project itself: the presented
-    // frame is readable here with no copy and no round trip (design.md §5.3).
+    // frame is readable here with no copy and no round trip (docs/design.md §5.3).
     let ptr = IcdLocal::map_memory(icd, device, memory, 0, len)?;
     Ok((buffer, memory, ptr as usize))
 }
@@ -483,7 +483,7 @@ fn record_copy(
     let region = p::VkBufferImageCopy {
         buffer_offset: 0,
         // Zero means "tightly packed to `imageExtent.width`", which is the
-        // third of design.md §10's improvements over sharedgl: the stride is
+        // third of docs/design.md §10's improvements over sharedgl: the stride is
         // the actual width rather than the configured maximum.
         buffer_row_length: 0,
         buffer_image_height: 0,
@@ -662,7 +662,7 @@ pub fn queue_present(
     // SAFETY: `pixels` is the address `vkMapMemory` returned for this buffer's
     // arena allocation, whose length is at least `len` by construction in
     // `create_readback`, and the arena mapping outlives every swapchain
-    // (design.md §5.3). The GPU side's write to it is ordered before this read
+    // (docs/design.md §5.3). The GPU side's write to it is ordered before this read
     // by the fence just waited on.
     let bytes = unsafe { core::slice::from_raw_parts(pixels as *const u8, len) };
     frame_note(swapchain, bytes, width, height);

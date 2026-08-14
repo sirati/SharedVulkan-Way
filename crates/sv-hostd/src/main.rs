@@ -6,7 +6,7 @@
 //!
 //! One extent, any number of clients. Each client that connects gets an
 //! `Attachment` describing the two views and **the name of the object to map
-//! them from**, which it opens itself — design.md §1a. No descriptor crosses,
+//! them from**, which it opens itself — docs/design.md §1a. No descriptor crosses,
 //! which is what lets the same handoff work when the peer is a VM.
 //!
 //! Each client replies `Accept` once it has opened the object. The daemon waits
@@ -348,14 +348,14 @@ fn qemu_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// **The name is QEMU's backing object, and the ICD opens it itself**
 /// (`qemu::backend_name`): the `mem-path` when the guest is on
 /// `memory-backend-file`, and `/proc/<qemu-pid>/fd/<n>` when it is on
-/// `memory-backend-memfd`. design.md §1a calls the second case legal and says
+/// `memory-backend-memfd`. docs/design.md §1a calls the second case legal and says
 /// what it costs — it is a same-machine name, so it may only ever be given to
 /// the *app* side, which is where every reader of it is. The GPU side is inside
 /// the VM and never receives a name at all: it locates its own memory by content
 /// (§5.1), which is the strongest possible form of "no descriptor crosses".
 ///
 /// The extent is scattered through that object, so the ICD also needs the run
-/// list — one `mmap` per run into one reservation. That is design.md §3's "hands
+/// list — one `mmap` per run into one reservation. That is docs/design.md §3's "hands
 /// **name + runs** to the ICDs", and it is a different boundary from §5.7's "the
 /// run list does not cross the wire", which is about guest↔host.
 #[cfg(target_os = "linux")]

@@ -5,14 +5,14 @@
  * glxgears is a GLX program and GLX needs a window system. This machine is
  * headless, and Xvfb's GLX has no DRI3 — so a Zink screen cannot be created on
  * it, because Zink's window-system path (`zink_kopper`) wants a real swapchain.
- * design.md §10 puts presentation outside the protocol on purpose and §13 step 5
+ * docs/design.md §10 puts presentation outside the protocol on purpose and §13 step 5
  * targets headless first, so a windowed GL test would be measuring the one thing
  * this stage deliberately does not implement.
  *
  * What it does instead is EGL's surfaceless platform and an FBO, which removes
  * the window system and *keeps everything else*: this draws an indexed,
  * depth-tested, textured, lit mesh through a real graphics pipeline and then
- * reads the pixels back. Every family design.md §11 names as Zink's requirement
+ * reads the pixels back. Every family docs/design.md §11 names as Zink's requirement
  * set is exercised — buffers, images, samplers, descriptor sets, a render pass,
  * a graphics pipeline, synchronisation and a transfer — and the result is
  * checked rather than assumed.

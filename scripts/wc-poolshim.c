@@ -11,7 +11,7 @@
  * are three host processes; the descriptor this shim substitutes is created on
  * the host, travels one `SCM_RIGHTS` hop over the local Wayland socket that
  * `wl_shm` already uses, and is consumed on the host. It never approaches the
- * VM boundary, so it is not the kind of descriptor design.md §1a forbids.
+ * VM boundary, so it is not the kind of descriptor docs/waycompose-design.md §1a forbids.
  *
  * WHY THIS SYMBOL. `wl_shm_create_pool` is a `static inline` in the generated
  * protocol header, so it cannot be interposed. It calls the exported varargs

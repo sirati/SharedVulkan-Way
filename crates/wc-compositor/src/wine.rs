@@ -1,7 +1,7 @@
 //! **Which implementation of Win32 this process is talking to**, decided once
 //! at startup and never asked again.
 //!
-//! docs/waycompose-design.md §58.
+//! docs/waycompose-design.md §60.
 //!
 //! # Why this exists
 //!
@@ -34,7 +34,7 @@
 //! merely different.** The whole value of the Wine legs is that they are a
 //! stand-in for Windows: every `if under_wine()` is one more thing the Wine run
 //! stops testing about the Windows run, so the set has to stay small enough to
-//! list. It is listed in §58.4, and today it is two entries, neither of which
+//! list. It is listed in §60.4, and today it is two entries, neither of which
 //! changes a pixel:
 //!
 //! * `platform::win32::apply_frame` — Wine's `dwmapi` answers `S_OK` to
@@ -49,7 +49,7 @@
 //!   same way, from the same probe.
 //!
 //! Three things that look like candidates and are deliberately **not** here are
-//! in §58.5, with the reason each was refused.
+//! in §60.5, with the reason each was refused.
 //!
 //! # The override, and why a stale assumption must be falsifiable
 //!
@@ -74,7 +74,7 @@ pub enum Win32 {
     Windows,
     /// Wine, with what `ntdll!wine_get_version` and `wine_get_host_version`
     /// said. The version is kept rather than discarded because every entry in
-    /// §58.4 is a claim about a *particular* Wine, and the first question asked
+    /// §60.4 is a claim about a *particular* Wine, and the first question asked
     /// of a quirk that stops reproducing is "which one was it measured on".
     Wine { version: String, host: String },
     /// Not a Windows binary at all: the Linux build, which is what `cargo test`
@@ -337,7 +337,7 @@ mod tests {
         let (w, how) = decide(wine(), None);
         assert_eq!(how, How::Probe);
         assert_eq!(w.tag(), "wine");
-        // The version survives the trip, because §58.4's entries are claims
+        // The version survives the trip, because §60.4's entries are claims
         // about a particular Wine and a log that dropped the number would make
         // the next person re-measure to find out which.
         assert_eq!(w, Win32::Wine { version: "11.14".into(), host: "Linux 6.18.33".into() });
