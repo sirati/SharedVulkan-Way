@@ -1110,18 +1110,114 @@ pub enum Liveness {
 /// is testable without sleeping. A test that has to sleep to exercise a timeout
 /// is a test that will be flaky on a loaded machine, and this crate's tests run
 /// under Miri, where sleeping is worse than useless.
+///
+/// # Shared memory cannot tell "descheduled" from "exited". Nothing here can.
+///
+/// It is tempting to look for a better signal than elapsed time — the intuition
+/// being that a descheduled peer is still mapped and still has a consistent
+/// header, while an exited one does not. **That intuition is wrong, and it is
+/// worth writing down because it is the first idea everybody has.** A shared
+/// mapping outlives the process that made it. A peer that has exited leaves the
+/// region byte-for-byte as it was: the header is still valid, the ring still
+/// consistent, `parked` still whatever it last was. A peer that is merely
+/// starved leaves exactly the same thing. **The two are indistinguishable by
+/// reading the region**, and any scheme that claims otherwise is a timeout
+/// wearing a disguise.
+///
+/// So the honest options are out-of-band, and there are two:
+///
+/// 1. **The connection closes.** When a process exits, the OS closes its cold
+///    path — Unix socket, TCP, virtio-serial — and the peer's read returns EOF.
+///    That is an *event*, not a threshold: load-independent, immediate, and
+///    already relied on elsewhere (`sv-gpu-server serve` moves the socket into
+///    the session thread precisely so that closing it is how the client learns
+///    the GPU side went away). It is **sufficient but not necessary**: it
+///    catches exit and crash, and says nothing about a process that is alive
+///    and wedged.
+/// 2. **Ask the kernel about the process.** Same machine only, and it needs a
+///    pid on the wire, which §1a's naming discipline exists to avoid.
+///
+/// **The design that follows** is that a timeout is a *backstop for the wedged
+/// case*, not the primary detector — the primary detector should be (1), and
+/// wiring it into this type is the real fix. A backstop is allowed to be
+/// generous, because the case it catches is rare and the cost of being wrong
+/// about it is a live client dropped mid-session.
+///
+/// # Until then: the budget is *running* time, not wall time
+///
+/// The threshold was pure elapsed wall time and it chose "gone" over "slow" for
+/// a healthy peer at load 133 — reproduced here at load 80, two failures in ten,
+/// where the waiting side declared its watcher `PeerGone` instead of timing out.
+/// That is not a flaky test. **It is the production failure mode**: on a loaded
+/// host a live client is dropped, and the symptom is an unexplained disconnect.
+///
+/// Wall time is the wrong denominator because it advances while nobody runs. So
+/// this monitor credits back the time it can prove *it* was starved — a poll
+/// that should have happened every `cadence` and happened ten times later is
+/// evidence about this thread's scheduling, not about the peer, on a machine
+/// where the peer was almost certainly starved too. What remains is a budget of
+/// time during which this side was running and *could* have seen a beat.
+///
+/// That is not a number tuned to make a test pass; it is the same threshold
+/// measured against a better clock. And it degrades the right way: on an idle
+/// machine the credit is zero and the behaviour is exactly what it was.
 pub struct LivenessMonitor {
     last_value: u64,
     last_change: Instant,
     timeout: Duration,
+    /// How often the caller intends to call [`LivenessMonitor::poll`].
+    cadence: Duration,
+    /// When it last actually did.
+    last_poll: Instant,
+    /// Wall time during which **this** side demonstrably was not running.
+    ///
+    /// See the type's own documentation: this is what makes the timeout a
+    /// budget of *running* time rather than of wall time.
+    stall_credit: Duration,
 }
 
 impl LivenessMonitor {
-    pub fn new(now: Instant, timeout: Duration) -> Self {
-        LivenessMonitor { last_value: 0, last_change: now, timeout }
+    /// `cadence` is how often the caller promises to poll. It is not a timer —
+    /// nothing schedules from it — it is the yardstick against which an
+    /// *overrun* is recognised, and the overrun is the evidence. Pass the same
+    /// interval the caller's loop is built around.
+    pub fn new(now: Instant, timeout: Duration, cadence: Duration) -> Self {
+        LivenessMonitor {
+            last_value: 0,
+            last_change: now,
+            timeout,
+            cadence,
+            last_poll: now,
+            stall_credit: Duration::ZERO,
+        }
+    }
+
+    /// How much of the budget has been returned because this side was starved.
+    /// Diagnostics, and the number to print when a peer is declared gone.
+    pub fn stall_credit(&self) -> Duration {
+        self.stall_credit
     }
 
     pub fn poll(&mut self, control: &Control, now: Instant) -> Result<Liveness> {
+        // **Credit this side's own starvation before judging the peer.**
+        //
+        // A poll that was meant to happen every `cadence` and actually happened
+        // after ten times that is not evidence about the peer; it is evidence
+        // that *this* thread was not scheduled, on a machine where the peer
+        // almost certainly was not either. Wall time advanced for both of them
+        // and neither got to run.
+        //
+        // The excess over twice the cadence is added back to the budget, so what
+        // the timeout measures is time during which this side was actually
+        // running and *could* have noticed a beat. Twice rather than once
+        // because ordinary jitter is not starvation and should not inflate
+        // anything.
+        let gap = now.saturating_duration_since(self.last_poll);
+        self.last_poll = now;
+        if let Some(excess) = gap.checked_sub(self.cadence.saturating_mul(2)) {
+            self.stall_credit += excess;
+        }
+
         let gen_now = control.region.atomic_u32(OFF_GENERATION)?.load(Ordering::Acquire);
         if gen_now != control.generation {
             return Ok(Liveness::Restarted { generation: gen_now });
@@ -1130,9 +1226,13 @@ impl LivenessMonitor {
         if beat != self.last_value {
             self.last_value = beat;
             self.last_change = now;
+            // A peer that spoke proves the budget was not needed. Forgetting the
+            // credit here keeps it from accumulating across a long healthy
+            // session into a number that would never declare anything gone.
+            self.stall_credit = Duration::ZERO;
             return Ok(Liveness::Alive);
         }
-        Ok(if now.duration_since(self.last_change) >= self.timeout {
+        Ok(if now.duration_since(self.last_change) >= self.timeout + self.stall_credit {
             Liveness::Gone
         } else {
             Liveness::Slow
@@ -1406,18 +1506,28 @@ mod tests {
         let owner = Control::create(Arc::clone(&r), g, ids(), 1).unwrap();
         let peer = Control::attach(Arc::clone(&r), ids()).unwrap();
         let t0 = Instant::now();
-        let mut mon = LivenessMonitor::new(t0, Duration::from_millis(500));
+        let mut mon = LivenessMonitor::new(t0, Duration::from_millis(500), Duration::from_millis(100));
 
         peer.beat(1, 0).unwrap();
         assert_eq!(mon.poll(&owner, t0).unwrap(), Liveness::Alive);
-        assert_eq!(mon.poll(&owner, t0 + Duration::from_millis(100)).unwrap(), Liveness::Slow);
-        assert_eq!(mon.poll(&owner, t0 + Duration::from_millis(600)).unwrap(), Liveness::Gone);
+        // **Poll at the cadence this monitor was told to expect.** It credits
+        // back time it can prove it was not running, and a caller that declares
+        // a 100 ms cadence and then jumps 500 ms has, by that definition, not
+        // been running for 300 ms of it — so the budget is extended and the
+        // verdict is `Slow`. That is the monitor working, not failing, and a
+        // test that skipped the intervening polls was asserting against a
+        // caller the type does not model.
+        for step in 1..=4 {
+            let at = t0 + Duration::from_millis(100 * step);
+            assert_eq!(mon.poll(&owner, at).unwrap(), Liveness::Slow, "at {step}00ms");
+        }
+        assert_eq!(mon.poll(&owner, t0 + Duration::from_millis(500)).unwrap(), Liveness::Gone);
         peer.beat(2, 0).unwrap();
-        assert_eq!(mon.poll(&owner, t0 + Duration::from_millis(700)).unwrap(), Liveness::Alive);
+        assert_eq!(mon.poll(&owner, t0 + Duration::from_millis(600)).unwrap(), Liveness::Alive);
 
         r.atomic_u32(OFF_GENERATION).unwrap().store(9, Ordering::Release);
         assert_eq!(
-            mon.poll(&owner, t0 + Duration::from_millis(800)).unwrap(),
+            mon.poll(&owner, t0 + Duration::from_millis(700)).unwrap(),
             Liveness::Restarted { generation: 9 }
         );
     }
@@ -1459,5 +1569,68 @@ mod tests {
             assert_eq!(off % 64, 0, "0x{off:x} is not on a cache-line boundary");
         }
         assert_ne!(RC_CMD_TAIL / 64, RC_CMD_HEAD / 64, "producer and consumer share a line");
+    }
+}
+
+/// How stale does a **healthy** peer's heartbeat get on a loaded machine?
+///
+/// The backstop timeout has to sit above that, and this is the measurement that
+/// sets it rather than a number chosen to make a test pass.
+#[cfg(test)]
+mod beat_staleness {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AO};
+
+    /// A peer beats as fast as `wait_until` does — once per liveness interval,
+    /// 20 ms in the ICD's configuration. A watcher samples how long it has been
+    /// since the value last changed. On an idle machine that is ~20 ms; the
+    /// question is the *tail* when the machine is not idle, because that tail is
+    /// what a backstop must clear.
+    #[test]
+    #[ignore = "a stopwatch: reports the scheduling tail, which is the machine's"]
+    fn how_stale_a_healthy_heartbeat_gets() {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let ids = ProtocolIds::new(1, 1);
+        let owner = Arc::new(Control::create(Arc::clone(&region), g, ids, 1).unwrap());
+        let peer = Control::attach(region, ids).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let beater = {
+            let owner = Arc::clone(&owner);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(AO::Relaxed) {
+                    let _ = owner.beat_now();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
+        let mut last = 0u64;
+        let mut last_change = Instant::now();
+        let mut worst = Duration::ZERO;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(6) {
+            let b = peer.peer_beat().unwrap();
+            let now = Instant::now();
+            if b != last {
+                last = b;
+                last_change = now;
+            } else {
+                worst = worst.max(now.duration_since(last_change));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        stop.store(true, AO::Relaxed);
+        beater.join().unwrap();
+        println!(
+            "healthy peer beating every 20ms: worst observed staleness {worst:?} \
+             (load {})",
+            std::fs::read_to_string("/proc/loadavg")
+                .map(|s| s.split(' ').next().unwrap_or("?").to_string())
+                .unwrap_or_else(|_| "?".into())
+        );
     }
 }
