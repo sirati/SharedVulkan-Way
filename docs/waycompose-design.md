@@ -18986,6 +18986,22 @@ input — works and is obeyed. It is the lock: Windows refuses synthetic input
 injection while the workstation is locked, and `SendInput` returns 0 having
 inserted nothing.
 
+> **CORRECTED BY §73.4. The fourth line was my bug, not the lock.** When the
+> same probe was run months later on the *unlocked* desktop it still returned
+> `SendInput_returned=0`, this time with `lasterror=87` —
+> `ERROR_INVALID_PARAMETER`, which is what `SendInput` answers when `cbSize`
+> does not match its `INPUT`. The struct carried two extra padding fields and
+> was 56 bytes where the ABI wants 40, so **that call had never worked, locked
+> or not**.
+>
+> The conclusion of this section survives on the other evidence and only on it:
+> `LockApp` was the foreground window and `WindowFromPoint` at the drag's origin
+> returned it, and the control below — a real drag between two Explorer windows
+> — did not move the file. Those are about the lock. The `SendInput` line was
+> never evidence of anything, and it is left in place above rather than quietly
+> edited because a diagnosis that was 80% right is more useful to the next
+> person than one that was retconned into being entirely right.
+
 The control makes it concrete rather than theoretical. Two Explorer windows
 were opened on a scratch directory containing two throwaway files created for
 the purpose, placed side by side, and a drag was injected from one to the
@@ -22202,11 +22218,20 @@ is unchanged by any of this: all three arrangements above are Linux and Wine.
 The user asked for three, and they are the three combinations of *which side is
 Wine* that exist while the Windows laptop is unavailable:
 
-| | arrangement | harness | result |
+| | arrangement | harness | result *as first run* |
 |---|---|---|---:|
-| 1 | linux → linux vm | `scripts/wc-vm-client.sh linux` | **9 passed, 0 failed** |
-| 2 | linux → wine linux vm | `scripts/wc-wine-guest.sh` | **3 passed, 0 failed** |
-| 3 | wine linux → linux vm | `scripts/wc-vm-client.sh wine` | **10 passed, 0 failed** |
+| 1 | linux → linux vm | `wc-vm-client.sh linux` | 9 passed, 0 failed |
+| 2 | linux → wine linux vm | `wc-wine-guest.sh` | **3 passed, 0 failed** |
+| 3 | wine linux → linux vm | `wc-vm-client.sh wine` | 10 passed, 0 failed |
+
+> **Read §67.10 before this table.** Two of these three rows have since been
+> withdrawn as transport results and one of them no longer passes. The legs
+> carry the wire on a channel the user's rule forbids, so they are demoted to
+> venue evidence; and their assertions stopped before the session broke, so the
+> zeros in rows 1 and 3 were measuring less than they appear to. The leg names
+> are now `linux-relay` and `wine-relay`, and `ring` is the leg that asks the
+> transport question properly. Row 2 is unaffected — it moves no Wayland traffic
+> across the boundary at all.
 
 Arrangement 3 is the one §26.5 specified as "leg 3" and nobody had run: *"Wine
 plays the Windows side, and a Linux VM guest runs the client."* Arrangement 1 is
@@ -22306,6 +22331,165 @@ arrangement most likely to be wrong.
 ---
 ---
 
+
+### 67.10 The relay is withdrawn, the ring is blocked, and the file pool cannot cross 9p
+
+§67.9's two `*-relay` legs carried the Wayland wire over
+`/dev/virtio-ports/org.sirati.svcold.0` through two `socat`s. The user's rule:
+
+> all communication is to go through the ring. alternative channels are
+> permitted only for wakeup from idle
+
+**That forbids them.** The doorbell is the sanctioned use of virtio-serial
+(§36.6) because ringing a bell to wake a parked consumer *is* wakeup; a byte
+relay carrying `wl_shm`, `wl_surface` and every commit is the conversation. §70.5
+withdrew `--upstream-cold` for exactly this and observed that withdrawing only
+the flag would leave this harness standing, "because what the rule forbids is
+the channel, not the flag that names it". That is correct and this section
+accepts it.
+
+The legs are **kept and demoted**, not deleted. What they establish is about the
+*venue* and none of it is a transport claim: the guest has no network, a Unix
+socket node exported over 9p is a host kernel object a guest `connect()` cannot
+reach, and both halves really are in different kernels — which the kernel
+assertion proves in both directions. Each leg now prints a banner saying it is
+not a sanctioned transport before it prints anything else.
+
+#### The ring, attempted, and two measured refusals
+
+`scripts/wc-vm-client.sh ring` is the leg that tries to obey the rule. For this
+arrangement — compositor on the host, client in the guest — the control region
+has to be memory *both kernels can map*, which on this rig means the guest's RAM
+through the memfd backend. The compositor offers a control region two ways and
+neither reaches that:
+
+```text
+--wayland-cold  →  exit 2: "publishes a control region out of guest RAM, which
+                   needs the Linux guest-RAM provider (sv_arena::guestram) …
+                   no compositor has been taught to do it yet"
+--wayland-ring  →  accepted: "accepting Wayland rings in Local\wc-vm-ring"
+```
+
+The second *works*, and being a **named section** is exactly why it does not
+help: a section is a same-machine object, and the compositor's own startup says
+so about the neighbouring keymap in the very next line — *"unopenable by one
+across the boundary"*. The ring section is the same kind of object.
+
+So there is no combination that puts a **Windows-build** compositor's control
+region into a form the far side of a hypervisor can map, and the missing piece
+is one function. `RingLink::publish` is `#[cfg(target_os = "linux")]`; the
+compositor already commits and stamps guest RAM on Windows for an *arena*
+(`--arena-guest-ram`, through `awe-probe`), and ringlink has simply never been
+wired to it. Both refusals are measured here rather than read out of the source,
+because a blocker asserted from reading is what §67.5 is about.
+
+#### The harness passed over a session that had already died
+
+§70.5's run reported **9 passed / 0 failed** while the session broke immediately
+after the window appeared, because every assertion stopped at
+`window … created`. **This harness had the same defect and it is worth being
+plain about that**: its assertions stopped at the registry walk, and
+`wayland-info` disconnects cleanly, so a leg could pass with the interesting
+part untouched.
+
+`assert_session_survived` is the fix, and it is three sources because each
+failure was visible in only one of them:
+
+* the **client's** own log — a `wl_display` protocol error ends the session, and
+  libwayland prints it and carries on;
+* the **proxy's** log — a failed client, a refused pool, a keymap the far side
+  cannot open;
+* the **compositor's** log, so this is not one end agreeing with itself.
+
+The third is not decoration. Run with `WC_VM_POOLTEST=1`, which swaps the
+registry walk for `wc-pooltest` — the smallest client that sends an `h` —
+**both legs break, and `wc-pooltest` prints `4 pools created and destroyed` and
+exits 0 anyway**:
+
+```text
+FAIL  the client hit a protocol error, so the session died:
+      wl_display#1: error 0: Invalid new_id: 6.
+FAIL  the proxy reports the session did not survive:
+      pool 3: could not publish 1228800 bytes: Invalid argument (os error 22)
+....  the h-sending client: wc-pooltest: 4 pools created and destroyed
+....  and its own exit status was 0
+```
+
+A client's exit status is not a session check. That is a sharper form of §70.5's
+lesson: there the *harness* stopped at the first good news, here the **client
+itself** reported success over a dead connection, and a harness that trusted its
+exit code would have agreed with it.
+
+#### Two failures, and the control separates them cleanly
+
+The two legs differ in exactly one thing — whether the compositor is the Linux
+build or the Windows one under Wine — which is the pairing the dialect question
+turns on (§70.2, §72). That is what leg 1 was built to be, and with the session
+check in place it pays for itself immediately: **one of the two failures moves
+when the dialect moves and the other does not.**
+
+| symptom | linux leg | wine leg | so it is |
+|---|---|---|---|
+| `pool 3: could not publish 1228800 bytes: EINVAL` | yes | yes | **not** the dialect |
+| `wl_keyboard.keymap (event): argument 1 claims 35572 bytes, 0 available` | yes | no | **the dialect** |
+
+The second is the interesting one and it arrives on the *plain* run, with
+`wayland-info` and no pool in sight. It is `wc-proxy` reading the compositor's
+**server-to-client** `wl_keyboard.keymap`: against the Windows build the
+descriptor is in band (§2.3) and the proxy finds it; against a Linux compositor
+the fd came as `SCM_RIGHTS` and the in-band read finds `0 available`. §72 reports
+the same mismatch in the client-to-server direction on `create_pool`; this is the
+other direction of the same fact, and between them the dialect is wrong both
+ways round rather than only on the path a pool takes.
+
+It also means §67.9's original claim — that the legs "walked the registry only,
+so the in-band path is advertised and not exercised" — was too generous to
+itself. The registry walk *does* reach the dialect, through the keymap the seat
+sends unprompted. The old harness did not notice because nothing was looking.
+
+#### The `EINVAL` is 9p, and it is not the dialect
+
+Measured directly, in the guest, with a five-line probe:
+
+```text
+/sv mount: 9p rw,relatime,access=client,msize=16384,trans=virtio
+  mmap MAP_SHARED  on /sv    → FAILED, Invalid argument (errno 22)
+  mmap MAP_PRIVATE on /sv    → ok
+  mmap MAP_SHARED  on /tmp   → ok            (tmpfs, the control)
+```
+
+`SharedFile::create` ends in `Handle::map_mut`, an `mmap(MAP_SHARED)` on the
+pool file, and the share is mounted with **no cache mode**, where 9p refuses
+shared mappings. So `could not publish … os error 22` is the mount, not Wine,
+not the compositor and not the translator. It also explains §70.5's six
+identical refusals, which were on the same share.
+
+**The consequence is larger than one harness.** The file pool transport is not
+merely "a fixture rather than the deployment" across this boundary — it is
+**non-functional** across it. Nothing can publish a pool into a 9p share this
+way. The only substrate that crosses is the arena in guest RAM, which is the
+deployment's answer and the ring's, and §71 is the section building it. A
+`cache=loose` mount would probably make the fixture work and is deliberately
+**not** proposed here: it would restore a path the rule says should not carry
+this traffic anyway.
+
+One thing is left unattributed on purpose: `Invalid new_id: 6` arrives on both
+legs alongside the refusals, and whether it is downstream of the held-back pool
+or independent has not been established. Naming a cause for it here would be
+§63.3's error with a fresh coat of paint.
+
+#### Where this leaves §67.9
+
+| leg | what it is now |
+|---|---|
+| `ring` | the transport question, answered: blocked, with both refusals measured |
+| `linux-relay`, `wine-relay` | venue evidence only, banner-labelled, **not** a transport result |
+| `wc-wine-guest.sh` | unaffected — it runs one process under Wine in the guest and moves no Wayland traffic across the boundary at all |
+
+The arrangement is viable — §70.5 got a mapped `HWND` out of it and this section
+got a registry walk — and the thing that makes it *shippable* is not a channel
+but the two pieces named above: a guest-RAM publish for the Windows build, and
+the negotiated format §72 is for. Neither belongs to this section.
 ## 68. Subsurface state that belongs to the parent's commit is applied on the child's
 
 ### 68.1 Status in one paragraph
@@ -22541,6 +22725,16 @@ this — and it is always the same bug wearing a different symptom.
 
 *(§69's continuation. A feasibility finding, not a run.)*
 
+> **AMENDED. The title is wrong and §70.5 is the correction.** The flag this
+> section proposed — `--upstream-cold` on `wc-proxy` — was written, run
+> successfully, and then **withdrawn**, because the user restated the
+> architectural rule: *"all communication is to go through the ring.
+> alternative channels are permitted only for wakeup from idle."* A
+> virtio-serial port carrying the protocol stream is not a wakeup, it is the
+> whole conversation on an alternative channel. The reasoning below about *why
+> the arrangement needs a channel at all* still stands; only the choice of
+> channel was wrong.
+
 ### 70.1 Status in one paragraph
 
 The third of the user's three arrangements — *"wine linux to linux vm"* — was
@@ -22626,6 +22820,72 @@ deployment"*; this is the venue that could measure the real one.
    about Wayland. A client built for the Linux target and *run under Wine* is
    not a thing; a Windows client speaking out-of-band would need the vendored
    `cfg` inverted, which is a fork of the fork.
+
+### 70.5 `--upstream-cold` was built, run, and withdrawn on the ring rule
+
+**It worked, and that is not the same as it being right.** `--upstream-cold
+PATH` was added to `wc-proxy` as a third `Upstream` variant beside `Socket` and
+`Ring` — a character device carrying the protocol as bytes, refused at *parse*
+if the path is not one — and a harness ran the whole arrangement: the
+compositor under Wine on this workstation, `wc-proxy` and `weston-clickdot`
+inside the svGuest VM, `socat` joining QEUM's end of
+`/dev/virtio-ports/org.sirati.svcold.0` to the compositor's socket. The guest
+reported kernel 6.18.44 against this host's 6.18.33, the proxy logged
+`upstream cold … (a byte stream; no fd can be represented on it)`, and the
+compositor logged `wl_surface created`, `xdg_toplevel created (#1) -> window 1`
+and `window 1 created (HWND 0x2007a)`.
+
+It is withdrawn anyway. The user's rule is that **all communication goes
+through the ring, and alternative channels are permitted only for wakeup from
+idle**. A doorbell qualifies — ringing a bell to wake a parked consumer *is*
+wakeup. A virtio-serial port carrying `wl_surface`, `wl_shm` and every commit
+does not; it is the conversation, not the wake. The code is reverted and the
+harness is not in the tree.
+
+**The same objection lands on `scripts/wc-vm-client.sh` (§67.9), which is in
+master**, and withdrawing only this flag would leave the equivalent violation
+standing. That harness reaches the same arrangement more cheaply — two `socat`s
+and no new flag, so `wc-proxy` uses its ordinary `--upstream` — but the bytes
+still cross on the same virtio-serial port. What the rule forbids is the
+channel, not the flag that names it.
+
+**Three things the run showed that are worth keeping.**
+
+*The arrangement is viable.* A Linux client in a VM drove a Windows compositor
+on the host through a real hypervisor as far as a mapped `HWND`. Whatever
+carries the bytes, the halves fit together — which is what §29.8 asserted and
+nothing had shown.
+
+*It then broke, and the harness said it passed.* Immediately after the window
+appeared:
+
+```text
+[proxy] client 1 failed: compositor: wl_keyboard.keymap names Section
+  { name: "Local\\wc-eb7bc4cb…", size: 36950 }, which this side cannot open
+[proxy] client 1: pool 3: could not publish 38272 bytes: Invalid argument (os error 22)
+```
+
+The compositor published the keymap as a Windows kernel section because it was
+started without `--shared-dir` — §11.2's problem, in a topology where the far
+side is a Linux guest that cannot open one — and the pool publish failed with
+`EINVAL` six times. **Every assertion in the harness had already passed**,
+because they stopped at `window … created` and nothing checked that the session
+survived. A gate that stops at the first good news is the shape §35 is about,
+and this one was mine.
+
+*The dialect question does not arise here, and §72's does.* This proxy talked to
+a **Windows** compositor, which is the pairing it was built for, so the
+in-band-`h` stream was correct at both ends. §72 reports that the same proxy
+against a **Linux** compositor desynchronises the server's reader on
+`create_pool` with nothing logged on either side. That is the other half of
+§70.2's two-dialects-one-translator fact, and it means the arrangement cannot
+composite against a Linux compositor whatever channel carries the bytes.
+
+**Where this leaves the work.** Not a transport flag. Either the proxy learns
+the out-of-band dialect for a Unix upstream, or — more in keeping with the rule
+just restated — the **ring** carries the descriptor properly so the dialect
+question does not arise at the boundary at all. `--upstream-ring` already
+exists; that is the direction. §70.1's "one flag away" is withdrawn.
 
 ## 71. The arena route to topology 1, and the outbound pages that are not there
 
@@ -22866,32 +23126,52 @@ Measured, and the shape is the point because nothing anywhere says a word:
 reproduces it, so the defect is not in the client that found it. **That is the
 regression test, and it has to go from failing to passing.**
 
-**The fix is decided and is not a rewrite at the boundary.** The user's
-instruction: *"the ring data format can be specialised for the other side
-instead of needing translation after the fact if that is faster, however that
-requires that during client server handshake this format is negotiated"*. So:
+**The design is settled, and it is the standard protocol rather than a
+negotiated specialisation.** The user's instruction allowed either — *"the ring
+data format can be specialised for the other side instead of needing translation
+after the fact **if that is faster**, however that requires that during client
+server handshake this format is negotiated"* — and made it conditional on a
+measurement. The measurement came back: rewriting a message costs **301–304 ns**,
+which is **0.056% of one cross-VM present** (§34.5's 216.9 ms). Against that, the
+multi-client cost the user raised is the decisive term: §41 disproved "the arena
+serves exactly one connection" with a real two-client run, and Firefox opens
+four. A negotiated dialect means a server holding one encoding per peer and a
+matrix of pairs that can only be tested by having both kinds of peer; the
+standard protocol means one wire and one translator. **Specialisation buys three
+hundred nanoseconds and costs the combinatorics, so it is not built.**
 
-1. **Negotiated, not assumed.** Today's defect *is* the assumption that the peer
-   is Windows. `WIRE_VERSION` and the protocol hash already ride the handshake
-   and `finish_attach` already refuses a skew and names the cause, so that is
-   where an encoding belongs — and it turns today's symptom, a silently
-   desynchronised reader, into an explicit refusal.
-2. **Once per connection, never per message.** The user is explicit that this
-   will not change during a session, so the whole cost belongs in the handshake.
-3. **The multi-client cost is a stated trade, not an oversight.** The user
-   raised it. It bites here specifically: §41 disproved "the arena serves exactly
-   one connection" with a real two-client run, and Firefox opens four. Each
-   connection negotiates separately, so a proxy serving four peers of two
-   dialects holds two encodings live — which it must be able to do anyway, since
-   negotiation is per connection. What specialisation buys is not a second
-   implementation avoided; it is **every message not being rewritten at the
-   boundary**, and that is the claim worth measuring rather than asserting.
+What is built instead, and the phrase that matters is *by transport rather than
+by platform*:
 
-Whether the descriptor can instead be resolved **in the ring**, so the boundary
-never encodes it in either dialect, is open and owned elsewhere; it would remove
-the negotiation rather than implement it. **Nothing here is written until that is
-settled**, which is why this section states the defect, the reproducer and the
-decided shape, and stops.
+1. **Both encodings exist on both platforms.** The in-band form is not a Windows
+   thing that Unix lacks; it is what a peer reached through `wc-proxy` speaks,
+   and a Linux compositor behind the proxy needs to read it exactly as the
+   Windows one does. `vendor/wayland-backend/src/os.rs` is already the single
+   place where "what a file descriptor is" is decided — that fork note says the
+   protocol machinery "is genuinely fd-type-agnostic already", and `Argument<Id,
+   Fd>` is generic over the payload, so the seam exists.
+2. **The transport picks.** A connection whose peer is the proxy reads and writes
+   in band; a connection from a stock libwayland client reads and writes
+   `SCM_RIGHTS`. Both live in one binary and the choice is per connection, which
+   is what lets one Linux `wc-compositor` serve WLCS and the proxy without a
+   second build.
+3. **`wc_handle::Handle` and `Descriptor` are portable already** — no `cfg` on
+   either — so the type the in-band arm needs exists on Unix today. The whole of
+   the coupling is `#[cfg(windows)]` at three sites in
+   `vendor/wayland-backend/src/rs/wire.rs` and sixteen occurrences across six
+   files in `vendor/smithay`, eight of them in `wayland/shm/pool.rs`. That is the
+   work, and it is a cfg becoming a runtime choice rather than a redesign.
+
+The one genuinely new thing it needs is a way to say *"a descriptor that is an
+already-open fd"*: an SCM_RIGHTS fd arrives with no name, and `Descriptor` names
+things. That is a variant on the Unix side, and it is the same escape hatch
+`NtHandle` already is on Windows — an object that cannot be named — so the shape
+is precedented rather than invented.
+
+Resolving the descriptor **in the ring** was considered and dropped: it would
+have removed the encoding question entirely, but the ring owner confirms nothing
+in `sv-transport` has to change for the standard protocol, so it buys nothing
+here.
 
 **What it means for this run.** This topology cannot composite — no surface, no
 window, no pixel — and the memory result is untouched by it, because the proxy's
@@ -22933,29 +23213,57 @@ fix, and it is worth keeping because it is what the fix had to beat:
 * **15 seconds with nobody connected returns no region**;
 * one client reconnects and the region follows within seconds.
 
-So the region was returnable the whole time and nothing was asking. The diagnosis
-named the fix — a tick from the accept loop, which owns the shared arena — and
-`Arena::frame_idle` is it: `&self` rather than `&mut self`, because the caller
-that matters has no session and therefore no mutable handle, and because taking a
-second `share()` handle would have silently shifted the `sharers()` count every
-client reports.
+So the region was returnable the whole time and nothing was asking. The accept
+was one blocking `accept_one(wait)` for the whole `--timeout`, so a proxy with
+no clients sat in it and the arena stood still. It is sliced now, and a slice
+with nobody arriving is a frame's worth of nothing happening — the same unit
+`--arena-grow-idle` is written in, and the same argument the pump's poll timeout
+makes, from the only other place that can make it.
 
-The accept was one blocking `accept_one(wait)` for the whole `--timeout`, so a
-proxy with no clients sat in it and the arena stood still. It is now sliced at
-20 ms, and a slice with nobody arriving is a frame's worth of nothing happening —
-the same unit `--arena-grow-idle` is written in, and the same argument the pump's
-poll timeout makes, from the only other place that can make it.
+**Two agents fixed this independently and the slicing here is the other one's.**
+Same diagnosis, same place, 100 ms slices rather than 20. Nothing is preserved
+of the duplicate except two differences that were **behavioural rather than
+stylistic**, and they are worth recording because both are the same mistake:
+*the flag is not the policy.*
+
+`Arena::reclaim_idle` is the policy. It is **0 by default** and is only set from
+`--arena-grow-idle` inside `if args.arena_grow`. An accept loop reading the flag
+therefore disagreed with the pump twice, in opposite directions:
+
+* **without `--arena-grow`** the arena's own value is 0, so the pump returns
+  nothing — and the flag is still 120, so the accept loop returned regions. A
+  proxy never told it may grow gave memory back from one clock and not the other.
+* **with `--arena-grow-idle 0`**, which `Arena::frame` reads as "never" and
+  guards for by name, the accept loop passed 0 to `reclaim_regions`, where it
+  means *the instant it empties* — the thrash the idle count exists to prevent.
+
+One flag, two policies, decided by which clock happened to turn. `frame_idle()`
+is the pump's own body: same source, same `== 0` guard. It is `&self` rather than
+`&mut self`, because the caller that matters has no session and therefore no
+mutable handle, and because taking a second `share()` handle to get one would
+have silently shifted the `sharers()` count every client reports.
+
+**And slicing the wait lost the exit path.** The give-up arm was spelled
+`break Err(e)?`, which breaks nothing: `?` returns from `run()`. So the ordinary
+idle timeout — the way every successful proxy ends — became an error exit that
+skipped the thread joins and the entire arena report after the loop. Before the
+wait was sliced this arm was a plain `break` and was right; the rewrite lost it.
+`rustc` reported it as `unreachable statement` pointing at the first line *past*
+the loop, which is the shape of the bug: the compiler naming the code that
+stopped running rather than the line that stopped it. It is `break 'accept` now.
 
 **Leg B holds it**: the last client killed, nothing reconnecting, `0 wc-poolhog`
 processes alive across the wait, and `arena region 2 returned by the accept loop:
 16777216 bytes` with the guest's resident set down by the same.
 
-Two things this cost, both worth recording. The line first read *"returned with
-no client connected"* — a claim the accept loop cannot make, since it runs
-whether or not sessions exist, and it printed **while a client was up** on the
-first run; it names who did it instead. And leg B's check first scanned the whole
-log, which leg A's own release already satisfies — a gate that passes before the
-leg has done anything. It counts only lines after a mark now.
+Two things this cost, both worth recording, and both were in **each** version
+independently. The line read *"returned with no client connected"* — a claim the
+accept loop cannot make, since it runs whether or not sessions exist and usually
+wins the race against a pump, which turns only when *its* poll times out. It was
+observed printing **while a client was up**. It names who did it now, which is a
+fact rather than a guess about the world. And leg B's check first scanned the
+whole log, which leg A's own release already satisfies — a gate that passes
+before the leg has done anything. It counts only lines after a mark now.
 
 ### 72.6 §61.4's ring wall is deterministic on a Linux guest
 
@@ -23038,3 +23346,225 @@ rather than refusing"*, with click latencies against the 64 MiB baseline. There
 is no Firefox here, no click and no window, and there cannot be one until §72.3
 is fixed. Moving that line is a separate, deliberate commit with a failing guard
 test in front of it.
+
+### 36.22 The doorbell is a bell, and that is the whole of its licence
+
+The rule, as the user states it:
+
+> all communication is to go through the ring. alternative channels are
+> permitted only for wakeup from idle
+
+**The doorbell is the sanctioned exception and it is sanctioned narrowly.** A
+byte on a virtio-serial port that wakes a parked consumer is "wakeup from idle"
+exactly; it carries no payload, no sequencing and no state, and §36.6.3's
+framing argument is that it *cannot* — one byte, one wake, seven bits of
+slot-and-lane, and a lost or spurious byte costs a slice or a syscall
+respectively because there is nothing in it to lose.
+
+So the boundary, stated because the port exists and the temptation is
+structural: **nothing may ride that port except a wake.** Not a handshake, not a
+locator, not a small reply that would be convenient because the port is already
+open and a ring packet feels heavier. The moment it carries meaning, the ring
+stops being the channel and starts being one of two, and the reason the design
+survived contact with a hypervisor is that there is one.
+
+Two byte relays over virtio-serial were built for the Wayland wire and are
+withdrawn on this rule. If either returns, the answer is §36's ring — which is
+what carries a Wayland connection, and does so at 0.54 ms a present.
+
+The doorbell's own results are unaffected because a bell is all it ever was:
+13.6 µs across the boundary to the Windows guest, no floor for a delivered
+wake, and 48.7× on a real present in topology 1.
+
+### 36.23 `create_pool` against a Linux compositor: measured, and the rewrite is noise
+
+`wc-proxy` writes the in-band-`h` dialect upstream unconditionally, so against a
+*Linux* compositor `create_pool` desynchronises the reader with nothing logged.
+The user's rule for choosing the fix:
+
+> whatever is more efficient is the correct choice i.e. the ring data format can
+> be specialised for the other side instead of needing translation after the
+> fact if that is faster, however that requires that during client server
+> handshake this format is negotiated … on the other hand having a standard
+> protocol would make multi-client operations easier
+
+Efficiency decides, negotiation is the mechanism, and multi-client is the
+counterweight. Two questions had to be answered, and one of them is measurable.
+
+#### 36.23.1 Can the descriptor be resolved in the ring? It is resolved *before* it
+
+Not by the ring, and it does not need to be. §36.4's `PacketKind::Bytes` exists
+precisely because the ring carries opaque bytes — "nothing in this crate parses
+them or is allowed to" — and giving it a Wayland parser to find an `h` would
+make the transport protocol-aware, which is what §36 was built to avoid.
+
+It does not need to, because **the descriptor is already gone by then**. §14.7
+is exactly this: `wc-proxy`'s session turns the client's fd into an arena handle
+of integers before the bytes reach the boundary, which is *why* the fd count at
+the crossing hop is unrepresentable rather than zero. There is no descriptor at
+the ring. There is an integer that used to be one.
+
+And that settles the ring path on its own:
+
+> **`OutOfBand` is not merely wrong over a ring, it is impossible.** A ring
+> cannot carry a descriptor, by construction — that is §14.7's guarantee, not an
+> accident. A Linux compositor reached over a ring cannot be sent an
+> `SCM_RIGHTS` fd whatever the proxy is willing to do.
+
+So the in-band encoding is **not a Windows quirk**. It is the only encoding
+compatible with "all communication goes through the ring"; Windows merely got
+there first because `afunix.sys` forced it. **For the ring path there is nothing
+to negotiate** — the transport determines the encoding. Negotiation is only
+meaningful on the socket path, where both remain possible and where §14.7's
+argument for a local `SCM_RIGHTS` still holds.
+
+#### 36.23.2 Does specialisation buy anything? 300 ns against a 540,000 ns present
+
+The remaining case for a negotiated, side-specialised format is that it avoids a
+per-message rewrite at the boundary. That is a quantity, so it was measured
+rather than argued — `wire::rewrite_cost`, the full `walk` + `splice_fds` a
+message actually pays:
+
+| message | per-message rewrite |
+|---|---|
+| `wl_surface.attach` (three words — the shape nearly every message has) | **301 ns** |
+| `wl_shm.create_pool` (the message in question) | **304 ns** |
+
+Against §36.21's cross-VM present of **0.54 ms**, one rewrite is **0.056%** of a
+present — and that is a *debug* build, which is several times slower than
+anything shipped.
+
+**So specialisation buys nothing measurable, and the standard protocol wins on
+the multi-client argument the user raised themselves.** §41's two-client run
+over one arena makes multi-client real here rather than hypothetical, and a
+single dialect is what keeps a second client from being a second negotiation.
+
+The coordinator's reading was also right and is worth keeping: because
+negotiation is per connection, **the server must implement both encodings
+regardless** — so specialisation never removes a dialect, it only moves where
+the rewrite happens. Paying 300 ns at a boundary that already costs half a
+millisecond, in exchange for one protocol instead of two, is not a close call.
+
+#### 36.23.3 What should actually change
+
+Not the ring, and not a negotiation. The defect is narrower than either:
+
+- `wc-proxy`'s `FdEncoding` is **already a parameter, not a `cfg`** —
+  deliberately, "because this one process reads one dialect and writes the
+  other". The proxy is not the problem.
+- the vendored `wayland-backend`'s in-band `h` is **`#[cfg(windows)]`**. That is
+  the hard-coding, and it is on the compositor's side.
+
+The fix is to make that path conditional on **the transport rather than the
+platform**: a client arriving over a ring reads `h` in band on Linux exactly as
+on Windows, because there is no other way for the bytes to have arrived. A proxy
+that always writes in band over a ring is then *correct* rather than
+hard-coded — and the desynchronisation stops being possible instead of being
+detected.
+
+Where a refusal is still wanted, `finish_attach` is the place: it already
+carries `WIRE_VERSION` and a protocol hash and already refuses a skew while
+naming the cause, which is the failure mode this defect lacks — today it is a
+desynchronised reader with nothing logged and the connection still open.
+
+## 73. `counter=live`: the skip that only a Windows kernel could resolve
+
+*(§53's and §69's continuation. Six minutes on the deployment guest.)*
+
+### 73.1 Status in one paragraph
+
+§53.3 skipped the USER/GDI leak assertion because `GetGuiResources` returns 0
+under Wine, and §69 established — from inside a Linux VM, on the guest's own
+kernel — that the zero is a fact about **Wine** rather than about the venue, so
+**no arrangement of local virtualisation could ever turn that skip into an
+assertion**. This is the run that could. On the deployment guest, real Windows
+11, session 1: the counter answers, and it answers in both directions.
+
+```text
+       real Windows (guest)        the same binary, Wine on the workstation
+       before user=1               before user=0
+       after  user=6   (4 windows) after  user=0   (5 windows enumerated)
+       counter=live                counter=stub
+       destroyed user=1            destroyed user=0
+       fell=yes                    fell=no
+```
+
+§53's `SKIP` is now a real assertion waiting to be written, and §69's negative
+result is confirmed from the other side rather than merely not contradicted.
+
+### 73.2 Why the third sample is the one that matters
+
+The first version of this probe stopped at `after`, and it would have been
+enough to report `live`. It is not enough to report anything **useful**, and the
+reason is the same one §64.4 ran into from a different direction: the assertion
+§53 wants is *"the count came back"*, and a counter that only ever goes up
+cannot express it. On a stubbed counter `0 == 0` satisfies "came back" forever.
+
+So `selftest` now destroys its four windows and samples a third time. `fell=yes`
+is what separates an instrument from a decoration, and it is the difference
+between the two columns above: Wine's zero is *flat*, and flat is
+indistinguishable from perfect.
+
+`gdi=0` on both sides, and that is probably **correct rather than stubbed**: a
+plain `WS_OVERLAPPEDWINDOW` with no device context owns no GDI objects. The
+count §53 needs is the USER one — an `HWND` is a USER object — and that is the
+one that moved.
+
+### 73.3 What this unlocks, and what it does not
+
+**Unlocked.** The window-handle leak assertion of §53 can be made against the
+compositor's own process on the guest: churn clients, watch `GR_USEROBJECTS`
+return to its baseline. §64's icon account gets the same treatment — `HICON` is
+a USER object too, so the `0 icon(s) destroyed` that no local harness could turn
+into a number now has somewhere to be one.
+
+**Not done.** Neither of those runs happened. This visit was six minutes and
+there were two agents queued behind it, so it bought the *decisive* measurement
+and handed the machine back. Both are now one `grep` away rather than a
+rewrite, which is the state §53.6 item 3 and §64.5 item 3 asked for.
+
+### 73.4 A correction I owe §53, and the shape of the mistake
+
+§53.3 lists five lines as "the whole diagnosis" of the locked session, and one
+of them was wrong for a reason that had nothing to do with locking.
+
+Run again on the **unlocked** desktop, the same probe still reported
+`SendInput_returned=0` — this time with `lasterror=87`,
+`ERROR_INVALID_PARAMETER`. That is what `SendInput` answers when `cbSize` does
+not match the `INPUT` it is given, and the struct in that probe carried two
+extra padding fields: 56 bytes where the x64 ABI wants 40. **The call had never
+worked, locked or not.**
+
+The conclusion of §53.3 survives, on the other evidence and only on it:
+`LockApp` was the foreground window, `WindowFromPoint` at the drag's origin
+returned it, and the control — a real drag between two Explorer windows on a
+scratch directory — did not move the file. Those are about the lock. The
+`SendInput` line was never evidence of anything.
+
+**The shape is worth naming because it is the one this document keeps
+rediscovering.** A wrong instrument agreed with a correct conclusion, so nothing
+about the run looked wrong. §53.4 records three harness bugs found because they
+made the harness disagree with reality; this is the fourth and it was invisible
+precisely because it *agreed*. The only reason it surfaced at all is that the
+same probe was pointed at a machine whose state had changed, and it gave the
+same answer — an answer that was supposed to depend on that state.
+
+And the same misreading nearly recurred at the top of this run. `Get-Process
+LockApp` returned 1 on the unlocked desktop, because Windows 11 leaves `LockApp`
+resident and suspended after an unlock. Counting the process would have said
+"locked"; `WindowFromPoint` at the centre of the screen said `firefox` with a
+page title, which is what the desktop actually had on it. **Asking what is on
+the screen beat asking what is in the process list**, both times.
+
+### 73.5 What is not proven
+
+1. **No compositor was run on the guest in this visit.** §73.3.
+2. **`gdi=0` is inferred to be correct, not shown.** A window that owns a device
+   context would settle it and none was made.
+3. **One process, four windows.** That the counter tracks a compositor holding
+   dozens of windows across many clients is likely and untested.
+4. **The USER count includes more than windows** — the `+5` for four windows is
+   the windows plus something (a class, a message queue). A leak assertion
+   should therefore compare against a *baseline of itself*, which is what §53's
+   harness already does for the enumerated count, rather than treating the
+   number as a window count.

@@ -173,8 +173,22 @@ int main(int argc, char **argv)
 			 * owns windows owns USER objects. Four were just made. */
 			(after_u == 0) ? "stub"
 				       : (after_u > before_u ? "live" : "flat"));
+		/* AND DOWN AGAIN. ADDED FOR docs/waycompose-design.md §73.
+		 *
+		 * A counter that only goes up cannot show a leak: the assertion
+		 * §53 wants is "the number came back", and on a stubbed counter
+		 * `0 == 0` satisfies it forever. So the windows are destroyed and
+		 * the count is taken a third time, and the verdict is `live` only
+		 * if it rose AND fell. On real Windows this is the difference
+		 * between an instrument and a decoration. */
 		for (k = 0; k < 4; k++)
 			if (made[k]) DestroyWindow(made[k]);
+		{
+			DWORD gone_u = GetGuiResources(self, GR_USEROBJECTS);
+			fprintf(g_out ? g_out : stdout, "destroyed user=%lu\nfell=%s\n",
+				(unsigned long)gone_u,
+				(gone_u < after_u) ? "yes" : "no");
+		}
 		if (g_out) fclose(g_out);
 		return 0;
 	}

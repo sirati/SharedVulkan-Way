@@ -2,11 +2,38 @@
 #
 # The compositor **on this host**, a real third-party client **inside the VM**.
 #
-#   scripts/wc-vm-client.sh linux      a Linux compositor here, the client in the guest
-#   scripts/wc-vm-client.sh wine       wc-compositor.exe under Wine here, ditto
+#   scripts/wc-vm-client.sh ring          can the wire ride the ring here? (the answer is no)
+#   scripts/wc-vm-client.sh linux-relay   a Linux compositor here, the client in the guest
+#   scripts/wc-vm-client.sh wine-relay    wc-compositor.exe under Wine here, ditto
 #   scripts/wc-vm-client.sh all
 #
 # docs/waycompose-design.md §67.9.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# THE RULE, AND WHY TWO OF THESE THREE LEGS ARE NOT A TRANSPORT RESULT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The user's standing rule:
+#
+#   > all communication is to go through the ring. alternative channels are
+#   > permitted only for wakeup from idle
+#
+# The `*-relay` legs below carry the **Wayland wire itself** over the
+# virtio-serial cold path, through two `socat`s. That is the protocol stream on
+# an alternative channel and **the rule forbids it.** The doorbell is the one
+# sanctioned use of virtio-serial (§36.6) because waking a parked consumer *is*
+# wakeup from idle; a byte relay carrying the whole conversation is not.
+#
+# They are kept, and labelled, because what they establish is not about the
+# transport at all: that the guest has no network, that a Unix socket node
+# exported over 9p is a host kernel object a guest `connect()` cannot reach, and
+# that both halves really are in different kernels — which the kernel assertion
+# proves in both directions. That is the venue, and it is real. **No result from
+# a `*-relay` leg is a statement about how the deployment moves bytes**, and the
+# banner each one prints says so rather than leaving it to this comment.
+#
+# `ring` is the leg that tries to obey the rule. It fails, and the failure is
+# the point — see §67.9 and `run_ring` below.
 #
 # THE THREE ARRANGEMENTS, AND WHICH TWO THIS FILE IS
 #
@@ -86,8 +113,8 @@ RUNDIR=${SV_RUNDIR:-/tmp/wc-vm-client}
 KEEP=0
 MODE=${1:-all}
 case "$MODE" in
-  linux|wine|all) ;;
-  *) echo "usage: $0 [linux|wine|all] [--keep]"; exit 2 ;;
+  ring|linux-relay|wine-relay|all) ;;
+  *) echo "usage: $0 [ring|linux-relay|wine-relay|all] [--keep]"; exit 2 ;;
 esac
 [ "${2:-}" = "--keep" ] && KEEP=1
 
@@ -120,9 +147,31 @@ WIN_BIN="$ROOT/target/x86_64-pc-windows-gnu/debug"
 WAYLAND_INFO=$(command -v wayland-info) || { echo "wayland-info is not on PATH"; exit 2; }
 WAYLAND_INFO=$(readlink -f "$WAYLAND_INFO")
 
+# `WC_VM_POOLTEST=1` swaps the registry walk for a client that sends an `h`.
+#
+# The default client, `wayland-info`, binds globals and disconnects; it never
+# creates a `wl_shm` pool, so the in-band-descriptor path (§2.3) is never taken.
+# `wc-pooltest.c` exists precisely to create and destroy pools and nothing else,
+# which makes it the smallest client that reaches the argument this arrangement
+# stops short of. Built here, on the host, because /nix/store is shared and the
+# guest runs the binary by absolute path like everything else.
+POOLTEST=""
+if [ "${WC_VM_POOLTEST:-}" = 1 ]; then
+  POOLTEST="$RUNDIR/wc-pooltest"
+fi
+
 rm -rf "$RUNDIR"; mkdir -p "$RUNDIR/pools" "$RUNDIR/keymaps"
 export SV_RUNDIR="$RUNDIR"
 cp "$LINUX_BIN/wc-proxy" "$RUNDIR/wc-proxy"
+
+# Which client the guest runs, as an absolute path it can reach.
+CLIENT_CMD="$WAYLAND_INFO"
+if [ -n "$POOLTEST" ]; then
+  gcc -O2 -o "$POOLTEST" "$ROOT/scripts/wc-pooltest.c" -lwayland-client \
+    || { echo "could not build wc-pooltest"; exit 2; }
+  CLIENT_CMD="/sv/wc-pooltest 4"
+  say "client: wc-pooltest, which sends an h, instead of wayland-info"
+fi
 
 VM=$(nix build "$ROOT#svGuest" --no-link --print-out-paths) || exit 1
 say "guest image: $VM"
@@ -137,6 +186,63 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Did the connection outlive the assertions made about it?
+#
+# See the call site for why this exists. Every check here is a *negative*: it
+# looks for the evidence of a broken session that the positive assertions cannot
+# see, because a positive assertion is true the moment it is taken and says
+# nothing about the moment after.
+assert_session_survived() {
+  local kind=$1 cdir=$2
+  local cl="$RUNDIR/client.log" pl="$RUNDIR/proxy.log" sl="$cdir/comp.log"
+  local broke=0
+
+  # 1. A `wl_display` error is the protocol's own way of saying the session is
+  #    over. libwayland prints it and keeps going, which is why the client's
+  #    exit status is not a substitute for reading this.
+  if grep -qE "wl_display#[0-9]+: error|error [0-9]+: " "$cl" 2>/dev/null; then
+    bad "the client hit a protocol error, so the session died: \
+$(grep -m1 -E "wl_display#[0-9]+: error|error [0-9]+: " "$cl" | tr -d '\r')"
+    broke=1
+  fi
+
+  # 2. The proxy's account of the same connection.
+  local why
+  why=$(grep -m1 -E "client [0-9]+ failed|could not publish|which this side cannot open|stopped: the compositor closed" "$pl" 2>/dev/null | tr -d '\r')
+  if [ -n "$why" ]; then
+    bad "the proxy reports the session did not survive: ${why#\[proxy\] }"
+    broke=1
+    # Every distinct complaint, not just the first: §70.5's run had one keymap
+    # refusal and six pool refusals, and reporting one of the seven would make a
+    # systematic failure look like an incident.
+    grep -cE "could not publish" "$pl" 2>/dev/null | grep -qv '^0$' \
+      && note "pool publish refusals: $(grep -c 'could not publish' "$pl")"
+    # **And the cause, measured rather than guessed** (§67.9). `SharedFile::create`
+    # ends in `Handle::map_mut`, an `mmap(MAP_SHARED)` on the pool file. `/sv` is
+    # 9p mounted `rw,relatime,access=client,msize=16384,trans=virtio` -- no cache
+    # mode -- and a shared mapping there returns EINVAL. Measured in the guest
+    # with a five-line probe: MAP_SHARED on /sv fails with errno 22, MAP_PRIVATE
+    # succeeds, and MAP_SHARED on tmpfs succeeds. So this is the 9p share
+    # refusing the mapping, not the dialect, not Wine and not the compositor --
+    # which is also why it is identical on both legs, the one pair that differs
+    # in exactly the dialect.
+    if grep -q "could not publish.*os error 22" "$pl" 2>/dev/null; then
+      note "the EINVAL is 9p: mmap(MAP_SHARED) on /sv returns errno 22 (measured;"
+      note "MAP_PRIVATE there and MAP_SHARED on tmpfs both succeed). The file pool"
+      note "transport cannot cross this share at all -- see §67.9."
+    fi
+  fi
+
+  # 3. And the compositor's, so this is not one side agreeing with itself.
+  if grep -qE "protocol error|client .* error" "$sl" 2>/dev/null; then
+    bad "the compositor reports a protocol error: $(grep -m1 -E 'protocol error|client .* error' "$sl" | tr -d '\r')"
+    broke=1
+  fi
+
+  [ "$broke" = 0 ] && ok "the session survived: no protocol error, no failed client, no refused pool"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # One leg. `$1` is `linux` or `wine`, and it is the only thing that differs.
 # ---------------------------------------------------------------------------
@@ -144,6 +250,12 @@ run_leg() {
   local kind=$1
   echo
   echo "== the client is in the VM; the compositor is $kind on this host =="
+  note "TRANSPORT: this leg carries the Wayland wire over virtio-serial through two"
+  note "socats. The rule is that all communication goes through the ring and an"
+  note "alternative channel is only for wakeup from idle, so **this is not a"
+  note "sanctioned transport and no result below is a statement about one.** What"
+  note "it establishes is the venue: two kernels, no network, no shared socket."
+  note "See the 'ring' leg for the transport question and §67.9 for the blocker."
 
   local sock=wg-vm cdir="$RUNDIR/$kind"
   mkdir -p "$cdir"
@@ -234,7 +346,7 @@ XDG_RUNTIME_DIR=/tmp/rt /sv/wc-proxy --upstream /tmp/up.sock --socket wl-proxy \
   --pool-dir /sv/pools --peer-prefix '${peer_pools}' \
   --accept-timeout 40 --timeout 60 >/sv/proxy.log 2>&1 &
 sleep 2
-XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY=wl-proxy timeout 40 ${WAYLAND_INFO} \
+XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY=wl-proxy timeout 40 ${CLIENT_CMD} \
   >/sv/client.log 2>&1
 printf 'client-%s %s\n' rc "\$?"
 printf 'WCVM-%s\n' DONE
@@ -314,8 +426,59 @@ GUEST
     fi
   fi
 
+  # --- did the session SURVIVE ------------------------------------------
+  #
+  # **This block exists because both this harness and §70.5's reported a pass
+  # over a session that had already died.** Theirs stopped at `window … created`;
+  # this one stopped at the registry walk. In both cases every assertion was true
+  # when it was made and the connection was broken a moment later, which is §35's
+  # shape exactly and is the failure this whole section is about.
+  #
+  # It is deliberately three sources rather than one, because the interesting
+  # failures were each visible in only one of them:
+  #
+  #   * the **client's** own log -- a `wl_display` protocol error is fatal to the
+  #     session and libwayland prints it to stderr; `wc-pooltest` then went on to
+  #     print "4 pools created and destroyed" and **exit 0**, so neither its
+  #     output nor its exit status noticed;
+  #   * the **proxy's** log -- `client N failed`, a pool that could not be
+  #     published, a keymap the far side cannot open;
+  #   * the **compositor's** log -- the far end of the same connection.
+  #
+  # Reported before the content assertions, so a run that broke is not read as a
+  # run that worked.
+  assert_session_survived "$kind" "$cdir"
+
   # --- what the client saw, from inside another kernel --------------------
   local cl="$RUNDIR/client.log"
+
+  # The `h`-sending client, when asked for. **The expected result is a hang,
+  # not a pass**, and the assertion is written that way on purpose: `wc-proxy`
+  # writes the in-band-descriptor dialect (§2.3) upstream unconditionally
+  # because the far side has always been the Windows build, so against a *Linux*
+  # compositor the first `wl_shm.create_pool` desynchronises the reader with
+  # nothing logged on either side. A harness that called that a failure of this
+  # arrangement would be blaming the venue for a dialect bug; a harness that
+  # called it a pass would be worse. It reports which of the two happened.
+  if [ -n "$POOLTEST" ]; then
+    local made
+    made=$(grep -o "create_pool=[0-9]*" "$cl" 2>/dev/null | head -1)
+    # **What it printed, and no cause attached.** An earlier version of this
+    # block said "expected against a Linux compositor: wc-proxy writes the
+    # in-band-h dialect upstream" -- on *both* legs, including the `wine` one
+    # where that pairing is correct and §70.5 confirms the stream is right at
+    # both ends. That is docs/waycompose-design.md §63.3's error and §67.5's:
+    # a real explanation attached to the wrong path. The two legs differ in one
+    # thing, so let the two logs say which of them broke and how, and leave the
+    # attribution to whoever reads both.
+    note "the h-sending client on the $kind leg: $(tail -1 "$cl" 2>/dev/null | tr -d '\r')"
+    note "and its own exit status was 0 -- see the session check above, which is the"
+    note "only thing in this harness that noticed anything was wrong."
+    grep -E "could not publish|cannot open|failed" "$RUNDIR/proxy.log" 2>/dev/null \
+      | sed 's/^/        /' | head -4
+    return
+  fi
+
   if grep -q "interface: 'wl_compositor'" "$cl" 2>/dev/null; then
     ok "a stock libwayland client in the VM enumerated the compositor's globals: \
 $(grep -c "interface: '" "$cl") interfaces"
@@ -330,6 +493,26 @@ $(grep -c "interface: '" "$cl") interfaces"
       && ok "  ... including $want" \
       || bad "  ... but not $want"
   done
+
+  # **And this leg stops exactly where the interesting argument starts.**
+  # `wayland-info` walks the registry and disconnects; it never sends an `h`.
+  # `wc-proxy` writes the in-band-descriptor dialect (§2.3) upstream
+  # unconditionally, because the far side has always been the Windows build --
+  # so on the `linux` leg the first `wl_shm.create_pool` desynchronises the
+  # compositor's reader, with nothing logged on either side and the connection
+  # left open. That is why a registry walk passes here and is not evidence that
+  # a drawing client would. `scripts/wc-pooltest.c` is the client that reaches
+  # it; `WC_VM_POOLTEST=1` runs it instead, and the assertion is inverted --
+  # the desync is expected until the dialect is chosen rather than assumed.
+  # **Corrected.** This used to say the registry walk left the in-band path
+  # "advertised and not exercised". It does not: `wayland-info` sends no `h`,
+  # but the seat sends `wl_keyboard.keymap` unprompted, which carries one in the
+  # server-to-client direction -- and on the `linux` leg that is exactly where
+  # the dialect mismatch surfaces. The old sentence was true about the client's
+  # requests and wrong about the connection, and nothing noticed because nothing
+  # was checking the session. See docs/waycompose-design.md §67.10.
+  note "wayland-info sends no \`h\` itself, but the seat's wl_keyboard.keymap carries"
+  note "one the other way, so this walk does reach the dialect. §67.10."
 
   # The compositor's own account of the same client, so this is not one log
   # agreeing with itself.
@@ -348,11 +531,78 @@ end_leg() {
   sleep 2
 }
 
+# ---------------------------------------------------------------------------
+# The leg that obeys the rule, and the two refusals it collects.
+# ---------------------------------------------------------------------------
+#
+# The wire must ride the ring. For this arrangement — a compositor on this host,
+# a client in the guest — the control region has to be memory *both kernels can
+# map*, which on this rig means the guest's own RAM through the memfd backend.
+# The compositor has exactly two ways to offer a control region and neither
+# reaches that:
+#
+#   --wayland-cold PORT   publishes a region out of guest RAM. `#[cfg(target_os
+#                         = "linux")]` on `RingLink::publish`, and refused at
+#                         parse on any other build by `check_platform_flags`.
+#   --wayland-ring NAME   a named region: a file on Linux, a **named section**
+#                         on Windows. A section is a same-machine object; the
+#                         compositor's own startup already says the neighbouring
+#                         keymap section is "unopenable by one across the
+#                         boundary", and the ring section is the same kind of
+#                         object.
+#
+# So there is no combination that gets a *Windows-build* compositor's control
+# region into a form the far side of a hypervisor can map. Both are measured
+# here rather than argued, because a blocker asserted from reading the source is
+# the thing §67.5 is about.
+run_ring() {
+  echo
+  echo "== can the wire ride the ring in this arrangement? =="
+
+  local d="$RUNDIR/ring"; mkdir -p "$d"
+  export WINEPREFIX="${WINEPREFIX:-/tmp/wc-wineprefix}" WINEDEBUG="${WINEDEBUG:--all}"
+
+  # 1. the cross-VM publish, on the Windows build.
+  wine "$WIN_BIN/wc-compositor.exe" --socket ring-a \
+    --wayland-cold /dev/virtio-ports/org.sirati.svcold.0 --timeout 3 \
+    >"$d/cold.log" 2>&1
+  local rc=$?
+  if [ "$rc" != 0 ] && grep -q "needs the Linux guest-RAM provider" "$d/cold.log"; then
+    ok "the Windows build refuses --wayland-cold at parse (exit $rc), and says why:"
+    echo "        $(grep -o 'wc-compositor: --wayland-cold.*' "$d/cold.log" | head -1 | cut -c1-150)..."
+  else
+    bad "expected --wayland-cold to be refused on the Windows build; exit $rc"
+    sed 's/^/        /' "$d/cold.log" | head -5
+  fi
+
+  # 2. the named region, on the Windows build. This one *works* — and being a
+  #    named section is exactly why it does not help.
+  timeout 30 wine "$WIN_BIN/wc-compositor.exe" --socket ring-b \
+    --wayland-ring 'Local\wc-vm-ring' --timeout 4 >"$d/ring.log" 2>&1
+  if grep -q 'accepting Wayland rings in' "$d/ring.log"; then
+    ok "--wayland-ring is accepted and creates a section: \
+$(grep -o 'accepting Wayland rings in.*' "$d/ring.log" | head -1 | tr -d '\r')"
+    note "and a named section is a same-machine object. The compositor says so about"
+    note "the keymap in the very next line of its own log: \"unopenable by one across"
+    note "the boundary\". Nothing in the guest can open this region either."
+  else
+    bad "--wayland-ring did not start a ring directory"
+    sed 's/^/        /' "$d/ring.log" | head -8
+  fi
+
+  note "CONCLUSION: this arrangement cannot be made ring-compliant today, and the"
+  note "missing piece is one function -- a guest-RAM publish for the Windows build."
+  note "The compositor already commits and stamps guest RAM on Windows for an *arena*"
+  note "(--arena-guest-ram, via awe-probe); ringlink's publish has never been wired"
+  note "to it. See docs/waycompose-design.md §67.9."
+}
+
 SOCAT_ABS=$(readlink -f "$(command -v socat)")
 case "$MODE" in
-  linux) run_leg linux; end_leg ;;
-  wine)  run_leg wine;  end_leg ;;
-  all)   run_leg linux; end_leg; run_leg wine; end_leg ;;
+  ring)        run_ring ;;
+  linux-relay) run_leg linux; end_leg ;;
+  wine-relay)  run_leg wine;  end_leg ;;
+  all)         run_ring; run_leg linux; end_leg; run_leg wine; end_leg ;;
 esac
 
 echo

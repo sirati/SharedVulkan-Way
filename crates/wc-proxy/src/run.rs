@@ -688,7 +688,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut served: usize = 0;
     let deadline = std::time::Instant::now() + args.accept_timeout;
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    loop {
+    'accept: loop {
         // The first client is waited for; later ones are only accepted while
         // something is still running, so a proxy whose client has finished does
         // not sit forever.
@@ -697,71 +697,95 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.idle_timeout
         };
-        // DYNAMIC ARENA, and this is §72.5's fix: **the tick from the accept
-        // loop.**
+        // DYNAMIC ARENA. Waiting for a client in one long `accept_one` is what
+        // left the last region stranded: `Session::drop` returns a departing
+        // client's pools, the region becomes empty — and the release policy's
+        // clock is turned by the *pump*, which no longer exists, so the region
+        // waits for a tick that never comes. Measured on the VM leg: 15 s with
+        // nobody connected returned nothing, and one reconnect returned it
+        // within seconds.
         //
-        // The pump turns the release policy's clock on its `poll` timeout,
-        // which covers an idle client and covers nothing at all when there is
-        // **no** client — with zero sessions there is no pump. §72.5 measured
-        // it across a hypervisor: the last client is killed, `Drop for Session`
-        // returns its pools, the region is empty, and fifteen seconds later it
-        // is still the guest's. One reconnect and it came back in seconds. So
-        // the region was returnable the whole time and nothing was asking.
-        //
-        // That is the state the user's complaint is about — a machine with
-        // nothing running still holding memory — and it is the one state the
-        // old code could not leave, because `accept_one(wait)` was a single
-        // blocking call for the whole `--timeout`. A proxy with no clients sat
-        // in it and the arena stood still.
-        //
-        // This loop is the one thing that still exists with zero clients and it
-        // owns the shared arena, so this is where the clock has to turn. A slice
-        // with nobody arriving is a frame's worth of nothing happening, which is
-        // the unit `--arena-grow-idle` is already written in — the same argument
-        // the pump's poll timeout makes, from the only other place that can make
-        // it.
-        //
-        // The slice costs one atomic load and a `try_lock`-free tick every
-        // 20 ms while idle, and nothing at all while clients are arriving.
-        const ACCEPT_SLICE: Duration = Duration::from_millis(20);
-        let overall = std::time::Instant::now() + wait;
-        let mut accepted = None;
-        loop {
-            let left = overall.saturating_duration_since(std::time::Instant::now());
-            match listener.accept_one(ACCEPT_SLICE.min(left)) {
-                Ok(c) => {
-                    accepted = Some(c);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    if let Some(a) = &shared_arena {
-                        for (id, bytes, origin) in a.frame_idle() {
-                            // "by the accept loop" and **not** "with no client
-                            // connected", which is what this line said first and
-                            // could not know: this loop is running whether or not
-                            // sessions exist, and it usually wins the race
-                            // against them because it turns every 20 ms while a
-                            // pump turns only when *its* poll times out. Naming
-                            // who did it is a fact; naming the state of the world
-                            // would have been a guess, and it was wrong on the
-                            // very first run — printed while a client was up.
-                            println!(
-                                "[proxy] arena region {id} returned by the accept loop: \
-                                 {bytes} bytes of {origin}"
-                            );
+        // So the wait is sliced, and the arena is ticked between slices. This
+        // loop is the only thing that outlives every session and still holds
+        // the arena, which makes it the only place the zero-client case can be
+        // fixed. A slice is cheap — the tick is an atomic increment and a walk
+        // of at most a handful of regions — and it is only reached when nothing
+        // is connecting, which is exactly when it matters.
+        const TICK_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+        let client = {
+            let give_up = std::time::Instant::now() + wait;
+            loop {
+                let slice = TICK_SLICE.min(give_up.saturating_duration_since(std::time::Instant::now()));
+                match listener.accept_one(slice) {
+                    Ok(c) => break c,
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        if let Some(a) = &shared_arena {
+                            // `frame_idle()` rather than `tick()` +
+                            // `reclaim_regions(args.arena_grow_idle)`, and the
+                            // difference is **behavioural rather than tidy**:
+                            // the flag is not the policy. `Arena::reclaim_idle`
+                            // is, and it is 0 by default and only set from
+                            // `--arena-grow-idle` inside `if args.arena_grow`.
+                            // Reading the flag here therefore disagreed with the
+                            // pump twice, in opposite directions:
+                            //
+                            // * **without `--arena-grow`** the arena's own value
+                            //   is 0, so the pump returns nothing — and the flag
+                            //   is still 120, so this loop returned regions. A
+                            //   proxy never told it may grow gave memory back
+                            //   from one clock and not the other.
+                            // * **with `--arena-grow-idle 0`**, which the pump
+                            //   reads as "never" and guards for by name, this
+                            //   loop passed 0 to `reclaim_regions` — where it
+                            //   means "the instant it empties", the thrash the
+                            //   idle count exists to prevent.
+                            //
+                            // One flag, two policies, decided by which clock
+                            // happened to turn. `frame_idle` is the pump's own
+                            // body: same source, same `== 0` guard, and it is
+                            // `&self` so this loop needs no `share()` handle —
+                            // one would silently shift the `sharers()` count
+                            // every client reports.
+                            for (id, bytes, origin) in a.frame_idle() {
+                                // "by the accept loop", **not** "with no client
+                                // connected", which is a claim this loop cannot
+                                // make: it runs whether or not sessions exist,
+                                // and it usually wins the race against them
+                                // because it turns on every slice while a pump
+                                // turns only when *its* poll times out. Observed
+                                // printing while a client was up. Naming who did
+                                // it is a fact; naming the state of the world
+                                // was a guess.
+                                println!(
+                                    "[proxy] arena region {id} returned by the accept loop: \
+                                     {bytes} bytes of {origin}"
+                                );
+                            }
+                        }
+                        if std::time::Instant::now() >= give_up {
+                            // `break 'accept` and **not** `break Err(e)?`, which
+                            // is what slicing the wait first spelled. `Err(e)?`
+                            // does not break anything: it returns from `run()`,
+                            // so the ordinary idle timeout — the way every
+                            // successful proxy ends — became an error exit that
+                            // skipped the thread joins and the whole arena
+                            // report after this loop. `rustc` said so, as
+                            // `unreachable statement` at the first line past the
+                            // loop, which is the shape of this bug: the compiler
+                            // pointing at the code that stopped running rather
+                            // than at the line that stopped it.
+                            //
+                            // Before the wait was sliced this arm was a plain
+                            // `break`, so the exit path was right and slicing
+                            // lost it.
+                            let _ = e;
+                            break 'accept;
                         }
                     }
-                    // After the tick, not before it: the last slice of a run
-                    // that is about to give up is the one most likely to have
-                    // something to return.
-                    if std::time::Instant::now() >= overall {
-                        break;
-                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
-        }
-        let Some(client) = accepted else { break };
+        };
         served += 1;
         let n = served;
 

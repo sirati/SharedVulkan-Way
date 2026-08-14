@@ -473,7 +473,41 @@ impl GuestEnd {
         };
         let req = Request::decode(packet.payload)?;
         self.from_host.advance().map_err(other)?;
-        let reply = handler(req);
+        let mut reply = handler(req);
+        // §61.4. A frame list is 8 bytes a page, so a region large enough to
+        // need one bigger than the ring's lane is expressible: `GROW_STEP_CAP`
+        // is 64 MiB, which is 16384 pages and 131072 bytes — twice the 64 KiB
+        // lane, before `ReplyHeader`. Pushing it would fail the push, and the
+        // *reply* is what would be lost: the host would sit out its 20-second
+        // deadline and report a compositor that never answered, for a growth
+        // that in fact succeeded and whose region is now committed and
+        // unreachable.
+        //
+        // So the frame list is dropped and the region is answered for anyway.
+        // This is not a new failure mode being invented — it is exactly the
+        // degradation §0.21/§34.2 already specify and the host already
+        // implements: no frame list means the locator sweeps, which is correct
+        // on a freshly committed region because nothing has overwritten its
+        // stamps, and costs seconds instead of milliseconds. Losing the reply
+        // would strand a region; losing the frame list costs time and says so.
+        //
+        // Checked here rather than at either caller because this is the one
+        // place every reply passes through, and because the limit is the
+        // *ring's*, which is the thing this type owns.
+        let max = self.to_host.max_payload() as usize;
+        if reply.encode().len() > max && !reply.frames.is_empty() {
+            let pages = reply.frames.len();
+            reply.frames.clear();
+            let why = format!(
+                "the frame list for {pages} page(s) does not fit in a {max}-byte ring \
+                 packet; the host will sweep for the stamps instead"
+            );
+            reply.message = if reply.message.is_empty() {
+                why
+            } else {
+                format!("{}; {why}", reply.message)
+            };
+        }
         self.to_host.push_bytes(&reply.encode()).map_err(other)?;
         Ok(Some((req, reply)))
     }
@@ -662,6 +696,60 @@ mod tests {
         let mut bad = r.encode();
         bad[0..4].copy_from_slice(&99u32.to_le_bytes());
         assert!(Request::decode(&bad).is_err());
+    }
+
+    /// §61.4. A region at `GROW_STEP_CAP` has a frame list twice the ring's
+    /// lane, and the reply must still arrive.
+    ///
+    /// The failure this prevents is asymmetric and that is why it is worth a
+    /// test: pushing an oversized packet loses the **reply**, so the host sits
+    /// out its deadline and reports a compositor that never answered — for a
+    /// growth that succeeded, whose region is committed, pinned, and now
+    /// unreachable. Dropping the frame list instead costs the host a sweep,
+    /// which it already knows how to do and which says so in the log.
+    ///
+    /// It only arises on Windows, where the PFN database exists, so no Linux
+    /// leg can reach it: it would have bitten exactly once, on the deployment.
+    #[test]
+    fn a_frame_list_too_big_for_the_ring_is_dropped_and_the_region_still_answered() {
+        use std::sync::Arc;
+        use sv_transport::region::SharedRegion;
+
+        let g = geometry();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let guest = Control::create(Arc::clone(&region), g, protocol_ids(), 1).unwrap();
+        let host = Control::attach(Arc::clone(&region), protocol_ids()).unwrap();
+        let mut host_end = HostEnd::attach(&host).unwrap();
+        let mut guest_end = GuestEnd::open(&guest).unwrap().expect("the claim made it Live");
+
+        // 64 MiB is `wc_proxy::pool::GROW_STEP_CAP`: 16384 pages, 131072 bytes
+        // of frame list, against a 64 KiB lane.
+        let pages = (64 << 20) / 4096;
+        host_end
+            .to_guest
+            .push_bytes(&Request { op: Op::Grow, region: 2, bytes: 64 << 20 }.encode())
+            .unwrap();
+        guest_end
+            .service(&mut |req| Reply {
+                status: 0,
+                run_id: 0xabc,
+                len: req.bytes,
+                pages,
+                locked: true,
+                frames: (0..pages as u64).collect(),
+                query_ms: 331,
+                message: String::new(),
+            })
+            .expect("the oversized reply must not fail the push");
+
+        let packet = host_end.from_guest.next().unwrap().expect("an answer arrived at all");
+        let reply = Reply::decode(packet.payload).unwrap();
+        // The growth succeeded and the host can locate it — by sweeping.
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.pages, pages);
+        assert_eq!(reply.run_id, 0xabc);
+        assert!(reply.frames.is_empty(), "the frame list is what gives way");
+        assert!(reply.message.contains("does not fit"), "and it says why: {}", reply.message);
     }
 
     /// A compositor that never answers must not hang the client's thread inside
