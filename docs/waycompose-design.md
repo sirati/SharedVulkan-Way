@@ -21651,3 +21651,127 @@ unchanged at 23. What changed is the description of seven of them, from a
 double-buffering problem to a pointer-focus problem — which matters because the
 two live in different files and only one of them was on the list anybody was
 about to read.
+
+
+---
+---
+
+## 67. Subsurface state that belongs to the parent's commit is applied on the child's
+
+### 67.1 Status in one paragraph
+
+§66 narrowed the seven subsurface failures from "commit semantics" to "the scene
+lookup", and that narrowing was half right. The lookup is fine. What is wrong is
+one thing, in `vendor/smithay`, which this project owns outright: **`set_position`
+and `place_above`/`place_below` are double-buffered on the *parent* surface, and
+smithay applies them on the child's commit and on the bare request
+respectively.** Two sentences of protocol text say so, and they are the whole
+argument. Nothing is fixed here — the change is delicate and belongs to its own
+session — but the group is no longer seven puzzles; it is one deviation with a
+citation.
+
+### 67.2 The two sentences
+
+From `vendor/wayland-server/wayland.xml`, `wl_subsurface`:
+
+> **`set_position`** — "Position is double-buffered state **on the parent
+> surface**, see wl_subsurface and wl_surface.commit for more information."
+>
+> **`place_above`** / **`place_below`** — "Z-order is double-buffered state **on
+> the parent surface**, see wl_subsurface and wl_surface.commit for more
+> information."
+
+"On the parent surface" is the operative phrase in both, and it is not the same
+as "double-buffered". Sync and desync change when the *subsurface's own* state is
+applied; they do not move position or z-order off the parent's commit, because
+those never belonged to the child in the first place.
+
+### 67.3 What smithay does instead
+
+**Position.** `set_position` writes `SubsurfaceCachedState.pending().location`,
+and that cache hangs off the **subsurface's own** surface:
+
+```rust
+impl Cacheable for SubsurfaceCachedState {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self { Self { location: self.location } }
+```
+
+so it is promoted on the *subsurface's* commit. In sync mode that is invisible,
+because the child's cache is applied when the parent commits anyway. In **desync**
+mode the child's commit applies immediately, and the position moves with no
+parent commit at all.
+
+That is exactly what WLCS reports. `subsurface_does_not_move_when_parent_not_committed`
+sets desync, sets position (20, 20), commits **only the subsurface**, and then
+asks where the pointer at (30, 30) landed:
+
+```
+Expected: (30, 30)      the subsurface has not moved, so the pointer is at (30,30) in it
+  Actual: (10, 10)      it moved: 30 - 20
+```
+
+`(2560, 2560)` in the raw log is `wl_fixed` for `(10.0, 10.0)`.
+
+**Z-order.** Worse, and simpler: it is not buffered at all.
+
+```rust
+wl_subsurface::Request::PlaceAbove { sibling } => {
+    if let Err(()) = PrivateSurfaceData::reorder(&data.surface, Location::After, &sibling) {
+```
+
+`reorder` runs on the request. The parent's commit is not involved.
+
+### 67.4 What this does to §66.4's hypothesis
+
+§66.4 recorded that `place_above_simple` and `place_below_simple` look
+unsatisfiable — each asserts that neither the moved subsurface nor the fixture's
+is focused, when after the restack one of them must be — and refused to conclude
+the suite was wrong without a reference run.
+
+That refusal now looks better than it did. With z-order applied on the request
+rather than on the parent's commit, **the stack these tests are asserting about
+is not the stack we build**, and reasoning about which surface "should" be on top
+from the request order was reasoning about a sequence the spec does not describe.
+The hypothesis is not disproved and it is not needed: fix the deviation first,
+and re-read the assertions against what the parent's commit actually produces.
+
+The reference run in §66.4 is still the way to settle it, and it is still one
+command. But it is no longer the *first* thing to do.
+
+### 67.5 Why this is ours to fix, and the shape of it
+
+`Cargo.toml` is explicit: *"Nothing in `vendor/` is upstream code any more; treat
+it as ours."* `vendor/PATCHES.md` is the index of what has been changed and why,
+and this would be another entry.
+
+The shape, and the reason it is not done here:
+
+* **Position** wants moving from a `Cacheable` on the child to state applied when
+  the parent commits. smithay's cache machinery has the hook — sync children are
+  already committed from the parent — but "apply the child's location on the
+  parent's commit while leaving the rest of the child's state alone" is a
+  different split from the one the type currently expresses.
+* **Z-order** wants the reorder staged and applied at the parent's commit, which
+  means a pending stacking list per parent where today there is one live list.
+* Both are changes to the traversal every other part of this compositor reads
+  through — `placed_tree` feeds both the blit and the hit test (§40), so an error
+  here is an error in two places that must stay each other's inverse.
+
+That is a session's work with its own measurements, not a change to append to
+this one.
+
+### 67.6 What is claimed and what is not
+
+Claimed: the two spec sentences, the two pieces of smithay that contradict them,
+and that `subsurface_does_not_move_when_parent_not_committed`'s numbers are the
+predicted consequence of the first.
+
+**Not claimed: that fixing this fixes six tests.** Four are position tests and
+the mechanism accounts for them directly; two are restacking tests and §67.4
+says only that they cannot be judged until the stack is built at the right time.
+The seventh, `subsurface_extends_parent_input_region`, throws `bad optional
+access` — the pointer entered nothing at all — and nothing here explains it.
+
+Also not claimed: that this is a *bug* in upstream smithay as shipped. This is
+what `vendor/smithay` does at the revision this tree carries, read from the
+source in the tree. Whether upstream has since changed it was not checked.
