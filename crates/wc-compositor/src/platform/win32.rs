@@ -2221,7 +2221,7 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
         "wc-compositor: windows at exit: {made} created, {gone} destroyed, \
          {held} still held, {live} still alive, {clients} client(s) still connected"
     );
-    // ADDED FOR docs/waycompose-design.md §60. The same accounting for the
+    // ADDED FOR docs/waycompose-design.md §62. The same accounting for the
     // *other* per-window resource, and it rides on this line's coat-tails for
     // §56.2's reason: a stranded OLE registration has no symptom at all, so the
     // only way it is ever noticed is a number printed where a run already

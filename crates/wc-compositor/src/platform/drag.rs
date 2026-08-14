@@ -762,7 +762,7 @@ thread_local! {
     /// the gesture lasts.
     static OVER_RUN: Cell<(DROPEFFECT, u32)> = const { Cell::new((DROPEFFECT_NONE, 0)) };
     /// Drop-target registrations OLE accepted, gave back, and refused to give
-    /// back. ADDED FOR docs/waycompose-design.md §60; see `drop_target_counts`.
+    /// back. ADDED FOR docs/waycompose-design.md §62; see `drop_target_counts`.
     static REGISTERED: Cell<u32> = const { Cell::new(0) };
     static REVOKED: Cell<u32> = const { Cell::new(0) };
     static REVOKE_FAILED: Cell<u32> = const { Cell::new(0) };
@@ -1398,7 +1398,7 @@ pub(crate) fn revoke(hwnd: HWND) {
     }
     // SAFETY: a live window handle on the thread that owns it.
     let hr = unsafe { RevokeDragDrop(hwnd) };
-    // ADDED FOR docs/waycompose-design.md §60. **The result used to be
+    // ADDED FOR docs/waycompose-design.md §62. **The result used to be
     // discarded**, and the whole of §43.7's ordering argument — revoke before
     // `DestroyWindow`, because OLE keys the registration on the `HWND` and a
     // destroyed handle cannot be revoked — rests on this call succeeding. A
@@ -1418,7 +1418,7 @@ pub(crate) fn revoke(hwnd: HWND) {
 
 /// How many windows OLE accepted as drop targets, and how many were given back.
 ///
-/// ADDED FOR docs/waycompose-design.md §60. These are the compositor's own
+/// ADDED FOR docs/waycompose-design.md §62. These are the compositor's own
 /// account of its own behaviour and are labelled as such wherever they are
 /// printed — §56's distinction. What makes them worth having anyway is that the
 /// *external* check is impossible here: OLE's registration table is not
@@ -1489,7 +1489,7 @@ mod tests {
     /// `RevokeDragDrop` tells a window it never registered apart from one it
     /// did, so counting its successes is a measurement rather than a formality.
     ///
-    /// ADDED FOR docs/waycompose-design.md §60. `revoke` used to discard the
+    /// ADDED FOR docs/waycompose-design.md §62. `revoke` used to discard the
     /// `HRESULT`; it now counts, and a counter is only worth having if the
     /// thing it counts can come out the other way. This is the other way: OLE
     /// answers `DRAGDROP_E_INVALIDHWND` for a window that was never a drop
