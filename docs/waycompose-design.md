@@ -19868,3 +19868,101 @@ compositor was already correct on this path: six windows created, six destroyed,
 none left, its own count agreeing with the window manager's. What did not exist
 was any way to know that — and the difference between "correct" and "known to be
 correct" is the whole of what this section adds.
+
+## 54. The checker behind the gate, and a margin measured instead of a failure forced
+
+### 54.1 `wc-xref.sh` now runs under `cargo test`
+
+§48.6 item 2 said the obvious thing about §48's own result: *"Nothing runs
+`wc-xref.sh` automatically. It is a script that must be invoked, which is exactly
+the property that let the citations rot."* A checker nobody runs reports the
+state of the tree on the day somebody remembered it, and "somebody remembered"
+is not a schedule for a tree a dozen agents edit.
+
+`crates/sv-testkit/tests/design_citations.rs` puts it behind
+`cargo test --workspace`, which is the gate every agent is already told to run.
+It lives there because the workspace is a virtual manifest with no root package,
+and `sv-testkit` is the crate whose whole purpose is test-only support — the
+least arbitrary of the available homes for a check belonging to no single crate.
+
+**Two tests, and the second is the one that matters.**
+`every_design_document_citation_resolves` runs the script and fails with its full
+output. `the_citation_check_can_fail` builds a throwaway tree — two documents
+defining §1, one source file citing §99.99 — and requires the checker to reject
+it. Without that, a future change that made the scan match nothing silently (a
+broken regex, a path that stopped resolving, or `grep` treating a file as binary
+after a bad byte, §44.7) would turn the first test into a green no-op. That is
+§42 applied to the checker itself: a gate that cannot fail is counted as
+coverage.
+
+A missing script is also a failure rather than a skip, for the same reason.
+
+**And the negative fixture broke the real check on its first run**, which is
+worth recording because the pattern has now appeared three times. The bait
+string — the Vulkan document's path followed by a section number nothing
+defines — written as a literal *is* a citation, sitting in a `.rs` file the
+checker scans, and the run reported it against `design_citations.rs:125` exactly
+as it would any other broken reference.
+
+**It happened a fourth time writing this paragraph**, which is why the string is
+described here rather than quoted: the first draft pasted the failure message
+verbatim into this document, and `cargo test --workspace` went red on
+`docs/waycompose-design.md` for the two lines that quoted it. A checker that
+scans prose catches prose, including prose about the checker. The lesson is not
+that the scan is too broad — it is exactly as broad as it should be, since a
+citation in a document is one a reader will follow — but that **there is no safe
+way to write a broken citation down**, and describing one is the only option
+that does not require an exemption.
+
+Fixed by assembling the string at run time rather than excluding test files from
+the scan — the same call §48.3 made when this document's own prose tripped it.
+An exception for "examples" is how a checker starts having exceptions, and the
+concatenation costs one line.
+
+### 54.2 `minframes`: the path did not fire, and the attempt measured the margin
+
+§48.6 item 3 recorded that `minframes`'s inconclusive path had never fired on a
+real run. The only variable that reaches it is the leg's window: `weston-terminal`
+owes 2 frames by construction, so seeing 1 means closing the window before the
+second lands. The 8-second leg duration was a constant with no stated basis —
+the same shape as every other bound in this line of work — so it is now
+`WC_LEG_SECS`, and the path can be aimed at deliberately.
+
+**It still did not fire, and that is the result.** With the window cut to one
+eighth of its default:
+
+```
+$ WC_LEG_SECS=1 ./scripts/wc-proxy.sh window
+  PASS  term: 3 frames of the client's pixels reached the window (owed 2)
+== 41 passed, 0 failed ==
+```
+
+Three frames in a one-second window, against a floor of two. §35.9 item 3's
+worry was that the floor had *no margin* — the counts observed were 2, 2 and 5,
+so 2 looked like the minimum rather than a bound. That worry was about the
+**count**. What this measures is the **time** margin, which is the axis load
+actually attacks, and it is at least eightfold: the client completes both
+structural draws with a window an eighth as long as the one it is given.
+
+So the honest statement is not "the inconclusive path works" — it has still
+never been observed on a real client — but "the conditions that would reach it
+are further away than they looked". Reaching it needs a machine that cannot let
+`weston-terminal` map and take its configure inside a second, and manufacturing
+that means loading a box a dozen agents share, which is not worth a
+demonstration. The logic remains verified on six synthetic cases (§48.5),
+including the one that must not skip.
+
+### 54.3 What is not done
+
+1. **The inconclusive path is still untried in anger**, now with a measured
+   distance to it rather than a guess. If it ever fires, §54.2's eightfold time
+   margin is the number to check it against: at a load that leaves that intact,
+   the window is not the explanation and the client is the suspect.
+2. **`the_citation_check_can_fail` builds its fixture in `/tmp`** and copies the
+   checker into it. If the checker ever grows a dependency on something outside
+   its own directory — a config file, a second script — the negative test will
+   fail for that reason rather than the one it is testing, and the message will
+   not say so.
+3. **The 748 unqualified and 2457 bare citations are still unchecked**, §48.6
+   item 1 unchanged. The test inherits whatever the script decides to fail on,
+   so tightening remains one line in one place.
