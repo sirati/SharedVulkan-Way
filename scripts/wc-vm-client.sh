@@ -208,8 +208,16 @@ $(grep -m1 -E "wl_display#[0-9]+: error|error [0-9]+: " "$cl" | tr -d '\r')"
   fi
 
   # 2. The proxy's account of the same connection.
+  # **`failed` and not `stopped`, and the difference is the proxy's own.**
+  # `run.rs` prints `client N stopped: {why}` for `Ok(why)` and
+  # `client N failed: {e}` for `Err(e)` -- an orderly end against an error. This
+  # check matched `stopped: the compositor closed the connection` as a failure,
+  # so once the dialect fix made the session *work*, a clean `wayland-info`
+  # disconnect was still reported as the session not surviving. A survival check
+  # that cannot recognise a normal ending is a check that will be ignored, which
+  # is the failure mode after the one it was written for.
   local why
-  why=$(grep -m1 -E "client [0-9]+ failed|could not publish|which this side cannot open|stopped: the compositor closed" "$pl" 2>/dev/null | tr -d '\r')
+  why=$(grep -m1 -E "client [0-9]+ failed|could not publish|which this side cannot open" "$pl" 2>/dev/null | tr -d '\r')
   if [ -n "$why" ]; then
     bad "the proxy reports the session did not survive: ${why#\[proxy\] }"
     broke=1
@@ -291,8 +299,27 @@ run_leg() {
     node=$n
   else
     peer_pools="$RUNDIR/pools/"
+    # **`--in-band`, and §79 names this harness in the flag's own doc comment.**
+    # The dialect is now chosen per connection from the transport rather than by
+    # platform, and a ring slot needs no flag because a connection that arrives
+    # as one *is* the proxy by construction. A socket carries no identity, and
+    # this leg puts the proxy on a socket, so the operator that arranged the
+    # relay declares it. Without it the compositor treats the proxy as a stock
+    # libwayland client, and the first `h` in either direction is read out of
+    # band -- which is the `wl_keyboard.keymap … 0 available` this leg reported
+    # before the flag existed.
+    #
+    # The `wine` leg needs no equivalent: there the compositor is the Windows
+    # build, where in band is what a peer on a socket always speaks.
+    # `WC_VM_SEALED=1` drops `--shared-dir`, which is how the keymap becomes a
+    # `SealedFile` memfd instead of a file in the shared directory. That is the
+    # path §79's dialect work has not reached yet, and this leg is the cheapest
+    # way to see what an in-band peer gets when it arrives -- so the flag exists
+    # for whoever takes `SealedFile` next rather than for this section.
+    local sharedir=(--shared-dir "$RUNDIR/keymaps" --shared-peer-prefix "/sv/keymaps/")
+    [ "${WC_VM_SEALED:-}" = 1 ] && sharedir=()
     XDG_RUNTIME_DIR="$cdir" "$LINUX_BIN/wc-compositor" --socket "$sock" --timeout 120 --layout us \
-      --shared-dir "$RUNDIR/keymaps" --shared-peer-prefix "/sv/keymaps/" \
+      --in-band "${sharedir[@]}" \
       >"$cdir/comp.log" 2>&1 &
     COMP=$!
     local n=""

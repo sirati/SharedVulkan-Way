@@ -22619,6 +22619,113 @@ The arrangement is viable — §70.5 got a mapped `HWND` out of it and this sect
 got a registry walk — and the thing that makes it *shippable* is not a channel
 but the two pieces named above: a guest-RAM publish for the Windows build, and
 the negotiated format §72 is for. Neither belongs to this section.
+
+### 67.11 The day it unblocked, and what a leg written to announce it actually said
+
+§67.10 said the legs were written "to start working rather than to need
+rewriting", and named two things that had to land. One of them did:
+`ProtoFd`/`WireFd` chose the `h` encoding **per connection from the transport**
+instead of by platform, and `scripts/wc-pool.sh` is its acceptance test — four
+pools through the proxy to a Linux compositor, client exit 0, with a control leg
+proving that removing one flag brings the original hang back. It passes on this
+tree.
+
+So the legs were re-run. **Three things moved and one of them was mine.**
+
+#### The keymap failure moved, and it needed the flag §79 added
+
+The first re-run reported the failure **byte-identical** to before:
+
+```text
+FAIL  client 1 failed: compositor: wl_keyboard.keymap (event):
+      argument 1 claims 35572 bytes, 0 available
+```
+
+Which was correct, and the reason is in `--in-band`'s own doc comment: *"A ring
+slot needs no flag — a connection that arrives as one **is** the proxy, by
+construction. A socket cannot say who is on the far end, and the relay legs put
+the proxy on one (`wc-vm-client.sh --upstream`), so the operator that arranged
+the relay declares it here."* §79 anticipated this harness by name. The leg was
+putting the proxy on a socket and never declaring it, so the compositor treated
+it as a stock libwayland client and wrote the keymap descriptor out of band.
+
+With `--in-band` on the Linux compositor:
+
+```text
+wc-compositor: client 1 accepted, h in band
+wc-compositor: client InnerClientId { .. } disconnected: ConnectionClosed
+[proxy] client 1 ... 8 client msgs, 30 server msgs
+```
+
+No keymap complaint, orderly close. **The dialect half of §67.10's two-cause
+split is closed.**
+
+#### The other half did not move, which is the point of having split them
+
+Run with `WC_VM_POOLTEST=1`, the `h`-sending client still fails — and now with
+*only* the one failure left:
+
+```text
+FAIL  pool 3: could not publish 1228800 bytes: Invalid argument (os error 22)
+....  the EINVAL is 9p: mmap(MAP_SHARED) on /sv returns errno 22
+```
+
+That is the split holding up under the fix, which is the strongest evidence it
+was drawn in the right place. §67.10 predicted that one of the two failures would
+move when the dialect moved and the other would not; the dialect landed, the
+keymap went, the `EINVAL` stayed exactly where it was. A two-cause diagnosis that
+survives one of its causes being fixed is worth more than the reasoning that
+produced it.
+
+#### `assert_session_survived` reported it — and had a false positive of its own
+
+It did report the change without a harness edit, which was the point. But once
+the session actually *worked*, it kept failing the leg on:
+
+```text
+FAIL  client 1 stopped: the compositor closed the connection
+```
+
+`run.rs` prints `client N stopped: {why}` for `Ok(why)` and `client N failed:
+{e}` for `Err(e)` — an orderly end against an error — and the check was matching
+both. So a clean `wayland-info` disconnect read as the session not surviving.
+Fixed by keying on `failed`.
+
+**That is the failure mode after the one it was written for**, and it is worth
+naming because it is the more dangerous of the two. A check that cries wolf gets
+switched off, and this one is now load-bearing in four harnesses across three
+agents. It was caught the same way everything else in this section was caught:
+by reading the log rather than the verdict.
+
+#### What was *not* shown, said plainly
+
+`SealedFile` — the keymap as a `memfd` rather than a file in `--shared-dir` — is
+the next piece of the dialect work, and `WC_VM_SEALED=1` drops `--shared-dir` so
+this leg can reach it. It passes, and **that is not evidence that the path
+works**: the proxy reports `0 fds in, 0 out`, so nothing crossed that would have
+exercised it. `wayland-info` reads the seat's capabilities without ever binding
+a `wl_keyboard`, so the run says nothing either way. The flag is in the harness
+for whoever takes `SealedFile` next, with a client that binds a keyboard; this
+section claims only that it did not break.
+
+`Invalid new_id: 6` still arrives beside the pool refusal and is still
+unattributed.
+
+#### Where the arrangement stands
+
+| | |
+|---|---|
+| `wc-vm-client.sh all` | **24 passed, 0 failed** (was 22/1) |
+| `wc-vm-client.sh ring` | 3 passed, 0 failed — all three refusals still stand |
+| with `WC_VM_POOLTEST=1` | the 9p `EINVAL` alone, dialect no longer implicated |
+
+The transport conclusion is unchanged and none of the above touches it: the
+relay legs still carry the wire on a channel the rule forbids, and they are still
+venue evidence rather than a transport result. What moved is that the venue is
+now known to be sound for everything the file substrate does not block — which
+makes the remaining blocker exactly one thing, a guest-RAM publish for the
+Windows build, rather than two.
+
 ## 68. Subsurface state that belongs to the parent's commit is applied on the child's
 
 ### 68.1 Status in one paragraph
