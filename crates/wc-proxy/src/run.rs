@@ -51,6 +51,15 @@ struct Args {
     /// of it that are the guest's arena. Set, `--transport arena` maps guest
     /// RAM; unset, it opens `--arena-path` as a file.
     arena_plan: PathBuf,
+    /// GROWTH. `wc-arena-host`, and the two things it needs to reach QEMU.
+    ///
+    /// Empty means this proxy cannot cause a region to exist and falls back to
+    /// watching the plan for one somebody else added. That is not a degraded
+    /// mode so much as the pre-growth one, and it is what every test of growth
+    /// before this stage actually exercised.
+    arena_locator: PathBuf,
+    arena_qmp: PathBuf,
+    arena_vm: String,
     /// STAGE 10. How many bytes at the **end** of the arena belong to the
     /// compositor rather than to this process's pool allocator — the window it
     /// cuts the objects it creates for clients out of. Zero means it has none.
@@ -141,6 +150,14 @@ usage: wc-proxy --upstream <path> [options]
   --arena-plan PATH      arena: instead of a file, the guest-RAM plan written by
                          wc-arena-host -- the object to open and the runs of it
                          that are the guest's own pinned pages
+  --arena-locator PATH   arena: wc-arena-host, so that --arena-grow can ask the
+                         compositor for a region and then locate it. Without it
+                         growth only watches the plan for a region somebody else
+                         appended, which is what it did before it worked.
+  --arena-qmp PATH       arena: QEMU's QMP socket for the locator
+                         (default /run/windows-vm/qmp.sock)
+  --arena-vm HINT        arena: process-name hint for finding QEMU
+                         (default windows-vm)
   --arena-id N           arena: the number both sides call it (default 0)
   --arena-size BYTES     arena: how big (default 64 MiB; with --arena-plan the
                          guest's allocation decides and this is ignored)
@@ -209,6 +226,9 @@ fn parse_args() -> Result<Args, String> {
         arena_size: 64 << 20,
         arena_path: PathBuf::new(),
         arena_plan: PathBuf::new(),
+        arena_locator: PathBuf::new(),
+        arena_qmp: "/run/windows-vm/qmp.sock".into(),
+        arena_vm: "windows-vm".into(),
         arena_outbound: 0,
         arena_policy: Policy::default(),
         arena_grow: false,
@@ -239,6 +259,9 @@ fn parse_args() -> Result<Args, String> {
             "--peer-prefix" => a.peer_prefix = next()?,
             "--arena-path" => a.arena_path = next()?.into(),
             "--arena-plan" => a.arena_plan = next()?.into(),
+            "--arena-locator" => a.arena_locator = next()?.into(),
+            "--arena-qmp" => a.arena_qmp = next()?.into(),
+            "--arena-vm" => a.arena_vm = next()?,
             "--arena-id" => a.arena_id = next()?.parse().map_err(|e| format!("--arena-id: {e}"))?,
             "--arena-outbound" => {
                 a.arena_outbound =
@@ -401,9 +424,32 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // itself, and it already knows which regions have been taken up.
             if args.arena_grow {
                 let ids = t.region_ids();
-                let src = PlanGrowth::new(&args.arena_plan, &ids);
+                // GROWTH. `PlanGrowth` re-reads the plan and takes whatever the
+                // locator has added; it was armed and inert for four stages
+                // because nothing added anything. `GuestGrowth` is what causes
+                // a region to be added — it asks the compositor over the
+                // shared-memory channel and then runs the locator — so it is
+                // the source whenever this side knows how to run the locator.
+                //
+                // Without `--arena-locator` there is nothing to run, and the
+                // plan-watching source is still the right answer: an operator
+                // may be appending to the plan by hand, which is how every
+                // growth before this stage was ever tested.
+                let src: Box<dyn RegionSource> = if args.arena_locator.as_os_str().is_empty() {
+                    Box::new(PlanGrowth::new(&args.arena_plan, &ids))
+                } else {
+                    Box::new(wc_proxy::guestgrow::GuestGrowth::new(
+                        wc_proxy::guestgrow::Locator {
+                            program: args.arena_locator.clone(),
+                            qmp: args.arena_qmp.clone(),
+                            vm: args.arena_vm.clone(),
+                            plan: args.arena_plan.clone(),
+                        },
+                        &ids,
+                    ))
+                };
                 println!("[proxy] arena {} may grow: {}", t.id(), src.describe());
-                t.set_source(Box::new(src))?;
+                t.set_source(src)?;
                 t.set_grow_step(args.arena_grow_step)?;
                 t.set_reclaim_idle(args.arena_grow_idle)?;
             }

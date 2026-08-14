@@ -367,6 +367,27 @@ mod win {
     /// tunnel, the relay, the compositor — never had the problem, because their
     /// output goes to `NUL`, which is a device rather than a pipe.
     fn ssh(cfg: &Config, p: &Paths, verb: &[&str]) -> Result<String, String> {
+        ssh_in(cfg, p, verb, None)
+    }
+
+    /// `ssh`, with a file on the far end's standard input.
+    ///
+    /// The one caller is the locate, and what it sends is the arena's page
+    /// frame list. It goes on stdin rather than in the verb because it is
+    /// 16 bytes a page — 256 KiB for a 64 MiB arena — and an argument that size
+    /// does not survive a command line, let alone `$SSH_ORIGINAL_COMMAND`.
+    ///
+    /// It is also the one thing this launcher sends the host that is *bulk*,
+    /// and it is worth noting what it is not: it is a list of **page frame
+    /// numbers**, which is where the guest's pages are, not what is in them.
+    /// The arena is still guest RAM located in QEMU's backing object and this
+    /// file changes only how it is found.
+    fn ssh_in(
+        cfg: &Config,
+        p: &Paths,
+        verb: &[&str],
+        stdin: Option<&std::path::Path>,
+    ) -> Result<String, String> {
         let argv = plan::ssh_exec(cfg, &p.known_hosts.to_string_lossy(), verb);
         let stem = p.state_dir.join(format!(
             "wc-launch-{}-{}.ssh",
@@ -380,10 +401,16 @@ mod win {
         let make = |path: &std::path::Path| {
             std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))
         };
+        let input = match stdin {
+            None => Stdio::null(),
+            Some(path) => Stdio::from(
+                std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+            ),
+        };
         let status = Command::new(&cfg.ssh)
             .args(&argv)
             .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
+            .stdin(input)
             .stdout(Stdio::from(make(&op)?))
             .stderr(Stdio::from(make(&ep)?))
             .status()
@@ -538,7 +565,12 @@ mod win {
             .map_err(|e| format!("state file: {e}"))?;
 
         // 1. The compositor, here, on the desktop the user is looking at.
-        let argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
+        let argv = plan::compositor_argv(
+            cfg,
+            &socket,
+            &p.comp_log.to_string_lossy(),
+            &p.comp_log.with_file_name("arena.frames").to_string_lossy(),
+        );
         log.say(&format!("compositor: {} {}", cfg.compositor, argv.join(" ")));
         let comp = quiet(Command::new(&cfg.compositor).args(&argv))
             .spawn()
@@ -570,12 +602,27 @@ mod win {
         // reads as a permissions problem — and holds the mutex's session
         // half-built. The first version returned `?` here and the next click
         // met a guest with a compositor nobody owned.
+        // The frame list, if the compositor managed one. Its absence is a
+        // *slow* locate rather than a broken one — the host falls back to the
+        // sweep — so this is conditional and says which way it went. A guest
+        // whose account lacks the privilege, or a build without the query, is
+        // still a working session.
+        let frames_path = p.comp_log.with_file_name("arena.frames");
+        let frames = std::fs::metadata(&frames_path).map(|m| m.len() > 0).unwrap_or(false);
         let t_locate = Instant::now();
-        let said = match ssh(
-            cfg,
-            p,
-            &["up", &id, &run_id, &pages.to_string(), &cfg.outbound.to_string()],
-        ) {
+        let mut verb: Vec<String> =
+            ["up", &id, &run_id, &pages.to_string(), &cfg.outbound.to_string()]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        if frames {
+            // The word is what tells `wc-session` to read stdin at all. A verb
+            // that always read it would block on a launcher that sent nothing,
+            // which is the older spelling of this call and has to keep working.
+            verb.push("frames".into());
+        }
+        let verb: Vec<&str> = verb.iter().map(String::as_str).collect();
+        let said = match ssh_in(cfg, p, &verb, frames.then_some(frames_path.as_path())) {
             Ok(s) => s,
             Err(e) => {
                 kill(comp_pid);

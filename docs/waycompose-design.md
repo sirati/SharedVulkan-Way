@@ -12461,6 +12461,78 @@ not something this compositor can assert.
    ones. Re-running it also found §41.8: the taskbar photograph had been failing
    a geometry gate that could never pass for a 1280x48 strip.
 
+### 34.8 The locate was a coin flip, and the frame list was already built
+
+Everything above treats the PFN locator as *growth's* prerequisite — the thing
+that keeps a mid-session locate from stalling a running Firefox for three
+seconds. That framing was too narrow, and five consecutive guest runs said so
+while this branch was being written:
+
+| attempt | outcome |
+|---|---|
+| 1 | `16377 of 16384 pages` after sweeping 13312 MiB |
+| 2 | `1 page index claimed twice` |
+| 3 | located; died later on an unrelated relay timeout |
+| 4 | `28 page index(es) claimed twice` |
+| 5 | `1 page index claimed twice` |
+
+**The duplicate is not the stale-stamp case**, and the error message invites
+that assumption. `new_run_id` hashes the millisecond with the pid, so a previous
+boot's stamps carry a different run id, land in `other_runs`, and are counted
+separately — attempt 1 counted 140 of them correctly. A *duplicate* is two pages
+carrying **this** run's id at the same page index, at two different file offsets,
+with no compositor running and 6.8 GiB free. Either the flat view reaches one
+guest page at two offsets, or pages move under a sweep that takes seconds on a
+loaded machine. That is `sv-hostd`'s subject and it is **still open**.
+
+What closes it here is not diagnosing it. The sweep reads 13 GiB of *contents*
+that the guest is entitled to change while they are being read; `PfnLocator`
+reads the kernel's page-frame database instead. **No stamp is read, so neither a
+stale stamp nor a duplicate is expressible** — the failure stops being possible
+rather than becoming less likely. It is also 0.064 s against 2.308 s, with
+byte-identical offset tables.
+
+So the locate is not slow-but-fine with growth as its only customer. It was
+**unreliable for everybody**, and both halves of the fix had been sitting in the
+tree with no caller outside the growth path. The missing piece was one flag:
+
+* `wc-compositor --arena-frames PATH` writes the frame list of every region it
+  commits — the data region, and separately the outbound window's own region
+  when `reserve_outbound` had to commit one, because that has its own run id and
+  its own locate. The path is printed **on the same report line as the run id**,
+  so a harness greps one line and gets both.
+* `wc-guest.sh` and `sv-firefox-guest.sh` pass `--frames` from the share they
+  already use for `--log`.
+* `wc-session up … frames` reads the list from **stdin** and the launcher pipes
+  it down the ssh channel it already has. Opt-in on a fifth word rather than
+  "read stdin if there is any", because a `cat` that blocked for ever on an older
+  launcher would be a session that hangs at the locate — worse than one that
+  sweeps.
+
+A frame list is 16 bytes a page, so a 64 MiB arena's is 256 KiB. That is why it
+is a file and a pipe rather than an argument, and it is worth being explicit
+about what that transfer is: **page frame numbers, which say where the guest's
+pages are, never what is in them.** The arena is still guest RAM found in QEMU's
+backing object, in every branch. Nothing here makes a file-backed arena reachable.
+
+Every call site is **conditional and says which locator ran**. A guest without
+the query, or an account without `SeProfileSingleProcessPrivilege`, gets a slow
+sweep rather than a refusal — a harness that would not start at all is a worse
+regression than the one being fixed — and the compositor's report line carries
+the *reason* there is no frame list, so a run that quietly fell back says so in
+its own output.
+
+The scan is not deleted and should not be. `--verify` still re-reads every page
+of the stitched view and checks that page *n* carries index *n*, which over a
+frame list is `security-model.md` R28's cross-check at the one moment the stamps
+still exist to hold the **trusting** locator to — and it is one pass over the
+region rather than over all of guest RAM.
+
+**None of this has run on a guest.** The numbers are from earlier measurements in
+this tree, and the first harness through will be what proves the query executes
+there at all.
+
+
 ## 35. Gates that reported success while something was wrong
 
 ### 35.1 Status in one paragraph
