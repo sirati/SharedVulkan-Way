@@ -294,7 +294,8 @@ mod tests {
     #[test]
     fn defaults_and_overrides() {
         let cfg = ok("");
-        assert_eq!(cfg.arena_mib, 64);
+        // The default is `Floor::CURRENT`, not a literal -- see `crate::floor`.
+        assert_eq!(cfg.arena_mib, crate::floor::Floor::CURRENT.mib());
         assert_eq!(cfg.port, 57431);
         let cfg = ok("arena-mib=64\nport=1\noutput=800x600\n");
         assert_eq!((cfg.arena_mib, cfg.port, cfg.output.as_str()), (64, 1, "800x600"));

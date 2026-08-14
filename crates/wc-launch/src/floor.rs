@@ -113,7 +113,7 @@ impl Floor {
     ///
     /// `MustStandAlone` until a guest run says otherwise. See that arm for
     /// exactly what "says otherwise" has to consist of.
-    pub const CURRENT: Floor = Floor::MustStandAlone;
+    pub const CURRENT: Floor = Floor::GrowsUnderPressure;
 
     /// The startup region, in MiB.
     pub const fn mib(self) -> u64 {
@@ -190,13 +190,37 @@ mod tests {
         assert_eq!(crate::config::Config::default().arena_mib, Floor::CURRENT.mib());
     }
 
-    /// Where the policy stands today, asserted so that flipping it is a
-    /// deliberate act with a failing test in front of it rather than a quiet
-    /// edit. Delete this assertion in the same commit that flips `CURRENT`, and
-    /// say in that commit's message which guest run earned it.
+    /// Where the policy stands, and what earned it.
+    ///
+    /// This replaces `growth_has_not_been_demonstrated_on_a_guest_yet`, whose
+    /// job was to make flipping `CURRENT` a deliberate act with a failing test
+    /// in front of it. It has been flipped and the run that earned it is in the
+    /// commit message; what the assertion guards now is the other direction —
+    /// that nobody quietly puts the floor back up without saying why.
+    ///
+    /// The run, on testhost's guest, 2026-08-14, at this exact floor:
+    ///
+    /// * `4096 pages` located by frame list — 16 MiB, so the floor really was
+    ///   the small one. (The first attempt at this measurement ran at 64 MiB
+    ///   because the size reaches the guest through the deployed ini rather
+    ///   than the environment, and its click times were quietly a 64 MiB
+    ///   result. Worth recording: the numbers looked right.)
+    /// * `grew 1` — `region 1: 16777216 bytes of guest RAM, 760 ms in the
+    ///   guest, 27 ms locating (frame list)`.
+    /// * **`refusals = 0`.**
+    /// * `peak resident 32.0 MiB in 2 region(s); floor 16.0 MiB`.
+    /// * warm clicks **1356 / 1375 / 1357 ms**, against **1414–1601 ms** at the
+    ///   64 MiB floor and against §28.12's failing **2144–2777 ms** with ten
+    ///   refusals.
+    ///
+    /// So a small start behaves like a large one — marginally *faster*, in
+    /// fact — and peak resident is half what the stand-alone floor reserved.
     #[test]
-    fn growth_has_not_been_demonstrated_on_a_guest_yet() {
-        assert_eq!(Floor::CURRENT, Floor::MustStandAlone);
-        assert_eq!(Floor::CURRENT.mib(), 64);
+    fn growth_is_demonstrated_and_the_floor_is_one_step() {
+        assert_eq!(Floor::CURRENT, Floor::GrowsUnderPressure);
+        assert_eq!(Floor::CURRENT.mib(), 16);
+        // The startup region is one growth step, so the first region *is* the
+        // first step and there is no second growth policy in the launcher.
+        assert_eq!(Floor::CURRENT.mib() * 1024 * 1024, measured::GROW_STEP);
     }
 }
