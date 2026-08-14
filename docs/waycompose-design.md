@@ -17793,6 +17793,112 @@ platform and named as such; **42 are debts**, and they are:
 None of these is blocked on a decision. The largest single one is 12 and the
 whole tail is smaller than the cluster §40 removed in one change.
 
+### 45.10 Continuing: the cheapest cluster first, and a bug the fix exposed
+
+Three of the eight remaining clusters were taken, in the order the evidence
+suggested rather than the order they appear in the table: **409 / 57 / 759**,
+which is 35 debts left.
+
+#### A compositor that cannot tell a client it is wrong
+
+Five of the 42 debts were protocol errors that are never raised, and they were
+first because a compositor that never refuses anything is missing a whole
+category of behaviour rather than a detail. Three are fixed.
+
+`xdg_wm_base.get_xdg_surface` must refuse a `wl_surface` that already has a
+role, and one that already has a buffer. Vendored smithay does neither — it
+checks the role on `get_toplevel` and `get_popup` but not here — so the two
+`post_error` calls are small and local. They are recorded in
+`vendor/PATCHES.md` §3 as an upstreamable bug rather than a port change: they
+would apply unchanged on Linux.
+
+**The third one took a second file, and the reason is a good one.** "Does this
+surface have a buffer" cannot be answered from `SurfaceAttributes`. Checking
+`pending()` and `current()` fixes the attached-but-uncommitted case and leaves
+the committed case failing — because **the compositor consumed the buffer when
+it committed**. `present` does `attrs.buffer.take()`, deliberately, so that a
+frame's damage and callbacks are not replayed forever; after that the surface
+has drawn and the protocol state says it never did. The question the protocol
+asks is about the surface's *history*, and nothing was recording it.
+
+So `BufferEverAttached` is a marker set by `wl_surface.attach` and never
+cleared — including for a null buffer, because a client that attaches nothing
+has still had a buffer. It is the only form of the question that both cases
+answer.
+
+The fourth, `attaching_buffer_to_unconfigured_xdg_surface_is_an_error`, is left.
+It wants `xdg_surface.unconfigured_buffer` raised on *attach*, with no commit
+anywhere in the test, and the attach handler has no view of xdg state — the
+`xdg_surface` is a resource, not something in the `wl_surface`'s data map. It
+needs a marker threaded the other way, and it is one test.
+
+#### A subsurface is mapped only while its parent is
+
+§40 implemented half of the protocol's mapping rule. "A sub-surface is mapped
+when the parent is mapped **and** the sub-surface has a buffer" — §40 made a
+surface that lost its own buffer stop taking input, and its children went on
+taking it as though nothing had happened. WLCS builds exactly that shape and
+calls it `unmapping_parent_stops_subsurface_getting_input`: a subsurface, a
+subsurface of *it*, and a null buffer committed to the middle one.
+
+The check walks from the candidate surface up to the root, and the root is
+deliberately not part of the walk: "the root has no buffer" is the window-level
+question, already answered by `Window::mapped` and by the platform ceasing to
+report the window. Including it would also break the case §9 documented —
+Firefox commits the subsurface holding the browser *before* the toplevel behind
+it, so a tree whose root has not drawn yet is a normal transient state rather
+than an unmapped window. Four tests.
+
+#### The bug §40 introduced and this section found
+
+The remaining eight in that cluster are
+`input_seen_by_subsurface_after_parent_unmapped_and_remapped`, and chasing them
+turned up something better than a fix: **§40's union bounding box changed the
+window's size and not its origin.**
+
+The test puts a subsurface at `(-100, 0)` — a hundred pixels to the *left* of
+its parent — and clicks 90 pixels left of the parent's origin. §40 taught
+`compose_tree` that an unset window geometry is "the full bounds of the surface,
+including any subsurfaces", so the window correctly grows. Measured, rather than
+reasoned about:
+
+```
+present window=1 frame=1 215x108
+present window=1 frame=2 315x108
+```
+
+315 = 215 + 100. The window grew by exactly the overhang. But its **position**
+is still the one the platform was given for the root surface, so the whole
+window now sits 100 pixels to the right of where it should be, and a click at
+the subsurface's real location lands outside it.
+
+That is a defect §40 introduced, in a case §40's tests did not reach, and it is
+worth being plain about: a bounding box that can extend up and to the left
+implies a window origin that moves, and nothing tells the platform to move it.
+On Windows that is a `SetWindowPos`, and `ToUi::Map`/`Present` carry no origin —
+so the fix is a platform-level change rather than a compositor-side one, and it
+is left named rather than rushed at the end of a long session.
+
+It is a debt with a diagnosis, which is a different thing from a debt with a
+symptom, and the eight tests stay in the debt column rather than being
+reclassified. **The temptation was to call them justified failures** — four of
+the eight do have the declared-geometry shape of §45.4's twenty-two — and that
+would have been laundering, because the other four are this bug and the
+measurement says so.
+
+#### Where it stands
+
+| | passed | failed | skipped |
+|---|---|---|---|
+| §45 first pass | 402 | 64 | 759 |
+| **§45.10** | **409** | **57** | **759** |
+
+409 of 466, 87.8%. Of the 57, 22 are expected on this platform and **35 are
+debts**: 8 subsurface remap (diagnosed above), 7 subsurface commit
+synchronisation, 7 popup grab and reposition, 6 interactive move and resize, 4
+toplevel configuration, 3 fullscreen, 2 protocol errors, and the two singletons.
+With the 79 skipped gaps, the number that must reach zero is **114**.
+
 
 ## 46. §27 continued: the arena leg, and an identity with a hole in it
 
