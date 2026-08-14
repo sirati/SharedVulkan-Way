@@ -153,7 +153,7 @@ run_linux() {
     timeout 10 wayland-info ) >"$dir/direct.log" 2>&1
   wait "$srv" 2>/dev/null
 
-  # §66, the negative case, and it is worth an assertion for the same reason the
+  # §67, the negative case, and it is worth an assertion for the same reason the
   # wine leg's is: this leg is *supposed* to have no Win32, and a `linux` run
   # that had somehow reached a Windows binary would pass every check below it
   # while proving nothing about the platform it names.
@@ -336,7 +336,7 @@ run_wine() {
   # handed the program over the launcher returns at once and `$probe_rc` is the
   # launcher's, not the probe's.
   #
-  # This harness got away with it until §66 for an uncomfortable reason: the
+  # This harness got away with it until §67 for an uncomfortable reason: the
   # probe used to *die* at the first `GetCursorInfo`, about a second in, so
   # everything it was ever going to write was already written by the time the
   # log was read. Giving it a Wine path that lets it survive turned a crash into
@@ -528,7 +528,7 @@ compositor claimed the resize border too" ;;
   # `GetCursorInfo` — what a *user* would see, as against the queue reading
   # above. Both legs make this reading and both assert on it.
   #
-  # Before §66 the probe *died* here under Wine and this harness printed a note
+  # Before §67 the probe *died* here under Wine and this harness printed a note
   # and carried on, so the Wine leg silently lost this reading and the two below
   # it: three assertions that looked like they were being made. §67.5 has the
   # cause and it was this harness, not Wine. An empty reading is therefore a

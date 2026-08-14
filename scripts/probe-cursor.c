@@ -315,7 +315,7 @@ static void ask_window(const char *tag, HWND w, int hittest)
  * probe dying at exactly this call with
  * `X Error of failed request: BadWindow (invalid Window parameter), Major
  * opcode 38 (X_QueryPointer)` -- and it reproduced on this branch, three times
- * out of three, before anything was changed. §66 was about to give it a Wine
+ * out of three, before anything was changed. §67 was about to give it a Wine
  * path. It does not have one, because the cause is not Wine:
  * `scripts/wc-cursor.sh` was tearing the compositor down while this probe was
  * still running, so the window whose pointer was being queried had just been
