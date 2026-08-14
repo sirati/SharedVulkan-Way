@@ -16956,3 +16956,231 @@ The test count does not move: the new tests are `cfg(windows)` and the cross
 target's test binary is a `.exe`, which `cargo test --target` cannot execute
 without a `binfmt_misc` registration — §29.10's second row, for the same reason
 and with five more tests in it.
+
+## 45. The remaining sixty-eight, split by cause rather than by name
+
+The standing requirement is the user's, and it is not a ratio:
+
+> "the windows wayland server must pass wayland compliance testing suits"
+
+So the target is zero applicable failures. §40 took the suite from 232 passing
+to 351 by finding that 136 failures were one missing call; §38 took it to 398 by
+fixing popup constraint. This section is about the 68 that were left, and its
+main product is not the eight it fixed — it is knowing what the other 60 are.
+
+### 45.1 Re-measured first, again, and again it mattered
+
+§38, §41 and §42 had all landed since the 68 was counted, and the scene-lookup
+and positioner work touched overlapping ground. Measured on `655c559` before
+anything was changed: **398 / 68 / 759**, with the 677/79/3 skip split intact.
+The 68 was real and none of it had moved.
+
+### 45.2 The split
+
+Every one of the 68 was traced to a cause. They are not 68 different things:
+
+| tests | cause |
+|---|---|
+| 22 | input outside the window geometry rectangle — **not a defect**, see §45.4 |
+| 12 | surface unmap and remap |
+| 7 | subsurface commit synchronisation (`sync`/`desync` position) |
+| 7 | popup grab and reposition semantics |
+| 6 | interactive move and resize (`xdg_toplevel.move`/`resize`) |
+| 5 | protocol errors that are never raised |
+| 4 | toplevel configuration state |
+| 3 | fullscreen, which does not exist |
+| 2 | one truncated-`wl_shm` case, one clipboard-focus case |
+
+Eight of these were fixed here, in three groups.
+
+### 45.3 A geometry that was only ever read on the buffer path
+
+`XdgToplevelStableTest.pointer_respects_window_geom_offset` sets a window
+geometry, commits **without attaching a buffer**, and expects the pointer to
+arrive at the offset coordinate. It arrived at the raw one.
+
+`compose_tree` is the only code that turns a geometry rectangle into
+`Window::content_offset`, and `present` was its only caller — so a commit that
+carried a geometry and no buffer applied it to nothing. This is §37's bug
+exactly, on the path §37 did not look at: §37 fixed *where the pointer is on a
+surface* for buffer commits, and a client that changes its outline without
+redrawing kept the old answer indefinitely. That is not contrived; it is what a
+client does when it leaves a maximised state, or acks a configure and
+re-declares its geometry before it has drawn.
+
+**The first fix was two tests worse than no fix**, and the reason is worth
+keeping. It recomposed on *every* state-only commit of a window root. But when
+a client has declared no geometry at all, the protocol defines it as the bounds
+of the tree — and a parent's commit is precisely the moment smithay is applying
+pending subsurface state, so the walk can read positions that are about to
+change. The compositor then cached a crop derived from a half-applied tree, and
+§40's pointer arithmetic was wrong again by that difference.
+`place_above_simple` and `subsurface_moves_under_input_device` noticed.
+
+So the trigger is a client's **stated** intent — a rectangle it actually passed
+to `set_window_geometry` — compared against the one the window is already
+using. A *derived* geometry is left to the buffer path, where the tree has
+settled, and to §40's hit test, which reads subsurface positions live and never
+caches them. `declared_geometry` exists to keep that distinction in one place:
+`None` means "the client has never said", which is a different fact from "the
+client said this", and conflating them is what the broken version did.
+
+### 45.4 The twenty-two, and the decision behind them
+
+WLCS's `XdgStableSurfaceBuilder(12, 5, 20, 6)` commits a 215×108 buffer, sets a
+window geometry of `(12, 5, 183, 97)`, and then probes the four edges of the
+*buffer* — every one of which is outside the geometry rectangle. Wayland is
+clear that window geometry does not clip input; only the input region does.
+
+Here it does clip input, because the `HWND` **is** the geometry rectangle.
+
+**§37 made that call and this section was asked to revisit it. It should not
+change, and the argument is stronger now than when it was made.** The area
+outside a client's declared geometry is its own drop shadow and invisible
+resize margin — the thing a Linux compositor lets you grab to resize a window.
+On this desktop Windows owns the frame, the resize border and the shadow;
+§33 is an entire section about a client drawing decorations that Windows has
+already drawn, and §38 taught the compositor to place windows against the
+monitor work area, which is a rectangle Windows defines in terms of window
+rects. A window whose `HWND` included the client's shadow would snap, maximise,
+tile and cascade to the wrong rectangle in every one of those interactions, and
+would put a 26-pixel invisible border around every GTK window that swallowed
+clicks meant for whatever is behind it.
+
+**What changing it would cost**, stated so the decision can be re-opened by
+someone who disagrees: the `HWND` would have to become the buffer's bounding
+box, and every consumer of "the window rectangle" — `fit_to_work_area`, the
+snap and maximise paths, the taskbar's idea of the window, and the frame
+geometry in `win32.rs` — would need a second rectangle threaded through it,
+because Windows offers no way to say "the window is here but treat *this*
+smaller rectangle as its bounds". `SetWindowRgn` clips what is painted and does
+not move the window rect. That is a cross-cutting change to §37's model for 22
+conformance tests and a behaviour no Windows user wants.
+
+### 45.5 So the scoreboard learned to say "expected"
+
+That leaves an honest reporting problem, and it is the interesting part of this
+section. A justified **skip** is easy: WLCS turns a missing global into a skip,
+prints which one, and `reason_for` keys a reason to it. That machinery only
+reaches failures caused by an absent protocol. A test that runs, is answered,
+and is answered differently here **on purpose** has no such mechanism — nothing
+is missing from the registry.
+
+Two wrong answers were available and both were rejected. Declaring the
+extension unsupported so the tests skip would be a lie of exactly the kind §26
+exists to prevent: the protocol *is* implemented. Filtering the tests out of
+the run would be worse, because then nothing counts them at all.
+
+So they stay in the failed column, and `justified_failure_patterns` records
+which failures this platform expects. **The scoreboard now reports three
+numbers where it reported two**: 402 passed, 64 failed of which 22 are expected
+and 42 are debts, 759 skipped of which 677 are justified and 79 are debts. The
+debt count — the number that must reach zero — is 121, and it is now the only
+number anybody has to watch.
+
+**The table validates itself, and it caught its own first draft.** §42 found
+twelve gates that were vacuous, and a table of expected failures is the single
+easiest thing in a harness to make vacuous. Two checks:
+
+* **A listed test that passes is an error.** The reason has expired — somebody
+  fixed it, or the pattern was wrong — and silently accepting a pass lets a
+  stale entry sit forever excusing nothing.
+* **A listed pattern that matches no test is an error.** The typo case, and the
+  renamed-upstream case, which excuse nothing while looking like they excuse
+  something.
+
+The first draft used `*RegionSurfaceInputCombinations.*/6`. The check rejected
+it on its first run, naming ten tests that passed while listed as expected to
+fail — because the parameter index means different things in different
+instantiations (only `DefaultEdges` and `MultiRectEdges` are built over
+`all_surface_types`), and because within one instantiation only the *positive*
+assertions fail: a test checking that input is **not** seen passes trivially
+when nothing is delivered at all. The table is now twenty-two individual test
+names, which is verbose and is the point — each is a separate auditable claim.
+
+### 45.6 What scale accounts for: nothing, and that is worth knowing
+
+Scale is hard-coded to 1, and §38's note says half an implementation would be
+worse than none. The question asked here was how many of the 68 that costs.
+
+**Zero.** Every WLCS test that exercises scale is in a protocol that is already
+skipped and already categorised: `wp_fractional_scale_manager_v1` (2 skips),
+`wp_viewporter` (23 skips), and the layer-shell tests (justified). The two live
+files that mention scale at all — `wl_output.cpp` and `xdg_toplevel_stable.cpp`
+— have one reference each, and both of those suites' scale-touching tests pass.
+
+So scale is a known exclusion sitting in the GAP column where it can be counted,
+not an unknown hiding in the failure column. It is 25 of the 79 skipped debts
+and none of the 42 failing ones.
+
+### 45.7 Toplevel state: a configure that existed but said nothing
+
+`window_can_maximize_itself` sets `maximized` and waits for one configure.
+`maximize_request` sent one — a bare `send_configure()` — on the reasoning that
+the state belonged to Windows and would arrive from `WM_SIZE`. Both halves of
+that are true and the conclusion still does not hold: **a configure that omits
+the `maximized` state tells the client, in the protocol's own terms, that its
+request was declined.** A second configure a moment later saying the opposite
+does not repair the first, and a client is entitled to act on what it was sent.
+
+The state is now adopted where the request is honoured and forwarded. If
+Windows refuses, the echo corrects it through the same `set_state` and sends
+another configure — so the optimism is bounded by exactly the round trip that
+used to be waited for, and disagreement is the exceptional case rather than the
+ordinary one.
+
+### 45.8 A stale binary, measured, in the middle of writing this
+
+Worth recording because §42 has just finished a sweep for this class. The
+maximize fix appeared to change nothing across two measurements. It had not
+compiled: `surface.send_configure()` returns a `Serial`, the match arm it now
+shared returned `()`, and the error was hidden by my own `grep -E "^error" -A12`
+being swallowed further up a pipeline. Both runs measured the *previous*
+binary.
+
+`scripts/wc-wlcs.sh` has had `fresh` since §42 and it would have caught this —
+it now prints `wc-compositor is newer than every source file in the tree` on
+every run. It did not fire because the runs in question invoked the WLCS runner
+directly, to get a single test's output quickly, and so went around the harness.
+**The guard was correct and the shortcut around it was not**, which is the same
+shape as §42's finding one layer up: a gate only guards the path that goes
+through it.
+
+### 45.9 Where it stands
+
+| | passed | failed | skipped |
+|---|---|---|---|
+| §40 | 351 | 115 | 759 |
+| §38 | 398 | 68 | 759 |
+| **§45** | **402** | **64** | **759** |
+
+402 of 466 applicable, 86.3%. Of the 64 failures, 22 are expected on this
+platform and named as such; **42 are debts**, and they are:
+
+* **12 — surface unmap and remap.** `present` re-maps a window on any commit in
+  its tree, including a subsurface's, so an unmapped parent is resurrected by a
+  child that draws.
+* **7 — subsurface commit synchronisation.** `sync` and `desync` position
+  changes applying on the wrong commit.
+* **7 — popup grab and reposition.** Done-event ordering, keyboard focus under
+  a grab, and reactive/non-reactive repositioning when the parent moves. Not
+  positioner arithmetic, which §38 fixed.
+* **6 — interactive move and resize.** `xdg_toplevel.move` and `.resize` reach
+  the platform but the pointer bookkeeping the protocol requires around them
+  does not happen.
+* **5 — protocol errors never raised.** Four in `xdg_surface` (attaching a
+  buffer before the first configure, creating a surface from one that already
+  has a role or a buffer) and one in `xdg_decoration`. A coherent class: the
+  compositor is permissive where the protocol requires it to be fatal.
+* **4 — toplevel configuration.** The initial configure sends the client's own
+  size where the protocol wants `0×0` meaning "you choose"; `activated` does
+  not follow the pointer.
+* **3 — fullscreen**, which is not implemented at all. Implementable on Windows
+  — a borderless window covering the monitor — and therefore a debt rather than
+  an exclusion.
+* **2 —** a truncated `wl_shm` file that should be a protocol error, and a
+  clipboard offer that should be seen when the sink already has focus. The
+  second is the same test that disagrees between the Wine and headless legs.
+
+None of these is blocked on a decision. The largest single one is 12 and the
+whole tail is smaller than the cluster §40 removed in one change.
