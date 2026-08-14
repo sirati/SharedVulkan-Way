@@ -429,6 +429,23 @@ pub fn pump(
             }
             return Err(e);
         }
+        // DYNAMIC ARENA. Nothing happened for `wait` milliseconds, and that is
+        // exactly when the arena's release policy most needs the clock to turn.
+        //
+        // The policy is written in *frames* and the frame counter advanced only
+        // in `Session::commit` — so it stopped whenever nothing was drawing,
+        // which is precisely the state the user complained about: an idle
+        // machine holding memory. A region that has been empty for a hundred
+        // idle seconds looked, to the policy, exactly like one that had been
+        // empty for no time at all.
+        //
+        // A poll timeout is a frame's worth of *not drawing*, which is the
+        // right unit: it is how the policy already measures, it needs no wall
+        // clock, and it cannot run away from a busy client because a busy
+        // client is what stops `poll` timing out.
+        if n == 0 {
+            session.tick_idle();
+        }
 
         // --- client -> compositor -------------------------------------------
         if pollfds[0].revents & libc::POLLIN != 0 {

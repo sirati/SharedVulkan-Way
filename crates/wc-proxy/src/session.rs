@@ -934,6 +934,65 @@ pub struct Session {
 /// arena, and no measured client is either.
 const RECLAIM_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Give the arena back every pool this client still holds.
+///
+/// # The leak this closes, and why it was invisible for four stages
+///
+/// [`Pool::releasable`] is `zombie && acked && buffers == 0`, and `zombie` is
+/// set in exactly one place: the client sending `wl_shm_pool.destroy`. A client
+/// that **exits** — which is what a browser being closed looks like — never
+/// sends it. So `release_pool_if_done` never fired for the pools a client still
+/// held, the `Session` was dropped, and the bytes stayed `published` on an
+/// arena that outlives it.
+///
+/// It was invisible because nothing above the allocator noticed. The socket
+/// closes, the client is gone, and the *proxy* is fine — the arena is shared
+/// (`Arc<ArenaInner>`) and simply carries the loss into the next connection.
+/// The guest measurement is what made it visible: `21880832 of 29360128 bytes
+/// out` with no Firefox alive.
+///
+/// # Why it is the whole of the release story and not a tidy-up
+///
+/// A region is returned to the guest only when it is **empty**
+/// ([`Arena::reclaim_regions`] marks `idle_since` from `slot.is_empty()`), and
+/// the guest's pages are `VirtualLock`ed, so they stay gone from Windows until
+/// `VirtualFree` runs guest-side. A region that never empties is therefore a
+/// region Windows never gets back — which is the user's original complaint,
+/// `sv-guest.exe` holding memory with nothing connected. Leaked pool bytes are
+/// upstream of every other part of release: no amount of fixing the reclaim
+/// clock helps a region that can never reach empty.
+///
+/// # `Drop` rather than a call at the teardown site
+///
+/// Because there is more than one way for a session to end — a clean
+/// disconnect, a protocol error, a read failure, a panic unwinding the pump —
+/// and a sweep that has to be remembered at each of them is a sweep that will
+/// be forgotten at the next one added. The arena's bytes outlive this struct,
+/// so returning them is exactly what `Drop` is for.
+impl Drop for Session {
+    fn drop(&mut self) {
+        let mut n = 0u64;
+        let mut bytes = 0u64;
+        for (_, pool) in self.pools.iter_mut() {
+            if let Some(region) = pool.region.take() {
+                bytes += region.size;
+                self.transport.destroy(&region);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.stats.pools_released += n;
+            // Said out loud, because "the client left holding pools" is normal
+            // and "the client left holding *all* of them" is a client that
+            // crashed — and the two are worth telling apart in a log after the
+            // fact.
+            println!(
+                "[proxy] session ended holding {n} pool(s), {bytes} bytes returned to the arena"
+            );
+        }
+    }
+}
+
 impl Session {
     pub fn new(
         spec: Spec,
@@ -2455,6 +2514,21 @@ impl Session {
     fn forget_buffer_arrears(&mut self, id: u32) {
         for surface in self.surfaces.values_mut() {
             surface.stale.remove(&id);
+        }
+    }
+
+    /// Turn the release policy's clock without a frame having been drawn.
+    ///
+    /// DYNAMIC ARENA. `commit` was the only thing that advanced it, so the
+    /// policy stopped whenever the client stopped drawing — and "the client
+    /// stopped drawing" is the state in which giving memory back matters most.
+    /// Called from the pump's poll timeout; see the note there for why a
+    /// timeout is the right unit.
+    pub fn tick_idle(&mut self) {
+        for (id, bytes, origin) in self.transport.frame() {
+            self.stats.regions_released += 1;
+            self.stats.region_bytes_released += bytes;
+            self.note(format!("arena region {id} returned while idle: {bytes} bytes of {origin}"));
         }
     }
 
