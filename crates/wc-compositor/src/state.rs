@@ -33,7 +33,7 @@ use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::reexports::wayland_server::protocol::{
     wl_buffer, wl_output, wl_seat, wl_surface::WlSurface,
 };
-use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -64,6 +64,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::utils::Transform;
 use smithay::wayland::output::OutputHandler;
+use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
@@ -120,9 +121,12 @@ use smithay::{
     delegate_shm, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
-use crate::platform::{CursorSpec, Edge, FromUi, IconImage, ToUi, Ui, WindowId, WindowKind};
+use crate::platform::{
+    CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
+};
 use crate::surface::{
-    bars, decorator, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow, ShmSource,
+    bars, decorator, fold_caption, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow,
+    ShmSource,
 };
 
 /// Which decoration mode the compositor advertises, and answers with.
@@ -138,10 +142,30 @@ use crate::surface::{
 /// So the mode is a flag with `Server` as its default — Windows' caption is a
 /// real server-side decoration and claiming it is the honest answer — and
 /// `Client` is what the frame-extension work of §22.7 is developed against.
+///
+/// **§46 made `Auto` the default and `Server` a named leg.** `Server` was the
+/// right default for as long as the compositor had only two arrangements and
+/// had to promise one of them to every client; §31 built the third, and the
+/// user's `weston-terminal` bug is a client for which `Server` is a promise
+/// nobody can keep — it binds no decoration protocol, so it never hears the
+/// promise, and it draws a title bar under ours. `Auto` advertises exactly what
+/// `Server` advertises and differs only for a window that turns out to have
+/// decorated itself anyway. See [`crate::surface::fold_caption`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Decorations {
-    /// Windows draws the caption; the client draws none. **The default.**
+    /// Advertise `Server`, and fold the caption for a window that decorated
+    /// itself regardless. **The default since §46.**
+    ///
+    /// On the wire this is indistinguishable from [`Self::Server`]: same
+    /// `default_mode`, same `xdg-decoration` answer. The difference is one
+    /// `bool` per window, decided at map from the geometry inset, and it is
+    /// what gives a non-negotiating self-decorating client one title bar
+    /// instead of two.
     #[default]
+    Auto,
+    /// Windows draws the caption; the client draws none. **The default before
+    /// §46**, and still the leg to name when a run wants the old behaviour
+    /// — including the run that photographs the bug.
     Server,
     /// The client draws its own title bar, and Windows draws its caption above
     /// it. This is the two-title-bar arrangement every stage before 17 shipped,
@@ -164,6 +188,7 @@ impl Decorations {
     /// Parse the `--decorations` argument. `None` for anything else.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "auto" => Some(Self::Auto),
             "server" => Some(Self::Server),
             "client" => Some(Self::Client),
             "tabs" => Some(Self::Tabs),
@@ -171,9 +196,19 @@ impl Decorations {
         }
     }
 
-    /// Whether the Win32 side should fold the caption into the client area.
+    /// Whether **every** window in this run folds its caption, regardless of
+    /// what the client turns out to be. `Tabs` only.
+    ///
+    /// §46 renamed nothing here and changed nothing about what it answers; what
+    /// changed is that this is no longer the whole story, because `Auto` decides
+    /// per window. See [`Self::auto`] and [`crate::surface::fold_caption`].
     pub fn extends_frame(self) -> bool {
         matches!(self, Self::Tabs)
+    }
+
+    /// Whether the fold is decided per window from what the client did.
+    pub fn auto(self) -> bool {
+        matches!(self, Self::Auto)
     }
 
     /// The KDE protocol's spelling, which is the one that decides GTK's
@@ -182,7 +217,11 @@ impl Decorations {
     /// to any per-surface request.
     fn kde(self) -> KdeDefaultMode {
         match self {
-            Self::Server => KdeDefaultMode::Server,
+            // **`Auto` is `Server` on the wire, and that is the point.** A
+            // client that binds this manager gets told the system decorates,
+            // takes it, and draws no bar — which is already right and must not
+            // change. `Auto` only differs for a client that never asked.
+            Self::Auto | Self::Server => KdeDefaultMode::Server,
             // `Tabs` is `Client` here, and that is the whole reason it is not a
             // third value on the wire: the tab strip this arrangement puts in
             // the caption is drawn by the client, and it only exists at all
@@ -195,7 +234,7 @@ impl Decorations {
     /// project runs (§15.7), and answered consistently anyway.
     fn xdg(self) -> DecorationMode {
         match self {
-            Self::Server => DecorationMode::ServerSide,
+            Self::Auto | Self::Server => DecorationMode::ServerSide,
             Self::Client | Self::Tabs => DecorationMode::ClientSide,
         }
     }
@@ -282,6 +321,22 @@ struct Window {
     /// question the current value can answer, and an animating client commits
     /// sixty times a second with the same icon attached.
     icon_dirty: bool,
+    /// Where this window's *own* popups may go, in this window's coordinates.
+    ///
+    /// ADDED FOR STAGE 38. Filled in by whatever can see the desktop — Windows
+    /// through `platform/win32.rs`, the synthetic Win32 in `crate::control` on
+    /// the conformance leg — and read here when a popup is parented to this
+    /// window. See [`crate::platform::PopupBounds`] for why it is a cell and
+    /// not a message.
+    popup_bounds: PopupBounds,
+    /// For a popup: the window it is parented to, and where it sits inside that
+    /// parent's window geometry.
+    ///
+    /// ADDED FOR STAGE 38 for one reader, `crate::control`: the synthetic Win32
+    /// has to know where a popup is in order to hit-test it, and a popup is the
+    /// one window whose position the *compositor* chooses rather than the
+    /// window manager. `None` for a toplevel, which Windows places.
+    popup_at: Option<(WindowId, i32, i32)>,
     /// The window-geometry rectangle's origin, in root-surface coordinates —
     /// the number that turns a pixel of the window into a point of the surface.
     ///
@@ -351,6 +406,21 @@ pub struct State {
     /// they happen wherever the last motion was — so the compositor has to
     /// remember.
     pointer_at: (f64, f64),
+    /// Which surface each live touch contact landed on.
+    ///
+    /// ADDED FOR §40, to answer one question smithay will not: **when a
+    /// surface is destroyed with a finger still on it, which contacts have to
+    /// be ended?** `TouchHandle` keeps the per-slot focus privately and does
+    /// not release it when the focused surface dies, so without this the
+    /// client is left holding a contact that can never come up — there is no
+    /// `wl_touch.leave` to rescue it, and the next `down` on the same slot
+    /// arrives with the previous one still notionally held.
+    ///
+    /// Keyed by the *surface* rather than by the window, because the surface
+    /// is what gets destroyed: a `wl_subsurface` can go away while its window
+    /// lives on, and WLCS's `sends_touch_up_on_surface_destroy` runs that case
+    /// against both subsurface builders.
+    touch_contacts: Vec<(i32, WlSurface)>,
     /// `wp_cursor_shape_v1`, held only so the global outlives the display.
     ///
     /// ADDED FOR STAGE 12. Named with a leading underscore for the same reason
@@ -491,6 +561,28 @@ pub struct State {
     pub clip_fetched: usize,
     pub clip_offered: usize,
     pub clip_drags: usize,
+
+    /// The Windows drag currently over one of our windows, if any: which
+    /// window, and what it offers.
+    ///
+    /// ADDED FOR §42. `None` between drags, which is what makes a stray
+    /// `DragMotion` — OLE is entitled to send one after a `DragLeave` if the
+    /// user re-enters fast enough, and Wine does — a no-op rather than a
+    /// motion delivered into a grab that is not running.
+    dnd_over: Option<(WindowId, Vec<String>)>,
+    /// The mime type the client under the drag last accepted, if any.
+    ///
+    /// `Some(None)` and `None` mean different things and the difference is the
+    /// drop: `None` is "no client has said anything yet", `Some(None)` is "a
+    /// client answered and refuses everything". Both forbid a drop; only the
+    /// second is a decision.
+    dnd_accepted: Option<Option<String>>,
+    /// How many drags from Windows have entered a window of ours, and how many
+    /// of those were dropped. The harness asserts on both: a drag that enters
+    /// and never resolves is the failure this half exists not to build, and it
+    /// is invisible in a count that only rises on success.
+    pub dnd_entered: usize,
+    pub dnd_dropped: usize,
 
     pub clients_seen: usize,
     pub toplevels: usize,
@@ -771,6 +863,7 @@ impl State {
             keyboard_focus: None,
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
+            touch_contacts: Vec::new(),
             // ADDED FOR STAGE 12. Version 2 of the protocol, which is what
             // smithay's global advertises and what adds `dnd_ask` and
             // `all_resize` to the shape enum.
@@ -812,6 +905,10 @@ impl State {
             clip_fetched: 0,
             clip_offered: 0,
             clip_drags: 0,
+            dnd_over: None,
+            dnd_accepted: None,
+            dnd_entered: 0,
+            dnd_dropped: 0,
             clients_seen: 0,
             toplevels: 0,
             popups: 0,
@@ -1007,6 +1104,12 @@ impl State {
                         source.drag_finished(action);
                     }
                 }
+                FromUi::DragEnter { id, x, y, mimes, actions, time } => {
+                    self.dnd_enter(id, x, y, mimes, actions, time)
+                }
+                FromUi::DragMotion { id, x, y, time } => self.dnd_motion(id, x, y, time),
+                FromUi::DragLeave { id, time } => self.dnd_leave(id, time),
+                FromUi::DragDrop { id, x, y, time } => self.dnd_drop(id, x, y, time),
                 FromUi::TouchDown { id, slot, x, y, shape, time } => {
                     self.touch_down(id, slot, x, y, shape, time)
                 }
@@ -1065,6 +1168,137 @@ impl State {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The drop target: a Windows drag, over one of our windows (§42)
+    // -----------------------------------------------------------------------
+
+    /// `IDropTarget::DragEnter`: something from a Windows application is over
+    /// one of our windows.
+    ///
+    /// This is a **server-side** drag in Wayland's terms — the compositor is
+    /// the source and no client owns a `wl_data_source` — which is exactly what
+    /// `start_dnd` is for, and it is why `ServerDndGrabHandler` exists and has
+    /// been empty since §29.
+    ///
+    /// # The grab needs a pointer that is already where the drag is
+    ///
+    /// `start_dnd` takes a `PointerGrabStartData` whose `focus` and `location`
+    /// are where the gesture *began*, and smithay's DnD grab sends
+    /// `wl_data_device.enter` to whatever is under that location. During an OLE
+    /// drag there is no `WM_MOUSEMOVE` at all (§29.8), so the compositor's idea
+    /// of where the pointer is can be arbitrarily old — it is wherever the
+    /// mouse was when the user pressed the button in the *other* application.
+    /// So the location is taken from `DragEnter`'s own coordinates, which
+    /// Windows measured, and not from `self.pointer_at`.
+    fn dnd_enter(&mut self, id: WindowId, x: f64, y: f64, mimes: Vec<String>, actions: u32, time: u32) {
+        if self.dnd_over.is_some() {
+            // OLE guarantees enter/leave are balanced per window, but a drag
+            // that crosses from one of our windows straight into another
+            // produces the second enter before the first leave under Wine.
+            // Ending the old grab first keeps at most one running, which is
+            // what "there is one mouse" means.
+            self.dnd_leave_inner(time);
+        }
+        let Some(window) = self.by_id(id) else { return };
+        let surface = window.role.surface().clone();
+        self.dnd_entered += 1;
+        self.dnd_over = Some((id, mimes.clone()));
+        println!(
+            "wc-compositor: a Windows drag entered window {id} at {x},{y} offering {} \
+             mime type(s): {} (actions {})",
+            mimes.len(),
+            mimes.join(", "),
+            crate::platform::dnd_action::describe(actions)
+        );
+
+        // The pointer has to be *at* the drag before the grab starts, or the
+        // grab's first `enter` names whatever was under the stale position.
+        self.pointer_motion(Some(id), x, y, time);
+
+        let start_data = smithay::input::pointer::GrabStartData {
+            focus: self
+                .surface_under(id, x, y)
+                .map(|(s, origin)| (s, origin.into()))
+                .or(Some((surface, (0.0, 0.0).into()))),
+            button: 0x110,
+            location: (x, y).into(),
+        };
+        smithay::wayland::selection::data_device::start_dnd(
+            &self.display.clone(),
+            &self.seat.clone(),
+            self,
+            SERIAL_COUNTER.next_serial(),
+            Some(start_data),
+            None,
+            smithay::wayland::selection::data_device::SourceMetadata {
+                mime_types: mimes,
+                dnd_action: dnd_actions_from_bits(actions),
+            },
+        );
+    }
+
+    /// `IDropTarget::DragOver`. The grab is running, so an ordinary pointer
+    /// motion is what moves it: smithay's DnD grab intercepts `motion` and
+    /// turns it into `wl_data_device.motion`, or into a `leave`/`enter` pair
+    /// when it crosses a surface boundary.
+    fn dnd_motion(&mut self, id: WindowId, x: f64, y: f64, time: u32) {
+        if self.dnd_over.as_ref().map(|(w, _)| *w) != Some(id) {
+            return;
+        }
+        self.pointer_motion(Some(id), x, y, time);
+    }
+
+    /// `IDropTarget::DragLeave`, and the cancellation path for everything else.
+    fn dnd_leave(&mut self, id: WindowId, time: u32) {
+        if self.dnd_over.as_ref().map(|(w, _)| *w) != Some(id) {
+            return;
+        }
+        println!("wc-compositor: the Windows drag left window {id} without dropping");
+        self.dnd_leave_inner(time);
+    }
+
+    /// End the grab without a drop, whatever the reason.
+    ///
+    /// **A button release is what ends a pointer grab in smithay**, not a
+    /// method call: the grab holds the pointer until the button that started it
+    /// goes up, and `ServerDnDGrab` treats that release as the drop. So a
+    /// cancel is a release with the accepted-action bookkeeping already
+    /// cleared, which makes smithay send `wl_data_device.leave` and finish the
+    /// grab rather than `drop`.
+    fn dnd_leave_inner(&mut self, time: u32) {
+        self.dnd_over = None;
+        // Nothing accepted, so the release cannot be read as a drop.
+        self.dnd_accepted = None;
+        self.dnd_release(time);
+    }
+
+    /// `IDropTarget::Drop`. The bytes are already staged on the platform side.
+    fn dnd_drop(&mut self, id: WindowId, x: f64, y: f64, time: u32) {
+        if self.dnd_over.as_ref().map(|(w, _)| *w) != Some(id) {
+            return;
+        }
+        self.dnd_dropped += 1;
+        println!("wc-compositor: the Windows drag was dropped on window {id} at {x},{y}");
+        self.pointer_motion(Some(id), x, y, time);
+        self.dnd_over = None;
+        self.dnd_release(time);
+    }
+
+    /// The button release that ends the grab, one way or the other.
+    fn dnd_release(&mut self, time: u32) {
+        let pointer = self.pointer.clone();
+        pointer.button(
+            self,
+            &smithay::input::pointer::ButtonEvent {
+                button: 0x110,
+                state: smithay::backend::input::ButtonState::Released,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
     /// The UI thread has read the clipboard. Send it back to whoever asked.
     ///
     /// Chunked at [`crate::clipboard::CHUNK`] for the reason §16.5 gives about
@@ -1105,17 +1339,113 @@ impl State {
         self.by_id(id).map(|w| w.role.surface().clone())
     }
 
-    /// A window's surface **and where that surface's origin is**, which is what
-    /// every input event needs and what none of them had until §37.
+    /// **Which surface of window `id` is under the point `(x, y)`**, and where
+    /// that surface's origin sits — the pair every input event needs.
     ///
-    /// Returned together on purpose. The two are read from the same `Window` in
-    /// the same borrow, so there is no call site that can pick up the surface
-    /// and forget the origin — which is precisely the bug §37 fixes, committed
-    /// once in `pointer_motion` and copied from there into `touch_down` and
-    /// `touch_motion` with the comment "`(0, 0)` for the same reason".
-    fn surface_and_origin(&self, id: WindowId) -> Option<(WindowId, WlSurface, (f64, f64))> {
-        self.by_id(id)
-            .map(|w| (id, w.role.surface().clone(), surface_origin(w.content_offset)))
+    /// # What this replaces, and why it is the compositor's job on both legs
+    ///
+    /// Until §40 this was `surface_and_origin`: the window's *root* surface and
+    /// nothing else. §37 fixed the origin half — the second element stopped
+    /// being a hard-coded `(0, 0)` and became the window-geometry inset — but
+    /// the first half was still a placeholder, and it is the single largest
+    /// source of WLCS failures in the suite. A subsurface never received a
+    /// pointer event, and `wl_surface.set_input_region` was parsed by smithay
+    /// and read by nobody.
+    ///
+    /// **This is not harness-only code, and the architecture note in
+    /// `control.rs` is easy to misread as saying it is.** Windows routes a
+    /// `WM_MOUSEMOVE` to an `HWND`, and there is one `HWND` per *window*. A
+    /// `wl_subsurface` has no `HWND` — the whole surface tree is composed into
+    /// one window's pixels by `compose_tree` — so the routing *within* a window
+    /// is something Win32 has already declined to do and cannot do. Windows
+    /// answers "which window"; only this function can answer "which surface".
+    /// It runs on the real platform path exactly as it runs under `--control`.
+    ///
+    /// # The coordinate spaces, because there are three
+    ///
+    /// `(x, y)` arrives in **window-content pixels**: the platform has already
+    /// subtracted the frame, so `(0, 0)` is the top-left of the client area.
+    /// `placed_tree` reports each surface in **root-buffer** coordinates. The
+    /// blit puts root-buffer point `(gx, gy)` at window pixel `(0, 0)`, where
+    /// `(gx, gy)` is [`Window::content_offset`] — so the two spaces differ by
+    /// exactly that offset, and a surface placed at `loc` has its origin at
+    /// window pixel `loc - g`. That subtraction is done once, here, and the
+    /// result is handed to smithay in the form it wants: smithay computes
+    /// `location - origin`, so the client is sent `(x, y) - (loc - g)`, which
+    /// is the same arithmetic `compose_tree` did to the pixels.
+    ///
+    /// For a window whose tree is one surface this returns exactly what
+    /// `surface_and_origin` did — `loc` is `(0, 0)` and the origin is
+    /// `(-gx, -gy)`, which is [`surface_origin`]'s value. The old function is
+    /// the new one's single-surface case, so §37's fix is preserved rather than
+    /// re-derived.
+    ///
+    /// # Topmost wins, and `None` is a real answer
+    ///
+    /// `placed_tree` is in paint order, so the reverse is top-to-bottom and the
+    /// first surface that accepts the point is the one the client would see
+    /// drawn there. If nothing accepts it — every surface's input region
+    /// excludes it, or the window has no buffer yet — the answer is `None`, and
+    /// the caller sends a `leave` rather than delivering to the root anyway.
+    /// That is the case `set_input_region` exists to create and the one the
+    /// placeholder got wrong in the direction that matters: silently claiming
+    /// input a client asked not to receive.
+    fn surface_under(&self, id: WindowId, x: f64, y: f64) -> Option<(WlSurface, (f64, f64))> {
+        let window = self.by_id(id)?;
+        // §37's sign, reused rather than re-derived: this is the root surface's
+        // origin, and every other surface of the tree is that plus its own
+        // placement. A second copy of the negation is a second chance to get it
+        // backwards, and the whole of `surface_origin`'s doc comment is about
+        // how easy that is.
+        let (rx, ry) = surface_origin(window.content_offset);
+        let root = window.role.surface().clone();
+        placed_tree(&root).into_iter().rev().find_map(|(surface, loc)| {
+            // **A subsurface is mapped only while its parent is.** The protocol
+            // says so directly — "a sub-surface is mapped when the parent is
+            // mapped and the sub-surface has a buffer" — and §40 implemented
+            // only the second half: a surface that lost its own buffer stopped
+            // taking input, and its children went on taking it as though
+            // nothing had happened.
+            //
+            // WLCS's `unmapping_parent_stops_subsurface_getting_input` builds
+            // exactly that: a subsurface, a subsurface of *it*, and a null
+            // buffer committed to the middle one. The child is still there,
+            // still has a buffer, and must not be clickable.
+            //
+            // Checked from the surface up to the root rather than by keeping a
+            // mapped flag per surface, because the buffer *is* the flag — the
+            // staging entry is created on commit and dropped on a null buffer
+            // or a destroy (§40), so asking whether an ancestor has one is
+            // asking the same question the child is asked.
+            //
+            // **The root is deliberately not part of this walk.** "The root has
+            // no buffer" is the window-level question, and it is answered
+            // already: `Window::mapped` gates it, and the platform stops
+            // reporting the window at all. Including it here would also break
+            // the case §9 documented — Firefox commits the subsurface holding
+            // the browser *before* the toplevel behind it, so a tree whose root
+            // has not drawn yet is a normal transient state rather than an
+            // unmapped window.
+            let mut ancestor = compositor::get_parent(&surface);
+            while let Some(p) = ancestor {
+                if p == root {
+                    break;
+                }
+                if !self.staging.contains_key(&p) {
+                    return None;
+                }
+                ancestor = compositor::get_parent(&p);
+            }
+            // The surface's origin in window-content pixels.
+            let origin = (rx + f64::from(loc.0), ry + f64::from(loc.1));
+            let local = (x - origin.0, y - origin.1);
+            let size = self.staging.get(&surface).map(|s| (s.width(), s.height()))?;
+            let accepted = compositor::with_states(&surface, |states| {
+                let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+                accepts_input_at(size, attrs.current().input_region.as_ref(), local)
+            });
+            accepted.then_some((surface, origin))
+        })
     }
 
     /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
@@ -1151,11 +1481,74 @@ impl State {
                     w: shadow.width(),
                     h: shadow.height(),
                     toplevel: w.role.toplevel().is_some(),
+                    popup_at: w.popup_at,
                 })
             })
             .collect();
         out.sort_by_key(|r| r.id);
         out
+    }
+
+    /// ADDED FOR STAGE 38. Told by the synthetic Win32 where a window is on the
+    /// one output, so that a popup of that window can be constrained to it.
+    ///
+    /// The real platform writes the same cell from the UI thread, from
+    /// `MonitorFromWindow`; this is the same fact arriving from the stand-in.
+    #[cfg(unix)]
+    pub fn set_popup_bounds(&self, id: WindowId, bounds: Rect) {
+        let Some(w) = self.windows.values().find(|w| w.id == id) else {
+            return;
+        };
+        let mut cell = w.popup_bounds.lock().unwrap_or_else(|e| e.into_inner());
+        *cell = Some(bounds);
+    }
+
+    /// Where a popup goes, in its parent's window-geometry coordinates.
+    ///
+    /// **REWRITTEN FOR STAGE 38, and the previous behaviour was a bug the user
+    /// reported**: a menu opened near the right or bottom edge of the screen
+    /// had the part that did not fit simply hanging off the display.
+    ///
+    /// `get_geometry` is the positioner's own arithmetic — anchor rectangle,
+    /// anchor edge, gravity and offset — and nothing more. Up to this stage it
+    /// was the whole answer, and the comment that said so argued that
+    /// *"constraining a menu to the monitor is the compositor's job, and on
+    /// Windows the compositor that owns the monitor is Windows"*. The first
+    /// half is right and the second is false: `SetWindowPos` places a window
+    /// exactly where it is told and constrains nothing. Windows keeps a menu on
+    /// screen only for menus **it** owns, put up through `TrackPopupMenu`; an
+    /// arbitrary `WS_POPUP` is placed literally, off the edge and all. Owning
+    /// the monitor and constraining to it are different claims, and the code
+    /// relied on the second while only the first was true.
+    ///
+    /// So the compositor does it, which is what `xdg_positioner`'s
+    /// `set_constraint_adjustment` asks of it. The client declares which moves
+    /// it will tolerate — `slide_x`, `flip_y`, `resize_x` and the rest — and
+    /// `get_unconstrained_geometry` applies exactly those, in the precedence
+    /// the XML fixes (flip, then slide, then resize, per axis, and a flip that
+    /// fails to help is reverted). **That precedence is not reimplemented here
+    /// on purpose**: a client that asked for `slide_x` alone must never be
+    /// flipped, and the one implementation of that rule in the tree should be
+    /// smithay's, which is generated from the same XML the client read.
+    ///
+    /// The naming is a trap worth restating, because it reads backwards:
+    /// `get_geometry` is the *unconstrained* rectangle and
+    /// `get_unconstrained_geometry` is the *constrained* one — "unconstrained"
+    /// there means "adjusted until it no longer violates the constraint".
+    ///
+    /// `bounds` of `None` means nothing has told us where the monitor is, and
+    /// then the answer is the raw arithmetic again — the pre-stage-38
+    /// behaviour, which is wrong but is not a guess. A degenerate rectangle is
+    /// treated the same way: fitting a menu into a zero-width monitor would
+    /// produce a zero-width menu, and no answer is better than that one.
+    fn constrain(positioner: PositionerState, bounds: Option<Rect>) -> Rectangle<i32, Logical> {
+        match bounds {
+            Some(b) if b.w > 0 && b.h > 0 => positioner.get_unconstrained_geometry(Rectangle::new(
+                Point::from((b.x, b.y)),
+                Size::from((b.w, b.h)),
+            )),
+            _ => positioner.get_geometry(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1337,24 +1730,30 @@ impl State {
     /// something this file could get subtly wrong.
     fn pointer_motion(&mut self, id: Option<WindowId>, x: f64, y: f64, time: u32) {
         let pointer = self.pointer.clone();
-        let focus = id.and_then(|id| self.surface_and_origin(id));
-        match &focus {
-            Some((id, _, _)) => {
-                self.pointer_focus = Some(*id);
+        // **The scene lookup, and the window bookkeeping, are deliberately
+        // separate.** `pointer_focus` answers "which window is the pointer
+        // over", which is Windows' answer and is true whether or not any
+        // surface in that window accepts input there; `pointer_button` relies
+        // on it to re-place the pointer under a `SetCapture` drag, and
+        // `pointer_axis` on it to say where a wheel went. The hit test answers
+        // "which surface", and its `None` — a point inside the window but
+        // outside every input region — must not be allowed to read as "the
+        // pointer left the window".
+        match id {
+            Some(id) => {
+                self.pointer_focus = Some(id);
                 self.pointer_at = (x, y);
             }
             None => self.pointer_focus = None,
         }
+        let focus = id.and_then(|id| self.surface_under(id, x, y));
         pointer.motion(
             self,
-            // The second element is the surface's origin in compositor space,
-            // and smithay subtracts it from `location` to get the surface-local
-            // point the client is sent. Compositor space here is the window's
-            // client area in pixels — one `HWND` per window, the platform has
-            // already subtracted the frame — so the only thing left in it is
-            // the client's own window-geometry inset, and that is
-            // [`Window::content_offset`] negated. See `surface_and_origin`.
-            focus.map(|(_, s, origin)| (s, origin.into())),
+            // The second element is the surface's origin in window-content
+            // pixels, and smithay subtracts it from `location` to get the
+            // surface-local point the client is sent. See `surface_under` for
+            // the three coordinate spaces and which one this is.
+            focus.map(|(s, origin)| (s, origin.into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial: SERIAL_COUNTER.next_serial(),
@@ -1518,7 +1917,14 @@ impl State {
         time: u32,
     ) {
         let Some(touch) = self.touch.clone() else { return };
-        let Some((_, surface, origin)) = self.surface_and_origin(id) else { return };
+        // §24 said touch reuses the pointer's conversion rather than doing its
+        // own arithmetic, and §40 keeps that promise through the scene lookup
+        // as well: a contact lands on whichever surface of the tree is under
+        // it, honouring input regions, exactly as a click does. A contact on a
+        // point no surface accepts is dropped rather than delivered to the
+        // root — `wl_touch` has no "leave without down", so there is nothing to
+        // send and the `down` simply does not happen.
+        let Some((surface, origin)) = self.surface_under(id, x, y) else { return };
         // Logged, unlike pointer motion, because a contact is rare — a few per
         // gesture rather than one per pixel — and because "touch does nothing"
         // is otherwise indistinguishable from "no touch message ever arrived",
@@ -1537,6 +1943,8 @@ impl State {
                 None => "no contact geometry reported".to_owned(),
             }
         );
+        self.touch_contacts.retain(|(s, _)| *s != slot);
+        self.touch_contacts.push((slot, surface.clone()));
         touch.down(
             self,
             // The surface origin in compositor space, found the same way it is
@@ -1571,7 +1979,7 @@ impl State {
         // contact. Which is why a motion for a window that has gone away is
         // still worth delivering — the contact's focus is the surface it landed
         // on, not this one.
-        let focus = self.surface_and_origin(id).map(|(_, s, origin)| (s, origin.into()));
+        let focus = self.surface_under(id, x, y).map(|(s, origin)| (s, origin.into()));
         touch.motion(
             self,
             focus,
@@ -1582,6 +1990,7 @@ impl State {
 
     fn touch_up(&mut self, id: WindowId, slot: i32, time: u32) {
         let Some(touch) = self.touch.clone() else { return };
+        self.touch_contacts.retain(|(s, _)| *s != slot);
         println!("wc-compositor: window {id} touch up contact {slot}");
         touch.up(
             self,
@@ -1788,7 +2197,7 @@ impl State {
                 "wc-compositor: window {id} pixels served by {served_by} \
                  (mapped: {sections} section, {files} shared-file, {slices} arena-slice)"
             );
-            self.report_decorator(&root, id, &app_id);
+            let fold_caption = self.report_decorator(&root, id, &app_id);
             // ADDED FOR STAGE 9. `wl_surface.enter` is how a client learns
             // which output it is on, and therefore what scale to draw at and
             // what refresh rate to expect. It is sent at map because before a
@@ -1823,6 +2232,7 @@ impl State {
                 id,
                 width: w,
                 height: h,
+                fold_caption,
             });
             if !title.is_empty() {
                 self.ui.send(ToUi::Title { id, title });
@@ -2127,7 +2537,16 @@ impl State {
     /// draw anyway becomes the only one — and that is a per-window window
     /// style, on the Win32 side, which this branch does not have. The one thing
     /// that has to exist first is the ability to *tell*, and that is here.
-    fn report_decorator(&self, root: &WlSurface, id: WindowId, app_id: &str) {
+    /// Decide this window's frame, and say so. Returns whether its caption is
+    /// folded into its client area, which is what `ToUi::Map` carries.
+    ///
+    /// §33 wrote this as a report and said in as many words that it reported
+    /// and did not decide, because the arrangement to switch to did not exist
+    /// on that branch and because the inset is not a fact a live window style
+    /// should track. §31 built the arrangement and §46 takes the decision —
+    /// **once, here, at map** — which is what makes the second objection not
+    /// apply. See [`crate::surface::fold_caption`].
+    fn report_decorator(&self, root: &WlSurface, id: WindowId, app_id: &str) -> bool {
         use smithay::wayland::shell::xdg::SurfaceCachedState;
         let inset = compositor::with_states(root, |states| {
             states
@@ -2144,7 +2563,14 @@ impl State {
         // that named "two title bars" from `who` alone was right only while the
         // caption was never folded — which was true when §33 was written and
         // stopped being true when §31 merged.
-        let folded = self.decorations.extends_frame();
+        // §46: per window, not per run. `extends_frame()` is still the run-wide
+        // `tabs` switch and is still honoured; `auto` adds the arm that asks
+        // what this particular client turned out to be.
+        let folded = fold_caption(
+            self.decorations.extends_frame(),
+            self.decorations.auto(),
+            who,
+        );
         let app = if app_id.is_empty() { "<no app id>" } else { app_id };
         match bars(who, folded) {
             Bars::Agreed => println!(
@@ -2157,10 +2583,11 @@ impl State {
                  margin around its window; Windows' caption is the only title bar"
             ),
             Bars::OneClient => println!(
-                "wc-compositor: window {id} ({app}) draws its own title bar and this run folds \
-                 the caption into the client area ({:?}), so that bar is the window's -- \
-                 geometry inset {},{} (§31, §33.7)",
-                self.decorations, inset.0, inset.1
+                "wc-compositor: window {id} ({app}) bound no decoration protocol and reports a \
+                 {},{} margin around its window -- it is drawing its own title bar, so this \
+                 window's caption is folded into its client area ({:?}) and that bar is the \
+                 window's (§46)",
+                inset.0, inset.1, self.decorations
             ),
             // The two that are defect reports. Named as such, because the
             // compositor is telling the truth about a window the user is about
@@ -2180,6 +2607,7 @@ impl State {
                 self.decorations
             ),
         }
+        folded
     }
 
     /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
@@ -2210,52 +2638,59 @@ impl State {
         committed: &WlSurface,
         committed_damage: &[Rect],
     ) -> (Vec<Rect>, i32, i32) {
-        use smithay::wayland::compositor::{
-            SubsurfaceCachedState, TraversalAction, SUBSURFACE_ROLE,
-        };
-        use smithay::wayland::shell::xdg::SurfaceCachedState;
 
         // Where each surface of the tree sits, relative to the root surface's
         // own origin. Collected first because composing needs `&mut` on the
         // window's shadow while `staging` is read, and because the traversal
         // closure cannot borrow `self`.
-        let mut placed: Vec<(WlSurface, (i32, i32))> = Vec::new();
-        compositor::with_surface_tree_upward(
-            root,
-            (0i32, 0i32),
-            |_, states, loc| {
-                let mut loc = *loc;
-                if states.role == Some(SUBSURFACE_ROLE) {
-                    let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
-                    loc = (loc.0 + p.x, loc.1 + p.y);
-                }
-                TraversalAction::DoChildren(loc)
-            },
-            |surface, states, loc| {
-                let mut loc = *loc;
-                if states.role == Some(SUBSURFACE_ROLE) {
-                    let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
-                    loc = (loc.0 + p.x, loc.1 + p.y);
-                }
-                placed.push((surface.clone(), loc));
-            },
-            |_, _, _| true,
-        );
+        let placed = placed_tree(root);
 
         // The window geometry rectangle, in root-surface coordinates. Absent
         // means "the whole buffer", which is what the protocol says and what
         // every non-GTK client relies on.
-        let geometry = compositor::with_states(root, |states| {
-            states.cached_state.get::<SurfaceCachedState>().current().geometry
-        });
-        let root_size = self
-            .staging
-            .get(root)
-            .map(|s| (s.width(), s.height()))
-            .unwrap_or((0, 0));
+        let geometry = declared_geometry(root);
+        // **"The full bounds of the surface, *including any subsurfaces*."**
+        //
+        // That is `xdg_surface.set_window_geometry`'s wording for what the
+        // geometry is when a client never sets one, and until §40 the last
+        // three words were missing here: the fallback was the root buffer's
+        // size, so a `wl_subsurface` hanging over its parent's edge was
+        // clipped away — not drawn, and therefore not clickable either, since
+        // the window is the canvas and `surface_under` hit-tests what the
+        // window contains.
+        //
+        // WLCS builds exactly that shape on purpose (`SubsurfaceBuilder` in
+        // `surface_builder.cpp` puts a 215x108 subsurface on an 80x50 parent),
+        // and it is not a contrived one: a video player whose overlay controls
+        // extend past the video, or any client that positions a subsurface at
+        // a negative offset, has it.
+        //
+        // **This changes nothing for a client without subsurfaces**, which is
+        // the case every earlier stage measured: the union of a one-surface
+        // tree is that surface's own rectangle at `(0, 0)`, which is the
+        // `root_size` this replaces. And it changes nothing for a client that
+        // *does* set a geometry — Firefox, `weston-terminal`, every GTK
+        // application — because that is still the branch above.
+        let bounds = placed
+            .iter()
+            .filter_map(|(surface, (x, y))| {
+                let s = self.staging.get(surface)?;
+                (s.width() > 0 && s.height() > 0)
+                    .then(|| (*x, *y, x + s.width(), y + s.height()))
+            })
+            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
         let (gx, gy, gw, gh) = match geometry {
             Some(r) if r.size.w > 0 && r.size.h > 0 => (r.loc.x, r.loc.y, r.size.w, r.size.h),
-            _ => (0, 0, root_size.0, root_size.1),
+            // The origin is part of the answer, not assumed to be `(0, 0)`: a
+            // subsurface may sit at a negative offset, and then the tree's
+            // top-left is above and to the left of the root's. That flows into
+            // `content_offset` and out through `surface_origin`, whose sign
+            // convention already handles a negative inset and is unit-tested
+            // for it.
+            _ => match bounds {
+                Some((x0, y0, x1, y1)) => (x0, y0, x1 - x0, y1 - y0),
+                None => (0, 0, 0, 0),
+            },
         };
         let format = self
             .staging
@@ -2293,6 +2728,131 @@ impl State {
             })
             .collect();
         (damage, gw, gh)
+    }
+}
+
+/// What a window's popups have to fit inside, if anything has said.
+///
+/// ADDED FOR STAGE 38. A poisoned lock is treated as "nothing has said" rather
+/// than unwrapped: the cell is written by the UI thread, and a panic there must
+/// not take the Wayland thread with it — the worst it can cost is one menu
+/// placed the way every menu was placed before this stage.
+fn popup_bounds_of(window: &Window) -> Option<Rect> {
+    *window.popup_bounds.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The window geometry rectangle a client has **declared**, if it has declared
+/// one.
+///
+/// ADDED FOR §45, as one function because it now has two readers and they must
+/// not drift: `compose_tree` turns it into the window's crop and size, and the
+/// state-only commit path in `CompositorHandler::commit` compares it against
+/// what the window already has to decide whether that work is needed at all.
+///
+/// `None` is a real answer and is not the same as `Some` of the buffer's
+/// rectangle. It means the client has never called
+/// `xdg_surface.set_window_geometry`, and the protocol then defines the
+/// geometry as the bounds of the tree — which is a *derived* value that changes
+/// whenever a subsurface moves, and therefore cannot be compared against a
+/// stored one to detect a client's intent. Keeping the two cases distinct here
+/// is what stops the caller confusing "the client changed its mind" with "a
+/// subsurface moved".
+fn declared_geometry(root: &WlSurface) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
+    use smithay::wayland::shell::xdg::SurfaceCachedState;
+    compositor::with_states(root, |states| {
+        states.cached_state.get::<SurfaceCachedState>().current().geometry
+    })
+}
+
+/// Every surface of `root`'s subsurface tree, with its position relative to
+/// `root`'s own origin, **in paint order**: parent before child, and siblings
+/// in the order `wl_subsurface.place_above`/`place_below` put them.
+///
+/// ADDED FOR §40, by lifting the walk out of `compose_tree` unchanged. It is a
+/// free function with one caller-visible promise — the order — because it now
+/// has two callers that must not disagree: the blit, which paints the list
+/// front to back, and [`State::surface_under`], which hit-tests it back to
+/// front. Hit-testing is the exact inverse of painting, and the only way to
+/// keep that true as the tree grows a case is to derive both from one list.
+///
+/// `with_surface_tree_upward` is what promises the order, and the two closures
+/// add the subsurface offset in the same way for the same reason: the pre-order
+/// closure passes the accumulated position down to the children, and the
+/// post-order one records it.
+fn placed_tree(root: &WlSurface) -> Vec<(WlSurface, (i32, i32))> {
+    use smithay::wayland::compositor::{
+        SubsurfaceCachedState, TraversalAction, SUBSURFACE_ROLE,
+    };
+    let mut placed: Vec<(WlSurface, (i32, i32))> = Vec::new();
+    compositor::with_surface_tree_upward(
+        root,
+        (0i32, 0i32),
+        |_, states, loc| {
+            let mut loc = *loc;
+            if states.role == Some(SUBSURFACE_ROLE) {
+                let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+                loc = (loc.0 + p.x, loc.1 + p.y);
+            }
+            TraversalAction::DoChildren(loc)
+        },
+        |surface, states, loc| {
+            let mut loc = *loc;
+            if states.role == Some(SUBSURFACE_ROLE) {
+                let p = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+                loc = (loc.0 + p.x, loc.1 + p.y);
+            }
+            placed.push((surface.clone(), loc));
+        },
+        |_, _, _| true,
+    );
+    placed
+}
+
+/// Whether `surface` accepts input at `point`, in its own surface-local
+/// coordinates.
+///
+/// ADDED FOR §40. Two rules, in this order, and the order is the protocol's:
+///
+/// 1. **The point must be on the surface.** `wl_surface.set_input_region` says
+///    the region "is clipped to the surface size", so a region larger than the
+///    buffer does not extend it — which is what WLCS's `ClippedLargerRegion`
+///    parameterisation exists to check, and which is why the buffer bound is
+///    tested even when a region was set.
+/// 2. **An absent region means the whole surface**, not an empty one. That is
+///    the protocol's initial value ("infinite"), and reading `None` as "no
+///    input" would silently make every ordinary client unclickable.
+///
+/// 3. **A surface with no size takes no input**, whatever its region says.
+///    That is the state a `wl_subsurface` sits in between `get_subsurface` and
+///    its first commit, and smithay's own `contains_point` answers the same
+///    way.
+///
+/// The size comes from the staging shadow rather than from a stored field for
+/// the same reason `mapped_windows` reads it there: the shadow is reset to the
+/// buffer's dimensions on every commit, so it cannot disagree with what the
+/// client last drew.
+///
+/// **The region is an argument rather than something read from the surface,
+/// and that is what makes the rules testable.** A `WlSurface` needs a live
+/// display and a connected client to exist, so a function that took one could
+/// only ever be exercised through the whole conformance suite — the same
+/// hundred-second feedback loop that let the placeholder this replaces survive
+/// as long as it did. The protocol lookup is one line in the caller.
+fn accepts_input_at(
+    size: (i32, i32),
+    region: Option<&compositor::RegionAttributes>,
+    point: (f64, f64),
+) -> bool {
+    if size.0 <= 0 || size.1 <= 0 {
+        return false;
+    }
+    if point.0 < 0.0 || point.1 < 0.0 || point.0 >= f64::from(size.0) || point.1 >= f64::from(size.1)
+    {
+        return false;
+    }
+    match region {
+        None => true,
+        Some(region) => region.contains((point.0.round() as i32, point.1.round() as i32)),
     }
 }
 
@@ -2395,6 +2955,56 @@ impl CompositorHandler for State {
         println!("wc-compositor: wl_surface created");
     }
 
+    /// A `wl_surface` went away.
+    ///
+    /// ADDED FOR §40, for one reason: **a contact still down on it has to come
+    /// up.** `wl_touch` has no `leave` — `down` binds a contact to a surface
+    /// and only `up` or `cancel` releases it — so a client whose surface is
+    /// destroyed mid-gesture is otherwise left holding a finger it can never
+    /// put down, and the slot cannot be reused. WLCS asks this as
+    /// `TouchTest.sends_touch_up_on_surface_destroy`, against every surface
+    /// type including both subsurface shapes.
+    ///
+    /// `up` rather than `cancel`, deliberately. `wl_touch.cancel` means "the
+    /// compositor took the gesture away and you should undo what it did" — an
+    /// edge swipe, a system gesture — and it ends *every* live contact on the
+    /// seat at once. A surface being destroyed is neither: the other contacts,
+    /// on other surfaces, are unaffected and must not be cancelled, and the
+    /// client has no reason to roll anything back. The contact simply ended.
+    ///
+    /// The staging entry goes too. `commit` already drops it for a null
+    /// buffer; this is the other way a surface's pixels stop existing, and
+    /// leaving them behind would keep the surface's size answerable to
+    /// `surface_under` after the surface itself was gone.
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.staging.remove(surface);
+        let ended: Vec<i32> = self
+            .touch_contacts
+            .iter()
+            .filter(|(_, s)| s == surface)
+            .map(|(slot, _)| *slot)
+            .collect();
+        if ended.is_empty() {
+            return;
+        }
+        let Some(touch) = self.touch.clone() else { return };
+        self.touch_contacts.retain(|(_, s)| s != surface);
+        let time = self.now_ms();
+        for slot in ended {
+            println!("wc-compositor: touch contact {slot} ended: its surface was destroyed");
+            touch.up(
+                self,
+                &UpEvent {
+                    slot: Some(slot as u32).into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+        }
+        // One frame for the group, as for every other batch of touch events.
+        touch.frame(self);
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         println!("wc-compositor: wl_surface commit");
 
@@ -2477,6 +3087,18 @@ impl CompositorHandler for State {
                 self.present(surface, &buffer, rects)
             }
             Some(BufferAssignment::Removed) => {
+                // **The staging entry goes with the buffer, and until §40 it
+                // did not.** A null buffer unmaps the surface — it has no
+                // content and, the protocol is explicit, no input either. But
+                // the pixels stayed in `staging`, so the surface kept its size
+                // for anything that asked; `surface_under` takes its size from
+                // there, so an unmapped subsurface went on swallowing every
+                // click that landed on where it used to be, invisibly and
+                // forever. That is WLCS's
+                // `input_not_seen_in_region_after_null_buffer_committed`, and
+                // it is the same leak `cursor_surface` above already guards
+                // against by hand.
+                self.staging.remove(surface);
                 if let Some(window) = self.windows.get_mut(surface) {
                     // A null buffer unmaps the surface. The toplevel still
                     // exists, so the window is not destroyed — it has nothing
@@ -2489,15 +3111,143 @@ impl CompositorHandler for State {
                         maximized: None,
                         minimized: Some(true),
                     });
+                } else {
+                    // A subsurface went away. The window it belongs to is still
+                    // mapped and is still showing the pixels this surface put
+                    // there, so the tree has to be recomposed — otherwise the
+                    // input answer changes immediately (correct) and the
+                    // picture does not (wrong), which is the more confusing
+                    // half of the bug rather than the lesser one.
+                    let root = root_of(surface);
+                    if self.windows.contains_key(&root) {
+                        let (damage, w, h) = self.compose_tree(&root, surface, &[]);
+                        if w > 0 && h > 0 {
+                            let id = self.windows[&root].id;
+                            self.ui.send(ToUi::Present { id, damage });
+                        }
+                    }
                 }
             }
             // A commit with no new buffer: state-only, or an ack. Damage
-            // without a buffer means nothing.
-            None => {}
+            // without a buffer means nothing — but the *geometry* can mean a
+            // great deal.
+            //
+            // **`xdg_surface.set_window_geometry` is double-buffered, and until
+            // §45 it was only ever read on the buffer path.** `compose_tree` is
+            // the one place that turns a geometry rectangle into
+            // `Window::content_offset` and into the window's size, and
+            // `present` is the only caller — so a client that set a geometry
+            // and committed *without attaching a new buffer* had it applied to
+            // nothing. The crop stayed where it was, the window kept its old
+            // size, and every input event kept arriving at the old offset.
+            //
+            // That is not a corner case invented by the suite. It is what a
+            // client does whenever its window outline changes but its pixels do
+            // not: leaving a maximised state, a GTK client adjusting its shadow
+            // margin, anything that acks a configure and re-declares its
+            // geometry before it has drawn. WLCS asks it as
+            // `XdgToplevelStableTest.pointer_respects_window_geom_offset` and
+            // its touch twin, and both failed with the pointer arriving at the
+            // raw window coordinate — the exact symptom §37 fixed for the
+            // buffer path, surviving on the path §37 did not look at.
+            //
+            // **Only a *declared* geometry, and only when it has changed**, and
+            // both halves were learned by breaking something.
+            //
+            // The first attempt recomposed on every state-only commit of a
+            // window root. That is two tests worse, not better, and the reason
+            // is instructive: when a client has declared *no* geometry the
+            // protocol defines it as the bounds of the tree, so recomposing
+            // re-derives `content_offset` from wherever the subsurfaces
+            // currently are — and a parent's commit is exactly the moment
+            // smithay is applying pending subsurface state, so the walk can
+            // read positions that are about to change. The compositor then
+            // caches a crop computed from a half-applied tree, and the pointer
+            // arithmetic that §40 fixed is wrong again by that difference.
+            // `place_above_simple` and `subsurface_moves_under_input_device`
+            // are the two that noticed.
+            //
+            // So the trigger is a client's *stated* intent — a rectangle it
+            // called `set_window_geometry` with — compared against the one the
+            // window is already using. A derived geometry is left to the buffer
+            // path, where the tree is settled, and to §40's hit test, which
+            // reads subsurface positions live and never caches them.
+            None => {
+                let declared = declared_geometry(surface)
+                    .filter(|r| r.size.w > 0 && r.size.h > 0);
+                if let (true, Some(r)) = (self.windows.contains_key(surface), declared) {
+                    let before = self.windows[surface].content_offset;
+                    let before_size = self.windows[surface]
+                        .shadow
+                        .lock()
+                        .map(|s| (s.width(), s.height()))
+                        .unwrap_or((0, 0));
+                    // Not an early `return`: the pointer re-evaluation at the
+                    // end of this function is §40's, it applies to every
+                    // commit, and skipping it here would trade one bug for
+                    // another.
+                    let changed = before != (r.loc.x, r.loc.y)
+                        || before_size != (r.size.w, r.size.h);
+                    let (_, w, h) = if changed {
+                        self.compose_tree(surface, surface, &[])
+                    } else {
+                        (Vec::new(), 0, 0)
+                    };
+                    let after = self.windows[surface].content_offset;
+                    if w > 0 && h > 0 && (before != after || before_size != (w, h)) {
+                        let id = self.windows[surface].id;
+                        println!(
+                            "wc-compositor: window {id} geometry committed without a buffer: \
+                             crop {before:?} -> {after:?}, {}x{} -> {w}x{h}",
+                            before_size.0, before_size.1
+                        );
+                        // The whole window, because the crop moved: every pixel
+                        // of it now shows a different part of the buffer.
+                        self.ui.send(ToUi::Present {
+                            id,
+                            damage: vec![Rect::new(0, 0, w, h)],
+                        });
+                    }
+                }
+            }
         }
 
         if icon_dirty {
             self.take_client_icon(surface);
+        }
+
+        // **The scene can move under a stationary pointer, and until §40
+        // nothing re-asked who was under it.**
+        //
+        // Every hit test before this ran on a pointer *event* — the pointer
+        // moved, so the compositor worked out what it had moved onto. But the
+        // other half of the same question is a commit: a `wl_subsurface` that
+        // is repositioned, raised with `place_above`, given a new input region
+        // or unmapped changes what is under a pointer that has not moved at
+        // all. The client is entitled to a `leave` and an `enter` for that, and
+        // it was getting neither — the last motion event stayed true forever.
+        //
+        // WLCS asks this directly and by name:
+        // `subsurface_moves_under_input_device_once`, `..._twice`,
+        // `subsurface_moves_out_from_under_input_device`,
+        // `subsurface_extends_parent_input_region`, `place_above_simple`.
+        //
+        // Re-delivered at the *same* coordinates rather than as a synthesised
+        // move, so this cannot invent motion the user did not make: the
+        // position is `pointer_at`, which is where the platform last said the
+        // pointer was. If the answer is unchanged, smithay coalesces it to a
+        // `motion` at the point the client already knows about; if it changed,
+        // the enter/leave pair it owes the client comes out of the same call
+        // that would have sent it had the pointer moved instead.
+        //
+        // Gated on the committing tree being the one under the pointer, so an
+        // application animating in the background does not re-run a hit test
+        // for a window nobody is pointing at.
+        if let Some(over) = self.pointer_focus
+            && self.by_id(over).map(|w| w.role.surface().clone()) == Some(root_of(surface))
+        {
+            let (x, y) = self.pointer_at;
+            self.pointer_motion(Some(over), x, y, self.now_ms());
         }
     }
 }
@@ -2647,6 +3397,7 @@ impl XdgShellHandler for State {
         let (title, app_id) = metadata(&surface);
         let client = client_index(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
+        let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
         println!(
             "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
             self.toplevels
@@ -2666,6 +3417,7 @@ impl XdgShellHandler for State {
             aumid: crate::taskbar::identity(&app_id, client),
             shadow: shadow.clone(),
             kind: WindowKind::Toplevel,
+            bounds: popup_bounds.clone(),
         });
 
         // The initial configure carries no size: the client picks, which is
@@ -2690,6 +3442,8 @@ impl XdgShellHandler for State {
                 presented: 0,
                 icon_from_client: false,
                 icon_dirty: false,
+                popup_bounds,
+                popup_at: None,
                 // Zero until the first commit, which is the only honest value:
                 // a window with no buffer has no geometry rectangle either, and
                 // no input can reach it before it has mapped.
@@ -2810,9 +3564,10 @@ impl XdgShellHandler for State {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(window) = self.windows.get(surface.wl_surface()) {
+        let id = self.windows.get(surface.wl_surface()).map(|w| w.id);
+        if let Some(id) = id {
             self.ui.send(ToUi::SetWindowState {
-                id: window.id,
+                id,
                 maximized: Some(true),
                 minimized: None,
             });
@@ -2821,18 +3576,48 @@ impl XdgShellHandler for State {
         // the compositor declines. The real state arrives a moment later from
         // `WM_SIZE`; this meets the protocol obligation on time rather than
         // making it conditional on a round trip through Win32.
-        surface.send_configure();
+        //
+        // **§45: the configure has to carry the state, not merely exist.** It
+        // used to be a bare `send_configure()`, on the reasoning that the state
+        // was Windows' to report and would follow from `WM_SIZE`. Both halves
+        // of that are true and the conclusion still did not hold: a client that
+        // asks to be maximised and receives a configure *without* the maximized
+        // state has been told, in the protocol's own terms, that its request
+        // was declined. It then gets a second configure a moment later saying
+        // the opposite. Nothing in xdg-shell licenses that sequence, and a
+        // client is entitled to act on the first one — WLCS's
+        // `window_can_maximize_itself` does exactly that, waiting for one
+        // configure and reading the state off it.
+        //
+        // So the state is adopted here, at the moment the request is honoured
+        // and forwarded, rather than borrowed from the echo. **If Windows
+        // refuses, the echo corrects it** — `FromUi::Maximized { on: false }`
+        // runs through the same `set_state` and sends another configure — so
+        // the optimism is bounded by the same round trip that used to be waited
+        // for, and the disagreement is now the exceptional case rather than the
+        // ordinary one.
+        match id {
+            Some(id) => self.set_state(id, |s| toggle(s, xdg_state::Maximized, true)),
+            None => { surface.send_configure(); }
+        }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(window) = self.windows.get(surface.wl_surface()) {
+        // The mirror of `maximize_request`, and it carries the state for the
+        // same reason: a configure that does not clear `maximized` says the
+        // request was declined.
+        let id = self.windows.get(surface.wl_surface()).map(|w| w.id);
+        if let Some(id) = id {
             self.ui.send(ToUi::SetWindowState {
-                id: window.id,
+                id,
                 maximized: Some(false),
                 minimized: None,
             });
         }
-        surface.send_configure();
+        match id {
+            Some(id) => self.set_state(id, |s| toggle(s, xdg_state::Maximized, false)),
+            None => { surface.send_configure(); }
+        }
     }
 
     fn minimize_request(&mut self, surface: ToplevelSurface) {
@@ -2883,22 +3668,36 @@ impl XdgShellHandler for State {
         self.next_id += 1;
         self.popups += 1;
 
-        // Where the popup goes, in the parent's window-geometry coordinates.
-        // `get_geometry` is the positioner's own arithmetic — anchor rectangle,
-        // anchor edge, gravity and offset — which smithay implements from the
-        // XML. What is deliberately **not** used here is
-        // `get_unconstrained_geometry`: constraining a menu to the monitor is
-        // the compositor's job, and on Windows the compositor that owns the
-        // monitor is Windows. Letting `SetWindowPos` place it and reporting no
-        // constraint back is honest; recomputing it here would be a second,
-        // disagreeing, opinion. See docs/waycompose-design.md §13.6.
-        let rect = positioner.get_geometry();
         let parent = surface.get_parent_surface().map(|s| root_of(&s));
-        let parent_id = parent.as_ref().and_then(|p| self.windows.get(p)).map(|w| w.id);
+        let parent_window = parent.as_ref().and_then(|p| self.windows.get(p));
+        let parent_id = parent_window.map(|w| w.id);
+        let bounds = parent_window.and_then(popup_bounds_of);
 
+        // Where the popup goes, in the parent's window-geometry coordinates.
+        // See [`Self::constrain`]: the rectangle is the positioner's own
+        // arithmetic, fitted to the monitor if anything has told us where the
+        // monitor is.
+        let rect = Self::constrain(positioner, bounds);
+
+        // The declared adjustment is logged, and it is the first question to
+        // ask of any report that a menu is in the wrong place: a client that
+        // declared nothing is **entitled** to a popup that hangs off the
+        // screen, and moving it would be the bug. `weston-terminal` declares
+        // nothing; Firefox declares all six.
         println!(
-            "wc-compositor: xdg_popup created (#{}) -> window {id} at {},{} {}x{} parent {:?}",
-            self.popups, rect.loc.x, rect.loc.y, rect.size.w, rect.size.h, parent_id
+            "wc-compositor: xdg_popup created (#{}) -> window {id} at {},{} {}x{} parent {:?} \
+             adjust {:?} bounds {}",
+            self.popups,
+            rect.loc.x,
+            rect.loc.y,
+            rect.size.w,
+            rect.size.h,
+            parent_id,
+            positioner.constraint_adjustment,
+            match bounds {
+                Some(b) => format!("{},{} {}x{}", b.x, b.y, b.w, b.h),
+                None => "unknown".to_owned(),
+            }
         );
 
         let Some(parent_id) = parent_id else {
@@ -2910,6 +3709,7 @@ impl XdgShellHandler for State {
         };
 
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
+        let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
         self.ui.send(ToUi::Create {
             id,
             title: String::new(),
@@ -2925,6 +3725,10 @@ impl XdgShellHandler for State {
                 x: rect.loc.x,
                 y: rect.loc.y,
             },
+            // A popup is a window like any other and a submenu is parented to
+            // it, so it gets a cell of its own; the platform fills it in from
+            // the popup's own `HWND`.
+            bounds: popup_bounds.clone(),
         });
 
         // The popup's configure carries the positioner's rectangle, which is
@@ -2954,6 +3758,8 @@ impl XdgShellHandler for State {
                 // is one type for both roles, which is stage 9's decision.
                 icon_from_client: false,
                 icon_dirty: false,
+                popup_bounds,
+                popup_at: Some((parent_id, rect.loc.x, rect.loc.y)),
                 // A popup has an inset of its own — GTK gives its menus the
                 // same shadow margin it gives its windows — and it is found the
                 // same way, at its first commit. The *position* above is
@@ -3050,26 +3856,37 @@ impl XdgShellHandler for State {
     /// that sends only the configure leaves the client unable to match the
     /// answer to its request, which for GTK means it ignores the move.
     ///
-    /// The positioner's own arithmetic is used unchanged, exactly as
-    /// [`Self::new_popup`] does — anchor rectangle, anchor edge, gravity and
-    /// offset, which smithay implements from the XML. The constraint
-    /// adjustments are still not applied here (§18.6): this compositor does not
-    /// know where the parent window is on the Windows desktop, so it cannot
-    /// tell whether the result would be off-screen. Windows keeps an owned
-    /// `WS_POPUP` on the monitor by itself, which is why that has not bitten.
+    /// The positioner goes through [`Self::constrain`], exactly as
+    /// [`Self::new_popup`] does. **REWRITTEN FOR STAGE 38**, and this is the
+    /// half that is easy to forget: a submenu that GTK opens near the bottom of
+    /// the screen is *first* mapped wherever the positioner says and *then*
+    /// repositioned with a second positioner carrying `slide_y`, so a
+    /// compositor that constrains only at creation moves the menu on screen and
+    /// then puts it back off again on the next keystroke.
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
         positioner: PositionerState,
         token: u32,
     ) {
-        let rect = positioner.get_geometry();
         let Some(&Window { id, .. }) = self.windows.get(surface.wl_surface()) else {
             // A reposition for a popup we never mapped. Answering the token
             // anyway is better than silence: the client is waiting for it.
             surface.send_repositioned(token);
             return;
         };
+        // The bounds belong to the **parent**, not to the popup being moved:
+        // the positioner's rectangle is in the parent's coordinates, and so is
+        // the answer. Resolved the same way `new_popup` resolves it, because a
+        // popup can be reparented in neither protocol nor practice but can
+        // certainly be repositioned after its parent has moved to another
+        // monitor.
+        let bounds = surface
+            .get_parent_surface()
+            .map(|s| root_of(&s))
+            .and_then(|p| self.windows.get(&p))
+            .and_then(popup_bounds_of);
+        let rect = Self::constrain(positioner, bounds);
         println!(
             "wc-compositor: xdg_popup reposition -> window {id} to {},{} {}x{} (token {token})",
             rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
@@ -3079,6 +3896,14 @@ impl XdgShellHandler for State {
         });
         surface.send_repositioned(token);
         let _ = surface.send_configure();
+        // The synthetic Win32 hit-tests popups by this, so a popup that moved
+        // and did not say so would keep taking clicks at its old position.
+        if let Some(w) = self.windows.get_mut(surface.wl_surface())
+            && let Some(at) = w.popup_at.as_mut()
+        {
+            at.1 = rect.loc.x;
+            at.2 = rect.loc.y;
+        }
         self.ui.send(ToUi::MovePopup {
             id,
             x: rect.loc.x,
@@ -3384,21 +4209,136 @@ impl DataDeviceHandler for State {
     }
 }
 
-// Drag and drop, both directions, at their defaults: the events are accepted
-// and nothing is done with them. A drag *within* one client works because
-// smithay runs the grab; a drag onto the Windows desktop is `IDropTarget` and
-// is not started here.
-//
-// §29 left this alone on purpose. Drag and drop is the same interface
-// family as the clipboard and it is **not implemented**, which is a decision
-// and not an oversight: a half-built DnD is a drag that starts, offers a
-// format, and then hangs on the drop, and that failure — a client waiting
-// forever on a transfer nobody will finish — is precisely what this stage
-// exists to remove. wc-proxy answers `wl_data_device.start_drag` with an
-// immediate `wl_data_source.cancelled`, so a client that tries gets a drag that
-// does not begin instead of one that does not end. docs/waycompose-design.md §29.8.
+/// A drag started by a **client**, within Wayland.
+///
+/// Still at its defaults, and §29's reasoning for that is unchanged: a client
+/// dragging out of its own window is intercepted by `wc-proxy`, which pulls the
+/// payload and calls `wc_clipboard_v1.start_drag`, so the compositor is told
+/// about it through that protocol rather than through this handler. The one
+/// case this trait would serve — a drag from one Wayland window to another,
+/// both on this compositor — smithay runs entirely by itself.
+///
+/// (The comment that used to be here said wc-proxy answers `start_drag` with an
+/// immediate `cancelled`. That was true when it was written and stopped being
+/// true in §29, which built the pull. Corrected rather than deleted, because a
+/// stale comment about a *behaviour* is the §35 failure in miniature.)
 impl ClientDndGrabHandler for State {}
-impl ServerDndGrabHandler for State {}
+
+/// A drag started by the **compositor**, which here means by Windows: something
+/// is being dragged out of a Windows application and over one of our windows,
+/// and `dnd_enter` has called `start_dnd`.
+///
+/// ADDED FOR §42. Every method here is a client's answer arriving
+/// asynchronously, and the two that matter are `accept` and `action`, because
+/// `IDropTarget::DragOver` has to answer OLE *synchronously* — see
+/// [`crate::platform::ToUi::DragFeedback`] for that decision and its cost.
+impl ServerDndGrabHandler for State {
+    fn accept(&mut self, mime_type: Option<String>, _seat: Seat<Self>) {
+        println!(
+            "wc-compositor: the client under the drag accepts {}",
+            match &mime_type {
+                Some(m) => m.as_str(),
+                None => "nothing",
+            }
+        );
+        let accepted = mime_type.is_some();
+        self.dnd_accepted = Some(mime_type);
+        self.ui.send(ToUi::DragFeedback {
+            accepted,
+            // The action is reported separately by `action` below; until it
+            // arrives, "accepted" alone means copy, which is what every
+            // toolkit's default is and what `DROPEFFECT_COPY` shows.
+            action: if accepted {
+                crate::platform::dnd_action::COPY
+            } else {
+                crate::platform::dnd_action::NONE
+            },
+        });
+    }
+
+    fn action(&mut self, action: DndAction, _seat: Seat<Self>) {
+        let bits = dnd_action_bits(action);
+        println!(
+            "wc-compositor: the client under the drag chose {}",
+            crate::platform::dnd_action::describe(bits)
+        );
+        self.ui.send(ToUi::DragFeedback {
+            accepted: self.dnd_accepted.as_ref().is_some_and(|m| m.is_some()),
+            action: bits,
+        });
+    }
+
+    /// The user let go. smithay has sent `wl_data_device.drop` to the client,
+    /// which is now entitled to `receive` on the offer.
+    fn dropped(&mut self, _seat: Seat<Self>) {
+        println!("wc-compositor: the client under the drag was told about the drop");
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>) {
+        println!("wc-compositor: the drag over our window was cancelled");
+        self.dnd_accepted = None;
+    }
+
+    /// `wl_data_offer.receive` on a **drag** offer, which carries an `h`.
+    ///
+    /// Closed rather than written, for exactly the reason
+    /// [`SelectionHandler::send_selection`] closes its own — and it is the same
+    /// sentence with one word changed, so it is worth being explicit that this
+    /// is not an oversight in a new feature. The bytes reach the client through
+    /// `wc_clipboard_v1.fetch(source=drag)`, which `wc-proxy` issues *instead*
+    /// of forwarding this request; a `receive` that reaches here at all came
+    /// from a client with no proxy in front of it (§29.6).
+    fn send(&mut self, mime_type: String, fd: smithay::utils::os::OwnedFd, _seat: Seat<Self>) {
+        drop(fd);
+        println!(
+            "wc-compositor: a client asked for the drag's bytes as {mime_type:?} through \
+             wl_data_offer.receive, which carries a descriptor this compositor cannot \
+             write into across the boundary; the bytes go through wc_clipboard_v1's \
+             fetch(source=drag) instead. Closing the descriptor: an empty drop rather \
+             than a dead client."
+        );
+    }
+
+    fn finished(&mut self, _seat: Seat<Self>) {
+        println!("wc-compositor: the client has finished with the drag");
+        self.dnd_accepted = None;
+    }
+}
+
+/// Wayland's `DndAction` bitflags from the plain bits that cross the platform
+/// boundary, and back.
+///
+/// Two functions rather than a cast in four places, and they are here rather
+/// than in `crate::platform` because `DndAction` is smithay's type and the
+/// platform side must not link a protocol crate — the same rule that keeps
+/// `Edge` and evdev keycodes in the boundary's own vocabulary.
+fn dnd_actions_from_bits(bits: u32) -> DndAction {
+    let mut out = DndAction::empty();
+    if bits & crate::platform::dnd_action::COPY != 0 {
+        out |= DndAction::Copy;
+    }
+    if bits & crate::platform::dnd_action::MOVE != 0 {
+        out |= DndAction::Move;
+    }
+    if bits & crate::platform::dnd_action::ASK != 0 {
+        out |= DndAction::Ask;
+    }
+    out
+}
+
+fn dnd_action_bits(action: DndAction) -> u32 {
+    let mut out = 0;
+    if action.contains(DndAction::Copy) {
+        out |= crate::platform::dnd_action::COPY;
+    }
+    if action.contains(DndAction::Move) {
+        out |= crate::platform::dnd_action::MOVE;
+    }
+    if action.contains(DndAction::Ask) {
+        out |= crate::platform::dnd_action::ASK;
+    }
+    out
+}
 
 /// `xdg-decoration`, which is the standard one and — measured — the one Firefox
 /// does not use.
@@ -3660,6 +4600,127 @@ delegate_kde_decoration!(State);
 delegate_cursor_shape!(State);
 
 // ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// ADDED FOR STAGE 38, for [`State::constrain`] — the placement arithmetic, in
+/// isolation.
+///
+/// A `PositionerState` is a plain struct of public fields, so the whole of
+/// `xdg_positioner` can be exercised here without a client, a socket or a
+/// window. What is being tested is **which** of smithay's two functions is
+/// called and with what rectangle; the adjustment rules inside
+/// `get_unconstrained_geometry` are smithay's and are tested there.
+///
+/// The negative cases are the point. A constraint that fires when it should not
+/// is the same bug as one that never fires, wearing different clothes: it moves
+/// a menu the client placed deliberately, and it does it in the common case
+/// where nobody is looking for it.
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+
+    /// A menu of `w`x`h` hung off the bottom right corner of a 10x10 anchor at
+    /// `(x, y)` — the shape of a context menu, and the one that runs off the
+    /// right and the bottom of a screen.
+    fn menu(x: i32, y: i32, w: i32, h: i32, adjust: ConstraintAdjustment) -> PositionerState {
+        PositionerState {
+            rect_size: Size::from((w, h)),
+            anchor_rect: Rectangle::new(Point::from((x, y)), Size::from((10, 10))),
+            anchor_edges: Anchor::BottomRight,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: adjust,
+            ..Default::default()
+        }
+    }
+
+    /// The 800x600 work area of a window whose own origin is the screen's.
+    const SCREEN: Rect = Rect { x: 0, y: 0, w: 800, h: 600 };
+
+    #[test]
+    fn a_menu_that_fits_is_placed_exactly_where_the_positioner_asked() {
+        let p = menu(100, 100, 60, 40, ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
+        let got = State::constrain(p, Some(SCREEN));
+        assert_eq!((got.loc.x, got.loc.y), (110, 110));
+        assert_eq!((got.size.w, got.size.h), (60, 40));
+        assert_eq!(got, p.get_geometry(), "an unconstrained menu was moved anyway");
+    }
+
+    #[test]
+    fn a_menu_off_the_right_edge_slides_back_on() {
+        // Anchored at 760: the raw arithmetic puts it at 770 and 30 pixels of
+        // it are past 800.
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::SlideX);
+        assert_eq!(p.get_geometry().loc.x, 770);
+        let got = State::constrain(p, Some(SCREEN));
+        assert_eq!(got.loc.x, 740, "the menu did not slide back onto the screen");
+        assert_eq!(got.loc.y, 110, "an x constraint moved it in y");
+        assert_eq!((got.size.w, got.size.h), (60, 40), "a slide resized it");
+    }
+
+    #[test]
+    fn a_menu_off_the_bottom_edge_slides_up() {
+        let p = menu(100, 580, 60, 40, ConstraintAdjustment::SlideY);
+        assert_eq!(p.get_geometry().loc.y, 590);
+        let got = State::constrain(p, Some(SCREEN));
+        assert_eq!((got.loc.x, got.loc.y), (110, 560));
+    }
+
+    /// The client's declaration is the whole of the protocol's contract here.
+    /// A menu that asked to be slid and was flipped instead is on screen and
+    /// in the wrong place — under the cursor that opened it, typically.
+    #[test]
+    fn a_client_that_asked_only_to_slide_is_not_flipped() {
+        let slide = State::constrain(menu(760, 100, 60, 40, ConstraintAdjustment::SlideX), Some(SCREEN));
+        let flip = State::constrain(menu(760, 100, 60, 40, ConstraintAdjustment::FlipX), Some(SCREEN));
+        assert_eq!(slide.loc.x, 740);
+        assert_eq!(flip.loc.x, 700, "a flip should mirror the anchor, not slide");
+        assert_ne!(slide.loc.x, flip.loc.x);
+    }
+
+    /// `ConstraintAdjustment::None` is a client saying "leave it where I put
+    /// it", and it is entitled to that even when the result is off screen.
+    #[test]
+    fn a_client_that_declared_nothing_is_left_alone() {
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::None);
+        assert_eq!(State::constrain(p, Some(SCREEN)), p.get_geometry());
+    }
+
+    #[test]
+    fn without_bounds_the_answer_is_the_raw_arithmetic() {
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::SlideX);
+        assert_eq!(State::constrain(p, None), p.get_geometry());
+    }
+
+    /// A window whose monitor answered with nothing measurable. Fitting a menu
+    /// into it would produce a menu of no size at all.
+    #[test]
+    fn a_degenerate_work_area_is_ignored_rather_than_fitted_into() {
+        let p = menu(760, 100, 60, 40, ConstraintAdjustment::SlideX);
+        let empty = Rect { x: 0, y: 0, w: 0, h: 0 };
+        assert_eq!(State::constrain(p, Some(empty)), p.get_geometry());
+    }
+
+    /// The work area is in the **parent's** coordinates, so a window at (300,
+    /// 200) on the desktop is told the screen starts at (-300, -200). Getting
+    /// that sign wrong is the failure mode that looks right on a maximised
+    /// window and is wrong everywhere else.
+    #[test]
+    fn the_work_area_is_relative_to_the_parent_window() {
+        let bounds = Rect { x: -300, y: -200, w: 800, h: 600 };
+        // 40 pixels from the right-hand edge of the screen, in the window's
+        // coordinates: -300 + 800 = 500.
+        let p = menu(450, 100, 60, 40, ConstraintAdjustment::SlideX);
+        assert_eq!(p.get_geometry().loc.x, 460);
+        let got = State::constrain(p, Some(bounds));
+        assert_eq!(got.loc.x, 440, "the screen's right edge is at 500 in these coordinates");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §37: the window-geometry inset, which is the only thing between a window
 // pixel and a surface point
 // ---------------------------------------------------------------------------
@@ -3729,5 +4790,123 @@ mod tests {
     #[test]
     fn a_negative_inset_shifts_the_other_way() {
         assert_eq!(delivered((-5, -7), (100.0, 100.0)), (95.0, 93.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // §40: the input region, which was parsed and ignored
+    // -----------------------------------------------------------------------
+
+    mod input_region {
+        use crate::state::accepts_input_at;
+        use smithay::utils::Rectangle;
+        use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
+
+        fn region(rects: &[(RectangleKind, i32, i32, i32, i32)]) -> RegionAttributes {
+            RegionAttributes {
+                rects: rects
+                    .iter()
+                    .map(|&(kind, x, y, w, h)| {
+                        (kind, Rectangle::new((x, y).into(), (w, h).into()))
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The default, and the one that matters most: no region means the
+        /// whole surface. `None` is the protocol's initial value and it means
+        /// *infinite* — reading it as an empty region would make every
+        /// ordinary client, which never calls `set_input_region` at all,
+        /// silently unclickable.
+        #[test]
+        fn an_absent_region_accepts_the_whole_surface() {
+            assert!(accepts_input_at((100, 100), None, (0.0, 0.0)));
+            assert!(accepts_input_at((100, 100), None, (99.0, 99.0)));
+        }
+
+        /// The buffer is a bound even with no region: past the last pixel is
+        /// off the surface. Half-open, so `(100, 100)` on a 100x100 surface is
+        /// outside — the same convention `Rect::clip` and the blit use.
+        #[test]
+        fn the_buffer_bounds_the_surface_from_below_and_above() {
+            assert!(!accepts_input_at((100, 100), None, (100.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), None, (50.0, 100.0)));
+            assert!(!accepts_input_at((100, 100), None, (-1.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), None, (50.0, -1.0)));
+        }
+
+        /// A surface with no buffer takes no input. This is the state a
+        /// `wl_subsurface` is in between `get_subsurface` and its first
+        /// commit, and hit-testing it would put the pointer on a surface with
+        /// nothing drawn on it.
+        #[test]
+        fn a_surface_with_no_buffer_takes_no_input() {
+            assert!(!accepts_input_at((0, 0), None, (0.0, 0.0)));
+            let r = region(&[(RectangleKind::Add, 0, 0, 100, 100)]);
+            assert!(!accepts_input_at((0, 0), Some(&r), (0.0, 0.0)));
+        }
+
+        /// A region smaller than the surface: inside accepts, the gap between
+        /// the region and the buffer edge does not. WLCS's `SmallerRegion`.
+        #[test]
+        fn a_smaller_region_leaves_the_rest_of_the_surface_inert() {
+            let r = region(&[(RectangleKind::Add, 20, 20, 60, 60)]);
+            assert!(accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+            assert!(accepts_input_at((100, 100), Some(&r), (20.0, 20.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (19.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (80.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (5.0, 5.0)));
+        }
+
+        /// **A region larger than the surface does not extend it.** The
+        /// protocol says the input region "is clipped to the surface size", so
+        /// the buffer bound is checked whether or not a region was set — which
+        /// is the whole point of WLCS's `ClippedLargerRegion` parameterisation,
+        /// and the case an implementation that checked the region *instead of*
+        /// the bounds would get wrong.
+        #[test]
+        fn a_larger_region_is_clipped_to_the_surface() {
+            let r = region(&[(RectangleKind::Add, -50, -50, 200, 200)]);
+            assert!(accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (-10.0, 50.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (120.0, 50.0)));
+        }
+
+        /// An empty region is the opposite of an absent one: it accepts
+        /// nothing. A client that calls `set_input_region` with a fresh
+        /// `wl_region` is asking to be transparent to input, and that is a
+        /// thing clients deliberately do.
+        #[test]
+        fn an_empty_region_accepts_nothing() {
+            let r = region(&[]);
+            assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+        }
+
+        /// `wl_region.subtract` is not a suggestion. A region built as one
+        /// rectangle minus a hole has a hole, and the rectangles are applied
+        /// in order — which is why `contains` scans the whole list rather than
+        /// stopping at the first hit.
+        #[test]
+        fn a_subtracted_rectangle_is_a_hole() {
+            let r = region(&[
+                (RectangleKind::Add, 0, 0, 100, 100),
+                (RectangleKind::Subtract, 40, 40, 20, 20),
+            ]);
+            assert!(accepts_input_at((100, 100), Some(&r), (10.0, 10.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+            assert!(accepts_input_at((100, 100), Some(&r), (65.0, 50.0)));
+        }
+
+        /// Several disjoint rectangles, which is WLCS's `MultiRectCorners`:
+        /// the corners accept and the middle does not.
+        #[test]
+        fn disjoint_rectangles_each_accept_their_own_area() {
+            let r = region(&[
+                (RectangleKind::Add, 0, 0, 20, 20),
+                (RectangleKind::Add, 80, 80, 20, 20),
+            ]);
+            assert!(accepts_input_at((100, 100), Some(&r), (5.0, 5.0)));
+            assert!(accepts_input_at((100, 100), Some(&r), (85.0, 85.0)));
+            assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
+        }
     }
 }

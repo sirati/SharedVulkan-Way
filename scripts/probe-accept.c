@@ -9,7 +9,7 @@
  * only interesting when a real afunix.sys connection crosses a process
  * boundary.
  *
- * QUESTION 1 -- SIO_AF_UNIX_GETPEERPID (docs/design.md §7.8 item 1)
+ * QUESTION 1 -- SIO_AF_UNIX_GETPEERPID (docs/waycompose-design.md §7.8 item 1)
  *
  * Stage 1 chose AF_UNIX over a named pipe partly because this ioctl exists.
  * Wine implements no `IOC_VENDOR` ioctl at all, so the call has compiled and
@@ -19,7 +19,7 @@
  * that happens to be wrong would be worse than a failure.
  *
  * QUESTION 2 -- what `accept()` writes into the peer address
- *              (docs/design.md §7.8 item 2)
+ *              (docs/waycompose-design.md §7.8 item 2)
  *
  * `uds_windows::UnixListener::accept` calls `accept()` with a real
  * `sockaddr_un` and then rejects the connection outright if `len != 0 &&

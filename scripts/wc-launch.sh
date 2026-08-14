@@ -94,6 +94,9 @@ note() { echo "  ----  $*"; }
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@" 2>&1 | grep -v 'post-quantum\|store now, decrypt\|may need to be upgraded'; }
 h() { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
 
+# STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
+. "$(dirname "$0")/wc-binaries.sh"
+
 # Run something on the guest's interactive desktop. See the header.
 int() {
   local name="$1" exe="$2" argstr="$3" wait="${4:-}"
@@ -233,12 +236,29 @@ do_deploy() {
   # the product's own verb, which kills by the pid in its own state file.
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --stop" >/dev/null 2>&1
 
+  # STAGE 44. **Three builds whose success was never established.** Each is a
+  # bare pipeline in a script with no `set -e`, so its status was simply not
+  # looked at — and looking at it would not have helped, which is the part worth
+  # knowing: with `pipefail` (set on line 49) `cargo … | grep '^error' | head`
+  # returns 1 when the build *succeeds*, because grep matching nothing is a 1.
+  # Success and failure are both `rc=1`; only `${PIPESTATUS[0]}` tells them
+  # apart, and it has to be read on the very next line.
+  #
+  # §42.3 got the mechanism wrong here and §44.2 says so. It claimed the
+  # pipeline "gives grep's exit status" — true without `pipefail`, and no
+  # harness in this tree is without it.
   echo "  building the Windows half"
   cargo build --target x86_64-pc-windows-gnu \
         -p wc-launch -p wc-desk 2>&1 | grep -E "^error" | head -5
+  built_ok "${PIPESTATUS[0]}" "wc-launch and wc-desk for Windows" || exit 1
   cargo build --target x86_64-pc-windows-gnu -p sv-guest --no-default-features -F wayland 2>&1 | grep -E '^error|warning: unused' | head -5
+  built_ok "${PIPESTATUS[0]}" "sv-guest for Windows" || exit 1
+  # And freshness on top, because a build that succeeded without recompiling
+  # anything is also possible: `cargo` is content when the tree has not changed,
+  # and this check is about the tree rather than about cargo. §35.4.
+  local e
   for e in wc-launch.exe sv-guest.exe wc-desk.exe; do
-    [ -f "$WIN_BIN/$e" ] || { echo "error: no $WIN_BIN/$e"; exit 1; }
+    fresh "$WIN_BIN/$e" "cargo build --target x86_64-pc-windows-gnu" || exit 1
   done
 
   echo "  building the Linux half"
@@ -247,7 +267,10 @@ do_deploy() {
   # path dependency that kept it excluded no longer exists (one-binary.md §1.3). The
   # merge deleted it outright; stage 14 put it back, because nothing replaced it.
   cargo build -p wc-proxy -p wc-arena-host 2>&1 | grep -E '^error' | head -5
+  built_ok "${PIPESTATUS[0]}" "wc-proxy and wc-arena-host" || exit 1
   local locator="$LINUX_BIN/wc-arena-host"
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
+  fresh "$locator"            "cargo build -p wc-arena-host" || exit 1
   for b in "$LINUX_BIN/wc-proxy" "$locator"; do
     [ -x "$b" ] || { echo "error: no $b"; exit 1; }
   done
@@ -295,6 +318,14 @@ INI
   sleep 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:wclaunch/" >/dev/null || { echo "error: scp to the guest"; exit 1; }
   echo "  copied wc-launch.exe, sv-guest.exe, wc-desk.exe, probe-relay.exe and the ini to $DIR_WIN"
+  # STAGE 42. `sv-guest.exe` is the GPU side, which is the binary the
+  # wire-version refusal is actually about: it is *copied* here, so rebuilding
+  # on this machine changes only this side. `finish_attach` refuses the skew
+  # with "This is a version skew between two builds, not a transport fault",
+  # and `WIRE_VERSION` went 1 -> 2 while this was written. Checked before the
+  # run rather than diagnosed from a handshake failure during it.
+  deployed_all "$stage" "$DIR_MSYS" g "re-run $0 deploy with nothing of ours running on the guest" \
+    wc-launch.exe sv-guest.exe wc-desk.exe || exit 1
 
   # The guest's key for the VM host, generated on the guest so the private half
   # never leaves it, and restricted on the host to wc-session's verbs.
@@ -312,6 +343,11 @@ INI
   scp "${SSHOPT[@]}" "$ROOT/scripts/wc-session" "$HOST:$HOSTDIR/" >/dev/null
   scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOSTDIR/bin/" >/dev/null \
     || { echo "error: scp to the VM host"; exit 1; }
+  # STAGE 42, the host boundary. The unlink trick above means `scp` cannot fail
+  # on a live binary any more, which removes the loud failure and leaves only
+  # the quiet one: a copy that did not land where the run will look for it.
+  deployed_is "$LINUX_BIN/wc-proxy" "$HOSTDIR/bin/wc-proxy"      h "re-run $0 deploy" || exit 1
+  deployed_is "$locator"            "$HOSTDIR/bin/wc-arena-host" h "re-run $0 deploy" || exit 1
   h "chmod 755 $HOSTDIR/wc-session $HOSTDIR/bin/*; \
      mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; \
      grep -q '$(echo "$pub" | awk '{print $2}')' ~/.ssh/authorized_keys || \
@@ -575,13 +611,25 @@ do_desktop_shot() {
   int "wclaunch-deskshot" "powershell.exe" \
       "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $DIR_WIN\\shot.ps1" -Wait >/dev/null
   sleep 3
+  # STAGE 42. This writes a **checked-in photograph** — the evidence that the
+  # shortcut is on the desktop — and both arms were `note`, so nothing asserted
+  # anything about it. A 1x1 or all-black capture landed in `docs/stage14/` and
+  # the run said "docs/stage14/stage14-desktop.png" either way. Informational is
+  # a legitimate state for a number (see `wc-proxy.sh`'s audit block) but not
+  # for the artefact a section cites as its evidence.
+  #
+  # The absent case stays a `note`: a locked guest genuinely cannot be
+  # photographed (§13), and that is a fact about the machine rather than a
+  # failure of this stage.
   if g "test -s $DIR_MSYS/desktop.bmp && echo yes" | grep -q yes; then
     g "base64 $DIR_MSYS/desktop.bmp" | base64 -d > "$ROOT/docs/stage14/stage14-desktop.bmp"
     if command -v magick >/dev/null 2>&1; then
       magick "$ROOT/docs/stage14/stage14-desktop.bmp" "$ROOT/docs/stage14/stage14-desktop.png" 2>/dev/null
       rm -f "$ROOT/docs/stage14/stage14-desktop.bmp"
+      picture_is "$ROOT/docs/stage14/stage14-desktop.png" screen "the desktop with the shortcut on it -> docs/stage14/stage14-desktop.png"
+    else
+      note "docs/stage14/stage14-desktop.bmp (no imagemagick here, so nothing checked the pixels)"
     fi
-    note "docs/stage14/stage14-desktop.png"
   else
     note "no screen capture (the guest's screen is a lock screen, §13)"
   fi

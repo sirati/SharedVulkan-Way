@@ -41,6 +41,16 @@ set -uo pipefail
 
 fail=0
 
+# §51. Same-box, declared so the distinction above is machine-checkable rather
+# than only argued. The glxgears bound IS a throughput claim, and it is a sound
+# one, because what it concludes is **which device answered** -- an order of
+# magnitude between a GPU and llvmpipe -- and not how long anything took to
+# cross a boundary. There is no boundary here, and `wc_latency_claim` would
+# refuse one if this file asked.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "Xvfb, glxgears and the ICD all run on this machine; the control is the same machine with no forwarding" >/dev/null || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The other harnesses hard-code `target/debug` and this one follows them by
 # default, so the numbers it prints are the numbers those harnesses produce.
@@ -53,8 +63,22 @@ RUNDIR="$(mktemp -d /tmp/sv-bench.XXXXXX)"
 MANIFEST="$BIN/sv_icd.json"
 SOCK="$RUNDIR/gpu.sock"
 
-[ -f "$MANIFEST" ] || { echo "build first: cargo build -p sv-icd" >&2; exit 1; }
-[ -x "$BIN/sv-gpu-server" ] || { echo "build first: cargo build -p sv-gpu-server" >&2; exit 1; }
+# STAGE 44. §35.6 item 6 and §42.5 item 4: this harness had no freshness guard,
+# and it is one of the three that produce numbers this project quotes. Stronger
+# than freshness alone, because `sv_icd.json` is a *generated file holding an
+# absolute path*: `scripts/sv-worktree.sh` seeds a worktree by reflinking
+# `target/`, so a fresh worktree's manifest names the **base tree's**
+# `libsv_icd.so`. That file exists, so `[ -f "$MANIFEST" ]` was satisfied while
+# the Vulkan loader handed this suite another checkout's driver — and a
+# benchmark that measures the wrong tree is worse than one that does not run.
+#
+# `SV_BENCH_BIN=target/release` is a supported second data point (see `BIN`
+# above), and `manifest_is_ours` only requires the path to be *inside this
+# worktree*, so it does not constrain which profile is measured.
+. "$(dirname "${BASH_SOURCE[0]}")/wc-binaries.sh"
+manifest_is_ours "$MANIFEST" "cargo build -p sv-icd, in this worktree" || exit 1
+fresh "$BIN/libsv_icd.so"  "cargo build -p sv-icd" || exit 1
+fresh "$BIN/sv-gpu-server" "cargo build -p sv-gpu-server" || exit 1
 
 GPUPID=""
 cleanup() {

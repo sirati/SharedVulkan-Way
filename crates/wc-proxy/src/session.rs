@@ -493,6 +493,19 @@ pub struct Stats {
     /// much of the traffic the check has nothing to say about, and a check
     /// whose coverage is unstated is a check nobody can size.
     pub verify_skipped: u64,
+    /// Commits that never reached the copy at all, and so were neither verified
+    /// nor classified as state-only: no such surface, a surface that has never
+    /// had a buffer attached, a buffer or pool already gone, or a pool the
+    /// compositor does not have.
+    ///
+    /// This exists because `wc-damage.sh` asserts an **identity** — every
+    /// commit is verified, skipped, or unreached — and an identity with an
+    /// unnamed remainder is not one. The remainder was 7 of 3711 on the first
+    /// arena run, and the harness was right to fail: not because seven commits
+    /// matter, but because a coverage claim with a hole in it cannot be sized.
+    /// Every one of these is a legitimate early return; what was missing was
+    /// the arithmetic saying so.
+    pub verify_unreached: u64,
 }
 
 impl Stats {
@@ -529,8 +542,13 @@ impl Stats {
         // indistinguishable from a check that never ran.
         let verify = if self.verified > 0 || self.verify_skipped > 0 {
             format!(
-                "; verified {} commits ({} state-only, unverifiable), {} stale (worst {} rows)",
-                self.verified, self.verify_skipped, self.stale_commits, self.stale_rows_worst
+                "; verified {} commits ({} state-only, unverifiable, {} never reached the copy), \
+                 {} stale (worst {} rows)",
+                self.verified,
+                self.verify_skipped,
+                self.verify_unreached,
+                self.stale_commits,
+                self.stale_rows_worst
             )
         } else {
             String::new()
@@ -783,6 +801,29 @@ struct Clip {
     /// `enter` and nothing says the old one is destroyed first; the ids are
     /// retired by `wl_display.delete_id` like every other object.
     drag_offers: std::collections::HashSet<u32>,
+    /// Of those, the ones a `wl_data_device.drop` has already been sent for.
+    ///
+    /// ADDED FOR docs/waycompose-design.md §50, and it exists because of an ordering nobody had seen.
+    /// `wl_data_device.leave` used to forget every drag offer, which reads
+    /// correctly — the drag is over, nothing more will be received. It is
+    /// wrong, and the first drag that ever entered a client showed why: the
+    /// client's `wl_data_offer.receive` comes **after** the drop, and this
+    /// compositor sends `leave` in between. The proxy's own log, from that run:
+    ///
+    /// ```text
+    /// wl_data_device.enter: offer 4278190080 is a drag's
+    /// wl_data_device.drop
+    /// wl_data_device.leave: forgetting drag offers {4278190080}
+    /// receive on offer 4278190080 for "text/plain;charset=utf-8" -> Clipboard
+    /// paste 1 refused: the clipboard holds nothing of that type
+    /// ```
+    ///
+    /// A dropped offer stays valid until the client destroys it — that is what
+    /// `wl_data_offer.finish` is for — so `leave` may only forget the offers
+    /// that were *not* dropped. The direction this failed in loses the paste;
+    /// §29.8 names the direction it could fail in instead, where a `receive`
+    /// routed to the wrong selection hands somebody the last thing dragged.
+    dropped_offers: std::collections::HashSet<u32>,
     outgoing: Vec<Outgoing>,
     /// When the current pull started, for [`COPY_DEADLINE`].
     started: Option<Instant>,
@@ -1489,6 +1530,15 @@ impl Session {
         } else {
             Source::Clipboard
         };
+        // ADDED FOR docs/waycompose-design.md §50. This decision had never been *observed* — the first
+        // real drag into a client made it wrongly and the only symptom was a
+        // paste that came back empty, four processes away. It is one line and
+        // it names both the answer and the evidence for it.
+        self.note(format!(
+            "receive on offer {offer} for {mime:?} -> {source:?} \
+             (offers announced by wl_data_device.enter: {:?})",
+            self.clip.drag_offers
+        ));
         self.clip.fetches.push((token, source, mime));
         self.clip.incoming.push(Incoming { token, fd, data: None, at: 0 });
     }
@@ -2026,12 +2076,38 @@ impl Session {
                         && id != 0
                     {
                         self.clip.drag_offers.insert(id);
+                        self.note(format!("wl_data_device.enter: offer {id} is a drag's"));
                     }
                 }
                 // The drag is over one way or the other. The ids stay valid
                 // until the client destroys them, but nothing more will be
                 // received from them.
-                "leave" => self.clip.drag_offers.clear(),
+                // The drag is over one way or the other. An offer that was
+                // *dropped* outlives this — see `dropped_offers`.
+                "leave" => {
+                    let forget: Vec<u32> = self
+                        .clip
+                        .drag_offers
+                        .iter()
+                        .copied()
+                        .filter(|id| !self.clip.dropped_offers.contains(id))
+                        .collect();
+                    if !forget.is_empty() {
+                        self.note(format!(
+                            "wl_data_device.leave: forgetting undropped drag offers {forget:?}"
+                        ));
+                    }
+                    for id in forget {
+                        self.clip.drag_offers.remove(&id);
+                    }
+                }
+                // The user let go over one of our surfaces. Every offer `enter`
+                // announced is now one the client may still `receive` from.
+                "drop" => {
+                    let dropped: Vec<u32> = self.clip.drag_offers.iter().copied().collect();
+                    self.note(format!("wl_data_device.drop on offers {dropped:?}"));
+                    self.clip.dropped_offers.extend(dropped);
+                }
                 _ => {}
             }
         }
@@ -2078,6 +2154,7 @@ impl Session {
             }
             self.objects.forget(id);
             self.clip.drag_offers.remove(&id);
+            self.clip.dropped_offers.remove(&id);
             // The compositor has finished with this object. For a pool that
             // means it has certainly opened the region by now, so one of the
             // three conditions on releasing it is met. See the note on
@@ -2394,6 +2471,7 @@ impl Session {
             self.note(format!("arena region {id} returned: {bytes} bytes of {origin}"));
         }
         let Some(surface) = self.surfaces.get_mut(&surface_id) else {
+            self.stats.verify_unreached += 1;
             return;
         };
         let attached_now = surface.pending_attached;
@@ -2407,12 +2485,15 @@ impl Session {
         let full = surface.needs_full_copy;
         let Some(buffer_id) = surface.current else {
             surface.damage.clear();
+            self.stats.verify_unreached += 1;
             return;
         };
         let Some(info) = self.buffers.get(&buffer_id).cloned() else {
+            self.stats.verify_unreached += 1;
             return;
         };
         let Some(pool) = self.pools.get_mut(&info.pool) else {
+            self.stats.verify_unreached += 1;
             return;
         };
 
@@ -2421,6 +2502,7 @@ impl Session {
             // want of room, or mid-teardown. Already noted, and the surface
             // keeps whatever it last showed. The damage list is deliberately
             // **not** consumed on the way out — see `needs_full_copy`.
+            self.stats.verify_unreached += 1;
             return;
         };
         pool.last_used = Instant::now();
@@ -2438,6 +2520,7 @@ impl Session {
         let pool = self.pools.get_mut(&info.pool).expect("just read");
         let src = pool.client.as_slice();
         let Some(dst) = self.transport.bytes_mut(&region) else {
+            self.stats.verify_unreached += 1;
             return;
         };
         let usable = src.len().min(dst.len()).min(pool.size);

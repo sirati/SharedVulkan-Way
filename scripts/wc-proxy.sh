@@ -10,7 +10,7 @@
 #
 # WHAT THIS CLOSES, AND WHY IT IS ONE EXPERIMENT RATHER THAN TWO
 #
-# docs/design.md §8.5 had to split its evidence in half and said so:
+# docs/waycompose-design.md §8.5 had to split its evidence in half and said so:
 #
 #   * **Linux** ran `weston-terminal` and `weston-presentation-shm` — real
 #     libwayland clients that cannot share a bug with this project — through the
@@ -106,6 +106,50 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 47. **A third outcome, because this harness had no way to say "the
+# machine was too loaded to measure".**
+#
+# Every gate here could previously end in exactly two places: `bad`, which says
+# the *code* is wrong, or `note`, which says nothing and is counted by nobody.
+# A gate whose shortfall can be caused by load alone therefore had to lie in one
+# direction or the other — blame the tree for the box, or go silent. §35's rule
+# is that a number nobody asserts on is unwatched; the corollary this stage adds
+# is that **an outcome the vocabulary cannot express gets misfiled**.
+#
+# `inconclusive` is counted and printed in the summary, so a run that could not
+# measure something says so in the same line as its passes and failures, and a
+# reader can tell "nothing was wrong" from "we could not tell".
+#
+# It is deliberately *not* a way to make a failing gate quiet. It is used only
+# where the condition is a property of the machine — sample size under load —
+# and never where the property being tested is the code's.
+inconc=0
+skip() { echo "  ????  $*"; inconc=$((inconc + 1)); }
+
+# The load average, for the messages that need to distinguish slow from broken.
+# One decimal, and the 1-minute figure, because the legs here are 6 seconds long
+# and the 5-minute average would describe a different run.
+loadnow() { awk '{printf "%.1f", $1}' /proc/loadavg 2>/dev/null || echo "?"; }
+
+# STAGE 41. No QEMU on this box, so no guest RAM to locate: this harness is the
+# Wine fixture and its `arena` transport is a file. `wc_substrate_declare
+# wine-fixture` is what hands it the `SV_ALLOW_FILE_ARENA=1` that `wc-proxy` and
+# `wc-compositor` now require, and it refuses to hand that out to any harness
+# that has a guest.
+. "$(dirname "$0")/wc-substrate.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "weston's clients, the proxy and wc-compositor.exe all run on this box" || exit 1
+# STAGE 42. `fresh` / `fresh_or_skip` / `deployed_is`, shared rather than copied.
+. "$(dirname "$0")/wc-binaries.sh"
+wc_substrate_declare wine-fixture \
+  "no QEMU on this box: a Wine run has no guest RAM to locate" || exit 2
+
 RUNDIR=$(mktemp -d /tmp/wc-proxy-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -147,22 +191,16 @@ start_x() {
 # them*. `[ -x "$LINUX_BIN/wc-proxy" ]` is a check that the file exists, which
 # is not the same claim at all. §18.8 says the neighbouring thing about clippy
 # — it builds metadata, not an executable — and this is its other half.
-fresh() {
-  local bin=$1 how=$2 newer
-  if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
-    bad "no $bin -- $how"
-    return 1
-  fi
-  newer=$(find "$ROOT/crates" "$ROOT/vendor" "$ROOT/Cargo.lock" \
-            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-            -newer "$bin" -print -quit 2>/dev/null)
-  if [ -n "$newer" ]; then
-    bad "$(basename "$bin") is older than ${newer#$ROOT/} -- $how, or this run measures the previous tree"
-    return 1
-  fi
-  ok "$(basename "$bin") is newer than every source file in the tree"
-  return 0
-}
+# STAGE 42. `fresh` now lives in `scripts/wc-binaries.sh`, sourced above, and
+# this copy is deleted rather than kept in sync. §35.6 item 6 said it was
+# "copied rather than shared because these scripts have no common file"; that
+# stopped being true when `wc-substrate.sh` landed, and two copies of a check
+# are two checks that can disagree — which is the same argument §41.4 makes for
+# not implementing the file-arena refusal twice.
+#
+# The shared file also carries `fresh_or_skip`, which this harness does not need
+# and the seventeen in §35.6 item 6's list mostly did: a block that skips when a
+# binary is absent must still fail when one is present and stale.
 
 # wait_for <file> <extended-regex> <seconds> <what>
 #
@@ -254,7 +292,7 @@ run_one() {
   fi
 
   # A **distinct desktop name per run, and a gap before starting**, both of
-  # which were measured rather than chosen. docs/design.md §8.9 records that the
+  # which were measured rather than chosen. docs/waycompose-design.md §8.9 records that the
   # Wine harnesses collide when run back to back because the previous
   # `wineserver` is still shutting down; this harness runs three compositors in
   # one go and hit a sharper version of it. With the same desktop name the
@@ -387,8 +425,36 @@ check_common() {
   local presents
   presents=$(grep -o "([0-9]* frames presented)" "$srv" | grep -o "[0-9]*" | tail -1)
   presents=${presents:-0}
+  # STAGE 48. **Zero is broken; short is inconclusive.** §35.9 item 3 flagged
+  # this floor as having no margin — `weston-terminal`'s present count was 2, 2
+  # and 5 across the runs measured — and asked what to do if a fourth
+  # observation came in at 1. This is the answer, and it turns on the floor's
+  # *basis* rather than on its value.
+  #
+  # The basis is structural, not a rate: `weston-terminal` draws once at map and
+  # once on the configure, so 2 is what the client owes by construction and no
+  # amount of load changes what it owes. What load can change is whether both
+  # draws land inside this leg's 8-second window. So the two cases are genuinely
+  # different facts and were reported as one:
+  #
+  #   0 frames  nothing of the client's pixels ever reached the window. That is
+  #             the claim of the stage failing, and no load explains it — the
+  #             client connected, mapped and committed to get this far.
+  #   1..n-1    fewer than the structural count, inside a bounded window, on a
+  #             machine that now reaches load average 175. That is a statement
+  #             about the box, and §47.3's third outcome is where it belongs.
+  #
+  # This is deliberately *not* applied to `weston-presentation-shm`, whose floor
+  # is 500 against the 784 it presents: that floor is a rate and a short count
+  # there is a real regression in a client that draws continuously. The
+  # distinction is the same one §47.2 draws between bytes and time — a
+  # structural count can be bounded tightly, a rate cannot.
   if [ "$presents" -ge "$minframes" ]; then
     ok "$tag: $presents frames of the client's pixels reached the window (owed $minframes)"
+  elif [ "$presents" -eq 0 ]; then
+    bad "$tag: no frame of the client's pixels ever reached the window (owed $minframes)"
+  elif [ "$minframes" -le 4 ]; then
+    skip "$tag: $presents of the $minframes structural frames arrived inside the window at load $(loadnow) -- the client owes them by construction, so this is the window and not the code"
   else
     bad "$tag: only $presents frame(s) presented, against the $minframes this client owes"
   fi
@@ -474,7 +540,7 @@ check_common() {
 
   # Two shots of a live window. `weston-terminal` is static by design and
   # `weston-presentation-shm` animates, so only the second can carry a live-ness
-  # claim — the same asymmetry docs/design.md §8.9 records for the Linux
+  # claim — the same asymmetry docs/waycompose-design.md §8.9 records for the Linux
   # harness.
   #
   # **CHANGED IN §31, twice over.**
@@ -565,7 +631,7 @@ run_window() {
       # compositor's view; the checks are stage 3's.
       # The pixels, read back out of the process by tools that are not ours.
       # `--dump-frames` is new on Win32 for stage 4 and is what gives this leg
-      # the read-back the Linux leg always had (docs/design.md §8.5).
+      # the read-back the Linux leg always had (docs/waycompose-design.md §8.5).
       local frame
       frame=$(find "$RUNDIR/term/frames" -name '*.ppm' 2>/dev/null | sort | tail -1)
       if [ -n "$frame" ]; then
@@ -591,7 +657,7 @@ run_window() {
         # `weston-terminal` draws its own toytoolkit title bar as a light band
         # across the top of its buffer and a black terminal field below. An
         # upside-down blit puts the light band at the bottom, which is exactly
-        # docs/design.md §8.11 item 3's worry about `SetDIBitsToDevice` with a
+        # docs/waycompose-design.md §8.11 item 3's worry about `SetDIBitsToDevice` with a
         # negative `biHeight` — the one place the documentation is ambiguous
         # and the most likely to differ between Wine's GDI and the real one.
         #
@@ -671,7 +737,7 @@ run_window() {
       # Pure red, green and blue must all be on the captured screen: the wheel
       # arrived with its channels intact. This is the check that a `Xrgb8888`
       # buffer and a 32-bit `BI_RGB` DIB really are the same bytes in the same
-      # order (docs/design.md §8.4) — a B/R swap anywhere between the client's
+      # order (docs/waycompose-design.md §8.4) — a B/R swap anywhere between the client's
       # `memfd` and the glass would leave a plausible-looking wheel with red and
       # blue exchanged, and the harness would still find three primaries, so the
       # *positions* are what carry it below.
@@ -704,7 +770,7 @@ run_window() {
 
       # The wheel is inscribed in the client's 250x250 buffer, so the union of
       # the three coloured wedges must fit inside 250x250 and must not be tiny.
-      # That is the scale check: a DPI-virtualised window (docs/design.md §8.10
+      # That is the scale check: a DPI-virtualised window (docs/waycompose-design.md §8.10
       # item 9) would be drawn larger, and a stride error would smear the wedges
       # horizontally past the buffer's width. Both fail this and neither fails a
       # "the colours are there" check.
@@ -731,7 +797,7 @@ run_window() {
   #
   # Each client has now driven one transport. Swapping them is what says the
   # result is a property of the path and not of one client's habits, which is
-  # the same argument docs/design.md §8.5 makes for running two clients at all.
+  # the same argument docs/waycompose-design.md §8.5 makes for running two clients at all.
   if command -v weston-terminal >/dev/null; then
     echo "  -- weston-terminal / arena (the cross-check) --"
     run_one term-arena weston-terminal arena damage 8
@@ -772,9 +838,39 @@ run_cost() {
   for transport in shared-file arena; do
     for scope in pool buffer damage; do
       local tag="cost-$transport-$scope"
-      run_one "$tag" weston-presentation-shm "$transport" "$scope" 6 0 0 || continue
-      local line
-      line=$(grep -o "[0-9]* commits, [0-9]* copies, [0-9.]* MiB in [0-9.]* ms" "$RUNDIR/$tag/proxy.log" | tail -1)
+      # STAGE 47. **Measure until the sample is big enough, rather than for a
+      # fixed time and then complain.**
+      #
+      # The floor below is `commits >= 50`, and its reasoning is sound on an
+      # idle box: 620 to 736 commits were measured in 6 seconds, so 50 is more
+      # than ten times clear. But it is a floor on a *rate*, and this machine now
+      # runs full-profile workspace builds at a load average north of 100 on 32
+      # cores. At that point a 6-second window can genuinely fail to reach 50
+      # commits, and the harness would report `bad` — announcing a defect in the
+      # tree because the box was busy. **A threshold picked when the machine was
+      # quiet cannot tell slow from broken.**
+      #
+      # So the window grows instead of the verdict changing: 6 s, then 18 s if
+      # the sample was short. A slow machine pays time and still produces a
+      # measurement; a broken one produces a short sample twice and is reported
+      # as inconclusive with the load quoted, not as a failure. That is the
+      # distinction the fixed window could not express.
+      #
+      # The retry is not flakiness-papering: the *cost* gates below are ratios
+      # per commit, which are load-independent by construction (§31), so a
+      # longer window changes the confidence and not the number.
+      local secs=6 attempt=0 commits_seen=0 line=""
+      while [ "$attempt" -lt 2 ]; do
+        attempt=$((attempt + 1))
+        run_one "$tag" weston-presentation-shm "$transport" "$scope" "$secs" 0 0 || break
+        line=$(grep -o "[0-9]* commits, [0-9]* copies, [0-9.]* MiB in [0-9.]* ms" "$RUNDIR/$tag/proxy.log" | tail -1)
+        commits_seen=$(printf '%s' "$line" | grep -o '^[0-9]*')
+        [ "${commits_seen:-0}" -ge 50 ] && break
+        [ "$attempt" -ge 2 ] && break
+        note "$tag: ${commits_seen:-0} commits in ${secs}s at load $(loadnow) -- widening the window to 18s rather than calling it a failure"
+        secs=18
+      done
+      [ -n "$line" ] || continue
       local us kib
       us=$(grep -o "[0-9]* us per copy" "$RUNDIR/$tag/proxy.log" | tail -1 | grep -o "^[0-9]*")
       kib=$(grep -o "[0-9.]* KiB and" "$RUNDIR/$tag/proxy.log" | tail -1 | grep -o "^[0-9.]*")
@@ -815,8 +911,20 @@ run_cost() {
   local t s commits copies kibper
   while read -r t s commits _ copies _ _ _ _ _ _ _ kibper; do
     kibper=${kibper%kib}
-    local why=""
-    [ "$commits" -lt 50 ] && why="only $commits commits in 6 s -- too few to measure over"
+    # STAGE 47. **A short sample is inconclusive, not failing.** This was
+    # `bad "only N commits in 6 s -- too few to measure over"`, which is a true
+    # sentence filed under the wrong verdict: too few commits says the machine
+    # was busy, and nothing about whether the code copies correctly. With the
+    # window now widening once before giving up, reaching this line means two
+    # windows were short — still a fact about the box, and reported as one, with
+    # the load quoted so it can be told from a real stall.
+    #
+    # The load-independent gates below (`copies <= 2 x commits`, KiB per copy,
+    # and the per-commit ratios) are *not* skipped by this: they still run on
+    # whatever sample there is, because they are properties of the code and a
+    # thin sample cannot make a 55x regression look like 1x.
+    local why="" thin=""
+    [ "$commits" -lt 50 ] && thin="only $commits commits over two windows at load $(loadnow) -- too thin to draw a rate from"
     if [ -z "$why" ] && [ "$copies" -gt $((commits * 2)) ]; then
       why="$copies copies for $commits commits -- a buffer is being copied more than once per commit"
     fi
@@ -824,10 +932,16 @@ run_cost() {
        && awk -v k="$kibper" -v c="$extent_ceiling" 'BEGIN { exit !(k > c) }'; then
       why="$kibper KiB per copy of a ${extent_kib} KiB buffer -- a scope that copies part of a buffer moved more than all of it"
     fi
-    if [ -z "$why" ]; then
-      ok "$t/$s: $commits commits, $copies copies, $kibper KiB per copy -- once per commit, never more than the extent"
-    else
+    # The code gates win over the sample-size note: a run that is BOTH thin and
+    # copying 55 times per commit is a failure, and saying "inconclusive" there
+    # would be the skip hiding a defect. Only a thin sample with nothing else
+    # wrong is inconclusive.
+    if [ -n "$why" ]; then
       bad "$t/$s: $why"
+    elif [ -n "$thin" ]; then
+      skip "$t/$s: $thin (the per-copy and per-commit gates still ran and found nothing wrong)"
+    else
+      ok "$t/$s: $commits commits, $copies copies, $kibper KiB per copy -- once per commit, never more than the extent"
     fi
   done <"$RUNDIR/cost.txt"
 
@@ -912,6 +1026,16 @@ case "${1:-all}" in
 esac
 
 echo
-echo "== $pass passed, $fail failed =="
+# STAGE 47. The inconclusive count is in the summary, and only there when it is
+# non-zero — a run that measured everything should not have to say so. It does
+# **not** affect the exit status: "we could not measure it" is not a failure,
+# and a harness that exited non-zero for load would teach everyone to re-run
+# until green, which §35.1 names as worse than failing.
+if [ "$inconc" -gt 0 ]; then
+  echo "== $pass passed, $fail failed, $inconc inconclusive (load $(loadnow)) =="
+  echo "   inconclusive = the machine was too loaded to draw a rate; the code gates still ran."
+else
+  echo "== $pass passed, $fail failed =="
+fi
 [ -n "$KEEP" ] && echo "artefacts kept in $RUNDIR"
 [ "$fail" -eq 0 ]

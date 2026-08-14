@@ -238,7 +238,11 @@ pub fn generate_gpu_entry(model: &Model, wire_profile: &Profile) -> Result<Gener
     let cx = emit::icd_entry::Ctx::new(model, &abi, &wire);
     let hand = exceptions::gpu_hand_written();
     let (sections, refusals) =
-        emit::gpu_entry::emit_all(&cx, &hand, &wire_profile.extensions);
+        // `resolved.extensions`, not `wire_profile.extensions`. A profile that
+        // states a *rule* rather than a list — `include_portable_extensions` —
+        // declares thirty names and enables nearer three hundred, and the GPU
+        // side must advertise what it forwards rather than what was typed.
+        emit::gpu_entry::emit_all(&cx, &hand, &resolved.extensions);
 
     let mut tokens = proc_macro2::TokenStream::new();
     for (_, t) in &sections {
@@ -324,8 +328,41 @@ pub fn profile_by_name(name: &str) -> Option<Profile> {
         // `docs/video-decode.md`; `SV_PROTO_PROFILE=video` builds the whole
         // stack against it.
         "video" => Some(vk_registry::profiles::video()),
+        // Core 1.0–1.4 and every portable extension: the answer to "740 defined,
+        // 239 carried". See `vk_registry::profiles::full`.
+        "full" => Some(vk_registry::profiles::full()),
         _ => None,
     }
 }
 
-pub const PROFILE_NAMES: &[&str] = &["zink", "step3-minimal", "video"];
+pub const PROFILE_NAMES: &[&str] = &["zink", "step3-minimal", "video", "full"];
+
+/// The profile a build uses when `SV_PROTO_PROFILE` is not set.
+///
+/// # Why `full` and not `zink`, and why that is a decision rather than a default
+///
+/// The requirement is the user's and it is not about a count: *advertise and
+/// forward everything the underlying GPU actually supports, and gracefully do
+/// without what it does not.* `zink` forwards 253 commands and advertises 25
+/// device extensions of RADV's 236; `full` forwards 509 and advertises 218 with
+/// **zero** over-advertisement (design.md §0.19 item 6). A capability that only
+/// exists behind an environment variable is a capability nobody gets, so
+/// shipping `zink` by default would have meant answering the requirement in a
+/// file rather than in a build.
+///
+/// What made it safe to switch, measured rather than assumed:
+///
+/// - `cargo test --workspace --no-fail-fast` is green under **both** — 1386
+///   tests under `zink`, 2393 under `full`, 0 failed either way. The difference
+///   is generated round-trips, one per struct and command carried.
+/// - `vulkaninfo` through the forwarder against RADV works and over-advertises
+///   nothing.
+/// - Cold build of the two generated crates: 31 s under `zink`, 50 s under
+///   `full`. Real, bounded, and paid once per registry bump.
+///
+/// The two profiles are otherwise the same declaration — since the
+/// `pHostPointer` policy landed, `zink` carries core 1.4 too, and the
+/// difference between them is extensions alone. `SV_PROTO_PROFILE=zink` gets
+/// the narrow build back with no code change, which is what makes this
+/// reversible if a consumer needs the smaller protocol.
+pub const DEFAULT_PROFILE: &str = "full";

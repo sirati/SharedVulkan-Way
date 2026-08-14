@@ -6,6 +6,7 @@
 #   scripts/wc-guest.sh stage4   only blocks 7-10, the host half (needs WC_HOST)
 #   scripts/wc-guest.sh arena    only block 10, the guest-RAM arena (needs WC_HOST)
 #   scripts/wc-guest.sh firefox  only block 11, Firefox over guest RAM (needs WC_HOST_FIREFOX)
+#   scripts/wc-guest.sh damage   only block 12, the damage path WITH a hypervisor in it (§46)
 #   scripts/wc-guest.sh clean    remove everything this script put on the guest
 #   scripts/wc-guest.sh all      deploy, run, clean
 #
@@ -125,7 +126,7 @@ HOST_WESTON="${WC_HOST_WESTON:-}"                    # dir holding weston-termin
 # root-only. That is a property of how testhost starts the VM and not of the
 # design: shared_vulkan's own boundary hands the same name to unprivileged ICD
 # processes, and it works there because QEMU runs as the developer. Recorded in
-# docs/design.md §12.9 rather than worked around, because the workaround would be
+# docs/waycompose-design.md §12.9 rather than worked around, because the workaround would be
 # passing a descriptor between the two processes and the rule says no.
 QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"            # QEMU's monitor, on WC_HOST
 VM_HINT="${WC_VM_HINT:-windows-vm}"                  # how to recognise its process
@@ -141,7 +142,7 @@ ARENA_OUTBOUND="${WC_ARENA_OUTBOUND:-1048576}"       # 1 MiB, the outbound windo
 HOST_FIREFOX="${WC_HOST_FIREFOX:-}"
 # Set by the one block that needs them and empty everywhere else, so that every
 # existing leg passes exactly what it passed before.
-S4_FIREFOX=""; S4_OUTPUT=""
+S4_FIREFOX=""; S4_OUTPUT=""; S4_VERIFY=""
 
 STAGE=$(mktemp -d /tmp/wc-guest-XXXXXX)
 RUNDIR=$(mktemp -d /tmp/wc-guest-run-XXXXXX)
@@ -169,6 +170,9 @@ pin_key() {
 g()  { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 gq() { ssh "${SSHOPT[@]}" "$GUEST" "$@" 2>&1; }
 h()  { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
+
+# STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
+. "$(dirname "$0")/wc-binaries.sh"
 
 # Kill every process running out of one directory on the guest, and nothing
 # else. See the call site in `do_deploy` for why an image name will not do.
@@ -219,10 +223,22 @@ ARENA_OUTBOUND=${15:-1048576}
 FIREFOX=${16:-}
 # The size of the one `wl_output`. It matters for exactly one client and it
 # matters a lot: with no output at all GTK sizes Firefox's window against an
-# empty monitor list and produces 552x172 (docs/design.md §15.3), and with a
+# empty monitor list and produces 552x172 (docs/waycompose-design.md §15.3), and with a
 # different one the window size in the assertions moves. Fixed here so that the
 # guest's numbers and §15.6's workstation numbers are the same numbers.
 OUTPUT=${17:-}
+# §46. Compare the region against the client's own bytes after every copy, and
+# count the rows that differ. **Off unless asked for**, because it reads the
+# whole buffer every commit -- the cost `--copy damage` exists to avoid -- and
+# because it is an instrument for correctness and must never be used to time
+# anything on a topology whose latency is the point (§27.6).
+#
+# An 18th positional rather than an environment variable, because everything
+# else this script needs is passed the same way and a flag that arrives by a
+# different route is a flag that is set in one place and read in another.
+VERIFY=${18:-}
+VERIFY_ARG=""
+[ -n "$VERIFY" ] && VERIFY_ARG="--verify-damage"
 # Unique per invocation. Reusing a name across runs cost an hour: killing the
 # ssh session that started a compositor kills the compositor, but the socket
 # node it bound survives it, and the next `bind` then fails with "Could not
@@ -272,6 +288,30 @@ case "$TRANSPORT" in
     # Provided out of band, before either side starts, which is what an arena
     # is. Truncated to zero first: a region left full of the previous run's
     # pixels is a way for a frozen frame to look like a live one.
+    #
+    # STAGE 41. **This is the file arena on a machine that has a guest, which is
+    # the one combination the rest of stage 41 exists to make impossible — and
+    # it is licensed here, by name, for the one reason that survives.** §18.2's
+    # second bullet: this branch is a *control*. It is how the export's
+    # incoherence is re-measured rather than assumed, and §12.6 is the section
+    # made of its output. A control that cannot be run is an assumption.
+    #
+    # What makes that legitimate rather than the defect §41 removed is that it
+    # is never silent. The transport is a positional argument of this driver —
+    # `s4_run term arena …`, `s4_run termg guest-ram …` — it is in the tag of
+    # every line the run prints, and `s4_run`'s `case "$transport:$counts"`
+    # asserts that the substrate named is the substrate that served the pixels.
+    # `SV_ALLOW_FILE_ARENA` is exported for this branch alone, so the two
+    # `guest-ram` legs below cannot inherit it and degrade to a file if their
+    # locate fails; they fail instead, which is the whole point.
+    #
+    # `wc-proxy` and `wc-compositor` each print their own warning on top of this
+    # one. Three lines saying "not a target" is the correct number for a
+    # substrate §10.3 measured 65280-of-65536 bytes wrong in both directions.
+    echo "S4-SUBSTRATE: FILE arena on the export -- a CONTROL for §12.6's incoherence"
+    echo "S4-SUBSTRATE: measurement, NOT a result about the deployment. Guest RAM is"
+    echo "S4-SUBSTRATE: the substrate; the guest-ram legs are the ones that measure it."
+    export SV_ALLOW_FILE_ARENA=1
     : >"$SHARE/arena"; truncate -s $ARENA_SIZE "$SHARE/arena"; chmod 666 "$SHARE/arena"
     COMP_EXTRA=(--arena "0:$ARENA_SIZE:$SHARE_WIN\\arena")
     PROXY_EXTRA=(--transport arena --arena-path "$SHARE/arena" --arena-id 0 --arena-size $ARENA_SIZE) ;;
@@ -285,6 +325,11 @@ case "$TRANSPORT" in
     # tell the compositor about, and PROXY_EXTRA cannot be filled in yet -- the
     # plan does not exist until the compositor has printed its run id.
     ARENA_SIZE=$((PAGES * 4096))
+    # STAGE 41. Actively removed rather than merely not set, so that a value
+    # inherited from the shell of somebody who ran the control an hour ago
+    # cannot license a file if this leg's locate fails. This leg has no file to
+    # fall back to and must not acquire one.
+    unset SV_ALLOW_FILE_ARENA
     COMP_EXTRA=(--arena-guest-ram "0:$ARENA_SIZE" --arena-outbound "0:$ARENA_OUTBOUND")
     # STAGE 10: no shared directory. The keymap comes out of the arena, so
     # there is nothing for the compositor to publish and nothing for this side
@@ -348,6 +393,7 @@ COMP_SECS=$((SECS + 45))
 
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./wc-compositor.exe \
   --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
+  --arena-frames '$SHARE_WIN\\arena.frames' \
   --log '$SHARE_WIN\\s4.log' ${OUT_EXTRA[*]@Q} ${COMP_EXTRA[*]@Q} ${KEYMAP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
 COMP=$!
 sleep 8
@@ -376,11 +422,38 @@ if [ "$TRANSPORT" = guest-ram ]; then
     sed -n '1,20p' "$SHARE/s4.log" 2>/dev/null
     kill $COMP 2>/dev/null; exit 1
   fi
+  # THE FRAME LIST, AND WHY IT IS NOT OPTIONAL IN PRACTICE
+  #
+  # The compositor wrote the page frame behind every page of its arena into the
+  # share, and translating that is what the locate should do. The sweep it
+  # replaces is not merely slow (0.064 s against 2.308 s), it is **unreliable on
+  # a loaded machine**: five consecutive runs of this harness gave `16377 of
+  # 16384 pages`, `1 page index claimed twice`, `28 page index(es) claimed
+  # twice`. Those duplicates are not stale stamps -- the run id hashes the
+  # millisecond with the pid, and the tool counts a previous run's stamps
+  # separately as `other_runs` -- they are two pages carrying *this* run's id at
+  # one page index, found by a search that reads 13 GiB of contents which are
+  # allowed to change while it reads them.
+  #
+  # Reading the kernel's page-frame database instead makes that entire class of
+  # failure inexpressible, because no stamp is read at all.
+  #
+  # Conditional on the file existing rather than required, because the guest may
+  # be a build without the query or an account without the privilege, and a
+  # harness that refused to run at all would be a worse regression than a slow
+  # locate. The locate line below says which locator ran.
+  FRAMES_ARG=""
+  if [ -s "$SHARE/arena.frames" ]; then
+    FRAMES_ARG="--frames '$SHARE/arena.frames'"
+    echo "S4-FRAMES: $(wc -l <"$SHARE/arena.frames") frames from the guest; locating by translation"
+  else
+    echo "S4-FRAMES: none; falling back to the content sweep (slow, and the duplicate-index failure is possible)"
+  fi
   # Root, and only for this: QEMU is a system service here, so its QMP socket
   # and its /proc/<pid>/fd are root-only. See the header.
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 $HERE/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $RUNID --pages $FOUNDPAGES \
-  --outbound $ARENA_OUTBOUND --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
+  --outbound $ARENA_OUTBOUND $FRAMES_ARG --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
 echo \"rc=\$?\" >>'$RUN/locate.log'
 chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | eval "$ROOTC" >/dev/null 2>&1
   echo "S4-LOCATE-BEGIN"; cat "$RUN/locate.log" 2>/dev/null; echo "S4-LOCATE-END"
@@ -400,12 +473,33 @@ ssh "${GK[@]}" -N -L "$RUN/up.sock:127.0.0.1:$PORT" "$G" >"$RUN/fwd.out" 2>&1 &
 FWD=$!
 sleep 4
 
+# §46. The scroll, injected **on the guest**, because that is where the
+# compositor's window is. Started here rather than after the client because
+# `probe-scroll.exe` polls for a window of class `WaycomposeToplevel` for
+# `--wait` seconds and then scrolls it: launching it early costs nothing and
+# removes a race against however long Firefox takes to map on a given day.
+#
+# Backgrounded and never waited on. Its exit status is not the measurement --
+# the measurement is the proxy's stale count -- and a probe that failed to find
+# the window would show up as a run with no scroll in it, which the commit floor
+# catches. Blocking the harness on it would trade a detectable failure for a
+# hang.
+SCROLL=0
+if [ -n "$VERIFY" ]; then
+  ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && \
+    ./probe-scroll.exe --class WaycomposeToplevel --wait $((SECS)) \
+    --notches ${WC_NOTCHES:-60} --gap ${WC_GAP:-150} --settle 6000 \
+    --log 'C:\\Users\\<guest-user>\\$GDIR\\scroll.log'" >"$RUN/scroll.out" 2>&1 &
+  SCROLL=$!
+  echo "S4-SCROLL: probe-scroll.exe launched on the guest"
+fi
+
 PROXY=0
 if [ ! -S "$RUN/up.sock" ]; then
   echo "S4-FAIL: the ssh -L forward produced no socket"
 elif [ "$TRANSPORT" != guest-ram ]; then
   XDG_RUNTIME_DIR="$RUN" "$HERE/wc-proxy" --upstream "$RUN/up.sock" --socket wl-proxy \
-    --runtime-dir "$RUN" "${PROXY_EXTRA[@]}" --copy damage \
+    --runtime-dir "$RUN" "${PROXY_EXTRA[@]}" --copy damage $VERIFY_ARG \
     --accept-timeout 20 --timeout $((SECS + 5)) >"$RUN/proxy.log" 2>&1 &
   PROXY=$!
   sleep 2
@@ -433,7 +527,7 @@ export XDG_RUNTIME_DIR="$RUN"
 chown -R 0:0 "$RUN/home" "$RUN/profile" "$RUN/xdg" 2>/dev/null
 chmod 700 "$RUN/xdg" 2>/dev/null
 "$HERE/wc-proxy" --upstream "$RUN/up.sock" --socket wl-proxy \\
-  --runtime-dir "$RUN" ${PROXY_EXTRA[*]@Q} --copy damage \\
+  --runtime-dir "$RUN" ${PROXY_EXTRA[*]@Q} --copy damage $VERIFY_ARG \\
   --accept-timeout 20 --timeout $((SECS + 5)) >"$RUN/proxy.log" 2>&1 &
 P=\$!
 sleep 2
@@ -476,7 +570,7 @@ sleep 3
 # only the error path and is now the normal one for guest-ram -- so the zero has
 # to be filtered rather than passed through. The symptom was a driver that
 # printed the client's exit code and then nothing at all.
-for p in $PROXY $FWD $RELAY $COMP; do [ "$p" -gt 0 ] 2>/dev/null && kill "$p" 2>/dev/null; done
+for p in $PROXY $FWD $RELAY $COMP $SCROLL; do [ "$p" -gt 0 ] 2>/dev/null && kill "$p" 2>/dev/null; done
 wait 2>/dev/null
 sleep 1
 
@@ -515,6 +609,16 @@ do_deploy() {
       echo "  FAILED to build probe-$p.exe"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
     fi
   done
+
+  # §46's scroll probe, which needs `-mwindows` (it has no console) and no
+  # sockets. It is deployed here rather than by `wc-damage.sh` because the
+  # cross-VM leg's compositor runs *on the guest*, so the thing that scrolls its
+  # window has to be on the guest too -- see `do_damage`.
+  if $cc -O1 -mwindows -o "$STAGE/probe-scroll.exe" "$ROOT/scripts/probe-scroll.c" 2>"$STAGE/cc.log"; then
+    echo "  built probe-scroll.exe"
+  else
+    echo "  FAILED to build probe-scroll.exe"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
+  fi
   if $cc -O1 -o "$STAGE/probe-xkb.exe" "$ROOT/scripts/probe-xkb.c" \
        -I"$WC_XKB_MINGW_DEV/include" -L"$WC_XKB_MINGW/lib" -lxkbcommon 2>"$STAGE/cc.log"; then
     echo "  built probe-xkb.exe"
@@ -536,13 +640,20 @@ do_deploy() {
     echo "  FAILED to build probe-filemap.exe"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
   fi
 
-  local missing=0
+  # STAGE 42. **Existence is not freshness.** §35.4 measured a harness reporting
+  # the previous tree's behaviour after `cargo test` declined to relink, and
+  # §35.6 item 6 named this harness among the seventeen with no guard. Five
+  # binaries here, so `fresh_all` says it once when they are all fine and names
+  # each offender when they are not.
+  local how_win="cargo build --target x86_64-pc-windows-gnu"
+  local wins=() e
   for e in wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe; do
-    if [ -f "$WIN_BIN/$e" ]; then cp "$WIN_BIN/$e" "$STAGE/"; else
-      echo "  missing $WIN_BIN/$e"; missing=1
-    fi
+    wins+=("$WIN_BIN/$e")
   done
-  [ $missing -eq 0 ] || { echo "error: build first: cargo build --target x86_64-pc-windows-gnu"; exit 1; }
+  fresh_all "$how_win" "${wins[@]}" || exit 1
+  for e in wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe; do
+    cp "$WIN_BIN/$e" "$STAGE/"
+  done
 
   # A `.exe` still running holds its own file open, and `scp` over it fails as
   # `dest open ...: Failure` -- which reads as a permissions or disk problem and
@@ -556,7 +667,7 @@ do_deploy() {
   # the guest uses, so the blanket kill fired in precisely the case where two
   # runs collide. Stage 8 watched it happen from the other side — a compositor
   # in `wcdesk` photographed and driven into a resize loop by a run that
-  # believed it owned the machine (docs/design.md §13.9).
+  # believed it owned the machine (docs/waycompose-design.md §13.9).
   #
   # An image name is not an identity here; the image *path* is, because every
   # experiment deploys its own copy into its own directory. `taskkill` cannot
@@ -566,6 +677,13 @@ do_deploy() {
   g "mkdir -p $GUESTDIR" || exit 1
   scp "${SSHOPT[@]}" "$STAGE"/*.exe "$STAGE/us.xkb" "$GUEST:$GUESTNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$STAGE" | grep -c . ) files to $GUEST:$GUESTDIR"
+  # STAGE 42. The long comment above is about `scp` *failing* on a running
+  # `.exe`; this is the case where it appears to succeed and the old bytes stay.
+  # `scp` returning 0 cannot tell them apart, and on the GPU path a stale copy
+  # presents as a transport fault — `finish_attach` refuses a wire-version skew
+  # with "This is a version skew between two builds, not a transport fault."
+  deployed_all "$STAGE" "$GUESTDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    wc-server.exe wc-probe.exe wc-compositor.exe wc-xkb-probe.exe wc-poolcost.exe || exit 1
 
   [ -n "$HOST" ] || { echo "  WC_HOST unset -- nothing deployed for stage 4"; return; }
 
@@ -579,7 +697,7 @@ do_deploy() {
   else
     echo "  FAILED to build probe-filemap-peer"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
   fi
-  [ -x "$LINUX_BIN/wc-proxy" ] || { echo "error: no $LINUX_BIN/wc-proxy -- cargo build first"; exit 1; }
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
   write_stage4_driver "$STAGE/wc-stage4"
 
   # `probe-filemap.c`'s pattern, generated here so that both the generator and
@@ -659,7 +777,7 @@ check_milestones() {
 
 do_run() {
   echo "== 1. the transport, on afunix.sys =="
-  # docs/design.md §7.8 items 1 and 2. Both roles are separate processes: a pid
+  # docs/waycompose-design.md §7.8 items 1 and 2. Both roles are separate processes: a pid
   # is only interesting when it is not our own.
   gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && rm -f acc-*.log && (./probe-accept.exe server '$GUESTDIR_WIN\\acc.sock' > acc-srv.log 2>&1 &) && sleep 2 && ./probe-accept.exe client '$GUESTDIR_WIN\\acc.sock' > acc-cli.log 2>&1; sleep 1; cat acc-srv.log acc-cli.log" >"$RUNDIR/acc.log"
   if grep -q "RESULT: GETPEERPID returned the client's real pid" "$RUNDIR/acc.log"; then
@@ -728,7 +846,7 @@ do_run() {
     relayed wc-compositor.exe wg-xdg $((PORT_BASE + 1)) weston-multi-resource
     check_milestones "$RUNDIR/wg-xdg.server.log" "weston-multi-resource"
 
-    # docs/design.md §7.8 item 3: three bytes at a time guarantees the server
+    # docs/waycompose-design.md §7.8 item 3: three bytes at a time guarantees the server
     # reads a partial message and has to wait for the rest.
     CHUNK=3 DELAY=15 relayed wc-compositor.exe wg-frag $((PORT_BASE + 2)) weston-multi-resource
     check_milestones "$RUNDIR/wg-frag.server.log" "fragmented (3-byte writes, 15 ms apart)"
@@ -755,7 +873,7 @@ do_run() {
   note "be shorter than the platform timer tick. Under Wine it is ~1 ms."
   gq "cd $GUESTDIR && for e in wc-server.exe wc-compositor.exe; do s=\$(date +%s%N); ./\$e --socket ld\$e --timeout 1 >/dev/null 2>&1; f=\$(date +%s%N); echo \"\$e: \$(( (f-s)/1000000 )) ms wall, of which 1000 ms is the idle timeout\"; done" >"$RUNDIR/load.log"
   sed 's/^/        /' "$RUNDIR/load.log"
-  note "docs/design.md §7.8 item 6: the 56 MB debug binary costs nothing measurable to load."
+  note "docs/waycompose-design.md §7.8 item 6: the 56 MB debug binary costs nothing measurable to load."
 
   do_coherency
   do_poolcost
@@ -764,7 +882,7 @@ do_run() {
 }
 
 # =============================================================================
-# Stage 4 on the real boundary. docs/design.md §9.11, all five items.
+# Stage 4 on the real boundary. docs/waycompose-design.md §9.11, all five items.
 # =============================================================================
 
 # ------------------------------------------------------------------ 7 --------
@@ -863,6 +981,15 @@ do_poolcost() {
     return
   fi
 
+  # §51. **This block's claims are about time across the boundary**, which is
+  # what makes the declaration load-bearing here rather than bookkeeping: the
+  # export is virtio-fs, so "the same open costs 1046 us over the export and
+  # 24 on NTFS" is precisely a cross-VM latency claim. It is legitimate because
+  # there is a hypervisor in this path -- and the identical sentence written in
+  # a Wine harness would be §27.6 again.
+  wc_topology_declare cross-vm \
+    "the pools are opened by the compositor on the guest, across the export from $HOST" || return
+
   local n=32 size=1048576 arena=$((64 * 1024 * 1024))
   # The pool files are created **by the peer**, on the far side of the mount,
   # because that is who creates them in the real path and a file this process
@@ -949,7 +1076,7 @@ s4_run() {
   local tag=$1 transport=$2 client=$3 port=$4 secs=$5
   local log="$RUNDIR/s4-$tag.log"
   echo "  -- $client / $transport --"
-  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" $HOST_WESTON $secs '$QMP' '$VM_HINT' \"$ROOTC\" $ARENA_PAGES $GUESTNAME $ARENA_OUTBOUND '$S4_FIREFOX' '$S4_OUTPUT'" >"$log"
+  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" $HOST_WESTON $secs '$QMP' '$VM_HINT' \"$ROOTC\" $ARENA_PAGES $GUESTNAME $ARENA_OUTBOUND '$S4_FIREFOX' '$S4_OUTPUT' '$S4_VERIFY'" >"$log"
 
   if grep -q "S4-FAIL" "$log"; then
     bad "$tag: $(grep S4-FAIL "$log")"
@@ -1023,15 +1150,45 @@ s4_run() {
   # was relayed. What enforces the rule is that the proxy's upstream writer has
   # no fd path at all -- construction, not a counter -- and what this asserts is
   # the part a counter can see: every descriptor going out was made here.
-  # docs/design.md §14.7 is the full argument: which two processes that
+  # docs/waycompose-design.md §14.7 is the full argument: which two processes that
   # descriptor exists between, why that pair is not the boundary, and what this
   # number would have to be for the rule to be broken.
-  local fds
+  # STAGE 42. **The twenty lines above argue about which number would mean the
+  # rule was broken, and the code then asserted only that a number exists.** Any
+  # `"N fds in, M out"` passed, including one that showed descriptors being
+  # relayed — which is the single thing this project must never do and the whole
+  # subject of §14.7. A gate on the boundary claim of the stage that could not
+  # fail.
+  #
+  # What is asserted now is the number the comment names. The proxy prints, for
+  # example, `12 fds in, 2 out (2 from the arena)`, and the rule is that **every
+  # descriptor going out was made here**: over guest RAM they come from the
+  # arena, so `out` and `from the arena` must be equal. A descriptor that was
+  # relayed rather than manufactured shows up as `out` exceeding the number
+  # accounted for, which is exactly the shape §14.7 says to watch.
+  local fds out fromarena
   fds=$(grep -o "[0-9]* fds in, [0-9]* out[^;]*" "$log" | tail -1)
-  case "$fds" in
-    "") bad "$tag: the proxy reported no descriptor counts" ;;
-    *) ok "$tag: descriptors in from the client, out only ones made here from a name ($fds)" ;;
-  esac
+  if [ -z "$fds" ]; then
+    bad "$tag: the proxy reported no descriptor counts"
+  else
+    out=$(echo "$fds" | grep -o "[0-9]* out" | tr -dc 0-9)
+    fromarena=$(echo "$fds" | grep -o "([0-9]* from the arena)" | tr -dc 0-9)
+    if [ "$transport" = guest-ram ] && [ -n "$fromarena" ]; then
+      if [ "${out:-0}" -eq "${fromarena:-0}" ]; then
+        ok "$tag: all ${out:-0} descriptor(s) that went out were made here from the arena, none relayed ($fds)  <-- §14.7"
+      else
+        bad "$tag: ${out:-0} descriptor(s) went out but only ${fromarena:-0} came from the arena -- the rest were not accounted for ($fds)"
+      fi
+    elif [ "${out:-0}" -eq 0 ]; then
+      ok "$tag: no descriptor went out at all ($fds)  <-- §14.7"
+    else
+      # The shared-file and file-arena controls manufacture theirs from a name
+      # rather than from the arena, so there is no per-descriptor accounting
+      # line to compare against. Stated as informational rather than dressed up
+      # as a verdict this leg cannot reach.
+      note "$tag: ${out:-0} descriptor(s) out, made here from a name; this transport prints no arena accounting ($fds)"
+    fi
+  fi
 
   # STAGE 10, and it is the claim of the stage on the deployment that matters.
   # Over guest RAM the compositor was started with **no `--shared-dir`**, so a
@@ -1109,7 +1266,7 @@ s4_run() {
       note "Nothing above catches this: the HWND, the frame count and the transport line are"
       note "all correct while it happens. Over a file on virtio-fs it is expected and is"
       note "block 7's result arriving as pixels -- the mount is not coherent while mapped, so"
-      note "the compositor reads its own cached copy (docs/design.md §10.3, §10.7). Over"
+      note "the compositor reads its own cached copy (docs/waycompose-design.md §10.3, §10.7). Over"
       note "guest-ram it is not expected and means one of two things: the host is writing"
       note "into memory that is not the compositor's (check block 10's COH- lines, and the"
       note "verify line above), or the guest's pages moved after they were located, which"
@@ -1238,6 +1395,127 @@ do_firefox() {
     || bad "the window is a flat fill"
   [ -n "${WC_KEEP:-}" ] && { cp "$RUNDIR/ff-last.ppm" /tmp/wc12-firefox-guest.ppm; note "kept /tmp/wc12-firefox-guest.ppm"; }
   true
+}
+
+# ---------------------------------------------------------------- damage -----
+#
+# §46. THE CROSS-VM LEG, and the one this project's second symptom needs.
+#
+# `scripts/wc-damage.sh` measures the damage path exhaustively and declares
+# `same-box`, because Firefox, the proxy and the compositor all run under Wine
+# on one Linux box there. That is the right harness for the copy's correctness
+# -- `--verify-damage` compares two mappings inside one Linux process and Wine
+# is only an upstream that consumes the stream -- and it is the wrong harness
+# for anything about the boundary, which is §27.6's retraction in one sentence.
+#
+# This block is the same measurement with the boundary in it: the compositor on
+# the guest, the proxy on the VM host over an arena located in the guest's own
+# RAM, Firefox scrolling `about:support`, and `probe-scroll.exe` injecting the
+# wheel **on the guest**, where the window is.
+#
+# WHAT IT CAN AND CANNOT SETTLE
+#
+# It settles the correctness question on the real substrate: whether the arrears
+# bookkeeping holds when the region is guest RAM reached through QEMU rather
+# than a file this side mapped. Nothing in §46's argument predicts a difference
+# and the arena leg found none, but "the arena code path on a file" and "guest
+# RAM through a hypervisor" are two claims and only one of them has been made.
+#
+# It does **not** on its own settle the user's second symptom. A stale-row count
+# of zero says the bytes are right; it says nothing about when they arrive. What
+# makes this leg able to speak to that is `wc_topology_declare cross-vm`, which
+# is what `wc_latency_claim` requires before any assertion about the present may
+# be made at all -- so a latency assertion added here later will be permitted,
+# and the same assertion added to `wc-damage.sh` will be refused.
+#
+# **UNRUN.** testhost was down when this was written and nothing here has
+# executed. It is assembled entirely from paths this harness already exercises
+# -- `s4_run ff guest-ram firefox` is §17's, the scroll probe is §46's, and the
+# proxy flag is one argument -- but §14.9's rule is that "implemented" has meant
+# "compiled" twice on this project, so it is marked rather than counted. The
+# first run of it is a measurement; until then it is a hypothesis with a script
+# attached.
+do_damage() {
+  echo
+  echo "== 12. the damage path, with a hypervisor in it =="
+  if [ -z "$HOST" ]; then
+    nope "WC_HOST unset: the proxy has to run where QEMU is"
+    return
+  fi
+  if [ -z "$HOST_FIREFOX" ]; then
+    nope "WC_HOST_FIREFOX unset: no Firefox on $HOST"
+    return
+  fi
+
+  # The declarations, before anything runs, and both of them refuse rather than
+  # default. `guest-ram` is the only substrate this leg may use and
+  # `wc_substrate_declare` will not hand out the file-arena escape hatch to a
+  # harness that has a guest configured; `cross-vm` is refused unless there is
+  # both a VM host and a guest, so it cannot be declared on the Wine box.
+  wc_substrate_declare guest-ram || return
+  wc_topology_declare cross-vm \
+    "compositor on $GUEST, proxy on $HOST, arena in the guest's own RAM" || return
+
+  S4_FIREFOX="$HOST_FIREFOX"; S4_OUTPUT=1600x1000; S4_VERIFY=1
+  s4_run dmg guest-ram firefox $((PORT_BASE + 16)) "${WC_DAMAGE_SECS:-90}"
+  S4_FIREFOX=""; S4_OUTPUT=""; S4_VERIFY=""
+
+  local log="$RUNDIR/s4-dmg.log"
+  [ -s "$log" ] || { bad "the damage leg produced no log"; return; }
+
+  grep -q "S4-SCROLL:" "$log" \
+    && ok "probe-scroll.exe was launched on the guest, where the compositor's window is" \
+    || bad "no scroll was injected; this leg measures an idle browser"
+
+  # The substrate and the topology, from the run's own evidence. `wc_locate_arena`
+  # has set WC_SUBSTRATE_LOCATED by now if a locate ran, and `wc_assert_topology`
+  # refuses a cross-vm claim without one -- a hypervisor in the path is exactly
+  # what makes guest RAM locatable, so the locate is the proof.
+  local comp="$RUNDIR/s4-dmg-comp.log"
+  sed -n '/S4-COMP-BEGIN/,/S4-COMP-END/p' "$log" >"$comp"
+  wc_assert_substrate "$comp" "dmg"
+  wc_assert_topology "$comp" "dmg"
+
+  # THE ASSERTION, and it is `wc-damage.sh`'s, unchanged, over a boundary.
+  local verified skipped unreached stale worst commits
+  verified=$(grep -o 'verified [0-9]* commits' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  skipped=$(grep -o '([0-9]* state-only, unverifiable' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  unreached=$(grep -o '[0-9]* never reached the copy' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  stale=$(grep -o '[0-9]* stale (worst [0-9]* rows)' "$log" | awk -F' stale' '{print $1}' | awk '{s+=$1} END {print s+0}')
+  worst=$(grep -o 'worst [0-9]* rows' "$log" | grep -o '[0-9]*' | sort -n | tail -1)
+  commits=$(grep -o '[0-9]* commits,' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+
+  if [ "${verified:-0}" -eq 0 ]; then
+    bad "dmg: no commit was checked -- --verify-damage did not reach the proxy on the host"
+    sed -n '/S4-PROXY-BEGIN/,/S4-PROXY-END/p' "$log" | tail -8 | sed 's/^/        /'
+    return
+  fi
+
+  # The identity, as §46.3 defines it: every commit is checked, state-only, or
+  # never reached the copy. Carried over verbatim because a coverage claim that
+  # is only made on one topology is a coverage claim about that topology.
+  local classified=$(( ${verified:-0} + ${skipped:-0} + ${unreached:-0} ))
+  [ "$classified" -eq "${commits:-0}" ] \
+    && ok "dmg: every one of $commits commits is accounted for -- $verified checked, $skipped attached no buffer, $unreached never reached the copy" \
+    || bad "dmg: $classified of $commits commits classified; $(( ${commits:-0} - classified )) unaccounted for"
+
+  if [ "${stale:-0}" -eq 0 ]; then
+    ok "dmg: over a real VM boundary, the region matched the client on every one of $verified checked commits"
+  else
+    bad "dmg: $stale of $verified commits left the region stale, worst ${worst:-?} rows -- and this is guest RAM, not a fixture"
+    grep -o 'stale: .*' "$log" | head -6 | sed 's/^/        /'
+  fi
+
+  # **What this leg is now permitted to say, and the Wine legs are not.** The
+  # gate is called for its permission rather than its refusal here, which is the
+  # whole point of the declaration: the same call in `wc-damage.sh` fails and
+  # this one passes, and the difference is a hypervisor.
+  if wc_latency_claim "the present latency is measurable on this leg"; then
+    ok "dmg: this leg may make a claim about cross-VM latency -- there is a boundary in it"
+    note "The claim itself is not made here. §46.7 item 5: the doorbell's 0.876 ms"
+    note "against 20.29 ms is somebody else's measurement, and pairing it with a"
+    note "scroll-smoothness number is the next run's errand, not this block's."
+  fi
 }
 
 have_magick() { command -v magick >/dev/null 2>&1; }
@@ -1375,9 +1653,10 @@ case "$MODE" in
   stage4) do_coherency; do_poolcost; do_stage4; do_guestarena ;;
   arena)  do_guestarena ;;
   firefox) do_firefox ;;
+  damage)  do_damage ;;
   clean)  do_clean ;;
   all)    do_deploy; echo; do_run; echo; do_clean ;;
-  *) echo "usage: $0 [deploy|run|stage4|arena|firefox|clean|all]"; exit 2 ;;
+  *) echo "usage: $0 [deploy|run|stage4|arena|firefox|damage|clean|all]"; exit 2 ;;
 esac
 
 if [ "$MODE" = run ] || [ "$MODE" = all ] || [ "$MODE" = stage4 ] || [ "$MODE" = firefox ]; then

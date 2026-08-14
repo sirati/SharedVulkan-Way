@@ -287,6 +287,7 @@ pub struct RingTransport {
 impl Drop for RingTransport {
     fn drop(&mut self) {
         self.beating.store(false, std::sync::atomic::Ordering::Relaxed);
+        report_park_time();
     }
 }
 
@@ -601,6 +602,27 @@ impl RingTransport {
                          and diff it."
                     ));
                 }
+                // The coarse check in front of the hash, and the one that fires
+                // on a **stale deployed binary** rather than on a code change.
+                // This project has lost time to that twice, both times reading
+                // the symptom as a transport fault, so the next step is spelled
+                // out here rather than left to be inferred from two numbers.
+                //
+                // `WIRE_VERSION` went 1 → 2 for design.md §0.18's
+                // `svDriverVersions`, which is hand-written in `sv_proto::sv`
+                // and therefore outside the generated table the protocol hash
+                // covers. A GPU side copied to the guest before that commit
+                // cannot answer it, and the honest thing is to refuse here
+                // rather than to discover it on the first version query.
+                Err(e @ sv_transport::Error::WireVersionMismatch { .. }) => {
+                    return Err(format!(
+                        "{e}\nThis is a version skew between two builds, not a transport \
+                         fault. The usual cause is a stale binary: on the cross-VM \
+                         topology the GPU side is *copied* to the guest, so rebuilding \
+                         here changes only this side. Rebuild and re-deploy **both** \
+                         sides from the same tree."
+                    ));
+                }
                 Err(e) => return Err(e.to_string()),
             }
         };
@@ -652,6 +674,11 @@ impl RingTransport {
         // A failure to attach is a warning, never an error: a session without a
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
+        // Unix only: the host end of the chardev is a Unix socket, which is what
+        // the cross-VM topology has. A Windows *app* side is the same-machine
+        // topology, where the peer is on this kernel and the ordinary futex wake
+        // already reaches it — there is no hypervisor to carry anything across.
+        #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             Ok(path) => match sv_transport::vdoorbell::PortHandle::host_socket(&path)
@@ -670,6 +697,11 @@ impl RingTransport {
                 }
             },
         };
+
+        #[cfg(not(unix))]
+        let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
+
+        arm_park_report();
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -801,6 +833,24 @@ impl RingTransport {
             match ring.producer.push(command, barrier) {
                 Ok(seqno) => {
                     self.note_seqno(class, seqno);
+                    // §0.23.4's instrument. The GPU side's `SV_TRACE` prints
+                    // command *names* in the order it executes them, which
+                    // cannot distinguish "the app sent the destroy first" from
+                    // "the app published the blob late" — both look identical
+                    // from there. This prints the order the app *sent* things,
+                    // with the seqno the fatal names, which is the one fact
+                    // that separates the three candidates.
+                    if crate::transport::send_trace() {
+                        eprintln!(
+                            "[icd] ring {:?} seqno {seqno} opcode {} ({} bytes)",
+                            class,
+                            command
+                                .get(0..4)
+                                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                                .unwrap_or(u32::MAX),
+                            command.len()
+                        );
+                    }
                     return Ok(seqno);
                 }
                 Err(sv_transport::Error::RingFull { .. }) => {
@@ -921,6 +971,73 @@ impl RingTransport {
         Ok(())
     }
 
+    /// Publish everything recorded so far, before sending anything that is
+    /// *not* recorded. design.md §0.23.5.
+    ///
+    /// # The bug this is the whole of
+    ///
+    /// `vkCmd*` are buffered into a command buffer's blob and published on a
+    /// schedule of their own; `vkCreate*`, `vkDestroy*` and everything else are
+    /// forwarded immediately. Both go to the device ring, so each class is
+    /// ordered *with itself* — and the program order **between** the two
+    /// classes was not preserved. An application that records with a pipeline
+    /// layout, ends the command buffer and then destroys the layout emits
+    /// `[recorded…] [destroy]`, and the wire carried `[destroy] [recorded…]`.
+    ///
+    /// `VK_KHR_maintenance4` makes that application correct — a layout's
+    /// lifetime ends when the command buffer leaves the recording state — so
+    /// this was our defect and not the application's. It reproduced as
+    /// `no VkPipelineLayout with id 44` on 144 of 48 CTS cases; §0.23.4 has the
+    /// send trace that separates "the app sent the destroy first" from "the app
+    /// published the blob late", which is the distinction that decides the fix
+    /// and which the GPU side's own trace cannot see.
+    ///
+    /// # Why here, and why not "before destroys"
+    ///
+    /// A transport that knew which opcodes are destroys would be a transport
+    /// with a reason to be regenerated (see [`Transport`]). It does not need
+    /// to: the invariant is simply *program order between recorded and
+    /// non-recorded commands*, and restoring it for every immediately-forwarded
+    /// command is both simpler and more obviously correct than restoring it for
+    /// the one class where it has bitten so far. Destroys are where it was
+    /// found; `vkUpdateDescriptorSets` and every other unrecorded command had
+    /// the same hole.
+    ///
+    /// # What it does not cost
+    ///
+    /// Not the pipelining §6.5 measured at 105 µs against 130 µs. That is
+    /// `vkCmd*` against `vkCmd*`, and [`Transport::record`] does **not** call
+    /// this — recording still buffers, still crosses nothing, and still
+    /// publishes at `vkEndCommandBuffer` or when a block fills. What is forced
+    /// here is a publish before an unrecorded command, which is not a per-draw
+    /// operation; and [`Self::flush_blob`] returns without a packet when there
+    /// is nothing new, so the common case is a lock and a map walk.
+    ///
+    /// Publishing a blob that is still being recorded is safe and is not new:
+    /// a blob is append-only, `published` records how much has gone, and the
+    /// sub-decoder replays a partial stream in order. Filling a block already
+    /// did exactly this.
+    fn publish_recorded_first(&self) -> IcdResult<()> {
+        // Collected under the lock and flushed outside it: `flush_blob` takes
+        // the same lock, and it takes the ring producer's too.
+        let open: Vec<u64> = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            if blobs.open.is_empty() {
+                return Ok(());
+            }
+            blobs
+                .open
+                .iter()
+                .filter(|(_, b)| b.len > b.published)
+                .map(|(cb, _)| *cb)
+                .collect()
+        };
+        for cb in open {
+            self.flush_blob(cb)?;
+        }
+        Ok(())
+    }
+
     /// The slow half of [`Transport::record`]: make room, then write.
     ///
     /// Growing has to wait for every piece already handed over, because it
@@ -998,6 +1115,9 @@ impl Transport for RingTransport {
         command: &[u8],
         reply: &mut Vec<u8>,
     ) -> IcdResult<()> {
+        // Before the ring lock, because publishing takes it. See
+        // `publish_recorded_first`.
+        self.publish_recorded_first()?;
         // The producer lock is held from here to the reply, which is what makes
         // the packet that arrives *this* call's — a ring is SPSC and replies come
         // back in the order the commands went out.
@@ -1036,6 +1156,7 @@ impl Transport for RingTransport {
     }
 
     fn send(&self, class: RingClass, _opcode: u32, command: &[u8]) -> IcdResult<()> {
+        self.publish_recorded_first()?;
         self.push_on(class, command).map(|_| ())
     }
 
@@ -1187,6 +1308,26 @@ impl RingTransport {
         Ok(())
     }
 
+    /// Ask the GPU side which Vulkan version its driver actually is (§0.18).
+    ///
+    /// On the **instance** ring, because it is asked before any device exists —
+    /// `vkEnumerateInstanceVersion` is a global command and the loader may call
+    /// it before `vkCreateInstance`.
+    ///
+    /// `None` for any failure, and that is deliberate rather than lazy: a GPU
+    /// side built before this command existed answers "unknown protocol command"
+    /// and its ring is then fatal, so the *only* correct handling of a failure
+    /// here is to fall back to the ceiling. `WIRE_VERSION` is what actually
+    /// keeps such a peer away; this is the belt to that pair of braces.
+    pub fn driver_versions(&self) -> Option<(u32, u32)> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::DriverVersions.encode(&mut cmd).ok()?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Instance, sv_proto::sv::SV_DRIVER_VERSIONS, &cmd, &mut reply).ok()?;
+        let r = sv_proto::sv::DriverVersionsReply::decode(&reply).ok()?;
+        Some((r.instance_api_version, r.device_api_version))
+    }
+
     /// `vkFreeCommandBuffers`: give the block back to the reserve.
     ///
     /// Separate from [`Transport::discard_blob`] because the two mean different
@@ -1205,4 +1346,68 @@ impl RingTransport {
             Self::release(&mut blobs, b);
         }
     }
+}
+
+/// Print how long this process spent blocked on a ring, once.
+///
+/// §36.10's instrument. Wall clock could not resolve the doorbell — most of a
+/// run is setup, and one sample includes a VM boot — but **time spent parked**
+/// is exactly the quantity a doorbell changes, and the app side is the side that
+/// does the waiting.
+///
+/// # Why an `atexit` and not just `Drop`
+///
+/// `RingTransport` is reached through a process-lifetime singleton, so its
+/// `Drop` never runs: an application that exits without destroying its instance
+/// — which `vulkaninfo` does, and which is legal — takes the number with it. The
+/// first version of this printed nothing for exactly that reason and the log
+/// looked as though the ICD had never waited at all.
+///
+/// Registered once, on the first attach, so a process that never talks to a ring
+/// prints nothing.
+fn report_park_time() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(s) = sv_transport::park::park_summary() {
+            eprintln!("[icd] {s}");
+        }
+    });
+}
+
+#[cfg(unix)]
+extern "C" fn park_time_atexit() {
+    report_park_time();
+}
+
+/// Arrange for [`report_park_time`] to run however the process ends.
+///
+/// Unix only, and that is the measurement's venue rather than a limitation: in
+/// the cross-VM topology the app side — this side — runs on the **host**, which
+/// is Linux, and the guest is the GPU half. A Windows app side is the
+/// same-machine topology, where the peer is on this kernel, the ordinary futex
+/// wake already reaches it, and there is no hypervisor latency to account for.
+pub(crate) fn arm_park_report() {
+    #[cfg(unix)]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            // SAFETY: `park_time_atexit` is a plain `extern "C"` function with
+            // no arguments that touches only atomics and stderr.
+            unsafe { libc::atexit(park_time_atexit) };
+        });
+    }
+}
+
+/// `SV_SEND_TRACE=1`: print every packet this side pushes, with its ring and
+/// seqno.
+///
+/// §0.23.4. The GPU side's `SV_TRACE` prints commands in *execution* order,
+/// which is the order it drains rings — so a destroy that appears before a blob
+/// there is consistent with the app having sent it first *and* with the app
+/// having published the blob late, and those have different fixes. This is the
+/// send order, from the only side that knows it.
+pub fn send_trace() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SV_SEND_TRACE").is_some())
 }

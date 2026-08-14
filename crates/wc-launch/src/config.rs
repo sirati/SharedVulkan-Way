@@ -67,57 +67,20 @@ pub struct Config {
     pub session: String,
     /// The **startup** region, in MiB of the guest's own pinned RAM.
     ///
-    /// **64, and the number is measured rather than guessed.** This was 768 for
-    /// one afternoon, as a workaround for an allocator that fragmented — and a
-    /// workaround is what it stayed for about six hours too long, because
-    /// `VirtualLock`ed pages are not merely committed, they are **non-pageable**:
-    /// 768 MiB of the guest's RAM was unavailable to Windows for anything, with
-    /// no client connected, and the user noticed before this file did.
+    /// **Chosen by [`crate::floor::Floor`], which carries the measurements.**
+    /// It is not a literal here and it was one until the doc comment on this
+    /// field went on explaining that "growth is armed and inert" — listing the
+    /// two absences that made it so — for several commits after both had been
+    /// closed. The reasoning and the number now live in one place, and
+    /// `Floor::CURRENT` is the single line that moves when a guest run earns a
+    /// smaller floor.
     ///
-    /// **32 MiB was tried first and is too small**, which is why this comment
-    /// has a measurement in it instead of a rule of thumb. A `6877184 of …
-    /// bytes out` high-water taken seconds after start-up looked like the
-    /// number and was not: a Firefox that has finished starting puts
-    /// **28–30 MB out on two connections**, and asks for 4.6 MB pools on top of
-    /// that. Three warm clicks on 32 MiB produced **ten refusals** —
-    /// `cannot serve 4608000 bytes … 4419584 free across 1 region(s), largest
-    /// run 3575808` — free space that fragmentation had made unusable, and warm
-    /// clicks of **2144–2777 ms** against 1414–1601 before, because a held-back
-    /// pool is a surface that stops updating until there is room.
-    ///
-    /// So the number is set by what one region has to hold **alone**:
-    ///
-    /// * **28–30 MB** — measured out to two connections by a running Firefox.
-    /// * **40 MiB in 2 regions** — peak resident in a heavier session elsewhere.
-    /// * **64 MiB** — also the cap of the growth series, so it is where growth
-    ///   would converge anyway.
-    ///
-    /// It has to hold it alone because **growth is armed and inert**, and that
-    /// is a fact about the tree rather than about this file. Over guest RAM the
-    /// proxy takes a new region by re-reading the plan
-    /// (`wc_proxy::pool::PlanGrowth`), and **two things that would put a region
-    /// in that plan do not exist**:
-    ///
-    /// * nothing makes the guest commit one. `wc_handle::arena::attach_guest_ram`
-    ///   is called once per `--arena-guest-ram` at start-up and from nowhere
-    ///   else; the compositor's only growth flag is `--arena-grow-dir`, which is
-    ///   the *file* fixture.
-    /// * nothing appends to the plan. `wc-arena-host` writes one for a run and a
-    ///   page count and has no append mode.
-    ///
-    /// **The target is 16 MiB** — one `GROW_STEP`, so the first region is the
-    /// first step and there is no separate startup constant — and it is one line
-    /// here (or `WC_LAUNCH_ARENA_MIB=16`) the day those two exist. It is not that
-    /// today because it was measured: 32 MiB already refuses, so 16 would refuse
-    /// harder, and a window that stops updating is worse than 48 MiB of RAM.
-    ///
-    /// 64 MiB, then — twelve times smaller than the 768 that reached the user,
-    /// and large enough that nothing measured here refuses. The asymmetry that
-    /// makes over-reserving the worse error still holds and is why this is not
-    /// 256: the pages are `VirtualLock`ed, so they are non-pageable rather than
-    /// merely committed, and **the startup region is never reclaimed** — it
-    /// holds the outbound window, so its size is a floor for the whole session
-    /// that release can never recover.
+    /// The short version, because a reader here deserves one: these pages are
+    /// `VirtualLock`ed, so they are non-pageable rather than merely committed,
+    /// and the startup region is never reclaimed because it holds the outbound
+    /// window. Its size is a floor for the whole session that release can never
+    /// recover, which is why over-reserving is the more expensive mistake and
+    /// why 768 MiB once reached a user.
     pub arena_mib: u64,
     /// How much of it the compositor keeps for the objects it makes for clients.
     pub outbound: u64,
@@ -140,7 +103,7 @@ impl Default for Config {
             compositor: String::new(),
             relay: String::new(),
             session: "wcl".into(),
-            arena_mib: 64,
+            arena_mib: crate::floor::Floor::CURRENT.mib(),
             outbound: 1024 * 1024,
             output: "1600x1000".into(),
             port: 57431,

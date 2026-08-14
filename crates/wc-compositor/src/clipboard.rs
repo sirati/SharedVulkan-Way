@@ -64,6 +64,23 @@ pub enum SystemFormat {
 }
 
 impl SystemFormat {
+    /// Every format this compositor can convert, in the order it prefers them.
+    ///
+    /// ADDED FOR §42, where the drop target asks an incoming `IDataObject`
+    /// which of them it holds. A constant rather than three literals at that
+    /// call site: a format added here without being added there would be one
+    /// the clipboard understands and a drop silently does not, which is the
+    /// asymmetry §29.5 spent a paragraph avoiding for `CF_HDROP`.
+    /// Read only by the Win32 drop target, so off Windows the compiler is
+    /// right that nothing uses it — the same note `platform::PopupBounds`
+    /// carries for the same reason.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub const ALL: [SystemFormat; 3] = [
+        SystemFormat::UnicodeText,
+        SystemFormat::Html,
+        SystemFormat::HDrop,
+    ];
+
     /// For a log line, so a run says which formats were on the clipboard rather
     /// than which numbers were.
     pub fn name(self) -> &'static str {

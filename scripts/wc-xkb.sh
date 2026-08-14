@@ -47,6 +47,17 @@ fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "the keymap crosses between two processes on this box" || exit 1
+
 command -v wine >/dev/null || { echo "error: wine not on PATH"; exit 2; }
 [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: WC_XKB_MINGW unset -- run inside \`nix develop\`"; exit 2; }
 

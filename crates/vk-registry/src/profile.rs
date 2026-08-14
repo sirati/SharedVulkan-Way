@@ -45,6 +45,29 @@ pub struct Profile {
     pub only_commands: Option<Vec<String>>,
     /// Types to exclude, with the same reasoning.
     pub excluded_types: Vec<String>,
+    /// Take **every** extension the registry supports for `vulkan` that carries
+    /// no `platform=`, instead of naming them one at a time.
+    ///
+    /// # Why a rule rather than a list
+    ///
+    /// The doc comment at the top of this file argues for a *declared* subset,
+    /// and it still holds — but "declared" means "reviewable", not "typed out".
+    /// A three-hundred-name list is not reviewable; nobody can tell a missing
+    /// line from a deliberate omission, and it goes stale the day the registry
+    /// moves. The rule is one sentence a reviewer can check against `vk.xml`,
+    /// and [`Profile::excluded_extensions`] carries the exceptions with a reason
+    /// each — which is the part that actually wants reading.
+    ///
+    /// `platform=` is the filter because it is exactly the registry's own mark
+    /// for "this needs a header we do not have": `win32`, `android`, `fuchsia`,
+    /// `metal`, `ggp`, `screen`, `vi`, `ohos`, and — usefully — `provisional`.
+    ///
+    /// Auto-included extensions whose `depends=` the profile cannot satisfy are
+    /// **dropped**, not fatal; an explicitly listed one still bails, because
+    /// naming an extension whose dependency is missing is a profile bug.
+    pub include_portable_extensions: bool,
+    /// Extensions the rule above must not pull in, with the reason each is out.
+    pub excluded_extensions: Vec<String>,
 }
 
 /// The closed result of resolving a [`Profile`] against a [`Model`].
@@ -56,6 +79,17 @@ pub struct ResolvedProfile {
     /// Sorted rather than in registry order because opcode assignment reads
     /// this list, and an opcode table that depends on `vk.xml`'s declaration
     /// order would shuffle whenever Khronos reorders a block.
+    /// The extensions actually enabled, after
+    /// [`Profile::include_portable_extensions`] has been applied and the
+    /// `depends=` fixpoint has dropped what it cannot satisfy.
+    ///
+    /// **Not `Profile::extensions`**, and the difference is the whole point of
+    /// the rule: under it the declared list is thirty names and the effective
+    /// one is nearer three hundred. Anything that answers "which extensions does
+    /// this build forward" — the GPU side's `PROFILE_DEVICE_EXTENSIONS` above
+    /// all — has to read this one, or it advertises the declaration instead of
+    /// the result.
+    pub extensions: Vec<String>,
     pub commands: Vec<String>,
     /// Command aliases in scope: alias name → the definition it shares an
     /// opcode with.
@@ -81,6 +115,34 @@ impl ResolvedProfile {
 }
 
 impl Profile {
+    /// The highest core Vulkan version this profile declares, as
+    /// `VK_MAKE_API_VERSION(0, major, minor, 0)`.
+    ///
+    /// **This is the number the app side may advertise**, and deriving it here
+    /// rather than writing it down twice is the point: an ICD's
+    /// `vkEnumerateInstanceVersion` is a promise that the entry points and
+    /// structures of that version exist, and the only thing that can keep the
+    /// promise is the wire profile. `sv-icd` calls this its *ceiling* and
+    /// advertises `min(what the driver supports, this)`; see design.md §0.18.
+    ///
+    /// A profile with no `VK_VERSION_*` feature carries no core Vulkan at all,
+    /// which is the §13-step-3 tiny profile, and 1.0 is the honest answer for
+    /// it: an ICD cannot report less.
+    pub fn core_api_version(&self) -> u32 {
+        let mut best = (1u32, 0u32);
+        for f in &self.features {
+            let Some(rest) = f.strip_prefix("VK_VERSION_") else { continue };
+            let Some((major, minor)) = rest.split_once('_') else { continue };
+            let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+                continue;
+            };
+            if (major, minor) > best {
+                best = (major, minor);
+            }
+        }
+        (best.0 << 22) | (best.1 << 12)
+    }
+
     /// Resolve the profile: gather what the listed features and extensions
     /// require, then close over type dependencies.
     pub fn resolve(&self, model: &Model) -> Result<ResolvedProfile> {
@@ -134,7 +196,57 @@ impl Profile {
             .filter(|f| enabled_names.contains(&f.name))
             .collect();
 
-        for name in &self.extensions {
+        // -- 1a. the rule, if the profile states one -------------------------
+        //
+        // Every portable extension, less the ones named out, less the ones whose
+        // `depends=` the result cannot satisfy. That last part is a fixpoint and
+        // not a filter: `VK_KHR_win32_keyed_mutex` depends on
+        // `VK_KHR_external_memory_win32`, which is `platform="win32"` and so is
+        // never in the set; dropping it then makes nothing else undroppable, but
+        // `VK_QCOM_data_graph_model` → `VK_ARM_data_graph` →
+        // `VK_KHR_deferred_host_operations` is three deep, and a single pass
+        // would keep the first two.
+        let extensions: Vec<String> = if self.include_portable_extensions {
+            let out_by_name: BTreeSet<&str> =
+                self.excluded_extensions.iter().map(String::as_str).collect();
+            let explicit: BTreeSet<&str> = self.extensions.iter().map(String::as_str).collect();
+            let mut keep: BTreeSet<String> = model
+                .extensions
+                .iter()
+                .filter(|e| e.supported_for_vulkan)
+                .filter(|e| e.platform.is_none())
+                .filter(|e| !out_by_name.contains(e.name.as_str()))
+                .map(|e| e.name.clone())
+                .chain(self.extensions.iter().cloned())
+                .collect();
+            loop {
+                let reachable = |n: &str| enabled_names.contains(n) || keep.contains(n);
+                let dropped: Vec<String> = keep
+                    .iter()
+                    .filter(|name| !explicit.contains(name.as_str()))
+                    .filter(|name| {
+                        model
+                            .extensions
+                            .iter()
+                            .find(|e| &e.name == *name)
+                            .and_then(|e| e.depends.as_deref())
+                            .is_some_and(|d| !crate::depends::satisfied(d, &reachable))
+                    })
+                    .cloned()
+                    .collect();
+                if dropped.is_empty() {
+                    break;
+                }
+                for d in dropped {
+                    keep.remove(&d);
+                }
+            }
+            keep.into_iter().collect()
+        } else {
+            self.extensions.clone()
+        };
+
+        for name in &extensions {
             match model.extensions.iter().find(|e| &e.name == name) {
                 Some(e) if e.supported_for_vulkan => {
                     enabled.push(e);
@@ -153,8 +265,10 @@ impl Profile {
         // a Vulkan version that does not provide the types it uses. That is a
         // profile bug, and a loud one is better than a protocol quietly missing
         // half a struct.
+        out.extensions = extensions.clone();
+
         let is_enabled = |n: &str| enabled_names.contains(n);
-        for name in &self.extensions {
+        for name in &extensions {
             let e = model.extensions.iter().find(|e| &e.name == name).unwrap();
             if let Some(dep) = &e.depends
                 && !crate::depends::satisfied(dep, &is_enabled) {
@@ -395,6 +509,7 @@ pub mod profiles {
             excluded_commands: excluded_commands(),
             excluded_types: excluded_types(),
             only_commands: Some(STEP3_COMMANDS.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
         }
     }
 
@@ -441,6 +556,25 @@ pub mod profiles {
                 "VK_VERSION_1_1".into(),
                 "VK_VERSION_1_2".into(),
                 "VK_VERSION_1_3".into(),
+                // **1.4, and the thing that was in its way was one line.**
+                //
+                // §0.18 tried to add this and was refused by
+                // `VkImageToMemoryCopy.pHostPointer: a void* with no len= and no
+                // policy entry`, then recorded core 1.4 as costing fourteen
+                // commands' worth of work. It costs none: the refusal was §7.4
+                // asking what a host pointer *is* in this design, and §5.3
+                // already answers — `arena_base + offset`. The entry is
+                // `("pHostPointer", VoidPolicy::ArenaOffset)` in
+                // `sv_codegen::exceptions`, and with it every one of core 1.4's
+                // fourteen commands plans, generates and builds.
+                //
+                // What is *not* free is `hostImageCopy`'s runtime: an
+                // application may hand `vkCopyMemoryToImage` a plain `malloc`
+                // buffer rather than arena memory, and the bounce that needs is
+                // not written. That is a *feature* gate rather than a command
+                // gate — see `sv_icd::advertise::gated_features` — which is why
+                // it does not keep the version at 1.3 for everything else.
+                "VK_VERSION_1_4".into(),
             ],
             extensions: vec![
                 // Zink's five hard requirements (design.md §11).
@@ -525,11 +659,97 @@ pub mod profiles {
                 "VK_KHR_xlib_surface".into(),
                 "VK_KHR_xcb_surface".into(),
                 "VK_KHR_wayland_surface".into(),
+                // ---------------------------------------------------------
+                // What the conformance suite asked for, in its own words
+                // ---------------------------------------------------------
+                //
+                // design.md §0.20. Everything above this line is here because
+                // Zink, DXVK or the WSI needs it; everything below is here
+                // because `scripts/sv-cts.sh` counted a test that **passes on
+                // the control** and skips forwarded, and printed deqp's own
+                // reason. That is the difference between widening the profile
+                // and guessing at it: each of these has a number of tests
+                // beside it, measured on RADV RAPHAEL_MENDOCINO at 1-in-19997,
+                // and none of them is speculative.
+                //
+                // Nine extensions, 21 of the 50 skips in that sample, and
+                // **five commands between them** — the cheap half of the gap
+                // is almost entirely features and structures rather than entry
+                // points, which is not what "501 commands not carried"
+                // suggests from the registry side alone.
+                //
+                // 7 tests, no commands at all: a pipeline built in libraries
+                // and linked, which is a `pNext` on the create-info and a
+                // feature bit.
+                "VK_KHR_pipeline_library".into(),
+                "VK_EXT_graphics_pipeline_library".into(),
+                // 5 tests, two commands.
+                "VK_KHR_fragment_shading_rate".into(),
+                // 2 tests, no commands: a SPIR-V execution-mode capability.
+                "VK_KHR_shader_subgroup_uniform_control_flow".into(),
+                // One test each, and between them one command.
+                "VK_EXT_sample_locations".into(),
+                "VK_EXT_depth_range_unrestricted".into(),
+                "VK_EXT_depth_bias_control".into(),
+                "VK_KHR_fragment_shader_barycentric".into(),
+                "VK_EXT_shader_image_atomic_int64".into(),
+                // ---------------------------------------------------------
+                // Asked for and deliberately still out, each with its reason
+                // ---------------------------------------------------------
+                //
+                // - **`VK_EXT_shader_object`** (14 tests, the largest single
+                //   line in the skip list). Five commands of its own and a
+                //   second, parallel model of the whole pipeline: without
+                //   `VK_EXT_extended_dynamic_state3`'s 31 setters an
+                //   application that binds shaders has no way to set the state
+                //   a pipeline would have carried, so the real cost is 36
+                //   commands and a validity model this generator has never
+                //   walked. It is a stage, not a line, and it is the next one.
+                // - **`VK_EXT_descriptor_buffer`** (1 test, 11 commands).
+                //   design.md §9.2 excludes it by name: it puts raw device
+                //   addresses in *application-visible* data, which is a
+                //   different thing from `vkGetBufferDeviceAddress` returning
+                //   one — the application writes descriptors by address into
+                //   memory we own, and the boundary has no way to know which
+                //   words are addresses.
+                // - **`VK_KHR_acceleration_structure` and
+                //   `VK_KHR_ray_tracing_pipeline`** (3 tests, 23 commands).
+                //   Same address problem, an order of magnitude more surface.
+                // - **`VK_KHR_external_semaphore_fd`** (1 test). Refused on
+                //   principle rather than on cost: its entire purpose is to
+                //   move a **file descriptor** between processes, and
+                //   design.md §1a says no descriptor ever crosses. A profile
+                //   that carried it would be advertising a promise this
+                //   project exists not to keep.
+                // - **`VK_KHR_push_descriptor`** (2 tests). **Added, measured,
+                //   and taken back out** — the one entry here that is a
+                //   measurement rather than a judgement, and worth the space it
+                //   takes because of *how* it failed. Its `vkCmdPushDescriptor-
+                //   SetWithTemplate` carries a `const void* pData` whose layout
+                //   lives in the template object, exactly like
+                //   `vkUpdateDescriptorSetWithTemplate`; and
+                //   `exceptions::void_policy` already declares
+                //   `VoidPolicy::ArenaOffset` for it. **A policy is not an
+                //   implementation.** `vkUpdateDescriptorSetWithTemplate` is
+                //   expanded app-side into `vkUpdateDescriptorSets` (§0.4 item
+                //   10) and the push variants have no such expansion, so the
+                //   application's own pointer was lowered as though it were an
+                //   arena offset. Measured: two `DeviceLost`, one ring fatal
+                //   (`no VkDescriptorUpdateTemplate with id 20`) and **a
+                //   segmentation fault in `sv-gpu-server` itself** — the driver
+                //   walking a descriptor layout at an offset that never meant
+                //   anything. That is worse than an unimplemented command, and
+                //   it is what an extension costs when only half of it is
+                //   declared. The work is the mirror of §0.4 item 10:
+                //   `vkCmdPushDescriptorSetWithTemplate` expanded app-side into
+                //   `vkCmdPushDescriptorSet`, which needs the template's
+                //   `pipelineBindPoint` kept alongside its entries.
             ],
             extra_commands: vec![],
             excluded_commands: excluded_commands(),
             excluded_types: excluded_types(),
             only_commands: None,
+            ..Default::default()
         }
     }
 
@@ -573,6 +793,176 @@ pub mod profiles {
             "VK_KHR_video_decode_h264".into(),
         ]);
         p
+    }
+
+    /// Core 1.0–1.4 and every portable extension the registry defines.
+    ///
+    /// # The requirement this answers
+    ///
+    /// "740 commands are defined but only 239 are carried… all commands not only
+    /// for 1.3 but for 1.4 must be implemented, and if a GPU supports less than
+    /// we advertise that and fall back gracefully."
+    ///
+    /// Two halves, and they are separate mechanisms:
+    ///
+    /// - **Carried** is this profile. A command that no device here supports
+    ///   still costs nothing to carry — it is generated marshalling, not code
+    ///   anybody wrote — so the rule is "everything portable", not "everything
+    ///   this house's GPUs expose".
+    /// - **Advertised** is not this profile. `sv-icd` filters what it reports to
+    ///   the application by what the GPU side's real driver reports *and* by
+    ///   what this profile carries every command of. That is the graceful
+    ///   fallback, and it lives in `sv_icd::advertise`.
+    ///
+    /// # What "portable" excludes, and why that is a decision
+    ///
+    /// [`Profile::include_portable_extensions`] takes every extension with no
+    /// `platform=`. That is the registry's own mark for "needs a header this
+    /// build does not have", and it removes the Win32, Android, Fuchsia, Metal,
+    /// GGP, QNX, VI, OHOS and `provisional` families in one rule rather than in
+    /// ninety lines. `VK_ARM_tensors`, `VK_ARM_data_graph` and `VK_NV_ray_tracing`
+    /// are **not** excluded by name: nothing here exposes them, but carrying
+    /// them costs a few opcodes and excluding them would be a claim about other
+    /// people's hardware that this project has no way to check.
+    ///
+    /// [`Profile::excluded_extensions`] then names what is genuinely unreachable,
+    /// with a reason each. Those reasons fall into two kinds and neither is a
+    /// scope decision — they are the boundary invariant (design.md §1a) and the
+    /// serialisability rule (§6.1) refusing, which is the generator working.
+    pub fn full() -> Profile {
+        let mut p = zink();
+        p.name = "full".into();
+        // Core 1.4 is `zink`'s too, since the `pHostPointer` policy landed. The
+        // difference between the two profiles is now extensions alone, which is
+        // the honest shape: the version is a floor both share and the rule below
+        // is what `full` adds.
+        debug_assert!(p.features.iter().any(|f| f == "VK_VERSION_1_4"));
+        p.include_portable_extensions = true;
+        p.excluded_extensions = excluded_extensions();
+        p
+    }
+
+    /// Extensions [`full`] must not take, and the reason each is out.
+    ///
+    /// Every one of these is a *refusal by the generator*, reproduced by
+    /// `sv-codegen --audit`. None is a judgement about whether the extension is
+    /// worth having.
+    fn excluded_extensions() -> Vec<String> {
+        [
+            // A callback is a function pointer into the application's address
+            // space. design.md §6.1 takes Venus's exclusion list verbatim in
+            // spirit and function pointers are the first entry on it; §1a is the
+            // sharper version — the pointer is meaningless on the other side of
+            // the VM boundary and there is no encoding that makes it meaningful.
+            //
+            // `VK_EXT_debug_utils` is in the profile and this is not a
+            // contradiction: its messenger is created *app-side* and its output
+            // reaches the application over the reverse ring (design.md §4.6), so
+            // no function pointer ever crosses. `VK_EXT_debug_report` has no such
+            // treatment and `VK_EXT_device_memory_report` puts its callback in a
+            // `VkDeviceCreateInfo` `pNext` chain, which does cross.
+            "VK_EXT_debug_report",
+            "VK_EXT_device_memory_report",
+            // `pfnGetInstanceProcAddr` in a `VkInstanceCreateInfo` chain: the
+            // same objection, and the extension exists to let a loader skip the
+            // ICD's manifest — which is the one thing this ICD is.
+            "VK_LUNARG_direct_driver_loading",
+            // Bitfields mixed with ordinary members. design.md §7.4 already
+            // refuses `VkAccelerationStructureInstanceKHR` for this and the
+            // reason is the same one: C does not state where a 9-bit field sits
+            // inside a word, the registry does not either, and a generator that
+            // guesses produces a struct that is right on one compiler.
+            "VK_NV_cluster_acceleration_structure",
+            // A `void*` whose extent is a device property rather than a `len=`,
+            // and no policy in `sv_codegen::exceptions` fits: the bytes are a
+            // capture-replay token that only a capture tool produces.
+            // design.md §9.2 is the sharper objection — a descriptor buffer *is*
+            // raw device addresses in application memory, which is the one thing
+            // this design says it will not put there.
+            "VK_EXT_descriptor_buffer",
+            // The same shape, without the §9.2 argument: `pParams` is an array
+            // of pointers to CUDA kernel arguments whose count and element sizes
+            // live in the CUDA module, which the registry cannot see and this
+            // side does not parse.
+            "VK_NVX_binary_import",
+            // `ppData` hands the application a pointer into the driver's own
+            // descriptor set allocation. That pointer is in the GPU side's
+            // address space and design.md §1a says it cannot cross; there is no
+            // encoding that makes it mean anything here.
+            "VK_VALVE_descriptor_set_host_mapping",
+            // More `void*` with no `len=`. Each one is a vendor blob whose
+            // extent is stated somewhere the registry does not point at — a
+            // device property, a sibling in a *different* struct, or a format
+            // only the vendor's tooling knows. §7.4 requires a policy entry
+            // rather than a guess, and none of these has an honest one.
+            //
+            // `VK_ARM_data_graph` also takes its whole dependent family
+            // (`…_optical_flow`, `…_instruction_set_tosa`, `VK_QCOM_data_graph_model`)
+            // out with it, through the `depends=` fixpoint in `Profile::resolve`.
+            "VK_ARM_data_graph",
+            "VK_EXT_device_fault",
+            "VK_NV_low_latency",
+            "VK_NV_optical_flow",
+            "VK_NV_external_compute_queue",
+            "VK_ARM_shader_instrumentation",
+            // `pPlacedAddress` asks the driver to map at an address the
+            // application chose. In this design the ICD, not the driver, decides
+            // where mapped memory lands — it is arena memory and the address is
+            // `arena_base + offset` (design.md §5.3) — so honouring the request
+            // is not the GPU side's to honour, and forwarding it would be a
+            // promise nothing keeps. `sv_codegen::exceptions` already marks the
+            // field `NotSerialisable`; this is the profile agreeing.
+            "VK_EXT_map_memory_placed",
+            // The **capture-replay class**, and it is one class rather than two
+            // coincidences. `pShaderGroupCaptureReplayHandle` and
+            // `opaqueCaptureDescriptorData` are both optional `void*` whose
+            // extent is a *device property* (`shaderGroupHandleCaptureReplaySize`,
+            // `…CaptureReplayDescriptorDataSize`) rather than a `len=`, and both
+            // are written only by a capture tool replaying a trace.
+            //
+            // The right answer is not an exclusion — it is a fourth
+            // `sv_codegen::exceptions::VoidPolicy` that encodes "we do not
+            // advertise the capture-replay feature, so this member is null on
+            // the wire and a non-null one is a usage error we refuse by name".
+            // That is a generator change with a test, not a profile line, and it
+            // is the next thing worth doing here: it is what stands between this
+            // profile and `VK_KHR_ray_tracing_pipeline` (7 commands) plus
+            // `VK_EXT_descriptor_buffer` (11).
+            "VK_KHR_ray_tracing_pipeline",
+            // **The union-of-handles class used to be excluded here, and it is
+            // gone** — `VK_KHR_acceleration_structure`,
+            // `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap`,
+            // 52 commands with everything they drag in through `depends=`, which
+            // was the single largest block of uncarried API (design.md §0.21).
+            //
+            // What it said, and what was wrong with it: that
+            // `VkAccelerationStructureGeometryDataKHR` and its three siblings
+            // are unions with a handle in at least one arm, that the handle-map
+            // pass cannot rewrite ids inside them "because which arm is live is
+            // decided by a sibling the union does not name", and that the fix
+            // was "four `SIBLING_SELECTED`-shaped entries taught to the union
+            // emitter".
+            //
+            // The middle clause is false twice over. **The union does not have
+            // to name it — the registry already does**: `selector=` on the
+            // enclosing struct's member names the sibling and `selection=` on
+            // each arm names the values that choose it, ten annotations in
+            // `vk.xml`, parsed into `Member::selector`/`Member::selection` since
+            // this crate was written and read by nothing. And **the handle-map
+            // pass never needed a selector at all**, because by the time a value
+            // reaches it the union is a Rust `enum` and the enum is the tag; the
+            // barrier was standing at the wrong pass. The one place that genuinely
+            // has to choose is the app side's C → wire lowering, which was
+            // reading member [0] unconditionally, and that is where the barrier
+            // now is.
+            //
+            // So no exception table was added. The fix is the registry's own
+            // data, which makes it ten unions rather than four and leaves nothing
+            // to keep in step by hand.
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     }
 
     /// Commands excluded from every profile, with the reason each is out.
@@ -748,6 +1138,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The ceiling `sv-icd` advertises comes from here and from nowhere else.
+    ///
+    /// Needs no registry: it reads the declaration, not the resolution, which is
+    /// what makes it usable from a build script.
+    #[test]
+    fn the_core_version_is_the_highest_one_declared() {
+        // The real one. The ICD's manifest no longer has to be bumped with it —
+        // `sv-proto` publishes `cargo:core_version` through `links = "sv_proto"`
+        // and `sv-icd`'s build script reads `DEP_SV_PROTO_CORE_VERSION`, so the
+        // manifest tracks the profile in both directions (§0.18). This line is
+        // the profile's own declaration and nothing else now depends on its
+        // value being a particular number.
+        //
+        // **1.4, not 1.3, since the `pHostPointer` policy landed.** §0.18 tried
+        // this and was refused by `VkImageToMemoryCopy.pHostPointer: a void*
+        // with no len= and no policy entry`; §0.19 answered it with §5.3's own
+        // rule — a host pointer here *is* `arena_base + offset` — and core 1.4's
+        // fourteen commands then planned, generated and built with no further
+        // work. What is gated is `hostImageCopy`'s *feature* bit, in
+        // `sv_icd::advertise::withdraw_gated_features`, not the version.
+        assert_eq!(
+            profiles::zink().core_api_version(),
+            (1 << 22) | (4 << 12),
+            "zink is 1.0-1.4"
+        );
+
+        let mk = |minor: u32| (1u32 << 22) | (minor << 12);
+        let with = |features: &[&str]| Profile {
+            features: features.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+        .core_api_version();
+
+        // Out of order, because `features` is a declaration and not a ladder.
+        assert_eq!(with(&["VK_VERSION_1_3", "VK_VERSION_1_0", "VK_VERSION_1_2"]), mk(3));
+        assert_eq!(with(&["VK_VERSION_1_4"]), mk(4));
+        // Two digits must not sort as text: 1.10 is above 1.9, and a profile
+        // that compared strings would say the opposite.
+        assert_eq!(with(&["VK_VERSION_1_9", "VK_VERSION_1_10"]), mk(10));
+        // A profile with no core version at all is still a 1.0 ICD; there is no
+        // lower thing an ICD may report.
+        assert_eq!(with(&[]), mk(0));
+        assert_eq!(with(&["VK_KHR_swapchain"]), mk(0));
     }
 
     #[test]

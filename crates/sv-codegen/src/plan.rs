@@ -220,6 +220,19 @@ pub struct FieldPlan {
     /// Non-const outermost pointer: the callee fills it in and it comes back in
     /// the reply, not in the command.
     pub is_output: bool,
+    /// `selector=` — this member is a **union**, and the named sibling of the
+    /// same struct holds the discriminator that says which arm is live.
+    ///
+    /// Ten members in the whole registry carry it, and until design.md §0.21
+    /// nothing read it: `exceptions`' own header records that unions needed no
+    /// exception table because "a Rust `enum` *is* the tag", which is true of
+    /// the wire and stops at the C ABI — where a union has no tag and the app
+    /// side was reading member [0] regardless.
+    pub selector: Option<String>,
+    /// `selection=` — this member belongs to a union, and these are the
+    /// discriminator values that choose it. Comma-separated in the registry and
+    /// split here; several arms are chosen by more than one value.
+    pub selection: Vec<String>,
 }
 
 /// A struct or union.
@@ -265,6 +278,10 @@ pub struct CommandPlan {
     pub outputs: Vec<FieldPlan>,
     /// `VkResult`, or `None` for a `void` command.
     pub returns_result: bool,
+    /// The command returns a value that is neither `void` nor `VkResult` — a
+    /// `VkDeviceAddress` or a bare `uint64_t`. It travels in the reply's `ret`
+    /// field, which exists for exactly this.
+    pub returns_value: bool,
     pub return_type: Option<String>,
     /// Whether a reply is generated at all. A command with no outputs and no
     /// result is fire-and-forget, which is most of the `vkCmd*` family
@@ -522,11 +539,26 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
 
         let return_type = cmd.return_type.base_name().map(str::to_string);
         let returns_result = return_type.as_deref() == Some("VkResult");
+        // **A reply exists whenever the command returns anything at all**, which
+        // is design.md §0.3 item 5's correction to this line and the hole it
+        // named. `vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress`
+        // and `vkGetDeviceMemoryOpaqueCaptureAddress` return a
+        // `VkDeviceAddress` with no output parameter and no `VkResult`, so the
+        // rule as first written — `returns_result || !outputs.is_empty()` —
+        // generated no reply for them, the emitter had nowhere to put the value,
+        // and all three came out in `NOT_IMPLEMENTED`.
+        //
+        // §0.3 called that "latent rather than live" because §9.2 does not
+        // advertise `bufferDeviceAddress`. §0.16 item 3 falsified it: the
+        // feature is mirrored from the physical device, so `vulkaninfo` says
+        // true, and CTS called all three on the first afternoon anyone asked.
+        let returns_value = return_type.is_some() && !returns_result;
         // A `vkCmd*` recorded into a blob never generates a reply: its result is
         // the state of the command buffer, and design.md §6.5 sends the whole
         // blob as one `svExecuteCommandBlob`.
         let is_recorded = cmd.is_command_buffer_recorded();
-        let generates_reply = !is_recorded && (returns_result || !outputs.is_empty());
+        let generates_reply =
+            !is_recorded && (returns_result || returns_value || !outputs.is_empty());
 
         plan.commands.push(CommandPlan {
             name: name.clone(),
@@ -535,6 +567,7 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
             inputs,
             outputs,
             returns_result,
+            returns_value,
             return_type,
             generates_reply,
             is_recorded,
@@ -645,6 +678,8 @@ fn field_plan(
         no_auto_validity: m.no_auto_validity,
         is_a_length: lengths.contains(&m.name),
         is_output: m.is_output_pointer(),
+        selector: m.selector.clone(),
+        selection: m.selection.clone(),
     })
 }
 

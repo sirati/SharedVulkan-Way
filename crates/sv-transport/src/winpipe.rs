@@ -142,31 +142,58 @@ unsafe impl Send for Pipe {}
 /// through the one handle this returns.
 #[cfg(windows)]
 pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
-    // `\\.\Global\` rather than `\\.\`: the port has to be reachable from a
-    // service and from a session-0 process, and the session-local namespace is
-    // not. The guest half of this project has run as both.
-    let path = format!("\\\\.\\Global\\{name}");
-    let wpath = wide(&path);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    // **Two spellings, tried in order, and the second is not a guess.**
+    //
+    // `\\.\Global\<name>` is the one to want: the session-0 namespace, reachable
+    // from a service and from a desktop process alike, and the guest half of
+    // this project has run as both.
+    //
+    // It is tried *first* and not *only* because on the deployment guest it
+    // fails with `ERROR_ACCESS_DENIED` (5) — measured, not supposed. `vioser.sys`
+    // publishes the port under both namespaces and the security descriptor on
+    // the `Global\` alias is not the one on the device itself, so an
+    // unprivileged process is refused there and admitted here. Falling back is
+    // strictly better than requiring elevation for a doorbell.
+    //
+    // A `Global\` failure is therefore not reported unless the plain form fails
+    // too, and the error that surfaces is the plain form's — which is the one
+    // that says something about the port rather than about the alias.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    // A `name` that is already a device path is used verbatim, so a caller that
+    // has identified a port some other way can hand it over. §36.13 measured a
+    // guest where neither spelling below opened an *existing* port, and the only
+    // non-guessing way to identify one is to diff `Control\DeviceClasses`
+    // before and after a QMP `device_add` — which yields a device path, not a
+    // name.
+    let paths: Vec<String> = if name.starts_with("\\\\") {
+        vec![name.to_string()]
+    } else {
+        vec![format!("\\\\.\\Global\\{name}"), format!("\\\\.\\{name}")]
+    };
+    let mut last = 0i32;
     loop {
-        // SAFETY: `wpath` outlives the call.
-        let handle = unsafe {
-            sys::CreateFileW(
-                wpath.as_ptr(),
-                sys::GENERIC_READ | sys::GENERIC_WRITE,
-                0,
-                core::ptr::null_mut(),
-                sys::OPEN_EXISTING,
-                0,
-                0,
-            )
-        };
-        if handle != sys::INVALID_HANDLE_VALUE {
-            return Ok(Pipe { handle, server: false });
+        for path in &paths {
+            let wpath = wide(path);
+            // SAFETY: `wpath` outlives the call.
+            let handle = unsafe {
+                sys::CreateFileW(
+                    wpath.as_ptr(),
+                    sys::GENERIC_READ | sys::GENERIC_WRITE,
+                    0,
+                    core::ptr::null_mut(),
+                    sys::OPEN_EXISTING,
+                    0,
+                    0,
+                )
+            };
+            if handle != sys::INVALID_HANDLE_VALUE {
+                return Ok(Pipe { handle, server: false });
+            }
+            last = unsafe { sys::GetLastError() } as i32;
         }
-        let errno = unsafe { sys::GetLastError() } as i32;
         if std::time::Instant::now() >= deadline {
-            return Err(Error::Os { call: "CreateFileW (virtio-serial port)", errno });
+            return Err(Error::Os { call: "CreateFileW (virtio-serial port)", errno: last });
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -258,6 +285,19 @@ impl Pipe {
 #[cfg(windows)]
 impl std::io::Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+/// `&Pipe` is `Read` and `Write` so that one open handle can serve a reader
+/// thread and a writer thread at once. Neither operation mutates anything in
+/// `Pipe` — both are a syscall on `handle` — and a virtio-serial port permits
+/// exactly one opener, so sharing the handle is not a convenience but the only
+/// way a doorbell can exist at all: a doorbell is by construction a thing you
+/// write while something else is blocked reading. See `vdoorbell::attach`.
+#[cfg(windows)]
+impl std::io::Read for &Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut got: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;
         // SAFETY: `buf` is valid for `len` bytes and `handle` is live.
@@ -274,6 +314,22 @@ impl std::io::Read for Pipe {
             if e == ERROR_BROKEN_PIPE || e == ERROR_PIPE_NOT_CONNECTED {
                 return Ok(0);
             }
+            // **A virtio-serial port whose host end has nobody attached fails a
+            // read with `ERROR_NO_SYSTEM_RESOURCES`**, which is a startling
+            // spelling of "not ready". Measured on the deployment guest, not
+            // guessed: the guest half necessarily opens before the host process
+            // connects — a harness has to see "echoing" in the log before it is
+            // safe to measure — and the first run died here instead of waiting.
+            //
+            // It is *not* an end. The Linux side of the same situation reads
+            // EOF, which is already treated as "nothing yet"; reporting this as
+            // an error would make every guest-first bring-up a failure. So it
+            // becomes `WouldBlock` and the caller retries, which is what the
+            // condition actually is.
+            const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
+            if e == ERROR_NO_SYSTEM_RESOURCES {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
             return Err(std::io::Error::from_raw_os_error(e as i32));
         }
         Ok(got as usize)
@@ -282,6 +338,16 @@ impl std::io::Read for Pipe {
 
 #[cfg(windows)]
 impl std::io::Write for Pipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self).flush()
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Write for &Pipe {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut put: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;

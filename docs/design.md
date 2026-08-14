@@ -1860,7 +1860,12 @@ writes it into a buffer, a shader dereferences it, and the GPU faults.
   GPU-side fill, the app-side fold, and the boundary translation. That is a
   stage, and it is the next one.
 
-**What is not settled.** Five wedges remain and they cluster into two families
+**What is not settled** — and **§0.20 settles most of it**: the five wedges below
+turned out not to be two families. Three of them are one defect, confirmed by a
+single-variable control there; two were never reproduced against a controlled
+before-state and have no established cause. Left as written, because the shape of
+the guess is the point.
+Five wedges remain and they cluster into two families
 that share no obvious mechanism with the above: four
 `query_pool.statistics_query.*` (all of them `cmdcopyquerypoolresults` or
 `host_query_reset` variants) and one
@@ -1946,6 +1951,2503 @@ returns `VK_SUCCESS` and whose window is nonetheless black is indistinguishable
 from a broken display target without it; with it the answer was "the frame has
 content, and there is exactly one of them", which is a different problem from
 the one being chased.
+
+---
+
+### 0.17 The codec the host can afford, and what the dropped frames were not
+
+**Numbered 0.17 and not 0.16 as briefed**, because master — checked at
+`4a5dfb4` and again at `a7210e8` — already has a §0.16, "Why the forwarder was
+hanging the GPU", and a §0.15 that appears twice. Renumbering somebody else's
+landed section from this branch would be worse than taking the next free
+number, so this takes the next free number.
+
+Measured 2026-08-13 on **testhost's Linux host** and, for the parts that are
+facts about a browser rather than about that machine, on **devhost**. Both
+ran the same binary — `/nix/store/qxgg26945r3f9yzdqg0gfbnjvg6wm7x5-firefox-151.0.2`,
+byte for byte the same store path — because otherwise the two machines are not
+comparable. `scripts/sv-firefox-codec.sh` runs all of it.
+
+The claim being checked was mine and it was too strong: *hardware video decode
+is blocked*. The user's correction was one sentence — "GPU video is not blocked,
+just test with a video in a format that the host iGPU can decode" — and testing
+it splits the claim into three, of which one is true, one is true for a reason I
+had not measured, and one was never about decode at all.
+
+#### The Firefox in use has no Vulkan Video decoder, so §5 of `video-decode.md` is about a different browser
+
+`docs/video-decode.md` §5a reads `FFmpegVulkanVideoDecoder.cpp` at
+mozilla-central tip and concludes that both output paths end in
+`vkGetMemoryFdKHR` with no host-memory fallback. That reading is sound and it
+does not apply here: the decoder it describes shipped in **Firefox 153**, and
+this deployment runs **151.0.2**. Asked of the binary rather than of the source
+tree, with `strings` on its own `libxul.so`:
+
+| symbol | occurrences in 151.0.2's `libxul.so` |
+|---|---|
+| `FFmpegVulkanVideoDecoder` | **0** |
+| `media.hardware-video-decoding-vulkan.enabled` | **0** |
+| `AV_HWDEVICE_TYPE_VULKAN` | **0** |
+| `VulkanVideo` | **0** |
+| `FFmpegVideoDecoder` | 362 |
+| `VA-API` | 20 |
+
+`lib/firefox/vaapitest` exists and there is no Vulkan equivalent beside it. So
+**this browser has exactly two hardware decode paths, VA-API and V4L2, and both
+want a DRM node.** There is no pref to turn on and no branch to patch, which
+also means the whole §5a question — *which* of the two Vulkan branches would end
+in a dma-buf — is not a question this deployment can ask yet. It becomes one at
+153, and §5a is the right analysis to have waiting.
+
+#### `/dev/dri` is empty, and that is only half of why
+
+On testhost's host `/dev/dri` contains an empty `by-path` and nothing else, so
+VA-API has no device. That was the fact I had. The other half was found by
+running the *same binary* on devhost, which has two working VA-API render
+nodes (`vainfo` lists H.264 VLD on the NVIDIA node and H.264 VLD plus encode on
+radeonsi), under two different compositors:
+
+| harness | `WEBRENDER` | `DMABUF` | `HARDWARE_VIDEO_DECODING` |
+|---|---|---|---|
+| devhost, weston **pixman** | blocklisted `SOFTWARE_GL` | failed **`NO_DRM_DEVICE`** | unavailable `VIDEO_DECODING_TEST_FAILED` |
+| devhost, weston **gl** (RTX 5090, "dmabuf support: modifiers") | available | **available** | unavailable `VIDEO_DECODING_TEST_FAILED` |
+| testhost host, weston pixman | blocklisted `GLXTEST_FAILED` | blocklisted `GLXTEST_FAILED` | blocklisted `GLXTEST_FAILED` |
+
+The first two rows differ **only** in the compositor. So `NO_DRM_DEVICE` is not
+a statement about `/dev/dri` at all — it is what Firefox says when the
+compositor offers no `zwp_linux_dmabuf`, on a machine whose `/dev/dri` is fully
+populated. **`wc-proxy` offers `wl_shm` and nothing else**, which is the same
+shape, so even a host that grew a GPU tomorrow would still read `NO_DRM_DEVICE`
+until the proxy advertises a dmabuf it cannot have. Two independent causes had
+been producing one row and I had been reading it as one cause.
+
+#### What `about:support` says, which is the arbiter
+
+Codec Support Information on testhost's host, photographed rather than quoted
+from a log:
+
+```
+Codec Name  Software Decoding  Hardware Decoding
+H264        Supported          Unsupported
+VP9         Supported          Unsupported
+AV1         Supported          Unsupported
+HEVC        Supported          Unsupported
+```
+
+![about:support's Media section on testhost's host: Hardware Decoding
+"Unsupported" for every codec](video-decode/h264-support-media.png)
+
+Every codec, hardware decoding **Unsupported**, and `media.hardware-video-decoding.force-enabled`
+does not move it. The one control this does not have is a positive one: the
+`HWDEC` token is present in `libxul.so`, so the field is capable of saying it,
+but `vaapitest` produced no output on either of devhost's render nodes
+either, so no run in this stage ever saw the field say `HWDEC`. That is stated
+as a gap rather than glossed.
+
+**So: no. Hardware decode does not engage, and the guest's Intel iGPU is not
+reachable from `151.0.2` by any path that binary has.** §1's capability tables
+are still correct — that iGPU decodes H.264 baseline, main and high, 8×8 to
+4096×4096 — and they are correct about a GPU on the *other side of the
+hypervisor* from the browser that would need it.
+
+#### 153 is a `nix build` away, its Vulkan decoder is real, and the wall is ours
+
+The paragraph above says "this binary" four times, and that qualifier turned out
+to be the whole story. The user's correction: *Firefox recently added Vulkan
+based video decoding, i.e. using Vulkan to address the video decoder; you can
+get that version and enable the backend — after all this is NixOS.* Both halves
+are right, and no compiling was needed for either.
+
+**The version is one flake input away.** The pinned nixpkgs carries 151.0.2;
+`github:NixOS/nixpkgs/nixpkgs-unstable` today carries **153.0.4**, and
+`firefox-bin` is Mozilla's own prebuilt binary, so it arrives from a substituter
+rather than from a three-hour build. Asked of *that* `libxul.so` with the same
+`strings` method:
+
+| symbol | 151.0.2 | 153.0.4 |
+|---|---|---|
+| `FFmpegVulkanVideoDecoder` | 0 | **10** |
+| `media.hardware-video-decoding-vulkan.enabled` | 0 | **3** |
+| `media.hardware-video-decoding-vulkan.direct-export.enabled` | 0 | **2** |
+| `vkGetMemoryFdKHR` | 0 | **1** |
+
+**And it engages.** Firefox 153.0.4 under a GL weston on devhost, with the
+pref on, grows an `about:support` row that does not exist in 151 at all, and it
+tracks the preference:
+
+| pref | `HARDWARE_VIDEO_DECODING_VULKAN` |
+|---|---|
+| `true` | **available** |
+| `false` | disabled, `FEATURE_HARDWARE_VIDEO_DECODING_VULKAN_PREF_DISABLED` |
+
+with `FFMPEG: VulkanDeviceHolder: created shared VkDevice for NVIDIA GeForce
+RTX 5090` in `MOZ_LOG=PlatformDecoderModule:5` to say a device was really made.
+
+**This is also the positive control §0.17 was missing**, and it is worth being
+precise about what it does and does not license. `codecSupportInfo` on 153 reads
+`H264 SWDEC HWDEC`, `AV1 SWDEC HWDEC`, and so on — so the field *can* say
+`HWDEC`, and the all-`SWDEC` reading on testhost's host is a real measurement
+and not a stuck string. It does **not** show that Vulkan decoded anything: the
+`HWDEC` appears with the Vulkan pref both on and off, because
+`media.hardware-video-decoding.force-enabled` had also been set and VA-API
+answers on that machine. An A-B-A-B of the Vulkan pref alone measured 0.10 cores
+either way for 1080p60 AV1, which separates nothing — VA-API served both arms,
+and a 9950X3D decodes this content in software for about the same price. **What
+Vulkan decode costs, on its own, is not measured here.**
+
+**The wall that matters is ours, and it is one line of output.** Firefox's
+decoder is irrelevant until a forwarded device can decode at all, so that was
+asked directly, with `video-probe` — the same instrument as §1–§3 — built for
+the video profile and pointed at our own ICD:
+
+```
+$ video-probe decode idr.264 out.nv12          # direct, RADV
+decoded 24 frames of 320x180 (coded 320x192) as G8_B8R8_2PLANE_420_UNORM
+decode submit->fence: median 0.784 ms over 24 frames
+
+$ SV_SOCKET=… VK_DRIVER_FILES=…/sv_icd.json video-probe decode idr.264 out.nv12
+Error: no device can decode this profile:
+  AMD Ryzen 9 9950X3D … (RADV RAPHAEL_MENDOCINO): no queue family with VIDEO_DECODE
+```
+
+The forwarded device advertises `VK_KHR_video_queue`, `VK_KHR_video_decode_h264`
+and `VK_KHR_video_decode_queue` and answers every capability query with the
+driver's own numbers — and then offers exactly one queue family,
+`GRAPHICS|COMPUTE|TRANSFER|SPARSE`, `codecs -`. This reproduces
+`video-decode.md` §6 on this branch rather than taking it on trust.
+
+So the ordering changes, and in the project's favour:
+
+1. **"Firefox cannot speak Vulkan Video" is dead.** It was true of 151 and is
+   false of 153, and 153 is a prebuilt binary in a channel we already use.
+2. **The blocker is now `advertise.rs`, not Mozilla.** A Firefox 153 on the host
+   with our ICD installed would be refused at device selection, for the same
+   reason `video-probe` is — before it ever reached §5a's dma-buf question. That
+   is a *better* failure to have, because it is ours.
+3. **It is still not a small thing to fix**, and §0.8 item 2 already says the
+   shape: not a second visible queue family, but a video session owned privately
+   by the GPU side, so that what crosses is a bitstream and an image id.
+   `video-decode.md` §6 costs that out. Nothing here shortens it.
+4. **§5a's dma-buf wall is not disproved, only deferred.** It stands behind the
+   queue-family wall and will be met next, on a topology where the frame is in a
+   Windows guest and a dma-buf is a host-kernel object.
+
+#### The codec can be forced, and the obvious preference for it is the wrong one
+
+`media.av1.enabled=false` is not enough on its own: YouTube's ABR simply moves
+down its own list to VP9, which is also a software decode. The preference whose
+*name* says it fixes that does nothing at all. Measured per combination, by
+`MediaSource.isTypeSupported` and then by what the site actually served:
+
+| combination | av1-mp4 | vp9-webm | vp9-mp4 | h264-mp4 | opus-webm | aac-mp4 | what the site then served |
+|---|---|---|---|---|---|---|---|
+| default | yes | yes | yes | yes | yes | yes | `av01.0.09M.08 (399) / opus (251)` |
+| `av1` off | NO | yes | yes | yes | yes | yes | `vp09.00.51.08… (303) / opus (251)` |
+| `mediasource.vp9` off | yes | yes | yes | yes | yes | yes | `av01.0.09M.08 (399) / opus (251)` |
+| `webm` off | yes | NO | yes | yes | NO | yes | **`avc1.64002a (299) / mp4a.40.2 (140)`** |
+| `av1` off + `mediasource.vp9` off | NO | yes | yes | yes | yes | yes | `vp09.00.51.08… (303) / opus (251)` |
+| `av1` off + `webm` off | NO | NO | yes | yes | NO | yes | **`avc1.64002a (299) / mp4a.40.2 (140)`** |
+
+**`media.mediasource.vp9.enabled=false` changes not one cell.** It does not even
+change the answer for `video/mp4; codecs="vp09…"`, which is the one thing its
+name promises. An earlier version of this work had shipped that preference in a
+test, on the strength of the name; the row above is why the test now says
+`media.webm.enabled` instead.
+
+The pair that works is `media.av1.enabled=false;media.webm.enabled=false` —
+`webm` because it is what actually removes VP9 and, for this content, AV1 with
+it; `av1` as belt to its braces, for the content where AV1 arrives in MP4. The
+cost is real and is not hidden: **WebM goes entirely, Opus with it**, and the
+site falls back to AAC. That is a defensible trade on a two-core machine with no
+GPU and a poor one anywhere else, which is exactly why it belongs in `prefs` in
+`wc-launch.ini` rather than in a binary.
+
+**It is deliberately not in the shipped `wc-launch.ini`.** The pair is pinned by
+`plan::tests::the_deployment_can_state_the_codec_the_host_can_afford` so that
+the correction cannot be lost, and turning it on is one line — but the section
+below measures that it does not fix the thing that prompted it, and taking Opus
+off a machine the user browses with, to buy 6.5% of two cores that are not the
+bottleneck, is the user's call to make rather than a default to slip in.
+
+#### What it buys: 1.7× the decoder's CPU, and not one dropped frame
+
+Interleaved A-B-A-B at 720p60, 60-second windows, on testhost's host, because
+its two cores are shared with the VM and a straight before/after would measure
+the drift as well as the codec:
+
+| res | arm | codec line, from the player's own stats | dropped | of | cpu-s | cores |
+|---|---|---|---|---|---|---|
+| 720p60 | av1 | `av01.0.08M.08 (398) / opus (251)` | 0 | 3587 | 13.4 | 0.22 |
+| 720p60 | h264 | `avc1.4d4020 (298) / mp4a.40.2 (140)` | 0 | 3563 | 11.4 | 0.19 |
+| 720p60 | av1 | `av01.0.08M.08 (398) / opus (251)` | 7 | 3569 | 23.4 | 0.39 |
+| 720p60 | h264 | `avc1.4d4020 (298) / mp4a.40.2 (140)` | 0 | 3579 | 9.8 | 0.16 |
+| 1080p60 | av1 | `av01.0.09M.08 (399) / opus (251)` | 43 | 3588 | 13.8 | 0.23 |
+| 1080p60 | h264 | `avc1.64002a (299) / mp4a.40.2 (140)` | **165** | 3705 | 11.9 | 0.20 |
+| 1080p60 | av1 | `av01.0.09M.08 (399) / opus (251)` | 0 | 3583 | 15.3 | 0.26 |
+| 1080p60 | h264 | `avc1.64002a (299) / mp4a.40.2 (140)` | 0 | 3564 | 11.8 | 0.20 |
+
+The codec line is read off the player's own "Stats for nerds" panel rather than
+off the preference, because the preference is what was asked and the panel is
+what was answered:
+
+![YouTube's stats panel, AV1 arm: Codecs av01.0.08M.08 (398) / opus (251), 0
+dropped of 1412, optimal 1280x720@60](video-decode/h264-overlay-av1.png)
+
+![the same panel, H.264 arm: Codecs avc1.4d4020 (298) / mp4a.40.2 (140), 0
+dropped of 2007, optimal 1280x720@60](video-decode/h264-overlay-avc1.png)
+
+**AV1 costs more CPU, and the margin is smaller and noisier than one resolution
+made it look.** Pooling the four windows of each arm: AV1 13.4, 23.4, 13.8, 15.3
+cpu-seconds against H.264 11.4, 9.8, 11.9, 11.8 — a ratio of **1.25× on the
+medians and 1.47× on the means**, and the gap between those two numbers is one
+AV1 window at 23.4. H.264 is the strikingly *stable* one: every window inside
+9.8–11.9, against AV1's 13.4–23.4. An earlier draft of this section read 1.74×
+off the 720p rows alone; 1080p is why it does not say that. On a host with two
+cores the median difference is about 3 cpu-seconds a minute, 2.5% of the
+machine.
+
+**And the dropped-frame count does not move with the codec at all.** It is 0 in
+five of the eight windows, 7 and 43 for AV1, and **165 for H.264** — the largest
+number in the table belongs to the codec that is supposed to be cheaper, in the
+window right after an AV1 arm that dropped 43. These are not decoder numbers.
+They are what a shared host does to a 60 fps video element, and the correct
+reading of the whole table is that at these resolutions **this machine is not
+decode-bound in either codec.**
+
+#### So the 387 dropped frames were the present path, not the decoder
+
+The observation that started this was 387 dropped of 4352 at 1280×720@60 with
+YouTube's own overlay calling 480p30 optimal. The same host, the same two cores,
+the same Firefox and the same AV1 stream, with the *compositor* changed from the
+live `wc-proxy` session to a headless weston, drops **0 of 3587** and calls
+1280x720@60 optimal. Nothing about the decoder differs between those two runs.
+
+What differs is what §0.6's successor measures: a cross-VM present costs 216.9 ms
+because `sv_transport::park`'s futex doorbell cannot cross a hypervisor, against
+1.7–2.1 ms locally. A `<video>` element whose frame callbacks arrive at ~4.6 Hz
+will report enormous `droppedVideoFrames`, because that counter is frames
+decoded and never composited — and YouTube's ABR reads exactly that counter to
+decide what is optimal, which is how a machine that decodes 720p60 AV1 on 0.22
+of its two cores gets told it should be watching 480p30.
+
+**The codec change and the doorbell fix are not alternatives and should not be
+reported as one number.** The doorbell fix is what returns the frames — and at
+the time of writing a doorbell measuring ~9 µs across a real boundary is merged
+but **nothing calls it yet**, so anyone re-running this against the live session
+today will still see the 217 ms and should not read it as a decode result. The codec
+change is worth making anyway, on its own smaller merits: it is about 3
+cpu-seconds a minute on a machine that has 120, and it removes the arm whose
+cost varies by 70% window to window. It is not, on this evidence, worth losing
+Opus for on its own.
+
+#### What this does not tell us
+
+1. **No positive control for `HWDEC`.** Every run in this stage read
+   `Unsupported`, on both machines. `vaapitest` fails on devhost too, so the
+   harness has never been shown reading a machine where hardware decode works.
+2. **One video.** Big Buck Bunny is animation and is cheap to decode; the 1.74×
+   is a ratio taken on easy content and film-grain-heavy material would move
+   both arms and probably the ratio.
+3. **The audio changes with the video.** Turning WebM off takes Opus with it, so
+   the H.264 arm decodes AAC where the AV1 arm decoded Opus. Both are small
+   against a 60 fps video decode, but the 7.8 cpu-seconds is a codec *pair*
+   difference and not a video-codec difference, and nothing here separated them.
+4. **Neither number is the user's path.** The harness is headless weston with
+   `wl_shm`, which is the same *shape* `wc-proxy` offers but not the same code;
+   the decode and the one shm copy are shared with the live session and the
+   transport is not.
+### 0.19 What an uncarried command actually did, and 239 → 509
+
+Measured 2026-08-13 on **devhost**, in `nix develop` unless a line says
+otherwise. §0.2's codegen bought the wire; this section asks what the profile
+left outside it, and answers the question the number 239 was standing in for.
+
+**1. "No-op" was the wrong word, and the right word is three words.** The
+premise for this work was that the 501 registry commands the zink profile does
+not carry are no-ops. They are not, and the distinction decides what kind of
+work this is. `sv-codegen --icd-entry` and the generated proc tables say there
+are exactly three behaviours, and only one of them is a bug:
+
+| what happens | count (zink) | can the application tell? |
+|---|---|---|
+| **absent** — no proc-table entry, `vkGetDeviceProcAddr` returns null | 501 | yes, and it is the *correct* answer |
+| **clean failure** — `VK_ERROR_INITIALIZATION_FAILED` | 6 | yes |
+| **silent** — `void`, or a value type returning `Default::default()` | 6 | **no** |
+
+The 501 were never the problem. `sv_codegen::abi::surface_profile` derives the C
+surface from the wire profile, so a command in no listed extension gets no stub
+and no table entry, `sv_icd_entry::lookup` returns `None`, and a conforming
+application that also never sees the extension advertised never calls it. That
+is what an implementation is *supposed* to do about an extension it does not
+have. Widening the profile was therefore **coverage**, not a correctness fix.
+
+**The correctness fix was the other six**, and they were hiding behind the big
+number. `vkGetDeviceQueue2` is core 1.1 — unconditionally present, no extension
+to decline — and its stub returned without writing `*pQueue`, leaving the
+application's uninitialised memory to be used as a dispatchable handle.
+`vkGetBufferDeviceAddress`, `vkGetBufferOpaqueCaptureAddress` and
+`vkGetDeviceMemoryOpaqueCaptureAddress` returned `Default::default()`, which is
+the address zero, while `bufferDeviceAddress` was advertised.
+`vkSubmitDebugUtilsMessageEXT` and `vkDestroyDebugUtilsMessengerEXT` did nothing
+and said so only under `SV_DEBUG`, which nobody sets.
+
+Two changes, and neither is a list. `sv_icd_entry::not_implemented` now reports
+**always**, once per name, because gating the only evidence of a silent failure
+on an environment variable makes the worst failure mode the quietest one. And
+the advertised set gained a third term, below.
+
+**2. The devices, measured rather than assumed.** From a clean
+`nix shell nixpkgs#vulkan-tools`, never the dev shell:
+
+| device | instance | device `apiVersion` | device extensions |
+|---|---|---|---|
+| RADV RAPHAEL_MENDOCINO (Ryzen 9 9950X3D iGPU) | 1.4.341 | 1.4.348 | 236 |
+| NVIDIA GeForce RTX 5090 | 1.4.341 | 1.4.329 | 276 |
+
+Union 307, of which 304 are extensions this registry supports for `vulkan` with
+no `platform=`. The RTX 5090 *does* enumerate from a clean `nix shell`, which
+settles the open question in the brief for this work; it is the dev shell that
+is the odd one out and the cause is still unknown.
+
+**testhost's Intel iGPU cannot be measured from testhost**, and the reason
+is not a tooling problem — it is the machine's whole architecture. `00:02.0
+Raptor Lake-P UHD Graphics` reports `Kernel driver in use: vfio-pci`; `i915` and
+`xe` are loaded with a zero use count and `/sys/class/drm/` contains nothing but
+`version`. The host has no DRM node for that GPU because the GPU belongs to the
+Windows guest. `vulkaninfo` there fails with `Found no drivers!` and that is the
+correct answer for a host with no graphics device.
+
+So the third data point is a *guest-side* measurement through the guest's own
+Intel driver, which is a different exercise from this section's and is left as
+one. The assumption recorded meanwhile: an Intel iGPU exposes no portable
+extension that RADV and NVIDIA between them do not, so the target set two
+vendors define is not narrowed by the third.
+
+The first attempt at this reported "no ssh-agent socket reachable", which was
+also true and entirely beside the point — the sockets under `~/.ssh/agent/` are
+stale and refuse operations in a way that reads as a locked vault. The live one
+is `~/.1password/agent.sock`, and it has to be passed as
+`-o IdentityAgent=` and not only as `SSH_AUTH_SOCK`. Recorded because the
+failure mode lies about its cause.
+
+**3. The profile states a rule, not a list.** `vk_registry::profiles::full` is
+core 1.0–1.4 plus [every extension the registry supports for `vulkan` with no
+`platform=`], less an exclusion list with a reason per line. The rule is one
+sentence a reviewer can check against `vk.xml`; a 304-name list is not
+reviewable, and nobody could tell a missing line in it from a deliberate
+omission. `platform=` is exactly the registry's own mark for "needs a header
+this build does not have" — Win32, Android, Fuchsia, Metal, GGP, QNX, VI, OHOS,
+and usefully `provisional` — so one filter removes nine families.
+
+Auto-included extensions whose `depends=` cannot be satisfied are **dropped**,
+by fixpoint rather than by filter: `VK_QCOM_data_graph_model` → `VK_ARM_data_graph`
+→ `VK_KHR_deferred_host_operations` is three deep and a single pass keeps the
+first two. An *explicitly* listed extension whose dependency is missing still
+bails, because that is a profile bug.
+
+`VK_ARM_tensors` and `VK_NV_ray_tracing` are **not** excluded by name. Nothing in
+this house exposes them, but carrying them costs a few opcodes, and excluding
+them would be a claim about other people's hardware this project cannot check.
+
+| | zink | full |
+|---|---|---|
+| commands carried on the wire | 239 | **509** |
+| C-surface entry points | 261 | **531** |
+| of those, stubs that refuse | 12 | 27 |
+| wire structs | 460 | 1210 |
+
+**4. What is still out, and it is two generator gaps rather than a scope
+decision.** The exclusion list has fourteen entries and they group into three
+kinds. Platform headers and function pointers are the boundary invariant (§1a)
+and the serialisability rule (§6.1) refusing, which is the generator working —
+`VK_EXT_debug_report`'s and `VK_EXT_device_memory_report`'s callbacks are
+pointers into the application's address space and no encoding makes them mean
+anything on the other side of a VM boundary. A dozen `void*` with no `len=` are
+§7.4 asking for a policy entry nobody can write honestly. The two that are worth
+naming as work:
+
+- **The capture-replay class.** `pShaderGroupCaptureReplayHandle` and
+  `opaqueCaptureDescriptorData` are optional `void*` whose extent is a *device
+  property* rather than a `len=`, and both are written only by a tool replaying
+  a trace. The answer is a fourth `sv_codegen::exceptions::VoidPolicy` — "we do
+  not advertise the capture-replay feature, so this is null on the wire and a
+  non-null one is a usage error we refuse by name" — and it is what stands
+  between this profile and `VK_KHR_ray_tracing_pipeline` plus
+  `VK_EXT_descriptor_buffer` — **17 commands**, counted in item 7a.
+- **The union-of-handles class.** `VkAccelerationStructureGeometryDataKHR`,
+  `VkIndirectExecutionSetInfoEXT`, `VkDescriptorMappingSourceDataEXT` and
+  `VkResourceDescriptorDataEXT` are unions with a handle in an arm, and the
+  handle-map pass emits a `compile_error!` rather than guess which arm is live.
+  It is the same `noautovalidity` gap `exceptions::SIBLING_SELECTED` already
+  closes for `VkWriteDescriptorSet`, one level in. This is the expensive one:
+  `VK_KHR_acceleration_structure` takes ray query, ray tracing maintenance and
+  position fetch, and `VK_EXT_opacity_micromap` with it — **53 commands** across
+  six extensions, again counted in item 7a. It is the largest single thing
+  standing between 509 and 740.
+
+**5. Advertisement is now the intersection of three things, and the third was
+missing.** §9.2 says an extension in the advertised list is a promise its entry
+points work. The list was the profile intersected with what the GPU side's
+driver reports — two terms, neither of which knows whether the *generator*
+produced a working stub. That is how `bufferDeviceAddress` came to be advertised
+with three of its entry points refusing, and an application could call one and
+get a silent zero.
+
+`sv_icd_entry::INCOMPLETE_EXTENSIONS` is generated: an extension is in it when
+any command it introduces is refused. Not "all" — an extension is one promise,
+and half of it working is a driver that fails where the specification says it
+must not. `sv_icd::SharedVulkan::ask_device_extensions` subtracts it.
+
+Two details cost a build each and both are worth keeping. The table has to
+follow **aliases**: `VK_KHR_buffer_device_address` requires
+`vkGetBufferDeviceAddressKHR`, the generator refuses the core
+`vkGetBufferDeviceAddress`, and comparing names alone let the extension straight
+through — the exact bug the table exists to stop, one indirection down. And the
+GPU side's `PROFILE_DEVICE_EXTENSIONS` had to move from `Profile::extensions` to
+`ResolvedProfile::extensions`: under a rule the declared list is thirty names
+and the effective one is 360, so the first `vulkaninfo` through the widened
+forwarder advertised 25 extensions and looked like a failure of the whole
+section.
+
+**6. The proof, and the one thing it caught.** `vulkaninfo` through the
+forwarder against RADV, versus `vulkaninfo` against RADV directly, same machine,
+same `nix shell` for the tool:
+
+```
+RADV, directly            236 device extensions
+through the forwarder     218 device extensions
+advertised but absent       0
+```
+
+Zero over-advertisement is the half that matters — nothing is promised that the
+device does not have. The eighteen differences are exactly the two exclusion
+classes of §4 (11) and `INCOMPLETE_EXTENSIONS` (7: both buffer-device-address
+extensions, `VK_KHR_deferred_host_operations`, `VK_KHR_device_group`,
+`VK_KHR_pipeline_binary`, `VK_KHR_pipeline_executable_properties`,
+`VK_EXT_present_timing`).
+
+The device `apiVersion` read 1.3.0 when this was first measured and reads
+**1.4.0** now, which is §0.18's negotiation working on top of a profile that
+declares 1.4. Neither number was set here: §0.18 made the version
+`min(driver, wire)` over `svDriverVersions`, derived from
+`Profile::core_api_version`, and this section only moved what the profile
+declares. RADV's own is 1.4.348, so the driver is not the binding term — the
+wire is, and it is 1.4.0 because that is the highest core feature the profile
+lists.
+
+**The run caught one regression, and the ordering of two statements was the
+whole of it.** `VK_KHR_swapchain` is in `INCOMPLETE_EXTENSIONS` —
+`vkAcquireNextImage2KHR` and the three device-group present queries have always
+been stubs — so adding it to the list before filtering removed presentation from
+the advertised set. 218 became 217 and the missing one was the extension every
+windowed application requires. The filter answers "did the *generator* keep the
+promise"; the `VK_KHR_swapchain` line answers "did `crate::wsi`", and those are
+different questions about different code. Nothing but the diff would have found
+it: the count moved by one.
+
+**7. `full` is now the default, and that was a decision with a measurement
+behind it.** A capability behind an environment variable is a capability nobody
+gets, so leaving `SV_PROTO_PROFILE` unset had to mean the wide profile.
+`sv_codegen::DEFAULT_PROFILE` is the single place it is stated; the three build
+scripts read it instead of each repeating a literal. What made the switch safe:
+
+| | `zink` | `full` (default) |
+|---|---|---|
+| commands forwarded | 253 | **509** |
+| device extensions advertised, of RADV's 236 | 25 | **218** |
+| advertised but absent from the device | 0 | **0** |
+| `cargo test --workspace --no-fail-fast` | 1386, 0 failed | **2393, 0 failed** |
+| cold build, the two generated crates | 31 s | 50 s |
+
+`SV_PROTO_PROFILE=zink` gets the narrow protocol back with no code change. The
+two profiles now differ in extensions alone: **`zink` carries core 1.4 too**,
+because §0.18's blocker was one policy entry and §5.3 already contained its
+answer — see item 9.
+
+**7a. The remaining gap, as a list rather than a number.** 740 defined, 509
+carried, 231 not. Grouped by *why*, which is the form that says what work would
+close each:
+
+| commands | extensions | class |
+|---:|---:|---|
+| 67 | 32 | **platform-gated** — the registry's own `platform=`: Win32, Android, Fuchsia, Metal, GGP, QNX, VI, OHOS, screen, DirectFB, the X11/Wayland surface creators, and `provisional`. Out of scope for this build rather than missing from it. |
+| 53 | 6 | **union-of-handles** — a union with a handle in an arm whose live arm a sibling decides. `VK_KHR_acceleration_structure` (16) and `VK_EXT_opacity_micromap` (14) are the bulk. The same `noautovalidity` class `exceptions::SIBLING_SELECTED` closes one level in. |
+| 42 | 13 | **`void*` with no `len=` and no honest policy** — a vendor blob whose extent lives where the registry does not point. `VK_ARM_data_graph` (11) and `VK_ARM_shader_instrumentation` (7) lead. |
+| 23 | — | **unreachable by any profile** — Vulkan SC, or behind a `disabled` extension. |
+| 20 | 5 | **answered app-side by design** — `VK_KHR_swapchain` (9), `VK_KHR_surface` (5), `VK_EXT_debug_utils` (3), the two proc-address lookups. Implemented, never forwarded (§8, §10, §4.6). |
+| 17 | 2 | **capture-replay `void*`** — `VK_EXT_descriptor_buffer` (11) and `VK_KHR_ray_tracing_pipeline` (6). |
+| 9 | 3 | **function pointers** — `VK_EXT_debug_report`, `VK_EXT_device_memory_report`, and dependents. §1a: no encoding makes a pointer into the application's address space mean anything on the other side of a VM boundary. |
+
+**Two of those seven are the honest remainder**, and together they are 70
+commands: the union-of-handles class and the capture-replay class. Neither is a
+scope decision and each is one generator change. The other five are the design
+refusing on purpose, and closing them would mean breaking a stated invariant.
+
+**8. `vkMapMemory2` was the same bug this section is about, introduced by the
+commit that removed the others.** Core 1.4 arrived as fourteen generated commands
+and thirteen were right. `ppData` carries `VoidPolicy::NotSerialisable`, which
+drops a parameter from the wire — correct for `vkMapMemory`, whose stub is
+written by hand and never forwards — so the *generated* `vkMapMemory2` would have
+encoded the info struct, sent it, decoded an empty reply and returned
+`VK_SUCCESS` **without writing `*ppData`**. Silent, undetectable, and exactly the
+class item 1 counts six of.
+
+A void policy states what a member *means*; only `HAND_WRITTEN` states which side
+answers. Both it and `vkUnmapMemory2` are hand-written now and delegate to the
+same `IcdLocal::map_memory` as the 1.0 pair — `VkMemoryMapInfo` is
+`{flags, memory, offset, size}`, so the body is the delegation it looks like.
+`VK_EXT_map_memory_placed` is excluded from every profile, so
+`VK_MEMORY_MAP_PLACED_BIT_EXT` cannot appear.
+
+**9. `hostImageCopy` is withdrawn as a feature, not as an extension, and that
+distinction is new.** `INCOMPLETE_EXTENSIONS` can decline
+`VK_EXT_host_image_copy`. It cannot decline core 1.4's `hostImageCopy`, which is
+the same capability reached through `VkPhysicalDeviceVulkan14Features` with no
+extension string to withdraw. So `sv_icd::advertise::withdraw_gated_features`
+walks the `vkGetPhysicalDeviceFeatures2` reply's chain and clears the bit
+wherever it appears — core 1.4's struct, the promoted extension's, and the
+`…EXT` alias's — because an application may ask through any of the three and must
+not get two answers.
+
+The wire is right: `pHostPointer` is `ArenaOffset`, which is what §5.3 says a
+host pointer *is* here. What is not written is the case where the application's
+pointer is not arena memory — `vkCopyMemoryToImage` accepts a plain `malloc`
+buffer, and honouring that needs a bounce whose extent must be computed from
+`imageExtent`, `imageSubresource`, `memoryRowLength` and the format. Carry
+everything, advertise what works: the three commands stay on the wire and in the
+proc tables, and a conforming application that respects the feature bit never
+calls them.
+
+**10. A third instrument lied, and this one looked exactly like a protocol
+bug.** The first full-profile workspace run failed two generated round trips —
+`VkDependencyInfo` and `vkCmdWaitEvents2` — with a `pNext` chain nested inside a
+`pNext` link coming back empty. Read as data loss in barrier submission that
+would have been the most serious finding in this section.
+
+It is not a bug. In C a `pNext` chain is a *linked list*, and `lower_pnext` walks
+it iteratively and flattens it into one `Vec<PNextLink>`; `size_pnext`,
+`encode_pnext` and `decode_pnext` all use each link's `_self` form, which
+excludes its own `p_next`. All three agree with each other, which is what would
+matter. A `PNextLink` with a non-empty `p_next` is a value **the C boundary
+cannot produce**, and the sampler in `sv_codegen::emit::tests` was producing one
+and then asserting the codec preserved it. Clearing it there makes the round trip
+assert the contract the boundary actually has.
+
+Recorded rather than fixed, because it is waste and not error: each link's
+`lower_vk_*` calls `lower_pnext` on its own `pNext` as well, so lowering a chain
+of *n* links walks *n* tails and discards all but the outermost. Bounded by
+`MAX_PNEXT_LINKS` and invisible in behaviour; the fix is a `lower_*_self` for the
+walker's arms.
+
+**11. One instrument was added and it was wrong the first time.**
+`sv-codegen --audit` asks, per extension, whether the generator can carry it —
+resolve, plan the wire, plan the C ABI — and prints a verdict a line each, so
+the profile can be edited from facts rather than by bisecting a build failure.
+Its first run reported 287 carryable and **139 not**, and 118 of those 139 were
+an artefact of the instrument: it tests one extension at a time against the base
+profile, so every extension whose `depends=` names another extension fails for a
+reason that evaporates once both are in. The control was resolving the whole
+candidate set at once, which is what §3 does. Five instruments in this project
+have now produced a wrong number before a control caught them; this is the
+sixth, and the pattern is the same one §0.13 named — an instrument that does not
+hold the venue fixed answers a different question from the one asked.
+
+---
+
+### 0.18 The API version, negotiated instead of asserted
+
+Built and measured 2026-08-13 on **devhost**. The requirement, in the user's
+words:
+
+> previously i once saw that shared vulkan impl a smaller subset than the iGPU —
+> iirc one was vulkan 4, the other was vulkan 5. we want to support the full
+> feature set. yes there are gpus that do not support the newer version; what we
+> do is we advertise and forward what the gpu supports. so graceful fallback
+
+The observation is correct and the diagnosis is exact. `sv-icd` advertised
+
+```rust
+pub const API_VERSION: u32 = (1 << 22) | (3 << 12);   // 1.3.0, hard-coded
+```
+
+while every device on this machine reports 1.4 — RADV RAPHAEL_MENDOCINO
+**1.4.348**, the RTX 5090 **1.4.329**, and the testhost guest's Intel UHD
+**1.4.323** (`docs/video-decode.md`). One number was a constant and the other was
+the truth, and they were never compared.
+
+**But the fix is not "report 1.4".** §7's `clamp_api_version` already records, in
+detail, what happened the last time this ICD claimed a version it did not
+implement: Zink reads `screen->vk_version` from
+`VkPhysicalDeviceProperties::apiVersion`, and at 1.4 it stops chaining
+`VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT` into
+`vkGetPhysicalDeviceFeatures2` and reads the promoted feature out of
+`VkPhysicalDeviceVulkan14Features` instead — a struct this wire does not carry,
+which therefore came back false, which cost `GL_ARB_instanced_arrays` and two GL
+versions. Over-promising is not the safe direction; it is the direction that
+already cost something measurable.
+
+So the defect is not the number 1.3. It is that **1.3 was a constant**: it could
+not rise when the wire rose, it could not fall when the driver was older, and
+when it disagreed with the device nothing said so. Three separate wrongs, and
+this section fixes all three.
+
+#### 1. The ceiling is derived, not declared
+
+`vk_registry::profile::Profile::core_api_version` reads the highest
+`VK_VERSION_1_x` out of the profile's own feature list; the generator hands it to
+`sv-proto` as `SV_PROTOCOL_CORE_VERSION`, and `sv_icd::state::PROTOCOL_API_VERSION`
+*is* `sv_proto::CORE_API_VERSION`. The ICD can no longer advertise a version its
+own command table does not back, because there is nowhere left to write a
+different number. `sv-gpu-server`'s `Driver::open` takes the same constant as its
+instance cap, so the two sides rise together in one edit.
+
+#### 2. The driver's real version crosses, over `svDriverVersions`
+
+A new hand-written protocol command (`sv_proto::sv`, opcode `PROTOCOL_BASE + 2`),
+asked once on the instance ring inside `SharedVulkan::connected`, answered by the
+GPU side from `driver.instance_api_version` and `driver.props.api_version`,
+**unclamped**. Clamping there would make the negotiation a tautology: the app
+side would learn its own ceiling back and could never notice that the driver is
+richer than the wire.
+
+The cold-path handshake was tried first and does not work, for two ordering
+reasons that are worth recording because both look like they should be fine:
+
+- On the cross-VM path the guest sends its `Hello` **before it opens the
+  driver**, deliberately — "bound before the driver is opened so that a host
+  waiting on the port sees it come up promptly". There is no `apiVersion` yet.
+- On the `sv-hostd` path the process that sends the `Attachment` is not the one
+  holding the driver. In `Mode::Local` the GPU side is one of the daemon's
+  *clients*.
+
+A ring command has neither problem: by the time any ring is served, the GPU side
+has a `Driver`. It is the pattern `ask_device_extensions` already uses, and for
+the same reason — the answer belongs to whoever holds the driver.
+
+#### 3. `min(driver, ceiling)`, and it says which one it took
+
+`sv_icd::state::negotiate` is a pure function of two numbers with four outcomes,
+and `announce` prints the reason on the loader's diagnostic channel — **on the
+line that always prints, not behind `SV_DEBUG`**. A demotion nobody can see is
+how this defect survived long enough to cost two GL versions.
+
+| driver reports | advertised | outcome | measured |
+| --- | --- | --- | --- |
+| nothing (no GPU side, or no answer) | ceiling | `Unknown` | standalone driver |
+| below the ceiling | **the driver's number** | `Fallback` | 1.1.0, below |
+| equal on major.minor | the driver's, patch kept | `Exact` | — |
+| above the ceiling | ceiling | `Clamped` | 1.4.348 → 1.3.0 |
+
+Two details that are decisions rather than arithmetic. The comparison **ignores
+the patch**: 1.3.290 against a 1.3.0 ceiling is the same *contract*, and treating
+it as "newer than we can carry" would print a demotion notice on every ordinary
+run and mean nothing by it. And the `Exact` case keeps the **driver's** patch
+digits, because `vulkaninfo` prints them and the acceptance test is that the
+forwarded report and the direct one are the same text.
+
+The instance number is additionally bounded by the device's. §8 gives this ICD
+exactly one physical device, so an application told "instance 1.3" and then
+handed a 1.1 device learns nothing from the first number that the second does not
+contradict — and the GPU side's instance number is its *loader's*, which on this
+machine is 1.4.350 whichever driver is selected. Taking the smaller is what stops
+the loader's version from becoming our answer.
+
+#### 4. The manifest: what the loader actually does with it
+
+**This is the part that cannot be negotiated**, and the constraint had to be
+established rather than guessed. The manifest is a file on disk; the loader
+parses it before a line of this crate runs.
+
+Read out of `Vulkan-Loader`'s `loader/loader.c` (main; this tree links
+vulkan-loader 1.4.350.0): the manifest's `api_version` is stored verbatim as
+`scanned_icd->api_version` in `loader_scanned_icd_add` and is **never** refreshed
+from a runtime query on the manifest path. Only the
+`VkDirectDriverLoadingLUNARG` path — which has no manifest — takes its number
+from `vkEnumerateInstanceVersion` at scan time. It is then read in exactly three
+places, all in `terminator_CreateInstance`:
+
+1. `if (icd_term->scanned_icd->api_version >= VK_API_VERSION_1_1)` — the gate on
+   whether the loader asks us for `vkEnumerateInstanceVersion` **at all**. Below
+   1.1 our runtime answer is never read and we are a 1.0 driver forever.
+2. the same test again, for whether `khr_get_physical_device_properties2` is
+   marked enabled on this ICD.
+3. a `== 1.0` test, on `LOADER_ENABLE_LINUX_SORT` builds, that force-enables
+   `VK_KHR_get_physical_device_properties2`.
+
+**Nothing compares the manifest number with the application's requested version,
+and nothing clamps `VkApplicationInfo::apiVersion` down to it.** The only rewrite
+of the application's requested version is guarded by
+`icd_version_nopatch == api_version_1_0`, where `icd_version` is what *our*
+`vkEnumerateInstanceVersion` returned. So:
+
+> **The manifest must state the ceiling — the highest version this build could
+> ever advertise — and the runtime number does the real work.** The manifest is a
+> floor-gate and an upper bound on nothing. There is no reading of the loader
+> under which it could carry a negotiated number anyway: one file serves every
+> GPU the machine has.
+
+And graceful fallback is safe under that rule, which is the thing worth checking
+rather than assuming. A driver that only does 1.1 gives a runtime answer of 1.1
+against this 1.3 manifest; the gate passes, no demotion fires (1.1 is not 1.0),
+and the application's requested version reaches us untouched. Per the loader's
+own policy **LDP_DRIVER_10**, at interface version ≥ 5 a driver must *not* return
+`VK_ERROR_INCOMPATIBLE_DRIVER` for a version it does not support — "This check is
+performed by the loader on the drivers behalf" — so the 1.1 device reports 1.1
+and the application decides. We negotiate 7 and degrade to 5 (§8), so this is our
+case.
+
+The one coupling that survives is `build.rs`'s `MANIFEST_API_VERSION` string
+against `PROTOCOL_API_VERSION`, and `the_manifest_agrees_with_what_we_report`
+fails the build's tests if they part company. A build script cannot read the
+library's constants — it runs first, and a build-dependency on `sv-proto` would
+compile the ~100,000 generated lines a second time for the host — so the check is
+a test rather than an impossibility.
+
+#### 5. Measured, both directions
+
+`vulkaninfo --summary` against the real driver, and through the forwarder on the
+same machine, same driver:
+
+| shell | driver | direct | forwarded | sv-icd said |
+| --- | --- | --- | --- | --- |
+| `nix develop` | RADV RAPHAEL_MENDOCINO | **1.4.348** | **1.3.0** | `Clamped` |
+| clean `nix shell` | NVIDIA RTX 5090, 595.71.05 | **1.4.329** | **1.3.0** | `Clamped` |
+| `nix develop` | RADV, `SV_DRIVER_VERSION_MAX=1.1` | — | **1.1.0** | `Fallback` |
+
+The NVIDIA row is from a clean `nix shell nixpkgs#vulkan-tools` with
+`LD_LIBRARY_PATH` pointing at a store `vulkan-loader`, never the dev shell, per
+`hardware-constraints.md`; the 5090 enumerates there and the GPU side served
+rings on it.
+
+The third row is the graceful-fallback path, and it needed a knob because **no
+GPU on this machine is older than the ceiling** — every ICD here reports 1.4.
+`SV_DRIVER_VERSION_MAX` on the *GPU side* lowers what `svDriverVersions` reports;
+it **can only lower**, and a value above the driver's own is ignored rather than
+honoured, because the one thing it must never become is a way to make the app
+side advertise a version nothing implements. With it, `vulkaninfo` through the
+forwarder reports `apiVersion = 1.1.0` — the whole driver, instance and device,
+one consistent claim — which is exactly what the requirement asks for and what a
+unit test alone could not have shown.
+
+Making that row come out right forced one further correction: `clamp_api_version`
+now bounds the forwarded `apiVersion` by the **negotiated** device version rather
+than by the bare ceiling. The two are identical on every ordinary run. Where they
+part is where it matters — the first measurement of the fallback path produced an
+ICD whose `vkEnumerateInstanceVersion` said 1.1 and whose physical device said
+1.3, a driver contradicting itself one call apart.
+
+#### 6. The honest statement: what "1.4" actually costs, and who has paid it
+
+Advertising 1.4 while the wire cannot carry a 1.4 command is the same defect
+wearing the other hat, so the number belongs next to the claim. `sv-codegen gap`
+on this branch: **740 commands in the registry, 239 carried by the zink
+profile**, 501 not (23 of those unreachable by any profile).
+
+Resolving zink with `VK_VERSION_1_4` added, against vulkan-headers 1.4.350.0:
+
+- **239 → 253 commands (+14)**: `vkCmdBindDescriptorSets2`, `vkCmdPushConstants2`,
+  `vkCmdPushDescriptorSet`, `vkCmdPushDescriptorSet2`,
+  `vkCmdPushDescriptorSetWithTemplate`, `vkCmdPushDescriptorSetWithTemplate2`,
+  `vkCmdSetRenderingAttachmentLocations`,
+  `vkCmdSetRenderingInputAttachmentIndices`, `vkCopyImageToImage`,
+  `vkCopyImageToMemory`, `vkCopyMemoryToImage`, `vkMapMemory2`,
+  `vkTransitionImageLayout`, `vkUnmapMemory2`.
+- **618 → 662 types (+44)**, including `VkPhysicalDeviceVulkan14Features` and
+  `VkPhysicalDeviceVulkan14Properties` — the two the Zink regression above turned
+  on — plus the host-image-copy family, the maintenance-6 and push-descriptor
+  structs, and eight promoted `…Features` blocks.
+- Nothing is removed: the 1.4 `<remove>` block takes nothing this profile has.
+
+**And it does not merely resolve — it refuses.** Adding `VK_VERSION_1_4` to zink
+here does not produce a bigger protocol; it produces a generator error:
+
+```
+Error: planning profile "zink"
+  VkImageToMemoryCopy.pHostPointer: a `void*` with no `len=` and no policy
+  entry. design.md §7.4 requires every one of these to be a data entry in
+  crates/sv-codegen/src/exceptions.rs; add one, with the reason.
+```
+
+That is §7.4 working, and it is the real gate on 1.4 — not the count.
+
+**`full-api` (b516f1c) has paid it, and this section's numbers are superseded by
+its.** That branch carries **509 of 740** commands in a new `full` profile,
+core 1.4 complete, and it adds exactly the policy the refusal above asks for — a
+name-based `("pHostPointer", VoidPolicy::ArenaOffset)` whose comment names core
+1.4's host image copy as the case it exists for. So the honest updated answer is
+not "fourteen commands away" but:
+
+> **The ceiling moves for free the moment `full` is the profile.** Nothing in
+> this section changes. `Profile::core_api_version` returns 1.4.0 for a
+> `features` list containing `VK_VERSION_1_4`, `DEP_SV_PROTO_CORE_VERSION`
+> carries it into the manifest and `sv_proto::CORE_API_VERSION` into
+> `vkEnumerateInstanceVersion`, in one build, and `negotiate` then stops clamping
+> RADV's 1.4.348 and NVIDIA's 1.4.329. That is the whole reason the ceiling was
+> derived from the profile rather than written down.
+
+Verified, rather than asserted: `SV_PROTO_PROFILE=step3-minimal` — the §13 step 3
+profile, whose only core feature is `VK_VERSION_1_0` — writes
+`"api_version": "1.0.0"` into the manifest with no other edit. The chain tracks
+the profile downward, so it tracks it upward. (It also demonstrates why
+`the_manifest_agrees_with_what_we_report` asserts `minor >= 1`: that profile
+would ship an ICD the loader silently demotes, and the assertion is the thing
+that says so.)
+
+Two things that will *not* follow automatically, and belong to whoever lands
+`full` rather than here. `full-api` deliberately leaves `zink()` at 1.0–1.3 and
+puts 1.4 in a separate profile, so the **default** build still advertises 1.3
+until `SV_PROTO_PROFILE`'s default changes — a decision about what ships, not
+about what is possible. And `vkMapMemory2`/`vkUnmapMemory2` still have to be
+reconciled with §5's arena, which owns `vkMapMemory` locally and would have to
+own its successors too; `full-api` says the same about `hostImageCopy`, which it
+gates in `sv_icd::advertise` because the bounce copy is not written.
+
+Until then 1.3 is not a limitation being hidden; it is the number, and the ICD
+now says so out loud on every run against a 1.4 device.
+
+#### 7. The other direction, and where the two meet
+
+**Out of scope and named as such.** The ICD also *over*-promises: features are
+mirrored wholesale from the driver, so `bufferDeviceAddress` is advertised while
+`vkGetBufferDeviceAddress` and two friends sit in `NOT_IMPLEMENTED`. That is the
+same "advertise a constant, not the truth" shape and it is a live bug. Nothing in
+this section touches the feature-mirroring path — no edit to
+`get_physical_device_features`/`…2` or to `convert.rs`'s `features()`.
+
+The two directions are the same defect and they meet in one place.
+`full-api` filters the advertised device-extension list against
+`sv_icd_entry::INCOMPLETE_EXTENSIONS`, which is "stop advertising what we do not
+implement"; this section is "stop under-advertising what we do". Its finding
+sharpens the point: six commands were *silent* rather than absent —
+`vkGetDeviceQueue2` among them, core 1.1 with no extension to decline, returning
+without writing `*pQueue`, and three of the six were buffer-device-address
+queries returning address zero while the feature was advertised. A version number
+that is too low and a feature list that is too high are the same failure to
+compare a claim against an implementation, and the fix in both directions is the
+same: derive the claim, do not declare it.
+
+#### 8. One deployment consequence, stated loudly
+
+**`WIRE_VERSION` went 1 → 2.** `svDriverVersions` is hand-written in
+`sv_proto::sv`, so it is outside the generated table `protocol_hash` is computed
+over and the hash cannot see it; the coarse counter in front of it is exactly
+what §4.3 keeps that check for. A GPU side built before this commit is refused at
+handshake, correctly.
+
+That matters because on the cross-VM topology the GPU side is a binary *copied*
+into the guest, so rebuilding on the host changes only the host's half. This
+project has twice read a stale deployed binary as a transport fault. So the
+refusal now names the cause and the fix in `RingTransport::finish_attach`
+— beside the `ProtocolHashMismatch` message that already did — and the four
+harnesses that deploy into a guest (`sv-windows-e2e.sh`, `sv-guest-e2e.sh`,
+`sv-guest-host.sh`, `sv-firefox-guest.sh`) say it in their headers. Rebuild and
+re-deploy **both** sides from one tree.
+### 0.20 The wedge rate, re-measured; and the one pass that was written once
+
+Measured 2026-08-13/14 on **devhost** in `nix develop`, RADV
+RAPHAEL_MENDOCINO, CTS 1.4.6.1, `scripts/sv-cts.sh`. §0.16 ended with two
+admissions: five device losses remained undiagnosed, and *"the rate itself has
+not been re-measured on a fresh CTS sample — the paired 12 → 5 is on the
+known-wedging set, which is not a random sample of anything"*. This section is
+that measurement, and what it turned up.
+
+**The headline, on a sample chosen before anything was fixed.** A fresh
+1-in-19997 selection — 164 tests, disjoint from §0.15's 1-in-20000 except by
+coincidence.
+
+> **The `before` column of this table has been withdrawn** (2026-08-14). It read
+> `36 Pass / 7 DeviceLost / 4 ring fatals`, and it was taken in a worktree whose
+> `target/debug/sv_icd.json` had been **reflinked from the base checkout** and
+> still named base's `libsv_icd.so`. The loader therefore loaded a library that
+> was not this worktree's, and the driver was byte-identical between that run and
+> the "after" one — so **no `sv-icd` change was in effect across the gain the
+> table attributed to one**. `scripts/sv-worktree.sh` now deletes the copied
+> manifest rather than inheriting it. The lesson is §0.15 item 4's, one layer
+> along: a measurement's provenance is part of the measurement, and a path that
+> resolves is not the same as a path that resolves *here*.
+>
+> What is *not* withdrawn is the per-test paired work below, which rebuilt
+> between arms in one tree, and item 1's causal control, which was re-taken from
+> scratch and is what the section now rests on.
+
+Re-taken 2026-08-14 on master, on a quiet machine (load average 12), same 164
+tests, same harness:
+
+| | control | forwarded |
+|---|---|---|
+| Pass | **93** | **68** |
+| NotSupported | 71 | 90 |
+| Fail | 0 | 1 |
+| DeviceLost | **0** | 5 |
+| ring fatals | — | **0** |
+| hard GPU recoveries | **0** | **0** |
+| lost against the control | — | 25 (26.9%) |
+
+**The control is identical to the withdrawn run — 93/71/0 — which is what says
+the sample and the harness are stable and the app-side column was the unreliable
+one.** Three of the six defects are `with_push_template` / `push.template`: the
+`VK_KHR_push_descriptor` gap item 4 documents, which `full` reintroduced by
+carrying the extension without the app-side expansion. That is the mechanical
+widening item 4 warned about, measured.
+
+**The claim this section originally made — "`sv-cts: PASS`, zero device losses on
+164, §0.15's 7% is now 0.24%" — is narrowed by the withdrawal.** What survives
+is item 5's wider run, which was taken in a worktree whose manifest was checked
+and whose numbers were paired against a control in the same tree: **820 tests,
+two device losses, and no hard GPU recovery at all**, against §0.15's 313
+`amdgpu` ring timeouts in ten minutes the last time a run that size was
+attempted. That is the honest form of the headline, and it does not depend on
+any before/after pair.
+
+The re-taken 164-case column above shows five device losses rather than zero,
+and the difference is not a regression in the forwarder: `full` became the
+default profile between the two, carrying `VK_KHR_push_descriptor` — whose
+app-side expansion does not exist — so three of the six defects are that one
+gap. **A profile widened mechanically re-opens a defect an earlier section
+closed by scope**, which item 4 predicted in as many words.
+
+**Two of the seven were §0.16's `bufferDeviceAddress`, and three were one bug.**
+
+---
+
+**1. `vkBindImageMemory` never had the app-side half of pass 6, and neither did
+five other commands.** design.md §5.3 splits the `(memory, offset)` rewrite in
+two: the app side turns *allocation* coordinates into *arena* coordinates, and
+the GPU side turns arena coordinates into a `VkDeviceMemory` plus an offset. §7.2
+lists the pass as GPU-side, which is half true, and the app-side half existed as
+**one hand-written line inside `vkBindBufferMemory`**.
+
+So every other command that carries a memory id across sent the app-side id raw:
+`vkBindImageMemory`, `vkBindBufferMemory2`, `vkBindImageMemory2`,
+`vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges` and
+`vkQueueBindSparse`. The GPU side's `resolve_memory` looked the id up, did not
+find it, and the ring went fatal with `no VkDeviceMemory with id 8` — which is
+**§0.15 item 8's first unexplained ring fatal, arrived at from the other end**.
+That item guessed at a missing `RingBarrier`; it was not an ordering fault at
+all.
+
+  **Why it did not break everything.** An image bound to *device-local* memory
+  crosses fine, because heap 0 is a real GPU-side allocation under the
+  application's own id — §9.1's two heaps are what made the bug intermittent.
+  Only a buffer or image bound to **host-visible arena memory** hits it, which is
+  a readback target, a staging image, a query result buffer, a linear
+  multi-planar image. That is why the wedging set spanned fifteen unrelated
+  groups with no feature in common (§0.16's opening observation).
+
+  **How many wedges this actually accounts for: three, not five.** The first
+  version of this paragraph named five — `ycbcr`, `query_pool.statistics_query`,
+  `renderpasses.multisample_resolve`, `glsl.operator.mul` and
+  `memory_model.message_passing` — inferred from two batch runs whose app-side
+  column has since been withdrawn above. It is now a **single-variable control**,
+  run 2026-08-14 on master in one worktree, minutes apart, with the library
+  relinked between arms and nothing else changed: arm A as master stands, arm B
+  with the `IcdLocal::rewrite_memory` override removed and the old hand-written
+  rewrite restored inside `vkBindBufferMemory` — which is exactly the state
+  before this fix, one command translated by hand and the other six not.
+
+  | test | rewrite on | rewrite off |
+  |---|---|---|
+  | `ycbcr.copy…linear_optimal` | Pass | **DeviceLost** |
+  | `memory_model.message_passing…` | Pass | **DeviceLost** |
+  | `query_pool.statistics_query…` | Pass | **DeviceLost** |
+  | `glsl.operator…mul.mediump_uvec3_vertex` | Pass | Pass |
+  | `renderpasses…multisample_resolve…` | Pass | Pass |
+  | `binding_model.buffer_device_address…` | Pass | Pass |
+  | `ssbo.phys…mediump_ivec4` | Pass | Pass |
+
+  All three that flip fail at **`vkBindImageMemory`** with `no VkDeviceMemory
+  with id N` on the GPU side — ids 8, 14 and 35 — which is the mechanism this
+  item describes, arrived at causally rather than by subtraction. The other two
+  pass in both arms: **whatever fixed `glsl.operator.mul` and
+  `renderpasses.multisample_resolve`, it was not this**, and on the withdrawn
+  evidence there is no honest way to say what did. They may never have been
+  genuine wedges — §0.15 item 3 is explicit that `DeviceLost` is contagious and
+  that a test can be collateral twice in a row.
+
+  Two claims survive intact and one does not. The mechanism is confirmed; the
+  count was inflated by a third.
+
+  The fix is `IcdLocal::rewrite_memory` plus a generated pass in
+  `sv_icd_entry::forward`, reusing `passes::transform_walk_pub` and
+  `exceptions::memory_offset_sibling` — **the same fold the GPU side already
+  ran**, applied one boundary earlier, so the two cannot disagree about what a
+  pair is. It is emitted into `forward::*` rather than into the C stub, and the
+  seam matters: a stub rewrite would reach `vkAllocateMemory`, `vkMapMemory` and
+  `vkFreeMemory`, which are answered out of the app-side allocator and never
+  cross, and would hand those overrides arena coordinates in place of the ids
+  their own tables are keyed by. `forward::*` is exactly "about to become bytes
+  on a ring", so the sentence *every memory id that crosses is rewritten* is
+  stated where it is true.
+
+  An id the allocator never handed out is now `WireError::NoSuchMemory` **before
+  the packet leaves**, and the difference is the whole point: caught here it
+  costs the application one failed call, missed it costs a ring fatal on the far
+  side and `VK_ERROR_DEVICE_LOST` out of an unrelated `vkWaitForFences` several
+  calls later. `every_forwarded_memory_pair_is_rewritten` asserts the bind
+  commands together, precisely because their being different was the bug.
+
+**2. `bufferDeviceAddress` is implemented, not retracted.** §0.16 item 3 found
+the feature advertised and all three query commands sitting in
+`NOT_IMPLEMENTED`, and recorded that clamping the feature to false had been
+tried, measured, and reverted — *"converting a goal into a skip is not a fix"*.
+Four things were needed and all four are §0.3 item 5's own prescription:
+
+- `plan.rs` generates a reply **whenever a command returns anything at all**,
+  which is the one-line correction §0.3 named and never made;
+- the reply carries a `ret: u64`, sized, encoded and decoded like any other
+  field;
+- the GPU side fills it from the driver's return value;
+- the ICD's stub reads it back out *before* the writeback consumes the reply and
+  casts it to whatever the C header spells the return type.
+
+  **And a fifth thing nobody had named, which is where the work actually was.**
+  `VUID-VkBufferDeviceAddressInfo-buffer-02601` requires the buffer's *memory* to
+  have been allocated with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. **The arena
+  is one allocation made at startup, before any application exists to ask**, so
+  either every arena-backed buffer can have its address taken or none can, and
+  the decision has to be taken in `sv_gpu_server::arena` or not at all. Without
+  it the three commands are implemented, legal, and useless. It is conditional on
+  the driver reporting the feature, because setting the bit without it is invalid
+  usage and the allocation fails outright.
+
+  `NOT_IMPLEMENTED` went from twelve entries to nine.
+  `dEQP-VK.binding_model.buffer_device_address.*` and `dEQP-VK.ssbo.phys.*` went
+  from `DeviceLost` to `Pass`, one test per process. §11's caveat is what holds
+  it together and is now load-bearing rather than hypothetical: *we return the
+  GPU side's true device address and never relocate*, so R3 is intact — a device
+  address is not a host pointer, it is a number the **GPU's** page tables
+  interpret, and nothing on the app side dereferences it.
+
+  The test that was supposed to guard §9.2's claim was called
+  `we_do_not_advertise_buffer_device_address` and **asserted about
+  `VkPhysicalDeviceFeatures`, where the feature does not live**. It is renamed to
+  what it checks. The feature is mirrored from the physical device through
+  `vkGetPhysicalDeviceFeatures2`, so `vulkaninfo` printed it true throughout; the
+  guard could never have fired.
+
+  **"Do we support buffer device address" has two answers, and which one you get
+  depends on the profile.** Asked as *the core 1.2 feature* —
+  `bufferDeviceAddress` in `VkPhysicalDeviceVulkan12Features`, used through
+  `vkGetBufferDeviceAddress` — the answer is **yes** under every profile, and
+  this section is what makes it true. Asked as *the extension*, in
+  `vkEnumerateDeviceExtensionProperties`:
+
+  - under **`full`**, which §0.19 made the default, `VK_KHR_buffer_device_address`
+    and `VK_EXT_buffer_device_address` are carried, so all three spellings —
+    `vkGetBufferDeviceAddress`, `…KHR` and `…EXT` — are in the proc tables and
+    all three are implemented, because an alias is one entry point under three
+    names. The two answers agree;
+  - under **`zink`**, neither extension is in the profile, so
+    `PROFILE_DEVICE_EXTENSIONS` does not carry them,
+    `driver::forwardable_device_extensions` intersects them away, and the ICD
+    never advertises them. The suffixed entry points are correspondingly absent
+    from the proc tables, which is not a hole: an application may only call
+    `vkGetBufferDeviceAddressKHR` after enabling an extension it cannot see. The
+    two answers differ, and they are consistent because the extension is
+    unreachable rather than because they agree.
+
+  **That paragraph was written the other way round two days ago and was already
+  wrong when `full` landed**, which is the same mistake as the one below it one
+  level up: a statement about a *particular profile* dressed as a statement about
+  the implementation. It is left visible rather than quietly corrected.
+
+  This is what §0.19's `no_extension_is_advertised_with_a_stubbed_entry_point`
+  caught, from the wrong end. That guard is right and its derivation resolves a
+  promoted extension through its alias to the core command — but it also **named
+  `VK_KHR_buffer_device_address` by hand** as the case that motivated it, and
+  when the three entry points here stopped being stubs the assertion was left
+  demanding that a fixed bug still be present. It failed on master for exactly
+  that reason. The fix is not an exclusion: the generator now emits
+  `INCOMPLETE_EXTENSION_REASONS`, pairing every excluded extension with the
+  refused entry point that excluded it, and the test asserts *that* pairing. It
+  is strictly stronger — it would have caught the original bug, it catches an
+  extension excluded for no reason, and it cannot expire when a stub becomes an
+  implementation. **A hand-named case inside a test about an invariant is a fact
+  with an expiry date**, and this one expired against a fix, which is the best
+  way for it to have happened and still a gate that went red for everyone.
+
+  Two agents reached that conclusion independently and reached for different
+  properties, so both are kept: `noop-audit`'s asks that every entry be a
+  **well-formed extension name**, which is the part no compiler checks —
+  `ask_device_extensions` subtracts by `binary_search`, so a malformed entry
+  subtracts *nothing, silently* — and this one asks that every entry **name a
+  stub that is genuinely in `NOT_IMPLEMENTED`**. They are not the same
+  assertion and neither implies the other.
+
+  **And the shape is now better evidence than any instance of it.** This is the
+  third time in one night that a check recorded a *fact* where it meant to state
+  a *property*: the size gate that could never pass, the arena's
+  one-connection sentence, and this. §0.16 item 1 is the same shape one layer
+  down — a catch-all arm whose comment asserted four things about a type, all
+  four true when written and none true when it fired. A recorded fact is
+  indistinguishable from a property on the day it is written and diverges
+  silently afterwards, and the tell is grammatical: a check that names a
+  specific command, extension or number in its assertion is describing the tree
+  it was written against, not the rule it believes in.
+
+**3. The profile was widened by what CTS asked for, and the cheap half of the
+gap is not commands.** `sv-codegen gap` reports the registry's side — 740
+commands defined, 239 carried — and check 4 reports the suite's side, in deqp's
+own words, restricted to tests the control passes. Nine extensions were added,
+each with the number of tests that asked for it beside it in `profiles::zink()`,
+and **between them they carry five new commands**. `VK_EXT_graphics_pipeline_-
+library` is seven tests and *no commands at all*; so are
+`VK_KHR_shader_subgroup_uniform_control_flow`, `VK_EXT_depth_range_-
+unrestricted`, `VK_KHR_fragment_shader_barycentric` and
+`VK_EXT_shader_image_atomic_int64`. "501 commands not carried" is a true number
+that badly misdescribes the work: much of the reachable gap is feature bits,
+`pNext` structures and enum values.
+
+  Adding an extension string is not sufficient. The GPU side opens its device
+  before any application connects, so a feature struct that is not chained into
+  `vkGetPhysicalDeviceFeatures2` comes back false and is *enabled* false — and
+  the application then finds the extension present and the feature off, which
+  fails at `vkCreateGraphicsPipelines` instead of at `vkCreateDevice`. Six of the
+  nine needed a `chain_if!`.
+
+  **Four extensions CTS asked for are deliberately still out**, and the reasons
+  are in the profile beside the names rather than here:
+  `VK_EXT_shader_object` (fourteen tests, the largest single line in the skip
+  list, and a second parallel model of the whole pipeline);
+  `VK_EXT_descriptor_buffer` and the ray-tracing pair (§9.2's exclusion — they
+  put raw device addresses in *application-visible* data, which is a different
+  thing from `vkGetBufferDeviceAddress` returning one); and
+  **`VK_KHR_external_semaphore_fd`, refused on principle — its entire purpose is
+  to move a file descriptor between processes, and §1a says none crosses.**
+
+**4. A `void*` policy is not an implementation, and the difference cost a
+segmentation fault.** `VK_KHR_push_descriptor` was added, measured, and taken
+back out — the one entry in that list that is a measurement rather than a
+judgement, and the most useful finding in it.
+
+  **It is excluded because it is unimplemented, not because it is unwanted**,
+  and the distinction is load-bearing: `VK_EXT_descriptor_buffer`, the
+  ray-tracing pair and `VK_KHR_external_semaphore_fd` are excluded on *policy*
+  and must stay out; this one is excluded on *state* and should come back in the
+  moment somebody writes the expansion below. Ten of the wider run's 198 skips
+  are waiting on it. A mechanical widening that restores it without the
+  expansion restores the segmentation fault with it.
+
+  `exceptions::void_policy` already declared
+  `VoidPolicy::ArenaOffset` for `vkCmdPushDescriptorSetWithTemplate`'s `pData`,
+  with a paragraph explaining why it is the hardest `void*` in the registry.
+  What it does not say is that **only `vkUpdateDescriptorSetWithTemplate` has the
+  app-side expansion that makes the policy true** (§0.4 item 10, rewritten into
+  `vkUpdateDescriptorSets`); the push variants have none, so the application's
+  own pointer was lowered as though it were an offset into our arena. Measured:
+  two `DeviceLost`, a ring fatal reading `no VkDescriptorUpdateTemplate with id
+  20`, and **a segmentation fault in `sv-gpu-server` itself** — the driver
+  walking a descriptor layout at an offset that never meant anything.
+
+  That is strictly worse than an unimplemented command, and the general form is
+  worth keeping: **a declared exception with no implementation behind it reads
+  like a solved problem in every file that mentions it.** The work is the mirror
+  of §0.4 item 10 and is named in the profile.
+
+**5. The wider sample, which is what turns "zero on 164" into a rate.** A
+1-in-4001 selection — **820 tests**, five times the table above and disjoint from
+it — on the same machine, same shell, same driver:
+
+| | control | forwarded |
+|---|---|---|
+| Pass | **444** | 242 |
+| NotSupported | 376 | 571 |
+| Fail | 0 | 3 |
+| DeviceLost | **0** | **2** |
+| Timeout | 0 | 2 |
+| ring fatals | — | 2 |
+| hard GPU recoveries | **0** | **0** |
+| total | 820 | 820 |
+| wall | 11 s | 533 s |
+
+**Two device losses in 820 forwarded tests — 0.24%.** §0.15 item 10's figure was
+"about 7% of forwarded tests hang the GPU", from twelve isolated losses in 164
+and an upper bound of 71/661 in the abandoned wider run. Both are gone. **And
+the number that mattered most is zero: no hard GPU recovery, against 313
+`amdgpu: ring gfx_0.0.0 timeout … device wedged` messages in ten minutes** the
+last time a run this size was attempted. That run was stopped because it was
+resetting somebody else's GPU every twenty seconds; this one finished.
+
+  Of the 202 tests the forwarder loses here, **198 are `NotSupported`** — the
+  profile declining something it does not carry — and **four are defects**: two
+  `DeviceLost`, two `Fail`. Two further `Timeout` are the hang class §0.15 item
+  5's watchdog exists to survive rather than to explain, and one of them,
+  `dEQP-VK.memory.device_group_allocation.*`, is a neighbour of the case that
+  section named.
+
+  `sv-cts` reports **FAIL** on this run, on the ring-fatal budget, and the budget
+  is not being raised. Two fatals is what the tree does; item 6 is what they are.
+
+**6. `no VkPipelineLayout with id 46` — §0.15 item 8's second shape, and the R22
+annotation on it is wrong.** Both ring fatals in the wider run have that shape,
+inside a command blob, and one is reproducible by name
+(`dEQP-VK.pipeline.fast_linked_library.multisample.misc.dynamic_rendering.*`).
+`SV_TRACE=1` puts the mechanism beyond argument — the last four things the GPU
+side does before the fatal are:
+
+```
+[trace] vkCreatePipelineLayout
+[trace] vkDestroyPipelineLayout
+[trace] vkCreatePipelineLayout
+[trace] vkDestroyPipelineLayout
+[gpu] ring 2 seqno 84 FATAL: in a command blob: no VkPipelineLayout with id 46
+```
+
+  **It is a lifetime bug, not an ordering one.** `VK_KHR_maintenance4` — core
+  1.3, which this ICD advertises — permits an application to destroy a pipeline
+  layout as soon as the command buffer that used it *leaves the recording state*;
+  it does not have to survive execution. Our architecture moves execution to
+  `vkQueueSubmit` (§6.5: the blob carries ids and they are resolved when the blob
+  is replayed), so an object whose lifetime the specification ends at end-of-
+  recording has to live, on our side, until end-of-*execution*. The destroy rides
+  the device ring, unbinds the id, and the queue ring then replays a blob naming
+  it.
+
+  So the message's own suggestion — *"if the app side created it on another ring,
+  the packet needed a `RingBarrier` (R22)"* — is a guess that has now been
+  falsified twice: §0.16 item 2 traced the `VkBuffer` shape to an out-of-bounds
+  read of the application's memory, item 1 above traced the `VkDeviceMemory`
+  shape to a missing pass, and this is the third and none of the three was a
+  barrier. A diagnostic that names one cause teaches everyone who reads it to
+  look in the wrong place.
+
+  **The fix is a mechanism this design already wants and has not built.** §5.5's
+  deferred free — *"defers this until the timelines an allocation could be
+  referenced by have passed"* — is recorded in `sv_icd::icd::free_memory` as
+  still immediate because "the timeline mirror is not wired to submissions yet".
+  This is the same gap met from the object table's side: a destroy must not
+  unbind an id while any published blob still names it, and the ring already
+  publishes the fact needed to decide, in the `completed_seqno` that
+  `transport::Blob::in_flight` compares against. Diagnosed, reproducible, and
+  deliberately not fixed here, because deferring destruction touches every
+  destroy command and wants its own measurement.
+
+**7. The one synthesised queue family is now the largest thing left that is not
+an extension**, and it is unchanged. Of the 198 skips in the wider run, **40 are
+it**: eighteen `No matching queue found:
+findQueueFamilyIndexWithCaps(requiredCaps=0x2; excludedCaps=0x1)`, fifteen
+`Exclusive compute queue not supported`, seven `Concurrent requires more than 1
+queue family`. Only `VK_EXT_shader_object` (67) is larger, and that is an
+extension somebody could add; this is not. §0.15 item 6 sized it at eleven of
+fifty-nine on a sample a fifth as large, and the share has grown as the
+extension gaps have closed.
+
+  Nothing here changed it, deliberately: the GPU side opens **one** device with
+  **one** queue on **one** family, `server::one_queue_family` reports that
+  family's real flags with `queueCount` forced to 1, and advertising a second
+  family without opening a second queue is exactly the failure §0.4 item 7
+  recorded — an application selects family 3 and gets family 0's queue in
+  silence. The change is a real one and its parts are known: a second queue at
+  driver open, a per-queue rather than per-device lock, and a family/queue
+  mapping in the object table.
+
+---
+
+**What is not settled.**
+
+- **0.24% is a rate on 820 tests, not a proof of anything about 3.28 million.**
+  Two losses is two; the interval around it is wide and one more sample could
+  put it at four. What is *not* fragile is the direction and the size of the
+  step — 7% to a fraction of one percent, with the control at zero in both runs
+  and the kernel silent in the second where it produced 313 ring resets in the
+  first.
+- **This is still a sample.** 164 and 820 tests of 3,279,369; the word
+  "conformant" applies to nothing in this section. What the instrument costs to
+  scale is wall time on a machine eleven other agents are using. The forwarded
+  wall time is 48× the control at this size and that figure is not a performance
+  measurement: it is a GPU-side restart per chunk, twenty-six isolations, and two
+  tests that had to time out.
+- **`sv-cts` ends FAIL on the wider run and that is the honest state**, on two
+  ring fatals of one diagnosed shape (item 6). The budget is
+  `SV_CTS_MAX_RING_FATALS=0` and it was not touched.
+- **The `NotSupported` half is honest and the `Fail` half is untested at scale.**
+  Every loss in the final column is the profile declining something. That is the
+  best shape this number can have — it means the remaining work is *scope*, which
+  is addable, rather than *correctness*, which has to be found — but it is only
+  established at this sample size.
+- **Nothing here ran on testhost, and nothing ran on NVIDIA.** Every number is
+  devhost, RADV, same machine, over a Unix socket, in `nix develop`. §0.15
+  said this and it is still true. The RTX 5090 does not enumerate in the dev
+  shell and the cause is still unknown, so a measurement taken there would be
+  taken where NVIDIA is absent.
+- **The wire moved.** The reply grew a `ret` field for three commands and the
+  profile grew seven, so the protocol hash changed twice on this branch. Both
+  sides are built together here; a GPU side built before this branch will not
+  understand one built on it, and the handshake is what says so.
+
+---
+
+### 0.20 Carried is not implemented: where every command's answer comes from
+
+Derived 2026-08-14 on **devhost**. §0.19 answered "what does an *uncarried*
+command do?" and found the honest answer — absent, which is what an
+implementation is supposed to do — plus six genuinely silent ones, which it
+fixed. This section asks the question one layer down, which §0.19 did not:
+
+> Of the commands that **are** carried and **do** have a working entry point,
+> which of them actually reach a driver?
+
+The user's objection is the reason both sections exist:
+
+> also if we onlt carry 239 that means the others are all noop, thats also a
+> nogo, those ALL need to be properly implemented
+
+"Carried" and "implemented" are different claims, and a command that forwards on
+paper while a hand-written override answers it from a table is exactly the noop
+being objected to — worse than an absent one, because an absent one is
+diagnosable and this one returns a plausible value.
+
+#### 1. Derived, not read
+
+`crates/sv-icd/tests/audit.rs` sorts the profile mechanically, and the whole
+method rests on one property of the generated `Icd` trait: **its default method,
+with no transport, returns `Err(NotImplemented(<its own command name>))`, and no
+hand-written body does that.** So calling every method on a driver with no GPU
+side separates "the generated default is in force" from "`sv-icd` overrode this"
+without reading a line of source.
+
+`sv_codegen::emit::icd_entry::emit_audit_probes` emits the call sites —
+`AUDIT_PROBES`, one closure per command, invoked with `Default::default()`
+arguments, which is safe by construction because a zeroed `Args` names object id
+0 (`VK_NULL_HANDLE`) and so cannot resolve to anything. A maintained list of
+names would have been the same mistake §0.18 removed from the API version.
+
+Two independent derivations agree on the answer: the probe, and a separate
+source reading of `impl Icd for SharedVulkan` done without sight of it. Both say
+**36**.
+
+#### 2. The result
+
+| | zink | full |
+|---|---|---|
+| commands with a generated `Icd` method | 229 | 494 |
+| **untouched generated default — forwards** | **193** | **458** |
+| overridden by `sv-icd` | 36 | 36 |
+
+**The local set does not grow with the profile.** Widening from 239 to 509
+carried commands added 270 that forward untouched and not one new hand-written
+answer — so the hand-written surface is a fixed 36, and §0.19's coverage work
+did not quietly enlarge the thing this section is auditing.
+
+**Nor does it grow when refusals are fixed**, which is the other half of the same
+observation and it was measured by accident. Between the first run of this audit
+and merging master, `cts-close` landed the three buffer-device-address entry
+points: `NOT_IMPLEMENTED` went 12 → 9, the zink figures went 224 → 229 and
+188 → 193, and the locally-answered 36 did not move at all. Three commands went
+from *refused* straight to *forwarding*, with no stop at "answered here". That is
+the shape a healthy fix has, and the audit test is what showed it — a
+classification-only check would have reported nothing.
+
+The 36, classified for the **connected** case, which is the one that matters:
+
+| classification | count | meaning |
+|---|---|---|
+| forwards when connected | 27 | the local arm exists only for the standalone driver of §13 step 5 |
+| legitimately client-side | 7 | a round trip would be **wrong**, not merely slow |
+| a correct cache | 1 | `vkGetBufferMemoryRequirements` |
+| **a canned value that should be a forward** | **1** | `vkQueueSubmit`'s `VkResult` |
+| **an outright stub** | **0** | — |
+
+The seven client-side are the arena and the tables this side owns:
+`vkAllocateMemory` and `vkFreeMemory` (§5.2 — arena memory is a sub-range of one
+imported `VkDeviceMemory`, and per-allocation round trips are the thing the arena
+exists to remove); `vkGetPhysicalDeviceMemoryProperties` and its `2` (§9.1 — the
+table describes *our* arena's heap and types, and forwarding it would describe
+memory the application cannot allocate from); and the three
+`vkGetPhysicalDeviceExternal*Properties`, whose all-zero answer is the
+specification's "not supported for this handle type" and is *true* here, because
+§1a says no handle crosses the boundary.
+
+#### 3. The one canned value, named
+
+**`vkQueueSubmit` sends its packet and synthesises its `VkResult`.** The work
+reaches the driver; what does not reach the application is the driver's opinion
+of it. Submission is fire-and-forget by design — §4.4 and D15 — so no reply is
+waited for, and `VK_SUCCESS` is returned unconditionally. A ring that goes fatal
+surfaces as `VK_ERROR_DEVICE_LOST` on the *next* call, not on this one.
+
+It is listed as `CannedShouldForward` rather than excused, because an application
+that checks `vkQueueSubmit`'s return learns nothing from it, and that is a real
+gap however good the reason. It is **not** fixed here: waiting for the reply
+would serialise submission against execution and undo the pipelining §6.5
+measured at 105 µs against 130 µs. The honest options are a deferred error
+channel or an explicit "submission errors surface at the next call" contract, and
+both are design decisions rather than a small forward.
+
+#### 4. Why there is no silent class left below this layer
+
+The layer under the `Icd` trait is the generated writeback, and that is where
+§0.19's six silent commands lived. They cannot recur, and the reason is
+structural rather than diligent: `emit_writeback` **returns an error** for an
+output it cannot store, `emit_command` turns that error into a `Refusal`, and a
+refused command gets a stub that fails by name plus an entry in
+`NOT_IMPLEMENTED`. There is no path from "the generator could not write this
+output back" to "return success anyway". A partial writeback is not something the
+generator can express.
+
+So the population of genuinely undiagnosable commands is **zero**, and the
+population of honestly-refused ones is the 9 in `NOT_IMPLEMENTED` —
+`vkGetDeviceQueue2`, the three debug-utils messenger commands, and five
+device-group / present-rectangle / `vkAcquireNextImage2KHR` queries. Their
+extensions are kept out of the advertised list by `INCOMPLETE_EXTENSIONS`, so a
+conforming application never reaches them.
+
+#### 5. The other end of the wire
+
+Named for completeness and checked, not audited to the same depth: the GPU side
+has the same shape and the same guarantee. `sv_gpu_server`'s generated `Forward`
+calls a driver entry point through a loaded function pointer, and a pointer the
+driver did not provide produces `note_missing` plus an error return — never a
+synthesised success. That is why every session logs, at startup, a line like
+`[gpu] the driver is missing 4 of the profile's entry points`. The four are
+`vkCreateInstance` and the three instance-level enumerations, which are the
+loader's to answer and not the driver's, so the count is expected rather than
+alarming — but it is printed, which is the property that matters.
+
+#### 6. What was fixed here, and what was deliberately not
+
+Two things, both small and both about the audit itself rather than about a
+forward:
+
+- **`icd.rs`'s "every one of them is marked `// NO GPU:` … deliberately easy to
+  grep for" was false.** One marker survived against roughly twenty-six sites, so
+  the grep returned 1/26 *and looked authoritative doing it* — worse than no
+  convention, because a reader who finds one hit concludes there is one gap. The
+  claim is replaced by a pointer to the derivation, which cannot rot.
+- **`sv_icd::state::unimplemented` was dead** and had been for long enough that
+  this audit found it while looking for the opposite thing. A helper whose name
+  announces a convention, with no callers, is evidence that refusals are marked
+  when they are not. Deleted rather than wired up.
+
+And one that was not this section's to find. **Master was red when this branch
+merged it**, and the cause is worth recording because it is this section's own
+subject arriving in the test written to prevent it.
+`no_extension_is_advertised_with_a_stubbed_entry_point` asserted, by name, that
+`VK_KHR_buffer_device_address` and `VK_EXT_buffer_device_address` are in
+`INCOMPLETE_EXTENSIONS` — and said so in its comment: *"named rather than
+derived, because this is the case that motivated the table"*. Then `cts-close`
+implemented those entry points, which is the outcome everyone wanted, the
+extensions correctly left the list, and the assertion failed for having recorded
+a fact where it meant to state a property. Two branches, each correct, colliding
+on a hard-coded name.
+
+The fix is the one this whole workstream keeps arriving at: assert the property,
+not the instance. What the table *contains* is derived by `emit_tables` from the
+registry and re-asserting a derivation against itself tests nothing; what is
+load-bearing and uncheckable by a compiler is that every entry is a well-formed
+extension name, because `ask_device_extensions` subtracts the list by
+`binary_search` and a malformed entry subtracts nothing **silently**. That is now
+what the test says.
+
+**Not fixed: nothing was converted from local to forwarding**, because the audit
+found nothing that should be. That is the result, not an omission — the one
+`CannedShouldForward` is `vkQueueSubmit` and its fix is a design decision about
+error reporting, not a missing `forward::` call. An audit that produced a list of
+easy fixes would have been a more satisfying deliverable and a less honest one.
+
+
+### 0.21 Where a decoded frame lives, and the arena's answer is "not here"
+
+Design, 2026-08-14. No code. §0.8 item 2 and §6 of `docs/video-decode.md` left
+one decision unmade — *whose memory holds the decoded picture* — and it is an
+arena question, so it is settled here before anything is built against a guess.
+
+**The answer is that the arena does not carry decoded frames**, and that is the
+finding rather than a caveat. The obvious move, given that the arena is how
+every other large thing crosses this boundary, is to put decoded pictures in it.
+That would be wrong on the fast path and it would be wrong expensively.
+
+#### 0.21.1 The topology fact that decides it
+
+Four processes, and where they run is the whole argument:
+
+```
+Linux host                                  Windows guest
+  Firefox                                     sv-gpu-server   ← decode happens here
+    └ ffmpeg vulkan ─┐                        wc-compositor   ← the window is here
+    └ WebRender/zink ┴→ sv-icd ══════════════▶ (one device, one queue)
+  wc-proxy ═══════════════════════════════════▶
+```
+
+Firefox is on the host, but **nothing Firefox does to a video frame executes on
+the host.** Its GL goes through zink to `sv-icd` and is executed by
+`sv-gpu-server`; its Vulkan Video decode would go the same way. The decoder and
+the consumer of the decoded picture — WebRender, sampling it as a texture while
+compositing the page — are the *same device*, on the guest side, and the window
+those pixels end up in is served by a compositor in that same guest.
+
+So the frame is produced and consumed on one side, and the application that
+orchestrates it is on the other. **A decoded frame that crosses the boundary
+crosses it twice and for nobody**: out to the host so Firefox can hold it, back
+to the guest so it can be drawn. At 1080p NV12 that is 3.1 MB a frame; at 60 fps
+it is 186 MB/s of arena bandwidth spent on pixels no host-side instruction ever
+reads.
+
+`docs/video-decode.md` §2 already measured the asymmetry on a real 1080p clip,
+and it is the whole argument in one number: 16,511 bytes of bitstream per frame
+against 3,110,400 bytes of NV12. **188×.** Sending the compressed thing up and
+keeping the decoded thing where it was made is not an optimisation; it is the
+difference of two orders of magnitude between what the boundary must carry and
+what it must not.
+
+That is the same rule §1a is an instance of, stated for pixels instead of
+descriptors: **the side that allocates is the side that can, and what crosses is
+a name.**
+
+#### 0.21.2 Decision 1 — the frame lives in the GPU side's own device memory
+
+A decoded picture is a `VkImage` the GPU side allocated, out of a private video
+session it owns entirely: the session, the DPB, the session parameters and the
+decode queue, exactly as §0.8 item 2 predicted. What crosses is:
+
+* **host → guest:** the compressed bitstream. Kilobytes, not megabytes, and it
+  is already the thing the app has in its hand.
+* **guest → host:** an **image id**. An integer, in precisely the sense
+  `Descriptor::ArenaSlice`'s `arena` is an integer (waycompose §17.2, "an arena
+  id names a region, not a client"), and for the identical reason — a descriptor
+  cannot cross, and an id needs nothing to.
+
+The app side never sees the DPB, never sees a decode queue family it has no
+ring for (§6's actual blocker: "no queue family with `VIDEO_DECODE`"), and never
+learns where the picture is. It names it in later commands and the GPU side
+resolves it.
+
+The id already has a type, and it is worth using rather than inventing a second:
+`sv_arena::handle::FrameHandle` — *"cannot represent a descriptor. Not 'does
+not'; **cannot**. Every field is an integer"*, with `Format` discriminants that
+are `wl_shm`'s own. It compiles, it is tested, and `one-binary.md` §"no frame has
+travelled by handle" is exact: **it has never had a caller.** A decoded picture
+is the second customer for it, after the swapchain frame that
+`firefox-accel.md`'s copy-removal names as the first, and both want the same
+thing — a picture on the GPU side, named by integers, drawn by a compositor in
+the same guest.
+
+**Not the arena, and the reason is stronger than "it would be wasteful".**
+
+Arena memory in practice holds `VkBuffer`s. Binding a `VkImage` to it does not
+work today and the fix is not local: the GPU side pushes
+`VkExternalMemoryBufferCreateInfo` onto **every** forwarded `vkCreateBuffer`,
+unconditionally, because a buffer that might later bind imported arena memory
+has to have been created external-capable. §4 already records that the identical
+argument applies to images via `VkExternalMemoryImageCreateInfo`, and that it
+*"does not fire only because §9.1 puts optimal-tiling images in memory type 0"* —
+which that section flags as a load-bearing consequence it does not itself state.
+So "put the decoded picture in the arena" is not a memory-type choice; it is a
+global change to every forwarded image in the project, made to serve the one
+workload that least needs it.
+
+And device address does not help either. The buffer-device-address work made
+arena memory *shader-addressable*, which is what a vertex buffer the host wrote
+needs. A decoded picture is written by the video engine and read by the 3D
+engine, both on the far side. §5's passthrough arena is for memory **both sides
+touch**; this is memory neither host processor touches.
+
+#### 0.21.3 Decision 2 — readback exists, is correct, and is never the default
+
+Firefox does sometimes want the actual pixels: `drawImage` of a `<video>` onto a
+canvas, `toDataURL`, `captureStream`, a screenshot, `about:support`. That path
+has to exist and be right, and §0.21.2 must not make it impossible.
+
+It is a **separate, explicitly-invoked operation**, not the output path:
+
+1. GPU side records `vkCmdCopyImageToBuffer` from the decoded image into a
+   `VkBuffer` bound to **arena** memory.
+2. The host reads it out of the arena with no further copy, because the arena is
+   already mapped on both sides. That is the arena doing the one job it is for.
+
+One copy, on the side that has the picture, into memory the host already maps.
+
+**Why it must be a separate operation rather than a mode.** If readback were the
+output path with a flag to skip it, the flag would be off in some configuration
+and every frame would cross — 186 MB/s to serve the one frame in ten thousand
+that a canvas actually asks for. Worse, the failure would be invisible: the
+video would play, correctly, at a cost nobody attributed to it. Making the
+crossing a *different call* means it cannot be entered by omission, only by
+request, which is the same argument `ProvidedRegion::file` is under (§5.1: a
+caller has to ask for it by name).
+
+Latency is not the constraint here and should not be optimised for. A canvas
+readback is a synchronous stall by construction in every browser on every
+platform; correctness and never-by-accident are what this path owes.
+
+**The one size check, done rather than assumed.** A single arena allocation is
+capped at one slab, which is 64 MiB — the number §0.6 records being raised from
+4 after a 1080p BGRA swapchain image (8.29 MB) failed `vkCreateSwapchainKHR`
+with `VK_ERROR_OUT_OF_DEVICE_MEMORY`. A readback buffer is **one frame**: 3.1 MB
+at 1080p NV12, 12.4 MB at 4K. Both fit with room to spare. It is worth stating
+because the *DPB* would not — sixteen 4K slots is 199 MB — and the reason it
+never arises is precisely §0.21.2: the DPB is the GPU side's own memory and
+never touches the arena. A design that put the DPB in the arena would have hit
+this ceiling and it would have looked like a video bug.
+
+#### 0.21.4 Decision 3 — protected content is out of scope, and that shapes the code
+
+DRM and protected playback are out of scope, repeatedly and deliberately. The
+non-obvious consequence is about *structure* rather than about features:
+
+**§0.21.3's readback must not be written as "copy out unless the content is
+protected".** That shape is the first half of a DRM implementation — it
+introduces the notion of a frame whose pixels the owner may not have, and every
+subsequent decision inherits it. There is no protected path, so there is no
+predicate; readback is always allowed, because everything this will ever decode
+is content the user already has.
+
+Concretely, nothing on the way to it: no `VK_MEMORY_PROPERTY_PROTECTED_BIT`, no
+`protectedNoFault`, no protected queue submission, no `VkVideoSessionCreateFlags`
+protected bits. If a future stage wants them it can have the argument then, on
+purpose, rather than inheriting a half-built mechanism nobody decided to build.
+
+#### 0.21.5 What still blocks it, and it is not on our side
+
+Everything above is implementable against the wire as it stands — §6 measured
+the thirteen video commands crossing and the H.264 capability block coming back
+byte-identical. **Firefox cannot use it, and the gap is in Firefox.**
+
+`FFmpegVulkanVideoDecoder` has two output paths and both end in
+`vkGetMemoryFdKHR`; `direct-export` chooses between zero copies and one copy,
+not between GPU and host memory. Everything below `GetVideoFrameSurface` is
+typed on `AVDRMFrameDescriptor`. So neither existing branch can be redirected at
+an image id, and §5 of `docs/video-decode.md` is right that this needs a *third*
+output path.
+
+What that path has to be, stated so the ask is concrete rather than a wish: a
+frame handed onward as a **`VkImage` in the same device**, sampled directly by
+the compositor, with no export and no `sync_fd` — synchronisation by a Vulkan
+semaphore that never leaves the device. That is strictly less machinery than
+either path Firefox has now. It is also, notably, the right thing for a native
+Linux Vulkan-Video Firefox regardless of this project: exporting to dma-buf and
+re-importing to sample on the *same* device is work that a same-device path
+would not do either.
+
+Until that exists, hardware video decode over a forwarded device is blocked in
+the browser and not in the transport, and the honest statement is that this
+section specifies a destination rather than reporting an arrival.
+
+#### 0.21.6 A live hazard: `full` already advertises what it cannot serve
+
+Found while inventorying for this section, and it is not a design question — it
+is true of the shipped default today.
+
+The default profile became `full` (`sv_codegen::DEFAULT_PROFILE`). `full` is
+`zink` plus the portable extensions minus an exclusion list, and **no video
+extension is on that list**. So a forwarded device now advertises
+`VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_decode_h264`,
+`_h265`, `_av1`, `_vp9` and the encode family — whatever the GPU-side driver
+really has, intersected in `driver.rs`'s `forwardable_device_extensions` and
+passed through `state.rs`'s `INCOMPLETE_EXTENSIONS` filter, which no video
+extension is on either.
+
+The chain, with its citations, so it can be checked rather than believed:
+
+| step | where |
+|---|---|
+| the default profile is `full` | `sv_codegen::DEFAULT_PROFILE`, `crates/sv-codegen/src/lib.rs:368` |
+| `full` excludes five extensions and no video one | `Profile::full` → `excluded_extensions()`, `crates/vk-registry/src/profile.rs:832,850` |
+| every video command is forwarded, so no video extension is *incomplete* | `docs/video-decode.md` §6: "the thirteen new commands … all of them forwarded by the generator with no hand-written line on either side"; the filter is `crates/sv-icd/src/state.rs:440` |
+| the device type an application sees is the **real GPU's**, forwarded | `crates/sv-icd/src/icd.rs:1358`, `crates/sv-gpu-server/src/convert.rs:49`. `advertise.rs:143`'s `VK_PHYSICAL_DEVICE_TYPE_OTHER` is only the pre-connection fallback |
+| but there is one queue family and it has no `VIDEO_DECODE` | `advertise.rs` (§0.4 item 7), `driver.rs` |
+
+The last row is where it breaks, and §6 of `docs/video-decode.md` has already
+measured the exact message: `no queue family with VIDEO_DECODE`.
+
+The device-type row is worth its line because it *removes* the escape. §0.8 item
+7 noted Firefox accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, which reads as
+though selection depended on our claiming something unusual. It does not: the
+type is forwarded from the guest's real GPU, so a guest with an Intel iGPU
+presents as `INTEGRATED_GPU` and there is no device-type check anywhere that
+Firefox could fail.
+
+**Those two facts together are exactly the trap §0.8 item 7 documented.**
+Firefox 153 selects a device on `VK_KHR_video_queue` + `VK_KHR_video_decode_queue`
+alone — it accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU` — and its first-frame
+failures are `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which `MediaFormatReader`'s
+hardware-to-software recovery **does not** admit. So a user who turns
+`media.hardware-video-decoding-vulkan.enabled` on against a forwarded device
+does not get software decode. Playback breaks.
+
+That was a documented future risk when the profile was `zink` and the extensions
+were not advertised. It became live when the default changed, and the two facts
+are in different files with nothing connecting them.
+
+**This is a different defect from a stale comment, and the difference is worth
+naming, because the tree has been finding both all week and only one of them has
+a fix.** A stale comment is a sentence that stopped being true because somebody
+edited the code beside it and not the prose — `arena_mib`'s "growth is armed and
+inert" outliving the branch that closed it, in the very file that set the number.
+The cure is proximity: put the reasoning where the value is decided, and a test
+that fails when they disagree.
+
+This is the other kind. **Nobody edited anything, and no sentence was ever
+wrong.** §0.8 item 7 was accurate the day it was written and is accurate now:
+*"Firefox 153 would select a forwarded device — it accepts
+`VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, and it requires only `VK_KHR_video_queue`
+and `VK_KHR_video_decode_queue` to do so."* It was a statement about what would
+happen **if** we advertised those extensions. Somebody then changed the default
+profile, for good reasons that had nothing to do with video, and the `if`
+quietly became true. The condition and its consequence were correct, in separate
+files, and the thing that changed was neither of them.
+
+Proximity cannot fix this one: the two facts have no natural place to sit
+together, because "which extensions does `full` advertise" and "what does
+Firefox do when it sees them" are genuinely different subjects. What would have
+caught it is an assertion rather than a sentence — *this profile does not
+advertise an extension whose queue family we do not serve* — which is a test the
+codegen could run and does not. That is worth building, and it belongs with
+whoever owns `advertise.rs` rather than here.
+
+The general shape, so it can be looked for elsewhere: **a documented conditional
+risk whose condition is a decision made in another file by another person for
+another reason.** Every "this is safe as long as X" in this document is one of
+these waiting to happen, and the ones that matter are those where X is somebody
+else's default.
+
+There is a second, quieter one underneath it: the generated GPU-side handler for
+`vkCmdDecodeVideoKHR` calls `note_missing(...)` and returns `Ok(())` when the
+driver has no such entry point — a **silent no-op**, R8's shape again, on a
+command whose whole output is a side effect nobody would check.
+
+**This section does not fix either**, because both fixes are decisions with
+costs and this is a design note. It records them so that the choice is made
+deliberately:
+
+* advertise the video extensions only when a decode queue can actually be
+  served, i.e. gate them on the private session existing — the honest option,
+  and the one consistent with §9.2's "advertise what the driver reports" being
+  about *numbers* rather than about capabilities we cannot reach; or
+* keep advertising and accept that one pref away from the default is broken
+  playback rather than a slow one.
+
+The first is right. It is written here rather than done here because it belongs
+with the private session, and doing it separately would leave a gate with
+nothing behind it.
+
+#### 0.21.8 Is it reachable without patching Firefox? No — and the smallest patch is one symbol
+
+The question that decides whether "Firefox must use GPU accel for video decoding"
+is a transport job or a browser-integration job. Read from Firefox and ffmpeg
+source on 2026-08-14, not inferred.
+
+**The verdict is no**, and the reason is narrower and more fixable than §0.8 item
+7 suggested.
+
+`FFmpegVulkanVideoDecoder`'s two output paths both end in `vkGetMemoryFdKHR`;
+that was already established (§5b of `docs/video-decode.md`). What is new here is
+the *third* possibility everyone assumes exists — reading the decoded frame back
+into ordinary shared memory and letting it take Firefox's software surface — and
+whether it is reachable:
+
+* **ffmpeg can do it.** `hwcontext_vulkan.c:4994` implements
+  `vulkan_transfer_data_from`; a Vulkan hardware frame can be transferred to a
+  software `AVFrame` by `av_hwframe_transfer_data`. This is upstream, shipped,
+  and not specific to anything here.
+* **Firefox never calls it.** `av_hwframe_transfer_data` appears **zero** times
+  in `FFmpegVideoDecoder.cpp`, `FFmpegVulkanVideoDecoder.cpp` and
+  `FFmpegLibWrapper.h`.
+* **Firefox does not even load the symbol.** `FFmpegLibWrapper.h:197–212` loads
+  `av_hwframe_ctx_alloc`, `av_hwframe_ctx_init`, `av_hwframe_map`,
+  `av_hwdevice_get_hwframe_constraints`, `av_hwframe_constraints_free` and
+  `av_hwframe_transfer_get_formats` — the call that asks *which formats a
+  transfer would support* — but **not the call that performs one**.
+
+That last line is the finding. The readback capability is present in the library
+Firefox already has open, and Firefox loads the function that describes it and
+not the function that does it.
+
+**There are three independent locks, and each is sufficient on its own.** The
+missing symbol is only the second:
+
+1. Both Vulkan output paths converge on an `AVDRMFrameDescriptor` at
+   `FFmpegVideoDecoder.cpp:2344`, and everything below `GetVideoFrameSurface` is
+   dma-buf typed.
+2. `av_hwframe_transfer_data` is not in `FFmpegLibWrapper` at all — and
+   `GetVideoBuffer` refuses hardware frames outright, in as many words
+   (`FFmpegVideoDecoder.cpp:1260–1265`): *"Pre-allocation is only for sw
+   decoding … it would cause a need to read CPU data from GPU, which is slow."*
+   There is no readback-to-host-memory code anywhere to reach.
+3. The IPC type that would have to carry a foreign frame,
+   `RemoteDecoderVideoSubDescriptor` (`gfx/layers/ipc/LayersSurfaces.ipdlh:152`),
+   has **no member capable of naming one on Linux** — its only non-null Linux
+   arm is `SurfaceDescriptorDMABuf`, which is file handles. Decode runs in the
+   RDD process, so every frame crosses this union.
+
+**The smallest patch, then, is a third branch rather than a redirection of
+either existing one:** in `FFmpegVideoDecoder<LIBAV_VER>::CreateImageVulkan`
+(`FFmpegVideoDecoder.cpp:2218`), taken *before* the `directExport`/copy split at
+`:2296`, producing a `PlanarYCbCrImage` through `VideoData::CreateAndCopyData`
+(`:2084`) — the call software decode already falls back to, three hundred lines
+above in the same file.
+
+It is smallest because it is the only candidate that touches neither
+`FFmpegVideoFramePool`, nor `DMABufSurface`, nor
+`RemoteDecoderVideoSubDescriptor`, nor WebRender. It also clears lock 3 for
+free: the RDD boundary's shmem fallback (`dom/media/ipc/RemoteVideoDecoder.cpp:286–307`)
+hard-requires `AsPlanarYCbCrImage()`, and a `PlanarYCbCrImage` is exactly what
+it wants.
+
+**And on our side it needs `vkCmdCopyImageToBuffer` rather than
+`av_hwframe_transfer_data`** — which is a correction to the obvious reading of
+the missing symbol. Adding the ffmpeg call would work, and would allocate its
+own destination buffer; §0.21.3's readback wants the destination to be **arena**
+memory, so that the host reads the frame out of a mapping it already holds
+instead of out of a buffer ffmpeg chose. Recording the copy ourselves is both
+fewer moving parts and the only version that keeps the one copy landing
+somewhere the host does not have to copy it again.
+
+So the readback path, designed in §0.21.3 as the *canvas* path, turns out to be
+the path that makes decode work at all — but it is reached by a branch we write,
+not by a symbol Firefox forgot to load.
+
+#### 0.21.9 Two tiers, and only one of them is small
+
+| | what Firefox needs | what we need | frame crosses? |
+|---|---|---|---|
+| **Tier 1** — it works | one new branch in `CreateImageVulkan`, reusing `CreateAndCopyData` | §0.21.3's readback into arena memory | **every frame** |
+| **Tier 2** — it is fast | a new `Image` subclass, a new `RemoteDecoderVideoSubDescriptor` member, a new `RenderTextureHost` | private video session, §0.21.2's image id | never |
+
+Tier 2's row is the one to read twice. §0.21.5 describes it as "strictly less
+machinery than either path Firefox has now", which is true of the *Vulkan* work
+— no export, no `sync_fd` — and false of the *Firefox* work, and the second is
+what decides the effort. It also fails `RemoteVideoDecoder.cpp:288`'s
+`AsPlanarYCbCrImage()` check, so it cannot borrow the shmem fallback the way
+tier 1 does. The nearest existing analogue to §0.21.2's image id is
+`SurfaceDescriptorRemoteTexture { RemoteTextureId; RemoteTextureOwnerId }`
+(`LayersSurfaces.ipdlh:220`) — two integers naming a texture the receiver does
+not own, which is exactly the right shape — but it is in the top-level
+`SurfaceDescriptor` union and **not** in the video one, and its `RemoteTextureMap`
+resolves inside Firefox's own compositor rather than to a foreign GPU server. So
+it is a precedent for the shape, not a seam to reuse.
+
+Tier 1 is small enough to be worth proposing upstream on its own merits: a
+Vulkan decoder that cannot export should degrade rather than fail, and today it
+fails fatally. That is arguably a bug in Firefox independent of this project —
+any Vulkan device without `VK_EXT_external_memory_dma_buf` hits it.
+
+The fatality is worth stating exactly, because it is finer than §0.8 item 7 put
+it and the conclusion survives the refinement. **Init-time failures do fall
+back**: `InitHWDecoderIfAllowed` (`FFmpegVideoDecoder.cpp:999`) tests only
+`NS_SUCCEEDED` and discards the code, so a `FATAL_ERR` from `InitVulkanDecoder`
+merely moves on to VA-API and then software. And *some* first-frame failures are
+`NS_ERROR_DOM_MEDIA_DECODE_ERR`, which does recover — there is even a Linux
+"decode error, disable HW acceleration" path at `MediaFormatReader.cpp:2645`, and
+a speed-triggered `HW decoding is slow, switching back to SW decode` at
+`FFmpegVideoDecoder.cpp:1657`.
+
+But **the two failures a forwarded device actually hits are the fatal ones**:
+`"Failed to create NV12 image"` (`FFmpegVulkanVideoDecoder.cpp:933`, creating an
+image with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` on a device that never
+enabled the extension) and `"Failed to export NV12 FD"` (`:1040`,
+`vkGetMemoryFdKHR`). Both are `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which
+`MediaFormatReader.h:574` classifies as fatal, so the recovery guarded at
+`MediaFormatReader.cpp:2611` never runs. The slowness fallback cannot save it
+either — it fires on being slow, not on failing to export.
+
+One thing that makes §0.21.6's hazard less bad than it reads, and it should be
+recorded rather than left for someone to discover with relief:
+`media.hardware-video-decoding-vulkan.enabled` defaults to **false**
+(`StaticPrefList.yaml:13061`, `mirror: once`). So the broken-playback path needs
+a user to turn a pref on *and* restart. It is a trap rather than a live
+regression — which is why it belongs on a list rather than in a hotfix, and why
+it should still be closed before someone finds it.
+
+Tier 2 is §0.21.5's third output path and is not small.
+
+**The honest caveat on tier 1, and it is the one that needs a guest.** Tier 1
+decodes on the guest GPU and then copies every decoded frame across the
+boundary — 3.1 MB a frame at 1080p, 186 MB/s at 60 fps. Whether that beats
+plain software decode *on the host*, where no frame crosses at all, is not
+obvious and cannot be settled by reading: it is guest decode plus a copy against
+host CPU decode plus nothing. It is entirely possible that tier 1 is slower than
+doing nothing, in which case the only version of this feature worth having is
+tier 2.
+
+So the answer to "transport job or Firefox-integration job" is: **Firefox
+integration, at both tiers**, with our side ready for tier 1 as specified and
+tier 2 blocked behind the private session. And the first thing to measure, when
+there is a guest, is whether tier 1 is worth building at all.
+
+#### 0.21.10 What would demonstrate it
+
+Nothing here has run. The measurement that would settle it needs a guest, and a
+format the host iGPU can decode:
+
+1. A decode whose output never appears in the arena's byte counters — the
+   negative measurement is the point, and `Arena::peak` already reports what
+   would show a violation.
+2. The same clip with a canvas `drawImage` per frame, showing the readback path
+   working and showing it costing what a copy costs, so the two are visibly
+   different paths and not one path with a flag.
+3. `about:support` reporting hardware decode against the forwarded device.
+
+Item 3 cannot pass until §0.21.5's Firefox gap is closed, and items 1 and 2 are
+what this project can demonstrate on its own once the private session is built.
+
+### 0.23 Two clocks for one id: the blob lifetime bug, and why the fix is not local
+
+Diagnosis, 2026-08-14, on §0.22 item 6's reproducible fatal. One thing fixed —
+the diagnostic — and the mechanism specified rather than built, for a reason
+given at the end.
+
+#### 0.23.1 Two clocks
+
+`no VkPipelineLayout with id 46` is a disagreement between two definitions of
+when an id stops meaning something.
+
+* **Vulkan's clock.** `VK_KHR_maintenance4` — core 1.3, which this ICD
+  advertises — ends a pipeline layout's required lifetime when the command
+  buffer that used it **leaves the recording state**. It need not survive
+  execution. An application that destroys it after `vkEndCommandBuffer` and
+  before `vkQueueSubmit` is correct, and CTS does exactly that.
+* **Our clock.** §6.5 puts ids in the blob and resolves them **when the blob is
+  replayed**. So an object whose life the specification ends at end-of-recording
+  has to live, on our side, until end-of-replay.
+
+Between those two instants the app side is entitled to send the destroy, the
+destroy unbinds the id, and a blob that already names it is then replayed
+against a table that no longer has it.
+
+This is the same class of defect as a free list that shortens under a live
+consumer, which is why it landed here: the arena's release path
+(waycompose §34) and this both come down to *who decides an id is dead, and who
+is still holding one*.
+
+#### 0.23.2 What it is not, and the diagnostic that said otherwise
+
+The message said *"if the app side created it on another ring, the packet needed
+a `RingBarrier` (R22)"*. That is a guess, and it has now been falsified three
+times out of three: §0.16 item 2's `VkBuffer` shape was an out-of-bounds read of
+the application's own memory; §0.22 item 1's `VkDeviceMemory` shape was a
+missing pass; this one is a lifetime bug. **None was a barrier.**
+
+That is worse than an unhelpful message. A diagnostic that names one cause sends
+every reader to the same wrong place, and three investigations have now started
+there. `TableError::Unknown` now states what is *observed* — never created,
+already destroyed, destroyed while a blob still named it, or a wrong id read out
+of application memory — and says to check the last create/destroy of the id
+before assuming a barrier. **This is the part of §0.23 that is fixed.**
+
+#### 0.23.3 Why a GPU-side deferral is not a local change (and §0.23.5 makes it unnecessary)
+
+§5.5 item 2 already specifies the mechanism — *"the GPU-side object table keeps
+a destroyed object alive until in-flight command buffers referencing it have
+retired"* — and budgets it as hand-written. The obvious implementation is to
+make `GpuHost::unbind` defer, and it does not work, for a reason worth writing
+down before somebody tries it:
+
+**the driver's object is already gone by the time `unbind` runs.** The generated
+destroy pass (`sv_codegen::emit::gpu_entry`) captures the ids into `__gone`,
+maps them to driver handles, **calls the driver's `vkDestroy*`**, and only then
+calls `unbind`. Retaining the table entry after that would resolve the id to a
+handle the driver has freed — trading a clean fatal for a use-after-free in the
+driver, which is strictly worse and would not be reproducible.
+
+So a real deferral has to prevent the *driver call*, which means the generated
+destroy has to ask before it destroys — a new `GpuHost` hook consulted between
+the handle map and the driver call, on **every** destroy command, not only the
+one that reproduces. That is the codegen change §0.22 item 6 was pointing at
+when it said this "touches every destroy command and wants its own measurement".
+
+#### 0.23.4 Settled by measurement: the blob is published *after* the destroy
+
+§0.23.3 left three candidates and a contradiction — blobs and destroys ride the
+same device ring, so they are ordered, so the bug should not exist. It
+reproduces. One instrument settled it.
+
+`SV_SEND_TRACE=1` (new, `sv_icd::transport::send_trace`) prints every packet the
+**app** side pushes, with its ring and seqno. The GPU side's `SV_TRACE` prints
+commands in *execution* order, which is the order it drains rings — so a destroy
+appearing before a blob there is equally consistent with "the app sent it first"
+and with "the app published the blob late", and those have different fixes. Send
+order is the fact only this side has.
+
+Reproducer: `dEQP-VK.pipeline.*.multisample.misc.dynamic_rendering.basic.*.2x`,
+48 cases, all three pipeline constructions. **144 fatals, ids 44 and 46.** The
+session whose device ring matches the fatal's seqno:
+
+```
+[icd] ring Device seqno 75 opcode 342 (28 bytes)     vkDestroyShaderModule
+[icd] ring Device seqno 76 opcode 318 (28 bytes)     vkDestroyDescriptorSetLayout
+[icd] ring Device seqno 77 opcode 334 (28 bytes)     vkDestroyPipelineLayout   ← 44 dies
+[icd] ring Device seqno 78 opcode 2147483648         svExecuteCommandBlob      ← names 44
+[gpu] ring 2 seqno 78 FATAL: … no VkPipelineLayout with id 44
+```
+
+**The transport is faithful and the ring is in order.** The app side really did
+send the destroy first, and the GPU side really did execute it first. So it is
+neither a barrier (R22) nor a race, and candidate 3 — a block grown under a
+concurrent reader — is excluded: nothing is torn, the bytes arrive intact, they
+arrive *late*.
+
+What it is, exactly: **`vkCmd*` are buffered into the blob and published on a
+schedule of their own, while `vkCreate*`/`vkDestroy*` are forwarded
+immediately.** Both go to the device ring, so each *class* is ordered with
+itself — but the program order *between* the two classes is not preserved. An
+application that records with a layout, ends the command buffer, and destroys
+the layout is emitting `[recorded…] [destroy]`, and the wire carries
+`[destroy] [recorded…]`. `VK_KHR_maintenance4` makes that application correct,
+which is why CTS does it and why it is not a CTS bug.
+
+That is candidate 1, generalised: not "secondary command buffers publish late"
+but "**recording publishes late, always, by design**" — the pipelining §6.5's
+`Blob::published` note argues for, which bought `frame-200` 105 µs against
+130 µs and quietly reordered two command classes against each other.
+
+#### 0.23.5 The fix is in `Transport`, not in the codegen
+
+This is the part worth having measured, because §0.23.3 concluded the opposite.
+
+A GPU-side deferral — a hook on every destroy command, the object table holding
+destroyed objects alive — is **not needed**. The ordering can be repaired on the
+side that broke it: **flush every open blob before forwarding a destroy.**
+
+```
+vkDestroyX  →  for each open blob: flush_blob(cb)   // publish what is recorded
+            →  push the destroy
+```
+
+Then the wire carries `[recorded…] [destroy]`, which is the application's own
+order, and the GPU side replays the blob into a real command buffer while the
+object is still alive — exactly what `VK_KHR_maintenance4` promises. No object
+outlives its specification lifetime on either side, and nothing generated
+changes.
+
+Three properties that make this the right shape rather than the expedient one:
+
+* **It is contained.** `Transport` alone; `flush_blob` already exists, is
+  already called from two places, and already "returns without a packet when
+  there is nothing new", so the idle case is a map lookup.
+* **It is not on the hot path.** The pipelining §6.5 wants is between `vkCmd*`
+  and `vkCmd*`, and that is untouched — a flush is forced only by a destroy,
+  which is not a per-draw operation.
+* **It fixes the class, not the case.** Every object nameable inside a blob has
+  this bug, not only `VkPipelineLayout`; §0.16 item 2 and §0.22 item 1 were
+  different causes with the same message, and this is the third and last of the
+  *ordering* family.
+
+The alternative — deferring destruction GPU-side — would additionally have had
+to stop the driver call (§0.23.3), which means every destroy in the project.
+Measuring first turned a codegen-wide change into a change in one function.
+
+#### 0.23.6 Measured: 144 → 0, and what that says about the order of work
+
+`sv_icd::transport::RingTransport::publish_recorded_first`, called from `call`
+and `send` and deliberately **not** from `record`. Same reproducer, same
+selection, same box:
+
+| | ring fatals | `no VkPipelineLayout` | of the control's passes, lost | verdict |
+|---|---|---|---|---|
+| before | 2 | **144** | 100.0% | `sv-cts: FAIL` |
+| after | **0** | **0** | **0.0%** | `sv-cts: PASS` |
+
+It is written as *program order between recorded and non-recorded commands*
+rather than as "flush before destroys", because a transport that knew which
+opcodes are destroys would be a transport with a reason to be regenerated (§6.5,
+`Transport`). Destroys are where it was found; `vkUpdateDescriptorSets` and
+every other unrecorded command had the same hole.
+
+**The order of work is the lesson, and it is worth stating plainly.** §0.23.3
+concluded that the fix was a GPU-side deferral — a hook on every destroy
+command, plus an object table holding destroyed objects alive — and that
+conclusion was *reasonable*: it follows from §5.5 item 2, which specifies
+exactly that, and from the observation that `unbind` runs after the driver call.
+It was also wrong, and nothing on paper was going to show it.
+
+The cheap fix was invisible until the expensive one had been disproved. What
+disproved it was one instrument — `SV_SEND_TRACE`, the app side's own send
+order — and the reason it was needed is general: **an instrument that can only
+see one side of a boundary cannot answer a question about ordering across it.**
+The GPU side's trace prints execution order, and execution order is equally
+consistent with "the app sent the destroy first" and "the app published the blob
+late". Those have different fixes, one of them project-wide.
+
+So: a change to every destroy command in the codebase became a change to one
+function, because the reproducer was run before the fix was written. That is the
+whole argument for measuring first, and this is the clearest instance of it in
+the project.
+
+#### 0.23.7 Two diagnostics that cost time, both now fixed
+
+**`GpuServer::note` fabricated its headline.** Every table failure returned
+`WireError::UnknownCommand { opcode: 0 }`, so the fatal read:
+
+```text
+in a command blob: unknown command opcode 0 (no VkPipelineLayout with id 44 …)
+```
+
+The opcode was fine and nothing was unknown; the truth was the parenthetical.
+Reading the headline first sends you looking for a decoder that has lost
+alignment — a plausible bug, in a different subsystem, and this investigation
+spent time there. It is `TableError::Unknown`'s `RingBarrier` guess one layer
+out, and the same rule: **an error must not assert something it does not know.**
+
+It is now `WireError::Table`, which says *"an object-table lookup failed"* and
+nothing more. It carries no detail because `WireError` is `Copy` and appears in
+the return of every generated read — the specifics are in `last_error`, which
+the ring already prints beside it. The headline is now true and the detail is
+unchanged.
+
+**`sv-cts.sh --fraction 1` selected zero tests.** The sampler was
+`awk 'NR % n == 1'`, and `NR % 1` is always 0, so the documented meaning — "run
+1 test in every N", i.e. all of them at N=1 — silently selected nothing and the
+run died with `the selection is empty`. It is now `(NR - 1) % n == 0`, which is
+identical for every N ≥ 2 and correct at 1.
+
+This is a gate that cannot fire, in the harness that produces this project's
+headline Vulkan numbers, and the documentation is what made it dangerous: a
+reader asking for the whole suite got an error about their *selection* rather
+than about the sampler. **No recorded result used it** — checked across `docs/`
+and `scripts/`, the only mentions are this section and an unrelated comment
+about 1-in-2000 — so nothing in the tree needs re-measuring.
+
+
+---
+
+### 0.21 The union that knew its own tag, and a barrier at the wrong pass
+
+Built 2026-08-14 on **devhost** in `nix develop`. §0.19's breakdown of the
+231 commands no profile carried named **53 of them "the union-of-handles class"**
+— the largest single block — and `profiles::full`'s own comment described the
+fix as *"four `SIBLING_SELECTED`-shaped entries taught to the union emitter"*.
+
+**No exception table was added.** The registry already states the whole rule, in
+two attributes this project has parsed since `vk-registry` was written and never
+read. `509 → 561` carried, `231 → 179` uncarried, and the four exception entries
+that were budgeted for do not exist.
+
+---
+
+**1. The barrier was at the wrong pass, and that is why it cost 52 commands.**
+`emit_handle_map_union` emitted a `compile_error!` reading *"a union containing
+handles reached the handle_map pass; the selector rules of design.md §7.4 must be
+applied before this can be generated"*. Every word of it is true about the
+project and none of it is true about that function.
+
+  The handle-map pass runs on a value that has **already crossed into the wire
+  representation**, where a union is a Rust `enum` — and `exceptions`' own header
+  says exactly what follows: *"A Rust `enum` is the tag, so an encoded union
+  always knows which member it holds and no default is ever guessed."* The walk
+  is a `match`. It needs no selector, no exception entry and no registry lookup;
+  it is fourteen lines and it was blocking `VK_KHR_acceleration_structure`,
+  `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap` together with
+  everything `depends=` drags behind them.
+
+  **The ambiguity is real, and it lives one boundary away** — in `sv-icd-entry`'s
+  C → wire lowering, where a C union genuinely has no tag. That code was reading
+  **member [0] unconditionally**, gfxstream's rule, with a comment justifying it:
+  *"every member of this union occupies the same storage and the encoding is
+  bit-preserving, so what the peer reconstructs is the bytes the application
+  wrote; what is lost is only the name."* True for `VkClearValue`. False the
+  moment an arm holds something the boundary must **translate** — an object id
+  the handle-map pass has to turn into a driver handle, or a `(memory, offset)`
+  pair the transform pass has to rebase. Reading the wrong arm then does not
+  mis-name bytes; it puts a number that was never a handle on the wire. That is
+  §0.16 item 2's hazard exactly, and it cost a GPU hang the first time it was met
+  one level in.
+
+  So a correct refusal was placed where there was nothing to refuse, and a silent
+  guess was left where the refusal belonged. **The barrier has moved**: the
+  handle-map and transform passes generate a `match`, and the *lowering* refuses
+  — by name, at generation time — any union it cannot select.
+
+**2. The registry states both halves, and nothing had read either.** `selector=`
+on the enclosing struct's member names the sibling holding the discriminator;
+`selection=` on each arm of the union names the values that choose it, comma-
+separated where an arm has several. Ten annotations in the whole of `vk.xml`,
+covering every union this class is about:
+
+```xml
+<member selector="geometryType">VkAccelerationStructureGeometryDataKHR geometry</member>
+…
+<member selection="VK_GEOMETRY_TYPE_INSTANCES_KHR">…InstancesDataKHR instances</member>
+```
+
+  `Member::selector` and `Member::selection` have been in the model all along.
+  §7.4 predicted this would need "a table of hardcoded discriminators" — Venus
+  carries `UNION_DEFAULT_TAGS` for it — and `exceptions`' header records the
+  conclusion that no such table was needed *because the enum is the tag*. That
+  conclusion was right about the wire and was quietly applied to the C ABI, where
+  it does not hold. **The correction is not a table either**; it is reading the
+  attribute. Ten unions rather than the four that were budgeted, and nothing to
+  keep in step by hand.
+
+**3. The discriminator is a parameter, so a caller that has not found it cannot
+compile.** The selector-driven lowering is emitted as
+
+```rust
+pub unsafe fn lower_vk_acceleration_structure_geometry_data_khr(
+    p: *const VkAccelerationStructureGeometryDataKHR,
+    __sel: i32,
+) -> crate::LowerResult<sv_proto::VkAccelerationStructureGeometryDataKHR>
+```
+
+  rather than as a function that reaches for the sibling itself. There is exactly
+  one place in the generator that holds both the union and the struct member that
+  decides it, and making the discriminator an argument means that place is the
+  only place a call can be emitted from. A union reached anywhere else — as a
+  bare array element, inside another union — hits `union_needs_selector` and
+  **fails the build with the type's name**, instead of taking member [0].
+
+  This is the property `noop-audit` established for writeback (`emit_writeback`
+  → `emit_command` → `Refusal` makes a silent partial writeback structurally
+  inexpressible) applied to the other direction: not "we remembered to check",
+  but "the wrong thing has no spelling". An unrecognised discriminator value at
+  run time refuses the call rather than falling back to an arm.
+
+**4. And behind the unions, a second gap that only a doubly indirect member could
+reach.** With the unions carried, `sv-gpu-entry` failed to compile on five sites
+of one shape: `let __v: *const T = raise_…()` against a function returning `T`.
+
+  `const VkAccelerationStructureGeometryKHR* const* ppGeometries` is
+  `Pointer(Pointer(T))`. `raise_expr`'s `Array` arm recursed into its element
+  with the **whole member's** C type, so the element's `Optional` arm peeled one
+  pointer level where two were needed. The `FixedArray` arm already had the fix
+  and a comment explaining it — `StdVideoH264ScalingLists`, `uint8_t
+  ScalingList4x4[6][16]`, "the first member in any profile that has two
+  [dimensions]" — written as a special case for two-dimensional *arrays* when it
+  is really the rule for **every level of indirection**. Nothing in any profile
+  was doubly indirect until the acceleration-structure family arrived, which is
+  how a pass that has marshalled half a million lines had never met it.
+
+  It is the same shape as §0.20 item 1's: a rule applied at the one site that
+  needed it, which then fails wherever the rule was needed *next*, with a symptom
+  that looks unrelated. Caught by the compiler here, and only because the
+  generated crate is Rust.
+
+**5. The extensions were carried and still not advertised, and the table from
+§0.20 is what said so.** Carrying 52 commands changed nothing an application
+could see, because `VK_KHR_acceleration_structure` was still in
+`INCOMPLETE_EXTENSIONS` — and `INCOMPLETE_EXTENSION_REASONS` named the entry
+point holding it there: `vkGetDeviceAccelerationStructureCompatibilityKHR`. Its
+`VkAccelerationStructureVersionInfoKHR` has `pVersionData` with
+`altlen="2*VK_UUID_SIZE"`, which `parse_len_expr` recorded as `Unresolved`, so
+the struct's *lowering* was refused, so the command was, so the extension was.
+`VK_EXT_opacity_micromap` was blocked by the identical shape through
+`vkGetDeviceMicromapCompatibilityEXT`.
+
+  `2*VK_UUID_SIZE` is **arithmetic over the registry's own constants with no
+  run-time input**, and `abi.rs`'s own comment had already listed it as one of
+  the four `altlen=` expressions in Vulkan while parsing only the other three.
+  `ArrayLen::Constant` evaluates it at generation time. One arithmetic case, two
+  extensions, and 23 refused entry points down to 21.
+
+  The general shape is worth more than the fix: **an extension is only as
+  advertised as its least-implemented entry point**, so a class of work can be
+  99% done and deliver nothing. Without the reasons table this would have looked
+  like the union work having no effect.
+
+**6. What it is worth, measured — 34 tests that could not run at all before.**
+`dEQP-VK.ray_query.*` at 1-in-400, 97 tests, on **devhost** in `nix develop`
+against RADV RAPHAEL_MENDOCINO:
+
+| | control | forwarded |
+|---|---|---|
+| Pass | 59 | **34** |
+| NotSupported | 38 | 59 |
+| DeviceLost | 0 | 4 |
+| ring fatals | — | **0** |
+| hard GPU recoveries | 0 | **0** |
+
+  Before this section every one of these was `NotSupported`, because the
+  extension was not advertised. **Thirty-four of them now build an acceleration
+  structure and trace rays through the forwarder** — 52 commands, four
+  selector-driven unions and a doubly indirect `ppGeometries` between the
+  application and the driver — with no ring fatal and no GPU reset.
+
+  Twenty-one of the remaining skips are `VK_KHR_ray_tracing_pipeline is not
+  supported`, which is the capture-replay class (§0.19) and untouched here; the
+  rest are `sparse_binding_structures`. **Four device losses are real and
+  undiagnosed**, and they are the honest cost of the section: a path that could
+  not execute at all now executes and is wrong four times in ninety-seven.
+
+  **Measured at load average 259**, on a machine an image-processing job was
+  saturating, which is the wrong conditions for a device-loss count and the right
+  conditions for nothing. The passes and the zero ring fatals are robust to that;
+  the four are an upper bound and want re-taking on a quiet machine.
+
+---
+
+**What is not settled.**
+
+- **Carried is not exercised.** These 52 commands now have a wire encoding, a
+  lowering, a handle map and a forwarder, and `sv-codegen`'s generated round-trip
+  tests cover the marshalling — but **no acceleration structure has been built
+  through this forwarder**. CTS's `ray_query` and `acceleration_structures`
+  groups are what would say, and they need `VK_KHR_ray_tracing_pipeline`, which
+  is still out on the capture-replay class (§0.19). The honest claim is *the
+  protocol carries them*, not *they work*.
+- **`VkDeviceOrHostAddressConstKHR` is a union this section did not have to
+  solve, and that is luck rather than design.** It has no `selector=`, and its
+  two arms are a `VkDeviceAddress` and a host pointer — so member [0] is taken,
+  which is right only because the acceleration-structure API is used with device
+  addresses and the host-address arm is a build-on-host feature nothing here
+  advertises. It is plain bytes by the letter of `union_needs_selector` and a
+  latent wrong answer by intent. Recorded rather than fixed, because fixing it
+  means deciding what a host address *means* across this boundary, which is
+  §5.3's question and not this section's.
+- **The nine remaining classes are unchanged.** 179 uncarried: platform-gated,
+  `void*` without `len=`, capture-replay, function pointers, app-side by design,
+  and 23 unreachable by any profile. §0.19's breakdown stands with the union row
+  struck out.
+
+---
+
+### 0.22 The queue nobody opened, and the extension that promised it anyway
+
+Measured 2026-08-14 on **devhost**, in `nix develop`; the `vulkaninfo`
+comparisons from a clean `nix shell nixpkgs#vulkan-tools`.
+
+**1. What went live, and when.** §0.19 made `full` the default profile. No video
+extension is on its exclusion list — none needed to be, the marshalling
+generates fine — and none is in `INCOMPLETE_EXTENSIONS`, because every one of
+their entry points has a working stub. So from that commit a forwarded device
+advertised **sixteen** video extensions:
+
+```
+VK_KHR_video_queue          VK_KHR_video_decode_queue    VK_KHR_video_encode_queue
+VK_KHR_video_decode_h264    VK_KHR_video_decode_h265     VK_KHR_video_decode_av1
+VK_KHR_video_decode_vp9     VK_KHR_video_encode_h264     VK_KHR_video_encode_h265
+VK_KHR_video_maintenance1   VK_KHR_video_maintenance2    …and four more
+```
+
+and **one queue family**, `GRAPHICS | COMPUTE | TRANSFER` — §0.8 item 7's
+synthesised family. `vkCmdDecodeVideoKHR` is
+`queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR"`. There was no family an application
+could record it on.
+
+Firefox 153 selects a video device on exactly `VK_KHR_video_queue` and
+`VK_KHR_video_decode_queue`, and its first-frame failure returns
+`NS_ERROR_DOM_MEDIA_FATAL_ERR`, which its hardware-to-software recovery path
+does not admit. **One pref away from the default that was broken playback, not
+slow playback.**
+
+The risk was written down in §0.8 item 7 while the profile was `zink` and the
+extensions were out of scope. Nothing connected that note to the profile change,
+and the two facts lived in different files. That is the whole failure: not that
+nobody knew, but that knowing was not attached to anything that would fire.
+
+**2. Why `INCOMPLETE_EXTENSIONS` could not catch it, although it is the right
+table.** §0.19 built it to stop exactly this shape — an extension advertised
+whose entry points cannot do the job. It asks one question: *did the generator
+emit a working stub?* For the video family the answer is yes, honestly. Nothing
+about a **queue family** is expressible in a table keyed on stubbed entry points.
+
+The underlying fact is "we advertise a family we did not open", and both halves
+were already data. The registry states `queues=` per command; `advertise::queue_families`
+states what we offer. So the check is derived from those two rather than being a
+name on a list:
+
+- `sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS` is generated: per extension, **one
+  mask per command** that constrains anything.
+- `sv_icd::advertise::unservable_queue_requirement` intersects each mask with
+  `advertised_queue_flags()`.
+
+**One mask per command, not one per extension**, and that is the load-bearing
+detail. `queues=` is a *disjunction* — `queues="A,B"` means "recordable from a
+family with A or B" — so folding an extension's commands together with `|` would
+report `VK_KHR_video_queue` as servable because some other command of it runs on
+graphics. That is how this class of defect survives being looked at.
+
+Naming `VK_KHR_video_queue` in an exclusion list would have fixed today and said
+nothing about `VK_KHR_video_encode_queue`, `VK_NV_optical_flow` or
+`VK_ARM_data_graph`, which fail for the identical reason and are now caught
+without being named. And when the ICD grows a real video family — §0.21's path —
+the gate stops firing on its own, because it reads the families rather than a
+constant.
+
+**An honest refusal rather than a placeholder.** If we cannot serve a video
+queue we must not claim one; a gate with nothing behind it would be worse than
+the documented gap.
+
+**3. The ten that the queue check could not see either, and the second derived
+rule.** Withdrawing the three command-bearing video extensions left ten:
+`VK_KHR_video_decode_h264`, `…_av1`, `VK_KHR_video_maintenance1` and the rest are
+codec and maintenance extensions that add **only structs and enums**. They
+constrain no queue, so `EXTENSION_QUEUE_REQUIREMENTS` has no entry for them and
+the first check had nothing to say.
+
+Advertising them is still a claim we cannot keep — each `depends=` on one of the
+three that just went, and "H.264 decode, but not the decode queue you would
+decode on" is not something an implementation may say. So the advertised set is
+closed under `depends=` too, by fixpoint, for the same reason
+`Profile::include_portable_extensions` needs one: chains are deeper than a link.
+
+`sv_icd_entry::depends_satisfied` is the registry's expression **compiled to
+Rust** — `,` became `||`, `+` became `&&`, a name became a call. `sv-icd` is a
+`cdylib`, so the alternatives were linking `vk-parse` into a driver for one
+function, or writing a second evaluator that could drift. `vk_registry::depends`
+gained a public AST and `satisfied` is now defined in terms of it, so there is
+still exactly one parser; `the_compiled_depends_expressions_agree_with_the_registry_evaluator`
+sweeps every supported extension against every subset of the names its own
+expression mentions — 100k-odd comparisons, and it asserts that more than fifty
+of those expressions actually contain an operator, because a sweep over bare
+names would pass whatever the compiler did to `,` and `+`.
+
+**4. The measurement, and the regression it caught for the second time in this
+file.** `vulkaninfo` through the forwarder against RADV:
+
+| | device extensions | video | over-advertised |
+|---|---:|---:|---:|
+| before | 221 | 16 | 0 |
+| queue check only | 218 | 13 | 0 |
+| + `depends` closure, first attempt | **192** | 0 | 0 |
+| + `depends` closure, corrected | **201** | **0** | **0** |
+
+The 192 is the regression. A device extension's `depends=` routinely names an
+*instance* extension — `VK_KHR_swapchain` on `VK_KHR_surface`,
+`VK_KHR_external_fence` on `VK_KHR_external_fence_capabilities`,
+`VK_KHR_shader_untyped_pointers` on `VK_KHR_get_physical_device_properties2` —
+and my `have` closure consulted only the *device* list. It withdrew swapchain,
+present_id, present_wait, incremental_present, hdr_metadata and eleven more.
+
+**§0.19 item 6 recorded losing `VK_KHR_swapchain` to an ordering mistake; this
+lost it again to a scope mistake.** Same extension, same file, different
+disguise: a check that is right about the extension it was written for and wrong
+about the set it reads. Nothing but the diff against the real driver would have
+found either — the count moved, and that is the whole signal.
+
+The six non-video extensions still withdrawn at 201 are **correct** withdrawals,
+and the gate finding them is the derived check doing its job:
+`VK_EXT_display_control`, `VK_EXT_swapchain_maintenance1`,
+`VK_KHR_swapchain_maintenance1`, `VK_KHR_present_id2`, `VK_KHR_present_wait2` and
+`VK_EXT_device_address_binding_report` each depend on an instance extension this
+ICD does not advertise. They were over-claims of the same kind, unnoticed.
+
+**5. The GPU side's silent `Ok(())`, made loud but not closed.** The generated
+forwarder, on a command whose entry point the driver lacks, calls `note_missing`
+and returns the "missing answer": `VK_ERROR_EXTENSION_NOT_PRESENT` where there is
+a reply to carry it, and **`Ok(())` where there is not**. For
+`vkCmdDecodeVideoKHR` — a recorded `vkCmd*` whose entire output is a side effect
+— nothing was recorded, no reply existed, and no caller checking a return value
+could have noticed. `last_error` was set and dropped: it is consumed only where a
+command returns `Err`.
+
+`note_missing` now reports once per command name on stderr, always rather than
+under a variable — the same change and the same argument as
+`sv_icd_entry::not_implemented` in §0.19 item 1: when the only evidence of a
+silent failure is whether we said anything, gating it on an environment variable
+nobody sets makes the worst failure mode the quietest one.
+
+**That is a diagnosis, not a fix, and this section says so rather than implying
+otherwise.** The Vulkan-correct outcome is that a command buffer which could not
+record a command is invalid and its *submit* fails. The blob decoder's `Err` path
+sets `fatal` on the ring and kills the session, which is far too blunt for a
+driver that merely lacks an optional extension — the same argument that made the
+generated caller lenient in the first place, and it still holds. Poisoning the
+command buffer, so its submit fails and nothing else does, is the right shape and
+is **not written**. It is the open item here.
+
+The primary defence does hold: a command belonging to an extension whose queue
+family this ICD cannot offer is no longer advertised, so a conforming application
+never reaches that path.
+
+**6. What this says about the two claims.** §0.20 separated *carried* from
+*implemented* and found the forwarding path in good shape — 36 hand-written
+answers either way, 239 → 509 adding 270 forwards and not one new local answer,
+one deliberate canned value and zero outright stubs. This section is the other
+half of that split and it lands on the *advertising* path: a command can be
+carried, generated, forwarded and executed by a real driver, and still be
+unreachable because the family it must be recorded on does not exist here.
+"Carried", "implemented" and "servable" are three claims, and the third is the
+one no table keyed on entry points can make.
 
 ---
 
@@ -3526,6 +6028,28 @@ lifetime is the read-pending word of §5.5 plus retirement by timeline value.
 
 `vkResetCommandPool` / `vkResetCommandBuffer` return blobs to the arena
 allocator through the same deferred path.
+
+**Buffering `vkCmd*` reorders them against everything that is not a `vkCmd*`,
+and that has to be paid for.** This is the consequence of the paragraph above
+and it went unstated for four stages. Recorded commands are published on a
+schedule of their own — at `vkEndCommandBuffer`, or when a block fills — while
+`vkCreate*`, `vkDestroy*` and every other forwarded call goes immediately. Both
+travel the device ring, so each class is ordered *with itself*; program order
+**between** the classes is not preserved, and the wire can carry
+`[destroy] [recorded…]` for an application that wrote `[recorded…] [destroy]`.
+
+`VK_KHR_maintenance4` makes that application correct — a pipeline layout's
+lifetime ends when the command buffer leaves the recording state — so it is a
+real defect and not a licence to blame the caller. It reproduced as
+`no VkPipelineLayout with id 44`, 144 times across 48 CTS cases, and §0.23 is
+the whole story.
+
+The repair is `sv_icd::transport::RingTransport::publish_recorded_first`:
+publish what is recorded before sending anything that is not. **It does not cost
+the 105 µs against 130 µs this section's pipelining bought**, because that
+number is `vkCmd*` against `vkCmd*` and `Transport::record` still buffers; what
+is forced is a publish before an *unrecorded* command, which is not a per-draw
+operation.
 
 ### 6.6 Licences, stated once
 

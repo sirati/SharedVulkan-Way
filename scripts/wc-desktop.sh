@@ -12,7 +12,7 @@
 #
 # WHY THIS SCRIPT EXISTS, AND WHAT IT DOES THAT wc-guest.sh DOES NOT
 #
-# `wc-guest.sh` runs the compositor over ssh. docs/design.md §10.12 item 3 is the
+# `wc-guest.sh` runs the compositor over ssh. docs/waycompose-design.md §10.12 item 3 is the
 # discovery that this was never enough: **a Windows ssh session is not on the
 # desktop**. sshd logs the user on in session 0 with its own window station,
 # `Service-0x0-18f160f$`, whose single desktop has no display device behind it.
@@ -95,7 +95,7 @@ PORT="${WC_PORT_BASE:-57271}"
 # The stage-4 half: the machine the VM runs on. It used to be described as "the
 # machine that shares a filesystem with the guest", and stage 13 demoted that:
 # the export still carries the frame dump and the logs, but **not the pixels**.
-# See `locate_arena` below and docs/design.md §18.2.
+# See `locate_arena` below and docs/waycompose-design.md §18.2.
 HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage8}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc}"
@@ -178,6 +178,12 @@ miss() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 
 g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
+
+# STAGE 42. `fresh` and `deployed_is`: is the binary newer than the tree, and is
+# the copy on the guest the one this tree built. Sourced after `ok`/`bad`/`note`
+# and `g`/`h`, which it uses.
+. "$(dirname "$0")/wc-binaries.sh"
+. "$(dirname "$0")/wc-topology.sh"
 
 # ------------------------------------------------------------ the arena ------
 # STAGE 13. Everything the guest-RAM transport needs, in one place, because
@@ -486,17 +492,16 @@ PS1
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
-  local missing=0
-  for e in wc-desk.exe wc-compositor.exe probe-relay.exe; do
-    if [ -f "$WIN_BIN/$e" ]; then :; else
-      case "$e" in
-        probe-relay.exe) ;;   # built below, it is a C probe
-        *) echo "  missing $WIN_BIN/$e"; missing=1 ;;
-      esac
-    fi
-  done
-  [ $missing -eq 0 ] || {
-    echo "error: cargo build --workspace --target x86_64-pc-windows-gnu first"; exit 1; }
+  # STAGE 42. **Existence is not freshness.** This checked that each binary was
+  # a file, which a binary built before the change under test also is: §35.4
+  # measured a harness reporting the *previous* tree's behaviour after `cargo
+  # test` declined to relink, and §35.6 item 6 named this harness among the
+  # seventeen with no guard. `probe-relay.exe` stays exempt for the reason it
+  # always was — it is a C probe built below rather than by cargo, so no cargo
+  # target exists for `fresh` to compare against.
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
+  fresh "$WIN_BIN/wc-desk.exe"       "$how_win" || exit 1
+  fresh "$WIN_BIN/wc-compositor.exe" "$how_win" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-desk-stage-XXXXXX)
   cp "$WIN_BIN/wc-desk.exe" "$WIN_BIN/wc-compositor.exe" "$stage/"
@@ -526,6 +531,17 @@ do_deploy() {
   g "mkdir -p $DESKDIR" || exit 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DESKNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
+
+  # STAGE 42. **And the copy is checked.** The comment above says a running
+  # `.exe` makes `scp` fail — it does when Windows holds the file open, and the
+  # `kill_ours` above is why that is usually avoided. What neither covers is the
+  # case where the transfer *appears* to succeed and the old bytes remain, and
+  # `scp` returning 0 cannot tell the two apart. The symptom is a behaviour
+  # change; on the GPU path it is a transport fault, which `finish_attach`
+  # refuses with "This is a version skew between two builds, not a transport
+  # fault" — `WIRE_VERSION` went 1 -> 2 while this was written.
+  deployed_all "$stage" "$DESKDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-desk.exe" "wc-compositor.exe" || exit 1
   rm -rf "$stage"
   mkdir -p "$OUT"
   # After the copy, because `reaptasks.ps1` has to be on the guest to run — and
@@ -614,19 +630,29 @@ do_probe() {
   int wcshot "cmd.exe" \
     "/c $DESKDIR_WIN\\wc-desk.exe shot --class Shell_TrayWnd --out $DESKDIR_WIN\\taskbar.bmp > $DESKDIR_WIN\\shot.txt 2>&1" \
     >/dev/null 2>&1
-  fetch taskbar.bmp stage8-taskbar-empty.png "the taskbar with no compositor window"
+  fetch taskbar.bmp stage8-taskbar-empty.png "the taskbar with no compositor window" tray
 }
 
 # Pull a BMP off the guest and convert it. `convert` is in the dev shell for
 # exactly this (see flake.nix); a PNG is what a repository should hold.
+# STAGE 42. **Seven photographs, and the gate on all of them was that
+# ImageMagick could open the file.** The geometry went into the success string
+# and was compared with nothing, so a 1x1 or an all-black capture read as a
+# PASS. §41.8 fixed this helper in `wc-taskbar.sh`; the audit after it found the
+# original still here, in `wc-icon.sh`, `wc-popup.sh` and `wc-titlebar.sh`.
+#
+# `kind` is required and not defaulted, which is §41.8's other half: `tray2.bmp`
+# is a `--class Shell_TrayWnd` strip at **1280x48** and `screen.bmp` is a whole
+# desktop, so one bound across all seven callers would be the
+# impossible-threshold defect rather than a fix for the vacuous one.
 fetch() {
-  local remote="$1" local_png="$2" caption="$3"
+  local remote="$1" local_png="$2" caption="$3" kind="${4:-window}"
   scp "${SSHOPT[@]}" "$GUEST:$DESKNAME/$remote" "$RUNDIR/$remote" >/dev/null 2>&1
   if [ -s "$RUNDIR/$remote" ]; then
     mkdir -p "$OUT"
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null \
        || convert "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      ok "$caption -> docs/stage8/$local_png ($(identify -format '%wx%h' "$OUT/$local_png" 2>/dev/null))"
+      picture_is "$OUT/$local_png" "$kind" "$caption -> docs/stage8/$local_png"
     else
       bad "could not convert $remote"
     fi
@@ -648,6 +674,13 @@ do_window() {
   fi
   [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || {
     miss "WC_HOST_WESTON and WC_HOST_FIREFOX both unset: no client to run"; return; }
+
+  # §51. A hypervisor is in this path. Block 4's timer comparison is a claim
+  # about the *guest's own* scheduler rather than about the boundary, so it is
+  # not gated -- the declaration is what lets a reader tell those two apart,
+  # and what would permit a real cross-VM claim here.
+  wc_topology_declare cross-vm \
+    "the compositor is on the guest, the client on the VM host, over guest RAM" || return
 
   local sock="wg-s8-$$"
   # Stale compositors go **first**, before the frame directory is emptied. An
@@ -754,8 +787,24 @@ do_window() {
   fi
   note "our compositor is pid $CPID (socket $sock)"
 
+  # **The relay must outlive the compositor, not the setup.** It was `--timeout
+  # 120`, and it is started *here* — before the arena locate, which sweeps 13
+  # GiB of guest RAM through `rootc` and QMP and on a contended guest takes
+  # minutes rather than the 2.4 s §12.5 measured on an idle one. So the relay
+  # would exit part-way through a run that had done nothing wrong, and what the
+  # harness reported was the *client*: "Failed to process Wayland connection:
+  # Broken pipe", with the proxy saying "the compositor closed the connection"
+  # and "2 client msgs, 0 server msgs". The compositor had closed nothing; its
+  # log ends at "listening" and never mentions a client. Measured on this guest
+  # tonight, twice.
+  #
+  # 330 is the compositor's own `--timeout`, which is the honest coupling: the
+  # relay is the compositor's socket seen from the other side of the
+  # hypervisor, and there is no run in which one should outlive the other. The
+  # sibling call in `do_fps` already derives its timeout instead of naming a
+  # constant; this one was the last magic number.
   ssh "${SSHOPT[@]}" "$GUEST" \
-    "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 120" \
+    "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 330" \
     >"$RUNDIR/relay.log" 2>&1 &
   local relay=$!
   sleep 3
@@ -1011,8 +1060,8 @@ chmod +x s8.sh" >/dev/null
   sed 's/^/        /' "$RUNDIR/shot.txt"
 
   fetch win.bmp    "stage8-window$SUFFIX.png"  "the client's window, frame and all"
-  fetch tray2.bmp  "stage8-taskbar$SUFFIX.png" "the taskbar with the window's button in it"
-  fetch screen.bmp "stage8-screen$SUFFIX.png"  "the screen, which is the lock screen"
+  fetch tray2.bmp  "stage8-taskbar$SUFFIX.png" "the taskbar with the window's button in it" tray
+  fetch screen.bmp "stage8-screen$SUFFIX.png"  "the screen, which is the lock screen" screen
 
   # Is the blit the right way up (§8.11 item 3), and is it the right rectangle?
   #
@@ -1233,6 +1282,17 @@ chmod +x s8.sh" >/dev/null
       | sed 's/^/        /' | head -20
   fi
   sed -n '/S8-PROXY-BEGIN/,/S8-CLIENT-END/p' "$RUNDIR/s8.log" | sed 's/^/        /' | head -40
+  # **The relay, but only when the client did not get a display.** It is the one
+  # process in this topology that nothing has ever printed, and it sits exactly
+  # where a failure is most easily misattributed: a relay that has exited looks
+  # to the proxy like a compositor that closed the connection, and looks to the
+  # harness like a client that could not connect. Both readings blame the wrong
+  # end. Printed conditionally rather than always, because on a good run it is
+  # four uninteresting lines.
+  if grep -q "failed to create display\|Broken pipe" "$RUNDIR/s8.log" 2>/dev/null; then
+    echo "        --- the relay, which is the half nothing else prints:"
+    sed 's/^/        /' "$RUNDIR/relay.log" 2>/dev/null | head -10
+  fi
   kill_ours "$sock" >/dev/null 2>&1
   # And the task definitions, which `kill_ours` does not touch: it ends
   # *processes* and `int_bg`'s task outlives its process by design. Without this
@@ -1251,7 +1311,7 @@ chmod +x s8.sh" >/dev/null
 # at the rates involved it is megabytes a second through a paravirtual
 # filesystem. The first version of this measurement counted those files and
 # attributed the result to the poll loop; it was measuring its own instrument.
-# See docs/design.md §13.8, which keeps the wrong number and the right one.
+# See docs/waycompose-design.md §13.8, which keeps the wrong number and the right one.
 #
 # So this mode dumps nothing and reads the compositor's own closing line --
 # `xdg_toplevel destroyed -> window 1 (N frames presented)` -- which costs a
@@ -1385,6 +1445,11 @@ chmod +x $HOST_DIR/s8fps.sh" >/dev/null 2>&1
 # comment in `reaptasks.ps1` warns about and is why that comment is there.
 do_psgate() {
   echo "== the generated PowerShell, checked on this machine =="
+  # §51. No guest at all: this leg parses the PowerShell the script generates.
+  # `wc-desktop.sh`'s other legs declare cross-vm -- the topology is a property
+  # of the leg, not of the file.
+  wc_topology_declare same-box \
+    "pwsh parses the generated PowerShell here; nothing is deployed and no client runs" || return
   if ! command -v pwsh >/dev/null; then
     miss "pwsh is not on PATH (\`nix-shell -p powershell\`); the generated PowerShell is unchecked"
     return

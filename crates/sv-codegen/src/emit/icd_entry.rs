@@ -673,6 +673,11 @@ fn count_expr(len: &ArrayLen, member_access: &dyn Fn(&str) -> TokenStream) -> Op
             let a = member_access(sibling);
             quote!((((#a) as usize) + (#add as usize)) / (#divisor as usize))
         }
+        // The bound is arithmetic the generator already did: nothing to read.
+        ArrayLen::Constant(n) => {
+            let n = *n as usize;
+            quote!(#n)
+        }
         // A path length (`pAllocateInfo->commandBufferCount`) is only ever a
         // command parameter, and the parameter accessor handles it.
         ArrayLen::Path { .. } | ArrayLen::Unresolved(_) => return None,
@@ -830,10 +835,46 @@ fn lower_scalar(cx: &Ctx<'_>, s: &Scalar, access: &TokenStream) -> Result<TokenS
             if !cx.shared.contains(n) {
                 return Err(format!("{n} has no wire counterpart"));
             }
+            // **A union whose arm changes what the bytes mean cannot be reached
+            // from here**, because here is the generic path and it has no
+            // sibling to read. `emit_lower_struct` handles the selector case, so
+            // arriving in this arm means the union is a member of something that
+            // does not annotate it — a registry gap — and the honest answer is
+            // to refuse the whole command by name rather than take member [0]
+            // and hope. See `union_needs_selector`.
+            if union_needs_selector(cx, n) {
+                return Err(format!(
+                    "{n} is a union carrying a handle or a (memory, offset) pair, so which arm \
+                     is live decides what crosses — and it is being lowered somewhere with no \
+                     `selector=` sibling in scope. gfxstream's member-[0] rule is not safe here \
+                     (design.md §0.21)"
+                ));
+            }
             let f = cx.lower_fn(n);
             quote!(#f(&(#access))?)
         }
     })
+}
+
+/// Whether reading the wrong arm of this union would be a *semantic* error
+/// rather than a renaming.
+///
+/// gfxstream's rule — always marshal member [0] — is safe exactly when every arm
+/// is plain bytes of the same extent, because the peer then reconstructs the
+/// bytes the application wrote and only the *name* is lost. `VkClearValue` and
+/// `VkPerformanceCounterResultKHR` are that shape and stay on the fast path.
+///
+/// It stops being safe the moment an arm holds something the boundary has to
+/// *translate*: an object id that the handle-map pass must turn into a driver
+/// handle, or a `(memory, offset)` pair the transform pass must rebase. Reading
+/// the wrong arm then does not mis-name the bytes, it hands the driver a
+/// descriptor built from a number that was never a handle — design.md §0.16
+/// item 2's hazard, which cost this project a GPU hang the first time it was met
+/// one level in.
+fn union_needs_selector(cx: &Ctx<'_>, name: &str) -> bool {
+    cx.wire
+        .struct_plan(name)
+        .is_some_and(|s| s.is_union && (s.has_handles || s.has_device_memory))
 }
 
 /// `lower_<Struct>(p: *const abi::Struct) -> Result<sv_proto::Struct>`.
@@ -862,6 +903,87 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         }),
     );
 
+    if s.is_union && union_needs_selector(cx, name) {
+        // **The selector-driven form, and it takes the discriminator as a
+        // parameter so that it cannot be called without one.**
+        //
+        // The registry states both halves of this and nothing read either: the
+        // enclosing struct's member carries `selector="geometryType"`, and each
+        // arm of the union carries `selection="VK_GEOMETRY_TYPE_TRIANGLES_KHR"`
+        // — ten annotations across the whole of `vk.xml`, parsed into
+        // `Member::selector` and `Member::selection` since the registry crate
+        // was written. `exceptions`' header concluded that unions needed no
+        // exception table because "a Rust `enum` *is* the tag", which is true of
+        // the wire and **stops at the C ABI**, where there is no tag and this
+        // function is the thing that has to invent one.
+        //
+        // Making the selector an argument rather than something read from an
+        // enclosing pointer is what makes the property structural: there is no
+        // way to emit a call to this function that has not gone and found the
+        // sibling. A caller that cannot is a compile error in the generator, not
+        // a wrong answer at run time.
+        let mut arms = Vec::new();
+        for field in &s.fields {
+            if field.selection.is_empty() {
+                return Err(format!(
+                    "{name}.{}: a union arm carrying a handle or memory pair with no \
+                     `selection=` in the registry — there is nothing to select it by, and \
+                     guessing is what design.md §0.21 exists to stop",
+                    field.name
+                ));
+            }
+            let variant = naming::union_variant(&field.name);
+            let abi = abi_members
+                .get(field.name.as_str())
+                .ok_or_else(|| format!("{name}.{}: no C member", field.name))?;
+            let access = member_access(&field.name);
+            let e = lower_expr(cx, &field.shape, abi, &access, &count_access, name)?;
+            // Resolved to numbers here rather than emitted as associated
+            // constants, because the C-layer enums are newtypes and a `match`
+            // pattern over an associated const depends on structural-equality
+            // rules the generator should not have an opinion about.
+            let mut pats = Vec::new();
+            for c in &field.selection {
+                let v = cx
+                    .wire
+                    .enums
+                    .iter()
+                    .find_map(|e| e.values.iter().find(|(n, _)| n == c).map(|(_, v)| *v))
+                    .ok_or_else(|| {
+                        format!("{name}.{}: selection={c} is not a value of any enum in this profile", field.name)
+                    })?;
+                let v = v as i32;
+                pats.push(quote!(#v));
+            }
+            arms.push(quote! {
+                #(#pats)|* => sv_proto::#ty::#variant(#e),
+            });
+        }
+        let cname = name.to_string();
+        let doc = format!(
+            "Lower a C `{name}`, choosing the arm its `selector=` sibling names.\n\n\
+             The discriminator is a parameter rather than something read out of \
+             an enclosing pointer, so a caller that has not found the sibling \
+             cannot compile. An unrecognised value refuses the call by name \
+             instead of falling back to a member (design.md §0.21)."
+        );
+        return Ok(quote! {
+            #[doc = #doc]
+            #[allow(unused_unsafe, unused_variables)]
+            pub unsafe fn #f(
+                p: *const #ty,
+                __sel: i32,
+            ) -> crate::LowerResult<sv_proto::#ty> {
+                unsafe {
+                    Ok(match __sel {
+                        #(#arms)*
+                        _ => return Err(crate::LowerError::Shape(#cname)),
+                    })
+                }
+            }
+        });
+    }
+
     if s.is_union {
         // design.md §7.4: a C union carries no tag and only ten `selector=`
         // annotations exist in the whole registry. gfxstream always marshals
@@ -870,6 +992,11 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         // generator refuses a union whose member [0] is not the one every other
         // member fits inside, so the bytes an application wrote are never
         // truncated, only reinterpreted.
+        //
+        // **It is reached only for a union that is plain bytes**
+        // (`union_needs_selector` above): every arm the same storage, nothing
+        // the boundary has to translate, so reinterpreting loses the name and
+        // nothing else.
         let first = s
             .fields
             .first()
@@ -923,7 +1050,25 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         let access = member_access(&field.name);
         let e = match validity {
             PartialValidity::Skip => wire_default(&field.shape),
-            _ => lower_expr(cx, &field.shape, abi, &access, &count_access, name)?,
+            // **The `selector=` call site.** This is the only place in the
+            // generator that has both the union and the sibling that decides
+            // it, so it is the only place that can call the selector-driven
+            // lowering — which is why that function takes the discriminator as
+            // an argument rather than reaching for it.
+            _ => match (&field.selector, &field.shape) {
+                (Some(sel), Shape::Scalar(Scalar::Union(u))) if union_needs_selector(cx, u) => {
+                    if !s.fields.iter().any(|f| &f.name == sel) {
+                        return Err(format!(
+                            "{name}.{}: selector={sel} names no sibling of this struct",
+                            field.name
+                        ));
+                    }
+                    let f = cx.lower_fn(u);
+                    let sib = member_access(sel);
+                    quote!(#f(&(#access), (#sib).0 as i32)?)
+                }
+                _ => lower_expr(cx, &field.shape, abi, &access, &count_access, name)?,
+            },
         };
         inits.push(quote!(#id: #e,));
     }
@@ -1101,6 +1246,15 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkEnumerateDeviceLayerProperties",
     "vkMapMemory",
     "vkUnmapMemory",
+    // Core 1.4's promotion of the same two, and they are here for the same
+    // reason and one sharper one. `ppData` is `VoidPolicy::NotSerialisable`,
+    // which drops it from the wire — right for a command answered app-side,
+    // and *silently wrong* for a generated one, because the stub would forward
+    // the info struct and return `VK_SUCCESS` having never written `*ppData`.
+    // A void policy states what a member means; only this list states which
+    // side answers. See `crate::local::sv_vk_map_memory2`.
+    "vkMapMemory2",
+    "vkUnmapMemory2",
     // design.md §10. Presentation is the ICD's, entirely: a swapchain image is
     // a GPU-side `VkImage` the app side created out of ordinary forwarded
     // commands, and `vkQueuePresentKHR` is a copy into the arena followed by
@@ -1451,6 +1605,14 @@ fn stub_body(
     // one of the results the specification allows an implementation to invent.
     let on_err = if c.returns_void {
         quote!({ crate::report_failure(__e); return; })
+    } else if wire.returns_value {
+        // There is no `VkResult` to fail with and the specification gives these
+        // three no error path at all — `vkGetBufferDeviceAddress` "returns the
+        // address" and that is the whole contract. Zero is the one value that
+        // cannot be a valid device address, so it is the failure, and it is
+        // *reported* as well so that a run under `SV_DEBUG` says why rather than
+        // leaving an application to dereference a null address in a shader.
+        quote!({ crate::report_failure(__e); return 0 as _; })
     } else {
         quote!(return crate::lower_failed(__e))
     };
@@ -1458,10 +1620,18 @@ fn stub_body(
     // --- call and write back ---------------------------------------------
     let call = if wire.generates_reply {
         let store = emit_writeback(store_cx, c, wire, &abi_by_name)?;
-        let result = if c.returns_result {
-            quote!(__r)
+        // A value that is neither `void` nor `VkResult` rides the reply's `ret`
+        // field (design.md §0.3 item 5, closed). It is read out *before* the
+        // writeback, because the writeback consumes the reply, and cast back to
+        // whatever the C header spells the return type — `VkDeviceAddress` here,
+        // a bare `uint64_t` for the two opaque-capture-address commands.
+        let (take_ret, result) = if c.returns_result {
+            (quote!(), quote!(__r))
         } else if c.returns_void {
-            quote!()
+            (quote!(), quote!())
+        } else if wire.returns_value {
+            let cret = c_type(lower_cx, &c.return_type);
+            (quote!(let __ret = __reply.ret as #cret;), quote!(__ret))
         } else {
             return Err(format!(
                 "{} returns {:?}, which is neither void nor VkResult",
@@ -1473,6 +1643,7 @@ fn stub_body(
                 Ok(r) => r,
                 Err(__e) => #on_err,
             };
+            #take_ret
             let __r = #store;
             #result
         }
@@ -1746,6 +1917,100 @@ fn ring_class(c: &crate::plan::CommandPlan) -> TokenStream {
 /// rather than methods on a trait so that nothing here has to be object-safe and
 /// so that `sv-icd` can call one directly when it wants to forward a command it
 /// otherwise answers locally.
+/// Pass 6, app-side half: the `(memory, offset)` rewrite of design.md §5.3,
+/// applied to one command's inputs just before they are encoded.
+///
+/// # Why here and not in the C stub
+///
+/// The stub lowers the application's arguments and then calls the [`Icd`] trait,
+/// whose method the app side is entitled to *answer itself*: `vkAllocateMemory`,
+/// `vkMapMemory` and `vkFreeMemory` are answered out of the app-side allocator
+/// and never cross at all. Rewriting in the stub would hand those overrides
+/// arena coordinates in place of the ids their own tables are keyed by. This
+/// module is the narrower seam — everything that reaches it is about to become
+/// bytes on a ring — so "every memory id that crosses is rewritten" is stated
+/// exactly where it is true, and nothing that does not cross is touched.
+///
+/// It is the same fold `gpu_entry` runs on the way in, sharing
+/// [`super::passes::transform_walk_pub`] and
+/// [`crate::exceptions::memory_offset_sibling`] so that the two sides cannot
+/// disagree about what a pair is.
+fn memory_rewrite_pre(cx: &Ctx<'_>, c: &crate::plan::CommandPlan) -> TokenStream {
+    // A `(memory, offset)` pair at the top level of a parameter list, which no
+    // struct walker can see: `vkBindImageMemory(device, image, memory,
+    // memoryOffset)` is exactly this shape.
+    let param_names: Vec<String> = c.inputs.iter().map(|f| f.name.clone()).collect();
+    let mut pairs = Vec::new();
+    for f in &c.inputs {
+        if !matches!(&f.shape, Shape::Scalar(Scalar::Handle(h)) if h == "VkDeviceMemory") {
+            continue;
+        }
+        let mem = naming::ident(&f.rust_name);
+        match crate::exceptions::memory_offset_sibling(&param_names, &f.name) {
+            Some(off) => {
+                let off_id = naming::ident(&naming::snake_case(&off));
+                pairs.push(quote! {
+                    let (__mm, __oo) = sv_proto::MemoryTransform::rewrite(
+                        &mut crate::MemoryRewrite, args.#mem.0, args.#off_id,
+                    ).map_err(crate::wire_failed)?;
+                    args.#mem.0 = __mm;
+                    args.#off_id = __oo;
+                });
+            }
+            None => pairs.push(quote! {
+                let (__mm, _) = sv_proto::MemoryTransform::rewrite(
+                    &mut crate::MemoryRewrite, args.#mem.0, 0,
+                ).map_err(crate::wire_failed)?;
+                args.#mem.0 = __mm;
+            }),
+        }
+    }
+
+    // And every pair reachable through a struct, an array of structs or a
+    // `pNext` link: `VkBindImageMemoryInfo`, `VkMappedMemoryRange`,
+    // `VkSparseMemoryBind`.
+    let mut walks = Vec::new();
+    for f in &c.inputs {
+        let id = naming::ident(&f.rust_name);
+        if let Some(stmt) = super::passes::transform_walk_pub(cx.wire, &f.shape, &quote!(args.#id)) {
+            walks.push(stmt);
+        }
+    }
+    if pairs.is_empty() && walks.is_empty() {
+        return quote!();
+    }
+    // `__t` is deliberately shadowed inside the block: the walkers were written
+    // to be emitted next to a `&mut dyn MemoryTransform` of that name, and the
+    // enclosing function's `__t` is the transport. Nothing inside the block
+    // wants the transport, and the shadow ends with it.
+    // The walkers speak `sv_wire::Result` and this function returns
+    // `IcdResult`, and `sv_icd_entry` deliberately has no `From<WireError>` —
+    // its own words: "`?` on a `WireError` inside a generated body would then
+    // convert silently, and this crate's rule is that a generated block does
+    // nothing the generator did not write out". So the conversion is written
+    // out, once, around the whole walk.
+    let walks = if walks.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            {
+                let mut __ad = crate::MemoryRewrite;
+                let __t: &mut dyn sv_proto::MemoryTransform = &mut __ad;
+                let mut __walk = || -> sv_wire::Result<()> {
+                    #(#walks)*
+                    Ok(())
+                };
+                __walk().map_err(crate::wire_failed)?;
+            }
+        }
+    };
+    quote! {
+        let mut args = args;
+        #(#pairs)*
+        #walks
+    }
+}
+
 fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
     let fns = cx.wire.commands.iter().map(|c| {
         let m = naming::command_method(&c.name);
@@ -1756,10 +2021,12 @@ fn emit_forward_module(cx: &Ctx<'_>) -> TokenStream {
         let opcode = c.opcode;
         let ring = ring_class(c);
         let doc = format!("Forward `{}` to the GPU side.", c.name);
+        let mem_pre = memory_rewrite_pre(cx, c);
 
         // The command bytes are identical in both directions; only the flag and
         // what happens afterwards differ.
         let encode = quote! {
+            #mem_pre
             let mut __cmd = vec![0u8; sv_proto::#size_cmd(&args)];
             {
                 let mut __enc = sv_wire::Encoder::new(&mut __cmd);
@@ -1965,6 +2232,73 @@ fn emit_icd_trait(cx: &Ctx<'_>) -> TokenStream {
     }
 }
 
+/// One callable probe per forwarded command, for the carried-vs-implemented audit.
+///
+/// # The question this exists to answer mechanically
+///
+/// The profile says which commands are *carried*. It does not say which are
+/// *implemented*, and the two are not the same claim: a command whose generated
+/// forwarder exists but whose `Icd` method `sv-icd` overrides with a canned
+/// value never reaches a driver, and returns something plausible while doing so.
+/// That is worse than a missing command, because a missing one is diagnosable.
+///
+/// Reading 239 method bodies answers it and does not stay answered. This does,
+/// and it rests on one property of [`emit_icd_trait`] above: **the generated
+/// default, with no transport, returns
+/// `Err(LowerError::NotImplemented(<this command's own name>))` and nothing
+/// else does.** So calling every method on a driver with no GPU side sorts the
+/// set exactly in two:
+///
+/// - that precise error ⇒ the default is in force ⇒ the command *forwards* when
+///   there is a GPU side, and no hand-written code stands in its way;
+/// - anything else — a success, a different error, a panic ⇒ `sv-icd` overrode
+///   it and answered locally, and it needs classifying by hand.
+///
+/// The second set is small enough to read. The first is the one that would
+/// otherwise be taken on trust, and it is the larger by an order of magnitude.
+///
+/// `Default::default()` for the arguments is deliberate and is not a weakness of
+/// the probe: a zeroed `Args` names object id 0, which is `VK_NULL_HANDLE`, so
+/// nothing here can resolve to a real object and no probe can have an effect
+/// beyond minting an id. What is being measured is *which branch the
+/// implementation takes*, and that is decided before any argument is looked at.
+fn emit_audit_probes(cx: &Ctx<'_>) -> TokenStream {
+    let probes = cx.wire.commands.iter().filter_map(|c| {
+        if HAND_WRITTEN.contains(&c.name.as_str()) {
+            // On `IcdLocal`, with a hand-written signature that does not take an
+            // `Args`. There is nothing mechanical to call.
+            return None;
+        }
+        let m = naming::command_method(&c.name);
+        let cname = c.name.as_str();
+        Some(quote! {
+            crate::AuditProbe {
+                command: #cname,
+                run: |__icd| {
+                    match crate::Icd::#m(__icd, Default::default()) {
+                        Ok(_) => crate::Answered::Locally,
+                        // The command's own name, matched as a pattern rather
+                        // than compared in a guard: only the generated default
+                        // refuses with exactly this string, and a pattern says
+                        // so where a guard merely tests it.
+                        Err(crate::LowerError::NotImplemented(#cname)) => {
+                            crate::Answered::ByTheGeneratedDefault
+                        }
+                        Err(__e) => crate::Answered::LocallyWithError(__e),
+                    }
+                },
+            }
+        })
+    });
+    quote! {
+        /// Every forwarded command, callable, for `sv-icd`'s audit test.
+        ///
+        /// See `sv_codegen::emit::icd_entry::emit_audit_probes` for what the
+        /// outcomes mean and why a zeroed `Args` is the right argument.
+        pub static AUDIT_PROBES: &[crate::AuditProbe] = &[#(#probes),*];
+    }
+}
+
 /// Entry points that are hand-written **and not on the generated C surface**,
 /// which have to be put in the proc tables by name.
 ///
@@ -2041,6 +2375,239 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     }
 
     let not_implemented: Vec<&str> = refused.iter().map(String::as_str).collect();
+
+    // Extensions this build must not advertise, worked out here rather than
+    // guessed at runtime.
+    //
+    // design.md §9.2 says an extension in the advertised list is a promise its
+    // entry points work. Until now that promise was kept by *intersecting* the
+    // profile with what the GPU side's driver reports, which answers "does the
+    // hardware have it" and leaves "did we generate a working stub for it"
+    // unasked — which is how `bufferDeviceAddress` came to be advertised with
+    // three of its entry points in `NOT_IMPLEMENTED`, and how an application
+    // could call one and get a silent zero back.
+    //
+    // An extension appears here when **any** command it introduces is refused.
+    // Not "all": an extension is one promise, and half of it working is a driver
+    // that fails where the specification says it must not.
+    //
+    // Core versions are deliberately absent. A refused core command cannot be
+    // un-advertised — the version number is what advertises it — so it stays a
+    // `NOT_IMPLEMENTED` entry and nothing else. That is the honest split, and
+    // the API version is `sv-worktrees/vers`'s question, not this table's.
+    let mut incomplete: BTreeSet<(&str, String)> = BTreeSet::new();
+    for e in &cx.model.extensions {
+        if !e.supported_for_vulkan {
+            continue;
+        }
+        // Through the alias, not just the name. `VK_KHR_buffer_device_address`
+        // requires `vkGetBufferDeviceAddressKHR`, which is an *alias* of the
+        // core `vkGetBufferDeviceAddress` — one entry point under two names, and
+        // it is the core name the generator refuses. Comparing names alone let
+        // the extension through, which is the exact bug this table exists to
+        // stop, one indirection down.
+        // **The refused command is kept, not just the fact that there was one.**
+        // Without it the only thing a test can check about this table is that it
+        // is sorted, and the interesting property — that every entry is here
+        // *because of* a named stub — has to be asserted by writing the answer
+        // down. It was, and it went stale the moment the stub it named became a
+        // real implementation: `no_extension_is_advertised_with_a_stubbed_entry_-
+        // point` hard-coded `VK_KHR_buffer_device_address`, and when
+        // §0.20 implemented `vkGetBufferDeviceAddress` the assertion was left
+        // demanding that a fixed bug still be present. Carrying the reason makes
+        // the pairing derivable on both sides, so the test checks the invariant
+        // instead of remembering an example.
+        let because = e.requires.iter().flat_map(|b| b.items.iter()).find_map(|it| match it {
+            vk_registry::InterfaceRef::Command(c) => {
+                // Through the alias, not just the name.
+                // `VK_KHR_buffer_device_address` requires
+                // `vkGetBufferDeviceAddressKHR`, which is an *alias* of the core
+                // `vkGetBufferDeviceAddress` — one entry point under two names,
+                // and it is the core name the generator refuses. Comparing names
+                // alone let the extension through, which is the exact bug this
+                // table exists to stop, one indirection down. The name reported
+                // is the one that is actually in `NOT_IMPLEMENTED`, so a reader
+                // can find it and a test can look it up.
+                if refused.contains(c) {
+                    return Some(c.clone());
+                }
+                let canon = cx.model.canonical_command(c);
+                refused.contains(&canon).then(|| canon.to_string())
+            }
+            _ => None,
+        });
+        if let Some(cmd) = because {
+            incomplete.insert((e.name.as_str(), cmd));
+        }
+    }
+    let incomplete_reasons: Vec<TokenStream> = incomplete
+        .iter()
+        .map(|(e, c)| {
+            let c = c.as_str();
+            quote!((#e, #c))
+        })
+        .collect();
+    let incomplete: Vec<&str> = incomplete.iter().map(|(e, _)| *e).collect();
+
+    // What queue an extension's commands have to be recorded on, from `queues=`.
+    //
+    // # The defect this exists for, and why the other table could not catch it
+    //
+    // `INCOMPLETE_EXTENSIONS` asks "did the generator emit a working stub". It
+    // answered yes for `VK_KHR_video_queue` and `VK_KHR_video_decode_queue` —
+    // every one of their entry points marshals correctly — and the extensions
+    // were advertised the moment `full` became the default profile. But the ICD
+    // advertises **one queue family**, `GRAPHICS | COMPUTE | TRANSFER`, and
+    // `vkCmdDecodeVideoKHR` is `queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR"`. There
+    // is no family an application can record it on. Firefox 153 selects a device
+    // on exactly those two extensions and reports the failure as
+    // `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which its hardware-to-software recovery
+    // path does not admit: one pref away from the default, that was broken
+    // playback rather than slow playback.
+    //
+    // A table of stubbed entry points cannot see this, because nothing about a
+    // *queue family* is expressible in one. The fact is "we advertise a family
+    // we did not open", and the registry states the other half of it.
+    //
+    // # Why the shape is a list of masks
+    //
+    // `queues=` is a **disjunction** — `queues="A,B"` means the command may be
+    // recorded from a family with A *or* B. So one mask per command that has a
+    // requirement, and an extension is servable when *every* mask intersects
+    // what we advertise. Folding them together with `|` would say
+    // `VK_KHR_video_queue` is fine because some other command of it runs on
+    // graphics, which is how this class of bug survives a summary.
+    //
+    // Extensions with no queue requirement at all are omitted, which is most of
+    // them: the table is the exceptions, and `sv-icd` treats an absent entry as
+    // "nothing to check".
+    let queue_flag_bits: BTreeMap<&str, i64> = cx
+        .model
+        .types
+        .values()
+        .find_map(|t| match t {
+            vk_registry::TypeDef::Enum(e) if e.name == "VkQueueFlagBits" => Some(e),
+            _ => None,
+        })
+        .map(|e| e.values.iter().map(|v| (v.name.as_str(), v.value)).collect())
+        .unwrap_or_default();
+
+    let mut unknown_queue_bits: BTreeSet<String> = BTreeSet::new();
+    let mut queue_reqs: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+    for e in &cx.model.extensions {
+        if !e.supported_for_vulkan {
+            continue;
+        }
+        for it in e.requires.iter().flat_map(|b| b.items.iter()) {
+            let vk_registry::InterfaceRef::Command(c) = it else { continue };
+            let canon = cx.model.canonical_command(c);
+            let Some(cmd) = cx.model.commands.get(&canon) else { continue };
+            let Some(q) = cmd.queues.as_deref() else { continue };
+            // `queues="true"` is the registry's older spelling for "any queue",
+            // which constrains nothing.
+            if q == "true" {
+                continue;
+            }
+            let mut mask = 0u32;
+            for name in q.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match queue_flag_bits.get(name) {
+                    Some(v) => mask |= *v as u32,
+                    // A bit the registry names in `queues=` but does not define
+                    // as a `VkQueueFlagBits` value is a registry the generator
+                    // does not understand, and guessing zero would silently mean
+                    // "no requirement" — the permissive direction, which is the
+                    // wrong one to guess in.
+                    // A bit named in `queues=` that this registry does not
+                    // define as a `VkQueueFlagBits` value would silently mean
+                    // "no requirement" if skipped — the permissive direction,
+                    // which is the wrong one to guess in. `compile_error!` is
+                    // how this file already refuses what it cannot know, and it
+                    // fails the build rather than the playback.
+                    None => {
+                        unknown_queue_bits.insert(format!("{canon} queues={q:?}: {name}"));
+                    }
+                }
+            }
+            if mask != 0 {
+                queue_reqs.entry(e.name.as_str()).or_default().insert(mask);
+            }
+        }
+    }
+    let queue_reqs: Vec<TokenStream> = queue_reqs
+        .iter()
+        .map(|(e, masks)| {
+            let masks = masks.iter().copied().collect::<Vec<u32>>();
+            quote!((#e, &[#(#masks),*] as &[u32]))
+        })
+        .collect();
+    let unknown_queue_bits = if unknown_queue_bits.is_empty() {
+        quote!()
+    } else {
+        let msg = format!(
+            "queues= names a VkQueueFlagBits this registry does not define, so \
+             EXTENSION_QUEUE_REQUIREMENTS cannot say what family these need and \
+             would under-constrain them: {}",
+            unknown_queue_bits.iter().cloned().collect::<Vec<_>>().join("; ")
+        );
+        quote!(compile_error!(#msg);)
+    };
+
+    // `depends=`, compiled to a boolean expression over the advertised set.
+    //
+    // The queue check above withdrew `VK_KHR_video_queue`,
+    // `VK_KHR_video_decode_queue` and `VK_KHR_video_encode_queue` — every video
+    // extension that *has* commands. Ten remained: `VK_KHR_video_decode_h264`,
+    // `…_av1`, `VK_KHR_video_maintenance1` and the rest are codec and
+    // maintenance extensions that add only structs and enums, so they constrain
+    // no queue and the check had nothing to say about them.
+    //
+    // Advertising them is still a claim we cannot keep. Each `depends=` on one
+    // of the three that just went away, and §9.2's promise is about the
+    // extension as a whole: "we support H.264 decode, but not the decode queue
+    // you would decode on" is not a thing an implementation may say. So the
+    // advertised set is closed under `depends=` as well — by fixpoint, because
+    // `VK_KHR_video_maintenance2` depends on `VK_KHR_video_queue` through
+    // nothing else and a single pass would keep whatever depended on *it*.
+    //
+    // Lowered to code here rather than evaluated at runtime because `sv-icd` is
+    // a `cdylib` and the alternative was linking `vk-parse` into a driver for
+    // one function, or writing a second evaluator that could drift from
+    // `vk_registry::depends`. `Expr` is that module's own AST, so there is still
+    // exactly one parser.
+    fn lower_depends(e: &vk_registry::depends::Expr) -> TokenStream {
+        match e {
+            vk_registry::depends::Expr::Name(n) => quote!(__have(#n)),
+            vk_registry::depends::Expr::Any(v) => {
+                let parts = v.iter().map(lower_depends);
+                quote!((false #(|| #parts)*))
+            }
+            vk_registry::depends::Expr::All(v) => {
+                let parts = v.iter().map(lower_depends);
+                quote!((true #(&& #parts)*))
+            }
+        }
+    }
+    let depends_arms: Vec<TokenStream> = cx
+        .model
+        .extensions
+        .iter()
+        .filter(|e| e.supported_for_vulkan)
+        .filter_map(|e| {
+            let expr = e.depends.as_deref()?;
+            let name = e.name.as_str();
+            // An expression this parser cannot read must read as *unsatisfied*,
+            // the conservative direction — the same rule
+            // `vk_registry::depends::satisfied` states.
+            match vk_registry::depends::compile(expr) {
+                Some(ast) => {
+                    let body = lower_depends(&ast);
+                    Some(quote!(#name => #body,))
+                }
+                None => Some(quote!(#name => false,)),
+            }
+        })
+        .collect();
+
     let n_impl = cx.abi.commands.len() - refused.len();
     let total = cx.abi.commands.len();
     let hand_written = HAND_WRITTEN;
@@ -2065,6 +2632,72 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         /// read off a partial implementation, and a list that drifts from the
         /// code is worse than no list.
         pub static NOT_IMPLEMENTED: &[&str] = &[#(#not_implemented,)*];
+
+        /// Extensions at least one of whose entry points is in
+        /// [`NOT_IMPLEMENTED`], and which must therefore **not** be advertised.
+        ///
+        /// `sv_icd` subtracts this from whatever the GPU side reports, so that
+        /// the advertised set is the intersection of three things and not two:
+        /// what the profile carries, what the device supports, and what this
+        /// build actually generated a working stub for.
+        ///
+        /// Sorted, so `binary_search` is the lookup.
+        pub static INCOMPLETE_EXTENSIONS: &[&str] = &[#(#incomplete,)*];
+
+        #unknown_queue_bits
+
+        /// What queue an extension's commands must be recorded on, from the
+        /// registry's `queues=`.
+        ///
+        /// One entry per extension that constrains anything, and **one mask per
+        /// command** rather than one per extension: `queues=` is a disjunction,
+        /// so a command is satisfiable when its mask intersects a family we
+        /// advertise, and the *extension* is satisfiable when every one of its
+        /// masks is. Folding them together with `|` would report
+        /// `VK_KHR_video_queue` as servable because some other command of it
+        /// runs on graphics, which is precisely how the defect this table exists
+        /// for survived being looked at.
+        ///
+        /// `sv_icd::advertise::unservable_queue_requirement` is the consumer.
+        /// Extensions absent from this list constrain nothing.
+        ///
+        /// Sorted by extension name, so `binary_search_by_key` is the lookup.
+        pub static EXTENSION_QUEUE_REQUIREMENTS: &[(&str, &[u32])] = &[#(#queue_reqs,)*];
+
+        /// Whether an extension's `depends=` is satisfied by `__have`.
+        ///
+        /// The registry's expression, compiled: `,` became `||`, `+` became
+        /// `&&`, and a name became a call. An extension the registry gives no
+        /// `depends=` — most of them — answers `true`.
+        ///
+        /// `sv_icd` uses it to close the advertised set under dependency, so
+        /// that withdrawing `VK_KHR_video_decode_queue` also withdraws
+        /// `VK_KHR_video_decode_h264`, which adds no commands of its own and so
+        /// no other check can see.
+        pub fn depends_satisfied(extension: &str, __have: &dyn Fn(&str) -> bool) -> bool {
+            match extension {
+                #(#depends_arms)*
+                _ => true,
+            }
+        }
+
+        /// Why each entry of [`INCOMPLETE_EXTENSIONS`] is there: the extension
+        /// paired with one entry point of its own that is in
+        /// [`NOT_IMPLEMENTED`].
+        ///
+        /// The name is the one the *generator refused*, which for a promoted
+        /// extension is the core spelling rather than the suffixed alias —
+        /// `VK_KHR_buffer_device_address` would appear here against
+        /// `vkGetBufferDeviceAddress`, not against `vkGetBufferDeviceAddressKHR`
+        /// — so it can be found in `NOT_IMPLEMENTED` and looked up by a test.
+        ///
+        /// This exists because the alternative was a test that named one
+        /// extension by hand, and a hand-named case is a fact with an expiry
+        /// date: it asserted `VK_KHR_buffer_device_address` must be excluded,
+        /// design.md §0.20 implemented the three entry points, and the assertion
+        /// then failed for the best possible reason — demanding that a fixed bug
+        /// still be present.
+        pub static INCOMPLETE_EXTENSION_REASONS: &[(&str, &str)] = &[#(#incomplete_reasons,)*];
 
         /// Entry points `sv-icd-entry` writes by hand — see the generator's
         /// `HAND_WRITTEN` for why each one cannot be a fold over a wire reply.
@@ -2291,6 +2924,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     let forward = emit_forward_module(cx);
     let icd_trait = emit_icd_trait(cx);
     let tables = emit_tables(cx, &refused_names);
+    let probes = emit_audit_probes(cx);
 
     // Sections are kept separate rather than concatenated, because when the
     // whole stream does not parse the only useful question is "which item", and
@@ -2316,6 +2950,7 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     sections.push(("forward".to_string(), forward));
     sections.push(("trait".to_string(), icd_trait));
     sections.push(("tables".to_string(), tables));
+    sections.push(("audit probes".to_string(), probes));
 
     let keep = |m: BTreeMap<String, String>| -> BTreeMap<String, String> {
         m.into_iter().filter(|(_, why)| why != NOT_NEEDED).collect()

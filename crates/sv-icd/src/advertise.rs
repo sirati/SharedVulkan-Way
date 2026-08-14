@@ -262,6 +262,60 @@ pub fn queue_families() -> Vec<VkQueueFamilyProperties> {
     vec![q]
 }
 
+/// The queue capabilities an application can actually reach, as one mask.
+///
+/// Derived from [`queue_families`] rather than written down beside it, so that
+/// opening a second family is the only edit needed to make the extensions that
+/// need it appear. The whole point of the check below is that it stops being
+/// true the moment the families change, and a constant would not.
+pub fn advertised_queue_flags() -> u32 {
+    queue_families().iter().fold(0u32, |acc, f| acc | f.queue_flags.0)
+}
+
+/// Why this extension cannot be served, if it cannot: the first command
+/// requirement no advertised queue family satisfies.
+///
+/// # The defect, and why `INCOMPLETE_EXTENSIONS` could not see it
+///
+/// That table asks whether the *generator* produced a working stub. For
+/// `VK_KHR_video_queue` and `VK_KHR_video_decode_queue` it did — every entry
+/// point marshals — so when `full` became the default profile a forwarded device
+/// began advertising sixteen video extensions. It also advertises **one queue
+/// family**, `GRAPHICS | COMPUTE | TRANSFER` (§0.8 item 7's synthesised family),
+/// and `vkCmdDecodeVideoKHR` is `queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR"`. There
+/// was no family an application could record it on.
+///
+/// Firefox 153 selects a device on exactly those two extensions, and its
+/// first-frame failure comes back as `NS_ERROR_DOM_MEDIA_FATAL_ERR` — which its
+/// hardware-to-software recovery path does not admit. One pref away from the
+/// default that was broken playback, not slow playback.
+///
+/// # Why it is derived and not a list
+///
+/// The underlying fact is "we advertise a family we did not open", and both
+/// halves are already data: the registry states `queues=` per command
+/// (`sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS`), and [`queue_families`] states
+/// what we offer. Adding `VK_KHR_video_queue` to an exclusion list would have
+/// fixed today and said nothing about `VK_KHR_video_encode_queue`,
+/// `VK_NV_optical_flow` or `VK_ARM_data_graph`, which fail for the identical
+/// reason and are caught here without being named.
+///
+/// **An honest refusal, not a placeholder.** A gate with nothing behind it is
+/// worse than a documented gap: if we cannot serve a video queue we must not
+/// claim one. When the ICD grows a real video family — §0.21's path — this
+/// function starts returning `None` for those extensions on its own.
+pub fn unservable_queue_requirement(extension: &str) -> Option<u32> {
+    let have = advertised_queue_flags();
+    let reqs = sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS
+        .binary_search_by_key(&extension, |(name, _)| name)
+        .ok()
+        .map(|i| sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS[i].1)?;
+    // Every command's mask must intersect what we advertise; the first that does
+    // not is the reason, and is worth returning rather than a bool so the
+    // diagnostic can say which capability was missing.
+    reqs.iter().copied().find(|mask| mask & have == 0)
+}
+
 /// Features, curated rather than mirrored (design.md §9.2).
 ///
 /// **`bufferDeviceAddress` is deliberately absent** and is not an oversight: an
@@ -345,6 +399,48 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
 /// driver's own extensions is not knowable here.
 pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
 
+/// Features the driver over there has and this side will not promise.
+///
+/// # Why this exists at all, given `INCOMPLETE_EXTENSIONS`
+///
+/// Extensions and features are not the same lever, and core 1.4 is where the
+/// difference stops being academic. `sv_icd_entry::INCOMPLETE_EXTENSIONS` can
+/// withdraw `VK_EXT_host_image_copy` — but the same capability is *also* core
+/// 1.4's `hostImageCopy`, reachable through `VkPhysicalDeviceVulkan14Features`
+/// with no extension string to decline. Withdrawing the extension and leaving
+/// the feature bit set advertises the same thing twice and denies it once.
+///
+/// So this walks the reply's `pNext` chain and clears the bit wherever it
+/// appears: in `VkPhysicalDeviceVulkan14Features`, in the promoted
+/// `VkPhysicalDeviceHostImageCopyFeatures`, and in the `…EXT` form. All three
+/// are the same bit and an application may ask through any of them.
+///
+/// # Why `hostImageCopy` in particular
+///
+/// The wire is right: `sv_codegen::exceptions` gives `pHostPointer` the
+/// `ArenaOffset` policy, which is what design.md §5.3 says a host pointer *is*
+/// here — `arena_base + offset`. What is not written is the case where the
+/// application's pointer is **not** arena memory. `vkCopyMemoryToImage` accepts
+/// a plain `malloc` buffer, and honouring that needs a bounce through an arena
+/// block whose extent must be computed from `imageExtent`, `imageSubresource`,
+/// `memoryRowLength` and the image's format. That is real work and it is not
+/// done, so the feature is withdrawn rather than half-kept.
+///
+/// This is the seam design.md §0.19 item 3 asks for: carry everything, advertise
+/// what works. The three commands stay on the wire and in the proc tables — they
+/// are core 1.4 and cannot be made to disappear — and a conforming application
+/// that respects the feature bit never calls them.
+pub fn withdraw_gated_features(chain: &mut [sv_proto::PNextLink]) {
+    use sv_proto::PNextLink as L;
+    for link in chain.iter_mut() {
+        match link {
+            L::VkPhysicalDeviceVulkan14Features(f) => f.host_image_copy = false,
+            L::VkPhysicalDeviceHostImageCopyFeatures(f) => f.host_image_copy = false,
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,15 +508,127 @@ mod tests {
         );
     }
 
+    /// The 1.0 feature set is the fallback with no GPU side, and it stays empty.
+    ///
+    /// **This test used to be called `we_do_not_advertise_buffer_device_address`
+    /// and it never checked that.** `bufferDeviceAddress` is not in
+    /// `VkPhysicalDeviceFeatures` at all — it arrives through
+    /// `VkPhysicalDeviceVulkan12Features`, which is forwarded whole from the
+    /// physical device — so the assertion below was true, the name was false,
+    /// and design.md §9.2's claim that we do not advertise the feature rested on
+    /// a test about a different structure. `vulkaninfo` printed
+    /// `bufferDeviceAddress = true` throughout (design.md §0.16 item 3).
+    ///
+    /// The name is corrected rather than the assertion, because the feature is
+    /// now **implemented** — all three of `vkGetBufferDeviceAddress`,
+    /// `vkGetBufferOpaqueCaptureAddress` and
+    /// `vkGetDeviceMemoryOpaqueCaptureAddress` forward and return the GPU side's
+    /// real address (§0.20) — so advertising it is honest and the check that
+    /// belongs here is the one the body actually makes.
     #[test]
-    fn we_do_not_advertise_buffer_device_address() {
-        // The feature is not in `VkPhysicalDeviceFeatures` at all — it arrives
-        // through `VkPhysicalDeviceVulkan12Features` — so what this checks is
-        // that the base feature set is empty and nothing has quietly turned
-        // something on.
+    fn the_ten_zero_feature_set_is_empty() {
         let f = features();
         assert_eq!(f.robust_buffer_access, 0);
         assert_eq!(f.shader_int64, 0);
+    }
+
+    /// A feature the driver has and we do not keep is withdrawn on *every* path
+    /// an application can ask through.
+    ///
+    /// The bug this guards is not "we forgot to clear it" — it is "we cleared it
+    /// in one of the three places". `hostImageCopy` is core 1.4's feature, the
+    /// promoted extension's feature and the `…EXT` alias's feature, and an
+    /// application that chains `VkPhysicalDeviceVulkan14Features` sees a
+    /// different answer from one that chains
+    /// `VkPhysicalDeviceHostImageCopyFeatures` unless both are handled.
+    #[test]
+    /// We do not claim an extension whose commands need a queue family we do
+    /// not open — stated as the invariant, not as a list of names.
+    ///
+    /// The property is checkable in both directions from data that already
+    /// exists, which is the point of deriving it: `EXTENSION_QUEUE_REQUIREMENTS`
+    /// is generated from the registry's `queues=`, and [`queue_families`] is
+    /// what we advertise. A name-based test would have to be edited when the
+    /// ICD grows a video family; this one starts passing for a different reason
+    /// and keeps asserting the same thing.
+    #[test]
+    fn no_extension_is_advertised_that_needs_a_queue_family_we_do_not_open() {
+        let have = advertised_queue_flags();
+        assert_ne!(have, 0, "we advertise at least one family");
+
+        let mut refused = 0usize;
+        for (ext, masks) in sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS {
+            let unservable = masks.iter().any(|m| m & have == 0);
+            assert_eq!(
+                unservable,
+                unservable_queue_requirement(ext).is_some(),
+                "{ext}: the gate disagrees with the table it reads"
+            );
+            if unservable {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused > 0,
+            "with one GRAPHICS|COMPUTE|TRANSFER family, something must be \
+             refused — if nothing is, the table is empty and the gate is a \
+             no-op dressed as a check"
+        );
+
+        // The case that motivated it, named once. Not as the assertion — that is
+        // the loop above — but because a regression here is broken video
+        // playback in Firefox and the next reader should meet the example.
+        // `VK_KHR_video_queue` introduces `vkCmdBeginVideoCodingKHR`, which is
+        // `queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR,VK_QUEUE_VIDEO_ENCODE_BIT_KHR"`
+        // and cannot be recorded on any family this driver offers.
+        assert!(
+            unservable_queue_requirement("VK_KHR_video_queue").is_some(),
+            "VK_KHR_video_queue needs a video family and we open none"
+        );
+        assert!(
+            unservable_queue_requirement("VK_KHR_video_decode_queue").is_some(),
+            "VK_KHR_video_decode_queue needs a video family and we open none"
+        );
+        // And the control: an extension whose commands run on graphics must not
+        // be caught by the same rule, or the gate is refusing everything.
+        assert!(
+            unservable_queue_requirement("VK_EXT_transform_feedback").is_none(),
+            "VK_EXT_transform_feedback records on graphics and must be servable"
+        );
+    }
+
+    #[test]
+    fn a_gated_feature_is_withdrawn_wherever_it_is_asked_for() {
+        let mut chain = vec![
+            sv_proto::PNextLink::VkPhysicalDeviceVulkan14Features(Box::new(
+                sv_proto::VkPhysicalDeviceVulkan14Features {
+                    host_image_copy: true,
+                    // A neighbour that must survive: the walk clears one bit,
+                    // not a struct.
+                    push_descriptor: true,
+                    ..Default::default()
+                },
+            )),
+            sv_proto::PNextLink::VkPhysicalDeviceHostImageCopyFeatures(Box::new(
+                sv_proto::VkPhysicalDeviceHostImageCopyFeatures {
+                    host_image_copy: true,
+                    ..Default::default()
+                },
+            )),
+        ];
+        withdraw_gated_features(&mut chain);
+        for link in &chain {
+            match link {
+                sv_proto::PNextLink::VkPhysicalDeviceVulkan14Features(f) => {
+                    assert!(!f.host_image_copy, "core 1.4's bit is still set");
+                    assert!(f.push_descriptor, "the walk cleared a bit it was not asked to");
+                }
+                sv_proto::PNextLink::VkPhysicalDeviceHostImageCopyFeatures(f) => {
+                    assert!(!f.host_image_copy, "the promoted extension's bit is still set");
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

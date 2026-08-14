@@ -41,8 +41,81 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use sv_icd_entry::{IcdResult, LowerError};
 
-/// `VK_MAKE_API_VERSION(0, 1, 3, 0)`, and it must agree with the manifest.
-pub const API_VERSION: u32 = (1 << 22) | (3 << 12);
+/// **The ceiling**: the highest Vulkan version this build could ever advertise.
+///
+/// `VK_MAKE_API_VERSION(0, 1, 3, 0)` today, and *derived* rather than written
+/// down: it is [`sv_proto::CORE_API_VERSION`], which the generator computed from
+/// the wire profile's `VK_VERSION_*` features. A constant here could disagree
+/// with the command table; this cannot.
+///
+/// It is a ceiling and not an answer. What an application is told is
+/// [`negotiate`]'s output — `min(what the driver behind us reports, this)` — so
+/// that a 1.1 device is advertised as 1.1 and a 1.4 device is advertised as 1.3
+/// *and said so at startup*. See design.md §0.18, and [`crate::icd`]'s
+/// `clamp_api_version` for the two GL versions that claiming more than this
+/// cost the last time it was claimed.
+///
+/// It must also agree with the manifest, which is a file the loader reads before
+/// any of this runs; `the_manifest_agrees_with_what_we_report` is that check and
+/// `build.rs` is where the constraint is written out.
+pub const PROTOCOL_API_VERSION: u32 = sv_proto::CORE_API_VERSION;
+
+/// What [`negotiate`] decided, and why — so the reason can be printed once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Negotiated {
+    /// No GPU side, or one that did not answer `svDriverVersions`. The ceiling
+    /// is the honest answer: it is exactly what the standalone driver
+    /// implements.
+    Unknown,
+    /// The driver reports the same version the wire carries. Nothing to say
+    /// beyond "negotiation ran".
+    Exact,
+    /// The driver is **older** than the ceiling, and we advertise the driver's
+    /// number. This is the graceful-fallback case the whole exercise is for: a
+    /// GPU that only does 1.1 still works, and the application is told 1.1 so
+    /// that its own version check makes the right decision.
+    Fallback { driver: u32 },
+    /// The driver is **newer** than the ceiling, and we advertise the ceiling.
+    ///
+    /// This is a demotion and it must never be silent — a silent demotion is
+    /// precisely the defect §0.18 exists to fix. The application would otherwise
+    /// never attempt anything the extra version enables and nothing anywhere
+    /// would say why.
+    Clamped { driver: u32 },
+}
+
+/// Format a packed `VK_MAKE_API_VERSION` the way a person writes it.
+pub fn version_string(v: u32) -> String {
+    format!("{}.{}.{}", (v >> 22) & 0x7f, (v >> 12) & 0x3ff, v & 0xfff)
+}
+
+/// Decide what to advertise, given what the driver reports and what we carry.
+///
+/// `driver` is `0` for "not known", which is what a standalone driver and an
+/// unanswered `svDriverVersions` both produce. Pure, and separate from the
+/// connect path, because the interesting cases are the ones no GPU on this
+/// machine can produce: a device *older* than the ceiling needs a test as much
+/// as a newer one does, and there is no 1.1-only GPU here to get it from.
+pub fn negotiate(driver: u32, ceiling: u32) -> (u32, Negotiated) {
+    // Compare on major.minor and ignore the patch. A driver at 1.3.290 and a
+    // ceiling of 1.3.0 are the same *contract* — the patch of a core version
+    // says which header revision the driver was built against and promises no
+    // entry point — so treating 1.3.290 as "newer than we can carry" would print
+    // a demotion notice on every ordinary run and mean nothing by it.
+    let nopatch = |v: u32| v & !0xfff;
+    match driver {
+        0 => (ceiling, Negotiated::Unknown),
+        d if nopatch(d) == nopatch(ceiling) => {
+            // Keep the *driver's* patch digits. They are the only part of the
+            // number that distinguishes two drivers of one minor version, and
+            // `vulkaninfo` prints them, so throwing them away is what makes the
+            // forwarded report differ from the direct one by a visible digit.
+            (d, Negotiated::Exact)
+        }
+        d if nopatch(d) < nopatch(ceiling) => (d, Negotiated::Fallback { driver: d }),
+        d => (ceiling, Negotiated::Clamped { driver: d }),
+    }
+}
 
 /// The reserved id the arena's `VkDeviceMemory` has on the GPU side.
 ///
@@ -135,6 +208,22 @@ pub struct SharedVulkan {
     pub arena_len: u64,
     state: Mutex<State>,
     transport: Option<crate::transport::RingTransport>,
+    /// What `vkEnumerateInstanceVersion` answers and what every instance this
+    /// driver creates is stamped with.
+    ///
+    /// Settled once, at construction, by [`negotiate`] over what the GPU side
+    /// reported. A field rather than a constant because it is a fact about the
+    /// *pair* — this build's wire and that machine's driver — and the whole
+    /// point of §0.18 is that neither half decides it alone.
+    api_version: u32,
+    /// The negotiated `VkPhysicalDeviceProperties::apiVersion`, kept apart from
+    /// [`Self::api_version`] because Vulkan keeps them apart: a driver may
+    /// support a higher instance version than a particular device does. With a
+    /// GPU side this is a cross-check on the forwarded number rather than the
+    /// source of it — the forwarded properties carry the device's own answer and
+    /// `clamp_api_version` bounds it — and without one it is what the local
+    /// table reports.
+    device_api_version: u32,
     /// What we tell an application `vkEnumerateDeviceExtensionProperties`
     /// returns, and what `vkCreateDevice` will accept.
     ///
@@ -185,6 +274,11 @@ impl SharedVulkan {
             arena_len,
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: None,
+            // No driver behind us, so there is nothing to negotiate against and
+            // the ceiling is the honest answer: a standalone driver implements
+            // exactly the profile and no more.
+            api_version: PROTOCOL_API_VERSION,
+            device_api_version: PROTOCOL_API_VERSION,
             device_extensions: Vec::new(),
             swapchains: Mutex::new(HashMap::new()),
             surfaces: Mutex::new(HashMap::new()),
@@ -220,11 +314,40 @@ impl SharedVulkan {
             sv_arena::canary::CanaryPolicy::None,
         )
         .map_err(|e| format!("{e}"))?;
+        // **Before anything else is asked of the ring.** The loader may call
+        // `vkEnumerateInstanceVersion` before `vkCreateInstance` — it is a global
+        // command — so the answer has to exist by the time this constructor
+        // returns, and the only side that knows it is the one holding the
+        // driver.
+        let (driver_instance, driver_device) =
+            attached.transport.driver_versions().unwrap_or((0, 0));
+        // **The instance number is bounded by the device's**, and that is a
+        // consequence of design.md §8 rather than of Vulkan: an ICD may in
+        // general offer more instance-level version than any of its devices
+        // supports, but this one has exactly one physical device, so an
+        // application told "instance 1.3" and then handed a 1.1 device learns
+        // nothing from the first number that the second does not contradict.
+        // The GPU side's instance number is also its *loader's*, which on a
+        // machine with a new loader and an old driver overstates the driver by
+        // an entire minor version; taking the smaller of the two is what stops
+        // that from becoming our answer. Zero means "not reported" and must not
+        // win a `min`.
+        let both = match (driver_instance, driver_device) {
+            (0, d) => d,
+            (i, 0) => i,
+            (i, d) => i.min(d),
+        };
+        let (api_version, how) = negotiate(both, PROTOCOL_API_VERSION);
+        let (device_api_version, _) = negotiate(driver_device, PROTOCOL_API_VERSION);
+        announce(how, api_version, driver_device);
+
         let mut icd = SharedVulkan {
             arena,
             arena_len: attached.arena_len,
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: Some(attached.transport),
+            api_version,
+            device_api_version,
             device_extensions: Vec::new(),
             swapchains: Mutex::new(HashMap::new()),
             surfaces: Mutex::new(HashMap::new()),
@@ -300,8 +423,146 @@ impl SharedVulkan {
         // (`vk_registry::profile::zink`). If the driver over there lacks it
         // entirely, that is a driver we cannot present through, and it will say
         // so at the first barrier rather than here.
+        // The third term of the intersection, and the one that was missing.
+        //
+        // The GPU side answers "the profile, intersected with what my driver
+        // has". Both halves of that can be true of an extension whose entry
+        // points this build never generated — the generator refuses a command
+        // whose reply it cannot shape, and the refusal lands in
+        // `sv_icd_entry::NOT_IMPLEMENTED` rather than in the profile. So the
+        // answer arriving over the wire is "the device supports it", not "it
+        // works", and design.md §9.2 asks for the second.
+        //
+        // Concretely: this is what stops `VK_KHR_buffer_device_address` being
+        // advertised while `vkGetBufferDeviceAddress` returns a silent zero.
+        // Nothing here decides *whether* to implement it — `sv-worktrees/cts2`
+        // owns that — it decides not to promise it until something does.
+        out.retain(|(n, _)| sv_icd_entry::INCOMPLETE_EXTENSIONS.binary_search(n).is_err());
+
+        // The fourth term, and the one that has nothing to do with entry points.
+        //
+        // The filter above asks whether the *generator* kept §9.2's promise. It
+        // cannot ask whether the *device* can: an extension whose commands must
+        // be recorded on a `VIDEO_DECODE` queue is unservable here no matter how
+        // well its marshalling was generated, because
+        // `crate::advertise::queue_families` offers one family and it is
+        // `GRAPHICS | COMPUTE | TRANSFER`.
+        //
+        // This went live the moment `full` became the default profile: sixteen
+        // video extensions appeared in `vulkaninfo` through the forwarder, and
+        // Firefox 153 selects a device on two of them. Recorded as a future risk
+        // in §0.8 item 7 while the profile was `zink`, with nothing connecting
+        // that note to the profile change — see §0.22.
+        out.retain(|(n, _)| {
+            match crate::advertise::unservable_queue_requirement(n) {
+                None => true,
+                Some(missing) => {
+                    // Always, not under `SV_DEBUG`: an extension silently
+                    // missing from the advertised set is the kind of thing that
+                    // gets diagnosed as "the GPU does not support it".
+                    sv_icd_entry::report_always(&format_args!(
+                        "{n} needs a queue family with flags {missing:#x} and this \
+                         driver advertises {:#x}; not advertising it",
+                        crate::advertise::advertised_queue_flags()
+                    ));
+                    false
+                }
+            }
+        });
+
+        // **`VK_KHR_swapchain` is added here rather than intersected**, and that
+        // is a correction to design.md §0.4 item 8 rather than an exception to
+        // it. §0.4's rule — the list is "the profile's extensions intersected
+        // with what the driver actually has, and only the side holding the
+        // driver knows the second half" — is right for every extension whose
+        // commands are *forwarded*. This one's commands are not: the whole of
+        // `VK_KHR_swapchain` is implemented in [`crate::wsi`], out of ordinary
+        // Vulkan the GPU side never learns is a swapchain. §9.2 says an
+        // extension in this list is a promise its entry points work, and the
+        // side that keeps that promise here is this one.
+        //
+        // The GPU-side driver still has to *enable* it — an application
+        // transitions a swapchain image to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`,
+        // and that layout does not exist on a device that did not — which is
+        // why it is in the profile the GPU side enables from
+        // (`vk_registry::profile::zink`). If the driver over there lacks it
+        // entirely, that is a driver we cannot present through, and it will say
+        // so at the first barrier rather than here.
+        //
+        // **It goes after the filter, not before, and that ordering is the whole
+        // of a regression this section caused and caught.** `VK_KHR_swapchain`
+        // is in `INCOMPLETE_EXTENSIONS` — `vkAcquireNextImage2KHR` and the three
+        // device-group present queries are stubs, and have always been — so
+        // adding it first and filtering second removed presentation from the
+        // advertised set. `vulkaninfo` through the forwarder went from 218
+        // device extensions to 217 and the missing one was the extension every
+        // windowed application requires. The filter answers "did the *generator*
+        // keep the promise"; this line answers "did `crate::wsi`", and those are
+        // different questions about different code.
         if !out.iter().any(|(n, _)| *n == "VK_KHR_swapchain") {
             out.push(("VK_KHR_swapchain", 70));
+        }
+
+        // Close the set under `depends=`.
+        //
+        // The queue check withdrew the three video extensions that *have*
+        // commands. Ten codec and maintenance ones — `VK_KHR_video_decode_h264`,
+        // `…_av1`, `VK_KHR_video_maintenance1` — add only structs and enums, so
+        // they constrain no queue and nothing above could see them. Each depends
+        // on one of the three that just went, and §9.2's promise is about the
+        // whole extension: "H.264 decode, but not the decode queue you would
+        // decode on" is not something an implementation may say.
+        //
+        // A fixpoint rather than one pass, for the reason
+        // `Profile::include_portable_extensions` needs one: dependency chains
+        // are deeper than one link, and a single pass keeps whatever depended on
+        // what it just removed.
+        //
+        // **`have` is three sets, not one, and getting that wrong cost
+        // `VK_KHR_swapchain` for the second time in this file.** A device
+        // extension's `depends=` routinely names an *instance* extension —
+        // `VK_KHR_swapchain` depends on `VK_KHR_surface`,
+        // `VK_KHR_external_fence` on `VK_KHR_external_fence_capabilities`,
+        // `VK_KHR_shader_untyped_pointers` on
+        // `VK_KHR_get_physical_device_properties2` — and none of those is in
+        // `out`, which is the *device* list. A closure that consulted only `out`
+        // withdrew swapchain, present_id, present_wait, incremental_present,
+        // hdr_metadata and eleven more, and `vulkaninfo` through the forwarder
+        // went from 218 device extensions to 192.
+        //
+        // It is the same mistake as the ordering bug §0.19 item 6 records, in a
+        // different disguise: a check that is right about the extension it was
+        // written for and wrong about the set it reads. The diff caught it
+        // again, which is the argument for the diff being the gate.
+        //
+        // Core versions satisfy a `depends=` on themselves — an extension
+        // promoted into 1.1 may say `VK_VERSION_1_1,VK_KHR_…`, and this is a 1.4
+        // device.
+        loop {
+            let have = |n: &str| {
+                if let Some(minor) =
+                    n.strip_prefix("VK_VERSION_1_").and_then(|m| m.parse::<u32>().ok())
+                {
+                    return minor <= 4;
+                }
+                out.iter().any(|(o, _)| *o == n)
+                    || crate::advertise::INSTANCE_EXTENSIONS.iter().any(|(o, _)| *o == n)
+            };
+            let drop: Vec<&str> = out
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| !sv_icd_entry::depends_satisfied(n, &have))
+                .collect();
+            if drop.is_empty() {
+                break;
+            }
+            for d in &drop {
+                sv_icd_entry::report_always(&format_args!(
+                    "{d} depends on something this driver does not advertise; \
+                     not advertising it either"
+                ));
+            }
+            out.retain(|(n, _)| !drop.contains(n));
         }
         out
     }
@@ -364,6 +625,16 @@ impl SharedVulkan {
         Ok((ARENA_MEMORY_ID, base + offset))
     }
 
+    /// What `vkEnumerateInstanceVersion` answers: the negotiated version.
+    pub fn advertised_api_version(&self) -> u32 {
+        self.api_version
+    }
+
+    /// What a physical device this driver reports is allowed to claim.
+    pub fn advertised_device_api_version(&self) -> u32 {
+        self.device_api_version
+    }
+
     /// A poisoned lock is not a reason to abort an application's Vulkan call:
     /// the state it protects is plain tables, and the panic that poisoned it has
     /// already been reported.
@@ -372,10 +643,53 @@ impl SharedVulkan {
     }
 }
 
-/// Refuse, naming the command.
-pub fn unimplemented<T>(what: &'static str) -> IcdResult<T> {
-    Err(LowerError::NotImplemented(what))
+/// Say, on the loader's diagnostic channel, what was negotiated and why.
+///
+/// **On the line that always prints, not behind a debug flag.** The bug §0.18
+/// fixes was not that the wrong version was reported — it was that the wrong
+/// version was reported *without anything saying so*, which is why it survived
+/// long enough to cost two GL versions through Zink. A demotion nobody can see
+/// is the same defect wearing different clothes, so the one case that must never
+/// be quiet is [`Negotiated::Clamped`].
+fn announce(how: Negotiated, advertised: u32, driver_device: u32) {
+    let adv = version_string(advertised);
+    match how {
+        Negotiated::Unknown => eprintln!(
+            "sv-icd: the GPU side did not report a driver version; advertising this build's \
+             ceiling, Vulkan {adv}"
+        ),
+        Negotiated::Exact => eprintln!(
+            "sv-icd: Vulkan {adv}, which is both what the driver offers and what this wire \
+             carries (device {})",
+            version_string(driver_device)
+        ),
+        Negotiated::Fallback { driver } => eprintln!(
+            "sv-icd: the driver offers Vulkan {}, below this build's ceiling {}; advertising \
+             {adv} — what the GPU supports, forwarded",
+            version_string(driver),
+            version_string(PROTOCOL_API_VERSION),
+        ),
+        Negotiated::Clamped { driver } => eprintln!(
+            "sv-icd: the driver offers Vulkan {}, but this wire carries only {} (profile {}); \
+             advertising {adv}.\n\
+             sv-icd: applications will not attempt anything above {adv} through this driver. \
+             Raising the ceiling means adding the missing core version to the wire profile — \
+             see design.md §0.18 for what that costs.",
+            version_string(driver),
+            version_string(PROTOCOL_API_VERSION),
+            sv_proto::PROTOCOL_PROFILE,
+        ),
+    }
 }
+
+// `pub fn unimplemented<T>(what) -> IcdResult<T>` used to live here, unused by
+// anything in the workspace and unused for long enough that the audit of §0.20
+// found it by looking for the opposite thing. It is deleted rather than wired
+// up: a helper whose name announces a convention, with no callers, reads as
+// evidence that refusals are marked when they are not. The one place that does
+// refuse spells it out — `LowerError::NotImplemented("vkCreateSwapchainKHR
+// without a GPU side")` in `crate::wsi` — and a spelled-out refusal carrying its
+// own reason is better than a shared helper that carries none.
 
 /// The memory table, with this ICD's arena size in it.
 pub fn memory_properties(icd: &SharedVulkan) -> sv_icd_entry::VkPhysicalDeviceMemoryProperties {
@@ -386,22 +700,85 @@ pub fn memory_properties(icd: &SharedVulkan) -> sv_icd_entry::VkPhysicalDeviceMe
 mod tests {
     use super::*;
 
-    /// The manifest's `api_version` and `vkEnumerateInstanceVersion` must agree.
+    /// The manifest must state the **ceiling**, and the ceiling is derived.
     ///
-    /// design.md §8: if they disagree in the wrong direction the loader demotes
-    /// the driver to Vulkan 1.0 *and rewrites every application's requested
-    /// version*, with no diagnostic. A string comparison is a cheap way never to
-    /// find that out the hard way.
+    /// This is the drift detector for the one coupling §0.18 could not remove:
+    /// the manifest is a file on disk, written by `build.rs`, and the loader
+    /// reads it before a line of this crate runs, so it cannot be negotiated.
+    /// `build.rs` explains what the loader does with the number and why "state
+    /// the ceiling" is the right answer; this checks that the file says it.
+    ///
+    /// The failure it prevents is silent in both directions. Below 1.1 the
+    /// loader stops asking us for a runtime version at all and treats us as a
+    /// 1.0 driver forever, rewriting every application's requested version on
+    /// the way past (loader.c, `terminator_CreateInstance`). Above the ceiling
+    /// the JSON claims something the wire cannot carry, and a person reading the
+    /// two files gets the wrong answer about which one is authoritative.
     #[test]
     fn the_manifest_agrees_with_what_we_report() {
-        let major = (API_VERSION >> 22) & 0x7f;
-        let minor = (API_VERSION >> 12) & 0x3ff;
-        let patch = API_VERSION & 0xfff;
         assert_eq!(
-            format!("{major}.{minor}.{patch}"),
+            version_string(PROTOCOL_API_VERSION),
             env!("SV_ICD_MANIFEST_API_VERSION"),
-            "the manifest and vkEnumerateInstanceVersion must report the same version"
+            "the manifest states the ceiling; the ceiling comes from the wire profile \
+             (sv_proto::CORE_API_VERSION), so a profile that gains a core version needs \
+             build.rs's MANIFEST_API_VERSION moved with it"
         );
+        let minor = (PROTOCOL_API_VERSION >> 12) & 0x3ff;
         assert!(minor >= 1, "a manifest below 1.1 makes the loader demote us silently");
+    }
+
+    /// The four outcomes, including the two no GPU on this machine can produce.
+    #[test]
+    fn we_advertise_what_the_driver_supports_up_to_what_we_carry() {
+        let mk = |minor: u32, patch: u32| (1u32 << 22) | (minor << 12) | patch;
+        let ceiling = mk(3, 0);
+
+        // The testhost guest's Intel UHD, and this machine's RADV: newer than
+        // the wire. Demoted to the ceiling, and *said so*.
+        for driver in [mk(4, 323), mk(4, 348), mk(4, 0)] {
+            assert_eq!(negotiate(driver, ceiling), (ceiling, Negotiated::Clamped { driver }));
+        }
+
+        // The case with no hardware here to produce it, and the one the
+        // requirement is actually about: a GPU that only does 1.1 must still
+        // work, and must be advertised as 1.1 rather than as our ceiling.
+        for driver in [mk(1, 0), mk(1, 128), mk(2, 0), mk(0, 0) | (1 << 22)] {
+            let (advertised, how) = negotiate(driver, ceiling);
+            assert_eq!(advertised, driver, "a driver below the ceiling is forwarded, not raised");
+            assert_eq!(how, Negotiated::Fallback { driver });
+        }
+
+        // Equal on major.minor. The driver's patch survives, because that is
+        // what `vulkaninfo` prints and the acceptance test is that the forwarded
+        // report and the direct one are the same text.
+        assert_eq!(negotiate(mk(3, 290), ceiling), (mk(3, 290), Negotiated::Exact));
+        assert_eq!(negotiate(ceiling, ceiling), (ceiling, Negotiated::Exact));
+
+        // No answer: the ceiling, which is what a standalone driver implements.
+        assert_eq!(negotiate(0, ceiling), (ceiling, Negotiated::Unknown));
+
+        // Whatever happens, we never advertise above what the wire carries.
+        for driver in [0, mk(1, 0), mk(3, 999), mk(4, 323), mk(9, 9), u32::MAX] {
+            let (advertised, _) = negotiate(driver, ceiling);
+            assert!(
+                advertised & !0xfff <= ceiling,
+                "negotiate({driver:#x}) advertised {advertised:#x}, above the ceiling"
+            );
+        }
+    }
+
+    /// A standalone driver reports the ceiling and nothing else.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn with_no_gpu_side_the_ceiling_is_what_is_advertised() {
+        let icd = SharedVulkan::new(1 << 20).expect("a 1 MiB arena");
+        assert_eq!(icd.advertised_api_version(), PROTOCOL_API_VERSION);
+        assert_eq!(icd.advertised_device_api_version(), PROTOCOL_API_VERSION);
+    }
+
+    #[test]
+    fn a_version_is_printed_the_way_a_person_writes_it() {
+        assert_eq!(version_string((1 << 22) | (4 << 12) | 323), "1.4.323");
+        assert_eq!(version_string((1 << 22) | (3 << 12)), "1.3.0");
     }
 }

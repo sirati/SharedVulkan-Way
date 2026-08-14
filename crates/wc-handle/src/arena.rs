@@ -954,6 +954,76 @@ pub fn attached() -> Vec<(u32, usize, String)> {
     out
 }
 
+/// Take the front of the outbound window for the growth channel's control
+/// region, and say where it is.
+///
+/// GROWTH. Returns `(arena offset, len)` — the range `crate::grow` builds a
+/// `Control` over, and the range the gift allocator must never hand to a
+/// client.
+///
+/// # Why this is its own call and not part of `reserve_outbound`
+///
+/// It was part of it for about ten minutes, and three tests said why it should
+/// not be. A window is a fact about *this compositor's objects*; the growth
+/// channel is a fact about *the deployment having growth turned on*. Carving
+/// the channel out of every window would impose a 272 KiB minimum on every
+/// caller that reserves one — including the harnesses that reserve 64 KiB to
+/// test a keymap, which do not grow, will never grow, and would have had to be
+/// rewritten to accommodate a feature they do not use.
+///
+/// So it is opt-in, on the side that opts in, in the same shape as
+/// `--arena-grow` on the host. A compositor nobody asked to grow has exactly
+/// the window it always had.
+///
+/// # Two refusals
+///
+/// * **Anything already given.** The channel is the *front* of the window and
+///   the free list is a sorted run list; taking bytes out of the middle of one
+///   that has already been cut would need a hole, and a hole in this list is
+///   the one thing it is written not to have. Before the first gift is
+///   naturally satisfied: the host cannot ask to grow before a client exists.
+/// * **A window too small to hold it and still be a window.** Refused where the
+///   number is rather than discovered later as a keymap that would not fit.
+pub fn reserve_growth_channel(arena: u32) -> io::Result<(u64, u64)> {
+    let control = crate::grow::CONTROL_BYTES;
+    let mut guard = outbound_slot()
+        .lock()
+        .map_err(|_| io::Error::other("outbound window poisoned"))?;
+    let Some(w) = guard.as_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this process has no outbound window, so there is nowhere to put the \
+             growth channel: the channel lives in the one range that is already \
+             located, already ours to write and never reclaimed",
+        ));
+    };
+    if w.arena != arena {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the outbound window is in arena {}, not {arena}", w.arena),
+        ));
+    }
+    if w.len <= control {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "an outbound window of {} bytes cannot hold the {control}-byte growth \
+                 channel and still have room for the objects it exists for",
+                w.len
+            ),
+        ));
+    }
+    if w.given != 0 || w.free != vec![(w.base, w.len)] {
+        return Err(io::Error::other(
+            "the growth channel must be reserved before anything is given out of the \
+             outbound window: it is the front of that window, and the free list has no \
+             way to express a hole",
+        ));
+    }
+    w.free = vec![(w.base + control, w.len - control)];
+    Ok((w.base, control))
+}
+
 /// Where a region this process **provided** starts in this process's address
 /// space, for the one caller that needs an address rather than bytes.
 ///

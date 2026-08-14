@@ -89,29 +89,147 @@ impl RingLink {
     /// the module header. An existing file is truncated: a stale region from a
     /// previous run has a stale generation and stale ring states, and attaching
     /// to it would be attaching to a session whose peers are gone.
-    pub fn create(path: &str) -> Result<RingLink, String> {
+    pub fn create(name: &str) -> Result<RingLink, String> {
         let geometry = Geometry::for_arena(256 << 20);
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|e| format!("{path}: {e}"))?;
-        f.set_len(geometry.control_size).map_err(|e| format!("{path}: {e}"))?;
-        let region = Arc::new(
-            sv_transport::region::SharedRegion::map_fd(
-                std::os::fd::AsFd::as_fd(&f),
-                0,
-                geometry.control_size as usize,
+        // The region is a **file** on Unix and a **named section** on Windows,
+        // and that is the only platform difference in this module. It is the
+        // same split the arena already lives with: §1a made the arena a *named*
+        // object on both sides precisely so that nothing but text has to cross,
+        // and `winshm::Section` is the Windows half of that. Reused here rather
+        // than written again — a second mapper is a second place for the
+        // geometry to be wrong.
+        #[cfg(unix)]
+        let region = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(name)
+                .map_err(|e| format!("{name}: {e}"))?;
+            f.set_len(geometry.control_size).map_err(|e| format!("{name}: {e}"))?;
+            Arc::new(
+                sv_transport::region::SharedRegion::map_fd(
+                    std::os::fd::AsFd::as_fd(&f),
+                    0,
+                    geometry.control_size as usize,
+                )
+                .map_err(|e| e.to_string())?,
             )
-            .map_err(|e| e.to_string())?,
-        );
+        };
+        #[cfg(windows)]
+        let region = {
+            let section = sv_transport::winshm::Section::create(name, geometry.control_size)
+                .map_err(|e| format!("{name}: {e}"))?;
+            Arc::new(
+                sv_transport::region::SharedRegion::map_section(section)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
         // The same ids the Vulkan half uses. R13: two builds that disagree must
         // fail to connect rather than desynchronise.
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
         let control = Control::create(region, geometry, ids, 1).map_err(|e| e.to_string())?;
         control.stamp_epoch().map_err(|e| e.to_string())?;
+        Ok(RingLink { control: Arc::new(control), links: Vec::new(), seen: Vec::new() })
+    }
+
+    /// Publish the control region out of **guest RAM**, over the cold path, and
+    /// listen on its directory. The cross-VM form of [`RingLink::create`].
+    ///
+    /// This is `win_guest`'s bring-up with the arena left out, and it is the same
+    /// sequence for the same reasons (§4.3, §5.1, and the ordering note below):
+    ///
+    /// 1. commit a window of guest RAM and **stamp every page**, so the host can
+    ///    find it by content — the guest cannot enumerate its own frames, so the
+    ///    locator is `Scan`;
+    /// 2. publish an `ExtentDesc` in a `Hello` down the virtio-serial port;
+    /// 3. wait for `Accept`, which is the host saying it has located the pages;
+    /// 4. **only then** `Control::create`.
+    ///
+    /// Step 4 comes last and that is load-bearing: `Control::create` zeroes the
+    /// region, which would erase exactly the stamps step 2 asked the host to
+    /// sweep for. `sv-gpu-server` learned this by measurement — "located 8192 of
+    /// 12288 pages", the arena's present and every control page missing — and the
+    /// comment there is the one to read. Publishing first costs nothing because
+    /// `magic` is written last anyway, so an early attacher sees `NotReady` and
+    /// retries.
+    ///
+    /// **The arena is committed and never used**, and that is worth a sentence
+    /// because it looks like waste. `commit_and_stamp(control_size, 0)` is
+    /// refused — "an extent with no arena" — and rightly: an extent is the unit
+    /// the host locates and `sv-arena`'s geometry has no meaning without one.
+    /// The Wayland rings carry a byte stream and need no arena; the proxy's pools
+    /// are a separate mechanism with their own region. So the smallest legal
+    /// arena is committed, stamped along with everything else, and left alone.
+    /// The cost is guest RAM the host will map and nobody will write to, and the
+    /// alternative — a second shape of extent that means "control only" — would
+    /// put a special case in the locator to save 64 MiB in a fixture.
+    #[cfg(target_os = "linux")]
+    pub fn publish(port: &str) -> Result<RingLink, String> {
+        use sv_arena::guestram::{GuestRamProvider, Pages};
+        use sv_transport::cold::{ColdMessage, Hello};
+        use sv_transport::control::ENDIAN_MARKER;
+        use sv_transport::stream::{open_virtio_port, read_message, write_message};
+
+        let geometry = Geometry::for_arena(64 << 20);
+        let mut provider = GuestRamProvider::new(Pages::Small);
+        let extent = provider
+            .commit_and_stamp(geometry.control_size, geometry.arena_size)
+            .map_err(|e| format!("cannot commit guest RAM: {e}"))?;
+        println!(
+            "wc-compositor: {} MiB of guest RAM for the ring region, run 0x{:016x}, {} pages stamped",
+            extent.total_len() >> 20,
+            extent.desc.run_id,
+            extent.desc.control_pages + extent.desc.arena_pages
+        );
+        let window = provider.take_window().ok_or("the provider kept no window")?;
+        let base = unsafe { window.base_ptr() };
+        let region = Arc::new(unsafe {
+            sv_transport::region::SharedRegion::from_raw(base, geometry.control_size as usize)
+        });
+
+        let mut chan: Box<dyn sv_transport::stream::ColdChannel> =
+            if port.starts_with("/dev/virtio-ports/") {
+                Box::new(
+                    open_virtio_port(port.rsplit('/').next().unwrap_or(port))
+                        .map_err(|e| format!("{port}: {e}"))?,
+                )
+            } else {
+                Box::new(
+                    std::os::unix::net::UnixStream::connect(port)
+                        .map_err(|e| format!("{port}: {e}"))?,
+                )
+            };
+        let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+        write_message(
+            &mut chan,
+            &ColdMessage::Hello(Box::new(Hello {
+                ids,
+                generation: 1,
+                extent: extent.desc.clone(),
+                geometry,
+                endianness: ENDIAN_MARKER,
+                pointer_width: 64,
+            })),
+        )
+        .map_err(|e| format!("cannot publish the extent: {e}"))?;
+        let mut scratch = Vec::new();
+        match read_message(&mut chan, &mut scratch).map_err(|e| e.to_string())? {
+            ColdMessage::Accept { generation } => {
+                println!("wc-compositor: the host located the ring region, generation {generation}");
+            }
+            ColdMessage::Refuse { code, reason } => {
+                return Err(format!("the host refused {code}: {reason}"));
+            }
+            other => return Err(format!("unexpected cold-path reply {other:?}")),
+        }
+
+        let control = Control::create(region, geometry, ids, 1).map_err(|e| e.to_string())?;
+        control.stamp_epoch().map_err(|e| e.to_string())?;
+        // The window is the region's now; dropping it here would unmap the pages
+        // the host has just located.
+        std::mem::forget(window);
         Ok(RingLink { control: Arc::new(control), links: Vec::new(), seen: Vec::new() })
     }
 
@@ -239,6 +357,100 @@ impl Link {
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Why `--wayland-cold` is Linux-only, in one place.
+///
+/// The message names the asymmetry rather than the platform, because "not
+/// supported on Windows" would invite someone to add a `cfg` and move on.
+// Dead on Linux by construction: it is the message for the platforms that
+// cannot honour the flag, and Linux can. Kept unconditional rather than
+// `cfg`-ed so there is exactly one copy of the wording, which is the whole
+// point of hoisting it out of the two places that print it.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub const COLD_NEEDS_LINUX: &str = "--wayland-cold publishes a control region out of guest RAM, \
+     which needs the Linux guest-RAM provider (sv_arena::guestram). The Windows guest commits its \
+     window through awe_probe's VirtualAlloc path instead — that is what `sv-gpu-server`'s \
+     win_guest does — and no compositor has been taught to do it yet. Use --wayland-ring with a \
+     section name, or run the Linux guest fixture.";
+
+/// Refuse a flag this build cannot honour, **at parse**.
+///
+/// # Why this exists at all
+///
+/// `--wayland-ring` and `--wayland-cold` used to sit behind a `#[cfg(unix)]`
+/// block. On Windows they were parsed, accepted, and silently ignored, and the
+/// compositor fell through to the socket listener — so the claim that Wayland
+/// rides shared_vulkan's channel was true on the machine the tests run on and
+/// false on the machine the thing ships to, and **the only artefact that said so
+/// was an `unused variable` warning**.
+///
+/// That is §35's failure mode in its purest form: a gate that reports success
+/// while something is wrong. The rule this encodes is that a flag which cannot
+/// be honoured must fail loudly where the user typed it, never be quietly
+/// dropped and never merely warn at compile time — a compile warning is
+/// addressed to whoever built the binary, and the person who needs to know is
+/// whoever ran it.
+pub fn check_platform_flags(
+    wayland_ring: Option<&str>,
+    wayland_cold: Option<&str>,
+) -> Result<(), String> {
+    let _ = wayland_ring;
+    #[cfg(not(target_os = "linux"))]
+    if wayland_cold.is_some() {
+        return Err(COLD_NEEDS_LINUX.to_string());
+    }
+    let _ = wayland_cold;
+    Ok(())
+}
+
+#[cfg(test)]
+mod platform_flag_tests {
+    use super::*;
+
+    /// The regression this file's `check_platform_flags` exists for.
+    ///
+    /// On Windows `--wayland-cold` cannot be honoured, and the old code said so
+    /// only by not using the variable. A build warning is addressed to whoever
+    /// compiled the binary; the person who needs to know is whoever ran it.
+    #[test]
+    fn a_flag_this_platform_cannot_honour_is_refused_at_parse() {
+        let got = check_platform_flags(None, Some("/dev/virtio-ports/x"));
+        if cfg!(target_os = "linux") {
+            assert!(got.is_ok(), "Linux can publish guest RAM; it must not refuse");
+        } else {
+            let e = got.expect_err("a flag that will be ignored must not be accepted");
+            // The message must name the *asymmetry*, not the platform: "not
+            // supported on Windows" invites somebody to add a cfg and move on.
+            assert!(e.contains("guest RAM"), "the reason is missing from: {e}");
+            assert!(e.contains("--wayland-ring"), "the way out is missing from: {e}");
+        }
+    }
+
+    /// `--wayland-ring` is honoured everywhere now — a file on Unix, a named
+    /// section on Windows — so it must never be refused on either.
+    #[test]
+    fn the_ring_flag_is_accepted_on_every_platform() {
+        assert!(check_platform_flags(Some("wc-ring"), None).is_ok());
+    }
+
+    /// And the region really can be created and its directory polled, whichever
+    /// kind of object it is underneath. This is the part that was `#[cfg(unix)]`.
+    #[test]
+    fn a_ring_region_can_be_created_and_starts_empty() {
+        let name = if cfg!(windows) {
+            format!("wc-ringlink-test-{}", std::process::id())
+        } else {
+            let d = std::env::temp_dir().join(format!("wc-ringlink-{}", std::process::id()));
+            d.to_string_lossy().into_owned()
+        };
+        let mut rl = RingLink::create(&name).expect("the region must be creatable");
+        assert!(rl.accept().is_empty(), "a fresh directory has no connections");
+        rl.pump();
+        if !cfg!(windows) {
+            let _ = std::fs::remove_file(&name);
         }
     }
 }

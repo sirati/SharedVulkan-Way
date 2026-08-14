@@ -54,7 +54,6 @@ mod icon;
 mod input;
 mod platform;
 /// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
-#[cfg(unix)]
 mod ringlink;
 mod state;
 mod surface;
@@ -62,7 +61,7 @@ mod surface;
 /// docs/waycompose-design.md §32.
 mod taskbar;
 mod tick;
-/// §39: whether the Win32 underneath is Windows' or Wine's, decided once.
+/// docs/waycompose-design.md §55: whether the Win32 underneath is Windows' or Wine's, decided once.
 /// `pub` because `sv-guest` is this compositor too, and because the few places
 /// allowed to branch on it are named in that module's header rather than found
 /// by grepping.
@@ -94,6 +93,9 @@ struct Args {
     /// slots in the control region it creates at this path — the `accept()` half
     /// of §36.2's table. The socket listener stays up alongside it.
     wayland_ring: Option<String>,
+    /// §36, cross-VM. Publish the ring region out of the guest's own RAM over
+    /// this cold path, instead of creating it as a file.
+    wayland_cold: Option<String>,
     idle_timeout: Duration,
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
@@ -131,6 +133,40 @@ struct Args {
     /// backend and write into them. The compositor prints the run id, which is
     /// the only thing the host needs and the only thing that crosses.
     guest_arenas: Vec<(u32, u64)>,
+    /// Where to write the **page frame list** of every region this process
+    /// commits, so the host can locate it by translation instead of by
+    /// searching guest RAM for its stamps.
+    ///
+    /// # Why this is the flag that unblocks the guest harnesses
+    ///
+    /// The content sweep is not merely slow, it is **unreliable on a loaded
+    /// machine**, and five consecutive guest runs demonstrated it: `16377 of
+    /// 16384 pages`, `1 page index claimed twice`, `28 page index(es) claimed
+    /// twice`. A duplicate is not the stale-stamp case — `new_run_id` hashes
+    /// the millisecond with the pid, so a previous run's stamps land in
+    /// `other_runs` and the tool counts them separately — it is two pages
+    /// carrying *this* run's id at the same page index at two different file
+    /// offsets. Whatever the cause (the flat view reaching one guest page at
+    /// two offsets, or pages moving under a sweep that takes seconds), the
+    /// sweep is reading **contents that are allowed to change while it reads
+    /// them**, over 13 GiB, and it is a coin flip.
+    ///
+    /// `SuperfetchPfnQuery` reads the kernel's page-frame database rather than
+    /// the extent's contents. **No stamps are read, so neither a stale stamp
+    /// nor a duplicate is expressible**, and it is 0.064 s against the sweep's
+    /// 2.3 s. That is the whole argument: it turns a locate from something that
+    /// usually works into something that either works or says why.
+    ///
+    /// The file is written where *both sides can see it* — the harnesses
+    /// already share a folder with the guest for `--log` — because the frame
+    /// list is 16 bytes a page and a 64 MiB arena's is 256 KiB, which is a file
+    /// and not a command-line argument.
+    ///
+    /// One file per committed region: exactly `PATH` when this process commits
+    /// one region, and `PATH.<id>` for any region after the first, because a
+    /// second region committed for the outbound window (§28's split) has its
+    /// own run id and needs its own locate.
+    arena_frames: Option<String>,
     /// Arenas to provide as a **file both sides open**, as `id:size:path`.
     ///
     /// ADDED FOR STAGE 10. `--arena` opens the region read-only, which is all a
@@ -174,20 +210,33 @@ struct Args {
     ///
     /// ADDED FOR STAGE 9. A flag rather than `GetSystemMetrics` because the
     /// harness has to be able to ask for a known desktop, and because the
-    /// headless platform has no desktop to ask. The Win32 platform ought to
-    /// override it with the real monitor and does not yet; that is named in
-    /// docs/waycompose-design.md §13.9 rather than left for someone to find.
+    /// headless platform has no desktop to ask.
+    ///
+    /// **STAGE 38 closed the debt this comment used to name.** It said "the
+    /// Win32 platform ought to override it with the real monitor and does not
+    /// yet"; it does now, with the primary monitor's *work area* rather than
+    /// its full size — see [`Started::work_area`] — and only when the flag was
+    /// not given. The default of 1920x1080 was true of no particular machine,
+    /// and a client that sizes itself to the output was opening a window
+    /// larger than a 1280x800 screen because of it.
     output: (i32, i32),
+    /// Whether `--output` was given. STAGE 38: a real monitor may replace the
+    /// default, and must never replace an answer the harness asked for.
+    output_explicit: bool,
     /// One scripted click, as `X,Y[,BUTTON][,MS]`. Headless only.
     ///
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
     #[cfg(not(windows))]
     click: Option<platform::Click>,
-    /// Which decoration mode to advertise, as `server`, `client` or `tabs`.
+    /// Which decoration mode to advertise, as `auto`, `server`, `client` or
+    /// `tabs`.
     ///
-    /// ADDED FOR STAGE 17, and given a third value by TABS IN THE TITLE BAR. See
-    /// [`Decorations`] for why it defaults to `server`, what a run that asks
-    /// for `client` is for, and what `tabs` changes on the Win32 side.
+    /// ADDED FOR STAGE 17, given a third value by TABS IN THE TITLE BAR and a
+    /// fourth — the default — by §46. See [`Decorations`] for what each is for:
+    /// `auto` advertises what `server` advertises and folds the caption only
+    /// for a window whose client turned out to decorate itself, `server` is
+    /// that arrangement without the per-window arm, `client` is the deliberate
+    /// two-bar control leg, and `tabs` folds unconditionally.
     decorations: Decorations,
     /// Whether `--decorations tabs` also calls `DwmExtendFrameIntoClientArea`.
     ///
@@ -233,9 +282,10 @@ pub struct ControlHook;
 fn open_control(
     path: Option<&str>,
     events: std::sync::mpsc::Sender<platform::FromUi>,
+    output: (i32, i32),
 ) -> Result<ControlHook, u8> {
     let Some(path) = path else { return Ok(None) };
-    match control::Control::bind(path, events) {
+    match control::Control::bind(path, events, output) {
         Ok(c) => Ok(Some(c)),
         Err(e) => {
             eprintln!("wc-compositor: could not bind --control {path}: {e}");
@@ -251,6 +301,7 @@ fn open_control(
 fn open_control(
     path: Option<&str>,
     _events: std::sync::mpsc::Sender<platform::FromUi>,
+    _output: (i32, i32),
 ) -> Result<ControlHook, u8> {
     if path.is_some() {
         eprintln!("wc-compositor: --control is a Linux-only hook; there is no AF_UNIX listener here");
@@ -264,6 +315,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         once: false,
         socket: None,
         wayland_ring: None,
+        wayland_cold: None,
         idle_timeout: Duration::from_secs(30),
         dump_frames: None,
         debug_icon: false,
@@ -274,12 +326,14 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         arenas: Vec::new(),
         arena_grow_dir: None,
         guest_arenas: Vec::new(),
+        arena_frames: None,
         provide_arenas: Vec::new(),
         outbound: None,
         shared_dir: None,
         shared_peer_prefix: String::new(),
         layout: None,
         output: (1920, 1080),
+        output_explicit: false,
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
@@ -295,8 +349,10 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--simulate-wm" => args.simulate_wm = true,
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
+            "--arena-frames" => args.arena_frames = it.next(),
             "--socket" => args.socket = it.next(),
             "--wayland-ring" => args.wayland_ring = it.next(),
+            "--wayland-cold" => args.wayland_cold = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -438,6 +494,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                     return Err(2);
                 }
                 args.output = (w, h);
+                args.output_explicit = true;
             }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -445,12 +502,12 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             // ADDED FOR STAGE 17, and it is the flag §22.2 is about.
             "--decorations" => {
                 let Some(v) = it.next() else {
-                    eprintln!("wc-compositor: --decorations needs server, client or tabs");
+                    eprintln!("wc-compositor: --decorations needs auto, server, client or tabs");
                     return Err(2);
                 };
                 let Some(d) = Decorations::parse(&v) else {
                     eprintln!(
-                        "wc-compositor: --decorations {v}: expected server, client or tabs"
+                        "wc-compositor: --decorations {v}: expected auto, server, client or tabs"
                     );
                     return Err(2);
                 };
@@ -492,6 +549,16 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 return Err(2);
             }
         }
+    }
+    // A flag this build cannot honour fails **here**, where it was typed. It
+    // used to be dropped by a `#[cfg(unix)]` and reported only as an
+    // `unused variable` warning to whoever compiled the binary — which is never
+    // the person who needs to know. §36.14.
+    if let Err(e) =
+        ringlink::check_platform_flags(args.wayland_ring.as_deref(), args.wayland_cold.as_deref())
+    {
+        eprintln!("wc-compositor: {e}");
+        return Err(2);
     }
     Ok(args)
 }
@@ -561,6 +628,141 @@ fn redirect_output(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write one region's page frame list where the host can read it, and say what
+/// happened in a few words that fit on the region's own report line.
+///
+/// # Why a failure here is a note and not an exit
+///
+/// Because the sweep still works. A frame list makes the locate fast and
+/// deterministic; its absence makes the locate slow and a coin flip, which is
+/// bad and is not "the compositor cannot run". A process that refused to start
+/// because it could not open the PFN database would take a machine that has
+/// been working all along and stop it, which is a worse failure than the one
+/// being fixed.
+///
+/// So the reason travels instead, on the line a harness is already grepping,
+/// and `wc-arena-host` falls back to the sweep. That is the only fallback in
+/// the path and it is the right one: it degrades *speed and reliability*, never
+/// correctness, and it says so out loud.
+fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> String {
+    let Some(base) = &args.arena_frames else {
+        return String::new();
+    };
+    // Exactly `PATH` for the first region and `PATH.<id>` after it. A second
+    // region is the outbound window's own commit, which has its own run id and
+    // needs its own locate — and its own file, or the two would overwrite each
+    // other and the survivor would be located against the wrong run.
+    let path = if *written == 0 { base.clone() } else { format!("{base}.{id}") };
+    let (frames, ms) = match crate::grow::frames(id, pages) {
+        Ok(v) => v,
+        Err(e) => return format!(", frames=none ({e})"),
+    };
+    if frames.len() != pages as usize {
+        return format!(
+            ", frames=none (the query returned {} frames for a {pages}-page region)",
+            frames.len()
+        );
+    }
+    match std::fs::write(&path, crate::grow::frame_list_text(&frames)) {
+        Ok(()) => {
+            *written += 1;
+            format!(", frames={path} ({} in {ms} ms)", frames.len())
+        }
+        Err(e) => format!(", frames=none ({path}: {e})"),
+    }
+}
+
+/// What to do about the file arenas named on a command line.
+///
+/// Split out of [`run_from`] so it can be *tested*, which is the whole reason
+/// it exists as a function. The refusal it implements was added over
+/// `--arena-provide` alone while its own message named `--arena` too, and
+/// `--arena <id>:<size>:<path>` therefore attached a file in silence — on the
+/// two harnesses that used exactly that flag against the real guest, over the
+/// export §10.3 measured incoherent for live mappings. Nothing could have
+/// caught that: the check lived four statements into a function that starts a
+/// compositor, so no test could reach it, and the message asserted a coverage
+/// the condition did not have. §41.4.
+#[derive(Debug, PartialEq, Eq)]
+enum FileArenaVerdict {
+    /// No `--arena` and no `--arena-provide`: nothing to decide.
+    NoFileArena,
+    /// A file arena, and no `SV_ALLOW_FILE_ARENA`. The run stops.
+    Refuse(String),
+    /// A file arena a fixture asked for by name. The run continues and says so,
+    /// so that a fixture cannot be mistaken for a result in a log read later.
+    Warn(String),
+}
+
+fn file_arena_verdict(file_arenas: usize, allowed: bool) -> FileArenaVerdict {
+    if file_arenas == 0 {
+        return FileArenaVerdict::NoFileArena;
+    }
+    if !allowed {
+        return FileArenaVerdict::Refuse(
+            "wc-compositor: the FILE arena is not a target. `--arena` and \
+             `--arena-provide` open files, which is a Wine-only fixture for a machine \
+             with no hypervisor. Use `--arena-guest-ram <id>:<bytes>`. Set \
+             SV_ALLOW_FILE_ARENA=1 for a fixture run — never to make a guest run pass."
+                .to_owned(),
+        );
+    }
+    FileArenaVerdict::Warn(format!(
+        "wc-compositor: WARNING: FILE arena in use ({file_arenas} region(s), \
+         SV_ALLOW_FILE_ARENA is set). This is a fixture, not a target; guest RAM is \
+         the only real substrate."
+    ))
+}
+
+#[cfg(test)]
+mod file_arena_tests {
+    use super::*;
+
+    /// The regression that motivated splitting this out. `--arena` and
+    /// `--arena-provide` are counted together, so a run that names only the
+    /// first is refused exactly like a run that names only the second — which
+    /// was not true when the condition read `!args.provide_arenas.is_empty()`.
+    #[test]
+    fn either_file_arena_flag_is_refused_without_the_fixture_permission() {
+        for n in 1..=3 {
+            match file_arena_verdict(n, false) {
+                FileArenaVerdict::Refuse(m) => {
+                    assert!(m.contains("not a target"), "{m}");
+                    // The message names both flags, and now the condition
+                    // covers both. A message that claims more coverage than the
+                    // code has is how the hole survived review.
+                    assert!(m.contains("`--arena`"), "{m}");
+                    assert!(m.contains("`--arena-provide`"), "{m}");
+                    assert!(m.contains("--arena-guest-ram"), "the way out must be named: {m}");
+                }
+                other => panic!("{n} file arena(s) were not refused: {other:?}"),
+            }
+        }
+    }
+
+    /// Guest RAM is not a file arena and must never be touched by this check.
+    #[test]
+    fn a_run_with_no_file_arena_is_not_asked_for_permission() {
+        assert_eq!(file_arena_verdict(0, false), FileArenaVerdict::NoFileArena);
+        assert_eq!(file_arena_verdict(0, true), FileArenaVerdict::NoFileArena);
+    }
+
+    /// A fixture that asked for it by name runs, and **says so**: a fixture
+    /// that produced a silent green log is how a file result gets quoted later
+    /// as a result about the deployment.
+    #[test]
+    fn a_fixture_run_is_allowed_and_announces_itself() {
+        match file_arena_verdict(2, true) {
+            FileArenaVerdict::Warn(m) => {
+                assert!(m.contains("WARNING"), "{m}");
+                assert!(m.contains("not a target"), "{m}");
+                assert!(m.contains("2 region(s)"), "the count is in it: {m}");
+            }
+            other => panic!("a permitted fixture was not allowed to run: {other:?}"),
+        }
+    }
+}
+
 /// Run the compositor.
 ///
 /// This was `fn main` until the unification (one-binary.md §2.2). It is `pub`
@@ -580,7 +782,7 @@ pub fn run() -> std::process::ExitCode {
 /// each half re-reading a process-wide `env::args` that has one extra token in
 /// it. one-binary.md §2.2.
 pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
-    let args = match parse_args(&argv) {
+    let mut args = match parse_args(&argv) {
         Ok(a) => a,
         Err(code) => return std::process::ExitCode::from(code),
     };
@@ -594,7 +796,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // §39, and first because everything below it is evidence *about a
+    // §55, and first because everything below it is evidence *about a
     // platform*: a log whose first line does not say which one is a log that
     // cannot be attributed. It is after `--log` for the same reason — a
     // harness that has to race the process for this line would sometimes lose.
@@ -608,6 +810,33 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // a filesystem open on the frame path exactly once in a way no measurement
     // would catch. Attaching here also means a wrong `--arena` is a startup
     // failure with a path in it rather than a pool that cannot be mapped.
+    //
+    // THE FILE ARENA IS NOT A TARGET, AND `--arena` IS ONE — which is the whole
+    // reason this check is *here* rather than only over `provide_arenas` below.
+    //
+    // The refusal added with `--arena-provide` names both flags in its message
+    // and tested only one of them, so `--arena <id>:<size>:<path>` attached a
+    // file in silence. That is not an academic gap: `--arena 0:N:Z:\wc11\arena`
+    // and `--arena 0:N:Z:\wc32\arena` are exactly what `wc-icon.sh` and
+    // `wc-taskbar.sh` passed on every run they ever made against the real
+    // guest, over the export §10.3 measured incoherent for live mappings. The
+    // escape hatch had a hole in the shape of the defect it was added to close.
+    //
+    // Both flags open a file; they differ only in whether it is opened
+    // read-write, which is what `--arena-provide` adds so that an outbound
+    // window is possible on a machine with no hypervisor. Neither is guest RAM,
+    // so neither is a target, and one condition covers both.
+    match file_arena_verdict(
+        args.arenas.len() + args.provide_arenas.len(),
+        std::env::var_os("SV_ALLOW_FILE_ARENA").is_some(),
+    ) {
+        FileArenaVerdict::Refuse(msg) => {
+            eprintln!("{msg}");
+            return std::process::ExitCode::from(2);
+        }
+        FileArenaVerdict::Warn(msg) => eprintln!("{msg}"),
+        FileArenaVerdict::NoFileArena => {}
+    }
     for (id, size, path) in &args.arenas {
         match wc_handle::arena::attach(*id, path, *size) {
             Ok(()) => println!("wc-compositor: arena {id} attached: {size} bytes at {path}"),
@@ -637,13 +866,21 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // line because a region that is findable now and movable later is the one
     // failure mode that would look like a working arena for the first few
     // seconds. See `wc_handle::arena::attach_guest_ram`.
+    let mut frames_written = 0usize;
     for (id, size) in &args.guest_arenas {
         match wc_handle::arena::attach_guest_ram(*id, *size) {
-            Ok(r) => println!(
-                "wc-compositor: arena {id} provided from guest RAM: \
-                 run 0x{:016x}, {} bytes, {} pages, locked={}",
-                r.run_id, r.len, r.pages, r.locked
-            ),
+            Ok(r) => {
+                // The frame list, on the same line as the run id and for the
+                // same reason: the host's locator cannot start without the run
+                // id, and it should not have to *guess* whether a frame list
+                // exists. A harness greps one line and gets both.
+                let note = publish_frames(&args, *id, r.pages, &mut frames_written);
+                println!(
+                    "wc-compositor: arena {id} provided from guest RAM: \
+                     run 0x{:016x}, {} bytes, {} pages, locked={}{note}",
+                    r.run_id, r.len, r.pages, r.locked
+                );
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not provide arena {id} from guest RAM: {e}");
                 return std::process::ExitCode::from(2);
@@ -654,6 +891,12 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // And the ones this process provides as a file. See `--arena-provide`: this
     // is `--arena` opened read-write, which is what makes an outbound window
     // possible on a machine with no hypervisor in it.
+    //
+    // THE FILE ARENA IS NOT A TARGET — guest RAM is (design.md §1a), and
+    // `--arena-guest-ram` is how this process provides one. The refusal for
+    // both this flag and `--arena` is above, before either is opened: it was
+    // here and tested only `provide_arenas`, which let `--arena` through in
+    // silence. §41.4.
     for (id, size, path) in &args.provide_arenas {
         match wc_handle::arena::provide_file(*id, path, *size) {
             Ok(()) => println!(
@@ -682,12 +925,17 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 // one the compositor writes keymaps into that no client ever
                 // reads.
                 if let Some(run) = w.run_id {
+                    let pages = (w.len / wc_handle::arena::GIFT_GRANULARITY) as u32;
+                    // Its own region, so its own frame list. Locating it by
+                    // sweep would be a second ~2.3 s search of the whole guest
+                    // with the same chance of a duplicate, for a region whose
+                    // stamps this process is about to write keymaps over.
+                    let note = publish_frames(&args, id, pages, &mut frames_written);
                     println!(
                         "wc-compositor: arena {id} provided from guest RAM: \
-                         run 0x{run:016x}, {} bytes, {} pages, locked=true \
+                         run 0x{run:016x}, {} bytes, {pages} pages, locked=true{note} \
                          (the outbound window's own region)",
                         w.len,
-                        w.len / wc_handle::arena::GIFT_GRANULARITY,
                     );
                 }
                 println!(
@@ -777,7 +1025,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // Before the platform, because it takes the same sender: the control
     // socket is a *second* source of `FromUi`, sitting exactly where the
     // platform sits, which is the whole of what makes it honest.
-    let control = match open_control(args.control.as_deref(), event_tx.clone()) {
+    let control = match open_control(args.control.as_deref(), event_tx.clone(), args.output) {
         Ok(c) => c,
         Err(code) => return std::process::ExitCode::from(code),
     };
@@ -805,7 +1053,29 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let platform::Started { ui, pump } = started;
+    let platform::Started { ui, pump, work_area } = started;
+
+    // STAGE 38. The one `wl_output` describes the **work area** of the real
+    // monitor, unless the harness asked for a particular size.
+    //
+    // The output is what a client sizes itself against, so the honest number
+    // has to be the one it can actually use: the screen minus the taskbar. The
+    // alternative — letting the client open whatever it likes and resizing the
+    // window afterwards (`map_window`) — still happens, because a client may
+    // ask for anything, but it arrives after the client has laid out for a size
+    // it will not get, and a browser reflows visibly when that happens.
+    //
+    // `--output` wins. A conformance run asks for a known desktop and must not
+    // be given this machine's.
+    if let Some((w, h)) = work_area
+        && !args.output_explicit
+    {
+        println!(
+            "wc-compositor: wl_output is the monitor's work area, {w}x{h} \
+             (--output would override it)"
+        );
+        args.output = (w, h);
+    }
 
     // Which layout the keyboard compiles. `--layout` wins so a harness is not
     // at the mercy of the machine's regional settings; otherwise ask the
@@ -826,7 +1096,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let wayland = std::thread::Builder::new()
         .name("wayland".into())
         .spawn(move || {
-            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.idle_timeout, args.debug_icon,
+            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control);
             thread_exit.store(code, Ordering::SeqCst);
@@ -855,6 +1125,7 @@ fn wayland_thread(
     once: bool,
     socket: Option<String>,
     wayland_ring: Option<String>,
+    wayland_cold: Option<String>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -918,6 +1189,9 @@ fn wayland_thread(
     // One per thread, reused every turn. See `tick.rs`: on Windows a
     // `thread::sleep(5ms)` is a 15.9 ms sleep, and 15.9 ms against
     // `tick_frames`' 16 ms gate halves the frame rate of anything that animates.
+    // GROWTH. Built at the first client accept rather than here, because
+    // `Control::create` zeroes bytes the host is still locating by until then.
+    let mut grow: Option<crate::grow::Service> = None;
     let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
     println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
     let _ = std::io::stdout().flush();
@@ -925,27 +1199,57 @@ fn wayland_thread(
     // §36. `accept()` on the ring directory, beside `accept()` on the socket.
     // Both produce a `wc_transport::Stream` for `insert_client`; only one of
     // them involves anything crossing the VM boundary.
-    #[cfg(unix)]
-    let mut ring_link = match wayland_ring.as_deref() {
-        None => None,
-        Some(path) => match ringlink::RingLink::create(path) {
-            Ok(rl) => {
-                println!("wc-compositor: accepting Wayland rings in {path}");
+    // **Not `#[cfg(unix)]`.** It was, and that was the bug: on Windows both
+    // flags were parsed, accepted and silently ignored, and the compositor fell
+    // through to the socket listener. So "the Wayland connection rides
+    // shared_vulkan's channel" was true on the fixture and false on the
+    // deployment, and the only thing that said so was an unused-variable
+    // warning. §36.14.
+    let mut ring_link = {
+        // Two ways to obtain the region and one directory to poll afterwards.
+        // `--wayland-cold` is the cross-VM one: the region is guest RAM the host
+        // locates. `--wayland-ring` is a named region, for one machine.
+        let made = match (wayland_cold.as_deref(), wayland_ring.as_deref()) {
+            (Some(port), _) => {
+                #[cfg(target_os = "linux")]
+                {
+                    Some(
+                        ringlink::RingLink::publish(port)
+                            .map(|rl| (rl, format!("guest RAM published on {port}"))),
+                    )
+                }
+                // Unreachable: `check_platform_flags` refuses this at parse.
+                // Kept so the arm exists on every platform and the reason lives
+                // in one place rather than being implied by a `cfg`.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = port;
+                    Some(Err(ringlink::COLD_NEEDS_LINUX.to_string()))
+                }
+            }
+            (None, Some(path)) => {
+                Some(ringlink::RingLink::create(path).map(|rl| (rl, path.to_string())))
+            }
+            (None, None) => None,
+        };
+        match made {
+            None => None,
+            Some(Ok((rl, what))) => {
+                println!("wc-compositor: accepting Wayland rings in {what}");
                 let _ = std::io::stdout().flush();
                 Some(rl)
             }
-            Err(e) => {
-                eprintln!("wc-compositor: could not create the ring region {path}: {e}");
+            Some(Err(e)) => {
+                eprintln!("wc-compositor: could not obtain the ring region: {e}");
                 state.quit();
                 return 2;
             }
-        },
+        }
     };
 
     loop {
         // The ring's accept, first, so a connection that arrived between turns
         // is dispatched in the same turn as one that arrived on the socket.
-        #[cfg(unix)]
         if let Some(rl) = ring_link.as_mut() {
             for (slot, stream) in rl.accept() {
                 let index = (state.clients_seen + 1) as u32;
@@ -996,6 +1300,39 @@ fn wayland_thread(
                                 eprintln!("wc-compositor: could not release held objects: {e}")
                             }
                         }
+                        // GROWTH, and it is created *here* for exactly the
+                        // reason the gifts are released here. `Control::create`
+                        // zeroes the control region and on guest RAM those
+                        // bytes are stamp pages; doing it before the host's
+                        // locate would delete the stamps out from under it. A
+                        // client having arrived is the proof the locate
+                        // finished — it came through a proxy started from a
+                        // plan, and the plan exists only if the locate
+                        // succeeded. See `crate::grow::Service::start`.
+                        if grow.is_none() {
+                            match crate::grow::Service::start() {
+                                Ok(Some(s)) => {
+                                    println!(
+                                        "wc-compositor: growth channel up; the host may ask \
+                                         for another region when its pools do not fit"
+                                    );
+                                    grow = Some(s);
+                                }
+                                // No outbound window, or none big enough. Said
+                                // once, because a session that silently cannot
+                                // grow is the failure this stage exists to
+                                // remove and it must not be silent.
+                                Ok(None) => println!(
+                                    "wc-compositor: no outbound window, so no growth channel; \
+                                     this session cannot be asked for more memory"
+                                ),
+                                Err(e) => eprintln!(
+                                    "wc-compositor: no growth channel ({e}); this session \
+                                     cannot be asked for more memory and will refuse under \
+                                     pressure instead"
+                                ),
+                            }
+                        }
                     }
                     Err(e) => eprintln!("wc-compositor: could not insert client: {e}"),
                 }
@@ -1005,6 +1342,19 @@ fn wayland_thread(
                 eprintln!("wc-compositor: accept failed: {e}");
                 break;
             }
+        }
+
+        // GROWTH. Before the client work, so that a pool the host could not
+        // place is answered in the same turn the request arrived rather than
+        // one poll interval later — the client whose pool it is, is stopped
+        // until it is. One request per turn; `Service::service` never blocks,
+        // because this loop also drives every client's input and a growth that
+        // held it would freeze the desktop to allocate memory for it.
+        if let Some(g) = grow.as_mut()
+            && let Some(line) = g.service()
+        {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
         }
 
         // Order matters. UI events first, so a resize or a close reaches the
@@ -1031,7 +1381,6 @@ fn wayland_thread(
         // the local socket *before* smithay reads it, or they wait a whole 5 ms
         // tick. `pump` also drains what smithay wrote last turn, which is why it
         // is one call and not two.
-        #[cfg(unix)]
         if let Some(rl) = ring_link.as_mut() {
             rl.pump();
         }

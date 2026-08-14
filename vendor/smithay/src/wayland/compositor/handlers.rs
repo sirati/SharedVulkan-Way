@@ -15,6 +15,7 @@ use wayland_server::{
     DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
 
+use crate::wayland::compositor::BufferEverAttached;
 use crate::utils::{
     alive_tracker::{AliveTracker, IsAlive},
     Client, Logical, Point,
@@ -208,6 +209,31 @@ where
                         Some(buffer) => BufferAssignment::NewBuffer(buffer),
                         None => BufferAssignment::Removed,
                     })
+                });
+
+                // WAYCOMPOSE FORK (§45.10). Remember, permanently, that this
+                // surface has had a buffer.
+                //
+                // `xdg_wm_base.get_xdg_surface` must refuse a `wl_surface` that
+                // already has one, and the obvious test — "is there a buffer in
+                // the surface's current or pending state" — cannot answer it. A
+                // compositor consumes the buffer when it commits: waycompose
+                // does `attrs.buffer.take()`, deliberately, so that a frame's
+                // damage and callbacks are not replayed forever. After that the
+                // surface has drawn and the state says it never did.
+                //
+                // So the fact is recorded where it happens, once, and is never
+                // cleared — including for `BufferAssignment::Removed`, because
+                // a client that attaches a null buffer has still *had* one and
+                // the protocol's prohibition is about the surface's history,
+                // not its present contents.
+                PrivateSurfaceData::with_states(surface, |states| {
+                    states
+                        .data_map
+                        .insert_if_missing_threadsafe(BufferEverAttached::default);
+                    if let Some(seen) = states.data_map.get::<BufferEverAttached>() {
+                        seen.0.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 });
             }
             wl_surface::Request::Damage { x, y, width, height } => {

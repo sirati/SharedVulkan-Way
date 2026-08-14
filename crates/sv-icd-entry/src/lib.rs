@@ -394,10 +394,26 @@ pub fn report_always(e: &dyn core::fmt::Display) {
 }
 
 /// Note that an unimplemented entry point was called.
+///
+/// **Always, not only under `SV_DEBUG`,** and once per command name.
+///
+/// A refused stub returns `VK_ERROR_INITIALIZATION_FAILED` when the command
+/// returns a `VkResult`, and an application can act on that. The other two
+/// shapes it cannot: a `void` command that does nothing is indistinguishable
+/// from one that worked, and a command returning `VkDeviceAddress` or `uint64_t`
+/// hands back `Default::default()`, which is a zero the caller has no way to
+/// tell from an answer. Six of the twelve refusals in the zink profile were one
+/// of those two, `vkGetDeviceQueue2` among them — a core 1.1 entry point that
+/// left the caller's `*pQueue` exactly as it found it.
+///
+/// The advertised set now excludes any extension with a refused command
+/// ([`INCOMPLETE_EXTENSIONS`]), so a conforming application should never reach
+/// here at all. This line is for when one does: at that point the *only* thing
+/// standing between a silent wrong answer and a diagnosable one is whether we
+/// said anything, and gating that on an environment variable nobody has set
+/// makes the worst failure mode the quietest one.
 pub fn not_implemented(command: &'static str) {
-    if debug_enabled() {
-        eprintln!("sv-icd: {command} is not implemented in this build");
-    }
+    report_always(&format_args!("{command} is not implemented in this build"));
 }
 
 fn debug_enabled() -> bool {
@@ -481,6 +497,36 @@ pub trait IcdLocal {
     /// enumerates, because the commands that answer it are the overridden ones.
     fn transport(&self) -> Option<&dyn Transport> {
         None
+    }
+
+    /// design.md §5.3's `(memory, offset)` rewrite, **app-side half** — pass 6
+    /// of §7.2, on the side that owns the allocator.
+    ///
+    /// An app-side `VkDeviceMemory` is an id this process minted for a sub-range
+    /// of an arena slab; the GPU side has never heard of it and, by §6.4, must
+    /// not have to. What crosses is `(ARENA_MEMORY_ID, arena_offset + offset)`,
+    /// a well-known id and a number this side already owns, and
+    /// `sv_gpu_server::table::resolve_memory` finishes the translation. Heap-0
+    /// memory is a real GPU-side allocation under the app's own id and crosses
+    /// unchanged.
+    ///
+    /// **The default is the identity**, which is right for an ICD with no arena
+    /// — `NullIcd`, the test doubles, and any build where every allocation is
+    /// the GPU side's.
+    ///
+    /// # Why this is on the trait rather than in one command
+    ///
+    /// It was a single hand-written line in `sv-icd`'s `vkBindBufferMemory` for
+    /// four stages, and the other six commands that carry a memory id across —
+    /// `vkBindImageMemory`, `vkBindBufferMemory2`, `vkBindImageMemory2`,
+    /// `vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges`,
+    /// `vkQueueBindSparse` — sent the app-side id raw. The GPU side then said
+    /// `no VkDeviceMemory with id 8` and took the ring fatal, and every CTS test
+    /// that binds an image to host-visible memory lost the device
+    /// (design.md §0.20). Generating the pass is what makes the set closed: it
+    /// is the same fold the GPU side already runs, applied one boundary earlier.
+    fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
+        Ok((memory, offset))
     }
 
     /// `vkGetInstanceProcAddr`, which cannot be forwarded because its answer is
@@ -762,6 +808,32 @@ pub fn icd() -> &'static dyn Icd {
     }
 }
 
+/// [`sv_proto::MemoryTransform`] over the registered ICD: the adapter the
+/// generated forwarders hand to pass 6's struct walkers.
+///
+/// It is the app-side twin of `sv_gpu_server`'s `Mapping`, and it exists for the
+/// same reason: the generated walk speaks to a trait object, and one side's
+/// state has to be lent to it. The state here is reached through [`icd`] rather
+/// than passed in, because a `forward::*` function's whole signature is
+/// `(&dyn Transport, args)` — it is below the `Icd` trait, not above it.
+///
+/// An id the ICD does not know is [`sv_wire::WireError::NoSuchMemory`] and the
+/// call fails on this side of the boundary. That is the point: the alternative
+/// is a ring fatal on the far side naming an id nobody can look up.
+pub struct MemoryRewrite;
+
+impl sv_proto::MemoryTransform for MemoryRewrite {
+    fn rewrite(&mut self, memory: u64, offset: u64) -> sv_wire::Result<(u64, u64)> {
+        // `VK_NULL_HANDLE` is legal in a `VkSparseMemoryBind`, where it means
+        // "unbind this range", so it passes through rather than being looked up.
+        if memory == 0 {
+            return Ok((0, offset));
+        }
+        IcdLocal::rewrite_memory(icd(), memory, offset)
+            .map_err(|_| sv_wire::WireError::NoSuchMemory { id: memory })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // small helpers the generated code calls
 // ---------------------------------------------------------------------------
@@ -803,6 +875,41 @@ pub struct ProcEntry {
 unsafe impl Sync for ProcEntry {}
 // SAFETY: as above.
 unsafe impl Send for ProcEntry {}
+
+/// Where a command's answer came from, as observed rather than as documented.
+///
+/// See [`AUDIT_PROBES`] and `sv_codegen::emit::icd_entry::emit_audit_probes`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Answered {
+    /// The generated default was in force: with no transport it refused by its
+    /// own name, which no hand-written body does. **This command forwards.**
+    ByTheGeneratedDefault,
+    /// `sv-icd` overrode the method and returned a reply without a GPU side.
+    Locally,
+    /// `sv-icd` overrode the method and returned an error of its own choosing.
+    /// Still a local answer — the point is that the default did not run.
+    LocallyWithError(LowerError),
+}
+
+impl Answered {
+    /// Did anything hand-written stand between this command and the wire?
+    pub fn is_local(self) -> bool {
+        !matches!(self, Answered::ByTheGeneratedDefault)
+    }
+}
+
+/// One forwarded command, callable with zeroed arguments.
+///
+/// The audit in `sv-icd` runs the whole table against a driver with no GPU side
+/// and sorts the profile into "forwards" and "answered here". A generated table
+/// rather than a hand-kept list for the same reason the API version is derived
+/// from the profile (design.md §0.18): a list of 239 names maintained beside the
+/// code it describes is a list that is wrong within a release.
+#[derive(Clone, Copy)]
+pub struct AuditProbe {
+    pub command: &'static str,
+    pub run: fn(&dyn Icd) -> Answered,
+}
 
 /// Look a name up in one of the generated tables.
 pub fn lookup(table: &[ProcEntry], name: &str) -> Option<*const c_void> {
@@ -975,6 +1082,14 @@ mod tests {
     /// nothing else would notice an entry point quietly becoming real.
     #[test]
     fn the_stubbed_entry_points_are_exactly_these() {
+        // The list below is the `zink` profile's. `full` carries 509 commands
+        // instead of 239 and refuses 27 instead of 12, and pinning both by hand
+        // would mean maintaining two lists to catch one class of change; the
+        // invariant that matters for every profile is the one asserted by
+        // `no_extension_is_advertised_with_a_stubbed_entry_point` below.
+        if env!("SV_ICD_ENTRY_PROFILE") != "zink" {
+            return;
+        }
         let expected: &[&str] = &[
             // The debug-utils messenger, whose GPU-side half is the reverse
             // ring (design.md §4.6) rather than a forwarded command.
@@ -993,13 +1108,17 @@ mod tests {
             // set and has not been written.
             "vkEnumeratePhysicalDeviceGroups",
             "vkGetDeviceQueue2",
-            // design.md §0.3 finding 5: a command returning a value that is
-            // neither `void` nor `VkResult` has no reply to carry it. Latent —
-            // §9.2 does not advertise `bufferDeviceAddress` — and a hole in the
-            // protocol rather than in this crate.
-            "vkGetBufferDeviceAddress",
-            "vkGetBufferOpaqueCaptureAddress",
-            "vkGetDeviceMemoryOpaqueCaptureAddress",
+            // **`vkGetBufferDeviceAddress` and its two friends left this list**
+            // (design.md §0.20). §0.3 finding 5 put them here — a command
+            // returning a value that is neither `void` nor `VkResult` had no
+            // reply to carry it — and called the hole latent because "§9.2 does
+            // not advertise `bufferDeviceAddress`, so a conforming application
+            // never calls them". Both halves of that were wrong: the feature is
+            // mirrored from the physical device and `vulkaninfo` printed it
+            // true, and CTS called all three. `plan.rs` now generates a reply
+            // whenever a command returns anything at all, the reply carries a
+            // `ret`, and the arena is allocated with
+            // `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` so the address is real.
         ];
         let mut got: Vec<&str> = NOT_IMPLEMENTED.to_vec();
         got.sort_unstable();
@@ -1007,6 +1126,142 @@ mod tests {
         want.sort_unstable();
         assert_eq!(got, want);
         assert_eq!(IMPLEMENTED_COUNT + NOT_IMPLEMENTED.len(), COMMAND_COUNT);
+    }
+
+    /// The promise in design.md §9.2, made checkable.
+    ///
+    /// "An extension in the advertised list is a promise its entry points work."
+    /// Before [`INCOMPLETE_EXTENSIONS`] the list was the profile intersected
+    /// with the device, and neither term knew whether the generator had produced
+    /// a working stub — which is how `VK_KHR_buffer_device_address` came to be
+    /// advertised with `vkGetBufferDeviceAddress` returning a silent zero.
+    ///
+    /// This is the invariant, not the list: every stubbed entry point that
+    /// belongs to an extension puts that extension out of the advertised set,
+    /// and `sv_icd::SharedVulkan::ask_device_extensions` subtracts it. It holds
+    /// under every profile, which is the point.
+    ///
+    /// # It named its motivating case, and the name expired
+    ///
+    /// As first written this test asserted, under the `zink` profile, that
+    /// `VK_KHR_buffer_device_address` and `VK_EXT_buffer_device_address` **must**
+    /// be in [`INCOMPLETE_EXTENSIONS`] — true when written, because
+    /// `vkGetBufferDeviceAddress` was a stub returning a silent zero. design.md
+    /// §0.20 implemented all three entry points, the derivation correctly stopped
+    /// listing the extensions, and the assertion failed **demanding that a fixed
+    /// bug still be present**. A hand-named case in a test about an invariant is
+    /// a fact with an expiry date, and this one expired against a fix.
+    ///
+    /// So the pairing is derived now: the generator emits
+    /// [`INCOMPLETE_EXTENSION_REASONS`], and what is checked is that every
+    /// entry is there *because of* an entry point that is genuinely refused.
+    /// That is strictly stronger than the named case — it would have caught the
+    /// original bug, it catches an extension listed for no reason, and it cannot
+    /// go stale when a stub becomes an implementation.
+    #[test]
+    fn no_extension_is_advertised_with_a_stubbed_entry_point() {
+        assert!(
+            INCOMPLETE_EXTENSIONS.windows(2).all(|w| w[0] < w[1]),
+            "INCOMPLETE_EXTENSIONS must be sorted and duplicate-free: \
+             sv-icd looks entries up with binary_search"
+        );
+        // A core command can be refused and cannot be un-advertised — the API
+        // version is what advertises it — so core-only refusals leave this list
+        // empty and that is correct, not a gap. What must never happen is the
+        // reverse: an extension-introduced refusal that is *not* here.
+        for name in NOT_IMPLEMENTED {
+            assert!(
+                !name.is_empty(),
+                "an empty name in NOT_IMPLEMENTED would silently match nothing"
+            );
+        }
+        // **This assertion used to name `VK_KHR_buffer_device_address` and
+        // `VK_EXT_buffer_device_address` and require them to be in the list.**
+        // It said, in its own comment, "named rather than derived, because this
+        // is the case that motivated the table" — and then `cts-close`
+        // implemented the three buffer-device-address entry points, which is the
+        // outcome everybody wanted, and the test failed for having recorded a
+        // fact instead of a property. Two branches landing a week apart, each
+        // correct, and the collision was a hard-coded name.
+        //
+        // That is precisely the defect design.md §0.19 and §0.20 are about,
+        // arriving in the test written to prevent it. So the property is stated
+        // instead. **Two properties, because the two branches that hit this
+        // reached for different ones and both are real**: this one is about the
+        // table's *shape*, and the block after it is about the table's
+        // *agreement with `NOT_IMPLEMENTED`*.
+        //
+        // The table is a table of extension names, and
+        // `sv_icd::ask_device_extensions` subtracts it from what the GPU side
+        // reports. A malformed entry there silently subtracts nothing, which is
+        // the failure mode that matters and the one no compiler catches.
+        for ext in INCOMPLETE_EXTENSIONS {
+            assert!(
+                ext.starts_with("VK_") && ext.len() > 3,
+                "{ext:?} is not an extension name; sv-icd looks these up by \
+                 binary_search against what the GPU side reports, so a malformed \
+                 entry subtracts nothing and does it silently"
+            );
+        }
+
+        // **And the pairing, which is not the derivation re-asserted against
+        // itself.** `INCOMPLETE_EXTENSIONS` and `NOT_IMPLEMENTED` are two tables
+        // emitted separately and consumed by different code — `sv-icd` subtracts
+        // the first, and the second is the documented list of what refuses — so
+        // "every exclusion names a stub that is genuinely there" is a statement
+        // about *both* and is checkable without repeating the registry walk.
+        // `INCOMPLETE_EXTENSION_REASONS` is what the generator emits to make it
+        // sayable, under the name that is actually in `NOT_IMPLEMENTED`: for a
+        // promoted extension that is the core spelling, not the suffixed alias,
+        // which is the indirection the original bug hid behind.
+        let named: Vec<&str> = INCOMPLETE_EXTENSION_REASONS.iter().map(|(e, _)| *e).collect();
+        assert_eq!(
+            named, INCOMPLETE_EXTENSIONS,
+            "INCOMPLETE_EXTENSION_REASONS and INCOMPLETE_EXTENSIONS are emitted from one \
+             set and must not disagree"
+        );
+
+        // An extension listed without a refused entry point is a promise
+        // withdrawn for no reason, which costs an application a feature the
+        // device has; an extension *not* listed while one of its entry points
+        // refuses is §9.2's promise broken, which costs it a silent wrong
+        // answer. This checks the first directly and the second by construction,
+        // since the generator builds both tables from one `refused` set.
+        for (ext, why) in INCOMPLETE_EXTENSION_REASONS {
+            assert!(
+                NOT_IMPLEMENTED.contains(why),
+                "{ext} is excluded because of {why}, which is not in NOT_IMPLEMENTED — \
+                 either the reason is stale or the exclusion is"
+            );
+        }
+
+        // And the direction that has no derivation behind it: if nothing is
+        // refused, nothing may be excluded.
+        if NOT_IMPLEMENTED.is_empty() {
+            assert!(
+                INCOMPLETE_EXTENSIONS.is_empty(),
+                "no entry point refuses, so no extension can be incomplete"
+            );
+        }
+
+        // The buffer-device-address case, kept and **inverted** rather than
+        // deleted, because it is the case the table was built for and the
+        // direction it points in is now the interesting one. design.md §0.20
+        // implemented `vkGetBufferDeviceAddress`,
+        // `vkGetBufferOpaqueCaptureAddress` and
+        // `vkGetDeviceMemoryOpaqueCaptureAddress`, so none of the three may be a
+        // stub again — and a merge that reintroduced one would fail on the
+        // pairing loop above with the command's own name.
+        for cmd in [
+            "vkGetBufferDeviceAddress",
+            "vkGetBufferOpaqueCaptureAddress",
+            "vkGetDeviceMemoryOpaqueCaptureAddress",
+        ] {
+            assert!(
+                !NOT_IMPLEMENTED.contains(&cmd),
+                "{cmd} is implemented as of design.md §0.20 and must not be a stub again"
+            );
+        }
     }
 
     /// Every entry point on the C surface is answerable from some table.

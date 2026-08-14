@@ -63,12 +63,29 @@ fn arg(name: &str) -> Option<String> {
     a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
 }
 
+/// Unix only, and the gate is honest rather than incidental: the host end of a
+/// QEMU `-chardev socket` is a Unix socket, and the guest half opens
+/// `/dev/virtio-ports/`. Both halves of this probe are the Linux shapes of a
+/// port. The Windows guest opens `\\\\.\\Global\\<name>` instead
+/// (`winpipe::open_virtio_port`), which `vdoorbell` already handles — what has
+/// no Windows form is this *measurement harness*, not the doorbell.
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let port = arg("--port").unwrap_or_else(|| usage());
     match mode.as_str() {
         "guest" => guest(&port),
-        "host" => host(&port),
+        "host" => {
+            #[cfg(unix)]
+            host(&port);
+            // The host end of a QEMU `-chardev socket` is a Unix socket, so the
+            // measuring half is Unix-only. The *guest* half is not, and that is
+            // the half that had never run on Windows.
+            #[cfg(not(unix))]
+            {
+                eprintln!("the host half measures a Unix chardev; run it on the VM host");
+                std::process::exit(2);
+            }
+        }
         _ => usage(),
     }
 }
@@ -80,9 +97,20 @@ fn main() {
 /// serialises them and a reader blocked in one stops the other making progress.
 fn guest(port: &str) {
     let seconds: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(120);
-    let mut f = match sv_transport::stream::open_virtio_port(
-        port.rsplit('/').next().unwrap_or(port),
-    ) {
+    let name = port.rsplit('/').next().unwrap_or(port);
+    // The port is a different object on each side and the same byte pipe to
+    // everything above: `/dev/virtio-ports/<name>` on Linux, `\\\\.\\Global\\<name>`
+    // on Windows. This is the call that had never been exercised on the guest.
+    #[cfg(target_os = "linux")]
+    let mut f = match sv_transport::stream::open_virtio_port(name) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[bell-probe] cannot open {port}: {e}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(windows)]
+    let mut f = match sv_transport::winpipe::open_virtio_port(name, 10_000) {
         Ok(f) => f,
         Err(e) => {
             println!("[bell-probe] cannot open {port}: {e}");
@@ -117,6 +145,11 @@ fn guest(port: &str) {
                 }
                 echoed += n as u64;
             }
+            // See `vdoorbell::serve_port`: not-yet-attached, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 println!("[bell-probe] guest read failed: {e}");
@@ -127,12 +160,14 @@ fn guest(port: &str) {
     println!("[bell-probe] guest echoed {echoed} bytes");
 }
 
+#[cfg(unix)]
 fn stats(mut v: Vec<f64>) -> (f64, f64, f64, f64) {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let at = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
     (v[0], at(0.5), at(0.99), v[v.len() - 1])
 }
 
+#[cfg(unix)]
 fn host(port: &str) {
     let count: usize = arg("--count").and_then(|s| s.parse().ok()).unwrap_or(2000);
 

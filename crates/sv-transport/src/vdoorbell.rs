@@ -190,6 +190,13 @@ pub fn serve_port<R: Read>(
         let n = match port.read(&mut buf) {
             Ok(0) => return ServeEnd::Closed,
             Ok(n) => n,
+            // The Windows guest end of a virtio-serial port reports "host not
+            // attached" as `WouldBlock` (winpipe maps ERROR_NO_SYSTEM_RESOURCES).
+            // A doorbell whose peer has not connected yet must wait, not exit.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return ServeEnd::Failed,
         };
@@ -204,8 +211,32 @@ pub fn serve_port<R: Read>(
             // stray byte take the doorbell down for the whole session.
             let Ok(ctrl) = RingCtrl::open(control, slot) else { continue };
             let Ok(bell) = ctrl.bell(lane) else { continue };
-            bell.ring_local();
+            // COUNT BEFORE RINGING, and the order is the whole of it.
+            //
+            // `ring_local` is what makes the wake observable: the waiter it
+            // releases can be scheduled, return from `park`, and read
+            // `Doorman::woken()` before this thread executes the next
+            // statement. With the increment *after* the ring, the counter is
+            // therefore allowed to read 0 in a waiter that has already been
+            // woken by it — which is not a doorbell defect but is
+            // indistinguishable from one at the assertion.
+            //
+            // Measured rather than reasoned about:
+            // `a_byte_on_the_port_wakes_a_waiter_that_no_futex_could_reach`
+            // passed 5 times out of 5 run alone and failed on both full
+            // `cargo test --workspace` runs, on `the doorman delivered no wakes
+            // at all` — while the two assertions *before* it, that the outcome
+            // was `Woken` and that it took under 500 ms, both passed. The wake
+            // plainly happened; only the count had not landed yet. Parallel
+            // load widens the window between these two lines, which is why the
+            // whole-workspace run is where it shows.
+            //
+            // Incrementing first is accurate: this thread has committed to
+            // delivering the wake and nothing between the two statements can
+            // fail. §35's shape — the failure mode of the *check*, not of the
+            // thing checked, and it made a shared gate red for everyone.
             woken.fetch_add(1, Ordering::Relaxed);
+            bell.ring_local();
         }
     }
 }
@@ -299,9 +330,14 @@ pub fn attach(port: PortHandle, control: Arc<Control>) -> std::io::Result<Doorma
 /// host (the chardev's socket end), and a `Pipe` on the Windows guest.
 pub enum PortHandle {
     /// `/dev/virtio-ports/<name>`, from [`crate::stream::open_virtio_port`].
+    #[cfg(unix)]
     File(std::fs::File),
     /// The host end of the QEMU `-chardev socket`.
+    #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    /// `\\.\Global\<name>`, from [`crate::winpipe::open_virtio_port`].
+    #[cfg(windows)]
+    Pipe(std::sync::Arc<crate::winpipe::Pipe>),
 }
 
 impl PortHandle {
@@ -311,25 +347,74 @@ impl PortHandle {
         crate::stream::open_virtio_port(name).map(PortHandle::File)
     }
 
+    /// Open the guest end by port name. Windows guest.
+    ///
+    /// Ten seconds, because on a *hot-added* port the device object appears when
+    /// `vioser.sys` binds it, which is some milliseconds after the QMP
+    /// `device_add` returns — and a guest started by a harness may well race it.
+    #[cfg(windows)]
+    pub fn guest_port(name: &str) -> std::io::Result<PortHandle> {
+        crate::winpipe::open_virtio_port(name, 10_000)
+            .map(|p| PortHandle::Pipe(std::sync::Arc::new(p)))
+            .map_err(|e| std::io::Error::other(format!("{e}")))
+    }
+
     /// Connect to the host end of the chardev.
+    #[cfg(unix)]
     pub fn host_socket(path: &str) -> std::io::Result<PortHandle> {
         std::os::unix::net::UnixStream::connect(path).map(PortHandle::Unix)
     }
 
     fn split(self) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         Ok(match self {
+            #[cfg(unix)]
             PortHandle::File(f) => {
                 let w = f.try_clone()?;
                 (Box::new(f), Box::new(w))
             }
+            #[cfg(unix)]
             PortHandle::Unix(s) => {
                 let w = s.try_clone()?;
                 (Box::new(s), Box::new(w))
             }
+            // One handle, shared, rather than a `DuplicateHandle`: a
+            // virtio-serial port permits one opener and the point of the `Arc`
+            // is that this is still *one* open, used by a reader thread and a
+            // writer thread. `ReadFile` and `WriteFile` on one handle from two
+            // threads are independent operations on a byte-mode device.
+            #[cfg(windows)]
+            PortHandle::Pipe(p) => (Box::new(SharedPipe(p.clone())), Box::new(SharedPipe(p))),
         })
     }
 }
 
+/// A `Pipe` two threads may use at once, one reading and one writing.
+#[cfg(windows)]
+struct SharedPipe(std::sync::Arc<crate::winpipe::Pipe>);
+
+#[cfg(windows)]
+impl Read for SharedPipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+#[cfg(windows)]
+impl Write for SharedPipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+// Unix-only, and the reason is the stand-in rather than the mechanism: these
+// tests use a `socketpair` where the real thing is a virtio-serial port, and a
+// socketpair is a Unix construct. The Windows *port* path is exercised on the
+// deployment guest (§36.16); what has no Windows form is this fixture. The
+// module under test — `PortWake`, `Doorman`, `serve_port` — is built on both.
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,9 +509,24 @@ mod tests {
         // it never calls `sys::wake`.
         let poker = {
             let flag = Arc::clone(&flag);
+            let watch = ctrl.clone();
             let mut host_end = host_end;
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(2));
+                // Wait for the waiter to be observably parked, not for a
+                // duration: under load the 32-yield spin phase outlasts any
+                // fixed sleep, readiness gets seen during the spin, and the
+                // doorbell this test exists to exercise is never needed.
+                // A liveness guard, not a performance bound: it exists so a consumer
+            // that never parks fails instead of hanging. Sixty seconds because at
+            // load 312 the 32-yield spin phase alone exceeded ten, and a guard
+            // that fires on a slow machine is the defect this whole exercise is
+            // about. Slow pays time; broken still fails.
+            let until = Instant::now() + Duration::from_secs(60);
+                let bell = watch.bell(Lane::Command).unwrap();
+                while bell.parked.load(Ordering::Acquire) == 0 {
+                    assert!(Instant::now() < until, "the waiter never parked");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 flag.store(true, Ordering::Release);
                 let token = crate::park::lane_token(slot, Lane::Command);
                 host_end.write_all(&[token]).unwrap();
@@ -445,23 +545,34 @@ mod tests {
         // waiter in milliseconds, or it did not and the wait takes two seconds,
         // and no amount of contention turns one into the other.
         let fixed = Futex {
-            first_slice: Duration::from_secs(2),
-            slice: Duration::from_secs(2),
+            first_slice: Duration::from_secs(30),
+            slice: Duration::from_secs(30),
             ..Futex::default()
         };
 
+        let before_bell = crate::park::woken_by_bell();
         let t0 = Instant::now();
         let outcome = fixed.park(&site, Deadline::after(Duration::from_secs(30)));
         let took = t0.elapsed();
         poker.join().unwrap();
 
         assert_eq!(outcome, ParkOutcome::Woken);
-        assert!(
-            took < Duration::from_millis(500),
-            "the wait took {took:?} with a 2 s slice and a doorbell installed; \
-             that is the slice expiring, so the byte woke nothing"
-        );
+        // Property, not stopwatch. Two independent observations, both exact:
+        // the `Doorman` converted a byte into a wake, and the waiter was
+        // released by a `wake` change rather than by its slice. A 2 s slice that
+        // had expired would have taken 2 s; but the assertion does not need to
+        // say that, because it can say the stronger thing directly.
         assert!(doorman.woken() >= 1, "the doorman delivered no wakes at all");
+        assert!(
+            took < Duration::from_secs(5),
+            "the wait took {took:?} against a 30 s slice; that is the slice \
+             expiring, so the byte woke nothing"
+        );
+        println!(
+            "a byte off the port woke a parked waiter in {took:?} \
+             (bell-released waits {before_bell} -> {})",
+            crate::park::woken_by_bell()
+        );
         doorman.join();
     }
 

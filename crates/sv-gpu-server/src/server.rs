@@ -124,9 +124,31 @@ impl GpuServer {
         &self.shared.driver.device
     }
 
+    /// Record a table failure and turn it into a wire error.
+    ///
+    /// # It used to say `UnknownCommand { opcode: 0 }`, and that was a lie
+    ///
+    /// Every table failure — a handle that does not resolve, a wrong type, a
+    /// memory range outside the arena — came out as *"unknown command opcode
+    /// 0"*, with the truth demoted to a parenthetical:
+    ///
+    /// ```text
+    /// in a command blob: unknown command opcode 0 (no VkPipelineLayout with id 44 …)
+    /// ```
+    ///
+    /// The opcode was fine and nothing was unknown. A reader who takes the
+    /// headline at face value goes looking for a decoder that has lost
+    /// alignment — a plausible bug, in a different subsystem, and §0.23's
+    /// investigation spent time there before noticing the headline was
+    /// fabricated.
+    ///
+    /// This is `TableError::Unknown`'s `RingBarrier` guess one layer out, and
+    /// the same lesson: **an error must not assert something it does not
+    /// know.** `WireError::Table` says a lookup failed and nothing more; the
+    /// specifics are in `last_error`, which the ring prints beside it.
     fn note(&mut self, e: TableError) -> WireError {
         self.last_error = Some(e.to_string());
-        WireError::UnknownCommand { opcode: 0 }
+        WireError::Table
     }
 
     /// The single family we advertise, with the real properties of the family
@@ -199,7 +221,60 @@ impl GpuHost for GpuServer {
         }
     }
 
+    /// The driver has no entry point for a command the profile carries.
+    ///
+    /// # Why this says something out loud, and why that is not the whole fix
+    ///
+    /// `last_error` alone reaches nobody here. It is consumed only where a
+    /// command returns `Err` (`session.rs`, the blob decoder and the ring's
+    /// fatal path), and the generated caller deliberately does **not**: a
+    /// missing entry point is a normal configuration, because the profile is a
+    /// superset of any one driver's extensions, and failing the ring over
+    /// `vkSetDebugUtilsObjectNameEXT` would lose the device over a debug label.
+    ///
+    /// For a command that generates a reply, the trade is sound — the caller
+    /// gets `VK_ERROR_EXTENSION_NOT_PRESENT` and can act on it. For a **recorded
+    /// `vkCmd*` whose entire output is a side effect** it is not:
+    /// `vkCmdDecodeVideoKHR` returned `Ok(())`, nothing was recorded, no reply
+    /// existed to carry the fact, and no caller checking a return value could
+    /// have noticed. That is the silent class §0.19 item 1 counts, on the GPU
+    /// side rather than the app side, and it is the sharpest argument that
+    /// *carried* and *implemented* have to stay separate claims.
+    ///
+    /// Reported once per command name, always rather than under a variable,
+    /// exactly as `sv_icd_entry::not_implemented` is and for the same reason:
+    /// when the only evidence of a silent failure is whether we said anything,
+    /// gating it on an environment variable nobody sets makes the worst failure
+    /// mode the quietest one.
+    ///
+    /// **What this deliberately does not do** is turn a missing recorded command
+    /// into a ring fatal. That would be the Vulkan-correct outcome — a command
+    /// buffer that could not record a command is invalid, and its submit should
+    /// fail — but the blob decoder's `Err` path sets `fatal` on the ring and
+    /// kills the session, which is far too blunt for a driver that merely lacks
+    /// an optional extension. Poisoning the *command buffer* instead, so that
+    /// its submit fails and nothing else does, is the right shape and is not
+    /// written. §0.22 states it as an open item rather than pretending the
+    /// message closes it.
+    ///
+    /// The primary defence is upstream and does hold: a command belonging to an
+    /// extension whose queue family this ICD cannot offer is no longer
+    /// advertised at all (`sv_icd::advertise::unservable_queue_requirement`), so
+    /// a conforming application never reaches here.
     fn note_missing(&mut self, command: &'static str) {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SAID: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+        let first = {
+            let mut g = SAID.lock().unwrap_or_else(|p| p.into_inner());
+            g.get_or_insert_with(HashSet::new).insert(command)
+        };
+        if first {
+            eprintln!(
+                "sv-gpu-server: the driver has no {command}; the profile is wider \
+                 than this driver. Calls to it do nothing and cannot report it."
+            );
+        }
         self.last_error =
             Some(format!("the driver has no {command}; the profile is wider than this driver"));
     }

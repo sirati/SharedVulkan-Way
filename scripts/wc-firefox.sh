@@ -53,6 +53,23 @@ bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 non() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 41. This harness has no guest and never did — see the header — so both
+# of its transports are the Wine fixture, and the library is what lets it say so
+# and what hands the arena leg the permission the binaries now require.
+# `WC_GUEST_CONFIGURED` is deliberately *not* set here: setting it would be
+# claiming a guest this harness has never had.
+. "$(dirname "$0")/wc-substrate.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "every block runs on this box: the Linux compositor directly, and wc-compositor.exe under Wine" || exit 1
+# STAGE 42. `fresh`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
 RUNDIR=$(mktemp -d /tmp/wc-firefox-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -183,7 +200,7 @@ block_enumerate() {
   done
 
   # The decoration question, measured rather than assumed. Both protocols are
-  # advertised; exactly one is used. docs/design.md §13.7.
+  # advertised; exactly one is used. docs/waycompose-design.md §13.7.
   if grep -q '^org_kde_kwin_server_decoration_manager ' "$b"; then
     ok "decorations: Firefox bound KDE's org_kde_kwin_server_decoration_manager"
   else
@@ -225,7 +242,7 @@ block_enumerate() {
     && ok "Firefox creates a wl_subsurface for its content" \
     || bad "Firefox created no subsurface"
 
-  # What a pool costs, which is the number docs/design.md §12.13 item 5 asks
+  # What a pool costs, which is the number docs/waycompose-design.md §12.13 item 5 asks
   # for. Reported rather than asserted: it is a property of the client and of
   # what it was doing, and a threshold here would be a threshold on Firefox's
   # mood.
@@ -599,7 +616,7 @@ block_wine() {
   have "$FIREFOX" || { non "no firefox on PATH"; return; }
   have wine || { non "no wine"; return; }
   have Xvfb || { non "no Xvfb"; return; }
-  [ -x "$WIN_BIN/wc-compositor.exe" ] || { non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return; }
+  fresh_or_skip "$WIN_BIN/wc-compositor.exe" "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; case $? in 2) non "no wc-compositor.exe; cargo build --target x86_64-pc-windows-gnu"; return ;; 1) return ;; esac
 
   local dir="$RUNDIR/wine-$transport"
   mkdir -p "$dir/rt" "$dir/frames" "$dir/pools" "$dir/keymaps" "$dir/profile"
@@ -654,10 +671,32 @@ block_wine() {
   local comp_extra=() proxy_extra=()
   case "$transport" in
     shared-file)
+      # Also a fixture, and declared as one for the same reason — but it needs
+      # no permission from the binaries, because `shared-file` opens pool files
+      # by name and never touches the arena code. Declaring it is what makes the
+      # substrate assertion below able to say which of the two ran.
+      wc_substrate_declare wine-fixture \
+        "no QEMU on this box: a Wine run has no guest RAM to locate" || return
       comp_extra=(--shared-dir "$(winp "$dir/keymaps")" --shared-peer-prefix "$dir/keymaps/")
       proxy_extra=(--transport shared-file --pool-dir "$dir/pools"
                    --peer-prefix "$(winp "$dir/pools")\\") ;;
     arena)
+      # STAGE 41. **This is the file arena, and the file arena is not a target.**
+      # `wc-proxy` and `wc-compositor` both refuse it now unless
+      # `SV_ALLOW_FILE_ARENA=1` says the run means it, and this is the one place
+      # in the tree that is entitled to say so: there is no QEMU on this box, so
+      # there is no guest RAM to locate, so a file standing in for the region is
+      # the only way to exercise the arena code path at all. §18.2's first
+      # bullet, enforced instead of described.
+      #
+      # `wc_substrate_declare` will refuse to hand out that permission if
+      # `WC_HOST` is set or the harness declared a guest, which is what stops
+      # this branch being copied into a harness that has one. Both this and the
+      # binaries then print a line saying the substrate is not a target, so a
+      # result from here cannot be mistaken for a result about the deployment in
+      # a log somebody reads later.
+      wc_substrate_declare wine-fixture \
+        "no QEMU on this box: a Wine run has no guest RAM to locate" || return
       : >"$dir/arena"; truncate -s $arena_size "$dir/arena"
       comp_extra=(--arena-provide "0:$arena_size:$(winp "$dir/arena")"
                   --arena-outbound "0:$arena_out")
@@ -744,6 +783,14 @@ block_wine() {
     "") bad "the window never mapped" ;;
     *)  bad "unexpected window size: $mapped (expected 1280x900)" ;;
   esac
+
+  # STAGE 41. Which substrate, said once and asserted on — and here it says
+  # *fixture*, which is the honest answer for a box with no hypervisor and is
+  # the answer this harness's header has always given in prose. Nothing about
+  # this leg changes; what changes is that the word now appears in the run's own
+  # output next to the numbers, so a `wine` result cannot be quoted later as a
+  # guest result by somebody reading only the PASS lines.
+  wc_assert_substrate "$dir/srv.log" "wine/$transport"
 
   # The rule. A run that got the pixels there by passing a descriptor would
   # produce an identical picture and fail this.

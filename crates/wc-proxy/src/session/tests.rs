@@ -2121,3 +2121,81 @@ fn an_offer_from_a_drag_is_fetched_from_the_drag_and_not_the_clipboard() {
         .unwrap();
     assert_eq!(h.session.take_fetches()[0].1, Source::Clipboard);
 }
+
+/// A `leave` **after a `drop`** does not turn the drag's offer into the
+/// clipboard's, because the client has not read from it yet.
+///
+/// ADDED FOR docs/waycompose-design.md §50, and it is the regression test for the defect that made every
+/// drop into a Wayland client deliver nothing. The test above asserts that
+/// `leave` forgets a drag offer, which is right for a drag that left the
+/// surface — and the code implementing it forgot *every* offer, including one
+/// the user had just dropped. The ordering that exposes it cannot be reached by
+/// reasoning about the protocol in the abstract; it took a real gesture, and
+/// the proxy's own log from that run reads:
+///
+/// ```text
+/// wl_data_device.enter: offer 4278190080 is a drag's
+/// wl_data_device.drop
+/// wl_data_device.leave: forgetting drag offers {4278190080}
+/// receive on offer 4278190080 for "text/plain;charset=utf-8" -> Clipboard
+/// paste 1 refused: the clipboard holds nothing of that type
+/// ```
+///
+/// `wl_data_offer.receive` is what a client calls *after* the drop — that is
+/// the whole shape of a Wayland drop, and `wl_data_offer.finish` exists because
+/// the offer outlives the gesture. So the rule is that `leave` may forget only
+/// the offers that were not dropped.
+#[test]
+fn a_drop_keeps_the_offer_the_drags_even_after_the_leave() {
+    let (mut h, _m, device) = clipboard_harness();
+    let dragged = 0xff00_0020u32;
+
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "data_offer"), size: 12 },
+            &dragged.to_ne_bytes(),
+        )
+        .unwrap();
+    let mut body = Vec::new();
+    for w in [1u32, 0, 0, 0] {
+        body.extend_from_slice(&w.to_ne_bytes());
+    }
+    body.extend_from_slice(&dragged.to_ne_bytes());
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "enter"), size: 8 + body.len() },
+            &body,
+        )
+        .unwrap();
+
+    // The user let go, and *then* the compositor said leave. Both orders happen;
+    // this is the one that was wrong.
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "drop"), size: 8 },
+            &[],
+        )
+        .unwrap();
+    h.session
+        .server_message(
+            Header { object: device, opcode: ev("wl_data_device", "leave"), size: 8 },
+            &[],
+        )
+        .unwrap();
+
+    let receive = rq("wl_data_offer", "receive");
+    let mime = string_body("text/plain;charset=utf-8");
+    let (_r, w) = pipe().unwrap();
+    h.session
+        .client_message(
+            Header { object: dragged, opcode: receive, size: 8 + mime.len() },
+            &mime,
+            &mut VecDeque::from([w]),
+        )
+        .unwrap();
+    assert_eq!(
+        h.session.take_fetches()[0].1,
+        Source::Drag,
+        "a receive after the drop must still ask Windows for the drag"
+    );
+}

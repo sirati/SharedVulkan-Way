@@ -4,7 +4,12 @@
 #
 #   scripts/sv-cts.sh [options] [icd-manifest-basename]   default: radeon_icd.x86_64.json
 #
-#     --fraction N     run 1 test in every N of the suite (default 2000)
+#     --fraction N     run 1 test in every N of the suite (default 2000). N=1 is
+#                      the whole suite: the sampler is `(NR-1) % n == 0`, and it
+#                      was `NR % n == 1`, which is never true at N=1 -- so the
+#                      documented "all of them" silently selected *nothing* and
+#                      the run died with "the selection is empty" (design.md
+#                      §0.23.6). No recorded result used it.
 #     --jobs J         concurrent deqp-vk processes, each its own session (default 8)
 #     --include RE     restrict to tests whose name matches this ERE, repeatable
 #     --arena BYTES    per-session arena (default 256 MiB)
@@ -110,8 +115,19 @@ done
 
 command -v deqp-vk >/dev/null || { echo "deqp-vk is missing; enter 'nix develop'" >&2; exit 1; }
 MANIFEST="$BIN/sv_icd.json"
-[ -f "$MANIFEST" ]          || { echo "build first: cargo build -p sv-icd" >&2; exit 1; }
-[ -x "$BIN/sv-gpu-server" ] || { echo "build first: cargo build -p sv-gpu-server" >&2; exit 1; }
+# STAGE 44. §35.6 item 6 listed this harness as having no freshness guard, and
+# §42.5 item 4 left it as the unfinished half. Both are closed here, and the
+# preflight is stronger than a freshness check alone because of what the manifest
+# is: a *generated file holding an absolute path*. `scripts/sv-worktree.sh` seeds
+# a worktree by reflinking `target/`, so a fresh worktree's `sv_icd.json` names
+# the **base tree's** `libsv_icd.so` — which exists, so `[ -f "$MANIFEST" ]` was
+# satisfied and the loader would hand this suite another checkout's driver. That
+# is the state of every worktree on its first run, which is exactly when the CTS
+# is run to get a baseline. See `manifest_is_ours`.
+. "$(dirname "${BASH_SOURCE[0]}")/wc-binaries.sh"
+manifest_is_ours "$MANIFEST" "cargo build -p sv-icd, in this worktree" || exit 1
+fresh "$BIN/libsv_icd.so"  "cargo build -p sv-icd" || exit 1
+fresh "$BIN/sv-gpu-server" "cargo build -p sv-gpu-server" || exit 1
 [ -f "$ICDDIR/$ICD" ]       || { echo "no such ICD manifest: $ICDDIR/$ICD" >&2; exit 1; }
 
 RUNDIR="$(mktemp -d /tmp/sv-cts.XXXXXX)"
@@ -194,9 +210,9 @@ echo "  caselist     $TOTAL tests"
 # the whole point of having a control.
 SAMPLE="$RUNDIR/sample.txt"
 if [ -n "$INCLUDE" ]; then
-  grep -E "$INCLUDE" "$CASELIST" | awk -v n="$FRACTION" 'NR % n == 1' > "$SAMPLE"
+  grep -E "$INCLUDE" "$CASELIST" | awk -v n="$FRACTION" '(NR - 1) % n == 0' > "$SAMPLE"
 else
-  awk -v n="$FRACTION" 'NR % n == 1' "$CASELIST" > "$SAMPLE"
+  awk -v n="$FRACTION" '(NR - 1) % n == 0' "$CASELIST" > "$SAMPLE"
 fi
 NSAMPLE=$(wc -l < "$SAMPLE")
 echo "  selected     $NSAMPLE tests"

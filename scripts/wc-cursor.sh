@@ -14,7 +14,7 @@
 #
 # The same split every stage here draws, and the line is in a different place
 # than usual because the two halves of this feature are genuinely different
-# problems (docs/design.md §23):
+# problems (docs/waycompose-design.md §23):
 #
 #   * **linux.** `wp_cursor_shape_v1` is a *name* on the wire and nothing else,
 #     so what can go wrong with it is protocol-shaped: the global is not
@@ -51,7 +51,7 @@
 # cursor is the client's, so nothing else has to be.
 #
 # WHAT WINE DOES AND DOES NOT PROVE. Wine is not Windows and has been wrong
-# four times on this project (docs/design.md §13.6), and a cursor is exactly
+# four times on this project (docs/waycompose-design.md §13.6), and a cursor is exactly
 # the kind of thing it emulates rather than implements: `SetCursor`,
 # `CreateIconIndirect` with a 32-bit ARGB bitmap, and `GetCursorInfo` are all
 # Wine's own reimplementations. A pass here says the compositor installed the
@@ -70,6 +70,17 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "the compositor runs under Wine on this box" || exit 1
+
 RUNDIR=$(mktemp -d /tmp/wc-cursor-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -81,14 +92,14 @@ trap cleanup EXIT
 export WINEPREFIX="${WINEPREFIX:-/tmp/wc-wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 
-# Which Win32 a compositor log says its run was on -- docs/waycompose-design.md §39.
+# Which Win32 a compositor log says its run was on -- docs/waycompose-design.md §55.
 #
 # The compositor prints `wc-compositor: win32 is <tag>` as the first line of
 # every log, before it has done anything else, precisely so this is answerable
 # without racing it. A harness that cannot answer it is a harness whose Windows
 # assertions might be about Wine, or whose Wine assertions might be about the
 # Linux build -- and this file used to hold two allowances that were granted to
-# *every* leg because one of them needed it. That is what §39.3 is about.
+# *every* leg because one of them needed it. That is what docs/waycompose-design.md §55.3 is about.
 win32_of() {
   local line
   line=$(grep -o 'wc-compositor: win32 is [a-z]*' "$1" 2>/dev/null | head -1)
@@ -127,7 +138,7 @@ start_x() {
 
 run_linux() {
   echo "== wp_cursor_shape_v1, advertised and proxied =="
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "cargo build -p wc-compositor" || return
   command -v wayland-info >/dev/null || { note "SKIP (wayland-info not installed)"; return; }
 
   local dir="$RUNDIR/linux"
@@ -142,15 +153,15 @@ run_linux() {
     timeout 10 wayland-info ) >"$dir/direct.log" 2>&1
   wait "$srv" 2>/dev/null
 
-  # §39, the negative case, and it is worth an assertion for the same reason the
+  # §55, the negative case, and it is worth an assertion for the same reason the
   # wine leg's is: this leg is *supposed* to have no Win32, and a `linux` run
   # that had somehow reached a Windows binary would pass every check below it
   # while proving nothing about the platform it names.
   case "$(win32_of "$dir/direct-srv.log")" in
     none)    ok "this leg is the Linux build and says so: \
 $(grep -o 'win32 is .*' "$dir/direct-srv.log" | head -1)" ;;
-    unknown) bad "the compositor never said which Win32 it was on (§39)" ;;
-    *)       bad "the linux leg found a Win32 -- it is not running the binary it thinks (§39)" ;;
+    unknown) bad "the compositor never said which Win32 it was on (docs/waycompose-design.md §55)" ;;
+    *)       bad "the linux leg found a Win32 -- it is not running the binary it thinks (docs/waycompose-design.md §55)" ;;
   esac
 
   if grep -q "interface: 'wp_cursor_shape_manager_v1'" "$dir/direct.log"; then
@@ -184,7 +195,7 @@ $(grep -o 'win32 is .*' "$dir/direct-srv.log" | head -1)" ;;
   # never heard of is refused with a diagnosis rather than desynchronised
   # (docs/design.md §9.3) — so a run where `crates/wc-proxy/protocols/` was not
   # updated fails *here*, loudly, and not on the guest a week later.
-  [ -x "$LINUX_BIN/wc-proxy" ] || { note "SKIP the proxy leg (no wc-proxy built)"; return; }
+  fresh_or_skip "$LINUX_BIN/wc-proxy" "SKIP the proxy leg (no wc-proxy built)"; case $? in 2) note "SKIP the proxy leg (no wc-proxy built)"; return ;; 1) return ;; esac
   mkdir -p "$dir/prt" "$dir/pools" "$dir/keymaps"; chmod 700 "$dir/prt"
 
   # `--shared-dir`, and it is required rather than tidy. Without somewhere to
@@ -245,8 +256,8 @@ $(grep -o 'win32 is .*' "$dir/direct-srv.log" | head -1)" ;;
 # with a hotspot that is not 0,0. Nothing in this project chose any of it.
 run_wine() {
   echo "== a client's cursor surface becomes a Win32 HCURSOR =="
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe"; return; }
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "no $LINUX_BIN/wc-proxy"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || return
+  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH"; return; }
   command -v weston-eventdemo >/dev/null || { note "SKIP (weston-eventdemo not installed)"; return; }
@@ -325,7 +336,7 @@ run_wine() {
   # handed the program over the launcher returns at once and `$probe_rc` is the
   # launcher's, not the probe's.
   #
-  # This harness got away with it until §39 for an uncomfortable reason: the
+  # This harness got away with it until §55 for an uncomfortable reason: the
   # probe used to *die* at the first `GetCursorInfo`, about a second in, so
   # everything it was ever going to write was already written by the time the
   # log was read. Giving it a Wine path that lets it survive turned a crash into
@@ -355,7 +366,7 @@ run_wine() {
 
   # --- which Win32 did this actually run on ------------------------------
   #
-  # §39, and it is first because every assertion below is a claim about a
+  # docs/waycompose-design.md §55, and it is first because every assertion below is a claim about a
   # platform. Asserted rather than noted: a `wine` leg that quietly ran the
   # Linux build, or that found a real Windows, has measured something -- but not
   # the thing its name says, and the readings would still all pass.
@@ -366,9 +377,9 @@ run_wine() {
       ok "the compositor says which Win32 it is on: \
 $(grep -o 'win32 is .*' "$dir/srv.log" | head -1)" ;;
     unknown)
-      bad "the compositor never said which Win32 it was on -- this leg cannot be attributed (§39)" ;;
+      bad "the compositor never said which Win32 it was on -- this leg cannot be attributed (docs/waycompose-design.md §55)" ;;
     *)
-      bad "the wine leg ran on '$plat', so nothing below is about Wine (§39)" ;;
+      bad "the wine leg ran on '$plat', so nothing below is about Wine (docs/waycompose-design.md §55)" ;;
   esac
 
   # --- the compositor's own view -----------------------------------------
@@ -415,7 +426,7 @@ $(grep -o 'cursor -> .*' "$dir/srv.log" | tail -1)"
   # that the message never reached the window procedure. It listed the two
   # sharp assertions below as things only a real guest could make.
   #
-  # **That was never Wine.** §39.5: the harness was killing the compositor one
+  # **That was never Wine.** §55.5: the harness was killing the compositor one
   # second after the launcher returned, while this probe was still in its
   # `--settle` sleep, so both `SendMessageW`s were being sent to a window that
   # had already been destroyed — and `SendMessageW` to a dead window returns 0.
@@ -490,9 +501,9 @@ compositor claimed the resize border too" ;;
   # `GetCursorInfo` — what a *user* would see, as against the queue reading
   # above. Both legs make this reading and both assert on it.
   #
-  # Before §39 the probe *died* here under Wine and this harness printed a note
+  # Before §55 the probe *died* here under Wine and this harness printed a note
   # and carried on, so the Wine leg silently lost this reading and the two below
-  # it: three assertions that looked like they were being made. §39.5 has the
+  # it: three assertions that looked like they were being made. §55.5 has the
   # cause and it was this harness, not Wine. An empty reading is therefore a
   # failure on either platform now, because on either platform something has to
   # have gone wrong to produce one.
@@ -500,13 +511,14 @@ compositor claimed the resize border too" ;;
     *"cursor=custom"*)
       ok "and GetCursorInfo agrees: ${client_line#*cursor=}" ;;
     "")
-      bad "GetCursorInfo produced nothing -- did probe-cursor.exe die? (§39.5)" ;;
+      bad "GetCursorInfo produced nothing -- did probe-cursor.exe die? \
+(docs/waycompose-design.md §55.5)" ;;
     *)
       bad "over the client area Win32 is showing ${client_line#*cursor=}" ;;
   esac
   case "$still_line" in
     *"cursor=custom"*) ok "and it is still there after 1.5 s of no mouse movement" ;;
-    "")                bad "no still reading -- the probe stopped before it (§39.5)" ;;
+    "")                bad "no still reading -- the probe stopped before it (docs/waycompose-design.md §55.5)" ;;
     *)                 bad "the cursor reverted once the pointer stopped moving: $still_line" ;;
   esac
 
@@ -516,7 +528,7 @@ compositor claimed the resize border too" ;;
   # border, which is why it is worth having twice.
   #
   # **THIS IS THE ONE PLACE IN THIS FILE WHERE WINE IS GENUINELY BROKEN** and
-  # therefore the one place with a Wine branch (§39.4). `probe-cursor.c` names a
+  # therefore the one place with a Wine branch (§55.4). `probe-cursor.c` names a
   # cursor by comparing its handle against `LoadCursorW(NULL, IDC_*)`, which is
   # proof of identity on Windows because stock cursors are shared per-session
   # handles. Under Wine they are **per process**: measured on wine-11.14, the
@@ -537,7 +549,7 @@ compositor claimed the resize border too" ;;
   edge_h=$(echo "$edge_line" | grep -o 'handle=[0-9a-fA-F]*')
   client_h=$(echo "$msg_line" | grep -o 'handle=[0-9a-fA-F]*')
   if [ -z "$edge_line" ]; then
-    bad "no border reading -- the probe stopped before it (§39.4)"
+    bad "no border reading -- the probe stopped before it (docs/waycompose-design.md §55.4)"
   elif grep -q "stock-identity=unavailable" "$dir/probe.log"; then
     case "$edge_line" in
       *"cursor=stock"*)
@@ -545,7 +557,7 @@ compositor claimed the resize border too" ;;
       *)
         if [ -n "$edge_h" ] && [ "$edge_h" != "$client_h" ]; then
           ok "the border's cursor is not the client's ($edge_h vs $client_h); \
-Wine cannot say which system cursor it is (§39.4)"
+Wine cannot say which system cursor it is (docs/waycompose-design.md §55.4)"
         else
           bad "the client's cursor leaked onto the window frame: $edge_line"
         fi ;;

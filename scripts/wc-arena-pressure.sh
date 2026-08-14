@@ -7,7 +7,7 @@
 #
 # # Why this exists, and why it is not `wc-firefox.sh` with a smaller number
 #
-# docs/design.md §20.2 is a correction to §17.8. §17.8 said that an arena with
+# docs/waycompose-design.md §20.2 is a correction to §17.8. §17.8 said that an arena with
 # no room for a pool would leave "the client's window stops updating" — a
 # compositor that looks frozen. It does not. The pool goes unannounced, the
 # client's next `wl_shm_pool.create_buffer` is forwarded to a compositor that
@@ -33,7 +33,13 @@
 # there the largest pool is bigger than the whole arena, so the client's main
 # surface can never be given memory at all and no policy can save it. That case
 # is worth running and is not worth asserting on -- see §20.7.
-set -u
+# STAGE 44. `pipefail` added: these were the only two harnesses without it, and
+# uniformity is the point rather than a live bug — neither currently has a
+# pipeline whose head is the thing under test, so this closes a latent hazard
+# rather than an open one. Without it a failing `cargo`/`ssh` at the head of a
+# pipeline is invisible; with it the status is at least *available*, which is
+# what `built_ok` and `${PIPESTATUS[0]}` then make usable.
+set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LINUX_BIN="$here/target/debug"
@@ -46,6 +52,24 @@ pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
 note(){ echo "  ....  $*" >&2; }
+
+# STAGE 41. No QEMU on this box, so no guest RAM to locate: this harness is the
+# Wine fixture. `wc_substrate_declare wine-fixture` is what hands it the
+# `SV_ALLOW_FILE_ARENA=1` that `wc-proxy` and `wc-compositor` now require, and
+# it refuses to hand that out to any harness that has a guest.
+. "$(dirname "$0")/wc-substrate.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "the proxy and its clients run on this box; the arena is a file here" || exit 1
+# STAGE 42. `fresh`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+wc_substrate_declare wine-fixture \
+  "no QEMU on this box: a Wine run has no guest RAM to locate" || exit 2
 
 winp() { printf 'Z:%s\n' "$(echo "$1" | tr '/' '\\')"; }
 
@@ -139,7 +163,7 @@ verdict() {
   echo "$label|$closed|$died|$refusals|$frames|$reclaimed|$unknown"
 }
 main() {
-  [ -x "$WIN_BIN/wc-compositor.exe" ] || { echo "build wc-compositor.exe first"; exit 2; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || exit 2
   [ -n "$FIREFOX" ] || { echo "no firefox"; exit 2; }
   local root; root=$(mktemp -d /tmp/wc-press-XXXXXX)
   local which=${1:-this}

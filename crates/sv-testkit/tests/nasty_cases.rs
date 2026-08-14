@@ -492,7 +492,78 @@ fn the_transform_pass_rewrites_memory_and_offset_as_a_pair() {
 #[test]
 fn the_handshake_carries_a_hash_over_a_readable_manifest() {
     assert_ne!(sv_proto::PROTOCOL_HASH, 0);
-    assert_eq!(sv_proto::PROTOCOL_PROFILE, "zink");
+    // Which profile, not *the* profile. `SV_PROTO_PROFILE` selects it and
+    // `full` is a supported build (§0.19), so pinning the string to `zink` made
+    // this fail for a reason that has nothing to do with the handshake. What is
+    // worth asserting is that the manifest names the profile it was generated
+    // from — a hash with no readable explanation is the thing §4.3 is against.
+    assert!(
+        sv_codegen::PROFILE_NAMES.contains(&sv_proto::PROTOCOL_PROFILE),
+        "PROTOCOL_PROFILE {:?} is not a profile this generator knows",
+        sv_proto::PROTOCOL_PROFILE
+    );
     assert!(sv_proto::PROTOCOL_MANIFEST.contains("command vkCreateBuffer"));
     assert!(sv_proto::PROTOCOL_MANIFEST.contains("struct VkBufferCreateInfo"));
+}
+
+/// The generated `depends_satisfied` agrees with the registry's own evaluator.
+///
+/// # Why a differential test and not a unit test
+///
+/// `sv_icd_entry::depends_satisfied` is `vk_registry::depends`' expression
+/// *compiled to Rust* — `,` became `||`, `+` became `&&`, a name became a call.
+/// That lowering exists because `sv-icd` is a `cdylib` and the alternatives were
+/// linking `vk-parse` into a driver for one function, or writing a second
+/// evaluator by hand. A compiler is only safe if something checks it against the
+/// thing it compiled, over the real inputs rather than three examples.
+///
+/// So: every extension the registry supports, against pseudo-random subsets of
+/// the names its own expression mentions. Those are the only names that can
+/// change the answer, which makes the subsets small enough to enumerate and
+/// exactly the ones that exercise the operators.
+#[test]
+fn the_compiled_depends_expressions_agree_with_the_registry_evaluator() {
+    let Ok(registry) = vk_registry::Registry::load() else { return };
+    let model = registry.model().expect("model");
+
+    let mut checked = 0usize;
+    let mut with_operators = 0usize;
+    for e in &model.extensions {
+        if !e.supported_for_vulkan {
+            continue;
+        }
+        let Some(expr) = e.depends.as_deref() else { continue };
+        let names = vk_registry::depends::names(expr);
+        if names.is_empty() {
+            continue;
+        }
+        if expr.contains(',') || expr.contains('+') {
+            with_operators += 1;
+        }
+        // Every subset, capped: 2^n over the mentioned names is exhaustive for
+        // the shapes the registry actually writes (the widest is five names),
+        // and the cap keeps a future ten-name expression from costing 1024×.
+        let n = names.len().min(8);
+        for bits in 0u32..(1 << n) {
+            let have = |q: &str| {
+                names.iter().take(n).enumerate().any(|(i, name)| {
+                    name == q && bits & (1 << i) != 0
+                })
+            };
+            let want = vk_registry::depends::satisfied(expr, &have);
+            let got = sv_icd_entry::depends_satisfied(&e.name, &have);
+            assert_eq!(
+                want, got,
+                "{}: depends={expr:?} disagrees at subset {bits:#b}",
+                e.name
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 1000, "only {checked} subsets checked; the sweep did not run");
+    assert!(
+        with_operators > 50,
+        "only {with_operators} expressions had an operator; a sweep over bare \
+         names would pass whatever the compiler did to `,` and `+`"
+    );
 }

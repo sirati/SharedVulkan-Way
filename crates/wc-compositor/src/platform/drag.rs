@@ -12,10 +12,15 @@
 //! desktop. That is the direction `docs/goal-firefox.md` asks for first,
 //! because it is dragging a link or a file out of Firefox.
 //!
-//! **Not the drop target.** `RegisterDragDrop` and `IDropTarget` are not
-//! written; nothing can be dragged *onto* one of these windows yet.
-//! [`payload`] therefore answers `None`, which closes the client's pipe rather
-//! than leaving it open — see §29.6 for why an answer beats a silence.
+//! **And the drop target**, added by §42: `RegisterDragDrop` and an
+//! [`IDropTarget`] per toplevel, so that something dragged out of a Windows
+//! application and over one of our windows becomes a `wl_data_device.enter` and
+//! — if the client accepts — a drop whose bytes [`payload`] answers from.
+//!
+//! The two halves meet at exactly one place, and it is worth naming: both go
+//! through [`super::win32::system_formats`] and `crate::clipboard`'s
+//! conversions, so the bytes a Wayland client drags *out* and the bytes it is
+//! offered on the way *in* cannot be described by two different tables.
 //!
 //! # Three vtables, written out
 //!
@@ -57,10 +62,12 @@ use std::rc::Rc;
 use windows_sys::core::{BOOL, GUID, HRESULT};
 use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, HWND};
 use windows_sys::Win32::System::Com::{FORMATETC, STGMEDIUM};
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows_sys::Win32::System::Ole::{
-    DoDragDrop, OleInitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
-    DROPEFFECT_NONE,
+    DoDragDrop, OleInitialize, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, DROPEFFECT,
+    DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -109,13 +116,39 @@ const fn ole_iid(data1: u32) -> GUID {
     }
 }
 
-/// SAFETY: both pointers must be readable `GUID`s.
+/// SAFETY: `a` must be null or point at 16 readable bytes.
+///
+/// **The read is unaligned, and that is a fix rather than a precaution.** docs/waycompose-design.md §50's
+/// run is the first time `DoDragDrop` has been entered, and the first drag out
+/// of a Wayland window aborted the compositor here:
+///
+/// ```text
+/// thread 'main' panicked at platform/drag.rs:125:22:
+/// misaligned pointer dereference: address must be a multiple of 0x4 but is 0x6fffff1d3a86
+///   4: wc_compositor::platform::drag::guid_eq
+///   5: wc_compositor::platform::drag::do_query_interface
+///  17: OLEDD_DragTrackerWindowProc
+///  22: DoDragDrop
+/// ```
+///
+/// A `REFIID` is a pointer into **another module's** memory, and nothing about
+/// COM promises it satisfies Rust's alignment invariant for `&GUID`. OLE's
+/// standard marshaller — which is what runs the moment a drag crosses out of
+/// our own window and into another process's, so that our `IDataObject` can be
+/// marshalled to it — hands out interface identifiers that live inside packed
+/// marshalling buffers, at whatever byte offset the stream put them.
+///
+/// `&*a` asserts alignment in a debug build and aborts; in release the check is
+/// compiled out and the same code reads the same bytes and works. That is the
+/// worst shape a defect can have — it is invisible in the build that ships and
+/// fatal in the build every harness in this tree runs — and it is why this is
+/// `read_unaligned` and not a note.
 unsafe fn guid_eq(a: *const GUID, b: &GUID) -> bool {
     if a.is_null() {
         return false;
     }
-    // SAFETY: the caller guarantees `a` is readable.
-    let a = unsafe { &*a };
+    // SAFETY: the caller guarantees 16 readable bytes; alignment is not assumed.
+    let a = unsafe { a.read_unaligned() };
     a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
 }
 
@@ -696,6 +729,59 @@ thread_local! {
     /// from `controller_proc`, which has only `ui()` to work with anyway.
     static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
     static OLE_READY: Cell<bool> = const { Cell::new(false) };
+
+    // --- the drop target's side, §42 ---------------------------------------
+    /// The bytes read out of the incoming `IDataObject` at the moment of the
+    /// drop, by system format. See [`payload`] for why they are copied here
+    /// rather than pulled when the client asks.
+    static DROPPED: RefCell<Vec<(crate::clipboard::SystemFormat, Vec<u8>)>> =
+        const { RefCell::new(Vec::new()) };
+    /// What the client under the drag last told us, as a `DROPEFFECT`.
+    ///
+    /// This is the whole of the answer `IDropTarget::DragOver` gives OLE, and
+    /// it is **one round trip stale by design** — see
+    /// [`crate::platform::ToUi::DragFeedback`], which is where that decision is
+    /// argued. `DROPEFFECT_NONE` until the client says otherwise, so a drag
+    /// over a window whose client has not answered shows the no-entry cursor
+    /// rather than promising a drop that would do nothing.
+    static FEEDBACK: Cell<DROPEFFECT> = const { Cell::new(DROPEFFECT_NONE) };
+    /// The window a drag is currently over, so `Drop` and `DragLeave` can name
+    /// it without OLE telling them — neither method carries an `HWND`.
+    static OVER: Cell<u64> = const { Cell::new(0) };
+    /// The answer `DragOver` last gave, and how many times in a row it gave it.
+    ///
+    /// ADDED FOR docs/waycompose-design.md §50, and it exists to make one specific claim measurable
+    /// rather than arguable. §43.4 decided that `DragOver` answers from the
+    /// last known accepted action and is therefore up to one round trip stale;
+    /// §43.9 item 2 then recorded that **nobody had seen it**. What a user sees
+    /// is not milliseconds, it is *how many frames of the gesture wear the
+    /// no-entry cursor before the client's `accept` arrives* — which is exactly
+    /// the length of the first run here. Logging on change rather than on every
+    /// call keeps that number in the log without putting one line per mouse
+    /// move in it: OLE calls `DragOver` several times a second for as long as
+    /// the gesture lasts.
+    static OVER_RUN: Cell<(DROPEFFECT, u32)> = const { Cell::new((DROPEFFECT_NONE, 0)) };
+    /// `now_ms()` at the `DragEnter` of the gesture in progress, so the gap
+    /// until the client's first answer is a number rather than an estimate.
+    static ENTERED_AT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Close off the current run of `DragOver` answers and print it.
+///
+/// Called at the two ends of a gesture — `Drop` and `DragLeave` — because the
+/// last run has no *next* answer to be flushed by, and a measurement that
+/// silently drops its final sample is worse than one that is missing.
+fn flush_over_run(window: u64) {
+    OVER_RUN.with(|o| {
+        let (last, n) = o.get();
+        if n > 0 {
+            println!(
+                "wc-compositor: DragOver on window {window} answered {last:#x} for the last \
+                 {n} call(s)"
+            );
+        }
+        o.set((DROPEFFECT_NONE, 0));
+    });
 }
 
 /// Stage a drag and ask the pump to run it.
@@ -807,13 +893,507 @@ pub(crate) fn cancel(_ui: &Rc<Ui>) {
 
 /// One mime type out of the drag currently over one of our windows.
 ///
-/// Always `None`: `RegisterDragDrop` is not called, so nothing can be dragged
-/// onto these windows and `wl_data_device.enter` is never sent. Answering
-/// rather than ignoring is what closes the client's pipe if one somehow asks
-/// (§29.6).
-pub(crate) fn payload(_ui: &Rc<Ui>, _mime: &str) -> Option<Vec<u8>> {
-    None
+/// The bytes of the drag that was last dropped on one of our windows, as the
+/// mime type the client asked for.
+///
+/// **REWRITTEN FOR §42**, and until then this returned `None` unconditionally
+/// because nothing could be dragged onto these windows at all.
+///
+/// Answered out of a copy taken at the drop rather than from the `IDataObject`
+/// now, and that is forced rather than chosen: OLE's data object belongs to the
+/// *source* application and is released when `Drop` returns, while the client's
+/// `fetch` arrives later — after a hypervisor crossing, after the client has
+/// decided it wants the bytes. Holding the interface pointer past the drop and
+/// calling `GetData` on it then would be calling into another process's object
+/// after telling that process the drag was over. §29.5's argument for the eager
+/// pull on the clipboard is the same argument with a different deadline.
+pub(crate) fn payload(_ui: &Rc<Ui>, mime: &str) -> Option<Vec<u8>> {
+    DROPPED.with(|d| {
+        d.borrow()
+            .iter()
+            .find_map(|(format, bytes)| crate::clipboard::from_system(mime, *format, bytes))
+    })
 }
+// --- IDropTarget: the other direction (§42) ----------------------------------
+//
+// Everything above this line is the drag *source* — a Wayland client dragging
+// onto the Windows desktop. This is the target: a Windows application dragging
+// onto one of our windows, which §29.8 named as the missing half and which is
+// the second sentence of the user's requirement.
+//
+// **The shape is inverted, and one consequence is easy to miss.** As a source
+// we are asked for bytes and answer; as a target we are *told* about bytes and
+// have to decide, synchronously, what would happen if the user let go — while
+// the only party who can decide that is a Wayland client on the other side of a
+// hypervisor. `FEEDBACK` is that decision arriving late, and
+// `crate::platform::ToUi::DragFeedback` is where the cost is argued.
+
+/// `IID_IDropTarget`, in the same OLE range as the three above.
+const IID_IDROPTARGET: GUID = ole_iid(0x0000_0122);
+
+/// `POINTL`, which OLE passes to three of the four methods **by value**.
+///
+/// Declared here rather than imported so that the layout this code compiles
+/// against is visible at the call site: two `i32`s, eight bytes, which the
+/// x86-64 calling convention passes in a register. A `*const POINTL` here —
+/// the shape the other three arguments have — would read the *pointer* as
+/// coordinates and place every drop at an address.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct PointL {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[repr(C)]
+struct IDropTargetVtbl {
+    base: IUnknownVtbl<DropTarget>,
+    drag_enter: unsafe extern "system" fn(
+        *mut DropTarget,
+        *mut core::ffi::c_void,
+        u32,
+        PointL,
+        *mut DROPEFFECT,
+    ) -> HRESULT,
+    drag_over: unsafe extern "system" fn(*mut DropTarget, u32, PointL, *mut DROPEFFECT) -> HRESULT,
+    drag_leave: unsafe extern "system" fn(*mut DropTarget) -> HRESULT,
+    drop: unsafe extern "system" fn(
+        *mut DropTarget,
+        *mut core::ffi::c_void,
+        u32,
+        PointL,
+        *mut DROPEFFECT,
+    ) -> HRESULT,
+}
+
+/// One per window, owned by OLE between `RegisterDragDrop` and
+/// `RevokeDragDrop`.
+///
+/// It carries the `WindowId` rather than the `HWND` because that is what the
+/// Wayland side speaks, and because the four methods it implements are given no
+/// window at all — `DragLeave` and `Drop` have to know which of our windows
+/// they belong to, and the only place that can come from is here.
+#[repr(C)]
+struct DropTarget {
+    vtbl: *const IDropTargetVtbl,
+    refs: Cell<u32>,
+    window: u64,
+}
+
+static DROP_TARGET_VTBL: IDropTargetVtbl = IDropTargetVtbl {
+    base: IUnknownVtbl {
+        query_interface: dt_query_interface,
+        add_ref: dt_add_ref,
+        release: dt_release,
+    },
+    drag_enter: dt_drag_enter,
+    drag_over: dt_drag_over,
+    drag_leave: dt_drag_leave,
+    drop: dt_drop,
+};
+
+unsafe extern "system" fn dt_query_interface(
+    this: *mut DropTarget,
+    iid: *const GUID,
+    out: *mut *mut core::ffi::c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: OLE passes a writable out-pointer. Nulled even on refusal,
+    // because OLE reads it either way — the same rule the source's three
+    // objects follow.
+    unsafe { *out = std::ptr::null_mut() };
+    // SAFETY: `iid` is OLE's, and readable.
+    if unsafe { guid_eq(iid, &IID_IUNKNOWN) || guid_eq(iid, &IID_IDROPTARGET) } {
+        // SAFETY: `this` is one of ours, alive for the call.
+        unsafe {
+            dt_add_ref(this);
+            *out = this.cast();
+        }
+        return S_OK;
+    }
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn dt_add_ref(this: *mut DropTarget) -> u32 {
+    // SAFETY: `this` is a live `DropTarget` this module allocated.
+    let me = unsafe { &*this };
+    let n = me.refs.get() + 1;
+    me.refs.set(n);
+    n
+}
+
+unsafe extern "system" fn dt_release(this: *mut DropTarget) -> u32 {
+    // SAFETY: as above.
+    let n = {
+        let me = unsafe { &*this };
+        let n = me.refs.get().saturating_sub(1);
+        me.refs.set(n);
+        n
+    };
+    if n == 0 {
+        // SAFETY: the last reference; reclaim the `Box` `register` made.
+        drop(unsafe { Box::from_raw(this) });
+    }
+    n
+}
+
+/// A Windows drag arrived over one of our windows.
+///
+/// The formats are read **now** and the bytes are not: what the Wayland client
+/// needs at this moment is the mime list, so it can decide whether it wants
+/// any of them, and reading megabytes on every enter would put that read inside
+/// OLE's modal loop for a gesture the user may be about to move elsewhere.
+unsafe extern "system" fn dt_drag_enter(
+    this: *mut DropTarget,
+    data: *mut core::ffi::c_void,
+    _key_state: u32,
+    pt: PointL,
+    effect: *mut DROPEFFECT,
+) -> HRESULT {
+    // SAFETY: `this` is live for the call.
+    let window = unsafe { &*this }.window;
+    let formats = unsafe { formats_of(data) };
+    let mimes = crate::clipboard::mimes_for(&formats);
+    // Nothing has answered yet, so the first `DragOver` says no. See `FEEDBACK`.
+    FEEDBACK.with(|f| f.set(DROPEFFECT_NONE));
+    OVER.with(|o| o.set(window));
+    OVER_RUN.with(|o| o.set((DROPEFFECT_NONE, 0)));
+    ENTERED_AT.with(|t| t.set(super::win32::now_ms()));
+    DROPPED.with(|d| d.borrow_mut().clear());
+    // SAFETY: OLE passes a writable out-pointer.
+    unsafe { write_effect(effect, DROPEFFECT_NONE) };
+    if mimes.is_empty() {
+        // A drag of something we cannot describe — a bitmap, a shell object.
+        // Told to the Wayland side as nothing rather than as an empty drag: a
+        // `wl_data_device.enter` with no mime types is a legal thing to send
+        // and an unhelpful one to receive.
+        println!("wc-compositor: a Windows drag entered window {window} offering nothing we speak");
+        return S_OK;
+    }
+    // ADDED FOR docs/waycompose-design.md §50. Until this line the *successful* path of `DragEnter` said
+    // nothing at all, and the only entry in the log was the one above for a
+    // drag we could not describe — so "a drag entered" was a claim no run could
+    // support from the compositor's own output. §43.9 item 1 is the sentence
+    // this line exists to let somebody stop writing.
+    println!(
+        "wc-compositor: a Windows drag entered window {window} at screen ({}, {}) offering {} \
+         mime(s): {}",
+        pt.x,
+        pt.y,
+        mimes.len(),
+        mimes.join(", ")
+    );
+    if let Some(ui) = super::win32::ui() {
+        let (x, y) = super::win32::screen_to_surface(&ui, window, pt.x, pt.y);
+        let _ = ui.events.send(super::FromUi::DragEnter {
+            id: window,
+            x,
+            y,
+            mimes,
+            // What Windows will let the user ask for. The keyboard modifiers
+            // narrow it — Ctrl means copy, Shift means move — and OLE reports
+            // that in `grfKeyState`; the client is told the whole set and
+            // chooses, which is Wayland's model and the more informative one.
+            actions: dnd_action::COPY | dnd_action::MOVE,
+            time: super::win32::now_ms(),
+        });
+    }
+    S_OK
+}
+
+/// The drag moved. This is the method that must answer synchronously.
+unsafe extern "system" fn dt_drag_over(
+    this: *mut DropTarget,
+    _key_state: u32,
+    pt: PointL,
+    effect: *mut DROPEFFECT,
+) -> HRESULT {
+    // SAFETY: `this` is live for the call.
+    let window = unsafe { &*this }.window;
+    let answer = FEEDBACK.with(|f| f.get());
+    // SAFETY: OLE passes a writable out-pointer.
+    unsafe { write_effect(effect, answer) };
+    // ADDED FOR docs/waycompose-design.md §50; see `OVER_RUN`. One line per *change*, so the first run is
+    // the size of §43.4's staleness in the unit the user actually experiences.
+    OVER_RUN.with(|o| {
+        let (last, n) = o.get();
+        if last == answer && n > 0 {
+            o.set((answer, n + 1));
+        } else {
+            if n > 0 {
+                println!(
+                    "wc-compositor: DragOver on window {window} answered {last:#x} {n} time(s)"
+                );
+            }
+            println!(
+                "wc-compositor: DragOver on window {window} now answers {answer:#x} ({} ms after \
+                 the drag entered)",
+                super::win32::now_ms().wrapping_sub(ENTERED_AT.with(|t| t.get()))
+            );
+            o.set((answer, 1));
+        }
+    });
+    if let Some(ui) = super::win32::ui() {
+        let (x, y) = super::win32::screen_to_surface(&ui, window, pt.x, pt.y);
+        let _ = ui.events.send(super::FromUi::DragMotion {
+            id: window,
+            x,
+            y,
+            time: super::win32::now_ms(),
+        });
+    }
+    S_OK
+}
+
+unsafe extern "system" fn dt_drag_leave(this: *mut DropTarget) -> HRESULT {
+    // SAFETY: `this` is live for the call.
+    let window = unsafe { &*this }.window;
+    flush_over_run(window);
+    println!("wc-compositor: a Windows drag left window {window}");
+    FEEDBACK.with(|f| f.set(DROPEFFECT_NONE));
+    OVER.with(|o| o.set(0));
+    if let Some(ui) = super::win32::ui() {
+        let _ = ui.events.send(super::FromUi::DragLeave {
+            id: window,
+            time: super::win32::now_ms(),
+        });
+    }
+    S_OK
+}
+
+/// The user let go over our window.
+///
+/// **The bytes are read here, before this returns.** The `IDataObject` belongs
+/// to the source application and is released when this method returns; the
+/// Wayland client's `fetch` arrives later, across a hypervisor. See [`payload`].
+unsafe extern "system" fn dt_drop(
+    this: *mut DropTarget,
+    data: *mut core::ffi::c_void,
+    _key_state: u32,
+    pt: PointL,
+    effect: *mut DROPEFFECT,
+) -> HRESULT {
+    // SAFETY: `this` is live for the call.
+    let window = unsafe { &*this }.window;
+    let taken = FEEDBACK.with(|f| f.get());
+    // SAFETY: OLE passes a writable out-pointer. What is reported here is what
+    // the *client* accepted, which is the number the source application uses to
+    // decide whether to delete its original on a move.
+    unsafe { write_effect(effect, taken) };
+    let bytes = unsafe { read_all(data) };
+    flush_over_run(window);
+    println!(
+        "wc-compositor: a Windows drag was dropped on window {window}: {} format(s) read, \
+         effect {taken:#x}",
+        bytes.len()
+    );
+    DROPPED.with(|d| *d.borrow_mut() = bytes);
+    FEEDBACK.with(|f| f.set(DROPEFFECT_NONE));
+    OVER.with(|o| o.set(0));
+    if let Some(ui) = super::win32::ui() {
+        let (x, y) = super::win32::screen_to_surface(&ui, window, pt.x, pt.y);
+        let _ = ui.events.send(super::FromUi::DragDrop {
+            id: window,
+            x,
+            y,
+            time: super::win32::now_ms(),
+        });
+    }
+    S_OK
+}
+
+/// SAFETY: `effect` must be a writable `DROPEFFECT` or null.
+unsafe fn write_effect(effect: *mut DROPEFFECT, value: DROPEFFECT) {
+    if !effect.is_null() {
+        // SAFETY: the caller guarantees it is writable.
+        unsafe { *effect = value };
+    }
+}
+
+// --- reading somebody else's IDataObject ------------------------------------
+//
+// The source's object is a COM interface pointer this process did not create,
+// so its vtable has to be described again with `*mut c_void` receivers. Only
+// the three methods used are named; the rest of the layout is padding whose
+// only job is to put those three at the right offsets, which is why they are
+// declared and never called.
+
+#[repr(C)]
+struct RemoteDataObjectVtbl {
+    query_interface: unsafe extern "system" fn(*mut core::ffi::c_void, *const GUID, *mut *mut core::ffi::c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+    release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+    get_data: unsafe extern "system" fn(*mut core::ffi::c_void, *const FORMATETC, *mut STGMEDIUM) -> HRESULT,
+    get_data_here: unsafe extern "system" fn(*mut core::ffi::c_void, *const FORMATETC, *mut STGMEDIUM) -> HRESULT,
+    query_get_data: unsafe extern "system" fn(*mut core::ffi::c_void, *const FORMATETC) -> HRESULT,
+    get_canonical_format_etc: unsafe extern "system" fn(*mut core::ffi::c_void, *const FORMATETC, *mut FORMATETC) -> HRESULT,
+    set_data: unsafe extern "system" fn(*mut core::ffi::c_void, *const FORMATETC, *const STGMEDIUM, BOOL) -> HRESULT,
+    enum_format_etc: unsafe extern "system" fn(*mut core::ffi::c_void, u32, *mut *mut core::ffi::c_void) -> HRESULT,
+    d_advise: unsafe extern "system" fn(*mut core::ffi::c_void, *const FORMATETC, u32, *mut core::ffi::c_void, *mut u32) -> HRESULT,
+    d_unadvise: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> HRESULT,
+    enum_d_advise: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> HRESULT,
+}
+
+/// A `FORMATETC` asking for one clipboard format as an `HGLOBAL`.
+fn asking_for(format: u32) -> FORMATETC {
+    FORMATETC {
+        cfFormat: format as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL,
+    }
+}
+
+/// Which of the formats this compositor understands the drag is offering.
+///
+/// `QueryGetData` per format rather than walking `IEnumFORMATETC`, and it is
+/// the more robust of the two: an enumerator is a second object with its own
+/// contract — the same `S_FALSE`-on-short-read contract this module implements
+/// for the *source* and had to write four tests about — while `QueryGetData` is
+/// one call with one answer, asked only about the three formats we could do
+/// anything with anyway.
+///
+/// SAFETY: `data` must be a live `IDataObject` or null.
+unsafe fn formats_of(data: *mut core::ffi::c_void) -> Vec<crate::clipboard::SystemFormat> {
+    let mut out = Vec::new();
+    if data.is_null() {
+        return out;
+    }
+    let Some(ui) = super::win32::ui() else { return out };
+    // SAFETY: a live COM object: the first word is its vtable pointer.
+    let vtbl = unsafe { *(data as *const *const RemoteDataObjectVtbl) };
+    if vtbl.is_null() {
+        return out;
+    }
+    for format in crate::clipboard::SystemFormat::ALL {
+        let etc = asking_for(super::win32::format_id(&ui, format));
+        // SAFETY: `vtbl` is the object's, `etc` is a well-formed FORMATETC.
+        let hr = unsafe { ((*vtbl).query_get_data)(data, &etc) };
+        if hr == S_OK {
+            out.push(format);
+        }
+    }
+    out
+}
+
+/// Read every format we understand out of the object, as bytes.
+///
+/// SAFETY: `data` must be a live `IDataObject` or null.
+unsafe fn read_all(data: *mut core::ffi::c_void) -> Vec<(crate::clipboard::SystemFormat, Vec<u8>)> {
+    let mut out = Vec::new();
+    if data.is_null() {
+        return out;
+    }
+    let Some(ui) = super::win32::ui() else { return out };
+    // SAFETY: a live COM object.
+    let vtbl = unsafe { *(data as *const *const RemoteDataObjectVtbl) };
+    if vtbl.is_null() {
+        return out;
+    }
+    // SAFETY: the formats are the ones `formats_of` would have accepted.
+    for format in unsafe { formats_of(data) } {
+        let etc = asking_for(super::win32::format_id(&ui, format));
+        let mut medium: STGMEDIUM = unsafe { std::mem::zeroed() };
+        // SAFETY: `etc` is well-formed and `medium` is writable.
+        let hr = unsafe { ((*vtbl).get_data)(data, &etc, &mut medium) };
+        if hr != S_OK {
+            continue;
+        }
+        // SAFETY: `tymed` says the union holds an `HGLOBAL`, which is what the
+        // `FORMATETC` asked for; a source that answers `S_OK` for a different
+        // medium is out of contract and is skipped rather than trusted.
+        let bytes = if medium.tymed == TYMED_HGLOBAL {
+            unsafe { read_hglobal(medium.u.hGlobal) }
+        } else {
+            None
+        };
+        // **`ReleaseStgMedium`, always.** The medium is the source's memory and
+        // the receiver frees it; skipping this leaks whatever was dragged, once
+        // per drop, in the compositor rather than in the application that
+        // dragged it.
+        // SAFETY: `medium` was filled by `GetData` and is released exactly once.
+        unsafe { ReleaseStgMedium(&mut medium) };
+        if let Some(bytes) = bytes {
+            out.push((format, bytes));
+        }
+    }
+    out
+}
+
+/// SAFETY: `handle` must be a live `HGLOBAL` or null.
+unsafe fn read_hglobal(handle: HGLOBAL) -> Option<Vec<u8>> {
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: a live moveable global.
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 {
+        return Some(Vec::new());
+    }
+    // SAFETY: locked for the copy and unlocked immediately after.
+    let p = unsafe { GlobalLock(handle) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `GlobalSize` bytes are readable from the locked pointer.
+    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, size) }.to_vec();
+    // SAFETY: paired with the lock above.
+    unsafe { GlobalUnlock(handle) };
+    Some(bytes)
+}
+
+// --- registration -----------------------------------------------------------
+
+/// Let this window be dropped onto.
+///
+/// Called for every toplevel as it is created. A popup is deliberately not
+/// registered: a menu is not a drop destination, and `RegisterDragDrop` on a
+/// `WS_EX_NOACTIVATE` window whose lifetime is a gesture is a revoke waiting to
+/// be forgotten.
+pub(crate) fn register(hwnd: HWND, window: u64) {
+    if !ole_ready() {
+        return;
+    }
+    let target = Box::into_raw(Box::new(DropTarget {
+        vtbl: &DROP_TARGET_VTBL,
+        refs: Cell::new(1),
+        window,
+    }));
+    // SAFETY: a live window handle on the thread that owns it, and a COM object
+    // this module allocated. OLE takes its own reference.
+    let hr = unsafe { RegisterDragDrop(hwnd, target.cast()) };
+    if hr == S_OK {
+        println!("wc-compositor: window {window} accepts drops from Windows applications");
+    } else {
+        // Not fatal, and said out loud rather than swallowed: a compositor
+        // whose windows silently refuse drops looks exactly like one whose
+        // clients refuse them, and the two have nothing in common.
+        println!("wc-compositor: window {window} could not be made a drop target ({hr:#010x})");
+    }
+    // Ours is released either way: on success OLE holds its own reference, and
+    // on failure there is nothing to hold it.
+    // SAFETY: the reference `Box::into_raw` handed us.
+    unsafe { dt_release(target) };
+}
+
+/// Stop accepting drops, before the window goes.
+///
+/// **`RevokeDragDrop` before `DestroyWindow`, not after.** OLE keys its
+/// registration on the `HWND`; a handle that has been destroyed cannot be
+/// revoked, and the entry stays in OLE's table until the process exits — which
+/// on a compositor whose windows come and go with a client's menus is a leak
+/// that grows with use.
+pub(crate) fn revoke(hwnd: HWND) {
+    if !OLE_READY.with(|r| r.get()) {
+        return;
+    }
+    // SAFETY: a live window handle on the thread that owns it.
+    unsafe { RevokeDragDrop(hwnd) };
+}
+
 
 // --- the two vocabularies ---------------------------------------------------
 
@@ -989,4 +1569,193 @@ mod tests {
             assert_eq!(do_release(d), 0);
         }
     }
+
+    // --- the drop target, §42 ----------------------------------------------
+    //
+    // The same four kinds of silent wrongness the source's tests cover, from
+    // the other side of the interface: the vtable order, the out-pointer
+    // discipline, the ref count, and the one number OLE reads back.
+
+    /// Call through the vtable **by position**, the way OLE does.
+    ///
+    /// This is the point of the test rather than an implementation detail: a
+    /// vtable is a struct of function pointers whose order *is* the contract,
+    /// and a Rust struct field named `drop_` that happens to sit where OLE
+    /// expects `DragLeave` compiles perfectly and calls the wrong function at
+    /// runtime. Indexing the raw layout is the only way to assert the order.
+    unsafe fn dt_slot(t: *mut DropTarget, index: usize) -> *const () {
+        // SAFETY: a live `DropTarget`; its first word is the vtable pointer,
+        // and the vtable is `IDropTargetVtbl`'s seven function pointers.
+        unsafe {
+            let vtbl = *(t as *const *const ()) as *const *const ();
+            *vtbl.add(index)
+        }
+    }
+
+    #[test]
+    fn the_drop_target_vtable_is_in_idl_order() {
+        let t = Box::into_raw(Box::new(DropTarget {
+            vtbl: &DROP_TARGET_VTBL,
+            refs: Cell::new(1),
+            window: 7,
+        }));
+        // SAFETY: the object is alive for the whole test.
+        unsafe {
+            // IUnknown's three, then IDropTarget's four, in IDL order.
+            assert_eq!(dt_slot(t, 0), dt_query_interface as *const ());
+            assert_eq!(dt_slot(t, 1), dt_add_ref as *const ());
+            assert_eq!(dt_slot(t, 2), dt_release as *const ());
+            assert_eq!(dt_slot(t, 3), dt_drag_enter as *const ());
+            assert_eq!(dt_slot(t, 4), dt_drag_over as *const ());
+            assert_eq!(dt_slot(t, 5), dt_drag_leave as *const ());
+            assert_eq!(dt_slot(t, 6), dt_drop as *const ());
+            assert_eq!(dt_release(t), 0);
+        }
+    }
+
+    #[test]
+    fn the_drop_target_answers_for_idroptarget_and_nulls_the_out_pointer_when_it_refuses() {
+        let t = Box::into_raw(Box::new(DropTarget {
+            vtbl: &DROP_TARGET_VTBL,
+            refs: Cell::new(1),
+            window: 1,
+        }));
+        // SAFETY: the object is alive for the whole test.
+        unsafe {
+            let mut out: *mut core::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(dt_query_interface(t, &IID_IDROPTARGET, &mut out), S_OK);
+            assert!(!out.is_null(), "a successful QueryInterface must hand one back");
+            // It took a reference; give it back.
+            assert_eq!(dt_release(t), 1);
+
+            // A refusal still writes the out-pointer, because OLE reads it
+            // either way.
+            out = 0x1234 as *mut core::ffi::c_void;
+            assert_eq!(dt_query_interface(t, &IID_IDROPSOURCE, &mut out), E_NOINTERFACE);
+            assert!(out.is_null(), "a refusal must null the out-pointer, not leave it");
+
+            assert_eq!(dt_query_interface(t, &IID_IUNKNOWN, &mut out), S_OK);
+            assert_eq!(dt_release(t), 1);
+            assert_eq!(dt_release(t), 0);
+        }
+    }
+
+    /// `DragOver` answers from the last feedback, and the default is "no".
+    ///
+    /// The default is the half worth asserting: a drop target that answered
+    /// `DROPEFFECT_COPY` before any client had accepted would show a copy
+    /// cursor over a window that is going to refuse the drop, which is a
+    /// promise the compositor cannot keep.
+    #[test]
+    fn drag_over_answers_from_the_last_feedback_and_refuses_until_there_is_one() {
+        let t = Box::into_raw(Box::new(DropTarget {
+            vtbl: &DROP_TARGET_VTBL,
+            refs: Cell::new(1),
+            window: 3,
+        }));
+        let pt = PointL { x: 0, y: 0 };
+        // SAFETY: the object is alive for the whole test.
+        unsafe {
+            FEEDBACK.with(|f| f.set(DROPEFFECT_NONE));
+            let mut effect: DROPEFFECT = 0xdead_beef;
+            assert_eq!(dt_drag_over(t, 0, pt, &mut effect), S_OK);
+            assert_eq!(effect, DROPEFFECT_NONE, "nobody has accepted yet");
+
+            feedback(true, dnd_action::COPY);
+            assert_eq!(dt_drag_over(t, 0, pt, &mut effect), S_OK);
+            assert_eq!(effect, DROPEFFECT_COPY);
+
+            feedback(true, dnd_action::MOVE);
+            assert_eq!(dt_drag_over(t, 0, pt, &mut effect), S_OK);
+            assert_eq!(effect, DROPEFFECT_MOVE);
+
+            // A client that stops accepting takes the effect with it.
+            feedback(false, dnd_action::COPY);
+            assert_eq!(dt_drag_over(t, 0, pt, &mut effect), S_OK);
+            assert_eq!(effect, DROPEFFECT_NONE);
+
+            // And a null out-pointer is survivable rather than a crash: OLE is
+            // not supposed to pass one, and "not supposed to" is not a
+            // guarantee this process gets to rely on.
+            assert_eq!(dt_drag_over(t, 0, pt, std::ptr::null_mut()), S_OK);
+            assert_eq!(dt_release(t), 0);
+        }
+    }
+
+    /// A drag carrying nothing we understand is refused, and does not crash.
+    ///
+    /// A null `IDataObject` is not something OLE does; it is what a *harness*
+    /// can pass, and the assertion is that the four methods are total
+    /// functions of what they are given rather than of what they expect.
+    #[test]
+    fn a_drag_with_no_data_object_is_refused_rather_than_dereferenced() {
+        let t = Box::into_raw(Box::new(DropTarget {
+            vtbl: &DROP_TARGET_VTBL,
+            refs: Cell::new(1),
+            window: 5,
+        }));
+        let pt = PointL { x: 10, y: 20 };
+        // SAFETY: the object is alive; the data object is deliberately null.
+        unsafe {
+            let mut effect: DROPEFFECT = DROPEFFECT_COPY;
+            assert_eq!(dt_drag_enter(t, std::ptr::null_mut(), 0, pt, &mut effect), S_OK);
+            assert_eq!(effect, DROPEFFECT_NONE);
+            assert!(formats_of(std::ptr::null_mut()).is_empty());
+            assert!(read_all(std::ptr::null_mut()).is_empty());
+            assert_eq!(dt_drag_leave(t), S_OK);
+            assert_eq!(dt_release(t), 0);
+        }
+    }
+
+    /// What was dropped comes back as the mime type the client asks for.
+    ///
+    /// The conversion is `crate::clipboard::from_system`, which is the same
+    /// function the clipboard's paste path uses — so this asserts the wiring
+    /// rather than the encoding, which has its own tests. UTF-16 in, UTF-8
+    /// out, and a mime type the drag never held answers `None` rather than the
+    /// wrong bytes.
+    #[test]
+    fn the_dropped_bytes_come_back_as_the_mime_the_client_asked_for() {
+        let utf16 = crate::clipboard::utf16_bytes(&crate::clipboard::utf16_from_utf8("hi\r\n"));
+        DROPPED.with(|d| {
+            *d.borrow_mut() = vec![(crate::clipboard::SystemFormat::UnicodeText, utf16)]
+        });
+        // `payload` takes a `Ui` it does not read; the drop's bytes are
+        // thread-local because the drop is.
+        let got = DROPPED.with(|d| {
+            d.borrow()
+                .iter()
+                .find_map(|(f, b)| crate::clipboard::from_system("text/plain;charset=utf-8", *f, b))
+        });
+        assert_eq!(got.as_deref(), Some(&b"hi\n"[..]));
+        let none = DROPPED.with(|d| {
+            d.borrow()
+                .iter()
+                .find_map(|(f, b)| crate::clipboard::from_system("image/png", *f, b))
+        });
+        assert_eq!(none, None, "a mime the drag never held must not answer");
+        DROPPED.with(|d| d.borrow_mut().clear());
+    }
+}
+
+/// The client under an incoming drag has accepted or refused, and chosen an
+/// action. Remember it for the next `IDropTarget::DragOver`.
+///
+/// ADDED FOR §42, and this function is the whole of the asynchronous half of
+/// that answer. Its cost is argued at [`crate::platform::ToUi::DragFeedback`]:
+/// `DragOver` returns whatever arrived *before* it was called, so the cursor is
+/// up to one round trip behind the client. The drop is not, because the drop is
+/// answered after the client has been told about it.
+pub(crate) fn feedback(accepted: bool, action: u32) {
+    let effect = if accepted { to_dropeffect(action) } else { DROPEFFECT_NONE };
+    // ADDED FOR docs/waycompose-design.md §50. This is the *arrival* of the asynchronous half, and it is
+    // the other end of the interval `OVER_RUN` measures: between `DragEnter`
+    // and this line every `DragOver` answers `DROPEFFECT_NONE`, and the run
+    // length printed on the next change is how much of the gesture that was.
+    println!(
+        "wc-compositor: the client under the drag answered accepted={accepted} action={action} \
+         -> effect {effect:#x} ({} ms after the drag entered)",
+        super::win32::now_ms().wrapping_sub(ENTERED_AT.with(|t| t.get()))
+    );
+    FEEDBACK.with(|f| f.set(effect));
 }

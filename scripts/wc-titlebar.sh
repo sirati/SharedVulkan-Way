@@ -3,6 +3,7 @@
 # pixels in the guest's own RAM.
 #
 #   scripts/wc-titlebar.sh deploy   cross-compile and copy what this run needs
+#   scripts/wc-titlebar.sh local    §46, headless: two clients, one run, one flag
 #   scripts/wc-titlebar.sh server   one caption: default_mode(2) + the env var
 #   scripts/wc-titlebar.sh client   the arrangement before this stage, for the pair
 #   scripts/wc-titlebar.sh tabs     TABS IN THE TITLE BAR: the caption folded into the client
@@ -124,6 +125,11 @@ g() { ssh "${SSHOPT[@]}" "$GUEST" "$@"; }
 h() { ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`,
+# which it uses; this harness deploys across *both* boundaries, so it uses both.
+. "$(dirname "$0")/wc-binaries.sh"
+. "$(dirname "$0")/wc-topology.sh"
+
 # Run something on the interactive desktop, and wait for it.
 int() {
   g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
@@ -200,21 +206,23 @@ PS2
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
+  # STAGE 42. **Existence is not freshness**, and this harness already has the
+  # better half of the argument written down two comments below: looking in the
+  # wrong directory "is how a deploy silently ships the last run's copy". The
+  # same is true of looking in the *right* directory at a file that is simply
+  # old — §35.4's measurement, and §35.6 item 6 named this harness.
   local e
+  local how_win="cargo build --workspace --target x86_64-pc-windows-gnu"
   for e in wc-compositor.exe wc-desk.exe; do
-    [ -f "$WIN_BIN/$e" ] || {
-      echo "error: no $WIN_BIN/$e -- cargo build --workspace --target x86_64-pc-windows-gnu"
-      exit 1; }
+    fresh "$WIN_BIN/$e" "$how_win" || exit 1
   done
   # `wc-arena-host` is its own workspace — it links shared_vulkan's crates and
   # deliberately inherits nothing from this one — so its binary is not in the
   # shared target directory and looking for it there is how a deploy silently
   # ships the last run's copy.
   local arena_host="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
-  [ -x "$LINUX_BIN/wc-proxy" ] && [ -x "$arena_host" ] || {
-    echo "error: no wc-proxy / wc-arena-host -- cargo build --workspace and"
-    echo "       cargo build --manifest-path crates/wc-arena-host/Cargo.toml"
-    exit 1; }
+  fresh "$LINUX_BIN/wc-proxy" "cargo build --workspace" || exit 1
+  fresh "$arena_host" "cargo build --manifest-path crates/wc-arena-host/Cargo.toml" || exit 1
 
   local stage; stage=$(mktemp -d /tmp/wc-tb-stage-XXXXXX)
   cp "$WIN_BIN/wc-compositor.exe" "$WIN_BIN/wc-desk.exe" "$stage/"
@@ -234,6 +242,11 @@ do_deploy() {
   g "mkdir -p $GDIR" || exit 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$TBNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$GDIR"
+  # STAGE 42. `scp` returning 0 says the transfer ran, not that the bytes over
+  # there are this tree's. See the comment above: a running `.exe` usually makes
+  # it *fail*, and the case this catches is the one where it does not.
+  deployed_all "$stage" "$GDIR" g "re-run $0 deploy with nothing of ours running on the guest" \
+    "wc-compositor.exe" "wc-desk.exe" || exit 1
   rm -rf "$stage"
 
   [ -n "$HOST" ] || { echo "  WC_HOST unset: nothing copied to the VM host"; return; }
@@ -246,6 +259,12 @@ do_deploy() {
     >/dev/null || { echo "  could not copy to $HOST"; exit 1; }
   h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
   echo "  copied wc-proxy and wc-arena-host to $HOST:$HOST_DIR"
+  # STAGE 42, and the *other* boundary. `ETXTBSY` on a live Linux executable is
+  # the noisy failure the `pkill` above avoids; a copy that lands next to a
+  # binary another worktree is mid-run with is the quiet one. Same check, the
+  # caller's own `h` as the runner.
+  deployed_is "$LINUX_BIN/wc-proxy"  "$HOST_DIR/wc-proxy"      h "re-run $0 deploy" || exit 1
+  deployed_is "$arena_host"          "$HOST_DIR/wc-arena-host" h "re-run $0 deploy" || exit 1
   mkdir -p "$OUT"
 }
 
@@ -277,6 +296,11 @@ do_run() {
   echo "== $leg: Firefox on the guest's desktop, over the guest's own RAM =="
   [ -n "$HOST" ]         || { miss "WC_HOST unset: the proxy has to run where QEMU is"; return; }
   [ -n "$HOST_FIREFOX" ] || { miss "WC_HOST_FIREFOX unset: no Firefox path on $HOST"; return; }
+  # §51. A hypervisor is in this path, declared so that a claim about how long
+  # anything took across it is available here -- and refused in the Wine
+  # harnesses, which is what §27.6 needed and did not have.
+  wc_topology_declare cross-vm \
+    "the compositor is on the guest and Firefox is on the VM host, over the guest's own RAM" || return
   have magick            || { miss "no imagemagick here: nothing could be converted"; return; }
 
   local sock="wtb-$leg-$$"
@@ -533,8 +557,12 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
 
   scp "${SSHOPT[@]}" "$GUEST:$TBNAME/tb-$leg.bmp" "$RUNDIR/tb-$leg.bmp" >/dev/null 2>&1
   mkdir -p "$outdir"
+  # STAGE 42. Same vacuous gate as the four `fetch` helpers, inlined here: the
+  # geometry went into the success string and was compared with nothing, so a
+  # 1x1 or an all-black capture read as a PASS. This is a window capture
+  # (`tb-$leg.bmp` is the toplevel with its frame), so `window` is the shape.
   if [ -s "$RUNDIR/tb-$leg.bmp" ] && magick "$RUNDIR/tb-$leg.bmp" "$picture" 2>/dev/null; then
-    ok "$leg: the window, frame and all -> ${picture#"$ROOT"/} ($(magick identify -format '%wx%h' "$picture"))"
+    picture_is "$picture" window "$leg: the window, frame and all -> ${picture#"$ROOT"/}"
   else
     bad "$leg: nothing came back from the capture"
   fi
@@ -672,8 +700,72 @@ do_clean() {
   echo "  removed $GDIR and this run's leftovers"
 }
 
+# ---------------------------------------------------------------- local -----
+# STAGE 46. The half of the per-window claim that does not need a guest.
+#
+# Every other leg in this file photographs a window, which needs the interactive
+# desktop, the arena and the VM host. `auto` makes a claim a picture of one
+# window cannot carry and a headless run can: **two clients in one compositor
+# run come out differently.** No per-run flag can pass this leg whatever it is
+# set to, which is the point — it is the assertion that separates
+# `--decorations auto` from every arrangement before it, and it costs no guest.
+#
+# Deliberately not folded into `do_run`: that function is deploy, start on the
+# desktop, locate the arena, photograph. This shares none of it.
+do_local() {
+  echo "== auto: two clients, one run, one flag  (headless, no guest) =="
+  # §51. This leg has no guest in it, and says so. `wc-titlebar.sh`'s other legs
+  # declare cross-vm; the declaration is per-leg because the topology is.
+  wc_topology_declare same-box \
+    "headless: the Linux wc-compositor and two weston clients, all on this box" || return
+  fresh "$LINUX_BIN/wc-compositor" "cargo build --workspace" || return
+  local c
+  for c in weston-terminal weston-flower; do
+    have "$c" || { miss "$c is not installed; the per-window claim needs both clients"; return; }
+  done
+
+  local d="$RUNDIR/local"; mkdir -p "$d/rt"; chmod 700 "$d/rt"
+  local sock="wl-tb46-$$"
+  # One compositor, both clients in sequence. `--once` would exit when the first
+  # client left, and running them at the same time would turn "which window
+  # folded" into a question about ordering. Sequential in one process is enough:
+  # the flag under test is the run's and does not change between the two.
+  XDG_RUNTIME_DIR="$d/rt" "$LINUX_BIN/wc-compositor" --socket "$sock" --timeout 30 \
+    --decorations auto >"$d/srv.log" 2>&1 &
+  local srv=$!
+  sleep 1
+  for c in weston-terminal weston-flower; do
+    ( cd "$d" && XDG_RUNTIME_DIR="$d/rt" WAYLAND_DISPLAY="$sock" timeout 8 "$c" ) >/dev/null 2>&1
+  done
+  kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
+
+  # By app id, so that neither claim can be satisfied by the other window's line.
+  local t f folds
+  t=$(grep "org.freedesktop.weston.wayland-terminal" "$d/srv.log" | head -1)
+  f=$(grep "org.freedesktop.weston.flower" "$d/srv.log" | head -1)
+  echo "$t" | grep -q "caption is folded into its client area" \
+    && ok "weston-terminal decorates itself, so its caption was folded: one bar, the client's" \
+    || { bad "weston-terminal's caption was not folded"; echo "        $t"; }
+  echo "$f" | grep -q "Windows' caption is the only title bar" \
+    && ok "weston-flower draws no bar, so its caption was kept: one bar, Windows'" \
+    || { bad "weston-flower's caption was folded away"; echo "        $f"; }
+
+  # And the pair, which is the sentence a per-run flag cannot make true.
+  folds=$(grep -c "the system caption folded in" "$d/srv.log")
+  [ "$folds" = 1 ] \
+    && ok "exactly one of the two windows folded its caption, in one run, under one flag" \
+    || bad "$folds of 2 windows folded; --decorations auto is not deciding per window"
+  if grep -q "THIS WINDOW HAS" "$d/srv.log"; then
+    bad "the compositor still reports a defect under auto"
+    grep "THIS WINDOW HAS" "$d/srv.log" | sed 's/^/        /'
+  else
+    ok "and neither window is reported as having two title bars or none"
+  fi
+}
+
 case "$MODE" in
   deploy)  do_deploy ;;
+  local)   do_local ;;
   server)  do_run server ;;
   client)  do_run client ;;
   tabs)    do_run tabs ;;
@@ -687,7 +779,7 @@ case "$MODE" in
   all)     do_deploy; do_run tabs; do_run noglass; do_run nobuttons
            do_run server; do_run client ;;
   clean)   do_clean ;;
-  *) echo "usage: $0 [deploy|server|client|tabs|noglass|nobuttons|both|pair|all|clean]"
+  *) echo "usage: $0 [deploy|local|server|client|tabs|noglass|nobuttons|both|pair|all|clean]"
      exit 2 ;;
 esac
 

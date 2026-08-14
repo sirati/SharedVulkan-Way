@@ -161,6 +161,54 @@ pub struct FrameStyle {
     pub caption_buttons: bool,
 }
 
+/// Fit a window's outer rectangle into a work area: cap the size, then bound
+/// the position.
+///
+/// ADDED FOR STAGE 38. Pure arithmetic, in this file rather than in `win32.rs`,
+/// so that it is tested by the ordinary gate on a machine with no monitor at
+/// all — the Win32 side is then only the two system calls that say where the
+/// work area is.
+///
+/// **Fitting the whole rectangle is deliberately stronger than keeping the
+/// title bar on screen.** The requirement is that a window opens somewhere it
+/// can be grabbed and moved; there is no arrangement in which the frame fits
+/// inside the work area and the caption does not, so this needs no knowledge of
+/// where the caption is or how tall it is — which is what would otherwise have
+/// to be recomputed for every DPI and every theme.
+///
+/// The position is **bounded, not chosen**: a window that already fits comes
+/// back exactly as it went in. Windows placed it with `CW_USEDEFAULT` and that
+/// cascade is not wrong, it is merely unbounded — a few windows into it, the
+/// next one is off the bottom right corner.
+///
+/// `work` is `(left, top, right, bottom)` in screen coordinates, and the far
+/// edges are exclusive, which is Win32's convention for a `RECT`.
+/// Called from `win32.rs` and from this module's own tests, so off Windows a
+/// non-test build is right that nothing uses it. Saying so beats giving the
+/// headless platform a call it has no monitor to make.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn fit_to_work_area(
+    (x, y, w, h): (i32, i32, i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (left, top, right, bottom) = work;
+    if right <= left || bottom <= top {
+        // Nothing measurable to fit into. Refusing is the honest answer: a
+        // window squeezed into a zero-width monitor is worse than one that is
+        // where the system put it.
+        return (x, y, w, h);
+    }
+    let w = w.min(right - left);
+    let h = h.min(bottom - top);
+    // `min` before `max`. With the size already capped the two cannot fight,
+    // and this order leaves the top left corner on the work area even for a
+    // window that is exactly its size — the other order would push a window
+    // that is too far right back to `left` only after moving it past it.
+    let x = (x.min(right - w)).max(left);
+    let y = (y.min(bottom - h)).max(top);
+    (x, y, w, h)
+}
+
 /// Which edge an interactive resize is being driven from.
 ///
 /// ADDED FOR STAGE 17. Spelled out here rather than passing Wayland's
@@ -261,6 +309,37 @@ pub enum WindowKind {
     Popup { parent: WindowId, x: i32, y: i32 },
 }
 
+/// The rectangle this window's popups have to stay inside, in **this window's
+/// own window-geometry coordinates** — the same coordinates `xdg_positioner`
+/// works in — or `None` while nothing that can see the desktop has said.
+///
+/// ADDED FOR STAGE 38, and it is the one piece of monitor knowledge that
+/// crosses this boundary.
+///
+/// # Why a shared cell rather than a message
+///
+/// `xdg_positioner`'s constraint adjustments are applied by the *Wayland*
+/// thread, in `state.rs`, because the answer has to go into the popup's very
+/// first `configure` — the protocol has the compositor tell the client where
+/// the popup ended up, and a client that is told one rectangle while the window
+/// is placed at another has no way to notice. But the rectangle to fit into is
+/// **the monitor's work area**, and on this platform only the UI thread may ask
+/// Windows for that: `MonitorFromWindow` needs an `HWND` and `HWND`s are
+/// thread-affine.
+///
+/// A request/reply across the thread boundary would deadlock the first time the
+/// UI thread was inside a modal loop — a window drag, a system menu — so this
+/// is a *cache*: the UI thread writes it whenever Windows says the window
+/// moved, and the Wayland thread reads whatever is there. The cost is that a
+/// menu opened in the same millisecond as a window is dragged onto another
+/// monitor can be constrained against the monitor it just left. The alternative
+/// is not constraining at all, which is docs/waycompose-design.md §38's bug.
+///
+/// `None` means *do not constrain*, and it is not the same as an empty
+/// rectangle: it is the honest state of a window the platform has not placed
+/// yet, and of the headless platform when nothing is standing in for Windows.
+pub type PopupBounds = Arc<Mutex<Option<Rect>>>;
+
 /// Wayland thread -> UI thread.
 #[derive(Debug)]
 pub enum ToUi {
@@ -276,6 +355,15 @@ pub enum ToUi {
         aumid: String,
         shadow: Arc<Mutex<Shadow>>,
         kind: WindowKind,
+        /// Written by the platform, read by `state.rs` when a popup is
+        /// parented to this window. See [`PopupBounds`].
+        ///
+        /// Read on Win32 and dropped by the headless platform, which has no
+        /// monitor to describe — so off Windows the compiler is right that
+        /// nothing reads it, and saying so here is better than giving the
+        /// headless side a use it does not have.
+        #[cfg_attr(not(windows), allow(dead_code))]
+        bounds: PopupBounds,
     },
     /// `xdg_toplevel.set_title`.
     Title { id: WindowId, title: String },
@@ -330,7 +418,19 @@ pub enum ToUi {
     Present { id: WindowId, damage: Vec<Rect> },
     /// The surface has committed its first buffer and may now be shown, at
     /// this surface size.
-    Map { id: WindowId, width: i32, height: i32 },
+    ///
+    /// `fold_caption` is §46's per-window frame decision, and it rides on this
+    /// message rather than on [`ToUi::Create`] because it cannot be known any
+    /// earlier: it is derived from `xdg_surface.set_window_geometry`, and a
+    /// toplevel is created before it has committed anything. Applied before the
+    /// window is shown, so the first `WM_NCCALCSIZE` a window ever answers is
+    /// already the right one and no frame is recalculated under the user.
+    Map {
+        id: WindowId,
+        width: i32,
+        height: i32,
+        fold_caption: bool,
+    },
     /// The client asked to be maximised, unmaximised or minimised.
     SetWindowState {
         id: WindowId,
@@ -433,6 +533,40 @@ pub enum ToUi {
     },
     /// The Wayland source withdrew its drag.
     CancelDrag,
+
+    /// What the client under the pointer has said about the drag **Windows** is
+    /// running over it: whether it accepted a mime type at all, and which
+    /// action it chose.
+    ///
+    /// ADDED FOR §42, and it is the answer to the one question §29.8 left open.
+    ///
+    /// # Why this is a message and not a return value
+    ///
+    /// `IDropTarget::DragOver` must return a `DROPEFFECT` **synchronously** —
+    /// OLE is inside its modal loop, the cursor it draws is decided by that
+    /// return value, and there is nowhere for it to wait. The client's answer
+    /// is `wl_data_offer.accept` and `.set_actions`, which arrive when the
+    /// client gets round to them, across a hypervisor.
+    ///
+    /// Those two facts cannot both be honoured, so this is the decision:
+    /// **`DragOver` answers from the last feedback that arrived, and is
+    /// therefore up to one round trip stale.** The cursor can show "copy" for
+    /// one motion after the client has stopped accepting, and the effect
+    /// reported by the *drop* cannot — `Drop` is answered after the client has
+    /// been told about the drop and has replied, which is the moment the answer
+    /// has to be right. Stale feedback costs a cursor glyph; a wrong drop costs
+    /// data.
+    ///
+    /// The alternative — blocking `DragOver` on a round trip — puts a
+    /// hypervisor crossing inside a synchronous OLE callback while a modal loop
+    /// holds the pump, which is §29.5's argument against delayed rendering with
+    /// the same shape and a worse deadline.
+    DragFeedback {
+        /// The client accepted one of the offered mime types.
+        accepted: bool,
+        /// `dnd_action` bits the client chose. Meaningful only when `accepted`.
+        action: u32,
+    },
 
     /// End the pump.
     Quit,
@@ -593,6 +727,52 @@ pub enum FromUi {
     /// a drag that never ends is the failure this whole feature exists not to
     /// build.
     DragFinished { action: u32 },
+
+    // --- the drop target, §42 -----------------------------------------------
+    //
+    // The other direction: something is being dragged **out of a Windows
+    // application and over one of our windows**. These four are `IDropTarget`'s
+    // four methods, in the order OLE calls them, with the coordinates already
+    // converted to the surface's own — the conversion is `WindowState::to_surface`,
+    // the same one the pointer, the touch and §38's popup bounds go through, so
+    // a drop cannot land somewhere the clicks do not.
+    //
+    // **They are separate from the pointer events on purpose.** During an OLE
+    // drag the window receives `IDropTarget::DragOver` and **no**
+    // `WM_MOUSEMOVE` at all, so nothing drives the ordinary pointer path; and
+    // the drag has to reach smithay's DnD grab, which is a different
+    // destination from `wl_pointer.motion`. Synthesising a `PointerMotion` here
+    // would put the compositor's idea of where the pointer is somewhere Windows
+    // never said it was, and leave it there when the drag left.
+    /// The pointer entered a window of ours carrying a Windows drag.
+    ///
+    /// These four are constructed only by the Win32 drop target, so off
+    /// Windows the compiler is right that nothing builds them. Saying so beats
+    /// giving the headless platform a drag it has no desktop to receive.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragEnter {
+        id: WindowId,
+        /// Surface coordinates, converted on the platform side.
+        x: f64,
+        y: f64,
+        /// What the `IDataObject` offers, already translated to mime types by
+        /// `crate::clipboard::mimes_for` — the same table the clipboard uses.
+        mimes: Vec<String>,
+        /// `dnd_action` bits the Windows source permits, from `DROPEFFECT`.
+        actions: u32,
+        time: u32,
+    },
+    /// It moved. One per `IDropTarget::DragOver`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragMotion { id: WindowId, x: f64, y: f64, time: u32 },
+    /// It left without dropping, or the drag was cancelled.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragLeave { id: WindowId, time: u32 },
+    /// The user let go over our window. The bytes have already been read out of
+    /// the `IDataObject` by the time this is sent — see `drag::payload` and
+    /// §29.5's argument for why the pull is eager on both sides.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DragDrop { id: WindowId, x: f64, y: f64, time: u32 },
     // --- touch, stage 20 ---------------------------------------------------
     //
     // Already in Wayland's units, like everything above: surface-local
@@ -699,12 +879,34 @@ use headless::{PumpInner, Wake};
 pub(crate) struct Started {
     pub ui: Ui,
     pub pump: Pump,
+    /// The primary monitor's **work area**, in pixels, if the platform knows
+    /// one — the screen minus the taskbar and any other appbar.
+    ///
+    /// ADDED FOR STAGE 38, and it is the honest size of the one `wl_output`.
+    /// Until this stage the output was `--output WxH` and nothing else, with a
+    /// default of 1920x1080 that was true of no particular machine: on a guest
+    /// whose screen is 1280x800 a client that sizes itself to the output opens
+    /// a window half again as wide as the display, and Firefox does exactly
+    /// that. Telling the client the truth first is a better fix than resizing
+    /// its window afterwards, because a clamp arrives after the client has
+    /// already laid out for the size it asked for.
+    ///
+    /// `None` on the headless platform, which has no monitor and must not
+    /// invent one — `--output` remains the whole answer there, which is what
+    /// the conformance suite needs.
+    pub work_area: Option<(i32, i32)>,
 }
 
-pub(crate) fn assemble(tx: Sender<ToUi>, wake: Wake, inner: PumpInner) -> Started {
+pub(crate) fn assemble(
+    tx: Sender<ToUi>,
+    wake: Wake,
+    inner: PumpInner,
+    work_area: Option<(i32, i32)>,
+) -> Started {
     Started {
         ui: Ui { tx, wake },
         pump: Pump { inner },
+        work_area,
     }
 }
 
@@ -712,7 +914,19 @@ pub(crate) fn assemble(tx: Sender<ToUi>, wake: Wake, inner: PumpInner) -> Starte
 pub struct PlatformConfig {
     /// Where UI events are delivered.
     pub events: Sender<FromUi>,
-    /// How much frame the system owns.
+    /// How much frame the system owns, as the *run* was configured.
+    ///
+    /// Still the whole answer for `dwm_glass` and `caption_buttons`, which are
+    /// run-wide switches. `extend_top` is only this run's starting point since
+    /// §46: it is what `--decorations tabs` sets for every window, and every
+    /// window's own answer arrives later on [`ToUi::Map`].
+    ///
+    /// Unread on the headless platform, which has no caption to fold and now
+    /// takes the per-window flag straight off `Map`. Allowed rather than
+    /// `cfg`-ed away, because a field that exists on one platform's config and
+    /// not the other's is a second shape of `PlatformConfig` for two callers to
+    /// keep in step.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub frame: FrameStyle,
     /// Write every presented frame here as a PPM, for the harness to read back.
     /// `None` in normal operation.
@@ -737,3 +951,70 @@ pub struct PlatformConfig {
 
 /// Shared by both platforms: the receiving end of the command queue.
 pub(crate) type Commands = Receiver<ToUi>;
+
+/// ADDED FOR STAGE 38, for [`fit_to_work_area`] — the window-placement
+/// arithmetic, which is the same on every platform and needs no monitor to
+/// check.
+///
+/// The work area used throughout is `1280x752` at the origin, which is this
+/// project's guest with its taskbar: a 1280x800 screen minus 48 pixels.
+#[cfg(test)]
+mod tests {
+    use super::fit_to_work_area;
+
+    /// `(left, top, right, bottom)`, Win32's convention, far edges exclusive.
+    const WORK: (i32, i32, i32, i32) = (0, 0, 1280, 752);
+
+    #[test]
+    fn a_window_that_already_fits_is_not_touched() {
+        assert_eq!(fit_to_work_area((100, 80, 800, 600), WORK), (100, 80, 800, 600));
+    }
+
+    /// The corner case that matters most, because it is the one that is right
+    /// by a pixel or wrong by a pixel: a window exactly the size of the work
+    /// area belongs at its origin, not one pixel off it.
+    #[test]
+    fn a_window_exactly_the_size_of_the_work_area_sits_on_it() {
+        assert_eq!(fit_to_work_area((37, 19, 1280, 752), WORK), (0, 0, 1280, 752));
+    }
+
+    /// Firefox on this guest: it asked for 1296x820 because the compositor used
+    /// to advertise a 1920x1080 output, and that is larger than the screen in
+    /// both directions.
+    #[test]
+    fn a_window_larger_than_the_screen_is_capped_to_the_work_area() {
+        assert_eq!(fit_to_work_area((-16, -68, 1296, 820), WORK), (0, 0, 1280, 752));
+    }
+
+    /// The title bar is the point. A window whose top is above the work area
+    /// has a caption nobody can grab, and a window that cannot be grabbed
+    /// cannot be moved back.
+    #[test]
+    fn a_window_placed_above_the_work_area_comes_back_down_to_it() {
+        let (x, y, w, h) = fit_to_work_area((200, -120, 400, 300), WORK);
+        assert_eq!((x, y), (200, 0), "the caption was left off the top of the screen");
+        assert_eq!((w, h), (400, 300), "a window that fits was resized to move it");
+    }
+
+    #[test]
+    fn a_window_off_the_bottom_right_is_pulled_back_by_its_far_edges() {
+        assert_eq!(fit_to_work_area((1200, 700, 400, 300), WORK), (880, 452, 400, 300));
+    }
+
+    /// A taskbar on the left or the top makes the work area's origin non-zero,
+    /// and a clamp written against `0, 0` would put windows underneath it.
+    #[test]
+    fn the_work_area_origin_is_respected_and_not_assumed_to_be_zero() {
+        let docked = (0, 48, 1280, 800);
+        assert_eq!(fit_to_work_area((10, 0, 400, 300), docked), (10, 48, 400, 300));
+        assert_eq!(fit_to_work_area((10, 10, 4000, 4000), docked), (0, 48, 1280, 752));
+    }
+
+    /// A monitor that answered with nothing measurable. Squeezing a window into
+    /// it would produce a window of no size at all, which is worse than leaving
+    /// it where the system put it.
+    #[test]
+    fn a_degenerate_work_area_leaves_the_window_alone() {
+        assert_eq!(fit_to_work_area((5, 6, 700, 500), (0, 0, 0, 0)), (5, 6, 700, 500));
+    }
+}

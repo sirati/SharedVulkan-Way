@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    assemble, Commands, CursorSpec, FrameStyle, FromUi, PlatformConfig, Started, ToUi, TouchShape,
+    assemble, Commands, CursorSpec, FromUi, PlatformConfig, Started, ToUi, TouchShape,
     WindowId,
 };
 use crate::surface::{PixelFormat, Shadow};
@@ -181,7 +181,10 @@ pub(crate) struct PumpInner {
     commands: Commands,
     events: Sender<FromUi>,
     dump_frames: Option<PathBuf>,
-    frame: FrameStyle,
+    // §46 REMOVED THE RUN-WIDE `frame` HERE. It existed to answer "is the
+    // caption folded", and that question is now per window and arrives on
+    // `ToUi::Map`. A field kept "for symmetry with win32" would be a second
+    // answer to a question that has one, and the compiler said so.
     simulate: Simulation,
     /// ADDED FOR STAGE 9: one scripted click, into the first window that maps.
     ///
@@ -291,7 +294,6 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             commands: rx,
             events: config.events,
             dump_frames: config.dump_frames,
-            frame: config.frame,
             simulate: if config.simulate_wm {
                 Simulation::ON
             } else {
@@ -299,6 +301,9 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             },
             click: config.click,
         },
+        // STAGE 38: no monitor here, so no work area. `--output` stays the
+        // whole answer, which is what the conformance leg needs.
+        None,
     ))
 }
 
@@ -354,6 +359,13 @@ impl PumpInner {
                 aumid,
                 shadow,
                 kind,
+                // STAGE 38: deliberately dropped. There is no monitor here, so
+                // there is no work area to answer with, and a headless run with
+                // no `--control` must leave popups unconstrained rather than
+                // invent a screen. Where something *is* standing in for Windows
+                // — the conformance leg — `crate::control` fills the same cell
+                // from the advertised output.
+                bounds: _,
             } => {
                 // The kind is logged rather than acted on: there is no window
                 // manager here to place a popup against, and the harness reads
@@ -488,15 +500,21 @@ impl PumpInner {
                 "wc-compositor: window {id} repositioned to {x},{y} {width}x{height}"
             ),
 
-            ToUi::Map { id, width, height } => {
+            ToUi::Map { id, width, height, fold_caption } => {
                 if let Some(w) = windows.get_mut(&id) {
                     w.mapped = true;
                     w.surface = (width, height);
                     w.mapped_at = Some(Instant::now());
+                    // §46: `fold_caption` rather than `self.frame.extend_top`,
+                    // because the decision is now this window's rather than the
+                    // run's. There is no caption on this platform to fold, so
+                    // the line is the *only* thing the headless leg can assert
+                    // on — which makes it the instrument for every per-window
+                    // frame test that does not need a real Win32 window.
                     println!(
                         "wc-compositor: window {id} mapped surface {width}x{height} \
                          client {width}x{height}{}",
-                        if self.frame.extend_top {
+                        if fold_caption {
                             " (the system caption folded in)"
                         } else {
                             ""
@@ -654,6 +672,17 @@ impl PumpInner {
                 });
             }
             ToUi::CancelDrag => println!("wc-compositor: [headless] the drag was withdrawn"),
+            // The answer to a question only OLE asks. On Win32 this is what
+            // `IDropTarget::DragOver` returns to the modal loop, one round trip
+            // stale by construction (§42); here there is nobody to tell, and
+            // printing it is what lets a harness assert that the client's
+            // `accept` and `set_actions` came back at all — which is the half
+            // of the round trip that can be checked without a desktop.
+            ToUi::DragFeedback { accepted, action } => println!(
+                "wc-compositor: [headless] the client under the drag {} (action {})",
+                if accepted { "accepted" } else { "refused" },
+                crate::platform::dnd_action::describe(action)
+            ),
             ToUi::FetchClipboard { token, from_drag, mime } => {
                 if from_drag {
                     // Nothing can be dragged onto this platform, so there is

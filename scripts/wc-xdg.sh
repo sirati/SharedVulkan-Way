@@ -29,12 +29,12 @@
 # its `wl_shm` pool during `display_create()` — before any surface exists. A
 # `wl_shm.create_pool` carries an `h` argument, and on Windows an `h` is encoded
 # in-band as a length-prefixed descriptor rather than passed out-of-band by
-# `SCM_RIGHTS` (docs/design.md §2.3). A stock libwayland client sends the fd out
+# `SCM_RIGHTS` (docs/waycompose-design.md §2.3). A stock libwayland client sends the fd out
 # of band; Wine's AF_UNIX carries no ancillary data; so the descriptor is simply
 # absent from the byte stream and the server's parser desynchronises at exactly
 # that request.
 #
-# That is docs/design.md §2.4 — "the Windows byte stream is not libwayland's
+# That is docs/waycompose-design.md §2.4 — "the Windows byte stream is not libwayland's
 # byte stream" — arriving on schedule. Measured: against the Windows binary,
 # `weston-flower` sends `create_surface`, `get_xdg_surface`, `get_toplevel` and
 # `commit`, and the server sees none of them, because they follow the
@@ -80,6 +80,17 @@ fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "the compositor runs under Wine on this box" || exit 1
+
 RUNDIR=$(mktemp -d /tmp/wc-xdg-XXXXXX)
 chmod 700 "$RUNDIR"
 trap 'rm -rf "$RUNDIR"' EXIT
@@ -123,7 +134,7 @@ check_log() {
 
 run_linux() {
   echo "== linux: compositor as a Linux binary =="
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "no $LINUX_BIN/wc-compositor -- cargo build first"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "cargo build -p wc-compositor" || return
   [ -n "$CLIENT" ] || { echo "  SKIP  weston-flower not on PATH"; return; }
 
   XDG_RUNTIME_DIR="$RUNDIR" "$LINUX_BIN/wc-compositor" \
@@ -165,7 +176,7 @@ run_linux() {
 
 run_wine() {
   echo "== wine: compositor as a Windows binary =="
-  [ -f "$WIN_BIN/wc-compositor.exe" ] || { bad "no $WIN_BIN/wc-compositor.exe -- cargo build --target x86_64-pc-windows-gnu first"; return; }
+  fresh "$WIN_BIN/wc-compositor.exe" "cargo build -p wc-compositor --target x86_64-pc-windows-gnu" || return
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }
   [ -n "$CLIENT" ] || { echo "  SKIP  weston-flower not on PATH"; return; }
 

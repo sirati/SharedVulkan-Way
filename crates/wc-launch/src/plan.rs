@@ -34,7 +34,16 @@ pub fn remote_upstream(id: &str) -> String {
 /// a socket and a log — and nothing else. In particular **no `--dump-frames`**:
 /// a Firefox frame is a 2.3 MB PPM and a session is not a 60-second run
 /// (§17.7).
-pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
+///
+/// `frames` is where the compositor writes the page frame list of the region it
+/// commits. It is the difference between a locate that takes 0.064 s and always
+/// works and one that takes 2.3 s and sometimes reports `page index claimed
+/// twice` — the sweep reads 13 GiB of guest memory whose contents are allowed
+/// to change while it reads them, and five consecutive runs of the test harness
+/// failed that way. The file stays on the guest; the launcher pipes it to the
+/// VM host over the ssh channel it already has, because a 64 MiB arena's list
+/// is 256 KiB and that is not a command-line argument.
+pub fn compositor_argv(cfg: &Config, socket: &str, log: &str, frames: &str) -> Vec<String> {
     vec![
         // `sv-guest` is one binary with two halves and the first argument picks
         // one; `sv-guest wayland …` takes exactly the arguments the old
@@ -51,6 +60,8 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
         socket.into(),
         "--log".into(),
         log.into(),
+        "--arena-frames".into(),
+        frames.into(),
         "--output".into(),
         cfg.output.clone(),
         "--timeout".into(),
@@ -239,10 +250,19 @@ mod tests {
     #[test]
     fn guest_ram_is_the_only_transport() {
         let cfg = cfg();
-        let argv = compositor_argv(&cfg, "wl-x", "log");
+        let argv = compositor_argv(&cfg, "wl-x", "log", "frames.txt");
         assert_eq!(argv[0], "wayland", "the one binary needs its half named first");
         assert!(argv.iter().any(|a| a == "--arena-guest-ram"), "{argv:?}");
         assert!(argv.contains(&format!("0:{}", 64u64 * 1024 * 1024)));
+        // The frame list is asked for on every session, because the locate it
+        // replaces is not merely slower but *unreliable*: the sweep searches
+        // 13 GiB of guest memory for stamps while the guest is free to move
+        // pages under it, and five consecutive harness runs failed that way.
+        // Its absence would be a session that still works and sometimes takes
+        // three seconds to start and sometimes does not start at all, which is
+        // exactly the kind of degrade this test exists to make loud.
+        assert!(argv.iter().any(|a| a == "--arena-frames"), "{argv:?}");
+        assert!(argv.contains(&"frames.txt".to_string()), "{argv:?}");
         for forbidden in ["--arena", "--arena-provide", "--shared-dir", "--shared-peer-prefix"] {
             assert!(
                 !argv.iter().any(|a| a == forbidden),
@@ -270,7 +290,7 @@ mod tests {
     fn the_compositor_gets_a_session_length_and_not_a_test_length() {
         let mut c = cfg();
         c.session_secs = 43200;
-        let argv = compositor_argv(&c, "s", "l");
+        let argv = compositor_argv(&c, "s", "l", "f");
         let i = argv.iter().position(|a| a == "--timeout").unwrap();
         assert_eq!(argv[i + 1], "43200");
     }
@@ -350,6 +370,44 @@ mod tests {
         let app = c.app("firefox").unwrap();
         assert!(app.prefs.contains("middlemouse.paste=false"), "{}", app.prefs);
         assert!(user_js(&app.prefs).contains("user_pref(\"middlemouse.paste\", false);"));
+    }
+
+    /// The codec the host CPU can afford, stated by the deployment.
+    ///
+    /// design.md §0.17: on a VM host with no GPU, YouTube's ABR offers AV1 and
+    /// Firefox decodes it in software on two cores, at **1.25× the CPU of
+    /// H.264 on the medians** of eight interleaved windows at 720p60 and
+    /// 1080p60 — and far less predictably. These two preferences are what
+    /// leaves `avc1` as the thing the site negotiates, measured from the
+    /// player's own codec line: `avc1.4d4020 (298)`, not `av01.0.08M.08 (398)`.
+    ///
+    /// **`media.webm.enabled` and not `media.mediasource.vp9.enabled`**, which
+    /// is the correction this test exists to carry. The obvious-looking pref
+    /// does nothing: with it false, `MediaSource.isTypeSupported` still answers
+    /// yes for VP9 in both containers and the site still serves AV1. Only
+    /// turning WebM off removes VP9 — and AV1, which YouTube also ships in
+    /// WebM — so `media.av1.enabled` is belt to its braces, for the content
+    /// where AV1 arrives in MP4 instead. The cost is stated rather than hidden:
+    /// this takes Opus-in-WebM with it and the site falls back to AAC.
+    ///
+    /// It is pinned as a test rather than shipped in `wc-launch.ini`, because
+    /// the *deployment* is where it belongs — a fact about the machine the
+    /// browser runs on, that no protocol carries — but §0.17 also measures that
+    /// it does not fix what prompted it: the dropped frames were the 216.9 ms
+    /// cross-VM present, not the decoder. Across eight windows the largest drop
+    /// count belongs to *H.264*, so the codec is not what that number tracks.
+    /// Turning it on is one line in the `prefs` key. Losing Opus to buy 2.5% of
+    /// two cores that are not the bottleneck is a choice for whoever writes
+    /// that line, so the test carries the pair and not the ini.
+    #[test]
+    fn the_deployment_can_state_the_codec_the_host_can_afford() {
+        let js = user_js("media.av1.enabled=false;media.webm.enabled=false");
+        assert_eq!(
+            js,
+            "// Written by wc-launch on every start. See docs/waycompose-design.md §28.5.\n\
+             user_pref(\"media.av1.enabled\", false);\n\
+             user_pref(\"media.webm.enabled\", false);\n"
+        );
     }
 
     #[test]

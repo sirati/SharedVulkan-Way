@@ -98,6 +98,18 @@ pub const PNEXT_TERMINATOR: u32 = 0;
 pub enum WireError {
     /// The stream ended in the middle of a field.
     Truncated { need: usize, have: usize },
+    /// An object-table lookup failed while raising a command: a handle id that
+    /// resolves to nothing, an id of the wrong type, a memory range outside the
+    /// arena.
+    ///
+    /// It carries no detail because this type is `Copy` and appears in the
+    /// return of every generated read; the specifics live in the GPU side's
+    /// `last_error`, which the ring already prints beside it. What matters is
+    /// that the headline is *true*. Before this existed every table failure was
+    /// reported as `UnknownCommand { opcode: 0 }` — a fabricated headline that
+    /// sent readers hunting a desynchronised decoder when the decoder was fine.
+    /// design.md §0.23.6.
+    Table,
     /// A reserved span was not exactly filled. This is a generator bug — the
     /// `size` pass and the `encode` pass disagreed — and it is worth catching
     /// loudly, because the two passes disagreeing is precisely how a stream
@@ -136,6 +148,16 @@ pub enum WireError {
     /// registry's metadata is only ever used to *verify*, and a disagreement is
     /// reported instead of obeyed.
     LengthDisagreement { field: &'static str, declared: u64, actual: u64 },
+    /// A `VkDeviceMemory` id the app side's allocator has never handed out, met
+    /// while rewriting a `(memory, offset)` pair into arena coordinates
+    /// (design.md §5.3, §7.2 pass 6).
+    ///
+    /// It is a *wire* error because the pass that raises it is the generated
+    /// `MemoryTransform` walk, which speaks `sv_wire::Result` on both sides of
+    /// the boundary. Caught here it costs the application one failed call;
+    /// missed, the unrewritten id crosses and the GPU side takes a ring fatal
+    /// on a command it cannot resolve — which is how this was found.
+    NoSuchMemory { id: u64 },
 }
 
 impl fmt::Display for WireError {
@@ -162,6 +184,7 @@ impl fmt::Display for WireError {
             }
             WireError::UnknownPNext { s_type } => write!(f, "unknown pNext sType {s_type}"),
             WireError::UnknownUnionTag { tag } => write!(f, "union tag {tag} selects no member"),
+            WireError::Table => write!(f, "an object-table lookup failed"),
             WireError::UnknownCommand { opcode } => write!(f, "unknown command opcode {opcode}"),
             WireError::UnterminatedString => write!(f, "string is not NUL-terminated"),
             WireError::InvalidBool { value } => write!(f, "VkBool32 has value {value}"),
@@ -169,6 +192,9 @@ impl fmt::Display for WireError {
                 f,
                 "{field} says {declared} but the array it describes has {actual} elements"
             ),
+            WireError::NoSuchMemory { id } => {
+                write!(f, "no VkDeviceMemory with app-side id {id} to rewrite")
+            }
         }
     }
 }

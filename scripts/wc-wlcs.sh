@@ -61,6 +61,17 @@ bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 nay() { echo "  SKIP  $*"; skip=$((skip + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
+. "$(dirname "$0")/wc-binaries.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "both legs -- the Linux build and wc-compositor.exe under Wine -- are on this box" || exit 1
+
 RUNDIR=$(mktemp -d /tmp/wc-wlcs-run-XXXXXX)
 KEEP=${WC_KEEP:-}
 cleanup() {
@@ -251,7 +262,7 @@ headless() {
   local filter=${1:-*}
   echo "== headless: the Linux build, --control standing in for Win32"
   [ -f "$SHIM" ] || { bad "$SHIM is not built (cargo build -p wc-wlcs)"; return; }
-  [ -x "$LINUX_BIN/wc-compositor" ] || { bad "$LINUX_BIN/wc-compositor is not built"; return; }
+  fresh "$LINUX_BIN/wc-compositor" "$LINUX_BIN/wc-compositor is not built" || return
   [ -f "$EXTFILE" ] || { bad "no $EXTFILE; run 'globals' first"; return; }
   export WC_WLCS_COMPOSITOR="$LINUX_BIN/wc-compositor"
   export WC_WLCS_RUNDIR="$RUNDIR"
@@ -277,7 +288,7 @@ wine_leg() {
     note "a clippy run builds metadata, not an executable"
     return
   fi
-  [ -x "$LINUX_BIN/wc-proxy" ] || { bad "$LINUX_BIN/wc-proxy is not built"; return; }
+  fresh "$LINUX_BIN/wc-proxy" "$LINUX_BIN/wc-proxy is not built" || return
   [ -f "$EXTFILE" ] || { bad "no $EXTFILE; run 'globals' first"; return; }
   command -v wine >/dev/null || { bad "no wine in this shell"; return; }
   command -v Xvfb >/dev/null || { bad "no Xvfb in this shell"; return; }
@@ -463,6 +474,142 @@ score() {
     ok "$leg: every skip has a recorded reason"
   else
     bad "$leg: $unexplained missing extension(s) with no recorded reason"
+  fi
+
+  justified_failures "$log" "$leg"
+}
+
+# ---------------------------------------------------------------------------
+# Justified *failures*, which are not the same thing as justified skips
+# ---------------------------------------------------------------------------
+#
+# ADDED FOR §45, because the scoreboard could not say something true.
+#
+# A justified **skip** is easy: WLCS turns a missing global into a skip and
+# prints which one, so `reason_for` can key a reason to it and the run is
+# self-describing. That machinery only reaches failures caused by an *absent
+# protocol*.
+#
+# The case it cannot reach is a test that runs, is answered, and gets a
+# different answer here on purpose. `RegionSurfaceInputCombinations` with
+# WLCS's `XdgStableSurfaceBuilder(12, 5, 20, 6)` probes the four edges of a
+# buffer that lie outside the window geometry rectangle. Wayland says window
+# geometry does not clip input; on this platform it does, because the `HWND` is
+# the geometry rectangle and Windows delivers no message outside a window. See
+# §45.4 for why that is a decision rather than a defect. Nothing is missing
+# from the registry, so WLCS has no mechanism to declare it, and it fails.
+#
+# **The wrong answers, both of which were considered.** Adding the extension to
+# the table so the tests skip would be a lie of exactly the kind §26 exists to
+# prevent — the protocol *is* implemented. Filtering the tests out of the run
+# would be worse, because then nothing counts them at all. So they stay in the
+# failed column, and this table says which of them are expected to be there.
+#
+# THE PART THAT MATTERS: THIS TABLE VALIDATES ITSELF
+#
+# §42 found twelve gates that were vacuous — a guard that could never fire
+# looks exactly like a guard that always passes. A table of "expected
+# failures" is the single easiest thing in a harness to make vacuous, in two
+# different ways, and both are checked:
+#
+#   * **A listed test that PASSES is an error.** The reason has expired: either
+#     somebody fixed it, or the pattern was wrong from the start. Silently
+#     accepting a pass would let this table hide a *regression's* absence and,
+#     worse, let a stale entry sit forever.
+#   * **A listed pattern that matches NO test is an error.** That is the
+#     vacuous case: a typo, or a test WLCS renamed, and the entry then excuses
+#     nothing while looking like it excuses something.
+#
+# So the only way an entry stays quiet is if it matches at least one test and
+# every test it matches actually failed.
+justified_failure_patterns() {
+  # <pattern><TAB><reason>. Matched against the full gtest name with `case`, so
+  # `*` is a glob rather than a regex.
+  #
+  # **Written out one test at a time, deliberately.** The tempting entry is
+  # `*RegionSurfaceInputCombinations.*/6`, and it is wrong twice over. The
+  # parameter index means different things in different instantiations — only
+  # `DefaultEdges` and `MultiRectEdges` are built over `all_surface_types`, so
+  # only there does index ≡ 6, 7 (mod 12) select the inset builder; in
+  # `FullSurface` and the rest, index 6 is an entirely different surface. And
+  # even within one instantiation only the *positive* assertions fail: a test
+  # that checks input is **not** seen passes trivially here, because nothing is
+  # delivered at all. A pattern is a claim about which tests are excused, and a
+  # loose one excuses tests nobody examined.
+  #
+  # The first draft of this table used the loose pattern. The self-check below
+  # rejected it on its first run, naming ten tests that passed while being
+  # listed as expected failures. That is the check earning its place before the
+  # table it guards was even finished.
+  local why='input outside the window geometry rectangle: the HWND *is* that rectangle, and Windows delivers no message outside a window (§45.4)'
+  local t
+  for t in 6 7 18 19 30 31 42 43; do
+    printf 'DefaultEdges/RegionSurfaceInputCombinations.input_inside_region_seen/%s\t%s\n' "$t" "$why"
+  done
+  for t in 6 7 18 19 42 43 54 55; do
+    printf 'MultiRectEdges/RegionSurfaceInputCombinations.input_inside_region_seen/%s\t%s\n' "$t" "$why"
+  done
+  for t in input_hits_parent_after_falling_through_subsurface \
+           input_seen_after_dragged_off_surface \
+           input_seen_after_surface_unmapped_and_remapped; do
+    printf 'SurfaceInputRegions/SurfaceInputCombinations.%s/6\t%s\n' "$t" "$why"
+    printf 'SurfaceInputRegions/SurfaceInputCombinations.%s/7\t%s\n' "$t" "$why"
+  done
+}
+
+justified_failures() {
+  local log=$1 leg=$2
+  local verdicts='
+    function name(s) { sub(/,$/, "", s); return s }
+    /^\[ +OK +\] .*\([0-9]+ ?ms\)$/     { print name($4), "PASS" }
+    /^\[ +FAILED +\] .*\([0-9]+ ?ms\)$/ { print name($4), "FAIL" }'
+  awk "$verdicts" "$log" | LC_ALL=C sort -u > "$RUNDIR/jf.v"
+  [ -s "$RUNDIR/jf.v" ] || return 0
+
+  rm -f "$RUNDIR/jf.by-reason"
+  echo "  ---- failures this platform expects, and why ----"
+  local bad_table=0 total=0
+  while IFS=$'\t' read -r pattern reason; do
+    [ -n "$pattern" ] || continue
+    local matched=0 wrongly_passed=""
+    while read -r test verdict; do
+      case "$test" in
+        $pattern)
+          matched=$((matched + 1))
+          [ "$verdict" = PASS ] && wrongly_passed="$wrongly_passed $test"
+          ;;
+      esac
+    done < "$RUNDIR/jf.v"
+
+    if [ "$matched" = 0 ]; then
+      # The vacuous case. An entry that matches nothing excuses nothing.
+      echo "  ????  '$pattern' matches no test in this run — stale entry"
+      bad_table=$((bad_table + 1))
+      continue
+    fi
+    if [ -n "$wrongly_passed" ]; then
+      echo "  ????  '$pattern' is listed as expected-to-fail but these PASSED:"
+      for t in $wrongly_passed; do echo "          $t"; done
+      echo "        the reason has expired; remove the entry"
+      bad_table=$((bad_table + 1))
+      continue
+    fi
+    total=$((total + matched))
+    # Grouped by reason rather than one line per pattern: the table is written
+    # one test at a time so that each entry is an auditable claim, but a reader
+    # wants the *causes* and how many tests each accounts for.
+    printf '%d\t%s\n' "$matched" "$reason" >> "$RUNDIR/jf.by-reason"
+  done < <(justified_failure_patterns)
+  if [ -s "$RUNDIR/jf.by-reason" ]; then
+    awk -F'\t' '{n[$2] += $1} END {for (r in n) printf "  %-9s %4d  %s\n", "EXPECTED", n[r], r}' \
+      "$RUNDIR/jf.by-reason" | sort -k2 -rn
+  fi
+  echo
+
+  if [ "$bad_table" = 0 ]; then
+    ok "$leg: $total of the failures are expected on this platform, and the rest are debts"
+  else
+    bad "$leg: $bad_table entr(y/ies) in the expected-failure table no longer describe this run"
   fi
 }
 

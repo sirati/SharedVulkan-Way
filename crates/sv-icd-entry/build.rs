@@ -18,9 +18,14 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=SV_PROTO_PROFILE");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let profile_name = std::env::var("SV_PROTO_PROFILE").unwrap_or_else(|_| "zink".to_string());
+    let profile_name = std::env::var("SV_PROTO_PROFILE")
+        .unwrap_or_else(|_| sv_codegen::DEFAULT_PROFILE.to_string());
     let profile = sv_codegen::profile_by_name(&profile_name)
         .with_context(|| format!("unknown SV_PROTO_PROFILE {profile_name:?}"))?;
+    // Which profile this build was generated from, readable from inside the
+    // crate. The tests need it: "these are exactly the stubbed entry points" is
+    // a true and useful assertion, and it is a *different* list per profile.
+    println!("cargo:rustc-env=SV_ICD_ENTRY_PROFILE={profile_name}");
 
     let registry = vk_registry::Registry::load().context(
         "sv-icd-entry cannot be built outside `nix develop`: its C ABI is \

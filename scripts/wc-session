@@ -13,7 +13,11 @@
 # starts applications, and it is not a shell.
 #
 #   wc-session ping
-#   wc-session up   ID RUNID PAGES OUTBOUND   locate the guest-RAM arena, write the plan
+#   wc-session up   ID RUNID PAGES OUTBOUND [frames]
+#                                             locate the guest-RAM arena, write the
+#                                             plan. With `frames`, the arena's page
+#                                             frame list arrives on stdin and is
+#                                             translated instead of swept for.
 #   wc-session proxy ID                       start wc-proxy on the plan, as root
 #   wc-session run  ID BASE64CMD              run a Wayland client against that proxy
 #   wc-session icon APPID                     the app's icon from this machine's theme
@@ -130,8 +134,37 @@ up)
   D=$(dir_of "$ID")
   rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
   [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host"
-  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
-    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" \
+  # THE FRAME LIST, WHICH ARRIVES ON STDIN AND ONLY IF ASKED FOR
+  #
+  # A fifth word `frames` means the guest is piping the arena's page frame list
+  # down this same ssh channel. It is opt-in rather than "read stdin if there is
+  # any", because a `cat` here would block for ever on the older launcher that
+  # sends nothing, and a session that hangs at the locate is worse than one that
+  # sweeps.
+  #
+  # Why it is worth a transfer: the sweep is not merely slow (2.3 s against
+  # 0.064 s), it is a coin flip on a loaded guest. Five consecutive runs of the
+  # test harness gave `16377 of 16384 pages` and `28 page index(es) claimed
+  # twice` -- it searches 13 GiB of guest memory for stamps while the guest is
+  # free to move pages under it. Translating a frame list reads no stamps at
+  # all, so that whole class of failure stops being expressible.
+  #
+  # 16 bytes a page, so a 64 MiB arena is 256 KiB. That is why it is a pipe and
+  # not an argument. What crosses is *where the guest's pages are*, never what
+  # is in them: the arena is still guest RAM found in QEMU's backing object.
+  FRAMES_ARG=""
+  if [ "${5:-}" = frames ]; then
+    cat >"$D/arena.frames"
+    if [ -s "$D/arena.frames" ]; then
+      FRAMES_ARG="--frames $D/arena.frames"
+      echo "frames $(wc -l <"$D/arena.frames")"
+    else
+      echo "frames 0 (empty; sweeping instead)" >&2
+    fi
+  fi
+  # shellcheck disable=SC2086
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
+    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" "$FRAMES_ARG" \
     "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
     "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
     | "$ROOTC" >/dev/null 2>&1
@@ -150,29 +183,34 @@ up)
 # than a long-lived root shell because a root call that blocks for a session's
 # lifetime comes back with no output at all (testhost's rootc habits).
 #
-# `--arena-grow` IS ARMED AND THE APPENDER DOES NOT EXIST YET.
+# `--arena-grow` NOW GROWS, AND THIS IS THE FLAG THAT MAKES IT.
 #
-# The launcher starts a **32 MiB** region rather than the 768 MiB it reserved for
-# one afternoon, because those pages are `VirtualLock`ed — non-pageable, gone
-# from Windows entirely — and because the startup region is the one that can
-# never be given back: it holds the outbound window. So the size of it is a
-# floor for the whole session and the only safe direction is small.
+# The startup region is the one that can never be given back -- it holds the
+# outbound window -- so its size is a floor for the whole session and the only
+# safe direction is small. `VirtualLock`ed pages are non-pageable, gone from
+# Windows entirely, so a floor is not merely reserved memory.
 #
-# `--arena-grow` says what to do when 32 MiB is not enough: take another region
-# instead of refusing. Over guest RAM the proxy's `PlanGrowth` obtains one by
-# **re-reading the plan** — "the guest commits and stamps another region and the
-# locator appends it to this same plan". Nothing on this deployment does either
-# of those things yet. Growth is therefore armed and inert: a pool that does not
-# fit gets `the guest has not committed one, or the locator has not appended it
-# yet`, which since §20 is a refusal the client survives rather than a dead
-# window.
+# `--arena-grow` says what to do when the startup region is not enough: take
+# another one instead of refusing. For four stages that was armed and inert,
+# because over guest RAM the proxy's `PlanGrowth` obtains a region by re-reading
+# the plan and nothing on this deployment ever appended to it.
 #
-# It is passed anyway, deliberately. The flag is where the behaviour turns on,
-# the appender is one `wc-session` verb away — commit a region in the guest, run
-# the locator with `--append`, and this proxy picks it up on its next pool — and
-# a launcher that quietly did not ask for growth would make that verb look
-# unnecessary. See docs/waycompose-design.md §28.12.
+# `--arena-locator` is what closed that. With it the proxy uses `GuestGrowth`
+# instead: it asks the compositor for a region **over the shared memory both
+# sides already map** -- sv-transport's control region and one ring, the same
+# channel shared_vulkan uses across this boundary, not a socket and not a new
+# mechanism -- and then runs `wc-arena-host --append --frames` to translate the
+# page frame list the guest sent back into file offsets. Without the flag the
+# proxy falls back to watching the plan, which is the pre-growth behaviour and
+# is what an operator appending by hand still gets.
 #
+# QMP and the VM hint come with it because the locator needs them, and they are
+# the same two values `up` uses a few lines above. Root is not an issue: this
+# proxy already runs as root in a transient unit so it can open the backing
+# object, so running the locator is a fork and an exec rather than a privilege
+# boundary.
+#
+# See docs/waycompose-design.md §34.
 # The socket it creates is chowned to the invoking user, so the *application*
 # is not privileged. §17.7 gave the run its own root-owned home instead; this is
 # the other half of the same problem and the cheaper answer, because a Firefox
@@ -192,6 +230,7 @@ rm -f "$D/wl-proxy"
 "$BIN/wc-proxy" --upstream "$D/up.sock" --socket wl-proxy --runtime-dir "$D" \\
   --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage \\
   --arena-grow --arena-grow-step ${WC_LAUNCH_GROW_STEP:-16777216} \\
+  --arena-locator "$BIN/wc-arena-host" --arena-qmp "$QMP" --arena-vm "$VM_HINT" \\
   --accept-timeout ${WC_LAUNCH_SESSION_SECS:-43200} --timeout ${WC_LAUNCH_SESSION_SECS:-43200} \\
   >"$D/proxy.log" 2>&1 &
 P=\$!

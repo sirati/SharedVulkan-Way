@@ -33,8 +33,18 @@ ICDDIR=/run/opengl-driver/share/vulkan/icd.d
 RUNDIR="$(mktemp -d /tmp/sv-present.XXXXXX)"
 MANIFEST="$BIN/sv_icd.json"
 
-[ -f "$MANIFEST" ] || { echo "build first: cargo build -p sv-icd" >&2; exit 1; }
-[ -x "$BIN/sv-gpu-server" ] || { echo "build first: cargo build -p sv-gpu-server" >&2; exit 1; }
+# STAGE 44. §35.6 item 6 and §42.5 item 4: the last of the three that had no
+# freshness guard. Stronger than freshness alone, because `sv_icd.json` is a
+# *generated file holding an absolute path*: `scripts/sv-worktree.sh` seeds a
+# worktree by reflinking `target/`, so a fresh worktree's manifest names the
+# **base tree's** `libsv_icd.so`. That file exists, so `[ -f "$MANIFEST" ]` was
+# satisfied while the Vulkan loader used another checkout's driver — and this
+# harness compares rendered frames against golden images, so the one thing it
+# must never be uncertain about is which tree drew them.
+. "$(dirname "${BASH_SOURCE[0]}")/wc-binaries.sh"
+manifest_is_ours "$MANIFEST" "cargo build -p sv-icd, in this worktree" || exit 1
+fresh "$BIN/libsv_icd.so"  "cargo build -p sv-icd" || exit 1
+fresh "$BIN/sv-gpu-server" "cargo build -p sv-gpu-server" || exit 1
 
 fail=0
 GPUPID=""
