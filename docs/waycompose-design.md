@@ -23686,3 +23686,119 @@ passing.
    Untouched by any of this and still unexplained.
 
 The popup group of six remains unstarted.
+
+## 75. The leak assertion §53 could not make, made
+
+*(§53's and §73's continuation. Twenty minutes on the deployment guest.)*
+
+### 75.1 Status in one paragraph
+
+§53 built an outside witness for window destruction and had to **skip** its
+sharpest assertion, because `GetGuiResources` — the kernel's own per-process
+handle count — returns 0 under Wine. §69 showed that zero is a fact about Wine
+and not about the venue, so no local virtualisation could rescue it; §73 showed
+the counter answers on a real Windows kernel and moves both ways. This is the
+run that uses it. Three create/destroy cycles against the compositor's own
+process on the guest:
+
+```text
+BASE (no client)         user=1  all=0
+client up   (x2 samples) user=3  all=1     CLIENT-RUNNING=yes at both
+client gone              user=2  all=0
+                         ... identical for cycles 2 and 3
+windows at exit:      3 created, 3 destroyed, 0 still held, 0 still alive
+drop targets at exit: claims 3 registered, 3 revoked, 0 revoke(s) failed
+```
+
+**The count moves both ways and returns to a constant baseline.** Two, not
+three-four-five: nothing accumulates. §53's `SKIP` is an assertion now, and it
+passes.
+
+### 75.2 What the `1 → 2` step is, and why it is not the leak
+
+The baseline before any window is `user=1`; after the first window is created
+and destroyed it is `user=2`, and it stays 2 for ever. A permanent increase on
+the first window is exactly what a per-window leak would look like on cycle one,
+so it has to be accounted for rather than waved past.
+
+It is the **window class**. `RegisterClassExW` runs once per process, a class is
+a USER object, and it is not freed while the process lives. The distinguishing
+property is not the +1 but its *repetition*: a leak of an `HWND` would add one
+per window and the count would climb 2, 3, 4, 5 across the cycles. It does not
+move again. **The evidence for "no leak" is the second and third cycles, not the
+first**, which is why a one-cycle version of this run would have been
+unreadable.
+
+`EnumWindows` agrees independently — `all=1` while the client is up and `all=0`
+after — so the two instruments §53 built for different reasons corroborate each
+other on the venue where both work.
+
+`gdi=0` throughout, and it is probably correct rather than stubbed: these
+windows own no device context. §73.5 item 2 still stands.
+
+### 75.3 Two false passes, and the second is the one worth keeping
+
+Both are the shape that has now caught several harnesses in this document: a run
+that reports success because the thing it was watching never happened.
+
+**`wc-probe.exe` does not map a toplevel.** It was the obvious client — it is
+already on the guest and `wc-guest.sh` uses it — and it connects, binds globals
+and exits. The first run of this experiment reported `counter=live`, the
+compositor alive at every cycle, and a clean exit accounting:
+`0 created, 0 destroyed`. Every number was consistent and every one of them was
+about nothing. `wc-shmclient.exe` makes a real window.
+
+**Then the counter did not move, and that read as a clean result.** Three cycles
+of `UP == DOWN == 2` is exactly what a leak-free compositor looks like from a
+distance. It was the sampling: `--frames 90` meant the client had finished and
+gone before the `UP` sample was taken, so both samples were of an idle
+compositor. The fix is not a longer sleep — it is that **the harness now prints
+whether the client was still running at the moment of each sample**:
+
+```text
+CLIENT-RUNNING-AT-UP1=yes
+UP1=user=3 …
+```
+
+That line is the difference between a measurement and a coincidence, and it is
+cheap. The general form is worth stating because this document keeps paying for
+it: *when an assertion compares two samples, record the condition each sample
+was supposed to be taken under, next to the sample.* A number without its
+premise cannot be checked, and the failure mode is not a wrong answer — it is a
+right-looking answer to a question nobody asked.
+
+### 75.4 §64's icon count is still zero, and this run says why
+
+```text
+icon objects at exit: claims 0 created, 0 icon(s) and 0 cursor(s) destroyed
+icons: 0 window(s) got one, 3 had none to get; no resolver published anything
+```
+
+Both halves are **structurally absent from this arrangement** rather than
+untested by accident:
+
+* no client published an icon, so `release_icons` had nothing to release —
+  `wc-icon.sh` is the harness that publishes one;
+* the run is in **session 0** and has no pointer, so no `HCURSOR` is ever built
+  — and §64.3 already established that the cursor half only moves in a harness
+  that moves a mouse.
+
+So §64.5 item 1 is unchanged and its remedy is now precise: an icon-publishing
+client for one half, injected pointer motion for the other. Neither is the
+`grep` this was hoped to be; both are runs. The machine was handed back rather
+than held for them, with two agents queued.
+
+### 75.5 What is not proven
+
+1. **Three cycles.** The count returns to baseline three times; it is not a
+   soak, and a leak that appears on the hundredth window would not be seen.
+2. **One client shape.** `wc-shmclient.exe` makes one plain toplevel. Popups,
+   subsurfaces and a client with several windows are untested here, and §53.6
+   item 4 already names popups as the highest-churn case.
+3. **The `+1` is attributed, not proven.** The window class is the only
+   plausible one-time USER object on that path and the number never moves again,
+   but nothing enumerated it.
+4. **`gdi=0` is still inferred.** §73.5 item 2.
+5. **This says nothing about the drag or icon resources beyond their counters
+   balancing** — 3 registered / 3 revoked is the compositor's own account
+   (§62.2), and on this venue there is still no outside witness for OLE's table.
