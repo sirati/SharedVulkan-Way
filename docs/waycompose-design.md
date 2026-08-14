@@ -19617,12 +19617,44 @@ worth recording:
 3. **`HOST="${WC_HOST:-<host-user>@testhost}"`.** `wc-launch.sh` defaults its host,
    so `WC_HOST` can be empty in the environment while the harness has a real
    host. A `cross-vm` declaration that checks only `WC_HOST` would refuse it
-   wrongly. This is **not fixed** and is §52.7 item 1: the honest resolution is
+   wrongly. This is **not fixed** and is §52.8 item 1: the honest resolution is
    for the declaration's guard to be advisory and `wc_assert_topology` — which
    requires a proven guest-RAM locate and cannot be asserted into existence — to
    remain the real check.
 
-### 52.6 The gates
+### 52.6 Somebody else used it, unprompted, and that is the result that matters
+
+While this sweep was running, `wc-drag.sh` grew a use of the gate that nobody
+asked for:
+
+```
+  # §51, and this leg is exactly the class it was built for. Everything here is
+  # one kernel, so the declaration is `same-box` — but this harness also prints
+  # a **time**: the gap between a drag entering and the client's `accept` coming
+  # back (§50.6). That is a round trip, a round trip is the quantity §51 refuses
+  # to let a same-box leg claim, and §50.6 says so in prose. Prose is what §51.2
+  # says was not enough, so it is asked here instead …
+  if wc_latency_claim "the accept round trip in §50.6 is what a user would see"; then
+    bad "wc_latency_claim was granted on a same-box leg -- §51's gate is not gating"
+  else
+    ok "§51: the staleness figures are refused as a latency claim, and are a
+        lower bound with no hypervisor in them"
+  fi
+```
+
+That is the gate used correctly, in the probe-and-assert-the-refusal form, on a
+claim this sweep did not classify as one — a round trip printed by a same-box
+harness, which §50.6 had already hedged in prose and which is now hedged in a
+way that fails if the hedge stops being true. **A fifth latency-shaped number,
+found by somebody else because the mechanism existed to find it with.**
+
+The file now declares twice — once at the top from this sweep, once inside that
+leg — and both say `same-box`, so they cannot disagree. The redundancy is left
+alone deliberately: the block-level one is more precise and better argued, the
+file-level one covers the blocks it does not reach, and quietly deleting either
+under an agent still working in that file would be worse than a duplicated line.
+
+### 52.7 The gates
 
 | Gate | Result |
 |---|---|
@@ -19631,9 +19663,10 @@ worth recording:
 | `scripts/wc-proxy.sh cost` | **13 passed, 0 failed** |
 | `scripts/wc-xkb.sh` | **5 passed, 0 failed** |
 | `scripts/wc-damage.sh` | unchanged from §51 |
-| `cargo test --workspace --no-fail-fast` | unchanged — this section adds no Rust |
+| `cargo test --workspace --no-fail-fast` | **2592 tests**, 0 failures — unchanged, this section adds no Rust |
+| `cargo build --workspace`, both targets | clean |
 
-### 52.7 What is not proven
+### 52.8 What is not proven
 
 1. **The `cross-vm` guard is stricter than the tree's conventions.** It requires
    `WC_HOST` in the environment, and several harnesses default `HOST` from it.
