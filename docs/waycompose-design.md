@@ -18234,3 +18234,200 @@ was working.
    (master's `wayland-bell-win`), so it is reported with its measurement rather
    than patched from here. The precedent for *doing* it in §44 was a one-line
    publish-before-store race with no API change; this is not that.
+
+## 48. The mistake, made structural: a leg must say whether a hypervisor is in it
+
+*(§46's continuation. No stage number, for §27's reason.)*
+
+### 48.1 Status in one paragraph
+
+§46 withdrew §27.6's claim that the user's second symptom did not reproduce, on
+the grounds that a presented-over-committed ratio counts drops rather than
+latency **and** that the harness which produced it has no VM boundary in it at
+all. Withdrawing a claim does not stop the next person making it. So the second
+half is now a function that refuses: `scripts/wc-topology.sh` makes every leg
+declare whether there is a hypervisor in its path, and `wc_latency_claim` is
+unavailable to a leg that declares none — or that declares nothing. The Wine
+legs of `scripts/wc-damage.sh` now declare `same-box` and **assert that they are
+refused**. The cross-VM leg is built, declares `cross-vm`, and is **unrun**:
+testhost was down.
+
+### 48.2 Why a rule in prose was not enough
+
+§13.8's rule — keep the instrument out of the loop — has been restated in this
+document three times and was still violated by §27.6, in a form nobody
+recognised because it was one level up: not an instrument inside the loop, but a
+**loop with the subject outside it**. The experiment ran Firefox, `wc-proxy` and
+`wc-compositor.exe` under Wine on one Linux box and then concluded something
+about a cross-VM present. There is no cross-VM present in that experiment. It is
+not slow there; it is absent.
+
+The reason prose failed is worth naming, because it is not carelessness. Every
+harness in this tree is *about* the code, so the machine it runs on reads as
+background — a detail of where, not a term in the claim. It becomes a term only
+for the specific class of claim that is about time across a boundary, and that
+class is rare enough that nobody has it in mind while writing an assertion. A
+rule you have to remember at exactly the moment you are thinking about something
+else is a rule that fails.
+
+`wc_substrate_declare` had already solved the same shape of problem for memory:
+five harnesses could reach a file after guest RAM became the only substrate, and
+the fix was not a note in a document but a declaration the binaries enforce. This
+is that pattern applied to the other axis.
+
+### 48.3 What it refuses, and the third state
+
+```
+wc_topology_declare cross-vm|same-box [why]
+wc_latency_claim <what>                      # the gate
+wc_assert_topology <compositor-log> [tag]    # the declaration, checked
+```
+
+Three states, not two, and the third is the important one. `WC_TOPOLOGY` starts
+**empty** rather than defaulting to `same-box`, because every harness in this
+tree is currently in that state and a default would make "nobody said" silently
+equal to a real answer. An undeclared leg is refused a latency claim with a line
+saying the topology is unknown, which is a different diagnosis from "this leg
+has no boundary" and points at a different fix.
+
+`cross-vm` is refused unless `WC_HOST` names a machine running QEMU *and* a
+guest is configured — the mirror of `wc_substrate_declare` refusing a file
+fixture on a box that has a guest. A declaration nobody can falsify is
+decoration.
+
+**The proof is the substrate locate, and the coupling is deliberate.** There is
+no line in any log that says "a hypervisor was in the path", and inventing one
+would be a fourth place for this fact to live and disagree. But a guest-RAM
+arena is located by reading QEMU's monitor and translating the guest's page
+frames, which cannot succeed unless there is a QEMU with a guest in it — so a
+proven `guest-ram` substrate **is** a proven hypervisor. `wc_assert_topology`
+therefore refuses a `cross-vm` claim that did not locate one, and a run that
+declared `cross-vm` and served its pixels from a file fails rather than passes.
+
+### 48.4 The Wine legs assert that they are refused
+
+The obvious way to use a gate is to call it where you want permission. The more
+useful way, here, is to call it where you expect refusal:
+
+```
+if wc_latency_claim "the commit-to-present path is not the scroll bottleneck"; then
+    bad "$tag: this leg was allowed a latency claim it cannot support --
+         has it grown a VM boundary?"
+else
+    ok  "$tag: presented $presented of $verified buffer-carrying commits -- a
+         drop count, and this leg is correctly refused any conclusion about
+         latency from it"
+fi
+```
+
+The ratio is still computed and still reported, because it is a true statement
+about the compositor's bookkeeping and §46 kept it for that. What has changed is
+that the sentence next to it now says what it is not. And if somebody later
+wires a boundary into this harness without declaring one, the leg fails — the
+gate stops refusing, and the assertion is written so that is the failure.
+
+**It did not work the first time, twice, and both failures are the section's own
+subject.**
+
+First, the block was placed beside the substrate assertion, where `verified` has
+not been computed yet, so its guard was false and the whole check silently never
+ran. A check placed where its inputs do not exist is a check that passes by
+being absent. It was caught by running it and noticing the line was missing from
+the output — which is the only way it *could* be caught, and the reason the gate
+prints a `PASS` on the refusal path rather than staying quiet.
+
+Second, and worse: `wc_latency_claim` originally reported every refusal with
+`bad`. That is wrong for a reason that needed a run to see. **A refusal is the
+expected outcome for every same-box leg in this tree**, so a gate that counts
+its own refusals as failures cannot be probed — and because this harness calls
+it with output redirected (the refusal text is not wanted; the *answer* is), the
+result was `wc-damage.sh` reporting
+
+```
+11 passed, 1 failed, 0 skipped
+```
+
+**with no `FAIL` line anywhere in its output.** A failure counter incremented by
+a message nobody can see is a worse instrument than no counter, and it took
+three runs and a full-output capture to find, because every obvious grep for the
+failure returned nothing.
+
+The fix is a separation of concerns that should have been there from the start:
+`wc_latency_claim` answers *is this claim available* and reports with `note`;
+the **caller** decides what an unavailable claim means and writes `bad` in its
+own else-branch, where a reader can see it. The gate does not have an opinion
+about severity, because severity depends on whether the caller was probing or
+asserting — and only the caller knows which.
+
+### 48.5 The cross-VM leg, which is unrun
+
+`scripts/wc-guest.sh damage` is block 12: the compositor on the guest, the proxy
+on the VM host over an arena located in the guest's own RAM, Firefox scrolling
+`about:support`, and `probe-scroll.exe` injecting the wheel **on the guest**,
+because that is where the window is. It reuses `s4_run ff guest-ram firefox`
+wholesale — §17's path, already debugged — and adds three things: an 18th
+positional to `wc-stage4` that turns on `--verify-damage`, the scroll probe in
+the deploy list, and §46's assertions applied to the proxy log that comes back.
+
+It carries §46.3's identity check verbatim, and that is deliberate rather than
+copy-paste: a coverage claim made on one topology is a claim about that
+topology, and the number of commits that never reach the copy is exactly the
+sort of thing a relay and a hypervisor could change.
+
+**Nothing here has run.** testhost was down while it was written. §14.9's
+finding is that "implemented" has meant "compiled" twice on this project, so
+this is marked rather than counted: it is a hypothesis with a script attached,
+and its first run is the measurement. What can be said now is narrower — it is
+assembled from paths this harness already exercises, and it declines cleanly on
+a box with no `WC_HOST`, which is the only part testable here and was tested.
+
+### 48.6 The retry now covers both ways a run can fail to be a run
+
+§46.6 added a second sample when the commit floor was not met. Verification of
+this section then failed on the *other* way the same thing happens: the scroll
+probe found the window, attached to its input queue, and never got through its
+notch loop — on a box that had several Wine desktops up at once, it lost the
+race for the foreground.
+
+That is the same condition wearing different clothes. The floor says the client
+barely drew; an unfinished scroll says the wheel was never injected. Neither is
+about the tree, both make the leg's number meaningless, and §46.6's argument —
+a second sample is not a tolerance, because the bar does not move — applies
+without modification. So the retry now triggers on either, and says which:
+
+```
+....  damage-arena: the scroll never finished its notches. Re-running once.
+....  damage-arena: only 20 commits checked, below the floor of 200 -- the
+      client barely drew. Re-running once.
+```
+
+Naming the reason matters more than it looks. The two have different causes and
+a run that keeps hitting one of them is telling you something different from a
+run that keeps hitting the other — a persistent unfinished scroll would point at
+the probe or the desktop, a persistent shortfall at the client or the machine.
+A single "re-running" line would have flattened that.
+
+### 48.7 What this still does not settle
+
+The user's second symptom is **still unverified**, and the gate is what makes
+that statable rather than assumed. A zero stale-row count says the bytes are
+right; it says nothing about when they arrive. What block 12 buys is that the
+leg which *can* answer is now the only leg permitted to, and with the doorbell
+at 0.876 ms per wait against 20.29 ms the answer is worth having: either the
+scroll is smooth and the symptom was the present latency all along, or it is not
+and there is something else. Both are results. Neither can be had from a Wine
+box, which is the whole of §27.6's lesson.
+
+### 48.8 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace`, both targets | clean |
+| `cargo test --workspace --no-fail-fast` | unchanged — this section adds no Rust |
+| **`scripts/wc-damage.sh all`** | **33 passed, 0 failed** — all three legs declare and assert `same-box`, the latency gate refuses on each, and the refusal is asserted rather than assumed |
+| ... `damage` / shared-file | 1553 checked, **0 stale**, presented 1553 of 1553 |
+| ... `damage` / arena | 1189 checked, **0 stale**, presented 1189 of 1189 |
+| ... `buffer` / shared-file | 1039 checked, **0 stale** |
+| `scripts/wc-guest.sh damage` on a box with no `WC_HOST` | declines with its reason |
+| `wc_topology_declare` / `wc_latency_claim`, all three states | undeclared refuses, `same-box` refuses, `cross-vm` without `WC_HOST` is refused at declaration |
+| **`scripts/wc-guest.sh damage` against a real guest** | **NOT RUN — testhost is down** |

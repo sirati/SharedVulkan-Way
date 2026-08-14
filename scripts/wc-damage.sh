@@ -77,6 +77,9 @@ note(){ echo "  ....  $*"; }
 # assumed. §27 measured its whole result over `shared-file` and said nothing
 # about it, which is exactly the omission `wc_assert_substrate` exists for.
 . "$(dirname "$0")/wc-substrate.sh"
+# And whether a hypervisor is in the path, which is §27.6's retraction turned
+# into a function that refuses. This harness is the reason that file exists.
+. "$(dirname "$0")/wc-topology.sh"
 
 RUNDIR=$(mktemp -d /tmp/wc-damage-XXXXXX)
 KEEP=${WC_KEEP:-}
@@ -120,11 +123,21 @@ scroll_run() {
 
   winp() { local p=$1; echo "Z:${p//\//\\}"; }
 
-  # **Which memory, declared before anything starts.** Both legs are fixtures on
-  # this box for the same reason — a Wine run has no QEMU, so there is no guest
-  # RAM to locate — and `wc_substrate_declare` refuses to say so if `WC_HOST` or
-  # a configured guest is in the environment, which is what stops this harness
-  # measuring a file on a machine that has the real thing.
+  # **Which memory, and whether a hypervisor is in the path — both declared
+  # before anything starts.** Both legs are fixtures on this box for the same
+  # reason — a Wine run has no QEMU, so there is no guest RAM to locate — and
+  # `wc_substrate_declare` refuses to say so if `WC_HOST` or a configured guest
+  # is in the environment, which is what stops this harness measuring a file on
+  # a machine that has the real thing.
+  #
+  # The topology declaration is §27.6's retraction made structural. These legs
+  # run Firefox, the proxy and the compositor under Wine on one box: there is no
+  # VM boundary in them, so there is no cross-VM present in them to be fast or
+  # slow, and `wc_latency_claim` will now refuse any assertion that depends on
+  # one. The old §27.6 could not have been written against a harness that said
+  # this out loud.
+  wc_topology_declare same-box \
+    "Firefox, wc-proxy and wc-compositor.exe all run under Wine on this box" || return 1
   local arena_size=$((64 * 1024 * 1024)) arena_out=$((1024 * 1024))
   local comp_extra=() proxy_extra=()
   case "$transport" in
@@ -262,6 +275,8 @@ check_run() {
   # to be something other than the declared substrate is a run whose stale-row
   # count is about the wrong thing.
   wc_assert_substrate "$dir/srv.log" "$tag"
+  wc_assert_topology "$dir/srv.log" "$tag"
+
 
   local notches
   notches=$(grep -m1 'notches towards the user' "$dir/scroll.log" 2>/dev/null)
@@ -281,6 +296,30 @@ check_run() {
   stale=$(grep -o '[0-9]* stale (worst [0-9]* rows)' "$dir/proxy.log" | awk -F' stale' '{print $1}' | awk '{s+=$1} END {print s+0}')
   worst=$(grep -o 'worst [0-9]* rows' "$dir/proxy.log" | grep -o '[0-9]*' | sort -n | tail -1)
   worst=${worst:-0}
+
+  # **What this leg is not allowed to conclude, asserted rather than assumed.**
+  # The presented-over-committed ratio is still worth having — it is a real
+  # statement about the compositor's own bookkeeping — but §27.6 turned it into
+  # a claim about scroll smoothness, which it cannot support and which this leg
+  # has no boundary to support it with. So the gate is called, and it is
+  # expected to **refuse**: a run in which it stopped refusing would mean this
+  # harness had grown a VM boundary and nobody had noticed, which is worth a
+  # failure rather than a silence.
+  #
+  # Deliberately after `verified` is computed. The first version of this block
+  # sat beside the substrate assertion, read `verified` before it was set, and
+  # therefore never ran at all — a check placed where its inputs do not exist
+  # yet is a check that passes by being absent, which is this section's whole
+  # subject arriving in its own code.
+  local presented
+  presented=$(grep -o '([0-9]* frames presented)' "$dir/srv.log" 2>/dev/null | grep -o '[0-9]*' | tail -1)
+  if [ -n "$presented" ] && [ "${verified:-0}" -gt 0 ]; then
+    if wc_latency_claim "the commit-to-present path is not the scroll bottleneck" >/dev/null 2>&1; then
+      bad "$tag: this leg was allowed a latency claim it cannot support -- has it grown a VM boundary?"
+    else
+      ok "$tag: presented $presented of $verified buffer-carrying commits -- a drop count, and this leg is correctly refused any conclusion about latency from it"
+    fi
+  fi
 
   local skipped commits unreached
   skipped=$(grep -o '([0-9]* state-only, unverifiable' "$dir/proxy.log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
@@ -404,12 +443,23 @@ block_scroll() {
   local attempt
   for attempt in 1 2; do
     scroll_run "$tag" "$scope" "$transport" || return
-    local got
+    local got why=""
     got=$(grep -o 'verified [0-9]* commits' "$RUNDIR/$tag/proxy.log" 2>/dev/null \
           | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-    [ "${got:-0}" -ge "$floor" ] && break
+    # **Two ways a run can fail to be a run, and both are the same condition.**
+    # The floor says the client barely drew; an unfinished scroll says the wheel
+    # never got injected, which on a box running several Wine desktops at once is
+    # the probe losing a race for the foreground rather than anything about the
+    # code. Retrying only the first left the second failing a gate for a reason
+    # that is not about the tree — the distinction §46.6 draws between a
+    # tolerance and a second sample applies identically to both.
+    grep -q 'notches towards the user' "$RUNDIR/$tag/scroll.log" 2>/dev/null \
+      || why="the scroll never finished its notches"
+    [ -z "$why" ] && [ "${got:-0}" -lt "$floor" ] \
+      && why="only ${got:-0} commits checked, below the floor of $floor -- the client barely drew"
+    [ -z "$why" ] && break
     if [ "$attempt" = 1 ]; then
-      note "$tag: only ${got:-0} commits checked, below the floor of $floor -- the client barely drew. Re-running once."
+      note "$tag: $why. Re-running once."
       # A clean directory, so the second run's logs cannot be read as the
       # first's, and the probe relinked into it because it lived there.
       rm -rf "${RUNDIR:?}/$tag"
