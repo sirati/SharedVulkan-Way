@@ -2238,6 +2238,23 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
         "wc-compositor: drop targets at exit: claims {registered} registered, \
          {revoked} revoked, {failed} revoke(s) failed"
     );
+    // ADDED FOR docs/waycompose-design.md §64, the third per-window resource.
+    //
+    // `outstanding` is **not required to be zero** and saying so here is the
+    // point: the cursor on screen is deliberately still alive, because
+    // `set_cursor` frees the previous one only after the new one is installed.
+    // A number that is allowed to be one and is printed as a number is a gate;
+    // a number asserted to be zero would fail on every run that moved the mouse
+    // and would then be "fixed" by deleting it.
+    let made = ICON_OBJECTS_MADE.with(|c| c.get());
+    let icons = ICONS_FREED.with(|c| c.get());
+    let cursors = CURSORS_FREED.with(|c| c.get());
+    println!(
+        "wc-compositor: icon objects at exit: claims {made} created, \
+         {icons} icon(s) and {cursors} cursor(s) destroyed, \
+         {} outstanding (the shown cursor is one)",
+        made.saturating_sub(icons + cursors)
+    );
 }
 
 /// Look a window up without holding the map borrow across anything that can
@@ -4345,6 +4362,7 @@ fn release_icons(w: &Rc<WindowState>) {
             unsafe {
                 DestroyIcon(old as _);
             }
+            ICONS_FREED.with(|c| c.set(c.get() + 1));
         }
     }
 }
@@ -4481,8 +4499,39 @@ fn make_hicon(icon: &IconImage, tw: i32, th: i32, hotspot: Option<(i32, i32)>) -
     if hicon.is_null() {
         None
     } else {
+        // ADDED FOR docs/waycompose-design.md §64. Counted here rather than at
+        // the two callers because this is the *only* `CreateIconIndirect` in
+        // the compositor: window icons and mouse cursors are the same kind of
+        // GDI object and are built by this one function. The two are freed by
+        // different calls — `DestroyIcon` in `release_icons`, `DestroyCursor`
+        // when the pointer changes — so the account is one creation counter and
+        // two destruction counters, which is also the shape of the bug it would
+        // catch: a path that creates through here and frees through neither.
+        ICON_OBJECTS_MADE.with(|c| c.set(c.get() + 1));
         Some(hicon as isize)
     }
+}
+
+thread_local! {
+    /// Every `HICON`/`HCURSOR` this process has built, and every one it has
+    /// given back. ADDED FOR docs/waycompose-design.md §64.
+    ///
+    /// §53 gave the window handle an outside witness and §60 gave the OLE
+    /// drop-target registration an inside count. This is the third and last
+    /// per-window resource `ToUi::Destroy` releases, and it had **neither** —
+    /// `release_icons` ran, destroyed what it found, and said nothing, so a
+    /// window icon that was never released was invisible in exactly the way
+    /// §60's stranded registration was.
+    ///
+    /// The difference at exit is not required to be zero: the cursor currently
+    /// on screen is deliberately *not* destroyed — `set_cursor` frees the
+    /// previous one only once the new one is installed, because destroying a
+    /// cursor that is showing leaves the pointer drawn from freed memory. So
+    /// the invariant is "outstanding is at most the one being shown", which is
+    /// what `scripts/wc-drag.sh` asserts across seventeen cursor changes.
+    static ICON_OBJECTS_MADE: Cell<u32> = const { Cell::new(0) };
+    static ICONS_FREED: Cell<u32> = const { Cell::new(0) };
+    static CURSORS_FREED: Cell<u32> = const { Cell::new(0) };
 }
 
 // ---------------------------------------------------------------------------
@@ -4581,6 +4630,7 @@ fn set_cursor(ui: &Rc<Ui>, spec: CursorSpec) {
         unsafe {
             DestroyCursor(previously_owned as _);
         }
+        CURSORS_FREED.with(|c| c.set(c.get() + 1));
     }
 
     if previous != handle {
