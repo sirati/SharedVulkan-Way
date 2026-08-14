@@ -3865,7 +3865,114 @@ integration, at both tiers**, with our side ready for tier 1 as specified and
 tier 2 blocked behind the private session. And the first thing to measure, when
 there is a guest, is whether tier 1 is worth building at all.
 
-#### 0.21.10 What would demonstrate it
+#### 0.21.11 Is tier 1 worth building? Measured, and the answer is "not on its own"
+
+The question §0.21.9 left open and would not guess at: tier 1 decodes on the
+guest GPU and copies every frame back, against host CPU decode that crosses
+nothing. Two of the three numbers were already in the tree; the third was
+missing and is now measured.
+
+**Host software decode, measured here** — 300 frames of 1080p H.264, `ffmpeg`
+8.1.2, `-benchmark`:
+
+| | CPU time | wall | per frame |
+|---|---|---|---|
+| `-threads 1` | 0.994 s | 1.027 s | **3.31 ms CPU** |
+| default (32 threads) | 1.242 s | 0.162 s | 4.14 ms CPU, 0.54 ms wall |
+
+At 60 fps that is **~20% of one core**, and it is a *lower* bound twice over:
+the clip is `testsrc2`, which is far easier than real video, and this CPU is a
+9950X3D rather than testhost's.
+
+**Guest GPU decode** is §0.8's measured **0.664 ms/frame** on the guest Intel.
+**The frame** is 3,110,400 bytes of NV12; the bitstream is 16,511 —
+`video-decode.md` §2's 188×.
+
+**And the fact that decides it is topological, not arithmetic.** WebRender
+composites on the *guest* GPU — `firefox-accel.md`'s chain is WebRender → GL →
+zink → shared_vulkan → the GPU. So a frame that arrives at Firefox as a
+`PlanarYCbCrImage` in host shared memory has to be **uploaded back across the
+boundary** to be composited.
+
+That makes the two paths asymmetric in a way that is easy to miss:
+
+* **Software decode.** Frame is born on the host, crosses **once** (the
+  WebRender upload), costs 3.31 ms of host CPU.
+* **Tier 1.** Frame is born on the guest GPU, is copied to the arena, is read by
+  the host, and then crosses **back** for the upload. Same final upload, plus an
+  extra outbound leg of 3.1 MB — **186 MB/s at 60 fps** — to save the 3.31 ms.
+
+So tier 1 buys ~20% of a core and pays 186 MB/s of extra boundary traffic plus a
+round trip's latency per frame. On a laptop — which is the deployment — that is
+a genuine trade rather than a win: hardware decode exists to save power, and the
+extra memory traffic spends some of it back.
+
+**Tier 2 has neither cost.** The decoded frame never leaves the guest GPU and
+WebRender samples it there, so it saves the CPU *and* the traffic, and it is the
+only version of this feature that is unambiguously better than doing nothing.
+
+**Verdict: do not build tier 1 as the goal.** Its value is as a *stepping
+stone* — it is the smallest change that makes hardware decode reachable at all
+(§0.21.8), and it would prove the private video session end to end against a
+real browser. That is worth something. But it should be built knowing it is a
+scaffold, and the user's request — *"firefox must use GPU accel for video
+decoding"* — is satisfied properly only by tier 2.
+
+What would overturn this: a measurement showing the extra outbound leg is
+cheaper than 3.31 ms of CPU *in power terms* on testhost specifically. That
+needs the guest and a watt meter, and it is a much weaker reason to build
+something than "it is the right shape".
+
+#### 0.21.12 What Firefox needs to accept a frame it does not own
+
+§0.21.5 said the third output path must hand a frame onward as a `VkImage` in
+the same device. That is what *our* side would send. This is what Firefox would
+have to grow to receive it, which is the half that decides the effort — and
+§0.21.9 already corrected "strictly less machinery" to mean the Vulkan work, not
+the Firefox work.
+
+Four things, in the order a frame meets them:
+
+1. **A decoder branch.** `FFmpegVideoDecoder::CreateImageVulkan` gains a third
+   arm beside `directExport` and the copy path, producing not a
+   `DMABufSurfaceImage` but an image naming a foreign texture.
+2. **An `Image` subclass** that holds an id rather than a surface. The shape
+   already exists in the tree — `sv_arena::handle::FrameHandle`, *"cannot
+   represent a descriptor. Not 'does not'; **cannot**"*, every field an integer.
+   Firefox's own nearest analogue is `SurfaceDescriptorRemoteTexture
+   { RemoteTextureId; RemoteTextureOwnerId }`: two integers naming a texture the
+   receiver does not own, which is exactly right and is in the wrong union.
+3. **A `RemoteDecoderVideoSubDescriptor` member.** This is the hard lock
+   (§0.21.8 item 3) and it is a *type* problem rather than a code one: decode
+   runs in the RDD process, every frame crosses that union, and its only
+   non-null Linux arm is `SurfaceDescriptorDMABuf`. It also cannot borrow the
+   shmem fallback, because `RemoteVideoDecoder.cpp`'s fallback hard-requires
+   `AsPlanarYCbCrImage()` and a foreign-texture image is not one.
+4. **A `RenderTextureHost`** in WebRender that binds the id as an external
+   texture instead of importing a dma-buf.
+
+**Synchronisation is the part that gets easier, not harder.** Firefox today
+exports a semaphore `sync_fd` per frame and hands it to
+`DMABufSurface::SetSemaphoreFd`. A same-device path needs no fd at all: the
+decode and the sample are submissions on one device, so an ordinary
+`VkSemaphore` that never leaves it is sufficient. That is one fewer descriptor
+crossing §1a, and it is the one place where "less machinery" is true of the
+Firefox side too.
+
+**How much is reachable without patching Firefox: none of it.** Items 1–4 are
+all in Firefox, and item 3 is in an IPDL union — so no pref, no environment
+variable and no driver behaviour can reach it. That is the same verdict as
+§0.21.8 arrived at from the other end, and the two agree for different reasons,
+which is worth more than either alone.
+
+**Two things worth saying to whoever proposes this upstream.** It is not
+waycompose-specific: any Vulkan device that cannot export dma-buf hits the same
+wall, and a `RemoteTextureId`-shaped video descriptor is the generic answer.
+And the same-device case is work Firefox does today for nothing — exporting to
+dma-buf and re-importing to sample on the *same* device is a round trip a
+same-device path would simply not make.
+
+#### 0.21.13 What would demonstrate it
 
 Nothing here has run. The measurement that would settle it needs a guest, and a
 format the host iGPU can decode:
@@ -3878,7 +3985,7 @@ format the host iGPU can decode:
    different paths and not one path with a flag.
 3. `about:support` reporting hardware decode against the forwarded device.
 
-Item 3 cannot pass until §0.21.5's Firefox gap is closed, and items 1 and 2 are
+Item 3 cannot pass until §0.21.12's Firefox gap is closed, and items 1 and 2 are
 what this project can demonstrate on its own once the private session is built.
 
 ### 0.23 Two clocks for one id: the blob lifetime bug, and why the fix is not local
