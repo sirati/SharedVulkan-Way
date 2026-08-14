@@ -20184,6 +20184,24 @@ version about causes nobody checks. The rule that would have caught both: when a
 run refuses, the reason it refused is a *measurement to take*, not a story to
 supply from what happens to be on the screen.
 
+> **§60 adds the third instance, and it is the one that shows this rule's own
+> failure mode.** The correction to the paragraph above — *"the session is
+> locked, `SendInput` returns 0"* — was not a story. It was a correct
+> measurement, and §57 is a real defect found by taking it. It was simply about
+> a code path the launcher does not travel: ssh lands in session 0, the
+> launcher's clicks go through a scheduled task into session 1, and a window
+> there is visible and mappable while the session is locked. The run was
+> available the whole time.
+>
+> So the rule needs a second clause: **a measurement can be real and still be
+> about the wrong path.** Taking one is not sufficient — establishing which path
+> the failing thing actually travels is itself the first measurement.
+>
+> And it is the harder clause to follow, because a real number stops the search
+> sooner than a guess does. An inference from a window listing is cheap to
+> doubt; a measured `SendInput -> 0, ERROR_ACCESS_DENIED` is not, and it held
+> for a day. §60.3 is the full sequence.
+
 > **And it happened twice, to two people, from the same evidence, within an
 > hour — which is what turns this from an anecdote into a rule worth stating.**
 >
@@ -21196,3 +21214,117 @@ reporting the leak.
 
 The timeout is now 120 s, and the rule is written where the number is: it must
 outlast the longest stretch of the run with no client connected.
+
+
+---
+---
+
+## 63. The run happened: one title bar and a typed word, in the same photograph
+
+### 63.1 Status in one paragraph
+
+`docs/stage8/stage57-typed.png` is `weston-terminal` on the guest's interactive
+desktop with **one** title bar and the word `wazcomposetzpes` on its prompt.
+That is the original brief's deliverable — *"a photograph of `weston-terminal`
+on the guest desktop with one title bar, and a photograph of typed text
+appearing in it"* — and it is one picture rather than two because the two bugs
+were never as separate as the report made them look. 13 assertions, 0 failures,
+first attempt, on a run where nothing named `--decorations` at all.
+
+### 63.2 The two pictures
+
+`stage57-typed.png` — §33's block 5b. `probe-input.exe` on `WinSta0` types
+`waycomposetypes` with `SendInput`, having first checked it owns the
+foreground:
+
+```
+PASS  probe-input found our window: target HWND 0000000000170cb6
+----  foreground=...170cb6 (class 'WaycomposeToplevel') focus=...170cb6 target=...170cb6
+PASS  the window after waycomposetypes was typed into it
+```
+
+The prompt reads `wazcomposetzpes`, and that is **correct**: the guest's layout
+is German (`0x0407` -> `de`), the probe injects positional scan codes, and scan
+`0x15` is `Z` on a German board and `Y` on an American one. §49.9 measured the
+same substitution and it is the cheapest possible proof that the client compiled
+*our* keymap rather than guessing.
+
+`stage57-clicked-then-typed.png` — §37's block 5c, and the question §37.8 left
+open. A click 40 px down the client area, then typing:
+
+```
+PASS  §37: a click 40 px down the client area started no window move, so it landed
+      below the bar the client drew
+PASS  §37: the terminal repainted 22 times after being clicked in and typed at
+----  §37: every scan code of the typed word translated
+```
+
+The prompt shows the first word with `echowazcomposetzpes` appended, so the
+keyboard survived the click that used to be delivered 32 px too high and read as
+a title-bar drag. The assertion is the **repaint count**, not the picture, for
+§37.7's reason: with the bug present the "picture changed" check was green
+because the *window had moved*.
+
+And the window is **838x435**, which is §49's folded caption on a run that named
+no decoration flag at all — so `--decorations auto` is the shipped default doing
+its job on the real desktop, not a leg configured to succeed.
+
+### 63.3 Three causes, and none of them was the one that mattered
+
+This run was blocked for a day, and the sequence of explanations is the useful
+part of the section.
+
+| who | cause given | how it was arrived at |
+|---|---|---|
+| this author | "a person is at the machine" | inferred from a `wc-desk windows` listing showing Firefox on a news article |
+| the coordinator | "the session is locked; `SendInput` returns 0" | **measured**, and §57 is the real defect it found |
+| the growth agent | ssh lands in **session 0**; the launcher's clicks go through a scheduled task into **session 1** | measured, on the path the launcher actually uses |
+
+The third is the one that made the run possible: a probe window in session 1
+reported `session=1 handle=985882 visible=True` **while the session was
+locked**. Windows map on a locked session. The run was available the whole time.
+
+§55.3 said *the reason a run refuses is a measurement to take, not a story
+supplied from what happens to be on the screen*, and the middle row is why that
+rule needs a second clause. **The coordinator's cause was not a story.** It was
+a correct measurement — `SendInput` really does return 0 on a locked session,
+and §57 is a genuine defect found by taking it. It was simply about a code path
+the launcher does not travel.
+
+So:
+
+> **A measurement can be real and still be about the wrong path.** Taking one is
+> not sufficient; establishing which path the failing thing actually travels is
+> itself the first measurement, and it is the one all three of us skipped.
+
+That is a sharper rule than the one §55.3 states, and it is a *harder* one to
+follow, because a real number is far more convincing than a guess and stops the
+search sooner. My inference was cheap to doubt. A measured
+`SendInput -> 0, ERROR_ACCESS_DENIED` is not, and it held for a day.
+
+The three instances also line up with §55.3's mechanism — *a workaround that
+works removes the pressure that would have found the real cause* — in its
+third form. Here nobody wrote a workaround; the **explanation itself** was the
+workaround. It accounted for the symptom, so the question stopped being asked.
+
+### 63.4 What is now closed, and what is not
+
+Closed, both of the user's reports from `docs/waycompose-design.md`'s task list:
+
+* *"wayland terminal renders also a double titlebar"* — §49's `--decorations
+  auto`, photographed here under the shipped default. One bar, the client's,
+  with Windows' own caption buttons in it.
+* *"typing in wayland terminal does not seem to work"* — three causes across
+  three sections, and this is the venue the report came from. §33 guessed a
+  missing keymap; §37 found the pointer offset that made a click read as a
+  drag; §49.8 found a spurious configure at map from my own frame code. All
+  three are fixed and this run exercises all three at once.
+
+Not closed:
+
+1. **A client that starts maximised and decorates itself** still gets two bars
+   (§49.7 item 1). Neither weston client does.
+2. **The 35 unexplained WLCS failures** (§59.5) are untouched, and they are what
+   "implemented fully rather than partially" actually names.
+3. **`GetGuiResources` is still a skip under Wine**, which is one of the two
+   runs queued behind this one.
