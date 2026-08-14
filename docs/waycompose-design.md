@@ -22427,3 +22427,93 @@ the verdict came back as `stub\r`: mingw's stdio turns every `\n` into CRLF, so
 verdict 'stub'"* about a verdict it had just printed. That is the **third** time
 this session — `probe-drag`'s window list in §50, `probe-life`'s `gone` in §53,
 this — and it is always the same bug wearing a different symptom.
+
+## 70. Topology 3 cannot mean what it sounds like, and what it does mean needs one flag
+
+*(§69's continuation. A feasibility finding, not a run.)*
+
+### 70.1 Status in one paragraph
+
+The third of the user's three arrangements — *"wine linux to linux vm"* — was
+handed to me as "a client under Wine on this host against a compositor in a VM".
+**That arrangement cannot be built, and the reason is a `cfg`, not a
+difficulty.** The Windows build of the vendored `wayland-backend` encodes an `h`
+argument *in band* and the Linux build passes it out of band as `SCM_RIGHTS`;
+the two are selected by `#[cfg(windows)]` / `#[cfg(unix)]` in
+`vendor/wayland-backend/src/rs/wire.rs`, so a Windows client and a Linux
+compositor do not speak the same protocol and no transport between them changes
+that. §29.7 made exactly this argument for why the clipboard leg could not be
+split into two, and it applies here unchanged. **The coherent reading of
+topology 3 is the other one** — Wine on this workstation as the *Windows side*
+and the Linux VM as the *client* side, which is the arrangement §29.8 named in
+so many words — and that one is buildable, is the closest thing to the
+deployment that exists without the user's laptop, and is **one missing flag**
+away. This section names the flag rather than writing it, because writing it is
+a change to `wc-proxy`'s upstream and not a harness.
+
+### 70.2 Why a Wine client and a Linux compositor cannot meet
+
+`wc-proxy` exists precisely because these two dialects differ: it speaks
+ordinary out-of-band libwayland *downstream* to a Linux client and the in-band
+dialect *upstream* to the Windows compositor. It is the translator, and it only
+translates in that direction. A Windows client talking to a Linux compositor has
+no translator on either end and would need one written backwards.
+
+So the three topologies are not symmetric, and the asymmetry is structural:
+
+| the user's phrase | what it can mean | status |
+|---|---|---|
+| linux to linux vm | Linux client here, Linux compositor in the VM | `scripts/wc-ring-vm.sh` |
+| linux to wine linux vm | the Windows compositor under Wine *in* the VM | §67's `wc-wine-guest.sh` (server only), §69 (the probe) |
+| **wine linux to linux vm** | ~~Windows client here, Linux compositor in the VM~~ | **impossible, §70.2** |
+| | Windows compositor under Wine **here**, client in the VM | **§70.3 — one flag short** |
+
+### 70.3 The arrangement that does work, and the one thing it lacks
+
+§29.8: *"`nix build .#svGuest` builds the honest arrangement: Wine on this
+workstation as the Windows side, and a **Linux VM guest as the client**. That is
+a real hypervisor between the two halves."* Every dialect lines up: the client
+in the guest is an ordinary Linux Wayland client, `wc-proxy` beside it in the
+guest translates, and the compositor under Wine on this host receives the
+in-band dialect it expects.
+
+What is missing is the channel for the protocol byte stream, and it is
+one-sided rather than absent:
+
+* **The compositor already has one.** `--wayland-cold PATH` takes the *cold
+  path* — a virtio-serial port — and `scripts/wc-ring-vm.sh` already drives it,
+  with the compositor in the guest reading
+  `/dev/virtio-ports/org.sirati.svcold.0`.
+* **`wc-proxy` does not.** Its upstream is either `--upstream PATH`, which must
+  be an **AF_UNIX socket**, or `--upstream-ring PATH`, the shared_vulkan control
+  region. A character device is neither, so the proxy inside the guest has
+  nothing to point at the host.
+
+So the missing piece has a name: **an `--upstream-cold PATH` on `wc-proxy`,
+mirroring the compositor's `--wayland-cold`,** so that the guest's proxy can
+reach the host's compositor over the virtio-serial port the VM already has. The
+pixels need no new work — `--transport shared-file --pool-dir` over the 9p `/sv`
+share already puts pools where both sides can see them.
+
+**Why that is worth doing and not just noting.** Every drag, drop and window
+result in §50 through §64 carries the same caveat — one kernel, no boundary —
+and this arrangement is the one that removes it without the user's laptop.
+§50.8 item 1 says the ~100 ms round trip of §50.6 is *"a lower bound for the
+deployment"*; this is the venue that could measure the real one.
+
+### 70.4 What is not proven
+
+1. **Nothing was run for this section.** It is a reading of `--help`, of
+   `wire.rs`'s `cfg`s and of `wc-ring-vm.sh`, and it should be treated as a
+   design note until something boots.
+2. **The virtio-serial channel is assumed adequate for the Wayland byte
+   stream** because the compositor already uses it for exactly that in
+   `wc-ring-vm.sh`. Its throughput under a real client is unmeasured, and
+   §36's whole point is that a cold path is the slow one.
+3. **`graphics = false`.** §67 found the compositor comes up fully in the guest
+   with no X at all, but a *client* in the guest that draws needs somewhere to
+   draw; whether the guest needs a display for the client half is untested.
+4. **The impossibility in §70.2 is about this tree's vendored backend**, not
+   about Wayland. A client built for the Linux target and *run under Wine* is
+   not a thing; a Windows client speaking out-of-band would need the vendored
+   `cfg` inverted, which is a fork of the fork.
