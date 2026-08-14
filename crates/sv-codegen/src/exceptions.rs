@@ -61,6 +61,30 @@ pub enum VoidPolicy {
     /// opaque `u64` so the app side can round-trip it, and the GPU side treats
     /// it as a number.
     OpaqueToken,
+    /// A capture-replay token: null on the wire, and a non-null one is refused
+    /// by name.
+    ///
+    /// # The class, and why it needed a policy rather than an exclusion
+    ///
+    /// `pShaderGroupCaptureReplayHandle` and `opaqueCaptureDescriptorData` are
+    /// optional `void*` whose extent is a **device property** —
+    /// `shaderGroupHandleCaptureReplaySize`,
+    /// `…CaptureReplayDescriptorDataSize` — rather than a `len=`. §7.4 asks for
+    /// a policy and neither `ArenaOffset` nor `OpaqueToken` is honest: the bytes
+    /// are real data of a length the registry does not state.
+    ///
+    /// But they are only ever written by a tool *replaying a trace*, and doing
+    /// that requires the device to advertise the matching feature —
+    /// `rayTracingPipelineShaderGroupHandleCaptureReplay`,
+    /// `descriptorBufferCaptureReplay`. This driver advertises neither, and
+    /// `sv_icd::advertise` is where that is kept. So the specification already
+    /// requires the member to be null, and the honest encoding is "null, and say
+    /// so loudly if it is not" — which is what §0.19 item 4 predicted the answer
+    /// would be and what §0.24 implemented.
+    ///
+    /// This is what took `VK_KHR_ray_tracing_pipeline` and
+    /// `VK_EXT_descriptor_buffer` off the profile's exclusion list.
+    CaptureReplayUnsupported,
     /// Not serialisable at all; a command or struct reaching one is a build
     /// failure.
     ///
@@ -80,6 +104,84 @@ pub fn void_policy(owner: &str, field: &str) -> Option<VoidPolicy> {
         // nineteen of them by owner would be noise that hides the two entries
         // that actually carry a decision.
         .or_else(|| BY_FIELD_NAME.iter().find(|(f, _)| *f == field).map(|(_, p)| *p))
+        .or_else(|| is_capture_replay(owner, field).then_some(VoidPolicy::CaptureReplayUnsupported))
+}
+
+/// Commands whose `VoidPolicy::ArenaOffset` parameter `sv-icd` expands *before*
+/// anything crosses.
+///
+/// # The third class of over-promise, and the wild pointer that named it
+///
+/// `ArenaOffset` means "this `void*` is `arena_base + offset`, and the GPU side
+/// resolves it against its own mapping of the same pages" (design.md §5.3). That
+/// is true of `pHostPointer`, where the application's pointer really is arena
+/// memory. It is **not** true of a descriptor-template `pData`, which points at
+/// ordinary application memory laid out by the template — and for those the
+/// generated lowering emits `(p_data) as usize as u64`, handing the
+/// application's own pointer over as if it were an offset.
+///
+/// That is only safe when something app-side turns the data into wire structs
+/// first. `sv_icd::icd` overrides the generated method for
+/// `vkUpdateDescriptorSetWithTemplate` and does exactly that (§0.4 item 10). For
+/// `vkCmdPushDescriptorSetWithTemplate` nothing did, the raw pointer crossed,
+/// and the GPU side dereferenced it — a segfault, and the leading suspect for
+/// "Firefox crashes instantly" after `full` became the default profile.
+///
+/// **This list is what makes that checkable rather than remembered.** A command
+/// with an `ArenaOffset` `void*` *parameter* and no entry here cannot lower
+/// safely, so [`crate::emit::icd_entry`] puts its extension into
+/// `INCOMPLETE_EXTENSIONS` — and fails the build outright if the command is
+/// core, because a core command cannot be un-advertised. §0.20 item 4 predicted
+/// that a mechanical widening would restore this defect and it did; a list of
+/// excluded extensions is exactly what a mechanical widening reverses, and a
+/// derived check is not.
+///
+/// Struct *members* are not covered and do not need to be: a `pNext` chain is
+/// expanded by the same override, and `VkImportMemoryHostPointerInfoEXT`'s
+/// `pHostPointer` is genuinely arena memory by the extension's own contract.
+pub const ICD_EXPANDS_ARENA_POINTER: &[&str] = &[
+    // `sv_icd::icd::update_descriptor_set_with_template` reads `pData` through
+    // the template and emits `VkWriteDescriptorSet`s; the pointer never crosses.
+    "vkUpdateDescriptorSetWithTemplate",
+    "vkUpdateDescriptorSetWithTemplateKHR",
+    // Safe for the *other* reason, and the check's first run found it: nothing
+    // expands `pHostPointer` because nothing has to. `VK_EXT_external_memory_host`
+    // is the extension whose entire contract is "this pointer is host memory the
+    // driver will import", and in this design that memory is the arena
+    // (design.md §5.3) — so `arena_base + offset` is not an approximation of the
+    // pointer, it is what the pointer is.
+    //
+    // Listed rather than special-cased in the check, because "the policy is
+    // right here" and "something fixes it up first" are different facts and a
+    // reader should be able to tell which applies to a given line.
+    "vkGetMemoryHostPointerPropertiesEXT",
+];
+
+/// Whether a `void*` belongs to the capture-replay family, by the registry's own
+/// naming.
+///
+/// # Why a rule and not a list, after starting as a list
+///
+/// The list was `VkRayTracingShaderGroupCreateInfoKHR`,
+/// `VkOpaqueCaptureDescriptorDataCreateInfoEXT` and the five
+/// `vkGet…OpaqueCaptureDescriptorDataEXT` queries. Adding them made the profile
+/// fail on `vkGetTensorOpaqueCaptureDescriptorDataARM`, which is the identical
+/// shape from `VK_ARM_tensors` — and the next vendor to copy the pattern would
+/// have failed it again. A list that grows once per vendor for a reason that
+/// never changes is a rule that has not been written down.
+///
+/// Khronos names this family consistently, which is what makes the rule safe:
+/// every member is `…CaptureReplay…` or `…OpaqueCapture…` in its own name or its
+/// owner's. It is also *narrow* — [`void_policy`] is only consulted for a
+/// `void*` with no `len=`, so `vkGetBufferOpaqueCaptureAddress`, which returns a
+/// `uint64_t` and has no `void*` at all, is not reached by it.
+///
+/// A name that matches but is not capture-replay would be given a policy of
+/// "null, and refuse a non-null one", which fails loudly at the call rather than
+/// silently. That is the safe direction for a heuristic to be wrong in.
+fn is_capture_replay(owner: &str, field: &str) -> bool {
+    let hit = |s: &str| s.contains("CaptureReplay") || s.contains("OpaqueCapture");
+    hit(owner) || hit(field)
 }
 
 const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
@@ -127,6 +229,27 @@ const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
     ("vkCmdPushDescriptorSetWithTemplate2", "pData", VoidPolicy::ArenaOffset),
     ("VkPushDescriptorSetWithTemplateInfo", "pData", VoidPolicy::ArenaOffset),
     ("VkPushDescriptorSetWithTemplateInfoKHR", "pData", VoidPolicy::ArenaOffset),
+    // The capture-replay class (design.md §0.24). Both are optional, both have a
+    // device property for a length where the registry has no `len=`, and both
+    // are null unless a trace is being replayed against a device that advertises
+    // the matching feature — which this one does not.
+    (
+        "VkRayTracingShaderGroupCreateInfoKHR",
+        "pShaderGroupCaptureReplayHandle",
+        VoidPolicy::CaptureReplayUnsupported,
+    ),
+    (
+        "VkOpaqueCaptureDescriptorDataCreateInfoEXT",
+        "opaqueCaptureDescriptorData",
+        VoidPolicy::CaptureReplayUnsupported,
+    ),
+    // The five `vkGet…OpaqueCaptureDescriptorDataEXT` queries and their ARM
+    // sibling need no entries: `is_capture_replay` reaches them by name. They
+    // are the other half of the class — the calls a capture tool makes to
+    // *obtain* the token it would later replay — and there the policy makes the
+    // whole command refuse, which is right: `pData` must be non-null for the
+    // call to mean anything, so every one fails cleanly rather than answering a
+    // question this device may not be asked.
 ];
 
 const BY_FIELD_NAME: &[(&str, VoidPolicy)] = &[
@@ -349,6 +472,30 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
 /// It is a list of two and it is closed. Anything longer would be the
 /// restriction §6.5 asks for quietly dissolving.
 pub const BLOB_FRAMING: &[&str] = &["vkBeginCommandBuffer", "vkEndCommandBuffer"];
+
+/// The commands that return a command buffer to a recordable state, and so
+/// clear the "recording failed" mark of design.md §0.24.
+///
+/// # Why two names and not a rule
+///
+/// There is no attribute in `vk.xml` that distinguishes these from
+/// `vkEndCommandBuffer`, which is the third command taking a `VkCommandBuffer`
+/// as its first parameter without recording into it. So this is a list, and it
+/// is stated as one rather than dressed up as a derivation.
+///
+/// **`vkBeginCommandBuffer` alone would be enough**, and that is the useful
+/// fact. The specification requires it before recording into a command buffer in
+/// any state — initial, executable or invalid — so no path exists from "failed
+/// to record" back to "being recorded" that does not pass through it. That is
+/// why `vkResetCommandPool` needs no entry despite resetting buffers this list
+/// never sees: a buffer it reset is in the initial state, and the next thing
+/// that may legally happen to it is a `vkBeginCommandBuffer`.
+///
+/// `vkResetCommandBuffer` is here anyway because it is the same state
+/// transition, and a mark that outlived an explicit reset would be surprising to
+/// read in a trace even though nothing could observe it.
+pub const CLEARS_COMMAND_BUFFER_POISON: &[&str] =
+    &["vkBeginCommandBuffer", "vkResetCommandBuffer"];
 
 /// The commands a GPU side must give meaning to rather than forward verbatim.
 ///
