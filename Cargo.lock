@@ -988,6 +988,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "sv-codegen",
+ "sv-icd-entry",
  "sv-proto",
  "sv-wire",
  "vk-registry",
