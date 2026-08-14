@@ -2306,6 +2306,32 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 );
             }
         }
+        // §45.11. The corner moved; the size did not (a size change arrives on
+        // the ordinary present path) and neither did the z-order or the focus.
+        ToUi::ShiftOrigin { id, dx, dy } => {
+            if let Some(w) = window(ui, id) {
+                let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: a live handle, and `GetWindowRect` only writes the
+                // rectangle it is given.
+                unsafe {
+                    if GetWindowRect(w.hwnd(), &mut r) != 0 {
+                        SetWindowPos(
+                            w.hwnd(),
+                            std::ptr::null_mut(),
+                            r.left + dx,
+                            r.top + dy,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        println!(
+                            "wc-compositor: window {id} origin shifted by {dx},{dy} \
+                             (its content did not move)"
+                        );
+                    }
+                }
+            }
+        }
         ToUi::Present { id, damage } => {
             if let Some(w) = window(ui, id) {
                 present(&w, &damage);

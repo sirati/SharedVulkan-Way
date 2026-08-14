@@ -17900,6 +17900,98 @@ toplevel configuration, 3 fullscreen, 2 protocol errors, and the two singletons.
 With the 79 skipped gaps, the number that must reach zero is **114**.
 
 
+### 45.11 The origin bug, and the regression that finished the argument
+
+§45.10 found a defect §40 had introduced, diagnosed it, and deliberately left it
+named rather than fixed: **the union bounding box changed the window's size and
+not its origin.** A `wl_subsurface` hanging 100 px off the left of its parent
+makes the window 100 px wider and its top-left corner 100 px further left, and
+nothing said the second half. This is that fix, and the interesting part is what
+it broke on the way.
+
+#### Pinning the right point
+
+The synthetic Win32 stored what WLCS told it: "the window's top-left is here".
+That is the same point as the root surface's buffer origin *at the moment it is
+said*, for every surface the suite builds — and they stop being the same point
+the instant the window's extent changes without the surface moving.
+
+So the stored value is now the **buffer origin**, obtained by subtracting the
+inset in force when the position arrives, and the window's corner is derived
+back from it. A window whose geometry never changes is positioned exactly where
+the suite asked — the case every earlier stage measured, and the one a fix here
+had to leave completely alone. Two unit tests hold both ends: a window that grew
+leftwards is hit in its overhang, and a declared inset leaves the window where
+it was put.
+
+Pinning the buffer origin is not a harness convenience. It is what every
+compositor does and what a client is entitled to assume: **a subsurface
+appearing to the left must not drag the parent's pixels rightwards across the
+screen.**
+
+#### And the real platform has to move the window
+
+The above is `control.rs`, which is a stand-in. On Windows the `HWND` genuinely
+has to move, or the window stays put and its contents slide inside it — so
+`ToUi::ShiftOrigin` carries the change to the platform, and `win32.rs` answers
+it with a `SetWindowPos` against the current `GetWindowRect` under `SWP_NOSIZE`.
+
+**A delta rather than a position**, because this compositor does not know where
+any of its windows are — that is `control.rs`'s header and it is still true. The
+only thing this side can truthfully say is "whatever you have, it moved by this
+much". The headless arm logs it rather than ignoring it: a silent match arm is
+how a message stops being handled without anybody noticing (§42).
+
+#### The regression, which is the part worth keeping
+
+The fix worked — and the scoreboard did not move. Four tests went from failing
+to passing and four others went the other way, and the total was identical:
+409/57 before, 409/57 after. **A number that does not move is not evidence that
+nothing happened**, and the only reason this was caught is that the per-suite
+counts were compared rather than the total.
+
+The four that broke are `input_falls_through_subsurface_when_parent_unmapped`.
+The test puts a lower window under the overhang and unmaps the subsurface that
+created it; the click must fall through to the window underneath. It could not,
+because the window was still 315 px wide — §45.10 had taught the *hit test* that
+a subsurface is mapped only while its parent is, and had left the *bounding box*
+counting the children of an unmapped surface. Nothing was drawn in the overhang,
+but the window still covered it, and **a window covers pixels whether or not it
+paints them**.
+
+So `ancestors_mapped` became a function, and the three places that need it — the
+bounding box, the blit, and the hit test — all call it. That is §40's argument
+about `placed_tree` arriving where it was always going: painting and hit-testing
+must not disagree about which surfaces are in the tree, and for one section they
+did. §45.10 fixed one of the three and the arithmetic hid it.
+
+#### Four tests reclassified, in the right order
+
+§45.10 declined to call any of the eight remap failures expected, because four
+of them were a live bug and saying otherwise would have been laundering. With
+the bug fixed, parameters 8 to 11 pass and 4 to 7 remain — and those four put a
+subsurface 100 px left of a toplevel that has *declared* a window geometry, so
+the subsurface is outside the `HWND` for exactly §45.4's reason. They are now in
+the expected-failure table, and the self-check confirms all twenty-six still
+fail.
+
+The sequence is the point: **a failing test was not called expected until
+nothing else could explain it.**
+
+#### Where it stands
+
+| | passed | failed | skipped |
+|---|---|---|---|
+| §45.10 | 409 | 57 | 759 |
+| **§45.11** | **413** | **53** | **759** |
+
+413 of 466, 88.6%. Of the 53 failures, 26 are expected on this platform and **27
+are debts**: 7 subsurface commit synchronisation, 7 popup grab and reposition, 6
+interactive move and resize, 4 toplevel configuration, 3 fullscreen, 2 protocol
+errors, and the two singletons — less the overlaps already counted. With the 79
+skipped gaps, the number that must reach zero is **106**.
+
+
 ## 46. §27 continued: the arena leg, and an identity with a hole in it
 
 *(§27's continuation, appended here because this file is in append order. No
