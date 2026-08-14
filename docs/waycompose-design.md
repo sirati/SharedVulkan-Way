@@ -22541,6 +22541,16 @@ this — and it is always the same bug wearing a different symptom.
 
 *(§69's continuation. A feasibility finding, not a run.)*
 
+> **AMENDED. The title is wrong and §70.5 is the correction.** The flag this
+> section proposed — `--upstream-cold` on `wc-proxy` — was written, run
+> successfully, and then **withdrawn**, because the user restated the
+> architectural rule: *"all communication is to go through the ring.
+> alternative channels are permitted only for wakeup from idle."* A
+> virtio-serial port carrying the protocol stream is not a wakeup, it is the
+> whole conversation on an alternative channel. The reasoning below about *why
+> the arrangement needs a channel at all* still stands; only the choice of
+> channel was wrong.
+
 ### 70.1 Status in one paragraph
 
 The third of the user's three arrangements — *"wine linux to linux vm"* — was
@@ -22626,6 +22636,72 @@ deployment"*; this is the venue that could measure the real one.
    about Wayland. A client built for the Linux target and *run under Wine* is
    not a thing; a Windows client speaking out-of-band would need the vendored
    `cfg` inverted, which is a fork of the fork.
+
+### 70.5 `--upstream-cold` was built, run, and withdrawn on the ring rule
+
+**It worked, and that is not the same as it being right.** `--upstream-cold
+PATH` was added to `wc-proxy` as a third `Upstream` variant beside `Socket` and
+`Ring` — a character device carrying the protocol as bytes, refused at *parse*
+if the path is not one — and a harness ran the whole arrangement: the
+compositor under Wine on this workstation, `wc-proxy` and `weston-clickdot`
+inside the svGuest VM, `socat` joining QEUM's end of
+`/dev/virtio-ports/org.sirati.svcold.0` to the compositor's socket. The guest
+reported kernel 6.18.44 against this host's 6.18.33, the proxy logged
+`upstream cold … (a byte stream; no fd can be represented on it)`, and the
+compositor logged `wl_surface created`, `xdg_toplevel created (#1) -> window 1`
+and `window 1 created (HWND 0x2007a)`.
+
+It is withdrawn anyway. The user's rule is that **all communication goes
+through the ring, and alternative channels are permitted only for wakeup from
+idle**. A doorbell qualifies — ringing a bell to wake a parked consumer *is*
+wakeup. A virtio-serial port carrying `wl_surface`, `wl_shm` and every commit
+does not; it is the conversation, not the wake. The code is reverted and the
+harness is not in the tree.
+
+**The same objection lands on `scripts/wc-vm-client.sh` (§67.9), which is in
+master**, and withdrawing only this flag would leave the equivalent violation
+standing. That harness reaches the same arrangement more cheaply — two `socat`s
+and no new flag, so `wc-proxy` uses its ordinary `--upstream` — but the bytes
+still cross on the same virtio-serial port. What the rule forbids is the
+channel, not the flag that names it.
+
+**Three things the run showed that are worth keeping.**
+
+*The arrangement is viable.* A Linux client in a VM drove a Windows compositor
+on the host through a real hypervisor as far as a mapped `HWND`. Whatever
+carries the bytes, the halves fit together — which is what §29.8 asserted and
+nothing had shown.
+
+*It then broke, and the harness said it passed.* Immediately after the window
+appeared:
+
+```text
+[proxy] client 1 failed: compositor: wl_keyboard.keymap names Section
+  { name: "Local\\wc-eb7bc4cb…", size: 36950 }, which this side cannot open
+[proxy] client 1: pool 3: could not publish 38272 bytes: Invalid argument (os error 22)
+```
+
+The compositor published the keymap as a Windows kernel section because it was
+started without `--shared-dir` — §11.2's problem, in a topology where the far
+side is a Linux guest that cannot open one — and the pool publish failed with
+`EINVAL` six times. **Every assertion in the harness had already passed**,
+because they stopped at `window … created` and nothing checked that the session
+survived. A gate that stops at the first good news is the shape §35 is about,
+and this one was mine.
+
+*The dialect question does not arise here, and §72's does.* This proxy talked to
+a **Windows** compositor, which is the pairing it was built for, so the
+in-band-`h` stream was correct at both ends. §72 reports that the same proxy
+against a **Linux** compositor desynchronises the server's reader on
+`create_pool` with nothing logged on either side. That is the other half of
+§70.2's two-dialects-one-translator fact, and it means the arrangement cannot
+composite against a Linux compositor whatever channel carries the bytes.
+
+**Where this leaves the work.** Not a transport flag. Either the proxy learns
+the out-of-band dialect for a Unix upstream, or — more in keeping with the rule
+just restated — the **ring** carries the descriptor properly so the dialect
+question does not arise at the boundary at all. `--upstream-ring` already
+exists; that is the direction. §70.1's "one flag away" is withdrawn.
 
 ## 71. The arena route to topology 1, and the outbound pages that are not there
 
