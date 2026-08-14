@@ -439,6 +439,37 @@ impl SharedVulkan {
         // owns that — it decides not to promise it until something does.
         out.retain(|(n, _)| sv_icd_entry::INCOMPLETE_EXTENSIONS.binary_search(n).is_err());
 
+        // The fourth term, and the one that has nothing to do with entry points.
+        //
+        // The filter above asks whether the *generator* kept §9.2's promise. It
+        // cannot ask whether the *device* can: an extension whose commands must
+        // be recorded on a `VIDEO_DECODE` queue is unservable here no matter how
+        // well its marshalling was generated, because
+        // `crate::advertise::queue_families` offers one family and it is
+        // `GRAPHICS | COMPUTE | TRANSFER`.
+        //
+        // This went live the moment `full` became the default profile: sixteen
+        // video extensions appeared in `vulkaninfo` through the forwarder, and
+        // Firefox 153 selects a device on two of them. Recorded as a future risk
+        // in §0.8 item 7 while the profile was `zink`, with nothing connecting
+        // that note to the profile change — see §0.22.
+        out.retain(|(n, _)| {
+            match crate::advertise::unservable_queue_requirement(n) {
+                None => true,
+                Some(missing) => {
+                    // Always, not under `SV_DEBUG`: an extension silently
+                    // missing from the advertised set is the kind of thing that
+                    // gets diagnosed as "the GPU does not support it".
+                    sv_icd_entry::report_always(&format_args!(
+                        "{n} needs a queue family with flags {missing:#x} and this \
+                         driver advertises {:#x}; not advertising it",
+                        crate::advertise::advertised_queue_flags()
+                    ));
+                    false
+                }
+            }
+        });
+
         // **`VK_KHR_swapchain` is added here rather than intersected**, and that
         // is a correction to design.md §0.4 item 8 rather than an exception to
         // it. §0.4's rule — the list is "the profile's extensions intersected
@@ -470,6 +501,68 @@ impl SharedVulkan {
         // different questions about different code.
         if !out.iter().any(|(n, _)| *n == "VK_KHR_swapchain") {
             out.push(("VK_KHR_swapchain", 70));
+        }
+
+        // Close the set under `depends=`.
+        //
+        // The queue check withdrew the three video extensions that *have*
+        // commands. Ten codec and maintenance ones — `VK_KHR_video_decode_h264`,
+        // `…_av1`, `VK_KHR_video_maintenance1` — add only structs and enums, so
+        // they constrain no queue and nothing above could see them. Each depends
+        // on one of the three that just went, and §9.2's promise is about the
+        // whole extension: "H.264 decode, but not the decode queue you would
+        // decode on" is not something an implementation may say.
+        //
+        // A fixpoint rather than one pass, for the reason
+        // `Profile::include_portable_extensions` needs one: dependency chains
+        // are deeper than one link, and a single pass keeps whatever depended on
+        // what it just removed.
+        //
+        // **`have` is three sets, not one, and getting that wrong cost
+        // `VK_KHR_swapchain` for the second time in this file.** A device
+        // extension's `depends=` routinely names an *instance* extension —
+        // `VK_KHR_swapchain` depends on `VK_KHR_surface`,
+        // `VK_KHR_external_fence` on `VK_KHR_external_fence_capabilities`,
+        // `VK_KHR_shader_untyped_pointers` on
+        // `VK_KHR_get_physical_device_properties2` — and none of those is in
+        // `out`, which is the *device* list. A closure that consulted only `out`
+        // withdrew swapchain, present_id, present_wait, incremental_present,
+        // hdr_metadata and eleven more, and `vulkaninfo` through the forwarder
+        // went from 218 device extensions to 192.
+        //
+        // It is the same mistake as the ordering bug §0.19 item 6 records, in a
+        // different disguise: a check that is right about the extension it was
+        // written for and wrong about the set it reads. The diff caught it
+        // again, which is the argument for the diff being the gate.
+        //
+        // Core versions satisfy a `depends=` on themselves — an extension
+        // promoted into 1.1 may say `VK_VERSION_1_1,VK_KHR_…`, and this is a 1.4
+        // device.
+        loop {
+            let have = |n: &str| {
+                if let Some(minor) =
+                    n.strip_prefix("VK_VERSION_1_").and_then(|m| m.parse::<u32>().ok())
+                {
+                    return minor <= 4;
+                }
+                out.iter().any(|(o, _)| *o == n)
+                    || crate::advertise::INSTANCE_EXTENSIONS.iter().any(|(o, _)| *o == n)
+            };
+            let drop: Vec<&str> = out
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| !sv_icd_entry::depends_satisfied(n, &have))
+                .collect();
+            if drop.is_empty() {
+                break;
+            }
+            for d in &drop {
+                sv_icd_entry::report_always(&format_args!(
+                    "{d} depends on something this driver does not advertise; \
+                     not advertising it either"
+                ));
+            }
+            out.retain(|(n, _)| !drop.contains(n));
         }
         out
     }

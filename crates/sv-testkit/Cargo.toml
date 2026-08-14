@@ -11,5 +11,6 @@ publish = false
 anyhow.workspace = true
 sv-codegen.workspace = true
 vk-registry.workspace = true
+sv-icd-entry.workspace = true
 sv-wire.workspace = true
 sv-proto.workspace = true
