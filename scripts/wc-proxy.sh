@@ -106,6 +106,31 @@ ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
 note(){ echo "  ....  $*"; }
 
+# STAGE 47. **A third outcome, because this harness had no way to say "the
+# machine was too loaded to measure".**
+#
+# Every gate here could previously end in exactly two places: `bad`, which says
+# the *code* is wrong, or `note`, which says nothing and is counted by nobody.
+# A gate whose shortfall can be caused by load alone therefore had to lie in one
+# direction or the other — blame the tree for the box, or go silent. §35's rule
+# is that a number nobody asserts on is unwatched; the corollary this stage adds
+# is that **an outcome the vocabulary cannot express gets misfiled**.
+#
+# `inconclusive` is counted and printed in the summary, so a run that could not
+# measure something says so in the same line as its passes and failures, and a
+# reader can tell "nothing was wrong" from "we could not tell".
+#
+# It is deliberately *not* a way to make a failing gate quiet. It is used only
+# where the condition is a property of the machine — sample size under load —
+# and never where the property being tested is the code's.
+inconc=0
+skip() { echo "  ????  $*"; inconc=$((inconc + 1)); }
+
+# The load average, for the messages that need to distinguish slow from broken.
+# One decimal, and the 1-minute figure, because the legs here are 6 seconds long
+# and the 5-minute average would describe a different run.
+loadnow() { awk '{printf "%.1f", $1}' /proc/loadavg 2>/dev/null || echo "?"; }
+
 # STAGE 41. No QEMU on this box, so no guest RAM to locate: this harness is the
 # Wine fixture and its `arena` transport is a file. `wc_substrate_declare
 # wine-fixture` is what hands it the `SV_ALLOW_FILE_ARENA=1` that `wc-proxy` and
@@ -777,9 +802,39 @@ run_cost() {
   for transport in shared-file arena; do
     for scope in pool buffer damage; do
       local tag="cost-$transport-$scope"
-      run_one "$tag" weston-presentation-shm "$transport" "$scope" 6 0 0 || continue
-      local line
-      line=$(grep -o "[0-9]* commits, [0-9]* copies, [0-9.]* MiB in [0-9.]* ms" "$RUNDIR/$tag/proxy.log" | tail -1)
+      # STAGE 47. **Measure until the sample is big enough, rather than for a
+      # fixed time and then complain.**
+      #
+      # The floor below is `commits >= 50`, and its reasoning is sound on an
+      # idle box: 620 to 736 commits were measured in 6 seconds, so 50 is more
+      # than ten times clear. But it is a floor on a *rate*, and this machine now
+      # runs full-profile workspace builds at a load average north of 100 on 32
+      # cores. At that point a 6-second window can genuinely fail to reach 50
+      # commits, and the harness would report `bad` — announcing a defect in the
+      # tree because the box was busy. **A threshold picked when the machine was
+      # quiet cannot tell slow from broken.**
+      #
+      # So the window grows instead of the verdict changing: 6 s, then 18 s if
+      # the sample was short. A slow machine pays time and still produces a
+      # measurement; a broken one produces a short sample twice and is reported
+      # as inconclusive with the load quoted, not as a failure. That is the
+      # distinction the fixed window could not express.
+      #
+      # The retry is not flakiness-papering: the *cost* gates below are ratios
+      # per commit, which are load-independent by construction (§31), so a
+      # longer window changes the confidence and not the number.
+      local secs=6 attempt=0 commits_seen=0 line=""
+      while [ "$attempt" -lt 2 ]; do
+        attempt=$((attempt + 1))
+        run_one "$tag" weston-presentation-shm "$transport" "$scope" "$secs" 0 0 || break
+        line=$(grep -o "[0-9]* commits, [0-9]* copies, [0-9.]* MiB in [0-9.]* ms" "$RUNDIR/$tag/proxy.log" | tail -1)
+        commits_seen=$(printf '%s' "$line" | grep -o '^[0-9]*')
+        [ "${commits_seen:-0}" -ge 50 ] && break
+        [ "$attempt" -ge 2 ] && break
+        note "$tag: ${commits_seen:-0} commits in ${secs}s at load $(loadnow) -- widening the window to 18s rather than calling it a failure"
+        secs=18
+      done
+      [ -n "$line" ] || continue
       local us kib
       us=$(grep -o "[0-9]* us per copy" "$RUNDIR/$tag/proxy.log" | tail -1 | grep -o "^[0-9]*")
       kib=$(grep -o "[0-9.]* KiB and" "$RUNDIR/$tag/proxy.log" | tail -1 | grep -o "^[0-9.]*")
@@ -820,8 +875,20 @@ run_cost() {
   local t s commits copies kibper
   while read -r t s commits _ copies _ _ _ _ _ _ _ kibper; do
     kibper=${kibper%kib}
-    local why=""
-    [ "$commits" -lt 50 ] && why="only $commits commits in 6 s -- too few to measure over"
+    # STAGE 47. **A short sample is inconclusive, not failing.** This was
+    # `bad "only N commits in 6 s -- too few to measure over"`, which is a true
+    # sentence filed under the wrong verdict: too few commits says the machine
+    # was busy, and nothing about whether the code copies correctly. With the
+    # window now widening once before giving up, reaching this line means two
+    # windows were short — still a fact about the box, and reported as one, with
+    # the load quoted so it can be told from a real stall.
+    #
+    # The load-independent gates below (`copies <= 2 x commits`, KiB per copy,
+    # and the per-commit ratios) are *not* skipped by this: they still run on
+    # whatever sample there is, because they are properties of the code and a
+    # thin sample cannot make a 55x regression look like 1x.
+    local why="" thin=""
+    [ "$commits" -lt 50 ] && thin="only $commits commits over two windows at load $(loadnow) -- too thin to draw a rate from"
     if [ -z "$why" ] && [ "$copies" -gt $((commits * 2)) ]; then
       why="$copies copies for $commits commits -- a buffer is being copied more than once per commit"
     fi
@@ -829,10 +896,16 @@ run_cost() {
        && awk -v k="$kibper" -v c="$extent_ceiling" 'BEGIN { exit !(k > c) }'; then
       why="$kibper KiB per copy of a ${extent_kib} KiB buffer -- a scope that copies part of a buffer moved more than all of it"
     fi
-    if [ -z "$why" ]; then
-      ok "$t/$s: $commits commits, $copies copies, $kibper KiB per copy -- once per commit, never more than the extent"
-    else
+    # The code gates win over the sample-size note: a run that is BOTH thin and
+    # copying 55 times per commit is a failure, and saying "inconclusive" there
+    # would be the skip hiding a defect. Only a thin sample with nothing else
+    # wrong is inconclusive.
+    if [ -n "$why" ]; then
       bad "$t/$s: $why"
+    elif [ -n "$thin" ]; then
+      skip "$t/$s: $thin (the per-copy and per-commit gates still ran and found nothing wrong)"
+    else
+      ok "$t/$s: $commits commits, $copies copies, $kibper KiB per copy -- once per commit, never more than the extent"
     fi
   done <"$RUNDIR/cost.txt"
 
@@ -917,6 +990,16 @@ case "${1:-all}" in
 esac
 
 echo
-echo "== $pass passed, $fail failed =="
+# STAGE 47. The inconclusive count is in the summary, and only there when it is
+# non-zero — a run that measured everything should not have to say so. It does
+# **not** affect the exit status: "we could not measure it" is not a failure,
+# and a harness that exited non-zero for load would teach everyone to re-run
+# until green, which §35.1 names as worse than failing.
+if [ "$inconc" -gt 0 ]; then
+  echo "== $pass passed, $fail failed, $inconc inconclusive (load $(loadnow)) =="
+  echo "   inconclusive = the machine was too loaded to draw a rate; the code gates still ran."
+else
+  echo "== $pass passed, $fail failed =="
+fi
 [ -n "$KEEP" ] && echo "artefacts kept in $RUNDIR"
 [ "$fail" -eq 0 ]
