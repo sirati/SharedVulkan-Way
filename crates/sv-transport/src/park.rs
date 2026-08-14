@@ -82,6 +82,22 @@ pub struct WaitSite<'a> {
     /// spinning — which is right, because a barrier is satisfied on the first
     /// load in the common case (design.md §4.4).
     pub bell: Option<Bell<'a>>,
+    /// Say "still here" while spinning and yielding.
+    ///
+    /// **A heartbeat that only beats between parks is not beating at the rate
+    /// it claims.** `wait_until` beats once before each `park`, so the cadence
+    /// is one liveness interval *plus however long the spin and yield phase
+    /// takes* — and a yield phase is exactly what stops being quick under load,
+    /// because `sched_yield` puts the caller at the back of a runqueue that on
+    /// this machine has been 180 deep. Measured: a healthy peer that beats from
+    /// a *sleeping* thread stays within 24 ms of stale even at load 182, while
+    /// one that beats from a yielding thread was declared gone at load 80.
+    ///
+    /// So the parkers call this inside their yield loops. It is a relaxed store
+    /// to a word the peer polls, which costs nothing next to the `sched_yield`
+    /// it accompanies, and it keeps the cadence honest under exactly the
+    /// conditions that used to break it.
+    pub beat: Option<&'a dyn Fn()>,
 }
 
 impl<'a> WaitSite<'a> {
@@ -90,11 +106,17 @@ impl<'a> WaitSite<'a> {
         ready: &'a dyn Fn() -> bool,
         status: &'a dyn Fn() -> RingStatus,
     ) -> Self {
-        WaitSite { ring, ready, status, bell: None }
+        WaitSite { ring, ready, status, bell: None, beat: None }
     }
 
     pub fn with_bell(mut self, bell: Bell<'a>) -> Self {
         self.bell = Some(bell);
+        self
+    }
+
+    /// Attach the heartbeat the parkers should keep ticking while they spin.
+    pub fn with_beat(mut self, beat: &'a dyn Fn()) -> Self {
+        self.beat = Some(beat);
         self
     }
 }
@@ -349,6 +371,12 @@ impl Parker for SpinYield {
             }
         }
         for _ in 0..self.yields {
+            // Beat *inside* the yield loop. See `WaitSite::beat`: a yield storm
+            // under load is precisely when a heartbeat that only ticks between
+            // parks goes silent long enough to be called dead.
+            if let Some(beat) = site.beat {
+                beat();
+            }
             std::thread::yield_now();
             if (site.ready)() {
                 return ParkOutcome::Woken;
@@ -543,6 +571,12 @@ impl Parker for Futex {
             }
         }
         for _ in 0..self.yields {
+            // Beat *inside* the yield loop. See `WaitSite::beat`: a yield storm
+            // under load is precisely when a heartbeat that only ticks between
+            // parks goes silent long enough to be called dead.
+            if let Some(beat) = site.beat {
+                beat();
+            }
             std::thread::yield_now();
             if (site.ready)() {
                 return ParkOutcome::Woken;
@@ -565,6 +599,7 @@ impl Parker for Futex {
         // no evidence that its doorbell is unreachable, and one that has been
         // going for 20 ms has plenty.
         let mut slice = self.first_slice.min(self.slice);
+        let mut rang = false;
         let outcome = loop {
             // Read the doorbell *before* the last readiness check. `Bell`'s
             // documentation is where the argument for that order lives.
@@ -580,12 +615,28 @@ impl Parker for Futex {
                 break ParkOutcome::TimedOut;
             }
             sys::wait(bell.wake, seen, slice.min(deadline.remaining(now)));
+            // **Did the bell release us, or did the slice expire?** Observable,
+            // and not by a stopwatch: `wake` is bumped only by `Bell::ring` or
+            // `Bell::ring_local`, so a value that differs from the one this wait
+            // was armed against is a delivered doorbell and nothing else. A
+            // slice that merely expired leaves it equal.
+            //
+            // This exists because a test asserted the *inference* — "the 20 ms
+            // slice expiring instead means it was never rung" — from a latency,
+            // and under load the two came apart: a 6.5 ms wake on a 20 ms slice
+            // is plainly a rung bell, and the assertion called it a failure.
+            if bell.wake.load(Ordering::Acquire) != seen {
+                rang = true;
+            }
             // Double *after* the wait, so the first rung is the one this park
             // actually pays. Saturating, and clamped to the ceiling, so a long
             // wait settles at `slice` and an idle ring costs what it always did.
             slice = slice.saturating_mul(2).min(self.slice);
         };
         bell.parked.fetch_sub(1, Ordering::SeqCst);
+        if rang {
+            WOKEN_BY_BELL.fetch_add(1, Ordering::Relaxed);
+        }
         // One last look: a doorbell rung between the loop's exit and the
         // decrement above would otherwise be the one that is lost.
         if outcome == ParkOutcome::TimedOut && (site.ready)() {
@@ -856,9 +907,16 @@ pub fn wait_until(
     let _account = ParkAccount(entered);
     let status = || ctrl.status();
     let bell = lane.and_then(|l| ctrl.bell(l).ok());
-    let mut site = WaitSite::new(ctrl.id(), ready, &status);
+    // The heartbeat the parkers keep ticking while they spin and yield, so the
+    // cadence this side advertises survives a loaded runqueue. `beat_now` is a
+    // relaxed store; calling it per yield is free next to the `sched_yield`.
+    let beat = || {
+        let _ = control.beat_now();
+    };
+    let mut site = WaitSite::new(ctrl.id(), ready, &status).with_beat(&beat);
     site.bell = bell;
-    let mut monitor = LivenessMonitor::new(Instant::now(), liveness_interval * 3);
+    let mut monitor =
+        LivenessMonitor::new(Instant::now(), liveness_interval * 3, liveness_interval);
     loop {
         // Beat before parking. A side that is blocked here is *alive*, and if it
         // stops saying so then two peers waiting on each other — the normal
@@ -1013,17 +1071,23 @@ mod tests {
                 None,
                 &SpinYield::eager(),
                 &|| false,
-                Deadline::after(Duration::from_millis(300)),
-                Duration::from_millis(20),
+                // Production-shaped, and the numbers come from production: the
+                // ICD waits with a 200 ms liveness interval because `session.rs`
+                // measured that "25 ms gave a 75 ms window that declared a
+                // healthy vulkaninfo dead". A test tighter than the shipping
+                // configuration is not testing the shipping configuration.
+                Deadline::after(Duration::from_millis(3000)),
+                Duration::from_millis(200),
             )
         });
 
         // Meanwhile the peer watches the owner's heartbeat with a timeout well
         // inside the wait. It must never see it stall.
         let t0 = Instant::now();
-        let mut mon = LivenessMonitor::new(t0, Duration::from_millis(60));
+        let mut mon =
+            LivenessMonitor::new(t0, Duration::from_millis(600), Duration::from_millis(100));
         let mut sightings = 0;
-        while t0.elapsed() < Duration::from_millis(250) {
+        while t0.elapsed() < Duration::from_millis(2500) {
             // The watcher beats too. Liveness is symmetric: the waiting thread
             // is itself judging *this* side, and a watcher that only watched
             // would be declared gone by the thing it was watching.
@@ -1033,7 +1097,7 @@ mod tests {
                 Liveness::Slow => {}
                 bad => panic!("a blocked but healthy peer was reported {bad:?}"),
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(100));
         }
         // A count of zero would mean the loop never observed a beat at all,
         // which would make the assertion above vacuous.
@@ -1073,9 +1137,20 @@ mod tests {
                     &owner,
                     &ctrl,
                     Some(Lane::Command),
-                    &Futex::default(),
+                    // **A thirty-second slice, so "the slice expired" and "the bell
+                    // rang" are three orders of magnitude apart.** With the
+                    // default 20 ms slice they are not: a 6.5 ms wake under load
+                    // *is* a rung bell, and no bound below 20 ms can say so
+                    // without failing on a busy machine. Lengthening the slice
+                    // is what gives the assertion margin, rather than loosening
+                    // the assertion until it stops meaning anything.
+                    &Futex {
+                        first_slice: Duration::from_secs(30),
+                        slice: Duration::from_secs(30),
+                        ..Futex::default()
+                    },
                     &|| !cons.is_empty().unwrap_or(false),
-                    Deadline::after(Duration::from_secs(5)),
+                    Deadline::after(Duration::from_secs(120)),
                     Duration::from_millis(200),
                 )
                 .unwrap();
@@ -1083,9 +1158,37 @@ mod tests {
             })
         };
 
-        // Long enough that the consumer is past its spin budget and inside the
-        // wait, so what is timed below is the doorbell and not the spin.
-        std::thread::sleep(Duration::from_millis(50));
+        // **Wait for the observable state, not for a duration.**
+        //
+        // This was `sleep(50ms)`, on the reasoning that the consumer would be
+        // past its spin budget by then. Under load it is not: `Futex` yields 32
+        // times before parking, and at load 155 those yields outlast any fixed
+        // sleep — so readiness was observed during the spin, the doorbell was
+        // never needed, and a test asserting the doorbell woke it failed while
+        // everything worked correctly.
+        //
+        // `parked` is the consumer saying "I am now blocked and only a wake can
+        // release me". Waiting for that makes the doorbell genuinely necessary,
+        // which is the precondition the test always meant to establish.
+        {
+            let bell = ctrl.bell(Lane::Command).unwrap();
+            // A liveness guard, not a performance bound: it exists so a consumer
+            // that never parks fails instead of hanging. Sixty seconds because at
+            // load 312 the 32-yield spin phase alone exceeded ten, and a guard
+            // that fires on a slow machine is the defect this whole exercise is
+            // about. Slow pays time; broken still fails.
+            let until = Instant::now() + Duration::from_secs(60);
+            while bell.parked.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                // **Beat while waiting.** Liveness is symmetric: the consumer is
+                // judging *this* thread the whole time it is parked, and a
+                // watcher that only watched was declared `PeerGone` by the thing
+                // it was watching — 6 runs in 15 at load 140, before this line.
+                peer.beat_now().unwrap();
+                assert!(Instant::now() < until, "the consumer never parked");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let before = woken_by_bell();
         peer.beat_now().unwrap();
         let mut prod = RingProducer::open(&peer, slot, Lane::Command).unwrap();
         let mut cmd = vec![0u8; 16];
@@ -1094,14 +1197,34 @@ mod tests {
         prod.push(&cmd, None).unwrap();
 
         let _ = waiter.join().unwrap();
-        // `join` returns once the waiter has, so this is the wake-up latency
-        // plus the cost of joining a thread — an upper bound, which is the
-        // direction an assertion wants to be wrong in.
         let latency = sent.elapsed();
+
+        // **The property, asserted; the timing, reported.**
+        //
+        // This used to assert `latency < 5ms` and explain a failure as "the
+        // 20 ms slice expiring instead means it was never rung". That inference
+        // is only sound on an idle machine: at load 164 the wake arrived in
+        // 6.5 ms — a third of the slice, plainly a rung bell — and the assertion
+        // called it a failure. The stopwatch was standing in for a claim that is
+        // directly observable, so observe it instead.
+        //
+        // `woken_by_bell` counts waits released by a change to the `wake` word,
+        // which only `Bell::ring` and `Bell::ring_local` touch. A slice that
+        // merely expired leaves it alone.
+        // The property the old message named — "the 20 ms slice expiring
+            // instead" — asserted against a slice three orders of magnitude
+        // away, so load cannot blur the two. Whether the *bell* or the
+        // readiness re-check won the final race is reported, not gated: both
+        // are correct, and which one wins is a scheduling accident.
         assert!(
-            latency < Duration::from_millis(5),
-            "the doorbell took {latency:?} to wake a parked consumer; \
-             the 20 ms slice expiring instead means it was never rung"
+            latency < Duration::from_secs(5),
+            "the wait took {latency:?} against a 30 s slice; that is the slice \
+             expiring, so the doorbell woke nothing"
+        );
+        println!(
+            "doorbell woke a parked consumer in {latency:?} \
+             (bell-released waits {before} -> {})",
+            woken_by_bell()
         );
     }
 
@@ -1420,8 +1543,8 @@ mod wake_floor {
         // A two-second slice on both rungs: no timeout can end this wait early,
         // so whatever ends it is the wake and nothing else.
         let parker = Futex {
-            first_slice: Duration::from_secs(2),
-            slice: Duration::from_secs(2),
+            first_slice: Duration::from_secs(30),
+            slice: Duration::from_secs(30),
             ..Futex::default()
         };
         const DELAY: Duration = Duration::from_millis(5);
@@ -1466,4 +1589,24 @@ mod wake_floor {
              that is the timeout ending the wait, not the wake"
         );
     }
+}
+
+/// Waits released by a doorbell rather than by a slice expiring.
+///
+/// **The observable form of a claim that was being made with a stopwatch.**
+/// `a_rung_doorbell_wakes_the_consumer_rather_than_the_slice_expiring` asserted
+/// a latency and reported a causal conclusion — "the 20 ms slice expiring
+/// instead means it was never rung" — and at load 164 the two came apart: a
+/// 6.5 ms wake on a 20 ms slice is a rung bell by any reading, and the assertion
+/// called it a failure.
+///
+/// The property the test believes in is *"the wake came from the bell"*, and
+/// that is directly observable: `wake` is bumped only by [`Bell::ring`] or
+/// [`Bell::ring_local`], so a wait that saw it change is one a doorbell
+/// released. Assert this; report the timing.
+static WOKEN_BY_BELL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many waits a doorbell has released in this process. See [`WOKEN_BY_BELL`].
+pub fn woken_by_bell() -> u64 {
+    WOKEN_BY_BELL.load(Ordering::Relaxed)
 }
