@@ -2,6 +2,7 @@
 # Point **Firefox** at this compositor and write down what actually happens.
 #
 #   scripts/wc-firefox.sh enumerate   what Firefox binds, and what it does without
+#   scripts/wc-firefox.sh needs       what it binds when a page asks it to
 #   scripts/wc-firefox.sh window      the browser's own pixels, measured from outside
 #   scripts/wc-firefox.sh titlebar    the two levers that leave exactly one title bar
 #   scripts/wc-firefox.sh auto        Firefox under the compiled-in default, vs server
@@ -168,7 +169,7 @@ run_firefox() {
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     XDG_RUNTIME_DIR="$dir/rt" WAYLAND_DISPLAY="$sock" \
     ${WC_WAYLAND_DEBUG:+WAYLAND_DEBUG=1} "${FX_ENV[@]}" \
-    timeout "$secs" "$FIREFOX" --no-remote --profile "$dir/profile" about:blank \
+    timeout "$secs" "$FIREFOX" --no-remote --profile "$dir/profile" "${FX_URL:-about:blank}" \
     >"$dir/fx.log" 2>&1
   echo $? >"$dir/fx.rc"
   sleep 1
@@ -516,6 +517,134 @@ block_titlebar() {
 # The claim is an *equivalence*, so the block is a pair. `auto` and `server` are
 # run minutes apart with the same environment, and the assertions are on the
 # things Firefox can see: what it was told, what it asked for, and where it put
+# --------------------------------------------------------------------- needs -
+# STAGE 56. What Firefox binds when it is asked to do something.
+#
+# `enumerate` runs `about:blank`, and its list has been read ever since as "the
+# protocols Firefox needs" — including by the task that asks for them to be
+# implemented fully. **It is a floor, not the set.** A browser binds a protocol
+# when a page makes it necessary, and `about:blank` makes almost nothing
+# necessary: no text field, so no `text-input`; no pointer lock, so no
+# `pointer-constraints` and no `relative-pointer`; no video, so nothing that
+# would want `viewporter`.
+#
+# That matters for the gap list rather than being a curiosity. WLCS's skips are
+# grouped by the protocol that caused them, and the four largest gaps —
+# `wp_viewporter` 23, `zwp_pointer_constraints_v1` 15, `zwp_text_input_manager_v2`
+# 12, `zwp_text_input_manager_v3` 11 — are *all absent* from the `about:blank`
+# list. Read as "the subset that matters", that list says those 61 skips are
+# somebody else's problem. This block exists to find out whether that is true.
+#
+# The page is local and offline: this harness must not depend on a network, and
+# a remote page would make the measurement a fact about a website.
+block_needs() {
+  echo "== needs: what Firefox binds when a page asks it to"
+  have "$FIREFOX" || { non "no firefox on PATH"; return; }
+
+  local dir="$RUNDIR/needs"
+  mkdir -p "$dir"
+  # Each element is here to provoke exactly one protocol, and the comment says
+  # which. Nothing here is interactive: Firefox binds a manager when it decides
+  # the capability may be used, which for these is at layout or focus time.
+  cat >"$dir/needs.html" <<'HTML'
+<!doctype html><meta charset=utf-8><title>needs</title>
+<body>
+<!-- text-input v2/v3: a focused editable field is what makes an IME relevant -->
+<input id=t autofocus placeholder=type>
+<textarea rows=2>editable</textarea>
+<div contenteditable>editable div</div>
+<!-- pointer-constraints + relative-pointer: pointer lock is requested on click,
+     but Gecko binds the managers when a document that *can* lock is loaded -->
+<canvas id=c width=200 height=120></canvas>
+<!-- viewporter / fractional-scale: a scaled video surface is the usual reason -->
+<video id=v width=160 height=90 muted autoplay loop></video>
+<script>
+  document.getElementById('t').focus();
+  const c = document.getElementById('c');
+  c.addEventListener('click', () => c.requestPointerLock());
+  // Touch the APIs so Gecko instantiates the machinery behind them.
+  void (document.pointerLockElement, navigator.keyboard, window.devicePixelRatio);
+</script>
+HTML
+
+  FX_DECOR=client; FX_ENV=(); FX_URL="file://$dir/needs.html"
+  WC_WAYLAND_DEBUG=1 run_firefox "$dir" wc-needs 30 \
+    || { bad "the compositor never bound its socket"; FX_URL=; return; }
+  FX_URL=
+
+  # Bound interfaces, from libwayland's own decode of the client's requests.
+  local bound
+  bound=$(grep -o 'wl_registry#[0-9]*\.bind([0-9]*, "[a-z_0-9]*"' "$dir/fx.txt" \
+          | sed 's/.*"\(.*\)"/\1/' | sort -u)
+  [ -n "$bound" ] || { bad "Firefox bound nothing at all — it did not start"; return; }
+  note "bound with a page: $(echo "$bound" | tr '\n' ' ')"
+
+  # The comparison that is the point. `enumerate`'s baseline is recomputed here
+  # rather than read from that block's output, so this block stands alone.
+  local base="$RUNDIR/needs-base"
+  FX_DECOR=client; FX_ENV=()
+  WC_WAYLAND_DEBUG=1 run_firefox "$base" wc-needs-base 25 \
+    || { bad "the compositor never bound its socket (about:blank)"; return; }
+  local blank extra
+  blank=$(grep -o 'wl_registry#[0-9]*\.bind([0-9]*, "[a-z_0-9]*"' "$base/fx.txt" \
+          | sed 's/.*"\(.*\)"/\1/' | sort -u)
+  extra=$(comm -23 <(echo "$bound") <(echo "$blank") | tr '\n' ' ')
+
+  if [ -n "${extra// /}" ]; then
+    ok "a page made Firefox bind protocols about:blank never asks for: $extra"
+  else
+    ok "a page made Firefox bind nothing extra — about:blank's list really is the set"
+  fi
+
+  # And the question the gap list needs answered, named protocol by named
+  # protocol, so the answer is usable rather than a sentence.
+  local p
+  for p in zwp_text_input_manager_v3 zwp_text_input_manager_v2 \
+           zwp_pointer_constraints_v1 zwp_relative_pointer_manager_v1 \
+           wp_viewporter wp_fractional_scale_manager_v1 zxdg_output_manager_v1; do
+    if echo "$bound" | grep -qx "$p"; then
+      note "ON FIREFOX'S PATH: $p — a WLCS gap this client actually binds"
+    else
+      note "not bound even with a page: $p"
+    fi
+  done
+
+  # --- the third leg, and it is what stops the negative being misread --------
+  #
+  # "Firefox did not bind it" has two causes and they lead opposite ways: the
+  # client does not need the protocol, or the client's support for it is behind
+  # a preference that is off. Reporting the first when it is the second would
+  # tell whoever implements these gaps that they are not on the goal's path,
+  # which is the most expensive kind of wrong answer a measurement can give.
+  #
+  # So the prefs are turned **on** and the page is run again. Gecko's Wayland
+  # text-input and pointer-lock switches are the ones that matter here; a pref
+  # that does not exist in this build is simply ignored by Firefox, so naming a
+  # stale one costs nothing but the line.
+  local pref="$RUNDIR/needs-pref"
+  mkdir -p "$pref/profile"
+  cat >"$pref/profile/user.js" <<'JS'
+user_pref("widget.wayland.text-input-v3.enabled", true);
+user_pref("widget.wayland-text-input-v3.enabled", true);
+user_pref("widget.wayland.pointer-constraints.enabled", true);
+user_pref("widget.wayland.fractional-scale.enabled", true);
+user_pref("full-screen-api.allow-trusted-requests-only", false);
+JS
+  FX_DECOR=client; FX_ENV=(); FX_URL="file://$dir/needs.html"
+  WC_WAYLAND_DEBUG=1 run_firefox "$pref" wc-needs-pref 30 \
+    || { bad "the compositor never bound its socket (prefs on)"; FX_URL=; return; }
+  FX_URL=
+  local withpref gained
+  withpref=$(grep -o 'wl_registry#[0-9]*\.bind([0-9]*, "[a-z_0-9]*"' "$pref/fx.txt" \
+             | sed 's/.*"\(.*\)"/\1/' | sort -u)
+  gained=$(comm -23 <(echo "$withpref") <(echo "$bound") | tr '\n' ' ')
+  if [ -n "${gained// /}" ]; then
+    bad "with the Wayland prefs on, Firefox binds more: $gained — the earlier negative was a preference, not a need"
+  else
+    ok "with the Wayland prefs on as well, Firefox binds nothing further: the negative is about the client, not a switch"
+  fi
+}
+
 # its window geometry. Asserting only "auto looks right" would pass a compositor
 # that had quietly made `server` wrong too.
 block_auto() {
@@ -953,13 +1082,14 @@ case "${1:-all}" in
   window)     block_window ;;
   titlebar)   block_titlebar ;;
   auto)       block_auto ;;
+  needs)      block_needs ;;
   tabs)       block_tabs ;;
   menu)       block_menu ;;
   wine)       block_wine shared-file ;;
   wine-arena) block_wine arena ;;
-  all)        block_enumerate; block_window; block_titlebar; block_auto; block_tabs; block_menu
+  all)        block_enumerate; block_needs; block_window; block_titlebar; block_auto; block_tabs; block_menu
               block_wine shared-file; block_wine arena ;;
-  *) echo "usage: $0 [enumerate|window|titlebar|auto|tabs|menu|wine|wine-arena|all]"; exit 2 ;;
+  *) echo "usage: $0 [enumerate|needs|window|titlebar|auto|tabs|menu|wine|wine-arena|all]"; exit 2 ;;
 esac
 
 echo
