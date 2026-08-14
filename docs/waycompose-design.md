@@ -15298,11 +15298,13 @@ Three things follow.
    spin phase.
 2. **The ladder is a real mitigation and really is not the fix.** 4.3× better and
    still 4 ms a wait, because it is a poll and the ladder's own ceiling bounds it.
-3. **The doorbell is the fix: 17.9× against the fixed slice**, and what is left —
-   about 1 ms — is the residue of the waits that the ladder is still climbing
-   before the byte arrives, plus scheduling. The doorbell itself crosses in ~9 µs
-   (§36.6.3), so there is more available here; the ladder and the doorbell are
-   currently additive rather than the doorbell simply winning.
+3. **The doorbell is the fix: 17.9× against the fixed slice**, and what is left
+   is about 1 ms. ~~That residue is the waits the ladder is still climbing before
+   the byte arrives, so the two are additive rather than the doorbell simply
+   winning.~~ **That explanation was wrong and §36.17 measured it.** Holding the
+   slice at 20 ms and adding only the doorbell gives 0.876 ms — so the ladder
+   contributes almost nothing once the bell is wired, and the residue is
+   somewhere else.
 
 **Caveats, in the order they matter.** The guest is Linux, so the Windows
 `WaitOnAddress` floor of 1 ms is not in this measurement and the deployment guest
@@ -15311,6 +15313,207 @@ still a setup-heavy workload — but that no longer matters, because the instrum
 measures the waits rather than the process. And 95 waits is `vulkaninfo`'s
 enumeration, not a frame: a present is ~11 waits and the per-wait figure is what
 transfers, not the total.
+
+### 36.16 The fourth port: the hot-add works, and a fresh port *does* open by name
+
+§36.13 stopped at "there is no read-only way to map a port name to its device
+instance", and named the non-circular route: **add a fourth port, whose ordinal
+is then known by construction.** That was done, on the running deployment guest,
+and it answers the question and two more.
+
+**The hot-add.** Three QMP commands on `/run/windows-vm/qmp.sock`, addition only
+— no removal, nothing existing modified, no restart:
+
+```
+{"execute":"qmp_capabilities"}                                  {"return": {}}
+{"execute":"chardev-add","arguments":{"id":"svbell",...}}       {"return": {}}
+{"execute":"device_add","arguments":{"driver":"virtserialport",
+   "bus":"vioserial.0","chardev":"svbell",
+   "name":"org.sirati.svbell.0","id":"svbellport"}}             {"return": {}}
+```
+
+`docs/hardware-constraints.md` said ports can be hot-added to a running guest and
+`scripts/sv-guest-host.sh` said adding one "means … restarting a VM other people
+are using". **The first is right and the second is out of date**, and this is the
+run that settles it: a Windows guest with a live desktop gained a virtio-serial
+port and noticed nothing.
+
+**The ordinal, known by construction.** `Control\DeviceClasses\{6fde7521-…}`
+listed three interfaces before and four after, and the difference is one line:
+
+```
+##?#{6FDE7547-…}#VIOSerialPort#4&34687bc8&0&04#{6fde7521-…}
+```
+
+No guess was needed, and none was made — which mattered, because `&0&02` is
+almost certainly the WiFi port and a virtio-serial port takes one opener.
+
+**And then the interesting part: the new port opens by *name*.**
+
+```
+[bell-probe] guest echoing on org.sirati.svbell.0 for 3s
+```
+
+That is `winpipe::open_virtio_port("org.sirati.svbell.0")` succeeding on the
+deployment guest — the same call that returns `ERROR_ACCESS_DENIED` for
+`org.sirati.display.0` on the same guest, in the same session, at the same
+privilege. So §36.13's conclusion needs correcting: **`vioser.sys` does publish a
+symbolic link under the `name=` string.** The problem is specific to
+`org.sirati.display.0`, not general to the driver.
+
+The most likely explanation, and it is consistent with everything measured: that
+port was added to the host's QEMU argv on 2026-08-12, *after* the running QEMU
+was started, so the guest enumerated a port the host never attached a chardev to
+— a device object with no backing, which denies. The three interfaces present
+before the hot-add are then qga, wifi, and a display port that exists in Windows
+and reaches nothing. **That is a hypothesis with a cheap test — hot-add a chardev
+for it — and it is recorded as a hypothesis.** What is *measured* is that a
+freshly and completely added port opens by name.
+
+**A bug this found, and it is the kind only running finds.** A virtio-serial port
+on Windows whose host end has nobody attached fails a *read* with
+`ERROR_NO_SYSTEM_RESOURCES` (1450) — a startling spelling of "not ready". The
+guest half necessarily opens before the host process connects, because a harness
+has to see "echoing" in the log before it is safe to measure, so the first run
+died with an error that reads like memory exhaustion. `winpipe` now maps it to
+`WouldBlock`, and both readers retry: the Linux side of the same situation reads
+EOF and has always been treated as "nothing yet", so this is the two platforms
+agreeing rather than a special case.
+
+**The port is transient**, and that is worth saying loudly: a hot-added device
+lives exactly as long as the QEMU process. It is not in `testhost`'s NixOS
+configuration and will not survive a VM restart. Making it permanent is one line
+in `virtualisation.windowsVm.virtioSerialPorts` — which does need a restart, and
+is the right trade only once the doorbell is shown to be worth it there.
+
+**Not yet measured: the round trip.** The host half never ran — the machine went
+off the network before the two halves could be brought up together. So the
+Windows guest's doorbell latency, and with it whether `WaitOnAddress`'s 1 ms
+floor swallows the win, remain open. §36.6.3's ~9 µs and §36.15's 1.06 ms per
+wait are both Linux-guest numbers and stay that way until this is run.
+
+### 36.17 The doorbell does not need the ladder, and the residue is not what I said
+
+§36.15 reported 1.06 ms per wait with ladder *and* doorbell, and explained the
+residue as "the ladder still climbing before the byte arrives — the two are
+additive rather than the doorbell simply winning". `SV_PARK_FIRST_SLICE_US`
+exists precisely so that kind of claim can be tested from one binary instead of
+argued, so it was tested.
+
+Two rounds, `sv-guest-e2e.sh`, **95 ring waits in every condition** as before:
+
+| condition | parked | **mean per wait** |
+|---|---|---|
+| fixed 20 ms slice, no doorbell | 1801.5 / 1697.5 / 1927.8 ms | 18.96 / 17.87 / **20.29 ms** |
+| **fixed 20 ms slice + doorbell** | 82.8 / 83.2 ms | **0.871 / 0.876 ms** |
+| ladder + doorbell | 74.2 / 75.3 ms | 0.781 / 0.792 ms |
+
+**The middle row is the result.** With the slice left at the value that shipped —
+no ladder at all — the doorbell alone takes 20.29 ms per wait down to 0.876 ms.
+That is **23×**, and the ladder adds a further 0.08 ms, about 10% of what is
+left.
+
+So the explanation in §36.15 was wrong in an instructive direction: it credited
+the mitigation for the fix's residue. What it should have said, and what this
+measures, is that **the doorbell does not need the ladder.** The ladder remains
+worth keeping — it costs nothing, it is what protects a session whose doorbell
+fails to attach, and §36.6.1's argument that it needs to know nothing about the
+topology still holds — but it is no longer load-bearing anywhere the doorbell
+works.
+
+**And the real residue is now a sharper question than before.** The port itself
+crosses in ~9 µs (§36.6.3) and a wait costs 0.88 ms, which is ninety times that.
+The gap is not the slice, because the slice is 20 ms in that row and moving it to
+25 µs recovers only 0.08 ms. Three candidates, none of them yet measured, and
+they are written down rather than picked between:
+
+1. **Two thread wakeups per wake.** The `Doorman` blocks in `read`, wakes, and
+   then `sys::wake`s the *waiter* — so every doorbell costs two scheduler
+   round trips where the raw ping-pong in §36.6.3 costs one.
+2. **The waits that never park.** `Bell::ring` only pokes when `parked != 0`,
+   so a wait satisfied during the spin or yield phase involves no doorbell at
+   all. Those are microseconds and pull the mean *down*, which means the waits
+   that do park are costing more than 0.88 ms, not less.
+3. **One `Doorman` for all rings.** Three rings share one reader thread and one
+   port; a wake for the queue ring waits behind one for the device ring.
+
+Distinguishing them needs a histogram rather than a mean, which is the next
+increment of the instrument and is the same lesson §36.10 taught about picking
+the measurement before arguing about the number.
+
+**Still Linux.** Every figure here is the development guest. `WaitOnAddress`'s
+1 ms floor is not in any of them.
+
+### 36.18 The histogram: the doorbell works for two waits in three, and the tail is not a missed bell
+
+§36.17 could not say where 0.88 ms per wait went, listed three candidates, and
+said distinguishing them needed a histogram rather than a mean. So the instrument
+grew one — eight power-of-ten buckets, one relaxed increment on the wait path, no
+samples kept — and it answers the question in one line.
+
+**Without the doorbell**, every wait is the slice:
+
+```
+95 ring waits, 1947.4 ms parked, mean 20.499 ms [<100ms=95]
+```
+
+All ninety-five in one bucket. That is what "the number *was* the slice, once per
+wait" looks like when you stop taking a mean of it.
+
+**With the doorbell**, the shape is completely different:
+
+```
+95 ring waits, 73.8 ms parked, mean 0.777 ms
+   [<10us=16  <100us=48  <1ms=18  <10ms=11  <100ms=2]
+```
+
+**Sixty-four of ninety-five waits — two in three — complete in under 100 µs**,
+which is the doorbell doing exactly what §36.6.3's ~9 µs said it would. The mean
+of 0.777 ms is not what a typical wait costs; it is a handful of long ones
+averaged over the rest. The two waits in the 10–100 ms bucket alone carry more
+of the total than the sixty-four fast ones put together.
+
+So candidate 1 from §36.17 — a fixed cost of two thread wakeups per wake — is
+**refuted**: a fixed cost would put every wait in the same bucket, and two in
+three are under 100 µs.
+
+#### 36.18.1 And the tail is not a missed doorbell either
+
+The obvious next suspect was the `parked` check in `Bell::ring`. It is a
+same-kernel optimisation — skip the syscall when nobody is asleep — being applied
+to a cross-kernel decision, and a stale read of a word the *peer* writes would
+skip the poke and cost that wait a full slice.
+
+That is a guess, and `SV_BELL_ALWAYS=1` was added so it could be measured:
+
+| | mean | shape |
+|---|---|---|
+| default (`parked` respected) | **0.822 ms** | `<10us=43 <100us=20 <1ms=21 <10ms=9 <100ms=2` |
+| `SV_BELL_ALWAYS=1` | **0.872 ms** | `<10us=13 <100us=51 <1ms=19 <10ms=9 <100ms=3` |
+
+**Refuted.** Poking unconditionally does not remove the tail — the 10–100 ms
+bucket still has two or three waits in it — and it is slightly *worse* overall.
+It also does precisely the harm the check exists to prevent: the sub-10 µs bucket
+collapses from 43 waits to 13, because every publish now pays a vmexit whether
+anybody is listening or not.
+
+The knob stays in the tree, for the same reason `first_slice == slice` did: it is
+what makes this a finding rather than an opinion, and the next person to suspect
+the `parked` check can re-run it in one command.
+
+**What the tail most likely is, stated as the untested thing it is:** the peer
+genuinely taking that long. A doorbell removes the *latency of noticing* that
+work is done; it cannot make the work finish sooner, and `vulkaninfo` does ask
+lavapipe to do real things. Separating "the peer was slow" from "the wake was
+late" needs a timestamp taken on the *other* side of the ring, which is a
+protocol change and a bigger piece of work than anything here.
+
+**The honest summary of where the doorbell stands.** Against the 20 ms slice it
+is 23× on the mean and the mean understates it: the modal wait went from ~20 ms
+to under 100 µs, which is more than two orders of magnitude. What is left is a
+small number of long waits that look like real work, and the ladder is not
+involved in any of it.
+
 
 ## 41. Five guest harnesses could still reach a file, and three of them only ever had one
 

@@ -146,6 +146,30 @@ impl Bell<'_> {
     /// correct; a missing one costs a slice.
     pub fn ring(&self) {
         if self.parked.load(Ordering::Acquire) == 0 {
+            // **A hypothesis that was tested here and refuted. §36.18.**
+            //
+            // `parked` is a shared-memory word the *peer* writes, and the worry
+            // was that reading it stale across a hypervisor would skip the poke
+            // in the window between the peer's store and its wait — leaving that
+            // wait to pay a full slice, and explaining the tail of 2 waits in 95
+            // that landed in the 10-100 ms bucket and carried more than half of
+            // all remaining park time.
+            //
+            // `SV_BELL_ALWAYS=1` pokes regardless, so the guess could be
+            // measured instead of argued. **It does not help**: 0.872 ms per
+            // wait against 0.822 ms without it, and the tail is still there. It
+            // also does exactly the harm predicted — the sub-10 µs bucket falls
+            // from 43 waits to 13 as every publish starts paying a vmexit.
+            //
+            // So the check stays, and the tail is *not* a missed doorbell. The
+            // knob stays too, because it is what makes that a finding rather
+            // than an opinion, and the next person to suspect this can re-run it
+            // in one command.
+            if bell_always()
+                && let Some(cw) = cross_wake()
+            {
+                cw.poke(self.token);
+            }
             return;
         }
         self.wake.fetch_add(1, Ordering::Release);
@@ -725,6 +749,43 @@ mod sys {
 static PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PARKED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Waits bucketed by duration, in powers of ten from a microsecond.
+///
+/// # Why a mean was not enough
+///
+/// §36.17 got 0.88 ms per wait with the doorbell wired, against a ~9 µs port
+/// round trip, and could not say where the other 870 µs went. Three candidates
+/// were written down and none could be chosen, because **a mean cannot tell a
+/// population apart from an outlier**: "every wait costs 0.9 ms" and "nine waits
+/// in ten cost 2 µs and the tenth costs 9 ms" have the same mean and completely
+/// different causes — the first is a fixed cost on the wake path, the second is
+/// a few waits missing the doorbell entirely.
+///
+/// Buckets rather than percentiles because this has to be free on the wait path:
+/// one relaxed increment into a fixed array, no allocation, no sorting, and no
+/// samples kept. Powers of ten because the interesting range spans microseconds
+/// to tens of milliseconds and the question is which decade a wait lands in, not
+/// its third digit.
+const BUCKETS: usize = 8;
+static HIST: [std::sync::atomic::AtomicU64; BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; BUCKETS];
+
+/// `0: <1µs, 1: <10µs, 2: <100µs, 3: <1ms, 4: <10ms, 5: <100ms, 6: <1s, 7: >=1s`
+fn bucket_of(ns: u64) -> usize {
+    let mut b = 0usize;
+    let mut edge = 1_000u64; // 1 µs
+    while b < BUCKETS - 1 && ns >= edge {
+        edge = edge.saturating_mul(10);
+        b += 1;
+    }
+    b
+}
+
+/// The wait-duration histogram, oldest bucket first. See [`HIST`].
+pub fn park_histogram() -> [u64; BUCKETS] {
+    std::array::from_fn(|i| HIST[i].load(Ordering::Relaxed))
+}
+
 /// Accounts for one wait on drop, so every `return` path in `wait_until` —
 /// woken, timed out, fatal, peer gone — is counted without each having to
 /// remember. A wait that ends in an error is still a wait that cost time, and
@@ -733,8 +794,10 @@ struct ParkAccount(Instant);
 
 impl Drop for ParkAccount {
     fn drop(&mut self) {
+        let ns = self.0.elapsed().as_nanos() as u64;
         PARKS.fetch_add(1, Ordering::Relaxed);
-        PARKED_NS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PARKED_NS.fetch_add(ns, Ordering::Relaxed);
+        HIST[bucket_of(ns)].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -756,10 +819,21 @@ pub fn park_summary() -> Option<String> {
     if n == 0 {
         return None;
     }
+    // The shape is on the same line as the mean, because a mean without one is
+    // exactly what §36.17 could not decompose — and two lines invite quoting
+    // only the first.
+    const EDGE: [&str; BUCKETS] =
+        ["<1us", "<10us", "<100us", "<1ms", "<10ms", "<100ms", "<1s", ">=1s"];
+    let h = park_histogram();
+    let shape: Vec<String> = (0..BUCKETS)
+        .filter(|i| h[*i] != 0)
+        .map(|i| format!("{}={}", EDGE[i], h[i]))
+        .collect();
     Some(format!(
-        "{n} ring waits, {:.1} ms parked, mean {:.3} ms",
+        "{n} ring waits, {:.1} ms parked, mean {:.3} ms [{}]",
         total.as_secs_f64() * 1e3,
-        total.as_secs_f64() * 1e3 / n as f64
+        total.as_secs_f64() * 1e3 / n as f64,
+        shape.join(" ")
     ))
 }
 
@@ -1280,4 +1354,13 @@ mod measure {
              which is not the improvement this change exists for"
         );
     }
+}
+
+/// Whether to poke the cross-VM doorbell even when `parked` reads zero.
+///
+/// Read once and cached: this sits on the publish path and an environment
+/// lookup per packet would be a worse cost than the byte it is deciding about.
+fn bell_always() -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALWAYS.get_or_init(|| std::env::var("SV_BELL_ALWAYS").is_ok_and(|v| v != "0"))
 }

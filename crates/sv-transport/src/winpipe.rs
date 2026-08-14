@@ -160,7 +160,17 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
     // that says something about the port rather than about the alias.
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
-    let paths = [format!("\\\\.\\Global\\{name}"), format!("\\\\.\\{name}")];
+    // A `name` that is already a device path is used verbatim, so a caller that
+    // has identified a port some other way can hand it over. §36.13 measured a
+    // guest where neither spelling below opened an *existing* port, and the only
+    // non-guessing way to identify one is to diff `Control\DeviceClasses`
+    // before and after a QMP `device_add` — which yields a device path, not a
+    // name.
+    let paths: Vec<String> = if name.starts_with("\\\\") {
+        vec![name.to_string()]
+    } else {
+        vec![format!("\\\\.\\Global\\{name}"), format!("\\\\.\\{name}")]
+    };
     let mut last = 0i32;
     loop {
         for path in &paths {
@@ -303,6 +313,22 @@ impl std::io::Read for &Pipe {
             const ERROR_PIPE_NOT_CONNECTED: u32 = 233;
             if e == ERROR_BROKEN_PIPE || e == ERROR_PIPE_NOT_CONNECTED {
                 return Ok(0);
+            }
+            // **A virtio-serial port whose host end has nobody attached fails a
+            // read with `ERROR_NO_SYSTEM_RESOURCES`**, which is a startling
+            // spelling of "not ready". Measured on the deployment guest, not
+            // guessed: the guest half necessarily opens before the host process
+            // connects — a harness has to see "echoing" in the log before it is
+            // safe to measure — and the first run died here instead of waiting.
+            //
+            // It is *not* an end. The Linux side of the same situation reads
+            // EOF, which is already treated as "nothing yet"; reporting this as
+            // an error would make every guest-first bring-up a failure. So it
+            // becomes `WouldBlock` and the caller retries, which is what the
+            // condition actually is.
+            const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
+            if e == ERROR_NO_SYSTEM_RESOURCES {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             return Err(std::io::Error::from_raw_os_error(e as i32));
         }

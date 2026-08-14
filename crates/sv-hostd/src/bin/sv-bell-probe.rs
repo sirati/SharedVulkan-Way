@@ -145,6 +145,11 @@ fn guest(port: &str) {
                 }
                 echoed += n as u64;
             }
+            // See `vdoorbell::serve_port`: not-yet-attached, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 println!("[bell-probe] guest read failed: {e}");
