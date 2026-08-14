@@ -109,6 +109,7 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 
 # STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
 . "$(dirname "$0")/wc-binaries.sh"
+. "$(dirname "$0")/wc-topology.sh"
 
 int_bg() {
   g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
@@ -501,6 +502,11 @@ do_spawn() {
   echo "== $tag: $exe, where a window lands when nobody has placed it =="
   [ -n "$HOST" ] || { miss "WC_HOST unset"; return; }
   [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || { miss "no client"; return; }
+  # §51. A hypervisor is in this path, declared so that a claim about how long
+  # anything took across it is available here -- and refused in the Wine
+  # harnesses, which is what §27.6 needed and did not have.
+  wc_topology_declare cross-vm \
+    "the compositor is on the guest and the client on the VM host" || return
 
   local CLIENT_CMD="$HOST_WESTON/$CLIENT"
   if [ -n "$HOST_FIREFOX" ]; then

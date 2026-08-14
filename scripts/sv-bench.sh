@@ -41,6 +41,16 @@ set -uo pipefail
 
 fail=0
 
+# §51. Same-box, declared so the distinction above is machine-checkable rather
+# than only argued. The glxgears bound IS a throughput claim, and it is a sound
+# one, because what it concludes is **which device answered** -- an order of
+# magnitude between a GPU and llvmpipe -- and not how long anything took to
+# cross a boundary. There is no boundary here, and `wc_latency_claim` would
+# refuse one if this file asked.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "Xvfb, glxgears and the ICD all run on this machine; the control is the same machine with no forwarding" >/dev/null || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The other harnesses hard-code `target/debug` and this one follows them by
 # default, so the numbers it prints are the numbers those harnesses produce.

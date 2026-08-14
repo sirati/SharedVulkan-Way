@@ -4,7 +4,12 @@
 #
 #   scripts/sv-cts.sh [options] [icd-manifest-basename]   default: radeon_icd.x86_64.json
 #
-#     --fraction N     run 1 test in every N of the suite (default 2000)
+#     --fraction N     run 1 test in every N of the suite (default 2000). N=1 is
+#                      the whole suite: the sampler is `(NR-1) % n == 0`, and it
+#                      was `NR % n == 1`, which is never true at N=1 -- so the
+#                      documented "all of them" silently selected *nothing* and
+#                      the run died with "the selection is empty" (design.md
+#                      §0.23.6). No recorded result used it.
 #     --jobs J         concurrent deqp-vk processes, each its own session (default 8)
 #     --include RE     restrict to tests whose name matches this ERE, repeatable
 #     --arena BYTES    per-session arena (default 256 MiB)
@@ -205,9 +210,9 @@ echo "  caselist     $TOTAL tests"
 # the whole point of having a control.
 SAMPLE="$RUNDIR/sample.txt"
 if [ -n "$INCLUDE" ]; then
-  grep -E "$INCLUDE" "$CASELIST" | awk -v n="$FRACTION" 'NR % n == 1' > "$SAMPLE"
+  grep -E "$INCLUDE" "$CASELIST" | awk -v n="$FRACTION" '(NR - 1) % n == 0' > "$SAMPLE"
 else
-  awk -v n="$FRACTION" 'NR % n == 1' "$CASELIST" > "$SAMPLE"
+  awk -v n="$FRACTION" '(NR - 1) % n == 0' "$CASELIST" > "$SAMPLE"
 fi
 NSAMPLE=$(wc -l < "$SAMPLE")
 echo "  selected     $NSAMPLE tests"

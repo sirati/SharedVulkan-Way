@@ -137,6 +137,14 @@ loadnow() { awk '{printf "%.1f", $1}' /proc/loadavg 2>/dev/null || echo "?"; }
 # `wc-compositor` now require, and it refuses to hand that out to any harness
 # that has a guest.
 . "$(dirname "$0")/wc-substrate.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "weston's clients, the proxy and wc-compositor.exe all run on this box" || exit 1
 # STAGE 42. `fresh` / `fresh_or_skip` / `deployed_is`, shared rather than copied.
 . "$(dirname "$0")/wc-binaries.sh"
 wc_substrate_declare wine-fixture \

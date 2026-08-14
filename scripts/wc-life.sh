@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# docs/waycompose-design.md §52: does a window stop existing?
+# docs/waycompose-design.md §53: does a window stop existing?
 #
 #   scripts/wc-life.sh wine     the churn, with the external witness
 #   scripts/wc-life.sh up       the same, keeping the run directory
@@ -228,7 +228,7 @@ client_hwnd() {
 all_windows() { life count --pid "$COMP_PID" | grep -oE 'all=[0-9]+' | cut -d= -f2; }
 
 run_wine() {
-  echo "== docs/waycompose-design.md §52: does a window stop existing? =="
+  echo "== docs/waycompose-design.md §53: does a window stop existing? =="
 
   command -v Xvfb >/dev/null || { bad "Xvfb not on PATH"; return; }
   command -v wine >/dev/null || { bad "wine not on PATH"; return; }

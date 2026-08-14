@@ -84,6 +84,14 @@ note(){ echo "  ....  $*"; }
 # STAGE 42. `fresh` / `fresh_or_skip`: is the binary newer than the tree.
 . "$(dirname "$0")/wc-binaries.sh"
 
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "wc-compositor.exe under Wine on this box; no guest is involved" || exit 1
+
 RUNDIR=$(mktemp -d /tmp/wc-window-XXXXXX)
 chmod 700 "$RUNDIR"
 KEEP="${WC_KEEP:-}"

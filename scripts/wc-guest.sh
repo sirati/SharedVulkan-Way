@@ -981,6 +981,15 @@ do_poolcost() {
     return
   fi
 
+  # §51. **This block's claims are about time across the boundary**, which is
+  # what makes the declaration load-bearing here rather than bookkeeping: the
+  # export is virtio-fs, so "the same open costs 1046 us over the export and
+  # 24 on NTFS" is precisely a cross-VM latency claim. It is legitimate because
+  # there is a hypervisor in this path -- and the identical sentence written in
+  # a Wine harness would be §27.6 again.
+  wc_topology_declare cross-vm \
+    "the pools are opened by the compositor on the guest, across the export from $HOST" || return
+
   local n=32 size=1048576 arena=$((64 * 1024 * 1024))
   # The pool files are created **by the peer**, on the far side of the mount,
   # because that is who creates them in the real path and a file this process

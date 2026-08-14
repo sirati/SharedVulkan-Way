@@ -59,6 +59,14 @@ note(){ echo "  ....  $*"; }
 # `WC_GUEST_CONFIGURED` is deliberately *not* set here: setting it would be
 # claiming a guest this harness has never had.
 . "$(dirname "$0")/wc-substrate.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "every block runs on this box: the Linux compositor directly, and wc-compositor.exe under Wine" || exit 1
 # STAGE 42. `fresh`: is the binary newer than the tree.
 . "$(dirname "$0")/wc-binaries.sh"
 

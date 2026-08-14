@@ -128,6 +128,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`,
 # which it uses; this harness deploys across *both* boundaries, so it uses both.
 . "$(dirname "$0")/wc-binaries.sh"
+. "$(dirname "$0")/wc-topology.sh"
 
 # Run something on the interactive desktop, and wait for it.
 int() {
@@ -295,6 +296,11 @@ do_run() {
   echo "== $leg: Firefox on the guest's desktop, over the guest's own RAM =="
   [ -n "$HOST" ]         || { miss "WC_HOST unset: the proxy has to run where QEMU is"; return; }
   [ -n "$HOST_FIREFOX" ] || { miss "WC_HOST_FIREFOX unset: no Firefox path on $HOST"; return; }
+  # §51. A hypervisor is in this path, declared so that a claim about how long
+  # anything took across it is available here -- and refused in the Wine
+  # harnesses, which is what §27.6 needed and did not have.
+  wc_topology_declare cross-vm \
+    "the compositor is on the guest and Firefox is on the VM host, over the guest's own RAM" || return
   have magick            || { miss "no imagemagick here: nothing could be converted"; return; }
 
   local sock="wtb-$leg-$$"
@@ -708,6 +714,10 @@ do_clean() {
 # desktop, locate the arena, photograph. This shares none of it.
 do_local() {
   echo "== auto: two clients, one run, one flag  (headless, no guest) =="
+  # §51. This leg has no guest in it, and says so. `wc-titlebar.sh`'s other legs
+  # declare cross-vm; the declaration is per-leg because the topology is.
+  wc_topology_declare same-box \
+    "headless: the Linux wc-compositor and two weston clients, all on this box" || return
   fresh "$LINUX_BIN/wc-compositor" "cargo build --workspace" || return
   local c
   for c in weston-terminal weston-flower; do

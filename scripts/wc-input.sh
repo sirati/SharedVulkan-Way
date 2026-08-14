@@ -68,6 +68,14 @@ note(){ echo "  ....  $*"; }
 # `wc-compositor` now require, and it refuses to hand that out to any harness
 # that has a guest.
 . "$(dirname "$0")/wc-substrate.sh"
+
+# §51. Whether a hypervisor is in the path, declared rather than left unknown.
+# This harness is same-box, so `wc_latency_claim` will refuse any assertion here
+# whose truth depends on cross-VM timing -- which is the point: §27.6 drew one
+# from a harness exactly like this one.
+. "$(dirname "$0")/wc-topology.sh"
+wc_topology_declare same-box \
+  "the injector and the compositor are both processes on this box" || exit 1
 wc_substrate_declare wine-fixture \
   "no QEMU on this box: a Wine run has no guest RAM to locate" || exit 2
 
