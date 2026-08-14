@@ -22560,7 +22560,7 @@ at the end of a long session on a hypothesis.
 | Gate | Result |
 |---|---|
 | `cargo build --workspace`, both targets | clean |
-| `cargo test --workspace --no-fail-fast` | **2596 tests**, 0 failures — one test was rewritten rather than deleted, §70.2 |
+| `cargo test --workspace --no-fail-fast` | **2629 tests**, 0 failures — one test was rewritten rather than deleted, §70.2 |
 | **`scripts/wc-vm-damage.sh linux`** | **9 passed, 1 failed** — the failure is §70.4 |
 | ... the guest boots and QMP answers | pass |
 | ... `wc-compositor` listens **inside the guest** | pass |
