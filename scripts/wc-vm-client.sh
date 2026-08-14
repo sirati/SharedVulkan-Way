@@ -532,6 +532,30 @@ $(grep -c "interface: '" "$cl") interfaces"
   # a drawing client would. `scripts/wc-pooltest.c` is the client that reaches
   # it; `WC_VM_POOLTEST=1` runs it instead, and the assertion is inverted --
   # the desync is expected until the dialect is chosen rather than assumed.
+  # **Did the keyboard answer**, which is the assertion §80 built and this
+  # harness did not have.
+  #
+  # `wayland-info` binds `wl_seat` *and creates a `wl_keyboard`*, which is what
+  # makes a compositor send `wl_keyboard.keymap` -- the only core event carrying
+  # an `h` in the server-to-client direction. `repeat_info` is sent immediately
+  # after the keymap, so its absence is the symptom of a keymap that did not
+  # cross, in a run whose exit code says everything was fine.
+  #
+  # **This harness previously concluded the opposite from `0 fds in, 0 out`** --
+  # that `wayland-info` never binds a keyboard, so nothing could be said about
+  # the path. That was wrong: an in-band `h` is not an fd, so the counter reads
+  # zero whether or not the keymap crossed, and it cannot distinguish them. The
+  # counter was a real number about the wrong question, which is
+  # docs/waycompose-design.md §63.3 again and in my own log this time.
+  local repeat
+  repeat=$(grep -c 'keyboard repeat rate' "$cl" 2>/dev/null)
+  if [ "${repeat:-0}" -gt 0 ]; then
+    ok "the keyboard answered: $repeat repeat_info line(s), so the keymap crossed"
+  else
+    bad "no repeat_info: the keyboard never answered, so wl_keyboard.keymap did not \
+cross (docs/waycompose-design.md §80's assertion; exit code would have said fine)"
+  fi
+
   # **Corrected.** This used to say the registry walk left the in-band path
   # "advertised and not exercised". It does not: `wayland-info` sends no `h`,
   # but the seat sends `wl_keyboard.keymap` unprompted, which carries one in the
