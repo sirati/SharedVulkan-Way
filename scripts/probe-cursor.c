@@ -60,7 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* WHICH WIN32 IS THIS -- docs/waycompose-design.md §64.
+/* WHICH WIN32 IS THIS -- docs/waycompose-design.md §66.
  *
  * The same probe `crates/wc-compositor/src/wine.rs` makes, made here because
  * this is a separate process and the compositor's answer does not cross to it:
@@ -94,7 +94,7 @@ static int under_wine(void)
 	return cached;
 }
 
-/* THE ONE THING THIS PROBE CANNOT DO UNDER WINE (docs/waycompose-design.md §64.4)
+/* THE ONE THING THIS PROBE CANNOT DO UNDER WINE (docs/waycompose-design.md §66.4)
  *
  * `stock_name` below rests on a documented Windows property, and the header of
  * this file states it as the reason the reading is proof rather than
@@ -119,7 +119,7 @@ static void announce_stock_identity(void)
 	if (under_wine())
 		printf("probe-cursor: stock-identity=unavailable "
 		       "(Wine's stock HCURSORs are per-process, so a handle from "
-		       "another process cannot be named; docs/waycompose-design.md §64.4)\n");
+		       "another process cannot be named; docs/waycompose-design.md §66.4)\n");
 	else
 		printf("probe-cursor: stock-identity=available\n");
 	fflush(stdout);
@@ -309,13 +309,13 @@ static void ask_window(const char *tag, HWND w, int hittest)
 /* Report the cursor at the current pointer position, prefixed with `tag` so a
  * shell script can grep for one probe point among several.
  *
- * A NOTE ON WHAT USED TO BE HERE (docs/waycompose-design.md §64.5)
+ * A NOTE ON WHAT USED TO BE HERE (docs/waycompose-design.md §66.5)
  *
  * §23.7 item 1 recorded `GetCursorInfo` as *fatal* under Wine -- a run of this
  * probe dying at exactly this call with
  * `X Error of failed request: BadWindow (invalid Window parameter), Major
  * opcode 38 (X_QueryPointer)` -- and it reproduced on this branch, three times
- * out of three, before anything was changed. §64 was about to give it a Wine
+ * out of three, before anything was changed. §66 was about to give it a Wine
  * path. It does not have one, because the cause is not Wine:
  * `scripts/wc-cursor.sh` was tearing the compositor down while this probe was
  * still running, so the window whose pointer was being queried had just been

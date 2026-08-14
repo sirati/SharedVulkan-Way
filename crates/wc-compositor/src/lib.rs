@@ -61,7 +61,7 @@ mod surface;
 /// docs/waycompose-design.md §32.
 mod taskbar;
 mod tick;
-/// docs/waycompose-design.md §64: whether the Win32 underneath is Windows' or Wine's, decided once.
+/// docs/waycompose-design.md §66: whether the Win32 underneath is Windows' or Wine's, decided once.
 /// `pub` because `sv-guest` is this compositor too, and because the few places
 /// allowed to branch on it are named in that module's header rather than found
 /// by grepping.
@@ -796,7 +796,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // §64, and first because everything below it is evidence *about a
+    // §66, and first because everything below it is evidence *about a
     // platform*: a log whose first line does not say which one is a log that
     // cannot be attributed. It is after `--log` for the same reason — a
     // harness that has to race the process for this line would sometimes lose.

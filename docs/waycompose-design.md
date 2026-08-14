@@ -21328,9 +21328,227 @@ Not closed:
    "implemented fully rather than partially" actually names.
 3. **`GetGuiResources` is still a skip under Wine**, which is one of the two
    runs queued behind this one.
+## 64. The third resource, and a number that is allowed to be one
+
+*(§53 and §60's continuation, and the end of the list.)*
+
+### 64.1 Status in one paragraph
+
+`ToUi::Destroy` gives back three things and the project has now looked at all
+three. §53 gave the **window handle** an outside witness — a separate process
+asking the window manager, which nothing the compositor does can talk out of it.
+§60 gave the **OLE drop-target registration** an inside count, because that
+resource has no outside witness and cannot be given one. This is the third:
+`release_icons`, which ran, destroyed what it found, and **said nothing at all**,
+so a window icon that was never released was invisible in exactly the way §60's
+stranded registration was. It is counted now and reported at exit beside the
+other two. The assertion lives in `scripts/wc-drag.sh` rather than in
+`wc-life.sh`, which is a finding rather than a filing decision — see 61.3 — and
+the number it asserts is **allowed to be one**, which is 61.4.
+
+### 64.2 One creation site, two destruction sites
+
+There is exactly one `CreateIconIndirect` in the compositor. Window icons and
+mouse cursors are the same kind of GDI object and are built by the same
+function, and they are freed by **different** calls: `DestroyIcon` from
+`release_icons` when a window goes, `DestroyCursor` from `set_cursor` when the
+pointer changes shape. So the account is one creation counter and two
+destruction counters — which is also the shape of the defect it would catch: a
+path that creates through the shared function and frees through neither.
+
+```text
+wc-compositor: icon objects at exit: claims 10 created, 0 icon(s) and 9 cursor(s) destroyed, 1 outstanding (the shown cursor is one)
+```
+
+Three lines now ride out together, one per resource, and only the first has an
+external witness:
+
+```text
+windows at exit:      6 created, 6 destroyed, 0 still held, 0 still alive, 0 client(s) still connected
+drop targets at exit: claims 6 registered, 6 revoked, 0 revoke(s) failed
+icon objects at exit: claims 10 created, 0 icon(s) and 9 cursor(s) destroyed, 1 outstanding
+```
+
+### 64.3 The harness that could assert it was not the one that was looking
+
+`wc-life.sh` is §53's harness, it churns windows, and it is the obvious home for
+a per-window resource count. **It cannot assert this one**, and finding that out
+is worth more than the assertion:
+
+* it drives **no pointer input**, so no cursor is ever built — `grep -c 'cursor ->'`
+  on its log is `0`;
+* its churn client is `weston-clickdot`, which publishes **no icon** — the
+  compositor's log says `has no published icon (the store holds 0)` — and the
+  proxy is run with `--no-icons` besides.
+
+So in `wc-life.sh` the count is zero created and zero destroyed, and an
+assertion that `created == destroyed` there would be `0 == 0`: the vacuous gate
+this whole run of sections exists to avoid, arrived at for the third time by a
+different route.
+
+`wc-drag.sh` is the only harness in the tree that moves a pointer. It builds
+**ten** icon objects in a run. That is where the assertion goes, and the
+general lesson is one this project keeps paying for: *the harness that owns the
+subject is not always the harness that can exercise it*. The window count and
+the icon count are both per-window resources and they need opposite harnesses.
+
+The window-icon half is still unasserted anywhere, for the reason §53.6 item 2
+gave: the harness that publishes an icon is `wc-icon.sh`, and it is a **guest**
+harness. That leg is queued behind the machine being in use, and it is now one
+`grep` away from being an assertion rather than a rewrite.
+
+### 64.4 A number that is allowed to be one, and why that is the gate
+
+The obvious assertion is `created == destroyed`. **It is wrong**, and asserting
+it would have been worse than not asserting anything, because it fails on every
+run that moves the mouse and would then be "fixed" by deleting it.
+
+`set_cursor` frees the previous cursor **only after the new one is installed**:
+
+> Destroying a cursor that is on screen is legal but leaves the pointer drawn
+> from freed memory until the next `SetCursor`, which is the classic way to get
+> a corrupted pointer that survives the process.
+
+So exactly one object is outstanding at any moment, by design. The invariant is
+therefore *outstanding ≤ 1*, and it is a real gate rather than a tautology
+because the harness first asserts the counter **moved**: ten objects built, so
+"one outstanding" distinguishes a compositor that frees each cursor as it goes
+from one that keeps all ten. A leak here grows with mouse movement,
+which is the most common thing a user does.
+
+### 64.5 What is not proven
+
+1. **The window-icon half is counted but not asserted.** Nothing local
+   publishes an icon; see 61.3. `wc-icon.sh` on the guest is the run that turns
+   `0 icon(s) destroyed` into a number that has to match.
+2. **These are the compositor's own counts**, like §60's and unlike §53's. The
+   external witness for GDI objects is `GetGuiResources`, which Wine stubs
+   (§53.3) — so on this platform the inside count is all there is, and on the
+   guest it would finally have something to be checked against.
+3. **No run has made the compositor leak one.** The counters distinguish the
+   states; nothing in the tree currently provokes the bad one.
+4. **`DeleteObject` on the two bitmaps is not counted.** `make_icon` deletes the
+   colour and mask bitmaps immediately after `CreateIconIndirect` copies them,
+   and that pair is on the same path but is not part of this account.
+
+### 64.6 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-drag.sh wine`** | **22 passed, 0 failed** (18 in §50.10; 2 new here) |
+| `scripts/wc-life.sh wine` | 14 passed, 0 failed, 1 skipped (unchanged) |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `cargo test --workspace --no-fail-fast` | unchanged — no Linux code |
+| `scripts/wc-xref.sh` | 0 broken, 0 unqualified |
+
+`wc-drag.sh`'s compositor idle timeout came down to 60 s and its clients are now
+stopped before the wait, for §60.6's reason met from the other side: the account
+is printed **on the way out**, the idle timer does not run while a client is
+connected, and a harness that never lets the compositor exit never sees the line
+it is asserting on.
+
+
+---
 ---
 
-## 64. Wine becomes first class, and four of the six known quirks were not Wine
+## 65. The debt number was wrong, and the expected-failure table could not say why
+
+### 65.1 Status in one paragraph
+
+§59 said task #31's real content is *"the 35 unexplained WLCS failures"*. It is
+**23**, and the difference is two separate corrections: eight the tree fixed
+while this was waiting for a guest, and four that were never debts — WLCS drives
+`xdg_toplevel.move`/`.resize` and asserts the window moved, and the headless
+platform has no window manager to move it with. Reclassifying those four needed
+the expected-failure table to learn which **leg** it is describing, because the
+same four are entitled to pass under Wine, where §22.7 wires them to `SC_MOVE`
+and `SC_SIZE`. A table that excused them on both legs would have been a false
+green on the only leg that can observe them.
+
+```
+headless: 413 passed, 53 failed, 759 skipped
+EXPECTED    26  input outside the window geometry rectangle …(§45.4)
+EXPECTED     4  interactive move and resize: the headless platform has no window
+                manager … the Wine leg is where these must pass
+headless: 30 of the failures are expected on this platform, and the rest are debts
+```
+
+### 65.2 Why the table needed a leg, and why that is not a loosening
+
+`justified_failure_patterns` emitted one list for every caller. Adding the four
+interactive-move tests to it would have excused them on the Wine leg too, and
+the Wine leg is precisely where they are *not* excused: on Win32 the request
+reaches a real window manager, so a failure there is a real failure. The
+function now takes the leg and the new block is guarded by
+`[ "$leg" = headless ] || return 0`.
+
+That is a **tightening**, and the distinction is worth keeping straight because
+"add a leg parameter to the excuse table" reads like the opposite. Before: one
+list, applied everywhere, so any entry that was leg-specific was either omitted
+(and its tests counted as debts forever) or added (and its tests excused on a
+leg that could have caught them). After: an entry can say which leg it is about,
+and the Wine leg's list is *shorter* than the headless one by exactly these
+four.
+
+The existing self-check does the rest, and it is why this could be added at all
+without taking anything on trust: a listed test that **passes** is an error, and
+a listed pattern that matches **nothing** is an error. Both fired during this
+work — the second on every filtered run, which is a real wrinkle worth knowing:
+
+> `wc-wlcs.sh headless 'XdgToplevelStableTest.*'` reports 26 stale entries,
+> because the filter means the other 26 patterns match no test **in that run**.
+> The guard is right and the report is noise. Validating a change to this table
+> needs an unfiltered run; a filtered one can confirm the new entry matched and
+> nothing more.
+
+### 65.3 What the 23 are, and they are all on Firefox's path
+
+Deduplicated and grouped, with the parametrised instantiations folded together:
+
+| group | ~n | what it is |
+|---|---|---|
+| `SubsurfaceTest`, `SubsurfaceMultilevelTest` | 7 | sync/desync commit semantics and `place_above`/`place_below` — when a subsurface moves relative to its parent's and grandparent's commits |
+| `XdgPopupTest` (both instantiations) | 6 | reactive popups following a moved parent, grab semantics, keyboard focus for a grabbed popup, `popup_done` ordering |
+| `XdgToplevelStableConfigurationTest` | 4 | `defaults`, `activated_state_follows_pointer`, fullscreen and unfullscreen initiated by the client |
+| `XdgSurfaceStableTest` | 1 | attaching a buffer to an unconfigured `xdg_surface` must be a protocol error |
+| `XdgDecorationV1Test` | 1 | destroying a toplevel before its decoration must throw `orphaned` |
+| `CopyCutPaste` | 1 | a focused sink must see the offer a source makes |
+| `ClientSurfaceEventsTest` | 1 | `surface_resizes_under_pointer` |
+| `BadBufferTest` | 1 | a truncated shm file must be a protocol error |
+
+**Every group is inside an interface Firefox binds**, and the two largest are
+the two §59 predicted would matter:
+
+* **Subsurfaces.** `wc-firefox.sh enumerate` measures Firefox creating a
+  `wl_subsurface` for its content, and it binds `wl_subcompositor`. Seven
+  failures about *when* a subsurface moves are seven failures on the path the
+  browser's content takes.
+* **Popups.** §15 established that every Firefox menu, dropdown, autocomplete
+  and tooltip is an `xdg_popup`. Six failures about grabs, focus and
+  `popup_done` ordering are six failures in the machinery §15 built.
+
+So §59's conclusion survives its own arithmetic being wrong: the Firefox-relevant
+debt is entirely in protocols already written, none of it is in the 79 gap
+protocols, and the work has a shape — subsurface commit semantics first, popup
+grab semantics second, five singletons after.
+
+### 65.4 What this section did not do
+
+1. **None of the 23 is fixed.** This is a corrected number and a grouped work
+   list; the largest group is subsurface commit ordering and it is real work.
+2. **The four reclassified tests are unproven on the leg that matters.** The
+   claim is that they pass under Wine because §22.7 wires the requests to
+   `SC_MOVE`/`SC_SIZE`. Nothing here ran the Wine leg — it is a claim about
+   where they *should* be measured, and the table now makes that claim
+   explicitly instead of silently counting them as debts. Running
+   `wc-wlcs.sh wine 'XdgToplevelStableTest.*'` would settle it and is one
+   command on this workstation.
+3. **Eight of the twelve-test improvement is not mine.** 409/57 became 413/53
+   across a master merge; only the four reclassifications are this section's,
+   and the other eight were fixed by whoever moved the tree in between.
+---
+
+## 66. Wine becomes first class, and four of the six known quirks were not Wine
 
 The Wayland server runs on Windows. It also has to run under Wine, because a
 Wine box is the venue that is *always* available and a Windows guest is the one
@@ -21362,7 +21580,7 @@ two branches that do exist were both found while checking something else, which
 is the honest way round: the quirks somebody remembers are not the ones still
 biting.
 
-### 64.1 What was built
+### 66.1 What was built
 
 `crates/wc-compositor/src/wine.rs`. A `OnceLock<Win32>` with three values —
 `Windows`, `Wine { version, host }`, and `None` for the Linux build — decided
@@ -21371,7 +21589,7 @@ once and never re-asked.
 The probe is the one Wine documents: `GetModuleHandleW("ntdll.dll")` and then
 `GetProcAddress` for `wine_get_version`, whose presence is the whole answer.
 `wine_get_host_version` gives the kernel underneath, and both are kept rather
-than reduced to a boolean, because every claim in §64.4 is a claim about a
+than reduced to a boolean, because every claim in §66.4 is a claim about a
 *particular* Wine and the first question asked of a quirk that stops
 reproducing is which one it was measured on. Measured here:
 
@@ -21399,7 +21617,7 @@ It is printed from `run_from` immediately after `--log` has been redirected and
 **before `platform::start`**. That ordering is load-bearing rather than tidy:
 what platform a run is on must not depend on the platform having come up, or
 the one run that most needs attributing — the one that failed to start — is
-exactly the one that cannot be. It is also why the guest leg in §64.6 works at
+exactly the one that cannot be. It is also why the guest leg in §66.6 works at
 all on a VM with no X.
 
 `None` is a variant rather than an absence for the same reason. A harness that
@@ -21407,14 +21625,14 @@ meant to run the `.exe` and got the Linux build has measured nothing about
 Windows, and §35 is a whole section about gates that reported success while
 something was wrong.
 
-### 64.2 The override, and why a stale assumption has to be falsifiable
+### 66.2 The override, and why a stale assumption has to be falsifiable
 
 `WC_WIN32=windows|wine` replaces the probe's answer, in the compositor and in
 `scripts/probe-cursor.c` alike. Two uses, both of which were needed within
 hours of it existing:
 
 * **Force the Windows path under Wine**, to check that a branch is still
-  earning its place. Every entry in §64.4 is a claim about wine-11.14; this is
+  earning its place. Every entry in §66.4 is a claim about wine-11.14; this is
   how the next person tests whether it has been fixed upstream without booting
   anything.
 * **Force the Wine path on Windows**, so a workaround is not code that has only
@@ -21424,11 +21642,11 @@ An unrecognised value is a **startup failure**, not a warning — the same
 treatment `--decorations` gets. A typo that quietly falls back to the probe is a
 run that was told to exercise one path, measured the other, and passed.
 
-`WC_WIN32=windows` is what settled §64.5, and it settled it in one run. That is
+`WC_WIN32=windows` is what settled §66.5, and it settled it in one run. That is
 the argument for the flag in a sentence: the tool built to falsify a Wine claim
 falsified three of them the first afternoon it existed.
 
-### 64.3 Harnesses can no longer be wrong about which platform they measured
+### 66.3 Harnesses can no longer be wrong about which platform they measured
 
 `scripts/wc-cursor.sh` gained `win32_of()`, which reads the line out of a
 compositor log, and both legs now **assert** on it: the `wine` leg fails if the
@@ -21438,10 +21656,10 @@ This is cheap and it is the half of "first class" that pays for itself. §33
 records a photograph of "this compositor ignoring input" that was another
 worktree's `weston-terminal`, written into `docs/` as evidence before anybody
 noticed. A leg that cannot say what it ran on can be wrong in that direction
-silently, and this stage's own §64.5 is a second example of the same failure
+silently, and this stage's own §66.5 is a second example of the same failure
 wearing different clothes.
 
-### 64.4 The Wine paths, and there are two
+### 66.4 The Wine paths, and there are two
 
 **Neither changes a pixel.** Both correct a claim that was false under Wine.
 
@@ -21495,13 +21713,13 @@ while Windows keeps the assertion by name, where the name means something:
 
 ```
 PASS  the border's cursor is not the client's (handle=…100b0 vs handle=…20090);
-      Wine cannot say which system cursor it is (§64.4)
+      Wine cannot say which system cursor it is (§66.4)
 ```
 
 Weaker, and stated as weaker. It proves the compositor did not claim the resize
 border; it says nothing about which system cursor is there.
 
-### 64.5 The six that were refused, and two of them were this project's own bug
+### 66.5 The six that were refused, and two of them were this project's own bug
 
 This is the more useful half of the stage.
 
@@ -21604,7 +21822,7 @@ Two more were checked and left alone:
   both points it visited and accepts either, which costs nothing on Windows and
   asserts an order neither platform guarantees. Left as it is; tightening it to
   "the click came from the last move" on Windows only is a real option and is
-  §64.8's list, not this one.
+  §66.8's list, not this one.
 
 **And the ones §13.6 and §26.5 already settled, which stay settled.**
 `SetProcessDpiAwarenessContext` was a session-0 window station with no display
@@ -21619,7 +21837,7 @@ which was withdrawn. This stage removes two more from the folklore — §23.7's
 pair were never Wine — and adds one that is: `dwmapi` reporting success it
 cannot deliver. Cite the document, not a number somebody remembers.
 
-### 64.6 A VM running only Wine
+### 66.6 A VM running only Wine
 
 `scripts/wc-wine-guest.sh`, and it is the venue the requirement asked for.
 
@@ -21659,7 +21877,7 @@ a `cross-vm` claim that cannot back itself:
   somebody else configured and are refused when there is none; this one **is**
   the VM host — it starts QEMU itself a few lines later — so the two facts the
   guard checks are facts it establishes. That is stating the arrangement, not
-  evading the guard, and §64.6's two kernels are the run's own proof of it.
+  evading the guard, and §66.6's two kernels are the run's own proof of it.
 * **No substrate is declared, and that is the answer rather than an omission.**
   `wc_substrate_declare` offers `guest-ram` and `wine-fixture` and this leg uses
   neither: with no client there is no `wl_shm` pool and no arena, so nothing
@@ -21679,9 +21897,9 @@ about needing Xvfb implies for this particular use, and that note is about
 
 **What it does not do**, said plainly: no client, so no toplevel, no window and
 no pixel. A rendering leg in the guest needs an X server and a client in there
-too. §64.8.
+too. §66.8.
 
-### 64.7 The gates
+### 66.7 The gates
 
 | Gate | Result |
 |---|---|
@@ -21690,7 +21908,7 @@ too. §64.8.
 | `cargo clippy -p wc-compositor --all-targets` (Linux) | no warnings from this branch |
 | `cargo clippy -p wc-compositor --all-targets --target x86_64-pc-windows-gnu` | no warnings from this branch |
 | `design_citations` (the §54 gate, tightened by §55) | `every_design_document_citation_resolves` passes; every citation this branch added names its document |
-| `cargo test --workspace --no-fail-fast` | **86 binaries, 2627 tests**, 0 failures (2620 on master `988d359`; 7 new) |
+| `cargo test --workspace --no-fail-fast` | **86 binaries, 2627 tests**, 0 failures; seven are this branch's `wine::tests`, and the figure held across the last two merges |
 | `scripts/wc-cursor.sh linux` | **8 passed, 0 failed** |
 | `scripts/wc-cursor.sh wine` | **17 passed, 0 failed** (master: 10, and see below) |
 | `scripts/wc-cursor.sh all` | **25 passed, 0 failed** |
@@ -21711,7 +21929,7 @@ failing binary and under-reports the total.
 **On the wine leg's `+7`, and the run that measured master to check it.** Master's
 own `wc-cursor.sh wine` was run three times on this tree, unmodified, with only
 the compositor changed: **10 passed / 0 failed, 10 passed / 0 failed, and 5
-passed / 3 failed.** The third is §64.5's race caught in the act — "the
+passed / 3 failed.** The third is §66.5's race caught in the act — "the
 compositor never turned a cursor surface into pixels", "no reading of the
 compositor's queue: missing", and the three notes — and it is roughly one run in
 three. So the honest comparison is not 10 against 17 but *an intermittently
@@ -21734,9 +21952,9 @@ the compositor's cursor and passed. The probe now counts refusals, prints
 `moves-refused N of M` whether or not any were, and exits 3 when all were; the
 harness asserts the count is zero and reads `refused 0 of 4`.
 
-Worth naming as a pattern rather than a fix: §57 and §64.5 are the same failure
+Worth naming as a pattern rather than a fix: §57 and §66.5 are the same failure
 one level apart — a probe that cannot tell "I measured this" from "I measured
-whatever was already there". §64.5's version was the harness outliving the
+whatever was already there". §66.5's version was the harness outliving the
 probe; §57's is the window server refusing the probe. Both produce readings that
 look exactly like measurements.
 
@@ -21772,16 +21990,16 @@ should have changed it" is an argument and not a measurement, which is the
 distinction this whole section is about, so the row stays dated until it is run
 again.
 
-### 64.8 What is not done
+### 66.8 What is not done
 
 1. **No real Windows guest ran this.** Everything above is Wine, on this
    workstation and in the VM. The `windows` branch of every assertion in
    `wc-cursor.sh` has been exercised only by `WC_WIN32=windows` under Wine,
-   which tests the *branch* and not the platform. The `dwmapi` entry in §64.4
+   which tests the *branch* and not the platform. The `dwmapi` entry in §66.4
    in particular predicts that a real guest logs
    `DwmExtendFrameIntoClientArea ok` with no Wine caveat, and §31.7 says it
    does — but that was a different run on a different day.
-2. **A rendering leg in the guest.** §64.6 has no client. An X server and a
+2. **A rendering leg in the guest.** §66.6 has no client. An X server and a
    `weston-eventdemo` inside the VM would make `wc-cursor.sh wine` runnable
    there, which is the first Wine cursor run that would not share a wineserver,
    an X server and a machine with ten other worktrees.
@@ -21789,7 +22007,7 @@ again.
    does; `wc-input.sh`, `wc-clip.sh`, `wc-damage.sh`, `wc-inhibit.sh` and
    `wc-wlcs-wine.sh` all read a compositor log and none of them check who wrote
    it. `win32_of()` is six lines and should be shared rather than copied.
-4. **`wc-damage.sh`'s wait, everywhere else.** §64.5's cause — the harness
+4. **`wc-damage.sh`'s wait, everywhere else.** §66.5's cause — the harness
    outliving the thing it was measuring — is a shape, not an incident.
    `wc-cursor.sh` has the fix now and `wc-damage.sh` had it already; the others
    should be read with it in mind, because the symptom is a *missing* reading

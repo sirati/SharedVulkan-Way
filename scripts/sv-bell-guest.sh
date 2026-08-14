@@ -64,10 +64,10 @@ guest_ports() {
 }
 
 say "refusing to share the QMP socket"
-# `pgrep -x`, by executable name, **not** `pgrep -f` over the command line:
-# the ssh command that carries this check contains the string it searches for,
-# so `-f` matched its own shell and the guard refused a free socket. Same
-# self-match that once made a `pkill -f` take down the wrong process.
+# By executable name, never by command line. See `proc_running` in
+# wc-binaries.sh for why: the ssh command carrying this check contains the
+# string it searches for, so a `pgrep -f` matched its own shell and refused a
+# socket that was free.
 if vmhost 'export PATH=/run/current-system/sw/bin; pgrep -x sv-hostd >/dev/null' 2>/dev/null; then
   echo "FAIL: an sv-hostd holds QMP. The chardev serves one client and a second"
   echo "      opener hangs silently. Wait for that run to finish."

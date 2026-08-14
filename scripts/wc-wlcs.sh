@@ -523,6 +523,12 @@ score() {
 # So the only way an entry stays quiet is if it matches at least one test and
 # every test it matches actually failed.
 justified_failure_patterns() {
+  # §64: the leg, because "expected" is not a property of the suite alone. An
+  # entry that is right on the headless leg can be a **false green** on the Wine
+  # leg, where the same request reaches a real window manager instead of a
+  # `println!`. Everything above this line holds for both legs; the block at the
+  # bottom is headless-only and says why.
+  local leg="${1:-}"
   # <pattern><TAB><reason>. Matched against the full gtest name with `case`, so
   # `*` is a glob rather than a regex.
   #
@@ -570,6 +576,33 @@ justified_failure_patterns() {
     printf 'SurfaceInputRegions/SurfaceInputCombinations.input_seen_by_subsurface_after_parent_unmapped_and_remapped/%s\t%s\n' \
       "$t" "$why"
   done
+
+  # ------------------------------------------------------------ §64, headless -
+  #
+  # **Headless only, and that is the whole reason the leg argument exists.**
+  #
+  # These four drive `xdg_toplevel.move` and `.resize` and then assert the
+  # window actually moved. §22.7 wired both to Win32's `SC_MOVE`/`SC_SIZE`, so
+  # on the Wine leg they reach a real window manager and are entitled to pass;
+  # excusing them there would be exactly the false green this table's own
+  # self-check exists to prevent. On the headless platform there is no window
+  # manager at all — `platform/headless.rs` answers `ToUi::BeginMove` and
+  # `ToUi::BeginResize` with a `println!` and nothing moves, deliberately, so
+  # that a Linux run can still assert the request *arrived*.
+  #
+  # So this is not "the compositor is wrong and we accept it". It is "this leg
+  # cannot observe the half of the path that would make it right", which is the
+  # same shape as the 22 above and a different reason. §64.3 counts what
+  # reclassifying them does to the debt number, and says why the number was
+  # wrong rather than the tests.
+  [ "$leg" = headless ] || return 0
+  local nowm='interactive move and resize: the headless platform has no window manager, so BeginMove/BeginResize are logged and nothing moves. Wired to SC_MOVE/SC_SIZE on Win32 (§22.7), where this leg cannot see it — the Wine leg is where these must pass (§64.2)'
+  for t in surface_can_be_moved_interactively \
+           surface_can_be_resized_interactively \
+           pointer_leaves_surface_during_interactive_move \
+           pointer_leaves_surface_during_interactive_resize; do
+    printf 'XdgToplevelStableTest.%s\t%s\n' "$t" "$nowm"
+  done
 }
 
 justified_failures() {
@@ -614,7 +647,7 @@ justified_failures() {
     # one test at a time so that each entry is an auditable claim, but a reader
     # wants the *causes* and how many tests each accounts for.
     printf '%d\t%s\n' "$matched" "$reason" >> "$RUNDIR/jf.by-reason"
-  done < <(justified_failure_patterns)
+  done < <(justified_failure_patterns "$leg")
   if [ -s "$RUNDIR/jf.by-reason" ]; then
     awk -F'\t' '{n[$2] += $1} END {for (r in n) printf "  %-9s %4d  %s\n", "EXPECTED", n[r], r}' \
       "$RUNDIR/jf.by-reason" | sort -k2 -rn

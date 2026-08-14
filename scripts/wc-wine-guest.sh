@@ -4,11 +4,11 @@
 #
 #   scripts/wc-wine-guest.sh [--keep]
 #
-# docs/waycompose-design.md §64.6.
+# docs/waycompose-design.md §66.6.
 #
 # WHY THIS EXISTS
 #
-# The requirement docs/waycompose-design.md §64 answers is "we also need to be
+# The requirement docs/waycompose-design.md §66 answers is "we also need to be
 # able to test against a vm running only wine". Every Wine run in this document
 # before §26 was one machine with no VM boundary at all, and §26.5 is blunt
 # about what that cost: several consequences of *having no hypervisor* were
@@ -42,13 +42,13 @@
 # `flake.nix`'s note about needing Xvfb implies for this particular use.
 #
 # The identity line is printed *before* `platform::start` regardless
-# (docs/waycompose-design.md §64.3), and that ordering is the load-bearing
+# (docs/waycompose-design.md §66.3), and that ordering is the load-bearing
 # part: what platform a run is on must not depend on the platform having come
 # up, or the one run that most needs attributing — the one that failed to
 # start — is the one that cannot be.
 #
 # A leg that renders in the guest needs an X server and a client in there too.
-# docs/waycompose-design.md §64.8 names it as work rather than pretending this covers it.
+# docs/waycompose-design.md §66.8 names it as work rather than pretending this covers it.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -76,7 +76,7 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 # §26.5's correction is that every Wine run in this document before it was one
 # machine with no boundary at all. This script boots the VM itself and runs the
 # compositor inside it, so the boundary is real and the declaration is checkable
-# against the run's own output — docs/waycompose-design.md §64.6's two kernels are that check.
+# against the run's own output — docs/waycompose-design.md §66.6's two kernels are that check.
 #
 # `WC_HOST` and `WC_GUEST_CONFIGURED` are set here rather than expected from the
 # environment, and the difference matters: the other cross-VM harnesses *reach*
@@ -196,7 +196,7 @@ sed 's/^/        /' "$RUNDIR/comp.log"
 GUEST_LINE=$(grep -o 'wc-compositor: win32 is .*' "$RUNDIR/comp.log" | head -1 | tr -d '\r')
 case "$GUEST_LINE" in
   *"win32 is wine"*) ok "inside the VM the compositor says: ${GUEST_LINE#wc-compositor: }" ;;
-  "")                bad "the compositor never said which Win32 it was on (docs/waycompose-design.md §64)" ;;
+  "")                bad "the compositor never said which Win32 it was on (docs/waycompose-design.md §66)" ;;
   *)                 bad "inside the VM the compositor says: ${GUEST_LINE#wc-compositor: }" ;;
 esac
 
