@@ -929,31 +929,36 @@ pub mod profiles {
             // profile and `VK_KHR_ray_tracing_pipeline` (7 commands) plus
             // `VK_EXT_descriptor_buffer` (11).
             "VK_KHR_ray_tracing_pipeline",
-            // The **union-of-handles class**, and like the one above it is a
-            // generator gap rather than a scope decision.
+            // **The union-of-handles class used to be excluded here, and it is
+            // gone** — `VK_KHR_acceleration_structure`,
+            // `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap`,
+            // 52 commands with everything they drag in through `depends=`, which
+            // was the single largest block of uncarried API (design.md §0.21).
             //
-            // `VkAccelerationStructureGeometryDataKHR`,
-            // `VkIndirectExecutionSetInfoEXT`,
-            // `VkDescriptorMappingSourceDataEXT` and
-            // `VkResourceDescriptorDataEXT` are unions with a handle in at least
-            // one arm. The handle-map pass has to rewrite object ids into driver
-            // handles and cannot, because which arm is live is decided by a
-            // sibling the union does not name — the same `noautovalidity` gap
-            // `sv_codegen::exceptions::SIBLING_SELECTED` already closes for
-            // `VkWriteDescriptorSet`, one level further in. It emits a
-            // `compile_error!` rather than guessing, which is the generator
-            // being right; the fix is four `SIBLING_SELECTED`-shaped entries
-            // taught to the union emitter, not a profile line.
+            // What it said, and what was wrong with it: that
+            // `VkAccelerationStructureGeometryDataKHR` and its three siblings
+            // are unions with a handle in at least one arm, that the handle-map
+            // pass cannot rewrite ids inside them "because which arm is live is
+            // decided by a sibling the union does not name", and that the fix
+            // was "four `SIBLING_SELECTED`-shaped entries taught to the union
+            // emitter".
             //
-            // This is the expensive one: `VK_KHR_acceleration_structure` takes
-            // `VK_KHR_ray_query`, `…_ray_tracing_maintenance1`,
-            // `…_ray_tracing_position_fetch`, `VK_EXT_opacity_micromap` and the
-            // NV cluster/partitioned families with it through the `depends=`
-            // fixpoint. It is also the single largest remaining block, which is
-            // why it is named here rather than left to be rediscovered.
-            "VK_KHR_acceleration_structure",
-            "VK_EXT_device_generated_commands",
-            "VK_EXT_descriptor_heap",
+            // The middle clause is false twice over. **The union does not have
+            // to name it — the registry already does**: `selector=` on the
+            // enclosing struct's member names the sibling and `selection=` on
+            // each arm names the values that choose it, ten annotations in
+            // `vk.xml`, parsed into `Member::selector`/`Member::selection` since
+            // this crate was written and read by nothing. And **the handle-map
+            // pass never needed a selector at all**, because by the time a value
+            // reaches it the union is a Rust `enum` and the enum is the tag; the
+            // barrier was standing at the wrong pass. The one place that genuinely
+            // has to choose is the app side's C → wire lowering, which was
+            // reading member [0] unconditionally, and that is where the barrier
+            // now is.
+            //
+            // So no exception table was added. The fix is the registry's own
+            // data, which makes it ten unions rather than four and leaves nothing
+            // to keep in step by hand.
         ]
         .into_iter()
         .map(str::to_string)

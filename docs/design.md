@@ -3819,6 +3819,195 @@ what this project can demonstrate on its own once the private session is built.
 
 ---
 
+### 0.21 The union that knew its own tag, and a barrier at the wrong pass
+
+Built 2026-08-14 on **devhost** in `nix develop`. §0.19's breakdown of the
+231 commands no profile carried named **53 of them "the union-of-handles class"**
+— the largest single block — and `profiles::full`'s own comment described the
+fix as *"four `SIBLING_SELECTED`-shaped entries taught to the union emitter"*.
+
+**No exception table was added.** The registry already states the whole rule, in
+two attributes this project has parsed since `vk-registry` was written and never
+read. `509 → 561` carried, `231 → 179` uncarried, and the four exception entries
+that were budgeted for do not exist.
+
+---
+
+**1. The barrier was at the wrong pass, and that is why it cost 52 commands.**
+`emit_handle_map_union` emitted a `compile_error!` reading *"a union containing
+handles reached the handle_map pass; the selector rules of design.md §7.4 must be
+applied before this can be generated"*. Every word of it is true about the
+project and none of it is true about that function.
+
+  The handle-map pass runs on a value that has **already crossed into the wire
+  representation**, where a union is a Rust `enum` — and `exceptions`' own header
+  says exactly what follows: *"A Rust `enum` is the tag, so an encoded union
+  always knows which member it holds and no default is ever guessed."* The walk
+  is a `match`. It needs no selector, no exception entry and no registry lookup;
+  it is fourteen lines and it was blocking `VK_KHR_acceleration_structure`,
+  `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap` together with
+  everything `depends=` drags behind them.
+
+  **The ambiguity is real, and it lives one boundary away** — in `sv-icd-entry`'s
+  C → wire lowering, where a C union genuinely has no tag. That code was reading
+  **member [0] unconditionally**, gfxstream's rule, with a comment justifying it:
+  *"every member of this union occupies the same storage and the encoding is
+  bit-preserving, so what the peer reconstructs is the bytes the application
+  wrote; what is lost is only the name."* True for `VkClearValue`. False the
+  moment an arm holds something the boundary must **translate** — an object id
+  the handle-map pass has to turn into a driver handle, or a `(memory, offset)`
+  pair the transform pass has to rebase. Reading the wrong arm then does not
+  mis-name bytes; it puts a number that was never a handle on the wire. That is
+  §0.16 item 2's hazard exactly, and it cost a GPU hang the first time it was met
+  one level in.
+
+  So a correct refusal was placed where there was nothing to refuse, and a silent
+  guess was left where the refusal belonged. **The barrier has moved**: the
+  handle-map and transform passes generate a `match`, and the *lowering* refuses
+  — by name, at generation time — any union it cannot select.
+
+**2. The registry states both halves, and nothing had read either.** `selector=`
+on the enclosing struct's member names the sibling holding the discriminator;
+`selection=` on each arm of the union names the values that choose it, comma-
+separated where an arm has several. Ten annotations in the whole of `vk.xml`,
+covering every union this class is about:
+
+```xml
+<member selector="geometryType">VkAccelerationStructureGeometryDataKHR geometry</member>
+…
+<member selection="VK_GEOMETRY_TYPE_INSTANCES_KHR">…InstancesDataKHR instances</member>
+```
+
+  `Member::selector` and `Member::selection` have been in the model all along.
+  §7.4 predicted this would need "a table of hardcoded discriminators" — Venus
+  carries `UNION_DEFAULT_TAGS` for it — and `exceptions`' header records the
+  conclusion that no such table was needed *because the enum is the tag*. That
+  conclusion was right about the wire and was quietly applied to the C ABI, where
+  it does not hold. **The correction is not a table either**; it is reading the
+  attribute. Ten unions rather than the four that were budgeted, and nothing to
+  keep in step by hand.
+
+**3. The discriminator is a parameter, so a caller that has not found it cannot
+compile.** The selector-driven lowering is emitted as
+
+```rust
+pub unsafe fn lower_vk_acceleration_structure_geometry_data_khr(
+    p: *const VkAccelerationStructureGeometryDataKHR,
+    __sel: i32,
+) -> crate::LowerResult<sv_proto::VkAccelerationStructureGeometryDataKHR>
+```
+
+  rather than as a function that reaches for the sibling itself. There is exactly
+  one place in the generator that holds both the union and the struct member that
+  decides it, and making the discriminator an argument means that place is the
+  only place a call can be emitted from. A union reached anywhere else — as a
+  bare array element, inside another union — hits `union_needs_selector` and
+  **fails the build with the type's name**, instead of taking member [0].
+
+  This is the property `noop-audit` established for writeback (`emit_writeback`
+  → `emit_command` → `Refusal` makes a silent partial writeback structurally
+  inexpressible) applied to the other direction: not "we remembered to check",
+  but "the wrong thing has no spelling". An unrecognised discriminator value at
+  run time refuses the call rather than falling back to an arm.
+
+**4. And behind the unions, a second gap that only a doubly indirect member could
+reach.** With the unions carried, `sv-gpu-entry` failed to compile on five sites
+of one shape: `let __v: *const T = raise_…()` against a function returning `T`.
+
+  `const VkAccelerationStructureGeometryKHR* const* ppGeometries` is
+  `Pointer(Pointer(T))`. `raise_expr`'s `Array` arm recursed into its element
+  with the **whole member's** C type, so the element's `Optional` arm peeled one
+  pointer level where two were needed. The `FixedArray` arm already had the fix
+  and a comment explaining it — `StdVideoH264ScalingLists`, `uint8_t
+  ScalingList4x4[6][16]`, "the first member in any profile that has two
+  [dimensions]" — written as a special case for two-dimensional *arrays* when it
+  is really the rule for **every level of indirection**. Nothing in any profile
+  was doubly indirect until the acceleration-structure family arrived, which is
+  how a pass that has marshalled half a million lines had never met it.
+
+  It is the same shape as §0.20 item 1's: a rule applied at the one site that
+  needed it, which then fails wherever the rule was needed *next*, with a symptom
+  that looks unrelated. Caught by the compiler here, and only because the
+  generated crate is Rust.
+
+**5. The extensions were carried and still not advertised, and the table from
+§0.20 is what said so.** Carrying 52 commands changed nothing an application
+could see, because `VK_KHR_acceleration_structure` was still in
+`INCOMPLETE_EXTENSIONS` — and `INCOMPLETE_EXTENSION_REASONS` named the entry
+point holding it there: `vkGetDeviceAccelerationStructureCompatibilityKHR`. Its
+`VkAccelerationStructureVersionInfoKHR` has `pVersionData` with
+`altlen="2*VK_UUID_SIZE"`, which `parse_len_expr` recorded as `Unresolved`, so
+the struct's *lowering* was refused, so the command was, so the extension was.
+`VK_EXT_opacity_micromap` was blocked by the identical shape through
+`vkGetDeviceMicromapCompatibilityEXT`.
+
+  `2*VK_UUID_SIZE` is **arithmetic over the registry's own constants with no
+  run-time input**, and `abi.rs`'s own comment had already listed it as one of
+  the four `altlen=` expressions in Vulkan while parsing only the other three.
+  `ArrayLen::Constant` evaluates it at generation time. One arithmetic case, two
+  extensions, and 23 refused entry points down to 21.
+
+  The general shape is worth more than the fix: **an extension is only as
+  advertised as its least-implemented entry point**, so a class of work can be
+  99% done and deliver nothing. Without the reasons table this would have looked
+  like the union work having no effect.
+
+**6. What it is worth, measured — 34 tests that could not run at all before.**
+`dEQP-VK.ray_query.*` at 1-in-400, 97 tests, on **devhost** in `nix develop`
+against RADV RAPHAEL_MENDOCINO:
+
+| | control | forwarded |
+|---|---|---|
+| Pass | 59 | **34** |
+| NotSupported | 38 | 59 |
+| DeviceLost | 0 | 4 |
+| ring fatals | — | **0** |
+| hard GPU recoveries | 0 | **0** |
+
+  Before this section every one of these was `NotSupported`, because the
+  extension was not advertised. **Thirty-four of them now build an acceleration
+  structure and trace rays through the forwarder** — 52 commands, four
+  selector-driven unions and a doubly indirect `ppGeometries` between the
+  application and the driver — with no ring fatal and no GPU reset.
+
+  Twenty-one of the remaining skips are `VK_KHR_ray_tracing_pipeline is not
+  supported`, which is the capture-replay class (§0.19) and untouched here; the
+  rest are `sparse_binding_structures`. **Four device losses are real and
+  undiagnosed**, and they are the honest cost of the section: a path that could
+  not execute at all now executes and is wrong four times in ninety-seven.
+
+  **Measured at load average 259**, on a machine an image-processing job was
+  saturating, which is the wrong conditions for a device-loss count and the right
+  conditions for nothing. The passes and the zero ring fatals are robust to that;
+  the four are an upper bound and want re-taking on a quiet machine.
+
+---
+
+**What is not settled.**
+
+- **Carried is not exercised.** These 52 commands now have a wire encoding, a
+  lowering, a handle map and a forwarder, and `sv-codegen`'s generated round-trip
+  tests cover the marshalling — but **no acceleration structure has been built
+  through this forwarder**. CTS's `ray_query` and `acceleration_structures`
+  groups are what would say, and they need `VK_KHR_ray_tracing_pipeline`, which
+  is still out on the capture-replay class (§0.19). The honest claim is *the
+  protocol carries them*, not *they work*.
+- **`VkDeviceOrHostAddressConstKHR` is a union this section did not have to
+  solve, and that is luck rather than design.** It has no `selector=`, and its
+  two arms are a `VkDeviceAddress` and a host pointer — so member [0] is taken,
+  which is right only because the acceleration-structure API is used with device
+  addresses and the host-address arm is a build-on-host feature nothing here
+  advertises. It is plain bytes by the letter of `union_needs_selector` and a
+  latent wrong answer by intent. Recorded rather than fixed, because fixing it
+  means deciding what a host address *means* across this boundary, which is
+  §5.3's question and not this section's.
+- **The nine remaining classes are unchanged.** 179 uncarried: platform-gated,
+  `void*` without `len=`, capture-replay, function pointers, app-side by design,
+  and 23 unreachable by any profile. §0.19's breakdown stands with the union row
+  struck out.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
