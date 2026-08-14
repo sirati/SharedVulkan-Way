@@ -11,9 +11,10 @@
 # taskbar. Not one of them asserted that anything went away, and the two are not
 # the same claim: a compositor that creates a window per client and destroys
 # none of them passes every check in this tree, for a whole session, while
-# leaking an `HWND` per client. §50 found the same shape of hole on the WLCS
-# side -- a category of outcome nothing looked at -- and this is that category
-# in the platform layer.
+# leaking an `HWND` per client. §53 is the primary treatment of this category --
+# an outside process that asks the window manager -- and this file is its cheap
+# half: the same question answered by the compositor itself, on every platform
+# and every run, including ones where no witness process can be deployed.
 #
 # It is a real risk rather than a hypothetical one, and §21 is the precedent.
 # smithay calls `IdleInhibitHandler::uninhibit` from exactly one place: the

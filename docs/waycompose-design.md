@@ -19682,41 +19682,340 @@ under an agent still working in that file would be worse than a duplicated line.
    undeclared leg, so a new harness is safe; but nothing makes a new harness
    declare, and there is no check that every harness has. A `wc-xref.sh`-style
    gate over `scripts/` would close that and is not written here.
+## 53. Nothing asserted that a window stopped existing
 
-## 54. Nothing asserted that anything stopped existing
+*(§35's continuation, on the other side of the same rule.)*
 
-### 54.1 Status in one paragraph
+### 53.1 Status in one paragraph
 
-Task #35, and it is a missing **category** rather than a missing check. Every
-gate in this tree asserts that something *appeared* — a window was created, an
-`HWND` exists, pixels arrived, a title was set, an icon reached the taskbar.
-Not one asserted that anything went away. A compositor that made a window per
-client and destroyed none of them would pass all of them, for a whole session.
-The compositor now reports its window accounting on the way out, including
-**what Windows says is still on the desktop**, `scripts/wc-lifetime.sh` asserts
-on it, and `scripts/wc-teardown.sh` is the harness that runs it on both
-platforms. **The teardown path turns out to be correct**; what was missing was
-anything that would have noticed if it were not, and that is demonstrated
-rather than argued: a build with one line removed reports `1 created, 1
-destroyed, 0 still held, 1 still alive` and fails.
+**Every window gate in this tree asserts that something appeared, and until now
+none asserted that anything went away.** `wc-window.sh` waits for a toplevel,
+`wc-taskbar.sh` counts buttons, `wc-icon.sh` reads an icon back,
+`wc-titlebar.sh` measures a caption; the three harnesses that mention
+destruction all do it by grepping the compositor's own log for
+`xdg_toplevel destroyed -> window N`, which is the code under test reporting its
+own success. A compositor that dropped its map entry, printed that line and
+never called `DestroyWindow` would keep the entire suite green while leaking an
+`HWND`, its icons and its `IDropTarget` registration once per client, for a
+whole session — on a compositor whose windows come and go with a client's menus.
+`scripts/probe-life.c` and `scripts/wc-life.sh` are the missing *category*: a
+separate process that never speaks to the compositor asks the window manager
+instead, and the answer is now **11 passed, 0 failed, 1 skipped**. The
+compositor is clean — six windows created, six destroyed, zero left, and its own
+claim of six agrees with the window manager's count. **Three of the four things
+that went wrong on the way there were the harness lying to itself**, which is
+recorded in 52.4 because each was indistinguishable from the defect being looked
+for.
 
-### 54.2 Why a leaked window is worse than a leaked inhibitor
+### 53.2 Why this is a category and not a missing assertion
 
-§21 is the precedent and the contrast. smithay calls
-`IdleInhibitHandler::uninhibit` from exactly one place — the client's explicit
-`destroy` request — so a client that crashes leaves an inhibitor nothing will
-ever revoke. That was found, and the reason it was found is that its symptom is
-**visible**: a display that never sleeps again, which on a guest VM is a real
-bill.
+§35 is the section about gates that report success while something is wrong, and
+its examples are all one gate measuring one wrong thing. This is the same rule
+seen from a distance: not a gate that is wrong, but a **question nobody asked**.
 
-A leaked `HWND` has no symptom at all. Nothing in a log, nothing on screen,
-nothing in a screenshot, no protocol error, no failed assertion. The process
-holds a handle until it exits. On a compositor whose windows come and go with a
-client's menus, that is unbounded growth that only appears as a number in Task
-Manager that nobody is reading. The class of defect §21 caught by luck is one
-this class cannot be caught by luck at all.
+Everything in a compositor's window path is naturally shaped to answer "did it
+appear". A test creates a client, waits for a window, and looks at it; if the
+window is not there the test cannot proceed and fails loudly. Disappearance has
+no such shape. There is nothing to wait for, nothing to look at, and the
+absence of a thing is exactly what a test that has already finished looks like.
+So the assertion has to be constructed deliberately, against an instrument that
+can tell "gone" from "was never there" — and if it is not constructed, its
+absence is silent for as long as the project lasts.
 
-### 54.3 Five numbers, and the fourth is the one that matters
+The cost of not asking is not hypothetical. `ToUi::Destroy` does four things —
+`release_icons`, `drag::revoke`, `DestroyWindow`, and removing the map entry —
+and **the map entry is the only one any existing gate could notice**, because it
+is the one the compositor's own log line is downstream of. The other three could
+each be deleted without a single red result.
+
+### 53.3 What the outside witness can and cannot see here
+
+```
+probe-life.exe pidof   --title <substr>   the PID owning a visible toplevel
+probe-life.exe count   --pid <n>          user=, gdi=, toplevels=, all=, counter=
+probe-life.exe alive   --hwnd <h>         IsWindow
+probe-life.exe windows --pid <n>          one line per window it still owns
+```
+
+**The obvious instrument does not work on the only platform available, and that
+was measured rather than assumed.** `GetGuiResources` is the kernel's own
+per-process USER and GDI handle count and is precisely the right question;
+**Wine returns 0 for it**, checked against a `notepad` that plainly owned three
+windows. A harness that asserted `user == baseline` here would compare zero to
+zero and pass for ever — the exact defect this section is about, reintroduced by
+the tool meant to detect it.
+
+So `probe-life.exe` reports a fifth field, `counter=stub|live|denied`, and
+derives it from a contradiction rather than from a platform check: a process
+that owns windows owns USER objects, so `toplevels > 0` with `user == 0` means
+the counter is not implemented, whoever is underneath. `wc-life.sh` reads that
+word and **skips the handle assertion by name**, which is one `SKIP` in the
+output and a sentence in the log rather than a green tick that means nothing.
+
+What does work is `EnumWindows` over the compositor's PID, and it is the
+assertion that matters anyway: a leaked `HWND` is still enumerable.
+
+### 53.4 Four things that went wrong, three of which were the harness
+
+Each of these presented as the defect being hunted. That is the point of
+recording them: on this subject a broken instrument and a broken compositor
+produce the same output.
+
+**1. A client that closed itself.** `weston-terminal` was the obvious churn
+client and is the wrong one — it runs a shell in a pty, and on a
+non-interactive launch that shell exits at once and takes the terminal with it.
+The compositor's log showed the entire life of window 1, created through
+destroyed, inside five seconds, and the harness reported that no window existed
+to measure. Giving it a `--shell` script that blocks did not help; the terminal
+still went and left the blocked script behind as an orphan.
+`weston-clickdot` has no pty and no child. **A window whose lifetime the harness
+does not control is not a window the harness can ask lifetime questions about**,
+which on this subject is not a detail but the experiment backwards.
+
+**2. A probe whose answer went nowhere.** `EnumWindows` enumerates the *calling
+thread's* desktop, so the probe must be launched into the compositor's virtual
+desktop with `wine explorer /desktop=…` — and `wine explorer` starts the program
+without connecting its stdout to the caller. The probe found the right windows
+and reported nothing, and the harness said `no window titled 'ClickDot'` about a
+client that was running happily with its window mapped. It answers into a file
+now, as `probe-drag.exe` already did for the same reason.
+
+**3. A kill that killed the wrong process.** `wl` is a shell function, so
+`wl "$CLIENT" &` backgrounds a *subshell* and `$!` is the subshell's pid; the
+client is its child and survives `kill "$CLIENT"`. The first churn run therefore
+produced this, which is worth reading as though it were a bug report:
+
+```text
+FAIL  cycle 1: window 655528 still exists after its client went away
+FAIL  cycle 2: window 5636270 still exists after its client went away
+…
+FAIL  the compositor owns 8 windows after 5 cycles, up from 3 -- an HWND per client is leaking
+----  the compositor's own log claims 0 destruction(s)
+```
+
+That is a perfect description of a compositor that never destroys anything, and
+it was produced by a harness that never closed a client. **The assertion was
+right and its subject was wrong.** The tell is in the output and was missed
+twice: `claims 0 destruction(s)` — a compositor leaking windows would still have
+*seen* the clients go.
+
+**4. An instrument that intermittently said nothing.** One `wine explorer`
+invocation in twelve failed to start the program, returning an empty string. Had
+that reached the comparison it would have been read as "not gone", which is the
+right answer today and a wrong one the moment the empty string lands on the
+other branch. `life()` retries and returns non-zero rather than an empty string
+that reads like a verdict.
+
+### 53.5 The assertions, and why none of them can pass vacuously
+
+The baseline is **zero**: the compositor's own controller window is message-only
+and `EnumWindows` does not enumerate those, so with no client mapped it owns
+nothing enumerable. "Zero windows after five cycles, the same as before" is
+therefore a comparison of zero to zero, and would be worthless on its own.
+Three assertions exist to stop it being worthless, and each is the same
+discipline — *show the instrument giving the other answer*:
+
+| assertion | what stops it passing vacuously |
+|---|---|
+| every window was `alive` while its client ran | the same call on the same handle answers `gone` later, so the instrument is not stuck |
+| the count **rose** above baseline on every cycle | a counter that never moves cannot show a leak; this shows it moving |
+| every window was `gone` after its client went | paired with the row above, on the same handle |
+| the count returned to baseline | meaningful only because the two rows above proved it left it |
+| the compositor's claim equals the number of windows | six claimed for six created — the internal and external accounts are compared rather than one being trusted |
+
+The last row is the whole point of the harness. The compositor's log has always
+said it destroyed things; this is the first run in which anything checked.
+
+### 53.6 What is not proven
+
+1. **`RevokeDragDrop` is not observed.** `ToUi::Destroy` revokes the drop-target
+   registration before `DestroyWindow` (§43.7's ordering), and nothing here can
+   see whether it happened: OLE's registration table is not enumerable from
+   another process. A leak there would show as a `RegisterDragDrop` failure on a
+   later window that reused the `HWND`, which no run has provoked. §50's harness
+   is the one positioned to check it.
+2. **Icons are not observed.** `release_icons` runs on the same path and its
+   effect is an `HICON` count — a GDI object, which is exactly what
+   `GetGuiResources` would answer and Wine will not.
+3. **This is Wine, and the handle counter is the part Windows would answer.**
+   The single most valuable re-run of this harness is on the guest, where
+   `counter=live` and the `SKIP` becomes an assertion. §50.3 is what that needs.
+4. **Popups are not churned.** A menu is the highest-frequency window in a real
+   session and §43.7 deliberately does not register popups as drop targets, so
+   their create/destroy path differs from a toplevel's. This churns toplevels
+   only.
+5. **Five cycles is not a soak.** It shows the count returning to baseline, not
+   that it does so ten thousand times.
+6. **Nothing here asserts the `HWND` is not merely hidden.** `EnumWindows`
+   enumerates hidden windows too — which is why the count uses `all=` rather
+   than `toplevels=` — but a window destroyed on one desktop and re-parented to
+   another would not be noticed.
+
+### 53.7 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-life.sh wine`** (new) | **11 passed, 0 failed, 1 skipped** |
+| `cargo test --workspace --no-fail-fast` | unchanged — this section adds no Rust |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-xref.sh` | 0 broken, 0 ambiguous |
+
+`wc-life.sh` declares `wine-fixture` and `same-box`, and makes no latency claim.
+The compositor's log from a run is in `docs/life/compositor.log`.
+
+**No Rust changed, and that is the result rather than an omission.** The
+compositor was already correct on this path: six windows created, six destroyed,
+none left, its own count agreeing with the window manager's. What did not exist
+was any way to know that — and the difference between "correct" and "known to be
+correct" is the whole of what this section adds.
+
+## 54. The checker behind the gate, and a margin measured instead of a failure forced
+
+### 54.1 `wc-xref.sh` now runs under `cargo test`
+
+§48.6 item 2 said the obvious thing about §48's own result: *"Nothing runs
+`wc-xref.sh` automatically. It is a script that must be invoked, which is exactly
+the property that let the citations rot."* A checker nobody runs reports the
+state of the tree on the day somebody remembered it, and "somebody remembered"
+is not a schedule for a tree a dozen agents edit.
+
+`crates/sv-testkit/tests/design_citations.rs` puts it behind
+`cargo test --workspace`, which is the gate every agent is already told to run.
+It lives there because the workspace is a virtual manifest with no root package,
+and `sv-testkit` is the crate whose whole purpose is test-only support — the
+least arbitrary of the available homes for a check belonging to no single crate.
+
+**Two tests, and the second is the one that matters.**
+`every_design_document_citation_resolves` runs the script and fails with its full
+output. `the_citation_check_can_fail` builds a throwaway tree — two documents
+defining §1, one source file citing §99.99 — and requires the checker to reject
+it. Without that, a future change that made the scan match nothing silently (a
+broken regex, a path that stopped resolving, or `grep` treating a file as binary
+after a bad byte, §44.7) would turn the first test into a green no-op. That is
+§42 applied to the checker itself: a gate that cannot fail is counted as
+coverage.
+
+A missing script is also a failure rather than a skip, for the same reason.
+
+**And the negative fixture broke the real check on its first run**, which is
+worth recording because the pattern has now appeared three times. The bait
+string — the Vulkan document's path followed by a section number nothing
+defines — written as a literal *is* a citation, sitting in a `.rs` file the
+checker scans, and the run reported it against `design_citations.rs:125` exactly
+as it would any other broken reference.
+
+**It happened a fourth time writing this paragraph**, which is why the string is
+described here rather than quoted: the first draft pasted the failure message
+verbatim into this document, and `cargo test --workspace` went red on
+`docs/waycompose-design.md` for the two lines that quoted it. A checker that
+scans prose catches prose, including prose about the checker. The lesson is not
+that the scan is too broad — it is exactly as broad as it should be, since a
+citation in a document is one a reader will follow — but that **there is no safe
+way to write a broken citation down**, and describing one is the only option
+that does not require an exemption.
+
+Fixed by assembling the string at run time rather than excluding test files from
+the scan — the same call §48.3 made when this document's own prose tripped it.
+An exception for "examples" is how a checker starts having exceptions, and the
+concatenation costs one line.
+
+### 54.2 `minframes`: the path did not fire, and the attempt measured the margin
+
+§48.6 item 3 recorded that `minframes`'s inconclusive path had never fired on a
+real run. The only variable that reaches it is the leg's window: `weston-terminal`
+owes 2 frames by construction, so seeing 1 means closing the window before the
+second lands. The 8-second leg duration was a constant with no stated basis —
+the same shape as every other bound in this line of work — so it is now
+`WC_LEG_SECS`, and the path can be aimed at deliberately.
+
+**It still did not fire, and that is the result.** With the window cut to one
+eighth of its default:
+
+```
+$ WC_LEG_SECS=1 ./scripts/wc-proxy.sh window
+  PASS  term: 3 frames of the client's pixels reached the window (owed 2)
+== 41 passed, 0 failed ==
+```
+
+Three frames in a one-second window, against a floor of two. §35.9 item 3's
+worry was that the floor had *no margin* — the counts observed were 2, 2 and 5,
+so 2 looked like the minimum rather than a bound. That worry was about the
+**count**. What this measures is the **time** margin, which is the axis load
+actually attacks, and it is at least eightfold: the client completes both
+structural draws with a window an eighth as long as the one it is given.
+
+So the honest statement is not "the inconclusive path works" — it has still
+never been observed on a real client — but "the conditions that would reach it
+are further away than they looked". Reaching it needs a machine that cannot let
+`weston-terminal` map and take its configure inside a second, and manufacturing
+that means loading a box a dozen agents share, which is not worth a
+demonstration. The logic remains verified on six synthetic cases (§48.5),
+including the one that must not skip.
+
+### 54.3 What is not done
+
+1. **The inconclusive path is still untried in anger**, now with a measured
+   distance to it rather than a guess. If it ever fires, §54.2's eightfold time
+   margin is the number to check it against: at a load that leaves that intact,
+   the window is not the explanation and the client is the suspect.
+2. **`the_citation_check_can_fail` builds its fixture in `/tmp`** and copies the
+   checker into it. If the checker ever grows a dependency on something outside
+   its own directory — a config file, a second script — the negative test will
+   fail for that reason rather than the one it is testing, and the message will
+   not say so.
+3. **The 748 unqualified and 2457 bare citations are still unchecked**, §48.6
+   item 1 unchanged. The test inherits whatever the script decides to fail on,
+   so tightening remains one line in one place.
+
+
+## 55. The same category, from inside, so it travels to the guest
+
+### 55.1 Status in one paragraph
+
+**§53 got here first, and this is the second half of the same category rather
+than a rival to it.** That section built the stronger witness: `probe-life.c` is
+a *separate process* that never speaks to the compositor and asks the window
+manager instead, launched into the compositor's own virtual desktop because
+`EnumWindows` only sees the calling thread's. Nothing a compositor can do makes
+that witness lie. It is Wine-only, it runs a churn loop, and its answer was that
+the compositor is clean.
+
+What it cannot do is travel. It needs its own process deployed into the same
+desktop, which on the cross-VM guest means shipping a binary into a session that
+is presently locked, and it has no Linux leg at all. So this section adds the
+cheap half: **the compositor reports its own window accounting on the way out,
+on every platform, on every run**, including the number `EnumWindows` gives for
+its own process. `wc-guest.sh` and `wc-damage.sh` get it in logs they already
+capture, with nothing deployed and no extra process.
+
+The two are not interchangeable and the ordering between them is the honest one:
+§53's witness is authoritative and this one is ubiquitous. Where they disagree,
+believe §53.
+
+**This was duplicated effort and the cause is worth recording.** The assignment
+said §53 was claimed by something else, and I took that at face value instead of
+reading master before starting — which is the same mistake as §51.5's rebuild
+ritual, performed after it stopped being necessary. Two agents built the same
+category on the same night. What survives here is only what §53 does not cover.
+
+### 55.2 One thing §53's argument does not cover: §21's contrast
+
+§53.2 makes the case for the category and it is not repeated here. One point
+belongs to this half rather than that one, because it is about *why the number
+has to be everywhere* rather than why it has to come from outside.
+
+§21 is the precedent. smithay calls `IdleInhibitHandler::uninhibit` from exactly
+one place — the client's explicit `destroy` request — so a client that crashes
+leaves an inhibitor nothing will ever revoke. That was found, and the reason it
+was found is that its symptom is **visible**: a display that never sleeps again,
+which on a guest VM is a real bill.
+
+A leaked `HWND` has no symptom at all. The process holds a handle until it
+exits. A defect with no symptom is not found by somebody noticing; it is found
+by a number being printed somewhere a run already looks — which is the argument
+for carrying it in the compositor's own exit line rather than only in a harness
+somebody has to remember to run.
+### 55.3 Five numbers, and the fourth is the one that matters
 
 ```
 wc-compositor: windows at exit: 3 created, 3 destroyed, 0 still held,
@@ -19754,7 +20053,7 @@ machine and §16.8's rule is that identity on a shared box is never a class of
 thing. A count that swept up another run's windows would fail a harness for
 somebody else's leak.
 
-### 54.4 The fifth number exists because the first run was a false positive
+### 55.4 The fifth number exists because the first run was a false positive
 
 The first real run of this assertion reported `1 created, 0 destroyed, 1 still
 held, 1 still alive` and would have failed. There was no bug. The compositor had
@@ -19772,7 +20071,7 @@ It is carried on the quit message rather than printed as a second line
 deliberately: the number it qualifies is only knowable on the UI thread, and two
 lines that must be read together are two lines that can be read apart.
 
-### 54.5 The answer is that teardown works
+### 55.5 The answer is that teardown works
 
 A client killed with `SIGTERM` — no `destroy` request, no clean disconnect —
 still produces, in order:
@@ -19790,7 +20089,7 @@ did not have.
 Reporting that plainly is the point. This stage found no bug; it found that
 nothing would have found one.
 
-### 54.6 Why this is a harness of its own
+### 55.6 Why this is a harness of its own
 
 The report is printed on the way out, from the thread that owns the windows. A
 compositor killed with a signal prints nothing — and prints nothing about
@@ -19803,9 +20102,18 @@ them can carry this assertion without being restructured, and `wc-teardown.sh`
 lets the compositor reach its idle timeout instead: the client is given a
 shorter life than the compositor's timeout, so the client is always the one that
 goes first. That ordering *is* the design of the timings, and getting it
-backwards is what §54.4 was.
+backwards is what §55.4 was.
 
-### 54.7 The gates
+**Its Wine leg overlaps `wc-life.sh` and its Linux leg does not.** §53 churns
+windows open and closed and asks an outside process; this one runs a single
+window to a clean exit and reads the compositor's own line. They test different
+mechanisms — the witness against the accounting — and the Wine leg here exists
+because that is the only platform where the accounting has a second opinion to
+be checked against. If a future tidy-up wants one harness rather than two, the
+thing to keep is §53's witness and the thing to fold into it is this exit line;
+the reverse would lose the stronger check.
+
+### 55.7 The gates
 
 | Gate | Result |
 |---|---|
@@ -19821,7 +20129,7 @@ The negative-capability row is the one worth reading. The assertion was proved
 able to fail on the real mechanism, on the platform where the mechanism matters,
 by breaking the code it watches — not by feeding it a synthetic log.
 
-### 54.8 What is not proven
+### 55.8 What is not proven
 
 1. **Popups are counted, but nothing exercises their teardown.** `WindowKind`
    distinguishes toplevels from popups and both go through the same `Destroy`;
