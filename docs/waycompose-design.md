@@ -17958,20 +17958,36 @@ lying.
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | clean — a real gate, and `clippy --target` does not substitute for it |
 | `cargo test --workspace --no-fail-fast` | **2436 tests**, 0 failures — master's count, unchanged: this section adds a counter and a harness leg, not a test. One load-flaky `sv-transport` timing test, §46.7 item 4 |
 | **`scripts/wc-damage.sh all`** | **27 passed, 0 failed** — all three legs, and the §46.6 retry fired once and is visible in the log |
-| ... `damage` over **shared-file** | 3410 commits, all accounted (1630 checked, 1773 no buffer, 7 unreached), **0 stale**, `0 section, 3 shared-file, 0 arena-slice` |
-| ... `damage` over **arena** (new leg) | 3497 commits, all accounted (1651 checked, 1839 no buffer, 7 unreached), **0 stale**, `0 section, 0 shared-file, 3 arena-slice` |
-| ... `buffer` over shared-file (control) | 3274 commits, all accounted (1555 checked, 1712 no buffer, 7 unreached), **0 stale** |
+| ... `damage` over **shared-file** | 1637 commits, all accounted (744 checked, 886 no buffer, 7 unreached), **0 stale**, `0 section, 3 shared-file, 0 arena-slice` |
+| ... `damage` over **arena** (new leg) | 1878 commits, all accounted (836 checked, 1035 no buffer, 7 unreached), **0 stale**, `0 section, 0 shared-file, 3 arena-slice` |
+| ... `buffer` over shared-file (control) | 551 commits, all accounted (195 checked, 348 no buffer, 8 unreached), **0 stale** |
 | `cargo clippy --workspace --all-targets` | clean of anything this section touched |
 
-The **7 unreached is the same 7 in every leg**, and the control run is what makes
-that conclusive rather than suggestive. A remainder that tracked the length of
-the run would mean commits were escaping classification under load; this one was
-7 in a 3410-commit run, 7 in a 3497-commit run over a different transport, and 7
-in a 51-commit run on an earlier attempt — two orders of magnitude apart. That is
-a fixed set of surfaces committing before they ever attach, which is what a
-cursor and Firefox's subsurfaces do while being configured, and it cannot be a
-leak because a leak does not hold constant while the denominator moves 60x.
-§46.3's counter turned an unexplained discrepancy into a number with a cause.
+**The unreached count does not scale with the run**, which is the property that
+matters and is weaker than what an earlier draft of this paragraph claimed. That
+draft said "the same 7 in every leg"; a later run then produced an **8** on the
+control leg, so the exact-constant claim was wrong and is withdrawn. What
+survives it is the argument it was making:
+
+| leg | commits | unreached |
+|---|---|---|
+| `damage` / shared-file | 1637 | 7 |
+| `damage` / arena | 1878 | 7 |
+| `buffer` / shared-file | 551 | **8** |
+| (earlier attempts) | 51 … 3497 | 7 |
+
+Seven or eight, while the denominator moves between 51 and 3497 — a factor of
+68. A leak scales with the traffic; this does not, so it is a small fixed set of
+surfaces committing before they ever attach, which is what a cursor and
+Firefox's subsurfaces do while being configured. The eighth is presumably one
+more such surface in a run that happened to create one, and nothing in the data
+distinguishes that from a rarer path being taken once.
+
+The correction is worth leaving visible rather than quietly editing to "7–8",
+because "the same 7 every time" is exactly the kind of claim that reads as
+stronger evidence than it is, and it survived three runs before a fourth
+falsified it. §46.3's counter still turned an unexplained discrepancy into a
+number with a cause; it did not turn it into a constant.
 
 An earlier attempt's control leg came in at 20 checked, exactly on its floor, and that is
 the §27.10 variance again rather than anything new — the same run has produced
