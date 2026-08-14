@@ -18757,9 +18757,27 @@ REFUSED to inject: the foreground window is 0000000000020486, not our target
 00000000000b0b0a -- input would go to another process
 ```
 
-The desktop's foreground belonged to a person — `wc-desk windows` from the
-interactive session shows Firefox on an n-tv article, 1Password's lock screen
-and a Steam login. §16.8's seventh instance is precisely a probe that injected
+> **CORRECTED BY §53. The sentence that followed here was wrong, and the way it
+> was wrong is worth more than the sentence.** It read: *"The desktop's
+> foreground belonged to a person — `wc-desk windows` from the interactive
+> session shows Firefox on an n-tv article, 1Password's lock screen and a Steam
+> login."* That listing was real. The conclusion drawn from it was a guess: a
+> window list is equally consistent with somebody reading and with a session
+> nobody has touched for hours, and neither idle time nor `SendInput`'s return
+> value was checked.
+>
+> Measured afterwards, by somebody who did check: the guest's Windows session is
+> **locked**. `SendInput` returns 0 while `SetCursorPos` is obeyed — injected
+> input is accepted by the API and silently discarded — and the session's idle
+> time is about two and a half hours. The refusal was right and its cause was
+> not the one recorded here.
+>
+> The distinction is operational, not pedantic. "A person is using it" means
+> *wait*; "the session is locked" means *somebody has to unlock it*, and no
+> amount of waiting produces the measurement. A wrong cause attached to a
+> correct refusal sent the request to the wrong place.
+>
+> §16.8's seventh instance is precisely a probe that injected
 anyway and put a photograph of somebody else's terminal into `docs/` as evidence
 about this compositor, so the refusal is the harness working. The keyboard path
 is covered by the two Wine legs and the Linux leg above, which exercise
@@ -18772,6 +18790,7 @@ byte-for-byte `server` for a client that negotiates, and `Decorations::kde()`
 answers the same value for both — but `wc-firefox.sh` names `FX_DECOR` on every
 leg, so no run has yet exercised Firefox under the new default by not naming it.
 It is one leg and it should be added before anybody relies on the argument.
+*(**Done in §53.1**, and the argument holds.)*
 
 ### 49.10 An observation about `fresh`, which cost three rebuilds
 
@@ -19682,3 +19701,131 @@ under an agent still working in that file would be worse than a duplicated line.
    undeclared leg, so a new harness is safe; but nothing makes a new harness
    declare, and there is no check that every harness has. A `wc-xref.sh`-style
    gate over `scripts/` would close that and is not written here.
+
+
+---
+---
+
+## 53. Firefox under the default nobody had run, and a cause I asserted without measuring
+
+### 53.1 The block that could not have been written by accident
+
+§49 made `--decorations auto` the default and argued it is *byte-for-byte*
+`server` for a client that negotiates. The argument is short and it is in the
+code: `Decorations::kde()` answers `KdeDefaultMode::Server` for `Auto` and
+`Server` alike, `xdg()` answers `ServerSide` for both, and
+`surface::fold_caption` never folds a `Negotiated` window. Firefox binds KDE's
+manager — the asymmetry §22.2 measured, and GTK3's only route, since it ignores
+`zxdg_decoration_manager_v1` entirely — so Firefox is `Negotiated` on every run.
+
+§49.9 listed it as unmeasured and it stayed that way, because **this harness was
+built never to exercise it.** Every block in `wc-firefox.sh` names `FX_DECOR`,
+deliberately, and the settings block says why: *"a block that relied on it would
+be measuring the flag rather than the client"*. That is right for the other
+seven blocks and it makes the compiled-in default the one thing the file cannot
+reach. So the block needs a sentinel — `FX_DECOR=none`, meaning pass no
+`--decorations` at all — and it is worth saying out loud that a harness whose
+convention is "always name the flag" has a blind spot exactly where the flag's
+default lives.
+
+`scripts/wc-firefox.sh auto`:
+
+```
+== auto: Firefox under the compiled-in default, and against server
+  PASS  auto: no --decorations was passed and the compositor ran Auto
+  PASS  auto: Firefox received default_mode(2) — Auto advertises Server
+  PASS  auto: the compositor classified Firefox as Negotiated, so it is never folded
+  PASS  auto: no window's caption was folded, which is what server would have done
+  ....  auto:   told=default_mode(2), asked=request_mode(2), origin=0,0,
+  ....  server: told=default_mode(2), asked=request_mode(2), origin=0,0,
+  PASS  auto and server are indistinguishable to Firefox — §49.4's argument, measured
+  PASS  auto: the toplevel geometry origin is 0,0 — server-side decorations, no shadow inset
+```
+
+**It is a pair, and that is the part with the reasoning in it.** The claim is an
+*equivalence*, so asserting only "auto looks right" would pass a compositor that
+had quietly made `server` wrong too. The two legs run minutes apart with the
+same environment and are compared on the three things the *client* can observe:
+the mode it was told, the modes it asked for, and its toplevel window-geometry
+origin. Nothing in the comparison reads the compositor's own log.
+
+### 53.2 The gate can fail, and its failure reproduces §22's numbers
+
+One line mutated — `Auto` advertising `KdeDefaultMode::Client` instead of
+`Server` — and three of the eight assertions go red:
+
+```
+  FAIL  auto: Firefox never logged default_mode(2)
+  ....  auto:   told=default_mode(1), asked=request_mode(1), origin=26,23,
+  ....  server: told=default_mode(2), asked=request_mode(2), origin=0,0,
+  FAIL  auto and server differ where Firefox can see it
+  FAIL  auto: the toplevel geometry origin is not 0,0
+```
+
+`request_mode(1)` and an inset of `(26, 23)`: those are §22's measured
+client-side-decoration numbers, arrived at again by breaking one line. A gate
+whose failure mode reproduces a number measured two years of sections earlier is
+a gate that is looking at the right thing.
+
+### 53.3 A cause asserted without measuring it, and why the distinction cost something
+
+§49.9 recorded that three attempts to type into `weston-terminal` on the guest's
+desktop had refused, and gave the reason: *"The desktop's foreground belonged to
+a person"*, citing a `wc-desk windows` listing showing Firefox on a news
+article, a 1Password lock screen and a Steam login.
+
+The listing was real. The conclusion was a guess. A window list is equally
+consistent with somebody reading and with a session nobody has touched for
+hours, and the two things that would have separated them — the session's idle
+time, and what `SendInput` actually returned — were not checked. Measured
+afterwards by somebody who did check: the session is **locked**, `SendInput`
+returns 0 while `SetCursorPos` is obeyed, and idle time is about two and a half
+hours. Injected input is accepted by the API and silently discarded.
+
+The refusal was correct. The recorded cause was not, and the difference is
+operational rather than pedantic:
+
+* *"a person is using it"* means **wait**, and the measurement arrives on its
+  own;
+* *"the session is locked"* means **somebody has to unlock it**, and no amount
+  of waiting produces anything.
+
+So the wrong cause sent the request to the wrong place, and the run stayed
+outstanding for longer than it needed to. §49.9 now carries the correction
+rather than the claim.
+
+The same shape, smaller, in the same report: `testhost.lan` resolves to
+`<host-alt-ip>`, which does not answer, and I concluded the VM host was
+unreachable and built an ssh `ProxyJump` through the guest to work around it.
+The host is at **<host-ip>** and answers directly; the DNS name is stale.
+The workaround worked, which is exactly why it survived — a workaround that
+works stops anybody asking whether the problem was real.
+
+Both are the same error and it is not a new one for this project: **an
+observation and an explanation are different things, and only one of them was
+measured.** §35 is the section about numbers nobody asserts on; this is the
+version about causes nobody checks. The rule that would have caught both: when a
+run refuses, the reason it refused is a *measurement to take*, not a story to
+supply from what happens to be on the screen.
+
+### 53.4 What is still outstanding, stated as an ask rather than as a finding
+
+**Typing into `weston-terminal` on the guest's interactive desktop.** It needs
+an **unlocked** session and about five minutes of exclusive access; everything
+else is already deployed and byte-verified (`wct46`, ports 57433+,
+`/srv/winshare/wct46`). One command produces both remaining pieces:
+
+```
+WC_DESKNAME=wct46 WC_PORT_BASE=57433 WC_SUFFIX=-t46 WC_TYPE=waycomposetypes \
+  scripts/wc-desktop.sh window
+```
+
+— §33's 5b, a photograph of `SendInput` text arriving on `WinSta0`, and §37's
+5c, a click 40 px down the client area followed by typing, asserted on the
+terminal's repaint count rather than on the picture.
+
+The keyboard path itself is covered without the guest and is green: the Linux
+leg (`weston-eventdemo` decoding `helloZyz` through our keymap), and both Wine
+legs, 29/0 and 31/0. What the guest run adds is that chain on the guest's own
+desktop, which is the venue the user's report came from and the only one that
+can close it.
