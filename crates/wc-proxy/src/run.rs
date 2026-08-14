@@ -697,10 +697,44 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.idle_timeout
         };
-        let client = match listener.accept_one(wait) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e.into()),
+        // DYNAMIC ARENA. Waiting for a client in one long `accept_one` is what
+        // left the last region stranded: `Session::drop` returns a departing
+        // client's pools, the region becomes empty — and the release policy's
+        // clock is turned by the *pump*, which no longer exists, so the region
+        // waits for a tick that never comes. Measured on the VM leg: 15 s with
+        // nobody connected returned nothing, and one reconnect returned it
+        // within seconds.
+        //
+        // So the wait is sliced, and the arena is ticked between slices. This
+        // loop is the only thing that outlives every session and still holds
+        // the arena, which makes it the only place the zero-client case can be
+        // fixed. A slice is cheap — the tick is an atomic increment and a walk
+        // of at most a handful of regions — and it is only reached when nothing
+        // is connecting, which is exactly when it matters.
+        const TICK_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+        let client = {
+            let give_up = std::time::Instant::now() + wait;
+            loop {
+                let slice = TICK_SLICE.min(give_up.saturating_duration_since(std::time::Instant::now()));
+                match listener.accept_one(slice) {
+                    Ok(c) => break c,
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        if let Some(a) = &shared_arena {
+                            a.tick();
+                            for (id, bytes, origin) in a.reclaim_regions(args.arena_grow_idle) {
+                                println!(
+                                    "[proxy] arena region {id} returned with no client \
+                                     connected: {bytes} bytes of {origin}"
+                                );
+                            }
+                        }
+                        if std::time::Instant::now() >= give_up {
+                            break Err(e)?;
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
         };
         served += 1;
         let n = served;
