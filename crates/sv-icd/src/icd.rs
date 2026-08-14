@@ -1055,7 +1055,7 @@ impl Icd for SharedVulkan {
     /// fault inside `sv-gpu-server`** — a wrong pointer lowered as an offset is
     /// the worst blast radius this design has.
     ///
-    /// design.md §0.20 item 4 found it, excluded `VK_KHR_push_descriptor` from
+    /// docs/design.md §0.20 item 4 found it, excluded `VK_KHR_push_descriptor` from
     /// `zink` for exactly this, and wrote that *"a mechanical widening that
     /// restores it without the expansion restores the segmentation fault with
     /// it."* Making `full` the default did precisely that. The warning was
@@ -1525,7 +1525,7 @@ impl SharedVulkan {
     /// One expansion, reached from two trait methods, so the `2` form cannot
     /// drift from the form it is a restatement of. See
     /// `Icd::cmd_push_descriptor_set_with_template` for what this is closing and
-    /// why it is a rewrite rather than a forward (design.md §0.22).
+    /// why it is a rewrite rather than a forward (docs/design.md §0.22).
     #[allow(clippy::too_many_arguments)]
     fn push_with_template(
         &self,

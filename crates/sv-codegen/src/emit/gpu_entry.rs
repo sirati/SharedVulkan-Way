@@ -1040,7 +1040,7 @@ fn emit_forward_command(
             // `VK_ERROR_INITIALIZATION_FAILED` — while the app side advertised
             // the extension and forwarded the call perfectly happily.
             //
-            // **That is what was killing Firefox** (design.md §0.22). Zink calls
+            // **That is what was killing Firefox** (docs/design.md §0.22). Zink calls
             // `vkGetPhysicalDeviceCalibrateableTimeDomainsKHR` while building
             // its screen, takes the failure as fatal, and tears the device down
             // before rendering a frame: `DRI2: failed to create screen`,

@@ -166,7 +166,7 @@ pub struct Memory {
 ///
 /// So expanding a push template into `vkCmdPushDescriptorSet` needs a value the
 /// call does not carry, and the only place it exists is the template object.
-/// design.md §0.22.
+/// docs/design.md §0.22.
 #[derive(Debug, Clone)]
 pub struct Template {
     pub entries: Vec<sv_proto::VkDescriptorUpdateTemplateEntry>,

@@ -144,6 +144,33 @@ pub const ICD_EXPANDS_ARENA_POINTER: &[&str] = &[
     // the template and emits `VkWriteDescriptorSet`s; the pointer never crosses.
     "vkUpdateDescriptorSetWithTemplate",
     "vkUpdateDescriptorSetWithTemplateKHR",
+    "vkCmdPushDescriptorSetWithTemplate",
+    "vkCmdPushDescriptorSetWithTemplateKHR",
+    // The push forms, expanded the same way as of docs/design.md §0.22:
+    // `sv_icd::icd::cmd_push_descriptor_set_with_template` turns `pData` into
+    // `VkWriteDescriptorSet`s and forwards `vkCmdPushDescriptorSet`, so the
+    // application's pointer never crosses.
+    // **The `2` forms are here as documentation, not as suppression, and the
+    // difference matters.** `LOWERING_INCOMPLETE` scans a command's *parameters*
+    // for a `void*` with `ArenaOffset`, and these two carry `pData` inside
+    // `VkPushDescriptorSetWithTemplateInfo` — a struct member — so the check
+    // never sees them and removing these lines would change nothing it does.
+    //
+    // They are listed because a reader who finds the `2` forms carried and asks
+    // "is this one safe too?" deserves the answer where the answers live, and it
+    // is yes for a reason that has been measured rather than assumed:
+    // `sv_icd::icd::cmd_push_descriptor_set_with_template2` unwraps the info
+    // struct onto the same helper, so the pointer is expanded app-side before
+    // anything crosses, and `dEQP-VK.binding_model.shader_access.*.bind2.
+    // with_push_template.*` — which is the CTS group that calls the `2` entry
+    // points — passes through the forwarder.
+    //
+    // The blind spot is real and is recorded in §0.22: a `void*` policy on a
+    // struct member is invisible to this guard. Closing it means walking struct
+    // members transitively, which is a change to the check rather than to this
+    // list.
+    "vkCmdPushDescriptorSetWithTemplate2",
+    "vkCmdPushDescriptorSetWithTemplate2KHR",
     // Safe for the *other* reason, and the check's first run found it: nothing
     // expands `pHostPointer` because nothing has to. `VK_EXT_external_memory_host`
     // is the extension whose entire contract is "this pointer is host memory the

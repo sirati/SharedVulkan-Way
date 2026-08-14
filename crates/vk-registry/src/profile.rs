@@ -889,14 +889,6 @@ pub mod profiles {
             // already excludes it as a tripwire; this is the profile agreeing so
             // the tripwire is never reached.
             "VK_NV_ray_tracing_motion_blur",
-            // The other half of the push-descriptor mitigation above. The two
-            // commands are excluded by name because core 1.4 also requires them;
-            // the *extension* is excluded as well so that its name never reaches
-            // an application, because an extension advertised with its two
-            // template entry points missing is the over-promise §9.2 forbids.
-            //
-            // Out again when the app-side expansion lands.
-            "VK_KHR_push_descriptor",
             // The same shape, without the §9.2 argument: `pParams` is an array
             // of pointers to CUDA kernel arguments whose count and element sizes
             // live in the CUDA module, which the registry cannot see and this
@@ -1008,13 +1000,20 @@ pub mod profiles {
             // `VK_KHR_push_descriptor` and core 1.4. Dropping the extension
             // alone leaves the core command carried and the pointer still wild.
             //
-            // This comes out when the expansion exists — `sv-worktrees/cts2`
-            // owns writing it, as a mirror of the update path. Until then the
-            // guard that would have caught this automatically is
-            // `LOWERING_INCOMPLETE` (§0.24 item 6); this list is the mitigation,
-            // not the mechanism.
-            "vkCmdPushDescriptorSetWithTemplate",
-            "vkCmdPushDescriptorSetWithTemplate2",
+            // **The mitigation is gone as of §0.22: the expansion exists.**
+            // `sv_icd::icd::cmd_push_descriptor_set_with_template` reads `pData`
+            // through the template and emits `VkWriteDescriptorSet`s into
+            // `vkCmdPushDescriptorSet`, exactly as the update path does; the
+            // pointer never crosses. Both commands and the extension are carried
+            // again, and the three names are in
+            // `sv_codegen::exceptions::ICD_EXPANDS_ARENA_POINTER` so that
+            // `LOWERING_INCOMPLETE` knows why it is not complaining — which is a
+            // different thing from it having nothing to find.
+            //
+            // The paragraph above is left standing because the sequence it
+            // records is the argument for the guard: a prediction written down
+            // in §0.20 item 4, a mechanical widening that ignored it, and a
+            // segfault. The list was the mitigation; the guard is the mechanism.
             // docs/design.md §10: presentation is outside the protocol. The ICD
             // implements the swapchain; it is never forwarded.
             "vkCreateSwapchainKHR",
