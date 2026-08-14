@@ -21036,3 +21036,163 @@ machine, in a script written after that lesson.
 process, and `testhost/default.nix` was not touched. Making it permanent is
 one line there, needs a `nixos-rebuild switch` that restarts the VM, and is the
 user's to time.
+## 62. The other thing a window holds, and the return value nobody read
+
+*(§53's continuation. The window handle had a witness; this does not.)*
+
+### 62.1 Status in one paragraph
+
+§53.6 item 1 said `RevokeDragDrop` was not observed, and it was worse than
+unobserved: **`drag::revoke` discarded the `HRESULT`.** The whole of §43.7's
+ordering argument — revoke *before* `DestroyWindow`, because OLE keys the
+registration on the `HWND` and a destroyed handle cannot be revoked — rests on
+that call succeeding, and a compositor that got the ordering wrong produced
+exactly the same output as one that got it right: none. It is read now, counted,
+and printed at exit beside §56's window accounting, so it travels to the guest
+on every run with nothing deployed. A new test on the Windows target makes the
+count falsifiable rather than decorative. `scripts/wc-life.sh` asserts the pair
+balances and is not a pair of zeros: **14 passed, 0 failed, 1 skipped**, with
+6 registered and 6 revoked. **The idea that would have made this externally
+checkable does not work, and 57.3 is the measurement rather than the argument.**
+
+### 62.2 Why this resource has no outside witness
+
+§53's strength was that its witness could not be talked out of it: another
+process asks the window manager, and nothing the compositor does makes
+`EnumWindows` lie. That does not transfer here, for a structural reason rather
+than a missing tool. **OLE's drop-target registration table is not enumerable
+from another process.** There is no `EnumDragDropTargets`; the only documented
+way to observe a registration is to be refused when adding a second one for the
+same `HWND`, and that requires holding the `HWND` in question.
+
+So the asymmetry is real and is stated rather than papered over: the window
+count in §53 is authoritative, and the drop-target count here is the
+compositor's own account of its own behaviour — which §56.3 is right to label
+`claims`, because a bug in the teardown path is exactly the circumstance in
+which such an account is wrong.
+
+### 62.3 The trick that would have fixed that, and the measurement that killed it
+
+A stranded registration *does* have one observable consequence: OLE refuses a
+`RegisterDragDrop` on an `HWND` that already has one, with
+`DRAGDROP_E_ALREADYREGISTERED`. The compositor already logs that refusal. So if
+a destroyed window's `HWND` value were ever handed out again, a leaked
+registration would announce itself on the *next* window, from outside, with no
+new instrumentation at all.
+
+That only works if handle values are reused. **They are not, at this scale.**
+Six windows through one compositor process, from `docs/life/compositor.log`:
+
+```text
+window 1 created (HWND 0x1007a)
+window 2 created (HWND 0x700ac)
+window 3 created (HWND 0x1100ac)
+window 4 created (HWND 0x1b00ac)
+window 5 created (HWND 0x2500ac)
+window 6 created (HWND 0x800be)
+```
+
+Six windows, six distinct handles. The low half repeats — `0x00ac` four times —
+and the high half does not, which is the generation counter doing its job: a
+handle value is not reused until the table wraps, and the table is 16 bits wide.
+Provoking a collision would take of the order of 65,536 create/destroy cycles.
+
+**This is recorded as a negative result rather than quietly dropped**, because
+the idea is a good one and the next person will have it. It is not wrong; it is
+untestable at any cycle count this project will run, and a harness built on it
+would be a gate that cannot fail — which is the thing §53 exists to avoid,
+reintroduced by the mechanism meant to strengthen it.
+
+### 62.4 What makes a counter worth printing
+
+A count of successes is worth nothing unless the thing counted can come out the
+other way, so that is now a test on the Windows target
+(`revoking_a_window_that_was_never_a_drop_target_is_not_a_success`, in the
+`drag::` suite, **11 tests**):
+
+* `RevokeDragDrop` on a window that was never registered does **not** return
+  `S_OK` — so the `hr == S_OK` arm in `revoke` is a real branch;
+* and on one that *was* registered it does — so the arm is reachable.
+
+Deliberately not asserting the exact failure code beyond "not success": what
+matters is that OLE distinguishes the two cases, and pinning the constant would
+fail on a platform that returned a different-but-still-failing one for the same
+correct reason.
+
+The pair then rides out on the exit line, next to §56's:
+
+```text
+wc-compositor: windows at exit: 6 created, 6 destroyed, 0 still held, 0 still alive, 0 client(s) still connected
+wc-compositor: drop targets at exit: claims 6 registered, 6 revoked, 0 revoke(s) failed
+```
+
+`wc-life.sh` asserts three things about the second line, and the first of them is
+the one that stops the other two being decoration: that `registered` is **not
+zero**. The churn proved six windows were made; each registered; so the number
+has to be six, and a balance of `0 == 0` is a failure rather than a pass.
+
+### 62.5 What is not proven
+
+1. **The count is the compositor's own.** §62.2 is why there is no alternative,
+   not an excuse for not having one. If OLE ever grows an enumeration, this
+   should be replaced rather than supplemented.
+2. **`release_icons` is still unobserved**, for §53.6 item 2's reason: its
+   effect is an `HICON` count, `GetGuiResources` is what would answer, and Wine
+   returns 0. That is the one remaining per-window resource with neither an
+   external witness nor an internal count, and giving it an internal count is
+   the obvious next step.
+3. **The guest run is still the valuable one** and is still queued: on Windows
+   `counter=live` turns §53's `SKIP` into an assertion and would cover both the
+   icons and the handle totals at once.
+4. **Nothing here provokes a failure in a live compositor.** The test proves the
+   branch exists; no run has made the compositor's own revoke fail, because
+   nothing in the tree currently can.
+5. **Popups are still not churned** (§53.6 item 4), and they are the case where
+   this matters most: §43.7 does not register popups as drop targets at all, so
+   a menu-heavy session exercises the create/destroy path without the
+   registration path, and the two counts would legitimately diverge. Nothing
+   asserts what that divergence should look like.
+
+### 62.6 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-life.sh wine`** | **14 passed, 0 failed, 1 skipped** (11 in §53) |
+| `wine …/wc_compositor-*.exe drag::` | **11 tests, 0 failures** (10 in §50) |
+| `cargo test --workspace --no-fail-fast` | see below |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `scripts/wc-xref.sh` | 0 broken, 0 ambiguous |
+
+The compositor's idle timeout in `wc-life.sh` had to change, and that is
+load-bearing rather than tidying: the exit accounting is printed **on the way
+out**, so a harness that kills the compositor never sees it. §56's harness
+reaches the same conclusion by the same route.
+
+**The first number chosen for it was wrong, and the way it was wrong is the
+lesson.** 600 s went to 30 s, and 30 s fired *mid-churn* — because the stretch
+that matters is not the gap between cycles but the "is it gone yet" poll, which
+spends up to forty seconds with no client connected, each `life` call being a
+fresh `wine explorer`. The compositor exited, the next three cycles reported
+windows that never appeared, and the run printed:
+
+```text
+FAIL  cycle 4: the client's window never appeared
+FAIL  only 2 of 5 windows were ever seen alive -- the negative results below are worthless
+FAIL  4 registered but only 3 revoked -- a registration is stranded in OLE's table
+----  windows at exit: 4 created, 3 destroyed, 1 still held, 1 still alive, 2 client(s) still connected
+```
+
+That last line is a compositor leaking a window and stranding an OLE
+registration. It is also a harness that shut the compositor down while two
+clients were still connected. **This is the third time in two sections that a
+harness bug has produced a perfectly plausible bug report about the
+compositor** — §53.4's three were the same shape — and the reason is worth
+naming: on this subject the *evidence for a leak is an absence*, and everything
+that goes wrong with a harness also produces an absence. The defence is the one
+§53.5 already built, and it worked here: the "was it ever alive" and "did the
+count rise" rows failed first, and a run whose positive halves fail is a run
+whose negative halves prove nothing. The gate said so in those words rather than
+reporting the leak.
+
+The timeout is now 120 s, and the rule is written where the number is: it must
+outlast the longest stretch of the run with no client connected.
