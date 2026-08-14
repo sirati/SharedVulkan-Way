@@ -17956,7 +17956,7 @@ lying.
 |---|---|
 | `cargo build --workspace` | clean, **before** every run below and after every edit |
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | clean — a real gate, and `clippy --target` does not substitute for it |
-| `cargo test --workspace --no-fail-fast` | **2431 tests**, 0 failures — master's count, unchanged: this section adds a counter and a harness leg, not a test |
+| `cargo test --workspace --no-fail-fast` | **2436 tests**, 0 failures — master's count, unchanged: this section adds a counter and a harness leg, not a test. One load-flaky `sv-transport` timing test, §46.7 item 4 |
 | **`scripts/wc-damage.sh all`** | **27 passed, 0 failed** — all three legs, and the §46.6 retry fired once and is visible in the log |
 | ... `damage` over **shared-file** | 3410 commits, all accounted (1630 checked, 1773 no buffer, 7 unreached), **0 stale**, `0 section, 3 shared-file, 0 arena-slice` |
 | ... `damage` over **arena** (new leg) | 3497 commits, all accounted (1651 checked, 1839 no buffer, 7 unreached), **0 stale**, `0 section, 0 shared-file, 3 arena-slice` |
@@ -18026,3 +18026,14 @@ later has to wonder whether the number came first or second time.
    would be the sharper test, and `scripts/wc-arena-pressure.sh` exists.
 3. **§27.6's withdrawal is a retraction, not a new measurement.** The 17.9x
    present-latency result is somebody else's and is quoted, not reproduced here.
+4. **A timing test in `sv-transport` failed once under load and is not this
+   section's**, recorded because a reader of the gate table deserves to know it
+   was seen. `park::tests::a_rung_doorbell_wakes_the_consumer_rather_than_the_
+   slice_expiring` reported *"the doorbell took 12.769568 ms to wake a parked
+   consumer; the 20 ms slice expiring instead means it was never rung"* on a box
+   simultaneously running Firefox under Wine for the harness legs above. It
+   passed on the next three runs here, passes on master's own checkout, and this
+   branch changes zero files in `sv-transport`. A wall-clock assertion with a
+   12.8 ms budget on a machine ten agents share will do that; whoever owns the
+   doorbell may want the threshold to be a multiple of an idle-box measurement
+   rather than a constant, which is §13.8's argument in a third place.
