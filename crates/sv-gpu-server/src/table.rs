@@ -1,6 +1,6 @@
 //! The GPU side's object table: app-assigned id → driver handle.
 //!
-//! design.md §6.4: "Handles crossing the boundary are **always table indices,
+//! docs/design.md §6.4: "Handles crossing the boundary are **always table indices,
 //! never pointers** (R3)." The app side allocates ids from a counter and encodes
 //! the id it chose, so object creation costs no round trip; this is the table
 //! that turns one of those ids into something a driver will accept.
@@ -153,7 +153,7 @@ impl Objects {
     /// This is what the GPU-allocated provider does and always will: there the
     /// arena *is* a `vkAllocateMemory` this process made and then exported, so
     /// there is nothing to import lazily — the memory exists before the app side
-    /// has attached, let alone allocated. design.md §5.2's lazy import is a
+    /// has attached, let alone allocated. docs/design.md §5.2's lazy import is a
     /// property of the *import* providers, and [`Objects::set_lazy_arena`] is
     /// the other half.
     pub fn set_arena(&mut self, memory: vk::DeviceMemory, len: u64) {
@@ -165,7 +165,7 @@ impl Objects {
     }
 
     /// Publish an arena whose slabs will arrive one `svImportArenaSlab` at a
-    /// time (design.md §5.2).
+    /// time (docs/design.md §5.2).
     ///
     /// > Slabs are **imported** lazily. When the app side needs a slab it picks
     /// > a free region of the arena, writes a slab-directory entry, and sends

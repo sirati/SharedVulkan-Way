@@ -111,6 +111,22 @@ pub struct Rect {
     /// menu was under the cursor and was told about whatever was at the top
     /// left of the screen.
     pub popup_at: Option<(WindowId, i32, i32)>,
+    /// [`crate::state::Window::content_offset`]: where the window's top-left
+    /// pixel sits in the root surface's buffer.
+    ///
+    /// ADDED FOR §45.11, to fix a defect §40 introduced. It is `(0, 0)` for
+    /// almost every window; it is the declared window-geometry inset for a
+    /// client that set one; and it goes **negative** when a `wl_subsurface`
+    /// hangs off the top or left of its parent, because §40 taught
+    /// `compose_tree` that an undeclared geometry is "the full bounds of the
+    /// surface, including any subsurfaces".
+    ///
+    /// That last case is why this field has to exist here. The window grows to
+    /// contain the overhang — correctly — but the surface underneath it has not
+    /// moved, so the window's top-left corner is now further left than the
+    /// point the suite positioned. Without this, the hit test looks for the
+    /// window at the old corner and every click inside the overhang misses it.
+    pub content: (i32, i32),
 }
 
 /// What the Wayland side must be able to answer for the hit test to work.
@@ -372,7 +388,12 @@ impl Control {
     /// is always an older window and window ids only increase.
     fn origin(&self, r: &Rect, mapped: &[Rect]) -> (i32, i32) {
         let Some((parent, dx, dy)) = r.popup_at else {
-            return self.position_of(r.client, r.surface);
+            // The buffer origin the suite pinned, plus wherever the window's
+            // top-left corner currently sits inside that buffer. See the
+            // `position` handler for why the stored value is the first of those
+            // and not the second.
+            let (bx, by) = self.position_of(r.client, r.surface);
+            return (bx + r.content.0, by + r.content.1);
         };
         match mapped.iter().find(|p| p.id == parent) {
             Some(p) => {
@@ -413,7 +434,36 @@ impl Control {
                     return "err position wants <client> <surface> <x> <y>\n".to_owned();
                 };
                 let key = (c as u32, s as u32);
-                let val = (x as i32, y as i32);
+                // **Stored as the root surface's buffer origin, not as the
+                // window's top-left corner, and the difference only shows up
+                // later.**
+                //
+                // WLCS says "put the window here", and at the moment it says so
+                // the two are the same point for every surface it builds. They
+                // stop being the same when the window's extent changes without
+                // the surface moving — which is exactly what a `wl_subsurface`
+                // hanging off the left of its parent does, since §40 made an
+                // undeclared window geometry the bounds of the whole tree.
+                //
+                // Pinning the buffer origin is what makes the surface stay put
+                // while the window grows around it, which is what every
+                // compositor does and what the client is entitled to assume: a
+                // subsurface appearing to the left must not drag the parent's
+                // pixels rightwards across the screen.
+                //
+                // Subtracting the *current* inset is what converts the one to
+                // the other, and it is exactly right at this instant by
+                // construction — `origin` adds the inset straight back, so a
+                // window whose geometry never changes is positioned precisely
+                // where the suite asked, which is the case every earlier stage
+                // measured.
+                let inset = windows
+                    .mapped()
+                    .iter()
+                    .find(|r| (r.client, r.surface) == key)
+                    .map(|r| r.content)
+                    .unwrap_or((0, 0));
+                let val = (x as i32 - inset.0, y as i32 - inset.1);
                 match self.positions.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, v)) => *v = val,
                     None => self.positions.push((key, val)),
@@ -485,8 +535,9 @@ impl Control {
                 // The between-windows hit test, done once, here — a contact is
                 // captured to the window it lands on from this moment, so
                 // unlike the pointer there is no `refresh` to re-run later.
-                let hit = windows.mapped().into_iter().rev().find(|r| {
-                    let (wx, wy) = self.position_of(r.client, r.surface);
+                let mapped = windows.mapped();
+                let hit = mapped.iter().rev().find(|r| {
+                    let (wx, wy) = self.origin(r, &mapped);
                     x >= wx as f64
                         && y >= wy as f64
                         && x < (wx + r.w) as f64
@@ -499,7 +550,7 @@ impl Control {
                     self.touching = None;
                     return "ok no-window\n".to_owned();
                 };
-                let (wx, wy) = self.position_of(r.client, r.surface);
+                let (wx, wy) = self.origin(r, &mapped);
                 self.touching = Some(r.id);
                 let time = self.now_ms();
                 let _ = self.events.send(FromUi::TouchDown {
@@ -528,13 +579,17 @@ impl Control {
                 // window it landed on. A move that leaves that window sends
                 // coordinates outside it, which is what `wl_touch` says and
                 // what Win32 does for a captured contact.
-                let Some(r) = windows.mapped().into_iter().find(|r| r.id == id) else {
+                let mapped = windows.mapped();
+                let Some(r) = mapped.iter().find(|r| r.id == id) else {
                     // The window went away under the finger. `touch_up` will
                     // find nothing either; the contact is simply over.
                     self.touching = None;
                     return "ok window-gone\n".to_owned();
                 };
-                let (wx, wy) = self.position_of(r.client, r.surface);
+                // §45.11: `origin`, not `position_of` — §38 made a popup's
+                // position something only `origin` knows, and the touch path
+                // added in §40 had been reading past it.
+                let (wx, wy) = self.origin(r, &mapped);
                 let time = self.now_ms();
                 let _ = self.events.send(FromUi::TouchMotion {
                     id,
@@ -710,7 +765,7 @@ mod tests {
     }
 
     fn win(id: WindowId, client: u32, surface: u32, w: i32, h: i32) -> Rect {
-        Rect { id, client, surface, w, h, toplevel: true, popup_at: None }
+        Rect { id, client, surface, w, h, toplevel: true, popup_at: None, content: (0, 0) }
     }
 
     /// A popup of `parent`, at `(x, y)` inside it — what the compositor's
@@ -724,6 +779,62 @@ mod tests {
             h,
             toplevel: false,
             popup_at: Some((parent, x, y)),
+            content: (0, 0),
+        }
+    }
+
+    /// A window whose tree grew to the **left**, which is the case §45.11
+    /// exists for.
+    ///
+    /// The suite positions a 100x50 window at `(200, 100)`. A subsurface then
+    /// appears 40 px to its left, so `compose_tree` grows the window to 140
+    /// wide and its top-left corner becomes `(160, 100)` — the surface has not
+    /// moved, the window has grown around it.
+    ///
+    /// A click at `x = 170` is inside the overhang. Before §45.11 the hit test
+    /// still looked for the window at `x >= 200` and missed it entirely.
+    #[test]
+    fn a_window_that_grew_leftwards_is_hit_in_the_overhang() {
+        let (mut c, rx) = control();
+        // Positioned while the window is still 100x50 with no overhang.
+        let f = Fake::new(vec![win(1, 1, 3, 100, 50)]);
+        assert_eq!(c.handle("position 1 3 200 100", &f), "ok\n");
+        // The subsurface arrives: 40 px of overhang on the left.
+        let mut grown = win(1, 1, 3, 140, 50);
+        grown.content = (-40, 0);
+        let g = Fake::new(vec![grown]);
+        assert_eq!(c.handle("pointer-move 170 120", &g), "ok\n");
+        match rx.try_recv() {
+            Ok(FromUi::PointerEnter { id, x, y, .. }) => {
+                assert_eq!(id, 1);
+                // Surface-local: the window's corner is at (160, 100), so the
+                // point is 10 px into it.
+                assert_eq!((x, y), (10.0, 20.0));
+            }
+            other => panic!("expected an enter in the overhang, got {other:?}"),
+        }
+    }
+
+    /// The mirror of the above: a declared window-geometry inset must **not**
+    /// move the window, because the suite already compensated for it when it
+    /// said where to put the window.
+    ///
+    /// This is the case every stage before §45.11 measured, and the one the
+    /// buffer-origin bookkeeping has to leave exactly alone.
+    #[test]
+    fn a_declared_inset_leaves_the_window_where_it_was_put() {
+        let (mut c, rx) = control();
+        let mut inset = win(1, 1, 3, 100, 50);
+        inset.content = (12, 5);
+        let f = Fake::new(vec![inset]);
+        assert_eq!(c.handle("position 1 3 200 100", &f), "ok\n");
+        assert_eq!(c.handle("pointer-move 210 120", &f), "ok\n");
+        match rx.try_recv() {
+            Ok(FromUi::PointerEnter { id, x, y, .. }) => {
+                assert_eq!(id, 1);
+                assert_eq!((x, y), (10.0, 20.0));
+            }
+            other => panic!("expected an enter at the position given, got {other:?}"),
         }
     }
 

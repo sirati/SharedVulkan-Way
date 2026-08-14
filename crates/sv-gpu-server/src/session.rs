@@ -2,7 +2,7 @@
 //!
 //! # One thread per ring, and it is not a preference
 //!
-//! design.md §3 draws "ring consumers (1 thread/ring, spin-then-park)" and
+//! docs/design.md §3 draws "ring consumers (1 thread/ring, spin-then-park)" and
 //! `sv-loopback` records why in a comment that was written after the fact:
 //!
 //! > A single thread draining both rings deadlocks the first time a queue packet
@@ -158,7 +158,7 @@ fn result_of(op: sv_proto::Opcode, reply: &[u8]) -> Option<i32> {
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// design.md §6.3's non-Vulkan commands, on the GPU side.
+/// docs/design.md §6.3's non-Vulkan commands, on the GPU side.
 ///
 /// Returns how many Vulkan commands it executed, so the session's count means
 /// the same thing whether a `vkCmd*` crossed on its own or inside a blob.
@@ -177,7 +177,7 @@ fn result_of(op: sv_proto::Opcode, reply: &[u8]) -> Option<i32> {
 /// already accepts a copy to obey. So the blob is read *out* of the arena into
 /// a reused buffer and decoded from there.
 ///
-/// That is not merely a language concession. design.md §5.5 already draws the
+/// That is not merely a language concession. docs/design.md §5.5 already draws the
 /// distinction that settles it:
 ///
 /// > a value the GPU side reads *out* of the arena into a local variable is
@@ -193,7 +193,7 @@ fn result_of(op: sv_proto::Opcode, reply: &[u8]) -> Option<i32> {
 /// against one of each per `vkCmd*`.
 /// `SV_DRIVER_VERSION_MAX=1.1`: report the driver as *older* than it is.
 ///
-/// design.md §0.18 has to work in both directions — "a GPU that only does 1.1
+/// docs/design.md §0.18 has to work in both directions — "a GPU that only does 1.1
 /// must still work, and the path where the device is older than our ceiling
 /// needs a test, not just the path where it is newer" — and there is no such GPU
 /// on the development machine. Every driver here reports 1.4. Without a knob the
@@ -296,7 +296,7 @@ fn protocol_command(
                 .map_err(err)?;
                 return Ok(0);
             }
-            // A failed import is design.md §5.2's "hard error surfaced as
+            // A failed import is docs/design.md §5.2's "hard error surfaced as
             // `VK_ERROR_OUT_OF_DEVICE_MEMORY` from the triggering
             // `vkAllocateMemory`" — so it is a *reply*, not a fatal ring. The
             // app side is waiting for this answer and can act on it.
@@ -346,7 +346,7 @@ fn protocol_command(
             // would make the app side's negotiation a tautology — it would learn
             // its own ceiling back and could never notice that the driver is
             // richer than the wire. What travels is the driver's own two
-            // numbers; design.md §0.18 decides what to do with them, once, on
+            // numbers; docs/design.md §0.18 decides what to do with them, once, on
             // the app side.
             let lower = version_floor();
             sv_proto::sv::DriverVersionsReply {
@@ -367,21 +367,21 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     let mut cons = RingConsumer::open(&control, slot, Lane::Command).map_err(err)?;
     let mut replies = RingProducer::open(&control, slot, Lane::Reply).map_err(err)?;
     let ctrl = RingCtrl::open(&control, slot).map_err(err)?;
-    // design.md §4.5 implementation 2. A ring thread that spun here would cost a
+    // docs/design.md §4.5 implementation 2. A ring thread that spun here would cost a
     // core per ring for as long as the session lives; one that slept cost 59.6 µs
     // of Linux timer slack on every command that arrived after a quiet moment,
     // which is most of them in any workload that uses more than one ring.
     let parker = Futex::default();
     // `Forward` is the generated half: 221 of the 239 commands are answered
     // inside it, and `GpuServer` supplies only the eighteen whose meaning is
-    // ours (design.md §7.2 pass 12).
+    // ours (docs/design.md §7.2 pass 12).
     let mut srv = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&shared)));
     let mut handled = 0u64;
     let mut reply = Vec::new();
     // The blob is copied out of the arena before it is decoded, into a buffer
     // that is reused for the life of the ring, so a steady workload allocates
     // nothing here after its first frame. See `protocol_command` for why the
-    // copy is not the thing design.md §6.5 was trying to avoid.
+    // copy is not the thing docs/design.md §6.5 was trying to avoid.
     let mut blob = Vec::new();
     let mut idle_since = Instant::now();
     let trace = std::env::var_os("SV_TRACE").is_some();
@@ -447,7 +447,7 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
 
         reply.clear();
 
-        // design.md §6.3's commands are ours rather than Vulkan's and are
+        // docs/design.md §6.3's commands are ours rather than Vulkan's and are
         // routed before the generated dispatcher ever sees them — `Opcode` has
         // no variant for one, and that is the point: `sv_proto::dispatch` is
         // the *Vulkan* dispatcher and one of these arriving there would be a

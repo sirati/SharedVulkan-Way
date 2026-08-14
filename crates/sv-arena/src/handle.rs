@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn the_wire_form_is_integers_and_therefore_cannot_carry_a_descriptor() {
-        // design.md §1a, and waycompose §14.7's standard for how the claim is
+        // docs/design.md §1a, and waycompose §14.7's standard for how the claim is
         // made. The assertion a test *can* make is that the wire form is a
         // fixed-length array of u32 and that nothing is lost by treating it as
         // one: a descriptor is not a number the peer can act on, and there is no

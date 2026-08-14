@@ -8,7 +8,7 @@
 //! its length" and get an answer rather than a string to re-parse.
 //!
 //! This module is that answer, and it is the *only* place `vk_parse`'s types are
-//! touched (design.md §7.1: `vk-registry` is the only thing that reads the
+//! touched (docs/design.md §7.1: `vk-registry` is the only thing that reads the
 //! registry). Everything downstream sees [`Model`].
 //!
 //! # What "resolved" means here
@@ -16,7 +16,7 @@
 //! - Declarations are parsed into [`crate::ctype::CType`], so indirection depth
 //!   and per-level constness are facts rather than substrings.
 //! - `len=` is parsed into [`LenSpec`], one term per pointer level, with
-//!   `altlen=` preferred over `latexmath:` exactly as design.md §7.4 requires.
+//!   `altlen=` preferred over `latexmath:` exactly as docs/design.md §7.4 requires.
 //! - `optional=` is split per level into a `Vec<bool>`.
 //! - Type and command aliases are recorded but *not* collapsed: the generator
 //!   needs both the alias and the canonical name, because the wire protocol
@@ -136,7 +136,7 @@ pub enum TypeDef {
     FuncPointer(FuncPointer),
     /// A type from a platform header the registry only names: `HWND`,
     /// `ANativeWindow`, `xcb_connection_t`. Not serialisable, and the generator
-    /// must reject any subset that reaches one (design.md §6.1 exclusion list).
+    /// must reject any subset that reaches one (docs/design.md §6.1 exclusion list).
     External { name: String, requires: Option<String> },
 }
 
@@ -175,7 +175,7 @@ pub enum Primitive {
     F32,
     F64,
     /// `size_t`. Its width differs between the two sides in principle, which is
-    /// exactly why Venus's rules pin it to 64 bits on the wire (design.md §6.1).
+    /// exactly why Venus's rules pin it to 64 bits on the wire (docs/design.md §6.1).
     Size,
 }
 
@@ -226,7 +226,7 @@ pub struct Handle {
     ///
     /// The distinction survives into our design: a dispatchable handle the app
     /// side returns must be a pointer to a `#[repr(C)]` struct whose first word
-    /// the loader overwrites (design.md §6.4), while a non-dispatchable one is
+    /// the loader overwrites (docs/design.md §6.4), while a non-dispatchable one is
     /// just an id. On the wire both are a u64 id.
     pub dispatchable: bool,
     /// `parent=` — `VkDevice` for `VkBuffer`, etc. Used by the GPU-side object
@@ -272,7 +272,7 @@ pub struct StructType {
     pub members: Vec<Member>,
     /// `returnedonly="true"` — the struct is only ever filled in by the
     /// implementation. Venus's three-state output validity keys off this
-    /// (design.md §6.1).
+    /// (docs/design.md §6.1).
     pub returned_only: bool,
     /// `structextends=` — the structs this one may appear in the `pNext` of.
     pub extends: Vec<String>,
@@ -307,7 +307,7 @@ pub struct Member {
     pub optional: Vec<bool>,
     /// `externsync=` verbatim. Not used by marshalling; used by the GPU side to
     /// know which objects a command mutates, which is what the deferred-destroy
-    /// bookkeeping needs (design.md §5.5).
+    /// bookkeeping needs (docs/design.md §5.5).
     pub externsync: Option<String>,
     /// `selector=` — for a union member, the sibling holding the discriminator.
     pub selector: Option<String>,
@@ -317,7 +317,7 @@ pub struct Member {
     /// `values=` — the fixed `sType` value.
     pub values: Vec<String>,
     /// `noautovalidity="true"`, which usually marks a member whose presence is
-    /// decided by something the registry cannot express. design.md §7.4's
+    /// decided by something the registry cannot express. docs/design.md §7.4's
     /// "conditional presence" cases all carry it.
     pub no_auto_validity: bool,
     /// `objecttype=` — for a sibling member naming the `VkObjectType` of an
@@ -364,7 +364,7 @@ pub enum LenTerm {
     Path { root: String, field: String },
     /// A C expression from `altlen=`, e.g. `codeSize / 4`.
     ///
-    /// design.md §7.4 is explicit: read `altlen`, never `latexmath:`. There are
+    /// docs/design.md §7.4 is explicit: read `altlen`, never `latexmath:`. There are
     /// four of these in the whole registry and all four are simple arithmetic,
     /// so they are carried as text and evaluated by the generator's expression
     /// mapper rather than by a parser nobody needs.
@@ -392,7 +392,7 @@ pub struct Command {
     pub success_codes: Vec<String>,
     pub error_codes: Vec<String>,
     /// `cmdbufferlevel=` — present exactly on the `vkCmd*` family, which is what
-    /// the restricted sub-decoder of design.md §6.5 is allowed to accept.
+    /// the restricted sub-decoder of docs/design.md §6.5 is allowed to accept.
     pub cmd_buffer_level: Option<String>,
     pub queues: Option<String>,
     pub render_pass: Option<String>,
@@ -431,7 +431,7 @@ impl Command {
     ///
     /// This is what pass 12 consults to decide which generated dispatches take
     /// the device's queue lock. A GPU side opens **one** queue and every session
-    /// shares it (design.md §0.12 item 4), so the application's own
+    /// shares it (docs/design.md §0.12 item 4), so the application's own
     /// synchronisation cannot discharge the obligation: two clients that each
     /// use their queue correctly still reach one driver `VkQueue` at once.
     pub fn externally_synchronizes_a_queue(&self) -> bool {
@@ -1103,7 +1103,7 @@ fn build_member_from_command_param(p: &vk_parse::CommandParam) -> Result<Member>
 
 /// Parse `len=` into one term per pointer level, preferring `altlen=`.
 ///
-/// design.md §7.4: "read `altlen`; there are only 5 latexmath cases in the
+/// docs/design.md §7.4: "read `altlen`; there are only 5 latexmath cases in the
 /// registry and `altlen` exists to give the plain-C equivalent. Do not build a
 /// LaTeX parser."
 fn parse_len(len: Option<&str>, altlen: Option<&str>) -> Option<LenSpec> {

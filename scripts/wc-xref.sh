@@ -179,8 +179,19 @@ echo "  (they mean 'this file's own document'; resolving them needs a file-to-do
 
 rm -f /tmp/wc-xref-$$-missing.txt /tmp/wc-xref-$$-ambig.txt /tmp/wc-xref-$$-unqual.txt
 
-# **Only `missing` fails the check today.** Ambiguity and the unqualified form
-# are real and are reported, but there are hundreds of the latter and failing on
-# them would make this unrunnable rather than useful -- and a check nobody can
-# pass gets disabled, which is §42's other defect. Tighten as they come down.
-[ "$missing" -eq 0 ]
+# **`missing` and `unqualified` both fail now.** §54.3 left the second as
+# residue: there were 762 bare `design.md §N`, and failing on them would have
+# made the check unrunnable rather than useful, which is §42's other defect. All
+# 762 are qualified as of §55, so the count is 0 and the gate can close behind
+# them -- which is the whole point of reporting a number you intend to drive
+# down. This is the "one line in one place" §54.3 promised.
+#
+# **`ambiguous` still only reports, and that is not the same compromise.** Those
+# 103 citations name a document that defines their section *twice* — §1 alone is
+# defined twice in `docs/design.md` and cited 48 times. They were always
+# ambiguous; qualifying the unqualified ones is what made it visible, which is
+# progress rather than a regression. But no edit to the citation can fix it: the
+# document has to stop defining the same number twice, and renumbering a
+# document another agent is actively writing in is §48.3's trade. Failing here
+# would block every commit on work this checker cannot do.
+[ "$missing" -eq 0 ] && [ "$unqual" -eq 0 ]

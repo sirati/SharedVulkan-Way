@@ -4,7 +4,7 @@
 //!
 //! - `VkFooArgs` — the decoded parameters, and the type a client stub is handed.
 //! - `VkFooReply` — the result and the callee-filled parameters, when there is
-//!   one. Most commands have none: design.md §4.4 follows Venus in generating a
+//!   one. Most commands have none: docs/design.md §4.4 follows Venus in generating a
 //!   reply only when it is asked for.
 //! - `size_cmd_*` / `encode_cmd_*` / `decode_cmd_*` — the app side's two passes
 //!   and the GPU side's one.
@@ -12,14 +12,14 @@
 //!   other direction.
 //!
 //! and, once for the whole protocol, the opcode enum, the `Server` trait, the
-//! dispatcher, and the restricted sub-decoder of design.md §6.5.
+//! dispatcher, and the restricted sub-decoder of docs/design.md §6.5.
 //!
 //! # Why output parameters appear in *both* directions
 //!
 //! Venus does this and it is not redundancy. An out-parameter's *storage* is
 //! uninitialised on the way out, but its *shape* is not: `pPhysicalDevices` is
 //! accompanied by the count the caller allocated for, and an object handle is
-//! the id the app side has already chosen (design.md §6.4 — object creation
+//! the id the app side has already chosen (docs/design.md §6.4 — object creation
 //! costs no round trip precisely because the id goes out with the request). So
 //! the command carries the out-parameter in its `_partial` form and the reply
 //! carries it in full.
@@ -126,7 +126,7 @@ fn emit_opcodes(plan: &Plan) -> TokenStream {
         /// stable against the registry reordering a block but *not* against the
         /// profile gaining or losing a command. That is deliberate and it is
         /// safe: the profile is part of the protocol hash, so a build whose
-        /// opcodes moved cannot connect to one whose did not (design.md §4.3,
+        /// opcodes moved cannot connect to one whose did not (docs/design.md §4.3,
         /// R13).
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(u32)]
@@ -146,13 +146,13 @@ fn emit_opcodes(plan: &Plan) -> TokenStream {
             }
 
             /// Whether this opcode belongs to the recorded `vkCmd*` subset the
-            /// restricted sub-decoder accepts (design.md §6.5).
+            /// restricted sub-decoder accepts (docs/design.md §6.5).
             pub fn is_recorded(self) -> bool { #recorded_body }
 
             /// Whether this opcode may appear in a command blob at all.
             ///
             /// The recorded subset **plus the two commands that frame it**.
-            /// design.md §6.5 says "`vkEndCommandBuffer` publishes
+            /// docs/design.md §6.5 says "`vkEndCommandBuffer` publishes
             /// `(offset, len)`" and stops there, leaving `vkBeginCommandBuffer`
             /// as an ordinary round trip — which cannot work, because the GPU
             /// side replays the blob when it arrives rather than when the
@@ -235,7 +235,7 @@ fn emit_command(_plan: &Plan, c: &CommandPlan) -> TokenStream {
         "Client stub for `{}`: bytes the encoded command will occupy, header \
          included.\n\n\
          The `size` and `encode` passes are separate because a ring span has to \
-         be reserved before it can be written (design.md §7.2), and \
+         be reserved before it can be written (docs/design.md §7.2), and \
          [`sv_wire::Encoder::finish`] checks afterwards that they agreed.",
         c.name
     );
@@ -243,7 +243,7 @@ fn emit_command(_plan: &Plan, c: &CommandPlan) -> TokenStream {
     // -- the reply type ------------------------------------------------------
     let reply_block = if c.generates_reply {
         // **The `ret` field, and why it is a `u64` rather than the C type.**
-        // design.md §0.3 item 5's hole: a command returning a `VkDeviceAddress`
+        // docs/design.md §0.3 item 5's hole: a command returning a `VkDeviceAddress`
         // has no output parameter to carry it, so the reply grows a field of its
         // own. It is 64 bits wide and unsigned for all three commands in the
         // profile, and the wire has no reason to know which of the three
@@ -499,7 +499,7 @@ fn emit_server_trait(plan: &Plan) -> TokenStream {
         /// a decoded reply. Everything about the wire is on this side of the
         /// trait; nothing about Vulkan is. That separation is what lets the
         /// whole protocol be tested against a fake server with no driver
-        /// present, which is what design.md §13 steps 1–6 need.
+        /// present, which is what docs/design.md §13 steps 1–6 need.
         ///
         /// # Every method has a default, and that is a correction to design.md
         ///
@@ -588,7 +588,7 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
         /// Decode one command and hand it to the server.
         ///
         /// The header's `cmd_size` is checked against what decoding actually
-        /// consumed. That check is the whole reason design.md §6.2 spends four
+        /// consumed. That check is the whole reason docs/design.md §6.2 spends four
         /// bytes per command: without it, two builds from different registries
         /// do not fail to connect — they desynchronise and misinterpret
         /// everything downstream (R13). With it, the very first mismatched
@@ -624,7 +624,7 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
 
         /// Decode every command in a recorded blob.
         ///
-        /// The restricted sub-decoder of design.md §6.5: it accepts only the
+        /// The restricted sub-decoder of docs/design.md §6.5: it accepts only the
         /// `vkCmd*` opcodes, so a blob that names anything else is rejected
         /// rather than executed. gfxstream's `vk_sub_decoder.cpp` and Venus's
         /// `vkExecuteCommandStreamsMESA` do the same, for the same reason —

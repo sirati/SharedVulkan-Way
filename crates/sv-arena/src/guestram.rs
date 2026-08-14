@@ -1,7 +1,7 @@
 //! The **guest-side** arena provider on Linux: allocate guest RAM, pin it,
 //! stamp it.
 //!
-//! design.md §5.1 gives the rule — "the side inside the VM allocates, because
+//! docs/design.md §5.1 gives the rule — "the side inside the VM allocates, because
 //! only it can produce pages the hypervisor can locate" — and then describes
 //! only the Windows implementation, because `testhost`'s guest is Windows.
 //! This is the Linux one, and it exists because the development guest of §13
@@ -159,7 +159,7 @@ impl ArenaProvider for GuestRamProvider {
 
     /// `None` — this provider does not know its frames.
     ///
-    /// It is no longer true that it *could* not. design.md §0.14: on Windows,
+    /// It is no longer true that it *could* not. docs/design.md §0.14: on Windows,
     /// `NtQuerySystemInformation(SystemSuperfetchInformation)` with
     /// `SuperfetchPfnQuery` reports the frame behind every page of an ordinary
     /// mapped window in ~330 ms, measured against the live guest and agreeing

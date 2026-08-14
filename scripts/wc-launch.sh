@@ -96,6 +96,77 @@ h() { ssh "${SSHOPT[@]}" "$HOST" "$@" 2>&1; }
 
 # STAGE 42. `fresh` and `deployed_is`. Sourced after the reporters and `g`/`h`.
 . "$(dirname "$0")/wc-binaries.sh"
+# STAGE 53. The substrate and the topology, which this harness measured for
+# four stages without ever declaring either.
+#
+# It is the harness that most needed them and the last one to get them, and the
+# reason is worth naming: every *other* guest harness locates the arena itself
+# through `wc_locate_arena`, so sourcing `wc-substrate.sh` was how it got the
+# locate and the declaration came along with it. This one does not locate
+# anything — `wc-launch.exe` asks `wc-session` on the VM host, which runs
+# `wc-arena-host` there — so there was no function it had to call, and therefore
+# nothing that made the omission visible. A gate you reach for by accident is
+# not a gate; §51 is the same mistake made structural, and this is the harness
+# that structure had not reached.
+#
+# `WC_GUEST_CONFIGURED` is set because this harness ssh's into a guest, and
+# setting it is what makes `wc_substrate_declare wine-fixture` **refuse** here.
+# The launcher could not open a file arena anyway — `wc-session` spells
+# `--transport arena --arena-plan` in its own body and has no verb that names a
+# file (§34.7) — so this is the belt to that braces: the escape hatch is never
+# handed out on this path, by two independent mechanisms that would each have to
+# fail.
+WC_GUEST_CONFIGURED=1
+. "$(dirname "$0")/wc-substrate.sh"
+. "$(dirname "$0")/wc-topology.sh"
+
+# What every leg below runs on, declared before any of them runs.
+#
+# Called once, at the top, rather than per-leg: unlike `wc-guest.sh` — where
+# `do_damage` is one leg among twelve and the others are Wine — *every* verb in
+# this harness drives the same guest through the same launcher, so there is no
+# leg here for which a different answer could be correct.
+wcl_declare() {
+  wc_substrate_declare guest-ram || exit 2
+  wc_topology_declare cross-vm \
+    "sv-guest.exe on $GUEST, wc-proxy on $HOST, arena in the guest's own RAM" || exit 2
+}
+
+# The declaration checked against the run's own evidence, from the one line the
+# launcher already prints.
+#
+# `wc_assert_topology` wants `WC_SUBSTRATE_LOCATED`, which `wc_locate_arena`
+# sets — and this harness never calls it, because the locate happens on the VM
+# host under `wc-session`. So the same fact is taken from where it does exist:
+# the launcher's own `locate:` line, which carries `located N of N pages` and
+# **which locator produced them**. That line is the guest's report of a locate
+# it did not perform and could not fake: the numbers come back from
+# `wc-arena-host` on the far side of the ssh channel.
+#
+# Reading the locator from the line rather than assuming it is the point of
+# §34.2. `frames=none` is a legitimate outcome — the sweep works, it merely
+# costs seconds — so this records which arm ran instead of requiring one.
+wcl_assert_located() {
+  local line pages
+  line=$(read_clock | grep 'locate:' | tail -1)
+  if [ -z "$line" ]; then
+    bad "the launcher reported no locate: nothing here says the arena is guest RAM"
+    return 1
+  fi
+  pages=$(echo "$line" | grep -oE 'located [0-9]+ of [0-9]+ pages' | head -1 | awk '{print $2}')
+  if [ -z "$pages" ] || [ "$pages" -eq 0 ]; then
+    bad "the locate placed no pages: ${line}"
+    return 1
+  fi
+  WC_SUBSTRATE_LOCATED="$pages"
+  case "$line" in
+    *"by frame list"*) WC_SUBSTRATE_LOCATOR=frames ;;
+    *"frames=none"*)   WC_SUBSTRATE_LOCATOR=sweep ;;
+    *)                 WC_SUBSTRATE_LOCATOR=sweep ;;
+  esac
+  ok "the arena is guest RAM: $pages pages located by $WC_SUBSTRATE_LOCATOR on $HOST"
+  wc_assert_topology "/dev/null" "launch"
+}
 
 # Run something on the guest's interactive desktop. See the header.
 int() {
@@ -444,6 +515,7 @@ do_stop() {
 do_click() {
   local kind="$1"
   echo "== $kind click =="
+  wcl_declare
   g "rm -f $APPDATA_MSYS/wc-launch-$SESSION.log" >/dev/null
   local t0; t0=$(date +%s)
   int "wclaunch-click-$kind" "powershell.exe" \
@@ -487,6 +559,10 @@ do_click() {
     ok "$kind click to window: ${ms} ms, inside the ${waited}s the harness waited (the figure itself is informational: it is a rate on a contended guest)"
   fi
   read_clock | grep -E 'arena:|locate:|proxy:|run Firefox|cold start|session up' | sed 's/^/        /'
+  # Only a click that started the session has a locate of its own to check; a
+  # warm click joins one and its `locate:` line belongs to the cold click that
+  # came before, which this harness has already deleted the log of.
+  case "$kind" in cold|warm-first) wcl_assert_located ;; esac
   echo "$ms"
 }
 

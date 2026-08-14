@@ -15,7 +15,7 @@
 //! its width, every handle and every alias.
 //!
 //! See `crate::cheader` for why the published header is the reference and how
-//! design.md §7.1's fixture-drift objection is answered (it is not a fixture: it
+//! docs/design.md §7.1's fixture-drift objection is answered (it is not a fixture: it
 //! comes out of the same nix store path as `$VK_XML`).
 //!
 //! # It has been run against the real bug, not only against planted ones
@@ -112,7 +112,7 @@ fn zink_report(f: &Fixture) -> XReport {
 // provenance: the two artefacts must be the same release
 // ---------------------------------------------------------------------------
 
-/// The trap design.md §7.1 names, closed.
+/// The trap docs/design.md §7.1 names, closed.
 ///
 /// The objection to keeping a generated model as a fixture is that the protocol
 /// becomes a function of an artefact that can drift from `$VK_XML`. This
@@ -801,4 +801,84 @@ fn the_cross_check_is_deterministic() {
         b.sorted(),
         "the divergence list moved between two runs over one input"
     );
+}
+
+/// A command buffer whose recording failed makes its submit fail — asserted
+/// over the generated source, per command, rather than described.
+///
+/// # Why over the source and not through a host double
+///
+/// The property is a *generator* decision made four different ways for four
+/// kinds of command, and the thing that can go wrong is a command landing in the
+/// wrong kind. A host double would exercise one command and prove nothing about
+/// the other 560; reading the emitted dispatch proves it for all of them, and it
+/// is the same technique `the_video_profile_generates_all_three_passes` uses one
+/// test up.
+///
+/// The four kinds, and why each is what it is (docs/design.md §0.24):
+///
+/// - a recorded `vkCmd*` whose entry point the driver lacks **poisons** its
+///   target, because the failure belongs to the command buffer and not to a call
+///   with no reply to fail;
+/// - `vkQueueSubmit` and `vkEndCommandBuffer` **refuse**, which is where the
+///   failure becomes visible to an application;
+/// - `vkBeginCommandBuffer` **clears**, because recording afresh is the only way
+///   back and the specification routes every reuse through it;
+/// - `vkFreeCommandBuffers` does **neither**, because a destructor that can be
+///   refused is a leak.
+#[test]
+fn a_failed_recording_is_carried_to_the_submit_and_not_to_the_ring() {
+    let Some(f) = fixture() else { return };
+    let gpu = sv_codegen::generate_gpu_entry(&f.video.model, &f.video_profile)
+        .expect("the GPU side generates");
+    let src = &gpu.source;
+
+    // The dispatch body for one command, from its `fn` line to the next one.
+    let body = |name: &str| -> String {
+        let at = src
+            .find(&format!("\n    fn {name}("))
+            .unwrap_or_else(|| panic!("{name} is not in the generated GPU side"));
+        let rest = &src[at + 1..];
+        let end = rest[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+    let refuses = |n: &str| body(n).contains("if let Some(__why) = __h.take_poisoned_command_buffer()");
+    let poisons = |n: &str| body(n).contains("__h.poison_command_buffer(");
+    let clears = |n: &str| body(n).contains("__h.unpoison_command_buffer(");
+
+    // The one that matters. `vkQueueSubmit`'s command buffers are a member of
+    // `VkSubmitInfo`, not a parameter, so a check derived from the wire
+    // signature misses it — which the first version of this did. The traversal
+    // is the handle-mapping pass, which visits every handle at any depth.
+    assert!(refuses("queue_submit"), "vkQueueSubmit must refuse a poisoned command buffer");
+    assert!(refuses("queue_submit2"), "vkQueueSubmit2 must too, two levels down");
+    // The specification's own answer: recording failed, so ending fails.
+    assert!(refuses("end_command_buffer"), "vkEndCommandBuffer must report a failed recording");
+
+    // Recording afresh forgives, and must not refuse the call that forgives.
+    assert!(clears("begin_command_buffer"), "vkBeginCommandBuffer must clear the mark");
+    assert!(!refuses("begin_command_buffer"), "the call that clears must not be refused");
+
+    // A destructor is never refused: freeing an invalid command buffer is
+    // exactly what an application does about one.
+    assert!(!refuses("free_command_buffers"), "vkFreeCommandBuffers must never be refused");
+
+    // Every recorded command poisons rather than returning a silent `Ok(())`.
+    // Counted rather than spot-checked, because "most of them" is how the one
+    // that matters gets missed.
+    let recorded: Vec<&str> = src
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("fn cmd_"))
+        .filter_map(|l| l.split('(').next())
+        .collect();
+    assert!(recorded.len() > 80, "only {} vkCmd* found; the sweep did not run", recorded.len());
+    for c in &recorded {
+        let name = format!("cmd_{c}");
+        assert!(
+            poisons(&name),
+            "vk{c} returns silently when the driver lacks it instead of poisoning its \
+             command buffer"
+        );
+        assert!(!refuses(&name), "a recorded command must not refuse; the submit does");
+    }
 }

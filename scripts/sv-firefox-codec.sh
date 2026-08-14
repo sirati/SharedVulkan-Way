@@ -37,7 +37,7 @@
 # So this stands up its own weston -- headless, **pixman**, `wl_shm` and no
 # dmabuf, which is the same shape `wc-proxy` offers -- and everything below is
 # decode plus Software WebRender plus one shm copy. It is not the whole of the
-# user's path and design.md §0.17 says so where it matters.
+# user's path and docs/design.md §0.17 says so where it matters.
 #
 # WHY MARIONETTE AND NOT A SCREENSHOT
 #

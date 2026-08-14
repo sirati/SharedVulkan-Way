@@ -72,7 +72,7 @@ pub struct Grown {
     /// back to the content sweep — which will *work*, because a freshly
     /// committed region still carries its stamps, and will simply cost three
     /// seconds. That degradation is deliberate and is the only fallback in the
-    /// path: design.md §5.1's rule is that a failed locate fails the run, and
+    /// path: docs/waycompose-design.md §5.1's rule is that a failed locate fails the run, and
     /// this is not a failed locate, it is a slow one.
     pub frames: Vec<u64>,
     /// What the query cost, in milliseconds. Reported because a stage that
@@ -215,13 +215,22 @@ impl Service {
     /// Take the front of the outbound window and publish a control region in
     /// it. `Ok(None)` when there is no window, or none big enough — a stated
     /// fact, not a failure.
+    /// STAGE 53. Takes the range that was **already reserved** at start-up
+    /// rather than reserving one now.
+    ///
+    /// The two halves are split because their constraints point in opposite
+    /// directions and only one of them was seen when this was written: the
+    /// reservation must happen before the seat's keymap takes the front of the
+    /// outbound window, and the `Control::create` below must happen after the
+    /// host's locate has read the stamps those same pages carry. Reserving here
+    /// meant `reserve_growth_channel` refused on every guest session that ever
+    /// ran — see `wc_handle::arena::Window::channel`.
     pub fn start() -> Result<Option<Service>, String> {
         let Some(w) = wc_handle::arena::outbound() else {
             return Ok(None);
         };
-        let (offset, len) = match wc_handle::arena::reserve_growth_channel(w.arena) {
-            Ok(v) => v,
-            Err(e) => return Err(format!("{e}")),
+        let Some((offset, len)) = wc_handle::arena::growth_channel(w.arena) else {
+            return Ok(None);
         };
         let base = wc_handle::arena::region_base(w.arena)
             .ok_or_else(|| format!("arena {} is not a region this process provided", w.arena))?;

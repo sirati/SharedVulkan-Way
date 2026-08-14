@@ -10,7 +10,7 @@
 # * shared_vulkan reaches the guest's Intel iGPU from a host with no GPU
 #   (`sv-guest-host.sh`, and the commit that added it);
 # * waycompose puts a Firefox window from the Linux host onto the Windows
-#   guest's interactive desktop over an arena in guest RAM (its design.md §17).
+#   guest's interactive desktop over an arena in guest RAM (its docs/waycompose-design.md §17).
 #
 # This is one process tree containing both. Firefox's *pixels* come back through
 # waycompose's arena; Firefox's *rendering* goes out through shared_vulkan's.
@@ -49,7 +49,7 @@
 # BOTH SIDES MUST COME FROM ONE BUILD. The GPU side here is a binary *copied*
 # into the guest, so rebuilding on the host changes only the host's half.
 #
-# `WIRE_VERSION` went 1 -> 2 in design.md §0.18 (`svDriverVersions`, which is
+# `WIRE_VERSION` went 1 -> 2 in docs/design.md §0.18 (`svDriverVersions`, which is
 # hand-written in `sv_proto::sv` and so outside the protocol hash). A guest
 # binary from before that commit is refused at handshake — correctly, and by
 # design. The ICD names the cause and the fix in the refusal message; the

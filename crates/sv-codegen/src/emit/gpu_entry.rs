@@ -1,6 +1,6 @@
 //! Pass 12: `sv-gpu-entry` — **wire → C**, and the driver call on the far side.
 //!
-//! # The pass design.md §7.2 does not have, and why it is not optional
+//! # The pass docs/design.md §7.2 does not have, and why it is not optional
 //!
 //! §7.2's taxonomy has four corners of a two-by-two — *which side* by *which
 //! direction* — and names three of them:
@@ -24,7 +24,7 @@
 //!
 //! # Pass 4 is not dead, it moved
 //!
-//! design.md §7.2 strikes out pass 4 (`arena_bind`) with the note that owned
+//! docs/design.md §7.2 strikes out pass 4 (`arena_bind`) with the note that owned
 //! Rust values make it a no-op — "our decoder produces owned Rust values whose
 //! storage *is* their lifetime, so there is no binding step to generate". That
 //! is true of *decoding* and false of *raising*, which is the operation
@@ -172,7 +172,7 @@ fn raise_expr(
         //
         // Nothing in any profile was doubly indirect until
         // `VK_KHR_acceleration_structure` came in behind the union walkers
-        // (design.md §0.21), which is why a pass that has marshalled half a
+        // (docs/design.md §0.21), which is why a pass that has marshalled half a
         // million lines had never met it. The fix is the same one line
         // `FixedArray` already carries, and the lesson is that it was written as
         // a special case for two-dimensional *arrays* when it is really the rule
@@ -344,7 +344,7 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
             "Raise a wire `{name}` into its C form.\n\n\
              Unlike lowering, which has to pick a member because a C union \
              carries no tag, this direction is exact: the Rust enum *is* the \
-             tag (design.md §7.4)."
+             tag (docs/design.md §7.4)."
         );
         return Ok(quote! {
             #[doc = #doc]
@@ -368,7 +368,7 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
         if *mname == "sType" {
             // `sType` is not a wire field at all — dropping it from the Rust
             // type is what makes "a value with the wrong sType" unrepresentable
-            // (design.md §7.2). It is reconstructed here from the registry.
+            // (docs/design.md §7.2). It is reconstructed here from the registry.
             let Some(v) = s.s_type_value else {
                 return Err(format!("{name} has an sType member but no value in the registry"));
             };
@@ -390,7 +390,7 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
     let doc = format!(
         "Raise a wire `{name}` into the C struct a driver can be handed.\n\n\
          Pointer-valued members are allocated in `__a` and live as long as it \
-         does, which is design.md §7.2's pass 4 doing the job it was struck out \
+         does, which is docs/design.md §7.2's pass 4 doing the job it was struck out \
          for not having."
     );
     Ok(quote! {
@@ -434,7 +434,7 @@ fn emit_raise_pnext(cx: &Ctx<'_>) -> TokenStream {
         /// next one, so the tail has to exist before the head can point at it.
         ///
         /// A link whose `sType` this build does not know is skipped rather than
-        /// forwarded. That is not the app side's leniency (design.md §6.1 —
+        /// forwarded. That is not the app side's leniency (docs/design.md §6.1 —
         /// "the app side silently drops unknown links") reappearing on the wrong
         /// side: an unknown link is *already* fatal at the decoder here, so
         /// anything reaching this function is known to the protocol and merely
@@ -790,7 +790,7 @@ fn emit_forward_command(
         let ty = c_param_type(cx, &abi.ty);
         let e = raise_expr(cx, &f.shape, abi, &quote!(a.#id), &c.name)?;
         // An array *parameter* decays to a pointer and an array *member* does
-        // not — design.md §0.3's finding 4, met from the other side.
+        // not — docs/design.md §0.3's finding 4, met from the other side.
         // `vkCmdSetBlendConstants(const float blendConstants[4])` takes four
         // floats by address, so the raised `[f32; 4]` has to be given one.
         let e = if matches!(abi.ty.kind, CTypeKind::Array(..)) {
@@ -817,7 +817,7 @@ fn emit_forward_command(
             Out::Count { c_ty } => {
                 // The caller's capacity on the way in, the answer on the way
                 // out — Venus's `_partial` count, and the reason an output
-                // parameter travels in *both* directions (design.md §7.2).
+                // parameter travels in *both* directions (docs/design.md §7.2).
                 out_decls.push(quote!(let mut #id: #c_ty = a.#id.unwrap_or(0) as #c_ty;));
             }
             // # An output struct's `sType` and `pNext` are *inputs*
@@ -924,7 +924,7 @@ fn emit_forward_command(
         quote!(let __r = unsafe { __f(#(#args),*) };)
     };
 
-    // # External synchronisation of the one `VkQueue` (design.md §0.12 item 4)
+    // # External synchronisation of the one `VkQueue` (docs/design.md §0.12 item 4)
     //
     // Vulkan makes `vkQueueSubmit`, `vkQueueWaitIdle`, `vkQueueBindSparse` and
     // `vkDeviceWaitIdle` externally synchronised on the queue, which means *the
@@ -965,7 +965,7 @@ fn emit_forward_command(
         reply_fields.push(quote!(result: sv_proto::VkResult(__r.0),));
     } else if wire.returns_value {
         // The driver's own answer, widened to the wire's `u64`. This is the GPU
-        // side of design.md §0.3 item 5: `vkGetBufferDeviceAddress` returns a
+        // side of docs/design.md §0.3 item 5: `vkGetBufferDeviceAddress` returns a
         // real device address on a real device, and §11's caveat holds it
         // together — we never relocate, so the number stays true for as long as
         // the buffer does.
@@ -1059,7 +1059,7 @@ fn emit_forward_command(
                 // The count is in **bytes**, whatever the element type of the
                 // storage is, and it is the driver's answer rather than the
                 // capacity. Clamping against our own buffer is Venus's rule
-                // (design.md §6.1) applied in the direction the reply travels.
+                // (docs/design.md §6.1) applied in the direction the reply travels.
                 let n = match count {
                     Some(s) => {
                         let cid = naming::ident(&naming::snake_case(s));
@@ -1114,27 +1114,120 @@ fn emit_forward_command(
         quote!(Ok(()))
     };
 
+    // Recording is starting again, so whatever broke last time is forgiven.
+    let clears = crate::exceptions::CLEARS_COMMAND_BUFFER_POISON.contains(&cname);
+    let unpoison =
+        if clears { quote!(__h.unpoison_command_buffer(a.command_buffer.0);) } else { quote!() };
+
+    // Refuse a call that names a command buffer whose recording failed.
+    //
+    // # Where the set of command buffers comes from, and why not from here
+    //
+    // The first version of this walked the wire signature for `VkCommandBuffer`
+    // fields. It covered `vkCmdExecuteCommands` and `vkFreeCommandBuffers` and
+    // **missed `vkQueueSubmit`**, which is the only one that matters:
+    // `vkQueueSubmit` takes `VkSubmitInfo[]` and the buffers are a member of
+    // *that*, one level down, and `vkQueueSubmit2` puts them two levels down
+    // inside `VkCommandBufferSubmitInfo`. A shallow walk finds the commands that
+    // do not need checking and not the one that does.
+    //
+    // The right traversal already exists and runs immediately above: the
+    // **handle-mapping pass** visits every handle anywhere in the argument
+    // graph, nested or not, and calls `map_handle` with its `HandleType`. So the
+    // host notes command buffers as it maps them and this asks what it saw. No
+    // second walker, no depth limit, and a command added to the registry
+    // tomorrow with buffers three structs deep is covered by construction.
+    //
+    // # Which commands ask
+    //
+    // Not recorded ones: a `vkCmd*` recording into an already-poisoned buffer is
+    // harmless, the buffer is invalid either way, and refusing here would report
+    // the failure against whichever command happened to come next rather than
+    // against the submit.
+    //
+    // Not the ones that clear the mark — `vkBeginCommandBuffer` maps its target
+    // before `unpoison` runs, so it would refuse the very call that makes the
+    // buffer usable again.
+    //
+    // Not the ones that *destroy*, derived from the fact that they unbind
+    // handles: `vkFreeCommandBuffers` on an invalid buffer must free it, and a
+    // destructor that can be refused is a leak. This is why the check is keyed
+    // on `unbind.is_empty()` rather than on a list of names.
+    //
+    // What is left is `vkQueueSubmit`, `vkQueueSubmit2` and
+    // `vkEndCommandBuffer` — and `vkEndCommandBuffer` refusing is not a side
+    // effect but the specification: a command buffer whose recording failed
+    // returns an error from `vkEndCommandBuffer`.
+    let asks_about_poison = !wire.is_recorded && !clears && unbind.is_empty();
+    let poison_check = if asks_about_poison {
+        quote! {
+            if let Some(__why) = __h.take_poisoned_command_buffer() {
+                // Failing *this* call is the whole point: it is detectable, it
+                // names the command that broke recording, and it does not touch
+                // the ring.
+                __h.note_poisoned_submit(#cname, __why);
+                return #missing_answer;
+            }
+        }
+    } else {
+        // Still has to be drained, or a poisoned buffer seen by a recorded
+        // command would be reported against the next unrelated call that asks.
+        quote!(let _ = __h.take_poisoned_command_buffer();)
+    };
+
+    // A recorded command whose entry point the driver lacks poisons its target.
+    //
+    // `Ok(())` here was the silent-no-op §0.22 item 5 named and did not close:
+    // nothing is recorded, there is no reply to carry the fact, and a caller
+    // checking a return value cannot notice. Returning `Err` instead would take
+    // the ring fatal, which is far too blunt for a driver that merely lacks an
+    // optional extension — so neither answer was right, because the failure does
+    // not belong to *this* call. It belongs to the command buffer, and Vulkan
+    // already has a word for that: a command buffer whose recording failed is
+    // invalid, and submitting it must fail.
+    //
+    // The handle mapping above has already run, so `a.command_buffer.0` is the
+    // driver's handle rather than the wire id — which is also what
+    // `vkQueueSubmit` will be holding when it checks.
+    let missing_arm = if wire.is_recorded {
+        quote! {
+            __h.note_missing(#cname);
+            __h.poison_command_buffer(a.command_buffer.0, #cname);
+            return #missing_answer;
+        }
+    } else {
+        quote! {
+            __h.note_missing(#cname);
+            return #missing_answer;
+        }
+    };
+
     let mut_a = if has_pre { quote!(mut) } else { quote!() };
     Ok(quote! {
         let #mut_a a = a;
         let __h = &mut self.0;
         #unbind_block
         #pre
+        #unpoison
+        #poison_check
         let __maybe = __h.fns().#field;
         let __f = match __maybe {
             Some(__f) => __f,
             None => {
-                __h.note_missing(#cname);
                 // **Fail the call, not the session.** The profile is a superset
                 // of any one driver's extensions, so a missing entry point is a
                 // normal configuration and not a protocol error — and returning
                 // `Err` here would propagate out of `dispatch`, produce no reply
                 // at all, and take the ring fatal. That is exactly what
                 // `sv_proto::Server`'s own default refusal was changed to avoid
-                // (design.md §7.2's note on the trait), and the same argument
+                // (docs/design.md §7.2's note on the trait), and the same argument
                 // applies one layer down: `vkSetDebugUtilsObjectNameEXT` on a
                 // driver without the extension must not lose the device.
-                return #missing_answer;
+                //
+                // For a *recorded* command there is a third answer, and it is
+                // the right one: poison the command buffer, so the submit that
+                // would have executed it fails instead. See `missing_arm`.
+                #missing_arm
             }
         };
         let mut __pool = crate::Raise::default();
@@ -1266,18 +1359,18 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
         /// command whose meaning is *ours* rather than the driver's — the arena,
         /// the session, submission. The list is short and closed, and it is the
         /// honest measure of how much of a GPU side is hand-written: everything
-        /// not named here is generated (design.md §7.2, pass 12).
+        /// not named here is generated (docs/design.md §7.2, pass 12).
         pub trait GpuHost {
             /// The driver's entry points.
             fn fns(&self) -> &DriverFns;
-            /// App-assigned object id → the driver's own handle (design.md §6.4).
+            /// App-assigned object id → the driver's own handle (docs/design.md §6.4).
             fn map_handle(
                 &mut self,
                 ty: sv_proto::HandleType,
                 id: u64,
             ) -> sv_wire::Result<u64>;
             /// Arena coordinates → a driver allocation and an offset into it
-            /// (design.md §5.3, GPU-side half).
+            /// (docs/design.md §5.3, GPU-side half).
             fn rewrite_memory(&mut self, memory: u64, offset: u64)
                 -> sv_wire::Result<(u64, u64)>;
             /// Record the app side's id for an object the driver just created.
@@ -1287,6 +1380,40 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// Record that the driver has no such entry point, for one clear
             /// diagnosis rather than a silent refusal.
             fn note_missing(&mut self, command: &'static str);
+            /// Mark a command buffer as having failed to record, naming the
+            /// command that could not be recorded.
+            ///
+            /// Vulkan already has the concept: a command buffer whose recording
+            /// failed is *invalid*, and submitting an invalid command buffer
+            /// must not succeed. That is the answer to the question §0.22 item 5
+            /// left open — a recorded `vkCmd*` whose driver entry point is
+            /// missing has no reply to fail and must not fail the ring, because
+            /// the failure is not this call's. It is the command buffer's.
+            ///
+            /// Called with the **driver's** handle, because the generated
+            /// dispatch maps handles before it looks the entry point up, and
+            /// because that is what `vkQueueSubmit` will be holding when it
+            /// checks.
+            fn poison_command_buffer(&mut self, command_buffer: u64, why: &'static str);
+            /// Clear a command buffer's poison: it is being recorded afresh.
+            ///
+            /// Without this a buffer reused after a failed recording stays
+            /// invalid forever, which turns one missing extension into a device
+            /// that never submits again.
+            fn unpoison_command_buffer(&mut self, command_buffer: u64);
+            /// Take the reason, if the handle-mapping pass just mapped a command
+            /// buffer whose recording had failed.
+            ///
+            /// The mapping pass is the traversal: it visits every handle
+            /// anywhere in the argument graph, so this needs no walker of its
+            /// own and cannot miss a `VkCommandBuffer` nested inside a
+            /// `VkSubmitInfo`. Taking rather than peeking, because the flag is
+            /// per-dispatch and a stale one would be reported against the next
+            /// command.
+            fn take_poisoned_command_buffer(&mut self) -> Option<&'static str>;
+            /// Report that a call was refused because it names a command buffer
+            /// whose recording failed.
+            fn note_poisoned_submit(&mut self, command: &'static str, why: &'static str);
             /// Hold the device's queue lock for the duration of one driver call
             /// the specification marks externally synchronised on a `VkQueue`.
             ///
@@ -1295,7 +1422,7 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// `vk_registry::model::Command::externally_synchronizes_a_queue`
             /// selects. A GPU side has one queue and every session shares it, so
             /// the obligation cannot be discharged by any one client behaving
-            /// (design.md §0.12 item 4).
+            /// (docs/design.md §0.12 item 4).
             fn lock_queue(&self) -> crate::QueueGuard<'_>;
 
             #(#methods)*
@@ -1369,7 +1496,7 @@ fn emit_server_impl(
 /// The profile's *device* extensions, as a constant the GPU side can filter the
 /// driver's list against.
 ///
-/// design.md §9.2's rule, made checkable: "an extension in this list is a
+/// docs/design.md §9.2's rule, made checkable: "an extension in this list is a
 /// promise that its entry points work". An entry point works only if pass 12
 /// emitted a forwarder for it, so the set a GPU side may advertise is exactly
 /// the profile's device extensions intersected with the driver's — and the first
@@ -1397,7 +1524,7 @@ fn emit_profile_extensions(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
         /// A GPU side advertises the intersection of this with what its driver
         /// actually has; an app side advertises what the GPU side answered.
         /// Neither may advertise anything else, because an advertised extension
-        /// is a promise that its entry points cross (design.md §9.2).
+        /// is a promise that its entry points cross (docs/design.md §9.2).
         pub const PROFILE_DEVICE_EXTENSIONS: [&str; #n] = [#(#names),*];
     }
 }
@@ -1419,7 +1546,7 @@ pub fn emit_all(
     // the driver's answer here, so the app side's lowering zeroes exactly the
     // members this side exists to carry. See `Ctx::lower_full`.
     //
-    // Restricted to `needs_partial`, which design.md §6.1 defines as
+    // Restricted to `needs_partial`, which docs/design.md §6.1 defines as
     // "`returnedonly` or reachable from a command output" — precisely the
     // structs that can come back.
     let full_cx = cx.full_lowering();

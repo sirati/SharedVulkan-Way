@@ -63,7 +63,7 @@ fn main() -> Result<()> {
     println!("cargo:rustc-env=SV_PROTOCOL_HASH={}", generated.protocol_hash);
     println!("cargo:rustc-env=SV_PROTOCOL_PROFILE={}", profile.name);
     // The highest core Vulkan version the generated wire carries, which is what
-    // the app side is allowed to advertise (design.md §0.18). It is *not* in the
+    // the app side is allowed to advertise (docs/design.md §0.18). It is *not* in the
     // protocol hash and does not need to be: a profile that changes its core
     // version changes its command table, and the hash is over that.
     println!("cargo:rustc-env=SV_PROTOCOL_CORE_VERSION={}", profile.core_api_version());
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     // makes this reach a dependent build script, as `DEP_SV_PROTO_CORE_VERSION`.
     // It is the only way Cargo offers, and the alternative — a literal in
     // `sv-icd/build.rs` kept in step by a test — is the hand-maintained coupling
-    // design.md §0.18 exists to remove.
+    // docs/design.md §0.18 exists to remove.
     println!("cargo:core_version={}", profile.core_api_version());
     println!(
         "cargo:warning=sv-proto: profile {}, {} commands, {} structs, hash {:#018x}",

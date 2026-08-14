@@ -2764,7 +2764,7 @@ here does not produce a bigger protocol; it produces a generator error:
 ```
 Error: planning profile "zink"
   VkImageToMemoryCopy.pHostPointer: a `void*` with no `len=` and no policy
-  entry. design.md §7.4 requires every one of these to be a data entry in
+  entry. docs/design.md §7.4 requires every one of these to be a data entry in
   crates/sv-codegen/src/exceptions.rs; add one, with the reason.
 ```
 
@@ -2911,7 +2911,7 @@ closed by scope**, which item 4 predicted in as many words.
 ---
 
 **1. `vkBindImageMemory` never had the app-side half of pass 6, and neither did
-five other commands.** design.md §5.3 splits the `(memory, offset)` rewrite in
+five other commands.** docs/design.md §5.3 splits the `(memory, offset)` rewrite in
 two: the app side turns *allocation* coordinates into *arena* coordinates, and
 the GPU side turns arena coordinates into a `VkDeviceMemory` plus an offset. §7.2
 lists the pass as GPU-side, which is half true, and the app-side half existed as
@@ -4224,7 +4224,7 @@ that were budgeted for do not exist.
 
 **1. The barrier was at the wrong pass, and that is why it cost 52 commands.**
 `emit_handle_map_union` emitted a `compile_error!` reading *"a union containing
-handles reached the handle_map pass; the selector rules of design.md §7.4 must be
+handles reached the handle_map pass; the selector rules of docs/design.md §7.4 must be
 applied before this can be generated"*. Every word of it is true about the
 project and none of it is true about that function.
 
@@ -4555,6 +4555,193 @@ carried, generated, forwarded and executed by a real driver, and still be
 unreachable because the family it must be recorded on does not exist here.
 "Carried", "implemented" and "servable" are three claims, and the third is the
 one no table keyed on entry points can make.
+
+---
+
+### 0.24 The failure that belonged to the command buffer, the wild pointer, and 561 → 582
+
+Measured 2026-08-14 on **devhost**, in `nix develop`; `vulkaninfo` from a
+clean `nix shell nixpkgs#vulkan-tools`. Two items §0.22 left open, both closed.
+
+**1. `Ok(())` was the wrong answer and so was `Err`, because the failure is not
+the call's.** The generated GPU-side dispatch, on a command whose entry point the
+driver lacks, returned `VK_ERROR_EXTENSION_NOT_PRESENT` where there was a reply
+to carry it and `Ok(())` where there was not. For a recorded `vkCmd*` — whose
+whole output is a side effect — nothing was recorded, no reply existed, and a
+caller checking a return value could not notice. §0.22 made it *loud* and said
+plainly that was a diagnosis rather than a fix.
+
+Returning `Err` instead would take the ring fatal, which is far too blunt for a
+driver that merely lacks an optional extension; that is why the caller was
+lenient in the first place and the argument still holds. Both answers are wrong
+for the same reason: **the failure does not belong to the `vkCmd*`.** Vulkan
+already says whose it is — a command buffer whose recording failed is *invalid*,
+and submitting an invalid command buffer must not succeed.
+
+So a recorded command whose entry point is missing now **poisons its command
+buffer**, and the poison is checked where it becomes visible:
+
+| command | behaviour | why |
+|---|---|---|
+| recorded `vkCmd*` | poisons its target | the buffer is what failed |
+| `vkQueueSubmit`, `vkQueueSubmit2` | refuse | where an application finds out |
+| `vkEndCommandBuffer` | refuses | the specification's own answer |
+| `vkBeginCommandBuffer` | clears | recording afresh is the way back |
+| `vkFreeCommandBuffers` | neither | a destructor that can be refused is a leak |
+
+The last three rows are derived, not named. `vkBeginCommandBuffer` clears because
+it is in `exceptions::CLEARS_COMMAND_BUFFER_POISON` — a two-name list, stated as
+a list because `vk.xml` has no attribute distinguishing it from
+`vkEndCommandBuffer`. **`vkBeginCommandBuffer` alone would suffice**, and that is
+the useful fact: the specification routes every reuse of a command buffer through
+it, from any state, so `vkResetCommandPool` needs no entry despite resetting
+buffers this list never sees. `vkFreeCommandBuffers` is exempt because it
+*unbinds handles* — the check is keyed on `unbind.is_empty()`, so every
+destructor is exempt without anybody enumerating them.
+
+**2. The traversal was already there, and the first one I wrote missed the only
+command that mattered.** The check began as a walk over the wire signature for
+`VkCommandBuffer` fields. It covered `vkCmdExecuteCommands` and
+`vkFreeCommandBuffers` and **missed `vkQueueSubmit`**, whose command buffers are
+a member of `VkSubmitInfo` rather than a parameter — and `vkQueueSubmit2` puts
+them two levels down inside `VkCommandBufferSubmitInfo`. A shallow walk finds
+every command that does not need checking and not the one that does. I nearly
+shipped it with the residue written up as a known limitation, which would have
+been a gate with nothing behind it.
+
+The right traversal runs immediately above and visits every handle anywhere in
+the argument graph at any depth: the **handle-mapping pass**. `map_handle` sees
+each handle with its `HandleType`, so the host notes poisoned command buffers as
+it maps them and the generated dispatch asks what it saw. No second walker, no
+depth limit, and a future command with buffers three structs deep is covered by
+construction.
+
+Checked over the generated source per command rather than through a host double,
+because the property is a generator decision made four ways and what goes wrong
+is a command landing in the wrong way: a double would exercise one command and
+prove nothing about the other 583. The test asserts all four rows above and
+sweeps every one of the 100-odd recorded commands.
+
+**3. The capture-replay class, closed as §0.19 item 4 predicted it would be.**
+`pShaderGroupCaptureReplayHandle` and `opaqueCaptureDescriptorData` are optional
+`void*` whose extent is a **device property** rather than a `len=`. §0.19 named
+the answer without writing it: a fourth `VoidPolicy` meaning "we do not advertise
+the capture-replay feature, so this is null on the wire and a non-null one is a
+usage error we refuse by name". That is `VoidPolicy::CaptureReplayUnsupported`,
+and it cost almost nothing because every site in the generator already matched
+`OpaqueU64(_)` and ignored the policy — the wire, the raise and the store needed
+no change at all. Only the app-side *lowering* did, where a non-null value now
+returns `LowerError::CaptureReplayUnsupported` instead of being silently carried.
+
+**It started as a list and had to become a rule.** The list was two structs and
+five `vkGet…OpaqueCaptureDescriptorDataEXT` queries; adding them made the profile
+fail on `vkGetTensorOpaqueCaptureDescriptorDataARM`, the identical shape from
+`VK_ARM_tensors`, and the next vendor to copy the pattern would have failed it
+again. A list that grows once per vendor for a reason that never changes is a
+rule nobody wrote down. `is_capture_replay` matches `…CaptureReplay…` or
+`…OpaqueCapture…` in the owner or the field, which is safe because
+`void_policy` is only consulted for a `void*` with no `len=` — so
+`vkGetBufferOpaqueCaptureAddress`, which returns a `uint64_t`, is never reached
+by it — and because a false match would be refused loudly at the call rather than
+carried silently, which is the safe direction for a heuristic to be wrong in.
+
+| | before | after |
+|---|---:|---:|
+| commands carried, `full` | 561 | **582** |
+| device extensions advertised, of RADV's 236 | 201 | **208** |
+| advertised but absent from the device | 0 | **0** |
+| video extensions advertised | 0 | **0** |
+
+`VK_NV_ray_tracing_motion_blur` had to be excluded on the way, and for an old
+reason rather than a new one: it depends on `VK_KHR_ray_tracing_pipeline`, and
+`VkAccelerationStructureMotionInstanceDataNV` has
+`VkAccelerationStructureInstanceKHR` in an arm — the bitfield struct §7.4 names
+as the one type the registry genuinely cannot describe, and which
+`abi::surface_profile` has always kept out as a tripwire. The profile now agrees
+with the tripwire so it is never reached.
+
+**4. `VK_EXT_descriptor_buffer` is carried and still not advertised, and that is
+the strict rule being strict.** Its eleven commands are on the wire; five of them
+are the capture-replay getters, which refuse, so `INCOMPLETE_EXTENSIONS`
+withdraws the whole extension — "an extension is one promise, and half of it
+working is a driver that fails where the specification says it must not".
+
+Here that is arguably over-strict: those five may only be called when
+`descriptorBufferCaptureReplay` is enabled, which this driver does not advertise,
+so an application that respects the feature never reaches them. Encoding *that*
+needs the rule to know which commands are gated behind which feature, which is a
+third derivation and is not written. It is left over-strict deliberately: §9.2
+prefers under-promising, and a descriptor buffer is raw device addresses in
+application memory, which §9.2 independently declines to put there. Recorded as
+the open item rather than resolved by loosening a rule that is right everywhere
+else.
+
+**5. What is left of 740.** 582 carried, 158 not, and the shape of the remainder
+has changed: the two generator gaps §0.19 named are both closed — the
+union-of-handles class by another branch, the capture-replay class here. What
+remains is dominated by **platform-gated** commands the registry itself marks out
+of scope, the `void*`-without-`len=` vendor blobs whose extent lives where the
+registry does not point, and the 23 no profile can reach. Those are the design
+refusing on purpose rather than work outstanding, which is a different sentence
+from the one §0.19 could write.
+
+---
+
+**6. A wild pointer, and the third class of over-promise.** `full` became the
+default in §0.19 and it carries `VK_KHR_push_descriptor`. `pData` there is
+`VoidPolicy::ArenaOffset`, so the generated lowering emits
+`(p_data) as usize as u64` — **the application's own pointer, sent as an arena
+offset.** The GPU side resolves it against its own mapping and dereferences it.
+The CTS agent measured that as a segfault in `sv-gpu-server`; the user's report
+was "Firefox crashes instantly".
+
+That is only safe when something app-side expands the data first, and for
+`vkUpdateDescriptorSetWithTemplate` something does — `sv_icd::icd` overrides the
+generated method and emits `VkWriteDescriptorSet`s before anything crosses (§0.4
+item 10). For the push variants nothing does. §0.20 item 4 had excluded
+`VK_KHR_push_descriptor` from `zink` for exactly this and wrote down that a
+mechanical widening would restore it. §0.19 was that widening.
+
+**Neither `INCOMPLETE_EXTENSIONS` nor §0.22's queue check could see it**, and
+that is the finding rather than the fix. The first asks "did the generator emit a
+working stub" — it did. The second asks "can the device serve the queue" — it
+can. This is a third thing: **the entry point exists, marshals, dispatches, and
+the value it marshals is wrong.**
+
+So `LOWERING_INCOMPLETE` is derived from the tables that already exist: a command
+with a `VoidPolicy::ArenaOffset` `void*` **parameter** and no entry in
+`exceptions::ICD_EXPANDS_ARENA_POINTER` cannot lower safely. Its extension is
+folded into `INCOMPLETE_EXTENSIONS` — and if the command is **core**, it is a
+`compile_error!`, because there is no extension to withdraw and a mechanical
+widening must fail to build rather than fail at runtime.
+
+Two things the check's own first run corrected, both found by removing the manual
+exclusion and watching what happened:
+
+- It flagged `vkGetMemoryHostPointerPropertiesEXT`, which is *not* a defect:
+  `VK_EXT_external_memory_host`'s whole contract is that the pointer is host
+  memory to import, and in this design that memory is the arena, so
+  `arena_base + offset` is what the pointer *is* rather than an approximation of
+  it. Listed in `ICD_EXPANDS_ARENA_POINTER` beside the expansion cases, because
+  "the policy is right here" and "something fixes it up first" are different
+  facts and a reader should be able to tell which line is which.
+- It searched extensions **before** core versions, so
+  `vkCmdPushDescriptorSetWithTemplate` — required by `VK_KHR_push_descriptor`
+  *and* by Vulkan 1.4 — came out as "withdraw the extension", which does nothing:
+  the core command is still carried and a 1.4 application still calls it. The
+  check as first written would have let the wild pointer survive itself. Core is
+  now tested first.
+
+The mitigation is a profile exclusion of the two commands **by name** rather than
+only the extension, for the same reason: dropping `VK_KHR_push_descriptor` alone
+leaves the core 1.4 command carried. It comes out when the expansion lands, which
+`sv-worktrees/cts2` owns.
+
+**The residue, stated:** `vkCmdPushDescriptorSetWithTemplate2` carries its
+`pData` inside `VkPushDescriptorSetWithTemplateInfo`, a struct *member* rather
+than a parameter, and the check looks at parameters only. It is excluded by name
+here, and widening the check to struct members is the next thing this guard
+wants — the same shallow-versus-deep mistake item 2 records, one table over.
 
 ---
 

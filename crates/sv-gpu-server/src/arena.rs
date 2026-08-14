@@ -6,11 +6,11 @@
 //! > **No file descriptor or handle ever crosses between the app side and the
 //! > GPU side.** A descriptor created *locally*, out of memory that side can
 //! > already reach, is fine; a *name* crossing, which the peer opens itself, is
-//! > the mechanism. — design.md §1a
+//! > the mechanism. — docs/design.md §1a
 //!
 //! [`Provider::AppNamedShm`] obeys it. [`Provider::GpuExport`] does not, cannot
 //! be made to — a dma-buf has no name — and survives only because of a measured
-//! dead end recorded in design.md §0.7 and in `sv_transport::localfd`. Read the
+//! dead end recorded in docs/design.md §0.7 and in `sv_transport::localfd`. Read the
 //! next section knowing that its conclusion ("inverting the direction costs
 //! nothing") was reached before the rule was stated, and that the rule does not
 //! accept the trade.
@@ -19,7 +19,7 @@
 //!
 //! **Whichever side can allocate memory the other can map, allocates.**
 //!
-//! design.md §5.4 assumed the arena is always allocated by the side inside the
+//! docs/design.md §5.4 assumed the arena is always allocated by the side inside the
 //! VM and *imported* by the driver, and put the import behind [`SlabImport`].
 //! That is right for `testhost` and wrong for a Linux GPU side, because
 //! `sv_arena::import` measured RADV and NVIDIA both refusing a `MAP_SHARED` host
@@ -48,7 +48,7 @@
 //! | Intel, Windows guest | works (step 0, up to 2 GiB) | n/a — a descriptor cannot cross the VM boundary |
 //!
 //! **The last cell is right about descriptors and wrong about the direction.**
-//! Measured 2026-08-13 (design.md §0.10): the guest driver's *own*
+//! Measured 2026-08-13 (docs/design.md §0.10): the guest driver's *own*
 //! `vkAllocateMemory` lands in ordinary guest RAM — 16384 of 16384 pages of a
 //! 64 MiB allocation located in QEMU's memfd, on both host-visible memory types
 //! — the host can write it and the driver's mapping sees the write, and the
@@ -106,9 +106,9 @@ use sv_transport::region::SharedRegion;
 pub enum Provider {
     /// The app side allocated it — a **named** object `sv-hostd` created, or
     /// guest RAM it located — and the GPU side imports it with
-    /// `VK_EXT_external_memory_host`. design.md §5.4's `HostPointerImport`.
+    /// `VK_EXT_external_memory_host`. docs/design.md §5.4's `HostPointerImport`.
     ///
-    /// The name is historical: since design.md §1a the object is *named* shared
+    /// The name is historical: since docs/design.md §1a the object is *named* shared
     /// memory rather than a memfd, because a memfd can only be handed over as a
     /// descriptor and a descriptor may not cross the boundary. What the GPU side
     /// does with it is unchanged — it opens the name, maps it, and imports the
@@ -117,7 +117,7 @@ pub enum Provider {
     /// The GPU side allocated it from the driver and exported a **descriptor**
     /// for the app side to map.
     ///
-    /// # This provider violates design.md §1a and is kept for a measured reason
+    /// # This provider violates docs/design.md §1a and is kept for a measured reason
     ///
     /// A dma-buf has no name, so this is a same-machine-only mechanism: it
     /// cannot exist across a hypervisor in either direction. §1a says such a
@@ -127,7 +127,7 @@ pub enum Provider {
     /// It survives because on this host **RADV cannot obtain a named arena at
     /// all**, and the alternatives are closed for reasons that are facts about
     /// Linux rather than about this code — measured 2026-08-13, see
-    /// design.md §0.7 and `sv_transport::localfd`. Every harness that judges
+    /// docs/design.md §0.7 and `sv_transport::localfd`. Every harness that judges
     /// this project against a real GPU runs through here.
     GpuExport,
 }
@@ -151,7 +151,7 @@ impl Provider {
             // Refuses a shared host pointer whatever backs it
             // (`AMDGPU_GEM_USERPTR_ANONONLY`), and cannot wrap a named object in
             // a local dma-buf either, because a named object cannot be sealed
-            // and udmabuf requires `F_SEAL_SHRINK`. design.md §0.7.
+            // and udmabuf requires `F_SEAL_SHRINK`. docs/design.md §0.7.
             "radv" => Provider::GpuExport,
             // Imports a shared mapping of shmem; measured 2026-08-12.
             "nvidia" => Provider::AppNamedShm,
@@ -183,7 +183,7 @@ impl Provider {
     /// down.
     /// # The blocker was measured on the wrong machine
     ///
-    /// **[CORRECTED — 2026-08-13, design.md §0.10.]** The `None` below was
+    /// **[CORRECTED — 2026-08-13, docs/design.md §0.10.]** The `None` below was
     /// recorded as "`/dev/udmabuf` is `root:kvm` 0660 and this account is not in
     /// the group". That was measured on **devhost**, which runs no VM. On
     /// **testhost**, where the cross-VM topology actually exists, the account
@@ -257,7 +257,7 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// design.md §5.2's slab count, for a report. One import covers all of them
+    /// docs/design.md §5.2's slab count, for a report. One import covers all of them
     /// in this stage; see the note on lazy import in [`import_whole`].
     pub fn slab_count(&self, slab_size: u64) -> u64 {
         self.len.div_ceil(slab_size.max(1))
@@ -343,7 +343,7 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
 
 /// The app-allocated path: import the mapping we were handed.
 ///
-/// design.md §5.4's `HostPointerImport`, with gfxstream's defensive memory-type
+/// docs/design.md §5.4's `HostPointerImport`, with gfxstream's defensive memory-type
 /// rewrite, and one deviation from §5.2 stated plainly:
 ///
 /// **The whole arena is imported as one `VkDeviceMemory`, not one per slab, and
@@ -356,7 +356,7 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
 /// would have been. What it costs is that the driver pins the configured arena
 /// up front instead of tracking demand. What it does not cost is any of §5.3:
 /// the `(memory, offset)` rewrite is unchanged, with one slab.
-/// Import one slab of an already-mapped arena (design.md §5.2, `svImportArenaSlab`).
+/// Import one slab of an already-mapped arena (docs/design.md §5.2, `svImportArenaSlab`).
 ///
 /// The lazy half of [`import_whole`]: the same call over a sub-range of the same
 /// mapping. §5.4's claim that "`import` is granularity-blind, allocator-blind
@@ -445,7 +445,7 @@ pub fn import_slab(
 ///
 /// It costs nothing measurable — the bit tells the driver to allocate the buffer
 /// out of an address-visible range, which on every driver in scope is where it
-/// was going anyway — and it is what makes design.md §11's "if we return the GPU
+/// was going anyway — and it is what makes docs/design.md §11's "if we return the GPU
 /// side's true device address and never relocate" reachable rather than
 /// theoretical.
 ///
@@ -529,7 +529,7 @@ pub fn import_whole(driver: &Driver, region: Arc<SharedRegion>) -> Result<Arena>
         // "external" rather than for "export": an *imported* allocation carries
         // the same obligation on every buffer bound into it
         // (`VUID-vkBindBufferMemory-memory-02727`), naming the handle type it
-        // was imported with. design.md §0.4 recorded this as a consequence of
+        // was imported with. docs/design.md §0.4 recorded this as a consequence of
         // the export provider; it is a consequence of the arena being external
         // memory at all, which both providers make it.
         external_handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
@@ -635,7 +635,7 @@ mod tests {
     /// columns fails a test rather than a session.
     #[test]
     fn each_measured_driver_gets_the_provider_that_works_for_it() {
-        // The only driver on the wrong side of design.md §1a, and the only one
+        // The only driver on the wrong side of docs/design.md §1a, and the only one
         // with no alternative: §0.7.
         assert_eq!(Provider::for_driver("radv"), Provider::GpuExport);
         // Moved to the named path when the rule was stated: it can, so it must.

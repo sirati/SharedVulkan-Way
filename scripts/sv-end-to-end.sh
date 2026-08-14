@@ -6,7 +6,7 @@
 #
 # Two checks, in order of what they prove:
 #
-#  1. `vulkaninfo` reports the **GPU side's driver name**, not design.md §9's
+#  1. `vulkaninfo` reports the **GPU side's driver name**, not docs/design.md §9's
 #     synthesised "shared_vulkan forwarded device". That is the whole stage in
 #     one string: the loader accepted us, our ICD encoded
 #     vkGetPhysicalDeviceProperties, it crossed a ring into another process, a

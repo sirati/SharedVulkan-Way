@@ -1,6 +1,6 @@
 //! Where a presented frame goes once the app side holds its pixels.
 //!
-//! design.md §10 stage 2 ends with "the app-side WSI then blits from the arena
+//! docs/design.md §10 stage 2 ends with "the app-side WSI then blits from the arena
 //! to the window with `wl_shm` or `XShm` — a straight memcpy from shared memory
 //! into a window buffer, with no GPU involvement and no second copy of our own".
 //! This is that step, and it is deliberately the *only* part of presentation
@@ -11,7 +11,7 @@
 //!
 //! - [`Target::Headless`] displays nothing. That is not a stub: it is what
 //!   `VK_EXT_headless_surface` means, it is what Wine maps `VK_KHR_win32_surface`
-//!   onto when there is no display (design.md §0.5), and it is what DXVK needs
+//!   onto when there is no display (docs/design.md §0.5), and it is what DXVK needs
 //!   in order to create a device at all. `SV_PRESENT_DUMP` writes the frames out
 //!   so that a harness can judge presentation on pixels rather than on
 //!   `vkQueuePresentKHR` returning `VK_SUCCESS`.
@@ -142,7 +142,7 @@ impl Target {
 /// discard". A swapchain that returns `VK_SUCCESS` and drops every frame passes
 /// every check an application can make; the only way to know the image was
 /// rendered, copied and arrived is to look at it, which is the standard
-/// `gl-probe` sets (design.md §0.4).
+/// `gl-probe` sets (docs/design.md §0.4).
 pub struct Dump {
     prefix: Option<String>,
     max: u32,
@@ -614,7 +614,7 @@ pub mod wayland {
     //! A Wayland WSI normally means the driver creates dmabufs and attaches
     //! them, so that the compositor imports the GPU's own pages and nothing is
     //! copied. **This driver may not do that and it is not a limitation to be
-    //! removed.** design.md §1a forbids any file descriptor crossing the VM
+    //! removed.** docs/design.md §1a forbids any file descriptor crossing the VM
     //! boundary, and a dmabuf is both a kernel object and a descriptor; on the
     //! topology this exists for the GPU is in a Windows guest and the host has
     //! no DRM device at all, so there is nothing to make one from either.

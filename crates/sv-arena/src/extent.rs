@@ -1,6 +1,6 @@
 //! Extents, runs, and the provider/locator/attacher split.
 //!
-//! design.md §5.1 and §5.7. The vocabulary matters here because three words that
+//! docs/design.md §5.1 and §5.7. The vocabulary matters here because three words that
 //! sound alike mean different things:
 //!
 //! - An **extent** is one allocation made by the side inside the VM, covering
@@ -18,7 +18,7 @@
 //! > **The run list does not cross the wire, and it never did have to.** On the
 //! > locating paths the guest does not know it — that is the entire reason
 //! > `ScanLocator` exists — and on the AWE path what crosses is the frame list,
-//! > from which the runs are derived on the far side. — design.md §5.7
+//! > from which the runs are derived on the far side. — docs/design.md §5.7
 //!
 //! So [`RunList`] has no encoder and no decoder, and it is not reachable from
 //! any `sv_transport::cold` message. What crosses is
@@ -114,7 +114,7 @@ impl RunList {
     /// > `sv-hostd` reads `vm.max_map_count` at startup, compares it against the
     /// > run count it just built, and **refuses loudly with the actual numbers**
     /// > rather than letting a client discover it at the 1048577th mapping.
-    /// > — design.md §5.7
+    /// > — docs/design.md §5.7
     ///
     /// The kernel cannot merge these VMAs — adjacent runs are by definition
     /// non-adjacent in the file — so **VMA count equals run count exactly**.
@@ -218,7 +218,7 @@ impl Extent {
     }
 
     /// Publish this extent as located by its **frame list** rather than by its
-    /// contents: `desc.locator` becomes [`Locator::Pfns`] (design.md §0.14).
+    /// contents: `desc.locator` becomes [`Locator::Pfns`] (docs/design.md §0.14).
     ///
     /// This is the guest-side half of the frame path, and it is deliberately
     /// separate from [`ArenaProvider::commit`]: a provider that cannot ask its
@@ -261,7 +261,7 @@ impl Extent {
 }
 
 // ---------------------------------------------------------------------------
-// The three traits (design.md §5.1)
+// The three traits (docs/design.md §5.1)
 // ---------------------------------------------------------------------------
 
 /// The side inside the VM: allocates and describes.
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(runs.runs()[2].extent_offset, 4 * PAGE as u64);
     }
 
-    /// The measured cases from design.md §5.7's table, as arithmetic over the
+    /// The measured cases from docs/design.md §5.7's table, as arithmetic over the
     /// coalescer rather than as prose. If the coalescer ever regressed, the
     /// numbers this project quotes would stop being reproducible.
     #[test]
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn too_many_runs_is_refused_up_front_with_the_numbers() {
-        // design.md §5.7: a 2 GiB arena is ~47,000 VMAs on the 4 KiB path, which
+        // docs/design.md §5.7: a 2 GiB arena is ~47,000 VMAs on the 4 KiB path, which
         // "sits at 4.5% of the per-process limit" on this host's 1048576.
         let two_gib = RunList::new(vec![Run { file_offset: 0, extent_offset: 0, len: 1 }; 47_000]);
         two_gib.check_map_count(1_048_576).unwrap();
@@ -489,7 +489,7 @@ mod tests {
         assert!(contiguous_extent(7, 0, 4096, 0).is_err(), "no arena");
     }
 
-    /// The guest-side half of design.md §0.14: an extent that *was* going to be
+    /// The guest-side half of docs/design.md §0.14: an extent that *was* going to be
     /// found by content is re-described as one whose frames are known, and the
     /// descriptor then carries the frame list instead of nothing.
     #[test]
@@ -527,7 +527,7 @@ mod tests {
         e.locate_by_frames(&[1, 2, 3, 4]).unwrap();
     }
 
-    /// design.md §4.3: the descriptor "carries no addresses at all" on the
+    /// docs/design.md §4.3: the descriptor "carries no addresses at all" on the
     /// locating paths. A compiler cannot be asked to prove the run list has no
     /// wire form, so what is asserted is the observable consequence.
     #[test]

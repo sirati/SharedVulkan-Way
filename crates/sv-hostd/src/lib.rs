@@ -1,6 +1,6 @@
 //! `sv-hostd`: the daemon that owns the arena's backing and hands it out.
 //!
-//! design.md §3 forced this component into existence:
+//! docs/design.md §3 forced this component into existence:
 //!
 //! > Mapping guest RAM means opening QEMU's memfd through
 //! > `/proc/<qemu-pid>/fd/<n>`, which an arbitrary application process should
@@ -41,7 +41,7 @@
 //!
 //! # What the daemon does not do any more: pass a descriptor
 //!
-//! design.md §1a: **no file descriptor or handle ever crosses between the app
+//! docs/design.md §1a: **no file descriptor or handle ever crosses between the app
 //! side and the GPU side**, and a name crossing — which the peer then opens
 //! itself — is the mechanism that replaces it. This daemon used to hand its
 //! memfd out over `SCM_RIGHTS`. It now creates a *named* object under
@@ -152,7 +152,7 @@ pub struct Hostd {
     pub extent: Extent,
     pub runs: RunList,
     /// The daemon's **own** descriptor on the object. It is never given away —
-    /// design.md §1a — and exists so the daemon can map and verify the extent
+    /// docs/design.md §1a — and exists so the daemon can map and verify the extent
     /// before it tells anyone the name.
     pub fd: std::os::fd::OwnedFd,
     /// The name a client opens for itself: a `/dev/shm` path on [`Mode::Local`],
@@ -223,7 +223,7 @@ impl Hostd {
         let arena_len = geometry.arena_size;
         let total = control_len + arena_len;
 
-        // **A named object, not a memfd** (design.md §1a). A memfd has no name,
+        // **A named object, not a memfd** (docs/design.md §1a). A memfd has no name,
         // so the only way to give one to the GPU side is `SCM_RIGHTS`, and a
         // descriptor may not cross the boundary — on the topology this mode
         // stands in for, the GPU side is a VM and there is nothing for a
@@ -236,7 +236,7 @@ impl Hostd {
         // be sealed, so it can never be wrapped by `/dev/udmabuf`. The old
         // comment here said `MFD_ALLOW_SEALING` "is not decoration" because it
         // kept the AMD dma-buf path open; that path is closed on this handoff
-        // and the reason is in design.md §0.7. It is *not* closed on the
+        // and the reason is in docs/design.md §0.7. It is *not* closed on the
         // cross-VM handoff, where the object is QEMU's own sealed memfd.
         let object = sv_transport::region::shm_path(&format!("arena.{run_id:016x}"));
         let file = sv_transport::region::shm_create(&object, total)?;
@@ -474,7 +474,7 @@ pub fn become_owner(
 
 /// The identity the two sides must agree on.
 ///
-/// `sv-proto`'s `PROTOCOL_HASH` is the real value (design.md §4.3). This crate
+/// `sv-proto`'s `PROTOCOL_HASH` is the real value (docs/design.md §4.3). This crate
 /// does not depend on the 126,000-line generated crate — the transport has to be
 /// testable without it — so the binaries pass their own, and the *loopback*
 /// binaries pass a constant. A real `sv-icd` passes `sv_proto::PROTOCOL_HASH`
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(&buf, b"\0\0\0\0\0");
     }
 
-    /// design.md §1a, as the daemon's clients experience it: a *name* is enough.
+    /// docs/design.md §1a, as the daemon's clients experience it: a *name* is enough.
     ///
     /// The client here shares nothing with the daemon but a string — no
     /// descriptor, no `SCM_RIGHTS`, no `/proc` — and reaches the same pages.

@@ -60,7 +60,7 @@ fn blob_reserve(arena_len: u64) -> u64 {
     want.min(arena_len / 2) & !(crate::arena::GRANULARITY - 1)
 }
 
-/// One command buffer's recording, as design.md §6.5 describes it.
+/// One command buffer's recording, as docs/design.md §6.5 describes it.
 ///
 /// > Each `VkCommandBuffer` owns an arena block; recording encodes straight into
 /// > it; `vkEndCommandBuffer` publishes `(offset, len)`.
@@ -98,7 +98,7 @@ struct Blob {
     cap: u64,
     /// The seqno of the `svExecuteCommandBlob` that last named this block.
     ///
-    /// **This is design.md §5.5's read-pending word, and it did not need to be a
+    /// **This is docs/design.md §5.5's read-pending word, and it did not need to be a
     /// word.** §5.5 asks for "an 8-byte handshake word the GPU side flips from
     /// `READ_PENDING` to `READ_COMPLETE`, so the app side never recycles a blob
     /// the decoder is still walking". The ring already publishes exactly that
@@ -114,7 +114,7 @@ struct Blob {
 ///
 /// The default `HashMap` hasher is SipHash-1-3, chosen to make hash-flooding
 /// impossible from untrusted keys. These keys are ours: `State::mint` hands them
-/// out from a counter starting at 1 (design.md §6.4), so they are dense small
+/// out from a counter starting at 1 (docs/design.md §6.4), so they are dense small
 /// integers that this process chose. SipHash on the recording path measured at
 /// roughly a fifth of what a whole `vkCmd*` costs, for a property nothing here
 /// needs — the multiply-shift below spreads a dense counter perfectly and is one
@@ -207,7 +207,7 @@ struct Ring {
 
 /// Cross-ring ordering, in **both** directions.
 ///
-/// # The correction to design.md §4.4
+/// # The correction to docs/design.md §4.4
 ///
 /// §4.4 describes one direction: "an object created on the device ring may not
 /// yet exist on the GPU side when a queue ring references it", and the app side
@@ -271,7 +271,7 @@ pub struct RingTransport {
     /// send one import rather than two.
     importing: Mutex<()>,
     parker: Futex,
-    /// design.md §6.5's per-command-buffer arena blocks.
+    /// docs/design.md §6.5's per-command-buffer arena blocks.
     blobs: Mutex<Blobs>,
     /// The arena, mapped. Held here because the mapping must outlive every
     /// pointer `vkMapMemory` handed out, and this is the only thing that lives
@@ -291,7 +291,7 @@ impl Drop for RingTransport {
     }
 }
 
-/// design.md §4.2: "monotonic tick, updated at least every 100 ms."
+/// docs/design.md §4.2: "monotonic tick, updated at least every 100 ms."
 ///
 /// # Why this is a thread and not a call on the wait path
 ///
@@ -342,7 +342,7 @@ fn lower(e: sv_transport::Error) -> LowerError {
 impl RingTransport {
     /// Connect to whichever side is serving the cold path, attach, claim rings.
     ///
-    /// **The handoff is a name** (design.md §1a): the `Attachment` says what to
+    /// **The handoff is a name** (docs/design.md §1a): the `Attachment` says what to
     /// open and this process opens it, so nothing crosses the socket but text.
     /// `sv-hostd` names one object holding both regions at different offsets;
     /// its `Mode::Qemu` names QEMU's memory backend and sends the run list after
@@ -608,7 +608,7 @@ impl RingTransport {
                 // the symptom as a transport fault, so the next step is spelled
                 // out here rather than left to be inferred from two numbers.
                 //
-                // `WIRE_VERSION` went 1 → 2 for design.md §0.18's
+                // `WIRE_VERSION` went 1 → 2 for docs/design.md §0.18's
                 // `svDriverVersions`, which is hand-written in `sv_proto::sv`
                 // and therefore outside the generated table the protocol hash
                 // covers. A GPU side copied to the guest before that commit
@@ -972,7 +972,7 @@ impl RingTransport {
     }
 
     /// Publish everything recorded so far, before sending anything that is
-    /// *not* recorded. design.md §0.23.5.
+    /// *not* recorded. docs/design.md §0.23.5.
     ///
     /// # The bug this is the whole of
     ///
@@ -1081,7 +1081,7 @@ impl RingTransport {
 
     /// Wait until the GPU side has finished with a block before overwriting it.
     ///
-    /// design.md §5.5 item 3, answered with the ring's own `completed_seqno`
+    /// docs/design.md §5.5 item 3, answered with the ring's own `completed_seqno`
     /// rather than with a second handshake word — see [`Blob::in_flight`].
     fn await_blob_read(&self, in_flight: u64) -> IcdResult<()> {
         if in_flight == 0 {
@@ -1160,7 +1160,7 @@ impl Transport for RingTransport {
         self.push_on(class, command).map(|_| ())
     }
 
-    /// design.md §6.5: append to the command buffer's arena block, and cross
+    /// docs/design.md §6.5: append to the command buffer's arena block, and cross
     /// nothing.
     ///
     /// This is the whole of the blob change on the recording side. What it
@@ -1232,7 +1232,7 @@ impl Transport for RingTransport {
 
     /// `vkBeginCommandBuffer` and `vkResetCommandBuffer`: start again at zero.
     ///
-    /// **This is where design.md §5.5 item 3's read-pending check lives**, and
+    /// **This is where docs/design.md §5.5 item 3's read-pending check lives**, and
     /// it is the right place for it: rewinding is the only operation that
     /// rewrites bytes the GPU side may still be walking, it happens once per
     /// recording rather than once per command, and by the time an application
@@ -1266,7 +1266,7 @@ impl Transport for RingTransport {
 
 impl RingTransport {
     /// Make sure the GPU side has imported the slab an allocation landed in
-    /// (design.md §5.2, `svImportArenaSlab`).
+    /// (docs/design.md §5.2, `svImportArenaSlab`).
     ///
     /// Idempotent and cheap: the slab directory in the control region is the
     /// shared record of which slabs exist, so the common case — a slab already

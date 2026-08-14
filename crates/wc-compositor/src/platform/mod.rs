@@ -416,6 +416,26 @@ pub enum ToUi {
     },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },
+    /// The window's top-left corner moved by this much, without the surface
+    /// under it moving at all.
+    ///
+    /// ADDED FOR §45.11. `xdg_surface.set_window_geometry` — or, when a client
+    /// never declares one, the bounding box of the surface tree — says which
+    /// part of the buffer is "the window". When that rectangle's origin moves,
+    /// the pixels have not: a `wl_subsurface` appearing 100 px off the left
+    /// edge makes the window 100 px wider *and* starts it 100 px further left,
+    /// while everything already on screen stays exactly where the user last saw
+    /// it. Without this message the window stayed put and its contents slid
+    /// inside it.
+    ///
+    /// **A delta rather than a position, deliberately.** This compositor does
+    /// not know where its windows are — Windows owns that, which is the whole
+    /// argument in `control.rs`'s header — so the only thing it can truthfully
+    /// say is how much the corner moved relative to wherever the window
+    /// currently is. On Win32 that is a `SetWindowPos` with `SWP_NOSIZE`
+    /// against the current `GetWindowRect`; the size change, if any, rides on
+    /// the ordinary present path.
+    ShiftOrigin { id: WindowId, dx: i32, dy: i32 },
     /// The surface has committed its first buffer and may now be shown, at
     /// this surface size.
     ///
