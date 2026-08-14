@@ -688,7 +688,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut served: usize = 0;
     let deadline = std::time::Instant::now() + args.accept_timeout;
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    loop {
+    'accept: loop {
         // The first client is waited for; later ones are only accepted while
         // something is still running, so a proxy whose client has finished does
         // not sit forever.
@@ -720,16 +720,66 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(c) => break c,
                     Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                         if let Some(a) = &shared_arena {
-                            a.tick();
-                            for (id, bytes, origin) in a.reclaim_regions(args.arena_grow_idle) {
+                            // `frame_idle()` rather than `tick()` +
+                            // `reclaim_regions(args.arena_grow_idle)`, and the
+                            // difference is **behavioural rather than tidy**:
+                            // the flag is not the policy. `Arena::reclaim_idle`
+                            // is, and it is 0 by default and only set from
+                            // `--arena-grow-idle` inside `if args.arena_grow`.
+                            // Reading the flag here therefore disagreed with the
+                            // pump twice, in opposite directions:
+                            //
+                            // * **without `--arena-grow`** the arena's own value
+                            //   is 0, so the pump returns nothing — and the flag
+                            //   is still 120, so this loop returned regions. A
+                            //   proxy never told it may grow gave memory back
+                            //   from one clock and not the other.
+                            // * **with `--arena-grow-idle 0`**, which the pump
+                            //   reads as "never" and guards for by name, this
+                            //   loop passed 0 to `reclaim_regions` — where it
+                            //   means "the instant it empties", the thrash the
+                            //   idle count exists to prevent.
+                            //
+                            // One flag, two policies, decided by which clock
+                            // happened to turn. `frame_idle` is the pump's own
+                            // body: same source, same `== 0` guard, and it is
+                            // `&self` so this loop needs no `share()` handle —
+                            // one would silently shift the `sharers()` count
+                            // every client reports.
+                            for (id, bytes, origin) in a.frame_idle() {
+                                // "by the accept loop", **not** "with no client
+                                // connected", which is a claim this loop cannot
+                                // make: it runs whether or not sessions exist,
+                                // and it usually wins the race against them
+                                // because it turns on every slice while a pump
+                                // turns only when *its* poll times out. Observed
+                                // printing while a client was up. Naming who did
+                                // it is a fact; naming the state of the world
+                                // was a guess.
                                 println!(
-                                    "[proxy] arena region {id} returned with no client \
-                                     connected: {bytes} bytes of {origin}"
+                                    "[proxy] arena region {id} returned by the accept loop: \
+                                     {bytes} bytes of {origin}"
                                 );
                             }
                         }
                         if std::time::Instant::now() >= give_up {
-                            break Err(e)?;
+                            // `break 'accept` and **not** `break Err(e)?`, which
+                            // is what slicing the wait first spelled. `Err(e)?`
+                            // does not break anything: it returns from `run()`,
+                            // so the ordinary idle timeout — the way every
+                            // successful proxy ends — became an error exit that
+                            // skipped the thread joins and the whole arena
+                            // report after this loop. `rustc` said so, as
+                            // `unreachable statement` at the first line past the
+                            // loop, which is the shape of this bug: the compiler
+                            // pointing at the code that stopped running rather
+                            // than at the line that stopped it.
+                            //
+                            // Before the wait was sliced this arm was a plain
+                            // `break`, so the exit path was right and slicing
+                            // lost it.
+                            let _ = e;
+                            break 'accept;
                         }
                     }
                     Err(e) => return Err(e.into()),

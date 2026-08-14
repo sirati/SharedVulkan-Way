@@ -1448,6 +1448,36 @@ impl Arena {
         self.alloc().free_bytes()
     }
 
+    /// One turn of the release policy's clock: advance it, and hand back every
+    /// region that has become returnable.
+    ///
+    /// # Why this is `&self` when [`PoolTransport::frame`] is `&mut self`
+    ///
+    /// Because the caller that matters most has no session and therefore no
+    /// mutable handle. §72.5 measured the hole: the clock turns on a *session's*
+    /// poll timeout, so with **zero** clients connected there is no pump and
+    /// nothing turns it at all — the last session's `Drop` returns its pools and
+    /// the now-empty region waits for a tick that never comes. That is exactly
+    /// the state the user complained about, a machine with nothing running still
+    /// holding memory.
+    ///
+    /// The one thing that still exists with zero clients is the accept loop, and
+    /// it owns the shared arena. All this state is behind the allocator's lock
+    /// already, so `&mut` was never buying anything; taking `&self` lets that
+    /// loop turn the clock without holding a second `share()` handle, which
+    /// would have silently shifted the `sharers()` count every client reports.
+    pub fn frame_idle(&self) -> Vec<(u32, u64, String)> {
+        self.tick();
+        // `reclaim_idle == 0` means "never", not "immediately". Returning a
+        // region the instant it empties is the thrash the idle count exists to
+        // prevent, and it is not a behaviour worth having a spelling for.
+        let idle = self.alloc().reclaim_idle;
+        if idle == 0 {
+            return Vec::new();
+        }
+        self.reclaim_regions(idle)
+    }
+
     /// Advance the frame counter the release policy is written in terms of, and
     /// return any region that has become returnable.
     ///
@@ -1879,15 +1909,7 @@ impl PoolTransport for Arena {
     }
 
     fn frame(&mut self) -> Vec<(u32, u64, String)> {
-        self.tick();
-        // `reclaim_idle == 0` means "never", not "immediately". Returning a
-        // region the instant it empties is the thrash the idle count exists to
-        // prevent, and it is not a behaviour worth having a spelling for.
-        let idle = self.alloc().reclaim_idle;
-        if idle == 0 {
-            return Vec::new();
-        }
-        self.reclaim_regions(idle)
+        self.frame_idle()
     }
 
     /// **Only the compositor's outbound window**, and the narrowness is the
