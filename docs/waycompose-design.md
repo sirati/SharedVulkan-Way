@@ -16862,3 +16862,73 @@ the measurement before arguing about the number.
 
 **Still Linux.** Every figure here is the development guest. `WaitOnAddress`'s
 1 ms floor is not in any of them.
+
+### 36.18 The histogram: the doorbell works for two waits in three, and the tail is not a missed bell
+
+§36.17 could not say where 0.88 ms per wait went, listed three candidates, and
+said distinguishing them needed a histogram rather than a mean. So the instrument
+grew one — eight power-of-ten buckets, one relaxed increment on the wait path, no
+samples kept — and it answers the question in one line.
+
+**Without the doorbell**, every wait is the slice:
+
+```
+95 ring waits, 1947.4 ms parked, mean 20.499 ms [<100ms=95]
+```
+
+All ninety-five in one bucket. That is what "the number *was* the slice, once per
+wait" looks like when you stop taking a mean of it.
+
+**With the doorbell**, the shape is completely different:
+
+```
+95 ring waits, 73.8 ms parked, mean 0.777 ms
+   [<10us=16  <100us=48  <1ms=18  <10ms=11  <100ms=2]
+```
+
+**Sixty-four of ninety-five waits — two in three — complete in under 100 µs**,
+which is the doorbell doing exactly what §36.6.3's ~9 µs said it would. The mean
+of 0.777 ms is not what a typical wait costs; it is a handful of long ones
+averaged over the rest. The two waits in the 10–100 ms bucket alone carry more
+of the total than the sixty-four fast ones put together.
+
+So candidate 1 from §36.17 — a fixed cost of two thread wakeups per wake — is
+**refuted**: a fixed cost would put every wait in the same bucket, and two in
+three are under 100 µs.
+
+#### 36.18.1 And the tail is not a missed doorbell either
+
+The obvious next suspect was the `parked` check in `Bell::ring`. It is a
+same-kernel optimisation — skip the syscall when nobody is asleep — being applied
+to a cross-kernel decision, and a stale read of a word the *peer* writes would
+skip the poke and cost that wait a full slice.
+
+That is a guess, and `SV_BELL_ALWAYS=1` was added so it could be measured:
+
+| | mean | shape |
+|---|---|---|
+| default (`parked` respected) | **0.822 ms** | `<10us=43 <100us=20 <1ms=21 <10ms=9 <100ms=2` |
+| `SV_BELL_ALWAYS=1` | **0.872 ms** | `<10us=13 <100us=51 <1ms=19 <10ms=9 <100ms=3` |
+
+**Refuted.** Poking unconditionally does not remove the tail — the 10–100 ms
+bucket still has two or three waits in it — and it is slightly *worse* overall.
+It also does precisely the harm the check exists to prevent: the sub-10 µs bucket
+collapses from 43 waits to 13, because every publish now pays a vmexit whether
+anybody is listening or not.
+
+The knob stays in the tree, for the same reason `first_slice == slice` did: it is
+what makes this a finding rather than an opinion, and the next person to suspect
+the `parked` check can re-run it in one command.
+
+**What the tail most likely is, stated as the untested thing it is:** the peer
+genuinely taking that long. A doorbell removes the *latency of noticing* that
+work is done; it cannot make the work finish sooner, and `vulkaninfo` does ask
+lavapipe to do real things. Separating "the peer was slow" from "the wake was
+late" needs a timestamp taken on the *other* side of the ring, which is a
+protocol change and a bigger piece of work than anything here.
+
+**The honest summary of where the doorbell stands.** Against the 20 ms slice it
+is 23× on the mean and the mean understates it: the modal wait went from ~20 ms
+to under 100 µs, which is more than two orders of magnitude. What is left is a
+small number of long waits that look like real work, and the ladder is not
+involved in any of it.
