@@ -165,10 +165,10 @@ impl Bell<'_> {
             // knob stays too, because it is what makes that a finding rather
             // than an opinion, and the next person to suspect this can re-run it
             // in one command.
-            if bell_always() {
-                if let Some(cw) = cross_wake() {
-                    cw.poke(self.token);
-                }
+            if bell_always()
+                && let Some(cw) = cross_wake()
+            {
+                cw.poke(self.token);
             }
             return;
         }
