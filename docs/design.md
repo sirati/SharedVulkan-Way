@@ -1860,9 +1860,11 @@ writes it into a buffer, a shader dereferences it, and the GPU faults.
   GPU-side fill, the app-side fold, and the boundary translation. That is a
   stage, and it is the next one.
 
-**What is not settled** — and **§0.20 settles all of it**: the five wedges below
-turned out to be two defects, not two families, and the rate is re-measured on a
-fresh sample there. Left as written, because the shape of the guess is the point.
+**What is not settled** — and **§0.20 settles most of it**: the five wedges below
+turned out not to be two families. Three of them are one defect, confirmed by a
+single-variable control there; two were never reproduced against a controlled
+before-state and have no established cause. Left as written, because the shape of
+the guess is the point.
 Five wedges remain and they cluster into two families
 that share no obvious mechanism with the above: four
 `query_pool.statistics_query.*` (all of them `cmdcopyquerypoolresults` or
@@ -2851,27 +2853,60 @@ that measurement, and what it turned up.
 
 **The headline, on a sample chosen before anything was fixed.** A fresh
 1-in-19997 selection — 164 tests, disjoint from §0.15's 1-in-20000 except by
-coincidence — run against this tree at the start of the work and again at the
-end, control and forwarded both:
+coincidence.
 
-| | control | forwarded, before | forwarded, after |
-|---|---|---|---|
-| Pass | **93** / 93 | 36 | **58** |
-| NotSupported | 71 / 71 | 121 | 106 |
-| DeviceLost | 0 / 0 | **7** | **0** |
-| ring fatals | — | **4** | **0** |
-| hard GPU recoveries | 0 / 0 | 0 | 0 |
-| lost against the control | — | 57 (61.3%) | **35 (37.6%)** |
-| of those, `NotSupported` | — | 50 | **35 — all of them** |
+> **The `before` column of this table has been withdrawn** (2026-08-14). It read
+> `36 Pass / 7 DeviceLost / 4 ring fatals`, and it was taken in a worktree whose
+> `target/debug/sv_icd.json` had been **reflinked from the base checkout** and
+> still named base's `libsv_icd.so`. The loader therefore loaded a library that
+> was not this worktree's, and the driver was byte-identical between that run and
+> the "after" one — so **no `sv-icd` change was in effect across the gain the
+> table attributed to one**. `scripts/sv-worktree.sh` now deletes the copied
+> manifest rather than inheriting it. The lesson is §0.15 item 4's, one layer
+> along: a measurement's provenance is part of the measurement, and a path that
+> resolves is not the same as a path that resolves *here*.
+>
+> What is *not* withdrawn is the per-test paired work below, which rebuilt
+> between arms in one tree, and item 1's causal control, which was re-taken from
+> scratch and is what the section now rests on.
 
-**`sv-cts: PASS`**, for the first time, with all three budgets at the values
-§31 recorded and none of them raised. Every remaining loss is the profile
-declining something it does not carry; **not one is a defect**. The wedge rate on
-this sample went 7/164 to 0/164, and item 5's wider run — 820 tests, **two device
-losses, no GPU reset at all** — is what turns "zero on 164" into a rate rather
-than an anecdote: **§0.15's 7% is now 0.24%.**
+Re-taken 2026-08-14 on master, on a quiet machine (load average 12), same 164
+tests, same harness:
 
-**Two of the seven were §0.16's `bufferDeviceAddress`, and five were one bug.**
+| | control | forwarded |
+|---|---|---|
+| Pass | **93** | **68** |
+| NotSupported | 71 | 90 |
+| Fail | 0 | 1 |
+| DeviceLost | **0** | 5 |
+| ring fatals | — | **0** |
+| hard GPU recoveries | **0** | **0** |
+| lost against the control | — | 25 (26.9%) |
+
+**The control is identical to the withdrawn run — 93/71/0 — which is what says
+the sample and the harness are stable and the app-side column was the unreliable
+one.** Three of the six defects are `with_push_template` / `push.template`: the
+`VK_KHR_push_descriptor` gap item 4 documents, which `full` reintroduced by
+carrying the extension without the app-side expansion. That is the mechanical
+widening item 4 warned about, measured.
+
+**The claim this section originally made — "`sv-cts: PASS`, zero device losses on
+164, §0.15's 7% is now 0.24%" — is narrowed by the withdrawal.** What survives
+is item 5's wider run, which was taken in a worktree whose manifest was checked
+and whose numbers were paired against a control in the same tree: **820 tests,
+two device losses, and no hard GPU recovery at all**, against §0.15's 313
+`amdgpu` ring timeouts in ten minutes the last time a run that size was
+attempted. That is the honest form of the headline, and it does not depend on
+any before/after pair.
+
+The re-taken 164-case column above shows five device losses rather than zero,
+and the difference is not a regression in the forwarder: `full` became the
+default profile between the two, carrying `VK_KHR_push_descriptor` — whose
+app-side expansion does not exist — so three of the six defects are that one
+gap. **A profile widened mechanically re-opens a defect an earlier section
+closed by scope**, which item 4 predicted in as many words.
+
+**Two of the seven were §0.16's `bufferDeviceAddress`, and three were one bug.**
 
 ---
 
@@ -2897,11 +2932,40 @@ all.
   Only a buffer or image bound to **host-visible arena memory** hits it, which is
   a readback target, a staging image, a query result buffer, a linear
   multi-planar image. That is why the wedging set spanned fifteen unrelated
-  groups with no feature in common (§0.16's opening observation) and why `ycbcr`,
-  `query_pool.statistics_query`, `renderpasses.multisample_resolve`,
-  `glsl.operator.mul` and `memory_model.message_passing` were all the same
-  defect. **Five of §0.16's remaining wedges, including both of the two families
-  it named as sharing no obvious mechanism, were this one line.**
+  groups with no feature in common (§0.16's opening observation).
+
+  **How many wedges this actually accounts for: three, not five.** The first
+  version of this paragraph named five — `ycbcr`, `query_pool.statistics_query`,
+  `renderpasses.multisample_resolve`, `glsl.operator.mul` and
+  `memory_model.message_passing` — inferred from two batch runs whose app-side
+  column has since been withdrawn above. It is now a **single-variable control**,
+  run 2026-08-14 on master in one worktree, minutes apart, with the library
+  relinked between arms and nothing else changed: arm A as master stands, arm B
+  with the `IcdLocal::rewrite_memory` override removed and the old hand-written
+  rewrite restored inside `vkBindBufferMemory` — which is exactly the state
+  before this fix, one command translated by hand and the other six not.
+
+  | test | rewrite on | rewrite off |
+  |---|---|---|
+  | `ycbcr.copy…linear_optimal` | Pass | **DeviceLost** |
+  | `memory_model.message_passing…` | Pass | **DeviceLost** |
+  | `query_pool.statistics_query…` | Pass | **DeviceLost** |
+  | `glsl.operator…mul.mediump_uvec3_vertex` | Pass | Pass |
+  | `renderpasses…multisample_resolve…` | Pass | Pass |
+  | `binding_model.buffer_device_address…` | Pass | Pass |
+  | `ssbo.phys…mediump_ivec4` | Pass | Pass |
+
+  All three that flip fail at **`vkBindImageMemory`** with `no VkDeviceMemory
+  with id N` on the GPU side — ids 8, 14 and 35 — which is the mechanism this
+  item describes, arrived at causally rather than by subtraction. The other two
+  pass in both arms: **whatever fixed `glsl.operator.mul` and
+  `renderpasses.multisample_resolve`, it was not this**, and on the withdrawn
+  evidence there is no honest way to say what did. They may never have been
+  genuine wedges — §0.15 item 3 is explicit that `DeviceLost` is contagious and
+  that a test can be collateral twice in a row.
+
+  Two claims survive intact and one does not. The mechanism is confirmed; the
+  count was inflated by a third.
 
   The fix is `IcdLocal::rewrite_memory` plus a generated pass in
   `sv_icd_entry::forward`, reusing `passes::transform_walk_pub` and
