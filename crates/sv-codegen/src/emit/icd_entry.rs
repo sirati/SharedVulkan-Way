@@ -595,6 +595,9 @@ fn lower_struct_fn(name: &str) -> proc_macro2::Ident {
     // Kept for the app side; a full-lowering context goes through `Ctx::lower_fn`.
     format_ident!("lower_{}", naming::snake_case(name))
 }
+fn lower_out_struct_fn(name: &str) -> proc_macro2::Ident {
+    format_ident!("lower_out_{}", naming::snake_case(name))
+}
 fn store_struct_fn(name: &str) -> proc_macro2::Ident {
     format_ident!("store_{}", naming::snake_case(name))
 }
@@ -1665,6 +1668,34 @@ fn stub_body(
                     for _ in 0..__n { __v.push(#d); }
                     __v
                 })
+            }
+            // **An output struct parameter gives up its chain's tags and
+            // nothing else — decided here, by direction, not by the type.**
+            //
+            // Venus's three-state validity is a statement about *which way a
+            // parameter travels*: on the way out, a structure the implementation
+            // fills is the caller's uninitialised memory and must not be read.
+            // This build derived that from `returnedonly` on the struct, which
+            // is a property of the type — and a type can travel both ways.
+            // `VkPhysicalDeviceFeatures2` is an input to `vkCreateDevice` and an
+            // output of `vkGetPhysicalDeviceFeatures2`, so it carries no flag,
+            // so its chain was walked in full and Firefox faulted lowering a
+            // link out of the loader's uninitialised storage (docs/design.md
+            // §0.24, the fourth fault in that chain).
+            //
+            // The call site is the only place that knows the direction, so the
+            // call site decides. What the peer needs from an output structure is
+            // the *shape of its chain* — which links are there for it to fill —
+            // and nothing else; `lower_out_*` is that, and it subsumes the
+            // `returnedonly` case rather than sitting beside it.
+            (Shape::Optional(inner), _)
+                if field.is_output
+                    && matches!(&**inner, Shape::Scalar(Scalar::Struct(n))
+                        if cx.shared.contains(n.as_str())) =>
+            {
+                let Shape::Scalar(Scalar::Struct(n)) = &**inner else { unreachable!() };
+                let f = lower_out_struct_fn(n);
+                quote!(if #access.is_null() { None } else { Some(Box::new(#f(#access)?)) })
             }
             (Shape::Optional(inner), _) if field.is_output => {
                 // `uint32_t* pCount` on the way in carries the caller's capacity.
@@ -2938,15 +2969,47 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
 
 fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
     let cx = lower_cx;
-    let lower_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
+    // **One `#[inline(never)]` helper per link, for the stack.**
+    //
+    // The same defect as `sv_proto::decode_pnext`'s (docs/design.md §0.24) and
+    // it survived that fix because it is a different crate: as
+    // `#val => PNextLink::V(Box::new(lower_x(__p as *const T)?)),` every arm
+    // materialises its struct as a temporary **in `lower_pnext`'s own frame**
+    // before the `Box` moves it to the heap, and a debug build does not overlap
+    // the slots of mutually exclusive match arms — so the frame is the *sum* of
+    // a thousand link types rather than the largest.
+    //
+    // It is worse here than on the decode side, because this one **nests**: a
+    // chain parent that is itself a link — `VkPhysicalDeviceFeatures2` inside
+    // `VkDeviceCreateInfo`'s chain, which is exactly what Zink sends — puts two
+    // of these frames on the stack at once. Firefox reaches it on a Mesa thread
+    // with twenty frames already below.
+    let lower_helpers = cx.wire.pnext_links.iter().filter_map(|(name, _)| {
         if !lower_cx.shared.contains(name) {
             return None;
         }
         let v = naming::pnext_variant(name);
         let f = lower_struct_fn(name);
         let ty = naming::type_ident(name);
+        let helper = format_ident!("lower_link_{}", naming::snake_case(name));
+        let doc = format!("One `{name}` link, lowered in its own frame.");
+        Some(quote! {
+            #[doc = #doc]
+            #[inline(never)]
+            unsafe fn #helper(
+                __p: *const core::ffi::c_void,
+            ) -> crate::LowerResult<sv_proto::PNextLink> {
+                unsafe { Ok(sv_proto::PNextLink::#v(Box::new(#f(__p as *const #ty)?))) }
+            }
+        })
+    });
+    let lower_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
+        if !lower_cx.shared.contains(name) {
+            return None;
+        }
+        let helper = format_ident!("lower_link_{}", naming::snake_case(name));
         let val = *value as i32;
-        Some(quote!(#val => sv_proto::PNextLink::#v(Box::new(#f(__p as *const #ty)?)),))
+        Some(quote!(#val => #helper(__p)?,))
     });
     let store_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
         if !store_cx.shared.contains(name) {
@@ -2972,6 +3035,8 @@ fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
     });
 
     quote! {
+        #(#lower_helpers)*
+
         /// Walk a `pNext` chain that is **output storage**, taking the tags and
         /// nothing else.
         ///
@@ -3177,6 +3242,49 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
         .filter(|s| lower_cx.shared.contains(&s.name))
         .map(|s| emit_lower_struct(&lower_cx, s).expect("closed above"))
         .collect();
+    // The out-parameter form of every struct the app side can lower: the chain's
+    // tags and nothing else. See the `field.is_output` arm of `emit_lowering`
+    // for why direction and not `returnedonly` decides which is used.
+    let lower_outs: Vec<TokenStream> = cx
+        .wire
+        .structs
+        .iter()
+        .filter(|s| lower_cx.shared.contains(&s.name) && !s.is_union)
+        .map(|s| {
+            let f = lower_out_struct_fn(&s.name);
+            let ty = naming::type_ident(&s.name);
+            let inits = s.fields.iter().map(|field| {
+                let id = naming::ident(&field.rust_name);
+                if matches!(field.shape, Shape::PNext) {
+                    let allowed = crate::emit::pnext::allowed_fn_ident(&s.name);
+                    quote!(#id: lower_pnext_tags(
+                        (*p).#id as *const core::ffi::c_void,
+                        sv_proto::#allowed,
+                    )?,)
+                } else {
+                    let d = wire_default(&field.shape);
+                    quote!(#id: #d,)
+                }
+            });
+            let doc = format!(
+                "Lower a C `{}` that the implementation is about to **fill**.\n\n\
+                 Every member but the `pNext` chain is the caller's \
+                 uninitialised memory on the way out (docs/design.md §6.1), so \
+                 every member but the chain is a default. The chain itself \
+                 yields its tags, which is the one thing the peer needs: which \
+                 links are there for it to write into.",
+                s.name
+            );
+            quote! {
+                #[doc = #doc]
+                #[allow(unused_unsafe, unused_variables)]
+                pub unsafe fn #f(p: *const #ty) -> crate::LowerResult<sv_proto::#ty> {
+                    let _ = p;
+                    unsafe { Ok(sv_proto::#ty { #(#inits)* }) }
+                }
+            }
+        })
+        .collect();
     let stores: Vec<TokenStream> = cx
         .wire
         .structs
@@ -3215,6 +3323,15 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
     let mut sections = vec![("types".to_string(), types)];
     for (s, t) in cx.wire.structs.iter().filter(|s| lower_cx.shared.contains(&s.name)).zip(lowers) {
         sections.push((format!("lower {}", s.name), t));
+    }
+    for (s, t) in cx
+        .wire
+        .structs
+        .iter()
+        .filter(|s| lower_cx.shared.contains(&s.name) && !s.is_union)
+        .zip(lower_outs)
+    {
+        sections.push((format!("lower_out {}", s.name), t));
     }
     for (s, t) in cx.wire.structs.iter().filter(|s| store_cx.shared.contains(&s.name)).zip(stores) {
         sections.push((format!("store {}", s.name), t));
