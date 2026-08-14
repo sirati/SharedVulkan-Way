@@ -17168,7 +17168,79 @@ invisible in any review that looks at content.
 "sourced, never run" on line 1, and that is the distinction that made the other
 eight wrong.
 
-### 44.6 What is not done
+### 44.6 Which measurements loaded another checkout's driver — traced, not inferred
+
+§44.4 established that a reflink-seeded worktree points the Vulkan loader at the
+base tree's `libsv_icd.so`. §0.17's wedge-rate numbers were measured in
+`sv-worktrees/cts2`, so the question is not academic: **were they measured on the
+tree they are attributed to?** What follows is what the surviving artefacts
+prove, what they do not, and what to do about it.
+
+**The timeline, from the filesystem.**
+
+| | |
+|---|---|
+| `cts2/.git` created | 2026-08-13 **22:54:01** |
+| `/tmp/sv-cts.3Yb22I` run 1 | 2026-08-13 **23:05:42** — 164 cases, forwarded pass **36** |
+| `/tmp/sv-cts.GgTuqv` run 2 | 2026-08-13 **23:51:39** — 164 cases, forwarded pass **55** |
+| `cts2/target/debug/libsv_icd.so` last linked | 2026-08-14 **00:05:26** |
+| `/tmp/sv-cts.JfaGdJ` run 3 | 2026-08-14 **00:06:03** — 164 cases, forwarded pass **58** |
+| `/tmp/sv-cts.Iq35UC` run 4 | 2026-08-14 **00:36:44** — 820 cases, 2 device losses |
+
+§0.17's headline table is `control 93 / forwarded before 36 / forwarded after
+58`, which identifies **run 1 as "before" and run 3 as "after"**. The 0.24%
+figure is "two device losses in 820 forwarded tests", which is **run 4**.
+
+**What is proven.** `cts2`'s own `libsv_icd.so` was not written until 00:05:26.
+An mtime is the last write, so the app-side driver was **byte-identical across
+runs 1 and 2** — it was not relinked between them. Therefore:
+
+* The **+19 improvement from 36 to 55** cannot be attributed to any change in
+  `sv-icd` or `sv-icd-entry`. No ICD change was in effect across that interval.
+  Since `c559f43` touched `sv-gpu-server` and the codegen as well, that gain is
+  the GPU side's and the profile's, not the driver's.
+* The **+3 from 55 to 58** is the only interval spanning the relink.
+* Run 3 begins **37 seconds** after the link, and run 4 is half an hour later;
+  both post-date it, so **the 0.24% headline has sound provenance.**
+
+**What is not proven, and cannot be from here.** Whether `cts2` had built
+`sv-icd` at all before run 1. Cargo overwrote the fingerprints from that window,
+the run directories record no ICD path, and the base tree's `libsv_icd.so` has
+since been rebuilt, so the file run 1 would have loaded no longer exists. The
+exposure window is real — reproduced exactly in the worktree this section was
+written in, where `sv-cts.sh` named the base tree's driver — and **`sv-cts.sh`
+builds nothing**, so it cannot close that window itself. Run 1 is inside the
+window unless a build happened that left no trace.
+
+**The consequence, stated as an action rather than a caveat.** The 36 is a
+baseline whose provenance cannot be established, and a before/after table whose
+"before" cannot be shown to have been measured on the same tree as its "after"
+is not a controlled comparison. **The 36 should be re-taken**, which now costs
+one command and is checked: the suite refuses a manifest from another tree, and
+a fresh worktree no longer has one to refuse. The 58, the 0.24% and everything
+in run 4 stand.
+
+This is also the answer to "why not just annotate it". A number measured on the
+wrong tree is not a number with a caveat; it is a number about something else.
+
+### 44.7 A note on the tools, because it cost two reverts
+
+**`perl -0pi -e 's/…/…\x{a7}…/'` writes a raw byte `0xA7`, not UTF-8 `§`.** The
+file then contains an invalid sequence, and **`grep` silently treats it as
+binary**: `grep -c do_deploy` on a file plainly containing `do_deploy` returns
+nothing and exits 1, which reads as "the edit deleted the function". `grep -a`
+sees it; so does `iconv -f UTF-8 -t UTF-8`, which is the direct test. Hit twice
+in one session, both times reverted from git.
+
+The same session lost eight executable bits to `awk … > "$f.tmp" && mv "$f.tmp"
+"$f"` — `mv` installs a **new inode at the default mode**, so the bit goes with
+the old one, which is why every file edited with `sed -i` kept it (§44.5).
+
+Both are the section's own subject in miniature: a transformation that reports
+success while changing something nobody was checking. The check is one command —
+`bash -n` for syntax, `iconv` for encoding, `git diff --summary` for modes — and
+none of them was being run until each had already cost a revert.
+### 44.8 What is not done
 
 1. **`wc-popup.sh`'s negative control still asserts something no run has
    produced**, unchanged from §42.5 item 2 and repeated here because it is now a
@@ -17183,8 +17255,24 @@ eight wrong.
 3. **Nothing re-ran the CTS to completion.** The preflight was exercised in both
    directions and the suite was allowed to start; its actual results are §26's
    subject and are not re-measured here.
-4. **`sv-worktree.sh` still seeds the stale manifest.** The check now refuses it,
-   which is the safe half. Making the seed *correct* — rewriting `library_path`
-   into the new worktree, or excluding the generated manifest from the reflink —
-   would remove the failure rather than report it, and belongs to whoever owns
-   that script.
+4. ~~**`sv-worktree.sh` still seeds the stale manifest.**~~ **CLOSED.** It now
+   deletes every `target/*/sv_icd.json` it has just reflinked, so the trap does
+   not exist rather than being refused at run time. **Deleted rather than
+   rewritten, deliberately**: rewriting `library_path` to name this worktree
+   would point at the *reflinked copy* of the base tree's `libsv_icd.so` — the
+   same wrong code behind a right-looking path, and it would defeat
+   `manifest_is_ours`, which is the check that catches this. Deleting means the
+   first build regenerates it correctly and until then the suites say "build
+   first". Verified by creating a worktree, seeing the removal reported, and
+   watching `sv-cts.sh` refuse with `no ICD manifest at …` instead of silently
+   loading another tree's driver.
+5. **The `36` in §0.17's headline table should be re-taken** — §44.6. Its
+   provenance cannot be established and a "before" that cannot be shown to share
+   a tree with its "after" is not a controlled comparison. The `58`, the `0.24%`
+   and everything in the 820-case run stand.
+6. **`manifest_is_ours` is still only wired into the three suites.**
+   `sv-end-to-end.sh`, `sv-windows-e2e.sh`, `sv-zink-gl.sh` and the other
+   `sv-*.sh` runners load the ICD by manifest and have the same exposure. The
+   seed fix protects them all now, but nothing in them would catch a manifest
+   made wrong some other way.
+
