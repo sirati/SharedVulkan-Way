@@ -47,6 +47,11 @@
 //! layer with it. [`ProtoFd`] and its two companions give the protocol role its
 //! own name so that it can move on its own. See
 //! `docs/waycompose-design.md` §76.
+//!
+//! [`WireFd`] is what it is going to move **to**: an `h` that is either a name
+//! the peer can open or a descriptor that is already open, per connection rather
+//! than per platform. It exists and is tested; nothing constructs one yet,
+//! because `rs/wire.rs` still chooses by `cfg`. §77.
 
 #[cfg(unix)]
 pub use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -62,6 +67,10 @@ pub use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 /// `wc-proxy` speaks) or an already-open fd (out of band, `SCM_RIGHTS`), chosen
 /// by transport rather than by platform. When that definition changes, the
 /// socket layer stays on [`OwnedFd`] and does not move.
+///
+/// The type it will change **to** is [`WireFd`], which exists and is tested
+/// already; what is still missing is `rs/wire.rs` choosing between its two arms
+/// per connection instead of per platform.
 pub type ProtoFd = OwnedFd;
 
 /// What a wayland `h` argument carries when it is about to be **written**: the
@@ -79,6 +88,114 @@ pub type RawProtoFd = RawFd;
 /// and into the `Fd` field of every generated `Request<'a>`, which is why it has
 /// a lifetime the other two do not. See [`ProtoFd`].
 pub type BorrowedProtoFd<'a> = BorrowedFd<'a>;
+
+/// **What an `h` argument is once the dialect is a choice rather than a
+/// platform.** Either a *name* the peer can open, or a descriptor that is
+/// *already open*.
+///
+/// `docs/waycompose-design.md` §72.3 settled that both encodings exist on both
+/// platforms and that the **transport** picks between them: a connection whose
+/// peer is `wc-proxy` reads and writes the descriptor in band, a connection from
+/// a stock libwayland client reads and writes `SCM_RIGHTS`. One binary serves
+/// both, and the choice is per connection — which is what lets a single Linux
+/// `wc-compositor` serve WLCS and the proxy without a second build.
+///
+/// # Why the second variant is not a `wc_handle::Descriptor`
+///
+/// [`wc_handle::Descriptor`] is deliberately not extended to cover this, and the
+/// reason is the whole distinction the type draws: **`Descriptor` means "a name a
+/// peer can open"**, and an fd that arrived over `SCM_RIGHTS` has no name. It was
+/// never created under one, nothing can re-open it, and the only thing anybody
+/// can do with it is use the descriptor they were handed. Adding an unnamed arm
+/// to `Descriptor` would make `encode()`/`decode()` — a wire format — carry
+/// something that cannot be written down, and every reader of that type would
+/// have to learn that one variant is a lie.
+///
+/// So the disjunction lives here, in the one module that already decides what a
+/// file descriptor is. `wc_handle::Descriptor::NtHandle` is the precedent on the
+/// other side and it is precedent for the *shape*, not for reuse: it is Windows's
+/// escape hatch for an object that cannot be named, and this is Unix's.
+///
+/// # Why there is no `Open` arm on Windows
+///
+/// Not an omission. `SCM_RIGHTS` has no Windows equivalent — there is no
+/// ancillary channel on the socket to carry a descriptor out of band — so an
+/// already-open unnamed fd cannot arrive there and a variant for it would be
+/// uninhabited by construction. §72.3's "both encodings on both platforms" is
+/// about the *in-band* form existing on Unix, which is the half that was
+/// missing; it does not claim Windows grows an out-of-band one.
+#[derive(Debug)]
+pub enum WireFd {
+    /// A name the peer can open: the **in-band** dialect. Carries a
+    /// [`wc_handle::Handle`] rather than a bare
+    /// [`Descriptor`][wc_handle::Descriptor] because the sender must keep the
+    /// object alive until the peer has opened it — sending a name transfers
+    /// nothing, unlike `SCM_RIGHTS`, and a `Handle` is what carries that
+    /// keepalive.
+    Named(wc_handle::Handle),
+
+    /// A descriptor that is already open, received out of band over
+    /// `SCM_RIGHTS`. Owned, and closed on drop, exactly as the `Fd` payload of a
+    /// parsed `Message` is today.
+    #[cfg(unix)]
+    Open(OwnedFd),
+}
+
+impl WireFd {
+    /// The name a peer would open, if this is the in-band form.
+    ///
+    /// `None` for [`WireFd::Open`], and that `None` is the honest answer rather
+    /// than a failure: an `SCM_RIGHTS` fd has no name to give.
+    pub fn descriptor(&self) -> Option<&wc_handle::Descriptor> {
+        match self {
+            Self::Named(handle) => Some(handle.descriptor()),
+            #[cfg(unix)]
+            Self::Open(_) => None,
+        }
+    }
+
+    /// The open descriptor, borrowed, if this is the out-of-band form.
+    #[cfg(unix)]
+    pub fn as_open(&self) -> Option<BorrowedFd<'_>> {
+        match self {
+            Self::Open(fd) => Some(fd.as_fd()),
+            Self::Named(_) => None,
+        }
+    }
+}
+
+// Note that this is written out rather than left to the blanket
+// `impl<T: AsRawFd> FdRepr for T` below: a `WireFd` deliberately has no
+// `AsRawFd`, because half of its inhabitants have no raw fd to return and an
+// impl that answered for them would have to invent one.
+impl FdRepr for WireFd {
+    /// Whether two `h` arguments refer to the same thing.
+    ///
+    /// The two arms answer with different strength and that is inherited rather
+    /// than chosen: `Named` compares descriptors, so two handles to one section
+    /// are equal; `Open` compares raw fd numbers, so two `dup()`s of one file are
+    /// **not**. That is exactly the asymmetry this module's [`FdRepr`] docs
+    /// already record between the platforms, now visible within one type. A
+    /// named thing and an open thing are never equal — they might name the same
+    /// bytes, but nothing here can know that.
+    fn fd_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Named(a), Self::Named(b)) => a == b,
+            #[cfg(unix)]
+            (Self::Open(a), Self::Open(b)) => a.as_raw_fd() == b.as_raw_fd(),
+            #[cfg(unix)]
+            _ => false,
+        }
+    }
+
+    fn fd_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Named(handle) => write!(f, "{:?}", handle.descriptor()),
+            #[cfg(unix)]
+            Self::Open(fd) => write!(f, "{}", fd.as_raw_fd()),
+        }
+    }
+}
 
 /// A file descriptor, borrowed. On Windows there is no such thing, so this is
 /// the same refcounted handle as [`OwnedFd`].
@@ -430,4 +547,111 @@ pub mod c_abi {
 
     #[cfg(windows)]
     pub use defs::{wl_argument, wl_interface, wl_message};
+}
+
+/// Tests for [`WireFd`], which exists before anything constructs it.
+///
+/// **The point of these is the first one.** `docs/waycompose-design.md` §72.3
+/// describes the remaining work as "a cfg becoming a runtime choice rather than
+/// a redesign", and that sentence is only true if the type the choice produces
+/// is already a legal `Argument`/`Message` payload. `wire_fd_is_already_a_legal_message_payload`
+/// is that claim compiled: if it builds, `ProtoFd = WireFd` is a substitution.
+/// If `WireFd` had to grow a bound the protocol layer could not supply, this is
+/// where it would be found — before the wire format depends on it, rather than
+/// halfway through changing it.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Argument, Message};
+    use wc_handle::{Descriptor, Handle};
+
+    fn section(name: &str) -> Handle {
+        Handle::from_descriptor(Descriptor::Section { name: name.into(), size: 4096 })
+    }
+
+    #[test]
+    fn wire_fd_is_already_a_legal_message_payload() {
+        // Everything the protocol layer asks of an `Fd`: it goes in an
+        // `Argument`, the `Argument` goes in a `Message`, and two of them can be
+        // compared and printed. That is the whole of `FdRepr`'s contract.
+        let msg: Message<u32, WireFd> = Message {
+            sender_id: 3,
+            opcode: 0,
+            args: smallvec::smallvec![
+                Argument::Uint(7),
+                Argument::Fd(WireFd::Named(section("wc-pool-a"))),
+            ],
+        };
+        let same: Message<u32, WireFd> = Message {
+            sender_id: 3,
+            opcode: 0,
+            args: smallvec::smallvec![
+                Argument::Uint(7),
+                Argument::Fd(WireFd::Named(section("wc-pool-a"))),
+            ],
+        };
+        assert_eq!(msg, same);
+        assert!(format!("{}", msg.args[1]).contains("wc-pool-a"));
+    }
+
+    #[test]
+    fn two_handles_to_one_section_are_equal() {
+        // The strong answer: `Named` compares the name, so two references to one
+        // section are the same `h` argument even though they are two objects.
+        assert!(WireFd::Named(section("wc-pool-b")).fd_eq(&WireFd::Named(section("wc-pool-b"))));
+        assert!(!WireFd::Named(section("wc-pool-b")).fd_eq(&WireFd::Named(section("wc-pool-c"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_dups_of_one_file_are_not_equal_and_that_is_upstream_s_answer() {
+        // The weak answer, and it is inherited rather than chosen: upstream
+        // compares `as_raw_fd()` values, so a `dup()` is a different `h`. Held
+        // here so that the asymmetry between the two arms is asserted somewhere
+        // rather than only described.
+        let a = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let b = a.try_clone().unwrap();
+        assert_ne!(a.as_raw_fd(), b.as_raw_fd());
+        assert!(!WireFd::Open(a).fd_eq(&WireFd::Open(b)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_and_an_open_descriptor_are_never_equal() {
+        let named = WireFd::Named(section("wc-pool-d"));
+        let open = WireFd::Open(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
+        assert!(!named.fd_eq(&open));
+        assert!(!open.fd_eq(&named));
+    }
+
+    #[test]
+    fn a_named_h_has_a_descriptor_to_give() {
+        let named = WireFd::Named(section("wc-pool-e"));
+        assert!(matches!(named.descriptor(), Some(Descriptor::Section { name, .. }) if name == "wc-pool-e"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_h_has_no_name_and_says_so() {
+        // Not a failure and not a placeholder: an `SCM_RIGHTS` fd was never
+        // created under a name, so `None` is the true answer. This is the whole
+        // reason the disjunction is here and not a sixth `Descriptor` variant.
+        let open = WireFd::Open(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
+        assert!(open.descriptor().is_none());
+        assert!(open.as_open().is_some());
+        assert!(WireFd::Named(section("wc-pool-f")).as_open().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_trace_can_tell_the_two_arms_apart() {
+        // `WAYLAND_DEBUG=1` prints these, and a trace in which both dialects
+        // rendered the same way would be worse than no trace: the encoding is
+        // precisely what one would be reading it to find out.
+        let open = WireFd::Open(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
+        let raw = open.as_open().unwrap().as_raw_fd();
+        assert_eq!(format!("{}", Argument::<u32, WireFd>::Fd(open)), format!("{raw}"));
+        let named = format!("{}", Argument::<u32, WireFd>::Fd(WireFd::Named(section("wc-pool-g"))));
+        assert!(named.contains("Section"), "a named h should print its descriptor, got {named}");
+    }
 }

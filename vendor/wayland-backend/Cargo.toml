@@ -62,6 +62,19 @@ scoped-tls = { version = "1.0", optional = true }
 # `std::os::unix::net::UnixStream`, so this costs nothing and changes no
 # behaviour there.
 wc-transport = { path = "../../crates/wc-transport" }
+# Also not Windows-only, and for the same reason one step further on.
+#
+# It was `[target.'cfg(windows)'.dependencies]` while an `h` argument was a
+# descriptor on Windows and a raw fd on Unix. `crate::os::WireFd` is the type
+# that ends that split: the in-band dialect is what a peer reached through
+# `wc-proxy` speaks, and a **Linux** compositor behind the proxy has to read it
+# exactly as the Windows one does (docs/waycompose-design.md §72.3). So the
+# named-descriptor half of that type has to exist here on Unix as well.
+#
+# The crate was already portable — `src/lib.rs` has no `cfg` at all and
+# `src/platform/` has a `unix.rs` beside its `windows.rs` — so this moves a
+# dependency rather than porting one.
+wc-handle = { path = "../../crates/wc-handle" }
 
 [target.'cfg(unix)'.dependencies]
 # `event` for epoll/kqueue, `net` for sendmsg/recvmsg with SCM_RIGHTS, `fs` and
@@ -71,8 +84,6 @@ rustix = { version = "1.0.2", features = ["event", "fs", "net", "process"] }
 wayland-sys = { version = "0.31.11", features = [] }
 
 [target.'cfg(windows)'.dependencies]
-# The `h`-argument shim: what an fd becomes when the OS has no SCM_RIGHTS.
-wc-handle = { path = "../../crates/wc-handle" }
 # The third path in `rs/server_impl/common_poll.rs`, where upstream has only
 # epoll and kqueue. `polling` is wepoll on Windows and is what `calloop` already
 # uses, so choosing it keeps the dispatch loop compatible with the event loop

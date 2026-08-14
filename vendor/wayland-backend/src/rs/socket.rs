@@ -9,7 +9,11 @@ use std::io::{ErrorKind, Result as IoResult};
 // and the `AsRawFd`/`AsFd` impls on `Socket` and `BufferedSocket`. `ProtoFd` and
 // `RawProtoFd` appear only in the `Message` signatures this file forwards to
 // `wire.rs`, and are the protocol's business. See `crate::os`.
-use crate::os::{errors, OwnedFd, ProtoFd, RawFd, RawProtoFd, WlStream};
+//
+// `RawFd` is in the Unix group below rather than here, and the reason is the
+// separation itself: once the `Message` signatures stopped saying `RawFd`, its
+// only remaining readers were the two `AsRawFd` impls, which are Unix-only.
+use crate::os::{errors, OwnedFd, ProtoFd, RawProtoFd, WlStream};
 
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
@@ -18,7 +22,7 @@ use std::mem::MaybeUninit;
 #[cfg(unix)]
 use std::slice;
 #[cfg(unix)]
-use crate::os::{AsFd, AsRawFd, BorrowedFd};
+use crate::os::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
 #[cfg(unix)]
 use rustix::io::retry_on_intr;

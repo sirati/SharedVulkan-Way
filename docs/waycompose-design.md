@@ -24126,3 +24126,157 @@ something this run owns, and are left.
    session that was killed. Recorded here rather than repaired later: rewriting
    history to re-sign would make the commit that documents the outage the one
    piece of evidence that it happened.
+## 77. `WireFd`: the type an `h` argument becomes, and the dependency that had to move first
+
+### 77.1 Status in one paragraph
+
+§76 gave the protocol's file descriptor a name of its own. This gives it a
+**type**: `wayland_backend::os::WireFd`, an `h` argument that is **either a name
+the peer can open or a descriptor that is already open**. It is the thing
+§72.3's fix turns a `cfg` into a runtime choice *between*. Nothing constructs one
+yet — `rs/wire.rs` still decides by platform — so this changes no behaviour
+either, and the tripwire
+`the_upstream_dialect_is_still_assumed_rather_than_chosen` still passes. What is
+now true that was not: the type exists, it is **tested**, and one of those tests
+is the claim that §72.3's remaining work is a substitution rather than a
+redesign.
+
+### 77.2 Steps 2 and 3 are one commit, and that is a correction to the plan
+
+The plan had "the enum" and "`wc-handle` unconditional" as separate steps. They
+cannot be. `WireFd::Named` carries a `wc_handle::Handle`, and
+`vendor/wayland-backend/Cargo.toml` declared `wc-handle` under
+`[target.'cfg(windows)'.dependencies]` — so on Unix, the platform the whole fix
+is *for*, the enum could not name its own variant. Landing the enum first would
+have meant either a Windows-only type, which is the split being deleted, or a
+placeholder, which is a comment nothing asserts.
+
+### 77.3 The dependency move, and it is a move rather than a port
+
+`wc-handle` was already portable: `crates/wc-handle/src/lib.rs` contains **no
+`cfg` at all**, and `src/platform/` has had a `unix.rs` beside its `windows.rs`
+since it was written. Its own manifest puts `windows-sys` behind
+`cfg(windows)` and `libc` behind `cfg(unix)`, and its `sv-arena` dependency is
+already deliberately unconditional with a note saying why. So the change is two
+lines moving between tables, and there is a precedent directly above them in the
+same file: `wc-transport` is unconditional for exactly this reason — "so that the
+port has one socket abstraction rather than a `cfg` at every use site". This is
+the same sentence one level up, about descriptors rather than sockets.
+
+No dependency cycle: `wc-handle` reaches `sv-arena` and `sv-transport`, and
+neither of those names any wayland crate.
+
+### 77.4 The shape, and the two questions it has to answer
+
+```rust
+pub enum WireFd {
+    Named(wc_handle::Handle),
+    #[cfg(unix)]
+    Open(OwnedFd),
+}
+```
+
+**Why the second arm is not a sixth `wc_handle::Descriptor` variant.** Because
+`Descriptor` means *"a name a peer can open"*, and an fd that arrived over
+`SCM_RIGHTS` has no name — it was never created under one and nothing can
+re-open it. `Descriptor` has an `encode()`/`decode()` pair; it *is* a wire
+format. An unnamed arm would put something in that format that cannot be written
+down, and every reader of the type would have to learn that one variant is a lie.
+`Descriptor::NtHandle` is the precedent for the *shape* — an escape hatch for an
+object that cannot be named — and not for reuse: that one is Windows's, and this
+is Unix's. So the disjunction lives in `os.rs`, the module that already decides
+what a file descriptor is.
+
+**Why there is no `Open` arm on Windows.** Not an omission and not a `cfg` left
+in by accident. `SCM_RIGHTS` has no Windows equivalent — there is no ancillary
+channel on the socket at all — so an already-open unnamed fd cannot arrive there,
+and a variant for it would be uninhabited by construction. §72.3's "both
+encodings exist on both platforms" is a claim about the **in-band** form existing
+on Unix, which is the half that was missing. It does not claim Windows grows an
+out-of-band one, and reading it that way would produce a variant that could only
+ever be dead.
+
+**Why `Named` carries a `Handle` rather than a `Descriptor`.** Sending a name
+transfers nothing — unlike `SCM_RIGHTS`, the kernel takes no reference — so the
+sender must keep the object alive until the peer opens it. `Handle` is what
+carries that keepalive; a bare `Descriptor` would be a name for an object that
+may already be gone. `rs/wire.rs`'s existing Windows arm records this rule at
+length and it is unchanged by any of this.
+
+### 77.5 The test that is the point
+
+`os::tests::wire_fd_is_already_a_legal_message_payload` builds a
+`Message<u32, WireFd>`, compares two of them, and prints one. That is the whole
+of what the protocol layer asks of an `Fd`, and **§72.3's claim that the rest is
+"a cfg becoming a runtime choice rather than a redesign" is only true if that
+compiles.** If `WireFd` needed a bound the protocol layer could not supply, this
+is where it would be found — before the wire format depends on it rather than
+halfway through changing it.
+
+One thing that could have forced a restructure did not. `os.rs` carries a blanket
+`impl<T: AsRawFd> FdRepr for T` on Unix, and `WireFd` needs its own `FdRepr`
+because half its inhabitants have no raw fd to return. Those two impls coexist:
+`WireFd` is a local type with no `AsRawFd`, so coherence accepts both. Had it
+not, the blanket impl would have had to become three concrete ones first.
+
+Six more tests hold the behaviour rather than describing it, and the sharpest
+pair is the asymmetry: two `Named` handles to one section are **equal** (they
+compare descriptors), and two `dup()`s of one file are **not** (they compare raw
+fd numbers). That difference already existed between the platforms and this
+module's `FdRepr` docs already recorded it; it is now visible inside a single
+type, on one platform, where it can be asserted. A named thing and an open thing
+are never equal — they might name the same bytes, and nothing here can know that.
+
+### 77.6 A warning §76 introduced, fixed here rather than by amending it
+
+The Windows cross check reported `unused import: RawFd` in `rs/socket.rs`. It is
+§76's: once the `Message` signatures in that file stopped saying `RawFd`, its only
+remaining readers were the two `AsRawFd` impls, which are Unix-only. The Linux
+workspace clippy gate could not see it, because on Linux those impls compile. The
+import moved into the `cfg(unix)` group.
+
+Recorded rather than quietly fixed for the reason §35.10 gives: it is the *shape*
+of the mistake that generalises. A rename that is green on one platform can still
+strand an import on the other, and `cargo clippy --workspace --all-targets` is
+not that check — `cargo check --workspace --target x86_64-pc-windows-gnu` is.
+
+### 77.7 The gates
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **87 binaries, 2637 passed, 0 failed** |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0; `wayland-backend` warning-free |
+| `cargo check -p wayland-backend --all-targets` (Linux) | warning-free |
+| `cargo clippy --workspace --all-targets` | clean |
+| `scripts/wc-xref.sh` | exit 0 |
+| `the_upstream_dialect_is_still_assumed_rather_than_chosen` | passes, unchanged |
+
+**2637 is 2632 plus seven minus two, and only the seven are this commit's.** §76
+ran at 2632. A per-binary diff against that run shows exactly two lines moving:
+`wayland_backend` from 5 to 12, which is the seven `os::tests::*` above, and
+`sv_proto` from 1820 to 1818, which is `6cb8db3` adding seventeen lines to
+`crates/vk-registry/src/profile.rs` — `sv-proto` is generated from that profile,
+so its test count moves when the profile does. Nothing in this commit is
+reachable from `sv-proto`. This is the second time in three sections that the
+aggregate would have been read wrong and the per-binary diff read right.
+
+The Windows cross gate also reports five `never used` warnings in
+`crates/wc-launch/src/floor.rs`. They are **not** this commit's — that file is
+untouched here, and they are Windows-only dead code that predates it. Named
+rather than left for the next person to wonder about, which is the same rule
+77.6 is an instance of.
+
+### 77.8 What is still missing, and it is steps 4 and 5
+
+1. **`rs/wire.rs`'s two arms become a runtime choice.** Lines 157 and 332 — the
+   write arm and the parse arm of `Argument::Fd` — plus the `cfg(unix)` early
+   return in `parse_message` and the fd-count pre-check above it. §76.5 measured
+   that these are the only library sites that move.
+2. **`ProtoFd` aliases `WireFd`**, and `RawProtoFd`/`BorrowedProtoFd` grow their
+   send-side counterparts.
+3. **The per-connection flag**, which is what "the transport picks" means
+   concretely, and the smithay `cfg` sites that follow from it.
+
+The acceptance test for the sequence is unchanged and is not this: `wc-pooltest`
+through the proxy to a **Linux** compositor, and after that a client that maps a
+window and draws with the compositor across the hypervisor.
