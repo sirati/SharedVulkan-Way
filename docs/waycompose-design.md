@@ -20973,3 +20973,66 @@ until §61.5's two causes are fixed a lower floor buys regions it cannot return.
 The next run to flip that line is the one that puts a number in the "after"
 row of §61.5's table that is smaller than the "peak" row by the size of the
 regions it grew.
+
+### 36.20 The deployment guest answers: 13.6 µs, and there is no floor
+
+§36.19 predicted that `WaitOnAddress`'s whole-millisecond argument floors a
+*missed* wake and not a *delivered* one, from a 136 µs measurement on the
+Windows binary under Wine. That was evidence, not proof, and it stayed a
+prediction because Wine implements `WaitOnAddress` over futexes.
+
+Measured on `testhost`'s Windows guest — the machine where the 216.9 ms
+present was measured, running Microsoft's `WaitOnAddress` and virtio-win's
+`vioser.sys`. `scripts/sv-bell-guest.sh`, 2,000 samples, µs:
+
+| | min | median | p99 | max |
+|---|---|---|---|---|
+| same kernel (socketpair on the VM host) | 5.6 | 8.2 | 12.3 | 75.2 |
+| **across the boundary (virtio-serial)** | **22.3** | **27.1** | **43.6** | **130.0** |
+
+> **A doorbell reaches the Windows guest in 13.6 µs**, one way.
+
+Against the alternatives, per wait: the fixed 20 ms slice is **1,474×** that,
+and the ladder's 1 ms floor is **74×** it. Eleven waits — one present — is
+**0.15 ms of doorbell latency against 220 ms of slice**.
+
+**The prediction holds and the floor does not exist for a delivered wake.** If
+`WaitOnAddress`'s millisecond granularity applied to delivery, nothing here
+could have come in under 1,000 µs; the *slowest sample of two thousand* was 130.
+§36.18's worry — that the 64-of-95 sub-100 µs mass was exactly what a floor
+would destroy — is answered: it survives, on the real guest, with room.
+
+Against the Linux development guest's 8.8–9.4 µs one way, Windows costs about
+50% more. Same order, no cliff. Whatever `vioser.sys` and `afunix`-free
+virtio-serial cost over `/dev/virtio-ports`, it is tens of microseconds and not
+a millisecond.
+
+#### 36.20.1 Two guards that fired, and were right to
+
+**The one-opener rule caught a real leak.** A previous run's probe was still
+holding the port — `Id 21432, C:\Users\<guest-user>\sv-bell-probe.exe, StartTime
+10:22:23` — and the second attempt got `ERROR_ACCESS_DENIED`. That is the same
+errno §36.13 saw on `org.sirati.display.0`, which strengthens that section's
+hypothesis considerably: **5 is what this driver returns for a port that is
+present but unavailable**, whether because nothing backs it or because someone
+else has it. It was found by asking for pid and path rather than by killing an
+image name.
+
+**And the handshake-before-latency check did its job on the first try.** The run
+that hit the held port refused to measure and said so, instead of timing a
+transport that was not there. It was written for the locked-session worry, which
+turned out not to be the risk at all — the risk was a stale process of my own —
+and it caught the thing it was not written for. That is the argument for the
+shape rather than for the specific fear.
+
+**One self-inflicted delay worth recording**: the guard that refuses to share
+the QMP socket used `pgrep -f qemu-serve`, and the ssh command carrying the
+check *contains that string*, so it matched its own shell and refused a socket
+that was free. It is `pgrep -x sv-hostd` now, by executable name. This is the
+same self-match that once made a `pkill -f` take down the wrong process on this
+machine, in a script written after that lesson.
+
+**The port was hot-added and remains transient** — it dies with the QEMU
+process, and `testhost/default.nix` was not touched. Making it permanent is
+one line there, needs a `nixos-rebuild switch` that restarts the VM, and is the
+user's to time.
