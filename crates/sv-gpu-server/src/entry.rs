@@ -183,6 +183,7 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         objects: std::sync::Mutex::new(objects),
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
+        pool_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         Arc::new(control),
@@ -441,6 +442,7 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         objects: std::sync::Mutex::new(objects),
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
+        pool_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         control,
@@ -539,6 +541,7 @@ fn serve(
     let fns = Arc::new(driver.load_fns());
     report_missing(&fns);
     let queue_lock = Arc::new(std::sync::Mutex::new(()));
+    let pool_lock = Arc::new(std::sync::Mutex::new(()));
 
     // The arena comes from the driver. The control region does not: §4.1 splits
     // the two by purpose and the control region is "the one only our code
@@ -708,6 +711,7 @@ fn serve(
             objects: std::sync::Mutex::new(objects),
             fns: Arc::clone(&fns),
             queue_lock: Arc::clone(&queue_lock),
+            pool_lock: Arc::clone(&pool_lock),
         });
         let control = Arc::new(control);
         let slot_count = geometry.ring_slot_count;
@@ -819,6 +823,7 @@ fn attach(
         objects: std::sync::Mutex::new(objects),
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
+        pool_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         Arc::new(control),
@@ -1012,6 +1017,7 @@ fn guest(
         objects: std::sync::Mutex::new(objects),
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
+        pool_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let handled = session::serve(
         control,

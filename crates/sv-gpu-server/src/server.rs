@@ -96,6 +96,12 @@ pub struct Shared {
     /// in the generator rather than here because that is where every call site
     /// is.
     pub queue_lock: Arc<Mutex<()>>,
+    /// The device-wide command-pool lock (docs/design.md §0.23).
+    ///
+    /// Separate from `queue_lock` because they protect different driver
+    /// objects and a submit must not wait on a recording: holding one mutex for
+    /// both would serialise the two halves of every frame against each other.
+    pub pool_lock: Arc<Mutex<()>>,
 }
 
 impl Shared {
@@ -355,6 +361,10 @@ impl GpuHost for GpuServer {
 
     fn lock_queue(&self) -> sv_gpu_entry::QueueGuard<'_> {
         sv_gpu_entry::QueueGuard::held(&self.shared.queue_lock)
+    }
+
+    fn lock_command_pool(&self) -> sv_gpu_entry::QueueGuard<'_> {
+        sv_gpu_entry::QueueGuard::held(&self.shared.pool_lock)
     }
 
     // -- 1. the session -----------------------------------------------------

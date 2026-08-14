@@ -245,7 +245,7 @@ impl Driver {
         Option<ash::ext::external_memory_host::Device>,
         bool,
     )> {
-        let _ = entry;
+
         let pds =
             unsafe { instance.enumerate_physical_devices() }.map_err(vkerr("vkEnumeratePhysicalDevices"))?;
         let &pd = pds.get(index).ok_or_else(|| {
@@ -304,6 +304,67 @@ impl Driver {
             if has(want) && !owned.iter().any(|o| o.as_c_str() == want) {
                 owned.push(want.to_owned());
             }
+        }
+        // **Close the enabled set under `depends=`**, against the two sets that
+        // can satisfy one: the device extensions about to be enabled, and the
+        // *instance* extensions this instance actually enabled above.
+        //
+        // Enabling "every profile extension the driver has" is not the same as
+        // enabling a legal set, and the validation layer said so —
+        // `VUID-vkCreateDevice-ppEnabledExtensionNames-01387`, three times:
+        // `VK_EXT_display_control` without `VK_EXT_display_surface_counter`,
+        // `VK_EXT_present_timing` without `VK_KHR_get_surface_capabilities2`,
+        // `VK_EXT_swapchain_maintenance1` without `VK_EXT_surface_maintenance1`.
+        // Every one of those dependencies is an **instance** extension, so no
+        // amount of looking at the device list could have found them; this is
+        // the same "right about the extension, wrong about the set it reads"
+        // shape `sv_icd`'s own closure records (docs/design.md §0.23).
+        //
+        // A fixpoint rather than one pass, because dependency chains are deeper
+        // than one link and a single pass keeps whatever depended on what it
+        // just removed.
+        // The two `Driver::open` enables, re-derived by the same rule it used —
+        // "available on this loader" — rather than threaded through, so the two
+        // places cannot say different things about one instance.
+        let instance_enabled: Vec<&str> = {
+            let avail = unsafe { entry.enumerate_instance_extension_properties(None) }
+                .unwrap_or_default();
+            let has_inst = |want: &CStr| {
+                avail
+                    .iter()
+                    .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == want)
+            };
+            let mut v = Vec::new();
+            if has_inst(c"VK_EXT_debug_utils") {
+                v.push("VK_EXT_debug_utils");
+            }
+            if has_inst(c"VK_KHR_surface") {
+                v.push("VK_KHR_surface");
+            }
+            v
+        };
+        loop {
+            let present: Vec<String> =
+                owned.iter().filter_map(|c| c.to_str().ok().map(str::to_string)).collect();
+            let have = |n: &str| {
+                // A core version satisfies a `depends=` on itself; this device
+                // is created against the instance's own version, capped at 1.3.
+                if let Some(minor) =
+                    n.strip_prefix("VK_VERSION_1_").and_then(|m| m.parse::<u32>().ok())
+                {
+                    return minor <= 3;
+                }
+                present.iter().any(|o| o == n) || instance_enabled.contains(&n)
+            };
+            let drop: Vec<String> = present
+                .iter()
+                .filter(|n| !sv_gpu_entry::depends_satisfied(n, &have))
+                .cloned()
+                .collect();
+            if drop.is_empty() {
+                break;
+            }
+            owned.retain(|c| !c.to_str().is_ok_and(|s| drop.iter().any(|d| d == s)));
         }
         let names: Vec<*const std::ffi::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
 
