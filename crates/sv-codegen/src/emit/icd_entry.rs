@@ -2304,6 +2304,165 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         .collect();
     let incomplete: Vec<&str> = incomplete.iter().map(|(e, _)| *e).collect();
 
+    // What queue an extension's commands have to be recorded on, from `queues=`.
+    //
+    // # The defect this exists for, and why the other table could not catch it
+    //
+    // `INCOMPLETE_EXTENSIONS` asks "did the generator emit a working stub". It
+    // answered yes for `VK_KHR_video_queue` and `VK_KHR_video_decode_queue` —
+    // every one of their entry points marshals correctly — and the extensions
+    // were advertised the moment `full` became the default profile. But the ICD
+    // advertises **one queue family**, `GRAPHICS | COMPUTE | TRANSFER`, and
+    // `vkCmdDecodeVideoKHR` is `queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR"`. There
+    // is no family an application can record it on. Firefox 153 selects a device
+    // on exactly those two extensions and reports the failure as
+    // `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which its hardware-to-software recovery
+    // path does not admit: one pref away from the default, that was broken
+    // playback rather than slow playback.
+    //
+    // A table of stubbed entry points cannot see this, because nothing about a
+    // *queue family* is expressible in one. The fact is "we advertise a family
+    // we did not open", and the registry states the other half of it.
+    //
+    // # Why the shape is a list of masks
+    //
+    // `queues=` is a **disjunction** — `queues="A,B"` means the command may be
+    // recorded from a family with A *or* B. So one mask per command that has a
+    // requirement, and an extension is servable when *every* mask intersects
+    // what we advertise. Folding them together with `|` would say
+    // `VK_KHR_video_queue` is fine because some other command of it runs on
+    // graphics, which is how this class of bug survives a summary.
+    //
+    // Extensions with no queue requirement at all are omitted, which is most of
+    // them: the table is the exceptions, and `sv-icd` treats an absent entry as
+    // "nothing to check".
+    let queue_flag_bits: BTreeMap<&str, i64> = cx
+        .model
+        .types
+        .values()
+        .find_map(|t| match t {
+            vk_registry::TypeDef::Enum(e) if e.name == "VkQueueFlagBits" => Some(e),
+            _ => None,
+        })
+        .map(|e| e.values.iter().map(|v| (v.name.as_str(), v.value)).collect())
+        .unwrap_or_default();
+
+    let mut unknown_queue_bits: BTreeSet<String> = BTreeSet::new();
+    let mut queue_reqs: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+    for e in &cx.model.extensions {
+        if !e.supported_for_vulkan {
+            continue;
+        }
+        for it in e.requires.iter().flat_map(|b| b.items.iter()) {
+            let vk_registry::InterfaceRef::Command(c) = it else { continue };
+            let canon = cx.model.canonical_command(c);
+            let Some(cmd) = cx.model.commands.get(&canon) else { continue };
+            let Some(q) = cmd.queues.as_deref() else { continue };
+            // `queues="true"` is the registry's older spelling for "any queue",
+            // which constrains nothing.
+            if q == "true" {
+                continue;
+            }
+            let mut mask = 0u32;
+            for name in q.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match queue_flag_bits.get(name) {
+                    Some(v) => mask |= *v as u32,
+                    // A bit the registry names in `queues=` but does not define
+                    // as a `VkQueueFlagBits` value is a registry the generator
+                    // does not understand, and guessing zero would silently mean
+                    // "no requirement" — the permissive direction, which is the
+                    // wrong one to guess in.
+                    // A bit named in `queues=` that this registry does not
+                    // define as a `VkQueueFlagBits` value would silently mean
+                    // "no requirement" if skipped — the permissive direction,
+                    // which is the wrong one to guess in. `compile_error!` is
+                    // how this file already refuses what it cannot know, and it
+                    // fails the build rather than the playback.
+                    None => {
+                        unknown_queue_bits.insert(format!("{canon} queues={q:?}: {name}"));
+                    }
+                }
+            }
+            if mask != 0 {
+                queue_reqs.entry(e.name.as_str()).or_default().insert(mask);
+            }
+        }
+    }
+    let queue_reqs: Vec<TokenStream> = queue_reqs
+        .iter()
+        .map(|(e, masks)| {
+            let masks = masks.iter().copied().collect::<Vec<u32>>();
+            quote!((#e, &[#(#masks),*] as &[u32]))
+        })
+        .collect();
+    let unknown_queue_bits = if unknown_queue_bits.is_empty() {
+        quote!()
+    } else {
+        let msg = format!(
+            "queues= names a VkQueueFlagBits this registry does not define, so \
+             EXTENSION_QUEUE_REQUIREMENTS cannot say what family these need and \
+             would under-constrain them: {}",
+            unknown_queue_bits.iter().cloned().collect::<Vec<_>>().join("; ")
+        );
+        quote!(compile_error!(#msg);)
+    };
+
+    // `depends=`, compiled to a boolean expression over the advertised set.
+    //
+    // The queue check above withdrew `VK_KHR_video_queue`,
+    // `VK_KHR_video_decode_queue` and `VK_KHR_video_encode_queue` — every video
+    // extension that *has* commands. Ten remained: `VK_KHR_video_decode_h264`,
+    // `…_av1`, `VK_KHR_video_maintenance1` and the rest are codec and
+    // maintenance extensions that add only structs and enums, so they constrain
+    // no queue and the check had nothing to say about them.
+    //
+    // Advertising them is still a claim we cannot keep. Each `depends=` on one
+    // of the three that just went away, and §9.2's promise is about the
+    // extension as a whole: "we support H.264 decode, but not the decode queue
+    // you would decode on" is not a thing an implementation may say. So the
+    // advertised set is closed under `depends=` as well — by fixpoint, because
+    // `VK_KHR_video_maintenance2` depends on `VK_KHR_video_queue` through
+    // nothing else and a single pass would keep whatever depended on *it*.
+    //
+    // Lowered to code here rather than evaluated at runtime because `sv-icd` is
+    // a `cdylib` and the alternative was linking `vk-parse` into a driver for
+    // one function, or writing a second evaluator that could drift from
+    // `vk_registry::depends`. `Expr` is that module's own AST, so there is still
+    // exactly one parser.
+    fn lower_depends(e: &vk_registry::depends::Expr) -> TokenStream {
+        match e {
+            vk_registry::depends::Expr::Name(n) => quote!(__have(#n)),
+            vk_registry::depends::Expr::Any(v) => {
+                let parts = v.iter().map(lower_depends);
+                quote!((false #(|| #parts)*))
+            }
+            vk_registry::depends::Expr::All(v) => {
+                let parts = v.iter().map(lower_depends);
+                quote!((true #(&& #parts)*))
+            }
+        }
+    }
+    let depends_arms: Vec<TokenStream> = cx
+        .model
+        .extensions
+        .iter()
+        .filter(|e| e.supported_for_vulkan)
+        .filter_map(|e| {
+            let expr = e.depends.as_deref()?;
+            let name = e.name.as_str();
+            // An expression this parser cannot read must read as *unsatisfied*,
+            // the conservative direction — the same rule
+            // `vk_registry::depends::satisfied` states.
+            match vk_registry::depends::compile(expr) {
+                Some(ast) => {
+                    let body = lower_depends(&ast);
+                    Some(quote!(#name => #body,))
+                }
+                None => Some(quote!(#name => false,)),
+            }
+        })
+        .collect();
+
     let n_impl = cx.abi.commands.len() - refused.len();
     let total = cx.abi.commands.len();
     let hand_written = HAND_WRITTEN;
@@ -2339,6 +2498,43 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
         ///
         /// Sorted, so `binary_search` is the lookup.
         pub static INCOMPLETE_EXTENSIONS: &[&str] = &[#(#incomplete,)*];
+
+        #unknown_queue_bits
+
+        /// What queue an extension's commands must be recorded on, from the
+        /// registry's `queues=`.
+        ///
+        /// One entry per extension that constrains anything, and **one mask per
+        /// command** rather than one per extension: `queues=` is a disjunction,
+        /// so a command is satisfiable when its mask intersects a family we
+        /// advertise, and the *extension* is satisfiable when every one of its
+        /// masks is. Folding them together with `|` would report
+        /// `VK_KHR_video_queue` as servable because some other command of it
+        /// runs on graphics, which is precisely how the defect this table exists
+        /// for survived being looked at.
+        ///
+        /// `sv_icd::advertise::unservable_queue_requirement` is the consumer.
+        /// Extensions absent from this list constrain nothing.
+        ///
+        /// Sorted by extension name, so `binary_search_by_key` is the lookup.
+        pub static EXTENSION_QUEUE_REQUIREMENTS: &[(&str, &[u32])] = &[#(#queue_reqs,)*];
+
+        /// Whether an extension's `depends=` is satisfied by `__have`.
+        ///
+        /// The registry's expression, compiled: `,` became `||`, `+` became
+        /// `&&`, and a name became a call. An extension the registry gives no
+        /// `depends=` — most of them — answers `true`.
+        ///
+        /// `sv_icd` uses it to close the advertised set under dependency, so
+        /// that withdrawing `VK_KHR_video_decode_queue` also withdraws
+        /// `VK_KHR_video_decode_h264`, which adds no commands of its own and so
+        /// no other check can see.
+        pub fn depends_satisfied(extension: &str, __have: &dyn Fn(&str) -> bool) -> bool {
+            match extension {
+                #(#depends_arms)*
+                _ => true,
+            }
+        }
 
         /// Why each entry of [`INCOMPLETE_EXTENSIONS`] is there: the extension
         /// paired with one entry point of its own that is in

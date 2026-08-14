@@ -40,13 +40,98 @@
 
 /// Evaluate a `depends=` expression against a set of enabled names.
 pub fn satisfied(expr: &str, enabled: &dyn Fn(&str) -> bool) -> bool {
+    match compile(expr) {
+        Some(ast) => ast.eval(enabled),
+        // A trailing token means the expression used syntax this parser does not
+        // know. Treating that as "satisfied" would silently widen the profile, so
+        // it is treated as unsatisfied — the conservative direction.
+        None => false,
+    }
+}
+
+/// A parsed `depends=` expression.
+///
+/// Exposed so that a *generator* can lower one to code instead of shipping this
+/// evaluator: `sv-icd` has to decide at runtime whether an extension's
+/// dependencies are in the advertised set, and the alternatives were pulling
+/// `vk-parse` into a `cdylib`'s link line for one function, or writing a second
+/// evaluator that could drift from this one. Compiling the tree to a boolean
+/// expression at generation time costs neither, and the generated code is
+/// something a reader can check by eye.
+///
+/// [`satisfied`] is defined in terms of this, so there is exactly one parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expr {
+    /// A feature or extension name.
+    Name(String),
+    /// `,` — any one suffices.
+    Any(Vec<Expr>),
+    /// `+` — all are required.
+    All(Vec<Expr>),
+}
+
+impl Expr {
+    pub fn eval(&self, enabled: &dyn Fn(&str) -> bool) -> bool {
+        match self {
+            Expr::Name(n) => enabled(n),
+            Expr::Any(v) => v.iter().any(|e| e.eval(enabled)),
+            Expr::All(v) => v.iter().all(|e| e.eval(enabled)),
+        }
+    }
+    /// Every name the expression mentions.
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            Expr::Name(n) => vec![n.as_str()],
+            Expr::Any(v) | Expr::All(v) => v.iter().flat_map(Expr::names).collect(),
+        }
+    }
+}
+
+/// Parse a `depends=` expression, or `None` if it uses syntax this does not
+/// know — which callers must treat as *unsatisfied*, the conservative direction.
+pub fn compile(expr: &str) -> Option<Expr> {
     let tokens = tokenize(expr);
     let mut pos = 0;
-    let value = parse_expr(&tokens, &mut pos, enabled);
-    // A trailing token means the expression used syntax this parser does not
-    // know. Treating that as "satisfied" would silently widen the profile, so
-    // it is treated as unsatisfied — the conservative direction.
-    if pos != tokens.len() { false } else { value }
+    let ast = build_expr(&tokens, &mut pos)?;
+    if pos == tokens.len() { Some(ast) } else { None }
+}
+
+fn build_expr(tokens: &[Token], pos: &mut usize) -> Option<Expr> {
+    let mut parts = vec![build_term(tokens, pos)?];
+    while matches!(tokens.get(*pos), Some(Token::Comma)) {
+        *pos += 1;
+        parts.push(build_term(tokens, pos)?);
+    }
+    Some(if parts.len() == 1 { parts.pop().unwrap() } else { Expr::Any(parts) })
+}
+
+fn build_term(tokens: &[Token], pos: &mut usize) -> Option<Expr> {
+    let mut parts = vec![build_factor(tokens, pos)?];
+    while matches!(tokens.get(*pos), Some(Token::Plus)) {
+        *pos += 1;
+        parts.push(build_factor(tokens, pos)?);
+    }
+    Some(if parts.len() == 1 { parts.pop().unwrap() } else { Expr::All(parts) })
+}
+
+fn build_factor(tokens: &[Token], pos: &mut usize) -> Option<Expr> {
+    match tokens.get(*pos) {
+        Some(Token::Open) => {
+            *pos += 1;
+            let v = build_expr(tokens, pos)?;
+            if matches!(tokens.get(*pos), Some(Token::Close)) {
+                *pos += 1;
+                Some(v)
+            } else {
+                None
+            }
+        }
+        Some(Token::Name(n)) => {
+            *pos += 1;
+            Some(Expr::Name(n.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Every name an expression mentions, in order, ignoring the operators.
@@ -104,46 +189,6 @@ fn tokenize(s: &str) -> Vec<Token> {
     }
     flush(&mut cur, &mut out);
     out
-}
-
-fn parse_expr(tokens: &[Token], pos: &mut usize, enabled: &dyn Fn(&str) -> bool) -> bool {
-    let mut value = parse_term(tokens, pos, enabled);
-    while matches!(tokens.get(*pos), Some(Token::Comma)) {
-        *pos += 1;
-        // Not short-circuiting: the right-hand side must still be consumed, or
-        // `pos` ends up wrong and the trailing-token check misfires.
-        let rhs = parse_term(tokens, pos, enabled);
-        value = value || rhs;
-    }
-    value
-}
-
-fn parse_term(tokens: &[Token], pos: &mut usize, enabled: &dyn Fn(&str) -> bool) -> bool {
-    let mut value = parse_factor(tokens, pos, enabled);
-    while matches!(tokens.get(*pos), Some(Token::Plus)) {
-        *pos += 1;
-        let rhs = parse_factor(tokens, pos, enabled);
-        value = value && rhs;
-    }
-    value
-}
-
-fn parse_factor(tokens: &[Token], pos: &mut usize, enabled: &dyn Fn(&str) -> bool) -> bool {
-    match tokens.get(*pos) {
-        Some(Token::Open) => {
-            *pos += 1;
-            let v = parse_expr(tokens, pos, enabled);
-            if matches!(tokens.get(*pos), Some(Token::Close)) {
-                *pos += 1;
-            }
-            v
-        }
-        Some(Token::Name(n)) => {
-            *pos += 1;
-            enabled(n)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

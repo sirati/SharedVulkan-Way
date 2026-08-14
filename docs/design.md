@@ -3629,6 +3629,167 @@ what this project can demonstrate on its own once the private session is built.
 
 ---
 
+### 0.22 The queue nobody opened, and the extension that promised it anyway
+
+Measured 2026-08-14 on **devhost**, in `nix develop`; the `vulkaninfo`
+comparisons from a clean `nix shell nixpkgs#vulkan-tools`.
+
+**1. What went live, and when.** §0.19 made `full` the default profile. No video
+extension is on its exclusion list — none needed to be, the marshalling
+generates fine — and none is in `INCOMPLETE_EXTENSIONS`, because every one of
+their entry points has a working stub. So from that commit a forwarded device
+advertised **sixteen** video extensions:
+
+```
+VK_KHR_video_queue          VK_KHR_video_decode_queue    VK_KHR_video_encode_queue
+VK_KHR_video_decode_h264    VK_KHR_video_decode_h265     VK_KHR_video_decode_av1
+VK_KHR_video_decode_vp9     VK_KHR_video_encode_h264     VK_KHR_video_encode_h265
+VK_KHR_video_maintenance1   VK_KHR_video_maintenance2    …and four more
+```
+
+and **one queue family**, `GRAPHICS | COMPUTE | TRANSFER` — §0.8 item 7's
+synthesised family. `vkCmdDecodeVideoKHR` is
+`queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR"`. There was no family an application
+could record it on.
+
+Firefox 153 selects a video device on exactly `VK_KHR_video_queue` and
+`VK_KHR_video_decode_queue`, and its first-frame failure returns
+`NS_ERROR_DOM_MEDIA_FATAL_ERR`, which its hardware-to-software recovery path
+does not admit. **One pref away from the default that was broken playback, not
+slow playback.**
+
+The risk was written down in §0.8 item 7 while the profile was `zink` and the
+extensions were out of scope. Nothing connected that note to the profile change,
+and the two facts lived in different files. That is the whole failure: not that
+nobody knew, but that knowing was not attached to anything that would fire.
+
+**2. Why `INCOMPLETE_EXTENSIONS` could not catch it, although it is the right
+table.** §0.19 built it to stop exactly this shape — an extension advertised
+whose entry points cannot do the job. It asks one question: *did the generator
+emit a working stub?* For the video family the answer is yes, honestly. Nothing
+about a **queue family** is expressible in a table keyed on stubbed entry points.
+
+The underlying fact is "we advertise a family we did not open", and both halves
+were already data. The registry states `queues=` per command; `advertise::queue_families`
+states what we offer. So the check is derived from those two rather than being a
+name on a list:
+
+- `sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS` is generated: per extension, **one
+  mask per command** that constrains anything.
+- `sv_icd::advertise::unservable_queue_requirement` intersects each mask with
+  `advertised_queue_flags()`.
+
+**One mask per command, not one per extension**, and that is the load-bearing
+detail. `queues=` is a *disjunction* — `queues="A,B"` means "recordable from a
+family with A or B" — so folding an extension's commands together with `|` would
+report `VK_KHR_video_queue` as servable because some other command of it runs on
+graphics. That is how this class of defect survives being looked at.
+
+Naming `VK_KHR_video_queue` in an exclusion list would have fixed today and said
+nothing about `VK_KHR_video_encode_queue`, `VK_NV_optical_flow` or
+`VK_ARM_data_graph`, which fail for the identical reason and are now caught
+without being named. And when the ICD grows a real video family — §0.21's path —
+the gate stops firing on its own, because it reads the families rather than a
+constant.
+
+**An honest refusal rather than a placeholder.** If we cannot serve a video
+queue we must not claim one; a gate with nothing behind it would be worse than
+the documented gap.
+
+**3. The ten that the queue check could not see either, and the second derived
+rule.** Withdrawing the three command-bearing video extensions left ten:
+`VK_KHR_video_decode_h264`, `…_av1`, `VK_KHR_video_maintenance1` and the rest are
+codec and maintenance extensions that add **only structs and enums**. They
+constrain no queue, so `EXTENSION_QUEUE_REQUIREMENTS` has no entry for them and
+the first check had nothing to say.
+
+Advertising them is still a claim we cannot keep — each `depends=` on one of the
+three that just went, and "H.264 decode, but not the decode queue you would
+decode on" is not something an implementation may say. So the advertised set is
+closed under `depends=` too, by fixpoint, for the same reason
+`Profile::include_portable_extensions` needs one: chains are deeper than a link.
+
+`sv_icd_entry::depends_satisfied` is the registry's expression **compiled to
+Rust** — `,` became `||`, `+` became `&&`, a name became a call. `sv-icd` is a
+`cdylib`, so the alternatives were linking `vk-parse` into a driver for one
+function, or writing a second evaluator that could drift. `vk_registry::depends`
+gained a public AST and `satisfied` is now defined in terms of it, so there is
+still exactly one parser; `the_compiled_depends_expressions_agree_with_the_registry_evaluator`
+sweeps every supported extension against every subset of the names its own
+expression mentions — 100k-odd comparisons, and it asserts that more than fifty
+of those expressions actually contain an operator, because a sweep over bare
+names would pass whatever the compiler did to `,` and `+`.
+
+**4. The measurement, and the regression it caught for the second time in this
+file.** `vulkaninfo` through the forwarder against RADV:
+
+| | device extensions | video | over-advertised |
+|---|---:|---:|---:|
+| before | 221 | 16 | 0 |
+| queue check only | 218 | 13 | 0 |
+| + `depends` closure, first attempt | **192** | 0 | 0 |
+| + `depends` closure, corrected | **201** | **0** | **0** |
+
+The 192 is the regression. A device extension's `depends=` routinely names an
+*instance* extension — `VK_KHR_swapchain` on `VK_KHR_surface`,
+`VK_KHR_external_fence` on `VK_KHR_external_fence_capabilities`,
+`VK_KHR_shader_untyped_pointers` on `VK_KHR_get_physical_device_properties2` —
+and my `have` closure consulted only the *device* list. It withdrew swapchain,
+present_id, present_wait, incremental_present, hdr_metadata and eleven more.
+
+**§0.19 item 6 recorded losing `VK_KHR_swapchain` to an ordering mistake; this
+lost it again to a scope mistake.** Same extension, same file, different
+disguise: a check that is right about the extension it was written for and wrong
+about the set it reads. Nothing but the diff against the real driver would have
+found either — the count moved, and that is the whole signal.
+
+The six non-video extensions still withdrawn at 201 are **correct** withdrawals,
+and the gate finding them is the derived check doing its job:
+`VK_EXT_display_control`, `VK_EXT_swapchain_maintenance1`,
+`VK_KHR_swapchain_maintenance1`, `VK_KHR_present_id2`, `VK_KHR_present_wait2` and
+`VK_EXT_device_address_binding_report` each depend on an instance extension this
+ICD does not advertise. They were over-claims of the same kind, unnoticed.
+
+**5. The GPU side's silent `Ok(())`, made loud but not closed.** The generated
+forwarder, on a command whose entry point the driver lacks, calls `note_missing`
+and returns the "missing answer": `VK_ERROR_EXTENSION_NOT_PRESENT` where there is
+a reply to carry it, and **`Ok(())` where there is not**. For
+`vkCmdDecodeVideoKHR` — a recorded `vkCmd*` whose entire output is a side effect
+— nothing was recorded, no reply existed, and no caller checking a return value
+could have noticed. `last_error` was set and dropped: it is consumed only where a
+command returns `Err`.
+
+`note_missing` now reports once per command name on stderr, always rather than
+under a variable — the same change and the same argument as
+`sv_icd_entry::not_implemented` in §0.19 item 1: when the only evidence of a
+silent failure is whether we said anything, gating it on an environment variable
+nobody sets makes the worst failure mode the quietest one.
+
+**That is a diagnosis, not a fix, and this section says so rather than implying
+otherwise.** The Vulkan-correct outcome is that a command buffer which could not
+record a command is invalid and its *submit* fails. The blob decoder's `Err` path
+sets `fatal` on the ring and kills the session, which is far too blunt for a
+driver that merely lacks an optional extension — the same argument that made the
+generated caller lenient in the first place, and it still holds. Poisoning the
+command buffer, so its submit fails and nothing else does, is the right shape and
+is **not written**. It is the open item here.
+
+The primary defence does hold: a command belonging to an extension whose queue
+family this ICD cannot offer is no longer advertised, so a conforming application
+never reaches that path.
+
+**6. What this says about the two claims.** §0.20 separated *carried* from
+*implemented* and found the forwarding path in good shape — 36 hand-written
+answers either way, 239 → 509 adding 270 forwards and not one new local answer,
+one deliberate canned value and zero outright stubs. This section is the other
+half of that split and it lands on the *advertising* path: a command can be
+carried, generated, forwarded and executed by a real driver, and still be
+unreachable because the family it must be recorded on does not exist here.
+"Carried", "implemented" and "servable" are three claims, and the third is the
+one no table keyed on entry points can make.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
