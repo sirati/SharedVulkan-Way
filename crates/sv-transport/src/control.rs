@@ -1,6 +1,6 @@
 //! The control region: fixed layout, handshake, generation, heartbeats.
 //!
-//! design.md §4.2 gives the layout as a table and §4.3 gives the handshake as a
+//! docs/design.md §4.2 gives the layout as a table and §4.3 gives the handshake as a
 //! numbered sequence. Both are reproduced here as code, and the offsets below
 //! are that table transcribed — if the table moves, [`LAYOUT_VERSION`] moves
 //! with it and two builds refuse each other instead of misreading each other.
@@ -9,7 +9,7 @@
 //!
 //! > sharedgl has no readiness flag at all, because `READY_HINT` was aliased
 //! > away by `SHM_SLOT_MASK` at the same offset (sgl §5, §7.2b). Do not repeat
-//! > that. — design.md §4.3
+//! > that. — docs/design.md §4.3
 //!
 //! "Do not repeat that" is not a mechanism, so here is the mechanism. Every
 //! extent of the region is produced by [`Layout::compute`] and enumerated by
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// `b"SHVRK1\0\0"` read as a little-endian `u64`.
 ///
-/// design.md §4.2 gives the constant as `0x5348_5652_4B31_0000`. Written to the
+/// docs/design.md §4.2 gives the constant as `0x5348_5652_4B31_0000`. Written to the
 /// region as little-endian bytes, so a big-endian peer loads a byte-swapped
 /// value and refuses — which is why "refuse big-endian peers at handshake"
 /// needs no field of its own. The cold path checks it a second time and
@@ -47,7 +47,7 @@ pub const LAYOUT_VERSION: u32 = 1;
 /// A little-endian marker, exchanged on the cold path.
 pub const ENDIAN_MARKER: u32 = 0x0403_0201;
 
-// -- header field offsets, design.md §4.2 -----------------------------------
+// -- header field offsets, docs/design.md §4.2 -----------------------------------
 
 pub const OFF_MAGIC: u64 = 0x00;
 pub const OFF_LAYOUT_VERSION: u64 = 0x08;
@@ -66,7 +66,7 @@ pub const OFF_TIMELINE_DIR_OFFSET: u64 = 0x50;
 pub const OFF_REVERSE_RING_OFFSET: u64 = 0x58;
 pub const OFF_OWNER_HEARTBEAT: u64 = 0x60;
 pub const OFF_PEER_HEARTBEAT: u64 = 0x68;
-/// design.md §4.2 lists `owner_epoch_ns, peer_epoch_ns` as a single row at
+/// docs/design.md §4.2 lists `owner_epoch_ns, peer_epoch_ns` as a single row at
 /// 0x70. They are two `u64`s and cannot share an offset; this is where the
 /// second one goes. Diagnostics only, per that table.
 pub const OFF_OWNER_EPOCH_NS: u64 = 0x70;
@@ -84,7 +84,7 @@ pub const OFF_RING_DATA_OFFSET: u64 = 0x90;
 /// The header occupies one page; everything after 0x98 is reserved and zero.
 pub const HEADER_SIZE: u64 = PAGE as u64;
 
-/// `flags`, design.md §4.2.
+/// `flags`, docs/design.md §4.2.
 pub struct Flags;
 impl Flags {
     /// The owner finished writing the header. Set *before* `magic`.
@@ -94,7 +94,7 @@ impl Flags {
     pub const SHUTDOWN: u32 = 1 << 3;
 }
 
-// -- ring directory, design.md §4.2 -----------------------------------------
+// -- ring directory, docs/design.md §4.2 -----------------------------------------
 
 /// One cache line per entry, so two rings' directory entries never share one.
 pub const RING_DIR_ENTRY_SIZE: u64 = 64;
@@ -108,7 +108,7 @@ pub const RD_REPLY_LEN: u64 = 0x1C;
 pub const RD_CTRL_OFF: u64 = 0x20;
 pub const RD_DEPENDS_RING: u64 = 0x24;
 
-/// `state`, design.md §4.2.
+/// `state`, docs/design.md §4.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RingState {
@@ -130,14 +130,14 @@ impl RingState {
     }
 }
 
-/// `kind`, design.md §4.2 and the table in §4.4.
+/// `kind`, docs/design.md §4.2 and the table in §4.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RingKind {
     Instance = 1,
     Device = 2,
     Queue = 3,
-    /// GPU→app. design.md §4.6: built from day one, not retrofitted.
+    /// GPU→app. docs/design.md §4.6: built from day one, not retrofitted.
     Reverse = 4,
     /// One Wayland connection. waycompose-design.md §36.
     ///
@@ -168,7 +168,7 @@ impl RingKind {
     }
 }
 
-// -- ring control block, design.md §4.2 -------------------------------------
+// -- ring control block, docs/design.md §4.2 -------------------------------------
 
 /// One page per ring, "deliberately over-sized so producer and consumer never
 /// share a cache line, which is the mistake sharedgl's single global `SUBMIT`
@@ -190,7 +190,7 @@ pub const RC_FATAL_MSG_LEN: u64 = 160;
 
 // -- the doorbell, one pair of words per lane --------------------------------
 //
-// design.md §4.5 lists four parkers and says the second — "`Futex` — Linux-only,
+// docs/design.md §4.5 lists four parkers and says the second — "`Futex` — Linux-only,
 // works across processes on shared memory. Used by the same-machine development
 // loop, where it is strictly better than spinning and costs nothing" — is the
 // one the development loop should use. These are the words it needs.
@@ -204,7 +204,7 @@ pub const RC_FATAL_MSG_LEN: u64 = 160;
 //
 // `wake` is bumped by the producer and is the address both sides name; `parked`
 // is set by the consumer immediately before it waits, so the producer can skip
-// the syscall entirely in the common case — design.md §4.4's "the producer
+// the syscall entirely in the common case — docs/design.md §4.4's "the producer
 // checks `IDLE` before paying for a notification", made per-lane.
 //
 // They are at 0x200 and 0x240 rather than in the gap after `RC_NOTIFY_COUNT`
@@ -215,7 +215,7 @@ pub const RC_CMD_PARKED: u64 = 0x204;
 pub const RC_REPLY_WAKE: u64 = 0x240;
 pub const RC_REPLY_PARKED: u64 = 0x244;
 
-/// `status`, design.md §4.2.
+/// `status`, docs/design.md §4.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RingStatus {
@@ -236,7 +236,7 @@ impl RingStatus {
     }
 }
 
-// -- slab directory, design.md §4.2 and §5.2 --------------------------------
+// -- slab directory, docs/design.md §4.2 and §5.2 --------------------------------
 
 pub const SLAB_DIR_ENTRY_SIZE: u64 = 64;
 pub const SD_STATE: u64 = 0x00;
@@ -258,20 +258,20 @@ pub enum CacheClass {
     WriteBack = 0,
 }
 
-// -- timeline mirror, design.md §4.2 ----------------------------------------
+// -- timeline mirror, docs/design.md §4.2 ----------------------------------------
 
 pub const TIMELINE_ENTRY_SIZE: u64 = 64;
 pub const TL_SEMAPHORE_ID: u64 = 0x00;
 pub const TL_VALUE: u64 = 0x08;
 pub const TL_WAITER_COUNT: u64 = 0x10;
-/// design.md §4.2: "Timeline mirror table — 1024 × 64 B".
+/// docs/design.md §4.2: "Timeline mirror table — 1024 × 64 B".
 pub const TIMELINE_COUNT_DEFAULT: u32 = 1024;
 
 // ---------------------------------------------------------------------------
 // Geometry and layout
 // ---------------------------------------------------------------------------
 
-/// The numbers the owner picks and publishes. design.md §4.2's defaults.
+/// The numbers the owner picks and publishes. docs/design.md §4.2's defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
     pub control_size: u64,
@@ -324,7 +324,7 @@ impl Geometry {
     /// file, so both do.
     ///
     /// It differs from [`Geometry::default`] in one respect, and the reason is a
-    /// consequence of what design.md §6.5 does not yet have: a
+    /// consequence of what docs/design.md §6.5 does not yet have: a
     /// `vkCreateShaderModule` carries its SPIR-V **inline on the ring**, because
     /// the arena-blob path is not built. §4.2's 64 KiB ring cannot hold a real
     /// shader module, so the data buffer is 256 KiB and the slot count drops
@@ -346,7 +346,7 @@ impl Geometry {
     /// single allocation that big — Zink stages in pieces and DXVK's probe is
     /// 256×256 — so a limit that would stop any real application went unnoticed.
     ///
-    /// 64 MiB is design.md §5.2's own number and this was a silent deviation
+    /// 64 MiB is docs/design.md §5.2's own number and this was a silent deviation
     /// from it. It costs nothing measurable: the slab directory shrinks by the
     /// same factor it grows, and §0.1 measured that a *larger* window is more
     /// contiguous rather than less.
@@ -380,11 +380,11 @@ pub struct Layout {
 }
 
 /// The reverse ring's directory slot. Fixed, so the app side can find it
-/// without walking the directory and without a round trip (design.md §4.6).
+/// without walking the directory and without a round trip (docs/design.md §4.6).
 pub const REVERSE_RING_SLOT: u32 = 0;
 
 impl Layout {
-    /// Place every section, in the order design.md §4.2's sizing paragraph
+    /// Place every section, in the order docs/design.md §4.2's sizing paragraph
     /// lists them, page-aligned between sections.
     pub fn compute(g: Geometry) -> Result<Layout> {
         if g.ring_slot_count == 0 {
@@ -551,7 +551,7 @@ impl Layout {
 /// What the two sides have to agree about before anything else happens.
 ///
 /// `protocol_hash` comes from `sv_proto::PROTOCOL_HASH`, which the generator
-/// computed over the manifest it emitted (design.md §4.3, §6.2 deviation 2).
+/// computed over the manifest it emitted (docs/design.md §4.3, §6.2 deviation 2).
 /// This crate does not depend on `sv-proto` — the transport must be testable
 /// without a 126,000-line dependency — so the value is passed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -596,7 +596,7 @@ pub struct Control {
 }
 
 impl Control {
-    /// Create and publish, as the owner. design.md §4.3 step 1.
+    /// Create and publish, as the owner. docs/design.md §4.3 step 1.
     ///
     /// Order matters and is the whole of the step: zero everything, write every
     /// field, set `READY`, and only then store `magic` with `Release`. A peer
@@ -661,7 +661,7 @@ impl Control {
         Ok(ctl)
     }
 
-    /// Re-initialise in place, bumping the generation. design.md §4.3 step 1's
+    /// Re-initialise in place, bumping the generation. docs/design.md §4.3 step 1's
     /// second sentence.
     ///
     /// Zeroing `magic` *first* is what makes this safe against a peer that is
@@ -677,7 +677,7 @@ impl Control {
         Control::create(region, geometry, ids, next)
     }
 
-    /// Attach as the peer. design.md §4.3 step 4: check in this order and
+    /// Attach as the peer. docs/design.md §4.3 step 4: check in this order and
     /// refuse with a named error on any mismatch.
     ///
     /// The order is the design's, and it is the useful order: the cheapest and
@@ -792,7 +792,7 @@ impl Control {
             self.region.atomic_u32(e + RD_DEPENDS_RING)?.store(u32::MAX, Ordering::Relaxed);
         }
         // The reverse ring exists from the first instant the region does
-        // (design.md §4.6), so slot 0 is claimed here rather than negotiated.
+        // (docs/design.md §4.6), so slot 0 is claimed here rather than negotiated.
         self.set_ring(REVERSE_RING_SLOT, RingKind::Reverse, 0, None)?;
         Ok(())
     }
@@ -816,7 +816,7 @@ impl Control {
 
     /// Take the first free directory slot for a ring of `kind`.
     ///
-    /// design.md §4.3 step 5: the peer claims rings. The claim is a CAS from
+    /// docs/design.md §4.3 step 5: the peer claims rings. The claim is a CAS from
     /// `FREE` to `CLAIMED`, so two threads racing for the last slot produce one
     /// winner and one [`Error::NoFreeRing`] rather than one silent aliasing.
     pub fn claim_ring(
@@ -872,7 +872,7 @@ impl Control {
             .ok_or(Error::NoSuchRing { ring: slot })
     }
 
-    /// The device ring a queue ring orders against (design.md §4.4's
+    /// The device ring a queue ring orders against (docs/design.md §4.4's
     /// `depends_ring`, and the target of every barrier that queue emits).
     pub fn ring_depends(&self, slot: u32) -> Result<Option<u32>> {
         let e = self.layout.ring_dir_entry(slot)?;
@@ -918,7 +918,7 @@ impl Control {
     }
 
     /// Read the live generation and compare it against the one this handle was
-    /// made under. design.md §4.3: "Every ring operation carries the generation
+    /// made under. docs/design.md §4.3: "Every ring operation carries the generation
     /// it was created under; a mismatch means the peer restarted."
     pub fn check_generation(&self) -> Result<()> {
         let now = self.region.atomic_u32(OFF_GENERATION)?.load(Ordering::Acquire);
@@ -937,7 +937,7 @@ impl Control {
     /// That is a mutual false positive, it is reachable in ordinary operation
     /// rather than under a fault, and it was reproduced by running the two sides
     /// in separate containers where the timing is slower than in one process.
-    /// design.md §4.2 says the heartbeat is "updated at least every 100 ms" and
+    /// docs/design.md §4.2 says the heartbeat is "updated at least every 100 ms" and
     /// §4.5 says an expired wait consults it, but neither says who beats while
     /// you are waiting; [`crate::park::wait_until`] does.
     /// **Does not read the clock.** `owner_epoch_ns`/`peer_epoch_ns` are
@@ -973,7 +973,7 @@ impl Control {
         }
     }
 
-    /// Publish a heartbeat with a caller-chosen tick. design.md §4.2: at least
+    /// Publish a heartbeat with a caller-chosen tick. docs/design.md §4.2: at least
     /// every 100 ms.
     pub fn beat(&self, tick: u64, epoch_ns: u64) -> Result<()> {
         let (hb, ep) = match self.role {
@@ -1005,7 +1005,7 @@ impl Control {
 
     // -- slab directory ------------------------------------------------------
 
-    /// Publish a slab's geometry. design.md §4.2: "Written by the app side when
+    /// Publish a slab's geometry. docs/design.md §4.2: "Written by the app side when
     /// it requests a slab, completed by the GPU side when the import succeeds."
     pub fn write_slab(&self, index: u32, arena_offset: u64, size: u64) -> Result<()> {
         let e = self.layout.slab_dir_entry(index)?;
@@ -1062,7 +1062,7 @@ impl Control {
     }
 
     /// …so that an app-side `vkGetSemaphoreCounterValue` is a local acquire
-    /// load and not a round trip (design.md §4.2, fwd §2.9).
+    /// load and not a round trip (docs/design.md §4.2, fwd §2.9).
     pub fn timeline_value(&self, slot: u32) -> Result<u64> {
         let e = self.layout.timeline_entry(slot)?;
         Ok(self.region.atomic_u64(e + TL_VALUE)?.load(Ordering::Acquire))
@@ -1089,7 +1089,7 @@ impl Control {
 // Liveness
 // ---------------------------------------------------------------------------
 
-/// What a timed-out wait concluded. design.md §4.5: "A wait that expires checks
+/// What a timed-out wait concluded. docs/design.md §4.5: "A wait that expires checks
 /// the peer heartbeat and the generation counter before deciding between 'slow'
 /// and 'gone'."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1256,7 +1256,7 @@ mod tests {
     fn the_default_geometry_is_the_designs_and_fits_its_stated_size() {
         let g = Geometry::default();
         let l = Layout::compute(g).unwrap();
-        // design.md §4.2: "4 KiB header + 4 KiB directory + 64 KiB timelines +
+        // docs/design.md §4.2: "4 KiB header + 4 KiB directory + 64 KiB timelines +
         // 64 × 4 KiB control + 64 × (64 + 64) KiB data ≈ 8.6 MiB, which is why
         // the region default is 16 MiB."
         assert!(l.used < 16 << 20, "the default layout must fit the default region");
@@ -1410,7 +1410,7 @@ mod tests {
         let g = Geometry::small();
         let big = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
         let _owner = Control::create(Arc::clone(&big), g, ids(), 1).unwrap();
-        // Same bytes, a mapping half the size. This is the check design.md §4.3
+        // Same bytes, a mapping half the size. This is the check docs/design.md §4.3
         // step 4 ends with, and it is the one that stops a truncated attach from
         // reading a ring buffer that is not there.
         let mut bytes = vec![0u8; g.control_size as usize / 2];

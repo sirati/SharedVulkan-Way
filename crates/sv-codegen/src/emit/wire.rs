@@ -1,4 +1,4 @@
-//! Passes 1–3: `size`, `encode`, `decode` (design.md §7.2).
+//! Passes 1–3: `size`, `encode`, `decode` (docs/design.md §7.2).
 //!
 //! The `(size, encode)` split is not collapsible — you cannot reserve a ring
 //! span before you know how big the message is — so every struct gets both, and
@@ -12,7 +12,7 @@
 //! pool-allocated storage with the packet's lifetime. Our decoder produces owned
 //! Rust values — `Vec`, `Option<Box<_>>` — whose storage *is* their lifetime, so
 //! the pass has nothing to do. It is recorded here rather than silently dropped
-//! because design.md §7.2 lists it and a reader deserves to know why the file is
+//! because docs/design.md §7.2 lists it and a reader deserves to know why the file is
 //! missing.
 
 use crate::naming;
@@ -659,7 +659,7 @@ fn length_check(
         // `pAllocateInfo->commandBufferCount` names a field of a *different*
         // parameter, so it is a command-level check, not a struct-level one.
         // `Unchecked` is a length the registry states in a form we deliberately
-        // do not parse (design.md §7.4: do not build a LaTeX parser).
+        // do not parse (docs/design.md §7.4: do not build a LaTeX parser).
         Shape::Array { len, .. } | Shape::Blob { len } | Shape::CStringArray { len } => {
             len.as_ref()?
         }

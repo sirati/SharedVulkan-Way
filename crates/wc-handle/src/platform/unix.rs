@@ -176,7 +176,7 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
 
 /// The granularity every stamp and every locate step works in. Not a host page
 /// size: it is the *guest-physical* page size the host's scan sweeps in, and it
-/// stays 4096 whatever the allocator did (shared_vulkan design.md §5.1).
+/// stays 4096 whatever the allocator did (shared_vulkan docs/waycompose-design.md §5.1).
 pub const REGION_PAGE: usize = 4096;
 
 /// Commit `len` bytes of this process's own memory, pin them, and let the caller

@@ -1,4 +1,4 @@
-//! Pass: types, enums and constants (design.md §7.5's first row).
+//! Pass: types, enums and constants (docs/design.md §7.5's first row).
 //!
 //! Handles, enums and bitmasks are `#[repr(transparent)]` newtypes rather than
 //! Rust `enum`s. That is not stylistic: a Vulkan enum received from the peer can
@@ -105,7 +105,7 @@ fn emit_handle(h: &crate::plan::HandlePlan) -> TokenStream {
     let doc = format!(
         "A Vulkan `{}` as it crosses the boundary: an app-side-assigned object \
          id, never a pointer.\n\n\
-         design.md §6.4 assigns ids on the app side from a per-device counter, so \
+         docs/design.md §6.4 assigns ids on the app side from a per-device counter, so \
          object creation costs no round trip, and `security-model.md` R3 requires \
          that what crosses is always a table index. The two sides do not share an \
          address space, so this is correctness before it is safety.{}",
@@ -113,7 +113,7 @@ fn emit_handle(h: &crate::plan::HandlePlan) -> TokenStream {
         if h.dispatchable {
             "\n\nThis handle is *dispatchable*. On the app side the value the \
              application sees is a pointer to a `#[repr(C)]` struct whose first \
-             word the loader overwrites (design.md §6.4, R17); that is the ICD's \
+             word the loader overwrites (docs/design.md §6.4, R17); that is the ICD's \
              problem, not the protocol's, and only the id appears here."
         } else {
             ""
@@ -266,7 +266,7 @@ fn emit_struct(plan: &Plan, s: &StructPlan) -> TokenStream {
     let partial_doc = if s.needs_partial {
         "\n\nA `_partial` encoding is generated for this type, because it is \
          filled in by the implementation and the app side must not send \
-         uninitialised contents (design.md §6.1, Venus's three-state output \
+         uninitialised contents (docs/design.md §6.1, Venus's three-state output \
          validity)."
     } else {
         ""
@@ -290,11 +290,11 @@ fn emit_struct(plan: &Plan, s: &StructPlan) -> TokenStream {
     }
 }
 
-/// A union becomes a Rust `enum`, which is the whole reason design.md §7.4's
+/// A union becomes a Rust `enum`, which is the whole reason docs/design.md §7.4's
 /// union exception did not need a table.
 ///
 /// > "Venus hardcodes three and refuses to serialise structs containing any
-/// > other; gfxstream always marshals member `[0]`."  — design.md §7.4
+/// > other; gfxstream always marshals member `[0]`."  — docs/design.md §7.4
 ///
 /// Both are working around C having no tag. A Rust `enum` carries one, so the
 /// encoder always knows which member it holds and never has to guess. The
@@ -319,7 +319,7 @@ fn emit_union(s: &StructPlan) -> TokenStream {
          The wire form is Venus's: a `u32` member index, then the member. The \
          index is the variant, so unlike a C generator this one never has to \
          hardcode a discriminator for a union the registry does not annotate \
-         with `selector=` (design.md §7.4).",
+         with `selector=` (docs/design.md §7.4).",
         s.name
     );
     quote! {

@@ -72,7 +72,7 @@ pub struct Grown {
     /// back to the content sweep — which will *work*, because a freshly
     /// committed region still carries its stamps, and will simply cost three
     /// seconds. That degradation is deliberate and is the only fallback in the
-    /// path: design.md §5.1's rule is that a failed locate fails the run, and
+    /// path: docs/waycompose-design.md §5.1's rule is that a failed locate fails the run, and
     /// this is not a failed locate, it is a slow one.
     pub frames: Vec<u64>,
     /// What the query cost, in milliseconds. Reported because a stage that

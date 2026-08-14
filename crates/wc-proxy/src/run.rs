@@ -457,7 +457,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Some(t)
         }
         "arena" => {
-            // THE FILE ARENA IS NOT A TARGET. Guest RAM is (design.md §1a). This
+            // THE FILE ARENA IS NOT A TARGET. Guest RAM is (docs/waycompose-design.md §1a). This
             // branch exists so a Wine run on one Linux machine — which has no
             // QEMU and therefore no guest RAM to locate — can exercise the arena
             // path at all. It is **kept** rather than deleted, because deleting
@@ -504,7 +504,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // The fixture's growth, and it says so. `ProvidedRegion::file`'s
             // note applies: this is the Wine and same-machine path, and a
             // deployment reaching it would be a same-machine path wearing the
-            // design's clothes (design.md §1a).
+            // design's clothes (docs/waycompose-design.md §1a).
             if args.arena_grow {
                 let dir = args
                     .arena_path

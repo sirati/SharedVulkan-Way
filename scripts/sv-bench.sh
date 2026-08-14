@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The benchmark design.md §13 step 1 asks for, run twice: once through this
+# The benchmark docs/design.md §13 step 1 asks for, run twice: once through this
 # project's forwarded Vulkan and once against the real driver with no forwarding
 # at all.
 #

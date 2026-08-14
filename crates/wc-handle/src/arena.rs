@@ -5,7 +5,7 @@
 //!
 //! An arena is not a per-message fact. It is attached once, out of band, by
 //! whatever brought the two sides together — shared_vulkan's cold-path
-//! handshake in the real deployment (its design.md §4.3), a command-line flag
+//! handshake in the real deployment (its docs/waycompose-design.md §4.3), a command-line flag
 //! in a test — and from then on every `Descriptor::ArenaSlice` in the stream
 //! refers to it by a small integer.
 //!
@@ -114,7 +114,7 @@ fn registry() -> &'static Registry {
 /// identified by its number on the wire, and if the two sides ever disagree
 /// about what number 0 means, no amount of care here can detect it. That
 /// disagreement is what shared_vulkan's `generation` field exists to catch on
-/// the real path (its design.md §4.3), and a test harness passing the same
+/// the real path (its docs/waycompose-design.md §4.3), and a test harness passing the same
 /// flag to both processes is what catches it here.
 pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
     let len = usize::try_from(size)
@@ -1158,7 +1158,7 @@ pub fn committed_bytes() -> Option<u64> {
 ///   startup and there is no request in the protocol for a second.
 ///
 /// So this is a fixture affordance and is off unless asked for. It is not a
-/// fallback in design.md §5.1's sense — it cannot make a file stand in for
+/// fallback in docs/waycompose-design.md §5.1's sense — it cannot make a file stand in for
 /// guest RAM, because on the guest-RAM path the lookup never misses.
 fn grow_dir() -> &'static RwLock<Option<std::path::PathBuf>> {
     static DIR: OnceLock<RwLock<Option<std::path::PathBuf>>> = OnceLock::new();

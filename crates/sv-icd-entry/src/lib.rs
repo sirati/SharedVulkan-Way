@@ -3,7 +3,7 @@
 //! `sv-proto`.
 //!
 //! **This is the only crate in the project that contains `unsafe`, and almost
-//! all of it is generated.** design.md §7.3 and `security-model.md` R7 both say
+//! all of it is generated.** docs/design.md §7.3 and `security-model.md` R7 both say
 //! why: the ICD boundary is where raw pointers from an application arrive, that
 //! cannot be avoided, and the mitigation is to make every one of the ~250 sites
 //! the same three lines so they are reviewable by pattern rather than
@@ -26,7 +26,7 @@
 //! `&'static dyn Icd`. That is deliberate and it is not laziness about
 //! threading state: a Vulkan ICD is loaded once per process, an application may
 //! create several instances, and the wire object ids in the arguments already
-//! say which instance or device a call belongs to (design.md §6.4). A pointer
+//! say which instance or device a call belongs to (docs/design.md §6.4). A pointer
 //! chased out of the dispatchable handle would give the same answer with more
 //! moving parts. Until `sv-icd` registers itself the global is [`NullIcd`],
 //! whose every method is the trait's default refusal, so a call that arrives
@@ -94,7 +94,7 @@ include!(concat!(env!("OUT_DIR"), "/sv_icd_entry.rs"));
 /// dispatchable object an ICD returns, and asserts this value is there first.
 /// **The assertion is debug-only in a release loader**, so an object without it
 /// is not an error message — it is the loader dereferencing whatever we happened
-/// to put there (design.md §6.4, R17).
+/// to put there (docs/design.md §6.4, R17).
 pub const ICD_LOADER_MAGIC: usize = 0x01CD_C0DE;
 
 /// Our own marker, in the word after the loader's.
@@ -123,7 +123,7 @@ pub struct DispatchableHeader {
     pub loader_data: *mut c_void,
     /// [`SV_OBJECT_MAGIC`].
     pub magic: u64,
-    /// The wire object id (design.md §6.4, R3). This is what crosses; the
+    /// The wire object id (docs/design.md §6.4, R3). This is what crosses; the
     /// pointer never does.
     pub id: u64,
     /// Which kind of object this is, for diagnostics.
@@ -245,7 +245,7 @@ pub fn wire_failed(e: sv_wire::WireError) -> LowerError {
     LowerError::Wire(e)
 }
 
-/// Which ring a forwarded command belongs on (design.md §4.4).
+/// Which ring a forwarded command belongs on (docs/design.md §4.4).
 ///
 /// The generated forwarders pass one of these with every packet; the transport
 /// decides what a ring is. Note that this is a *class*, not a ring id: the app
@@ -280,10 +280,10 @@ pub trait Transport: Send + Sync {
         reply: &mut Vec<u8>,
     ) -> IcdResult<()>;
 
-    /// Send a command that generates no reply (design.md §4.4, D15).
+    /// Send a command that generates no reply (docs/design.md §4.4, D15).
     fn send(&self, ring: RingClass, opcode: u32, command: &[u8]) -> IcdResult<()>;
 
-    /// Append a recorded `vkCmd*` to `command_buffer`'s blob (design.md §6.5).
+    /// Append a recorded `vkCmd*` to `command_buffer`'s blob (docs/design.md §6.5).
     ///
     /// > Each `VkCommandBuffer` owns an arena block; recording encodes straight
     /// > into it; `vkEndCommandBuffer` publishes `(offset, len)`.
@@ -377,7 +377,7 @@ pub fn report_transport_failure(e: &dyn core::fmt::Display) {
 /// `VkResult` and no validation message, and the next thing that happens is the
 /// GPU reading uninitialised memory. `expand_descriptor_template` dropped 64
 /// inline-uniform-block writes per CTS test for exactly as long as its
-/// complaint was gated (design.md §0.16), and the cost was a device loss whose
+/// complaint was gated (docs/design.md §0.16), and the cost was a device loss whose
 /// diagnosis started three layers away.
 ///
 /// Once per distinct message, so a per-descriptor fault cannot become the
@@ -438,12 +438,12 @@ fn debug_enabled() -> bool {
 /// pointer work on both sides of them.
 ///
 /// Everything here has a default that refuses, so `sv-icd` can implement a
-/// subset and the rest still fails cleanly (design.md §13 step 5 is about the
+/// subset and the rest still fails cleanly (docs/design.md §13 step 5 is about the
 /// loader accepting us, not about a complete driver).
 pub trait IcdLocal {
     /// The Vulkan version this driver implements.
     ///
-    /// Ship a real one. design.md §8: if the manifest says < 1.1, or
+    /// Ship a real one. docs/design.md §8: if the manifest says < 1.1, or
     /// `vkEnumerateInstanceVersion` is missing, or it returns < 1.1, or it
     /// returns anything but `VK_SUCCESS`, the loader **demotes us to a 1.0
     /// driver and rewrites every `VkApplicationInfo::apiVersion` we receive**.
@@ -458,7 +458,7 @@ pub trait IcdLocal {
     /// `MAX_NUM_UNKNOWN_EXTS = 250` hand-generated trampolines and its
     /// known-extension list depends on its own header version, so reflecting
     /// everything the peer reports is how an ICD becomes unloadable on an older
-    /// loader (design.md §8, R16).
+    /// loader (docs/design.md §8, R16).
     fn instance_extensions(&self) -> &[(&'static str, u32)] {
         &[]
     }
@@ -470,7 +470,7 @@ pub trait IcdLocal {
 
     /// A fresh wire object id.
     ///
-    /// design.md §6.4's counter. Every generated [`Icd`] default that forwards a
+    /// docs/design.md §6.4's counter. Every generated [`Icd`] default that forwards a
     /// command with an output handle calls this *before* encoding, because the
     /// id is what the command carries — the application's `*pBuffer` holds
     /// nothing until we have returned.
@@ -489,7 +489,7 @@ pub trait IcdLocal {
     /// This is the hinge of the whole app side. Every generated [`Icd`] method
     /// consults it: with a transport the command is encoded and sent, without
     /// one it refuses by name. An implementation therefore does not have to
-    /// write 239 forwarders — it writes the handful design.md §8 and §10 say are
+    /// write 239 forwarders — it writes the handful docs/design.md §8 and §10 say are
     /// answered app-side, and the rest cross by default.
     ///
     /// `None` is a legitimate steady state and not only a startup window: a
@@ -499,7 +499,7 @@ pub trait IcdLocal {
         None
     }
 
-    /// design.md §5.3's `(memory, offset)` rewrite, **app-side half** — pass 6
+    /// docs/design.md §5.3's `(memory, offset)` rewrite, **app-side half** — pass 6
     /// of §7.2, on the side that owns the allocator.
     ///
     /// An app-side `VkDeviceMemory` is an id this process minted for a sub-range
@@ -523,14 +523,14 @@ pub trait IcdLocal {
     /// `vkQueueBindSparse` — sent the app-side id raw. The GPU side then said
     /// `no VkDeviceMemory with id 8` and took the ring fatal, and every CTS test
     /// that binds an image to host-visible memory lost the device
-    /// (design.md §0.20). Generating the pass is what makes the set closed: it
+    /// (docs/design.md §0.20). Generating the pass is what makes the set closed: it
     /// is the same fold the GPU side already runs, applied one boundary earlier.
     fn rewrite_memory(&self, memory: u64, offset: u64) -> IcdResult<(u64, u64)> {
         Ok((memory, offset))
     }
 
     /// `vkGetInstanceProcAddr`, which cannot be forwarded because its answer is
-    /// a pointer (design.md §6.1's exclusion list).
+    /// a pointer (docs/design.md §6.1's exclusion list).
     ///
     /// `instance` is `None` for the loader's NULL-instance global lookup.
     fn instance_proc_addr(&self, instance: Option<u64>, name: &str) -> Option<*const c_void> {
@@ -584,7 +584,7 @@ pub trait IcdLocal {
 
     /// `vkMapMemory`, and the whole reason the project exists.
     ///
-    /// design.md §5.3: the answer is `arena_base + slab_base + alloc_offset +
+    /// docs/design.md §5.3: the answer is `arena_base + slab_base + alloc_offset +
     /// offset`, a real pointer into real shared pages, with **no round trip and
     /// no copy**. The arena is mapped for the process's lifetime, so this and
     /// `vkUnmapMemory` are pure app-side bookkeeping.
@@ -602,7 +602,7 @@ pub trait IcdLocal {
         let _ = (device, memory);
     }
 
-    // -- presentation (design.md §10) ---------------------------------------
+    // -- presentation (docs/design.md §10) ---------------------------------------
     //
     // Eleven methods, none of which has a wire opcode. The whole of
     // `VK_KHR_swapchain` is implemented on this side, out of ordinary forwarded
@@ -618,7 +618,7 @@ pub trait IcdLocal {
 
     /// `vkCreateXxxSurfaceKHR`, for every `Xxx` this ICD answers for.
     ///
-    /// **The ICD owns its surfaces**, which design.md §8 says it does not. See
+    /// **The ICD owns its surfaces**, which docs/design.md §8 says it does not. See
     /// `sv_codegen::emit::icd_entry::EXTRA_LOCAL`: at loader interface ≥ 3 the
     /// loader creates the driver's surface lazily by calling this, and a driver
     /// that does not export it is silently told it cannot present.
@@ -724,7 +724,7 @@ pub trait IcdLocal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentTarget {
     /// `VK_EXT_headless_surface`, which is what Wine maps `VK_KHR_win32_surface`
-    /// onto when there is no display (design.md §0.5). The frame stops in the
+    /// onto when there is no display (docs/design.md §0.5). The frame stops in the
     /// arena; `SV_PRESENT_DUMP` is how a harness reads it out.
     Headless,
     /// An X11 window, by XID.
@@ -903,7 +903,7 @@ impl Answered {
 /// The audit in `sv-icd` runs the whole table against a driver with no GPU side
 /// and sorts the profile into "forwards" and "answered here". A generated table
 /// rather than a hand-kept list for the same reason the API version is derived
-/// from the profile (design.md §0.18): a list of 239 names maintained beside the
+/// from the profile (docs/design.md §0.18): a list of 239 names maintained beside the
 /// code it describes is a list that is wrong within a release.
 #[derive(Clone, Copy)]
 pub struct AuditProbe {
@@ -1019,7 +1019,7 @@ mod tests {
     /// Sizes of the structs whose layout an application depends on most.
     ///
     /// These are the numbers `vulkan_core.h` produces on the same target, and
-    /// they are asserted rather than trusted for the reason design.md §7.3 gives
+    /// they are asserted rather than trusted for the reason docs/design.md §7.3 gives
     /// after the sign-inversion bug: round-trip tests check that we agree with
     /// ourselves, and only an external number checks that we are right.
     #[test]
@@ -1092,7 +1092,7 @@ mod tests {
         }
         let expected: &[&str] = &[
             // The debug-utils messenger, whose GPU-side half is the reverse
-            // ring (design.md §4.6) rather than a forwarded command.
+            // ring (docs/design.md §4.6) rather than a forwarded command.
             "vkCreateDebugUtilsMessengerEXT",
             "vkDestroyDebugUtilsMessengerEXT",
             "vkSubmitDebugUtilsMessageEXT",
@@ -1109,7 +1109,7 @@ mod tests {
             "vkEnumeratePhysicalDeviceGroups",
             "vkGetDeviceQueue2",
             // **`vkGetBufferDeviceAddress` and its two friends left this list**
-            // (design.md §0.20). §0.3 finding 5 put them here — a command
+            // (docs/design.md §0.20). §0.3 finding 5 put them here — a command
             // returning a value that is neither `void` nor `VkResult` had no
             // reply to carry it — and called the hole latent because "§9.2 does
             // not advertise `bufferDeviceAddress`, so a conforming application
@@ -1128,7 +1128,7 @@ mod tests {
         assert_eq!(IMPLEMENTED_COUNT + NOT_IMPLEMENTED.len(), COMMAND_COUNT);
     }
 
-    /// The promise in design.md §9.2, made checkable.
+    /// The promise in docs/design.md §9.2, made checkable.
     ///
     /// "An extension in the advertised list is a promise its entry points work."
     /// Before [`INCOMPLETE_EXTENSIONS`] the list was the profile intersected
@@ -1184,7 +1184,7 @@ mod tests {
         // fact instead of a property. Two branches landing a week apart, each
         // correct, and the collision was a hard-coded name.
         //
-        // That is precisely the defect design.md §0.19 and §0.20 are about,
+        // That is precisely the defect docs/design.md §0.19 and §0.20 are about,
         // arriving in the test written to prevent it. So the property is stated
         // instead. **Two properties, because the two branches that hit this
         // reached for different ones and both are real**: this one is about the
@@ -1246,7 +1246,7 @@ mod tests {
 
         // The buffer-device-address case, kept and **inverted** rather than
         // deleted, because it is the case the table was built for and the
-        // direction it points in is now the interesting one. design.md §0.20
+        // direction it points in is now the interesting one. docs/design.md §0.20
         // implemented `vkGetBufferDeviceAddress`,
         // `vkGetBufferOpaqueCaptureAddress` and
         // `vkGetDeviceMemoryOpaqueCaptureAddress`, so none of the three may be a
@@ -1259,7 +1259,7 @@ mod tests {
         ] {
             assert!(
                 !NOT_IMPLEMENTED.contains(&cmd),
-                "{cmd} is implemented as of design.md §0.20 and must not be a stub again"
+                "{cmd} is implemented as of docs/design.md §0.20 and must not be a stub again"
             );
         }
     }

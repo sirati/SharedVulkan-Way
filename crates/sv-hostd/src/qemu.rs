@@ -1,7 +1,7 @@
 //! `Mode::Qemu`: find the guest's RAM, and learn how guest-physical addresses
 //! map into the backing object.
 //!
-//! design.md §5.1 is unusually firm about this module, and the reason is a
+//! docs/design.md §5.1 is unusually firm about this module, and the reason is a
 //! measured failure mode rather than taste:
 //!
 //! > **`sv-hostd` parses QEMU's flat view (`info mtree -f`) into a region table
@@ -435,7 +435,7 @@ pub fn open_backend(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().read(true).write(true).open(path)
 }
 
-/// The **name** an ICD is to open the backend by (design.md §1a).
+/// The **name** an ICD is to open the backend by (docs/design.md §1a).
 ///
 /// A name rather than a descriptor, because a descriptor may not cross a
 /// boundary and this project no longer has a mechanism for one to. Two cases,
@@ -446,7 +446,7 @@ pub fn open_backend(path: &Path) -> std::io::Result<std::fs::File> {
 ///   the name. It is openable by anyone with permission on the file, it is
 ///   stable across a QEMU restart, and it is what a real deployment should use.
 /// - `memory-backend-memfd` — the object has no path, and the only name it has
-///   is `/proc/<qemu-pid>/fd/<n>`. That is the name design.md §1a calls out as
+///   is `/proc/<qemu-pid>/fd/<n>`. That is the name docs/design.md §1a calls out as
 ///   legal — the app side reaching the hypervisor's own backing object — and the
 ///   cost of it is stated rather than hidden: it is a *same-machine* name, it
 ///   requires the reader to have `PTRACE_MODE_READ` on QEMU, and it moves that
@@ -482,7 +482,7 @@ impl QemuTarget {
     /// Discover the guest: pid, backend id, descriptor, and the region table.
     ///
     /// `qmp` is the monitor socket; `hint` narrows the process match. Nothing
-    /// here is cached between calls — design.md §5.1 asks for the table to be
+    /// here is cached between calls — docs/design.md §5.1 asks for the table to be
     /// re-read whenever the guest's RAM size, machine type or QEMU version
     /// changes, and the cheapest way to honour that is never to remember it.
     pub fn discover(qmp: &Path, hint: &str) -> std::io::Result<QemuTarget> {

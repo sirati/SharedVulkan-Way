@@ -1728,7 +1728,7 @@ like a rendering bug. That is §9.11 item 1.
 
 An arena is not a per-message fact and cannot be one. It is attached **out of
 band, before any protocol traffic**, by whatever brought the two sides together:
-shared_vulkan's cold-path handshake (its design.md §4.3) in the real deployment,
+shared_vulkan's cold-path handshake (its docs/design.md §4.3) in the real deployment,
 a `--arena id:size:path` flag on both processes here. `wc_handle::arena` is a
 process-global registry for that reason. Threading it through `Handle::map()`
 instead would mean a diff through smithay's `ShmState`, its `Client` data and
@@ -11896,7 +11896,7 @@ makes it necessary rather than nice.
 
 There is deliberately **no flag that prefers a locator**. The guest sends a frame
 list or it does not; a fallback that can be selected by configuration is one that
-gets selected by accident, which is design.md §5.1's objection to fallbacks
+gets selected by accident, which is docs/design.md §5.1's objection to fallbacks
 generally. When there is no frame list the sweep runs, and it *works* — a freshly
 committed region still carries its stamps — it merely costs three seconds, and
 the guest's reason for not having one travels with the answer so that the three
@@ -12793,7 +12793,7 @@ The same audit across the other harnesses. Ordered by how badly it mattered.
    ring-fatal block did the same thing one paragraph after saying "a ring that
    goes fatal is a forwarding defect by definition".
 
-   Why it was written that way is real: design.md §0.15 records a large, known,
+   Why it was written that way is real: docs/design.md §0.15 records a large, known,
    undiagnosed gap — roughly 70–75% of the control's passes lost, about 7% of
    forwarded tests hanging the GPU — so a check that failed on any regression at
    all would be red every run and would be ignored. **The answer to that is not
@@ -13008,7 +13008,7 @@ desktop shortcut) and of `c7ec2c0` (§32's taskbar identity), not before them.
    doctored inputs — the four in §35.6 items 1, 5, 6 and 7 each fail on the
    defect they exist to catch and pass on the good case — but that is not the
    same as a run. **`sv-cts.sh`'s budgets are the assumption most likely to be
-   wrong**: 80% is read off design.md §0.15's two recorded runs, and the first
+   wrong**: 80% is read off docs/design.md §0.15's two recorded runs, and the first
    real run may need it adjusted with a reason.
 2. **`SV_CTS_MAX_RING_FATALS=0` may be red on the first run.** If it is, that is
    a true statement about the tree and the number to write down is whatever it
@@ -20488,3 +20488,97 @@ must not hang the run), and a number in a log survives all three.
    user's second symptom — no tearing, no stalled scrolling, no blank frames in
    `about:support` — remains unverified. What has changed is only that the leg
    can no longer pass without having scrolled.
+## 58. The unqualified citations, and the ambiguity they were hiding
+
+### 58.1 Status in one paragraph
+
+§54.3 left two pieces of residue. Both are closed. The **762 unqualified
+`design.md §N` citations** — the bare form that names neither document in a tree
+with two of them — are all qualified, and the checker now **fails** on the form,
+which is the "one line in one place" §54.3 promised. Doing it surfaced something
+the bare form had been hiding: **103 citations name a section their document
+defines twice**, which no edit to a citation can fix. And the negative test now
+runs a control fixture first, so a checker that grows an external dependency
+reports that rather than being mistaken for a checker correctly rejecting a bad
+citation.
+
+### 58.2 The rule was the file's own side, and it was right 755 times out of 762
+
+A bare `design.md §N` could mean either document, so the question was whether
+there is a rule that decides it without reading 762 comments. There is, and it
+was checked before anything was rewritten:
+
+| | |
+|---|---|
+| resolve on the file's own side | **755** |
+| resolve only on the *other* side | **7** |
+| resolve in neither document | **0** |
+
+"Own side" is `crates/wc-*`, `scripts/wc-*` and the C probes for the Wayland
+document, everything else for the Vulkan one. That the "neither" column is zero
+is what makes this safe: every one of the 762 named a real section, so none of
+them was a guess about intent — only about which of two files it lived in.
+
+**The seven exceptions are genuine cross-references, not mistakes**, which is why
+they were inspected rather than forced to the majority rule:
+`wc-proxy`'s `guestram.rs` and `pool.rs` cite the Vulkan document's §5.7 and
+§0.14 because the arena is shared_vulkan's subject; `wc-launch/src/plan.rs`
+cites §0.17; and two `sv-*` guest scripts cite the Wayland document's §12.9 and
+§17. Each was qualified with the document it actually meant.
+
+The rewrite was line-scoped — file, line number and section number all had to
+match — so a line carrying two citations could not have one of them rewritten
+with the other's document.
+
+### 58.3 What qualifying revealed
+
+```
+before:  270 resolve to exactly one section    0 missing    0 ambiguous  762 unqualified
+after:   929 resolve to exactly one section    0 missing  103 ambiguous    0 unqualified
+```
+
+**The 103 are not new breakage.** They were always ambiguous; the bare form was
+hiding them, because a citation that names no document cannot be checked against
+one. Qualifying them moved a silent problem into a reported one, which is the
+direction that counts even though the number went up.
+
+They are concentrated in a handful of duplicated section numbers in
+`docs/design.md`: §1 is defined twice and cited 48 times, §8 twice and cited 28,
+then §3, §0.21, §0.15 and three singletons. **No edit to any citation fixes
+this** — the document has to stop defining the same number twice — so the
+checker reports and does not fail on it, for §48.3's reason: renumbering a
+document another agent is actively writing in, to repair citations that resolve
+to two correct-looking places rather than none, is the worse trade. It is now
+visible and counted, which is the precondition for someone deciding otherwise.
+
+### 58.4 The control fixture, and a negative test that could have lied
+
+§54.3 named the risk precisely: `the_citation_check_can_fail` copies only the
+script into a temporary tree, so if the checker ever grew a dependency on
+anything outside its own file — a config, a helper it sources — it would fail on
+the bait fixture for **that** reason, and be reported as the checker correctly
+rejecting a bad citation. A negative test passing for the wrong reason is §42's
+defect wearing the opposite mask: it is a check that cannot fail, disguised as
+one that just did.
+
+The fixture is now run twice. First with only a sound citation, where the
+checker must **succeed** — if it does not, the message says the checker is
+broken or unsatisfied in this environment and makes no claim about citations at
+all. Only then the bait. That is the same shape as §47's "slow is not broken":
+two different facts that were sharing one verdict.
+
+### 58.5 What is not done
+
+1. **The 103 ambiguous citations stand**, blocked on de-duplicating
+   `docs/design.md`'s section numbers. That is the Vulkan side's document and
+   the numbering collisions are §48.3's. The checker will fail on them the day
+   the count reaches zero, by the same one-line change §58.1 just made for the
+   unqualified form.
+2. **2457 bare `§N` with no document at all are still unchecked.** They mean
+   "this file's own document", and §58.2 shows that convention is right 99.1% of
+   the time — which is an argument that a file-to-document map is now worth
+   building, since the rule it would encode has been measured rather than
+   assumed. Not built here.
+3. **Nothing checks that a citation's section is *about* what the comment says.**
+   A citation can resolve perfectly and still point at the wrong argument, and
+   that is §35.10's territory rather than this checker's.

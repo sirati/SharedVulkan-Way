@@ -34,11 +34,12 @@
 //! # What this does *not* check
 //!
 //! Bare `§N` with no document — 2275 of them — which means "this file's own
-//! document" and would need a file-to-document map that does not exist. And the
-//! 748 unqualified `design.md §N`, which name neither document in a tree with
-//! two of them; the script reports both counts and fails on neither, for §42's
-//! reason that a check nobody can pass gets disabled. When those come down,
-//! tightening the script is one line and this test inherits it.
+//! document" and would need a file-to-document map that does not exist. The
+//! unqualified form is gone as of §55 and the script now fails on it; what it
+//! still only reports is the ambiguous form, for §42's
+//! reason that a check nobody can pass gets disabled -- 103 citations name a
+//! section their document defines twice, and only de-duplicating the document
+//! can fix that — no edit to the citation itself will.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,24 +121,57 @@ fn the_citation_check_can_fail() {
     // that neither defines.
     std::fs::write(tmp.join("docs/design.md"), "## 1. only section\n").expect("write");
     std::fs::write(tmp.join("docs/waycompose-design.md"), "## 1. only section\n").expect("write");
-    // **Assembled at run time, and that is not fussiness.** Written as a
-    // literal, this string is itself a citation living in a `.rs` file that the
-    // checker scans — so the negative fixture broke the real check, and the
-    // first run of this test failed on its own bait with
-    // `design_citations.rs:125: … §99.99 -> NO SUCH SECTION`.
+    // **The bait is assembled at run time, and that is not fussiness.** Written
+    // as a literal it is itself a citation, in a `.rs` file the checker scans, so
+    // the negative fixture broke the real check on this test's first run. The
+    // alternative was an exclusion for test files, which is how a checker starts
+    // having exceptions. Both fixtures below are built the same way.
     //
-    // The alternative was an exclusion for test files, which is how a checker
-    // starts having exceptions and is the same call §48.3 made when this
-    // section's prose tripped it. Concatenation costs one line and keeps the
-    // scan total.
-    let bait = format!("// see {}/design.md {}99.99 for the argument\n", "docs", '\u{a7}');
-    std::fs::write(tmp.join("crates/bait.rs"), bait).expect("write");
 
-    let out = Command::new("bash")
-        .arg(tmp.join("scripts/wc-xref.sh"))
-        .current_dir(&tmp)
-        .output()
-        .expect("run the checker against the fixture");
+    // **A control fixture first, so a failure here cannot be misread.** §54.3
+    // named this: the negative test copies only the script into a temporary
+    // tree, so if the checker ever grows a dependency on something outside its
+    // own file — a config, a second script, a helper it sources — it would fail
+    // on the fixture below for that reason and be reported as "the checker
+    // correctly rejected a bad citation". A negative test that passes for the
+    // wrong reason is the §42 defect wearing the opposite mask.
+    //
+    // So the same tree is run twice: once with only sound citations, where the
+    // checker must *succeed*, and then with the bait. If the control fails, the
+    // checker is broken or unsatisfied in this environment and the message says
+    // so instead of claiming a result about citations.
+    let run = |dir: &Path| {
+        Command::new("bash")
+            .arg(dir.join("scripts/wc-xref.sh"))
+            .current_dir(dir)
+            .output()
+            .expect("run the checker against the fixture")
+    };
+
+    std::fs::write(
+        tmp.join("crates/sound.rs"),
+        format!("// see {}/design.md {}1 for the argument\n", "docs", '\u{a7}'),
+    )
+    .expect("write");
+    let control = run(&tmp);
+    if !control.status.success() {
+        let so = String::from_utf8_lossy(&control.stdout).to_string();
+        let se = String::from_utf8_lossy(&control.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&tmp);
+        panic!(
+            "the citation checker rejected a fixture whose only citation is sound, so this \
+             test cannot say anything about its ability to detect a bad one. The usual cause \
+             is the checker having grown a dependency that the copied-into-/tmp fixture does \
+             not carry.\n--- stdout ---\n{so}\n--- stderr ---\n{se}"
+        );
+    }
+
+    std::fs::write(
+        tmp.join("crates/bait.rs"),
+        format!("// see {}/design.md {}99.99 for the argument\n", "docs", '\u{a7}'),
+    )
+    .expect("write");
+    let out = run(&tmp);
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let _ = std::fs::remove_dir_all(&tmp);

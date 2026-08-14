@@ -1,4 +1,4 @@
-//! Pass 7: the `pNext` chain walkers (design.md §7.2, D6).
+//! Pass 7: the `pNext` chain walkers (docs/design.md §7.2, D6).
 //!
 //! # The format, and why it is not Venus's
 //!
@@ -26,13 +26,13 @@
 //! This is the one place the design deliberately gives up byte-for-byte
 //! comparability with Venus's generated C, and it is worth saying plainly: since
 //! nearly every Vulkan struct has a `pNext`, this decision means the
-//! differential test of design.md §6.2 cannot be a whole-struct byte comparison.
+//! differential test of docs/design.md §6.2 cannot be a whole-struct byte comparison.
 //! What it compares instead is the `_self` body — the part that is Venus's
 //! format verbatim — and the operation sequence. See `crates/sv-testkit`.
 //!
 //! # Asymmetric handling
 //!
-//! design.md §6.1: the app side silently keeps an unknown link and continues;
+//! docs/design.md §6.1: the app side silently keeps an unknown link and continues;
 //! the GPU side treats one as fatal. The policy travels on the decoder
 //! ([`sv_wire::Decoder::lenient`]) rather than being a compile-time feature, so
 //! one test binary can exercise both sides.
@@ -117,7 +117,7 @@ fn emit_link_enum(plan: &Plan) -> TokenStream {
             /// A link this build does not know.
             ///
             /// Kept verbatim so the app side can carry it through unchanged
-            /// (design.md §6.1: "the app side silently drops unknown links and
+            /// (docs/design.md §6.1: "the app side silently drops unknown links and
             /// continues"), which also makes a decode/encode round trip exact
             /// even across a version skew. The GPU side never constructs one —
             /// its decoder refuses first.
@@ -343,7 +343,7 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
             }
         }
 
-        /// The asymmetry of design.md §6.1, in one place.
+        /// The asymmetry of docs/design.md §6.1, in one place.
         fn unknown_or_fatal(
             policy: sv_wire::UnknownPNextPolicy,
             s_type: i32,
