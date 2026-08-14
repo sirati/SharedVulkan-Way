@@ -3861,7 +3861,7 @@ already destroyed, destroyed while a blob still named it, or a wrong id read out
 of application memory — and says to check the last create/destroy of the id
 before assuming a barrier. **This is the part of §0.23 that is fixed.**
 
-#### 0.23.3 Why deferring is not a local change
+#### 0.23.3 Why a GPU-side deferral is not a local change (and §0.23.5 makes it unnecessary)
 
 §5.5 item 2 already specifies the mechanism — *"the GPU-side object table keeps
 a destroyed object alive until in-flight command buffers referencing it have
@@ -3882,51 +3882,158 @@ the handle map and the driver call, on **every** destroy command, not only the
 one that reproduces. That is the codegen change §0.22 item 6 was pointing at
 when it said this "touches every destroy command and wants its own measurement".
 
-#### 0.23.4 What the deferral must key on, which is narrower than it looks
+#### 0.23.4 Settled by measurement: the blob is published *after* the destroy
 
-The instinct is to hold destroyed objects until the GPU has finished executing —
-timelines, fences, `completed_seqno`. **That is more than is needed**, and the
-narrower condition is worth stating because it makes the mechanism much cheaper.
+§0.23.3 left three candidates and a contradiction — blobs and destroys ride the
+same device ring, so they are ordered, so the bug should not exist. It
+reproduces. One instrument settled it.
 
-On the GPU side a blob replay is where ids become driver handles: the replay
-records into a *real* command buffer, and from that moment the driver holds its
-own handle and the app-side id is not consulted again. `vkQueueSubmit` submits
-an already-recorded command buffer and resolves nothing.
+`SV_SEND_TRACE=1` (new, `sv_icd::transport::send_trace`) prints every packet the
+**app** side pushes, with its ring and seqno. The GPU side's `SV_TRACE` prints
+commands in *execution* order, which is the order it drains rings — so a destroy
+appearing before a blob there is equally consistent with "the app sent it first"
+and with "the app published the blob late", and those have different fixes. Send
+order is the fact only this side has.
 
-So an object must survive **replay**, not **execution**. The condition is "no
-blob that has been published and not yet replayed names this id" — and because
-blobs are published on the *device* ring (`Transport::flush_blob`, at
-`vkEndCommandBuffer` and whenever a block fills), and destroys ride the same
-device ring, the two are already ordered with respect to each other on one ring.
+Reproducer: `dEQP-VK.pipeline.*.multisample.misc.dynamic_rendering.basic.*.2x`,
+48 cases, all three pipeline constructions. **144 fatals, ids 44 and 46.** The
+session whose device ring matches the fatal's seqno:
 
-**That last fact is the open question this section does not close.** If blobs and
-destroys are ordered on one ring, the replay should always precede the destroy,
-and the bug should not exist — yet it reproduces. So one of the three holds, and
-which one decides the fix:
+```
+[icd] ring Device seqno 75 opcode 342 (28 bytes)     vkDestroyShaderModule
+[icd] ring Device seqno 76 opcode 318 (28 bytes)     vkDestroyDescriptorSetLayout
+[icd] ring Device seqno 77 opcode 334 (28 bytes)     vkDestroyPipelineLayout   ← 44 dies
+[icd] ring Device seqno 78 opcode 2147483648         svExecuteCommandBlob      ← names 44
+[gpu] ring 2 seqno 78 FATAL: … no VkPipelineLayout with id 44
+```
 
-1. a path publishes a blob later than `vkEndCommandBuffer` (secondary command
-   buffers and `vkCmdExecuteCommands` are the first place to look);
-2. the failing id is named by a blob that was rewound and re-recorded, so
-   `published` and the ids actually in the block disagree; or
-3. recording and destruction happen on different threads, and `RingClass::Device`
-   is one ring, so they are ordered — but the *arena block* the blob lives in is
-   per-command-buffer and can be grown and copied under a concurrent reader.
+**The transport is faithful and the ring is in order.** The app side really did
+send the destroy first, and the GPU side really did execute it first. So it is
+neither a barrier (R22) nor a race, and candidate 3 — a block grown under a
+concurrent reader — is excluded: nothing is torn, the bytes arrive intact, they
+arrive *late*.
 
-Deciding between them needs the reproducer under `SV_TRACE=1` with the ring
-seqno of the blob's publish printed next to the destroy's, which is one line of
-instrumentation and a CTS run. **It should be settled before the codegen change
-is written**, because option 2 has a fix that touches nothing generated.
+What it is, exactly: **`vkCmd*` are buffered into the blob and published on a
+schedule of their own, while `vkCreate*`/`vkDestroy*` are forwarded
+immediately.** Both go to the device ring, so each *class* is ordered with
+itself — but the program order *between* the two classes is not preserved. An
+application that records with a layout, ends the command buffer, and destroys
+the layout is emitting `[recorded…] [destroy]`, and the wire carries
+`[destroy] [recorded…]`. `VK_KHR_maintenance4` makes that application correct,
+which is why CTS does it and why it is not a CTS bug.
 
-#### 0.23.5 Status
+That is candidate 1, generalised: not "secondary command buffers publish late"
+but "**recording publishes late, always, by design**" — the pipelining §6.5's
+`Blob::published` note argues for, which bought `frame-200` 105 µs against
+130 µs and quietly reordered two command classes against each other.
 
-Fixed: the diagnostic, which was actively misleading and had misled three
-investigations.
+#### 0.23.5 The fix is in `Transport`, not in the codegen
 
-Not fixed: the lifetime itself. It is diagnosed to the level above and
-deliberately left, because the two candidate fixes are very different sizes —
-one is a codegen change across every destroy command, the other is a bookkeeping
-fix in `Transport` — and §0.23.4's question decides which. Guessing would mean a
-change to every destroy in the project made on a hunch.
+This is the part worth having measured, because §0.23.3 concluded the opposite.
+
+A GPU-side deferral — a hook on every destroy command, the object table holding
+destroyed objects alive — is **not needed**. The ordering can be repaired on the
+side that broke it: **flush every open blob before forwarding a destroy.**
+
+```
+vkDestroyX  →  for each open blob: flush_blob(cb)   // publish what is recorded
+            →  push the destroy
+```
+
+Then the wire carries `[recorded…] [destroy]`, which is the application's own
+order, and the GPU side replays the blob into a real command buffer while the
+object is still alive — exactly what `VK_KHR_maintenance4` promises. No object
+outlives its specification lifetime on either side, and nothing generated
+changes.
+
+Three properties that make this the right shape rather than the expedient one:
+
+* **It is contained.** `Transport` alone; `flush_blob` already exists, is
+  already called from two places, and already "returns without a packet when
+  there is nothing new", so the idle case is a map lookup.
+* **It is not on the hot path.** The pipelining §6.5 wants is between `vkCmd*`
+  and `vkCmd*`, and that is untouched — a flush is forced only by a destroy,
+  which is not a per-draw operation.
+* **It fixes the class, not the case.** Every object nameable inside a blob has
+  this bug, not only `VkPipelineLayout`; §0.16 item 2 and §0.22 item 1 were
+  different causes with the same message, and this is the third and last of the
+  *ordering* family.
+
+The alternative — deferring destruction GPU-side — would additionally have had
+to stop the driver call (§0.23.3), which means every destroy in the project.
+Measuring first turned a codegen-wide change into a change in one function.
+
+#### 0.23.6 Measured: 144 → 0, and what that says about the order of work
+
+`sv_icd::transport::RingTransport::publish_recorded_first`, called from `call`
+and `send` and deliberately **not** from `record`. Same reproducer, same
+selection, same box:
+
+| | ring fatals | `no VkPipelineLayout` | of the control's passes, lost | verdict |
+|---|---|---|---|---|
+| before | 2 | **144** | 100.0% | `sv-cts: FAIL` |
+| after | **0** | **0** | **0.0%** | `sv-cts: PASS` |
+
+It is written as *program order between recorded and non-recorded commands*
+rather than as "flush before destroys", because a transport that knew which
+opcodes are destroys would be a transport with a reason to be regenerated (§6.5,
+`Transport`). Destroys are where it was found; `vkUpdateDescriptorSets` and
+every other unrecorded command had the same hole.
+
+**The order of work is the lesson, and it is worth stating plainly.** §0.23.3
+concluded that the fix was a GPU-side deferral — a hook on every destroy
+command, plus an object table holding destroyed objects alive — and that
+conclusion was *reasonable*: it follows from §5.5 item 2, which specifies
+exactly that, and from the observation that `unbind` runs after the driver call.
+It was also wrong, and nothing on paper was going to show it.
+
+The cheap fix was invisible until the expensive one had been disproved. What
+disproved it was one instrument — `SV_SEND_TRACE`, the app side's own send
+order — and the reason it was needed is general: **an instrument that can only
+see one side of a boundary cannot answer a question about ordering across it.**
+The GPU side's trace prints execution order, and execution order is equally
+consistent with "the app sent the destroy first" and "the app published the blob
+late". Those have different fixes, one of them project-wide.
+
+So: a change to every destroy command in the codebase became a change to one
+function, because the reproducer was run before the fix was written. That is the
+whole argument for measuring first, and this is the clearest instance of it in
+the project.
+
+#### 0.23.7 Two diagnostics that cost time, both now fixed
+
+**`GpuServer::note` fabricated its headline.** Every table failure returned
+`WireError::UnknownCommand { opcode: 0 }`, so the fatal read:
+
+```text
+in a command blob: unknown command opcode 0 (no VkPipelineLayout with id 44 …)
+```
+
+The opcode was fine and nothing was unknown; the truth was the parenthetical.
+Reading the headline first sends you looking for a decoder that has lost
+alignment — a plausible bug, in a different subsystem, and this investigation
+spent time there. It is `TableError::Unknown`'s `RingBarrier` guess one layer
+out, and the same rule: **an error must not assert something it does not know.**
+
+It is now `WireError::Table`, which says *"an object-table lookup failed"* and
+nothing more. It carries no detail because `WireError` is `Copy` and appears in
+the return of every generated read — the specifics are in `last_error`, which
+the ring already prints beside it. The headline is now true and the detail is
+unchanged.
+
+**`sv-cts.sh --fraction 1` selected zero tests.** The sampler was
+`awk 'NR % n == 1'`, and `NR % 1` is always 0, so the documented meaning — "run
+1 test in every N", i.e. all of them at N=1 — silently selected nothing and the
+run died with `the selection is empty`. It is now `(NR - 1) % n == 0`, which is
+identical for every N ≥ 2 and correct at 1.
+
+This is a gate that cannot fire, in the harness that produces this project's
+headline Vulkan numbers, and the documentation is what made it dangerous: a
+reader asking for the whole suite got an error about their *selection* rather
+than about the sampler. **No recorded result used it** — checked across `docs/`
+and `scripts/`, the only mentions are this section and an unrelated comment
+about 1-in-2000 — so nothing in the tree needs re-measuring.
+
 
 ---
 
@@ -5857,6 +5964,28 @@ lifetime is the read-pending word of §5.5 plus retirement by timeline value.
 
 `vkResetCommandPool` / `vkResetCommandBuffer` return blobs to the arena
 allocator through the same deferred path.
+
+**Buffering `vkCmd*` reorders them against everything that is not a `vkCmd*`,
+and that has to be paid for.** This is the consequence of the paragraph above
+and it went unstated for four stages. Recorded commands are published on a
+schedule of their own — at `vkEndCommandBuffer`, or when a block fills — while
+`vkCreate*`, `vkDestroy*` and every other forwarded call goes immediately. Both
+travel the device ring, so each class is ordered *with itself*; program order
+**between** the classes is not preserved, and the wire can carry
+`[destroy] [recorded…]` for an application that wrote `[recorded…] [destroy]`.
+
+`VK_KHR_maintenance4` makes that application correct — a pipeline layout's
+lifetime ends when the command buffer leaves the recording state — so it is a
+real defect and not a licence to blame the caller. It reproduced as
+`no VkPipelineLayout with id 44`, 144 times across 48 CTS cases, and §0.23 is
+the whole story.
+
+The repair is `sv_icd::transport::RingTransport::publish_recorded_first`:
+publish what is recorded before sending anything that is not. **It does not cost
+the 105 µs against 130 µs this section's pipelining bought**, because that
+number is `vkCmd*` against `vkCmd*` and `Transport::record` still buffers; what
+is forced is a publish before an *unrecorded* command, which is not a per-draw
+operation.
 
 ### 6.6 Licences, stated once
 

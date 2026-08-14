@@ -124,9 +124,31 @@ impl GpuServer {
         &self.shared.driver.device
     }
 
+    /// Record a table failure and turn it into a wire error.
+    ///
+    /// # It used to say `UnknownCommand { opcode: 0 }`, and that was a lie
+    ///
+    /// Every table failure — a handle that does not resolve, a wrong type, a
+    /// memory range outside the arena — came out as *"unknown command opcode
+    /// 0"*, with the truth demoted to a parenthetical:
+    ///
+    /// ```text
+    /// in a command blob: unknown command opcode 0 (no VkPipelineLayout with id 44 …)
+    /// ```
+    ///
+    /// The opcode was fine and nothing was unknown. A reader who takes the
+    /// headline at face value goes looking for a decoder that has lost
+    /// alignment — a plausible bug, in a different subsystem, and §0.23's
+    /// investigation spent time there before noticing the headline was
+    /// fabricated.
+    ///
+    /// This is `TableError::Unknown`'s `RingBarrier` guess one layer out, and
+    /// the same lesson: **an error must not assert something it does not
+    /// know.** `WireError::Table` says a lookup failed and nothing more; the
+    /// specifics are in `last_error`, which the ring prints beside it.
     fn note(&mut self, e: TableError) -> WireError {
         self.last_error = Some(e.to_string());
-        WireError::UnknownCommand { opcode: 0 }
+        WireError::Table
     }
 
     /// The single family we advertise, with the real properties of the family

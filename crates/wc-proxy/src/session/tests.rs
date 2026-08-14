@@ -2125,7 +2125,7 @@ fn an_offer_from_a_drag_is_fetched_from_the_drag_and_not_the_clipboard() {
 /// A `leave` **after a `drop`** does not turn the drag's offer into the
 /// clipboard's, because the client has not read from it yet.
 ///
-/// ADDED FOR §44, and it is the regression test for the defect that made every
+/// ADDED FOR docs/waycompose-design.md §50, and it is the regression test for the defect that made every
 /// drop into a Wayland client deliver nothing. The test above asserts that
 /// `leave` forgets a drag offer, which is right for a drag that left the
 /// surface — and the code implementing it forgot *every* offer, including one

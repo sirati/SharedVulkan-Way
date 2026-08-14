@@ -833,6 +833,24 @@ impl RingTransport {
             match ring.producer.push(command, barrier) {
                 Ok(seqno) => {
                     self.note_seqno(class, seqno);
+                    // §0.23.4's instrument. The GPU side's `SV_TRACE` prints
+                    // command *names* in the order it executes them, which
+                    // cannot distinguish "the app sent the destroy first" from
+                    // "the app published the blob late" — both look identical
+                    // from there. This prints the order the app *sent* things,
+                    // with the seqno the fatal names, which is the one fact
+                    // that separates the three candidates.
+                    if crate::transport::send_trace() {
+                        eprintln!(
+                            "[icd] ring {:?} seqno {seqno} opcode {} ({} bytes)",
+                            class,
+                            command
+                                .get(0..4)
+                                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                                .unwrap_or(u32::MAX),
+                            command.len()
+                        );
+                    }
                     return Ok(seqno);
                 }
                 Err(sv_transport::Error::RingFull { .. }) => {
@@ -953,6 +971,73 @@ impl RingTransport {
         Ok(())
     }
 
+    /// Publish everything recorded so far, before sending anything that is
+    /// *not* recorded. design.md §0.23.5.
+    ///
+    /// # The bug this is the whole of
+    ///
+    /// `vkCmd*` are buffered into a command buffer's blob and published on a
+    /// schedule of their own; `vkCreate*`, `vkDestroy*` and everything else are
+    /// forwarded immediately. Both go to the device ring, so each class is
+    /// ordered *with itself* — and the program order **between** the two
+    /// classes was not preserved. An application that records with a pipeline
+    /// layout, ends the command buffer and then destroys the layout emits
+    /// `[recorded…] [destroy]`, and the wire carried `[destroy] [recorded…]`.
+    ///
+    /// `VK_KHR_maintenance4` makes that application correct — a layout's
+    /// lifetime ends when the command buffer leaves the recording state — so
+    /// this was our defect and not the application's. It reproduced as
+    /// `no VkPipelineLayout with id 44` on 144 of 48 CTS cases; §0.23.4 has the
+    /// send trace that separates "the app sent the destroy first" from "the app
+    /// published the blob late", which is the distinction that decides the fix
+    /// and which the GPU side's own trace cannot see.
+    ///
+    /// # Why here, and why not "before destroys"
+    ///
+    /// A transport that knew which opcodes are destroys would be a transport
+    /// with a reason to be regenerated (see [`Transport`]). It does not need
+    /// to: the invariant is simply *program order between recorded and
+    /// non-recorded commands*, and restoring it for every immediately-forwarded
+    /// command is both simpler and more obviously correct than restoring it for
+    /// the one class where it has bitten so far. Destroys are where it was
+    /// found; `vkUpdateDescriptorSets` and every other unrecorded command had
+    /// the same hole.
+    ///
+    /// # What it does not cost
+    ///
+    /// Not the pipelining §6.5 measured at 105 µs against 130 µs. That is
+    /// `vkCmd*` against `vkCmd*`, and [`Transport::record`] does **not** call
+    /// this — recording still buffers, still crosses nothing, and still
+    /// publishes at `vkEndCommandBuffer` or when a block fills. What is forced
+    /// here is a publish before an unrecorded command, which is not a per-draw
+    /// operation; and [`Self::flush_blob`] returns without a packet when there
+    /// is nothing new, so the common case is a lock and a map walk.
+    ///
+    /// Publishing a blob that is still being recorded is safe and is not new:
+    /// a blob is append-only, `published` records how much has gone, and the
+    /// sub-decoder replays a partial stream in order. Filling a block already
+    /// did exactly this.
+    fn publish_recorded_first(&self) -> IcdResult<()> {
+        // Collected under the lock and flushed outside it: `flush_blob` takes
+        // the same lock, and it takes the ring producer's too.
+        let open: Vec<u64> = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            if blobs.open.is_empty() {
+                return Ok(());
+            }
+            blobs
+                .open
+                .iter()
+                .filter(|(_, b)| b.len > b.published)
+                .map(|(cb, _)| *cb)
+                .collect()
+        };
+        for cb in open {
+            self.flush_blob(cb)?;
+        }
+        Ok(())
+    }
+
     /// The slow half of [`Transport::record`]: make room, then write.
     ///
     /// Growing has to wait for every piece already handed over, because it
@@ -1030,6 +1115,9 @@ impl Transport for RingTransport {
         command: &[u8],
         reply: &mut Vec<u8>,
     ) -> IcdResult<()> {
+        // Before the ring lock, because publishing takes it. See
+        // `publish_recorded_first`.
+        self.publish_recorded_first()?;
         // The producer lock is held from here to the reply, which is what makes
         // the packet that arrives *this* call's — a ring is SPSC and replies come
         // back in the order the commands went out.
@@ -1068,6 +1156,7 @@ impl Transport for RingTransport {
     }
 
     fn send(&self, class: RingClass, _opcode: u32, command: &[u8]) -> IcdResult<()> {
+        self.publish_recorded_first()?;
         self.push_on(class, command).map(|_| ())
     }
 
@@ -1307,4 +1396,18 @@ pub(crate) fn arm_park_report() {
             unsafe { libc::atexit(park_time_atexit) };
         });
     }
+}
+
+/// `SV_SEND_TRACE=1`: print every packet this side pushes, with its ring and
+/// seqno.
+///
+/// §0.23.4. The GPU side's `SV_TRACE` prints commands in *execution* order,
+/// which is the order it drains rings — so a destroy that appears before a blob
+/// there is consistent with the app having sent it first *and* with the app
+/// having published the blob late, and those have different fixes. This is the
+/// send order, from the only side that knows it.
+pub fn send_trace() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SV_SEND_TRACE").is_some())
 }

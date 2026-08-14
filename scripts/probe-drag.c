@@ -180,10 +180,20 @@ static Enum *enum_new(const FORMATETC *fmts, ULONG count, ULONG at) {
 
 /* ----------------------------------------------------------- IDataObject --- */
 
+/* One data object for both formats this probe can offer.
+ *
+ * It holds the **exact bytes** an HGLOBAL should contain rather than a string,
+ * because CF_HDROP is not a string: it is a DROPFILES header followed by a
+ * double-NUL-terminated path list, and the whole point of offering one from
+ * here is that the block is laid out by a *different program* than the one
+ * parsing it. docs/waycompose-design.md §50.8 item 3 is the claim this closes
+ * as far as it can be closed without Explorer. */
 typedef struct {
     IDataObject iface;
     LONG ref;
-    WCHAR *text;                             /* CF_UNICODETEXT, NUL-terminated */
+    CLIPFORMAT format;
+    unsigned char *bytes;
+    size_t len;
 } Data;
 
 static HRESULT STDMETHODCALLTYPE data_qi(IDataObject *me, REFIID iid, void **out) {
@@ -202,25 +212,23 @@ static ULONG STDMETHODCALLTYPE data_addref(IDataObject *me) {
 static ULONG STDMETHODCALLTYPE data_release(IDataObject *me) {
     Data *d = (Data *)me;
     LONG n = InterlockedDecrement(&d->ref);
-    if (n == 0) { free(d->text); free(d); }
+    if (n == 0) { free(d->bytes); free(d); }
     return (ULONG)n;
 }
 static HRESULT STDMETHODCALLTYPE data_getdata(IDataObject *me, FORMATETC *fmt, STGMEDIUM *med) {
     Data *d = (Data *)me;
-    size_t bytes;
     HGLOBAL h;
     void *p;
     if (!fmt || !med) return E_INVALIDARG;
-    if (fmt->cfFormat != CF_UNICODETEXT || !(fmt->tymed & TYMED_HGLOBAL))
+    if (fmt->cfFormat != d->format || !(fmt->tymed & TYMED_HGLOBAL))
         return DV_E_FORMATETC;
-    bytes = (wcslen(d->text) + 1) * sizeof(WCHAR);
     /* A fresh HGLOBAL every time, and pUnkForRelease NULL: the *receiver* frees
      * it, so handing back the same handle twice would be a double free. §29.8
      * lists this as one of the four silently-wrong things. */
-    h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    h = GlobalAlloc(GMEM_MOVEABLE, d->len);
     if (!h) return E_OUTOFMEMORY;
     p = GlobalLock(h);
-    memcpy(p, d->text, bytes);
+    memcpy(p, d->bytes, d->len);
     GlobalUnlock(h);
     med->tymed = TYMED_HGLOBAL;
     med->hGlobal = h;
@@ -232,9 +240,9 @@ static HRESULT STDMETHODCALLTYPE data_getdatahere(IDataObject *me, FORMATETC *f,
     return E_NOTIMPL;
 }
 static HRESULT STDMETHODCALLTYPE data_query(IDataObject *me, FORMATETC *fmt) {
-    (void)me;
+    Data *d = (Data *)me;
     if (!fmt) return E_INVALIDARG;
-    return (fmt->cfFormat == CF_UNICODETEXT && (fmt->tymed & TYMED_HGLOBAL))
+    return (fmt->cfFormat == d->format && (fmt->tymed & TYMED_HGLOBAL))
         ? S_OK : DV_E_FORMATETC;
 }
 static HRESULT STDMETHODCALLTYPE data_canon(IDataObject *me, FORMATETC *in, FORMATETC *out) {
@@ -251,11 +259,11 @@ static HRESULT STDMETHODCALLTYPE data_setdata(IDataObject *me, FORMATETC *f, STG
 static HRESULT STDMETHODCALLTYPE data_enum(IDataObject *me, DWORD dir, IEnumFORMATETC **out) {
     FORMATETC f;
     Enum *e;
-    (void)me;
+    Data *d = (Data *)me;
     if (!out) return E_INVALIDARG;
     *out = NULL;
     if (dir != DATADIR_GET) return E_NOTIMPL;
-    f.cfFormat = CF_UNICODETEXT;
+    f.cfFormat = d->format;
     f.ptd = NULL;
     f.dwAspect = DVASPECT_CONTENT;
     f.lindex = -1;
@@ -286,12 +294,60 @@ static IDataObjectVtbl data_vtbl = {
     data_dadvise, data_dunadvise, data_enumadvise
 };
 
-static Data *data_new(const WCHAR *text) {
+static Data *data_new(CLIPFORMAT format, const void *bytes, size_t len) {
     Data *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->iface.lpVtbl = &data_vtbl;
     d->ref = 1;
-    d->text = _wcsdup(text);
+    d->format = format;
+    d->len = len;
+    d->bytes = malloc(len ? len : 1);
+    if (!d->bytes) { free(d); return NULL; }
+    memcpy(d->bytes, bytes, len);
+    return d;
+}
+
+/* A real `CF_HDROP`: a DROPFILES header, then the paths as UTF-16, each
+ * NUL-terminated, with a second NUL closing the list.
+ *
+ * `--files` gives them semicolon-separated. Laid out by hand rather than by
+ * any shell helper, because the layout *is* what the compositor's
+ * `hdrop_to_uri_list` parses and a block built by the same code that reads it
+ * would test nothing (docs/waycompose-design.md §29.9 item 3). */
+static Data *data_new_hdrop(const char *semis) {
+    WCHAR wide[4096];
+    size_t used = 0, total;
+    unsigned char *buf;
+    Data *d;
+    DROPFILES df;
+    const char *p = semis;
+
+    while (*p && used < 4000) {
+        const char *sep = strchr(p, ';');
+        size_t n = sep ? (size_t)(sep - p) : strlen(p);
+        char one[1024];
+        int w;
+        if (n >= sizeof one) n = sizeof one - 1;
+        memcpy(one, p, n);
+        one[n] = 0;
+        w = MultiByteToWideChar(CP_UTF8, 0, one, -1, wide + used, (int)(4096 - used));
+        if (w <= 0) break;
+        used += (size_t)w;                   /* includes this path's NUL */
+        if (!sep) break;
+        p = sep + 1;
+    }
+    wide[used++] = 0;                        /* the second NUL closing the list */
+
+    memset(&df, 0, sizeof df);
+    df.pFiles = sizeof(DROPFILES);
+    df.fWide = TRUE;
+    total = sizeof(DROPFILES) + used * sizeof(WCHAR);
+    buf = malloc(total);
+    if (!buf) return NULL;
+    memcpy(buf, &df, sizeof df);
+    memcpy(buf + sizeof(DROPFILES), wide, used * sizeof(WCHAR));
+    d = data_new(CF_HDROP, buf, total);
+    free(buf);
     return d;
 }
 
@@ -470,14 +526,20 @@ static BOOL CALLBACK list_one(HWND w, LPARAM p) {
 /* ---------------------------------------------------------------- window --- */
 
 static int g_mode_source = 1, g_mode_target = 1;
+/* When set, the drag carries a CF_HDROP built from these semicolon-separated
+ * paths instead of CF_UNICODETEXT. */
+static const char *g_files;
 static WCHAR *g_text;
 
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_LBUTTONDOWN:
         if (g_mode_source) {
-            Data *d = data_new(g_text);
+            Data *d = g_files ? data_new_hdrop(g_files)
+                              : data_new(CF_UNICODETEXT, g_text,
+                                         (wcslen(g_text) + 1) * sizeof(WCHAR));
             Source *s = calloc(1, sizeof *s);
+            if (!d) { logf_("SOURCE: could not build the data object"); return 0; }
             DWORD effect = DROPEFFECT_NONE;
             HRESULT hr;
             s->iface.lpVtbl = &src_vtbl;
@@ -539,6 +601,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--h") && i + 1 < argc) ch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hwnd") && i + 1 < argc) hwnd_arg = argv[++i];
+        else if (!strcmp(argv[i], "--files") && i + 1 < argc) g_files = argv[++i];
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             mode = argv[++i];
             g_mode_source = (!strcmp(mode, "source") || !strcmp(mode, "both"));

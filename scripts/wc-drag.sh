@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §44: a drag that actually enters, in both directions.
+# docs/waycompose-design.md §50: a drag that actually enters, in both directions.
 #
 #   scripts/wc-drag.sh wine     the whole chain, both directions
 #   scripts/wc-drag.sh up       bring the chain up and leave it up (KEEP=1)
@@ -29,8 +29,8 @@
 #
 # It is **not** a boundary. §29.8's correction stands word for word: every
 # process here is on one kernel, and this leg says nothing about `afunix.sys`
-# or about a hypervisor. The guest is still the venue for that, and §44 records
-# why this run did not happen there (the guest's session was locked, and Windows
+# or about a hypervisor. The guest is still the venue for that, and
+# docs/waycompose-design.md §50 records why this run did not happen there (the guest's session was locked, and Windows
 # discards `SendInput` from a locked workstation — measured, not assumed).
 #
 # THE ONE THING THAT MUST NOT BE TRUSTED HERE
@@ -56,6 +56,7 @@ note() { echo "  ----  $*"; }
 
 . "$(dirname "$0")/wc-binaries.sh"
 . "$(dirname "$0")/wc-substrate.sh"
+. "$(dirname "$0")/wc-topology.sh"
 
 # §51. Whether a hypervisor is in the path, declared rather than left unknown.
 # This harness is same-box, so `wc_latency_claim` will refuse any assertion here
@@ -121,26 +122,65 @@ wl() { XDG_RUNTIME_DIR="$RUNDIR/run/rt" WAYLAND_DISPLAY=wl-proxy "$@"; }
 # and a run of small steps is a drag. `--sync` on each move keeps the X server
 # and Wine in step; without it xdotool outruns the wineserver and the whole
 # gesture arrives as two events.
-drag_x() {
-  local x1=$1 y1=$2 x2=$3 y2=$4 steps=${5:-40} delay=${6:-0.03}
-  local i x y
+drag_x() { drag_via 40 0.03 "$1,$2" "$3,$4"; }
+
+# The same gesture through a list of waypoints, so that a drag can be made to
+# cross *out of one of our windows and into another* without letting go.
+#
+#   drag_via <steps-per-leg> <delay> x1,y1 x2,y2 [x3,y3 ...]
+#
+# Two or more legs is the case §50.8 item 5 listed as unproven: OVER, FEEDBACK
+# and DROPPED are per-gesture state that `DragEnter` has to re-establish, and a
+# drag that only ever enters one window never asks it to.
+drag_via() {
+  local steps=$1 delay=$2; shift 2
+  local first=$1; shift
+  local x1=${first%,*} y1=${first#*,}
+  local i x y wp x2 y2
+
   $XDOTOOL mousemove --sync "$x1" "$y1"; sleep 0.4
   $XDOTOOL mousedown 1; sleep 0.3
-  for i in $(seq 1 "$steps"); do
-    x=$((x1 + (x2 - x1) * i / steps))
-    y=$((y1 + (y2 - y1) * i / steps))
-    $XDOTOOL mousemove --sync "$x" "$y"
-    sleep "$delay"
-  done
-  # Settle on the target: several DragOver calls at the drop point, so that a
-  # feedback that arrived late still has a call left to be reported on.
-  for i in 0 1 0 1 0 1 0 1; do
-    $XDOTOOL mousemove --sync $((x2 + i)) "$y2"
-    sleep 0.07
+  for wp in "$@"; do
+    x2=${wp%,*}; y2=${wp#*,}
+    for i in $(seq 1 "$steps"); do
+      x=$((x1 + (x2 - x1) * i / steps))
+      y=$((y1 + (y2 - y1) * i / steps))
+      $XDOTOOL mousemove --sync "$x" "$y"
+      sleep "$delay"
+    done
+    # Settle on each waypoint: several DragOver calls there, so that a feedback
+    # which arrived late still has a call left to be reported on, and so that an
+    # intermediate window is genuinely dwelt in rather than skimmed.
+    for i in 0 1 0 1 0 1 0 1; do
+      $XDOTOOL mousemove --sync $((x2 + i)) "$y2"
+      sleep 0.07
+    done
+    x1=$x2; y1=$y2
   done
   sleep 0.4
   $XDOTOOL mouseup 1
   sleep 0.8
+}
+
+# Start (or restart) probe-drag.exe. Each gesture gets its own process, because
+# what it offers is fixed at launch and every gesture here offers something
+# different — and a fresh log per gesture is one less thing to disentangle.
+#
+#   start_probe <tag> [--text TEXT | --files "A;B"]
+start_probe() {
+  local tag=$1; shift
+  [ -n "$PROBEPID" ] && { kill "$PROBEPID" 2>/dev/null; sleep 1; }
+  PROBELOG="$DIR/probe-$tag.log"
+  wined "$PROBE" --mode both --title "probe-drag" --log "$(winepath -w "$PROBELOG")" \
+    "$@" --x "$PX" --y "$PY" --w "$PW" --h "$PH" --seconds 240 \
+    >"$DIR/probe-$tag.out" 2>&1 &
+  PROBEPID=$!
+  local _
+  for _ in $(seq 1 60); do
+    grep -q PROBE-READY "$PROBELOG" 2>/dev/null && break
+    sleep 0.5
+  done
+  grep -q PROBE-READY "$PROBELOG" 2>/dev/null
 }
 
 # The Win32 windows on the Wine desktop. X cannot see them: they are all inside
@@ -210,7 +250,7 @@ start_chain() {
 # ------------------------------------------------------------------- the run ---
 
 run_wine() {
-  echo "== §44: a drag that enters, under Wine on Xvfb =="
+  echo "== docs/waycompose-design.md §50: a drag that enters, under Wine on Xvfb =="
 
   command -v Xvfb    >/dev/null || { bad "Xvfb not on PATH"; return; }
   command -v wine    >/dev/null || { bad "wine not on PATH"; return; }
@@ -230,6 +270,22 @@ run_wine() {
 
   wc_substrate_declare wine-fixture \
     "the Wine leg has no QEMU and no guest; the pixel substrate is not what this run measures" || return
+
+  # §51, and this leg is exactly the class it was built for. Everything here is
+  # one kernel, so the declaration is `same-box` — but this harness also prints
+  # a **time**: the gap between a drag entering and the client's `accept` coming
+  # back (§50.6). That is a round trip, a round trip is the quantity §51 refuses
+  # to let a same-box leg claim, and §50.6 says so in prose. Prose is what §51.2
+  # says was not enough, so it is asked here instead and the refusal is asserted
+  # rather than worked around: the number is reported as a *lower bound with no
+  # boundary in it*, which is the only thing this arrangement can support.
+  wc_topology_declare same-box \
+    "wc-compositor.exe under Wine, wc-proxy and both clients are processes on this workstation" || return
+  if wc_latency_claim "the accept round trip in §50.6 is what a user would see"; then
+    bad "wc_latency_claim was granted on a same-box leg -- §51's gate is not gating"
+  else
+    ok "§51: the staleness figures are refused as a latency claim, and are a lower bound with no hypervisor in them"
+  fi
 
   local W=$(ls -d /nix/store/*weston-15*/bin 2>/dev/null | head -1)
   [ -x "$W/weston-dnd" ] || { bad "weston-dnd not found"; return; }
@@ -275,17 +331,10 @@ CATCH
   CLIENT2=$!
   sleep 4
 
-  wined "$PROBE" --mode both --title "probe-drag" --log "$(winepath -w "$RUNDIR/run/probe.log")" \
-    --text "$OUTTEXT" --x $PX --y $PY --w $PW --h $PH --seconds 240 \
-    >"$RUNDIR/run/probe.out" 2>&1 &
-  PROBEPID=$!
-  for _ in $(seq 1 60); do
-    grep -q PROBE-READY "$RUNDIR/run/probe.log" 2>/dev/null && break
-    sleep 0.5
-  done
-  grep -q PROBE-READY "$RUNDIR/run/probe.log" 2>/dev/null \
+  DIR="$RUNDIR/run"
+  start_probe text --text "$OUTTEXT" \
     && ok "probe-drag.exe is up and registered" \
-    || { bad "probe-drag.exe never reported ready"; cat "$RUNDIR/run/probe.out"; return; }
+    || { bad "probe-drag.exe never reported ready"; cat "$DIR/probe-text.out"; return; }
 
   # Put the client's window where this harness expects it. The compositor puts
   # it at the origin, which is where Wine also puts a console window, and a drop
@@ -371,40 +420,154 @@ CATCH
   drag_x $((CX + 218)) $((CY + 185)) $((PX + PW / 2)) $((PY + PH / 2)) 45 0.03
 
   echo "--- probe-drag.exe's log ---"
-  cat "$DIR/probe.log" 2>/dev/null
+  cat "$PROBELOG" 2>/dev/null
   echo "--- compositor, the source side ---"
   grep -iE "drag|DoDragDrop" "$DIR/srv.log" 2>/dev/null | tail -25
 
-  grep -q "TARGET-DragEnter" "$DIR/probe.log" \
+  grep -q "TARGET-DragEnter" "$PROBELOG" \
     && ok "a drag out of the Wayland client entered the Windows application" \
     || bad "probe-drag.exe never saw a DragEnter from the Wayland client"
 
-  grep -q "TARGET-Drop" "$DIR/probe.log" \
+  grep -q "TARGET-Drop" "$PROBELOG" \
     && ok "the Windows application received the drop" \
     || bad "probe-drag.exe never saw a Drop"
 
   # Not `<<<.*>>>` on one line: weston-dnd's own payload ends in a newline, so
   # the closing marker is on the next one and the anchored form matched nothing
   # on a drop that had in fact delivered.
-  if grep -q "DROP-TEXT: <<<" "$DIR/probe.log" && ! grep -q "DROP-TEXT: no CF_UNICODETEXT" "$DIR/probe.log"; then
-    ok "and the bytes arrived: $(grep -m1 'DROP-TEXT' "$DIR/probe.log")"
+  if grep -q "DROP-TEXT: <<<" "$PROBELOG" && ! grep -q "DROP-TEXT: no CF_UNICODETEXT" "$PROBELOG"; then
+    ok "and the bytes arrived: $(grep -m1 'DROP-TEXT' "$PROBELOG")"
   else
     bad "the drop carried no CF_UNICODETEXT"
   fi
 
   import -window root "$RUNDIR/after-out.png" 2>/dev/null
 
+  # =====================================================================
+  # A DRAG THAT CROSSES BETWEEN TWO OF *OUR* WINDOWS MID-GESTURE.
+  # =====================================================================
+  #
+  # §50.8 item 5: nothing had tested a drag that leaves one of our windows and
+  # enters another without the button coming up, "which is where OVER, FEEDBACK
+  # and DROPPED would have to be re-established". This is that gesture, and the
+  # route is chosen so that the re-establishment is *observable* rather than
+  # merely exercised: it crosses the terminal (which **accepts**, so FEEDBACK
+  # becomes DROPEFFECT_COPY), then weston-dnd (which **refuses** foreign text),
+  # then back to the terminal to drop.
+  #
+  # The middle leg is the assertion. If `DragEnter` did not reset FEEDBACK, the
+  # first `DragOver` over weston-dnd would answer 0x1 — promising a copy that
+  # the client under the cursor has not agreed to and will not perform. That is
+  # a wrong cursor at best and a drop the client discards at worst, and it is
+  # invisible in a single-window gesture because there is nothing to leak from.
+  echo
+  echo "== a drag that crosses between two of our windows without letting go =="
+  local mark=$(( $(wc -l < "$DIR/srv.log") + 1 ))
+  start_probe cross --text "$CROSSTEXT" || { bad "probe-drag did not restart"; return; }
+  drag_via 25 0.03 \
+    "$((PX + PW / 2)),$((PY + PH / 2))" \
+    "$((EX + EW / 2)),$((EY + EH / 2))" \
+    "$((CX + 180)),$((CY + 200))" \
+    "$((EX + EW / 2)),$((EY + EH / 2))"
+
+  local slice="$RUNDIR/cross.log"
+  tail -n +"$mark" "$DIR/srv.log" > "$slice"
+  echo "--- the crossing, as the compositor saw it ---"
+  grep -E "entered window|left window|dropped on window|now answers" "$slice"
+
+  # The order is the claim: in 2, out 2, in 1, out 1, in 2, drop on 2.
+  #
+  # `entered window N at screen` rather than `entered window N`: an enter is
+  # announced **twice**, once by `IDropTarget::DragEnter` with the screen point
+  # Windows measured and once by the state side with the surface point and the
+  # actions. Both are wanted in the log and only one is an event, so matching
+  # the loose form counts every enter twice and turns a correct route into
+  # `in2,in2,out2,…`. Anchored on the platform-side line, which is the one that
+  # *is* the OLE callback.
+  local route=$(grep -oE "a Windows drag entered window [0-9]+ at screen|a Windows drag left window [0-9]+|a Windows drag was dropped on window [0-9]+" "$slice" \
+                | sed -E 's/a Windows drag was dropped on window /drop/; s/a Windows drag entered window /in/; s/ at screen//; s/a Windows drag left window /out/' \
+                | tr -d ' ' | paste -sd, -)
+  case "$route" in
+    in2,out2,in1,out1,in2,drop2)
+      ok "the drag crossed window 2 -> window 1 -> window 2 and dropped, in one gesture ($route)" ;;
+    *)
+      bad "the crossing did not take the expected route: $route" ;;
+  esac
+
+  # FEEDBACK was re-established rather than inherited.
+  local first_on_1=$(awk '/a Windows drag entered window 1/ {seen=1}
+                          seen && /DragOver on window 1 now answers/ {print; exit}' "$slice")
+  case "$first_on_1" in
+    *"now answers 0x0"*)
+      ok "entering window 1 reset the feedback to DROPEFFECT_NONE rather than inheriting window 2's copy" ;;
+    "")
+      bad "window 1 never answered a DragOver during the crossing" ;;
+    *)
+      bad "window 1's first answer was not 0x0 -- FEEDBACK leaked across the crossing: $first_on_1" ;;
+  esac
+
+  if grep -qF "$CROSSTEXT" "$RUNDIR/dropped.txt" 2>/dev/null; then
+    ok "and the bytes still arrived after two window changes mid-gesture"
+  else
+    bad "the crossing drag delivered nothing"
+  fi
+
+  # =====================================================================
+  # CF_HDROP, FROM A SOURCE THAT IS NOT THE PARSER.
+  # =====================================================================
+  #
+  # §29.9 item 3 and §50.8 item 3: `hdrop_to_uri_list` had only ever been given
+  # a `DROPFILES` block **this project built**, which tests the parser against
+  # itself. probe-drag.exe now lays one out by hand — header, `fWide`, the paths
+  # as UTF-16, double-NUL terminated — in a different process, in C, and drags
+  # it in. That is not Explorer and does not claim to be (§50.8 item 2 still
+  # stands); it is the shape of the block coming from somewhere other than the
+  # code that reads it.
+  #
+  # The bytes are checkable end to end because `mimes_for` announces a file list
+  # as `text/uri-list` **and** as text when there is no real text beside it, and
+  # `weston-terminal` takes the text — so the URIs land in the pty.
+  echo
+  echo "== CF_HDROP in, from a DROPFILES block laid out by another process =="
+  mark=$(( $(wc -l < "$DIR/srv.log") + 1 ))
+  start_probe hdrop --files "$HDROP_FILES" || { bad "probe-drag did not restart"; return; }
+  drag_x $((PX + PW / 2)) $((PY + PH / 2)) $((EX + EW / 2)) $((EY + EH / 2))
+  tail -n +"$mark" "$DIR/srv.log" > "$RUNDIR/hdrop.log"
+  echo "--- what the compositor made of the file list ---"
+  grep -E "entered window|dropped on window" "$RUNDIR/hdrop.log"
+
+  grep -q "offering .*text/uri-list" "$RUNDIR/hdrop.log" \
+    && ok "a real CF_HDROP was read and announced as text/uri-list" \
+    || bad "the CF_HDROP was not announced as text/uri-list"
+
+  for _ in $(seq 1 40); do grep -q "file:///" "$RUNDIR/dropped.txt" 2>/dev/null && break; sleep 0.25; done
+  if grep -q "file:///C:/wc-drag/alpha.txt" "$RUNDIR/dropped.txt" 2>/dev/null \
+     && grep -q "file:///C:/wc-drag/beta.txt" "$RUNDIR/dropped.txt" 2>/dev/null; then
+    ok "both paths arrived at the client as file:// URIs: $(grep -o 'file:///[^ ]*' "$RUNDIR/dropped.txt" | tr '\n' ' ')"
+  else
+    bad "the file list did not arrive: $(tail -c 200 "$RUNDIR/dropped.txt" 2>/dev/null)"
+  fi
+
   # Keep the evidence where §29.7 keeps the clipboard's, because a claim in the
   # design document that cites a log should be able to cite the log.
   mkdir -p "$ROOT/docs/drag"
   cp "$DIR/srv.log"   "$ROOT/docs/drag/compositor.log" 2>/dev/null
   cp "$DIR/proxy.log" "$ROOT/docs/drag/proxy.log"      2>/dev/null
-  cp "$DIR/probe.log" "$ROOT/docs/drag/probe-drag.log" 2>/dev/null
+  cp "$PROBELOG" "$ROOT/docs/drag/probe-drag.log" 2>/dev/null
   cp "$RUNDIR/after-out.png" "$ROOT/docs/drag/desktop.png" 2>/dev/null
+  wc_assert_topology "$DIR/srv.log" "wc-drag"
   note "logs in $ROOT/docs/drag/, screenshots in $RUNDIR/{before,after-in,after-out}.png"
 }
 
 OUTTEXT="${WC_DRAG_TEXT:-waycompose drag payload 4711}"
+# A different marker per gesture: `dropcatch.sh` is one long-lived `cat`, so the
+# file accumulates and "did this drop deliver" has to be a question about *these*
+# bytes rather than about the file being non-empty.
+CROSSTEXT="${WC_DRAG_CROSSTEXT:-waycompose crossing payload 8150}"
+# Paths that do not exist, and deliberately so: `hdrop_to_uri_list` converts
+# names and never opens them, so a block naming real files would test the same
+# code and invite the reader to think the file mattered.
+HDROP_FILES='C:\wc-drag\alpha.txt;C:\wc-drag\beta.txt'
 
 # Where the two windows go. Fixed rather than discovered, because every
 # coordinate in the gesture is relative to them and a run whose windows moved is

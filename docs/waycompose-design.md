@@ -19020,31 +19020,45 @@ DragOver on window 2 answered 0x0 6 time(s)
 DragOver on window 2 now answers 0x1 (119 ms after the drag entered)
 ```
 
-**Six `DragOver` calls, and 119 ms.** Across five runs the first run has been 2,
-5, 6, 6 and 6 calls and the switch has landed at 119, 128, 137, 189 and 199 ms.
-The gesture itself is 40–55 `DragOver` calls, so it is of order **one eighth of
-the drag**.
+**Six `DragOver` calls, and 119 ms** — on the first five runs. The gesture
+itself is 40–55 `DragOver` calls, so that is of order one eighth of the drag.
 
-So the answer to "invisible or obvious" is **neither, and the argument in §43.4
-is wrong about which quantity it was reasoning over**. 43.4 says the client
-answers in microseconds. The client's *think time* is indeed negligible —
-weston-terminal decides instantly. What the cursor waits for is not the client
-thinking, it is the round trip: an OLE callback on the UI thread, a channel to
-the compositor's state thread, smithay's `start_dnd`, a `wl_data_device.enter`
-down the wire to `wc-proxy`, the client's `accept` and `set_actions` back, and
-two poll loops with their own intervals in between. That is ~100 ms, and it is
-~100 ms **on a leg with no hypervisor in it**; the deployment this project is
-about adds a boundary crossing to that path in both directions.
+**Then the machine got quieter and the number changed, which is the more useful
+half of the measurement.** The first five runs were taken while cargo builds
+were running on the same workstation. Four gestures on an idle one give **1–2
+calls and 26–31 ms**. The honest range is therefore:
 
-A tenth of a second of no-entry cursor at the moment a drag crosses into a
-window is *perceptible* — it is above the threshold at which a cursor change
-reads as a change — and it is not *broken*: it resolves long before anybody lets
-go, and §43.4's second bullet is the one that matters and is still exactly
-right, because the **drop** is never stale. The design decision stands. The
-justification for it does not, and the honest form of it is: *the cursor is
-about six frames behind at the start of a gesture, the number grows with the
-boundary, and the alternative — blocking inside `DragOver` — would put that same
-latency in front of the pump instead of behind the cursor.*
+| | `DragOver` calls answering `NONE` | ms to the client's first answer |
+|---|---|---|
+| workstation under load | 5–6 | 119–199 |
+| workstation idle | 1–2 | 26–31 |
+
+So the answer to "invisible or obvious" is **load-dependent, and the argument in
+§43.4 is wrong about which quantity it was reasoning over even where its
+conclusion is right**. 43.4 says the client answers in microseconds. The
+client's *think time* is indeed negligible — weston-terminal decides instantly —
+but that is not what the cursor waits for. It waits for a round trip: an OLE
+callback on the UI thread, a channel to the compositor's state thread, smithay's
+`start_dnd`, a `wl_data_device.enter` down the wire to `wc-proxy`, the client's
+`accept` and `set_actions` back, and two poll loops with their own intervals in
+between. **Nothing in that chain is the client thinking, and every link in it
+lengthens under load** — which is why the number moves by 6× on the same code.
+
+One or two frames is at the edge of invisible and 199 ms is not; a cursor that
+wears the no-entry glyph for a fifth of a second as it crosses into a window is
+something a person notices. Both are the same build. What this rules out is the
+comfortable reading — that the staleness is small *because the client is fast* —
+and what it puts in its place is that the staleness is however long the round
+trip is, measured **on a leg with no hypervisor in it**, and the deployment this
+project is about adds a boundary crossing to that path in both directions.
+
+The decision stands, and §43.4's second bullet is the one that carries it: the
+**drop** is never stale, because it is answered after the client has been told.
+The justification does not, and its honest form is: *the cursor is one to six
+frames behind at the start of a gesture depending on how busy the machine is,
+the number grows with the boundary, and the alternative — blocking inside
+`DragOver` — would put that same latency in front of the pump instead of behind
+the cursor.*
 
 ### 50.7 The two directions, and what each one is evidence of
 
@@ -19115,18 +19129,25 @@ makes it evidence.
    client, and it is still one whose `IDataObject` was written next to the code
    it is testing. Explorer, a browser and an Office application each offer
    things this has never seen.
-3. **`CF_HDROP` has still never been read from a real Explorer**, and dragging a
-   *file* out of a Wayland client is still the open design question §29.8
-   states — it needs the file's bytes, not its name.
+3. **`CF_HDROP` has still never been read from a real Explorer.** A block laid
+   out by *another process* now crosses and is parsed correctly (§50.10), which
+   removes the "the parser was tested against its own output" objection and does
+   **not** remove this one: Explorer's `IDataObject` offers a shell item array
+   and several private formats beside the `CF_HDROP`, and none of that has been
+   seen. Dragging a *file* out of a Wayland client is also still the open design
+   question §29.8 states — it needs the file's bytes, not its name.
 4. **`move` has not been exercised end to end.** The client chose `copy` on
    every run here (`action=1`). §43.9 item 5's warning — that a `move` out of
-   Explorer into a Wayland client deletes the user's file — is untested and was
-   deliberately left that way on somebody's personal machine.
-5. **One client at a time was dragged over.** Nothing has tested a drag that
-   crosses *between* two of our windows mid-gesture, which is where `OVER`,
-   `FEEDBACK` and `DROPPED` would have to be re-established.
-6. **The staleness number is from three runs on a loaded workstation**, not a
-   distribution.
+   Explorer into a Wayland client deletes the user's file — is untested and is
+   deliberately being left that way while the only real Windows desktop
+   available is somebody's personal machine.
+5. ~~**One client at a time was dragged over.**~~ **Closed by §50.10**: a single
+   gesture now crosses window 2 → window 1 → window 2 and drops, and the
+   re-establishment of `FEEDBACK` on each entry is asserted rather than assumed.
+6. **The staleness figures are from nine gestures on one workstation**, five of
+   them while it was building. §50.6 gives both ends of the range rather than a
+   mean, because the spread is 6× and the mean would hide it. It is not a
+   distribution and nothing has been measured across a hypervisor.
 7. **Wine is not Windows** (§13.6), and this leg leans on Wine for the one thing
    no previous leg did: `DoDragDrop`'s modal loop and cross-process `IDropTarget`
    marshalling. That is the part most worth re-checking on the guest.
@@ -19141,7 +19162,7 @@ Run from the unified tree, inside `nix develop`.
 | `cargo test --workspace --no-fail-fast` | **83 binaries, 2425 tests, 0 failures** (2424 on master `655c559`; 1 new) |
 | `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
 | `wine …/wc_compositor-*.exe drag::` | **10 tests, 0 failures** |
-| **`scripts/wc-drag.sh wine`** (new) | **14 passed, 0 failed**, three times |
+| **`scripts/wc-drag.sh wine`** (new) | **20 passed, 0 failed** (14 as first written; see §50.10) |
 | `scripts/wc-clip.sh wine` | **15 passed, 0 failed** |
 
 The one new test is `a_drop_keeps_the_offer_the_drags_even_after_the_leave`, in
@@ -19173,6 +19194,99 @@ boundary in this leg, because there is no boundary.
 declaration is refused if `WC_HOST` or `WC_GUEST_CONFIGURED` is set — so it
 cannot be used to make a guest run pass. The substrate is not what this run
 measures; the pixel path is incidental to a drag.
+
+
+### 50.10 The follow-up: two things that needed no venue, and a citation that pointed at the wrong section
+
+§50 was written as §44 and renumbered on merge, because §44 had been taken by
+the harness work while this ran. **Every `ADDED FOR §44` comment this section
+left in the code then pointed at a real section that says something else**,
+which is the failure §48 built `scripts/wc-xref.sh` to catch — and could not
+catch here, because a bare `§N` names no document and the checker deliberately
+does not guess. The fix is not only to renumber: the eight citations are now
+written as `docs/waycompose-design.md §50`, which is the *qualified* form, so
+the next renumbering breaks the checker instead of quietly misleading a reader.
+A citation that cannot be checked is a citation that will eventually be wrong.
+
+Two of §50.8's unproven items needed no guest, and both are now closed.
+
+**A drag that crosses between two of our own windows without letting go.** The
+route is chosen so that the thing being tested can fail visibly: it crosses
+`weston-terminal`, which **accepts** text and so drives `FEEDBACK` to
+`DROPEFFECT_COPY`, then `weston-dnd`, which **refuses** foreign text, then back
+to the terminal to drop.
+
+```text
+a Windows drag entered window 2 at screen (515, 630) …
+DragOver on window 2 now answers 0x1 (26 ms after the drag entered)
+a Windows drag left window 2
+a Windows drag entered window 1 at screen (315, 552) …
+DragOver on window 1 now answers 0x0 (1 ms after the drag entered)
+a Windows drag left window 1
+a Windows drag entered window 2 at screen (320, 635) …
+a Windows drag was dropped on window 2: 1 format(s) read, effect 0x1
+```
+
+The middle leg is the assertion, and it is worth saying what a failure would
+have looked like: had `DragEnter` not reset `FEEDBACK`, the first `DragOver`
+over `weston-dnd` would have answered `0x1` — promising a copy to a user whose
+cursor is over a client that has agreed to nothing and will discard the drop.
+That is invisible in a single-window gesture, because there is nothing to leak
+*from*. The harness asserts the whole route as one string
+(`in2,out2,in1,out1,in2,drop2`) and the first answer on each entry separately.
+
+**One thing had to be got right for that assertion to mean anything**, and it
+is the shape §35 warns about: an enter is announced **twice** in the log, once
+by `IDropTarget::DragEnter` with the screen point Windows measured and once by
+the state side with the surface point. Matching the loose form counted every
+enter twice and produced `in2,in2,out2,…` — a *failing* gate on a *correct*
+route. A gate that fails for its own reasons trains people to ignore it.
+
+**A `CF_HDROP` whose `DROPFILES` block was laid out by something other than the
+parser.** §29.9 item 3's objection was exact: `hdrop_to_uri_list` had only ever
+been given a block this project built, which tests a parser against itself.
+`probe-drag.exe` now builds one in C, in another process — header, `fWide`, the
+paths as UTF-16, double-NUL terminated — and drags it in. The bytes are
+checkable all the way to the client because `mimes_for` announces a file list as
+`text/uri-list` **and** as text when there is no real text beside it, and
+`weston-terminal` takes the text:
+
+```text
+a Windows drag entered window 2 … offering 6 mime(s):
+  text/uri-list, text/plain;charset=utf-8, text/plain, UTF8_STRING, STRING, TEXT
+```
+
+and in the file the client's pty was piped into:
+
+```text
+file:///C:/wc-drag/alpha.txt
+file:///C:/wc-drag/beta.txt
+```
+
+The paths name nothing that exists, deliberately: `hdrop_to_uri_list` converts
+names and never opens them, so a block naming real files would exercise the same
+code while inviting a reader to believe the files mattered.
+
+**What this does not do is make `probe-drag.exe` into Explorer**, and §50.8 item
+3 now says so in the narrower form that survives: the objection this closes is
+"the parser was tested against its own output", and the one it leaves is that a
+real Explorer drag carries a shell item array and several private formats
+alongside the `CF_HDROP`, none of which anything here has seen.
+
+`move` is still untouched, on purpose. §43.9 item 5 is a warning about deleting
+a real person's file, and the only real Windows desktop in reach is a real
+person's.
+
+**And §51 arrived while this was being written, which this leg is a case of.**
+§50.6 prints a *time* — the gap between a drag entering and the client's `accept`
+coming back — and a round trip is exactly the quantity §51 refuses to let a
+same-box leg claim. The prose in §50.6 already said "on a leg with no hypervisor
+in it", and §51.2 is the argument that prose is not enough. So the harness now
+calls `wc_topology_declare same-box`, asks `wc_latency_claim` for the staleness
+figure, and **asserts that it is refused** — a gate that would fail if §51's gate
+ever stopped gating. `wc_assert_topology` closes the run.
+
+The harness is **20 passed, 0 failed** with these three and §51's two added.
 
 ## 51. The mistake, made structural: a leg must say whether a hypervisor is in it
 
