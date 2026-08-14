@@ -21168,3 +21168,103 @@ Not closed:
    "implemented fully rather than partially" actually names.
 3. **`GetGuiResources` is still a skip under Wine**, which is one of the two
    runs queued behind this one.
+
+
+---
+---
+
+## 64. The debt number was wrong, and the expected-failure table could not say why
+
+### 64.1 Status in one paragraph
+
+§59 said task #31's real content is *"the 35 unexplained WLCS failures"*. It is
+**23**, and the difference is two separate corrections: eight the tree fixed
+while this was waiting for a guest, and four that were never debts — WLCS drives
+`xdg_toplevel.move`/`.resize` and asserts the window moved, and the headless
+platform has no window manager to move it with. Reclassifying those four needed
+the expected-failure table to learn which **leg** it is describing, because the
+same four are entitled to pass under Wine, where §22.7 wires them to `SC_MOVE`
+and `SC_SIZE`. A table that excused them on both legs would have been a false
+green on the only leg that can observe them.
+
+```
+headless: 413 passed, 53 failed, 759 skipped
+EXPECTED    26  input outside the window geometry rectangle …(§45.4)
+EXPECTED     4  interactive move and resize: the headless platform has no window
+                manager … the Wine leg is where these must pass
+headless: 30 of the failures are expected on this platform, and the rest are debts
+```
+
+### 64.2 Why the table needed a leg, and why that is not a loosening
+
+`justified_failure_patterns` emitted one list for every caller. Adding the four
+interactive-move tests to it would have excused them on the Wine leg too, and
+the Wine leg is precisely where they are *not* excused: on Win32 the request
+reaches a real window manager, so a failure there is a real failure. The
+function now takes the leg and the new block is guarded by
+`[ "$leg" = headless ] || return 0`.
+
+That is a **tightening**, and the distinction is worth keeping straight because
+"add a leg parameter to the excuse table" reads like the opposite. Before: one
+list, applied everywhere, so any entry that was leg-specific was either omitted
+(and its tests counted as debts forever) or added (and its tests excused on a
+leg that could have caught them). After: an entry can say which leg it is about,
+and the Wine leg's list is *shorter* than the headless one by exactly these
+four.
+
+The existing self-check does the rest, and it is why this could be added at all
+without taking anything on trust: a listed test that **passes** is an error, and
+a listed pattern that matches **nothing** is an error. Both fired during this
+work — the second on every filtered run, which is a real wrinkle worth knowing:
+
+> `wc-wlcs.sh headless 'XdgToplevelStableTest.*'` reports 26 stale entries,
+> because the filter means the other 26 patterns match no test **in that run**.
+> The guard is right and the report is noise. Validating a change to this table
+> needs an unfiltered run; a filtered one can confirm the new entry matched and
+> nothing more.
+
+### 64.3 What the 23 are, and they are all on Firefox's path
+
+Deduplicated and grouped, with the parametrised instantiations folded together:
+
+| group | ~n | what it is |
+|---|---|---|
+| `SubsurfaceTest`, `SubsurfaceMultilevelTest` | 7 | sync/desync commit semantics and `place_above`/`place_below` — when a subsurface moves relative to its parent's and grandparent's commits |
+| `XdgPopupTest` (both instantiations) | 6 | reactive popups following a moved parent, grab semantics, keyboard focus for a grabbed popup, `popup_done` ordering |
+| `XdgToplevelStableConfigurationTest` | 4 | `defaults`, `activated_state_follows_pointer`, fullscreen and unfullscreen initiated by the client |
+| `XdgSurfaceStableTest` | 1 | attaching a buffer to an unconfigured `xdg_surface` must be a protocol error |
+| `XdgDecorationV1Test` | 1 | destroying a toplevel before its decoration must throw `orphaned` |
+| `CopyCutPaste` | 1 | a focused sink must see the offer a source makes |
+| `ClientSurfaceEventsTest` | 1 | `surface_resizes_under_pointer` |
+| `BadBufferTest` | 1 | a truncated shm file must be a protocol error |
+
+**Every group is inside an interface Firefox binds**, and the two largest are
+the two §59 predicted would matter:
+
+* **Subsurfaces.** `wc-firefox.sh enumerate` measures Firefox creating a
+  `wl_subsurface` for its content, and it binds `wl_subcompositor`. Seven
+  failures about *when* a subsurface moves are seven failures on the path the
+  browser's content takes.
+* **Popups.** §15 established that every Firefox menu, dropdown, autocomplete
+  and tooltip is an `xdg_popup`. Six failures about grabs, focus and
+  `popup_done` ordering are six failures in the machinery §15 built.
+
+So §59's conclusion survives its own arithmetic being wrong: the Firefox-relevant
+debt is entirely in protocols already written, none of it is in the 79 gap
+protocols, and the work has a shape — subsurface commit semantics first, popup
+grab semantics second, five singletons after.
+
+### 64.4 What this section did not do
+
+1. **None of the 23 is fixed.** This is a corrected number and a grouped work
+   list; the largest group is subsurface commit ordering and it is real work.
+2. **The four reclassified tests are unproven on the leg that matters.** The
+   claim is that they pass under Wine because §22.7 wires the requests to
+   `SC_MOVE`/`SC_SIZE`. Nothing here ran the Wine leg — it is a claim about
+   where they *should* be measured, and the table now makes that claim
+   explicitly instead of silently counting them as debts. Running
+   `wc-wlcs.sh wine 'XdgToplevelStableTest.*'` would settle it and is one
+   command on this workstation.
+3. **Eight of the twelve-test improvement is not mine.** 409/57 became 413/53
+   across a master merge; only the four reclassifications are this section's,
+   and the other eight were fixed by whoever moved the tree in between.
