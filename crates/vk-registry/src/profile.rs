@@ -873,13 +873,6 @@ pub mod profiles {
             // inside a word, the registry does not either, and a generator that
             // guesses produces a struct that is right on one compiler.
             "VK_NV_cluster_acceleration_structure",
-            // A `void*` whose extent is a device property rather than a `len=`,
-            // and no policy in `sv_codegen::exceptions` fits: the bytes are a
-            // capture-replay token that only a capture tool produces.
-            // docs/design.md §9.2 is the sharper objection — a descriptor buffer *is*
-            // raw device addresses in application memory, which is the one thing
-            // this design says it will not put there.
-            "VK_EXT_descriptor_buffer",
             // Reached only once `VK_KHR_ray_tracing_pipeline` came back, and out
             // for the *same* reason as the entry above rather than a new one:
             // `VkAccelerationStructureMotionInstanceDataNV` has
@@ -889,29 +882,79 @@ pub mod profiles {
             // already excludes it as a tripwire; this is the profile agreeing so
             // the tripwire is never reached.
             "VK_NV_ray_tracing_motion_blur",
-            // The same shape, without the §9.2 argument: `pParams` is an array
-            // of pointers to CUDA kernel arguments whose count and element sizes
-            // live in the CUDA module, which the registry cannot see and this
-            // side does not parse.
+            // **The `void*` with no extent at all**, and the first of the two
+            // groups the `void*`-without-`len=` class splits into once each one
+            // is read rather than counted (docs/design.md §0.25).
+            //
+            // `VkCuLaunchInfoNVX::pParams` has `len="paramCount"`, so the array
+            // is fine; it is the *element* that refuses. Each element is a
+            // `const void*` pointing at one CUDA kernel argument whose size is
+            // stated only by the kernel's signature, inside the CUDA module —
+            // which the registry cannot see, this side does not parse, and the
+            // application itself does not have to know. There is no length here
+            // to be found in any document, so this is not a gap in the
+            // generator. `sv_codegen::exceptions` marks `pParams` and `pExtras`
+            // `VoidPolicy::NotSerialisable` with that reason and this line is
+            // the profile agreeing, exactly as it does for
+            // `VK_EXT_map_memory_placed` below.
             "VK_NVX_binary_import",
             // `ppData` hands the application a pointer into the driver's own
             // descriptor set allocation. That pointer is in the GPU side's
             // address space and docs/design.md §1a says it cannot cross; there is no
-            // encoding that makes it mean anything here.
+            // encoding that makes it mean anything here. Marked
+            // `NotSerialisable` in `sv_codegen::exceptions` — and that entry is
+            // load-bearing rather than decorative, because a `NotSerialisable`
+            // *parameter* is dropped from the wire rather than refused, which
+            // would have made this command a silent no-op. See
+            // `exceptions::PARAMETER_ANSWERED_APP_SIDE` and the gate that reads
+            // it.
             "VK_VALVE_descriptor_set_host_mapping",
-            // More `void*` with no `len=`. Each one is a vendor blob whose
-            // extent is stated somewhere the registry does not point at — a
-            // device property, a sibling in a *different* struct, or a format
-            // only the vendor's tooling knows. §7.4 requires a policy entry
-            // rather than a guess, and none of these has an honest one.
+            // The same, for a `void*` in a `VkSemaphoreCreateInfo` chain that
+            // the extension's own registry comment calls "NV internal use only":
+            // `pQueriedLowLatencyData` has no size in the registry, none in the
+            // specification, and no member beside it that could be one.
+            "VK_NV_low_latency",
+            // **The `void*` whose extent is stated somewhere the registry cannot
+            // point at**, which is the second group and the one that is a
+            // missing *mechanism* rather than a missing fact. Each of these has
+            // a length; none of them has it in a place `len=` can name:
+            //
+            // - `VkDataGraphPipelineConstantARM::pConstantData` — "The size and
+            //   layout of the data pointed to by pConstantData is specified by a
+            //   specific structure in the pNext chain", i.e. computed from
+            //   `VkTensorDescriptionARM`'s `format`, `dimensionCount`,
+            //   `pDimensions` and `pStrides`. A layout computation over a
+            //   `pNext` sibling, not a count.
+            // - `vkGetShaderInstrumentationValuesARM::pMetricValues` —
+            //   `*pMetricBlockCount` blocks of
+            //   `sizeof(VkShaderInstrumentationMetricDataHeaderARM) + 8 *
+            //   VkPhysicalDeviceShaderInstrumentationPropertiesARM::numMetrics`
+            //   bytes: a count from one parameter times a *device property*.
+            // - `vkGetExternalComputeQueueDataNV::pData` — "must be at least the
+            //   size specified by the externalDataSize field in the
+            //   VkPhysicalDeviceExternalComputeQueuePropertiesNV structure": a
+            //   device property alone.
+            // - `VkDeviceFaultInfoEXT::pVendorBinaryData` —
+            //   `pFaultCounts->vendorBinarySize`, a member of a **different
+            //   parameter's** struct. Note that this extension has a second
+            //   defect of the same family and it is not a `void*` at all:
+            //   `pAddressInfos` and `pVendorInfos` are arrays with no `len=`
+            //   whatever, which the planner would carry as pointers to exactly
+            //   one element. Carrying `VK_EXT_device_fault` needs both answered.
+            //
+            // What would carry all four is one mechanism and not four
+            // exceptions: a length the app side computes and the wire carries
+            // explicitly, which is a fifth `VoidPolicy` **plus** an emitter that
+            // can evaluate something other than a sibling name. docs/design.md
+            // §0.25 states the shape; until it exists these are refused, because
+            // a policy without an implementation is what §0.22 and §0.24 are
+            // both about.
             //
             // `VK_ARM_data_graph` also takes its whole dependent family
             // (`…_optical_flow`, `…_instruction_set_tosa`, `VK_QCOM_data_graph_model`)
             // out with it, through the `depends=` fixpoint in `Profile::resolve`.
             "VK_ARM_data_graph",
             "VK_EXT_device_fault",
-            "VK_NV_low_latency",
-            "VK_NV_optical_flow",
             "VK_NV_external_compute_queue",
             "VK_ARM_shader_instrumentation",
             // `pPlacedAddress` asks the driver to map at an address the
@@ -931,8 +974,32 @@ pub mod profiles {
             // It was: `VoidPolicy::CaptureReplayUnsupported` encodes them as null
             // on the wire and refuses a non-null one by name, which is what the
             // specification already requires of a device that does not advertise
-            // `…CaptureReplay` — and this one does not. `VK_KHR_ray_tracing_pipeline`
-            // and `VK_EXT_descriptor_buffer` are carried now; docs/design.md §0.24.
+            // `…CaptureReplay`. `VK_KHR_ray_tracing_pipeline` went with §0.24 and
+            // **`VK_EXT_descriptor_buffer` with docs/design.md §0.25** — eleven
+            // commands, plus two of `VK_KHR_maintenance6` and two of
+            // `VK_ARM_tensors` whose `require` blocks `depends=` on it.
+            //
+            // The line that outlived its own argument, and what it said: "§9.2 is
+            // the sharper objection — a descriptor buffer *is* raw device
+            // addresses in application memory, which is the one thing this design
+            // says it will not put there". That was true when §9.2 declined
+            // `bufferDeviceAddress`. §0.20 implemented it — `vkGetBufferDeviceAddress`
+            // is forwarded and returns the GPU side's real address — so the
+            // addresses an application writes into a descriptor buffer are the
+            // GPU-side driver's own values, produced there and consumed there,
+            // and there is nothing for the `transform` pass to see or to miss.
+            // A stale exclusion looks exactly like a live one, which is why the
+            // sentence it rested on is quoted here rather than deleted.
+            //
+            // **What carrying it does not do is advertise it.** Its seven
+            // `vkGet…OpaqueCaptureDescriptorDataEXT` queries refuse — `pData`
+            // must be non-null for the call to mean anything and the policy is
+            // "null, or refused by name" — so the generated
+            // `INCOMPLETE_EXTENSIONS` withdraws the extension, and
+            // `sv_icd::advertise::withdraw_gated_features` withdraws the
+            // `descriptorBufferCaptureReplay` feature that would make an
+            // application call one. Carry everything, advertise what works
+            // (§0.19 item 3).
             // **The union-of-handles class used to be excluded here, and it is
             // gone** — `VK_KHR_acceleration_structure`,
             // `VK_EXT_device_generated_commands` and `VK_EXT_descriptor_heap`,

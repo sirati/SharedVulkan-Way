@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 /// docs/design.md §7.4 counts 103 of these registry-wide. Those with a `len` are
 /// blobs and need no entry. The rest are listed here by `(owner, field)`, and an
 /// unlisted one is a generator error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VoidPolicy {
     /// An offset into the passthrough arena.
     ///
@@ -76,14 +76,25 @@ pub enum VoidPolicy {
     /// But they are only ever written by a tool *replaying a trace*, and doing
     /// that requires the device to advertise the matching feature —
     /// `rayTracingPipelineShaderGroupHandleCaptureReplay`,
-    /// `descriptorBufferCaptureReplay`. This driver advertises neither, and
-    /// `sv_icd::advertise` is where that is kept. So the specification already
-    /// requires the member to be null, and the honest encoding is "null, and say
-    /// so loudly if it is not" — which is what §0.19 item 4 predicted the answer
+    /// `descriptorBufferCaptureReplay`. So the specification already requires
+    /// the member to be null, and the honest encoding is "null, and say so
+    /// loudly if it is not" — which is what §0.19 item 4 predicted the answer
     /// would be and what §0.24 implemented.
     ///
-    /// This is what took `VK_KHR_ray_tracing_pipeline` and
-    /// `VK_EXT_descriptor_buffer` off the profile's exclusion list.
+    /// **This paragraph used to end "This driver advertises neither, and
+    /// `sv_icd::advertise` is where that is kept", and it was not kept
+    /// anywhere.** Both bits arrive inside feature structs forwarded whole from
+    /// the physical device, and `withdraw_gated_features` cleared exactly one
+    /// bit — `hostImageCopy` — so on a driver that supports capture-replay we
+    /// advertised it and would have refused the first token an application
+    /// legally passed. `sv_icd::advertise::withdraw_gated_features` clears both
+    /// now, `no_capture_replay_feature_whose_token_is_a_void_pointer_is_advertised`
+    /// checks it, and `crates/sv-codegen/tests/void_star.rs` enumerates the
+    /// class this policy is applied to so a new member cannot join it unnoticed
+    /// (docs/design.md §0.25).
+    ///
+    /// This is what took `VK_KHR_ray_tracing_pipeline` (§0.24) and
+    /// `VK_EXT_descriptor_buffer` (§0.25) off the profile's exclusion list.
     CaptureReplayUnsupported,
     /// Not serialisable at all; a command or struct reaching one is a build
     /// failure.
@@ -184,6 +195,46 @@ pub const ICD_EXPANDS_ARENA_POINTER: &[&str] = &[
     "vkGetMemoryHostPointerPropertiesEXT",
 ];
 
+/// Commands whose `VoidPolicy::NotSerialisable` **parameter** is answered on the
+/// app side, and so may be dropped from the wire rather than refused.
+///
+/// # Why a policy needed a second list, again
+///
+/// `NotSerialisable` does two different things depending on where it lands. On a
+/// struct member it is a refusal: [`crate::plan`] bails, the build fails, and
+/// `Profile::excluded_extensions` is where the decision to live without the
+/// extension gets written down. On a command *parameter* it is a **deletion** —
+/// the parameter is dropped and the rest of the command is carried as if it had
+/// never had one.
+///
+/// For `vkMapMemory` that is exactly right and is the whole design: `ppData` is
+/// a pointer into our own mapping, computed app-side from `arena_base + offset`
+/// (docs/design.md §5.3), and `sv_icd::icd` writes it before the command is
+/// forwarded without it. Nothing is lost because nothing had to cross.
+///
+/// For `vkGetDescriptorSetHostMappingVALVE` the identical entry would produce a
+/// command that is forwarded, returns, and never writes the one output the
+/// caller asked for — the same shape of defect as §0.22's `ArenaOffset` on
+/// `vkCmdPushDescriptorSetWithTemplate`, where a policy that named a treatment
+/// nobody had implemented was taken as evidence that it had been. **A declared
+/// policy is not an implementation**, and the only way to keep saying that is to
+/// make the claim checkable: a command with a dropped `void*` parameter and no
+/// entry here cannot be carried, and [`crate::plan`] refuses it by name.
+///
+/// An entry is therefore a statement about `sv-icd`, not about the registry —
+/// "this parameter's value is produced here" — and it names the function that
+/// produces it so the claim can be followed.
+pub const PARAMETER_ANSWERED_APP_SIDE: &[(&str, &str)] = &[
+    ("vkMapMemory", "sv_icd::icd::map_memory computes arena_base + offset and writes *ppData"),
+    ("vkMapMemory2", "as vkMapMemory, through the same helper"),
+    ("vkMapMemory2KHR", "as vkMapMemory, through the same helper"),
+];
+
+/// Why a command may drop a `NotSerialisable` `void*` parameter, if it may.
+pub fn parameter_answered_app_side(command: &str) -> Option<&'static str> {
+    PARAMETER_ANSWERED_APP_SIDE.iter().find(|(c, _)| *c == command).map(|(_, why)| *why)
+}
+
 /// Whether a `void*` belongs to the capture-replay family, by the registry's own
 /// naming.
 ///
@@ -211,7 +262,12 @@ fn is_capture_replay(owner: &str, field: &str) -> bool {
     hit(owner) || hit(field)
 }
 
-const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
+/// The per-`(owner, field)` half of the table; [`BY_FIELD_NAME`] is the other.
+///
+/// Public so that `tests/void_star.rs` can check every entry against the
+/// registry: an entry naming a member that no longer exists is a rule still
+/// being applied to a question nobody asks.
+pub const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
     // docs/design.md §5.3: an app-side `vkMapMemory` pointer is arena_base + offset,
     // and the GPU side never maps arena memory through the driver at all. The
     // import path therefore carries an offset.
@@ -230,6 +286,50 @@ const VOID_POLICIES: &[(&str, &str, VoidPolicy)] = &[
     ("vkMapMemory2KHR", "ppData", VoidPolicy::NotSerialisable),
     // Explicitly out of scope: a window handle is a WSI handle.
     ("VkAndroidSurfaceCreateInfoKHR", "window", VoidPolicy::NotSerialisable),
+    // The other three window handles the registry spells as a bare `void*`
+    // rather than as a platform type. `VkAndroidSurfaceCreateInfoKHR::window`
+    // is an `ANativeWindow*` and refuses one line above because the *type* is
+    // opaque; these three are the identical thing wearing no type at all, and
+    // without an entry they refuse for the uninformative reason ("no policy")
+    // instead of the true one. All four are WSI handles, which is the first
+    // line of Venus's exclusion list (docs/design.md §6.1), and all four belong to
+    // `platform=` extensions no profile here can reach.
+    ("VkViSurfaceCreateInfoNN", "window", VoidPolicy::NotSerialisable),
+    ("VkIOSSurfaceCreateInfoMVK", "pView", VoidPolicy::NotSerialisable),
+    ("VkMacOSSurfaceCreateInfoMVK", "pView", VoidPolicy::NotSerialisable),
+    // **The CUDA argument vectors: a `void*` with no extent in any document.**
+    //
+    // Both structs give the *array* a length — `len="paramCount"`, and
+    // `len="extraCount"` — so what refuses is the element: one `const void*`
+    // per kernel argument, whose size is stated by the kernel's signature
+    // inside the CUDA module. The registry cannot see that, this side does not
+    // parse it, and the application is not required to know it either; the
+    // driver reads the arguments using the module's own metadata. So there is
+    // no length to be found rather than one we have not found, and that is the
+    // difference between this group and the four in
+    // `Profile::excluded_extensions` whose extent is real but is stated
+    // somewhere `len=` cannot name (docs/design.md §0.25).
+    ("VkCuLaunchInfoNVX", "pParams", VoidPolicy::NotSerialisable),
+    ("VkCuLaunchInfoNVX", "pExtras", VoidPolicy::NotSerialisable),
+    ("VkCudaLaunchInfoNV", "pParams", VoidPolicy::NotSerialisable),
+    ("VkCudaLaunchInfoNV", "pExtras", VoidPolicy::NotSerialisable),
+    // "NV internal use only", in the registry's own `<comment>` on the struct.
+    // The specification adds nothing: `pQueriedLowLatencyData` has no size
+    // member beside it, no `len=`, and no sentence anywhere stating an extent.
+    // A `void*` in a `VkSemaphoreCreateInfo` chain that only NVIDIA's own
+    // runtime writes and only NVIDIA's own driver reads.
+    ("VkQueryLowLatencySupportNV", "pQueriedLowLatencyData", VoidPolicy::NotSerialisable),
+    // A pointer into the *driver's* descriptor-set allocation, handed back to
+    // the application. docs/design.md §1a: an address in the GPU side's address
+    // space means nothing here and no encoding makes it mean anything.
+    //
+    // This is a command **parameter**, and that changes what the entry does: a
+    // `NotSerialisable` parameter is *dropped* from the wire rather than
+    // refused, so this line on its own would carry
+    // `vkGetDescriptorSetHostMappingVALVE` as a command that returns nothing
+    // and says so to nobody. [`PARAMETER_ANSWERED_APP_SIDE`] is what stops
+    // that: the command is not on it, so the generator refuses instead.
+    ("vkGetDescriptorSetHostMappingVALVE", "ppData", VoidPolicy::NotSerialisable),
     // The descriptor-update-template family, which is the hardest `void*` in
     // the registry and the one the generator found first.
     //

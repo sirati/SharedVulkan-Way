@@ -754,6 +754,7 @@ impl Model {
                             );
                         }
                     }
+                    apply_len_omissions(&name, &mut members);
                     let s_type = members
                         .iter()
                         .find(|mm| mm.name == "sType")
@@ -1176,6 +1177,67 @@ fn parse_len(len: Option<&str>, altlen: Option<&str>) -> Option<LenSpec> {
     Some(LenSpec(terms))
 }
 
+/// Members whose `len=` the registry omits although its own specification text
+/// states one, with the sentence that states it.
+///
+/// # Why this table exists, and why it is not the guess it looks like
+///
+/// A `void*` with no `len=` is a refusal (docs/design.md §7.4, and
+/// `sv_codegen::exceptions::VoidPolicy` is where each one is answered). Most of
+/// those refusals are right: the extent is genuinely somewhere the registry
+/// cannot point at — a device property, a member of a *different* parameter's
+/// struct, a layout computed from a `pNext` sibling — and inventing a length for
+/// them would be exactly the guessing this generator exists not to do.
+///
+/// **One is not that.** `VkOpticalFlowSessionCreatePrivateDataInfoNV` carries
+/// `size` and `pPrivateData` side by side, one member apart, and the
+/// specification says in as many words what the pair means:
+///
+/// > `size` is the size of data in bytes which is passed at a memory location
+/// > specified in `VkOpticalFlowSessionCreatePrivateDataInfoNV::pPrivateData`.
+/// >
+/// > — Vulkan specification, `chapters/VK_NV_optical_flow/optical_flow.adoc`
+///
+/// That is a `len="size"` the registry did not write down, not a fact the
+/// registry does not have. Recording it here makes `pPrivateData` an ordinary
+/// blob and `VK_NV_optical_flow`'s five commands plan, generate and build with
+/// no policy entry and no special case anywhere downstream.
+///
+/// The same shape as `sv_codegen::exceptions::PLATFORM_SCALARS`, and defensible
+/// for the same reason: there is a source, the entry names it and quotes it, and
+/// the table is **closed** — a `void*` this table does not cover still has to be
+/// answered by a `VoidPolicy`, so the list cannot grow silently. What it must
+/// never be used for is a length the specification does not state; that case is
+/// a refusal, and `Profile::excluded_extensions` says which extensions it costs.
+///
+/// Checked rather than trusted: `the_len_omissions_name_members_that_exist_and_lack_a_len`
+/// fails if an entry names a struct or member the registry does not have, or one
+/// that has since grown a `len=` of its own — a registry bump that fixes the
+/// omission upstream retires the entry rather than silently disagreeing with it.
+pub const LEN_OMISSIONS: &[(&str, &str, &str)] = &[(
+    "VkOpticalFlowSessionCreatePrivateDataInfoNV",
+    "pPrivateData",
+    "size",
+)];
+
+/// Apply [`LEN_OMISSIONS`] to a struct's members as they are built.
+///
+/// Only ever *adds*: a member the registry does give a `len=` keeps the
+/// registry's, whatever this table says, because the registry is the source and
+/// this is a patch over a hole in it.
+fn apply_len_omissions(owner: &str, members: &mut [Member]) {
+    for (s, m, len) in LEN_OMISSIONS {
+        if *s != owner {
+            continue;
+        }
+        if let Some(member) = members.iter_mut().find(|mm| mm.name == *m) {
+            if member.len.is_none() {
+                member.len = parse_len(Some(len), None);
+            }
+        }
+    }
+}
+
 /// `optional="true,false"` → `[true, false]`.
 fn parse_optional(s: Option<&str>) -> Vec<bool> {
     s.map(|s| s.split(',').map(|t| t.trim() == "true").collect()).unwrap_or_default()
@@ -1521,6 +1583,89 @@ mod tests {
         assert!(has("VkStructureType", "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO"));
         assert!(has("VkStructureType", "VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR"));
         assert!(has("VkMemoryHeapFlagBits", "VK_MEMORY_HEAP_DEVICE_LOCAL_BIT"));
+    }
+
+    /// [`LEN_OMISSIONS`] patches a hole in the registry, so it has to be
+    /// checked against the registry rather than against itself.
+    ///
+    /// Three ways an entry can be wrong and all three fail here: it names a
+    /// struct that does not exist, it names a member that does not exist, or
+    /// the registry has grown the `len=` upstream and the entry is now a second
+    /// opinion about a question that has an answer. The last is the one that
+    /// matters — a registry bump is how this table is meant to *shrink*, and an
+    /// entry that survives its own fix would be a hand-written length quietly
+    /// overriding the registry's.
+    #[test]
+    fn the_len_omissions_name_members_that_exist_and_lack_a_len() {
+        let Ok(path) = crate::registry_path() else {
+            eprintln!("VK_XML unset — skipping (run inside `nix develop`)");
+            return;
+        };
+        // The raw registry, not the model: the model is where the patch is
+        // applied, so asking it would only ever agree with the table.
+        let reg = crate::Registry::load_from(path).unwrap();
+
+        for (owner, member, len) in LEN_OMISSIONS {
+            let mut found = false;
+            for child in &reg.raw.0 {
+                let vk_parse::RegistryChild::Types(ts) = child else { continue };
+                for t in &ts.children {
+                    let vk_parse::TypesChild::Type(ty) = t else { continue };
+                    if ty.name.as_deref() != Some(*owner) {
+                        continue;
+                    }
+                    let vk_parse::TypeSpec::Members(ms) = &ty.spec else { continue };
+                    for mm in ms {
+                        let vk_parse::TypeMember::Definition(d) = mm else { continue };
+                        if !d.code.contains(*member) {
+                            continue;
+                        }
+                        found = true;
+                        assert!(
+                            d.len.is_none() && d.altlen.is_none(),
+                            "{owner}.{member} has a len= of its own in this registry \
+                             ({:?}/{:?}); the LEN_OMISSIONS entry naming {len:?} is stale \
+                             and must be removed rather than left to disagree with it",
+                            d.len,
+                            d.altlen
+                        );
+                    }
+                    // …and the length it names must be a member of the same
+                    // struct, or the patch is unresolvable downstream.
+                    let has_len_member = ms.iter().any(|mm| match mm {
+                        vk_parse::TypeMember::Definition(d) => {
+                            d.code.split_whitespace().any(|w| w.trim_matches(&[';', '*'][..]) == *len)
+                        }
+                        _ => false,
+                    });
+                    assert!(
+                        has_len_member,
+                        "{owner} has no member {len:?} to be the length of {member}"
+                    );
+                }
+            }
+            assert!(found, "LEN_OMISSIONS names {owner}.{member}, which this registry does not have");
+        }
+    }
+
+    /// The entry does what it is for: the member is a sized blob in the model.
+    #[test]
+    fn the_optical_flow_private_data_is_a_blob_of_its_stated_size() {
+        let Ok(path) = crate::registry_path() else {
+            eprintln!("VK_XML unset — skipping (run inside `nix develop`)");
+            return;
+        };
+        let m = crate::Registry::load_from(path).unwrap().model().unwrap();
+        let Some(TypeDef::Struct(s)) = m.type_def("VkOpticalFlowSessionCreatePrivateDataInfoNV")
+        else {
+            panic!("the registry has no VkOpticalFlowSessionCreatePrivateDataInfoNV")
+        };
+        let p = s.members.iter().find(|mm| mm.name == "pPrivateData").unwrap();
+        assert_eq!(
+            p.len.as_ref().and_then(|l| l.term(0)),
+            Some(&LenTerm::Sibling("size".into())),
+            "pPrivateData must carry the length the specification states"
+        );
     }
 
     #[test]

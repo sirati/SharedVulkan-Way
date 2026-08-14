@@ -526,6 +526,23 @@ pub fn build(model: &Model, profile: &ResolvedProfile) -> Result<Plan> {
             if let Some(VoidPolicy::NotSerialisable) =
                 p.ty.base().is_void().then(|| exceptions::void_policy(name, &p.name)).flatten()
             {
+                // **Dropping a parameter is a claim that something app-side
+                // produces its value**, and the claim has to be made out loud.
+                // Silently deleting an output parameter carries the command and
+                // answers nobody — §0.22's defect exactly, one policy over.
+                // `exceptions::PARAMETER_ANSWERED_APP_SIDE` is where the claim
+                // lives, with the function that keeps it.
+                if exceptions::parameter_answered_app_side(name).is_none() {
+                    bail!(
+                        "{name}.{}: a `void*` parameter marked \
+                         VoidPolicy::NotSerialisable is dropped from the wire, which is \
+                         only correct if the app side produces its value. Nothing in \
+                         crates/sv-codegen/src/exceptions.rs's PARAMETER_ANSWERED_APP_SIDE \
+                         says anything does, so carrying {name} would forward a command \
+                         that never answers its caller (docs/design.md §0.25).",
+                        p.name
+                    );
+                }
                 exceptions.note_void(name, &p.name, VoidPolicy::NotSerialisable);
                 continue;
             }
@@ -726,7 +743,13 @@ fn shape_of(
                                 "{owner}.{}: a `void*` with no `len=` and no policy entry. \
                                  docs/design.md §7.4 requires every one of these to be a data entry \
                                  in crates/sv-codegen/src/exceptions.rs; add one, with the \
-                                 reason.",
+                                 reason. Read the specification for this member before choosing \
+                                 one (§0.25): if the length is stated one member away, the \
+                                 registry omitted a `len=` and `vk_registry::model::LEN_OMISSIONS` \
+                                 is where that goes; if it is stated in a device property, in \
+                                 another parameter's struct or as a layout over a `pNext` \
+                                 sibling, no existing policy carries it and an entry saying \
+                                 otherwise would be a policy with nothing behind it.",
                                 m.name
                             )
                         })?;
