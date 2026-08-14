@@ -20184,6 +20184,31 @@ version about causes nobody checks. The rule that would have caught both: when a
 run refuses, the reason it refused is a *measurement to take*, not a story to
 supply from what happens to be on the screen.
 
+> **And it happened twice, to two people, from the same evidence, within an
+> hour — which is what turns this from an anecdote into a rule worth stating.**
+>
+> While this section was being written the coordinator reached the same
+> conclusion independently: three DNS names for the VM host did not resolve or
+> did not answer, and it declared the machine off the network and told four
+> agents so. Same premise, same day, same class of evidence, and — the part that
+> matters — **both of us were satisfied, because both of our workarounds
+> functioned.** Mine was an ssh `ProxyJump` through the guest; the coordinator's
+> was routing four agents around a machine that was answering the whole time on
+> an address nobody had tried.
+>
+> That is the mechanism, and it is worth naming separately from the rule:
+> **a workaround that works removes the pressure that would have found the real
+> cause.** A workaround that *fails* sends you back to the premise; one that
+> succeeds retires the question. So the moment to re-check a premise is not when
+> the workaround breaks — by then it may never break — but when you first notice
+> you are writing one.
+>
+> Two independent instances in a day is the same density that made §16.8 a rule
+> block rather than a footnote, and the two rules are siblings: §16.8 says *a
+> name is not an identity*, and this one says *a symptom is not a diagnosis*.
+> Both are cases of accepting the first thing that presented itself as though it
+> had been checked.
+
 ### 55.4 What is still outstanding, stated as an ask rather than as a finding
 
 **Typing into `weston-terminal` on the guest's interactive desktop.** It needs
@@ -20582,3 +20607,141 @@ two different facts that were sharing one verdict.
 3. **Nothing checks that a citation's section is *about* what the comment says.**
    A citation can resolve perfectly and still point at the wrong argument, and
    that is §35.10's territory rather than this checker's.
+
+
+---
+---
+
+## 59. The protocols Firefox binds, measured against the protocols WLCS is skipping
+
+### 59.1 Status in one paragraph
+
+Task #31 asks for *"the Wayland protocols Firefox actually binds, implemented
+fully rather than partially"*, and the natural way to read that against the
+scoreboard is: WLCS skips 759 tests, 79 of them because a protocol is
+unimplemented, so implement the ones Firefox needs. **That reading is wrong, and
+the measurement says so.** Firefox 151.0.2 binds twelve interfaces, all twelve
+are implemented, and it binds **none** of the seven protocols behind those 79
+skips — not with a page built to provoke them, and not with Gecko's Wayland
+preferences turned on. The Firefox-relevant debt is not in the skips at all. It
+is in the **35 unexplained failures**, which are inside protocols this
+compositor already implements. `wp_viewporter`, `pointer-constraints` and the
+two `text-input`s are 61 of the 79, and on this evidence none of them is on the
+goal's path.
+
+### 59.2 What the number 114 is made of
+
+```
+headless: 409 passed, 57 failed, 759 skipped
+```
+
+The 759 skips are already attributed, one reason per protocol, and the
+attribution is what makes the arithmetic possible:
+
+| | | |
+|---|---|---|
+| JUSTIFIED | 682 | protocols this compositor will not implement, with a reason — `zwlr_layer_shell_v1` 368, `zxdg_shell_v6` 180, `wl_shell` 89, `zwlr_foreign_toplevel_manager_v1` 30, the two primary-selection managers 10 |
+| GAP | 79 | unimplemented, no reason beyond not yet — `wp_viewporter` 23, `zwp_pointer_constraints_v1` 15, `zwp_text_input_manager_v2` 12, `zwlr_virtual_pointer_manager_v1` 12, `zwp_text_input_manager_v3` 11, `zwp_relative_pointer_manager_v1` 3, `wp_fractional_scale_manager_v1` 2, `zxdg_output_manager_v1` 1 |
+| SELFTEST | 3 | WLCS proving its own skip machinery |
+
+and of the 57 failures, 22 are expected on this platform — input outside the
+window-geometry rectangle, where the HWND *is* that rectangle and Windows
+delivers no message outside a window (§45.4).
+
+So **114 = 79 gaps + 35 unexplained failures**, and the two halves are not the
+same kind of debt. A gap is a protocol nobody has written. A failure is a
+protocol that is written and does the wrong thing — which is precisely the
+"partially rather than fully" the task names.
+
+### 59.3 The list, and why the obvious way to read it is a floor
+
+`scripts/wc-firefox.sh enumerate` has printed the same twelve interfaces for
+several stages:
+
+```
+org_kde_kwin_server_decoration_manager  wl_compositor  wl_data_device_manager
+wl_output  wl_seat  wl_shm  wl_subcompositor  wp_cursor_shape_manager_v1
+xdg_activation_v1  xdg_wm_base  zwp_idle_inhibit_manager_v1
+zwp_keyboard_shortcuts_inhibit_manager_v1
+```
+
+That block runs `about:blank`, and a browser binds a protocol when a page makes
+it necessary. `about:blank` makes almost nothing necessary: no editable field,
+so no reason for `text-input`; no pointer lock, so no reason for
+`pointer-constraints` or `relative-pointer`; no scaled video, so no reason for
+`viewporter`. Read as "the set Firefox needs", the list is an inference from a
+page that was chosen for being empty — which is the §55.3 error again, an
+observation standing in for a measurement nobody took.
+
+### 59.4 So the page was given something to do
+
+`scripts/wc-firefox.sh needs` is three legs, and the third is the one that
+stops the answer being misread.
+
+1. **A local page that provokes.** An autofocused `<input>`, a `<textarea>`, a
+   `contenteditable` div, a `<canvas>` wired to `requestPointerLock`, and an
+   autoplaying `<video>`. Offline and local: a remote page would make the
+   measurement a fact about a website, and this harness must not need a network.
+2. **The same run on `about:blank`**, recomputed here rather than read from
+   `enumerate`, so the block stands alone and the comparison is between two runs
+   minutes apart rather than between a run and a memory.
+3. **The same page again with Gecko's Wayland preferences on** —
+   `widget.wayland.text-input-v3.enabled`, the pointer-constraints and
+   fractional-scale switches, and trusted-request-only off. Because *"Firefox
+   did not bind it"* has two causes that lead opposite ways: the client does not
+   need the protocol, or its support is behind a pref that is off. Reporting the
+   first when it is the second would tell whoever implements these gaps that
+   they are not on the goal's path, and that is the most expensive kind of wrong
+   answer a measurement can give.
+
+The result, and it is the same in all three legs:
+
+```
+  PASS  a page made Firefox bind nothing extra — about:blank's list really is the set
+  ....  not bound even with a page: zwp_text_input_manager_v3
+  ....  not bound even with a page: zwp_text_input_manager_v2
+  ....  not bound even with a page: zwp_pointer_constraints_v1
+  ....  not bound even with a page: zwp_relative_pointer_manager_v1
+  ....  not bound even with a page: wp_viewporter
+  ....  not bound even with a page: wp_fractional_scale_manager_v1
+  ....  not bound even with a page: zxdg_output_manager_v1
+  PASS  with the Wayland prefs on as well, Firefox binds nothing further
+```
+
+**A negative result, and the useful kind.** The suspicion was that the twelve
+were an artefact of an empty page; they are not. Twelve is the set, for this
+build, for these capabilities.
+
+### 59.5 What that means for task #31
+
+* **The 61 skips from `viewporter`, `pointer-constraints` and the two
+  `text-input`s are not on Firefox's path.** They may be worth implementing for
+  conformance — WLCS is a conformance suite and 114 reaching zero is a real
+  goal — but they are not what *this* task is asking for, and doing them first
+  would be spending the goal's budget on clients this project does not have.
+* **The task's own words are already satisfied at the level of binding.** All
+  twelve interfaces Firefox binds are implemented; none of them is absent.
+* **So "fully rather than partially" means the 35 unexplained failures**, and
+  they are inside `wl_compositor`, `wl_seat`, `wl_surface`, `xdg_wm_base` and
+  friends — the protocols already written. That is where the next person should
+  start, and it is a different list from the one the scoreboard's skip table
+  suggests.
+
+### 59.6 What this does not say
+
+1. **One build, one set of capabilities.** Firefox 151.0.2, with a page
+   exercising text entry, pointer lock and video. A page doing something else —
+   WebXR, a colour-managed image, a tablet — could bind more, and a future
+   Firefox certainly will: `wp_fractional_scale_manager_v1` in particular is
+   the pair to `wl_compositor` v6's `preferred_buffer_scale`, and the day Gecko
+   adopts it this answer changes.
+2. **Binding is not using.** This measures the registry, not what Firefox does
+   with what it bound. A protocol bound and barely exercised is exactly the
+   "partially" the task is about, and nothing here looks inside the twelve.
+3. **Nothing here is about Win32.** Every leg is the Linux build, where Firefox
+   is a stock libwayland client talking to stock `wayland-server` — which is the
+   right place to ask what a client *needs* and says nothing about what the
+   Windows side does with it.
+4. **The 22 expected failures are argued, not proved.** §45.4 says input outside
+   the window-geometry rectangle cannot be delivered because the HWND is that
+   rectangle; that is a claim about Win32 being checked here by a Linux run.
