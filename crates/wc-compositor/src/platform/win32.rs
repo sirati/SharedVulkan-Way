@@ -305,7 +305,21 @@ struct WindowState {
     hwnd: Cell<isize>,
     shadow: Arc<Mutex<Shadow>>,
     events: Sender<FromUi>,
-    frame: FrameStyle,
+    /// This window's frame arrangement.
+    ///
+    /// **A `Cell`, and per window, since §46.** It was one value for the whole
+    /// run, copied in from `ui.frame` at creation, because `--decorations` was
+    /// the only thing that decided it. It is now settled per window from what
+    /// the client turned out to be (`ToUi::Map`'s `fold_caption`), because
+    /// §31's arrangement is right for a client that decorates itself and wrong
+    /// for one that does not, and a run contains both.
+    ///
+    /// Written exactly once, in [`map_window`], **before** the window is shown.
+    /// Every reader below is on the UI thread and every read is a `get`, so
+    /// this is the same shared-`&self` discipline as every other `Cell` in this
+    /// struct and for the same reason: a Win32 call can reenter the window
+    /// procedure from inside `drain`.
+    frame: Cell<FrameStyle>,
 
     /// The last surface size we sent as a configure. Windows emits `WM_SIZE`
     /// for every pixel of a drag; sending a configure per pixel is legal but
@@ -535,7 +549,7 @@ impl WindowState {
     /// sample that lands on an anti-aliased glyph edge produces a caption that
     /// is subtly the wrong colour on some frames and not others.
     fn match_caption_colour(&self) {
-        if !self.frame.extend_top || !self.frame.caption_buttons {
+        if !self.frame.get().extend_top || !self.frame.get().caption_buttons {
             return;
         }
         let Some(rc) = caption_button_rect(self.hwnd()) else {
@@ -599,7 +613,7 @@ impl WindowState {
     }
 
     fn uncover_caption_buttons(&self, hdc: HDC) {
-        if !self.frame.extend_top || !self.frame.caption_buttons {
+        if !self.frame.get().extend_top || !self.frame.get().caption_buttons {
             return;
         }
         let Some(mut rc) = caption_button_rect(self.hwnd()) else {
@@ -1173,8 +1187,8 @@ unsafe extern "system" fn toplevel_proc(
     // whose rectangles it learns by asking (`caption_button_rect`). A window
     // that hit-tests them and does not forward these gets buttons that respond
     // to nothing, which is worse than not having them.
-    if state.frame.extend_top
-        && state.frame.caption_buttons
+    if state.frame.get().extend_top
+        && state.frame.get().caption_buttons
         && matches!(
             msg,
             WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCRBUTTONUP
@@ -2169,9 +2183,9 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 set_icon(&w, &icons);
             }
         }
-        ToUi::Map { id, width, height } => {
+        ToUi::Map { id, width, height, fold_caption } => {
             if let Some(w) = window(ui, id) {
-                map_window(&w, width, height);
+                map_window(&w, width, height, fold_caption);
             }
         }
         // ADDED FOR STAGE 13. `SWP_NOACTIVATE` and no `ShowWindow`: the window
@@ -2504,7 +2518,7 @@ fn create_window(
         hwnd: Cell::new(0),
         shadow,
         events: ui.events.clone(),
-        frame: ui.frame,
+        frame: Cell::new(ui.frame),
         last_configured: Cell::new((0, 0)),
         maximized: Cell::new(false),
         minimized: Cell::new(false),
@@ -2765,7 +2779,7 @@ fn is_maximized(hwnd: HWND) -> bool {
 /// when maximised, which is exactly the kind of thing a single screenshot of a
 /// restored window does not show.
 fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
-    if !state.frame.extend_top || wparam == 0 || matches!(state.kind, WindowKind::Popup { .. }) {
+    if !state.frame.get().extend_top || wparam == 0 || matches!(state.kind, WindowKind::Popup { .. }) {
         return None;
     }
     let params = lparam as *mut NCCALCSIZE_PARAMS;
@@ -2813,10 +2827,10 @@ fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -
 /// `xdg_toplevel.move` (§22.7). The buttons are a different question and have a
 /// different answer only because they are *Windows'* buttons.
 fn nchittest(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
-    if !state.frame.extend_top || matches!(state.kind, WindowKind::Popup { .. }) {
+    if !state.frame.get().extend_top || matches!(state.kind, WindowKind::Popup { .. }) {
         return None;
     }
-    if state.frame.caption_buttons
+    if state.frame.get().caption_buttons
         && let Some(r) = dwm_defwindowproc(hwnd, WM_NCHITTEST, wparam, lparam)
     {
         return Some(r);
@@ -3012,15 +3026,9 @@ fn caption_button_rect(hwnd: HWND) -> Option<RECT> {
 /// is never — a window that looks like stage 17's until the user grabs a
 /// corner, and then silently becomes right.
 fn apply_frame(w: &WindowState) {
-    if !w.frame.extend_top || matches!(w.kind, WindowKind::Popup { .. }) {
+    if !frame_glass(w) {
         return;
     }
-    let inset = top_inset();
-    let dwm = if w.frame.dwm_glass {
-        dwm_extend_frame(w.hwnd(), inset)
-    } else {
-        None
-    };
     // SAFETY: a live window handle on its own thread. Sends `WM_NCCALCSIZE`
     // and `WM_WINDOWPOSCHANGED` to `toplevel_proc` before returning, which is
     // sound here for the reason this module's header gives: no `&mut` to
@@ -3036,16 +3044,50 @@ fn apply_frame(w: &WindowState) {
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
+}
+
+/// The DWM half of the fold, without the `SetWindowPos` that goes with it.
+///
+/// ADDED FOR §46, and splitting it out is a bug fix rather than tidying.
+/// [`apply_frame`] is right for a window that is **already on screen** — §31
+/// calls it at create and on a DPI change, and the extra `SetWindowPos` is the
+/// only way to make Windows ask `WM_NCCALCSIZE` again for a window that is not
+/// otherwise moving.
+///
+/// At map it is wrong twice over. `map_window` is *about* to call
+/// `SetWindowPos` with the window's real size, so a second one is redundant;
+/// and it lands **outside** the `self_driven` guard that call sets, so the
+/// `WM_SIZE` it provokes goes back to the Wayland thread as a spurious
+/// `xdg_toplevel.configure` — at map, before the window has been shown, at a
+/// size derived from a window that has not been sized yet.
+///
+/// Measured: with the extra call, `wc-input.sh wine` was **flaky** — one run in
+/// three or so came out with the client having decoded nothing at all, because
+/// `weston-eventdemo` was reallocating for a configure it should never have
+/// been sent while the harness was injecting into it. That is the shape of
+/// every reentrancy bug this module's header warns about, and the fix is to
+/// have one frame recalculation instead of two rather than to guard the second.
+fn frame_glass(w: &WindowState) -> bool {
+    if !w.frame.get().extend_top || matches!(w.kind, WindowKind::Popup { .. }) {
+        return false;
+    }
+    let inset = top_inset();
+    let dwm = if w.frame.get().dwm_glass {
+        dwm_extend_frame(w.hwnd(), inset)
+    } else {
+        None
+    };
     println!(
         "wc-compositor: window {} folds {inset} px of caption into its client area{}",
         w.id,
         match dwm {
             Some(0) => ", DwmExtendFrameIntoClientArea ok",
             Some(_) => ", DwmExtendFrameIntoClientArea FAILED",
-            None if w.frame.dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",
+            None if w.frame.get().dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",
             None => ", without DWM glass (--dwm-glass off)",
         }
     );
+    true
 }
 
 /// Hand a gesture the client started over to Windows' own modal loop.
@@ -3069,7 +3111,37 @@ fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
 }
 
 /// Show the window for the first time, at the size the client chose.
-fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
+fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) {
+    // §46, and it has to be here rather than at creation: the fact it is
+    // derived from is `xdg_surface.set_window_geometry`, which a toplevel sends
+    // after it exists. Here is still early enough — the window has never been
+    // shown, so the `WM_NCCALCSIZE` below is the first one it ever answers and
+    // no frame is recalculated under a user.
+    //
+    // A popup is never folded. It has no caption to fold and `apply_frame`
+    // already refuses one; setting the flag anyway would make every reader
+    // below need the popup test that three of them already have.
+    if !matches!(w.kind, WindowKind::Popup { .. }) {
+        let mut frame = w.frame.get();
+        if frame.extend_top != fold_caption {
+            frame.extend_top = fold_caption;
+            w.frame.set(frame);
+            println!(
+                "wc-compositor: window {} frame: {} the caption",
+                w.id,
+                if fold_caption { "folding" } else { "keeping" }
+            );
+            // The DWM call only. `apply_frame`'s `SetWindowPos` must **not**
+            // happen here: `map_window` is about to make one with the window's
+            // real size, and a second one lands outside the `self_driven` guard
+            // and sends the client a configure it should never receive. See
+            // [`frame_glass`] for the measurement that says so.
+            //
+            // `SWP_FRAMECHANGED` is added to that later call instead, so the
+            // fold and the sizing are one recalculation.
+            frame_glass(w);
+        }
+    }
     // ADDED FOR STAGE 9. A popup is a different act of window management from a
     // toplevel and shares only the blit: it is placed where the positioner said
     // relative to its owner's client area, it has no frame to adjust for, and
@@ -3143,7 +3215,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // the client area. Growing the window by it *and* handing it back would
     // make the window taller than the client asked for by exactly a caption,
     // once per map, which reads as a client that will not settle on a size.
-    if w.frame.extend_top {
+    if w.frame.get().extend_top {
         rc.top = 0;
     }
 
@@ -3242,7 +3314,14 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
             y,
             ww,
             wh,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            // §46: `SWP_FRAMECHANGED` when this window's caption is folded, so
+            // that the one `SetWindowPos` at map both sizes the window and asks
+            // `WM_NCCALCSIZE` again. `frame_glass` above did the DWM half and
+            // deliberately no `SetWindowPos` of its own — two of them at map is
+            // what made the Wine keyboard leg flaky.
+            SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | if w.frame.get().extend_top { SWP_FRAMECHANGED } else { 0 },
         );
     }
     w.self_driven.set(false);
@@ -3280,8 +3359,8 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     // to report the bounds of until the window has been shown, and asking in
     // `apply_frame` — which runs at create, before the window exists on a
     // screen — answers `None` on a window that will have them a moment later.
-    if w.frame.extend_top {
-        match (w.frame.caption_buttons, caption_button_rect(w.hwnd())) {
+    if w.frame.get().extend_top {
+        match (w.frame.get().caption_buttons, caption_button_rect(w.hwnd())) {
             (true, Some(rc)) => println!(
                 "wc-compositor: window {} keeps Windows' own caption buttons: \
                  client rect {},{} {}x{} left transparent for DWM",
@@ -3317,7 +3396,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32) {
     println!(
         "wc-compositor: window {} mapped {width}x{height}{}{}",
         w.id,
-        if w.frame.extend_top {
+        if w.frame.get().extend_top {
             format!(
                 " (tabs in the title bar: {} px of caption is the client's)",
                 w.nc_top.get()

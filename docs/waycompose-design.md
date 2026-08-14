@@ -18486,3 +18486,306 @@ term  0 of 2   -> FAIL        pres   0 of 500 -> FAIL
    at a load below ~100, the window rather than the machine is the suspect.
 4. **The duplicate section numbers in `docs/design.md` are reported, not
    fixed** — §48.3.
+
+---
+---
+
+## 49. `weston-terminal`, finished: one title bar, decided per window
+
+### 49.1 Status in one paragraph
+
+`docs/stage8/stage46-window.png` is `weston-terminal` on the guest's real
+desktop with **one** title bar — its own, sitting in the window's frame, with
+Windows' minimise, maximise and close in the corner of it. §33 measured why the
+user's *"wayland terminal renders also a double titlebar"* could not be fixed the
+way Firefox's was: this client binds neither decoration manager, so
+`default_mode(2)` is never read, and weston's toytoolkit has no environment
+variable that suppresses its frame. §31 then built the arrangement that *can*
+fix it — `WM_NCCALCSIZE` folding the caption into the client area — but behind a
+per-run flag, and a run contains clients for which folding is right and clients
+for which it is wrong. This section is the join: `--decorations auto`, now the
+default, which advertises exactly what `server` advertised and folds the caption
+**for the windows whose clients turned out to decorate themselves anyway**. The
+whole of it is one `bool` on `ToUi::Map` and a four-line function; the reason it
+took three sections to get here is that each of the three had to establish
+something the next one needed.
+
+### 49.2 What was actually wrong, in one line each
+
+* §33: the client cannot be told. Measured, and unchanged.
+* §31: the compositor can stop asking and just fold the caption. Built, and
+  unchanged.
+* §46: **which** windows to fold was a per-run flag and had to be a per-window
+  fact. That is this section.
+
+`Decorations` was — and still is — a run-wide enum. `FrameStyle` was copied out
+of it once, at `platform::start`, into `Ui`, and from there into every
+`WindowState` at creation:
+
+```rust
+frame: ui.frame,          // win32.rs, create_window
+```
+
+So `--decorations tabs` folded every window in the run, and §33.7 measured what
+that costs: `weston-flower`, which draws no title bar at all, comes out with
+**none** — the caption folded away and nothing in the strip it left. That is why
+`tabs` could not simply become the default, and why "just turn tabs on" was not
+the fix.
+
+### 49.3 The decision, and where it is taken
+
+```rust
+pub fn fold_caption(mode_folds: bool, mode_is_auto: bool, who: Decorator) -> bool {
+    if mode_folds { return true; }
+    mode_is_auto && who == Decorator::ProbablyItself
+}
+```
+
+`Decorator` is §33's, unchanged: `Negotiated` if the surface ever created a
+decoration object on either protocol, otherwise `ProbablyItself` or
+`ProbablySystem` according to whether `xdg_surface.set_window_geometry` reports a
+margin around the window. The measured values that make it a discriminator are
+§33.5's and are still the only ones on the wire: `(32, 32)` for
+`weston-terminal`, `(0, 0)` for `weston-flower`, `(26, 23)` for Firefox under
+client-side decorations.
+
+It is taken **at map**, in `State::report_decorator`, which §33 wrote as a
+report and which now returns the decision as well as printing it. It travels on
+`ToUi::Map` — not `ToUi::Create`, because a toplevel is created before it has
+committed anything and the inset does not exist yet — and `map_window` applies
+it before the window is shown, so the first `WM_NCCALCSIZE` a window ever
+answers is already the right one and no frame is recalculated under a user.
+
+`WindowState::frame` is therefore a `Cell<FrameStyle>` rather than a plain
+field. It is written exactly once, in `map_window`, on the UI thread, which is
+the same shared-`&self` discipline every other `Cell` in that struct follows and
+for the same reason: a Win32 call can reenter the window procedure from inside
+`drain`.
+
+### 49.4 Why `auto` is safe to make the default
+
+Because it is `Server` for every client that was already right, and the wire
+proves it rather than the argument:
+
+| | advertises | folds |
+|---|---|---|
+| `auto` | `Server` | only `ProbablyItself` windows |
+| `server` | `Server` | never |
+| `client` | `Client` | never — the deliberate two-bar leg |
+| `tabs` | `Client` | always |
+
+`Decorations::kde()` answers `KdeDefaultMode::Server` for `Auto` and `Server`
+alike, and `xdg()` answers `ServerSide` for both. So a client that binds a
+decoration manager — Firefox binds KDE's, which is the asymmetry §22.2 measured
+and GTK3's only route — is told the system decorates, takes it, draws no bar,
+and is `Negotiated`, which `fold_caption` never folds. **`auto` is byte-for-byte
+`server` for Firefox.** The client that moves is the one with two title bars.
+
+The three arms are also why `server` is kept rather than deleted: it is the run
+that reproduces the user's bug on demand, and §49.6's photograph needs it.
+
+### 49.5 The gate, which a per-run flag cannot pass
+
+`scripts/wc-titlebar.sh local` — new, and the first leg in that file that needs
+no guest. Every other one photographs a window, which needs the interactive
+desktop, the arena and the VM host. This one makes a claim a picture of a single
+window cannot carry:
+
+```
+== auto: two clients, one run, one flag  (headless, no guest) ==
+  PASS  weston-terminal decorates itself, so its caption was folded: one bar, the client's
+  PASS  weston-flower draws no bar, so its caption was kept: one bar, Windows'
+  PASS  exactly one of the two windows folded its caption, in one run, under one flag
+  PASS  and neither window is reported as having two title bars or none
+```
+
+The third line is the assertion that matters and it is the reason the leg exists:
+**no per-run flag can make it true**, whatever it is set to. `tabs` folds two of
+two, `server` folds none of two. Only a per-window decision folds one.
+
+The three-by-two table underneath it, measured the same way:
+
+| `--decorations` | `weston-terminal` | `weston-flower` |
+|---|---|---|
+| `auto` | folded — one bar, the client's | kept — one bar, Windows' |
+| `server` | kept — **two title bars** | kept — one bar, Windows' |
+| `tabs` | folded — one bar, the client's | folded — **no title bar** |
+
+Four unit tests in `surface.rs` cover the same table without a client, including
+the one that asserts `bars(who, fold_caption(...))` is `OneSystem`, `OneClient`
+or `Agreed` for all three clients under `auto` — so a change to either function
+has to keep them agreeing. 2424 tests to 2428.
+
+### 49.6 The photograph, and what it shows that §33's did not
+
+`docs/stage8/stage46-window.png`, guest desktop, guest RAM, `--decorations`
+unset so this is the default:
+
+* **One title bar.** It is the client's — the centred "Wayland Terminal" is
+  weston's own text, in weston's own grey, not Windows' left-aligned caption.
+* **Windows' buttons in it.** The minimise, maximise and close at the right are
+  the system's, composited by DWM through the alpha-0 rectangle §31.5 leaves,
+  not the boxy `_ □ X` weston draws. weston's are underneath them, hidden and
+  unreachable — which is §31.9's cost, and §33.7 predicted it would not matter
+  for *this* client because what is covered does the same three jobs. The
+  photograph is that prediction coming out right.
+* **31 pixels shorter.** 838x435 against §33's 838x466, which is the system
+  caption's height on this guest (§31.1's `nc_top`) folded away exactly once.
+
+The compositor says so itself before anyone looks at the picture:
+
+```
+window 1 (org.freedesktop.weston.wayland-terminal) bound no decoration protocol and
+reports a 32,32 margin around its window -- it is drawing its own title bar, so this
+window's caption is folded into its client area (Auto) and that bar is the window's (§46)
+window 1 frame: folding the caption
+window 1 folds 31 px of caption into its client area, DwmExtendFrameIntoClientArea ok
+```
+
+### 49.7 What this does not fix, and one of them is a real limit
+
+1. **A client that starts maximised and decorates itself.** The inset is a
+   *shadow* margin, and a maximised toytoolkit window sets it to zero while
+   still drawing its bar (§33.6). The decision is taken once at map, which is
+   what stops the frame flipping under a user when they maximise afterwards —
+   but a window whose *first* commit is already maximised reports `(0, 0)` and
+   is read as `ProbablySystem`. It gets two title bars, and the compositor says
+   `THIS WINDOW HAS TWO TITLE BARS` when it does. Not reached by anything here:
+   neither weston client starts maximised. The fix is an app-id list, which
+   §33.6 argued for and this section still does not add, because a list with one
+   entry that nothing reads is a list nobody maintains.
+2. **A client that draws a shadow and no title bar** would be folded and lose
+   its bar. Nothing measured does this; `weston-flower` was the candidate and it
+   reports `(0, 0)`.
+3. **The height mismatch is unchanged**, and it is §31.9's, not this section's.
+   weston's bar is 27 px in a 31 px caption (§33.7), so four pixels of terminal
+   sit in the strip above it; Firefox's 46 px strip in the same caption hangs 15
+   px below. Folding decides how many bars there are, not how they line up.
+4. **One DPI, one theme, one guest**, as every number in §31 is.
+
+### 49.8 The fix had a bug in it, and the Wine leg found it before the guest did
+
+`--decorations auto` was landed, the local gate was green, the guest photograph
+was taken — and `scripts/wc-input.sh wine` then failed with **the client having
+decoded nothing at all**:
+
+```
+  PASS  wine: WM_SETFOCUS became keyboard focus
+  PASS  wine: every injected scan code translated
+  FAIL  wine: no wl_keyboard.keymap reached the client
+  FAIL  wine: the keyboard never entered a surface
+  FAIL  wine: the client decoded "", which does not start with "hello"
+```
+
+Which is, word for word, the user's second bug. It was mine, it was two hours
+old, and the first reading of it was wrong twice over — so both are written
+down.
+
+**It was not a regression against master, and it was not deterministic.** The
+sequence that established that, in order:
+
+| what | result |
+|---|---|
+| 655c559, pristine worktree, shared-file leg | 28 passed, 1 failed |
+| this branch, shared-file leg | **20 passed, 8 failed**, decoded `""` |
+| this branch, same leg, `--decorations server` forced | 29 passed, 0 failed |
+| this branch, same leg, `auto`, run again | 28 passed, 1 failed |
+
+The third row says `auto` is the trigger. The fourth says it is a **flake**, not
+a breakage — and the fourth row is the one that matters, because after the
+second row the obvious move is to start reading the keymap path, which is
+exactly where the fault is not.
+
+**The mechanism is the reentrancy `platform/mod.rs`'s header warns about.** §31
+calls `apply_frame` at create and on a DPI change, and its `SetWindowPos(
+SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE)` is the only way to make Windows ask
+`WM_NCCALCSIZE` again for a window that is not otherwise moving. §46 has to
+apply the fold at *map* instead, and the first version of it simply called
+`apply_frame` there. At map that call is wrong twice:
+
+1. `map_window` is **about to** call `SetWindowPos` with the window's real size,
+   so a second one is redundant work on a window that has not been shown yet;
+2. and it lands **outside** the `self_driven` guard that the later call sets, so
+   the `WM_SIZE` it provokes goes back to the Wayland thread as a
+   `FromUi::Resized` and out to the client as an `xdg_toplevel.configure` — at
+   map, before the window is visible, at a size taken from a window that has not
+   been sized. `weston-eventdemo` reallocates for it, and the harness is
+   injecting keystrokes into a client that is busy doing so.
+
+The fix is one frame recalculation instead of two, not a guard around the
+second: `frame_glass` does the DWM call and the log and no `SetWindowPos`, and
+`map_window` adds `SWP_FRAMECHANGED` to the call it was already making. Four
+consecutive runs afterwards:
+
+```
+### run 1   PASS  wine: the client decoded the keystrokes as "helloZ"   == 29 passed, 0 failed ==
+### run 2   PASS  wine: the client decoded the keystrokes as "helloZ"   == 29 passed, 0 failed ==
+### run 3   PASS  wine: the client decoded the keystrokes as "helloZ"   == 29 passed, 0 failed ==
+### run 4   PASS  wine: the client decoded the keystrokes as "helloZ"   == 29 passed, 0 failed ==
+```
+
+29 of 29, where the pristine baseline is 28 of 29.
+
+**What this says about the user's second bug** is the useful part. A defect in
+the *frame* code produced a dead keyboard, with the compositor's own log showing
+focus arriving and every scan code translating — the two things anybody
+debugging "typing does not work" would check first, both green, and the keyboard
+dead anyway. §33 guessed that bug 2 would turn out to be a keymap that never
+arrived; §37 found it was a pointer coordinate; this found a third way to
+produce the same symptom from a fourth part of the system. The symptom does not
+name the subsystem, and this is now three sections' worth of evidence for that.
+
+### 49.9 What is measured, and what is not
+
+Measured, on this branch:
+
+| | |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 2424 -> 2428 |
+| `wc-titlebar.sh local` (new, headless) | 5 passed, 0 failed |
+| `wc-input.sh linux` | 30 passed, 0 failed — `eventdemo` decoded `helloZyz` |
+| `wc-input.sh wine` (shared-file keymap) | 29 passed, 0 failed, four runs |
+| `wc-input.sh arena` (guest-RAM keymap) | 31 passed, 0 failed — decoded `helloZ`; was 29/2 before §49.8's fix |
+| `wc-desktop.sh window` on the guest | the photograph in §49.6 |
+| Windows cross build | `cargo build --workspace --target x86_64-pc-windows-gnu` |
+
+**Not measured: typing into `weston-terminal` on the guest's interactive
+desktop, on this branch.** Three runs tried and all three refused, correctly:
+
+```
+REFUSED to inject: the foreground window is 0000000000020486, not our target
+00000000000b0b0a -- input would go to another process
+```
+
+The desktop's foreground belonged to a person — `wc-desk windows` from the
+interactive session shows Firefox on an n-tv article, 1Password's lock screen
+and a Steam login. §16.8's seventh instance is precisely a probe that injected
+anyway and put a photograph of somebody else's terminal into `docs/` as evidence
+about this compositor, so the refusal is the harness working. The keyboard path
+is covered by the two Wine legs and the Linux leg above, which exercise
+`WM_KEYDOWN` -> `evdev_keycode` -> `wl_keyboard` -> a client's own libxkbcommon
+end to end; what is missing is only that chain on the guest's own desktop, which
+is one run whenever the machine is idle.
+
+**Also not measured: `--decorations auto` with Firefox.** §49.4 argues it is
+byte-for-byte `server` for a client that negotiates, and `Decorations::kde()`
+answers the same value for both — but `wc-firefox.sh` names `FX_DECOR` on every
+leg, so no run has yet exercised Firefox under the new default by not naming it.
+It is one leg and it should be added before anybody relies on the argument.
+
+### 49.10 An observation about `fresh`, which cost three rebuilds
+
+`wc-binaries.sh`'s `fresh` compares a binary against **every** `.rs` in the tree,
+not against its own crate's inputs. So editing `wc-compositor/src/platform/
+win32.rs` makes `target/debug/wc-proxy` "stale", although `wc-proxy` does not
+depend on it and `cargo` will not relink it — and the only way out is to touch
+the sources of every crate whose binary a harness checks and rebuild them in one
+pass, because touching them one at a time makes each artefact stale with respect
+to the last file touched.
+
+This is the right trade and it should stay: the alternative is asking `cargo
+metadata` which crate depends on what, and a guard that is *conservative* fails
+safe while a guard that is clever fails silently — which is §42's whole
+argument. It is recorded because it is not obvious from the failure message,
+which names a file the binary has nothing to do with, and because "touch them
+all, build once" is the fix rather than "touch the one it named".
