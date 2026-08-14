@@ -3381,6 +3381,252 @@ found nothing that should be. That is the result, not an omission — the one
 error reporting, not a missing `forward::` call. An audit that produced a list of
 easy fixes would have been a more satisfying deliverable and a less honest one.
 
+
+### 0.21 Where a decoded frame lives, and the arena's answer is "not here"
+
+Design, 2026-08-14. No code. §0.8 item 2 and §6 of `docs/video-decode.md` left
+one decision unmade — *whose memory holds the decoded picture* — and it is an
+arena question, so it is settled here before anything is built against a guess.
+
+**The answer is that the arena does not carry decoded frames**, and that is the
+finding rather than a caveat. The obvious move, given that the arena is how
+every other large thing crosses this boundary, is to put decoded pictures in it.
+That would be wrong on the fast path and it would be wrong expensively.
+
+#### 0.21.1 The topology fact that decides it
+
+Four processes, and where they run is the whole argument:
+
+```
+Linux host                                  Windows guest
+  Firefox                                     sv-gpu-server   ← decode happens here
+    └ ffmpeg vulkan ─┐                        wc-compositor   ← the window is here
+    └ WebRender/zink ┴→ sv-icd ══════════════▶ (one device, one queue)
+  wc-proxy ═══════════════════════════════════▶
+```
+
+Firefox is on the host, but **nothing Firefox does to a video frame executes on
+the host.** Its GL goes through zink to `sv-icd` and is executed by
+`sv-gpu-server`; its Vulkan Video decode would go the same way. The decoder and
+the consumer of the decoded picture — WebRender, sampling it as a texture while
+compositing the page — are the *same device*, on the guest side, and the window
+those pixels end up in is served by a compositor in that same guest.
+
+So the frame is produced and consumed on one side, and the application that
+orchestrates it is on the other. **A decoded frame that crosses the boundary
+crosses it twice and for nobody**: out to the host so Firefox can hold it, back
+to the guest so it can be drawn. At 1080p NV12 that is 3.1 MB a frame; at 60 fps
+it is 186 MB/s of arena bandwidth spent on pixels no host-side instruction ever
+reads.
+
+`docs/video-decode.md` §2 already measured the asymmetry on a real 1080p clip,
+and it is the whole argument in one number: 16,511 bytes of bitstream per frame
+against 3,110,400 bytes of NV12. **188×.** Sending the compressed thing up and
+keeping the decoded thing where it was made is not an optimisation; it is the
+difference of two orders of magnitude between what the boundary must carry and
+what it must not.
+
+That is the same rule §1a is an instance of, stated for pixels instead of
+descriptors: **the side that allocates is the side that can, and what crosses is
+a name.**
+
+#### 0.21.2 Decision 1 — the frame lives in the GPU side's own device memory
+
+A decoded picture is a `VkImage` the GPU side allocated, out of a private video
+session it owns entirely: the session, the DPB, the session parameters and the
+decode queue, exactly as §0.8 item 2 predicted. What crosses is:
+
+* **host → guest:** the compressed bitstream. Kilobytes, not megabytes, and it
+  is already the thing the app has in its hand.
+* **guest → host:** an **image id**. An integer, in precisely the sense
+  `Descriptor::ArenaSlice`'s `arena` is an integer (waycompose §17.2, "an arena
+  id names a region, not a client"), and for the identical reason — a descriptor
+  cannot cross, and an id needs nothing to.
+
+The app side never sees the DPB, never sees a decode queue family it has no
+ring for (§6's actual blocker: "no queue family with `VIDEO_DECODE`"), and never
+learns where the picture is. It names it in later commands and the GPU side
+resolves it.
+
+The id already has a type, and it is worth using rather than inventing a second:
+`sv_arena::handle::FrameHandle` — *"cannot represent a descriptor. Not 'does
+not'; **cannot**. Every field is an integer"*, with `Format` discriminants that
+are `wl_shm`'s own. It compiles, it is tested, and `one-binary.md` §"no frame has
+travelled by handle" is exact: **it has never had a caller.** A decoded picture
+is the second customer for it, after the swapchain frame that
+`firefox-accel.md`'s copy-removal names as the first, and both want the same
+thing — a picture on the GPU side, named by integers, drawn by a compositor in
+the same guest.
+
+**Not the arena, and the reason is stronger than "it would be wasteful".**
+
+Arena memory in practice holds `VkBuffer`s. Binding a `VkImage` to it does not
+work today and the fix is not local: the GPU side pushes
+`VkExternalMemoryBufferCreateInfo` onto **every** forwarded `vkCreateBuffer`,
+unconditionally, because a buffer that might later bind imported arena memory
+has to have been created external-capable. §4 already records that the identical
+argument applies to images via `VkExternalMemoryImageCreateInfo`, and that it
+*"does not fire only because §9.1 puts optimal-tiling images in memory type 0"* —
+which that section flags as a load-bearing consequence it does not itself state.
+So "put the decoded picture in the arena" is not a memory-type choice; it is a
+global change to every forwarded image in the project, made to serve the one
+workload that least needs it.
+
+And device address does not help either. The buffer-device-address work made
+arena memory *shader-addressable*, which is what a vertex buffer the host wrote
+needs. A decoded picture is written by the video engine and read by the 3D
+engine, both on the far side. §5's passthrough arena is for memory **both sides
+touch**; this is memory neither host processor touches.
+
+#### 0.21.3 Decision 2 — readback exists, is correct, and is never the default
+
+Firefox does sometimes want the actual pixels: `drawImage` of a `<video>` onto a
+canvas, `toDataURL`, `captureStream`, a screenshot, `about:support`. That path
+has to exist and be right, and §0.21.2 must not make it impossible.
+
+It is a **separate, explicitly-invoked operation**, not the output path:
+
+1. GPU side records `vkCmdCopyImageToBuffer` from the decoded image into a
+   `VkBuffer` bound to **arena** memory.
+2. The host reads it out of the arena with no further copy, because the arena is
+   already mapped on both sides. That is the arena doing the one job it is for.
+
+One copy, on the side that has the picture, into memory the host already maps.
+
+**Why it must be a separate operation rather than a mode.** If readback were the
+output path with a flag to skip it, the flag would be off in some configuration
+and every frame would cross — 186 MB/s to serve the one frame in ten thousand
+that a canvas actually asks for. Worse, the failure would be invisible: the
+video would play, correctly, at a cost nobody attributed to it. Making the
+crossing a *different call* means it cannot be entered by omission, only by
+request, which is the same argument `ProvidedRegion::file` is under (§5.1: a
+caller has to ask for it by name).
+
+Latency is not the constraint here and should not be optimised for. A canvas
+readback is a synchronous stall by construction in every browser on every
+platform; correctness and never-by-accident are what this path owes.
+
+**The one size check, done rather than assumed.** A single arena allocation is
+capped at one slab, which is 64 MiB — the number §0.6 records being raised from
+4 after a 1080p BGRA swapchain image (8.29 MB) failed `vkCreateSwapchainKHR`
+with `VK_ERROR_OUT_OF_DEVICE_MEMORY`. A readback buffer is **one frame**: 3.1 MB
+at 1080p NV12, 12.4 MB at 4K. Both fit with room to spare. It is worth stating
+because the *DPB* would not — sixteen 4K slots is 199 MB — and the reason it
+never arises is precisely §0.21.2: the DPB is the GPU side's own memory and
+never touches the arena. A design that put the DPB in the arena would have hit
+this ceiling and it would have looked like a video bug.
+
+#### 0.21.4 Decision 3 — protected content is out of scope, and that shapes the code
+
+DRM and protected playback are out of scope, repeatedly and deliberately. The
+non-obvious consequence is about *structure* rather than about features:
+
+**§0.21.3's readback must not be written as "copy out unless the content is
+protected".** That shape is the first half of a DRM implementation — it
+introduces the notion of a frame whose pixels the owner may not have, and every
+subsequent decision inherits it. There is no protected path, so there is no
+predicate; readback is always allowed, because everything this will ever decode
+is content the user already has.
+
+Concretely, nothing on the way to it: no `VK_MEMORY_PROPERTY_PROTECTED_BIT`, no
+`protectedNoFault`, no protected queue submission, no `VkVideoSessionCreateFlags`
+protected bits. If a future stage wants them it can have the argument then, on
+purpose, rather than inheriting a half-built mechanism nobody decided to build.
+
+#### 0.21.5 What still blocks it, and it is not on our side
+
+Everything above is implementable against the wire as it stands — §6 measured
+the thirteen video commands crossing and the H.264 capability block coming back
+byte-identical. **Firefox cannot use it, and the gap is in Firefox.**
+
+`FFmpegVulkanVideoDecoder` has two output paths and both end in
+`vkGetMemoryFdKHR`; `direct-export` chooses between zero copies and one copy,
+not between GPU and host memory. Everything below `GetVideoFrameSurface` is
+typed on `AVDRMFrameDescriptor`. So neither existing branch can be redirected at
+an image id, and §5 of `docs/video-decode.md` is right that this needs a *third*
+output path.
+
+What that path has to be, stated so the ask is concrete rather than a wish: a
+frame handed onward as a **`VkImage` in the same device**, sampled directly by
+the compositor, with no export and no `sync_fd` — synchronisation by a Vulkan
+semaphore that never leaves the device. That is strictly less machinery than
+either path Firefox has now. It is also, notably, the right thing for a native
+Linux Vulkan-Video Firefox regardless of this project: exporting to dma-buf and
+re-importing to sample on the *same* device is work that a same-device path
+would not do either.
+
+Until that exists, hardware video decode over a forwarded device is blocked in
+the browser and not in the transport, and the honest statement is that this
+section specifies a destination rather than reporting an arrival.
+
+#### 0.21.6 A live hazard: `full` already advertises what it cannot serve
+
+Found while inventorying for this section, and it is not a design question — it
+is true of the shipped default today.
+
+The default profile became `full` (`sv_codegen::DEFAULT_PROFILE`). `full` is
+`zink` plus the portable extensions minus an exclusion list, and **no video
+extension is on that list**. So a forwarded device now advertises
+`VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_decode_h264`,
+`_h265`, `_av1`, `_vp9` and the encode family — whatever the GPU-side driver
+really has, intersected in `driver.rs`'s `forwardable_device_extensions` and
+passed through `state.rs`'s `INCOMPLETE_EXTENSIONS` filter, which no video
+extension is on either.
+
+Meanwhile the ICD advertises **one** queue family, `GRAPHICS|COMPUTE|TRANSFER`,
+and the GPU side opens the first compute-capable family — which on both RADV and
+the guest Intel is never the `VIDEO_DECODE`-only one. §6 of
+`docs/video-decode.md` measured the consequence: `no queue family with
+VIDEO_DECODE`.
+
+**Those two facts together are exactly the trap §0.8 item 7 documented.**
+Firefox 153 selects a device on `VK_KHR_video_queue` + `VK_KHR_video_decode_queue`
+alone — it accepts `VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU` — and its first-frame
+failures are `NS_ERROR_DOM_MEDIA_FATAL_ERR`, which `MediaFormatReader`'s
+hardware-to-software recovery **does not** admit. So a user who turns
+`media.hardware-video-decoding-vulkan.enabled` on against a forwarded device
+does not get software decode. Playback breaks.
+
+That was a documented future risk when the profile was `zink` and the extensions
+were not advertised. It became live when the default changed, and the two facts
+are in different files with nothing connecting them.
+
+There is a second, quieter one underneath it: the generated GPU-side handler for
+`vkCmdDecodeVideoKHR` calls `note_missing(...)` and returns `Ok(())` when the
+driver has no such entry point — a **silent no-op**, R8's shape again, on a
+command whose whole output is a side effect nobody would check.
+
+**This section does not fix either**, because both fixes are decisions with
+costs and this is a design note. It records them so that the choice is made
+deliberately:
+
+* advertise the video extensions only when a decode queue can actually be
+  served, i.e. gate them on the private session existing — the honest option,
+  and the one consistent with §9.2's "advertise what the driver reports" being
+  about *numbers* rather than about capabilities we cannot reach; or
+* keep advertising and accept that one pref away from the default is broken
+  playback rather than a slow one.
+
+The first is right. It is written here rather than done here because it belongs
+with the private session, and doing it separately would leave a gate with
+nothing behind it.
+
+#### 0.21.7 What would demonstrate it
+
+Nothing here has run. The measurement that would settle it needs a guest, and a
+format the host iGPU can decode:
+
+1. A decode whose output never appears in the arena's byte counters — the
+   negative measurement is the point, and `Arena::peak` already reports what
+   would show a violation.
+2. The same clip with a canvas `drawImage` per frame, showing the readback path
+   working and showing it costing what a copy costs, so the two are visibly
+   different paths and not one path with a flag.
+3. `about:support` reporting hardware decode against the forwarded device.
+
+Item 3 cannot pass until §0.21.5's Firefox gap is closed, and items 1 and 2 are
+what this project can demonstrate on its own once the private session is built.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
