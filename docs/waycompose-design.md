@@ -16956,3 +16956,388 @@ The test count does not move: the new tests are `cfg(windows)` and the cross
 target's test binary is a `.exe`, which `cargo test --target` cannot execute
 without a `binfmt_misc` registration — §29.10's second row, for the same reason
 and with five more tests in it.
+
+## 44. A drag that entered, in both directions — and the three things it broke on the way
+
+### 44.1 Status in one paragraph
+
+**Both directions of the user's requirement have now happened, and the evidence
+is four processes' logs rather than one.** A native Windows application dragged
+text into a Wayland client and the client's own program read the bytes off a
+pty; a Wayland client dragged one of its objects out and a *separate* Windows
+process's `IDropTarget::Drop` read the bytes back. `IDropTarget::DragEnter`,
+`DragOver` and `Drop` have all run outside a unit test, which is the sentence
+§43.9 item 1 said nobody had earned. Getting there **broke three things**, and
+none of them could have been found any other way: the compositor **aborted** the
+first time a drag left one of its own windows (an unaligned `REFIID` in
+`guid_eq`, a debug-only assertion, so it is invisible in a release build and
+fatal in every build this project's harnesses run), the proxy **misrouted every
+drop's `receive` to the clipboard** and delivered nothing (`wl_data_device.leave`
+forgot an offer that had already been dropped), and the successful path of
+`DragEnter` **logged nothing at all**, so §43's central claim had no observable
+form even when it was true. The venue is **not** the guest: testhost's Windows
+session was locked, and a locked Windows workstation discards `SendInput` — 
+measured, in §44.3, not assumed. So this is a Wine leg on a real X display with
+a real input path, and §29.8's correction about the boundary stands unchanged
+and unweakened.
+
+### 44.2 What a drag actually needs, which is not only a venue
+
+§29.8 and §43.9 both diagnose the missing thing as a *place*: "it needs a
+desktop with a Windows application on it and a mouse button held across two
+windows", and both point at `nix build .#svGuest` or the guest. That is right
+about the ingredients and wrong about which ones were missing, and the
+distinction is worth stating because it cost this project two stages of waiting
+for a machine.
+
+A drag needs four things:
+
+| | had it? |
+|---|---|
+| a display with a **real input path** | **yes, all along** — Xvfb has XTEST, and an XTEST event reaches Wine through the same X input queue a human's would |
+| **two** applications on it | no — every Wine leg ran the compositor and nothing else |
+| something to **hold the button down** | no — no harness in the tree had ever pressed a mouse button |
+| a hypervisor between the halves | no, and this leg still does not have one |
+
+Only the fourth needs a guest. The second is `scripts/probe-drag.c` and the
+third is nine lines of `xdotool` in `scripts/wc-drag.sh`. **The thing that had
+been described as needing a second machine needed a second window**, and the
+reason nobody noticed is that "Wine is not Windows" is such a good caveat that
+it absorbed a question it does not answer.
+
+What a guest would add is the boundary, and that is exactly what §29.8 says it
+would add. Nothing below is a claim about `afunix.sys`, about a hypervisor, or
+about a descriptor failing to cross. Every process in §44 is on one kernel.
+
+### 44.3 testhost, and the measurement that stopped it
+
+The guest was tried first and is worth writing down, because "it was locked" is
+a sentence that sounds like an excuse and is a fact with a number.
+
+The machine is up and the deployment is intact — the DNS name is stale
+(`testhost.lan` resolves to `<host-alt-ip>`; the host answers on
+`<host-ip>` and the guest on `<guest-ip>`), the VM is `active`, QMP
+and virtiofsd are listening, and the guest is real Windows 11 build 26200 with
+an interactive **session 1** and Explorer running in it. An `ssh` session lands
+in **session 0** on window station `Service-0x0-2e61f56$`, whose windows no
+Explorer can see; a scheduled task registered with
+`New-ScheduledTaskPrincipal -LogonType Interactive` lands in session 1 on
+`WinSta0`, which is the desktop with the user's applications on it. All of that
+worked.
+
+**Then nothing could be pressed.** From a session-1 process on `WinSta0\Default`:
+
+```text
+idle_ms=9162922                       # GetLastInputInfo: 2 h 32 min
+foreground=... 'Windows-Standardsperrbildschirm'
+windowfrompoint(316,239)=LockApp pid 16020
+SendInput_returned=0                  # zero events inserted
+SetCursorPos_returned=True  cursor_after=500,400 (asked 500,400)
+inputdesktop=Default  threaddesktop=Default
+```
+
+Those five lines are the whole diagnosis and they rule out the obvious wrong
+one. It is **not** a desktop mismatch: the input desktop *is* `Default` and we
+*are* on it, and `SetCursorPos` — which moves the pointer without injecting
+input — works and is obeyed. It is the lock: Windows refuses synthetic input
+injection while the workstation is locked, and `SendInput` returns 0 having
+inserted nothing.
+
+The control makes it concrete rather than theoretical. Two Explorer windows
+were opened on a scratch directory containing two throwaway files created for
+the purpose, placed side by side, and a drag was injected from one to the
+other. **The file did not move.** No OLE drag can be driven on that desktop
+while it is locked, by this harness or any other.
+
+A private desktop (`CreateDesktopW("wcdrag", …)`) was tried as a way round and
+failed with `ERROR_INVALID_PARAMETER` for every access mask; it was not pursued,
+because even had it worked it would have cost the one thing the guest is for —
+real Explorer is the session's shell and does not start a second copy on a
+desktop of one's own.
+
+What the guest venue therefore needs is somebody to leave the session unlocked.
+That is a note for whoever runs it and not a defect. **What was deliberately not
+done**: no account was created, and the logon screen was not driven through
+QEMU's input device. It is somebody's personal machine, the scratch directory
+and its two files were the only things written, and both Explorer windows were
+closed again.
+
+### 44.4 The two applications, and the two clients
+
+```text
+   weston-dnd ──┐                                  ┌── probe-drag.exe
+ (drag source)  │                                  │   (IDropTarget + DoDragDrop,
+                ├─ wc-proxy ── wc-compositor.exe ──┤    a separate process)
+weston-terminal ┘   (Linux)     (Windows, Wine)    │
+ (drop target)                                     └── xdotool holds the button
+```
+
+**`scripts/probe-drag.c` is the second application**, and it is deliberately
+ours-but-separate in exactly the sense §29.7's table means: it shares no code
+with the compositor, it hand-rolls its own `IDataObject`, `IDropSource` and
+`IDropTarget` against the same `ole32`, and it writes down what it is offered
+rather than what it expected. Its `IDataObject` is hand-rolled rather than
+obtained from `OleGetClipboard` for a reason worth keeping: the compositor holds
+a clipboard listener (§29.5's deliberate echo), so a probe that staged its drag
+*through the clipboard* could make a broken drag look like a working one.
+
+**Both Wayland clients are somebody else's**, and each is used for the direction
+it is actually about:
+
+* **`weston-dnd`** is the drag **source**. It offers
+  `application/x-wayland-dnd-flower` *and* `text/plain;charset=utf-8`, and the
+  text is a real serialisation of the object being dragged
+  (`seed=299012 x=32 y=32`), so what arrives on the Windows side is the client's
+  own bytes and not a string this harness planted.
+* **`weston-terminal`** is the drop **target**, and it is a better witness than
+  the obvious choice. Its drop handler calls
+  `input_receive_drag_data_to_fd(input, "text/plain;charset=utf-8", master)` —
+  it writes what it receives **straight into a pty**. So the assertion at the end
+  of the chain is on bytes in a file written by a program that has never heard of
+  this project, not on a screenshot.
+
+Two clients rather than one, and the first run is why. `weston-dnd` **refused**
+the incoming text drag — `the client under the drag accepts nothing`, once per
+`DragOver` — and that is weston-dnd being correct rather than a defect: it is a
+demo of dragging its own flower type and its drop handler wants that type.
+`weston-editor` was tried next and exits on this compositor with `No text input
+manager global`, which is a true statement about what is implemented here.
+
+### 44.5 Three defects, and the shape each one had
+
+**1. The compositor aborted the moment a drag left its own window.**
+
+```text
+thread 'main' panicked at crates/wc-compositor/src/platform/drag.rs:125:22:
+misaligned pointer dereference: address must be a multiple of 0x4 but is 0x6fffff1d3a86
+  4: wc_compositor::platform::drag::guid_eq
+  5: wc_compositor::platform::drag::do_query_interface
+ 17: OLEDD_DragTrackerWindowProc
+ 22: DoDragDrop
+ 23: wc_compositor::platform::drag::enter_modal_loop
+```
+
+`guid_eq` took `&*a` on a `REFIID`. A `REFIID` is a pointer into **another
+module's** memory and nothing in COM promises it satisfies Rust's alignment
+invariant for `&GUID`; OLE's standard marshaller — which runs precisely when a
+drag crosses out of our own window into another process's, so that our
+`IDataObject` can be marshalled to it — hands out identifiers that live inside
+packed marshalling buffers at whatever byte offset the stream put them. The fix
+is `read_unaligned`.
+
+**The shape of this defect is the worst one available**, and it is worth naming
+rather than just fixing: the misalignment check is a *debug* assertion. In a
+release build it is compiled out, the same code reads the same bytes, and
+everything works. In a debug build — which is what every harness in this tree
+runs and what `cargo test` produces — it aborts the process. A defect that is
+absent from the build you ship and fatal in the build you test with is one that
+gets diagnosed as "the harness is flaky".
+
+**2. Every drop delivered nothing, because the proxy asked the wrong selection.**
+Direction in reached `Drop` and the client accepted, and the bytes never
+arrived. The proxy's own log, once it was made to say what it had decided:
+
+```text
+client 2: wl_data_device.enter: offer 4278190080 is a drag's
+client 2: wl_data_device.drop
+client 2: wl_data_device.leave: forgetting drag offers {4278190080}
+client 2: receive on offer 4278190080 for "text/plain;charset=utf-8" -> Clipboard
+client 2: paste 1 refused: the clipboard holds nothing of that type
+```
+
+`wl_data_device.leave` forgot every drag offer, which reads correctly — the drag
+is over, nothing more will be received from it. It is wrong, and only a real
+gesture shows why: the client's `wl_data_offer.receive` comes **after** the
+drop, and this compositor sends `leave` in between. A dropped offer stays valid
+until the client destroys it — that is what `wl_data_offer.finish` exists for —
+so `leave` may forget only the offers that were **not** dropped. `dropped_offers`
+is that distinction.
+
+This is §29.8's hazard, met from the harmless side. That paragraph warns that
+answering a drag's `receive` from the clipboard "returns *the last thing dragged*
+to somebody who pressed Ctrl-V, which is a data-disclosure bug wearing a paste's
+clothes". Here the same confusion ran the other way and cost a paste rather than
+leaking one. The two are one bug and it is now decided from the offer's own
+identity in both directions.
+
+**3. A successful `DragEnter` said nothing.** Before this section the only
+`DragEnter` line in the compositor was the one for a drag offering *nothing we
+speak*, and `DragOver` had no line at all. So the claim §43 is about had no
+observable form: a run could not tell "the drag entered and the client refused"
+from "the drag never entered", and the only way to believe either was to trust
+the code under test. Three lines fix that, and one of them is a measurement
+rather than a trace — see below.
+
+### 44.6 §43.4's stale cursor, seen at last, and the argument for it is wrong
+
+§43.9 item 2: *"The stale cursor has never been seen. 43.4 argues the round trip
+is invisible in practice because a client answers in microseconds and a mouse
+moves in milliseconds. Nobody has measured the gap."*
+
+It is measured now, and the unit that matters is not milliseconds — it is **how
+many frames of the gesture wear the no-entry cursor**, which is what a user
+actually experiences. `DragOver` logs on *change*, so the length of the first
+run is exactly that number:
+
+```text
+a Windows drag entered window 2 at screen (521, 625) offering 5 mime(s): …
+DragOver on window 2 now answers 0x0 (3 ms after the drag entered)
+the client under the drag answered accepted=false action=2 -> effect 0x0 (108 ms …)
+the client under the drag answered accepted=true  action=1 -> effect 0x1 (108 ms …)
+DragOver on window 2 answered 0x0 6 time(s)
+DragOver on window 2 now answers 0x1 (119 ms after the drag entered)
+```
+
+**Six `DragOver` calls, and 119 ms.** Across five runs the first run has been 2,
+5, 6, 6 and 6 calls and the switch has landed at 119, 128, 137, 189 and 199 ms.
+The gesture itself is 40–55 `DragOver` calls, so it is of order **one eighth of
+the drag**.
+
+So the answer to "invisible or obvious" is **neither, and the argument in §43.4
+is wrong about which quantity it was reasoning over**. 43.4 says the client
+answers in microseconds. The client's *think time* is indeed negligible —
+weston-terminal decides instantly. What the cursor waits for is not the client
+thinking, it is the round trip: an OLE callback on the UI thread, a channel to
+the compositor's state thread, smithay's `start_dnd`, a `wl_data_device.enter`
+down the wire to `wc-proxy`, the client's `accept` and `set_actions` back, and
+two poll loops with their own intervals in between. That is ~100 ms, and it is
+~100 ms **on a leg with no hypervisor in it**; the deployment this project is
+about adds a boundary crossing to that path in both directions.
+
+A tenth of a second of no-entry cursor at the moment a drag crosses into a
+window is *perceptible* — it is above the threshold at which a cursor change
+reads as a change — and it is not *broken*: it resolves long before anybody lets
+go, and §43.4's second bullet is the one that matters and is still exactly
+right, because the **drop** is never stale. The design decision stands. The
+justification for it does not, and the honest form of it is: *the cursor is
+about six frames behind at the start of a gesture, the number grows with the
+boundary, and the alternative — blocking inside `DragOver` — would put that same
+latency in front of the pump instead of behind the cursor.*
+
+### 44.7 The two directions, and what each one is evidence of
+
+**In — a native Windows application into a Wayland client.** `probe-drag.exe`
+enters `DoDragDrop` from its own `WM_LBUTTONDOWN` offering `CF_UNICODETEXT`. The
+compositor's `IDropTarget` receives it, converts the format to five Wayland
+mimes, and hands it to smithay's `start_dnd` with the coordinates *Windows*
+measured (there is no `WM_MOUSEMOVE` during an OLE drag — §43.6). The bytes at
+the far end:
+
+```text
+a Windows drag entered window 2 at screen (521, 625) offering 5 mime(s):
+  text/plain;charset=utf-8, text/plain, UTF8_STRING, STRING, TEXT
+a Windows drag was dropped on window 2: 1 format(s) read, effect 0x1
+receive on offer 4278190080 for "text/plain;charset=utf-8" -> Drag
+```
+
+and in the file `weston-terminal`'s pty was piped into:
+
+```text
+0000000   w   a   y   c   o   m   p   o   s   e       d   r   a   g
+0000020   p   a   y   l   o   a   d       4   7   1   1
+```
+
+Nothing of ours is in the last four hops of that: smithay, the wire, the client,
+the pty, `cat`.
+
+**Out — a Wayland client into a native Windows application.** The press lands on
+one of `weston-dnd`'s flowers *inside the compositor's window*, so the pointer
+event travels Windows → compositor → `wc-proxy` → client; the client decides it
+is a drag and calls `wl_data_device.start_drag`; `wc-proxy` intercepts it, pulls
+the bytes through pipes that are local to the client, and ships them over
+`wc_clipboard_v1`; the compositor stages them and posts `WM_WC_DRAG` to itself
+so the modal loop is entered from the pump rather than from `drain` (§29.8) —
+all while the button is still down and moving. `probe-drag.exe`, a different
+process:
+
+```text
+TARGET-DragEnter at screen (787,291)
+  offers CF_UNICODETEXT (tymed 1) QueryGetData=S_OK
+TARGET-Drop at screen (991,270) after 55 DragOver call(s)
+DROP-TEXT: <<<seed=299012 x=32 y=32
+>>>
+```
+
+and the compositor closing the loop back to the client:
+
+```text
+a client started a drag with 1 mime type(s), actions 0x3
+entering DoDragDrop with 1 format(s), allowed DROPEFFECT 0x3
+DoDragDrop returned 0x00040100, effect 0x1 -> wl_data_device_manager action 0x1
+the drag ended with action 0x1
+```
+
+`seed=299012 x=32 y=32` is weston-dnd's own serialisation of the flower that was
+picked up. It is not a string this harness planted, which is the property that
+makes it evidence.
+
+### 44.8 What is not proven
+
+1. **No boundary.** Every process is on one kernel. §29.8's correction is
+   unchanged: this says nothing about `afunix.sys`, about a hypervisor, or
+   about a descriptor failing to cross, and the ~100 ms of §44.6 is a *lower*
+   bound for the deployment. The guest remains the venue and §44.3 is what it
+   needs.
+2. **Nothing has been dropped from a real third-party Windows application.**
+   §43.9 item 4 stands. `probe-drag.exe` is a separate process and a real OLE
+   client, and it is still one whose `IDataObject` was written next to the code
+   it is testing. Explorer, a browser and an Office application each offer
+   things this has never seen.
+3. **`CF_HDROP` has still never been read from a real Explorer**, and dragging a
+   *file* out of a Wayland client is still the open design question §29.8
+   states — it needs the file's bytes, not its name.
+4. **`move` has not been exercised end to end.** The client chose `copy` on
+   every run here (`action=1`). §43.9 item 5's warning — that a `move` out of
+   Explorer into a Wayland client deletes the user's file — is untested and was
+   deliberately left that way on somebody's personal machine.
+5. **One client at a time was dragged over.** Nothing has tested a drag that
+   crosses *between* two of our windows mid-gesture, which is where `OVER`,
+   `FEEDBACK` and `DROPPED` would have to be re-established.
+6. **The staleness number is from three runs on a loaded workstation**, not a
+   distribution.
+7. **Wine is not Windows** (§13.6), and this leg leans on Wine for the one thing
+   no previous leg did: `DoDragDrop`'s modal loop and cross-process `IDropTarget`
+   marshalling. That is the part most worth re-checking on the guest.
+
+### 44.9 The gates
+
+Run from the unified tree, inside `nix develop`.
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace` | clean |
+| `cargo test --workspace --no-fail-fast` | **83 binaries, 2425 tests, 0 failures** (2424 on master `655c559`; 1 new) |
+| `cargo build --workspace --target x86_64-pc-windows-gnu` | clean |
+| `wine …/wc_compositor-*.exe drag::` | **10 tests, 0 failures** |
+| **`scripts/wc-drag.sh wine`** (new) | **14 passed, 0 failed**, three times |
+| `scripts/wc-clip.sh wine` | **15 passed, 0 failed** |
+
+The one new test is `a_drop_keeps_the_offer_the_drags_even_after_the_leave`, in
+`wc-proxy/src/session/tests.rs`, next to the test whose assertion the defect in
+§44.5 was hiding behind. The compositor's ten are §43's and are unchanged; that
+row needs `cargo test --no-run -p wc-compositor --target x86_64-pc-windows-gnu`
+first, and it is worth saying because `cargo build --target` does **not** produce
+that `.exe` and the stale one left in `deps/` from an earlier tree runs happily
+and reports ten passes.
+
+`scripts/wc-clip.sh wine` is on the list as the regression gate rather than as a
+new result: this section changes `wc-proxy`'s handling of `wl_data_offer` and
+the compositor's `guid_eq`, both of which the clipboard goes through.
+
+The logs from a `wc-drag.sh` run are in `docs/drag/` — the compositor's, the
+proxy's, `probe-drag.exe`'s, and a screenshot of the desktop with all three
+windows on it.
+
+`scripts/wc-drag.sh` wires in both of §42's guards. `fresh` is checked for all
+three binaries — and note that it is checked against *every* source file in the
+tree, so an edit to the compositor makes `wc-proxy` "stale" until it is relinked;
+that is the guard being blunt rather than wrong, and the harness builds
+`probe-drag.exe` itself every run so that the third binary can never be the one
+that stops it. `deployed_is` is deliberately **not** used and says so in the run,
+for the reason that is the same fact as §44.8 item 1: nothing is copied across a
+boundary in this leg, because there is no boundary.
+
+`wc_substrate_declare wine-fixture` is what this harness declares, and the
+declaration is refused if `WC_HOST` or `WC_GUEST_CONFIGURED` is set — so it
+cannot be used to make a guest run pass. The substrate is not what this run
+measures; the pixel path is incidental to a drag.
