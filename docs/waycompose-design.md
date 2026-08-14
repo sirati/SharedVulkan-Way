@@ -24460,3 +24460,97 @@ them is touched by this.
 *(Committed unsigned: 1Password holds the signing key and its session was killed
 by an over-broad `pkill -9 -f weston` elsewhere on the machine. Recorded rather
 than rewritten later.)*
+
+## 60. The rule that stops the kill, behind the gate that runs it
+
+### 60.1 Status in one paragraph
+
+§59 built `proc_kill`, and §59.4 item 1 named its gap in the same breath:
+nothing forced a harness to call it. `scripts/wc-killcheck.sh` is that rule, and
+`crates/sv-testkit/tests/kill_scoping.rs` puts it behind
+`cargo test --workspace`. The population it governs is the sweep's, unchanged:
+**10 kills scoped to something the run owns, 3 baselined with their reasons, 0
+naming something the machine shares.** The gate caught its own documentation on
+its first run, which is the third time that has happened here and is answered
+the same way each time.
+
+### 60.2 The rule, and why it is exactly the sweep's finding
+
+> **A pattern is allowed only when it names something only THIS RUN could have
+> produced.**
+
+Encoded as: the pattern interpolates a shell variable. That is not a proxy for
+the rule, it *is* the rule — a literal cannot be run-unique, because two
+concurrent runs of a harness share every literal in it. `^$HOST_DIR/wc-proxy`,
+`$DIR/sv-hostd`, `qemu-system.*$RUNDIR` all pass; `weston` does not.
+
+**New occurrences only.** Eleven of the thirteen kills were already right, and a
+gate that demanded they be rewritten would be a gate people turn off. The two
+that are not run-unique are the baseline, and each carries its argument in the
+script rather than being a bare exemption — an allowlist without reasons is
+where rules go to die.
+
+**The judgement call, asked for and answered.** `wc-launch.sh`'s
+`pkill -f 'wc-launch/firefox'` is a path *fragment*. It cannot match a user's
+ordinary Firefox — an ordinary Firefox has no such string in its command line —
+so it is nothing like the outage. But it is **harness-unique, not run-unique**:
+two concurrent `wc-launch.sh` runs would match each other. They would also
+collide on the shared profile directory that pattern points at, so the kill is
+not the first thing that breaks, and it is tolerated on that basis. It is
+recorded as the one baseline entry that would become correct on its own by
+giving each run its own profile directory — which is a real fix, not a
+re-classification.
+
+`http.server 8931` is a port. Only one process can hold a port, so there is
+never a second match to hit by accident: scoped to something the run owns, if
+not to the run itself.
+
+### 60.3 A refusal that names the alternative
+
+The message is not just "no". §59's helpers exist, so the gate points at them in
+order of preference — `proc_kill` (you started it, you have its pid),
+`proc_kill_pidfile` (it outlives the shell), `kill_exact` (matches the executable
+name, so it cannot match the shell running it) — and then states the escape
+hatch: if a pattern really is the only option, interpolate the run's own
+directory, socket or port.
+
+A refusal that does not name the alternative gets worked around, so the test
+asserts the message contains `proc_kill`. That is the same reasoning as asserting
+it names the offending file: an output nobody can act on is a failure that will
+be re-run rather than fixed.
+
+### 60.4 The gate flagged its own documentation, again
+
+`proc_kill`'s refusal message quotes the command that caused the outage, so the
+string appears in `wc-binaries.sh` inside a `note`. The gate saw it and refused.
+
+That is the third checker in this tree to catch its own prose — §48.3 (the
+citation checker on this document), §54.1 (its own negative fixture) — and the
+answer has been the same every time: **narrow the rule, do not exempt the file.**
+Here that means skipping comments and *reporter calls*, whose leading token is
+`note`/`bad`/`echo` and whose job is to print text at a person rather than run a
+command. Deliberately a rule about one line's first word rather than a path
+exemption, because `wc-binaries.sh` is precisely the file most likely to grow a
+real kill.
+
+The pattern is worth naming now that it has three instances: **a checker good
+enough to be worth writing is good enough to catch the writing about it.** That
+is not a flaw in the checker. It is the checker being right about a string that
+is genuinely indistinguishable, at its level of analysis, from the thing it
+hunts — and the fix is always to make the rule see one level further, never to
+carve out the file that happens to hurt.
+
+### 60.5 What is not done
+
+1. **The gate governs `scripts/` only.** A `pkill` in a Rust test, or typed
+   directly into a shell by an agent, is not covered — and the outage was the
+   latter. This cannot stop a person; it can only stop the tree from teaching
+   them the habit. That is a real limit and not a small one.
+2. **`kill_exact` is not itself gated.** It matches an executable name, which is
+   correct for a program only this project runs and wrong for one the machine
+   shares — `kill_exact weston` would have caused the same outage. Nothing
+   checks its argument, and the honest reason it is not gated is that the check
+   would need to know which names are ours, which is a list nobody maintains.
+3. **The three baseline entries are tolerated, not fixed.** The `wc-launch` one
+   has a stated route to correctness (a per-run profile directory) that nobody
+   has taken.
