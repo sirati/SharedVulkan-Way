@@ -1806,9 +1806,6 @@ impl State {
             "wc-compositor: window {id} pointer button {button:#x} {}",
             if pressed { "pressed" } else { "released" }
         );
-        if pressed {
-            self.dismiss_grab_if_outside(id);
-        }
         if self.pointer_focus != Some(id) {
             // A button from a window the pointer is not over. Reachable on
             // Win32 during a drag, where `SetCapture` keeps sending us the
@@ -1827,6 +1824,26 @@ impl State {
             },
         );
         pointer.frame(self);
+        // **After the button, and that ordering is the protocol's.** §75.
+        //
+        // This used to run before `pointer.button`, so a click outside a
+        // grabbing popup sent `xdg_popup.popup_done` and only then delivered the
+        // press. WLCS names the requirement directly —
+        // `does_not_get_popup_done_event_before_button_press` — and measured it:
+        // "pointer button sent after popup done", expected false, actual true.
+        //
+        // The order matters to a client rather than being a formality. A menu
+        // dismissed *before* the press has no way to tell a click that merely
+        // closed it from a click that closed it and then activated whatever was
+        // underneath; the press is the event that says which, and it has to
+        // arrive while the popup still exists to attribute it.
+        //
+        // After `frame` rather than merely after `button`, because the press and
+        // its frame are one logical group and `popup_done` is a different
+        // interface's event about a different object.
+        if !pressed {
+            self.dismiss_grab_if_outside(id);
+        }
     }
 
     fn pointer_axis(
