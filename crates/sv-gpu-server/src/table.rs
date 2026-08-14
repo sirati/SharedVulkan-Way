@@ -53,9 +53,29 @@ pub struct Object {
 /// What can go wrong looking something up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableError {
-    /// No object with this id. Almost always the app side sending a handle it
-    /// created on a ring the GPU side has not drained yet, which is R22 — a
-    /// missing `RingBarrier` — rather than a bad handle.
+    /// No object with this id.
+    ///
+    /// # This used to name a cause, and the cause was wrong three times
+    ///
+    /// It read *"almost always the app side sending a handle it created on a
+    /// ring the GPU side has not drained yet, which is R22 — a missing
+    /// `RingBarrier` — rather than a bad handle"*, and the message said so too.
+    /// Every occurrence traced since has been something else:
+    ///
+    /// * §0.16 item 2 — the `VkBuffer` shape was an out-of-bounds read of the
+    ///   application's own memory.
+    /// * §0.22 item 1 — the `VkDeviceMemory` shape was a missing pass.
+    /// * §0.22 item 6 — the `VkPipelineLayout` shape is a **lifetime** bug:
+    ///   `VK_KHR_maintenance4` lets an application destroy a pipeline layout
+    ///   once the command buffer leaves the recording state, while §6.5 resolves
+    ///   blob ids when the blob is replayed, so the destroy legitimately arrives
+    ///   first. See §0.23.
+    ///
+    /// Three for three, and none was a barrier. A diagnostic that names one
+    /// cause does not merely fail to help — it sends every reader to the same
+    /// wrong place, and it did, repeatedly. So the message now says what is
+    /// *observed* and lists what has actually been behind it, in the order
+    /// those were found.
     Unknown { id: u64, want: HandleType },
     /// An id that names an object of a different type.
     WrongType { id: u64, want: HandleType, found: HandleType },
@@ -68,8 +88,11 @@ impl std::fmt::Display for TableError {
         match self {
             TableError::Unknown { id, want } => write!(
                 f,
-                "no {} with id {id} — if the app side created it on another ring, \
-                 the packet needed a RingBarrier (R22)",
+                "no {} with id {id} — it was never created, was already destroyed, \
+                 or was destroyed while a recorded blob still named it (design.md \
+                 §0.23); it may also be a wrong id read out of application memory. \
+                 Check the last create/destroy of this id before assuming a \
+                 missing RingBarrier",
                 want.name()
             ),
             TableError::WrongType { id, want, found } => {

@@ -3817,6 +3817,117 @@ format the host iGPU can decode:
 Item 3 cannot pass until §0.21.5's Firefox gap is closed, and items 1 and 2 are
 what this project can demonstrate on its own once the private session is built.
 
+### 0.23 Two clocks for one id: the blob lifetime bug, and why the fix is not local
+
+Diagnosis, 2026-08-14, on §0.22 item 6's reproducible fatal. One thing fixed —
+the diagnostic — and the mechanism specified rather than built, for a reason
+given at the end.
+
+#### 0.23.1 Two clocks
+
+`no VkPipelineLayout with id 46` is a disagreement between two definitions of
+when an id stops meaning something.
+
+* **Vulkan's clock.** `VK_KHR_maintenance4` — core 1.3, which this ICD
+  advertises — ends a pipeline layout's required lifetime when the command
+  buffer that used it **leaves the recording state**. It need not survive
+  execution. An application that destroys it after `vkEndCommandBuffer` and
+  before `vkQueueSubmit` is correct, and CTS does exactly that.
+* **Our clock.** §6.5 puts ids in the blob and resolves them **when the blob is
+  replayed**. So an object whose life the specification ends at end-of-recording
+  has to live, on our side, until end-of-replay.
+
+Between those two instants the app side is entitled to send the destroy, the
+destroy unbinds the id, and a blob that already names it is then replayed
+against a table that no longer has it.
+
+This is the same class of defect as a free list that shortens under a live
+consumer, which is why it landed here: the arena's release path
+(waycompose §34) and this both come down to *who decides an id is dead, and who
+is still holding one*.
+
+#### 0.23.2 What it is not, and the diagnostic that said otherwise
+
+The message said *"if the app side created it on another ring, the packet needed
+a `RingBarrier` (R22)"*. That is a guess, and it has now been falsified three
+times out of three: §0.16 item 2's `VkBuffer` shape was an out-of-bounds read of
+the application's own memory; §0.22 item 1's `VkDeviceMemory` shape was a
+missing pass; this one is a lifetime bug. **None was a barrier.**
+
+That is worse than an unhelpful message. A diagnostic that names one cause sends
+every reader to the same wrong place, and three investigations have now started
+there. `TableError::Unknown` now states what is *observed* — never created,
+already destroyed, destroyed while a blob still named it, or a wrong id read out
+of application memory — and says to check the last create/destroy of the id
+before assuming a barrier. **This is the part of §0.23 that is fixed.**
+
+#### 0.23.3 Why deferring is not a local change
+
+§5.5 item 2 already specifies the mechanism — *"the GPU-side object table keeps
+a destroyed object alive until in-flight command buffers referencing it have
+retired"* — and budgets it as hand-written. The obvious implementation is to
+make `GpuHost::unbind` defer, and it does not work, for a reason worth writing
+down before somebody tries it:
+
+**the driver's object is already gone by the time `unbind` runs.** The generated
+destroy pass (`sv_codegen::emit::gpu_entry`) captures the ids into `__gone`,
+maps them to driver handles, **calls the driver's `vkDestroy*`**, and only then
+calls `unbind`. Retaining the table entry after that would resolve the id to a
+handle the driver has freed — trading a clean fatal for a use-after-free in the
+driver, which is strictly worse and would not be reproducible.
+
+So a real deferral has to prevent the *driver call*, which means the generated
+destroy has to ask before it destroys — a new `GpuHost` hook consulted between
+the handle map and the driver call, on **every** destroy command, not only the
+one that reproduces. That is the codegen change §0.22 item 6 was pointing at
+when it said this "touches every destroy command and wants its own measurement".
+
+#### 0.23.4 What the deferral must key on, which is narrower than it looks
+
+The instinct is to hold destroyed objects until the GPU has finished executing —
+timelines, fences, `completed_seqno`. **That is more than is needed**, and the
+narrower condition is worth stating because it makes the mechanism much cheaper.
+
+On the GPU side a blob replay is where ids become driver handles: the replay
+records into a *real* command buffer, and from that moment the driver holds its
+own handle and the app-side id is not consulted again. `vkQueueSubmit` submits
+an already-recorded command buffer and resolves nothing.
+
+So an object must survive **replay**, not **execution**. The condition is "no
+blob that has been published and not yet replayed names this id" — and because
+blobs are published on the *device* ring (`Transport::flush_blob`, at
+`vkEndCommandBuffer` and whenever a block fills), and destroys ride the same
+device ring, the two are already ordered with respect to each other on one ring.
+
+**That last fact is the open question this section does not close.** If blobs and
+destroys are ordered on one ring, the replay should always precede the destroy,
+and the bug should not exist — yet it reproduces. So one of the three holds, and
+which one decides the fix:
+
+1. a path publishes a blob later than `vkEndCommandBuffer` (secondary command
+   buffers and `vkCmdExecuteCommands` are the first place to look);
+2. the failing id is named by a blob that was rewound and re-recorded, so
+   `published` and the ids actually in the block disagree; or
+3. recording and destruction happen on different threads, and `RingClass::Device`
+   is one ring, so they are ordered — but the *arena block* the blob lives in is
+   per-command-buffer and can be grown and copied under a concurrent reader.
+
+Deciding between them needs the reproducer under `SV_TRACE=1` with the ring
+seqno of the blob's publish printed next to the destroy's, which is one line of
+instrumentation and a CTS run. **It should be settled before the codegen change
+is written**, because option 2 has a fix that touches nothing generated.
+
+#### 0.23.5 Status
+
+Fixed: the diagnostic, which was actively misleading and had misled three
+investigations.
+
+Not fixed: the lifetime itself. It is diagnosed to the level above and
+deliberately left, because the two candidate fixes are very different sizes —
+one is a codegen change across every destroy command, the other is a bookkeeping
+fix in `Transport` — and §0.23.4's question decides which. Guessing would mean a
+change to every destroy in the project made on a hunch.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
