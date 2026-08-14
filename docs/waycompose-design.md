@@ -19298,7 +19298,32 @@ own else-branch, where a reader can see it. The gate does not have an opinion
 about severity, because severity depends on whether the caller was probing or
 asserting — and only the caller knows which.
 
-### 51.5 The cross-VM leg, which is unrun
+### 51.5 The rebuild ritual is obsolete, and that is the right outcome
+
+§46.4 worked out the only sequence that cleared `wc-binaries.sh`'s false
+positives — touch both crates' own sources, build the cross target, build the
+host — and said it should not stay the workaround. It has not. `wc-binaries.sh`
+now takes its scope from **cargo's own depfile** and its verdict from **content**
+rather than mtime, and its header cites the finding directly:
+
+> `wc-proxy` depends on 66 `.rs` files and `wc-compositor` on 272, out of 481 in
+> `crates/` and `vendor/`. Their dependency graphs are *disjoint* … One crate at
+> a time never converges; the only sequence that worked was to touch both and
+> build both, which is a **ritual rather than a check**.
+
+It also closes the half §46.4 only observed: `git stash pop` and the reflink that
+seeds these worktrees rewrite mtimes on bytes that did not change, and a content
+hash is indifferent to both.
+
+Verified here rather than assumed, because a workaround one has been performing
+for three sections is exactly the thing one keeps performing after it stops being
+necessary: a plain `cargo build --workspace` on both targets, **no touch of
+anything**, then `scripts/wc-damage.sh arena` — 11 passed, 0 failed, with no
+staleness line. §46.4 stands as the record of what was wrong and how it was
+found; the procedure in it is superseded and should not be copied into a new
+harness.
+
+### 51.6 The cross-VM leg, which is unrun
 
 `scripts/wc-guest.sh damage` is block 12: the compositor on the guest, the proxy
 on the VM host over an arena located in the guest's own RAM, Firefox scrolling
@@ -19320,7 +19345,7 @@ and its first run is the measurement. What can be said now is narrower — it is
 assembled from paths this harness already exercises, and it declines cleanly on
 a box with no `WC_HOST`, which is the only part testable here and was tested.
 
-### 51.6 The retry now covers both ways a run can fail to be a run
+### 51.7 The retry now covers both ways a run can fail to be a run
 
 §46.6 added a second sample when the commit floor was not met. Verification of
 this section then failed on the *other* way the same thing happens: the scroll
@@ -19346,7 +19371,7 @@ run that keeps hitting the other — a persistent unfinished scroll would point 
 the probe or the desktop, a persistent shortfall at the client or the machine.
 A single "re-running" line would have flattened that.
 
-### 51.7 What this still does not settle
+### 51.8 What this still does not settle
 
 The user's second symptom is **still unverified**, and the gate is what makes
 that statable rather than assumed. A zero stale-row count says the bytes are
@@ -19357,12 +19382,13 @@ scroll is smooth and the symptom was the present latency all along, or it is not
 and there is something else. Both are results. Neither can be had from a Wine
 box, which is the whole of §27.6's lesson.
 
-### 51.8 The gates
+### 51.9 The gates
 
 | Gate | Result |
 |---|---|
 | `cargo build --workspace`, both targets | clean |
 | `cargo test --workspace --no-fail-fast` | **2589 tests**, 0 failures — unchanged by this section, which adds no Rust |
+| `scripts/wc-damage.sh arena` with **no touch ritual** | 11 passed, 0 failed — §51.5, the dependency-aware freshness fix verified from this side |
 | **`scripts/wc-damage.sh all`** | **33 passed, 0 failed** — all three legs declare and assert `same-box`, the latency gate refuses on each, and the refusal is asserted rather than assumed |
 | ... `damage` / shared-file | 1545 checked, **0 stale**, presented 1545 of 1545 |
 | ... `damage` / arena | 1628 checked, **0 stale**, presented 1628 of 1628 |
