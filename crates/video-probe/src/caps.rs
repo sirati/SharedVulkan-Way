@@ -384,7 +384,7 @@ fn report_device(
 
     // Queue families, with the video codec operations chained in. This is the
     // half of the answer that says *where* a decode can be submitted, and it is
-    // the half `shared_vulkan` has to mirror: design.md §0.4 item 7 makes the
+    // the half `shared_vulkan` has to mirror: docs/design.md §0.4 item 7 makes the
     // queue-family table ours rather than the driver's.
     // SAFETY: the count-then-fill pair is ash's, and the chain outlives it.
     let count = unsafe { instance.get_physical_device_queue_family_properties2_len(pd) };

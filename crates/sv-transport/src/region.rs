@@ -3,7 +3,7 @@
 //! # What this type is
 //!
 //! A [`SharedRegion`] is a byte range that **two processes map at different base
-//! addresses**. design.md §1 states the invariant the whole project rests on:
+//! addresses**. docs/design.md §1 states the invariant the whole project rests on:
 //!
 //! > the shared regions are mapped at a different base address on each side, but
 //! > every byte has the same offset from the region base on both sides.
@@ -34,7 +34,7 @@
 //! makes a `&VkFoo` unsound even single-threaded. Concurrent mutation of an
 //! `AtomicU32` is *defined*, which is exactly why the atomics are the one
 //! exception. Everything else is a copy in or a copy out, and the copy is the
-//! act that snapshots the value — design.md §5.5's distinction between a value
+//! act that snapshots the value — docs/design.md §5.5's distinction between a value
 //! read *out* of shared memory (checkable) and one the GPU reads later by DMA
 //! (not).
 //!
@@ -93,7 +93,7 @@ pub struct StitchRun {
 
 enum Backing {
     /// An ordinary heap allocation. Portable, works under Miri, and is what the
-    /// single-process tests and the `Vec<u8>`-backed arena of design.md §13
+    /// single-process tests and the `Vec<u8>`-backed arena of docs/design.md §13
     /// step 2 use.
     Heap(std::alloc::Layout),
     /// `mmap(MAP_SHARED)` of a file descriptor. The real one.
@@ -182,7 +182,7 @@ impl SharedRegion {
     /// > `sv-hostd` … reserves one `PROT_NONE` range per region and
     /// > `mmap(MAP_FIXED)`s each run into it. The result is virtually contiguous
     /// > with identical internal offsets — the §1 invariant — and nothing above
-    /// > the attacher ever learns that it was stitched. — design.md §4.3
+    /// > the attacher ever learns that it was stitched. — docs/design.md §4.3
     ///
     /// **Both the daemon and every ICD call this**, on the same descriptor with
     /// the same run list, which is the point: two implementations of scatter
@@ -383,7 +383,7 @@ impl SharedRegion {
     }
 
     /// Set `len` bytes to `byte`. Used to zero the region before publication
-    /// (design.md §4.3 step 1) and to lay a canary down (§5.2).
+    /// (docs/design.md §4.3 step 1) and to lay a canary down (§5.2).
     pub fn fill(&self, off: u64, len: u64, byte: u8) -> Result<()> {
         let at = self.check(off, len)?;
         if len == 0 {
@@ -423,7 +423,7 @@ impl SharedRegion {
     /// than an atomic — is undefined behaviour. The one legitimate caller is the
     /// ICD's `vkMapMemory`, which hands `base + offset` to the *application* as
     /// a `void*`; from there it is the application's memory and the aliasing
-    /// question is the application's (design.md §5.3).
+    /// question is the application's (docs/design.md §5.3).
     pub unsafe fn base_ptr(&self) -> *mut u8 {
         self.base
     }
@@ -439,7 +439,7 @@ impl Drop for SharedRegion {
             // SAFETY: `base`/`len` are the mapping `map_fd` established. One
             // `munmap` releases every VMA inside the range, which is also why
             // detaching a stitched arena is cheap however many runs built it
-            // (design.md §5.7).
+            // (docs/design.md §5.7).
             Backing::Mapped => unsafe {
                 sys::munmap(self.base as *mut core::ffi::c_void, self.len);
             },
@@ -457,7 +457,7 @@ impl Drop for SharedRegion {
 impl core::fmt::Debug for SharedRegion {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Deliberately does not print `base`. A base address in a log is the one
-        // number design.md §1 says never crosses, and a log is a place it could.
+        // number docs/design.md §1 says never crosses, and a log is a place it could.
         f.debug_struct("SharedRegion").field("len", &self.len).finish_non_exhaustive()
     }
 }
@@ -687,7 +687,7 @@ pub fn shm_path(session: &str) -> String {
 
 /// Create a **named** shared-memory object of `len` bytes, and return it.
 ///
-/// design.md §1a: the arena and the control region are reached by *name*, and
+/// docs/design.md §1a: the arena and the control region are reached by *name*, and
 /// the name is what crosses. This is the Linux half of that rule; the Windows
 /// half is [`crate::winshm::Section::create`], which has worked this way since
 /// the Windows platform layer was written.
@@ -708,7 +708,7 @@ pub fn shm_path(session: &str) -> String {
 /// object has no name. So **a named shared-memory object can never back a
 /// udmabuf**, which is what decides that the local-dma-buf answer for RADV
 /// exists in the cross-VM topology (where the object is QEMU's own sealed memfd,
-/// opened by path) and nowhere else. design.md §0.7.
+/// opened by path) and nowhere else. docs/design.md §0.7.
 #[cfg(target_os = "linux")]
 pub fn shm_create(path: &str, len: u64) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -756,7 +756,7 @@ pub fn shm_unlink(path: &str) {
 /// Still here because the *guest-side* provider and the tests want an anonymous
 /// object, and because it is the only sealable one (see [`shm_create`]). It is
 /// no longer what `sv-hostd` hands out: an object nobody can name is an object
-/// that can only be shared by passing a descriptor, and design.md §1a forbids
+/// that can only be shared by passing a descriptor, and docs/design.md §1a forbids
 /// that across the boundary.
 #[cfg(target_os = "linux")]
 pub fn memfd(name: &str, len: u64) -> Result<std::os::fd::OwnedFd> {
@@ -882,7 +882,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "memfd_create and mmap are syscalls Miri does not implement")]
     fn a_memfd_maps_twice_and_the_two_views_are_the_same_memory() {
         use std::os::fd::AsFd;
-        // The dev loop in miniature, and the one property design.md §1 needs:
+        // The dev loop in miniature, and the one property docs/design.md §1 needs:
         // different base addresses, identical offsets.
         let fd = memfd("sv-test", (4 * PAGE) as u64).unwrap();
         let a = SharedRegion::map_fd(fd.as_fd(), 0, 4 * PAGE).unwrap();

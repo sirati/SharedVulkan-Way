@@ -1728,7 +1728,7 @@ like a rendering bug. That is §9.11 item 1.
 
 An arena is not a per-message fact and cannot be one. It is attached **out of
 band, before any protocol traffic**, by whatever brought the two sides together:
-shared_vulkan's cold-path handshake (its design.md §4.3) in the real deployment,
+shared_vulkan's cold-path handshake (its docs/design.md §4.3) in the real deployment,
 a `--arena id:size:path` flag on both processes here. `wc_handle::arena` is a
 process-global registry for that reason. Threading it through `Handle::map()`
 instead would mean a diff through smithay's `ShmState`, its `Client` data and
@@ -11896,7 +11896,7 @@ makes it necessary rather than nice.
 
 There is deliberately **no flag that prefers a locator**. The guest sends a frame
 list or it does not; a fallback that can be selected by configuration is one that
-gets selected by accident, which is design.md §5.1's objection to fallbacks
+gets selected by accident, which is docs/design.md §5.1's objection to fallbacks
 generally. When there is no frame list the sweep runs, and it *works* — a freshly
 committed region still carries its stamps — it merely costs three seconds, and
 the guest's reason for not having one travels with the answer so that the three
@@ -12793,7 +12793,7 @@ The same audit across the other harnesses. Ordered by how badly it mattered.
    ring-fatal block did the same thing one paragraph after saying "a ring that
    goes fatal is a forwarding defect by definition".
 
-   Why it was written that way is real: design.md §0.15 records a large, known,
+   Why it was written that way is real: docs/design.md §0.15 records a large, known,
    undiagnosed gap — roughly 70–75% of the control's passes lost, about 7% of
    forwarded tests hanging the GPU — so a check that failed on any regression at
    all would be red every run and would be ignored. **The answer to that is not
@@ -13008,7 +13008,7 @@ desktop shortcut) and of `c7ec2c0` (§32's taskbar identity), not before them.
    doctored inputs — the four in §35.6 items 1, 5, 6 and 7 each fail on the
    defect they exist to catch and pass on the good case — but that is not the
    same as a run. **`sv-cts.sh`'s budgets are the assumption most likely to be
-   wrong**: 80% is read off design.md §0.15's two recorded runs, and the first
+   wrong**: 80% is read off docs/design.md §0.15's two recorded runs, and the first
    real run may need it adjusted with a reason.
 2. **`SV_CTS_MAX_RING_FATALS=0` may be red on the first run.** If it is, that is
    a true statement about the tree and the number to write down is whatever it
@@ -17900,6 +17900,98 @@ toplevel configuration, 3 fullscreen, 2 protocol errors, and the two singletons.
 With the 79 skipped gaps, the number that must reach zero is **114**.
 
 
+### 45.11 The origin bug, and the regression that finished the argument
+
+§45.10 found a defect §40 had introduced, diagnosed it, and deliberately left it
+named rather than fixed: **the union bounding box changed the window's size and
+not its origin.** A `wl_subsurface` hanging 100 px off the left of its parent
+makes the window 100 px wider and its top-left corner 100 px further left, and
+nothing said the second half. This is that fix, and the interesting part is what
+it broke on the way.
+
+#### Pinning the right point
+
+The synthetic Win32 stored what WLCS told it: "the window's top-left is here".
+That is the same point as the root surface's buffer origin *at the moment it is
+said*, for every surface the suite builds — and they stop being the same point
+the instant the window's extent changes without the surface moving.
+
+So the stored value is now the **buffer origin**, obtained by subtracting the
+inset in force when the position arrives, and the window's corner is derived
+back from it. A window whose geometry never changes is positioned exactly where
+the suite asked — the case every earlier stage measured, and the one a fix here
+had to leave completely alone. Two unit tests hold both ends: a window that grew
+leftwards is hit in its overhang, and a declared inset leaves the window where
+it was put.
+
+Pinning the buffer origin is not a harness convenience. It is what every
+compositor does and what a client is entitled to assume: **a subsurface
+appearing to the left must not drag the parent's pixels rightwards across the
+screen.**
+
+#### And the real platform has to move the window
+
+The above is `control.rs`, which is a stand-in. On Windows the `HWND` genuinely
+has to move, or the window stays put and its contents slide inside it — so
+`ToUi::ShiftOrigin` carries the change to the platform, and `win32.rs` answers
+it with a `SetWindowPos` against the current `GetWindowRect` under `SWP_NOSIZE`.
+
+**A delta rather than a position**, because this compositor does not know where
+any of its windows are — that is `control.rs`'s header and it is still true. The
+only thing this side can truthfully say is "whatever you have, it moved by this
+much". The headless arm logs it rather than ignoring it: a silent match arm is
+how a message stops being handled without anybody noticing (§42).
+
+#### The regression, which is the part worth keeping
+
+The fix worked — and the scoreboard did not move. Four tests went from failing
+to passing and four others went the other way, and the total was identical:
+409/57 before, 409/57 after. **A number that does not move is not evidence that
+nothing happened**, and the only reason this was caught is that the per-suite
+counts were compared rather than the total.
+
+The four that broke are `input_falls_through_subsurface_when_parent_unmapped`.
+The test puts a lower window under the overhang and unmaps the subsurface that
+created it; the click must fall through to the window underneath. It could not,
+because the window was still 315 px wide — §45.10 had taught the *hit test* that
+a subsurface is mapped only while its parent is, and had left the *bounding box*
+counting the children of an unmapped surface. Nothing was drawn in the overhang,
+but the window still covered it, and **a window covers pixels whether or not it
+paints them**.
+
+So `ancestors_mapped` became a function, and the three places that need it — the
+bounding box, the blit, and the hit test — all call it. That is §40's argument
+about `placed_tree` arriving where it was always going: painting and hit-testing
+must not disagree about which surfaces are in the tree, and for one section they
+did. §45.10 fixed one of the three and the arithmetic hid it.
+
+#### Four tests reclassified, in the right order
+
+§45.10 declined to call any of the eight remap failures expected, because four
+of them were a live bug and saying otherwise would have been laundering. With
+the bug fixed, parameters 8 to 11 pass and 4 to 7 remain — and those four put a
+subsurface 100 px left of a toplevel that has *declared* a window geometry, so
+the subsurface is outside the `HWND` for exactly §45.4's reason. They are now in
+the expected-failure table, and the self-check confirms all twenty-six still
+fail.
+
+The sequence is the point: **a failing test was not called expected until
+nothing else could explain it.**
+
+#### Where it stands
+
+| | passed | failed | skipped |
+|---|---|---|---|
+| §45.10 | 409 | 57 | 759 |
+| **§45.11** | **413** | **53** | **759** |
+
+413 of 466, 88.6%. Of the 53 failures, 26 are expected on this platform and **27
+are debts**: 7 subsurface commit synchronisation, 7 popup grab and reposition, 6
+interactive move and resize, 4 toplevel configuration, 3 fullscreen, 2 protocol
+errors, and the two singletons — less the overlaps already counted. With the 79
+skipped gaps, the number that must reach zero is **106**.
+
+
 ## 46. §27 continued: the arena leg, and an identity with a hole in it
 
 *(§27's continuation, appended here because this file is in append order. No
@@ -20092,6 +20184,31 @@ version about causes nobody checks. The rule that would have caught both: when a
 run refuses, the reason it refused is a *measurement to take*, not a story to
 supply from what happens to be on the screen.
 
+> **And it happened twice, to two people, from the same evidence, within an
+> hour — which is what turns this from an anecdote into a rule worth stating.**
+>
+> While this section was being written the coordinator reached the same
+> conclusion independently: three DNS names for the VM host did not resolve or
+> did not answer, and it declared the machine off the network and told four
+> agents so. Same premise, same day, same class of evidence, and — the part that
+> matters — **both of us were satisfied, because both of our workarounds
+> functioned.** Mine was an ssh `ProxyJump` through the guest; the coordinator's
+> was routing four agents around a machine that was answering the whole time on
+> an address nobody had tried.
+>
+> That is the mechanism, and it is worth naming separately from the rule:
+> **a workaround that works removes the pressure that would have found the real
+> cause.** A workaround that *fails* sends you back to the premise; one that
+> succeeds retires the question. So the moment to re-check a premise is not when
+> the workaround breaks — by then it may never break — but when you first notice
+> you are writing one.
+>
+> Two independent instances in a day is the same density that made §16.8 a rule
+> block rather than a footnote, and the two rules are siblings: §16.8 says *a
+> name is not an identity*, and this one says *a symptom is not a diagnosis*.
+> Both are cases of accepting the first thing that presented itself as though it
+> had been checked.
+
 ### 55.4 What is still outstanding, stated as an ask rather than as a finding
 
 **Typing into `weston-terminal` on the guest's interactive desktop.** It needs
@@ -20263,7 +20380,8 @@ the reverse would lose the stronger check.
 | Gate | Result |
 |---|---|
 | `cargo build --workspace`, both targets | clean |
-| `cargo test --workspace --no-fail-fast` | **2592 tests**, 0 failures — unchanged; this stage adds no test, the harness is the test |
+| `cargo test --workspace --no-fail-fast` | **2594 tests**, 0 failures — unchanged by this section; the harness is the test |
+| **`scripts/wc-life.sh wine`** (§53's own gate, re-run) | **11 passed, 0 failed, 1 skipped** — the compositor claimed 9 destructions for 9 windows and the window manager agreed none were left |
 | **`scripts/wc-teardown.sh all`** (new) | **11 passed, 0 failed** |
 | ... `linux` leg | `1 created, 1 destroyed, 0 still held, 0 still alive` |
 | ... `wine` leg | the same, and Windows agrees none survives |
@@ -20292,11 +20410,346 @@ by breaking the code it watches — not by feeding it a synthetic log.
    and seat objects are not. The category is now open rather than closed, and
    the shape of the next one is the same: ask somebody outside the process.
 
-## 57. The other thing a window holds, and the return value nobody read
+## 57. The injection that returns zero, and the run that would have believed it
+
+### 57.1 Status in one paragraph
+
+Block 12 — the cross-VM damage leg, §51.6 — is still unrun, and the blocker is
+that the guest's Windows session is **locked**. That would not have mattered if
+the leg simply failed. It does not: a locked session puts the input desktop on
+`Winlogon`, a process on `Default` cannot inject into it, and `SendInput`
+**returns 0** and sets `ERROR_ACCESS_DENIED` without blocking, throwing or
+logging. `probe-scroll.c` discarded that return value. It would have printed
+`60 notches towards the user`, the harness would have matched its completion
+line, and the run would have gone on to measure a browser **nobody scrolled** —
+producing real numbers about the wrong thing, which is §27.6's shape exactly.
+The probe now counts refusals, says which, and exits 3 when everything was
+refused; block 12 asserts on the count rather than on the probe's survival.
+
+### 57.2 Why this was worth doing while the guest was busy
+
+The leg cannot run: another agent's growth run holds the guest, and the session
+is locked besides. But the two facts are not the same kind of obstacle. "The
+guest is busy" is a queue. "`SendInput` returns 0 and nothing notices" is a
+**defect in the experiment**, and it was sitting in the leg waiting for the
+queue to clear.
+
+If the session had been unlocked between writing block 12 and running it,
+nothing would have been learned. If it had not, the run would have produced a
+full set of plausible damage numbers from an idle browser and — because the
+damage path is *correct* — reported zero stale rows and passed. A green run
+that scrolled nothing is worse than a red one, because it is evidence that will
+be cited.
+
+### 57.3 What changed, and the one thing that deliberately did not
+
+```c
+	if (SendInput(1, &in, sizeof in) != 1)
+		refused++;
+```
+
+and, at the end:
+
+```
+probe-scroll: 40 of 40 notches towards the user accepted, 150 ms apart
+```
+
+Counted rather than aborted on, because the distribution is the diagnosis:
+`0 of 60` is a locked session and `58 of 60` is contention with whatever else is
+on that desktop. Aborting on the first refusal would have collapsed those into
+one symptom.
+
+**The completion line still contains the exact phrase `notches towards the
+user`**, and that is deliberate rather than lucky. Two harnesses grep for it to
+tell a finished scroll from a probe that died — `wc-damage.sh` in two places,
+`wc-guest.sh` in one. A harness that only looks for the phrase keeps working;
+one that reads the numbers in front of it can now tell a scroll from a refusal.
+Changing the wording would have been a silent regression in three greps, which
+is the kind of thing §50.10's citation checker exists for and which no checker
+covers for harness greps.
+
+The pointer move is checked too but only warns: a refused `move_to` with
+accepted notches is a wheel going somewhere unintended, which is worth a line
+and is not the same failure.
+
+### 57.4 The log had to be fetched, which it was not
+
+Block 12 wrote the probe's log to `C:\Users\<guest-user>\wctest\scroll.log` on the
+guest and never brought it back, so the only evidence the wheel had moved was
+that the probe had not crashed. `wc-stage4` now emits it between
+`S4-SCROLLLOG-BEGIN`/`END` markers like every other log it returns, and
+`do_damage` asserts on the accepted count found there.
+
+It reads the accounting rather than the exit status on purpose: the exit code
+travels through `ssh`, a backgrounded job and a `wait` that the harness
+deliberately does not perform (§51.6 — a probe that failed to find the window
+must not hang the run), and a number in a log survives all three.
+
+### 57.5 The gates
+
+| Gate | Result |
+|---|---|
+| `x86_64-w64-mingw32-gcc -mwindows probe-scroll.c` | clean |
+| `bash -n` on both changed harnesses | clean |
+| `scripts/wc-damage.sh arena` | **11 passed, 0 failed** — `40 of 40 notches towards the user accepted`, 1030 commits checked, 0 stale |
+| the three existing greps for `notches towards the user` | still match the new wording |
+| **`scripts/wc-guest.sh damage` against the guest** | **STILL NOT RUN** — the guest is held and its session is locked |
+
+### 57.6 What is not proven
+
+1. **The refusal path has never been exercised.** The fix is reasoned from
+   Windows' documented behaviour and from the coordinator's measurement that
+   `SendInput` returns 0 while `SetCursorPos` is obeyed on that session; this
+   branch has only ever seen `40 of 40` accepted, because the box it can reach
+   is not locked. The first locked-session run is the test of it, and if it
+   reports anything other than `0 of N` with a `REFUSED` line, this section is
+   wrong about the mechanism rather than about the need for the check.
+2. **`SetCursorPos` being obeyed is not used.** It would be a way to confirm a
+   locked session positively rather than inferring it from a refusal count. Not
+   done, because a probe that reports what it *could* do is a smaller change
+   than one that diagnoses the session, and the diagnosis belongs to whoever
+   owns the guest.
+3. **Block 12 remains a hypothesis with a script attached** (§51.6), and the
+   user's second symptom — no tearing, no stalled scrolling, no blank frames in
+   `about:support` — remains unverified. What has changed is only that the leg
+   can no longer pass without having scrolled.
+## 58. The unqualified citations, and the ambiguity they were hiding
+
+### 58.1 Status in one paragraph
+
+§54.3 left two pieces of residue. Both are closed. The **762 unqualified
+`design.md §N` citations** — the bare form that names neither document in a tree
+with two of them — are all qualified, and the checker now **fails** on the form,
+which is the "one line in one place" §54.3 promised. Doing it surfaced something
+the bare form had been hiding: **103 citations name a section their document
+defines twice**, which no edit to a citation can fix. And the negative test now
+runs a control fixture first, so a checker that grows an external dependency
+reports that rather than being mistaken for a checker correctly rejecting a bad
+citation.
+
+### 58.2 The rule was the file's own side, and it was right 755 times out of 762
+
+A bare `design.md §N` could mean either document, so the question was whether
+there is a rule that decides it without reading 762 comments. There is, and it
+was checked before anything was rewritten:
+
+| | |
+|---|---|
+| resolve on the file's own side | **755** |
+| resolve only on the *other* side | **7** |
+| resolve in neither document | **0** |
+
+"Own side" is `crates/wc-*`, `scripts/wc-*` and the C probes for the Wayland
+document, everything else for the Vulkan one. That the "neither" column is zero
+is what makes this safe: every one of the 762 named a real section, so none of
+them was a guess about intent — only about which of two files it lived in.
+
+**The seven exceptions are genuine cross-references, not mistakes**, which is why
+they were inspected rather than forced to the majority rule:
+`wc-proxy`'s `guestram.rs` and `pool.rs` cite the Vulkan document's §5.7 and
+§0.14 because the arena is shared_vulkan's subject; `wc-launch/src/plan.rs`
+cites §0.17; and two `sv-*` guest scripts cite the Wayland document's §12.9 and
+§17. Each was qualified with the document it actually meant.
+
+The rewrite was line-scoped — file, line number and section number all had to
+match — so a line carrying two citations could not have one of them rewritten
+with the other's document.
+
+### 58.3 What qualifying revealed
+
+```
+before:  270 resolve to exactly one section    0 missing    0 ambiguous  762 unqualified
+after:   929 resolve to exactly one section    0 missing  103 ambiguous    0 unqualified
+```
+
+**The 103 are not new breakage.** They were always ambiguous; the bare form was
+hiding them, because a citation that names no document cannot be checked against
+one. Qualifying them moved a silent problem into a reported one, which is the
+direction that counts even though the number went up.
+
+They are concentrated in a handful of duplicated section numbers in
+`docs/design.md`: §1 is defined twice and cited 48 times, §8 twice and cited 28,
+then §3, §0.21, §0.15 and three singletons. **No edit to any citation fixes
+this** — the document has to stop defining the same number twice — so the
+checker reports and does not fail on it, for §48.3's reason: renumbering a
+document another agent is actively writing in, to repair citations that resolve
+to two correct-looking places rather than none, is the worse trade. It is now
+visible and counted, which is the precondition for someone deciding otherwise.
+
+### 58.4 The control fixture, and a negative test that could have lied
+
+§54.3 named the risk precisely: `the_citation_check_can_fail` copies only the
+script into a temporary tree, so if the checker ever grew a dependency on
+anything outside its own file — a config, a helper it sources — it would fail on
+the bait fixture for **that** reason, and be reported as the checker correctly
+rejecting a bad citation. A negative test passing for the wrong reason is §42's
+defect wearing the opposite mask: it is a check that cannot fail, disguised as
+one that just did.
+
+The fixture is now run twice. First with only a sound citation, where the
+checker must **succeed** — if it does not, the message says the checker is
+broken or unsatisfied in this environment and makes no claim about citations at
+all. Only then the bait. That is the same shape as §47's "slow is not broken":
+two different facts that were sharing one verdict.
+
+### 58.5 What is not done
+
+1. **The 103 ambiguous citations stand**, blocked on de-duplicating
+   `docs/design.md`'s section numbers. That is the Vulkan side's document and
+   the numbering collisions are §48.3's. The checker will fail on them the day
+   the count reaches zero, by the same one-line change §58.1 just made for the
+   unqualified form.
+2. **2457 bare `§N` with no document at all are still unchecked.** They mean
+   "this file's own document", and §58.2 shows that convention is right 99.1% of
+   the time — which is an argument that a file-to-document map is now worth
+   building, since the rule it would encode has been measured rather than
+   assumed. Not built here.
+3. **Nothing checks that a citation's section is *about* what the comment says.**
+   A citation can resolve perfectly and still point at the wrong argument, and
+   that is §35.10's territory rather than this checker's.
+
+
+---
+---
+
+## 59. The protocols Firefox binds, measured against the protocols WLCS is skipping
+
+### 59.1 Status in one paragraph
+
+Task #31 asks for *"the Wayland protocols Firefox actually binds, implemented
+fully rather than partially"*, and the natural way to read that against the
+scoreboard is: WLCS skips 759 tests, 79 of them because a protocol is
+unimplemented, so implement the ones Firefox needs. **That reading is wrong, and
+the measurement says so.** Firefox 151.0.2 binds twelve interfaces, all twelve
+are implemented, and it binds **none** of the seven protocols behind those 79
+skips — not with a page built to provoke them, and not with Gecko's Wayland
+preferences turned on. The Firefox-relevant debt is not in the skips at all. It
+is in the **35 unexplained failures**, which are inside protocols this
+compositor already implements. `wp_viewporter`, `pointer-constraints` and the
+two `text-input`s are 61 of the 79, and on this evidence none of them is on the
+goal's path.
+
+### 59.2 What the number 114 is made of
+
+```
+headless: 409 passed, 57 failed, 759 skipped
+```
+
+The 759 skips are already attributed, one reason per protocol, and the
+attribution is what makes the arithmetic possible:
+
+| | | |
+|---|---|---|
+| JUSTIFIED | 682 | protocols this compositor will not implement, with a reason — `zwlr_layer_shell_v1` 368, `zxdg_shell_v6` 180, `wl_shell` 89, `zwlr_foreign_toplevel_manager_v1` 30, the two primary-selection managers 10 |
+| GAP | 79 | unimplemented, no reason beyond not yet — `wp_viewporter` 23, `zwp_pointer_constraints_v1` 15, `zwp_text_input_manager_v2` 12, `zwlr_virtual_pointer_manager_v1` 12, `zwp_text_input_manager_v3` 11, `zwp_relative_pointer_manager_v1` 3, `wp_fractional_scale_manager_v1` 2, `zxdg_output_manager_v1` 1 |
+| SELFTEST | 3 | WLCS proving its own skip machinery |
+
+and of the 57 failures, 22 are expected on this platform — input outside the
+window-geometry rectangle, where the HWND *is* that rectangle and Windows
+delivers no message outside a window (§45.4).
+
+So **114 = 79 gaps + 35 unexplained failures**, and the two halves are not the
+same kind of debt. A gap is a protocol nobody has written. A failure is a
+protocol that is written and does the wrong thing — which is precisely the
+"partially rather than fully" the task names.
+
+### 59.3 The list, and why the obvious way to read it is a floor
+
+`scripts/wc-firefox.sh enumerate` has printed the same twelve interfaces for
+several stages:
+
+```
+org_kde_kwin_server_decoration_manager  wl_compositor  wl_data_device_manager
+wl_output  wl_seat  wl_shm  wl_subcompositor  wp_cursor_shape_manager_v1
+xdg_activation_v1  xdg_wm_base  zwp_idle_inhibit_manager_v1
+zwp_keyboard_shortcuts_inhibit_manager_v1
+```
+
+That block runs `about:blank`, and a browser binds a protocol when a page makes
+it necessary. `about:blank` makes almost nothing necessary: no editable field,
+so no reason for `text-input`; no pointer lock, so no reason for
+`pointer-constraints` or `relative-pointer`; no scaled video, so no reason for
+`viewporter`. Read as "the set Firefox needs", the list is an inference from a
+page that was chosen for being empty — which is the §55.3 error again, an
+observation standing in for a measurement nobody took.
+
+### 59.4 So the page was given something to do
+
+`scripts/wc-firefox.sh needs` is three legs, and the third is the one that
+stops the answer being misread.
+
+1. **A local page that provokes.** An autofocused `<input>`, a `<textarea>`, a
+   `contenteditable` div, a `<canvas>` wired to `requestPointerLock`, and an
+   autoplaying `<video>`. Offline and local: a remote page would make the
+   measurement a fact about a website, and this harness must not need a network.
+2. **The same run on `about:blank`**, recomputed here rather than read from
+   `enumerate`, so the block stands alone and the comparison is between two runs
+   minutes apart rather than between a run and a memory.
+3. **The same page again with Gecko's Wayland preferences on** —
+   `widget.wayland.text-input-v3.enabled`, the pointer-constraints and
+   fractional-scale switches, and trusted-request-only off. Because *"Firefox
+   did not bind it"* has two causes that lead opposite ways: the client does not
+   need the protocol, or its support is behind a pref that is off. Reporting the
+   first when it is the second would tell whoever implements these gaps that
+   they are not on the goal's path, and that is the most expensive kind of wrong
+   answer a measurement can give.
+
+The result, and it is the same in all three legs:
+
+```
+  PASS  a page made Firefox bind nothing extra — about:blank's list really is the set
+  ....  not bound even with a page: zwp_text_input_manager_v3
+  ....  not bound even with a page: zwp_text_input_manager_v2
+  ....  not bound even with a page: zwp_pointer_constraints_v1
+  ....  not bound even with a page: zwp_relative_pointer_manager_v1
+  ....  not bound even with a page: wp_viewporter
+  ....  not bound even with a page: wp_fractional_scale_manager_v1
+  ....  not bound even with a page: zxdg_output_manager_v1
+  PASS  with the Wayland prefs on as well, Firefox binds nothing further
+```
+
+**A negative result, and the useful kind.** The suspicion was that the twelve
+were an artefact of an empty page; they are not. Twelve is the set, for this
+build, for these capabilities.
+
+### 59.5 What that means for task #31
+
+* **The 61 skips from `viewporter`, `pointer-constraints` and the two
+  `text-input`s are not on Firefox's path.** They may be worth implementing for
+  conformance — WLCS is a conformance suite and 114 reaching zero is a real
+  goal — but they are not what *this* task is asking for, and doing them first
+  would be spending the goal's budget on clients this project does not have.
+* **The task's own words are already satisfied at the level of binding.** All
+  twelve interfaces Firefox binds are implemented; none of them is absent.
+* **So "fully rather than partially" means the 35 unexplained failures**, and
+  they are inside `wl_compositor`, `wl_seat`, `wl_surface`, `xdg_wm_base` and
+  friends — the protocols already written. That is where the next person should
+  start, and it is a different list from the one the scoreboard's skip table
+  suggests.
+
+### 59.6 What this does not say
+
+1. **One build, one set of capabilities.** Firefox 151.0.2, with a page
+   exercising text entry, pointer lock and video. A page doing something else —
+   WebXR, a colour-managed image, a tablet — could bind more, and a future
+   Firefox certainly will: `wp_fractional_scale_manager_v1` in particular is
+   the pair to `wl_compositor` v6's `preferred_buffer_scale`, and the day Gecko
+   adopts it this answer changes.
+2. **Binding is not using.** This measures the registry, not what Firefox does
+   with what it bound. A protocol bound and barely exercised is exactly the
+   "partially" the task is about, and nothing here looks inside the twelve.
+3. **Nothing here is about Win32.** Every leg is the Linux build, where Firefox
+   is a stock libwayland client talking to stock `wayland-server` — which is the
+   right place to ask what a client *needs* and says nothing about what the
+   Windows side does with it.
+4. **The 22 expected failures are argued, not proved.** §45.4 says input outside
+   the window-geometry rectangle cannot be delivered because the HWND is that
+   rectangle; that is a claim about Win32 being checked here by a Linux run.
+## 60. The other thing a window holds, and the return value nobody read
 
 *(§53's continuation. The window handle had a witness; this does not.)*
 
-### 57.1 Status in one paragraph
+### 60.1 Status in one paragraph
 
 §53.6 item 1 said `RevokeDragDrop` was not observed, and it was worse than
 unobserved: **`drag::revoke` discarded the `HRESULT`.** The whole of §43.7's
@@ -20311,7 +20764,7 @@ balances and is not a pair of zeros: **14 passed, 0 failed, 1 skipped**, with
 6 registered and 6 revoked. **The idea that would have made this externally
 checkable does not work, and 57.3 is the measurement rather than the argument.**
 
-### 57.2 Why this resource has no outside witness
+### 60.2 Why this resource has no outside witness
 
 §53's strength was that its witness could not be talked out of it: another
 process asks the window manager, and nothing the compositor does makes
@@ -20327,7 +20780,7 @@ compositor's own account of its own behaviour — which §56.3 is right to label
 `claims`, because a bug in the teardown path is exactly the circumstance in
 which such an account is wrong.
 
-### 57.3 The trick that would have fixed that, and the measurement that killed it
+### 60.3 The trick that would have fixed that, and the measurement that killed it
 
 A stranded registration *does* have one observable consequence: OLE refuses a
 `RegisterDragDrop` on an `HWND` that already has one, with
@@ -20359,7 +20812,7 @@ untestable at any cycle count this project will run, and a harness built on it
 would be a gate that cannot fail — which is the thing §53 exists to avoid,
 reintroduced by the mechanism meant to strengthen it.
 
-### 57.4 What makes a counter worth printing
+### 60.4 What makes a counter worth printing
 
 A count of successes is worth nothing unless the thing counted can come out the
 other way, so that is now a test on the Windows target
@@ -20387,9 +20840,9 @@ the one that stops the other two being decoration: that `registered` is **not
 zero**. The churn proved six windows were made; each registered; so the number
 has to be six, and a balance of `0 == 0` is a failure rather than a pass.
 
-### 57.5 What is not proven
+### 60.5 What is not proven
 
-1. **The count is the compositor's own.** §57.2 is why there is no alternative,
+1. **The count is the compositor's own.** §60.2 is why there is no alternative,
    not an excuse for not having one. If OLE ever grows an enumeration, this
    should be replaced rather than supplemented.
 2. **`release_icons` is still unobserved**, for §53.6 item 2's reason: its
@@ -20409,7 +20862,7 @@ has to be six, and a balance of `0 == 0` is a failure rather than a pass.
    registration path, and the two counts would legitimately diverge. Nothing
    asserts what that divergence should look like.
 
-### 57.6 The gates
+### 60.6 The gates
 
 | Gate | Result |
 |---|---|

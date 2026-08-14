@@ -1,6 +1,6 @@
 //! The cold path on Windows: a named pipe.
 //!
-//! design.md §8's note that "a Windows app side would need a named-pipe and
+//! docs/design.md §8's note that "a Windows app side would need a named-pipe and
 //! `DuplicateHandle` implementation of exactly this file" is half right, and the
 //! half that is wrong is the interesting half.
 //!
@@ -10,7 +10,7 @@
 //! to hold `PROCESS_DUP_HANDLE` on every process that attaches, which is a real
 //! privilege relationship and one this design has no reason to establish.
 //!
-//! **This axis got the rule right first, and design.md §1a is that observation
+//! **This axis got the rule right first, and docs/design.md §1a is that observation
 //! generalised.** Linux used to pass a descriptor by `SCM_RIGHTS` here, on the
 //! grounds that the arena was a memfd one process created and the other had no
 //! other way to reach it. The answer was not a Windows equivalent of

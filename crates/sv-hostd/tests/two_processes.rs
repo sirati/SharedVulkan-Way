@@ -1,4 +1,4 @@
-//! design.md §13 step 1, as a test: two Linux processes over a memfd.
+//! docs/design.md §13 step 1, as a test: two Linux processes over a memfd.
 //!
 //! > **1. `sv-wire` + `sv-transport` over a memfd, two Linux processes, no
 //! > Vulkan.** Handshake, magic-written-last, generation counter, ring

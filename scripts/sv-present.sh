@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The acceptance criterion of design.md §10 stage 2: **a swapchain that
+# The acceptance criterion of docs/design.md §10 stage 2: **a swapchain that
 # presents, judged on the pixels that come out of it.**
 #
 #   scripts/sv-present.sh [icd-manifest-basename]   default: radeon_icd.x86_64.json

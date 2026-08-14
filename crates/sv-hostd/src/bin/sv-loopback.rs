@@ -5,7 +5,7 @@
 //! sv-loopback app  --socket <path>     # the peer: attaches, allocates, submits
 //! ```
 //!
-//! This is design.md §13 step 1 and step 2 executed for real:
+//! This is docs/design.md §13 step 1 and step 2 executed for real:
 //!
 //! > **1. `sv-wire` + `sv-transport` over a memfd, two Linux processes, no
 //! > Vulkan.** Handshake, magic-written-last, generation counter, ring
@@ -14,7 +14,7 @@
 //!
 //! and it is simultaneously the **Linux-host/Linux-guest topology**, not a
 //! stand-in for it. The two processes share nothing but a Unix socket and the
-//! *name* that crosses it — design.md §1a — so they run unchanged in two
+//! *name* that crosses it — docs/design.md §1a — so they run unchanged in two
 //! containers, and would run unchanged either side of a hypervisor if the socket
 //! were a virtio-serial port, because a name is text and a descriptor is not.
 //!
@@ -199,7 +199,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Connect to `sv-hostd`, learn the object's **name** and the view geometry, and
-/// map the two views by opening the object ourselves (design.md §1a).
+/// map the two views by opening the object ourselves (docs/design.md §1a).
 ///
 /// Returns the mappings rather than a descriptor, because a descriptor is no
 /// longer what a client is given and there is nothing left for the caller to do
@@ -303,7 +303,7 @@ fn gpu_side(
         RingCtrl::open(&control, slot)?.set_status(RingStatus::Alive)?;
     }
 
-    // ONE THREAD PER RING, which is design.md §3's topology ("ring consumers,
+    // ONE THREAD PER RING, which is docs/design.md §3's topology ("ring consumers,
     // 1 thread/ring, spin-then-park") and is **required** rather than merely
     // tidy. A single thread draining both rings deadlocks the first time a
     // queue packet carries a barrier: it blocks waiting for a device-ring
@@ -400,7 +400,7 @@ fn gpu_side(
     canary::verify_all(&arena, policy, g.arena_size, g.arena_slab_size)?;
     let mut out = Vec::new();
 
-    // design.md §4.6: the reverse ring, carrying what a validation layer would.
+    // docs/design.md §4.6: the reverse ring, carrying what a validation layer would.
     demo::encode_small(&mut out, demo::OP_DEBUG_MESSAGE, handled as u64, 0)?;
     reverse.push(&out, None)?;
     eprintln!("[gpu] handled {handled} commands, sent a reverse-ring message");
@@ -575,7 +575,7 @@ fn app_side(socket: &str, wait_for_replies: bool) -> Result<(), Box<dyn std::err
         }
     }
 
-    // The reverse ring, which design.md §4.6 says is built from day one.
+    // The reverse ring, which docs/design.md §4.6 says is built from day one.
     wait_until(
         &control,
         &RingCtrl::open(&control, REVERSE_RING_SLOT)?,

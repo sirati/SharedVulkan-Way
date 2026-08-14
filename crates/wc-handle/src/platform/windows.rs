@@ -224,7 +224,7 @@ pub fn alloc_locked_region(
 
 /// The granularity every stamp and every locate step works in. Not a Windows
 /// constant: it is the *guest-physical* page size the host's scan sweeps in, and
-/// it stays 4096 whatever the allocator did (shared_vulkan design.md §5.1).
+/// it stays 4096 whatever the allocator did (shared_vulkan docs/waycompose-design.md §5.1).
 pub const REGION_PAGE: usize = 4096;
 
 /// NUL-terminated UTF-16, which is what every `*W` entry point wants.

@@ -150,7 +150,7 @@ number.
 >
 > *Stronger: compare byte-for-byte against Venus's MIT-licensed generated C on
 > the shared subset, which is independent evidence rather than self-agreement
-> (design.md §6.2, §7.3).*
+> (docs/design.md §6.2, §7.3).*
 >
 > **The byte-for-byte comparison was never available, and by our own hand.** D6
 > replaces Venus's per-parent `pNext` switch with length-prefixed links, and R13's
@@ -318,7 +318,7 @@ inherit the constraint.
 *Mitigation:* size generously, report the *real* size in the heap so
 applications budget against it, and grow by adding slabs rather than resizing.
 A segregated free list rather than a buddy allocator, because buddy waste
-converts directly into this error (design.md §5.2).
+converts directly into this error (docs/design.md §5.2).
 *Amended 2026-08-11.* "Grow by adding slabs" survives, but **growing late is
 worse than it looks and lazy slabs are not the hedge they appear to be.** Both
 paths commit their memory up front: the 4 KiB path must be committed and
@@ -333,7 +333,7 @@ not as the normal path.
 A property of those projects and of the D3D12 contract, not a bug to fix.
 *Mitigation:* scope to Zink and DXVK ≤ 2.6, and **do not advertise the feature**
 — a clean device-creation failure is far better than a device that advertises it
-and renders garbage. *Annotation added by design.md §11:* the obstruction is
+and renders garbage. *Annotation added by docs/design.md §11:* the obstruction is
 more precisely that raw VAs in application-written data are invisible to the
 `transform` pass and would forbid suballocation, relocation and deferred
 allocation — not that such an address is meaningless across the boundary. The
@@ -348,7 +348,7 @@ header releases, so pinning `vk.xml` is necessary but not sufficient.
 *Mitigation:* a `protocol_hash` over the generated command and struct table,
 exchanged in the handshake with a hard refusal on mismatch, **plus** an explicit
 `u32` length in every command header so a desynchronisation is detected at the
-first bad command instead of propagating (design.md §4.3, §6.2).
+first bad command instead of propagating (docs/design.md §4.3, §6.2).
 
 ### R14 — No reverse channel means no validation-layer output on the app side
 Debug callbacks must run in the app side's address space, and neither Venus nor
@@ -356,14 +356,14 @@ gfxstream implements a generated reverse-call path. Validation layers are the
 primary debugging tool for an ICD, so this is a development-velocity risk rather
 than a niche gap.
 *Mitigation:* a dedicated GPU→app reverse ring in the control region, built from
-day one rather than retrofitted (design.md §4.6). Roughly 200 lines.
+day one rather than retrofitted (docs/design.md §4.6). Roughly 200 lines.
 
 ### R15 — The GPU-side process must survive without the driver's usual context
 Nothing has been validated against a Windows Vulkan driver running headless in a
 background process, imported-memory-only, with no swapchain. Intel does not test
 its driver this way.
 *Mitigation:* none available in advance. Run a trivial compute workload through
-the GPU-side server before building on it (design.md §13 step 7).
+the GPU-side server before building on it (docs/design.md §13 step 7).
 *Sharpened 2026-08-11, and now the largest unmeasured thing in the project.*
 Step 0 retired R9, R19 and R20, so what it proved is that the driver **accepts
 and maps** our pages and that its mapping is demonstrably the same physical
@@ -412,7 +412,7 @@ depends on the loader's own header version. An older app-side loader could run
 out of trampolines.
 *Mitigation:* advertise a curated extension set rather than mirroring all 148
 device extensions the GPU side reports — which is required for scope reasons
-anyway (design.md §8, §9.2).
+anyway (docs/design.md §8, §9.2).
 
 ### R17 — We would be the first production Rust Vulkan ICD
 The only substantially complete prior attempt (Kazan) is dormant and LGPL. The
@@ -421,7 +421,7 @@ dispatch-magic contract in particular is a place where Rust's natural idioms
 asserts in debug builds — so a mistake is a segfault inside the loader.
 *Mitigation:* copy the `#[repr(C)] { loader_dispatch_ptr: usize, value: T }`
 pattern exactly, never `Arc` as a handle, and add compile-time signature
-assertions against the `PFN_*` typedefs (design.md §6.4, §8).
+assertions against the `PFN_*` typedefs (docs/design.md §6.4, §8).
 
 ### R18 — GPU hangs are visible to a person sitting at the laptop
 The iGPU drives the physical panel of a family laptop in production use. A hang
@@ -563,7 +563,7 @@ than we told the application, the table becomes a lie that surfaces as
 allocation failure at an arbitrary moment.
 *Mitigation:* report the *real* arena size in heap 1 and the real remaining heap
 in heap 0; drop the `DEVICE_LOCAL | HOST_VISIBLE` type entirely when the GPU
-side is not UMA, rather than advertising it optimistically (design.md §9.1).
+side is not UMA, rather than advertising it optimistically (docs/design.md §9.1).
 *Measured 2026-08-11 — the awkward case does not arise on this hardware, which
 is luck and should be treated as such.* The GPU side reports **one** heap,
 6624 MiB `DEVICE_LOCAL`, and of its three memory types every one except [0] is
@@ -711,10 +711,10 @@ guest is somebody's daily machine.
    by the time it is noticed the two sides have already disagreed.
 
 ### R27 — The ICD talks to the window system from inside the application
-design.md §10 stage 2 makes the app side responsible for putting a finished
+docs/design.md §10 stage 2 makes the app side responsible for putting a finished
 frame in a window, which means an ICD `dlopen`ing `libX11.so.6` and issuing X
 requests from a process it does not own. Three distinct hazards, all realised
-at least once during the stage that introduced this entry (design.md §0.6):
+at least once during the stage that introduced this entry (docs/design.md §0.6):
 
 - **Xlib's default error handler calls `exit(1)`.** Every request names a window
   the *application* owns and may already have destroyed, and that race is the
@@ -745,7 +745,7 @@ more of this.
 
 ### R28 — The frame-list locator rests on an undocumented Windows interface
 Added 2026-08-13 (`measured-gpu-side.md`, "Asking Windows where the pages are";
-design.md §0.14, §5.1). The guest can be asked where its own pages are, rather
+docs/design.md §0.14, §5.1). The guest can be asked where its own pages are, rather
 than the host searching 13 GiB for them, via
 `NtQuerySystemInformation(SystemSuperfetchInformation)` with
 `SuperfetchPfnQuery`. That is the interface RAMMap uses and it is not in the SDK.

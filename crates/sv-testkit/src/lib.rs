@@ -1,6 +1,6 @@
 //! Test-only support: the Venus differential comparison and shared fixtures.
 //!
-//! design.md §6.6: "The differential-test harness that compiles Venus's
+//! docs/design.md §6.6: "The differential-test harness that compiles Venus's
 //! generated C lives in a test-only crate, clearly marked." This is that crate.
 //! It reads Venus's MIT-licensed generated headers as *data* — nothing from
 //! Venus is compiled or vendored into the product. See `THIRD-PARTY.md`.

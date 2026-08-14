@@ -8,7 +8,7 @@
 # the real loader. This is the topology `testhost` needs — there the GPU side
 # is inside a VM, no descriptor can cross that boundary, and the arena is guest
 # RAM `sv-hostd` locates — with the locating step degenerating to "create a
-# memfd and hand it out" on one machine (design.md §3).
+# memfd and hand it out" on one machine (docs/design.md §3).
 #
 # It is also the only path lavapipe can serve: lavapipe has no dma-buf export
 # and its opaque-fd export is not the same pages, but it will adopt a host

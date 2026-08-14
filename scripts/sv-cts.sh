@@ -22,7 +22,7 @@
 #   variables, all defaulting to this tree's recorded state:
 #
 #     SV_CTS_MAX_LOSS_PCT=80          share of the control's passes the
-#                                     forwarder may lose (design.md §0.15)
+#                                     forwarder may lose (docs/design.md §0.15)
 #     SV_CTS_MAX_RING_FATALS=0        ring fatals the GPU side may take
 #     SV_CTS_MAX_HARD_RECOVERIES=0    GPU resets the forwarded run may cause
 #
@@ -42,11 +42,11 @@
 # NotSupported is the interesting one and it is **not a failure**: a test that
 # asks for `VK_KHR_ray_tracing_pipeline` and is told the device does not have it
 # has been answered correctly. What the skip count measures is the *profile*,
-# which is design.md §11's declared scope — check 5 turns that into data.
+# which is docs/design.md §11's declared scope — check 5 turns that into data.
 #
 # ## The control is not optional
 #
-# design.md §0.13 retracted a headline that was measuring Xvfb, and §0.6 item 7
+# docs/design.md §0.13 retracted a headline that was measuring Xvfb, and §0.6 item 7
 # spent an afternoon on a triangle that was back-face culled on every
 # implementation including the unforwarded one. So this runs the *same tests, in
 # the same order, on the same driver, in the same shell*, once through the
@@ -80,7 +80,7 @@
 #
 # The ICD connects once per *process* (`sv_icd::instance`, a `OnceLock`), so a
 # chunk is a session and a long run opens hundreds of them one after another,
-# up to J at a time. Each has its own arena (design.md §0.12 item 3), which is
+# up to J at a time. Each has its own arena (docs/design.md §0.12 item 3), which is
 # why the default here is 256 MiB and not the 1 GiB the other harnesses use.
 set -uo pipefail
 
@@ -167,7 +167,7 @@ bad() { printf '  FAIL %s\n' "$*"; fail=1; }
 # saying "a ring that goes fatal is a forwarding defect by definition".
 #
 # The reason it was written that way is real and is not an excuse: this project
-# *has* a large, known, undiagnosed forwarding gap (design.md §0.15 — roughly
+# *has* a large, known, undiagnosed forwarding gap (docs/design.md §0.15 — roughly
 # 70-75% of the control's passes lost, and about 7% of forwarded tests hanging
 # the GPU), so a check that failed on any regression at all would be red on
 # every run and would teach everyone to ignore it. The answer to that is not to
@@ -268,7 +268,7 @@ start_gpu_side() {
 # provokes device loss, and one forwarded submit was enough to get
 # `radv/amdgpu: The CS has been cancelled … this context is guilty of a hard
 # recovery` out of RADV. A GPU side opens **one** `VkDevice` at startup and
-# every session shares it (design.md §0.12), so after that every later session
+# every session shares it (docs/design.md §0.12), so after that every later session
 # — belonging to processes that had nothing to do with the offending test — got
 # `vkQueueSubmit answered VkResult(-4)` and took its ring fatal. The first run
 # of this script measured 15 passes against the control's 96 for exactly that
@@ -488,7 +488,7 @@ score() {
 say "1. the control: the same tests, the same driver, no forwarding"
 # ---------------------------------------------------------------------------
 # `VK_DRIVER_FILES` names the *real* RADV here and our manifest in check 2, so
-# the two passes differ in exactly one value. design.md §0.13 item 3 is the run
+# the two passes differ in exactly one value. docs/design.md §0.13 item 3 is the run
 # where leaving it unset for one side and set for the other silently changed
 # what was being measured.
 CTL_START=$SECONDS
@@ -506,7 +506,7 @@ fi
 say "2. several sessions on one GPU side, at once"
 # ---------------------------------------------------------------------------
 # Check 3 gives every chunk its own GPU side, for the device-loss reason given
-# there, and that removes the property design.md §0.12 is about: **one driver,
+# there, and that removes the property docs/design.md §0.12 is about: **one driver,
 # one queue, several clients**. This puts it back, on a group the forwarder is
 # known to pass, so that a failure here is concurrency and not coverage.
 #
@@ -524,7 +524,7 @@ say "2. several sessions on one GPU side, at once"
 # damage, not concurrency, and a check placed after a phase that resets the GPU
 # is measuring the phase. Ordering is part of the experiment.
 #
-# The general form of this is the one design.md §0 keeps restating: a true
+# The general form of this is the one docs/design.md §0 keeps restating: a true
 # observation attached to the wrong cause. It survived one run in each
 # direction — 48/48 the first time, 12/18 the second — which is exactly long
 # enough to be believed.
@@ -580,7 +580,7 @@ else
 fi
 
 # **Which implementation actually ran.** Without this the whole script can pass
-# while measuring RADV twice — the failure mode design.md §0.13 item 3 describes
+# while measuring RADV twice — the failure mode docs/design.md §0.13 item 3 describes
 # from the other direction. Both ends have to say so: the ICD prints that it
 # connected, and the GPU side counts the sessions it served.
 cat "$RUNDIR/forwarded"/gpu-*.log > "$RUNDIR/gpu.log" 2>/dev/null
@@ -672,7 +672,7 @@ if [ -s "$CTL" ] && [ -s "$FWD" ]; then
   # would then mean "somebody changed the sample size". The share is the
   # property of the code.
   #
-  # 80% is design.md §0.15's recorded state (96 control passes, 24 and 29
+  # 80% is docs/design.md §0.15's recorded state (96 control passes, 24 and 29
   # forwarded across two runs of the same 164 tests — 75% and 70% lost), with
   # room for the ±5-tests-in-164 variance that section measures. It is a
   # ceiling on a defect, not a target, and the only good direction for it is
@@ -697,7 +697,7 @@ fi
 # ---------------------------------------------------------------------------
 say "5. the gap, as data: what the profile does not carry"
 # ---------------------------------------------------------------------------
-# design.md §11 declares the scope and `vk_registry::profiles::zink` is that
+# docs/design.md §11 declares the scope and `vk_registry::profiles::zink` is that
 # declaration, but until this there was no way to ask "which commands are out?"
 # other than to subtract one list from another in your head. A skip in check 1
 # is what a missing command looks like from the suite's side, so the two belong

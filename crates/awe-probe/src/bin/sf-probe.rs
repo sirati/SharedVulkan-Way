@@ -260,7 +260,7 @@ mod body {
         //
         // The frame list is a *wire* object before it is a text file: it is
         // `Locator::Pfns` in the `ExtentDesc` a guest publishes on the cold path
-        // (design.md §0.14, §4.3). Building it here rather than only writing the
+        // (docs/design.md §0.14, §4.3). Building it here rather than only writing the
         // text means this probe exercises the same encoding the handshake uses,
         // and the run count printed below is the one the host will reconstruct
         // from the descriptor rather than a second count that happens to agree.

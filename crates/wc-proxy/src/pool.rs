@@ -297,7 +297,7 @@ impl PoolTransport for SharedFile {
 /// This is `Descriptor::ArenaSlice`, reserved in the type since stage 1
 /// (docs/waycompose-design.md §2.2 (c)) and constructed here for the first time. In the
 /// real deployment the region is shared_vulkan's passthrough arena — guest RAM
-/// the host found by walking QEMU's flat view (its design.md §5.1) — and this
+/// the host found by walking QEMU's flat view (its docs/waycompose-design.md §5.1) — and this
 /// process is handed a range of it. In the same-machine test the region is one
 /// file, attached by both sides from a flag.
 ///
@@ -310,7 +310,7 @@ impl PoolTransport for SharedFile {
 ///
 /// First fit over a sorted free list, coalescing on release, 4096-byte
 /// granularity. The granularity is not arbitrary: it is `sv_arena::GRANULARITY`
-/// (shared_vulkan design.md §5.2), which is the measured
+/// (shared_vulkan docs/waycompose-design.md §5.2), which is the measured
 /// `minImportedHostPointerAlignment` on the target *and* the page granularity
 /// of the shared mapping. A pool that begins on a page boundary is also a pool
 /// whose peer-side mapping can be a whole number of pages, which is what makes
@@ -611,7 +611,7 @@ struct Alloc {
 /// host addresses. There is no arithmetic that reaches from one into the other.
 /// A buffer spanning both would therefore have to be described to the
 /// compositor as a *list* of runs — which is precisely the guest's own page
-/// layout, and design.md §5.7 is explicit that "the run list does not cross the
+/// layout, and docs/design.md §5.7 is explicit that "the run list does not cross the
 /// wire, and it never did have to".
 ///
 /// So `Descriptor::ArenaSlice { arena, offset, len }` names one region and one
@@ -621,7 +621,7 @@ struct Alloc {
 /// that is two imports is naming something nobody ever mapped as one thing.
 struct RegionMap {
     /// The number in `Descriptor::ArenaSlice { arena, .. }`. **An integer, and
-    /// never a descriptor** (design.md §1a): growth adds regions, and a region
+    /// never a descriptor** (docs/waycompose-design.md §1a): growth adds regions, and a region
     /// is named the same way the first one always was.
     id: u32,
     backing: SharedBacking,
@@ -730,7 +730,7 @@ impl Arenas {
 /// Wine fixture — it is one `set_len`.
 ///
 /// Making it a trait keeps the second from pretending to be the first.
-/// design.md §5.1's rule is that a failed locate fails the run and there is
+/// docs/waycompose-design.md §5.1's rule is that a failed locate fails the run and there is
 /// deliberately no fallback, so a `RegionSource` that quietly served a file
 /// when guest RAM was asked for would be exactly the "same-machine path wearing
 /// the design's clothes" §1a warns about. Each implementation serves one
@@ -807,7 +807,7 @@ impl core::fmt::Display for MemoryReport {
 ///
 /// Constructed only through the two functions below, which is what keeps
 /// [`Backing`] private. That is not tidiness: the two substrates are not
-/// interchangeable — design.md §5.1 says a failed locate fails the run and
+/// interchangeable — docs/waycompose-design.md §5.1 says a failed locate fails the run and
 /// there is deliberately no fallback — and a constructor taking an arbitrary
 /// backing would be the seam through which a file quietly stood in for guest
 /// RAM.
@@ -837,7 +837,7 @@ impl ProvidedRegion {
 
     /// A region backed by a file on this machine.
     ///
-    /// **The Wine fixture, and only ever the Wine fixture.** design.md §5.1 is
+    /// **The Wine fixture, and only ever the Wine fixture.** docs/waycompose-design.md §5.1 is
     /// explicit that guest RAM is the substrate and that the file-backed arena
     /// exists so a machine with no hypervisor can run the same code. A
     /// deployment that reached this by accident would be a same-machine path
@@ -1440,7 +1440,7 @@ impl Arena {
     ///
     /// The second number is the one that matters: an arena with room for a pool
     /// and nowhere to put it is the fragmentation failure shared_vulkan's
-    /// design.md §5.7 is about, and reporting only the total would hide it.
+    /// docs/design.md §5.7 is about, and reporting only the total would hide it.
     /// Growth does not change that — it adds a region whose largest run is the
     /// whole of it — and summing the largest runs across regions would be a
     /// second way to hide the same thing, since no pool may straddle two.
@@ -1959,7 +1959,7 @@ impl Arena {
     /// # What growth costs, and why the number is recorded rather than assumed
     ///
     /// Over guest RAM a new region is a `VirtualAlloc` and a *locate*. The
-    /// locate is the whole cost: design.md §12.5 measured the content sweep at
+    /// locate is the whole cost: docs/waycompose-design.md §12.5 measured the content sweep at
     /// **2.37–2.42 s** for a 13312 MiB backing object, and it is a function of
     /// the guest's RAM rather than of the region's size. A 2.4 s stall in the
     /// middle of a video is not a feature, which is why §0.14's
@@ -2997,8 +2997,8 @@ mod tests {
         println!("  growth mean            {} ns", nanos / u64::from(grown.max(1)));
         println!("  arena now              {} bytes in {} region(s)", a.size(), a.regions());
         println!("\n  the term this cannot measure is the locate:");
-        println!("    content sweep   2.37-2.42 s   (design.md 12.5, and it cannot re-locate)");
-        println!("    PFN query       0.064 s host + ~330 ms guest   (design.md 0.14)");
+        println!("    content sweep   2.37-2.42 s   (docs/waycompose-design.md 12.5, and it cannot re-locate)");
+        println!("    PFN query       0.064 s host + ~330 ms guest   (docs/design.md 0.14)");
         assert!(grown >= 1, "the point of the measurement is that growth happened");
     }
 

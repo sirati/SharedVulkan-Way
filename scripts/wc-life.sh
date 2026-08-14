@@ -352,11 +352,11 @@ run_wine() {
 
   # ------------------------------------------- the other per-window resource ---
   #
-  # §57. A window is not the only thing `ToUi::Destroy` gives back: it also
+  # docs/waycompose-design.md §60. A window is not the only thing `ToUi::Destroy` gives back: it also
   # revokes the window's OLE drop-target registration, and **that one has no
   # external witness at all**. OLE's registration table is not enumerable from
   # another process, and a stranded entry has no symptom until an `HWND` value
-  # is reused — which §57.3 measures as not happening within a run, so the
+  # is reused — which docs/waycompose-design.md §60.3 measures as not happening within a run, so the
   # trick that would have caught it is unavailable here.
   #
   # What is available is the compositor's own count, printed at exit, made

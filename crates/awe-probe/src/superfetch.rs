@@ -560,7 +560,7 @@ mod sys {
 
     /// The same, as the thing that actually crosses the cold path.
     ///
-    /// design.md §0.14: this is the call that turns "Windows will tell us where
+    /// docs/design.md §0.14: this is the call that turns "Windows will tell us where
     /// the pages are" into a descriptor the host can act on. What comes back is
     /// run-length encoded — 26 runs per 64 MiB on the large-page path, up to one
     /// per page on the 4 KiB one — and it is the *whole* of what the guest has

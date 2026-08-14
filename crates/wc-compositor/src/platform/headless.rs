@@ -553,6 +553,19 @@ impl PumpInner {
                     );
                 }
             }
+            // §45.11. There is no window rectangle here to move — `control.rs`
+            // owns positions on this platform and derives the corner from the
+            // window's `content_offset` directly, so it already knows. Logged
+            // rather than ignored, because "the window's origin moved" is a
+            // thing a person reading a headless run should be able to see, and
+            // because a silent arm is how a message stops being handled without
+            // anybody noticing (§42).
+            ToUi::ShiftOrigin { id, dx, dy } => {
+                println!(
+                    "wc-compositor: window {id} origin shifted by {dx},{dy} \
+                     (no window manager here; control.rs derives it)"
+                );
+            }
             ToUi::Present { id, damage } => {
                 let Some(w) = windows.get_mut(&id) else { return };
                 {

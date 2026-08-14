@@ -2221,7 +2221,7 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
         "wc-compositor: windows at exit: {made} created, {gone} destroyed, \
          {held} still held, {live} still alive, {clients} client(s) still connected"
     );
-    // ADDED FOR docs/waycompose-design.md §57. The same accounting for the
+    // ADDED FOR docs/waycompose-design.md §60. The same accounting for the
     // *other* per-window resource, and it rides on this line's coat-tails for
     // §56.2's reason: a stranded OLE registration has no symptom at all, so the
     // only way it is ever noticed is a number printed where a run already
@@ -2231,7 +2231,7 @@ fn report_window_leaks(ui: &Rc<Ui>, clients: u32) {
     // for the same reason §56 labels its first three: a bug in the teardown
     // path is exactly the circumstance in which the account is wrong. Unlike
     // the window count there is no external witness available — OLE's table is
-    // not enumerable from another process — which §57.3 says out loud rather
+    // not enumerable from another process — which §60.3 says out loud rather
     // than leaving the asymmetry to be noticed.
     let (registered, revoked, failed) = super::drag::drop_target_counts();
     println!(
@@ -2321,6 +2321,32 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                     "wc-compositor: window {id} repositioned to {},{} {width}x{height}",
                     origin.x, origin.y
                 );
+            }
+        }
+        // §45.11. The corner moved; the size did not (a size change arrives on
+        // the ordinary present path) and neither did the z-order or the focus.
+        ToUi::ShiftOrigin { id, dx, dy } => {
+            if let Some(w) = window(ui, id) {
+                let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: a live handle, and `GetWindowRect` only writes the
+                // rectangle it is given.
+                unsafe {
+                    if GetWindowRect(w.hwnd(), &mut r) != 0 {
+                        SetWindowPos(
+                            w.hwnd(),
+                            std::ptr::null_mut(),
+                            r.left + dx,
+                            r.top + dy,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        println!(
+                            "wc-compositor: window {id} origin shifted by {dx},{dy} \
+                             (its content did not move)"
+                        );
+                    }
+                }
             }
         }
         ToUi::Present { id, damage } => {
