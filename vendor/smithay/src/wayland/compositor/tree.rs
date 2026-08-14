@@ -255,11 +255,66 @@ impl PrivateSurfaceData {
         }
     }
 
+    /// Apply the positions `wl_subsurface.set_position` staged for `surface`'s
+    /// **direct children**.
+    ///
+    /// waycompose §68. *"Position is double-buffered state on the parent
+    /// surface"* — so this is the parent's commit doing the applying, and it is
+    /// the only place a subsurface's location becomes current. See
+    /// `handlers::SubsurfaceState::pending_location` for why the value cannot
+    /// live in the child's own `cached_state`.
+    ///
+    /// Called from **both** commit paths. `commit` handles a surface committing
+    /// on its own; `commit_sync_surface_tree` handles the synchronized subtree a
+    /// desync ancestor drags along with it, where each level is somebody's
+    /// parent and owes its children the same service.
+    fn apply_child_positions(surface: &WlSurface, dh: &DisplayHandle) {
+        let _ = dh;
+        for child in Self::get_children(surface) {
+            // A surface is in its own children list (see the field's comment),
+            // so the parent would otherwise apply its own pending position and
+            // move itself.
+            if child.id() == surface.id() {
+                continue;
+            }
+            Self::with_states(&child, |states| {
+                let Some(sub) = states
+                    .data_map
+                    .get::<super::handlers::SubsurfaceState>()
+                else {
+                    return;
+                };
+                let pending = *sub.pending_location.lock().unwrap();
+                // **Both halves, and the pending one is not redundant.**
+                //
+                // `SubsurfaceCachedState` is still a `Cacheable`, so the child's
+                // own commit will promote its pending value over whatever is
+                // current. With `set_position` no longer writing that pending
+                // value it stays at its default, so writing only `current` here
+                // is undone by the child's very next commit — measured, and it
+                // cost nine passing tests in `XdgShellStableSubsurfaces`
+                // (17 passed/7 failed became 8/16) before this line existed.
+                //
+                // Keeping the two equal makes the cache's promotion a no-op and
+                // leaves `current().location` — which is what every reader uses,
+                // `placed_tree` included — the single applied value.
+                let mut cached = states
+                    .cached_state
+                    .get::<super::handlers::SubsurfaceCachedState>();
+                cached.pending().location = pending;
+                cached.current().location = pending;
+            });
+        }
+    }
+
     fn commit_sync_surface_tree(
         surface: &WlSurface,
         parent_transaction: &PendingTransaction,
         dh: &DisplayHandle,
     ) {
+        // §68: this surface is the parent of the next level down, and its state
+        // is being applied now, so its children's positions are applied now too.
+        Self::apply_child_positions(surface, dh);
         let children = PrivateSurfaceData::get_children(surface);
         let mut my_data = Self::lock_user_data(surface);
 
@@ -280,6 +335,24 @@ impl PrivateSurfaceData {
 
     pub fn commit<C: CompositorHandler + 'static>(surface: &WlSurface, dh: &DisplayHandle, state: &mut C) {
         let is_sync = is_effectively_sync(surface);
+        // §68. A commit on *this* surface makes its children's staged positions
+        // current — **but only if this commit is itself taking effect.**
+        //
+        // `is_sync` is the whole of that condition and leaving it out is a real
+        // bug, measured: an effectively-synchronized surface's commit applies
+        // nothing until its own parent commits, so applying its children's
+        // positions here moves a grandchild one commit early. It cost three
+        // `SubsurfaceMultilevelTest` cases —
+        // `subsurface_with_sync_parent_does_not_move_when_only_parent_committed`
+        // and the two `..._is_sync` ones — which is the suite doing exactly the
+        // job it exists for.
+        //
+        // The synchronized case is not skipped, only deferred: when a desync
+        // ancestor eventually commits, `commit_sync_surface_tree` walks this
+        // subtree and applies each level's children there.
+        if !is_sync {
+            Self::apply_child_positions(surface, dh);
+        }
         let children = PrivateSurfaceData::get_children(surface);
         let mut my_data = Self::lock_user_data(surface);
         // commit our state
