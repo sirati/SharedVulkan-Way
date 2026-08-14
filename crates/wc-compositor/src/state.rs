@@ -4277,7 +4277,7 @@ impl SelectionHandler for State {
         &mut self,
         _ty: smithay::wayland::selection::SelectionTarget,
         mime_type: String,
-        fd: smithay::utils::os::OwnedFd,
+        fd: smithay::utils::os::ProtoFd,
         _seat: Seat<Self>,
         _user_data: &(),
     ) {
@@ -4381,7 +4381,7 @@ impl ServerDndGrabHandler for State {
     /// `wc_clipboard_v1.fetch(source=drag)`, which `wc-proxy` issues *instead*
     /// of forwarding this request; a `receive` that reaches here at all came
     /// from a client with no proxy in front of it (§29.6).
-    fn send(&mut self, mime_type: String, fd: smithay::utils::os::OwnedFd, _seat: Seat<Self>) {
+    fn send(&mut self, mime_type: String, fd: smithay::utils::os::ProtoFd, _seat: Seat<Self>) {
         drop(fd);
         println!(
             "wc-compositor: a client asked for the drag's bytes as {mime_type:?} through \

@@ -56,14 +56,21 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
   it; on Windows they were always distinct types and nothing had to say so.
   `docs/waycompose-design.md` §76 for the measurement, §72.3 for what the
   separation is for.
-* `WireFd` — the type `ProtoFd` is going to become: an `h` argument that is
-  **either** a name the peer can open (`Named`, a `wc_handle::Handle`) **or** a
-  descriptor that is already open (`Open`, Unix only — `SCM_RIGHTS` has no
-  Windows equivalent, so that arm would be uninhabited there). The unnamed form
-  is deliberately *not* a sixth `wc_handle::Descriptor` variant: `Descriptor` is
-  a wire format meaning "a name a peer can open", and an `SCM_RIGHTS` fd has no
-  name. Tested but not yet constructed — `rs/wire.rs` still chooses by `cfg`.
+* `WireFd` — what `ProtoFd` **is**: an `h` argument that is **either** a name the
+  peer can open (`Named`, a `wc_handle::Handle`) **or** a descriptor that is
+  already open (`Open`, Unix only — `SCM_RIGHTS` has no Windows equivalent, so
+  that arm would be uninhabited there). The unnamed form is deliberately *not* a
+  sixth `wc_handle::Descriptor` variant: `Descriptor` is a wire format meaning "a
+  name a peer can open", and an `SCM_RIGHTS` fd has no name.
   `docs/waycompose-design.md` §77.
+* `RawWireFd`, `BorrowedWireFd<'a>` — the send-side and borrowed forms of the
+  same disjunction, which `RawProtoFd` and `BorrowedProtoFd` now alias.
+* `FdEncoding` — **which dialect a connection speaks**, the thing that used to be
+  a `#[cfg]` in `rs/wire.rs`. Same name and same two variants as
+  `wc_proxy::wire::FdEncoding`, deliberately. Its `Default` is `cfg`-ed rather
+  than derived: an unannounced peer is out-of-band on Unix and in-band on
+  Windows, where there is no ancillary channel to be out of band *in*.
+  `docs/waycompose-design.md` §79.
 * `WlStream` — the socket type, `wc_transport::Stream` on both platforms.
 * `PollHandle` — an `OwnedFd` (epoll/kqueue) on Unix, a `polling::Poller`
   (wepoll) on Windows.
@@ -157,7 +164,8 @@ obligation the `unsafe` block around `Poller::add_with_mode` relies on.
 | `Cargo.toml` | `rustix` behind `cfg(unix)`; `wc-transport` added; `libwayland_1_2x` features kept but forwarding to the backend's inert ones. |
 | `src/socket.rs` | the listening socket. See below. |
 | `src/display.rs` | stream type; `AsFd` impl gated to Unix, with an inherent `poll_handle()` on Windows. |
-| `src/lib.rs`, `src/dispatch.rs`, `src/global.rs` | fd types from `wayland_backend::os`. |
+| `src/lib.rs`, `src/dispatch.rs`, `src/global.rs` | fd types from `wayland_backend::os`; `backend::os` re-exported, because `ProtoFd` and `FdEncoding` appear in every generated request and event (§79). |
+| `src/display.rs` | `DisplayHandle::set_client_fd_encoding`, the per-connection dialect (§79). |
 
 ### The lockfile, where Windows is *better*
 

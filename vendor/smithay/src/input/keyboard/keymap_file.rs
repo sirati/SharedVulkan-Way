@@ -1,5 +1,6 @@
 use std::ffi::CString;
-use crate::utils::os::{AsFd, BorrowedFd};
+#[cfg(unix)]
+use crate::utils::os::AsFd;
 
 use sha2::{Digest, Sha256};
 use tracing::error;
@@ -65,7 +66,7 @@ impl KeymapFile {
     /// Run a closure with the file descriptor to ensure safety
     pub fn with_fd<F>(&self, supports_sealed: bool, cb: F) -> Result<(), std::io::Error>
     where
-        F: FnOnce(BorrowedFd<'_>, usize),
+        F: FnOnce(crate::utils::os::BorrowedProtoFd<'_>, usize),
     {
         // On Windows the "unsealed" fallback below does not exist and cannot:
         // it hands the client a `tempfile` descriptor, and a Windows `h`
@@ -80,7 +81,7 @@ impl KeymapFile {
             let file = self.sealed.as_ref().ok_or_else(|| {
                 std::io::Error::other("no keymap section: creating it failed earlier")
             })?;
-            cb(file.as_fd(), file.size());
+            cb(file.proto_fd(), file.size());
             return Ok(());
         }
 
@@ -89,7 +90,7 @@ impl KeymapFile {
         use std::{io::Write, path::PathBuf};
 
         if let Some(file) = supports_sealed.then_some(self.sealed.as_ref()).flatten() {
-            cb(file.as_fd(), file.size());
+            cb(file.proto_fd(), file.size());
         } else {
             let dir = std::env::var_os("XDG_RUNTIME_DIR")
                 .map(PathBuf::from)
@@ -99,7 +100,10 @@ impl KeymapFile {
             file.write_all(self.keymap.as_bytes())?;
             file.flush()?;
 
-            cb(file.as_fd(), self.keymap.len());
+            // The unsealed fallback is a plain `tempfile`, so it can only ever
+            // be the open form. §79: a peer that speaks in band will be refused
+            // by `rs/wire.rs` rather than desynchronised.
+            cb(crate::utils::os::BorrowedProtoFd::Open(file.as_fd()), self.keymap.len());
         }
         Ok(())
         }

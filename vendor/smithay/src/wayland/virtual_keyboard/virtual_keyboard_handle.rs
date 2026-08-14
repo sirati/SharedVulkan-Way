@@ -88,7 +88,19 @@ where
     ) {
         match request {
             zwp_virtual_keyboard_v1::Request::Keymap { format, fd, size } => {
-                update_keymap(data, format, fd, size as usize);
+                // §79: this one is `mmap`ed directly, so it needs a real
+                // descriptor. A named keymap would have to be opened first, and
+                // nothing here can do that — refusing is the honest answer.
+                match fd.into_open() {
+                    Ok(fd) => update_keymap(data, format, fd, size as usize),
+                    Err(named) => {
+                        tracing::warn!(
+                            ?named,
+                            "a virtual keyboard sent a named keymap; only an open \
+                             descriptor can be mapped here"
+                        );
+                    }
+                }
             }
             zwp_virtual_keyboard_v1::Request::Key { time, key, state } => {
                 // Ensure keymap was initialized.

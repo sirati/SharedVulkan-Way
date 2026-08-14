@@ -4,7 +4,7 @@ use wc_transport::Stream as UnixStream;
 use std::sync::Arc;
 
 #[cfg(unix)]
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::io::{AsFd, BorrowedFd};
 
 use wayland_backend::{
     protocol::ObjectInfo,
@@ -127,6 +127,19 @@ impl DisplayHandle {
     ) -> std::io::Result<Client> {
         let id = self.handle.insert_client(stream, data.clone())?;
         Ok(Client { id, data })
+    }
+
+    /// WAYCOMPOSE FORK (`docs/waycompose-design.md` §79): declare which `h`
+    /// dialect a client speaks.
+    ///
+    /// See [`wayland_backend::server::Handle::set_client_fd_encoding`]. Call it
+    /// immediately after `insert_client`, before the next dispatch.
+    pub fn set_client_fd_encoding(
+        &self,
+        client: crate::backend::ClientId,
+        encoding: wayland_backend::os::FdEncoding,
+    ) -> std::io::Result<()> {
+        self.handle.set_client_fd_encoding(client, encoding)
     }
 
     /// Retrieve the [`Client`] which owns the object represented by the given ID

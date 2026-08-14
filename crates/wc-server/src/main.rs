@@ -177,38 +177,55 @@ mod globals {
     }
 }
 
-/// Open whatever the client's `h` argument named and print what is in it.
+/// Open whatever the client's `h` argument was and print what is in it.
 ///
 /// The printed line is what `scripts/wc-handshake.sh` greps for, and it is the
-/// only evidence that matters for the shim: the server was told a *name* and a
-/// *size* and nothing else, so bytes it can print are bytes it fetched from the
-/// object the client created.
-#[cfg(windows)]
-fn report_pool_contents(handle: &wc_handle::Handle) {
-    println!("wc-server:     descriptor: {:?}", handle.descriptor());
-    match handle.map() {
-        Ok(map) => {
-            let bytes = map.as_slice();
-            let head: String = String::from_utf8_lossy(&bytes[..17.min(bytes.len())]).into_owned();
-            let tail = if bytes.len() >= 4004 {
-                String::from_utf8_lossy(&bytes[4000..4004]).into_owned()
-            } else {
-                String::new()
-            };
-            println!("wc-server:     SHM MAPPED len={} head={head:?} tail={tail:?}", map.len());
+/// only evidence that matters: a *named* `h` means the server was told a name
+/// and a size and nothing else, so bytes it can print are bytes it fetched from
+/// the object the client created.
+///
+/// §79 folded the two `cfg`s into one function. Which arm applies is now a
+/// property of the connection rather than of the platform, so the same build
+/// exercises both mechanisms through the same protocol path.
+fn report_pool_contents(fd: &wayland_server::backend::os::ProtoFd) {
+    // §79: an `h` is now either kind on this platform too. A named one is read by
+    // opening it, exactly as the Windows build has always done.
+    let _open = match fd {
+        wayland_server::backend::os::WireFd::Named(handle) => {
+            println!("wc-server:     descriptor: {:?}", handle.descriptor());
+            match handle.map() {
+                Ok(mapping) => {
+                    let bytes = mapping.as_slice();
+                    let head: String =
+                        String::from_utf8_lossy(&bytes[..17.min(bytes.len())]).into_owned();
+                    let tail = if bytes.len() >= 4004 {
+                        String::from_utf8_lossy(&bytes[4000..4004]).into_owned()
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "wc-server:     SHM MAPPED len={} head={head:?} tail={tail:?}",
+                        bytes.len()
+                    );
+                }
+                Err(e) => println!("wc-server:     SHM MAP FAILED: {e}"),
+            }
+            return;
         }
-        Err(e) => println!("wc-server:     SHM MAP FAILED: {e}"),
-    }
+        #[cfg(unix)]
+        wayland_server::backend::os::WireFd::Open(fd) => fd,
+    };
+    #[cfg(unix)]
+    read_open_pool(_open);
 }
 
-/// See the Windows version. On Unix the `h` is a real file descriptor delivered
-/// by `SCM_RIGHTS`, so this reads it the ordinary way — which also means the
-/// same test exercises both mechanisms through the same protocol path.
+/// The out-of-band half of [`report_pool_contents`]. Unix-only because the
+/// `WireFd::Open` arm is.
 #[cfg(unix)]
-fn report_pool_contents(fd: &std::os::fd::OwnedFd) {
+fn read_open_pool(open: &std::os::fd::OwnedFd) {
     use std::io::{Read, Seek};
     use std::os::fd::AsFd;
-    let mut file = std::fs::File::from(fd.as_fd().try_clone_to_owned().unwrap());
+    let mut file = std::fs::File::from(open.as_fd().try_clone_to_owned().unwrap());
     let mut bytes = Vec::new();
     let _ = file.seek(std::io::SeekFrom::Start(0));
     match file.read_to_end(&mut bytes) {

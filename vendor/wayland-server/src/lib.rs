@@ -103,6 +103,10 @@ pub use socket::{BindError, ListeningSocket};
 /// Backend reexports
 pub mod backend {
     pub use wayland_backend::protocol;
+    // WAYCOMPOSE FORK (§79): `ProtoFd` and `FdEncoding` appear in every generated
+    // request and event, so a consumer of this crate has to be able to name them
+    // without depending on `wayland-backend` directly.
+    pub use wayland_backend::os;
     pub use wayland_backend::server::{
         Backend, ClientData, ClientId, Credentials, DisconnectReason, GlobalHandler, GlobalId,
         Handle, InitError, InvalidId, ObjectData, ObjectId, WeakHandle,

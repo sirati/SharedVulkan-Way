@@ -197,3 +197,30 @@ impl AsFd for SealedFile {
         self.handle.as_fd()
     }
 }
+
+impl SealedFile {
+    /// The `h` argument a `wl_keyboard.keymap` should carry for this file.
+    ///
+    /// §79. The one place that knows which arm a keymap is, and it replaced the
+    /// `cfg` at four call sites: the descriptor a Windows peer needs and the
+    /// descriptor a Unix peer needs are different *kinds*, not different
+    /// spellings, and only the object itself can say which it has.
+    ///
+    /// **On Unix this is always the open form**, and a client that speaks the
+    /// in-band dialect will therefore be refused by `rs/wire.rs` with
+    /// `WrongDialect` rather than silently desynchronised. Making a keymap
+    /// nameable on Unix means backing `SealedFile` with a
+    /// `wc_handle::Handle::create_shared_file` instead of a `memfd`, which is
+    /// real work and is the next step rather than this one.
+    pub fn proto_fd(&self) -> crate::utils::os::BorrowedProtoFd<'_> {
+        #[cfg(unix)]
+        {
+            use crate::utils::os::AsFd as _;
+            crate::utils::os::BorrowedProtoFd::Open(self.file.as_fd())
+        }
+        #[cfg(windows)]
+        {
+            crate::utils::os::BorrowedProtoFd::Named(&self.handle)
+        }
+    }
+}

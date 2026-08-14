@@ -24554,3 +24554,172 @@ carve out the file that happens to hurt.
 3. **The three baseline entries are tolerated, not fixed.** The `wc-launch` one
    has a stated route to correctness (a per-run profile directory) that nobody
    has taken.
+
+## 79. The `h` dialect is chosen per connection, and a Linux compositor can read the proxy's
+
+### 79.1 Status in one paragraph
+
+`ProtoFd` is `WireFd`. `rs/wire.rs` reads and writes **both** dialects on **both**
+platforms, and which one a connection speaks is a field on its `BufferedSocket`
+set by whoever accepted it — §72.3's "the transport picks", built. A Linux
+`wc-compositor` can now parse an in-band `wl_shm.create_pool` and map the named
+object it names, which is the half of §72.3's defect that lived in this tree.
+**The acceptance test has not been run**, and the proxy still spells its upstream
+dialect as a constant, so the tripwire stays; 79.7 is precise about the line
+between what is proven and what is merely compiled.
+
+### 79.2 The prediction held to the line
+
+§76.5 measured that swapping the three aliases for distinct types would produce
+errors only in the protocol layer, and named `rs/wire.rs` 157 and 332 as the work
+list. Pointing `ProtoFd`/`RawProtoFd`/`BorrowedProtoFd` at the real enums, before
+touching anything else, produced:
+
+| | errors |
+|---|---|
+| the whole of `wayland-backend` | **2** |
+| the whole of `wayland-server` | **0** |
+| and they were | `rs/wire.rs:157` and `rs/wire.rs:332` |
+
+Nothing in the socket layer moved, exactly as §76.5 said. That is a prediction
+made in one commit and discharged in another, and it is the reason this section
+is a day's work rather than the open-ended refactor the first attempt hit.
+
+### 79.3 The three names the send side needed
+
+`WireFd` was only the parsed form. The other two follow the shape §76.3 already
+described:
+
+| | arms |
+|---|---|
+| `WireFd` (`ProtoFd`) | `Named(Handle)` / `Open(OwnedFd)` |
+| `RawWireFd` (`RawProtoFd`) | `Named(Handle)` / `Open(RawFd)` |
+| `BorrowedWireFd<'a>` (`BorrowedProtoFd`) | `Named(&'a Handle)` / `Open(BorrowedFd<'a>)` |
+
+`Open` is `#[cfg(unix)]` in all three, for the reason §77.4 gives. `WireFd`
+gained two operations that turned out to carry most of the call-site work:
+`borrow()`, which is what a **forwarder** needs (a clipboard pipe arrives on one
+connection and leaves on another, and neither end should know which arm it is),
+and `into_open()`, which is what a caller that needs a **real kernel descriptor**
+needs — a `UnixListener` to accept on, an fd to `mmap` a virtual keyboard's
+keymap out of. `into_open()` is unconditional and on Windows always returns
+`Err`, which is the same answer those callers always got, now given by the type
+instead of by a `cfg` at each site.
+
+### 79.4 `FdEncoding::default()` is not derived, and that is a bug avoided
+
+The dialect defaults to what an **unannounced peer on this platform** is. On Unix
+that is a stock libwayland client speaking `SCM_RIGHTS`. On Windows there is no
+ancillary channel at all, so the only thing a connection can possibly be speaking
+is the in-band form.
+
+`#[derive(Default)]` on the first variant would have made every Windows
+connection start out claiming `OutOfBand` — a mechanism the platform does not
+have — and the parser would then have looked for body bytes that a correct sender
+never wrote. The Windows cross check is what surfaced it: `WireFd::Open` does not
+exist there, so the out-of-band parse branch failed to compile and forced the
+question. **That is the third thing `cargo check --workspace --target
+x86_64-pc-windows-gnu` has caught in this sequence** (§77.6 is the second), and
+`clippy --workspace --all-targets` would not have found any of them.
+
+### 79.5 Sixteen `cfg` sites became a `match`, and smithay shrank
+
+§72.3 predicted "sixteen occurrences across six files in `vendor/smithay`, eight
+of them in `wayland/shm/pool.rs`". The compiler found **12** breakages across ten
+files, and they split cleanly:
+
+* **four on the send side**, all `BorrowedFd` where a `BorrowedWireFd` is now
+  wanted. Three of them collapsed into one change: `SealedFile::proto_fd()` is
+  now the single place that knows which arm a keymap is, and `KeymapFile::with_fd`
+  hands the callback a `BorrowedProtoFd` instead of each caller wrapping one.
+* **eight on the receive side**, of which the one that matters is
+  `shm/handlers.rs` → `Pool::new`.
+
+`shm/pool.rs` is where the "shrink" is real. `MemMap::new`, `remap` and `map`
+were each two `#[cfg]` bodies; they are now one function with a `match` on the
+`WireFd` arm, and **the bodies are unchanged**. `_view: Option<Mapping>` stopped
+being `#[cfg(windows)]`: whether a mapping's view has to be held is a property of
+*which kind of `h` arrived*, not of which kernel is running, and that `Option` is
+now also what `Drop` reads to decide whether `munmap` applies. The `SIGBUS` guard
+stays Unix-only and that is still right — it defends against a client
+`ftruncate`ing its pool smaller, which is a thing an open fd allows and a named
+section does not.
+
+Three receive-side sites genuinely need a real descriptor and now say so:
+`security_context` (a `UnixListener` to accept on), `virtual_keyboard` (an fd to
+`mmap`), and both refuse a name with a protocol error or a warning rather than
+guessing. `vendor/PATCHES.md` already recorded that sandboxing this way is not
+portable and wants AppContainer instead, so the refusal is the position the fork
+already held, now enforced by the type.
+
+### 79.6 The doors, and why one of them needs a flag
+
+`wc-compositor` sets the dialect per accepted connection:
+
+* **the ring door needs no flag.** A connection arriving as a ring slot *is*
+  `wc-proxy --upstream-ring`, by construction — nothing else can claim one — so
+  it is set `InBand` unconditionally.
+* **the socket door takes `--in-band`.** A unix socket carries no identity, and
+  the relay legs put the proxy on one (`wc-vm-client.sh` runs `wc-proxy
+  --upstream /tmp/up.sock` over a virtio-serial pair). So the operator who
+  arranged the relay declares it. That is still "the transport picks" — it is a
+  property of how the compositor was launched, not of anything negotiated in the
+  stream, which §72.3 measured and rejected.
+
+The setter is deliberately separate from `insert_client` rather than a parameter
+on it: `insert_client` has seven signatures across two backends and
+`wayland-server`, and a connection cannot have read anything between the two
+calls because nothing is dispatched until the next turn. `Handle::set_client_fd_encoding`
+returns `io::Result` for one honest reason — **the `libwayland` backend refuses
+`InBand`**. It is a binding to a library that reads `SCM_RIGHTS` and nothing else,
+and silently accepting would reproduce §72.3's desync one layer down.
+
+### 79.7 What is proven, and what is only compiled
+
+**Proven, by tests that run in the gate:**
+
+* `an_in_band_h_round_trips_on_this_platform` — a `wl_shm.create_pool` written
+  and read back **on Linux** in the in-band dialect, asserting that the `h` costs
+  body bytes and comes back as the same `Descriptor`. Before this, no code on
+  Linux could write those bytes or read them.
+* `reading_in_band_bytes_out_of_band_does_not_silently_succeed` — the mismatch is
+  detectable rather than invisible.
+* `an_open_fd_cannot_be_written_in_band` — the write side refuses rather than
+  guessing, which is `MessageWriteError::WrongDialect`.
+
+**Not proven, and not claimed:**
+
+1. **`scripts/wc-pooltest.c` through the proxy to a Linux compositor has not been
+   run.** That is §72.3's acceptance test and it is the next thing to do. What is
+   now in place is everything it needs on the compositor side; what has not
+   happened is the run.
+2. **`wc-proxy` is untouched**, so
+   `the_upstream_dialect_is_still_assumed_rather_than_chosen` **still passes and
+   is deliberately still there**. Its assertion is that `session.rs` spells both
+   dialects as constants with no transport consulted, and that is still exactly
+   true. Deleting it now would be deleting a true statement because a *different*
+   statement became false.
+3. **A keymap still cannot be sent to an in-band peer on Linux.** `SealedFile` is
+   a `memfd` there, so `proto_fd()` can only return the open arm, and
+   `rs/wire.rs` will refuse with `WrongDialect`. **Loudly, which is the change** —
+   the same client previously desynchronised the stream with nothing logged.
+   Fixing it means backing `SealedFile` with `wc_handle::Handle::create_shared_file`
+   on Unix, which is real work and is the next step rather than this one. The
+   same applies to the clipboard and drag pipes.
+
+So the pool path — the one §72.3 names — is built end to end and the keymap path
+is not. That is the honest split, and 3 is why `wayland-info` over the relay is
+still expected to fail where `wc-pooltest` is not.
+
+### 79.8 The gates
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **89 binaries, 2645 passed, 0 failed** |
+| master `c2330a4` before this | 89 binaries, 2642 passed |
+| `cargo clippy --workspace --all-targets` | exit 0 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0, and it found 79.4 |
+| `the_upstream_dialect_is_still_assumed_rather_than_chosen` | passes, and stays — see 79.7 |
+
+The three new tests are the three in 79.7. No test moved binaries and none was
+deleted.

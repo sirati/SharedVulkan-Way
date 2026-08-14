@@ -13,7 +13,7 @@ use std::io::{ErrorKind, Result as IoResult};
 // `RawFd` is in the Unix group below rather than here, and the reason is the
 // separation itself: once the `Message` signatures stopped saying `RawFd`, its
 // only remaining readers were the two `AsRawFd` impls, which are Unix-only.
-use crate::os::{errors, OwnedFd, ProtoFd, RawProtoFd, WlStream};
+use crate::os::{errors, FdEncoding, OwnedFd, ProtoFd, RawProtoFd, WlStream};
 
 #[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
@@ -248,10 +248,19 @@ pub struct BufferedSocket {
     out_data: Buffer<u8>,
     out_fds: Vec<OwnedFd>,
     max_buffer_size: Option<usize>,
+    /// WAYCOMPOSE FORK (§79): how this connection spells an `h`.
+    ///
+    /// Per socket rather than per process, which is what lets one binary serve
+    /// a stock libwayland client and a `wc-proxy` peer at the same time.
+    encoding: FdEncoding,
 }
 
 impl BufferedSocket {
     /// Wrap a Socket into a Buffered Socket
+    ///
+    /// The connection starts out-of-band — see [`FdEncoding::OutOfBand`] for why
+    /// that is the right default — and whoever knows better calls
+    /// [`BufferedSocket::set_fd_encoding`].
     pub fn new(socket: Socket, max_buffer_size: Option<usize>) -> Self {
         Self {
             socket,
@@ -260,7 +269,23 @@ impl BufferedSocket {
             out_data: Buffer::new(DEFAULT_MAX_BUFFER_SIZE),
             out_fds: Vec::new(),
             max_buffer_size: max_buffer_size.map(round_max_buffer_size),
+            encoding: FdEncoding::default(),
         }
+    }
+
+    /// Declare which dialect this connection speaks.
+    ///
+    /// Must be called before any traffic: the two dialects disagree about how
+    /// many body bytes an `h` occupies, so changing it mid-stream would
+    /// desynchronise the reader — which is precisely the failure §72.3
+    /// describes.
+    pub fn set_fd_encoding(&mut self, encoding: FdEncoding) {
+        self.encoding = encoding;
+    }
+
+    /// Which dialect this connection speaks.
+    pub fn fd_encoding(&self) -> FdEncoding {
+        self.encoding
     }
 
     /// Flush the contents of the outgoing buffer into the socket
@@ -323,7 +348,7 @@ impl BufferedSocket {
     fn attempt_write_message(&mut self, msg: &Message<u32, RawProtoFd>) -> IoResult<bool> {
         let fds_len = self.out_fds.len();
         loop {
-            match write_to_buffers(msg, self.out_data.get_writable_storage(), &mut self.out_fds) {
+            match write_to_buffers(msg, self.out_data.get_writable_storage(), &mut self.out_fds, self.encoding) {
                 Ok(bytes_out) => {
                     self.out_data.advance(bytes_out);
                     return Ok(true);
@@ -337,6 +362,13 @@ impl BufferedSocket {
                 }
                 Err(MessageWriteError::DupFdFailed(e)) => {
                     return Err(e);
+                }
+                // WAYCOMPOSE FORK (§79). Retrying cannot help — the argument is
+                // the wrong kind for this peer and no amount of buffer will
+                // change that — so it leaves the loop as an I/O error, which is
+                // how every other unrecoverable write failure here is reported.
+                Err(e @ MessageWriteError::WrongDialect { .. }) => {
+                    return Err(std::io::Error::new(ErrorKind::InvalidInput, e.to_string()));
                 }
             }
         }
@@ -406,7 +438,7 @@ impl BufferedSocket {
             let word_2 = u32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
             let opcode = (word_2 & 0x0000_FFFF) as u16;
             if let Some(sig) = signature(object_id, opcode) {
-                match parse_message(data, sig, &mut self.in_fds) {
+                match parse_message(data, sig, &mut self.in_fds, self.encoding) {
                     Ok((msg, rest_data)) => (msg, data.len() - rest_data.len()),
                     Err(e) => return Err(e),
                 }
@@ -534,6 +566,7 @@ fn round_max_buffer_size(max_buffer_size: usize) -> usize {
 mod tests {
     use super::*;
     use crate::protocol::{AllowNull, Argument, ArgumentType, Message};
+    use crate::os::{RawWireFd, WireFd};
 
     use std::ffi::CString;
     use std::os::unix::io::IntoRawFd;
@@ -550,17 +583,24 @@ mod tests {
     //
     // if arguments contain FDs, check that the fd point to
     // the same file, rather than are the same number.
-    fn assert_eq_msgs<Fd: AsRawFd + std::fmt::Debug>(
-        msg1: &Message<u32, Fd>,
-        msg2: &Message<u32, Fd>,
-    ) {
+    /// Bring a parsed `h` back to the send-side form so the two can be compared.
+    fn as_send(fd: ProtoFd) -> RawProtoFd {
+        match fd {
+            WireFd::Open(owned) => RawWireFd::Open(IntoRawFd::into_raw_fd(owned)),
+            WireFd::Named(handle) => RawWireFd::Named(handle),
+        }
+    }
+
+    fn assert_eq_msgs(msg1: &Message<u32, RawProtoFd>, msg2: &Message<u32, RawProtoFd>) {
         assert_eq!(msg1.sender_id, msg2.sender_id);
         assert_eq!(msg1.opcode, msg2.opcode);
         assert_eq!(msg1.args.len(), msg2.args.len());
         for (arg1, arg2) in msg1.args.iter().zip(msg2.args.iter()) {
-            if let (Argument::Fd(fd1), Argument::Fd(fd2)) = (arg1, arg2) {
-                let fd1 = unsafe { BorrowedFd::borrow_raw(fd1.as_raw_fd()) };
-                let fd2 = unsafe { BorrowedFd::borrow_raw(fd2.as_raw_fd()) };
+            if let (Argument::Fd(RawWireFd::Open(fd1)), Argument::Fd(RawWireFd::Open(fd2))) =
+                (arg1, arg2)
+            {
+                let fd1 = unsafe { BorrowedFd::borrow_raw(*fd1) };
+                let fd2 = unsafe { BorrowedFd::borrow_raw(*fd2) };
                 assert!(same_file(fd1, fd2));
             } else {
                 assert_eq!(arg1, arg2);
@@ -614,7 +654,7 @@ mod tests {
                 })
                 .unwrap();
 
-        assert_eq_msgs(&msg.map_fd(|fd| fd.as_raw_fd()), &ret_msg.map_fd(IntoRawFd::into_raw_fd));
+        assert_eq_msgs(&msg, &ret_msg.map_fd(as_send));
     }
 
     #[test]
@@ -623,8 +663,8 @@ mod tests {
             sender_id: 42,
             opcode: 7,
             args: smallvec![
-                Argument::Fd(1), // stdin
-                Argument::Fd(0), // stdout
+                Argument::Fd(RawWireFd::Open(1)), // stdin
+                Argument::Fd(RawWireFd::Open(0)), // stdout
             ],
         };
 
@@ -649,7 +689,7 @@ mod tests {
                     }
                 })
                 .unwrap();
-        assert_eq_msgs(&msg.map_fd(|fd| fd.as_raw_fd()), &ret_msg.map_fd(IntoRawFd::into_raw_fd));
+        assert_eq_msgs(&msg, &ret_msg.map_fd(as_send));
     }
 
     #[test]
@@ -667,8 +707,8 @@ mod tests {
                 sender_id: 42,
                 opcode: 1,
                 args: smallvec![
-                    Argument::Fd(1), // stdin
-                    Argument::Fd(0), // stdout
+                    Argument::Fd(RawWireFd::Open(1)), // stdin
+                    Argument::Fd(RawWireFd::Open(0)), // stdout
                 ],
             },
             Message {
@@ -676,7 +716,7 @@ mod tests {
                 opcode: 2,
                 args: smallvec![
                     Argument::Uint(3),
-                    Argument::Fd(2), // stderr
+                    Argument::Fd(RawWireFd::Open(2)), // stderr
                 ],
             },
         ];
@@ -711,7 +751,7 @@ mod tests {
         assert_eq!(recv_msgs.len(), 3);
         // WAYCOMPOSE FORK: clippy, no behaviour change.
         for (msg1, msg2) in messages.into_iter().zip(recv_msgs) {
-            assert_eq_msgs(&msg1.map_fd(|fd| fd.as_raw_fd()), &msg2.map_fd(IntoRawFd::into_raw_fd));
+            assert_eq_msgs(&msg1, &msg2.map_fd(as_send));
         }
     }
 
@@ -750,6 +790,6 @@ mod tests {
                 })
                 .unwrap();
 
-        assert_eq_msgs(&msg.map_fd(|fd| fd.as_raw_fd()), &ret_msg.map_fd(IntoRawFd::into_raw_fd));
+        assert_eq_msgs(&msg, &ret_msg.map_fd(as_send));
     }
 }

@@ -729,7 +729,6 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         keymap_file: &KeymapFile,
         mods: ModifiersState,
     ) -> bool {
-        use crate::utils::os::AsFd;
         use tracing::warn;
         use wayland_server::{protocol::wl_keyboard::KeymapFormat, Resource};
 
@@ -748,7 +747,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
             };
 
             let res = keymap_file.with_fd(kbd.version() >= 7, |fd, size| {
-                kbd.keymap(KeymapFormat::XkbV1, fd.as_fd(), size as u32)
+                kbd.keymap(KeymapFormat::XkbV1, fd, size as u32)
             });
             if let Err(e) = res {
                 warn!(

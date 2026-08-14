@@ -63,7 +63,7 @@
 //! // You're now ready to go!
 //! ```
 
-use crate::utils::os::OwnedFd;
+use crate::utils::os::ProtoFd;
 use std::{
     cell::{Ref, RefCell},
     sync::Arc,
@@ -220,7 +220,7 @@ pub enum SelectionRequestError {
 pub fn request_primary_client_selection<D>(
     seat: &Seat<D>,
     mime_type: String,
-    fd: OwnedFd,
+    fd: ProtoFd,
 ) -> Result<(), SelectionRequestError>
 where
     D: SeatHandler + PrimarySelectionHandler + 'static,

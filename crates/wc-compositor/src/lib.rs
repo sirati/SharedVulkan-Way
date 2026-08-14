@@ -84,6 +84,7 @@ use std::time::{Duration, Instant};
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
 use platform::{FrameStyle, PlatformConfig};
+use smithay::utils::os::FdEncoding;
 use state::{ClientState, Decorations, State};
 
 struct Args {
@@ -261,6 +262,17 @@ struct Args {
     /// suite decides where to click based on what the client did. Linux only:
     /// see `crate::control` for why the thing it stands in for is Windows.
     control: Option<String>,
+    /// §79. **Treat every peer arriving on the socket as speaking the in-band
+    /// `h` dialect**, i.e. as being `wc-proxy` rather than a stock client.
+    ///
+    /// A ring slot needs no flag — a connection that arrives as one *is* the
+    /// proxy, by construction. A socket cannot say who is on the far end, and
+    /// the relay legs put the proxy on one (`wc-vm-client.sh --upstream`), so
+    /// the operator that arranged the relay declares it here. That is
+    /// §72.3’s "the transport picks" for a transport that carries no identity of
+    /// its own; it is deliberately **not** negotiated in the stream, which §72.3
+    /// measured and rejected.
+    in_band: bool,
 }
 
 /// The control socket, where one can exist, and nothing at all where one
@@ -340,11 +352,13 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         dwm_glass: true,
         caption_buttons: true,
         control: None,
+        in_band: false,
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--once" => args.once = true,
+            "--in-band" => args.in_band = true,
             "--debug-icon" => args.debug_icon = true,
             "--simulate-wm" => args.simulate_wm = true,
             "--poll-coarse" => args.poll_coarse = true,
@@ -1220,7 +1234,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
-                args.decorations, ui, event_rx, control);
+                args.decorations, ui, event_rx, control, args.in_band);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -1258,6 +1272,8 @@ fn wayland_thread(
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
     control: ControlHook,
+    // §79. See `Args::in_band`.
+    in_band: bool,
 ) -> u8 {
     use std::io::Write as _;
 
@@ -1383,11 +1399,24 @@ fn wayland_thread(
                     .handle()
                     .insert_client(stream, Arc::new(ClientState::new(index)))
                 {
-                    Ok(_) => {
+                    Ok(client) => {
+                        // §79. **A ring slot is the proxy by construction**, so this
+                        // door needs no flag: `wc-proxy --upstream-ring` is the
+                        // only thing that claims one. Set before the next
+                        // dispatch, which is what `set_client_fd_encoding`
+                        // requires — nothing has been read off this connection yet.
+                        if let Err(e) = display
+                            .handle()
+                            .set_client_fd_encoding(client.id(), FdEncoding::InBand)
+                        {
+                            eprintln!(
+                                "wc-compositor: ring slot {slot} could not be set in-band: {e}"
+                            );
+                        }
                         state.clients_seen += 1;
                         println!(
                             "wc-compositor: client {index} accepted on ring slot {slot} \
-                             (no socket crossed the VM boundary)"
+                             (no socket crossed the VM boundary, h in band)"
                         );
                         let _ = std::io::stdout().flush();
                         // §72. **The same two calls as the socket accept, and
@@ -1428,7 +1457,21 @@ fn wayland_thread(
                     .handle()
                     .insert_client(stream, Arc::new(ClientState::new(index)))
                 {
-                    Ok(_) => {
+                    Ok(client) => {
+                        // §79. A socket carries no identity, so the dialect is
+                        // whatever `--in-band` says. Default is out of band,
+                        // which is what a stock libwayland client is.
+                        if in_band {
+                            if let Err(e) = display
+                                .handle()
+                                .set_client_fd_encoding(client.id(), FdEncoding::InBand)
+                            {
+                                eprintln!("wc-compositor: client {index} not set in-band: {e}");
+                            } else {
+                                println!("wc-compositor: client {index} accepted, h in band");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
                         state.clients_seen += 1;
                         arm_arena_for_first_client(&mut grow, state.clients_seen);
                     }
