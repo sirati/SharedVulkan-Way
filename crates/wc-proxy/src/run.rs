@@ -697,11 +697,71 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.idle_timeout
         };
-        let client = match listener.accept_one(wait) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e.into()),
-        };
+        // DYNAMIC ARENA, and this is §72.5's fix: **the tick from the accept
+        // loop.**
+        //
+        // The pump turns the release policy's clock on its `poll` timeout,
+        // which covers an idle client and covers nothing at all when there is
+        // **no** client — with zero sessions there is no pump. §72.5 measured
+        // it across a hypervisor: the last client is killed, `Drop for Session`
+        // returns its pools, the region is empty, and fifteen seconds later it
+        // is still the guest's. One reconnect and it came back in seconds. So
+        // the region was returnable the whole time and nothing was asking.
+        //
+        // That is the state the user's complaint is about — a machine with
+        // nothing running still holding memory — and it is the one state the
+        // old code could not leave, because `accept_one(wait)` was a single
+        // blocking call for the whole `--timeout`. A proxy with no clients sat
+        // in it and the arena stood still.
+        //
+        // This loop is the one thing that still exists with zero clients and it
+        // owns the shared arena, so this is where the clock has to turn. A slice
+        // with nobody arriving is a frame's worth of nothing happening, which is
+        // the unit `--arena-grow-idle` is already written in — the same argument
+        // the pump's poll timeout makes, from the only other place that can make
+        // it.
+        //
+        // The slice costs one atomic load and a `try_lock`-free tick every
+        // 20 ms while idle, and nothing at all while clients are arriving.
+        const ACCEPT_SLICE: Duration = Duration::from_millis(20);
+        let overall = std::time::Instant::now() + wait;
+        let mut accepted = None;
+        loop {
+            let left = overall.saturating_duration_since(std::time::Instant::now());
+            match listener.accept_one(ACCEPT_SLICE.min(left)) {
+                Ok(c) => {
+                    accepted = Some(c);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    if let Some(a) = &shared_arena {
+                        for (id, bytes, origin) in a.frame_idle() {
+                            // "by the accept loop" and **not** "with no client
+                            // connected", which is what this line said first and
+                            // could not know: this loop is running whether or not
+                            // sessions exist, and it usually wins the race
+                            // against them because it turns every 20 ms while a
+                            // pump turns only when *its* poll times out. Naming
+                            // who did it is a fact; naming the state of the world
+                            // would have been a guess, and it was wrong on the
+                            // very first run — printed while a client was up.
+                            println!(
+                                "[proxy] arena region {id} returned by the accept loop: \
+                                 {bytes} bytes of {origin}"
+                            );
+                        }
+                    }
+                    // After the tick, not before it: the last slice of a run
+                    // that is about to give up is the one most likely to have
+                    // something to return.
+                    if std::time::Instant::now() >= overall {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let Some(client) = accepted else { break };
         served += 1;
         let n = served;
 

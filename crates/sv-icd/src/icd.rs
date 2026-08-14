@@ -946,11 +946,21 @@ impl Icd for SharedVulkan {
         let mut args = args;
         args.p_descriptor_update_template =
             Some(p::VkDescriptorUpdateTemplate(sv_icd_entry::IcdLocal::mint_id(self)));
-        let entries = args
-            .p_create_info
-            .as_ref()
-            .map(|c| c.p_descriptor_update_entries.clone())
-            .unwrap_or_default();
+        let template = crate::state::Template {
+            entries: args
+                .p_create_info
+                .as_ref()
+                .map(|c| c.p_descriptor_update_entries.clone())
+                .unwrap_or_default(),
+            // Meaningful only for a `PUSH_DESCRIPTORS` template, and harmless
+            // to keep for the others: it is the one thing
+            // `vkCmdPushDescriptorSetWithTemplate` needs and does not carry.
+            bind_point: args
+                .p_create_info
+                .as_ref()
+                .map(|c| c.pipeline_bind_point)
+                .unwrap_or(p::VkPipelineBindPoint(0)),
+        };
         let id = args.p_descriptor_update_template.map(|t| t.0);
         let reply = match self.wire() {
             Some(t) => forward::create_descriptor_update_template(t, args)?,
@@ -962,7 +972,7 @@ impl Icd for SharedVulkan {
         if reply.result.0 == 0
             && let Some(id) = id
         {
-            self.state().templates.insert(id, entries);
+            self.state().templates.insert(id, template);
         }
         Ok(reply)
     }
@@ -994,7 +1004,7 @@ impl Icd for SharedVulkan {
         let entries = {
             let s = self.state();
             match s.templates.get(&args.descriptor_update_template.0) {
-                Some(e) => e.clone(),
+                Some(t) => t.entries.clone(),
                 // A template we never saw created. Refusing is right: silently
                 // doing nothing would leave the descriptor set holding whatever
                 // it held, which is a wrong picture rather than a failed call.
@@ -1027,6 +1037,82 @@ impl Icd for SharedVulkan {
                 descriptor_copy_count: 0,
                 p_descriptor_copies: Vec::new(),
             },
+        )
+    }
+
+    /// The push form, rewritten into `vkCmdPushDescriptorSet`.
+    ///
+    /// # The defect this closes, which was predicted and then landed anyway
+    ///
+    /// `exceptions::void_policy` declares `VoidPolicy::ArenaOffset` for this
+    /// command's `pData`, with a paragraph on why it is the hardest `void*` in
+    /// the registry — **and nothing implemented it.** A policy is a statement
+    /// about what the bytes *are*; it does not move them. So the generated
+    /// lowering took the application's own `pData` pointer and put it on the
+    /// wire as though it were an offset into our arena, and the GPU side read a
+    /// descriptor layout from wherever in the arena that number happened to
+    /// land. Measured: two device losses, a ring fatal, and **a segmentation
+    /// fault inside `sv-gpu-server`** — a wrong pointer lowered as an offset is
+    /// the worst blast radius this design has.
+    ///
+    /// docs/design.md §0.20 item 4 found it, excluded `VK_KHR_push_descriptor` from
+    /// `zink` for exactly this, and wrote that *"a mechanical widening that
+    /// restores it without the expansion restores the segmentation fault with
+    /// it."* Making `full` the default did precisely that. The warning was
+    /// right, the exclusion was right, and neither survived a profile generated
+    /// from a rule — which is the argument for exclusions carrying their reasons
+    /// rather than only their names.
+    ///
+    /// # Why it is a rewrite and not a forward
+    ///
+    /// The same reason `vkUpdateDescriptorSetWithTemplate` is (§0.4 item 10):
+    /// `pData`'s *layout* lives in the template object and its *bytes* live in
+    /// the application's memory, so it cannot cross and does not have to.
+    /// Expanding it here produces the identical descriptor writes in a shape the
+    /// registry describes. The one thing this form needs and the call does not
+    /// carry is `pipelineBindPoint`, which is why [`crate::state::Template`]
+    /// keeps it.
+    ///
+    /// `dstSet` is zero because a push descriptor writes into no set — the
+    /// specification requires the member to be ignored, and sending anything
+    /// else would be inventing a handle.
+    fn cmd_push_descriptor_set_with_template(
+        &self,
+        args: p::VkCmdPushDescriptorSetWithTemplateArgs,
+    ) -> IcdResult<()> {
+        let Some(t) = self.wire() else { return Ok(()) };
+        self.push_with_template(
+            t,
+            args.command_buffer,
+            args.descriptor_update_template,
+            args.layout,
+            args.set,
+            args.p_data,
+        )
+    }
+
+    /// The `2` form, which is the same call with its parameters in a struct.
+    ///
+    /// `VkPushDescriptorSetWithTemplateInfo` carries the template, layout, set
+    /// and `pData`; there is nothing in it the form above does not handle, so
+    /// both unwrap onto one helper rather than expanding twice.
+    fn cmd_push_descriptor_set_with_template2(
+        &self,
+        args: p::VkCmdPushDescriptorSetWithTemplate2Args,
+    ) -> IcdResult<()> {
+        let Some(t) = self.wire() else { return Ok(()) };
+        let Some(info) = args.p_push_descriptor_set_with_template_info else {
+            return Err(LowerError::Shape(
+                "vkCmdPushDescriptorSetWithTemplate2: no VkPushDescriptorSetWithTemplateInfo",
+            ));
+        };
+        self.push_with_template(
+            t,
+            args.command_buffer,
+            info.descriptor_update_template,
+            info.layout,
+            info.set,
+            info.p_data,
         )
     }
 
@@ -1431,6 +1517,60 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
     w.optimal_buffer_copy_offset_alignment = c.optimal_buffer_copy_offset_alignment;
     w.optimal_buffer_copy_row_pitch_alignment = c.optimal_buffer_copy_row_pitch_alignment;
     w
+}
+
+impl SharedVulkan {
+    /// The shared body of the two `vkCmdPushDescriptorSetWithTemplate` forms.
+    ///
+    /// One expansion, reached from two trait methods, so the `2` form cannot
+    /// drift from the form it is a restatement of. See
+    /// `Icd::cmd_push_descriptor_set_with_template` for what this is closing and
+    /// why it is a rewrite rather than a forward (docs/design.md §0.22).
+    #[allow(clippy::too_many_arguments)]
+    fn push_with_template(
+        &self,
+        t: &dyn sv_icd_entry::Transport,
+        command_buffer: p::VkCommandBuffer,
+        template: p::VkDescriptorUpdateTemplate,
+        layout: p::VkPipelineLayout,
+        set: u32,
+        p_data: u64,
+    ) -> IcdResult<()> {
+        let (entries, bind_point) = {
+            let s = self.state();
+            match s.templates.get(&template.0) {
+                Some(t) => (t.entries.clone(), t.bind_point),
+                // As in the update form: a template we never saw created is
+                // refused rather than dropped, because dropping it leaves the
+                // command buffer holding a wrong picture instead of a failed
+                // call.
+                None => {
+                    return Err(LowerError::Shape(
+                        "vkCmdPushDescriptorSetWithTemplate: unknown template",
+                    ));
+                }
+            }
+        };
+        // SAFETY: `p_data` is the application's own `pData` for this call, read
+        // in the application's process, with the entries it created the template
+        // with. The specification's contract, exactly as for the update form.
+        let writes =
+            unsafe { sv_icd_entry::local::expand_descriptor_template(p_data, 0, &entries) };
+        if writes.is_empty() {
+            return Ok(());
+        }
+        forward::cmd_push_descriptor_set(
+            t,
+            p::VkCmdPushDescriptorSetArgs {
+                command_buffer,
+                pipeline_bind_point: bind_point,
+                layout,
+                set,
+                descriptor_write_count: writes.len() as u32,
+                p_descriptor_writes: writes,
+            },
+        )
+    }
 }
 
 fn memory_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceMemoryProperties {

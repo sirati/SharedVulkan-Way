@@ -21548,6 +21548,77 @@ grab semantics second, five singletons after.
    and the other eight were fixed by whoever moved the tree in between.
 
 
+### 36.21 A present, not a wake: the last link, on topology 1
+
+Everything before this measured a **wait**. §36.15 got 18.96 ms per wait against
+a 20 ms slice; §36.20 got a 13.6 µs wake to the Windows guest. But the figure
+that started all of it — 216.9 ms — was a **present**, and a present had never
+been measured across a boundary with the fix in place.
+
+**Venue, stated because §51 exists for this reason: topology 1, Linux host →
+Linux VM** (`nix build .#svGuest`, lavapipe in the guest). Not Wine, not
+testhost. The Windows numbers in §36.20 are a different venue and do not
+transfer to this table, nor this one to them.
+
+`scripts/sv-guest-e2e.sh` now takes `SV_E2E_APP`, so the application can be
+something that *presents* rather than something that enumerates.
+`vk-present-probe`, 60 frames at 256×256, 256 MiB arena:
+
+| condition | ring waits | parked | **mean per wait** | shape |
+|---|---|---|---|---|
+| fixed 20 ms slice | 281 | 5664.9 ms | **20.160 ms** | `<100ms=281` |
+| slice ladder | 281 | 631.1 ms | **2.246 ms** | `<10us=38 <100us=8 <1ms=137 <10ms=83 <100ms=15` |
+| **ladder + doorbell** | 281 | 116.4 ms | **0.414 ms** | `<10us=108 <100us=33 <1ms=121 <10ms=17 <100ms=2` |
+
+**281 ring waits in every condition**, as with the enumeration workload: the
+same presents, differing only in what a wait costs. **48.7× on the mean**, and
+the top row is again the whole story of the defect — every one of 281 waits in
+the 10–100 ms bucket, which is what "the number *was* the slice, once per wait"
+looks like for a present.
+
+And the probe's own per-frame timing, from the doorbell run:
+
+```
+timing 256x256 over 60 frames: 0.66 ms/frame total,
+  0.54 ms/frame in vkQueuePresentKHR,
+  0.009 ms/frame in vkAcquireNextImageKHR (0.2 MB/frame, 462 MB/s presented)
+PASS: 60 frames presented
+```
+
+> **A cross-VM present costs 0.54 ms in `vkQueuePresentKHR`.**
+
+That is the last link. 216.9 ms per present → diagnosed as a 20 ms slice once
+per wait → confirmed at 18.96 ms per wait → fixed by a hypervisor-carried wake
+→ **and now a present measured end to end at sub-millisecond across a real
+hypervisor.** Parking for the whole 60-frame run fell from 5.66 s to 116 ms.
+
+Two honest limits. The presents here are 256×256, not 1080p, so this is the
+*latency* of a present and not its bandwidth — `vk-present-probe`'s header asks
+for a 1080p run and that is still owed. And 281 waits over 60 frames is 4.7 per
+frame, which includes setup; the per-wait figure is the transferable one.
+
+#### 36.21.1 Two guards caught this run's mistakes, one of them mine
+
+The first attempt died with **R13's protocol-hash detector**: guest
+`0xc2ddabe30ce597a2` against host `0x3522313e5c823788`. That is the
+`sv_icd.json` trap `sv-present.sh` documents — a reflink-seeded worktree's
+manifest is a generated file holding an *absolute path*, and mine still named
+the base tree. The detector did exactly its job: refused to load rather than
+answering locally, and said which two hashes disagreed.
+
+The second was found by pointing §36's own freshness helper at the two halves,
+and it was **a bug in that helper**: `libsv_icd.so` reported stale and blamed
+`crates/wc-compositor/src/platform/drag.rs`, a file it cannot depend on. Cargo
+names the depfile after the *crate* — `libsv_icd.d`, not `libsv_icd.so.d` — and
+the helper stripped only `.exe`, so every `.so` fell down the whole-tree
+fallback and got blamed on whatever that walk reached first. Fixed to strip
+`.so` and `.dylib` too.
+
+Worth recording because it is the same defect the helper was written to remove,
+surviving in the helper: **a check whose scope is wrong reports a real-looking
+failure against an innocent file**, and the only reason it was caught is that
+the fallback path *says* it is the weaker check.
+
 ---
 ---
 
@@ -22017,7 +22088,9 @@ too. §67.8.
 | `scripts/wc-cursor.sh linux` | **8 passed, 0 failed** |
 | `scripts/wc-cursor.sh wine` | **17 passed, 0 failed** (master: 10, and see below) |
 | `scripts/wc-cursor.sh all` | **25 passed, 0 failed** |
-| `scripts/wc-wine-guest.sh` (new) | **3 passed, 0 failed** — measured on `e5e5963`, not re-run; see below |
+| `scripts/wc-wine-guest.sh` (new) — arrangement 2 | **3 passed, 0 failed**, re-measured on the merged tree |
+| `scripts/wc-vm-client.sh linux` (new) — arrangement 1 | **9 passed, 0 failed** |
+| `scripts/wc-vm-client.sh wine` (new) — arrangement 3 | **10 passed, 0 failed** |
 
 The seven new tests are `wine::tests`, and they are over `decide()` — the pure
 function that applies `WC_WIN32` to the probe — which is why they run on the
@@ -22083,17 +22156,18 @@ that had moved. The underlying point is unaffected and still worth keeping:
 catch a link failure and is not a substitute for `cargo build --target`.
 
 **The guest leg's three assertions were measured on `e5e5963`, not on the merge.**
-The workstation is in use — the user asked for no testing on it until they are
-done — and the guest's QMP chardev takes exactly one client besides, so
-re-running this needs a slot rather than a retry. Every other row in the table
-above has been re-measured across four merges; this one has not, and it is
-labelled with the commit it was taken on rather than left to look current.
+**The guest row was carried undated for four merges and is now measured.** For
+several revisions of this table it read *"measured on `e5e5963`, not re-run"*,
+because the development guest was held by another run. The argument for
+believing it in the meantime was that nothing in those merges touches what it
+measures — the platform line, printed before `platform::start`, and
+`wine_get_host_version`. That argument was correct and it was still an argument.
+It has now been run on the merged tree and reports the same two kernels, so the
+row is a measurement again; the point of having labelled it is that a reader
+could tell the difference while it was not.
 
-Nothing in those merges touches what it measures: the platform line, which is
-printed before `platform::start`, and `wine_get_host_version`. But "nothing
-should have changed it" is an argument and not a measurement, which is the
-distinction this whole section is about, so the row stays dated until it is run
-again.
+The Windows laptop remains unavailable, which is what §67.8 item 1 is about and
+is unchanged by any of this: all three arrangements above are Linux and Wine.
 
 ### 67.8 What is not done
 
@@ -22122,219 +22196,845 @@ again.
    call for a Wine branch and the wrong call for leaving the Windows leg
    untested.
 
-## 68. Release ran on a guest: 113.9 MiB down to 97.9 MiB, and the guest's own kernel says so
+
+### 67.9 All three arrangements, and the client is in another kernel
+
+The user asked for three, and they are the three combinations of *which side is
+Wine* that exist while the Windows laptop is unavailable:
+
+| | arrangement | harness | result |
+|---|---|---|---:|
+| 1 | linux → linux vm | `scripts/wc-vm-client.sh linux` | **9 passed, 0 failed** |
+| 2 | linux → wine linux vm | `scripts/wc-wine-guest.sh` | **3 passed, 0 failed** |
+| 3 | wine linux → linux vm | `scripts/wc-vm-client.sh wine` | **10 passed, 0 failed** |
+
+Arrangement 3 is the one §26.5 specified as "leg 3" and nobody had run: *"Wine
+plays the Windows side, and a Linux VM guest runs the client."* Arrangement 1 is
+its control, which is why the two live in one file with one word between them —
+§13.8 is the record of comparing two numbers taken on two trees with two
+instruments and being wrong, and leg 1's whole value is that it differs from
+leg 3 in exactly one thing.
+
+**What is new here is not Wine, it is the boundary.** §26.5's correction is that
+every Wine run in this document before it was one machine with no VM in it, and
+several consequences of *having no hypervisor* were written up as "Wine lied".
+In arrangements 1 and 3 the client is in another kernel: it cannot see the
+host's filesystem except where 9p says so, it cannot open a host Unix socket,
+and its `SCM_RIGHTS` cannot cross. Those are the real deployment's constraints
+and the local Wine legs do not have them.
+
+#### How the bytes cross, and why it is not a socket
+
+The guest has no network at all — `nix/guest.nix` sets `networkingOptions = []`
+— and a Unix socket node exported over 9p is a host kernel object a guest
+`connect()` cannot reach. What the guest does have is the virtio-serial cold
+path, whose host end is a Unix socket QEMU listens on:
+
+```text
+  client ── wc-proxy ── /tmp/up.sock            (guest)
+                            │ socat
+             /dev/virtio-ports/org.sirati.svcold.0
+        ═════════════ the hypervisor boundary ═════════════
+                    $SV_RUNDIR/cold.sock          (host)
+                            │ socat
+              the compositor's AF_UNIX socket
+```
+
+Two `socat`s and one virtio-serial port, forwarding the byte stream unaltered —
+which is `probe-relay.c`'s argument for the same move on the real guest, and
+here it is *more* honest than the local legs, where the "boundary" was two
+processes on one kernel.
+
+`wl_shm` pools and the keymap are the two things not on the wire, and both use
+9p rather than the port: the client's pools are written into `/sv/pools` in the
+guest, which is `$SV_RUNDIR/pools` on the host, which the compositor opens by
+the path `--peer-prefix` gives it — a `winepath -w` of the host directory on
+leg 3, the host directory itself on leg 1. The keymap goes the other way.
+**That is a file transport and therefore a fixture, not the deployment**, whose
+answer is the arena in guest RAM (§12); the harness declares the absence
+explicitly rather than declaring a substrate it does not use.
+
+#### Two measurements the first run produced
+
+**`--no-icons`, and it is the port's arithmetic rather than a preference.**
+`wc-proxy` opens a *second* upstream connection to resolve app ids to icon
+pixels. A virtio-serial port is one stream, so two connections interleave into
+it; the compositor sees a corrupt second message flow and closes, and the first
+connection dies of a broken pipe. That is exactly what the first run printed —
+`icon: the compositor closed the icon connection` followed by
+`client 1 failed: Broken pipe (os error 32)`, with `2 client msgs` already
+across, so the relay itself was working. The icon feed is not what this leg
+tests and the honest fix is to not open the second connection rather than to
+multiplex a port that cannot carry it.
+
+**`cold.sock` does not exist until QEMU makes it.** The first version connected
+the host relay before booting the guest and got a `socat` that exited
+immediately, producing a leg that failed two steps away from where it went
+wrong. The relay now starts after the socket appears.
+
+#### The kernel check, in both directions
+
+§67.6's assertion has a mirror image here, and the pair is the part worth
+keeping:
+
+* `wc-wine-guest.sh` asserts the compositor's `wine_get_host_version` is the
+  **guest's** kernel, because there the compositor is inside the VM.
+* `wc-vm-client.sh wine` asserts it is the **host's**, and that it differs from
+  the kernel the payload reported from inside.
+
+```
+  arrangement 2:  compositor 'Linux 6.18.44'  (inside)   client on the host
+  arrangement 3:  compositor 'Linux 6.18.33'  (host)     client 'Linux 6.18.44'
+```
+
+Neither can be satisfied by a run that put both halves in the same place, which
+is the failure both are guarding against — and it is the failure this project
+actually has a history of: §26.5's whole correction is that runs believed to
+have a boundary did not. Between them the two assertions say *which side of the
+boundary each half was on* rather than asserting that there was one.
+
+#### What these legs do not do
+
+`wayland-info` is the client, so this is the registry and not a pixel. No
+window is mapped, nothing is committed, and the `wl_shm` path is advertised
+rather than exercised — the pool directory is configured and stays empty. A leg
+that maps a window needs a drawing client in the guest and is the obvious next
+step now that the transport underneath it is known to work. It is also the leg
+that would first exercise the 9p pool path in anger, which is the part of this
+arrangement most likely to be wrong.
+
+---
+---
+
+## 68. Subsurface state that belongs to the parent's commit is applied on the child's
 
 ### 68.1 Status in one paragraph
 
-`docs/waycompose-design.md` §61.5 is the run that could not answer the user's
-question — *"its very important that the arena also releases unneeded memory
-again"* — and it named two causes. Both were fixed locally in the commit before
-this one and neither had been shown on a boundary. **They are shown now.** A
-client took 18 MiB of pools out of a guest's RAM, was killed rather than closed,
-and the guest gave a 16 MiB region back: `119382016 → 102604800` bytes of
-resident set, **read inside the virtual machine**, a fall of exactly the
-16,777,216 bytes the region was. Getting there cost two defects that only a real
-cross-VM leg could produce, and one of them means this topology cannot draw
-anything at all.
+§66 narrowed the seven subsurface failures from "commit semantics" to "the scene
+lookup", and that narrowing was half right. The lookup is fine. What is wrong is
+one thing, in `vendor/smithay`, which this project owns outright: **`set_position`
+and `place_above`/`place_below` are double-buffered on the *parent* surface, and
+smithay applies them on the child's commit and on the bare request
+respectively.** Two sentences of protocol text say so, and they are the whole
+argument. Nothing is fixed here — the change is delicate and belongs to its own
+session — but the group is no longer seven puzzles; it is one deviation with a
+citation.
 
-Venue: `nix build .#svGuest` — NixOS in QEMU on this workstation, guest Linux
-6.18.44 against the host's 6.18.33, RAM in a `memory-backend-memfd` the host
-maps. `wc-compositor` in the guest with a 12 MiB guest-RAM arena; `wc-proxy` and
-the clients on the host; the Wayland stream over §36's rings in guest RAM.
-Harness: `scripts/wc-release-vm.sh`, **17 passed, 0 failed**.
+### 68.2 The two sentences
+
+From `vendor/wayland-server/wayland.xml`, `wl_subsurface`:
+
+> **`set_position`** — "Position is double-buffered state **on the parent
+> surface**, see wl_subsurface and wl_surface.commit for more information."
+>
+> **`place_above`** / **`place_below`** — "Z-order is double-buffered state **on
+> the parent surface**, see wl_subsurface and wl_surface.commit for more
+> information."
+
+"On the parent surface" is the operative phrase in both, and it is not the same
+as "double-buffered". Sync and desync change when the *subsurface's own* state is
+applied; they do not move position or z-order off the parent's commit, because
+those never belonged to the child in the first place.
+
+### 68.3 What smithay does instead
+
+**Position.** `set_position` writes `SubsurfaceCachedState.pending().location`,
+and that cache hangs off the **subsurface's own** surface:
+
+```rust
+impl Cacheable for SubsurfaceCachedState {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self { Self { location: self.location } }
+```
+
+so it is promoted on the *subsurface's* commit. In sync mode that is invisible,
+because the child's cache is applied when the parent commits anyway. In **desync**
+mode the child's commit applies immediately, and the position moves with no
+parent commit at all.
+
+That is exactly what WLCS reports. `subsurface_does_not_move_when_parent_not_committed`
+sets desync, sets position (20, 20), commits **only the subsurface**, and then
+asks where the pointer at (30, 30) landed:
+
+```
+Expected: (30, 30)      the subsurface has not moved, so the pointer is at (30,30) in it
+  Actual: (10, 10)      it moved: 30 - 20
+```
+
+`(2560, 2560)` in the raw log is `wl_fixed` for `(10.0, 10.0)`.
+
+**Z-order.** Worse, and simpler: it is not buffered at all.
+
+```rust
+wl_subsurface::Request::PlaceAbove { sibling } => {
+    if let Err(()) = PrivateSurfaceData::reorder(&data.surface, Location::After, &sibling) {
+```
+
+`reorder` runs on the request. The parent's commit is not involved.
+
+### 68.4 What this does to §66.4's hypothesis
+
+§66.4 recorded that `place_above_simple` and `place_below_simple` look
+unsatisfiable — each asserts that neither the moved subsurface nor the fixture's
+is focused, when after the restack one of them must be — and refused to conclude
+the suite was wrong without a reference run.
+
+That refusal now looks better than it did. With z-order applied on the request
+rather than on the parent's commit, **the stack these tests are asserting about
+is not the stack we build**, and reasoning about which surface "should" be on top
+from the request order was reasoning about a sequence the spec does not describe.
+The hypothesis is not disproved and it is not needed: fix the deviation first,
+and re-read the assertions against what the parent's commit actually produces.
+
+The reference run in §66.4 is still the way to settle it, and it is still one
+command. But it is no longer the *first* thing to do.
+
+### 68.5 Why this is ours to fix, and the shape of it
+
+`Cargo.toml` is explicit: *"Nothing in `vendor/` is upstream code any more; treat
+it as ours."* `vendor/PATCHES.md` is the index of what has been changed and why,
+and this would be another entry.
+
+The shape, and the reason it is not done here:
+
+* **Position** wants moving from a `Cacheable` on the child to state applied when
+  the parent commits. smithay's cache machinery has the hook — sync children are
+  already committed from the parent — but "apply the child's location on the
+  parent's commit while leaving the rest of the child's state alone" is a
+  different split from the one the type currently expresses.
+* **Z-order** wants the reorder staged and applied at the parent's commit, which
+  means a pending stacking list per parent where today there is one live list.
+* Both are changes to the traversal every other part of this compositor reads
+  through — `placed_tree` feeds both the blit and the hit test (§40), so an error
+  here is an error in two places that must stay each other's inverse.
+
+That is a session's work with its own measurements, not a change to append to
+this one.
+
+### 68.6 What is claimed and what is not
+
+Claimed: the two spec sentences, the two pieces of smithay that contradict them,
+and that `subsurface_does_not_move_when_parent_not_committed`'s numbers are the
+predicted consequence of the first.
+
+**Not claimed: that fixing this fixes six tests.** Four are position tests and
+the mechanism accounts for them directly; two are restacking tests and §68.4
+says only that they cannot be judged until the stack is built at the right time.
+The seventh, `subsurface_extends_parent_input_region`, throws `bad optional
+access` — the pointer entered nothing at all — and nothing here explains it.
+
+Also not claimed: that this is a *bug* in upstream smithay as shipped. This is
+what `vendor/smithay` does at the revision this tree carries, read from the
+source in the tree. Whether upstream has since changed it was not checked.
+## 69. Wine inside the Linux VM, and a skip that has nowhere to go
+
+*(Topology 2 of the three the user asked for. §64's continuation.)*
+
+### 69.1 Status in one paragraph
+
+The user asked for three arrangements with a real hypervisor in the path, and
+this is the second: **a Windows binary under Wine, inside the Linux VM guest**.
+`scripts/wc-ring-vm.sh` was the first and runs the *Linux* compositor in the
+guest; nothing before this ran a Windows binary in one. The question it was
+built to settle is §53.3's: `GetGuiResources` returns 0 under Wine on this
+workstation, the USER/GDI leak assertion was skipped for that reason, and the
+skip could not say whether the zero was a fact about **Wine** or a fact about
+the **venue**. It is the first. Inside the guest, on the guest's own kernel,
+with the probe owning five windows, Wine answers `user=0 gdi=0` exactly as it
+does on the host. **No arrangement of Linux virtual machines can turn §53's SKIP
+into an assertion; only a real Windows kernel can** — which is worth knowing
+before the user's machine is spent on it, and which leaves the queued testhost
+run as the only thing that can settle it rather than one option among several.
+
+### 69.2 What the guest ran, and how it got a `.exe` without one being installed
+
+`nix/guest.nix` shares the host's `/nix/store` over 9p and says why: *"the guest
+half is handed in from the host's store, which the guest can see because
+/nix/store is shared. So there is nothing to install: the harness runs an
+absolute path."* Wine and Xvfb are store paths, so the guest runs them without
+the image growing a package; `probe-life.exe` is not in the store, so it is
+copied into the shared run directory the guest sees as `/sv`. The existing
+`sv-payload` rendezvous — a `guest-cmd.sh` appearing in that directory — is what
+starts it, unchanged.
+
+```text
+GUEST-UNAME: Linux nixos 6.18.44 #1-NixOS SMP PREEMPT_DYNAMIC …
+GUEST-WINE-VERSION: wine-11.14 (Staging)
+before user=0 gdi=0
+after  user=0 gdi=0
+windows=5
+counter=stub
+```
+
+against this host's `Linux devhost 6.18.33`. The harness **fails
+if those two unames match**, because a run that measured the host would
+otherwise be indistinguishable from a run that measured the guest — §51's
+mistake in a new place, and the reason that check is an assertion rather than a
+printed line.
+
+### 69.3 Why the verdict is `stub` and not an absence
+
+`user=0` is the same string a process with no windows would print, so the probe
+does not print it alone. `probe-life.exe selftest` creates four windows of its
+own, samples `GetGuiResources` before and after, and reports the enumerated
+window count beside both numbers. Five windows and `user=0` is a stub; no
+windows and `user=0` is an absence, and the harness refuses to draw a conclusion
+below four windows. That is the same discipline §64.4 needed for a different
+reason: a number is only evidence once something has been shown to move.
+
+### 69.4 What this does and does not establish
+
+**It establishes** that this Wine build does not implement `GetGuiResources`,
+measured on a second kernel behind a real hypervisor rather than argued.
+
+**It does not establish that a different Wine would stub**, and the reason is
+the venue's own construction: the guest runs the host's `/nix/store` over 9p, so
+the Wine inside the VM is byte-for-byte the Wine outside it. The hypervisor is
+real and the kernel is not the host's, but the *binary under test is the same
+binary*. For the question actually asked — "is the zero about Wine or about the
+venue" — that is exactly right, because holding the binary constant while
+changing the venue is what isolates the variable. For any question about Wine
+versions it is no evidence at all.
+
+**The corollary is the useful part.** §53.6 item 3 and §64.5 item 2 both name
+the guest run as the one that would turn the SKIP into an assertion. That is now
+narrowed: it must be the **Windows** guest, not a Linux one, and no amount of
+local virtualisation substitutes. The three topologies the user asked for are
+worth running for what they *do* test — a real boundary for the transport, the
+proxy and the descriptor rule — and this particular assertion is not among them.
+
+### 69.5 What is not proven
+
+1. **The compositor was not run in the guest**, only the probe. This answers one
+   question cheaply; running `wc-compositor.exe` under Wine in the VM is the
+   rest of topology 2 and is not done here.
+2. **Topologies 1 and 3 are untouched by this section.** `wc-ring-vm.sh` is 1;
+   3 (Wine-Linux host driving a Linux VM guest) has no harness yet.
+3. **One Wine build, one guest kernel.** See 66.4.
+4. **`release_icons` is still unasserted anywhere** (§64.5 item 1), and this
+   section removes the hope that a local VM would fix it.
+
+### 69.6 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-wine-vm.sh`** (new) | **3 passed, 0 failed, 1 skipped** — the skip *is* the finding |
+| `cargo test --workspace --no-fail-fast` | unchanged — no Rust outside `probe-life.c` |
+| `scripts/wc-xref.sh` | 0 broken, 0 unqualified |
+
+It declares `cross-vm` — the first harness in this tree to do so and mean this
+box. `wc_topology_declare` refuses that unless a VM host and a guest are
+configured, a guard written when the hypervisor was always somebody else's; here
+the harness *starts* the hypervisor, so it points both at this machine rather
+than weakening the guard.
+
+**Two harness bugs paid for on the way, both of the same family as §53.4's.**
+The `sv-payload` unit echoes the script it is about to run into the same log the
+harness greps, so an unanchored `grep "GUEST-SELFTEST-END"` matched the *source
+line* and the first two runs "finished" in seconds having measured nothing. And
+the verdict came back as `stub\r`: mingw's stdio turns every `\n` into CRLF, so
+`case "$counter" in stub)` did not match and the harness reported *"unexpected
+verdict 'stub'"* about a verdict it had just printed. That is the **third** time
+this session — `probe-drag`'s window list in §50, `probe-life`'s `gone` in §53,
+this — and it is always the same bug wearing a different symptom.
+
+## 70. Topology 3 cannot mean what it sounds like, and what it does mean needs one flag
+
+*(§69's continuation. A feasibility finding, not a run.)*
+
+### 70.1 Status in one paragraph
+
+The third of the user's three arrangements — *"wine linux to linux vm"* — was
+handed to me as "a client under Wine on this host against a compositor in a VM".
+**That arrangement cannot be built, and the reason is a `cfg`, not a
+difficulty.** The Windows build of the vendored `wayland-backend` encodes an `h`
+argument *in band* and the Linux build passes it out of band as `SCM_RIGHTS`;
+the two are selected by `#[cfg(windows)]` / `#[cfg(unix)]` in
+`vendor/wayland-backend/src/rs/wire.rs`, so a Windows client and a Linux
+compositor do not speak the same protocol and no transport between them changes
+that. §29.7 made exactly this argument for why the clipboard leg could not be
+split into two, and it applies here unchanged. **The coherent reading of
+topology 3 is the other one** — Wine on this workstation as the *Windows side*
+and the Linux VM as the *client* side, which is the arrangement §29.8 named in
+so many words — and that one is buildable, is the closest thing to the
+deployment that exists without the user's laptop, and is **one missing flag**
+away. This section names the flag rather than writing it, because writing it is
+a change to `wc-proxy`'s upstream and not a harness.
+
+### 70.2 Why a Wine client and a Linux compositor cannot meet
+
+`wc-proxy` exists precisely because these two dialects differ: it speaks
+ordinary out-of-band libwayland *downstream* to a Linux client and the in-band
+dialect *upstream* to the Windows compositor. It is the translator, and it only
+translates in that direction. A Windows client talking to a Linux compositor has
+no translator on either end and would need one written backwards.
+
+So the three topologies are not symmetric, and the asymmetry is structural:
+
+| the user's phrase | what it can mean | status |
+|---|---|---|
+| linux to linux vm | Linux client here, Linux compositor in the VM | `scripts/wc-ring-vm.sh` |
+| linux to wine linux vm | the Windows compositor under Wine *in* the VM | §67's `wc-wine-guest.sh` (server only), §69 (the probe) |
+| **wine linux to linux vm** | ~~Windows client here, Linux compositor in the VM~~ | **impossible, §70.2** |
+| | Windows compositor under Wine **here**, client in the VM | **§70.3 — one flag short** |
+
+### 70.3 The arrangement that does work, and the one thing it lacks
+
+§29.8: *"`nix build .#svGuest` builds the honest arrangement: Wine on this
+workstation as the Windows side, and a **Linux VM guest as the client**. That is
+a real hypervisor between the two halves."* Every dialect lines up: the client
+in the guest is an ordinary Linux Wayland client, `wc-proxy` beside it in the
+guest translates, and the compositor under Wine on this host receives the
+in-band dialect it expects.
+
+What is missing is the channel for the protocol byte stream, and it is
+one-sided rather than absent:
+
+* **The compositor already has one.** `--wayland-cold PATH` takes the *cold
+  path* — a virtio-serial port — and `scripts/wc-ring-vm.sh` already drives it,
+  with the compositor in the guest reading
+  `/dev/virtio-ports/org.sirati.svcold.0`.
+* **`wc-proxy` does not.** Its upstream is either `--upstream PATH`, which must
+  be an **AF_UNIX socket**, or `--upstream-ring PATH`, the shared_vulkan control
+  region. A character device is neither, so the proxy inside the guest has
+  nothing to point at the host.
+
+So the missing piece has a name: **an `--upstream-cold PATH` on `wc-proxy`,
+mirroring the compositor's `--wayland-cold`,** so that the guest's proxy can
+reach the host's compositor over the virtio-serial port the VM already has. The
+pixels need no new work — `--transport shared-file --pool-dir` over the 9p `/sv`
+share already puts pools where both sides can see them.
+
+**Why that is worth doing and not just noting.** Every drag, drop and window
+result in §50 through §64 carries the same caveat — one kernel, no boundary —
+and this arrangement is the one that removes it without the user's laptop.
+§50.8 item 1 says the ~100 ms round trip of §50.6 is *"a lower bound for the
+deployment"*; this is the venue that could measure the real one.
+
+### 70.4 What is not proven
+
+1. **Nothing was run for this section.** It is a reading of `--help`, of
+   `wire.rs`'s `cfg`s and of `wc-ring-vm.sh`, and it should be treated as a
+   design note until something boots.
+2. **The virtio-serial channel is assumed adequate for the Wayland byte
+   stream** because the compositor already uses it for exactly that in
+   `wc-ring-vm.sh`. Its throughput under a real client is unmeasured, and
+   §36's whole point is that a cold path is the slow one.
+3. **`graphics = false`.** §67 found the compositor comes up fully in the guest
+   with no X at all, but a *client* in the guest that draws needs somewhere to
+   draw; whether the guest needs a display for the client half is untested.
+4. **The impossibility in §70.2 is about this tree's vendored backend**, not
+   about Wayland. A client built for the Linux target and *run under Wine* is
+   not a thing; a Windows client speaking out-of-band would need the vendored
+   `cfg` inverted, which is a fork of the fork.
+
+## 71. The arena route to topology 1, and the outbound pages that are not there
+
+### 71.1 Status in one paragraph
+
+**Topology 1 already has a working leg and this is not it.** `wc-ring-vm.sh`
+(§69's first paragraph) runs the Linux compositor in the `svGuest` VM with a
+client on the host, and crosses by **ring** — a control region published down
+the cold path, swept for by `sv-hostd`, with no socket on the hop that crosses.
+It works. This section takes the *other* route to the same topology: the
+`--arena-guest-ram` + `wc-arena-host` path, which is what `wc-guest.sh` uses on
+testhost and therefore what §51.6's block 12 depends on. The two share a venue
+and share almost no code.
+
+That route does not complete, and the reason is specific. The leg gets the guest
+up, the compositor listening **inside** it, the arena cut from the guest's own
+RAM, and a frame list published — and then the locate's verify fails on 68 pages
+that turn out to be the outbound window's (§71.4). Two obstacles on the way were
+general and are fixed; the third is named and left.
+
+**The boundary is real and proved so**: `Linux 6.18.44` inside against
+`Linux 6.18.33` outside, the check borrowed from `wc-wine-guest.sh`. And **the
+user's second symptom remains unverified** — this leg stops one step before the
+proxy, so nothing has been scrolled and no commit has been checked across it.
+
+### 71.2 There is a page-frame database off Windows, and the code said there was not
+
+```rust
+/// There is no page-frame database off Windows …
+#[cfg(not(windows))]
+pub fn frames(_arena: u32, _pages: u32) -> Result<(Vec<u64>, u128), String> {
+    Err("SuperfetchPfnQuery is a Windows interface and this is not Windows".into())
+}
+```
+
+True of the only guest this project had when it was written, and false the
+moment a Linux guest became a topology somebody wanted tested. Linux's
+equivalent is `/proc/self/pagemap`, documented in the kernel's
+`admin-guide/mm/pagemap.rst`: one 64-bit entry per virtual page, bit 63
+*present*, bits 0..54 the frame number.
+
+The consequence was not a missing feature but a failing run. With no frame list
+the host falls back to the content sweep, and §7 measured that sweep unreliable
+on a loaded machine. The first Linux-guest run reproduced it exactly:
+
+```
+located 16316 of 16384 pages after sweeping 2048 MiB
+```
+
+With the pagemap implementation, the same run:
+
+```
+located 16384 of 16384 pages in 193.51ms by frame list (swept 0 MiB;
+714 frame run(s) became 714 file run(s), first frame 0xe807)
+```
+
+**A zero is treated as a refusal, not an answer.** Since Linux 4.0 a process
+without `CAP_SYS_ADMIN` reads *zeroes* for the frame number rather than being
+refused: the entry is returned, the present bit is set, and only the number is
+blanked. That is deliberate hardening against Rowhammer, and it is the worst
+possible failure shape here — a list of zeroes is a perfectly well-formed frame
+list that would send the host looking for page 0 sixteen thousand times. So a
+zero frame behind a present page returns an error naming the privilege.
+
+### 71.3 `-name sv-guest` is a class of thing, and §16.8 says identity is not
+
+The second obstacle was §16.8 arriving where it bites hardest. `nix/guest.nix`
+bakes `-name sv-guest,process=sv-guest` into every guest it boots, and
+`find_qemu_pid` matches a substring of the command line. On a workstation where
+several agents each have a guest up, `--vm sv-guest` matches all of them:
+
+```
+wc-arena-host: io: 3 qemu-system processes match "sv-guest": [3402756, 3405077, 3414992] — narrow the hint
+```
+
+The locator is right to refuse — "two VMs matching one hint and the daemon
+guessing is how a client ends up mapping the wrong guest's RAM" — and the fix is
+not to make it guess. This harness passes **its own run directory** as the hint,
+which appears in its QEMU's command line twice and in nobody else's.
+
+Two of those three processes were this harness's own leaks, and that is the
+other half of the lesson: `run-nixos-vm` is a wrapper, so the pid the shell
+knows is the wrapper's and killing it can leave the emulator behind. Cleanup now
+matches on the run directory too, which can only ever reach this run's guest.
+
+### 71.4 What is still in the way, stated precisely
+
+The locate now finds every page and the **verify** fails:
+
+```
+located 16384 of 16384 pages in 193.51ms by frame list
+verify: 16316/16384 pages of the stitched view carry their own arena index
+wc-arena-host: 68 page(s) are not where the arena says they are
+```
+
+16316 both ways, deterministically, across four runs — so this is not the sweep
+being flaky. Instrumenting the verify names the pages exactly: they begin at
+**page 16128**, which is byte 66060288, which is where the compositor said its
+outbound window starts. And their contents are the finding:
+
+```
+DBG page 16128: first8=[00, 00, 31, 4b, 52, 56, 48, 53]
+DBG page 16130: first8=[00, 00, 00, 00, 00, 00, 00, 00]
+DBG page 16131: first8=[00, 00, 00, 00, 00, 00, 00, 00]
+```
+
+**Mostly zeroes, not somebody else's data.** A page overwritten by a gift would
+carry the gift; a page reading zero has been *dropped and re-faulted*. That
+single observation explains both symptoms at once: a re-faulted page is zero, so
+the sweep cannot find its stamp, and it has a **new physical frame**, so the
+frame list captured at allocation time points at the old one. Two locate methods
+failing on identically the same 68 pages is what a changed frame looks like from
+both sides.
+
+This is §14.12 item 1's territory — stage 12 found the keymap sealed into the
+outbound window "a full minute before any client exists" and fixed it with
+`defer_gifts`, which is *active* here: the compositor logs `objects made for
+clients are held in memory until the first client connects`. So the deferral is
+working and something else is releasing those pages. On a Linux guest,
+`MADV_DONTNEED` on shared memory is exactly the call that drops a page and
+returns a zero-filled one with a different frame on the next touch.
+
+**Not fixed here**, deliberately. It is in the arena's gift and outbound
+handling, which §27's brief listed as somebody else's — and a blind change to
+page lifetime in the region every client's pixels live in is not a thing to make
+at the end of a long session on a hypothesis.
+
+### 71.5 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace`, both targets | clean |
+| `cargo test --workspace --no-fail-fast` | **2629 tests**, 0 failures — one test was rewritten rather than deleted, §71.2 |
+| **`scripts/wc-vm-damage.sh linux`** | **9 passed, 1 failed** — the failure is §71.4 |
+| ... the guest boots and QMP answers | pass |
+| ... `wc-compositor` listens **inside the guest** | pass |
+| ... **`Linux 6.18.44` inside vs `Linux 6.18.33` outside** | pass — the run cannot have measured the host |
+| ... the arena comes from the guest's own RAM | pass — 16384 pages, run id reported |
+| ... the guest publishes a frame list | pass — 16384 frames, §71.2's new path |
+| ... the host locates it | **fail** — 68 outbound pages, §71.4 |
+| topologies 2 and 3 | **NOT RUN** |
+
+### 71.6 What is not proven
+
+1. **The user's second symptom is still unverified.** The leg stops one step
+   before the proxy, so no commit has been checked across this boundary and no
+   scroll has happened. §27.6's withdrawal stands and nothing here replaces it.
+2. **Only topology 1 was attempted.** Topology 2 (Linux → Wine in a Linux VM) is
+   closest to the deployment and is where `wc-wine-guest.sh` on the unmerged
+   `wine-first-class` branch already has the guest-side Wine working — its own
+   notes say a rendering leg needs a client in the guest, which is the piece
+   this file solves differently by keeping the client outside. Topology 3 is
+   untouched.
+3. **The `MADV_DONTNEED` explanation is a hypothesis with evidence, not a
+   diagnosis.** Zero pages and a stale frame are both consistent with it and
+   neither proves it; the call has not been traced. What is established is
+   *which* pages, that it is deterministic, and that it is the outbound window.
+4. **`socat` bridging a Unix socket to a virtio-serial port is unexercised
+   beyond connecting.** The compositor bound its socket and the port carried
+   bytes as far as the harness got, but no Wayland client has completed a
+   handshake across it, so the transport is plausible rather than proven.
+## 72. Release ran on a guest, the clock now turns with nobody connected, and the pool path is broken
+
+### 72.1 Status in one paragraph
+
+`docs/waycompose-design.md` §61.5 could not answer the user's question — *"its
+very important that the arena also releases unneeded memory again"* — and named
+two causes. Both are now **shown on a boundary**: a client took pools out of a
+guest's RAM, was killed rather than closed, and the guest gave the region back,
+`111124480 → 102735872` bytes of resident set read **inside the virtual
+machine**, a fall of exactly the 8,388,608 the region was. §61.5's third cause —
+that with **zero** clients nothing turns the clock — was measured here, then
+fixed here, and leg B holds the fix with nothing connected at all. Getting there
+produced two further defects; one is fixed and **one is open work, not a
+documented limitation**, because it means this topology cannot draw a pixel.
+
+Venue: `nix build .#svGuest` — guest **Linux 6.18.44** against this
+workstation's **6.18.33**, RAM in a `memory-backend-memfd` the host maps.
+Compositor in the guest with a 12 MiB arena of its own RAM; `wc-proxy` and the
+clients on the host; Wayland over §36's rings. `scripts/wc-release-vm.sh`:
+**19 passed, 0 failed**.
 
 > **Topology: `cross-vm`, Linux host → Linux VM.** Every number below is from
-> that leg and from nowhere else. `testhost` was not touched.
+> that leg. `testhost` was not touched.
 
-### 68.2 The three numbers, and why they are the guest's
+### 72.2 The three numbers, and why they are the guest's
 
-| | `wc-compositor`'s resident set, **in the guest** |
+| leg A | `wc-compositor`'s resident set, **in the guest** |
 |---|---|
-| before — compositor up, no pools out | **102,596,608 B (97.8 MiB)** |
-| at peak — 3 pools out, one region grown | **119,382,016 B (113.9 MiB)** |
-| after — client killed, region returned | **102,604,800 B (97.9 MiB)** |
+| before — compositor up, no pools out | **102,727,680 B (98.0 MiB)** |
+| at peak — pools out, one region grown | **111,124,480 B (106.0 MiB)** |
+| after — client killed, region returned | **102,735,872 B (98.0 MiB)** |
 
-The rise is 16,785,408 bytes and the fall is 16,777,216 — the region, exactly,
-plus two pages of noise on the way up. §61.5's table has an "after" row larger
-than its "before" row by a region that never came back; this one closes.
+Rise 8,396,800; fall **8,388,608 — the region, exactly**. Leg B repeats it one
+size up and with nobody connected: a 16,777,216-byte region returned, and the
+resident set down by 16,777,216.
 
-Run twice, on separate boots. The absolute numbers move by a few pages
-(`102,653,952 → 119,439,360 → 102,662,144` the second time) and **the two deltas
-are identical to the byte**: +16,785,408 and −16,777,216. So the quantity being
-reported is the region and not the weather.
+Across five runs spanning two arena configurations the absolute numbers move by
+a few pages and **every delta is the region to the byte**. §61.5's table has an
+"after" row larger than its "before" row by a region that never came back; this
+closes it.
 
 **It has to be the guest's number and there is no substitute.** The host
-unmapping its view of a region frees nothing at all: the pages are the guest's,
-they are `mlock`ed (`VirtualLock`ed on Windows) and therefore non-pageable, and
-they stay gone from the guest's operating system until the guest frees them.
+unmapping its view frees nothing: the pages are the guest's, `mlock`ed
+(`VirtualLock`ed on Windows) and non-pageable, and they stay gone from the
+guest's operating system until the guest frees them.
 `wc_handle::arena::committed_bytes` was written for exactly this and had never
-been read by anything but a unit test; here it is `/proc/<pid>/statm` sampled by
-the guest's own payload script, which is the same accounting from outside the
-process.
+been read outside a unit test; here it is `/proc/<pid>/statm` sampled by the
+guest's own payload script.
 
 Note what does **not** move it: writing pixels into pages the guest already
-committed. The resident set is flat while pools are cut out of the startup
-region and only steps when a region is added or dropped. So "peak" here means
-"after the growth", and a run whose pools all fitted the floor would have shown
-nothing whatever the allocator did — which is worth saying because it is an easy
-way to build a release experiment that cannot fail.
+committed. The resident set is flat while pools are cut out of an existing
+region and steps only when a region is added or dropped. A release experiment
+whose pools all fitted the floor would show nothing whatever the allocator did,
+which is an easy way to build one that cannot fail.
 
-### 68.3 The first defect: the proxy cannot talk to a Linux compositor about a pool
+### 72.3 The pool path is broken, and it is work rather than a caveat
 
-`scripts/wc-ring-vm.sh` has passed since §36 — a Wayland client on this kernel
-driving a compositor in another one, over memory. It drives it with
-`wayland-info`, which sends no `h` argument, and **that is the only reason it
-passes.**
+`scripts/wc-ring-vm.sh` has passed since §36 — a client here driving a
+compositor in another kernel, over memory. It drives it with `wayland-info`,
+which sends no `h` argument, and **that is the only reason it passes.**
 
-`wc-proxy` writes its upstream stream in the in-band-`h` dialect
-(`docs/waycompose-design.md` §2.3): `FdEncoding::OutOfBand` facing the client and
-`FdEncoding::InBand` facing the compositor, hard-coded, because the far side has
-always been the Windows build. On Unix the vendored backend's `Argument::Fd` is
-a raw descriptor — `vendor/wayland-backend/src/rs/wire.rs` has the decode and it
-is `#[cfg(windows)]`, and it must be, because there is nowhere in a `RawFd` to
-put a `wc_handle::Descriptor`. So a rewritten `wl_shm.create_pool` handed to a
-*Linux* `wc-compositor` desynchronises its reader.
+`wc-proxy` writes its upstream stream in the in-band-`h` dialect (§2.3):
+`FdEncoding::OutOfBand` facing the client, `FdEncoding::InBand` facing the
+compositor, hard-coded, because the far side has always been the Windows build.
+On Unix the vendored backend's `Argument::Fd` is a raw descriptor —
+`vendor/wayland-backend/src/rs/wire.rs`, `#[cfg(windows)]` — so a rewritten
+`wl_shm.create_pool` desynchronises a Linux server's reader.
 
-Measured, and the shape is worth recording because nothing anywhere says a word:
+Measured, and the shape is the point because nothing anywhere says a word:
 
-* the client creates one pool and calls `wl_display_roundtrip`; the round trip
-  never returns;
-* the proxy logs the pool published, then two `wl_shm.format` events, then
-  nothing;
-* the compositor logs nothing at all and does not drop the connection;
-* the same client against the same compositor **with no proxy in between**
-  creates all three pools and is fine.
+* the client creates one pool and calls `wl_display_roundtrip`; it never returns;
+* the proxy logs the pool published, then two `wl_shm.format` events, then nothing;
+* the compositor logs nothing and does **not** drop the connection;
+* the same client against the same compositor **with no proxy** is fine.
 
-`scripts/wc-pooltest.c` — this tree's own client, written for a different
-purpose — reproduces it identically. So the defect is not in the client that
-found it.
+`scripts/wc-pooltest.c` — this tree's own client, written for another purpose —
+reproduces it, so the defect is not in the client that found it. **That is the
+regression test, and it has to go from failing to passing.**
 
-**What this means for the venue.** Linux host → Linux VM cannot composite: the
-compositor in that topology never sees a pool as a Wayland object, so there is
-no surface, no window and no pixel. The only compositor binary that can read the
-proxy's dialect is the Windows one, which on a Linux guest means Wine inside the
-guest — the user's second topology, and not attempted here.
+**The fix is decided and is not a rewrite at the boundary.** The user's
+instruction: *"the ring data format can be specialised for the other side
+instead of needing translation after the fact if that is faster, however that
+requires that during client server handshake this format is negotiated"*. So:
 
-**What it does not mean for this measurement.** The proxy's allocator takes the
-arena bytes when it *parses* `create_pool`, long before the compositor is
-involved: `[proxy] client 2: pool 3: 6291456 bytes from the client -> arena 0
-slice 0+6291456`, in a region located by `wc-arena-host` out of QEMU's memory
-backend. The pools really are cut out of guest RAM, the growth request really
-crosses the hypervisor, the region really is committed and pinned by the guest,
-and the guest really frees it. What is absent from this run is compositing, and
-nothing below depends on it. That is stated here rather than buried because
-`docs/waycompose-design.md` §27.6 is what happens when a run's absent quantity
-is not stated.
+1. **Negotiated, not assumed.** Today's defect *is* the assumption that the peer
+   is Windows. `WIRE_VERSION` and the protocol hash already ride the handshake
+   and `finish_attach` already refuses a skew and names the cause, so that is
+   where an encoding belongs — and it turns today's symptom, a silently
+   desynchronised reader, into an explicit refusal.
+2. **Once per connection, never per message.** The user is explicit that this
+   will not change during a session, so the whole cost belongs in the handshake.
+3. **The multi-client cost is a stated trade, not an oversight.** The user
+   raised it. It bites here specifically: §41 disproved "the arena serves exactly
+   one connection" with a real two-client run, and Firefox opens four. Each
+   connection negotiates separately, so a proxy serving four peers of two
+   dialects holds two encodings live — which it must be able to do anyway, since
+   negotiation is per connection. What specialisation buys is not a second
+   implementation avoided; it is **every message not being rewritten at the
+   boundary**, and that is the claim worth measuring rather than asserting.
 
-### 68.4 The second defect: a ring accept armed nothing
+Whether the descriptor can instead be resolved **in the ring**, so the boundary
+never encodes it in either dialect, is open and owned elsewhere; it would remove
+the negotiation rather than implement it. **Nothing here is written until that is
+settled**, which is why this section states the defect, the reproducer and the
+decided shape, and stops.
+
+**What it means for this run.** This topology cannot composite — no surface, no
+window, no pixel — and the memory result is untouched by it, because the proxy's
+allocator takes the arena bytes when it *parses* `create_pool`: `[proxy] client
+2: pool 3: 6291456 bytes from the client -> arena 0 slice 0+6291456`, in a region
+located out of QEMU's memory backend. Stated here rather than buried, because
+§27.6 is what happens when a run's absent quantity is not stated.
+
+### 72.4 A ring accept armed nothing
 
 `grow::Service::start()` and `wc_handle::arena::release_gifts()` were two
 statements inside the **socket** accept branch, and §36 added a second accept
-branch — a ring slot in guest RAM — which had neither. On a `--wayland-cold`
-session that is:
+branch — a ring slot in guest RAM — with neither. On a `--wayland-cold` session
+that is **no growth channel at all**: the arena cannot grow, and because
+`Op::Release` is a request on that same ring, it can never give a region back
+either. The gifts were never released either, so the seat's 71,249-byte keymap
+stayed held for the life of the session. Both silent, because a path that is not
+taken says nothing. The first run of this harness printed `growth channel
+reserved at 11534336+278528` and then never `growth channel up`, and reported
+`grew 0` under pressure that should have grown it twice.
 
-* **no growth channel at all.** The arena cannot grow, and because `Op::Release`
-  is a request on that same ring, it can never give a region back either. The
-  first run of this harness printed `growth channel reserved at 11534336+278528`
-  and then never `growth channel up`, and the proxy reported `grew 0` under
-  pressure that should have grown it twice.
-* **the gifts never released.** The seat's 71,249-byte keymap stays held for the
-  life of the session, so no client binding a `wl_keyboard` could be sent one.
+`arm_arena_for_first_client` is now one function called from both branches. The
+ordering argument transfers unchanged: a client arriving is the proof the locate
+finished, because it came through a proxy, and a proxy with an arena was started
+from a plan that exists only if the locate succeeded. That is about the proxy
+having a plan, not about which door the client came through.
 
-Both are silent on both sides, because a path that is simply not taken says
-nothing. `arm_arena_for_first_client` is now one function called from both
-branches, and the ordering argument transfers unchanged: a client arriving is
-the proof the locate finished, because it came through a proxy, and a proxy with
-an arena was started from a plan that exists only if the locate succeeded. That
-argument is about the proxy having a plan and not about which door the client
-came through.
+This is the second time a §36 accept path has been found skipping work the
+socket path does.
 
-This is the second time a §36 accept path has been found to skip work the socket
-path does, and it is the cost of the same event having two implementations.
+### 72.5 The zero-client tick, measured and then fixed
 
-### 68.5 The zero-client case, confirmed and then shown closing
+The reclaim clock turned on a *session's* `poll` timeout, so with **zero**
+clients there was no pump and nothing turned it. Measured on this leg before the
+fix, and it is worth keeping because it is what the fix had to beat:
 
-The previous commit stated a limitation rather than leaving it: with **zero**
-clients there is no pump, so no `poll` times out, so `tick_idle` never runs and
-the reclaim clock does not turn at all. The last session's `Drop` returns its
-pools and the now-empty region waits for a tick that will not come.
-
-Leg B is that case on purpose, and it behaved exactly as stated:
-
-* the lone client is killed; `session ended holding 3 pool(s), 18874368 bytes
+* the lone client is killed; `session ended holding 2 pool(s), 12582912 bytes
   returned to the arena` — the pools come back;
 * **15 seconds with nobody connected returns no region**;
-* one client reconnects, and `arena region 2 returned while idle: 33554432
-  bytes` follows within seconds.
+* one client reconnects and the region follows within seconds.
 
-So the diagnosis is precisely the missing tick and not a missing release, which
-is the distinction that decides the fix: a tick from the accept loop, which owns
-the shared arena. Not written here.
+So the region was returnable the whole time and nothing was asking. The diagnosis
+named the fix — a tick from the accept loop, which owns the shared arena — and
+`Arena::frame_idle` is it: `&self` rather than `&mut self`, because the caller
+that matters has no session and therefore no mutable handle, and because taking a
+second `share()` handle would have silently shifted the `sharers()` count every
+client reports.
 
-### 68.6 The gates, and one shim that is not a second locate
+The accept was one blocking `accept_one(wait)` for the whole `--timeout`, so a
+proxy with no clients sat in it and the arena stood still. It is now sliced at
+20 ms, and a slice with nobody arriving is a frame's worth of nothing happening —
+the same unit `--arena-grow-idle` is written in, and the same argument the pump's
+poll timeout makes, from the only other place that can make it.
 
-`scripts/wc-release-vm.sh` declares to both structures and proves rather than
-asserts:
+**Leg B holds it**: the last client killed, nothing reconnecting, `0 wc-poolhog`
+processes alive across the wait, and `arena region 2 returned by the accept loop:
+16777216 bytes` with the guest's resident set down by the same.
+
+Two things this cost, both worth recording. The line first read *"returned with
+no client connected"* — a claim the accept loop cannot make, since it runs
+whether or not sessions exist, and it printed **while a client was up** on the
+first run; it names who did it instead. And leg B's check first scanned the whole
+log, which leg A's own release already satisfies — a gate that passes before the
+leg has done anything. It counts only lines after a mark now.
+
+### 72.6 §61.4's ring wall is deterministic on a Linux guest
+
+§61.4 sized `ring_data_bytes` at 64 KiB and found later growths refused with `a
+65600-byte packet cannot fit a 65536-byte ring`, calling it rare — it needed full
+fragmentation on Windows. This leg reproduced it verbatim and the arithmetic is
+sharper than §61.4's, which reasoned at 16 bytes a frame:
+
+`Reply::encode` puts **one `u64` per frame**. A 32 MiB region is 8192 pages =
+65,536 bytes of frame list, plus `sv-wire`'s `ReplyHeader` = **65,600 against a
+65,536-byte ring** — the observed number, exactly. So the wall is not at a
+fragmented 16 MiB region; it is at **any region of 32 MiB or more**, and because
+§71.2's `/proc/self/pagemap` always names every page, a Linux guest hits it
+*every time* rather than occasionally. The default growth series is 16 / 32 / 64
+MiB, so it lands on the **second** growth, always.
+
+This harness uses `--arena-grow-step 8388608` so its two growths are 8 and 16
+MiB, and asserts the wall was not hit rather than hoping. **Not fixed here** —
+§61.4's own words name the answer, "the payload belongs in the arena", and
+choosing between a larger ring and an out-of-band payload is a protocol decision.
+It is now a much more urgent one than §61.4 thought.
+
+### 72.7 The gates, and one shim that is not a second locate
 
 ```
   PASS  the arena is guest RAM: all 3072 pages located by sweep through QEMU's flat view,
         and there is no file
   PASS  the compositor ran in another kernel: guest Linux 6.18.44, this workstation Linux 6.18.33
-  ----  topology: CROSS-VM -- a hypervisor is in the path.
   PASS  release: TOPOLOGY cross-vm: proven by 3072 pages of guest RAM located by sweep --
         QEMU's monitor cannot answer for a machine that is not running one
+  PASS  the accept loop returned it with nobody connected: arena region 2 returned by the
+        accept loop: 16777216 bytes of guest RAM
+  PASS  and there really was nobody: 0 wc-poolhog processes alive across that wait
+== 19 passed, 0 failed ==
 ```
 
-**`wc_locate_arena` is reused rather than reimplemented**, and that needed two
-shims: this rig has the guest, QEMU and the proxy all on one workstation, where
-that function expects ssh to a guest and ssh to a separate VM host. `g` and `h`
-are shells, and `g` rewrites `/sv` to the run directory because the guest's 9p
-mount and the host's directory are the same bytes under two names. Everything
-load-bearing stays that function's: the run id read out of the compositor's own
-line, `wc-arena-host` through QEMU's monitor, the `verify: 3072/3072` count and
-the refusal when a page is missing. A private copy that happened to agree with
-itself is the exact shape this project keeps finding gates in.
+**`wc_locate_arena` is reused rather than reimplemented.** This rig has guest,
+QEMU and proxy all on one workstation, where that function expects ssh to a guest
+and ssh to a separate VM host; `g` and `h` are shells, and `g` rewrites `/sv` to
+the run directory because the guest's 9p mount and the host's directory are the
+same bytes under two names. Everything load-bearing stays that function's — the
+run id from the compositor's own line, `wc-arena-host` through QEMU's monitor,
+`verify: 3072/3072`, and the refusal when a page is missing.
 
 **The kernel check earns its place.** A harness on one box that boots a guest can
 fail to reach it and measure the host instead, and every arena number would look
-plausible. `uname -r` inside the guest against `uname -r` here is a fact neither
-side can fake, and `wc_assert_topology` is the second, independent one.
+plausible. `uname -r` inside against `uname -r` here is a fact neither side can
+fake; `wc_assert_topology` is the second, independent one.
 
-Two notes on the apparatus, which had never run against a real `cross-vm` leg
-before this:
+**§71.3 arrived while this ran.** `--vm sv-guest` matched three QEMUs, because
+`nix/guest.nix` bakes that name into every guest and another agent had one up.
+The hint is this run's directory, which appears in its QEMU's command line and in
+nobody else's.
 
-* **It behaved.** `wc_substrate_declare guest-ram` unset `SV_ALLOW_FILE_ARENA`,
-  `wc_topology_declare cross-vm` checked for a VM host and a guest, and
-  `wc_assert_topology` refused to accept the declaration on anything but the
-  locate. No gate had to be loosened.
-* **The locate took the sweep arm, and that is not a degradation.** There is no
-  page-frame database off Windows — `grow::frames` says so in the reply — so
-  every locate here is `frames=none` and the sweep runs: 3072 of 3072 pages in
-  187–208 ms over 2048 MiB. §61.4's "a 65600-byte packet cannot fit a 65536-byte
-  ring" therefore **cannot arise on this leg**, because the reply carries zero
-  frames. It is untouched and still open on Windows.
+The apparatus behaved on its first real `cross-vm` legs: `guest-ram` unset
+`SV_ALLOW_FILE_ARENA`, `cross-vm` was checked for a VM host and a guest, and
+`wc_assert_topology` refused to take the declaration on anything but the locate.
+No gate was loosened.
 
-### 68.7 What is proven and what is not
+### 72.8 What is proven and what is not
 
 | | |
 |---|---|
-| a killed client's pools returned to the arena | **shown** — `session ended holding 3 pool(s), 18874368 bytes returned`, twice |
-| an empty region returned to the guest | **shown** — `arena region 1 returned while idle: 16777216 bytes` |
-| the guest's operating system got the pages back | **shown** — resident set −16,777,216 B, from `/proc` inside the VM |
-| growth on demand across a hypervisor, Linux guest | **shown** — 16 MiB in 28 ms, then 32 MiB in 65 ms |
-| the reclaim clock turning while nothing draws | **shown** — every release here happened with no client drawing anything, ever |
-| the zero-client case | **still open, and confirmed** — §68.5 |
-| release on a **Windows** guest | **not shown.** This is a Linux guest; `VirtualFree`/`VirtualLock` were not the code that ran |
-| anything about compositing on this topology | **not in the experiment** — §68.3 |
-| `frames=none` degradation on the *growth* path | now **the only arm this leg has**; the frame-list arm is still Windows-only |
+| a killed client's pools returned to the arena | **shown** — `session ended holding 2 pool(s), 12582912 bytes returned`, both legs |
+| an empty region returned to the guest | **shown** — leg A, 8,388,608 B |
+| the guest's operating system got the pages back | **shown** — resident set −8,388,608 and −16,777,216, from `/proc` inside the VM |
+| the clock turning with **zero** clients | **shown** — leg B, 0 client processes alive, `returned by the accept loop` |
+| growth on demand across a hypervisor, Linux guest | **shown** — 8 MiB in 15 ms, 16 MiB in 10 ms |
+| **a pool reaching the compositor on this topology** | **BROKEN — §72.3.** Open work, reproducer in `wc-pooltest` |
+| anything about compositing here | **not in the experiment**, and cannot be until §72.3 lands |
+| regions of 32 MiB or more over the growth ring | **BROKEN — §72.6**, deterministically on a Linux guest |
+| release on a **Windows** guest | **not shown.** This is Linux; `VirtualFree` was not the code that ran |
 | `Floor::CURRENT` moved to `GrowsUnderPressure` | **no** |
 
 `Floor::CURRENT` stays `MustStandAlone` and
 `growth_has_not_been_demonstrated_on_a_guest_yet` stays asserted. Release is now
 shown on a boundary, which was §61.6's stated blocker — but that arm asks for
-something this run does not contain and was not trying to: *"a guest session at
-this floor, with a real Firefox, showing the arena growing rather than
-refusing"*, with click latencies against the 64 MiB baseline. There is no
-Firefox here, no click and no window (§68.3). Moving that line is a separate,
-deliberate commit with a failing guard test in front of it, on a leg that has a
-browser in it.
+*"a guest session at this floor, with a real Firefox, showing the arena growing
+rather than refusing"*, with click latencies against the 64 MiB baseline. There
+is no Firefox here, no click and no window, and there cannot be one until §72.3
+is fixed. Moving that line is a separate, deliberate commit with a failing guard
+test in front of it.

@@ -679,7 +679,7 @@ fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> Stri
 ///
 /// Because it was two statements in *one* accept branch, and there are two.
 /// `--wayland-cold` (§36) accepts on a ring slot in guest RAM rather than on a
-/// socket, and that branch had neither call. §68 is the run that found it: a
+/// socket, and that branch had neither call. §72 is the run that found it: a
 /// cross-VM session with a guest-RAM arena and no growth channel, so the arena
 /// could not grow, and — because `Op::Release` is a request on that same
 /// channel — could not give a region back either. Both halves were silent,
@@ -889,7 +889,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // §68, and first because everything below it is evidence *about a
+    // §67, and first because everything below it is evidence *about a
     // platform*: a log whose first line does not say which one is a log that
     // cannot be attributed. It is after `--log` for the same reason — a
     // harness that has to race the process for this line would sometimes lose.
@@ -1390,7 +1390,7 @@ fn wayland_thread(
                              (no socket crossed the VM boundary)"
                         );
                         let _ = std::io::stdout().flush();
-                        // §68. **The same two calls as the socket accept, and
+                        // §72. **The same two calls as the socket accept, and
                         // their absence here is what the first real cross-VM
                         // leg found.**
                         //

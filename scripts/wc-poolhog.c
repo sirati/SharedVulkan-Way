@@ -7,7 +7,7 @@
  * shim's `wl_shm_pool.destroy` path gets run. This is the opposite client, and
  * it is the one the release question needs.
  *
- * docs/waycompose-design.md §68 is about the pools a client is still holding
+ * docs/waycompose-design.md §72 is about the pools a client is still holding
  * when it **exits**. `Pool::releasable` is `zombie && acked && buffers == 0`,
  * and `zombie` is set in exactly one place: the client sending
  * `wl_shm_pool.destroy`. A client that is killed never sends it, so before
@@ -26,7 +26,7 @@
  * With `N = 0` it is the **keepalive**: a connection that holds no arena bytes
  * and never draws. That is not a convenience, it is load-bearing. The reclaim
  * clock turns on a *session's* poll timeout, so with zero sessions nothing
- * ticks at all — see §68.5. The keepalive is the session whose idle poll turns
+ * ticks at all — see §72.5. The keepalive is the session whose idle poll turns
  * the clock for the arena the killed client's pools were in.
  *
  *   gcc -O2 -o wc-poolhog scripts/wc-poolhog.c -lwayland-client
@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
      * `Argument::Fd` is a raw descriptor and there is nowhere to put a
      * `wc_handle::Descriptor`. So against a *Linux* compositor the rewritten
      * `wl_shm.create_pool` desynchronises the server's reader, and a client
-     * that waits for a reply after its first pool waits forever. See §68.3.
+     * that waits for a reply after its first pool waits forever. See §72.3.
      *
      * That stall is upstream of nothing this client is for. The proxy's
      * allocator takes the arena bytes when the request is *parsed*, so all

@@ -106,7 +106,11 @@ type note >/dev/null 2>&1 || note() { echo "  ----  $*"; }
 # sources is exactly the class of mistake this file exists to stop.
 _fresh_deps() {
   local bin=$1 dep
-  dep="${bin%.exe}.d"
+  # Cargo names the depfile after the *crate*, so a binary's platform suffix is
+  # not part of it: `wc-proxy.exe` -> `wc-proxy.d`, `libsv_icd.so` -> `libsv_icd.d`.
+  # Stripping only `.exe` sent every `.so` down the whole-tree fallback, where it
+  # was blamed on the first unrelated file the walk happened to reach.
+  dep="${bin%.exe}"; dep="${dep%.so}"; dep="${dep%.dylib}.d"
   [ -f "$dep" ] || return 1
   # A Makefile rule: "target: dep dep dep", possibly over several lines.
   sed -e 's/\\$//' -e 's/^[^:]*://' "$dep" 2>/dev/null \
