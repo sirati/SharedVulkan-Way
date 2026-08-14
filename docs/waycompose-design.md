@@ -22316,3 +22316,114 @@ access` — the pointer entered nothing at all — and nothing here explains it.
 Also not claimed: that this is a *bug* in upstream smithay as shipped. This is
 what `vendor/smithay` does at the revision this tree carries, read from the
 source in the tree. Whether upstream has since changed it was not checked.
+## 69. Wine inside the Linux VM, and a skip that has nowhere to go
+
+*(Topology 2 of the three the user asked for. §64's continuation.)*
+
+### 69.1 Status in one paragraph
+
+The user asked for three arrangements with a real hypervisor in the path, and
+this is the second: **a Windows binary under Wine, inside the Linux VM guest**.
+`scripts/wc-ring-vm.sh` was the first and runs the *Linux* compositor in the
+guest; nothing before this ran a Windows binary in one. The question it was
+built to settle is §53.3's: `GetGuiResources` returns 0 under Wine on this
+workstation, the USER/GDI leak assertion was skipped for that reason, and the
+skip could not say whether the zero was a fact about **Wine** or a fact about
+the **venue**. It is the first. Inside the guest, on the guest's own kernel,
+with the probe owning five windows, Wine answers `user=0 gdi=0` exactly as it
+does on the host. **No arrangement of Linux virtual machines can turn §53's SKIP
+into an assertion; only a real Windows kernel can** — which is worth knowing
+before the user's machine is spent on it, and which leaves the queued testhost
+run as the only thing that can settle it rather than one option among several.
+
+### 69.2 What the guest ran, and how it got a `.exe` without one being installed
+
+`nix/guest.nix` shares the host's `/nix/store` over 9p and says why: *"the guest
+half is handed in from the host's store, which the guest can see because
+/nix/store is shared. So there is nothing to install: the harness runs an
+absolute path."* Wine and Xvfb are store paths, so the guest runs them without
+the image growing a package; `probe-life.exe` is not in the store, so it is
+copied into the shared run directory the guest sees as `/sv`. The existing
+`sv-payload` rendezvous — a `guest-cmd.sh` appearing in that directory — is what
+starts it, unchanged.
+
+```text
+GUEST-UNAME: Linux nixos 6.18.44 #1-NixOS SMP PREEMPT_DYNAMIC …
+GUEST-WINE-VERSION: wine-11.14 (Staging)
+before user=0 gdi=0
+after  user=0 gdi=0
+windows=5
+counter=stub
+```
+
+against this host's `Linux devhost 6.18.33`. The harness **fails
+if those two unames match**, because a run that measured the host would
+otherwise be indistinguishable from a run that measured the guest — §51's
+mistake in a new place, and the reason that check is an assertion rather than a
+printed line.
+
+### 69.3 Why the verdict is `stub` and not an absence
+
+`user=0` is the same string a process with no windows would print, so the probe
+does not print it alone. `probe-life.exe selftest` creates four windows of its
+own, samples `GetGuiResources` before and after, and reports the enumerated
+window count beside both numbers. Five windows and `user=0` is a stub; no
+windows and `user=0` is an absence, and the harness refuses to draw a conclusion
+below four windows. That is the same discipline §64.4 needed for a different
+reason: a number is only evidence once something has been shown to move.
+
+### 69.4 What this does and does not establish
+
+**It establishes** that this Wine build does not implement `GetGuiResources`,
+measured on a second kernel behind a real hypervisor rather than argued.
+
+**It does not establish that a different Wine would stub**, and the reason is
+the venue's own construction: the guest runs the host's `/nix/store` over 9p, so
+the Wine inside the VM is byte-for-byte the Wine outside it. The hypervisor is
+real and the kernel is not the host's, but the *binary under test is the same
+binary*. For the question actually asked — "is the zero about Wine or about the
+venue" — that is exactly right, because holding the binary constant while
+changing the venue is what isolates the variable. For any question about Wine
+versions it is no evidence at all.
+
+**The corollary is the useful part.** §53.6 item 3 and §64.5 item 2 both name
+the guest run as the one that would turn the SKIP into an assertion. That is now
+narrowed: it must be the **Windows** guest, not a Linux one, and no amount of
+local virtualisation substitutes. The three topologies the user asked for are
+worth running for what they *do* test — a real boundary for the transport, the
+proxy and the descriptor rule — and this particular assertion is not among them.
+
+### 69.5 What is not proven
+
+1. **The compositor was not run in the guest**, only the probe. This answers one
+   question cheaply; running `wc-compositor.exe` under Wine in the VM is the
+   rest of topology 2 and is not done here.
+2. **Topologies 1 and 3 are untouched by this section.** `wc-ring-vm.sh` is 1;
+   3 (Wine-Linux host driving a Linux VM guest) has no harness yet.
+3. **One Wine build, one guest kernel.** See 66.4.
+4. **`release_icons` is still unasserted anywhere** (§64.5 item 1), and this
+   section removes the hope that a local VM would fix it.
+
+### 69.6 The gates
+
+| Gate | Result |
+|---|---|
+| **`scripts/wc-wine-vm.sh`** (new) | **3 passed, 0 failed, 1 skipped** — the skip *is* the finding |
+| `cargo test --workspace --no-fail-fast` | unchanged — no Rust outside `probe-life.c` |
+| `scripts/wc-xref.sh` | 0 broken, 0 unqualified |
+
+It declares `cross-vm` — the first harness in this tree to do so and mean this
+box. `wc_topology_declare` refuses that unless a VM host and a guest are
+configured, a guard written when the hypervisor was always somebody else's; here
+the harness *starts* the hypervisor, so it points both at this machine rather
+than weakening the guard.
+
+**Two harness bugs paid for on the way, both of the same family as §53.4's.**
+The `sv-payload` unit echoes the script it is about to run into the same log the
+harness greps, so an unanchored `grep "GUEST-SELFTEST-END"` matched the *source
+line* and the first two runs "finished" in seconds having measured nothing. And
+the verdict came back as `stub\r`: mingw's stdio turns every `\n` into CRLF, so
+`case "$counter" in stub)` did not match and the harness reported *"unexpected
+verdict 'stub'"* about a verdict it had just printed. That is the **third** time
+this session — `probe-drag`'s window list in §50, `probe-life`'s `gone` in §53,
+this — and it is always the same bug wearing a different symptom.
