@@ -409,6 +409,12 @@ impl Write for SharedPipe {
     }
 }
 
+// Unix-only, and the reason is the stand-in rather than the mechanism: these
+// tests use a `socketpair` where the real thing is a virtio-serial port, and a
+// socketpair is a Unix construct. The Windows *port* path is exercised on the
+// deployment guest (§36.16); what has no Windows form is this fixture. The
+// module under test — `PortWake`, `Doorman`, `serve_port` — is built on both.
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
