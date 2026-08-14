@@ -3591,6 +3591,38 @@ That was a documented future risk when the profile was `zink` and the extensions
 were not advertised. It became live when the default changed, and the two facts
 are in different files with nothing connecting them.
 
+**This is a different defect from a stale comment, and the difference is worth
+naming, because the tree has been finding both all week and only one of them has
+a fix.** A stale comment is a sentence that stopped being true because somebody
+edited the code beside it and not the prose — `arena_mib`'s "growth is armed and
+inert" outliving the branch that closed it, in the very file that set the number.
+The cure is proximity: put the reasoning where the value is decided, and a test
+that fails when they disagree.
+
+This is the other kind. **Nobody edited anything, and no sentence was ever
+wrong.** §0.8 item 7 was accurate the day it was written and is accurate now:
+*"Firefox 153 would select a forwarded device — it accepts
+`VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU`, and it requires only `VK_KHR_video_queue`
+and `VK_KHR_video_decode_queue` to do so."* It was a statement about what would
+happen **if** we advertised those extensions. Somebody then changed the default
+profile, for good reasons that had nothing to do with video, and the `if`
+quietly became true. The condition and its consequence were correct, in separate
+files, and the thing that changed was neither of them.
+
+Proximity cannot fix this one: the two facts have no natural place to sit
+together, because "which extensions does `full` advertise" and "what does
+Firefox do when it sees them" are genuinely different subjects. What would have
+caught it is an assertion rather than a sentence — *this profile does not
+advertise an extension whose queue family we do not serve* — which is a test the
+codegen could run and does not. That is worth building, and it belongs with
+whoever owns `advertise.rs` rather than here.
+
+The general shape, so it can be looked for elsewhere: **a documented conditional
+risk whose condition is a decision made in another file by another person for
+another reason.** Every "this is safe as long as X" in this document is one of
+these waiting to happen, and the ones that matter are those where X is somebody
+else's default.
+
 There is a second, quieter one underneath it: the generated GPU-side handler for
 `vkCmdDecodeVideoKHR` calls `note_missing(...)` and returns `Ok(())` when the
 driver has no such entry point — a **silent no-op**, R8's shape again, on a
