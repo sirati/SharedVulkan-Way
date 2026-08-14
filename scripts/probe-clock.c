@@ -2,7 +2,7 @@
  *
  *   usage: probe-clock.exe
  *
- * docs/design.md §7.7 item 5: smithay's `Monotonic` clock currently has its
+ * docs/waycompose-design.md §7.7 item 5: smithay's `Monotonic` clock currently has its
  * epoch at process start rather than at boot, which is wrong for
  * `wp_presentation`, and the fix named there is `QueryPerformanceCounter`.
  * §7.8 item 7 makes the resolution of that counter a thing to check on the

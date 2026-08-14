@@ -63,7 +63,7 @@
 # code paths are self-consistent and structurally possible. Wine's `user32` and
 # `gdi32` are reimplementations; `SetDIBitsToDevice`'s top-down behaviour, the
 # `WM_ERASEBKGND` clipping and the modal resize loop are all places where the
-# real thing may differ. docs/design.md §8.8 lists them.
+# real thing may differ. docs/waycompose-design.md §8.8 lists them.
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -476,7 +476,7 @@ check_screenshot() {
 
 run_wine_thirdparty() {
   echo "== wine: what a *third-party* client gets from the Windows build =="
-  echo "  (docs/design.md §2.4 and §7.5, measured rather than asserted)"
+  echo "  (docs/waycompose-design.md §2.4 and §7.5, measured rather than asserted)"
   fresh_or_skip "$WIN_BIN/wc-compositor.exe" "SKIP: no wc-compositor.exe"; case $? in 2) note "SKIP: no wc-compositor.exe"; return ;; 1) return ;; esac
   command -v "$CLIENT_ANIM" >/dev/null || { note "SKIP: $CLIENT_ANIM not installed"; return; }
 

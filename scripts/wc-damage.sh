@@ -11,7 +11,7 @@
 # THE QUESTION, AND WHY A SCREENSHOT CANNOT ANSWER IT
 #
 # The user's clause is "screen must not tear or stop rendering of scrolling no
-# blank slides (e.g. in about:support)". docs/design.md §18 found and fixed one
+# blank slides (e.g. in about:support)". docs/waycompose-design.md §18 found and fixed one
 # cause of the first symptom — an incoherent virtio-fs export — by dumping the
 # compositor's own frames and finding them torn identically to the screen. That
 # technique cannot find *this* one, and the reason is worth stating: a stale

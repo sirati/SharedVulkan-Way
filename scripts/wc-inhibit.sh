@@ -12,7 +12,7 @@
 # `zwp_keyboard_shortcuts_inhibit_manager_v1` or `xdg_toplevel_icon_manager_v1`
 # gets the behaviour those protocols promise — not that the globals exist.
 # `wayland-info` already proves the second, and the second is what a broken
-# implementation also passes. The distinction is docs/design.md §25's whole
+# implementation also passes. The distinction is docs/waycompose-design.md §25's whole
 # argument: a client feature-detects by binding, so an absent global sends it
 # down a fallback path and a broken one sends it into a wall.
 #
@@ -93,7 +93,7 @@ if [ "$mode" = wine ]; then
 	#
 	# The first attempt pointed the probe straight at the Wine socket, the
 	# way `scripts/wc-xdg.sh wine` does, and it got as far as
-	# `wl_surface commit` and stopped. That is docs/design.md §2.4 arriving
+	# `wl_surface commit` and stopped. That is docs/waycompose-design.md §2.4 arriving
 	# on schedule and is worth recording rather than working around
 	# silently: this probe attaches a `wl_shm` buffer, `wl_shm.create_pool`
 	# carries an `h`, a stock libwayland client sends it out of band by

@@ -7,7 +7,7 @@
  *
  * WHY THIS EXISTS
  *
- * docs/design.md §2.2 chose *named kernel objects* because the peer can open
+ * docs/waycompose-design.md §2.2 chose *named kernel objects* because the peer can open
  * one by name and no handle has to be duplicated. That works between two
  * Windows processes. It does not work between a Linux process and a Windows
  * one: `Local\wc-...` is a name only the NT object manager understands, and a

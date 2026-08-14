@@ -2,7 +2,7 @@
  *
  * WHY A C CLIENT AND NOT A RUST TEST
  *
- * docs/design.md §14.9 records two occasions on this project where
+ * docs/waycompose-design.md §14.9 records two occasions on this project where
  * "implemented" turned out to mean "compiled". A unit test in `wc-proxy`
  * proves the wire table; `wayland-info` proves the globals are advertised.
  * Neither proves that a client which *binds* one of these and then uses it

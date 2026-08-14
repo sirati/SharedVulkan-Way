@@ -18234,3 +18234,149 @@ was working.
    (master's `wayland-bell-win`), so it is reported with its measurement rather
    than patched from here. The precedent for *doing* it in §44 was a one-line
    publish-before-store race with no API change; this is not that.
+
+## 48. A citation is the one comment a machine can check
+
+### 48.1 Status in one paragraph
+
+Task #42 was "113 comments point at the wrong design document". The fixes are
+worth less than the check, so the check came first: `scripts/wc-xref.sh`
+resolves every `<doc>.md §N` citation in the tree against the named document's
+actual headings and fails when one resolves to nothing. It found **49 broken
+citations** — every one of them `docs/design.md §N` where §N lives in
+`docs/waycompose-design.md` — and all 49 are now fixed, with the checker green.
+It also found that **`docs/design.md` defines ten section numbers twice**, which
+is the numbering collision seen from the reader's end rather than the author's.
+And running the fixes from the checker's own output exposed a defect in the
+checker, which is the part of this section worth reading.
+
+### 48.2 Why the check, and not just the 113
+
+§35.10 is that a comment nothing asserts is a claim that outlives its truth. A
+citation is the **one kind of comment that can be mechanically asserted** — it
+names a document and a section, both of which exist or do not — so leaving it
+unasserted was a choice, not a limitation.
+
+And a wrong citation is worse than no citation. `§14.7` in the right document is
+an argument you can go and read; the same string pointing at the other document
+resolves to something unrelated, and the reader either follows it and is
+confused or trusts it and is misled. This tree was unified from two repositories
+and rename detection has repeatedly landed sections in the wrong file, so
+without a check the 113 would be back after a few merges.
+
+**What the checker classifies, in decreasing order of wrongness:**
+
+* **missing** — the document is named and the section does not exist in it. The
+  reference cannot be followed. This is what fails the check.
+* **ambiguous** — the section number exists twice in the named document, so the
+  citation resolves to two places.
+* **unqualified** — `design.md §N` with no directory. In a tree with two design
+  documents whose names both end in `design.md`, the bare form names neither.
+  **748 citations are this**, which is why it is reported and not failed on: a
+  check nobody can pass gets disabled, which is §42's other defect.
+
+Bare `§N` with no document at all — 2275 of them — is not checked and is said
+so in the output. It means "this file's own document", and resolving it needs a
+file-to-document map that does not exist. Named as a known gap rather than
+silently skipped, because a coverage number that hides what it excludes is the
+same defect one level up.
+
+### 48.3 What it found
+
+```
+== design-document cross-references ==
+  199 resolve to exactly one section
+   49 name a document and a section that does not exist in it
+    0 name a section their document defines more than once
+  748 say `design.md` with no directory, which names neither document
+```
+
+All 49 were `docs/design.md §N` in `scripts/` and the C probes — the Wayland
+side citing the Vulkan document. This is §35.9 item 5 (`scripts/*.sh` still say
+`docs/design.md`) with a number attached. **Every one of the 49 sections exists
+in the Wayland document**, checked before anything was rewritten, so the repair
+was mechanical and safe rather than a guess: the `§14.7` cited by `wc-guest.sh`
+under the Vulkan document's name is §14.7 of the *Wayland* document and always
+was.
+
+(That sentence originally spelled the bad citation out in full, and the checker
+failed on this very file for it — correctly, since a citation in prose is one a
+reader will follow just as readily as one in a comment. It is written without
+the literal path instead of being excluded, because an exception for "examples"
+is how a checker starts having exceptions.)
+
+After: `248 resolve to exactly one section, 0 missing`, and the checker exits 0.
+
+**The ten duplicate section numbers in `docs/design.md`** — 0.15, 0.20, and 1
+through 8 — are reported by `--sections` and are not fixed here. Renumbering a
+document another agent is actively writing in, to fix citations that currently
+resolve to *two* correct-looking places rather than none, is a worse trade than
+leaving it visible. `docs/waycompose-design.md` has 470 headings and no
+duplicates.
+
+### 48.4 The checker's own defect, found by using it
+
+The fixes were driven from the checker's output. It repaired 41 of 49 and the
+re-run found 8 left — because the report **truncated its list at 40 lines**
+while the summary above it said 49.
+
+That is a new shape and worth naming: the count was right and the list was
+short, so anything working from the list did less than the summary claimed and
+had no way to notice. It is not a check that cannot fail, and not one that
+cannot pass — it is a check that **reports less than it found**, and it is
+particularly nasty because the correct number is printed two lines above the
+incomplete evidence.
+
+Fixed by not truncating the failing categories at all. Only the *unqualified*
+list is capped, and it says how many it withheld. The general rule this suggests,
+and it is the same one as §42's: **a list a human or a script will act on must
+not be summarised at a different length than it is counted.**
+
+### 48.5 `minframes`, which had a basis all along
+
+§35.9 item 3 flagged the floor of 2 as having no margin — `weston-terminal`'s
+present count was 2, 2 and 5 — and asked what to do if a fourth observation came
+in at 1. The answer turns on the floor's **basis** rather than its value, and the
+basis was already in the comment: `weston-terminal` draws once at map and once on
+the configure, so **2 is structural, not a rate**. Load does not change what the
+client owes. What load can change is whether both draws land inside the leg's
+8-second window.
+
+So the two cases are different facts and were reported as one:
+
+* **0 frames** — nothing of the client's pixels ever reached the window. No load
+  explains that; the client connected, mapped and committed to get this far. It
+  fails.
+* **1 to n-1** — fewer than the structural count inside a bounded window, on a
+  machine now reaching load average 175. That is §47.3's third outcome.
+
+Deliberately **not** applied to `weston-presentation-shm`, whose floor is 500
+against the 784 it presents: that floor *is* a rate, and a short count there is a
+real regression in a client that draws continuously. The guard is `minframes <=
+4`, so a rate-based floor can never take the inconclusive path. Verified on all
+six cases, including the one that matters — 18 presents against a floor of 500
+still fails:
+
+```
+term  5 of 2   -> PASS        pres 784 of 500 -> PASS
+term  1 of 2   -> ???? inconc pres  18 of 500 -> FAIL   (a rate, so no skip)
+term  0 of 2   -> FAIL        pres   0 of 500 -> FAIL
+```
+
+### 48.6 What is not done
+
+1. **The 748 unqualified `design.md §N` citations are untouched.** Mechanically
+   resolvable in most cases — the checker prints which document each section
+   exists in — but rewriting 748 comments across a tree a dozen agents are
+   editing would conflict with all of them. The check reports the count so it
+   can come down deliberately; tightening the checker to fail on them is one
+   line, once it has.
+2. **Nothing runs `wc-xref.sh` automatically.** It is a script that must be
+   invoked, which is exactly the property that let the citations rot. It belongs
+   in whatever gate runs `cargo test`, and that hook is not written here.
+3. **`minframes`'s inconclusive path has not fired on a real run**, like §47.5
+   item 1 before it. The logic is verified on six synthetic cases; a real
+   `weston-terminal` leg presenting 1 frame has never been observed. If it fires
+   at a load below ~100, the window rather than the machine is the suspect.
+4. **The duplicate section numbers in `docs/design.md` are reported, not
+   fixed** — §48.3.

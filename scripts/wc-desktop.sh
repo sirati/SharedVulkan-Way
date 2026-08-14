@@ -12,7 +12,7 @@
 #
 # WHY THIS SCRIPT EXISTS, AND WHAT IT DOES THAT wc-guest.sh DOES NOT
 #
-# `wc-guest.sh` runs the compositor over ssh. docs/design.md §10.12 item 3 is the
+# `wc-guest.sh` runs the compositor over ssh. docs/waycompose-design.md §10.12 item 3 is the
 # discovery that this was never enough: **a Windows ssh session is not on the
 # desktop**. sshd logs the user on in session 0 with its own window station,
 # `Service-0x0-18f160f$`, whose single desktop has no display device behind it.
@@ -95,7 +95,7 @@ PORT="${WC_PORT_BASE:-57271}"
 # The stage-4 half: the machine the VM runs on. It used to be described as "the
 # machine that shares a filesystem with the guest", and stage 13 demoted that:
 # the export still carries the frame dump and the logs, but **not the pixels**.
-# See `locate_arena` below and docs/design.md §18.2.
+# See `locate_arena` below and docs/waycompose-design.md §18.2.
 HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage8}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc}"
@@ -1303,7 +1303,7 @@ chmod +x s8.sh" >/dev/null
 # at the rates involved it is megabytes a second through a paravirtual
 # filesystem. The first version of this measurement counted those files and
 # attributed the result to the poll loop; it was measuring its own instrument.
-# See docs/design.md §13.8, which keeps the wrong number and the right one.
+# See docs/waycompose-design.md §13.8, which keeps the wrong number and the right one.
 #
 # So this mode dumps nothing and reads the compositor's own closing line --
 # `xdg_toplevel destroyed -> window 1 (N frames presented)` -- which costs a

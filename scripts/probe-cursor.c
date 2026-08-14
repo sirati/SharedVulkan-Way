@@ -2,7 +2,7 @@
  *
  * Stage 12 claims that a client's `wl_pointer.set_cursor` and its
  * `wp_cursor_shape_v1.set_shape` reach Win32 as a real `HCURSOR`
- * (docs/design.md §23). A screenshot cannot settle that: a cursor is drawn by
+ * (docs/waycompose-design.md §23). A screenshot cannot settle that: a cursor is drawn by
  * the window server above every window, so it is usually *absent* from a
  * screen capture, and where it is present it is a handful of antialiased
  * pixels that a human has to squint at. `GetCursorInfo` returns the handle
@@ -50,7 +50,7 @@
  * Whether the cursor is *drawn* correctly. `GetCursorInfo` reports what the
  * window server was told to show; the pixels that reach the screen are the
  * window server's business, and under Wine that window server is Wine
- * (docs/design.md §13.6 — four lies so far, and cursors are exactly the kind
+ * (docs/waycompose-design.md §13.6 — four lies so far, and cursors are exactly the kind
  * of thing it emulates rather than implements). A pass here means the
  * compositor installed the right handle. Whether Windows then draws it is a
  * real-guest question.
