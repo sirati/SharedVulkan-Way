@@ -21546,3 +21546,108 @@ grab semantics second, five singletons after.
 3. **Eight of the twelve-test improvement is not mine.** 409/57 became 413/53
    across a master merge; only the four reclassifications are this section's,
    and the other eight were fixed by whoever moved the tree in between.
+
+
+---
+---
+
+## 66. The subsurface group is not the work §65 said it was
+
+### 66.1 Status in one paragraph
+
+§65 grouped seven WLCS failures as *"subsurface sync/desync commit semantics
+and `place_above`/`place_below`"* and called it the largest coherent piece of
+task #31. Read properly, **none of the seven is commit plumbing.** Every one is
+an assertion about *pointer focus*, made by moving or restacking a subsurface
+and then asking which surface the pointer is over — so the group is a scene
+lookup group, which is §40's territory, not a double-buffering group. Nothing is
+fixed here: this section is the diagnosis, and it changes what the next person
+should open.
+
+### 66.2 What the seven actually assert
+
+The failure messages, which are the thing §65 never read:
+
+```
+Subsurface did not move after parent commit                  Actual: (7680, 7680)
+Subsurface moved to new location without parent being committed  Actual: (2560, 2560)
+Subsurface moved without parent being committed              Actual: (2560, 2560)
+Subsurface moved when hierarchy commits were in the wrong order  Actual: (2560, 2560)
+wrong surface/subsurface on top                              Actual: 0x…f0160
+wrong surface/subsurface on top                              Actual: 0x…e15f0
+C++ exception "bad optional access" thrown in the test body
+```
+
+`2560` and `7680` are `wl_fixed`: 10.0 and 30.0. They are **pointer positions**,
+not subsurface positions. The four "did/did not move" tests never look at the
+subsurface's geometry at all — they park a pointer, commit, and infer where the
+subsurface went from the surface-local coordinates the client is told. So a
+compositor with perfect commit semantics and a wrong hit test fails all four,
+and that is the shape to check first.
+
+### 66.3 What is already right, which is why the diagnosis moved
+
+Two things §40 built are correct and were the obvious suspects:
+
+* **`placed_tree` reads the double-buffered state.** It takes
+  `SubsurfaceCachedState::current().location`, not `pending()`, so a subsurface
+  position applied on the parent's commit is what the walk sees.
+* **`surface_under` descends into subsurfaces** and hit-tests them top-down
+  against their own input regions, with the ancestor-mapped rule. Pointer input
+  reaching a subsurface at all is implemented; §37.8 item 2's "every pointer
+  event goes to the toplevel's surface" is out of date.
+
+So the group is not "subsurfaces do not receive input". It is narrower, and the
+narrowing is the useful part.
+
+### 66.4 Two of the seven may not be ours, and saying which needs a reference run
+
+`place_above_simple` and `place_below_simple` both end with two assertions, and
+read together they appear unsatisfiable. Taking `place_below_simple`, with the
+fixture's `subsurface` at (0,0) 50x50 and `subsurface_moving_down` created after
+it at the same place:
+
+```c
+wl_subsurface_place_below(subsurface_moving_down, subsurface);   // moving_down goes under
+…
+ASSERT_THAT(focused_window(), Ne(subsurface_moving_down)) << "place_below() did not have an effect";
+ASSERT_THAT(focused_window(), Ne(subsurface))             << "wrong surface/subsurface on top";
+```
+
+After the restack `subsurface` is the topmost surface under the pointer, so the
+first assertion is satisfied *because* the second cannot be. `place_above_simple`
+is the mirror image with the same pair. Our run fails the second in both.
+
+**That is a hypothesis and it is deliberately not written up as a finding.**
+This session has spent three sections on causes asserted from strong-looking
+evidence and found to be about the wrong thing (§55.3, §60.3), and "the
+conformance suite is wrong" is exactly the conclusion that should be trusted
+least. What would settle it is one run of these two tests against a reference
+compositor — Weston or Mir, which is what WLCS is developed against. If they
+pass there, the reading above is wrong and the fault is ours; if they fail there
+too, these two are upstream and the subsurface debt is five, not seven.
+
+Until that run happens they stay counted as ours.
+
+### 66.5 What the next person should open
+
+1. **The four position tests**, and the question is not "when is the location
+   applied" but "what surface-local coordinate does a client under a stationary
+   pointer receive after the scene beneath it changes". Note that all four move
+   the pointer *before* the change, not after — so whether a commit that moves a
+   subsurface must produce a fresh `wl_pointer.motion` is the protocol question
+   to answer first, and `pointer_motion` is currently called only from real
+   input events.
+2. **`subsurface_extends_parent_input_region`**, which throws rather than
+   failing an assertion — a `bad optional access` on `focused_window()` means
+   the pointer entered nothing at all, so this one is about a surface that
+   should have accepted input and did not.
+3. **The two restacking tests**, after the reference run in §66.4.
+
+### 66.6 What this section did not do
+
+Nothing is fixed, no test moved from failing to passing, and the debt number is
+unchanged at 23. What changed is the description of seven of them, from a
+double-buffering problem to a pointer-focus problem — which matters because the
+two live in different files and only one of them was on the list anybody was
+about to read.
