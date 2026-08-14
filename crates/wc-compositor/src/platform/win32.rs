@@ -2873,6 +2873,33 @@ fn apply_frame(w: &WindowState) {
         "wc-compositor: window {} folds {inset} px of caption into its client area{}",
         w.id,
         match dwm {
+            // §39.4, and the one Wine branch in this file. §31.7 named this
+            // exact hole — "a run that extends the frame and finds `dwmapi`
+            // stubbed would look exactly like `noglass.png` and would report
+            // success ... the one failure mode of this arrangement with no
+            // diagnostic" — and left it open because the `HRESULT` cannot
+            // close it.
+            //
+            // **Measured, wine-11.14 staging, 2026-08-13.** With a plain
+            // `WS_OVERLAPPEDWINDOW` and nothing else in the process:
+            // `DwmIsCompositionEnabled` returns `S_OK` with `enabled = 1`,
+            // `DwmExtendFrameIntoClientArea` returns `S_OK`, and
+            // `DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS)` returns
+            // `0x80004001` — `E_NOTIMPL` — leaving the `RECT` untouched. So two
+            // of the three answer success and the only one that has to return
+            // *data* admits it is a stub. There is no composition behind this
+            // frame and `S_OK` says there is.
+            //
+            // Nothing about the window changes here: the branch corrects the
+            // claim, not the behaviour, because `caption_button_rect` already
+            // returns `None` under Wine and the fallback that produces is the
+            // arrangement `--caption-buttons off` asks for on purpose. What was
+            // broken was the evidence, and §35 is a whole section about gates
+            // that reported success while something was wrong.
+            Some(0) if crate::wine::under_wine() =>
+                ", DwmExtendFrameIntoClientArea returned ok -- but this dwmapi is Wine's stub \
+                 (DwmGetWindowAttribute is E_NOTIMPL) and nothing is composited behind the \
+                 frame; see docs/waycompose-design.md §39.4",
             Some(0) => ", DwmExtendFrameIntoClientArea ok",
             Some(_) => ", DwmExtendFrameIntoClientArea FAILED",
             None if w.frame.dwm_glass => ", dwmapi.dll has no DwmExtendFrameIntoClientArea",

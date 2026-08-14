@@ -81,6 +81,25 @@ trap cleanup EXIT
 export WINEPREFIX="${WINEPREFIX:-/tmp/wc-wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 
+# Which Win32 a compositor log says its run was on -- docs/waycompose-design.md §39.
+#
+# The compositor prints `wc-compositor: win32 is <tag>` as the first line of
+# every log, before it has done anything else, precisely so this is answerable
+# without racing it. A harness that cannot answer it is a harness whose Windows
+# assertions might be about Wine, or whose Wine assertions might be about the
+# Linux build -- and this file used to hold two allowances that were granted to
+# *every* leg because one of them needed it. That is what §39.3 is about.
+win32_of() {
+  local line
+  line=$(grep -o 'wc-compositor: win32 is [a-z]*' "$1" 2>/dev/null | head -1)
+  case "$line" in
+    *' wine')    echo wine ;;
+    *' windows') echo windows ;;
+    *' none')    echo none ;;
+    *)           echo unknown ;;
+  esac
+}
+
 find_socket() {
   local name=$1 node=""
   for _ in $(seq 1 250); do
@@ -122,6 +141,17 @@ run_linux() {
   ( cd "$dir" && XDG_RUNTIME_DIR="$dir/rt" WAYLAND_DISPLAY=wl-cur-info \
     timeout 10 wayland-info ) >"$dir/direct.log" 2>&1
   wait "$srv" 2>/dev/null
+
+  # §39, the negative case, and it is worth an assertion for the same reason the
+  # wine leg's is: this leg is *supposed* to have no Win32, and a `linux` run
+  # that had somehow reached a Windows binary would pass every check below it
+  # while proving nothing about the platform it names.
+  case "$(win32_of "$dir/direct-srv.log")" in
+    none)    ok "this leg is the Linux build and says so: \
+$(grep -o 'win32 is .*' "$dir/direct-srv.log" | head -1)" ;;
+    unknown) bad "the compositor never said which Win32 it was on (§39)" ;;
+    *)       bad "the linux leg found a Win32 -- it is not running the binary it thinks (§39)" ;;
+  esac
 
   if grep -q "interface: 'wp_cursor_shape_manager_v1'" "$dir/direct.log"; then
     ok "the global is advertised: $(grep -o "interface: 'wp_cursor_shape_manager_v1'.*" "$dir/direct.log" | head -1)"
@@ -288,6 +318,26 @@ run_wine() {
     "$dir/probe-cursor.exe" --class WaycomposeToplevel --wait 30 \
     --settle 1500 --dwell 1500 --log "$probe_log_win" >"$dir/probe-loader.log" 2>&1
   local probe_rc=$?
+
+  # **Wait for the probe's own last line, not for the launcher** — the same trap
+  # `wc-damage.sh` documents at length. `wine explorer /desktop=NAME` attaches
+  # to a desktop that already exists (the compositor made this one), so having
+  # handed the program over the launcher returns at once and `$probe_rc` is the
+  # launcher's, not the probe's.
+  #
+  # This harness got away with it until §39 for an uncomfortable reason: the
+  # probe used to *die* at the first `GetCursorInfo`, about a second in, so
+  # everything it was ever going to write was already written by the time the
+  # log was read. Giving it a Wine path that lets it survive turned a crash into
+  # a race, and the two failures look identical from here — a missing reading.
+  # That is why the missing-reading cases below are failures rather than notes.
+  local probe_done=1
+  for _ in $(seq 1 120); do
+    grep -q 'probe-cursor: done' "$dir/probe.log" 2>/dev/null && { probe_done=0; break; }
+    sleep 0.5
+  done
+  [ "$probe_done" = 0 ] || note "probe-cursor.exe never printed its last line \
+(launcher exit $probe_rc); the readings below are whatever it managed"
   sleep 1
 
   xwd -root -silent -out "$dir/s.xwd" 2>/dev/null \
@@ -302,6 +352,24 @@ run_wine() {
   [ -s "$dir/probe.log" ] || { bad "probe-cursor.exe wrote nothing (exit $probe_rc)"; \
     sed 's/^/        /' "$dir/probe-loader.log" | head -10; return; }
   sed 's/^/        /' "$dir/probe.log"
+
+  # --- which Win32 did this actually run on ------------------------------
+  #
+  # §39, and it is first because every assertion below is a claim about a
+  # platform. Asserted rather than noted: a `wine` leg that quietly ran the
+  # Linux build, or that found a real Windows, has measured something -- but not
+  # the thing its name says, and the readings would still all pass.
+  local plat
+  plat=$(win32_of "$dir/srv.log")
+  case "$plat" in
+    wine)
+      ok "the compositor says which Win32 it is on: \
+$(grep -o 'win32 is .*' "$dir/srv.log" | head -1)" ;;
+    unknown)
+      bad "the compositor never said which Win32 it was on -- this leg cannot be attributed (§39)" ;;
+    *)
+      bad "the wine leg ran on '$plat', so nothing below is about Wine (§39)" ;;
+  esac
 
   # --- the compositor's own view -----------------------------------------
   #
@@ -323,24 +391,55 @@ $(grep -o 'cursor -> .*' "$dir/srv.log" | tail -1)"
   # the thread's cursor, with the window server not involved.
   # `client-area` is `GetCursorInfo`, which is what a *user* would see and
   # which under Wine goes through `XQueryPointer`.
+  #
+  # `tr -d '\r'` on every one of them, and it is load-bearing rather than
+  # tidiness: `probe-cursor.exe` reopens its own `--log` with `freopen(…, "w")`,
+  # which on the mingw runtime is a *text* stream, so every line it writes ends
+  # `\r\n`. A `case` pattern anchored at the end — `*"returned 1")` — therefore
+  # never matches, and the first version of the assertions below reported a
+  # correct `returned 1` as a failure. The pre-existing patterns here are all
+  # `*…*` and were immune, which is exactly why nobody had hit it.
   local msg_ret msg_line frame_ret client_line still_line edge_line
-  msg_ret=$(grep "client-area-msg WM_SETCURSOR" "$dir/probe.log" | head -1)
-  msg_line=$(grep "probe-cursor: client-area-msg cursor=" "$dir/probe.log" | head -1)
-  frame_ret=$(grep "frame-msg WM_SETCURSOR" "$dir/probe.log" | head -1)
-  client_line=$(grep "probe-cursor: client-area cursor=" "$dir/probe.log" | head -1)
-  still_line=$(grep "probe-cursor: client-area-still cursor=" "$dir/probe.log" | head -1)
-  edge_line=$(grep "probe-cursor: frame-right-edge cursor=" "$dir/probe.log" | head -1)
+  msg_ret=$(grep "client-area-msg WM_SETCURSOR" "$dir/probe.log" | head -1 | tr -d '\r')
+  msg_line=$(grep "probe-cursor: client-area-msg cursor=" "$dir/probe.log" | head -1 | tr -d '\r')
+  frame_ret=$(grep "frame-msg WM_SETCURSOR" "$dir/probe.log" | head -1 | tr -d '\r')
+  client_line=$(grep "probe-cursor: client-area cursor=" "$dir/probe.log" | head -1 | tr -d '\r')
+  still_line=$(grep "probe-cursor: client-area-still cursor=" "$dir/probe.log" | head -1 | tr -d '\r')
+  edge_line=$(grep "probe-cursor: frame-right-edge cursor=" "$dir/probe.log" | head -1 | tr -d '\r')
 
-  # The hit-test guard, sent by hand. **Reported and not asserted on, and the
-  # reason is measured rather than assumed**: under wine-11.14 a cross-process
-  # `SendMessageW(WM_SETCURSOR)` returns 0 for *both* hit-test codes and the
-  # cursor on the queue does not change for either — including for `HTRIGHT`,
-  # where `DefWindowProc` would have installed `IDC_SIZEWE` if the message had
-  # arrived at all. So the message is not being delivered to the window
-  # procedure, and a pass or a fail here would both be about Wine's message
-  # routing. It stays in the log because on a real guest it is a sharp
-  # assertion, and §23.7 lists it as a thing to re-check there.
-  note "hand-sent WM_SETCURSOR: HTCLIENT ${msg_ret#*returned }, HTRIGHT ${frame_ret#*returned }"
+  # The hit-test guard, sent by hand, and **asserted on now — on both legs**.
+  #
+  # §23.7 item 2 recorded this as a Wine limitation: a cross-process
+  # `SendMessageW(WM_SETCURSOR)` returning 0 for *both* hit-test codes, with
+  # "the cursor on the queue does not change for `HTRIGHT` either" as the tell
+  # that the message never reached the window procedure. It listed the two
+  # sharp assertions below as things only a real guest could make.
+  #
+  # **That was never Wine.** §39.5: the harness was killing the compositor one
+  # second after the launcher returned, while this probe was still in its
+  # `--settle` sleep, so both `SendMessageW`s were being sent to a window that
+  # had already been destroyed — and `SendMessageW` to a dead window returns 0.
+  # With the wait above in place the same wine-11.14 returns `1` for `HTCLIENT`
+  # and `0` for `HTRIGHT`, and the frame's cursor handle differs from the client
+  # area's, which is the tell §23.7 was looking for.
+  #
+  # So the allowance is withdrawn rather than made conditional. That is the
+  # better outcome by some distance: a Wine path here would have frozen a
+  # harness bug into the design as a property of Wine, and the guest leg was
+  # paying for it too — the guard was, in §23.7's own words, "defended by
+  # reading and not by measurement" on *both* platforms.
+  case "$msg_ret" in
+    *"returned 1") ok "WM_SETCURSOR(HTCLIENT) returned 1: the compositor claimed the client area" ;;
+    "")            bad "no WM_SETCURSOR(HTCLIENT) reading at all" ;;
+    *)             bad "WM_SETCURSOR(HTCLIENT) returned ${msg_ret#*returned }, so the client's \
+cursor is not installed over the client area" ;;
+  esac
+  case "$frame_ret" in
+    *"returned 0") ok "WM_SETCURSOR(HTRIGHT) returned 0: the frame is still Windows'" ;;
+    "")            bad "no WM_SETCURSOR(HTRIGHT) reading at all" ;;
+    *)             bad "WM_SETCURSOR(HTRIGHT) returned ${frame_ret#*returned }, so the \
+compositor claimed the resize border too" ;;
+  esac
 
   # This one *is* asserted on. `GetCursor` reads the cursor of the calling
   # thread's input queue, and `AttachThreadInput` put this thread on the
@@ -388,36 +487,79 @@ $(grep -o 'cursor -> .*' "$dir/srv.log" | tail -1)"
     bad "the hotspot changed: asked $asked, ICONINFO holds $got"
   fi
 
+  # `GetCursorInfo` — what a *user* would see, as against the queue reading
+  # above. Both legs make this reading and both assert on it.
+  #
+  # Before §39 the probe *died* here under Wine and this harness printed a note
+  # and carried on, so the Wine leg silently lost this reading and the two below
+  # it: three assertions that looked like they were being made. §39.5 has the
+  # cause and it was this harness, not Wine. An empty reading is therefore a
+  # failure on either platform now, because on either platform something has to
+  # have gone wrong to produce one.
   case "$client_line" in
     *"cursor=custom"*)
       ok "and GetCursorInfo agrees: ${client_line#*cursor=}" ;;
     "")
-      note "GetCursorInfo produced nothing -- see whether Wine's X11 driver died \
-(docs/design.md §23.7); the WM_SETCURSOR reading above does not depend on it" ;;
+      bad "GetCursorInfo produced nothing -- did probe-cursor.exe die? (§39.5)" ;;
     *)
       bad "over the client area Win32 is showing ${client_line#*cursor=}" ;;
   esac
   case "$still_line" in
     *"cursor=custom"*) ok "and it is still there after 1.5 s of no mouse movement" ;;
-    "")                note "no still reading (see above)" ;;
+    "")                bad "no still reading -- the probe stopped before it (§39.5)" ;;
     *)                 bad "the cursor reverted once the pointer stopped moving: $still_line" ;;
   esac
 
   # The other half of "exactly one cursor": the system frame keeps its own.
   # The `WM_SETCURSOR(HTRIGHT)` assertion above is the sturdy version of this;
-  # this one is the same claim measured by parking the real pointer on the
-  # border, and it is a `note` rather than a `bad` when it is missing because
-  # it shares `GetCursorInfo`'s fragility.
-  case "$edge_line" in
-    *"cursor=stock IDC_SIZEWE"*)
-      ok "the window's right border still shows the system resize arrow" ;;
-    *"cursor=stock"*)
-      note "the border shows ${edge_line#*cursor=} -- a stock cursor, so the guard held" ;;
-    "")
-      note "no border reading (see above)" ;;
-    *)
-      bad "the client's cursor leaked onto the window frame: $edge_line" ;;
-  esac
+  # this one is the same claim measured by parking the *real* pointer on the
+  # border, which is why it is worth having twice.
+  #
+  # **THIS IS THE ONE PLACE IN THIS FILE WHERE WINE IS GENUINELY BROKEN** and
+  # therefore the one place with a Wine branch (§39.4). `probe-cursor.c` names a
+  # cursor by comparing its handle against `LoadCursorW(NULL, IDC_*)`, which is
+  # proof of identity on Windows because stock cursors are shared per-session
+  # handles. Under Wine they are **per process**: measured on wine-11.14, the
+  # sixteen handles in one process are 0x1004e … 0x1006c, a dense run from a
+  # per-process base that a second process allocates from again. The probe reads
+  # the cursor off the *compositor's* queue, so the two numbers come from two
+  # namespaces and comparing them can both miss a match and manufacture one.
+  # Everything therefore reads `cursor=custom` under Wine whatever it is, and
+  # the probe says so with `stock-identity=unavailable` rather than letting the
+  # word `custom` be mistaken for a measurement.
+  #
+  # The substitute is the weaker test the guard is actually about — the frame's
+  # handle must **differ** from the client area's — and it is weaker in a
+  # specific, stateable way: it proves the compositor did not claim the border,
+  # and says nothing about which system cursor is there. Windows keeps the
+  # assertion by name, where the name means something.
+  local edge_h client_h
+  edge_h=$(echo "$edge_line" | grep -o 'handle=[0-9a-fA-F]*')
+  client_h=$(echo "$msg_line" | grep -o 'handle=[0-9a-fA-F]*')
+  if [ -z "$edge_line" ]; then
+    bad "no border reading -- the probe stopped before it (§39.4)"
+  elif grep -q "stock-identity=unavailable" "$dir/probe.log"; then
+    case "$edge_line" in
+      *"cursor=stock"*)
+        ok "the window's right border shows ${edge_line#*cursor=}" ;;
+      *)
+        if [ -n "$edge_h" ] && [ "$edge_h" != "$client_h" ]; then
+          ok "the border's cursor is not the client's ($edge_h vs $client_h); \
+Wine cannot say which system cursor it is (§39.4)"
+        else
+          bad "the client's cursor leaked onto the window frame: $edge_line"
+        fi ;;
+    esac
+  else
+    case "$edge_line" in
+      *"cursor=stock IDC_SIZEWE"*)
+        ok "the window's right border still shows the system resize arrow" ;;
+      *"cursor=stock"*)
+        note "the border shows ${edge_line#*cursor=} -- a stock cursor, so the guard held" ;;
+      *)
+        bad "the client's cursor leaked onto the window frame: $edge_line" ;;
+    esac
+  fi
 }
 
 case "${1:-all}" in

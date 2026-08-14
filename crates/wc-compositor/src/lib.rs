@@ -62,6 +62,11 @@ mod surface;
 /// docs/waycompose-design.md §32.
 mod taskbar;
 mod tick;
+/// §39: whether the Win32 underneath is Windows' or Wine's, decided once.
+/// `pub` because `sv-guest` is this compositor too, and because the few places
+/// allowed to branch on it are named in that module's header rather than found
+/// by grepping.
+pub mod wine;
 
 /// How long the Wayland thread waits between turns.
 ///
@@ -587,6 +592,14 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     {
         eprintln!("wc-compositor: could not redirect output to {}: {e}", path.display());
         return std::process::ExitCode::from(2);
+    }
+
+    // §39, and first because everything below it is evidence *about a
+    // platform*: a log whose first line does not say which one is a log that
+    // cannot be attributed. It is after `--log` for the same reason — a
+    // harness that has to race the process for this line would sometimes lose.
+    if let Err(code) = wine::announce() {
+        return std::process::ExitCode::from(code);
     }
 
     // Arenas first, and before the socket exists. An arena that were attached

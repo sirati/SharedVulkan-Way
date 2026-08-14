@@ -57,7 +57,73 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* WHICH WIN32 IS THIS -- docs/waycompose-design.md §39.
+ *
+ * The same probe `crates/wc-compositor/src/wine.rs` makes, made here because
+ * this is a separate process and the compositor's answer does not cross to it:
+ * `ntdll!wine_get_version` exists under Wine and nowhere else. Cached in a
+ * static for the same reason the compositor uses a `OnceLock` -- a value two
+ * call sites can re-read is a value they can disagree about.
+ *
+ * `WC_WIN32=windows|wine` overrides it, exactly as it does for the compositor,
+ * so the fatal call below can be re-tried on a Wine that may have fixed it
+ * without anyone having to edit this file. */
+static int under_wine(void)
+{
+	static int cached = -1;
+	if (cached >= 0)
+		return cached;
+
+	const char *forced = getenv("WC_WIN32");
+	if (forced && !strcmp(forced, "wine"))  { cached = 1; return cached; }
+	if (forced && !strcmp(forced, "windows")) { cached = 0; return cached; }
+
+	HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+	const char *(CDECL *ver)(void) = nt
+		? (const char *(CDECL *)(void))(void *)GetProcAddress(nt, "wine_get_version")
+		: NULL;
+	cached = ver != NULL;
+	if (cached)
+		printf("probe-cursor: win32 is wine %s\n", ver());
+	else
+		printf("probe-cursor: win32 is windows\n");
+	fflush(stdout);
+	return cached;
+}
+
+/* THE ONE THING THIS PROBE CANNOT DO UNDER WINE (§39.4)
+ *
+ * `stock_name` below rests on a documented Windows property, and the header of
+ * this file states it as the reason the reading is proof rather than
+ * resemblance: "Stock cursors are shared per-session handles, so an exact match
+ * is proof of identity". Under Wine they are **per process**.
+ *
+ * Measured, wine-11.14 staging under Xvfb, 2026-08-13. In a single process the
+ * sixteen `LoadCursorW(NULL, IDC_*)` handles are stable across calls -- and
+ * they are 0x1004e, 0x10050 ... 0x1006c, a dense run from a per-process base.
+ * A second Wine process allocates from the same base, so a handle read off the
+ * *compositor's* input queue and a handle loaded here are two numbers from two
+ * namespaces, and comparing them is meaningless in both directions: it can
+ * miss a stock cursor, and it can collide with an unrelated one.
+ *
+ * So under Wine every reading comes back `cursor=custom` whatever it really
+ * is, and this line is what stops that being read as a measurement.
+ * `wc-cursor.sh` substitutes the weaker test the guard is actually about --
+ * the frame's handle must merely *differ* from the client area's -- and keeps
+ * the assertion by name for Windows, where it means something. */
+static void announce_stock_identity(void)
+{
+	if (under_wine())
+		printf("probe-cursor: stock-identity=unavailable "
+		       "(Wine's stock HCURSORs are per-process, so a handle from "
+		       "another process cannot be named; §39.4)\n");
+	else
+		printf("probe-cursor: stock-identity=available\n");
+	fflush(stdout);
+}
 
 /* The stock cursors, by ordinal. Written out rather than using the `IDC_*`
  * macros so that the numbers in this file and the numbers in
@@ -202,7 +268,24 @@ static void ask_window(const char *tag, HWND w, int hittest)
 }
 
 /* Report the cursor at the current pointer position, prefixed with `tag` so a
- * shell script can grep for one probe point among several. */
+ * shell script can grep for one probe point among several.
+ *
+ * A NOTE ON WHAT USED TO BE HERE (docs/waycompose-design.md §39.5)
+ *
+ * §23.7 item 1 recorded `GetCursorInfo` as *fatal* under Wine -- a run of this
+ * probe dying at exactly this call with
+ * `X Error of failed request: BadWindow (invalid Window parameter), Major
+ * opcode 38 (X_QueryPointer)` -- and it reproduced on this branch, three times
+ * out of three, before anything was changed. §39 was about to give it a Wine
+ * path. It does not have one, because the cause is not Wine:
+ * `scripts/wc-cursor.sh` was tearing the compositor down while this probe was
+ * still running, so the window whose pointer was being queried had just been
+ * destroyed. With the harness waiting for `probe-cursor: done` -- the fix
+ * `wc-damage.sh` already documents for the same `wine explorer /desktop=`
+ * trap -- the call is clean and returns every reading.
+ *
+ * It stays `GetCursorInfo` on both platforms, therefore, and this comment is
+ * here so the next person to see that X error looks at the harness first. */
 static void report(const char *tag)
 {
 	CURSORINFO ci;
@@ -266,6 +349,13 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+
+	/* Before anything is measured, and after `--log` has been reopened, so
+	 * that the first line of the probe's own log says which Win32 every
+	 * line below it is about. `wc-cursor.sh` reads it and refuses to run
+	 * the Windows-only assertions against a Wine reading. */
+	(void)under_wine();
+	announce_stock_identity();
 
 	HWND w = find_target(cls, wait);
 	if (!w) {

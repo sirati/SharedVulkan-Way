@@ -14745,3 +14745,374 @@ WiFi round trip. Removing it means teaching the vendored `wayland-backend` to
 take a `Read + Write` client rather than a socket, which is a change to vendored
 code and a `wepoll` problem, and is not worth doing before a client has driven a
 *guest* window through a ring.
+
+---
+
+## 39. Wine becomes first class, and four of the six known quirks were not Wine
+
+The Wayland server runs on Windows. It also has to run under Wine, because a
+Wine box is the venue that is *always* available and a Windows guest is the one
+that has to be arranged — so nearly every gate in `scripts/` is a Wine gate, and
+Wine has been carrying evidence about Windows for thirteen stages without ever
+having been asked to say who it was.
+
+The requirement, in the user's words:
+
+> the wayland server rn runs on windows. thats cool and all, but we also need to
+> be able to test against a vm running only wine and wine does have some quirks
+> and obviously there is no windows kernel there to talk to. so wine becomes
+> first class supported. for stuff where we know wine is just broken and
+> requires a workaround, we impl a workaround. on wayland server start you
+> detect if we are running under wine, based on that OnceCell all other code
+> paths that need it choose between windows and wine. **important: only if
+> something is truly broken under wine, it gets a wine path, the wine test
+> should still be a stand-in test for windows so this is only minimal fixes**
+
+The last sentence is the design. Every `if under_wine()` is one more thing the
+Wine run stops testing about the Windows run, so the interesting number in this
+stage is not how many branches were added but how many were *refused*.
+
+**Six known quirks went in and none of them came out as a Wine branch.** Four
+were not Wine at all — two of those four because of a bug in this project's own
+harness that had been written up as a fact about Wine and quoted as such for two
+stages — and the other two are real Wine behaviour that nothing depends on. The
+two branches that do exist were both found while checking something else, which
+is the honest way round: the quirks somebody remembers are not the ones still
+biting.
+
+### 39.1 What was built
+
+`crates/wc-compositor/src/wine.rs`. A `OnceLock<Win32>` with three values —
+`Windows`, `Wine { version, host }`, and `None` for the Linux build — decided
+once and never re-asked.
+
+The probe is the one Wine documents: `GetModuleHandleW("ntdll.dll")` and then
+`GetProcAddress` for `wine_get_version`, whose presence is the whole answer.
+`wine_get_host_version` gives the kernel underneath, and both are kept rather
+than reduced to a boolean, because every claim in §39.4 is a claim about a
+*particular* Wine and the first question asked of a quirk that stops
+reproducing is which one it was measured on. Measured here:
+
+```
+wine_get_version       -> "11.14"
+wine_get_host_version  -> "Linux 6.18.33"
+```
+
+`ntdll` is resolved with `GetModuleHandleW` rather than `LoadLibraryW` because
+it is mapped into every Windows process before `main` runs — there is nothing
+to load and nothing to release. On the Linux build `probe()` returns `None`
+rather than a plausible `Windows`, which is §13.6's lesson applied to this
+module's own construction: an answer taken where the question is meaningless is
+not an answer.
+
+**The line, first in every log.**
+
+```
+wc-compositor: win32 is wine 11.14 (host Linux 6.18.33)
+wc-compositor: win32 is windows
+wc-compositor: win32 is none -- this is the Linux build and nothing here is evidence about Windows
+```
+
+It is printed from `run_from` immediately after `--log` has been redirected and
+**before `platform::start`**. That ordering is load-bearing rather than tidy:
+what platform a run is on must not depend on the platform having come up, or
+the one run that most needs attributing — the one that failed to start — is
+exactly the one that cannot be. It is also why the guest leg in §39.6 works at
+all on a VM with no X.
+
+`None` is a variant rather than an absence for the same reason. A harness that
+meant to run the `.exe` and got the Linux build has measured nothing about
+Windows, and §35 is a whole section about gates that reported success while
+something was wrong.
+
+### 39.2 The override, and why a stale assumption has to be falsifiable
+
+`WC_WIN32=windows|wine` replaces the probe's answer, in the compositor and in
+`scripts/probe-cursor.c` alike. Two uses, both of which were needed within
+hours of it existing:
+
+* **Force the Windows path under Wine**, to check that a branch is still
+  earning its place. Every entry in §39.4 is a claim about wine-11.14; this is
+  how the next person tests whether it has been fixed upstream without booting
+  anything.
+* **Force the Wine path on Windows**, so a workaround is not code that has only
+  ever run where it does not matter.
+
+An unrecognised value is a **startup failure**, not a warning — the same
+treatment `--decorations` gets. A typo that quietly falls back to the probe is a
+run that was told to exercise one path, measured the other, and passed.
+
+`WC_WIN32=windows` is what settled §39.5, and it settled it in one run. That is
+the argument for the flag in a sentence: the tool built to falsify a Wine claim
+falsified three of them the first afternoon it existed.
+
+### 39.3 Harnesses can no longer be wrong about which platform they measured
+
+`scripts/wc-cursor.sh` gained `win32_of()`, which reads the line out of a
+compositor log, and both legs now **assert** on it: the `wine` leg fails if the
+answer is not `wine`, and the `linux` leg fails if it is anything but `none`.
+
+This is cheap and it is the half of "first class" that pays for itself. §33
+records a photograph of "this compositor ignoring input" that was another
+worktree's `weston-terminal`, written into `docs/` as evidence before anybody
+noticed. A leg that cannot say what it ran on can be wrong in that direction
+silently, and this stage's own §39.5 is a second example of the same failure
+wearing different clothes.
+
+### 39.4 The Wine paths, and there are two
+
+**Neither changes a pixel.** Both correct a claim that was false under Wine.
+
+**1. `dwmapi` answers `S_OK` for things it does not implement.**
+`platform::win32::apply_frame`.
+
+§31.7 named this hole precisely and left it open, because the `HRESULT` cannot
+close it:
+
+> A run that extends the frame and finds `dwmapi` stubbed would look exactly
+> like `noglass.png` and would report success. That is the one failure mode of
+> this arrangement with no diagnostic.
+
+Measured, wine-11.14 staging, on a plain `WS_OVERLAPPEDWINDOW` with nothing else
+in the process:
+
+| call | Wine's answer |
+|---|---|
+| `DwmIsCompositionEnabled` | `S_OK`, `enabled = 1` |
+| `DwmExtendFrameIntoClientArea` | `S_OK` |
+| `DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS)` | **`0x80004001` — `E_NOTIMPL`**, `RECT` untouched |
+
+The two calls that only have to return a status return success; the one that has
+to return *data* admits it is a stub. So there is no composition behind that
+frame and `S_OK` says there is. The compositor's log said
+`DwmExtendFrameIntoClientArea ok`, which under Wine is a false statement about
+the one arrangement in this tree whose failure has no other symptom.
+
+The branch replaces that log line under Wine and does nothing else. It does not
+need to: `caption_button_rect` already returns `None` when DWM will not answer,
+and the fallback that produces is exactly what `--caption-buttons off` asks for
+on purpose. **What was broken was the evidence, not the window.**
+
+**2. Wine's stock `HCURSOR`s are per-process, so a cursor cannot be named across
+one.** `scripts/probe-cursor.c` and `scripts/wc-cursor.sh`.
+
+`probe-cursor.c`'s header states the property its whole method rests on: "Stock
+cursors are shared per-session handles, so an exact match is proof of identity
+rather than resemblance". That is true on Windows. Measured on wine-11.14, the
+sixteen `LoadCursorW(NULL, IDC_*)` handles in one process are stable across
+calls and are `0x1004e, 0x10050 … 0x1006c` — a dense run from a per-process
+base, which a second process allocates from again. The probe reads the cursor
+off the **compositor's** input queue, so the two numbers come from two
+namespaces; the comparison can both miss a match and manufacture one.
+
+Everything therefore reads `cursor=custom` under Wine whatever it really is. The
+probe now prints `stock-identity=unavailable` so that word cannot be mistaken
+for a measurement, and `wc-cursor.sh` substitutes the weaker test the guard is
+actually about — **the frame's handle must differ from the client area's** —
+while Windows keeps the assertion by name, where the name means something:
+
+```
+PASS  the border's cursor is not the client's (handle=…100b0 vs handle=…20090);
+      Wine cannot say which system cursor it is (§39.4)
+```
+
+Weaker, and stated as weaker. It proves the compositor did not claim the resize
+border; it says nothing about which system cursor is there.
+
+### 39.5 The six that were refused, and two of them were this project's own bug
+
+This is the more useful half of the stage.
+
+**`GetCursorInfo` kills the probe (§23.7 item 1) — not Wine.**
+It reproduced, three runs out of three, exactly as recorded: a fatal
+`X Error of failed request: BadWindow (invalid Window parameter), Major opcode
+38 (X_QueryPointer)` in Wine's X11 driver, killing `probe-cursor.exe` mid-line.
+A Wine path was written for it.
+
+Then the isolated control: a binary that does `SendInput` and then
+`GetCursorInfo`, with no compositor and no `AttachThreadInput`, returns a clean
+`1` and the injected position. So it was the *combination*, and the combination
+included `wc-cursor.sh` killing the compositor **one second after the launcher
+returned, while the probe was still in its `--settle` sleep** — because
+`wine explorer /desktop=NAME` attaches to a desktop that already exists and
+returns at once. `wc-damage.sh` documents that exact trap at length; this
+harness had never hit it because the probe used to die a second in, so
+everything it was ever going to write was already written.
+
+With the harness waiting for `probe-cursor: done`, the call is clean and returns
+every reading. **The Wine path was deleted.**
+
+**Cross-process `SendMessageW(WM_SETCURSOR)` is not delivered (§23.7 item 2) —
+not Wine.** Same cause, and it falls out of the same fix. §23.7 recorded `0` for
+both hit-test codes, with "the cursor on the queue does not change for `HTRIGHT`
+either" as the tell that the message never reached the window procedure. Both
+`SendMessageW`s were being sent to a window that had already been destroyed, and
+`SendMessageW` to a dead window returns 0. With the wait in place, the same
+wine-11.14 returns:
+
+```
+client-area-msg WM_SETCURSOR(hittest=1)  returned 1
+frame-msg       WM_SETCURSOR(hittest=11) returned 0
+```
+
+— the two sharp assertions §23.7 said only a real guest could make, and the
+frame's cursor handle differs from the client area's, which is the tell it was
+looking for. **The allowance was withdrawn rather than made conditional**, which
+matters: a Wine path here would have frozen a harness bug into the design as a
+property of Wine, and the guest leg was paying for it too. The guard was, in
+§23.7's own words, "defended by reading and not by measurement" — on *both*
+platforms.
+
+**A signal-killed client does not flush stdio (§11.7 item 3) — not Wine, and not
+even Windows.** Full buffering plus `SIGKILL` loses the buffer on any platform;
+the client in question is a Linux `weston-eventdemo` writing to a file. It is
+filed under "what Wine got wrong" and it is a harness fact. Already fixed twice
+over with `stdbuf -oL` and an ordered shutdown. No branch.
+
+**`FindWindowW` enumerates one desktop (§11.7 item 1) — topology, not a defect.**
+`wine explorer /desktop=` makes a second desktop; that is what it is for. Already
+solved by running the probe inside the same desktop, and by `--pid` plus
+`EnumWindows` in `probe-input.c`. A real guest has no `wine explorer` at all, so
+a branch here would be a branch on the *harness's* arrangement wearing a
+platform's name. No branch.
+
+Two more were checked and left alone:
+
+* **`SetThreadExecutionState` returns `0x7` (§25.8).** Wine's stub reports
+  `ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_USER_PRESENT` as a previous
+  state, which no real thread returns. The code tests only for the documented
+  failure — a return of `0` — so nothing depends on it. §25.8 already called it
+  "a curiosity rather than a dependency" and it still is. No branch.
+* **Two `SendInput` moves arrive out of order (§37).** `probe-input.exe` prints
+  both points it visited and accepts either, which costs nothing on Windows and
+  asserts an order neither platform guarantees. Left as it is; tightening it to
+  "the click came from the last move" on Windows only is a real option and is
+  §39.8's list, not this one.
+
+**And the ones §13.6 and §26.5 already settled, which stay settled.**
+`SetProcessDpiAwarenessContext` was a session-0 window station with no display
+and Wine was right — §13.6 withdrew the claim and this stage does not reopen it.
+Nothing about `afunix.sys`, named sections across sessions or `Local\`
+namespaces gets a branch: those are real Windows behaviours Wine models
+differently *because there is no hypervisor and no second session in the test*,
+which is §26.5's correction and is about the topology.
+
+**On the tally.** §13.6 is the authority: four recorded discrepancies, one of
+which was withdrawn. This stage removes two more from the folklore — §23.7's
+pair were never Wine — and adds one that is: `dwmapi` reporting success it
+cannot deliver. Cite the document, not a number somebody remembers.
+
+### 39.6 A VM running only Wine
+
+`scripts/wc-wine-guest.sh`, and it is the venue the requirement asked for.
+
+`nix build .#svGuest` boots a NixOS VM on this workstation with a
+`memory-backend-memfd` and a QMP socket. It has no Wine of its own and does not
+need one: `/nix/store` is shared into it over 9p, so the same
+`wine-wow64-staging-11.14` the dev shell uses runs there by absolute path,
+unbuilt and unchanged. **`nix/guest.nix` is not modified**, which is the point —
+the guest stays the minimal disposable thing it was designed to be.
+
+The compositor runs as a Windows binary under Wine *inside the VM*, and the
+assertion is one sentence: it says which Win32 it is on, and it is the guest's
+Wine and not this workstation's.
+
+```
+  PASS  the guest ran the payload: guest-kernel: Linux 6.18.44
+        wc-compositor: win32 is wine 11.14 (host Linux 6.18.44)
+        …
+  PASS  inside the VM the compositor says: win32 is wine 11.14 (host Linux 6.18.44)
+[09:31:53] on this workstation the same binary says: win32 is wine 11.14 (host Linux 6.18.33)
+  PASS  and it is the guest's Wine, not this workstation's: 'Linux 6.18.44' inside, 'Linux 6.18.33' out
+```
+
+`wine_get_host_version` reports the kernel Wine sits on, so the two lines name
+two kernels and a run cannot claim to have measured the VM while having measured
+the host. That is what turns the platform line from decoration into evidence,
+and it is the first Wine leg in this document that is not one machine with no
+boundary in it (§26.5).
+
+**Further than expected, and worth writing down.** With no X in the guest at all
+(`graphics = false`) the whole platform still comes up:
+`SetProcessDpiAwarenessContext` succeeds, the clipboard listener starts, the
+keyboard layout compiles to a 71,249-byte keymap, the message pump runs, the
+socket binds, the high-resolution waitable timer is used, and the process exits
+cleanly on its idle timeout. Wine's null display driver is enough for everything
+short of a real `HWND` with pixels in it — which is more than `flake.nix`'s note
+about needing Xvfb implies for this particular use, and that note is about
+`CreateWindowExW` succeeding, which is not exercised here.
+
+**What it does not do**, said plainly: no client, so no toplevel, no window and
+no pixel. A rendering leg in the guest needs an X server and a client in there
+too. §39.8.
+
+### 39.7 The gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace` | clean |
+| `cargo clippy -p wc-compositor --all-targets` (Linux) | **clean, no warnings at all** |
+| `cargo clippy -p wc-compositor --all-targets --target x86_64-pc-windows-gnu` | no new warnings (two pre-existing, below) |
+| `cargo test --workspace --no-fail-fast` | **82 binaries, 1321 tests**, 0 failures (was 1314) |
+| `scripts/wc-cursor.sh linux` | 6 passed, 0 failed (was 5) |
+| `scripts/wc-cursor.sh wine` | **14 passed, 0 failed** (was 8 passed with 3 notes), twice |
+| `scripts/wc-wine-guest.sh` (new) | **3 passed, 0 failed** |
+
+The seven new tests are `wine::tests`, and they are over `decide()` — the pure
+function that applies `WC_WIN32` to the probe — which is why they run on the
+machine that builds them. The same argument `wc-handle`'s Unix build makes for
+itself. They pin the override in both directions, that a forced Wine does not
+invent a version number the log would then carry, that forcing what the probe
+already said is still *reported* as forced, that a typo is refused rather than
+ignored, and that the three tags are the strings the harnesses grep for.
+
+`cargo test --workspace --no-fail-fast` and not `cargo test`, for the reason
+that has now misled several people: plain `cargo test` stops at the first
+failing binary and under-reports the total.
+
+**The clippy gate is `-p wc-compositor` rather than `--workspace`, and that is a
+change of instrument that has to be declared.** Since the unification,
+`cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu` does not
+build at all: `sv-hostd`'s `sv-bell-probe` is `std::os::unix` and
+`sv_transport::stream::open_virtio_port`, three hard errors, and it is a
+host-side daemon that was never meant to cross-compile. That predates this
+branch and is not fixed here — it is named so the next person reading §11.9's
+gate table does not think this stage broke it.
+
+**Two warnings on the Windows target also predate this branch** and are left
+alone: `unused variable: wayland_ring` in `lib.rs` (§36's ringlink is
+`cfg(unix)`, so the field is unread on Windows) and `redundant redefinition of a
+binding expect` in `sv-transport`. On Linux `wc-compositor` is clean with no
+warnings at all.
+
+**The wine leg went from 8 assertions to 14**, and six of those are not new
+checks — they are checks that were always written down and were being reported
+as notes because one of them needed an allowance and the allowance was granted
+to all of them.
+
+### 39.8 What is not done
+
+1. **No real Windows guest ran this.** Everything above is Wine, on this
+   workstation and in the VM. The `windows` branch of every assertion in
+   `wc-cursor.sh` has been exercised only by `WC_WIN32=windows` under Wine,
+   which tests the *branch* and not the platform. The `dwmapi` entry in §39.4
+   in particular predicts that a real guest logs
+   `DwmExtendFrameIntoClientArea ok` with no Wine caveat, and §31.7 says it
+   does — but that was a different run on a different day.
+2. **A rendering leg in the guest.** §39.6 has no client. An X server and a
+   `weston-eventdemo` inside the VM would make `wc-cursor.sh wine` runnable
+   there, which is the first Wine cursor run that would not share a wineserver,
+   an X server and a machine with ten other worktrees.
+3. **The other harnesses do not assert the platform line yet.** `wc-cursor.sh`
+   does; `wc-input.sh`, `wc-clip.sh`, `wc-damage.sh`, `wc-inhibit.sh` and
+   `wc-wlcs-wine.sh` all read a compositor log and none of them check who wrote
+   it. `win32_of()` is six lines and should be shared rather than copied.
+4. **`wc-damage.sh`'s wait, everywhere else.** §39.5's cause — the harness
+   outliving the thing it was measuring — is a shape, not an incident.
+   `wc-cursor.sh` has the fix now and `wc-damage.sh` had it already; the others
+   should be read with it in mind, because the symptom is a *missing* reading
+   and a missing reading has been printed as a note in more than one file.
+5. **§37's `SendInput` ordering**, tightened to an assertion on Windows only.
+   Refused above for being a difference rather than a defect, which is the right
+   call for a Wine branch and the wrong call for leaving the Windows leg
+   untested.
