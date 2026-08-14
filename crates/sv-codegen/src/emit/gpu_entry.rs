@@ -1,6 +1,6 @@
 //! Pass 12: `sv-gpu-entry` — **wire → C**, and the driver call on the far side.
 //!
-//! # The pass design.md §7.2 does not have, and why it is not optional
+//! # The pass docs/design.md §7.2 does not have, and why it is not optional
 //!
 //! §7.2's taxonomy has four corners of a two-by-two — *which side* by *which
 //! direction* — and names three of them:
@@ -24,7 +24,7 @@
 //!
 //! # Pass 4 is not dead, it moved
 //!
-//! design.md §7.2 strikes out pass 4 (`arena_bind`) with the note that owned
+//! docs/design.md §7.2 strikes out pass 4 (`arena_bind`) with the note that owned
 //! Rust values make it a no-op — "our decoder produces owned Rust values whose
 //! storage *is* their lifetime, so there is no binding step to generate". That
 //! is true of *decoding* and false of *raising*, which is the operation
@@ -172,7 +172,7 @@ fn raise_expr(
         //
         // Nothing in any profile was doubly indirect until
         // `VK_KHR_acceleration_structure` came in behind the union walkers
-        // (design.md §0.21), which is why a pass that has marshalled half a
+        // (docs/design.md §0.21), which is why a pass that has marshalled half a
         // million lines had never met it. The fix is the same one line
         // `FixedArray` already carries, and the lesson is that it was written as
         // a special case for two-dimensional *arrays* when it is really the rule
@@ -344,7 +344,7 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
             "Raise a wire `{name}` into its C form.\n\n\
              Unlike lowering, which has to pick a member because a C union \
              carries no tag, this direction is exact: the Rust enum *is* the \
-             tag (design.md §7.4)."
+             tag (docs/design.md §7.4)."
         );
         return Ok(quote! {
             #[doc = #doc]
@@ -368,7 +368,7 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
         if *mname == "sType" {
             // `sType` is not a wire field at all — dropping it from the Rust
             // type is what makes "a value with the wrong sType" unrepresentable
-            // (design.md §7.2). It is reconstructed here from the registry.
+            // (docs/design.md §7.2). It is reconstructed here from the registry.
             let Some(v) = s.s_type_value else {
                 return Err(format!("{name} has an sType member but no value in the registry"));
             };
@@ -390,7 +390,7 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
     let doc = format!(
         "Raise a wire `{name}` into the C struct a driver can be handed.\n\n\
          Pointer-valued members are allocated in `__a` and live as long as it \
-         does, which is design.md §7.2's pass 4 doing the job it was struck out \
+         does, which is docs/design.md §7.2's pass 4 doing the job it was struck out \
          for not having."
     );
     Ok(quote! {
@@ -434,7 +434,7 @@ fn emit_raise_pnext(cx: &Ctx<'_>) -> TokenStream {
         /// next one, so the tail has to exist before the head can point at it.
         ///
         /// A link whose `sType` this build does not know is skipped rather than
-        /// forwarded. That is not the app side's leniency (design.md §6.1 —
+        /// forwarded. That is not the app side's leniency (docs/design.md §6.1 —
         /// "the app side silently drops unknown links") reappearing on the wrong
         /// side: an unknown link is *already* fatal at the decoder here, so
         /// anything reaching this function is known to the protocol and merely
@@ -790,7 +790,7 @@ fn emit_forward_command(
         let ty = c_param_type(cx, &abi.ty);
         let e = raise_expr(cx, &f.shape, abi, &quote!(a.#id), &c.name)?;
         // An array *parameter* decays to a pointer and an array *member* does
-        // not — design.md §0.3's finding 4, met from the other side.
+        // not — docs/design.md §0.3's finding 4, met from the other side.
         // `vkCmdSetBlendConstants(const float blendConstants[4])` takes four
         // floats by address, so the raised `[f32; 4]` has to be given one.
         let e = if matches!(abi.ty.kind, CTypeKind::Array(..)) {
@@ -817,7 +817,7 @@ fn emit_forward_command(
             Out::Count { c_ty } => {
                 // The caller's capacity on the way in, the answer on the way
                 // out — Venus's `_partial` count, and the reason an output
-                // parameter travels in *both* directions (design.md §7.2).
+                // parameter travels in *both* directions (docs/design.md §7.2).
                 out_decls.push(quote!(let mut #id: #c_ty = a.#id.unwrap_or(0) as #c_ty;));
             }
             // # An output struct's `sType` and `pNext` are *inputs*
@@ -924,7 +924,7 @@ fn emit_forward_command(
         quote!(let __r = unsafe { __f(#(#args),*) };)
     };
 
-    // # External synchronisation of the one `VkQueue` (design.md §0.12 item 4)
+    // # External synchronisation of the one `VkQueue` (docs/design.md §0.12 item 4)
     //
     // Vulkan makes `vkQueueSubmit`, `vkQueueWaitIdle`, `vkQueueBindSparse` and
     // `vkDeviceWaitIdle` externally synchronised on the queue, which means *the
@@ -965,7 +965,7 @@ fn emit_forward_command(
         reply_fields.push(quote!(result: sv_proto::VkResult(__r.0),));
     } else if wire.returns_value {
         // The driver's own answer, widened to the wire's `u64`. This is the GPU
-        // side of design.md §0.3 item 5: `vkGetBufferDeviceAddress` returns a
+        // side of docs/design.md §0.3 item 5: `vkGetBufferDeviceAddress` returns a
         // real device address on a real device, and §11's caveat holds it
         // together — we never relocate, so the number stays true for as long as
         // the buffer does.
@@ -1059,7 +1059,7 @@ fn emit_forward_command(
                 // The count is in **bytes**, whatever the element type of the
                 // storage is, and it is the driver's answer rather than the
                 // capacity. Clamping against our own buffer is Venus's rule
-                // (design.md §6.1) applied in the direction the reply travels.
+                // (docs/design.md §6.1) applied in the direction the reply travels.
                 let n = match count {
                     Some(s) => {
                         let cid = naming::ident(&naming::snake_case(s));
@@ -1131,7 +1131,7 @@ fn emit_forward_command(
                 // `Err` here would propagate out of `dispatch`, produce no reply
                 // at all, and take the ring fatal. That is exactly what
                 // `sv_proto::Server`'s own default refusal was changed to avoid
-                // (design.md §7.2's note on the trait), and the same argument
+                // (docs/design.md §7.2's note on the trait), and the same argument
                 // applies one layer down: `vkSetDebugUtilsObjectNameEXT` on a
                 // driver without the extension must not lose the device.
                 return #missing_answer;
@@ -1266,18 +1266,18 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
         /// command whose meaning is *ours* rather than the driver's — the arena,
         /// the session, submission. The list is short and closed, and it is the
         /// honest measure of how much of a GPU side is hand-written: everything
-        /// not named here is generated (design.md §7.2, pass 12).
+        /// not named here is generated (docs/design.md §7.2, pass 12).
         pub trait GpuHost {
             /// The driver's entry points.
             fn fns(&self) -> &DriverFns;
-            /// App-assigned object id → the driver's own handle (design.md §6.4).
+            /// App-assigned object id → the driver's own handle (docs/design.md §6.4).
             fn map_handle(
                 &mut self,
                 ty: sv_proto::HandleType,
                 id: u64,
             ) -> sv_wire::Result<u64>;
             /// Arena coordinates → a driver allocation and an offset into it
-            /// (design.md §5.3, GPU-side half).
+            /// (docs/design.md §5.3, GPU-side half).
             fn rewrite_memory(&mut self, memory: u64, offset: u64)
                 -> sv_wire::Result<(u64, u64)>;
             /// Record the app side's id for an object the driver just created.
@@ -1295,7 +1295,7 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// `vk_registry::model::Command::externally_synchronizes_a_queue`
             /// selects. A GPU side has one queue and every session shares it, so
             /// the obligation cannot be discharged by any one client behaving
-            /// (design.md §0.12 item 4).
+            /// (docs/design.md §0.12 item 4).
             fn lock_queue(&self) -> crate::QueueGuard<'_>;
 
             #(#methods)*
@@ -1369,7 +1369,7 @@ fn emit_server_impl(
 /// The profile's *device* extensions, as a constant the GPU side can filter the
 /// driver's list against.
 ///
-/// design.md §9.2's rule, made checkable: "an extension in this list is a
+/// docs/design.md §9.2's rule, made checkable: "an extension in this list is a
 /// promise that its entry points work". An entry point works only if pass 12
 /// emitted a forwarder for it, so the set a GPU side may advertise is exactly
 /// the profile's device extensions intersected with the driver's — and the first
@@ -1397,7 +1397,7 @@ fn emit_profile_extensions(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
         /// A GPU side advertises the intersection of this with what its driver
         /// actually has; an app side advertises what the GPU side answered.
         /// Neither may advertise anything else, because an advertised extension
-        /// is a promise that its entry points cross (design.md §9.2).
+        /// is a promise that its entry points cross (docs/design.md §9.2).
         pub const PROFILE_DEVICE_EXTENSIONS: [&str; #n] = [#(#names),*];
     }
 }
@@ -1419,7 +1419,7 @@ pub fn emit_all(
     // the driver's answer here, so the app side's lowering zeroes exactly the
     // members this side exists to carry. See `Ctx::lower_full`.
     //
-    // Restricted to `needs_partial`, which design.md §6.1 defines as
+    // Restricted to `needs_partial`, which docs/design.md §6.1 defines as
     // "`returnedonly` or reachable from a command output" — precisely the
     // structs that can come back.
     let full_cx = cx.full_lowering();

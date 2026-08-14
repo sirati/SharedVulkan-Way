@@ -15,7 +15,7 @@
 //! its width, every handle and every alias.
 //!
 //! See `crate::cheader` for why the published header is the reference and how
-//! design.md §7.1's fixture-drift objection is answered (it is not a fixture: it
+//! docs/design.md §7.1's fixture-drift objection is answered (it is not a fixture: it
 //! comes out of the same nix store path as `$VK_XML`).
 //!
 //! # It has been run against the real bug, not only against planted ones
@@ -112,7 +112,7 @@ fn zink_report(f: &Fixture) -> XReport {
 // provenance: the two artefacts must be the same release
 // ---------------------------------------------------------------------------
 
-/// The trap design.md §7.1 names, closed.
+/// The trap docs/design.md §7.1 names, closed.
 ///
 /// The objection to keeping a generated model as a fixture is that the protocol
 /// becomes a function of an artefact that can drift from `$VK_XML`. This

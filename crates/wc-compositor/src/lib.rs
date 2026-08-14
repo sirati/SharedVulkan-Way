@@ -879,7 +879,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // is `--arena` opened read-write, which is what makes an outbound window
     // possible on a machine with no hypervisor in it.
     //
-    // THE FILE ARENA IS NOT A TARGET — guest RAM is (design.md §1a), and
+    // THE FILE ARENA IS NOT A TARGET — guest RAM is (docs/waycompose-design.md §1a), and
     // `--arena-guest-ram` is how this process provides one. The refusal for
     // both this flag and `--arena` is above, before either is opened: it was
     // here and tested only `provide_arenas`, which let `--arena` through in

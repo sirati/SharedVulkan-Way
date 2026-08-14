@@ -750,7 +750,7 @@ fn run_vk_alloc(opts: &Opts) -> Result<(), Fail> {
 
     // **Does the new locator work on the memory the *driver* allocated?**
     //
-    // design.md §0.10 measured that this memory is ordinary guest RAM and that
+    // docs/design.md §0.10 measured that this memory is ordinary guest RAM and that
     // the host can find it by sweeping for the stamp. The constraint on any
     // replacement for that sweep is that it keep working here, because this is
     // the direction in which the arena *is* the GPU's own allocation and no

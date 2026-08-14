@@ -2,7 +2,7 @@
 //!
 //! # Why this exists at all
 //!
-//! It was not in the plan. design.md §13 step 3 and §11 both talk about
+//! It was not in the plan. docs/design.md §13 step 3 and §11 both talk about
 //! enabling `VK_VERSION_1_0` … `VK_VERSION_1_3` as if a `<feature>` were a leaf
 //! containing its own commands. As of `vulkan-headers 1.4.350` that is no longer
 //! true: the core versions have been split into `apitype="internal"`

@@ -174,7 +174,7 @@ fn optional_pointers_encode_their_absence() {
 }
 
 /// `pNext` chains: a link, an unknown link, and the asymmetric handling of
-/// design.md §6.1.
+/// docs/design.md §6.1.
 #[test]
 fn pnext_chains_carry_links_and_terminate() {
     let v = VkBufferCreateInfo {
@@ -213,7 +213,7 @@ fn pnext_chains_carry_links_and_terminate() {
 ///
 /// > gfxstream's reason was client-lenient/server-strict; ours is that a fatal
 /// > abort turns a silent protocol mismatch into a loud one.
-/// > — design.md §6.1
+/// > — docs/design.md §6.1
 #[test]
 fn an_unknown_pnext_link_is_kept_by_the_app_side_and_fatal_on_the_gpu_side() {
     // Hand-build a chain whose single link has an sType nothing knows.
@@ -401,7 +401,7 @@ fn a_command_reaches_a_server_and_a_reply_comes_back() {
             p_queue_family_indices: Vec::new(),
         })),
         // The id the app side chose, sent with the request: object creation
-        // costs no round trip (design.md §6.4).
+        // costs no round trip (docs/design.md §6.4).
         p_buffer: Some(VkBuffer(0x1234)),
     };
     let n = size_cmd_vk_create_buffer(&args);
@@ -429,7 +429,7 @@ fn a_command_reaches_a_server_and_a_reply_comes_back() {
 ///
 /// # Why the two passes have to partition the handle space
 ///
-/// design.md §7.2 lists `handle_map` (pass 5) and `transform` (pass 6) side by
+/// docs/design.md §7.2 lists `handle_map` (pass 5) and `transform` (pass 6) side by
 /// side and does not say which owns a `VkDeviceMemory`. Both did, and the result
 /// is specific: an app-side memory id is not a table entry at all — it is either
 /// `ARENA_MEMORY_ID`, a sentinel with no driver handle behind it, or an offset
@@ -468,7 +468,7 @@ fn the_handle_map_pass_leaves_device_memory_to_the_transform_pass() {
 #[test]
 fn the_transform_pass_rewrites_memory_and_offset_as_a_pair() {
     /// A stand-in for the slab allocator: every app-side allocation lives at
-    /// offset 0x10000 of slab 7 (design.md §5.3).
+    /// offset 0x10000 of slab 7 (docs/design.md §5.3).
     struct Slab;
     impl MemoryTransform for Slab {
         fn rewrite(&mut self, _memory: u64, offset: u64) -> sv_wire::Result<(u64, u64)> {

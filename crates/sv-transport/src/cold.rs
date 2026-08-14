@@ -9,7 +9,7 @@
 //!
 //! > **No file descriptor or handle ever crosses between the app side and the
 //! > GPU side.** What crosses is a *name*, which the peer opens for itself.
-//! > — design.md §1a
+//! > — docs/design.md §1a
 //!
 //! This module used to carry a `SCM_RIGHTS` pair, and every message it framed
 //! was therefore a message only a Unix socket could deliver — which is a
@@ -27,7 +27,7 @@
 //!
 //! > **The locator descriptor must ride the cold path and cannot live in the
 //! > control region**, for the obvious reason that the control region is one of
-//! > the two things being located. — design.md §4.3
+//! > the two things being located. — docs/design.md §4.3
 //!
 //! Hence [`ExtentDesc`] is a cold-path message type and lives in this crate
 //! rather than in `sv-arena`. The split is worth stating once: `ExtentDesc`
@@ -44,7 +44,7 @@ use crate::control::{Geometry, ProtocolIds, ENDIAN_MARKER};
 use crate::{Error, Result};
 use sv_wire::{Decoder, Encoder, pad4};
 
-/// How the guest obtained the extent's pages. design.md §4.3:
+/// How the guest obtained the extent's pages. docs/design.md §4.3:
 ///
 /// > **`granularity` is asserted, never assumed.** The GPU side calls
 /// > `QueryWorkingSetEx` on the extent and publishes the `LargePage` bit it
@@ -98,7 +98,7 @@ impl PfnRun {
     }
 }
 
-/// How the attaching side is to find the extent. design.md §5.1's table.
+/// How the attaching side is to find the extent. docs/design.md §5.1's table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Locator {
     /// Sweep the memfd for the stamp. **v1 on every path**: 1.8 s at 64 MiB,
@@ -111,7 +111,7 @@ pub enum Locator {
     Probe,
     /// A reported frame list, run-length encoded.
     ///
-    /// **No longer AWE-only** (design.md §0.14, 2026-08-13). Windows reports the
+    /// **No longer AWE-only** (docs/design.md §0.14, 2026-08-13). Windows reports the
     /// frame behind every page of any ordinary mapped window through
     /// `NtQuerySystemInformation(SystemSuperfetchInformation)` /
     /// `SuperfetchPfnQuery`, in ~330 ms whatever the window is, and — unlike
@@ -175,7 +175,7 @@ impl Locator {
     }
 }
 
-/// What crosses about an extent. design.md §4.3:
+/// What crosses about an extent. docs/design.md §4.3:
 ///
 /// > `ExtentDesc { run_id, granularity, control_pages, arena_pages, locator }`.
 /// > It is small in every case: on the two locating paths it carries no
@@ -272,7 +272,7 @@ impl ExtentDesc {
     }
 }
 
-/// design.md §4.3 step 2, in full.
+/// docs/design.md §4.3 step 2, in full.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub ids: ProtocolIds,
@@ -285,7 +285,7 @@ pub struct Hello {
 }
 
 impl Hello {
-    /// The check design.md §4.3 step 4 makes explicit, made here because a
+    /// The check docs/design.md §4.3 step 4 makes explicit, made here because a
     /// diagnostic that says "big-endian peer" is worth more than one that says
     /// "bad magic".
     pub fn check_against(&self, ours: ProtocolIds) -> Result<()> {
@@ -325,7 +325,7 @@ impl Hello {
 /// build from it, which is the only thing the client cannot work out for itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
-    /// **The name, which is the whole of the handoff** (design.md §1a).
+    /// **The name, which is the whole of the handoff** (docs/design.md §1a).
     ///
     /// A path the peer opens with [`crate::region::open_named`]:
     ///
@@ -354,7 +354,7 @@ pub struct Attachment {
     /// naming it; it is the marker of the one provider that a VM boundary
     /// cannot carry. Nothing that has to survive a real hypervisor may leave it
     /// empty, and the only sender that does is `sv-gpu-server serve` on Linux —
-    /// design.md §0.7 for the measurements that keep it alive.
+    /// docs/design.md §0.7 for the measurements that keep it alive.
     pub arena_object: String,
     pub control_offset: u64,
     pub control_len: u64,
@@ -377,7 +377,7 @@ pub enum ColdMessage {
     Attach(Attachment),
     /// The client asks for one.
     AttachRequest,
-    /// `svPing` / `svShutdown` of design.md §6.3, on the cold path where they
+    /// `svPing` / `svShutdown` of docs/design.md §6.3, on the cold path where they
     /// belong: a ring cannot carry liveness for a peer whose rings are the thing
     /// in doubt.
     Ping,
@@ -388,7 +388,7 @@ pub enum ColdMessage {
     ///
     /// # This is a different boundary from the one §5.7 is about
     ///
-    /// design.md §5.7 says, firmly, "**the run list does not cross the wire, and
+    /// docs/design.md §5.7 says, firmly, "**the run list does not cross the wire, and
     /// it never did have to**", and §4.3's `ExtentDesc` carries a *locator*
     /// rather than addresses. Both are about the **guest↔host** boundary, where
     /// the guest cannot know the runs — that is the entire reason `ScanLocator`
@@ -465,7 +465,7 @@ impl ColdMessage {
     /// Encode into `out`, replacing its contents. Uses `sv-wire`'s exact-fill
     /// encoder, so a `size`/`encode` disagreement is caught here rather than
     /// producing a message the far side silently mis-parses — the same
-    /// discipline the generated protocol is held to (design.md §7.2).
+    /// discipline the generated protocol is held to (docs/design.md §7.2).
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         out.clear();
         out.resize(self.size(), 0);
@@ -625,7 +625,7 @@ mod unix_socket {
     /// vsock would carry, so the handshake that works between two processes on
     /// one kernel is the same one that works across a hypervisor. A cold path
     /// that needed `sendmsg` was a cold path only a Unix socket could implement,
-    /// which is design.md §1a's objection stated as a fact about the code.
+    /// which is docs/design.md §1a's objection stated as a fact about the code.
     pub fn send_bytes(sock: &UnixStream, payload: &[u8]) -> Result<()> {
         let mut framed = Vec::with_capacity(payload.len() + 4);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(msgs.len(), 7, "every variant must appear above");
     }
 
-    /// design.md §4.3: the descriptor "is small in every case: on the two
+    /// docs/design.md §4.3: the descriptor "is small in every case: on the two
     /// locating paths it carries no addresses at all". Worth an assertion,
     /// because the superseded design *did* put a page list on the wire and the
     /// reason it no longer does is a measurement, not a preference.
@@ -923,7 +923,7 @@ mod tests {
     /// a byte stream and the receiver opens the object itself.
     ///
     /// This is the test that replaced `a_descriptor_crosses_the_socket_and_names
-    /// _the_same_memory`, and the difference between them is design.md §1a. The
+    /// _the_same_memory`, and the difference between them is docs/design.md §1a. The
     /// proof of sharing is the same and is the only part worth keeping: a write
     /// through the sender's mapping is visible through the receiver's.
     #[cfg(target_os = "linux")]
@@ -977,7 +977,7 @@ mod tests {
     ///
     /// Measured rather than reasoned, and pinned here because it is the fact
     /// that decides whether `Provider::GpuExport` can ever be deleted
-    /// (design.md §0.7). If a future kernel makes `F_ADD_SEALS` work on a named
+    /// (docs/design.md §0.7). If a future kernel makes `F_ADD_SEALS` work on a named
     /// object, this test fails and the finding is stale — which is the point.
     #[cfg(target_os = "linux")]
     #[test]

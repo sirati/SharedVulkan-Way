@@ -1,6 +1,6 @@
 //! `SlabImport`: how a slab becomes a `VkDeviceMemory` on the GPU side.
 //!
-//! design.md §5.4 puts this behind a trait, and gives the reason plainly:
+//! docs/design.md §5.4 puts this behind a trait, and gives the reason plainly:
 //!
 //! > RADV rejects *every* shared mapping through this path — libdrm passes
 //! > `AMDGPU_GEM_USERPTR_ANONONLY` unconditionally and Linux gives
@@ -18,7 +18,7 @@
 //!
 //! **A memfd is not a dma-buf, and no amount of trait plumbing makes it one.**
 //! `VkImportMemoryFdInfoKHR` with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`
-//! wants a dma-buf descriptor; handing it a memfd fails. design.md §5.4 treats
+//! wants a dma-buf descriptor; handing it a memfd fails. docs/design.md §5.4 treats
 //! the choice between `HostPointerImport` and `DmaBufImport` as a property of
 //! the *importing* side — "`SlabImport` is unchanged by the fragmentation
 //! finding … the importing side never learns of it" — and for the host-pointer
@@ -59,7 +59,7 @@ use crate::{Error, Result};
 /// The two variants are the reason this is not simply `(offset, size)`: a host
 /// pointer and a dma-buf descriptor are different resources, obtained
 /// differently, and an arena that can supply one may be unable to supply the
-/// other. Making that visible in the type is the whole point — design.md §5.4's
+/// other. Making that visible in the type is the whole point — docs/design.md §5.4's
 /// signature hides it, and hiding it is how a Linux GPU side gets built on a
 /// path RADV will refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,11 +105,11 @@ pub fn path_for_driver(driver: &str) -> BackingKind {
     }
 }
 
-/// The GPU side's import of one slab. design.md §5.4.
+/// The GPU side's import of one slab. docs/design.md §5.4.
 ///
 /// Generic over the driver's memory handle so that this crate needs no Vulkan
 /// dependency — `sv-arena` is testable with no driver present, which is what
-/// design.md §13 steps 1–6 depend on.
+/// docs/design.md §13 steps 1–6 depend on.
 pub trait SlabImport {
     /// Whatever the driver calls a `VkDeviceMemory`.
     type Memory;
@@ -132,7 +132,7 @@ pub trait SlabImport {
 ///
 /// > if the preferred type index is not in the returned `memoryTypeBits`, pick
 /// > the lowest set bit instead. A `memoryTypeBits` mask that excludes your
-/// > choice is a normal condition to handle, not a failure. — design.md §5.4
+/// > choice is a normal condition to handle, not a failure. — docs/design.md §5.4
 ///
 /// On the measured target the mask is `0x6` and the choice is index 1, so the
 /// rewrite never fires; it costs one branch and it is kept because the mask is
@@ -177,7 +177,7 @@ impl SlabImport for NoopImport {
 
 /// Import every slab an allocation touches that has not been imported yet.
 ///
-/// design.md §5.2: "Slabs are **imported** lazily. When the app side needs a
+/// docs/design.md §5.2: "Slabs are **imported** lazily. When the app side needs a
 /// slab it picks a free region of the arena, writes a slab-directory entry, and
 /// sends `svImportArenaSlab`." This is the app side's half of that decision,
 /// with the round trip left to the caller.
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn the_measured_drivers_get_the_path_that_works_for_them() {
-        // The correction to design.md §5.4's table, measured on this machine.
+        // The correction to docs/design.md §5.4's table, measured on this machine.
         assert_eq!(path_for_driver("radv"), BackingKind::DmaBuf);
         // Corrected 2026-08-12: NVIDIA imports a shared mapping of *shmem*, and
         // the arena is a memfd. What it refuses is a file on a real filesystem,

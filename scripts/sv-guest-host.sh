@@ -23,7 +23,7 @@
 # QEMU is a **system** service on this machine, so its QMP socket and its
 # `/proc/<pid>/fd` are root-only, and so is every process that opens the object
 # `sv-hostd` names — which is the application. waycompose reached the same
-# conclusion for the same reason (its design.md §12.9) and both projects put the
+# conclusion for the same reason (its docs/waycompose-design.md §12.9) and both projects put the
 # privileged half in a `systemd-run --collect` transient unit rather than a
 # long-lived root shell: a root call that blocks for a minute frequently returns
 # no output at all, and the unit's journal survives it.
@@ -41,7 +41,7 @@
 # BOTH SIDES MUST COME FROM ONE BUILD. The GPU side here is a binary *copied*
 # into the guest, so rebuilding on the host changes only the host's half.
 #
-# `WIRE_VERSION` went 1 -> 2 in design.md §0.18 (`svDriverVersions`, which is
+# `WIRE_VERSION` went 1 -> 2 in docs/design.md §0.18 (`svDriverVersions`, which is
 # hand-written in `sv_proto::sv` and so outside the protocol hash). A guest
 # binary from before that commit is refused at handshake — correctly, and by
 # design. The ICD names the cause and the fix in the refusal message; the
@@ -160,7 +160,7 @@ export SV_SOCKET=$DIR/icd.sock
   # session: vk-probe took it, sv-hostd had served its one client and exited,
   # and eglinfo printed "eglInitialize failed" -- which is indistinguishable,
   # from the log alone, from Zink being unable to use the device. Two clients
-  # need two sessions, which is what design.md 0.12 is about.
+  # need two sessions, which is what docs/design.md 0.12 is about.
   #
   # (No backticks anywhere in this heredoc. It is unquoted, so that the paths
   # above expand here rather than there, which means a backtick in a *comment*

@@ -1,4 +1,4 @@
-//! The differential test of design.md §6.2 and §7.3.
+//! The differential test of docs/design.md §6.2 and §7.3.
 //!
 //! > differential-test generated marshalling round-trips rather than trusting
 //! > symmetry. Stronger: compare byte-for-byte against Venus's MIT-licensed

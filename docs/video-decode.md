@@ -73,7 +73,7 @@ Five things in that table are worth reading twice.
 
 1. **There is no VP9 and there is no encode.** The extension list has five
    entries and every one is decode. `VK_KHR_video_encode_queue` is absent, so
-   the QuickSync encode design.md §11 keeps in reserve for a remote app side is
+   the QuickSync encode docs/design.md §11 keeps in reserve for a remote app side is
    not reachable through Vulkan on this driver. `VK_KHR_video_maintenance1` and
    `2` are also absent, which matters more than it looks: `maintenance1` is what
    lets a bitstream buffer be created *without* naming a video profile, and
@@ -290,7 +290,7 @@ same field the two RADVs disagree about in §1, from the other side.
 >
 > Caused by:
 >     VkVideoDecodeH264CapabilitiesKHR.maxLevelIdc: StdVideoH264LevelIdc comes
->     from a platform header and is not serialisable (design.md §6.1)
+>     from a platform header and is not serialisable (docs/design.md §6.1)
 > ```
 >
 > The profile resolves — every dependency is satisfied by a core 1.3 profile — and
@@ -773,12 +773,12 @@ Error: no device can decode this profile:
     no queue family with VIDEO_DECODE
 ```
 
-The ICD advertises one universal queue family (`advertise.rs`, design.md §0.4
+The ICD advertises one universal queue family (`advertise.rs`, docs/design.md §0.4
 item 7) and the GPU side serves one compute-capable family (`driver.rs`). A
 video decode queue is a second family, and D8 gives every family its own ring.
 
 **That is not a thing to fix by adding a second family**, and this stage
-deliberately did not. design.md §0.8 item 2 names the shape the topology wants:
+deliberately did not. docs/design.md §0.8 item 2 names the shape the topology wants:
 if the GPU side owns the video session, the DPB and the decode queue *privately*,
 then what crosses is a compressed bitstream and an image id, the second ring
 never exists, and the app side never sees a queue family it cannot use. Adding a

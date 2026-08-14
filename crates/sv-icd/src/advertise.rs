@@ -1,6 +1,6 @@
 //! What we tell the application, and where each number comes from.
 //!
-//! design.md §9 decides this and `measured-gpu-side.md` supplies the facts. The
+//! docs/design.md §9 decides this and `measured-gpu-side.md` supplies the facts. The
 //! rule the whole file follows: **a number here is either measured, derived from
 //! a measured number, or conservative**. R23 is the risk — "the advertised
 //! memory table is a claim about another machine" — and the mitigation is that
@@ -22,7 +22,7 @@
 //! `HOST_VISIBLE`, because it is an integrated GPU with unified memory. That is
 //! the single biggest simplification the measurement bought: "the awkward case a
 //! forwarder normally has to handle — device-local memory the application wants
-//! mapped — **does not arise on this hardware**" (design.md §9.1).
+//! mapped — **does not arise on this hardware**" (docs/design.md §9.1).
 
 use sv_icd_entry::*;
 
@@ -32,7 +32,7 @@ pub const MEASURED_DEVICE_HEAP: u64 = 6624 << 20;
 /// `minImportedHostPointerAlignment`, measured.
 pub const IMPORTED_HOST_POINTER_ALIGNMENT: u64 = 4096;
 
-/// Memory type indices, in the order design.md §9.1 fixes them.
+/// Memory type indices, in the order docs/design.md §9.1 fixes them.
 ///
 /// **The order is load-bearing and is not alphabetical or arbitrary.**
 /// Applications iterate the table and take the first type whose bits satisfy
@@ -69,12 +69,12 @@ pub fn is_arena_backed(memory_type_index: u32) -> bool {
 /// type but 0.
 ///
 /// This substitutes for whatever the real driver reports, and it has to: the two
-/// sides number memory types differently, and design.md §9.1 says we advertise
+/// sides number memory types differently, and docs/design.md §9.1 says we advertise
 /// our four rather than mirroring the driver's. An application handed the
 /// driver's mask would index our table with somebody else's numbering.
 pub const ARENA_MEMORY_TYPE_BITS: u32 = 0b1110;
 
-/// The memory table of design.md §9.1.
+/// The memory table of docs/design.md §9.1.
 ///
 /// `arena_len` is the real arena size and is reported honestly: "applications
 /// budget against it and use it for `VK_EXT_memory_budget`; lying produces
@@ -85,7 +85,7 @@ pub fn memory_properties(arena_len: u64) -> VkPhysicalDeviceMemoryProperties {
 
     p.memory_heap_count = 2;
     // Heap 0's size is the GPU side's real heap minus the arena, "since on this
-    // hardware they are physically the same 6624 MiB" (design.md §9.1).
+    // hardware they are physically the same 6624 MiB" (docs/design.md §9.1).
     p.memory_heaps[heap::DEVICE as usize] = VkMemoryHeap {
         size: MEASURED_DEVICE_HEAP.saturating_sub(arena_len),
         flags: VkMemoryHeapFlags::VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
@@ -316,7 +316,7 @@ pub fn unservable_queue_requirement(extension: &str) -> Option<u32> {
     reqs.iter().copied().find(|mask| mask & have == 0)
 }
 
-/// Features, curated rather than mirrored (design.md §9.2).
+/// Features, curated rather than mirrored (docs/design.md §9.2).
 ///
 /// **`bufferDeviceAddress` is deliberately absent** and is not an oversight: an
 /// application that writes a raw 64-bit address into arena memory for a shader
@@ -330,7 +330,7 @@ pub fn features() -> VkPhysicalDeviceFeatures {
 
 /// The instance extensions we advertise.
 pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
-    // design.md §10. Headless is stage 1 and is what Wine maps
+    // docs/design.md §10. Headless is stage 1 and is what Wine maps
     // `VK_KHR_win32_surface` onto when there is no display (§0.5); the two X11
     // extensions are stage 2, and are what Mesa's `zink_kopper` asks for by
     // name when a GL application draws to a window.
@@ -394,7 +394,7 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
 /// With a GPU side the list is **not a constant** — it is asked of the peer at
 /// connect and cached in [`crate::state::SharedVulkan::device_extensions`],
 /// because the only side that can keep §9.2's promise is the one holding the
-/// driver. That is a correction to design.md §9.2, which describes the list as
+/// driver. That is a correction to docs/design.md §9.2, which describes the list as
 /// something the app side curates: it cannot, because the intersection with the
 /// driver's own extensions is not knowable here.
 pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
@@ -418,7 +418,7 @@ pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
 /// # Why `hostImageCopy` in particular
 ///
 /// The wire is right: `sv_codegen::exceptions` gives `pHostPointer` the
-/// `ArenaOffset` policy, which is what design.md §5.3 says a host pointer *is*
+/// `ArenaOffset` policy, which is what docs/design.md §5.3 says a host pointer *is*
 /// here — `arena_base + offset`. What is not written is the case where the
 /// application's pointer is **not** arena memory. `vkCopyMemoryToImage` accepts
 /// a plain `malloc` buffer, and honouring that needs a bounce through an arena
@@ -426,7 +426,7 @@ pub const DEVICE_EXTENSIONS: &[(&str, u32)] = &[];
 /// `memoryRowLength` and the image's format. That is real work and it is not
 /// done, so the feature is withdrawn rather than half-kept.
 ///
-/// This is the seam design.md §0.19 item 3 asks for: carry everything, advertise
+/// This is the seam docs/design.md §0.19 item 3 asks for: carry everything, advertise
 /// what works. The three commands stay on the wire and in the proc tables — they
 /// are core 1.4 and cannot be made to disappear — and a conforming application
 /// that respects the feature bit never calls them.
@@ -445,7 +445,7 @@ pub fn withdraw_gated_features(chain: &mut [sv_proto::PNextLink]) {
 mod tests {
     use super::*;
 
-    /// The subset-ordering rule of design.md §9.1, checked rather than asserted
+    /// The subset-ordering rule of docs/design.md §9.1, checked rather than asserted
     /// in prose.
     ///
     /// The specification requires that if one memory type's property flags are a
@@ -515,9 +515,9 @@ mod tests {
     /// `VkPhysicalDeviceFeatures` at all — it arrives through
     /// `VkPhysicalDeviceVulkan12Features`, which is forwarded whole from the
     /// physical device — so the assertion below was true, the name was false,
-    /// and design.md §9.2's claim that we do not advertise the feature rested on
+    /// and docs/design.md §9.2's claim that we do not advertise the feature rested on
     /// a test about a different structure. `vulkaninfo` printed
-    /// `bufferDeviceAddress = true` throughout (design.md §0.16 item 3).
+    /// `bufferDeviceAddress = true` throughout (docs/design.md §0.16 item 3).
     ///
     /// The name is corrected rather than the assertion, because the feature is
     /// now **implemented** — all three of `vkGetBufferDeviceAddress`,

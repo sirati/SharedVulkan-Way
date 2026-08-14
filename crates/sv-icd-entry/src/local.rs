@@ -5,12 +5,12 @@
 //!
 //! 1. **It mints or destroys a dispatchable object.** What the application gets
 //!    back from `vkCreateInstance` is a pointer to an allocation whose first
-//!    word the loader owns (design.md §6.4). A fold over a wire reply cannot
+//!    word the loader owns (docs/design.md §6.4). A fold over a wire reply cannot
 //!    produce one: the reply carries a `u64` id, and turning an id into a live
 //!    object is bookkeeping, not marshalling. Vulkan has five dispatchable
 //!    types, so the list is short and closed.
 //! 2. **Its answer is a pointer.** `vkGetInstanceProcAddr` and
-//!    `vkGetDeviceProcAddr`; design.md §6.1's exclusion list.
+//!    `vkGetDeviceProcAddr`; docs/design.md §6.1's exclusion list.
 //! 3. **It is answered app-side by design.** The extension enumerations, because
 //!    we advertise a curated set rather than mirroring the peer's 148 (§8, R16);
 //!    and `vkMapMemory`/`vkUnmapMemory`, because the arena is already mapped and
@@ -419,7 +419,7 @@ pub unsafe extern "system" fn sv_vk_free_command_buffers(
 /// `vkMapMemory` — the whole point of the project, and it never leaves the
 /// process.
 ///
-/// design.md §5.3: "`vkMapMemory` on the app side returns `arena_base +
+/// docs/design.md §5.3: "`vkMapMemory` on the app side returns `arena_base +
 /// slab_base + alloc_offset + offset`. A real pointer into real shared pages. It
 /// involves **no round trip and no copy**." That the view is stitched from
 /// hundreds or thousands of `mmap` calls (§5.7) is invisible here and must stay
@@ -534,7 +534,7 @@ pub unsafe extern "system" fn sv_vk_unmap_memory2(
 /// bounds it**. Its layout is described by the *template object* — a handle —
 /// and by nothing in the registry. It is the one parameter on this surface whose
 /// size is a property of another object's contents, so no fold over `vk.xml`
-/// can marshal it and design.md §7.4's `void*` policy table can only classify it
+/// can marshal it and docs/design.md §7.4's `void*` policy table can only classify it
 /// as opaque. Venus and gfxstream both special-case it; so do we.
 ///
 /// # Why translating is better than forwarding
@@ -636,7 +636,7 @@ pub unsafe fn expand_descriptor_template(
             // set holding uninitialised inline data, and the shader that read it
             // hung the GPU — `VK_ERROR_DEVICE_LOST`, ten seconds of
             // `amdgpu: ring gfx_0.0.0 timeout`, and nothing anywhere naming a
-            // descriptor. design.md §0.9's "implemented has more than once meant
+            // descriptor. docs/design.md §0.9's "implemented has more than once meant
             // compiled", in its most expensive form yet: a branch that exists,
             // reports into a closed pipe, and discards data.
             //
@@ -680,7 +680,7 @@ pub unsafe fn expand_descriptor_template(
 }
 
 // ---------------------------------------------------------------------------
-// presentation (design.md §10)
+// presentation (docs/design.md §10)
 // ---------------------------------------------------------------------------
 //
 // Thirteen entry points, all hand-written for the same two reasons: none of
@@ -855,7 +855,7 @@ pub unsafe extern "system" fn sv_vk_destroy_surface_khr(
 
 /// `vkGetPhysicalDeviceSurfaceSupportKHR`.
 ///
-/// True for family 0 — the one family design.md §9 advertises — and for any
+/// True for family 0 — the one family docs/design.md §9 advertises — and for any
 /// surface whose platform we can read. Presentation needs nothing of the GPU
 /// side, so there is no family that could fail to support it.
 pub unsafe extern "system" fn sv_vk_get_physical_device_surface_support_khr(

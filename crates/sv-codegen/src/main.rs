@@ -58,7 +58,7 @@ fn main() -> Result<()> {
 
     // What the profile does not carry, as data rather than as prose.
     //
-    // design.md §11 declares the scope and `vk_registry::profiles::zink` *is*
+    // docs/design.md §11 declares the scope and `vk_registry::profiles::zink` *is*
     // the declaration, but until now the only way to ask "which commands are
     // out?" was to read the list and subtract it from the registry in your head.
     // That is the question `goal.md`'s "a lot of functions are still missing"

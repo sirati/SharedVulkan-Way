@@ -11,18 +11,18 @@
 //!
 //! Almost none of it is here. The `extern "system"` boundary, the C ABI types
 //! and the lowering all live in `sv-icd-entry`, generated, in one mechanical
-//! shape (design.md §7.3, R7). This crate contributes:
+//! shape (docs/design.md §7.3, R7). This crate contributes:
 //!
 //! - three exported entry points, below, which are the loader's own contract;
 //! - [`arena::Mapping`], which is `memfd_create` + `mmap` and is one of the
-//!   three modules design.md §7.3 names.
+//!   three modules docs/design.md §7.3 names.
 //!
 //! Everything else — every `Icd` trait method — is safe Rust over owned values.
 //!
 //! # What this build does and does not do
 //!
 //! It loads, negotiates, enumerates one physical device, reports the memory
-//! table of design.md §9.1, creates a device and a queue, allocates arena memory
+//! table of docs/design.md §9.1, creates a device and a queue, allocates arena memory
 //! and maps it to a real pointer into real shared pages. **It does not reach a
 //! GPU**, because `sv-transport` and `sv-gpu-server` are not on master. Every
 //! place that would have asked a GPU says so, and
@@ -47,7 +47,7 @@ pub mod wsi;
 ///
 /// Must equal `sv_gpu_server::protocol_ids()`. Both are `sv_proto`'s hash over
 /// the generated command and struct table, which is what makes a version skew a
-/// refusal rather than a desynchronisation (design.md §4.3, R13).
+/// refusal rather than a desynchronisation (docs/design.md §4.3, R13).
 pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
     sv_transport::control::ProtocolIds::new(WIRE_VERSION, sv_proto::PROTOCOL_HASH)
 }
@@ -82,7 +82,7 @@ use core::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 use sv_icd_entry::{PFN_vkVoidFunction, VkInstance, VkResult};
 
-/// The highest loader interface version we implement (design.md §8).
+/// The highest loader interface version we implement (docs/design.md §8).
 ///
 /// 7 relaxes the export requirements — an ICD at 7 need only export the three
 /// `vk_icd*` symbols. 4 is where `vk_icdGetPhysicalDeviceProcAddr` becomes
@@ -181,7 +181,7 @@ fn ensure_ready() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// the three exports (design.md §8)
+// the three exports (docs/design.md §8)
 // ---------------------------------------------------------------------------
 
 /// `vk_icdNegotiateLoaderICDInterfaceVersion`.
@@ -252,7 +252,7 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
 
 /// `vkGetInstanceProcAddr`, exported as well as the `vk_icd*` three.
 ///
-/// design.md §8 says "exactly" the three `vk_icd*` symbols, which is right at
+/// docs/design.md §8 says "exactly" the three `vk_icd*` symbols, which is right at
 /// loader interface 7. It is **not** right below it: at interface versions 0 and
 /// 1 the loader looks for this symbol by name and finds nothing, and at 2–6 some
 /// loaders still fall back to it. Exporting it costs one forwarding function and
@@ -327,7 +327,7 @@ mod tests {
         // Derived, not a literal: the manifest states the *ceiling*, and the
         // ceiling comes from the wire profile. A literal here would pass on the
         // day the profile moved and the manifest did not, which is the exact
-        // drift design.md §0.18 removed everywhere else.
+        // drift docs/design.md §0.18 removed everywhere else.
         assert!(
             text.contains(&format!(
                 "\"api_version\": \"{}\"",

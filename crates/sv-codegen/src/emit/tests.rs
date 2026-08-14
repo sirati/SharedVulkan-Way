@@ -1,4 +1,4 @@
-//! Pass 11: generated round-trip tests (design.md §7.2).
+//! Pass 11: generated round-trip tests (docs/design.md §7.2).
 //!
 //! `security-model.md` R8 is explicit that symmetry proves nothing: "marshalling
 //! that is wrong in the same way on both sides … *looks* consistent while
@@ -498,7 +498,7 @@ fn emit_command_sampler(plan: &Plan, c: &crate::plan::CommandPlan) -> TokenStrea
 /// Whether every parameter of this command is encoded in full.
 ///
 /// A callee-filled parameter is encoded with the partial rules — Venus's
-/// three-state validity, adopted by design.md §6.1 — which means the scalar
+/// three-state validity, adopted by docs/design.md §6.1 — which means the scalar
 /// fields of, say, `VkPhysicalDeviceProperties` are deliberately *not* on the
 /// wire. Comparing the decoded value to what was sampled would then fail for
 /// exactly the reason the encoding is correct. Byte idempotence is the check
@@ -590,7 +590,7 @@ fn emit_command_test(c: &crate::plan::CommandPlan) -> TokenStream {
 /// generated `Server` trait for a type is what proves the trait is
 /// *implementable*, and it lets `dispatch` and `subdecode` be exercised with no
 /// Vulkan driver anywhere near the test — which is the whole point of
-/// design.md §13's ordering.
+/// docs/design.md §13's ordering.
 fn emit_test_server(plan: &Plan) -> TokenStream {
     let methods = plan.commands.iter().map(|c| {
         let m = naming::command_method(&c.name);
@@ -641,7 +641,7 @@ fn emit_test_server(plan: &Plan) -> TokenStream {
 
                 /// A command whose declared length disagrees with its contents
                 /// must be caught at once, not carried forward. This is the R13
-                /// detector — the reason design.md §6.2 spends four bytes per
+                /// detector — the reason docs/design.md §6.2 spends four bytes per
                 /// command — and it is worth an explicit test rather than a
                 /// comment.
                 #[test]
@@ -698,7 +698,7 @@ fn emit_test_server(plan: &Plan) -> TokenStream {
             let encode = format_ident!("encode_cmd_{}", naming::snake_case(&c.name));
             quote! {
                 /// The restricted sub-decoder accepts a blob of `vkCmd*` and
-                /// nothing else (design.md §6.5).
+                /// nothing else (docs/design.md §6.5).
                 #[test]
                 fn subdecode_accepts_recorded_commands_and_refuses_the_rest() {
                     let mut rng = Rng::new(3);
@@ -735,7 +735,7 @@ fn emit_test_server(plan: &Plan) -> TokenStream {
                 /// The blob subset is the `vkCmd*` opcodes **plus the two that
                 /// frame them**, and it is exactly those.
                 ///
-                /// design.md §6.5 says "only the `vkCmd*` opcode subset"; the
+                /// docs/design.md §6.5 says "only the `vkCmd*` opcode subset"; the
                 /// blob turned out to have to carry its own
                 /// `vkBeginCommandBuffer` and `vkEndCommandBuffer`, because the
                 /// GPU side replays a blob when it arrives rather than when the

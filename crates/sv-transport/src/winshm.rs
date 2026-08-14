@@ -30,7 +30,7 @@
 //! Windows-to-Windows pair *and* would work across a VM boundary if the sides
 //! ever needed it, whereas `DuplicateHandle` works for neither.
 //!
-//! **That paragraph is now design.md §1a**, and it is stated as an invariant of
+//! **That paragraph is now docs/design.md §1a**, and it is stated as an invariant of
 //! the whole project rather than as a Windows implementation note. The Linux
 //! side was brought into line rather than the other way round: see
 //! [`crate::region::shm_create`], which is this file's argument in `/dev/shm`.

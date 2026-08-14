@@ -1,4 +1,4 @@
-//! design.md §6.3's non-Vulkan commands — "hand-written, not generated, and …
+//! docs/design.md §6.3's non-Vulkan commands — "hand-written, not generated, and …
 //! the only place the protocol is ours rather than Vulkan's."
 //!
 //! # Why they are opcodes and not a second framing
@@ -30,14 +30,14 @@ use sv_wire::{CommandHeader, Decoder, Encoder, Result, WireError};
 /// The first opcode that is ours rather than Vulkan's.
 pub const PROTOCOL_BASE: u32 = 0x8000_0000;
 
-/// design.md §6.3: "Hand a recorded `vkCmd*` blob at `(offset,len)` to the
+/// docs/design.md §6.3: "Hand a recorded `vkCmd*` blob at `(offset,len)` to the
 /// sub-decoder."
 pub const SV_EXECUTE_COMMAND_BLOB: u32 = PROTOCOL_BASE;
 
-/// design.md §6.3: "Slab import, with the memory-type reply."
+/// docs/design.md §6.3: "Slab import, with the memory-type reply."
 pub const SV_IMPORT_ARENA_SLAB: u32 = PROTOCOL_BASE + 1;
 
-/// design.md §0.18: "which Vulkan version is behind you?", asked once at connect.
+/// docs/design.md §0.18: "which Vulkan version is behind you?", asked once at connect.
 ///
 /// # Why this is a ring command and not a field of the cold-path `Attachment`
 ///
@@ -102,7 +102,7 @@ pub struct ExecuteCommandBlob {
     pub len: u64,
 }
 
-/// `svImportArenaSlab`: ask the GPU side to import one slab (design.md §5.2).
+/// `svImportArenaSlab`: ask the GPU side to import one slab (docs/design.md §5.2).
 ///
 /// > Slabs are **imported** lazily. When the app side needs a slab it picks a
 /// > free region of the arena, writes a slab-directory entry, and sends
@@ -129,7 +129,7 @@ pub struct ImportArenaSlabReply {
 /// `svDriverVersions`: ask the GPU side what Vulkan its driver actually is.
 ///
 /// No body. The GPU side has exactly one driver and one physical device
-/// (design.md §8), so there is nothing to name.
+/// (docs/design.md §8), so there is nothing to name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DriverVersions;
 

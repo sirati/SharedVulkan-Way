@@ -32,7 +32,7 @@
 #  5. **`glxgears`, in a real X window**, which is the program §13's acceptance
 #     criterion names and which the previous stage could not run at all: Zink's
 #     windowed path is `zink_kopper` and it wants a `VK_KHR_swapchain`, which
-#     design.md §10 stage 2 now provides. The frame is captured with `xwd` and
+#     docs/design.md §10 stage 2 now provides. The frame is captured with `xwd` and
 #     compared against the same program on llvmpipe — not pixel for pixel, since
 #     glxgears animates from the wall clock, but on the histogram statistics
 #     that are invariant under the gears' rotation.
@@ -197,7 +197,7 @@ fi
 
 # --- 4. a windowed GL program, in a real X window -----------------------------
 #
-# The check the previous stage could not make. design.md §10 stage 2 exists, so
+# The check the previous stage could not make. docs/design.md §10 stage 2 exists, so
 # `zink_kopper` has a swapchain to create and `glxgears` — which is the program
 # §13's acceptance criterion actually names — runs against a window rather than
 # refusing to start.

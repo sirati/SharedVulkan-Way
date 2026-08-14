@@ -9,7 +9,7 @@
  * bits, and a capability bit is a claim about a driver, not a test of one.
  *
  * The jump from 3.2 to 4.6 came from exactly three capabilities that were
- * being reported as absent (design.md §0.5). This program uses all three, in
+ * being reported as absent (docs/design.md §0.5). This program uses all three, in
  * one frame, and judges the result on its pixels:
  *
  *   - **GL_ARB_tessellation_shader** (the GL 4.0 gate). A four-vertex patch is

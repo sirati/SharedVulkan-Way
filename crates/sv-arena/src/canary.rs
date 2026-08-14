@@ -13,7 +13,7 @@
 //!
 //! Hence bytes that are never handed out and never overwritten.
 //!
-//! # What it costs, which is not what design.md §5.2 says
+//! # What it costs, which is not what docs/design.md §5.2 says
 //!
 //! > **On a 4 KiB-granularity extent the allocator reserves a canary per slab**
 //! > and never hands those bytes to an application: the **first 64 bytes of each
@@ -29,7 +29,7 @@
 //!
 //! | | per 64 MiB slab | fraction |
 //! |---|---:|---|
-//! | design.md §5.2 claims | 64 B | 1 / 1,048,576 |
+//! | docs/design.md §5.2 claims | 64 B | 1 / 1,048,576 |
 //! | **what it actually costs** | **4096 B** | **1 / 16,384 (0.0061%)** |
 //! | R26's measured per-page canary (`gpu-probe`, 256 B/page) | 4 MiB | 6.25% |
 //!
@@ -52,7 +52,7 @@
 //! manager, which has no reason to prefer page zero. So the per-slab canary
 //! detects a small fraction of the failure it was introduced for.
 //!
-//! This module implements the granularity design.md §5.2 specifies
+//! This module implements the granularity docs/design.md §5.2 specifies
 //! ([`CanaryPolicy::PerSlab`]) and makes the alternative available
 //! ([`CanaryPolicy::PerPage`]) rather than choosing on the design's behalf. The
 //! honest summary for the design to act on: **at 4096-byte allocator
@@ -70,7 +70,7 @@ use sv_transport::region::SharedRegion;
 /// be overwritten, the canary is expected never to be.
 pub const CANARY_MAGIC: &[u8; 8] = b"SVCANRY1";
 
-/// Bytes in one canary record. design.md §5.2's "first 64 bytes".
+/// Bytes in one canary record. docs/design.md §5.2's "first 64 bytes".
 pub const CANARY_LEN: u64 = 64;
 
 const OFF_MAGIC: usize = 0;
@@ -85,7 +85,7 @@ pub enum CanaryPolicy {
     /// page is not a candidate for relocation by the ordinary paging machinery"
     /// (§5.1), so there is nothing to detect and nothing to pay.
     None,
-    /// design.md §5.2: the first 64 bytes of each slab-sized block. Costs one
+    /// docs/design.md §5.2: the first 64 bytes of each slab-sized block. Costs one
     /// page per slab at 4096-byte granularity.
     PerSlab { run_id: u64 },
     /// R26 as measured. Costs one page in every `stride` pages, and detects a
@@ -171,7 +171,7 @@ pub fn write_all(
 ///
 /// > A canary mismatch is fatal to the session, not something to repair: by the
 /// > time it is noticed the two sides have already disagreed about memory.
-/// > — design.md §5.1
+/// > — docs/design.md §5.1
 ///
 /// Returns how many were checked, so that a caller can tell "all correct" from
 /// "there were none to check" — which is the same class of false negative as a
@@ -201,7 +201,7 @@ pub fn verify_all(
 
 /// Drives the periodic check without owning a thread or reading the clock.
 ///
-/// design.md §5.2 asks for the canary to be re-checked "at every handshake and
+/// docs/design.md §5.2 asks for the canary to be re-checked "at every handshake and
 /// on a timer". A timer that lives inside this crate would need a thread, and a
 /// thread would need a shutdown protocol; the caller already has an event loop,
 /// so it gets asked instead.
@@ -309,7 +309,7 @@ mod tests {
         let cost = per_slab.len() as u64 * GRANULARITY;
         assert_eq!(cost, 128 * 1024);
         assert_eq!(slab / GRANULARITY, 16_384, "1 part in 16384 per slab");
-        // design.md §5.2's figure, for contrast: 64 B × 32 slabs = 2 KiB.
+        // docs/design.md §5.2's figure, for contrast: 64 B × 32 slabs = 2 KiB.
         assert_eq!(per_slab.len() as u64 * CANARY_LEN, 2048);
         assert_eq!(cost / (per_slab.len() as u64 * CANARY_LEN), 64, "64× the bytes claimed");
 

@@ -1,6 +1,6 @@
 //! The allocator: a segregated free-list over 4096-byte pages, per slab.
 //!
-//! design.md §5.2, and §5.5 for deferred free. The design's own summary:
+//! docs/design.md §5.2, and §5.5 for deferred free. The design's own summary:
 //!
 //! > - Granularity is **4096 bytes**, dictated by the measured
 //! >   `minImportedHostPointerAlignment` and by the page granularity of the
@@ -37,7 +37,7 @@
 //!
 //! None. Not one line of this module touches the shared mapping — it computes
 //! offsets, and the caller turns an offset into bytes. That is what makes it
-//! Miri-testable against a plain `Vec<u8>`, exactly as design.md §5.2 asks.
+//! Miri-testable against a plain `Vec<u8>`, exactly as docs/design.md §5.2 asks.
 
 use crate::canary::{CanaryPolicy, CANARY_LEN};
 use crate::{Error, GRANULARITY, Result, round_up};
@@ -189,7 +189,7 @@ impl Slab {
 
 /// An app-side `VkDeviceMemory` backed by the arena.
 ///
-/// design.md §5.3: "a triple `(slab_id, offset_in_slab, size)` — a sub-range of
+/// docs/design.md §5.3: "a triple `(slab_id, offset_in_slab, size)` — a sub-range of
 /// a slab, 4096-aligned, whose `offset_in_slab + size` never exceeds the slab".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Allocation {
@@ -306,7 +306,7 @@ impl ArenaAllocator {
 
     /// Bytes the allocator will never hand out, across the whole arena.
     ///
-    /// The number design.md §5.2 gets wrong; see `canary.rs`.
+    /// The number docs/design.md §5.2 gets wrong; see `canary.rs`.
     pub fn reserved_bytes(&self) -> u64 {
         self.slabs.iter().map(|s| u64::from(s.reserved_pages) * GRANULARITY).sum()
     }
@@ -401,7 +401,7 @@ impl ArenaAllocator {
     }
 
     /// `vkFreeMemory`: retire the range against the timelines it could still be
-    /// referenced by. design.md §5.5 mechanism 1:
+    /// referenced by. docs/design.md §5.5 mechanism 1:
     ///
     /// > `vkFreeMemory` does not return the range to the free list. It moves it
     /// > to a retire list tagged with the current value of every timeline the
@@ -414,7 +414,7 @@ impl ArenaAllocator {
     /// Reclaim every retired allocation whose timelines have passed.
     ///
     /// `mirror(slot)` reads the control region's timeline mirror, which is a
-    /// local acquire load and not a round trip (design.md §4.2). Returns how
+    /// local acquire load and not a round trip (docs/design.md §4.2). Returns how
     /// many were reclaimed.
     pub fn reclaim(&mut self, mirror: &dyn Fn(u32) -> u64) -> Result<usize> {
         let mut still_waiting = Vec::new();
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(class_of(1023), 9);
         assert_eq!(class_of(1024), 10);
         // 4 MiB is 1024 pages and is the largest *class*; everything above goes
-        // to the first-fit list, which is what design.md §5.2 specifies.
+        // to the first-fit list, which is what docs/design.md §5.2 specifies.
         assert_eq!(class_of(2048), BIG_CLASS);
         assert_eq!(class_of(u32::MAX), BIG_CLASS);
     }
@@ -527,7 +527,7 @@ mod tests {
         assert!(a.alloc(SLAB).is_ok());
     }
 
-    /// The property design.md §13 step 2 asks for: allocations never overlap.
+    /// The property docs/design.md §13 step 2 asks for: allocations never overlap.
     /// Driven by a deterministic PRNG rather than a proptest dependency — the
     /// workspace has four external crates and this does not need to be the fifth.
     #[test]
@@ -642,7 +642,7 @@ mod tests {
         ));
     }
 
-    /// design.md §13 step 2's other property: "a freed range is not reissued
+    /// docs/design.md §13 step 2's other property: "a freed range is not reissued
     /// before its timeline value passes".
     #[test]
     fn a_deferred_free_is_not_reissued_until_its_timeline_passes() {

@@ -2,7 +2,7 @@
 //!
 //! # Why the driver is open before any application connects
 //!
-//! design.md §3 draws `sv-gpu-server` with `ash → Intel ICD → iGPU` hanging off
+//! docs/design.md §3 draws `sv-gpu-server` with `ash → Intel ICD → iGPU` hanging off
 //! the ring consumers, which reads as "open a driver when the app side says
 //! `vkCreateInstance`". That is the wrong order, and the arena is what decides
 //! it: on the GPU-allocated arena path (see [`crate::arena`]) the driver has to
@@ -78,7 +78,7 @@ pub struct Driver {
     /// this side's job is to say what the driver is, not what the app side may
     /// advertise. The clamp is `sv_gpu_server`'s business only for the instance
     /// it creates for itself; the *advertised* number is negotiated on the app
-    /// side, once, in `sv_icd::state::negotiate` — see design.md §0.18.
+    /// side, once, in `sv_icd::state::negotiate` — see docs/design.md §0.18.
     pub instance_api_version: u32,
     pub name: String,
     /// `VK_KHR_external_memory_fd`, and its dispatch table.
@@ -147,7 +147,7 @@ impl Driver {
             })
             .unwrap_or(false);
         // `VK_KHR_surface`, if the loader has it, for one reason and not for
-        // presentation: `VK_KHR_swapchain` is in the profile (design.md §10) so
+        // presentation: `VK_KHR_swapchain` is in the profile (docs/design.md §10) so
         // that the device enables it and
         // `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` exists, and a device extension may
         // only be enabled when its instance-level dependency is. This side
@@ -334,7 +334,7 @@ impl Driver {
         let mut nscm = vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT::default();
         let mut pgq = vk::PhysicalDevicePrimitivesGeneratedQueryFeaturesEXT::default();
         let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
-        // The six extensions design.md §0.20 added to the profile that carry a
+        // The six extensions docs/design.md §0.20 added to the profile that carry a
         // feature struct. Without the struct chained the feature comes back
         // false and is *enabled* false, so an application that asks for
         // `VK_EXT_graphics_pipeline_library` finds the extension present and the
@@ -402,7 +402,7 @@ impl Driver {
         // straight back as the enabled set, which is what makes "reported" and
         // "enabled" the same word here. Recording it is what lets `crate::arena`
         // allocate memory a shader may take the address of, and what turns
-        // design.md §0.16 item 3's "advertised and not implemented" into
+        // docs/design.md §0.16 item 3's "advertised and not implemented" into
         // implemented rather than into a retraction.
         //
         // After `vkCreateDevice` rather than before it, because `f12` is
@@ -481,7 +481,7 @@ impl Driver {
 /// to what the driver actually has, with the driver's own `specVersion`.
 ///
 /// Both halves of the intersection are load-bearing and for different reasons.
-/// The profile half is design.md §9.2's rule — "an extension in this list is a
+/// The profile half is docs/design.md §9.2's rule — "an extension in this list is a
 /// promise that its entry points work", and an entry point works only if pass 12
 /// emitted a forwarder. The driver half is obvious and is the one a hand-written
 /// list would have got right anyway.

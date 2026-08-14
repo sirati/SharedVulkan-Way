@@ -31,7 +31,7 @@
 # WHAT IS DELIBERATELY NOT CLAIMED
 #
 # Nothing here runs on the real guest, and the `wine` block is Wine. Wine has
-# been wrong four times on this project — the number is design.md §13.6's, which
+# been wrong four times on this project — the number is docs/waycompose-design.md §13.6's, which
 # withdrew the SetProcessDpiAwarenessContext entry with the measurement attached,
 # and §14.12 item 6 records why three different counts were in circulation. A
 # pass says the code paths are self-consistent; a negative is not a result, and
