@@ -270,6 +270,40 @@ pub struct RingTransport {
     /// Serialises `svImportArenaSlab`, so two threads allocating in one slab
     /// send one import rather than two.
     importing: Mutex<()>,
+    /// Serialises [`RingTransport::flush_blob`], so a range of a recording is
+    /// published exactly once and pieces are pushed in the order they were
+    /// recorded.
+    ///
+    /// # The bug this is the whole of
+    ///
+    /// `flush_blob` read `(off + published, len - published)` under the blob
+    /// lock, **released it**, pushed the packet, then re-took the lock to
+    /// advance `published`. Two threads entering that window with the same
+    /// `published` compute the *same* range, push it *twice*, and both then
+    /// store the same new watermark — so the GPU side replays one piece of a
+    /// recording twice and neither side can tell.
+    ///
+    /// It needs no illegal application: a `vkCmd*` is buffered and a
+    /// `vkQueueSubmit` is not, so [`RingTransport::publish_recorded_first`]
+    /// flushes **every** open blob — including one that another thread is
+    /// legitimately ending at that moment. Zink submits on its own
+    /// `util_queue` thread while the driver thread records the next frame, so
+    /// `gl-probe` hit it about one run in ten.
+    ///
+    /// What it cost when the duplicated piece was the tail of a recording: the
+    /// piece carries `vkEndCommandBuffer`, RADV finalises an already-finalised
+    /// command stream, `radv_amdgpu_cs_finalize` dereferences the `ib_buffer`
+    /// it nulled the first time, and `sv-gpu-server` takes a SIGSEGV with a
+    /// backtrace pointing at the driver.
+    ///
+    /// A lock and not a compare-and-swap on `published`, because *ordering* is
+    /// half of what is being restored: claiming the range atomically stops the
+    /// double send, and two threads could still push their pieces to the ring
+    /// out of order, which replays a recording's commands out of order. One
+    /// mutex held across the claim and the push settles both. It is taken once
+    /// per piece — once per [`BLOB_FLUSH`] of recording, or once at
+    /// `vkEndCommandBuffer` — and never on the `vkCmd*` path.
+    publishing: Mutex<()>,
     parker: Futex,
     /// docs/design.md §6.5's per-command-buffer arena blocks.
     blobs: Mutex<Blobs>,
@@ -734,6 +768,7 @@ impl RingTransport {
                 queue: Mutex::new(queue),
                 barriers: Mutex::new(barriers),
                 importing: Mutex::new(()),
+                publishing: Mutex::new(()),
                 parker: Futex::default(),
                 blobs: Mutex::new(Blobs::new(arena_len, reserve)),
                 arena,
@@ -943,6 +978,9 @@ impl RingTransport {
     /// `vkEndCommandBuffer`. Returns without a packet when there is nothing new,
     /// which is what makes calling it from both places harmless.
     fn flush_blob(&self, command_buffer: u64) -> IcdResult<()> {
+        // Held across the read, the push and the watermark update. See
+        // `RingTransport::publishing` for what happened without it.
+        let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
         let (off, len, upto) = {
             let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
             match blobs.open.get(&command_buffer) {

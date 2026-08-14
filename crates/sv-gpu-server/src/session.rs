@@ -273,10 +273,25 @@ fn protocol_command(
             // correctly; this design then replays those recordings on *ring*
             // threads, so the pairing the application established is gone and
             // two blobs for two command buffers of one pool can be decoded at
-            // once. Zink does exactly that, and RADV crashed inside
+            // once. Zink does exactly that, so the obligation is real and this
+            // is where it is met.
+            //
+            // **It is not what the `radv_amdgpu_cs_finalize` segfault was**, and
+            // this comment used to say it was — "RADV crashed inside
             // `radv_amdgpu_cs_finalize` from `vkEndCommandBuffer` on roughly one
-            // `gl-probe` run in two — and never under the validation layer,
-            // whose own locking hid it.
+            // `gl-probe` run in two". That reading survived the lock being added
+            // and the crash continuing, which should have retired it. The cause
+            // was on the app side: `sv_icd::transport::flush_blob` could publish
+            // one piece of a recording *twice*, so a piece carrying
+            // `vkEndCommandBuffer` finalised an already-finalised command stream
+            // and the driver dereferenced the `ib_buffer` it had nulled. Every
+            // byte of both copies was exactly what the application recorded,
+            // which is why no check on this side could see it and why the
+            // validation layer — which never sees a replay at all — reported
+            // nothing. See `RingTransport::publishing`.
+            //
+            // The lock stays: it is correct on its own terms, and what it
+            // protects against has simply never been observed to fire.
             //
             // A recording is a *sequence*, so the lock is taken once here rather
             // than by each `vkCmd*`: per-command locking permits precisely the
