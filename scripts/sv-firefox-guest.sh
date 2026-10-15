@@ -210,7 +210,7 @@ for _ in $(seq 1 60); do
   line=$(grep -o "arena 0 provided from guest RAM: run 0x[0-9a-f]*, [0-9]* bytes, [0-9]* pages, locked=[a-z]*" "$SHARE/s.log" 2>/dev/null | tail -1)
   if [ -n "$line" ]; then
     RUNID=$(echo "$line" | grep -o "run 0x[0-9a-f]*" | cut -d' ' -f2)
-    FOUNDPAGES=$(echo "$line" | grep -o "[0-9]* pages" | cut -d' ' -f1)
+    FOUNDPAGES=$(echo "$line" | grep -o "[0-9]* pages" | head -1 | cut -d' ' -f1)
     say "compositor arena: $line"
     break
   fi

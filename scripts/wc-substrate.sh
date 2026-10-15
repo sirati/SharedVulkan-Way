@@ -223,7 +223,10 @@ wc_locate_arena() {
   fi
   note "$line"
   runid=$(echo "$line" | grep -o "run 0x[0-9a-f]*" | cut -d' ' -f2)
-  pages=$(echo "$line" | grep -o "[0-9]* pages" | cut -d' ' -f1)
+  # The FIRST "N pages": a `frames=none (… 19 of 16384 pages missing …)` tail
+  # on the same line is a second match, and two lines in `--pages` broke the
+  # root script with "16384: command not found" (§82).
+  pages=$(echo "$line" | grep -o "[0-9]* pages" | head -1 | cut -d' ' -f1)
 
   # The frame list, if the compositor got one. `--arena-frames` puts `frames=`
   # on this very line for exactly this reason: one grep answers both "where is

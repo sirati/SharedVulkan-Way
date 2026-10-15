@@ -457,7 +457,7 @@ do_run() {
     return
   fi
   runid=$(echo "$line" | grep -o 'run 0x[0-9a-f]*' | cut -d' ' -f2)
-  pages=$(echo "$line" | grep -o '[0-9]* pages' | cut -d' ' -f1)
+  pages=$(echo "$line" | grep -o '[0-9]* pages' | head -1 | cut -d' ' -f1)
   note "$leg: $line"
 
   h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
