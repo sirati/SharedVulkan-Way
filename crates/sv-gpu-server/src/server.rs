@@ -135,11 +135,28 @@ pub struct GpuServer {
     /// dispatch just after. Per-dispatch, which is why it is taken rather than
     /// read — a stale one would be reported against the next command.
     dispatch_poison: Option<&'static str>,
+    /// Raise pools of the last `SV_VIDEO_RETAIN` video commands this ring
+    /// replayed (`exceptions::GPU_RETAIN_RAISE`, docs/video-decode.md §7.11).
+    /// Empty unless the variable is set.
+    retained: std::collections::VecDeque<sv_gpu_entry::Raise>,
+}
+
+/// `SV_VIDEO_RETAIN`: how many video commands' raise pools a ring keeps; 0,
+/// the default, keeps none.
+fn video_retain_limit() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SV_VIDEO_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 impl GpuServer {
     pub fn new(shared: std::sync::Arc<Shared>) -> GpuServer {
-        GpuServer { shared, last_error: None, poisoned: Default::default(), dispatch_poison: None }
+        GpuServer {
+            shared,
+            last_error: None,
+            poisoned: Default::default(),
+            dispatch_poison: None,
+            retained: Default::default(),
+        }
     }
 
     fn d(&self) -> &ash::Device {
@@ -445,6 +462,17 @@ impl GpuHost for GpuServer {
         // about to pass, or has just passed, to the driver — `GpuHost::observe`'s
         // contract, which is `video_log::observe`'s.
         unsafe { crate::video_log::observe(&self.shared, command, after, args, result) }
+    }
+
+    fn retain_raise(&mut self, _command: &'static str, pool: sv_gpu_entry::Raise) {
+        let keep = video_retain_limit();
+        if keep == 0 {
+            return;
+        }
+        self.retained.push_back(pool);
+        while self.retained.len() > keep {
+            self.retained.pop_front();
+        }
     }
 
     fn take_poisoned_command_buffer(&mut self) -> Option<&'static str> {

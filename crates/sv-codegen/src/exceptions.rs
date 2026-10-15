@@ -911,6 +911,20 @@ pub const GPU_OBSERVED: &[&str] = &[
     "vkQueueSubmit2",
 ];
 
+/// The generated commands whose raise pool `GpuHost::retain_raise` is handed
+/// after the driver call, instead of dropping it (docs/video-decode.md §7.11).
+///
+/// The guest's Intel driver faulted in `vkCmdDecodeVideoKHR` three times,
+/// each time by following a stale pointer at an IDR. In the last run the
+/// memory that pointer named had been reused by this side's own raise
+/// allocations. One explanation is that the driver keeps a pointer into a
+/// structure it was handed by an earlier call. Native ffmpeg keeps those
+/// structures in pooled per-picture memory, which would hide that; the
+/// forwarder frees each call's copies when the call returns. Keeping the pools
+/// (`SV_VIDEO_RETAIN`) is the experiment that tells the two explanations apart.
+pub const GPU_RETAIN_RAISE: &[&str] =
+    &["vkCmdBeginVideoCodingKHR", "vkCmdControlVideoCodingKHR", "vkCmdDecodeVideoKHR"];
+
 /// Just the names, for the generator's set membership.
 pub fn gpu_hand_written() -> Vec<&'static str> {
     GPU_HAND_WRITTEN.iter().map(|(n, _)| *n).collect()

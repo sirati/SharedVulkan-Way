@@ -1005,6 +1005,18 @@ fn emit_forward_command(
     // was given it. Each argument crosses as a `u64` (a pointer's address, a
     // handle's raw value, an integer); the observer knows each command's
     // signature. Off, it costs one call to `observing`.
+    // # A raise pool the host may keep, for `exceptions::GPU_RETAIN_RAISE`
+    //
+    // The pool owns every C structure the driver was handed. Dropped here, as
+    // it is for every other command, a pointer the driver kept past the call
+    // points into freed memory; handed to `GpuHost::retain_raise`, it lives as
+    // long as the host says (docs/video-decode.md §7.11).
+    let retain = if crate::exceptions::GPU_RETAIN_RAISE.contains(&cname) {
+        quote!(__h.retain_raise(#cname, __pool);)
+    } else {
+        quote!()
+    };
+
     let call = if crate::exceptions::GPU_OBSERVED.contains(&cname) {
         let words: Vec<TokenStream> = args
             .iter()
@@ -1437,6 +1449,7 @@ fn emit_forward_command(
         #(#out_decls)*
         #call
         #(#guard_checks)*
+        #retain
         let __b = __h;
         #tail
     })
@@ -1616,6 +1629,13 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// once `after` is true.
             fn observe(&self, command: &'static str, after: bool, args: &[u64], result: i32) {
                 let _ = (command, after, args, result);
+            }
+            /// The raise pool of a command `exceptions::GPU_RETAIN_RAISE` names,
+            /// after its driver call: every C structure the driver was handed.
+            /// Dropped by default, as every other command's is.
+            fn retain_raise(&mut self, command: &'static str, pool: crate::Raise) {
+                let _ = command;
+                drop(pool);
             }
 
             #(#methods)*

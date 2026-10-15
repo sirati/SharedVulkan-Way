@@ -1754,7 +1754,8 @@ not in the dump: it keeps only memory reachable from stacks and registers.
 Every view the dump does contain carries Intel's view magic `0x01cdc0de` and a
 live image.
 
-**The reading.** Intel's decoder keeps something derived from a picture's
+**The reading, as it stood after this run** (§7.11.4 refutes it: with the
+views kept alive the fault came anyway). Intel's decoder keeps something derived from a picture's
 view across decodes. ffmpeg destroys that view after the frame, and the
 driver later follows a pointer through the freed memory. Whether that
 faults, and with what, depends on what the allocator has put there since:
@@ -1765,6 +1766,10 @@ the view churn measured. Candidates 2 and 3 are out: every slice header read
 right at record time, and no scope was open at a submit.
 
 #### 7.11.3 The workaround: a video image's views live as long as the image
+
+> **[SUPERSEDED as the fix — §7.11.4.]** The cache does what it says, and the
+> confirmation run still faulted. It stays in: it is harmless, it removes one
+> class of stale view on every driver, and the next run is measured with it.
 
 `sv_gpu_server::video_views`. `vkCreateImage`, `vkCreateImageView`,
 `vkDestroyImageView` and `vkDestroyImage` are now hand-written on the GPU side
@@ -1803,6 +1808,84 @@ descriptions and non-video images, leftovers) run under Miri, as do the six
 pure `features` tests. The real-driver leftover test now includes a kept view
 and a second id naming one view. It destroys 19 objects plus the pipeline
 ones, each once.
+
+#### 7.11.4 The confirmation run: the view cache did not stop it
+
+The one confirmation run, at 22:00, with build 4281721: `sv-guest.exe`
+`88768149…`; the ICD was unchanged. The same session and drive as §7.11.2, with
+the same health checks before, during (52 samples, all good) and after. QEMU
+was still pid 230263 throughout.
+
+- **The cache worked as designed.** 7 driver views for the whole run (one per
+  frame-pool image), none destroyed, no address reuse, 0 findings.
+- **It faulted anyway**, 9 s in, at **decode #251**: the packet-250 IDR again,
+  now in the first loop, with setup slot 1, no references and 32768 bytes. The
+  fault was in the same function, at `igvk64.dll+0x2f1936`, as "access of
+  `0x0`". The VM kept running.
+- The minidump shows `mov 0x430(%rbp,%r8),%rcx` with `r8 =
+  0xa7a7a7a7a7a7a7a7`. **That is this side's guard canary**
+  (`sv_gpu_entry::CANARY`). The function's object argument was a 16-byte
+  allocation from one of *our* `Raise` pools, and `[obj+0x78]` read the guard
+  behind it. So the pointer Intel followed, `[[arg2+0x208]+0x10]`, named heap
+  memory that had been freed and handed to this side's own allocations since.
+  In the capture run the same memory held garbage (`0x800006a722ca67ac`); in
+  §87.12 it held `4`.
+
+So §7.11.3 is **not the fix**, and §7.10.5's candidate 1 was not the cause.
+Intel's views no longer die, and the stale pointer remains. The three faults
+share one picture, not one loop: **the IDR at packet 250**, an IDR that
+arrives with the DPB full of earlier pictures and no reset before it. The IDRs
+at a start (#1) or after a flush (#301) have never faulted. What remains:
+
+- **H1: Intel keeps a pointer into a structure from an earlier call.** For
+  example, a slot's `VkVideoPictureResourceInfoKHR` from the decode that set
+  it up, which it follows when an IDR retires the slots. Native ffmpeg keeps
+  those structures in per-picture memory that its frame pool recycles, so
+  such a pointer would always read *some* valid picture. The forwarder's
+  `Raise` pool frees its copies when the call returns, and the heap reuses
+  them at once, as the canary shows. This fits all three faults.
+- **H2: an Intel-internal use-after-free** of something other than views,
+  such as per-command-buffer state (ffmpeg alternates two command buffers).
+
+The dump cannot separate them. The pointer's holder is not in it: a minidump
+with `MiniDumpWithIndirectlyReferencedMemory` keeps what stacks and
+registers reach, not heap that only heap reaches.
+
+**The experiment that separates them is built and not run.** The generated
+forwarders of `vkCmdBeginVideoCodingKHR`, `vkCmdControlVideoCodingKHR` and
+`vkCmdDecodeVideoKHR` hand their raise pool to `GpuHost::retain_raise`
+(`exceptions::GPU_RETAIN_RAISE`; `tests/gpu_observed.rs` checks the hook is
+emitted for exactly those three). `GpuServer` keeps the last
+`SV_VIDEO_RETAIN` of them per ring, and none by default. Locally, with
+`SV_VIDEO_RETAIN=4096`, the Intel shape and validation: 2662 frames, 0
+dropped, peak RSS of the serving process 186 MB. The next authorised guest
+run is §7.11.2's drive with `SV_VIDEO_RETAIN=8192`, which keeps every video
+command's structures for a 60 s soak at about 5 KB each. No fault at packet
+250 means H1. Then the exact fix is to give the driver per-slot picture
+structures that live as long as the session, as ffmpeg's pool does. A fault
+means H2, and it goes to Intel with this log and dump.
+
+**Not done, because the soak did not survive:** hardware decode is not
+enabled in the deployed launcher (`wcivs` runs the stock Firefox 157 and no
+decode prefs, as §87.12 left it), and no about:support Media capture was
+taken on the guest. The test installation `wcgpu` has build 4281721's
+`sv-guest.exe`; its previous binaries are beside it as `sv-guest.exe.prev`
+(f0b8d9d) and `sv-guest.exe.capture` (f8a2e37). Both dumps were deleted from
+the guest after copying. They are not in the repository (22 MB of process
+memory each). The logs of both runs are in `docs/video-decode/guest-7.11/`.
+
+**Gates**, on this branch (master 4f4ea7d plus f8a2e37, 4281721 and the
+commit that adds this paragraph). `cargo test --workspace --no-fail-fast`:
+**101 binaries, 2815 passed, 0 failed**, 8 ignored (master: 2804; +7 for
+`features`, +3 for `video_views`, +1 for the retain hook). `cargo clippy
+--workspace --all-targets`: exit 0, no warning in a file this branch touched.
+`cargo check --workspace --target x86_64-pc-windows-gnu`: exit 0.
+`wc-pool: OK`, `wc-keymap: OK`. Miri (`nix develop .#miri`): the six pure
+`features` tests and `video_views`' three, no undefined behaviour. The new
+`unsafe` is calls into a real driver (`features::query_driver`, the four
+hand-written commands) and `ManuallyDrop::drop` of the loader under
+`Driver`'s lock, none of which Miri runs. They are covered by the real-driver
+tests on RADV and lavapipe.
 
 ## What this does not tell us
 

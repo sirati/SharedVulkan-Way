@@ -27402,3 +27402,34 @@ Gates at the commit that adds 87.12: `cargo test --workspace --no-fail-fast`
 this branch wrote; `cargo check --target x86_64-pc-windows-gnu` exit 0;
 `wc-pool: OK`, `wc-keymap: OK`. (The `wc-session` change has no unit test;
 `bash -n` and the deployed run above are its checks.)
+
+### 87.13 Follow-up: the decode fault, captured twice, and still open
+
+Branch `decode-capture`, 2026-10-15; the detail is video-decode.md §7.11.
+
+- **Feature chain (fixed).** The GPU side's device now enables every feature
+  struct of every enabled extension, from the registry, and answers
+  `vkGetPhysicalDeviceFeatures2` with what it enabled. Zink had been using
+  `VK_EXT_extended_dynamic_state3` and six other feature sets that were never
+  enabled: a 120 s Firefox soak under the GPU-side validation layer went from
+  395 errors to 0. On the guest, Intel accepted every `vkCreateDevice`.
+  Drivers are now opened and closed under one process-wide lock. Two
+  concurrent opens crashed the Vulkan loader in tests, and the guest's GPU
+  process opens one driver per session thread.
+- **Decode on the guest: two runs, two faults, VM up throughout.** The capture
+  run (`SV_VIDEO_LOG`, `SV_MINIDUMP`) faulted at `igvk64.dll+0x2f185b` on
+  decode #551. The confirmation run, with every video image's views kept
+  alive, faulted at `+0x2f1936` on decode #251. Both were the clip's
+  packet-250 IDR. Both times Intel's media layer followed a stale pointer into
+  heap memory that had been reused. The second time it was our own `Raise`
+  allocation (`0xa7` guard bytes). The forwarder's log found nothing wrong in
+  either run. Intel reports `DPB_AND_OUTPUT_COINCIDE`, which no local run
+  emulated.
+- **Not enabled.** Hardware decode in the deployed launcher stays off: `wcivs`
+  runs stock Firefox 157 with no decode prefs. The forwarded GPU is still on
+  for rendering, as §87.12 left it.
+- **Next** (needs one more authorised guest run): the same drive with
+  `SV_VIDEO_RETAIN=8192`, which keeps every video command's C structures
+  alive. No fault means Intel keeps pointers from earlier calls, and the fix
+  is session-lived per-slot structures. A fault means it is internal to
+  Intel's driver.
