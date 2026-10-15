@@ -102,6 +102,9 @@ pub struct Shared {
     /// objects and a submit must not wait on a recording: holding one mutex for
     /// both would serialise the two halves of every frame against each other.
     pub pool_lock: Arc<Mutex<()>>,
+    /// Video decode structures at session-lifetime addresses
+    /// (`crate::video_stable`, docs/video-decode.md §7.11.5).
+    pub video_stable: Mutex<crate::video_stable::Stores>,
 }
 
 impl Shared {
@@ -888,6 +891,135 @@ impl GpuHost for GpuServer {
         unsafe { f(device as usize as _, image, core::ptr::null()) };
         if obs {
             self.observe("vkDestroyImage", true, &words, 0);
+        }
+        Ok(())
+    }
+
+    // -- the coding scope and the decode (docs/video-decode.md §7.11.5) ------
+    //
+    // Forwarded as the generated code would, except that the structures the
+    // driver is handed live in `crate::video_stable`'s per-slot stores rather
+    // than in this call's raise pool: Intel's Windows driver follows pointers
+    // from earlier calls. Observed (`SV_VIDEO_LOG`) with exactly what the driver
+    // receives.
+
+    fn cmd_begin_video_coding_khr(&mut self, a: p::VkCmdBeginVideoCodingKHRArgs) -> WireResult<()> {
+        let mut a = a;
+        a.command_buffer.0 = self.map_handle(HandleType::VkCommandBuffer, a.command_buffer.0)?;
+        if let Some(info) = a.p_begin_info.as_mut() {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            p::handle_map_vk_video_begin_coding_info_khr(info, m)?;
+        }
+        let _ = self.take_poisoned_command_buffer();
+        let Some(f) = self.fns().vk_cmd_begin_video_coding_khr else {
+            self.note_missing("vkCmdBeginVideoCodingKHR");
+            self.poison_command_buffer(a.command_buffer.0, "vkCmdBeginVideoCodingKHR");
+            return Ok(());
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkVideoBeginCodingInfoKHR = match &a.p_begin_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_video_begin_coding_info_khr(x, &mut pool)?;
+                pool.one(v) as _
+            }
+            None => std::ptr::null(),
+        };
+        let cb = a.command_buffer.0;
+        // SAFETY: `info` and its array were raised into `pool` for this call.
+        unsafe { self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).begin(cb, info) };
+        let words = [cb, info as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCmdBeginVideoCodingKHR", false, &words, 0);
+        }
+        // SAFETY: the handles are the driver's; every pointer is in `pool` or
+        // in the stores, which outlive the call.
+        unsafe { f(cb as usize as _, info) };
+        if obs {
+            self.observe("vkCmdBeginVideoCodingKHR", true, &words, 0);
+        }
+        self.retain_raise("vkCmdBeginVideoCodingKHR", pool);
+        Ok(())
+    }
+
+    fn cmd_decode_video_khr(&mut self, a: p::VkCmdDecodeVideoKHRArgs) -> WireResult<()> {
+        let mut a = a;
+        a.command_buffer.0 = self.map_handle(HandleType::VkCommandBuffer, a.command_buffer.0)?;
+        if let Some(info) = a.p_decode_info.as_mut() {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            p::handle_map_vk_video_decode_info_khr(info, m)?;
+        }
+        let _ = self.take_poisoned_command_buffer();
+        let Some(f) = self.fns().vk_cmd_decode_video_khr else {
+            self.note_missing("vkCmdDecodeVideoKHR");
+            self.poison_command_buffer(a.command_buffer.0, "vkCmdDecodeVideoKHR");
+            return Ok(());
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let raised: *const sv_gpu_entry::VkVideoDecodeInfoKHR = match &a.p_decode_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_video_decode_info_khr(x, &mut pool)?;
+                pool.one(v) as _
+            }
+            None => std::ptr::null(),
+        };
+        let cb = a.command_buffer.0;
+        // SAFETY: `raised` and everything it points to are in `pool`.
+        let stable = unsafe {
+            self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).decode(cb, raised)
+        };
+        if stable.is_none() && !raised.is_null() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!(
+                    "sv-gpu-server: a vkCmdDecodeVideoKHR this side cannot keep at stable addresses \
+                     (not H.264, or outside a scope it saw); forwarded as raised (docs/video-decode.md §7.11.5)"
+                )
+            });
+        }
+        let info = stable.unwrap_or(raised);
+        let words = [cb, info as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCmdDecodeVideoKHR", false, &words, 0);
+        }
+        // SAFETY: as in `cmd_begin_video_coding_khr`.
+        unsafe { f(cb as usize as _, info) };
+        if obs {
+            self.observe("vkCmdDecodeVideoKHR", true, &words, 0);
+        }
+        self.retain_raise("vkCmdDecodeVideoKHR", pool);
+        Ok(())
+    }
+
+    fn cmd_end_video_coding_khr(&mut self, a: p::VkCmdEndVideoCodingKHRArgs) -> WireResult<()> {
+        let cb = self.map_handle(HandleType::VkCommandBuffer, a.command_buffer.0)?;
+        let _ = self.take_poisoned_command_buffer();
+        let Some(f) = self.fns().vk_cmd_end_video_coding_khr else {
+            self.note_missing("vkCmdEndVideoCodingKHR");
+            self.poison_command_buffer(cb, "vkCmdEndVideoCodingKHR");
+            return Ok(());
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkVideoEndCodingInfoKHR = match &a.p_end_coding_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_video_end_coding_info_khr(x, &mut pool)?;
+                pool.one(v) as _
+            }
+            None => std::ptr::null(),
+        };
+        self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).end(cb);
+        let words = [cb, info as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCmdEndVideoCodingKHR", false, &words, 0);
+        }
+        // SAFETY: the handle is the driver's; `info` is in `pool`.
+        unsafe { f(cb as usize as _, info) };
+        if obs {
+            self.observe("vkCmdEndVideoCodingKHR", true, &words, 0);
         }
         Ok(())
     }

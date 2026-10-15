@@ -637,6 +637,23 @@ impl Driver {
             .iter()
             .filter(|(n, _)| owned.iter().any(|o| o.to_bytes() == n.as_bytes()))
             .fold(vk::VideoCodecOperationFlagsKHR::empty(), |acc, (_, op)| acc | *op);
+        // Intel's Windows driver follows pointers from earlier decode calls, and
+        // `crate::video_stable` keeps H.264's structures at stable addresses and
+        // no other codec's (docs/video-decode.md §7.11.5). The others are not
+        // served there until they are.
+        let codecs = if crate::set_layout::refuses_push_binding_flags(dev_props.vendor_id, driver_id(instance, pd, dev_props.api_version))
+            && decode_family.is_some()
+            && codecs.intersects(!vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+        {
+            eprintln!(
+                "sv-gpu-server: Intel's Windows driver: video decode served for H.264 only; \
+                 H.265, AV1 and VP9 are withheld until their decode structures are kept at \
+                 stable addresses (docs/video-decode.md §7.11.5)"
+            );
+            codecs & vk::VideoCodecOperationFlagsKHR::DECODE_H264
+        } else {
+            codecs
+        };
         let served: Vec<ServedFamily> = open_on
             .iter()
             .map(|&f| {
