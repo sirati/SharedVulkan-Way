@@ -10,9 +10,15 @@
 #   SVFD_READBACK  1 (default) sets media.hardware-video-decoding-vulkan.readback.enabled
 #   SVFD_VULKAN    1 (default) turns Firefox's Vulkan decoder on at all
 #   SVFD_ICD       the driver the GPU side opens (default: the dev shell's RADV)
+#   SVFD_GECKODRIVER, SVFD_JQ   about:support is read through Marionette with
+#                  geckodriver and jq (`nix build nixpkgs#geckodriver nixpkgs#jq.bin`);
+#                  without them the decode checks still run and the support
+#                  check fails
+#   SVFD_BIN       sv-icd / sv-gpu-server build (default: target/release — the
+#                  debug ICD overflows Firefox's Renderer stack in `lower_pnext`)
 #
-# The topology is sv-firefox-wayland.sh's, which is the testhost one with the VM
-# taken out: an X server with no DRI3 and no dmabuf, the GPU side on
+# The topology is sv-firefox-wayland.sh's — the testhost one with the VM taken
+# out — with Xvfb in weston's place (see below): no DRI3, no dmabuf, the GPU side on
 # this machine's RADV, and Firefox reaching it only through `sv-icd` — Zink for
 # WebRender, ffmpeg's Vulkan hwaccel for the video. What it adds is a video.
 #

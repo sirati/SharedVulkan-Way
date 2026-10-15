@@ -763,6 +763,13 @@ could not: a `pNext` chain of `VkVideoDecodeCapabilitiesKHR` and
 and a `VkVideoProfileInfoKHR` carrying a `VkVideoDecodeH264ProfileInfoKHR` whose
 `stdProfileIdc` is a `StdVideoH264ProfileIdc` by value.
 
+> **[SUPERSEDED — 2026-10-15, §7.]** The decode runs. The GPU side now serves
+> its driver's decode queue family, and the reasoning below for *not* doing so
+> — a second ring, a family the application must be told not to use — did not
+> survive being checked against the code: every queue already shares one ring,
+> and a family the application can record `vkCmdDecodeVideoKHR` on is exactly
+> what ffmpeg and Firefox need. §7.1 says what was decided instead and why.
+
 **The decode does not run, and the wall has moved to where §4 item 3 said it
 would.**
 
@@ -796,7 +803,522 @@ test being met — and it is a stage, not an afternoon.
 
 ---
 
+## 7. Decoded through the forwarder
+
+Measured 2026-10-15 on **devhost** (Ryzen 9 9950X3D, RTX 5090), branch
+`decode-forwarder`. The GPU side ran against **RADV RAPHAEL_MENDOCINO**, the
+9950X3D's integrated GPU, on two Mesas: the dev shell's 26.2.0 and the system's
+26.2.4. The RTX 5090 was not used — it is leased to other work through
+`gpu-run`, and the lease this stage queued (job 120, shared, 2 GiB) had not
+started when this was written; §7.9 says what that leaves open. The guest's
+Intel iGPU was not used either, by instruction.
+
+**Everything in §6's last paragraph happened.** `video-probe decode` runs through
+the forwarder and its frames are byte-identical to libavcodec's; ffmpeg's own
+Vulkan decoder — the one Firefox 153+ decodes with — runs through it for H.264
+with B-frames, H.265 8- and 10-bit, AV1 and VP9, and every stream's frames are
+byte-identical to libavcodec's software decode of the same stream. Getting there
+found seven faults in the forwarder, none of them video-specific in kind, and
+each is §7.4's.
+
+### 7.1 The design, and the decision it overturns
+
+§6, docs/design.md §0.8 item 2, §0.21.2 and §11 all said the same thing: do
+**not** show the application a decode queue family; let the GPU side own the
+video session, the DPB and the decode queue *privately*, behind a protocol
+command of our own, and let what crosses be "a compressed bitstream and an
+image id". The reason given was D8: a second family is a second ring, and a
+family the application would have to be told not to use.
+
+Both halves of the reason were checked against the code before building
+against them, and neither held:
+
+- **There is no second ring.** D8's "SPSC, per queue" was never built. Every
+  `vkQueueSubmit` from every queue already travels `RingClass::Queue`, the GPU
+  side serialises the driver calls on one `queue_lock`, and a queue handle is
+  just an id the GPU side maps to a driver `VkQueue`. A second family costs a
+  `vkGetDeviceQueue` and an entry in a table.
+- **The family is not one the application must avoid — it is the one it
+  needs.** ffmpeg's Vulkan hwaccel, and therefore Firefox's
+  `FFmpegVulkanVideoDecoder`, creates its own `VkVideoSessionKHR` on a family
+  it found with `VK_QUEUE_VIDEO_DECODE_BIT_KHR` and records
+  `vkCmdDecodeVideoKHR` on it. A private session behind a protocol command has
+  no consumer: nothing that exists would call it, and Firefox would need tier 2
+  of docs/design.md §0.21.9 before a single frame decoded.
+
+And the property the private design was protecting — **the GPU side owns the
+session and the pictures never cross** — holds anyway, because it is true of
+every forwarded object. The session, its memory, the session parameters and
+every DPB and output image are the driver's objects, created and bound on the
+GPU side; the application holds ids. What crosses per frame is the bitstream —
+in a host-visible buffer, which on this design *is* the arena — and the
+commands. A decoded picture crosses only if the application copies it out,
+which is the readback of docs/design.md §0.21.3, and that is the application's
+choice rather than the transport's. `video-probe` now prints where every
+allocation landed, and through the forwarder:
+
+```
+memory: session 177152 B, bits 0x1 -> type 0 DEVICE_LOCAL
+memory: dpb image 92160 B, bits 0xf -> type 0 DEVICE_LOCAL
+memory: decode target image 98304 B, bits 0xf -> type 0 DEVICE_LOCAL
+memory: bitstream buffer 8192 B, bits 0xe -> type 1 HOST_VISIBLE | HOST_COHERENT
+memory: readback buffer 94208 B, bits 0xe -> type 1 HOST_VISIBLE | HOST_COHERENT
+```
+
+Session, DPB and target in docs/design.md §9.1's type 0, which is GPU-side
+memory and never mapped; bitstream and the probe's own readback in the arena.
+That is §0.21.2's decision 1, kept, by a different mechanism.
+
+**What is advertised, per codec.** Nothing is named. The GPU side reports the
+families it serves; the app side ORs their flags and hands that to the derived
+gate of docs/design.md §0.22 (`unservable_queue_requirement`), which now opens
+for `VK_KHR_video_queue` and `VK_KHR_video_decode_queue` and, through the
+`depends=` closure, for each `VK_KHR_video_decode_*` codec extension the
+driver has. Encode stays refused for the same reason it always was — the
+encode family is not served (`VIDEO_ENCODE` is masked) — and nothing had to be
+added to a list to keep it so. The decode family's `videoCodecOperations` is
+restricted to codecs whose extension the device enabled, so the family and the
+extension list cannot disagree. On RADV that is H.264, H.265, AV1 and VP9; on
+the guest Intel it would be H.264, H.265 and AV1, because that driver has no
+VP9 extension (§1).
+
+`SV_VIDEO_DECODE=0` on the GPU side puts back exactly the one family it served
+before, for bisecting.
+
+### 7.2 Queue families at the driver's own indices
+
+The served families are the driver's prefix `0..=max(compute, decode)`, **at
+their own indices**, one queue each — not a compact list with the decode family
+renumbered to 1. Renumbering would make every `queueFamilyIndex` in the API a
+value to translate: `VkCommandPoolCreateInfo`, `VkVideoSessionCreateInfoKHR`,
+`pQueueFamilyIndices` of every concurrently shared buffer and image, and the
+`src`/`dstQueueFamilyIndex` of every barrier *inside a recorded command
+buffer*. None of those is typed as a family index in `vk.xml`, so no generated
+pass could find them. With the driver's numbering there is nothing to
+translate.
+
+| driver | families served | what the application sees |
+|---|---|---|
+| RADV (measured) | 0, 1, 2 | `GRAPHICS\|COMPUTE\|TRANSFER\|SPARSE`, `COMPUTE\|TRANSFER\|SPARSE`, `VIDEO_DECODE` |
+| NVIDIA (from its table, not run) | 0, 1, 2, 3 | graphics, transfer, compute, `TRANSFER\|SPARSE\|VIDEO_DECODE` |
+| guest Intel (from §1, not run) | 0, 1 | universal, `VIDEO_DECODE` |
+
+The price is that an application sees the families in between — RADV's
+async-compute family, NVIDIA's transfer and compute families. They are real
+families with a real queue opened on each, so seeing them is true rather than
+merely harmless; ffmpeg uses RADV's family 1 for its compute transfers. Without
+a decode family the GPU side serves the one compute family it always did,
+presented as family 0, unchanged.
+
+### 7.3 Memory: the driver's numbering is not ours
+
+`memoryTypeBits` comes back from a driver in its own numbering and is read by
+the application against docs/design.md §9.1's four types. Buffers were already
+renumbered app-side. Images and sessions were forwarded verbatim, which was
+right only where the numberings happen to agree — on RADV they nearly do (its
+type 0 is `DEVICE_LOCAL`); on NVIDIA they do not (its type 0 has no flags and
+type 1 is `DEVICE_LOCAL`, so a DPB with the driver's `0x2` would have read as
+our type 1, the arena). Four commands are now hand-written on the GPU side,
+which is the only side that knows which driver type backs our type 0:
+
+| command | our bit 0 | our bits 1–3 (arena) |
+|---|---|---|
+| `vkGetImageMemoryRequirements`, `…2`, `vkGetDeviceImageMemoryRequirements` | iff the driver's bits include our type 0's driver type | iff they include the arena's driver type |
+| `vkGetVideoSessionMemoryRequirementsKHR` | iff the driver accepts any type | never |
+
+The session's bit 0 is unconditional because of a fifth: **RADV's AV1 session
+wants host-visible memory** — driver bits `0x678`, none of them its type 0 —
+and §9.1 has exactly one non-arena type to offer. `vkBindVideoSessionMemoryKHR`
+is the first moment the GPU side knows which session and bind index a
+`VkDeviceMemory` is for, so a *dedicated* type-0 allocation (offset 0, whole
+size bound — what ffmpeg and `video-probe` both do) is re-made there from a
+type the driver accepts. A shared allocation is passed through and the driver
+answers. Without this, AV1 and VP9 failed in ffmpeg with `No memory type found
+for flags 0xffffffff`.
+
+`vkAllocateMemory` now also carries `VkMemoryDedicatedAllocateInfo`. RADV
+reports `requiresDedicatedAllocation` for ffmpeg's decode pictures, and the GPU
+side's validation layer said `VUID-VkBindImageMemoryInfo-image-01445` ten times
+a run while the link was dropped. RADV decoded correctly regardless; a driver
+that relies on dedication would not.
+
+### 7.4 Seven faults, found by running it
+
+Each was invisible until a real consumer reached it, which is the pattern
+docs/design.md §0.9 item 2 names: *implemented* had meant *compiled*.
+
+1. **`pStdHeaderVersion` crossed as `{ "", 0 }`.** `VkExtensionProperties` is
+   `returnedonly`, and the app side's `lower_*` writes zeros for a
+   `returnedonly` struct because on the way out its storage is uninitialised.
+   `VkVideoSessionCreateInfoKHR::pStdHeaderVersion` takes one *in*. The GPU
+   side's validation layer: `VUID-VkVideoSessionCreateInfoKHR-pStdHeaderVersion-07190`,
+   *extensionName '' is an unsupported Video Std header name*. RADV accepted
+   it; a driver that checks the version would refuse every session. Now
+   `exceptions::RETURNED_ONLY_READ_AS_INPUT`, one entry, checked against the
+   registry by `sv-codegen/tests/returned_only_inputs.rs`.
+2. **Nested fixed arrays shadowed their loop index.** `StdVideoH264ScalingLists::
+   ScalingList4x4` is `uint8_t[6][16]`; both loops were `for __i`, every read
+   was `[__i][__i]` with the inner index, and the seventh read of the first
+   dimension panicked — inside `vkCmdDecodeVideoKHR`'s lowering, under ffmpeg,
+   as an abort. `video-probe`'s fixtures never set scaling matrices; x264's
+   High-profile output does. docs/design.md §0.9 item 5 fixed this array's
+   *element type* and left the index; the shadowing was in the app side's
+   lowering, the GPU side's raise and the app side's writeback. Each level now
+   has its own index (`__f0` innermost). Tests in `sv-icd-entry` and
+   `sv-gpu-entry` give every element a distinct value; the raise one fails
+   without the fix.
+3. **H.265 lost the device and took the GPU side with it.** `video.xml` gives
+   `StdVideoH265HrdParameters::pSubLayerHrdParametersNal`/`…Vcl` the length
+   `len="*_max_sub_layers_minus1 + 1"` — a count held by whichever VPS or SPS
+   the HRD parameters belong to, not by a sibling. With no lowering for the HRD
+   struct there was none for the VPS, the SPS (through its VUI) or any H.265
+   session- or inline-parameters struct, and **those links fell out of their
+   `pNext` chains without a word**. RADV received an H.265 session-parameters
+   object with no parameter sets, the first submit returned
+   `VK_ERROR_DEVICE_LOST`, and `sv-gpu-server` segfaulted. Now
+   `exceptions::LEN_FROM_CONTEXT` names the array and
+   `LEN_CONTEXT_PROVIDERS` the two ancestors; the ancestor's generated lowering
+   publishes the count on a per-thread stack for exactly as long as its members
+   are lowered (`sv_icd_entry::lowering_context`), and an HRD with no ancestor
+   above it is refused with `Shape` rather than read to a guessed bound.
+   `tests/h265_context.rs` checks both paths read exactly the published count;
+   it runs clean under Miri.
+4. **Session memory the driver will not take from our type 0** — §7.3.
+5. **A file descriptor forwarded as a number.** The forwarded device advertises
+   `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`,
+   `VK_KHR_external_semaphore_fd` and `VK_KHR_external_fence_fd` — they are in
+   the `full` profile and on the driver — while the external-properties queries
+   answer "no handle type". `vkGetMemoryFdKHR`, forwarded, returned the number
+   of a descriptor open in the GPU side's process; the importers would have had
+   the GPU side's driver take ownership of, and close, its own descriptor of
+   that number. Nothing had called them until there was a decode queue, and
+   Firefox's Vulkan decoder calls `vkGetMemoryFdKHR` on its first frame. The
+   six commands are now refused app-side (`VK_ERROR_TOO_MANY_OBJECTS`,
+   `VK_ERROR_INVALID_EXTERNAL_HANDLE`). Withdrawing the extensions would be
+   cleaner and is not done: Zink reads them, and narrowing the advertised set
+   is not this branch's call.
+6. **`vkGetDeviceQueue2` was a refused stub** that left `*pQueue` untouched.
+   ffmpeg 9.0.1 — the ffmpeg Firefox 157 loads — fetches every queue with it,
+   then submitted on an uninitialised handle; the GPU side mapped id 0 to a
+   null `VkQueue` and RADV segfaulted in `vk_common_QueueSubmit2`. ffmpeg 8
+   used `vkGetDeviceQueue` and never met it. Now hand-written beside
+   `vkGetDeviceQueue`.
+7. **A race in command-blob recording**, which is not video's at all and is the
+   one with the widest reach. `Transport::record` advanced a blob's `len` under
+   the lock and copied the command in after releasing it, on the argument that
+   the GPU side cannot see a range until the blob is published — but
+   `publish_recorded_first` runs before every unrecorded command from *any*
+   thread and publishes every open blob up to its `len`. ffmpeg's frame threads
+   record on one thread while another submits, and about one multi-threaded
+   1080p decode in seven stalled for ten seconds: the GPU side read zeros
+   (`stream truncated: need 4 bytes, 0 remain`), took the ring fatal, and the
+   application waited out `CALL_TIMEOUT`. None of twenty-five runs with
+   `-threads 1` did. The copy now happens before `len` advances, under the
+   lock; zero stalls in thirty runs after. Once, before the fix, a script run
+   produced *wrong H.265 frames* rather than a stall — consistent with the same
+   race landing a partly-written command the decoder could still parse — and
+   that did not recur in thirty-three runs after it; the attribution is
+   inferred, not shown.
+
+Fault 3's shape deserves its own line: **an app-side `pNext` link with no
+lowering is dropped, not refused.** That is why H.265 failed as a device loss
+three calls later instead of as an error at the call that carried the
+unlowerable struct. It is not changed here — `lower_pnext` belongs to another
+branch in flight — and it is the next thing that will hide a fault like this
+one.
+
+### 7.5 The results
+
+**`video-probe decode`, through the forwarder.** Same binary, same fixture as
+§3:
+
+| fixture | GPU side | frames | sha256 | vs libavcodec |
+|---|---|---|---|---|
+| 320×180 H.264 Main, 24 IDR | RADV, Mesa 26.2.0 (dev shell), debug build | 24 | `b3a1374e…` | **byte-identical** |
+| 320×180 H.264 Main, 24 IDR | RADV, Mesa 26.2.4 (system), release build, ×7 | 24 | `b3a1374e…` | **byte-identical** |
+| 1920×1080 H.264 High, 30 IDR | RADV, Mesa 26.2.0 | 30 | `9cc17c94…` | **byte-identical** |
+| 1920×1080 H.264 High, 30 IDR | RADV, Mesa 26.2.4, ×7 | 30 | `9cc17c94…` | **byte-identical** |
+
+**ffmpeg 8.1.2's `-hwaccel vulkan`, through the forwarder.** Every frame
+downloaded (`hwdownload`, which is `av_hwframe_transfer_data`) and hashed
+against libavcodec's software decode of the same file. Streams are
+`testsrc2`, encoded by x264/x265/SVT-AV1/libvpx with their usual GOPs:
+
+| stream | frames | direct | forwarded | software |
+|---|---|---|---|---|
+| H.264 High 1080p30, 4 Mbit/s, B-frames | 300 | `5d146c24…` | `5d146c24…` | `5d146c24…` |
+| H.265 Main 720p30 | 120 | `24f006fc…` | `24f006fc…` | `24f006fc…` |
+| H.265 Main10 720p30, P010 | 120 | `2d5ae18a…` | `2d5ae18a…` | `2d5ae18a…` |
+| AV1 Main 720p30 (SVT-AV1) | 120 | `e5c97c2f…` | `e5c97c2f…` | `e5c97c2f…` |
+| VP9 profile 0 720p30 | 120 | `c77e30cb…` | `c77e30cb…` | `c77e30cb…` |
+
+Measured on both Mesas; the table is identical for both. Every row was taken
+again with the final code — after faults 6 and 7 — with the release build on the
+system Mesa, and every hash is unchanged; ffmpeg 9.0.1 (which reaches the
+forwarder only since fault 6) gives the same hashes for the four 8-bit streams.
+
+**The validation layer, on both sides at once** (`VK_INSTANCE_LAYERS` in the
+environment of the GPU side and the application), over all four ffmpeg
+streams after the fixes: the **application** side reports nothing. The GPU side
+reports two things, neither new: `VUID-VkDeviceCreateInfo-pNext-04748` and
+`-03328` (the GPU side enables both `VK_KHR_` and `VK_EXT_buffer_device_address`
+when it opens its device), and `VUID-vkGetMemoryHostPointerPropertiesEXT-pHostPointer-parameter`,
+which is ffmpeg probing `VK_EXT_external_memory_host` with a `malloc` pointer
+the app side translates as if it were arena memory. That last is the same shape
+as fault 5 and is recorded, not fixed: `VK_EXT_external_memory_host` is
+advertised and its `pHostPointer` is only honest when it points into the arena.
+
+### 7.6 What the forwarder costs a frame
+
+**Latency**: `video-probe`'s submit→fence time, one frame at a time — decode on
+the decode family, copy on family 0, a binary semaphore between, a fence wait —
+release build of the final code, system Mesa, seven runs each, the median of
+each run, sorted (bold is the median of the seven):
+
+| fixture | direct (ms) | forwarded (ms) |
+|---|---|---|
+| 320×180 | 0.762 0.783 0.799 **0.802** 0.861 0.869 0.873 | 0.749 0.770 0.771 **0.812** 0.861 0.879 1.047 |
+| 1920×1080 | 3.882 3.988 4.033 **4.232** 4.392 4.442 4.449 | 3.993 4.273 4.282 **4.440** 4.443 4.461 4.528 |
+
+**At 320×180 the forwarder's cost is inside the run-to-run spread; at 1080p it
+is about 0.2 ms, 5%, on the median.** Two earlier sets, before the final fixes
+and with other work on the CPU, read +0.3 ms and −0.1 ms at 1080p, so the
+sign and size of that number move with the machine's load and this is not a
+precise figure. What makes it small at all is that both
+`vkQueueSubmit`s are asynchronous on the wire (docs/design.md §0.3) and only the
+fence wait is a round trip, against an RADV decode whose own floor for a
+320×180 picture is three quarters of a millisecond.
+
+**Throughput**: ffmpeg decoding with frames left on the GPU (`-f null`),
+`-benchmark`'s `rtime`, three runs each, final code:
+
+| stream | direct (s) | forwarded (s) |
+|---|---|---|
+| H.264 1080p, 300 frames | 0.511 0.477 0.497 | 0.489 0.495 0.503 |
+| H.265 720p, 120 frames | 0.185 0.186 0.188 | 0.181 0.174 0.185 |
+| AV1 720p, 120 frames | 0.227 0.223 0.216 | 0.225 0.222 0.223 |
+| VP9 720p, 120 frames | 0.189 0.227 0.195 | 0.200 0.196 0.189 |
+
+About 555–600 frames a second of 1080p H.264 either way: ffmpeg keeps several
+frames in flight, so a pipelined decoder does not wait on the transport at all.
+Before fault 7 was fixed, about one forwarded run in seven took **ten seconds**
+instead of half of one — the app side's `CALL_TIMEOUT`, after the GPU side had
+taken the ring fatal on a half-written command. That was the race, not a
+transport cost, and thirty runs after the fix had none.
+
+### 7.7 Firefox decodes H.264 on the forwarded device
+
+**Which Firefox.** Checked 2026-10-15 against `nixpkgs-unstable`, no
+compiling:
+
+| attribute | version | how it arrives |
+|---|---|---|
+| `firefox` / `firefox-unwrapped` | **157.0.1** | cache.nixos.org |
+| `firefox-bin` | 157.0.1 | unfree, so not on cache.nixos.org; nix-community.cachix.org |
+| `firefox-devedition` | 158.0b1 | substituter |
+| `firefox-esr` | 153.4.0esr | substituter |
+| `firefox-beta`, `-nightly` | aliases of `firefox`, or absent | — |
+
+157's `libxul.so` has `FFmpegVulkanVideoDecoder` and the three
+`media.hardware-video-decoding-vulkan.*` prefs, and its wrapper puts
+**ffmpeg 9.0.1** (built `--enable-vulkan`, with the H.264, H.265, AV1 and VP9
+Vulkan hwaccels) on `LD_LIBRARY_PATH`. Read at the 157.0.1, 158.0 and `main`
+tags: **neither Vulkan output path stopped ending in `vkGetMemoryFdKHR`**, and
+the VA-API path is `vaExportSurfaceHandle` only, so §5's conclusion stands for
+the newest Firefox too. Mesa !31517 (Zink's VA-API frontend) is out of draft but
+unmerged, and a VA-API surface reaches Firefox as a dma-buf anyway, so no VA-API
+route exists for this topology. The route is §5's item 3, docs/design.md
+§0.21.9's tier 1: a Firefox patch.
+
+**The patch is `nix/firefox-vulkan-readback.patch`**: 123 added lines in five
+files, behind a new pref `media.hardware-video-decoding-vulkan.readback.enabled`
+(default false), and it turned out to need **three** changes where §0.21.8
+predicted one:
+
+1. **The third output path**, in `FFmpegVideoDecoder::CreateImageVulkan`:
+   `av_hwframe_transfer_data` (now loaded beside `av_hwframe_map`) copies the
+   decoded NV12 frame to host memory, and `VideoData::CreateAndCopyData` makes
+   the `PlanarYCbCrImage` the software decoder makes, Cb and Cr taken from the
+   one interleaved plane with a skip of one. No dma-buf, no `sync_fd`, and the
+   RDD process's shmem path carries it unchanged. Anything but NV12 is a
+   `DECODE_ERR`, which `MediaFormatReader` recovers from with software decode,
+   so a 10-bit stream degrades instead of failing the element. The dma-buf copy
+   ring (`InitCtx`, which needs the export entry points) is skipped.
+2. **The GL test.** `GfxInfo` probes the Vulkan device only if glxtest said the
+   GL is accelerated, and Mesa's EGL says Zink on a device with no DRM node is
+   `EGL_MESA_device_software`. That is true of the forwarder here and of the real
+   host, which has no `/dev/dri` at all — so **an unpatched Firefox on this
+   topology never even tries Vulkan decode**, whatever its prefs. With readback
+   on, the probe no longer requires an accelerated GL: Vulkan decode does not
+   use GL.
+3. **"Requires DMABUF"**: `gfxPlatformGtk` disables `HARDWARE_VIDEO_DECODING`
+   outright when the compositor offers no dma-buf. A readback frame is never
+   one, so with the Vulkan decoder enabled and readback on, that requirement
+   is dropped for decoding (encoding keeps it).
+
+Reaching the decoder also needed two forwarder fixes and found a third, all in
+§7.4's sense: `vkGetDeviceQueue2` had been a refused stub, and ffmpeg 9 fetches
+every queue with it (the application then submitted on an uninitialised
+handle and RADV segfaulted in `vk_common_QueueSubmit2`); the command-blob race
+of §7.4 fault 7; and the debug build of `sv-icd` overflows the stack of Firefox's
+`Renderer` thread in `lower_pnext` — the fault another branch owns — so the run
+below uses the release ICD, whose frames are smaller.
+
+**Built locally, inside the shared slice.** `nix develop` on
+`firefox-unwrapped`, the nixpkgs patches, then `./mach configure` with nixpkgs'
+flags minus `--enable-lto` and `--enable-debug-symbols`, and `make` in a scope
+capped at 6–7 GiB inside `builds-10g.slice`. Two local build-file edits, not in
+the patch, were needed to fit: Rust's `codegen-units=1` (the `style` crate
+alone passed 6 GiB) and the fat `-Clto` of `gkrust` (7 GiB and still growing).
+About forty minutes of wall time for the last Rust and C++ stages once those
+were out of the way (earlier attempts died to the OOM killer); an incremental
+rebuild of the patched files is 25 seconds.
+
+**The run**, `scripts/sv-firefox-vulkan-decode.sh` with the patched build:
+Xvfb (on this machine Mesa's Wayland EGL refuses Zink — "failed to choose
+pdev", with or without this branch — while Zink through the same ICD on Xvfb
+comes up on the forwarded RADV), the GPU side on RADV, Firefox loading only
+`sv-icd`, `MOZ_DISABLE_RDD_SANDBOX=1` (the RDD sandbox brokers `connect()` to
+the display sockets only, so the decoder process could not reach the GPU side),
+no VA-API driver reachable, a 10-second 720p H.264 High clip looped in one tab
+and about:support in the other:
+
+```
+  ok   the GPU side served 4 session(s)
+  ok   the RDD process made its decode device: AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO) (gen 1)
+  ok   1770 frames decoded on the forwarded device and read back
+  ok   the page presented 1757 frames with no media error (frames 1757 dropped 0 t=8.5 err=none)
+  about:support → Graphics: zink Vulkan 1.4(… RADV RAPHAEL_MENDOCINO …) [mesa/software-unknown], WebRender
+        H264 SWDEC HWDEC
+        VP9 SWDEC HWDEC
+        AV1 SWDEC HWDEC
+        HEVC SWDEC HWDEC
+  about:support → Graphics → features:
+        HARDWARE_VIDEO_DECODING: available
+        HARDWARE_VIDEO_DECODING_VULKAN: force_enabled ; Force enabled by pref; Blocklisted by gfxInfo
+  ok   about:support lists H.264 hardware decoding
+sv-firefox-vulkan-decode: PASS
+```
+
+The 1770 is the RDD process's own per-frame log line, which only the readback
+branch prints, after a `vkCmdDecodeVideoKHR` on the forwarded device produced
+the frame. about:support was read as data through Marionette
+(`Troubleshoot.snapshot()`), and photographed through WebDriver; the
+photographs were checked by a separate reader, who reported the Media table's
+H264 row as Hardware Decoding **Supported** and the video tab as a correct
+testsrc2 frame (bars in order, no channel swap, no blocking) with the status
+line `frames … dropped 0 … err=none`. The `HWDEC` column is Firefox's probe's
+belief, not a measurement; the per-frame log line is the measurement.
+
+Controls, same machine, same GPU side:
+
+| Firefox | prefs | what decoded | about:support H264 |
+|---|---|---|---|
+| stock 157.0.1 | Vulkan on, force-enabled | **software**: the probe never ran (GL "software") | `SWDEC` |
+| patched | Vulkan on, readback **off** | **software**, same reason | `SWDEC` |
+| patched | Vulkan on, readback on | **Vulkan on the forwarded RADV**, 1770 frames | `SWDEC HWDEC` |
+
+Both controls play cleanly. That is §0.21.6's hazard measured rather than
+predicted, and it is milder than predicted: on this topology a stock Firefox
+with the Vulkan pref on does not reach the fatal export path at all, because the
+GL precondition stops it first — and if it ever did, the fd refusal of §7.4
+fault 5 turns the bogus descriptor into a `vkGetMemoryFdKHR` error.
+
+**What it costs** was not measured: no CPU or power comparison against
+software decode was taken, and docs/design.md §0.21.11's verdict — tier 1 is a
+stepping stone, not the goal — is unchanged by this run. What the run
+establishes is the stepping stone: the private session §0.21 asked for is the
+application's own forwarded session, and a real browser decodes on it.
+
+### 7.8 The gates
+
+Run on the branch's final code on devhost, 2026-10-15.
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **2718 passed, 0 failed**, 8 ignored (baseline 2704; the 14 new are this branch's) |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in code this branch wrote (two pre-existing elsewhere) |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| Miri: `sv-icd-entry` `h265_context`, `fixed_arrays`; `sv-gpu-entry` `fixed_arrays` | 5 tests, clean |
+| `scripts/sv-video-decode.sh` (dev-shell RADV, debug build) | **PASS** three runs in a row, 13 checks each |
+| ffmpeg 8.1.2 through the forwarder, 5 streams, system RADV, release | all equal libavcodec (§7.5) |
+| ffmpeg 9.0.1 through the forwarder, 4 streams + Firefox's clip | all equal libavcodec |
+| validation layer on both sides, ffmpeg H.264 and AV1 | application: none; GPU side: only findings that predate this branch |
+| multi-threaded decode stall (fault 7) | 0 of 30 runs after the fix, against ~1 in 7 before |
+| `scripts/sv-firefox-vulkan-decode.sh`, patched 157.0.1 | **PASS**: 1770 frames decoded and read back, page `err=none`, about:support `H264 SWDEC HWDEC` |
+| the same, stock 157.0.1 and patched with readback off | software decode, plays cleanly (the expected FAIL of the Vulkan checks) |
+| NVIDIA RTX 5090 | **not run** — lease job 120 queued |
+| guest Intel UHD | **not run** — by instruction; steps in §7.9 |
+
+### 7.9 What this does not tell us, and the steps for the real guest
+
+- **NVIDIA has not run through it.** The RTX 5090 is leased through `gpu-run`
+  and job 120 (shared, 2 GiB; a script kept outside the tree that runs §7.5's
+  and §7.6's measurements — `video-probe` direct and forwarded ×5 on both
+  fixtures, ffmpeg on all five streams, a validation-layer pass — under the
+  newer glibc the system NVIDIA driver needs) was still queued when this was
+  written. §7.2's NVIDIA
+  row and §7.3's argument for the image renumbering are read from its family
+  and memory tables, not from a decode. NVIDIA is the one driver here whose
+  decode family has `TRANSFER` and whose output must coincide with the DPB, so
+  it exercises paths RADV does not.
+- **The guest's Intel has not run through it**, by instruction. Three things
+  about it are untested and specific to it: its decode family has no
+  `TRANSFER` and no `VK_KHR_video_maintenance1`, so every bitstream buffer is
+  created against its profile; its bitstream alignment is 4096; and the
+  bitstream buffer is bound into **host-pointer-imported** guest RAM (the
+  Windows arena provider), with `VIDEO_DECODE_SRC` usage — whether driver
+  101.7076 accepts that combination is the first thing the guest run will
+  answer. If it does not, the fallback is a device-local bitstream buffer and
+  one copy out of the arena per frame, which is a GPU-side change only.
+- **Concurrency beyond ffmpeg's.** Fault 7 was found because ffmpeg records
+  and submits from different threads; nothing here stresses more than one
+  application thread pair, or several decoding processes on one GPU side.
+- **Interlaced H.264, AV1 film grain, 4:2:2/4:4:4** were not decoded. Film
+  grain is refused by the guest Intel anyway (§1).
+- **No sustained-playback power or CPU measurement** of the forwarded decode
+  was taken; docs/design.md §0.21.11's question — is tier 1 worth having over
+  software decode — is still open, and it needs the guest.
+
+**The real-guest verification, in order.** Every step's pass condition is a
+hash or a log line, not a judgement.
+
+1. Build both halves from one commit (`scripts/sv-firefox-guest.sh`'s banner
+   says why): `cargo build --release -p sv-icd -p video-probe` on the host and
+   `cargo build --release -p sv-guest --target x86_64-pc-windows-gnu` for the
+   guest's `sv-guest.exe` (whose `gpu guest` mode is the GPU side), deployed
+   as that script deploys it. `SV_VIDEO_DECODE=0` in the guest's environment
+   puts back the single-family GPU side, for a before/after on the same build.
+2. **Capabilities.** On the host, `video-probe caps` through the ICD against the
+   guest's GPU side; compare every codec block with `video-probe.exe caps` run
+   in the guest (`scripts/sv-video-decode.sh` check 6's comparison). Expect the
+   decode family as family 1, `videoCodecOperations`
+   `DECODE_H264|DECODE_H265|DECODE_AV1`, no VP9 extension, no encode.
+3. **`video-probe decode`** of the 320×180 IDR fixture through the forwarder:
+   `sha256 b3a1374e…`, the same as §3's in-guest run. The `memory:` lines must
+   show session, DPB and target in type 0 and the bitstream in the arena.
+4. **ffmpeg through the forwarder** (`scripts/sv-video-decode.sh` check 7, with
+   `SV_SOCKET` naming the guest session): H.264, H.265 8-bit and AV1 must equal
+   libavcodec; VP9 must be *refused* at device selection (no extension), not
+   fail mid-stream; H.265 Main10 is expected to fail on this driver's empty
+   format list (§1 finding 5) — record which way.
+5. **The validation layer** on both sides for steps 3 and 4.
+6. **Firefox**: the patched build (`nix/firefox-vulkan-readback.patch`) with
+   `scripts/sv-firefox-vulkan-decode.sh`'s prefs and environment, on
+   `sv-firefox-guest.sh`'s topology; pass condition is the RDD log's
+   `[VULKAN] readback: … copied to host memory` lines and the page's frame
+   count with `err=none`, then about:support's H264 row.
+
+
 ## What this does not tell us
+
+> **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the
+> "one codec" and "inter prediction" ones are answered by §7 for RADV on this
+> workstation: frames have been decoded through the forwarder, video objects
+> created through it, and ffmpeg's decoder has run H.264 with B-frames, H.265
+> (8- and 10-bit), AV1 and VP9 through it byte-identically to libavcodec.
+> §7.9 is the list that replaces this one for the forwarded path; the bullets
+> about the drivers themselves still stand.
 
 - **Nothing has been decoded through the forwarder.** §6 moves the wall from a
   type to a queue family and measures the capability path across it exactly, but
@@ -847,11 +1369,21 @@ test being met — and it is a stage, not an afternoon.
 ## Re-running it
 
 ```
-# everything, from the dev shell. The forwarded half of the script needs the
-# binaries built for the video profile, because the profile is a build input.
+# everything, from the dev shell. The default `full` profile carries the video
+# extensions; the script finds the dev shell's own RADV (the system Mesa needs
+# a newer glibc than the dev shell's binaries, §7).
 nix develop
-SV_PROTO_PROFILE=video cargo build -p video-probe -p sv-icd -p sv-gpu-server
+cargo build -p video-probe -p sv-icd -p sv-gpu-server
 scripts/sv-video-decode.sh
+
+# Firefox decoding on the forwarded device (§7.7): build 157.0.1 with the patch,
+# then point the harness at it. Release binaries: the debug ICD overflows
+# Firefox's Renderer stack (another branch's fix).
+cargo build --release -p sv-icd -p sv-gpu-server
+SVFD_FIREFOX=/path/to/patched/firefox scripts/sv-firefox-vulkan-decode.sh 60
+
+# the GPU side as it was before §7: one family, no decode
+SV_VIDEO_DECODE=0 target/debug/sv-gpu-server serve --socket …
 
 # NVIDIA — must be a clean shell, see flake.nix
 nix shell nixpkgs#vulkan-loader --command bash -c \

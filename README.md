@@ -196,6 +196,20 @@ actually carried the pixels — and `docs/waycompose-design.md` §28 is the argu
 number the design is arranged around is the host's 2.4 s sweep for the arena's
 stamps: a warm session pays it once instead of once per click.
 
+```
+scripts/sv-video-decode.sh
+scripts/sv-firefox-vulkan-decode.sh       # with SVFD_FIREFOX=<patched firefox>
+```
+
+**Hardware video decode through the forwarder.** The GPU side serves its
+driver's decode queue family, and `video-probe` and ffmpeg's own Vulkan decoder
+(H.264, H.265 8- and 10-bit, AV1, VP9) decode through it byte-identically to
+libavcodec. A Firefox 157 built with `nix/firefox-vulkan-readback.patch` decodes
+H.264 on the forwarded device and about:support lists it as hardware decoding;
+an unpatched Firefox decodes in software, cleanly. `docs/video-decode.md` §7 is
+the account, with what is still unmeasured — NVIDIA and the guest's Intel among
+it.
+
 ## Layout
 
 ```
