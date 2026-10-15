@@ -314,9 +314,20 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
   PY=${SVWL_PYTHON:-python3}
   command -v "$PY" >/dev/null || { echo "FAIL: no $PY; run under 'nix shell nixpkgs#python3'"; exit 1; }
   MPORT=${SVWL_MARIONETTE_PORT:-$((28000 + $$ % 1000))}
+  # **`media.cubeb.force_null_context`, because about:support can wedge the
+  # main thread without it**, and that has nothing to do with graphics
+  # (docs/design.md §0.28.9). Its load handler asks `GetCurrentMaxAudioChannels`,
+  # which goes through audioipc to the audio process; this Firefox has the
+  # harness's own XDG_RUNTIME_DIR and so no audio server, and that IPC did not
+  # answer in 6 of 22 short runs — two cores taken mid-stall have the main thread
+  # parked in `audioipc::rpccore::Proxy::call`. `media.cubeb.sandbox=false` does
+  # not help: CubebUtils turns the sandbox back on whenever the content sandbox
+  # is. The null context is Firefox's own switch for a session with no audio,
+  # and this is one.
   cat >>"$RUN/profile/user.js" <<PREFS
 user_pref("marionette.port", $MPORT);
 user_pref("webgl.sanitize-unmasked-renderer", false);
+user_pref("media.cubeb.force_null_context", true);
 user_pref("layout.css.devPixelsPerPx", "1.0");
 PREFS
   mkdir -p "$RUN/pages"
