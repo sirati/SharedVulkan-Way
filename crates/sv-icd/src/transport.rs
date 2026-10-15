@@ -1082,27 +1082,35 @@ impl RingTransport {
     /// copies the recorded bytes to a new block and the GPU side may still be
     /// reading them out of the old one.
     fn grow_and_write(&self, command_buffer: u64, command: &[u8]) -> IcdResult<()> {
-        let in_flight = {
+        let mut in_flight = {
             let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
             blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0)
         };
-        // Without the blob lock held: this can block for as long as the GPU
-        // side takes, and a thread recording into a different command buffer
-        // has no reason to wait behind it.
-        self.await_blob_read(in_flight)?;
-        let at = {
-            let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
-            let blobs = &mut *blobs;
-            Self::grow(blobs, &self.arena, command_buffer, command.len() as u64)?;
-            let b = blobs
-                .open
-                .get_mut(&command_buffer)
-                .ok_or(LowerError::Shape("a blob that grow() did not create"))?;
-            let at = b.off + b.len;
-            b.len += command.len() as u64;
-            at
+        let mut blobs = loop {
+            // Without the blob lock held: this can block for as long as the GPU
+            // side takes, and a thread recording into a different command
+            // buffer has no reason to wait behind it.
+            self.await_blob_read(in_flight)?;
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            // Another thread's `publish_recorded_first` may have sent a newer
+            // piece of this block while the lock was not held; the block is not
+            // ours to copy and release until that one has been read too.
+            let now = blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0);
+            if now == in_flight {
+                break blobs;
+            }
+            in_flight = now;
         };
-        self.arena.write_bytes(at, command).map_err(lower)
+        let blobs = &mut *blobs;
+        Self::grow(blobs, &self.arena, command_buffer, command.len() as u64)?;
+        let b = blobs
+            .open
+            .get_mut(&command_buffer)
+            .ok_or(LowerError::Shape("a blob that grow() did not create"))?;
+        // Written before `len` covers it, under the lock: see `record`.
+        self.arena.write_bytes(b.off + b.len, command).map_err(lower)?;
+        b.len += command.len() as u64;
+        Ok(())
     }
 
     /// Return a block to the reserve.
@@ -1225,10 +1233,26 @@ impl Transport for RingTransport {
     /// against 0.075 µs for the entire ring push this is replacing. A blob that
     /// is slower than the packet it removes is not an optimisation.
     ///
-    /// The write happens after the lock is released. That is safe because
-    /// advancing `len` under the lock is what *reserves* the range: no other
-    /// thread can be given the same bytes, and the GPU side cannot see them
-    /// until `publish_blob` names them.
+    /// # The bytes are written before `len` says they exist
+    ///
+    /// The write used to happen after the lock was released, on the argument
+    /// that advancing `len` under the lock *reserves* the range and the GPU side
+    /// cannot see it until `publish_blob` names it. The second half was false:
+    /// [`RingTransport::publish_recorded_first`] runs before **every** unrecorded
+    /// command from **any** thread, and it publishes every open blob up to its
+    /// `len`. A thread submitting on one queue while another records into its
+    /// own command buffer — which is what ffmpeg's frame threads do, and
+    /// Firefox's decoder with them — could publish a range whose bytes were
+    /// still being copied in. The GPU side read zeros, `stream truncated: need 4
+    /// bytes, 0 remain`, took the ring fatal, and the application waited out
+    /// `CALL_TIMEOUT`: a 10-second stall in roughly one multi-threaded ffmpeg
+    /// decode in seven through the forwarder, and none in twenty-five with
+    /// `-threads 1` (docs/video-decode.md §7.6).
+    ///
+    /// So the copy happens under the lock and `len` advances after it. Vulkan
+    /// gives one command buffer to one recording thread, so the only
+    /// contention this adds is between threads recording *different* command
+    /// buffers, for the length of one small `memcpy`.
     fn record(&self, command_buffer: u64, _opcode: u32, command: &[u8]) -> IcdResult<()> {
         let need = command.len() as u64;
         let flush = {
@@ -1236,11 +1260,9 @@ impl Transport for RingTransport {
             match blobs.open.get_mut(&command_buffer) {
                 Some(b) if b.len + need <= b.cap => {
                     let at = b.off + b.len;
-                    b.len += need;
-                    let flush = b.len - b.published >= BLOB_FLUSH;
-                    drop(blobs);
                     self.arena.write_bytes(at, command).map_err(lower)?;
-                    flush
+                    b.len += need;
+                    b.len - b.published >= BLOB_FLUSH
                 }
                 // No block yet, or a full one. Both are the slow path, and both
                 // are rare: a block that has found its size never grows again.
